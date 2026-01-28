@@ -1,0 +1,51 @@
+# SynapS3 Configuration Example
+# Override any value with environment variables: SYNAPS3_<SECTION>_<KEY>
+# e.g. SYNAPS3_SERVER_PORT=:9090
+
+server:
+  port: ":8080"
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+s3:
+  access_key: "admin"
+  secret_key: "password"
+  region: "us-east-1"
+
+filecoin:
+  network: "calibration"       # calibration | mainnet
+  rpc_url: "https://api.calibration.node.glif.io/rpc/v1"
+  private_key: "${SYNAPS3_FILECOIN_PRIVATE_KEY}"
+  provider_url: "https://your-storage-provider.example.com"
+
+database:
+  driver: "sqlite"             # postgres | sqlite
+  dsn: "file:synaps3.db?_pragma=journal_mode(WAL)"
+  # dsn: "postgres://user:pass@localhost:5432/synaps3?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 5
+
+cache:
+  dir: "./cache"
+  max_size_gb: 100
+  eviction_policy: "lru"       # lru | manual | none
+  evict_after_onchain: true
+
+worker:
+  upload:
+    concurrency: 4
+    poll_interval: "5s"
+    max_retries: 5
+  onchain:
+    concurrency: 2
+    poll_interval: "30s"
+    max_retries: 10
+  evictor:
+    enabled: true
+    interval: "1m"
+
+logging:
+  level: "info"                # debug | info | warn | error
+  format: "json"               # json | text

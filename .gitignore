@@ -30,3 +30,10 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# SynapS3 build & runtime
+.serena/
+bin/
+synaps3.db*
+/cache/
+config.yaml
