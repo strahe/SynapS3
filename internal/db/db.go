@@ -7,10 +7,11 @@ import (
 	"log/slog"
 
 	"github.com/strahe/synaps3/internal/config"
-	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
+	"github.com/uptrace/bun/migrate"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
@@ -49,41 +50,29 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 	return db, nil
 }
 
-// Migrate creates the database tables if they do not exist.
-func Migrate(ctx context.Context, db *bun.DB) error {
-	models := []interface{}{
-		(*model.Bucket)(nil),
-		(*model.Object)(nil),
-		(*model.Task)(nil),
+// RunMigrations initialises the Bun migrator and applies all pending migrations.
+func RunMigrations(ctx context.Context, db *bun.DB) error {
+	migrator := migrate.NewMigrator(db, migrations.Migrations)
+
+	if err := migrator.Init(ctx); err != nil {
+		return fmt.Errorf("initialising migrator: %w", err)
 	}
 
-	for _, m := range models {
-		if _, err := db.NewCreateTable().Model(m).IfNotExists().Exec(ctx); err != nil {
-			return fmt.Errorf("creating table for %T: %w", m, err)
-		}
+	group, err := migrator.Migrate(ctx)
+	if err != nil {
+		return fmt.Errorf("running migrations: %w", err)
 	}
 
-	// Composite unique index: one active object per (bucket_id, key).
-	if _, err := db.NewCreateIndex().
-		Model((*model.Object)(nil)).
-		Index("idx_objects_bucket_key").
-		Column("bucket_id", "key").
-		Unique().
-		IfNotExists().
-		Exec(ctx); err != nil {
-		return fmt.Errorf("creating unique index on objects: %w", err)
+	if group != nil && group.ID > 0 {
+		slog.Info("applied migrations", "group", group.ID, "count", len(group.Migrations))
+	} else {
+		slog.Info("no new migrations to apply")
 	}
 
-	// Index for task polling: status + scheduled_at.
-	if _, err := db.NewCreateIndex().
-		Model((*model.Task)(nil)).
-		Index("idx_tasks_status_scheduled").
-		Column("status", "scheduled_at").
-		IfNotExists().
-		Exec(ctx); err != nil {
-		return fmt.Errorf("creating index on tasks: %w", err)
-	}
-
-	slog.Info("database migration completed")
 	return nil
+}
+
+// Ping verifies the database connection is alive.
+func Ping(ctx context.Context, db *bun.DB) error {
+	return db.PingContext(ctx)
 }

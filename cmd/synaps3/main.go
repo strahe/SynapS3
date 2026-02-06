@@ -13,6 +13,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/worker"
 	"github.com/versity/versitygw/auth"
@@ -55,9 +56,17 @@ func run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
-	if err := db.Migrate(ctx, database); err != nil {
+	if err := db.RunMigrations(ctx, database); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
+
+	// Verify connectivity.
+	if err := db.Ping(ctx, database); err != nil {
+		return fmt.Errorf("pinging database: %w", err)
+	}
+
+	// Build repositories.
+	repos := repository.NewRepositories(database)
 
 	// Initialise local cache.
 	localCache, err := cache.NewFilesystem(cfg.Cache.Dir)
@@ -69,7 +78,7 @@ func run(configPath string) error {
 	sm := state.NewObjectStateMachine()
 
 	// Create backend.
-	be := backend.New(database, localCache, sm, logger)
+	be := backend.New(repos, localCache, sm, logger)
 
 	// Set up IAM (simple root-only for now).
 	rootCfg := middlewares.RootUserConfig{

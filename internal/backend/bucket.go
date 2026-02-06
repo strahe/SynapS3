@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/strahe/synaps3/internal/model"
@@ -22,7 +21,7 @@ func (b *SynapseBackend) CreateBucket(ctx context.Context, input *s3.CreateBucke
 		Status: model.BucketStatusActive,
 	}
 
-	if _, err := b.db.NewInsert().Model(bucket).Exec(ctx); err != nil {
+	if err := b.repos.Buckets.Create(ctx, bucket); err != nil {
 		// TODO: distinguish duplicate-key error → BucketAlreadyExists
 		return fmt.Errorf("creating bucket %q: %w", name, err)
 	}
@@ -41,12 +40,11 @@ func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInp
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 
-	var bucket model.Bucket
-	err := b.db.NewSelect().Model(&bucket).
-		Where("name = ?", *input.Bucket).
-		Where("status != ?", model.BucketStatusDeleted).
-		Scan(ctx)
+	bucket, err := b.repos.Buckets.GetByName(ctx, *input.Bucket)
 	if err != nil {
+		return nil, fmt.Errorf("querying bucket: %w", err)
+	}
+	if bucket == nil || bucket.Status == model.BucketStatusDeleted {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 
@@ -54,34 +52,21 @@ func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInp
 }
 
 func (b *SynapseBackend) DeleteBucket(ctx context.Context, bucket string) error {
-	// Check the bucket exists.
-	var bkt model.Bucket
-	err := b.db.NewSelect().Model(&bkt).
-		Where("name = ?", bucket).
-		Where("status != ?", model.BucketStatusDeleted).
-		Scan(ctx)
+	bkt, err := b.getBucket(ctx, bucket)
 	if err != nil {
-		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		return err
 	}
 
-	// Ensure bucket is empty.
-	count, err := b.db.NewSelect().Model((*model.Object)(nil)).
-		Where("bucket_id = ?", bkt.ID).
-		Count(ctx)
+	// Ensure bucket is empty (soft-deleted objects are automatically filtered).
+	objects, err := b.repos.Objects.ListByBucket(ctx, bkt.ID, "", 1)
 	if err != nil {
-		return fmt.Errorf("counting objects: %w", err)
+		return fmt.Errorf("checking bucket contents: %w", err)
 	}
-	if count > 0 {
+	if len(objects) > 0 {
 		return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 	}
 
-	// Soft-delete.
-	bkt.Status = model.BucketStatusDeleted
-	bkt.UpdatedAt = time.Now()
-	if _, err := b.db.NewUpdate().Model(&bkt).
-		Column("status", "updated_at").
-		WherePK().
-		Exec(ctx); err != nil {
+	if err := b.repos.Buckets.SoftDelete(ctx, bkt.ID); err != nil {
 		return fmt.Errorf("deleting bucket: %w", err)
 	}
 
@@ -93,11 +78,7 @@ func (b *SynapseBackend) DeleteBucket(ctx context.Context, bucket string) error 
 }
 
 func (b *SynapseBackend) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
-	var buckets []model.Bucket
-	err := b.db.NewSelect().Model(&buckets).
-		Where("status != ?", model.BucketStatusDeleted).
-		OrderExpr("name ASC").
-		Scan(ctx)
+	buckets, err := b.repos.Buckets.ListActive(ctx)
 	if err != nil {
 		return s3response.ListAllMyBucketsResult{}, fmt.Errorf("listing buckets: %w", err)
 	}

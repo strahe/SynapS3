@@ -4,8 +4,8 @@ import (
 	"log/slog"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/state"
-	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/backend"
 )
 
@@ -14,16 +14,16 @@ import (
 type SynapseBackend struct {
 	backend.BackendUnsupported // provides ErrNotImplemented for unimplemented methods
 
-	db           *bun.DB
+	repos        *repository.Repositories
 	cache        cache.Cache
 	stateMachine *state.Machine
 	logger       *slog.Logger
 }
 
 // New creates a new SynapseBackend.
-func New(db *bun.DB, c cache.Cache, sm *state.Machine, logger *slog.Logger) *SynapseBackend {
+func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, logger *slog.Logger) *SynapseBackend {
 	return &SynapseBackend{
-		db:           db,
+		repos:        repos,
 		cache:        c,
 		stateMachine: sm,
 		logger:       logger,

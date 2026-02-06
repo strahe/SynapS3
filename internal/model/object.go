@@ -9,6 +9,8 @@ import (
 // ObjectState represents the lifecycle state of an object.
 // Designed to be extensible — new states can be added without
 // breaking existing transitions.
+// Note: Object visibility is controlled by DeletedAt, NOT by State.
+// State tracks the storage pipeline lifecycle only.
 type ObjectState string
 
 const (
@@ -40,6 +42,7 @@ type Object struct {
 	RetryCount  int               `bun:",notnull,default:0"`
 	MaxRetries  int               `bun:",notnull,default:5"`
 	LastError   *string           `bun:",nullzero"`
+	DeletedAt   *time.Time        `bun:",soft_delete,nullzero"`
 	CreatedAt   time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt   time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
 

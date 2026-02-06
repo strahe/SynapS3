@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -28,82 +29,50 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		return s3response.PutObjectOutput{}, fmt.Errorf("caching object: %w", err)
 	}
 
-	now := time.Now()
-
 	// Build metadata map from input.
 	meta := make(map[string]string)
 	if input.Metadata != nil {
 		meta = input.Metadata
 	}
 
-	// Upsert object record and create async task atomically.
-	tx, err := b.db.BeginTx(ctx, nil)
-	if err != nil {
-		return s3response.PutObjectOutput{}, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
+	var objectID int64
+	var newGen int64
 
-	// Increment generation for overwrites.
-	var existingGen int64
-	err = tx.NewSelect().Model((*model.Object)(nil)).
-		Column("generation").
-		Where("bucket_id = ? AND key = ?", bucket.ID, keyName).
-		Scan(ctx, &existingGen)
-	newGen := existingGen + 1
-	if err != nil {
-		newGen = 1 // first write
-	}
+	// Atomic transaction: upsert object + enqueue task.
+	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		obj := &model.Object{
+			BucketID:    bucket.ID,
+			Key:         keyName,
+			Size:        cacheInfo.Size,
+			ETag:        cacheInfo.ETag,
+			Checksum:    cacheInfo.Checksum,
+			ContentType: stringOrDefault(input.ContentType, "application/octet-stream"),
+			Metadata:    meta,
+			CachePath:   cacheInfo.Path,
+			State:       model.ObjectStateCached,
+			MaxRetries:  5,
+		}
 
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         keyName,
-		Generation:  newGen,
-		Size:        cacheInfo.Size,
-		ETag:        cacheInfo.ETag,
-		Checksum:    cacheInfo.Checksum,
-		ContentType: stringOrDefault(input.ContentType, "application/octet-stream"),
-		Metadata:    meta,
-		CachePath:   cacheInfo.Path,
-		State:       model.ObjectStateCached,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
+		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
+		if err != nil {
+			return fmt.Errorf("upserting object: %w", err)
+		}
+		objectID = id
+		newGen = gen
 
-	// Upsert: ON CONFLICT (bucket_id, key) DO UPDATE
-	if _, err := tx.NewInsert().Model(obj).
-		On("CONFLICT (bucket_id, key) DO UPDATE").
-		Set("generation = EXCLUDED.generation").
-		Set("size = EXCLUDED.size").
-		Set("etag = EXCLUDED.etag").
-		Set("checksum = EXCLUDED.checksum").
-		Set("content_type = EXCLUDED.content_type").
-		Set("metadata = EXCLUDED.metadata").
-		Set("cache_path = EXCLUDED.cache_path").
-		Set("state = EXCLUDED.state").
-		Set("retry_count = 0").
-		Set("last_error = NULL").
-		Set("piece_cid = NULL").
-		Set("updated_at = EXCLUDED.updated_at").
-		Exec(ctx); err != nil {
-		return s3response.PutObjectOutput{}, fmt.Errorf("upserting object: %w", err)
-	}
-
-	// Enqueue upload task.
-	task := &model.Task{
-		Type:           model.TaskTypeUploadToSP,
-		RefType:        "object",
-		RefID:          obj.ID,
-		RefGeneration:  newGen,
-		IdempotencyKey: fmt.Sprintf("upload:%d:%d", bucket.ID, newGen),
-		Status:         model.TaskStatusPending,
-		ScheduledAt:    now,
-	}
-	if _, err := tx.NewInsert().Model(task).Exec(ctx); err != nil {
-		return s3response.PutObjectOutput{}, fmt.Errorf("enqueuing upload task: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return s3response.PutObjectOutput{}, fmt.Errorf("commit tx: %w", err)
+		// Enqueue upload task with correct idempotency key: upload:objectID:generation.
+		task := &model.Task{
+			Type:           model.TaskTypeUploadToSP,
+			RefType:        "object",
+			RefID:          objectID,
+			RefGeneration:  newGen,
+			IdempotencyKey: fmt.Sprintf("upload:%d:%d", objectID, newGen),
+			Status:         model.TaskStatusPending,
+			ScheduledAt:    time.Now(),
+		}
+		return txRepos.Tasks.Create(ctx, task)
+	}); err != nil {
+		return s3response.PutObjectOutput{}, err
 	}
 
 	b.logger.Info("object stored", "bucket", bucketName, "key", keyName, "size", cacheInfo.Size, "gen", newGen)
@@ -124,11 +93,11 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		return nil, err
 	}
 
-	var obj model.Object
-	err = b.db.NewSelect().Model(&obj).
-		Where("bucket_id = ? AND key = ?", bucket.ID, *input.Key).
-		Scan(ctx)
+	obj, err := b.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, *input.Key)
 	if err != nil {
+		return nil, fmt.Errorf("querying object: %w", err)
+	}
+	if obj == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
@@ -165,11 +134,11 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 		return nil, err
 	}
 
-	var obj model.Object
-	err = b.db.NewSelect().Model(&obj).
-		Where("bucket_id = ? AND key = ?", bucket.ID, *input.Key).
-		Scan(ctx)
+	obj, err := b.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, *input.Key)
 	if err != nil {
+		return nil, fmt.Errorf("querying object: %w", err)
+	}
+	if obj == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
@@ -195,16 +164,15 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 		return nil, err
 	}
 
-	// Delete object record (cancels pending tasks via generation mismatch).
-	res, err := b.db.NewDelete().Model((*model.Object)(nil)).
-		Where("bucket_id = ? AND key = ?", bucket.ID, *input.Key).
-		Exec(ctx)
+	// Soft-delete object (Bun soft_delete tag handles setting deleted_at).
+	obj, err := b.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, *input.Key)
 	if err != nil {
-		return nil, fmt.Errorf("deleting object: %w", err)
+		return nil, fmt.Errorf("querying object: %w", err)
 	}
-
-	rows, _ := res.RowsAffected()
-	if rows > 0 {
+	if obj != nil {
+		if err := b.repos.Objects.SoftDelete(ctx, obj.ID); err != nil {
+			return nil, fmt.Errorf("deleting object: %w", err)
+		}
 		_ = b.cache.Delete(ctx, *input.Bucket, *input.Key)
 	}
 
@@ -247,27 +215,26 @@ func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsI
 		return s3response.ListObjectsResult{}, err
 	}
 
-	q := b.db.NewSelect().Model((*model.Object)(nil)).
-		Where("bucket_id = ?", bucket.ID).
-		OrderExpr("key ASC")
-
-	if input.Prefix != nil && *input.Prefix != "" {
-		q = q.Where("key LIKE ?", *input.Prefix+"%")
-	}
-
 	maxKeys := int32(1000)
 	if input.MaxKeys != nil {
 		maxKeys = *input.MaxKeys
 	}
-	q = q.Limit(int(maxKeys) + 1)
 
-	if input.Marker != nil && *input.Marker != "" {
-		q = q.Where("key > ?", *input.Marker)
+	prefix := derefStr(input.Prefix)
+	objects, err := b.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, int(maxKeys)+1)
+	if err != nil {
+		return s3response.ListObjectsResult{}, fmt.Errorf("listing objects: %w", err)
 	}
 
-	var objects []model.Object
-	if err := q.Scan(ctx, &objects); err != nil {
-		return s3response.ListObjectsResult{}, fmt.Errorf("listing objects: %w", err)
+	// Apply marker filter (ListByBucket doesn't handle marker).
+	if input.Marker != nil && *input.Marker != "" {
+		filtered := objects[:0]
+		for _, obj := range objects {
+			if obj.Key > *input.Marker {
+				filtered = append(filtered, obj)
+			}
+		}
+		objects = filtered
 	}
 
 	isTruncated := false
@@ -313,30 +280,32 @@ func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObject
 		return s3response.ListObjectsV2Result{}, err
 	}
 
-	q := b.db.NewSelect().Model((*model.Object)(nil)).
-		Where("bucket_id = ?", bucket.ID).
-		OrderExpr("key ASC")
-
-	if input.Prefix != nil && *input.Prefix != "" {
-		q = q.Where("key LIKE ?", *input.Prefix+"%")
-	}
-
 	maxKeys := int32(1000)
 	if input.MaxKeys != nil {
 		maxKeys = *input.MaxKeys
 	}
-	q = q.Limit(int(maxKeys) + 1)
 
-	if input.StartAfter != nil && *input.StartAfter != "" {
-		q = q.Where("key > ?", *input.StartAfter)
-	}
-	if input.ContinuationToken != nil && *input.ContinuationToken != "" {
-		q = q.Where("key > ?", *input.ContinuationToken)
-	}
-
-	var objects []model.Object
-	if err := q.Scan(ctx, &objects); err != nil {
+	prefix := derefStr(input.Prefix)
+	objects, err := b.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, int(maxKeys)+1)
+	if err != nil {
 		return s3response.ListObjectsV2Result{}, fmt.Errorf("listing objects v2: %w", err)
+	}
+
+	// Apply start-after / continuation-token filter.
+	afterKey := ""
+	if input.ContinuationToken != nil && *input.ContinuationToken != "" {
+		afterKey = *input.ContinuationToken
+	} else if input.StartAfter != nil && *input.StartAfter != "" {
+		afterKey = *input.StartAfter
+	}
+	if afterKey != "" {
+		filtered := objects[:0]
+		for _, obj := range objects {
+			if obj.Key > afterKey {
+				filtered = append(filtered, obj)
+			}
+		}
+		objects = filtered
 	}
 
 	isTruncated := false
@@ -375,15 +344,14 @@ func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObject
 
 // getBucket retrieves an active bucket by name.
 func (b *SynapseBackend) getBucket(ctx context.Context, name string) (*model.Bucket, error) {
-	var bucket model.Bucket
-	err := b.db.NewSelect().Model(&bucket).
-		Where("name = ?", name).
-		Where("status != ?", model.BucketStatusDeleted).
-		Scan(ctx)
+	bucket, err := b.repos.Buckets.GetByName(ctx, name)
 	if err != nil {
+		return nil, fmt.Errorf("querying bucket: %w", err)
+	}
+	if bucket == nil || bucket.Status == model.BucketStatusDeleted {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
-	return &bucket, nil
+	return bucket, nil
 }
 
 func stringOrDefault(s *string, def string) string {
