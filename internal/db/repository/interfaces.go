@@ -27,6 +27,9 @@ type ObjectRepository interface {
 	ListByBucket(ctx context.Context, bucketID int64, prefix string, maxKeys int) ([]model.Object, error)
 	SoftDelete(ctx context.Context, id int64) error
 	UpdateState(ctx context.Context, id int64, from, to model.ObjectState) error
+	// UpdateStateToFailed transitions an object to ObjectStateFailed while
+	// recording which state it failed from (FailedAtState) and the error message.
+	UpdateStateToFailed(ctx context.Context, id int64, from model.ObjectState, lastError string) error
 }
 
 // TaskRepository defines persistence operations for Task entities.

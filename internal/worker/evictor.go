@@ -36,7 +36,9 @@ func (e *Evictor) Run(ctx context.Context) error {
 
 func (e *Evictor) tick(ctx context.Context) error {
 	// TODO: find objects eligible for cache eviction (state in uploaded/onchaining/onchained
-	// AND piece_cid IS NOT NULL), remove cache files, update state to cache_evicted.
+	// AND piece_cid IS NOT NULL), remove cache files.
+	// State transitions: uploaded/onchaining/onchained → cache_evicted.
+	// Use state.TransitionState for all changes.
 	e.logger.Debug("evictor tick")
 	return nil
 }

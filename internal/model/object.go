@@ -38,10 +38,11 @@ type Object struct {
 	Metadata    map[string]string `bun:"type:jsonb"`
 	CachePath   string            `bun:",notnull"`
 	PieceCID    *string           `bun:",nullzero"`
-	State       ObjectState       `bun:",notnull,default:'cached'"`
-	RetryCount  int               `bun:",notnull,default:0"`
-	MaxRetries  int               `bun:",notnull,default:5"`
-	LastError   *string           `bun:",nullzero"`
+	State         ObjectState       `bun:",notnull,default:'cached'"`
+	FailedAtState *ObjectState     `bun:",nullzero"`
+	RetryCount    int              `bun:",notnull,default:0"`
+	MaxRetries    int              `bun:",notnull,default:5"`
+	LastError     *string          `bun:",nullzero"`
 	DeletedAt   *time.Time        `bun:",soft_delete,nullzero"`
 	CreatedAt   time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt   time.Time         `bun:",nullzero,notnull,default:current_timestamp"`

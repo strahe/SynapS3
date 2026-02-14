@@ -69,7 +69,8 @@ func run(configPath string) error {
 	repos := repository.NewRepositories(database)
 
 	// Initialise local cache.
-	localCache, err := cache.NewFilesystem(cfg.Cache.Dir)
+	maxCacheBytes := int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024
+	localCache, err := cache.NewFilesystem(cfg.Cache.Dir, maxCacheBytes)
 	if err != nil {
 		return fmt.Errorf("initialising cache: %w", err)
 	}

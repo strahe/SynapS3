@@ -35,7 +35,9 @@ func (o *OnChain) Run(ctx context.Context) error {
 
 func (o *OnChain) tick(ctx context.Context) error {
 	// TODO: find objects in "uploaded" state, verify ProofSet exists for bucket,
-	// call AddRoots via go-synapse SDK, update object state to "onchained".
+	// call AddRoots via go-synapse SDK.
+	// State transitions: uploaded → onchaining (claim), then onchaining → onchained (success)
+	// or onchaining → failed (error). Use state.TransitionState for all changes.
 	o.logger.Debug("onchain tick")
 	return nil
 }

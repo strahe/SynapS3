@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
@@ -60,7 +61,9 @@ func (r *BunObjectRepo) UpsertAndBumpGeneration(ctx context.Context, obj *model.
 		Set("retry_count = 0").
 		Set("max_retries = ?", obj.MaxRetries).
 		Set("last_error = NULL").
+		Set("failed_at_state = NULL").
 		Set("deleted_at = NULL").
+		Set("updated_at = ?", time.Now()).
 		Where("id = ?", existing.ID).
 		WhereAllWithDeleted().
 		Exec(ctx)
@@ -118,17 +121,44 @@ func (r *BunObjectRepo) SoftDelete(ctx context.Context, id int64) error {
 }
 
 func (r *BunObjectRepo) UpdateState(ctx context.Context, id int64, from, to model.ObjectState) error {
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*model.Object)(nil)).
 		Set("state = ?", to).
-		Where("id = ? AND state = ?", id, from).
-		Exec(ctx)
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND state = ?", id, from)
+
+	// Clear FailedAtState when retrying from failed state.
+	if from == model.ObjectStateFailed {
+		q = q.Set("failed_at_state = NULL")
+	}
+
+	res, err := q.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("updating object state: %w", err)
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("state transition %s→%s failed: object %d not in expected state", from, to, id)
+	}
+	return nil
+}
+
+func (r *BunObjectRepo) UpdateStateToFailed(ctx context.Context, id int64, from model.ObjectState, lastError string) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("state = ?", model.ObjectStateFailed).
+		Set("failed_at_state = ?", from).
+		Set("last_error = ?", lastError).
+		Set("retry_count = retry_count + 1").
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND state = ?", id, from).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("updating object state to failed: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("state transition %s→failed failed: object %d not in expected state", from, id)
 	}
 	return nil
 }

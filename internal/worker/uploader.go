@@ -34,8 +34,9 @@ func (u *Uploader) Run(ctx context.Context) error {
 
 func (u *Uploader) tick(ctx context.Context) error {
 	// TODO: claim pending upload_to_sp tasks with lease semantics,
-	// verify object generation, upload to SP via go-synapse SDK,
-	// update object state, handle retries.
+	// verify object generation, upload to SP via go-synapse SDK.
+	// State transitions: cached → uploading (claim), then uploading → uploaded (success)
+	// or uploading → failed (error). Use state.TransitionState for all changes.
 	u.logger.Debug("uploader tick")
 	return nil
 }

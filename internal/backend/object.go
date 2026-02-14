@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -72,6 +73,14 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		}
 		return txRepos.Tasks.Create(ctx, task)
 	}); err != nil {
+		// Only clean up cache for truly new objects (gen 1).
+		// For overwrites (gen > 1), the rename already destroyed the old file;
+		// deleting the new file would cause data loss.
+		// When newGen == 0 (upsert itself failed), we can't distinguish new vs overwrite,
+		// so we leave the file. TODO: implement orphan reconciliation (compare cache files against DB).
+		if newGen == 1 {
+			_ = b.cache.Delete(ctx, bucketName, keyName)
+		}
 		return s3response.PutObjectOutput{}, err
 	}
 
@@ -101,13 +110,9 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
-	// Try local cache first.
-	if b.cache.Exists(ctx, *input.Bucket, *input.Key) {
-		rc, _, err := b.cache.Get(ctx, *input.Bucket, *input.Key)
-		if err != nil {
-			return nil, fmt.Errorf("reading from cache: %w", err)
-		}
-
+	// Try local cache first (no TOCTOU — call Get directly, handle ErrNotExist).
+	rc, _, cacheErr := b.cache.Get(ctx, *input.Bucket, *input.Key)
+	if cacheErr == nil {
 		etag := fmt.Sprintf(`"%s"`, obj.ETag)
 		contentType := obj.ContentType
 
@@ -117,6 +122,10 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 			ETag:          &etag,
 			ContentType:   &contentType,
 		}, nil
+	}
+
+	if !os.IsNotExist(cacheErr) {
+		return nil, fmt.Errorf("reading from cache: %w", cacheErr)
 	}
 
 	// Cache miss — object has been evicted, download from SP.
