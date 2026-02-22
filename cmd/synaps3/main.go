@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,59 +9,148 @@ import (
 	"syscall"
 
 	"github.com/strahe/synaps3/internal/backend"
+	"github.com/strahe/synaps3/internal/buildinfo"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/worker"
+	"github.com/uptrace/bun"
+	"github.com/urfave/cli/v3"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3api"
 	"github.com/versity/versitygw/s3api/middlewares"
 )
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "path to config file")
-	flag.Parse()
+	root := &cli.Command{
+		Name:        "synaps3",
+		Usage:       "S3-compatible gateway to Filecoin",
+		HideVersion: true,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "config",
+				Aliases: []string{"c"},
+				Value:   "config.yaml",
+				Usage:   "path to config file",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Len() > 0 {
+				return fmt.Errorf("unknown command %q, run --help for available commands", cmd.Args().First())
+			}
+			return runServe(ctx, cmd.String("config"))
+		},
+		Commands: []*cli.Command{
+			serveCommand(),
+			migrateCommand(),
+			versionCommand(),
+		},
+	}
 
-	if err := run(*configPath); err != nil {
+	if err := root.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath string) error {
-	// Load configuration.
+func serveCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "serve",
+		Usage: "start the S3 gateway server",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Len() > 0 {
+				return fmt.Errorf("unexpected argument %q, serve takes no positional arguments", cmd.Args().First())
+			}
+			return runServe(ctx, cmd.Root().String("config"))
+		},
+	}
+}
+
+func migrateCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "migrate",
+		Usage: "run database migrations and exit",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Len() > 0 {
+				return fmt.Errorf("unexpected argument %q, migrate takes no positional arguments", cmd.Args().First())
+			}
+			return runMigrate(ctx, cmd.Root().String("config"))
+		},
+	}
+}
+
+func versionCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "version",
+		Usage: "print version information",
+		Action: func(_ context.Context, _ *cli.Command) error {
+			fmt.Println(buildinfo.String())
+			return nil
+		},
+	}
+}
+
+// loadConfigAndDB is the shared setup used by serve and migrate.
+func loadConfigAndDB(ctx context.Context, configPath string) (*config.Config, *bun.DB, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		return fmt.Errorf("loading config: %w", err)
+		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
 
-	// Set up structured logging.
+	database, err := db.New(cfg.Database)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening database: %w", err)
+	}
+
+	if err := db.Ping(ctx, database); err != nil {
+		database.Close()
+		return nil, nil, fmt.Errorf("pinging database: %w", err)
+	}
+
+	return cfg, database, nil
+}
+
+func runMigrate(ctx context.Context, configPath string) error {
+	_, database, err := loadConfigAndDB(ctx, configPath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+
+	slog.Info("running database migrations")
+	if err := db.RunMigrations(ctx, database); err != nil {
+		return fmt.Errorf("running migrations: %w", err)
+	}
+	slog.Info("migrations completed successfully")
+	return nil
+}
+
+func runServe(ctx context.Context, configPath string) error {
+	cfg, database, err := loadConfigAndDB(ctx, configPath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+
+	// Set up structured logging so migration and runtime logs use the configured level/format.
 	logger := setupLogger(cfg.Logging)
 	slog.SetDefault(logger)
 
 	logger.Info("starting SynapS3",
+		"version", buildinfo.Version,
 		"port", cfg.Server.Port,
 		"network", cfg.Filecoin.Network,
 		"db_driver", cfg.Database.Driver,
 	)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Initialise database.
-	database, err := db.New(cfg.Database)
-	if err != nil {
-		return fmt.Errorf("opening database: %w", err)
-	}
+	// Run migrations on startup.
 	if err := db.RunMigrations(ctx, database); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
-	}
-
-	// Verify connectivity.
-	if err := db.Ping(ctx, database); err != nil {
-		return fmt.Errorf("pinging database: %w", err)
 	}
 
 	// Build repositories.

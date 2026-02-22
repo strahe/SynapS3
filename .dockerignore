@@ -1,0 +1,7 @@
+.git/
+bin/
+cache/
+*.db
+*.db-shm
+*.db-wal
+synaps3

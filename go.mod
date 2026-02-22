@@ -12,6 +12,7 @@ require (
 	github.com/uptrace/bun v1.2.18
 	github.com/uptrace/bun/dialect/pgdialect v1.2.18
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
+	github.com/urfave/cli/v3 v3.8.0
 	github.com/versity/versitygw v1.4.0
 	modernc.org/sqlite v1.48.1
 )
