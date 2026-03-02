@@ -78,11 +78,50 @@ func up001Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating index on object state: %w", err)
 	}
 
+	// Create multipart_uploads table.
+	if _, err := db.NewCreateTable().
+		Model((*model.MultipartUpload)(nil)).
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating multipart_uploads table: %w", err)
+	}
+
+	// Create multipart_parts table.
+	if _, err := db.NewCreateTable().
+		Model((*model.MultipartPart)(nil)).
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating multipart_parts table: %w", err)
+	}
+
+	// Index for listing uploads by bucket and status.
+	if _, err := db.NewCreateIndex().
+		Model((*model.MultipartUpload)(nil)).
+		Index("idx_multipart_uploads_bucket_status").
+		Column("bucket_id", "status").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating index on multipart_uploads: %w", err)
+	}
+
+	// Composite unique index: one part per (upload_id, part_number).
+	if _, err := db.NewCreateIndex().
+		Model((*model.MultipartPart)(nil)).
+		Index("idx_multipart_parts_upload_part").
+		Column("upload_id", "part_number").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating unique index on multipart_parts: %w", err)
+	}
+
 	return nil
 }
 
 func down001Init(ctx context.Context, db *bun.DB) error {
 	for _, m := range []interface{}{
+		(*model.MultipartPart)(nil),
+		(*model.MultipartUpload)(nil),
 		(*model.Task)(nil),
 		(*model.Object)(nil),
 		(*model.Bucket)(nil),

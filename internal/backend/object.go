@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -277,6 +279,137 @@ func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsI
 	result.MaxKeys = &maxKeys
 
 	return result, nil
+}
+
+func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
+	if input.Bucket == nil || input.Key == nil || input.CopySource == nil {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+
+	// Parse CopySource: "/<bucket>/<key>" or "<bucket>/<key>"
+	srcBucketName, srcKey, err := parseCopySource(*input.CopySource)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopySourceObject)
+	}
+
+	dstBucketName := *input.Bucket
+	dstKey := *input.Key
+
+	// Validate source and destination buckets
+	srcBucket, err := b.getBucket(ctx, srcBucketName)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
+
+	dstBucket, err := b.getBucket(ctx, dstBucketName)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
+
+	// Get source object metadata
+	srcObj, err := b.repos.Objects.GetByBucketAndKey(ctx, srcBucket.ID, srcKey)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, fmt.Errorf("querying source object: %w", err)
+	}
+	if srcObj == nil {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+
+	// Read source data from cache
+	srcReader, _, cacheErr := b.cache.Get(ctx, srcBucketName, srcKey)
+	if cacheErr != nil {
+		if os.IsNotExist(cacheErr) {
+			// Cache miss — SP fallback is a future feature
+			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		return s3response.CopyObjectOutput{}, fmt.Errorf("reading source from cache: %w", cacheErr)
+	}
+	defer srcReader.Close()
+
+	// Write to destination cache
+	cacheInfo, err := b.cache.Put(ctx, dstBucketName, dstKey, srcReader)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, fmt.Errorf("caching copy destination: %w", err)
+	}
+
+	// Determine metadata: COPY (default) preserves source, REPLACE uses request metadata
+	meta := make(map[string]string)
+	contentType := srcObj.ContentType
+	if input.MetadataDirective == types.MetadataDirectiveReplace {
+		if input.Metadata != nil {
+			meta = input.Metadata
+		}
+		contentType = stringOrDefault(input.ContentType, "application/octet-stream")
+	} else {
+		if srcObj.Metadata != nil {
+			for k, v := range srcObj.Metadata {
+				meta[k] = v
+			}
+		}
+	}
+
+	var newGen int64
+	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		obj := &model.Object{
+			BucketID:    dstBucket.ID,
+			Key:         dstKey,
+			Size:        cacheInfo.Size,
+			ETag:        cacheInfo.ETag,
+			Checksum:    cacheInfo.Checksum,
+			ContentType: contentType,
+			Metadata:    meta,
+			CachePath:   cacheInfo.Path,
+			State:       model.ObjectStateCached,
+			MaxRetries:  5,
+		}
+
+		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
+		if err != nil {
+			return fmt.Errorf("upserting copy destination: %w", err)
+		}
+		newGen = gen
+
+		task := &model.Task{
+			Type:           model.TaskTypeUploadToSP,
+			RefType:        "object",
+			RefID:          id,
+			RefGeneration:  gen,
+			IdempotencyKey: fmt.Sprintf("upload:%d:%d", id, gen),
+			Status:         model.TaskStatusPending,
+			ScheduledAt:    time.Now(),
+		}
+		return txRepos.Tasks.Create(ctx, task)
+	}); err != nil {
+		// Best-effort cleanup of destination cache file on tx failure
+		_ = b.cache.Delete(ctx, dstBucketName, dstKey)
+		return s3response.CopyObjectOutput{}, err
+	}
+
+	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)
+	lastModified := time.Now()
+	b.logger.Info("object copied", "src", srcBucketName+"/"+srcKey, "dst", dstBucketName+"/"+dstKey, "gen", newGen)
+
+	return s3response.CopyObjectOutput{
+		CopyObjectResult: &s3response.CopyObjectResult{
+			ETag:         &etag,
+			LastModified: &lastModified,
+		},
+	}, nil
+}
+
+// parseCopySource parses a CopySource header value into bucket and key.
+// Accepts "/<bucket>/<key>" or "<bucket>/<key>" format. URL-decodes per S3 spec.
+func parseCopySource(src string) (bucket, key string, err error) {
+	src, err = url.PathUnescape(src)
+	if err != nil {
+		return "", "", fmt.Errorf("url-decoding copy source: %w", err)
+	}
+	src = strings.TrimPrefix(src, "/")
+	idx := strings.IndexByte(src, '/')
+	if idx <= 0 || idx == len(src)-1 {
+		return "", "", fmt.Errorf("invalid copy source: %q", src)
+	}
+	return src[:idx], src[idx+1:], nil
 }
 
 func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {

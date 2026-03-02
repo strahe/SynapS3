@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 )
@@ -33,8 +34,33 @@ type ObjectRepository interface {
 }
 
 // TaskRepository defines persistence operations for Task entities.
-// Only producer operations are included here; claim/complete/fail belong to the worker layer.
 type TaskRepository interface {
 	Create(ctx context.Context, task *model.Task) error
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
+
+	// ClaimPending atomically claims one pending task of the given type by
+	// transitioning it to running and setting a lease. Returns nil if no task is available.
+	ClaimPending(ctx context.Context, taskType model.TaskType, leaseDuration time.Duration) (*model.Task, error)
+	// Complete marks a running task as completed.
+	Complete(ctx context.Context, taskID int64) error
+	// Fail marks a running task as failed, recording the error and incrementing retry count.
+	Fail(ctx context.Context, taskID int64, lastError string) error
+	// ReleaseExpiredLeases resets running tasks whose lease has expired back to pending.
+	ReleaseExpiredLeases(ctx context.Context) (int, error)
+}
+
+// MultipartUploadRepository defines persistence operations for multipart upload entities.
+type MultipartUploadRepository interface {
+	Create(ctx context.Context, upload *model.MultipartUpload) error
+	GetByUploadID(ctx context.Context, uploadID string) (*model.MultipartUpload, error)
+	ListByBucket(ctx context.Context, bucketID int64, prefix, keyMarker, uploadIDMarker string, maxUploads int) ([]model.MultipartUpload, error)
+	// SetStatus atomically transitions status using CAS (compare-and-swap) to prevent races.
+	SetStatus(ctx context.Context, uploadID string, from, to model.MultipartStatus) error
+	Delete(ctx context.Context, uploadID string) error
+
+	// Part operations
+	CreatePart(ctx context.Context, part *model.MultipartPart) error
+	GetParts(ctx context.Context, uploadID string, partNumberMarker, maxParts int) ([]model.MultipartPart, error)
+	GetPartsByNumbers(ctx context.Context, uploadID string, numbers []int) ([]model.MultipartPart, error)
+	DeleteParts(ctx context.Context, uploadID string) error
 }

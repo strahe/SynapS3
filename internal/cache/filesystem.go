@@ -372,3 +372,254 @@ func (f *Filesystem) DeleteBucketDir(_ context.Context, bucket string) error {
 	}
 	return nil
 }
+
+// multipartDir returns the path to .multipart/<uploadID>.
+func (f *Filesystem) multipartDir(uploadID string) (string, error) {
+	return f.safePath(".multipart", uploadID)
+}
+
+// partPath returns the path to .multipart/<uploadID>/<partNumber>.
+func (f *Filesystem) partPath(uploadID string, partNumber int) (string, error) {
+	return f.safePath(".multipart", uploadID, fmt.Sprintf("%d", partNumber))
+}
+
+func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int, r io.Reader) (*ObjectInfo, error) {
+	dst, err := f.partPath(uploadID, partNumber)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+
+	// Use shard lock keyed on uploadID+partNumber for per-part serialization.
+	mu := f.shardFor(".multipart/"+uploadID, fmt.Sprintf("%d", partNumber))
+	mu.Lock()
+	defer mu.Unlock()
+
+	var oldSize int64
+	if stat, statErr := os.Stat(dst); statErr == nil {
+		oldSize = stat.Size()
+	}
+
+	file, err := os.CreateTemp(dir, ".synaps3-*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := file.Name()
+	defer func() {
+		if file != nil {
+			file.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	md5Hash := md5.New()
+	sha256Hash := sha256.New()
+	w := io.MultiWriter(file, md5Hash, sha256Hash)
+
+	var src io.Reader = r
+	if f.maxBytes > 0 {
+		avail := f.maxBytes - f.usedBytes.Load() + oldSize
+		if avail <= 0 {
+			return nil, ErrCacheFull
+		}
+		src = &errLimitReader{r: r, remaining: avail}
+	}
+
+	n, err := io.Copy(w, src)
+	if err != nil {
+		if errors.Is(err, ErrCacheFull) {
+			return nil, ErrCacheFull
+		}
+		return nil, fmt.Errorf("writing part file: %w", err)
+	}
+
+	delta := n - oldSize
+	var reserved bool
+	if f.maxBytes > 0 && delta > 0 {
+		newUsed := f.usedBytes.Add(delta)
+		if newUsed > f.maxBytes {
+			f.usedBytes.Add(-delta)
+			return nil, ErrCacheFull
+		}
+		reserved = true
+	}
+
+	if err := file.Sync(); err != nil {
+		if reserved {
+			f.usedBytes.Add(-delta)
+		}
+		return nil, fmt.Errorf("fsync part file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		if reserved {
+			f.usedBytes.Add(-delta)
+		}
+		return nil, fmt.Errorf("closing part file: %w", err)
+	}
+	file = nil
+
+	if err := os.Rename(tmpPath, dst); err != nil {
+		if reserved {
+			f.usedBytes.Add(-delta)
+		}
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("renaming part to final: %w", err)
+	}
+
+	if err := fsyncDir(dir); err != nil {
+		slog.Warn("fsync multipart dir failed", "dir", dir, "error", err)
+	}
+
+	if !reserved {
+		f.usedBytes.Add(delta)
+	}
+
+	return &ObjectInfo{
+		Path:     dst,
+		Size:     n,
+		ETag:     hex.EncodeToString(md5Hash.Sum(nil)),
+		Checksum: hex.EncodeToString(sha256Hash.Sum(nil)),
+	}, nil
+}
+
+func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID string, partNumbers []int) (*ObjectInfo, []string, error) {
+	dst, err := f.safePath(bucket, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, nil, fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+
+	mu := f.shardFor(bucket, key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	var oldSize int64
+	if stat, statErr := os.Stat(dst); statErr == nil {
+		oldSize = stat.Size()
+	}
+
+	file, err := os.CreateTemp(dir, ".synaps3-*.tmp")
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := file.Name()
+	defer func() {
+		if file != nil {
+			file.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	sha256Hash := sha256.New()
+	w := io.MultiWriter(file, sha256Hash)
+
+	var totalSize int64
+	partETags := make([]string, 0, len(partNumbers))
+
+	for _, pn := range partNumbers {
+		partFile, pErr := f.partPath(uploadID, pn)
+		if pErr != nil {
+			return nil, nil, fmt.Errorf("part path %d: %w", pn, pErr)
+		}
+		pf, openErr := os.Open(partFile)
+		if openErr != nil {
+			return nil, nil, fmt.Errorf("opening part %d: %w", pn, openErr)
+		}
+
+		partMD5 := md5.New()
+		pr := io.TeeReader(pf, partMD5)
+
+		n, copyErr := io.Copy(w, pr)
+		pf.Close()
+		if copyErr != nil {
+			return nil, nil, fmt.Errorf("copying part %d: %w", pn, copyErr)
+		}
+		totalSize += n
+		partETags = append(partETags, hex.EncodeToString(partMD5.Sum(nil)))
+	}
+
+	delta := totalSize - oldSize
+	var reserved bool
+	if f.maxBytes > 0 && delta > 0 {
+		newUsed := f.usedBytes.Add(delta)
+		if newUsed > f.maxBytes {
+			f.usedBytes.Add(-delta)
+			return nil, nil, ErrCacheFull
+		}
+		reserved = true
+	}
+
+	if err := file.Sync(); err != nil {
+		if reserved {
+			f.usedBytes.Add(-delta)
+		}
+		return nil, nil, fmt.Errorf("fsync assembled file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		if reserved {
+			f.usedBytes.Add(-delta)
+		}
+		return nil, nil, fmt.Errorf("closing assembled file: %w", err)
+	}
+	file = nil
+
+	if err := os.Rename(tmpPath, dst); err != nil {
+		if reserved {
+			f.usedBytes.Add(-delta)
+		}
+		os.Remove(tmpPath)
+		return nil, nil, fmt.Errorf("renaming assembled to final: %w", err)
+	}
+
+	if err := fsyncDir(dir); err != nil {
+		slog.Warn("fsync dir after assemble failed", "dir", dir, "error", err)
+	}
+
+	if !reserved {
+		f.usedBytes.Add(delta)
+	}
+
+	info := &ObjectInfo{
+		Path:     dst,
+		Size:     totalSize,
+		Checksum: hex.EncodeToString(sha256Hash.Sum(nil)),
+	}
+	return info, partETags, nil
+}
+
+func (f *Filesystem) DeleteUpload(_ context.Context, uploadID string) error {
+	mpDir, err := f.multipartDir(uploadID)
+	if err != nil {
+		return err
+	}
+
+	// Walk without global lock — sum sizes first, then remove and adjust atomically.
+	var totalSize int64
+	_ = filepath.WalkDir(mpDir, func(_ string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".synaps3-") && strings.HasSuffix(d.Name(), ".tmp") {
+			return nil
+		}
+		if info, infoErr := d.Info(); infoErr == nil {
+			totalSize += info.Size()
+		}
+		return nil
+	})
+
+	if err := os.RemoveAll(mpDir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing upload dir %s: %w", mpDir, err)
+	}
+
+	if totalSize > 0 {
+		f.usedBytes.Add(-totalSize)
+	}
+	return nil
+}

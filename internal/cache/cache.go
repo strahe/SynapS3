@@ -52,4 +52,18 @@ type Cache interface {
 	// DeleteBucketDir removes the cache directory for a bucket.
 	// Returns ErrInvalidPath if bucket would escape the cache root.
 	DeleteBucketDir(ctx context.Context, bucket string) error
+
+	// PutPart writes a multipart upload part to the cache.
+	// Parts are stored under .multipart/<uploadID>/<partNumber>.
+	// Returns ObjectInfo with the part's Size, ETag (MD5), and Checksum (SHA-256).
+	PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader) (*ObjectInfo, error)
+
+	// AssembleParts concatenates the specified parts in order into a final
+	// object at bucket/key. Returns ObjectInfo for the assembled object and
+	// the ordered list of individual part MD5 hex digests (for S3 ETag computation).
+	// The part files are NOT deleted; call DeleteUpload to clean up.
+	AssembleParts(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*ObjectInfo, []string, error)
+
+	// DeleteUpload removes all part files for the given upload ID.
+	DeleteUpload(ctx context.Context, uploadID string) error
 }
