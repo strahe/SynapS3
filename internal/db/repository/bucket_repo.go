@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
@@ -58,7 +59,11 @@ func (r *BunBucketRepo) ListActive(ctx context.Context) ([]model.Bucket, error) 
 	var buckets []model.Bucket
 	err := r.db.NewSelect().
 		Model(&buckets).
-		Where("status != ?", model.BucketStatusDeleted).
+		Where("status IN (?)", bun.List([]model.BucketStatus{
+			model.BucketStatusActive,
+			model.BucketStatusCreating,
+			model.BucketStatusDeleting,
+		})).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing active buckets: %w", err)
@@ -74,6 +79,51 @@ func (r *BunBucketRepo) SoftDelete(ctx context.Context, id int64) error {
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("soft-deleting bucket: %w", err)
+	}
+	return nil
+}
+
+func (r *BunBucketRepo) UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("status = ?", to).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND status = ?", id, from).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("updating bucket status: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("bucket status transition %s→%s failed: bucket %d not in expected state", from, to, id)
+	}
+	return nil
+}
+
+func (r *BunBucketRepo) SetProofSetID(ctx context.Context, id int64, proofSetID string) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("proof_set_id = ?", proofSetID).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", id).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("setting proof set ID: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("setting proof set ID: bucket %d not found", id)
+	}
+	return nil
+}
+
+func (r *BunBucketRepo) HardDelete(ctx context.Context, id int64) error {
+	_, err := r.db.NewDelete().
+		Model((*model.Bucket)(nil)).
+		Where("id = ?", id).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("hard-deleting bucket: %w", err)
 	}
 	return nil
 }

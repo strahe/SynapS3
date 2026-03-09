@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -54,7 +55,8 @@ func (r *BunMultipartRepo) ListByBucket(
 		OrderExpr("key ASC, upload_id ASC")
 
 	if prefix != "" {
-		q = q.Where("key LIKE ?", prefix+"%")
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+		q = q.Where("key LIKE ? ESCAPE '\\'", escaped+"%")
 	}
 	if keyMarker != "" {
 		if uploadIDMarker != "" {
@@ -143,7 +145,7 @@ func (r *BunMultipartRepo) GetPartsByNumbers(ctx context.Context, uploadID strin
 	err := r.db.NewSelect().
 		Model(&parts).
 		Where("upload_id = ?", uploadID).
-		Where("part_number IN (?)", bun.In(numbers)).
+		Where("part_number IN (?)", bun.List(numbers)).
 		OrderExpr("part_number ASC").
 		Scan(ctx)
 	if err != nil {

@@ -10,10 +10,11 @@ import (
 type TaskType string
 
 const (
-	TaskTypeUploadToSP    TaskType = "upload_to_sp"
+	TaskTypeUploadToSP     TaskType = "upload_to_sp"
 	TaskTypeCreateProofSet TaskType = "create_proof_set"
-	TaskTypeAddRoots      TaskType = "add_roots"
-	TaskTypeEvictCache    TaskType = "evict_cache"
+	TaskTypeAddRoots       TaskType = "add_roots"
+	TaskTypeEvictCache     TaskType = "evict_cache"
+	TaskTypeDeleteProofSet TaskType = "delete_proof_set"
 )
 
 // TaskStatus represents the processing state of a task.

@@ -14,6 +14,12 @@ type BucketRepository interface {
 	GetByID(ctx context.Context, id int64) (*model.Bucket, error)
 	ListActive(ctx context.Context) ([]model.Bucket, error)
 	SoftDelete(ctx context.Context, id int64) error
+	// UpdateStatus atomically transitions bucket status using CAS.
+	UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error
+	// SetProofSetID sets the proof set ID for a bucket.
+	SetProofSetID(ctx context.Context, id int64, proofSetID string) error
+	// HardDelete permanently removes a bucket row (used after proof set deletion).
+	HardDelete(ctx context.Context, id int64) error
 }
 
 // ObjectRepository defines persistence operations for Object entities.
@@ -24,13 +30,22 @@ type ObjectRepository interface {
 	// Returns the object ID and new generation.
 	UpsertAndBumpGeneration(ctx context.Context, obj *model.Object) (id int64, generation int64, err error)
 
+	GetByID(ctx context.Context, id int64) (*model.Object, error)
 	GetByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error)
-	ListByBucket(ctx context.Context, bucketID int64, prefix string, maxKeys int) ([]model.Object, error)
+	ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error)
 	SoftDelete(ctx context.Context, id int64) error
-	UpdateState(ctx context.Context, id int64, from, to model.ObjectState) error
+	UpdateState(ctx context.Context, id int64, generation int64, from, to model.ObjectState) error
 	// UpdateStateToFailed transitions an object to ObjectStateFailed while
 	// recording which state it failed from (FailedAtState) and the error message.
-	UpdateStateToFailed(ctx context.Context, id int64, from model.ObjectState, lastError string) error
+	UpdateStateToFailed(ctx context.Context, id int64, generation int64, from model.ObjectState, lastError string) error
+	// SetPieceCIDAndTransition atomically sets the PieceCID and transitions state in one CAS update.
+	// This prevents split-write races where a stale worker could set PieceCID on a newer generation.
+	SetPieceCIDAndTransition(ctx context.Context, id int64, generation int64, pieceCID string, from, to model.ObjectState) error
+	// ListByState returns objects in the given state, limited to limit rows.
+	ListByState(ctx context.Context, state model.ObjectState, limit int) ([]model.Object, error)
+	// ResetStaleStates resets objects stuck in an intermediate state back to a safe state.
+	// Used during startup recovery for objects that were mid-transition when the process crashed.
+	ResetStaleStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
 }
 
 // TaskRepository defines persistence operations for Task entities.
@@ -45,6 +60,8 @@ type TaskRepository interface {
 	Complete(ctx context.Context, taskID int64) error
 	// Fail marks a running task as failed, recording the error and incrementing retry count.
 	Fail(ctx context.Context, taskID int64, lastError string) error
+	// Requeue resets a failed task back to pending with a scheduled backoff delay.
+	Requeue(ctx context.Context, taskID int64, backoff time.Duration) error
 	// ReleaseExpiredLeases resets running tasks whose lease has expired back to pending.
 	ReleaseExpiredLeases(ctx context.Context) (int, error)
 }

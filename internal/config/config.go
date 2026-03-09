@@ -54,27 +54,23 @@ type DatabaseConfig struct {
 }
 
 type CacheConfig struct {
-	Dir              string `koanf:"dir"`
-	MaxSizeGB        int    `koanf:"max_size_gb"`
-	EvictionPolicy   string `koanf:"eviction_policy"` // lru | manual | none
-	EvictAfterOnChain bool  `koanf:"evict_after_onchain"`
+	Dir               string `koanf:"dir"`
+	MaxSizeGB         int    `koanf:"max_size_gb"`
+	EvictionPolicy    string `koanf:"eviction_policy"` // lru | manual | none
+	EvictAfterOnChain bool   `koanf:"evict_after_onchain"`
 }
 
 type WorkerConfig struct {
 	Upload   WorkerPoolConfig `koanf:"upload"`
 	OnChain  WorkerPoolConfig `koanf:"onchain"`
-	Evictor  EvictorConfig    `koanf:"evictor"`
+	ProofSet WorkerPoolConfig `koanf:"proofset"`
+	Evictor  WorkerPoolConfig `koanf:"evictor"`
 }
 
 type WorkerPoolConfig struct {
 	Concurrency  int           `koanf:"concurrency"`
 	PollInterval time.Duration `koanf:"poll_interval"`
 	MaxRetries   int           `koanf:"max_retries"`
-}
-
-type EvictorConfig struct {
-	Enabled  bool          `koanf:"enabled"`
-	Interval time.Duration `koanf:"interval"`
 }
 
 type LoggingConfig struct {
@@ -101,9 +97,9 @@ func DefaultConfig() *Config {
 			MaxIdleConns: 5,
 		},
 		Cache: CacheConfig{
-			Dir:              "/var/lib/synaps3/cache",
-			MaxSizeGB:        100,
-			EvictionPolicy:   "lru",
+			Dir:               "/var/lib/synaps3/cache",
+			MaxSizeGB:         100,
+			EvictionPolicy:    "lru",
 			EvictAfterOnChain: true,
 		},
 		Worker: WorkerConfig{
@@ -117,9 +113,15 @@ func DefaultConfig() *Config {
 				PollInterval: 30 * time.Second,
 				MaxRetries:   10,
 			},
-			Evictor: EvictorConfig{
-				Enabled:  true,
-				Interval: time.Minute,
+			ProofSet: WorkerPoolConfig{
+				Concurrency:  1,
+				PollInterval: 30 * time.Second,
+				MaxRetries:   5,
+			},
+			Evictor: WorkerPoolConfig{
+				Concurrency:  2,
+				PollInterval: time.Minute,
+				MaxRetries:   3,
 			},
 		},
 		Logging: LoggingConfig{

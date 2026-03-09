@@ -131,7 +131,7 @@ func fsyncDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	return d.Sync()
 }
 
@@ -164,8 +164,8 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 	tmpPath := file.Name()
 	defer func() {
 		if file != nil {
-			file.Close()
-			os.Remove(tmpPath)
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -175,7 +175,7 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 
 	// Bound the write to prevent disk exhaustion from oversized uploads.
 	// Remaining capacity accounts for the old file being replaced.
-	var src io.Reader = r
+	src := r
 	if f.maxBytes > 0 {
 		avail := f.maxBytes - f.usedBytes.Load() + oldSize
 		if avail <= 0 {
@@ -223,7 +223,7 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 		if reserved {
 			f.usedBytes.Add(-delta)
 		}
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("renaming temp to final: %w", err)
 	}
 
@@ -260,7 +260,7 @@ func (f *Filesystem) Get(_ context.Context, bucket, key string) (io.ReadCloser, 
 
 	stat, err := file.Stat()
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, nil, err
 	}
 
@@ -410,8 +410,8 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 	tmpPath := file.Name()
 	defer func() {
 		if file != nil {
-			file.Close()
-			os.Remove(tmpPath)
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -419,7 +419,7 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 	sha256Hash := sha256.New()
 	w := io.MultiWriter(file, md5Hash, sha256Hash)
 
-	var src io.Reader = r
+	src := r
 	if f.maxBytes > 0 {
 		avail := f.maxBytes - f.usedBytes.Load() + oldSize
 		if avail <= 0 {
@@ -465,7 +465,7 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 		if reserved {
 			f.usedBytes.Add(-delta)
 		}
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("renaming part to final: %w", err)
 	}
 
@@ -511,8 +511,8 @@ func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID stri
 	tmpPath := file.Name()
 	defer func() {
 		if file != nil {
-			file.Close()
-			os.Remove(tmpPath)
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -536,7 +536,7 @@ func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID stri
 		pr := io.TeeReader(pf, partMD5)
 
 		n, copyErr := io.Copy(w, pr)
-		pf.Close()
+		_ = pf.Close()
 		if copyErr != nil {
 			return nil, nil, fmt.Errorf("copying part %d: %w", pn, copyErr)
 		}
@@ -573,7 +573,7 @@ func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID stri
 		if reserved {
 			f.usedBytes.Add(-delta)
 		}
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return nil, nil, fmt.Errorf("renaming assembled to final: %w", err)
 	}
 

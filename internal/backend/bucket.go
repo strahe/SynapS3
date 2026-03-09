@@ -3,8 +3,10 @@ package backend
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -16,22 +18,40 @@ func (b *SynapseBackend) CreateBucket(ctx context.Context, input *s3.CreateBucke
 	}
 	name := *input.Bucket
 
-	bucket := &model.Bucket{
-		Name:   name,
-		Status: model.BucketStatusActive,
-	}
+	// Atomic: create bucket (status=creating) + enqueue create_proof_set task.
+	var bucketID int64
+	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		bucket := &model.Bucket{
+			Name:   name,
+			Status: model.BucketStatusCreating,
+		}
+		if err := txRepos.Buckets.Create(ctx, bucket); err != nil {
+			// TODO: distinguish duplicate-key error → BucketAlreadyExists
+			return fmt.Errorf("creating bucket %q: %w", name, err)
+		}
+		bucketID = bucket.ID
 
-	if err := b.repos.Buckets.Create(ctx, bucket); err != nil {
-		// TODO: distinguish duplicate-key error → BucketAlreadyExists
-		return fmt.Errorf("creating bucket %q: %w", name, err)
+		task := &model.Task{
+			Type:           model.TaskTypeCreateProofSet,
+			RefType:        "bucket",
+			RefID:          bucket.ID,
+			IdempotencyKey: fmt.Sprintf("create_proof_set:%d", bucket.ID),
+			Status:         model.TaskStatusPending,
+			MaxRetries:     5,
+			ScheduledAt:    time.Now(),
+		}
+		return txRepos.Tasks.Create(ctx, task)
+	}); err != nil {
+		return err
 	}
 
 	if err := b.cache.CreateBucketDir(ctx, name); err != nil {
-		return fmt.Errorf("creating cache dir for bucket %q: %w", name, err)
+		// Bucket is already committed in 'creating' status. Cache dir will be
+		// created implicitly by cache.Put (MkdirAll), so this is non-fatal.
+		b.logger.Warn("pre-creating cache dir failed (non-fatal)", "bucket", name, "error", err)
 	}
 
-	b.logger.Info("bucket created", "bucket", name, "id", bucket.ID)
-	// TODO: synchronously create ProofSet via go-synapse and store proof_set_id.
+	b.logger.Info("bucket created (pending proof set)", "bucket", name, "id", bucketID)
 	return nil
 }
 
@@ -44,7 +64,7 @@ func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInp
 	if err != nil {
 		return nil, fmt.Errorf("querying bucket: %w", err)
 	}
-	if bucket == nil || bucket.Status == model.BucketStatusDeleted {
+	if bucket == nil || !bucket.Status.IsVisible() {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 
@@ -57,23 +77,40 @@ func (b *SynapseBackend) DeleteBucket(ctx context.Context, bucket string) error 
 		return err
 	}
 
-	// Ensure bucket is empty (soft-deleted objects are automatically filtered).
-	objects, err := b.repos.Objects.ListByBucket(ctx, bkt.ID, "", 1)
-	if err != nil {
-		return fmt.Errorf("checking bucket contents: %w", err)
-	}
-	if len(objects) > 0 {
-		return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
+	// Only active buckets can be deleted. Reject creating/deleting/failed states.
+	if bkt.Status != model.BucketStatusActive {
+		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 
-	if err := b.repos.Buckets.SoftDelete(ctx, bkt.ID); err != nil {
-		return fmt.Errorf("deleting bucket: %w", err)
+	// Atomic: empty check + status CAS (active→deleting) + enqueue delete_proof_set task.
+	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		objects, err := txRepos.Objects.ListByBucket(ctx, bkt.ID, "", "", 1)
+		if err != nil {
+			return fmt.Errorf("checking bucket contents: %w", err)
+		}
+		if len(objects) > 0 {
+			return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
+		}
+
+		if err := txRepos.Buckets.UpdateStatus(ctx, bkt.ID, model.BucketStatusActive, model.BucketStatusDeleting); err != nil {
+			return fmt.Errorf("transitioning bucket to deleting: %w", err)
+		}
+
+		task := &model.Task{
+			Type:           model.TaskTypeDeleteProofSet,
+			RefType:        "bucket",
+			RefID:          bkt.ID,
+			IdempotencyKey: fmt.Sprintf("delete_proof_set:%d", bkt.ID),
+			Status:         model.TaskStatusPending,
+			MaxRetries:     5,
+			ScheduledAt:    time.Now(),
+		}
+		return txRepos.Tasks.Create(ctx, task)
+	}); err != nil {
+		return err
 	}
 
-	_ = b.cache.DeleteBucketDir(ctx, bucket)
-
-	b.logger.Info("bucket deleted", "bucket", bucket)
-	// TODO: retire/delete ProofSet via go-synapse.
+	b.logger.Info("bucket deletion initiated", "bucket", bucket)
 	return nil
 }
 

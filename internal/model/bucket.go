@@ -10,11 +10,30 @@ import (
 type BucketStatus string
 
 const (
-	BucketStatusActive   BucketStatus = "active"
-	BucketStatusCreating BucketStatus = "creating"
-	BucketStatusDeleting BucketStatus = "deleting"
-	BucketStatusDeleted  BucketStatus = "deleted"
+	BucketStatusActive       BucketStatus = "active"
+	BucketStatusCreating     BucketStatus = "creating"
+	BucketStatusDeleting     BucketStatus = "deleting"
+	BucketStatusDeleted      BucketStatus = "deleted"
+	BucketStatusCreateFailed BucketStatus = "create_failed"
+	BucketStatusDeleteFailed BucketStatus = "delete_failed"
 )
+
+// IsVisible returns true for bucket statuses that should be visible to S3 clients
+// (i.e., for HeadBucket, GetObject read operations).
+func (s BucketStatus) IsVisible() bool {
+	switch s {
+	case BucketStatusActive, BucketStatusCreating, BucketStatusDeleting:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsWritable returns true for bucket statuses that allow write operations
+// (PutObject, multipart uploads, etc). Only active buckets accept writes.
+func (s BucketStatus) IsWritable() bool {
+	return s == BucketStatusActive
+}
 
 // Bucket maps an S3 bucket to a Filecoin ProofSet.
 type Bucket struct {

@@ -10,10 +10,7 @@ import (
 
 func TestBucketRepo_CreateAndGetByName(t *testing.T) {
 	db := testDB(t)
-	repo := &repository.BunBucketRepo{}
 	repos := repository.NewRepositories(db)
-	repo = repos.Buckets.(*repository.BunBucketRepo)
-	_ = repo // use repos.Buckets directly
 
 	ctx := context.Background()
 
@@ -93,6 +90,74 @@ func TestBucketRepo_ListActive(t *testing.T) {
 	}
 	if len(list) != 3 {
 		t.Errorf("expected 3 active buckets, got %d", len(list))
+	}
+}
+
+func TestBucketRepo_UpdateStatus(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "cas-status", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// CAS succeeds: active → creating
+	if err := repos.Buckets.UpdateStatus(ctx, bucket.ID, model.BucketStatusActive, model.BucketStatusCreating); err != nil {
+		t.Fatalf("UpdateStatus active→creating: %v", err)
+	}
+	got, _ := repos.Buckets.GetByID(ctx, bucket.ID)
+	if got.Status != model.BucketStatusCreating {
+		t.Errorf("expected creating, got %s", got.Status)
+	}
+
+	// CAS fails: wrong from state
+	err := repos.Buckets.UpdateStatus(ctx, bucket.ID, model.BucketStatusActive, model.BucketStatusDeleting)
+	if err == nil {
+		t.Fatal("expected error for wrong from state")
+	}
+}
+
+func TestBucketRepo_SetProofSetID(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "proofset-id", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := repos.Buckets.SetProofSetID(ctx, bucket.ID, "ps-12345"); err != nil {
+		t.Fatalf("SetProofSetID: %v", err)
+	}
+	got, _ := repos.Buckets.GetByID(ctx, bucket.ID)
+	if got.ProofSetID == nil || *got.ProofSetID != "ps-12345" {
+		t.Errorf("expected ProofSetID ps-12345, got %v", got.ProofSetID)
+	}
+}
+
+func TestBucketRepo_HardDelete(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "hard-del", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := repos.Buckets.HardDelete(ctx, bucket.ID); err != nil {
+		t.Fatalf("HardDelete: %v", err)
+	}
+
+	got, err := repos.Buckets.GetByID(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got != nil {
+		t.Fatal("expected nil after hard delete")
 	}
 }
 

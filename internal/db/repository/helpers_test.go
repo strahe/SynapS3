@@ -25,7 +25,7 @@ func testDB(t *testing.T) *bun.DB {
 	sqldb.SetMaxOpenConns(1)
 
 	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
 	migrator := migrate.NewMigrator(db, migrations.Migrations)

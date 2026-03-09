@@ -3,6 +3,7 @@ package repository_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -187,7 +188,7 @@ func TestObjectRepo_ListByBucket(t *testing.T) {
 	}
 
 	// List all.
-	all, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", 0)
+	all, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket: %v", err)
 	}
@@ -196,7 +197,7 @@ func TestObjectRepo_ListByBucket(t *testing.T) {
 	}
 
 	// List with prefix.
-	prefixed, err := repos.Objects.ListByBucket(ctx, bucket.ID, "dir/", 0)
+	prefixed, err := repos.Objects.ListByBucket(ctx, bucket.ID, "dir/", "", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket(prefix): %v", err)
 	}
@@ -205,12 +206,21 @@ func TestObjectRepo_ListByBucket(t *testing.T) {
 	}
 
 	// List with limit.
-	limited, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", 2)
+	limited, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 2)
 	if err != nil {
 		t.Fatalf("ListByBucket(limit): %v", err)
 	}
 	if len(limited) != 2 {
 		t.Errorf("expected 2 limited objects, got %d", len(limited))
+	}
+
+	// List with afterKey (pagination).
+	afterKey, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "a.txt", 0)
+	if err != nil {
+		t.Fatalf("ListByBucket(afterKey): %v", err)
+	}
+	if len(afterKey) != 2 {
+		t.Errorf("expected 2 objects after 'a.txt', got %d", len(afterKey))
 	}
 }
 
@@ -237,14 +247,175 @@ func TestObjectRepo_UpdateState(t *testing.T) {
 	}
 
 	// Valid transition.
-	if err := repos.Objects.UpdateState(ctx, id, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := repos.Objects.UpdateState(ctx, id, 1, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("UpdateState: %v", err)
 	}
 
 	// Invalid transition (wrong from state).
-	err = repos.Objects.UpdateState(ctx, id, model.ObjectStateCached, model.ObjectStateUploaded)
+	err = repos.Objects.UpdateState(ctx, id, 1, model.ObjectStateCached, model.ObjectStateUploaded)
 	if err == nil {
 		t.Fatal("expected error for invalid state transition")
+	}
+}
+
+func TestObjectRepo_SetPieceCIDAndTransition(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "piececid-bucket")
+	obj := &model.Object{
+		BucketID:    bucket.ID,
+		Key:         "piececid.txt",
+		Size:        1,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/piececid.txt",
+		MaxRetries:  5,
+	}
+	id, gen, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// Transition cached→uploading first
+	if err := repos.Objects.UpdateState(ctx, id, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+
+	// SetPieceCIDAndTransition uploading→uploaded
+	if err := repos.Objects.SetPieceCIDAndTransition(ctx, id, gen, "baga6ea4seaq123", model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
+		t.Fatalf("SetPieceCIDAndTransition: %v", err)
+	}
+
+	got, _ := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "piececid.txt")
+	if got.PieceCID == nil || *got.PieceCID != "baga6ea4seaq123" {
+		t.Errorf("PieceCID = %v, want %q", got.PieceCID, "baga6ea4seaq123")
+	}
+	if got.State != model.ObjectStateUploaded {
+		t.Errorf("State = %s, want uploaded", got.State)
+	}
+
+	// Stale generation should fail
+	err = repos.Objects.SetPieceCIDAndTransition(ctx, id, gen-1, "stale", model.ObjectStateUploaded, model.ObjectStateOnChaining)
+	if err == nil {
+		t.Fatal("expected error for stale generation")
+	}
+}
+
+func TestObjectRepo_ListByState(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "liststate-bucket")
+	for i, key := range []string{"a.txt", "b.txt", "c.txt"} {
+		obj := &model.Object{
+			BucketID:    bucket.ID,
+			Key:         key,
+			Size:        int64(i + 1),
+			ETag:        "e",
+			Checksum:    "c",
+			ContentType: "text/plain",
+			CachePath:   "/cache/" + key,
+			MaxRetries:  5,
+		}
+		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+			t.Fatalf("upsert %s: %v", key, err)
+		}
+	}
+
+	// All should be in "cached" state by default
+	list, err := repos.Objects.ListByState(ctx, model.ObjectStateCached, 10)
+	if err != nil {
+		t.Fatalf("ListByState: %v", err)
+	}
+	if len(list) != 3 {
+		t.Errorf("expected 3 cached objects, got %d", len(list))
+	}
+
+	// With limit
+	list2, err := repos.Objects.ListByState(ctx, model.ObjectStateCached, 2)
+	if err != nil {
+		t.Fatalf("ListByState with limit: %v", err)
+	}
+	if len(list2) != 2 {
+		t.Errorf("expected 2 objects with limit, got %d", len(list2))
+	}
+}
+
+func TestObjectRepo_ResetStaleStates(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "stale-bucket")
+	obj := &model.Object{
+		BucketID:    bucket.ID,
+		Key:         "stale.txt",
+		Size:        1,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/stale.txt",
+		MaxRetries:  5,
+	}
+	id, gen, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// Move to uploading
+	if err := repos.Objects.UpdateState(ctx, id, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+
+	// Reset stale uploading→cached (with future threshold — everything is stale)
+	count, err := repos.Objects.ResetStaleStates(ctx, model.ObjectStateUploading, model.ObjectStateCached, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ResetStaleStates: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 reset, got %d", count)
+	}
+
+	got, _ := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "stale.txt")
+	if got.State != model.ObjectStateCached {
+		t.Errorf("expected cached after reset, got %s", got.State)
+	}
+}
+
+func TestObjectRepo_UpdateState_StaleGeneration(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "stalegen-bucket")
+	obj := &model.Object{
+		BucketID:    bucket.ID,
+		Key:         "gentest.txt",
+		Size:        1,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/gentest.txt",
+		MaxRetries:  5,
+	}
+	id, gen, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// Valid generation should succeed
+	if err := repos.Objects.UpdateState(ctx, id, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+
+	// Stale generation should fail
+	err = repos.Objects.UpdateState(ctx, id, gen-1, model.ObjectStateUploading, model.ObjectStateUploaded)
+	if err == nil {
+		t.Fatal("expected error for stale generation")
 	}
 }
 
@@ -274,7 +445,7 @@ func TestObjectRepo_SoftDelete_ExcludesFromList(t *testing.T) {
 		t.Fatalf("SoftDelete: %v", err)
 	}
 
-	list, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", 0)
+	list, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket: %v", err)
 	}

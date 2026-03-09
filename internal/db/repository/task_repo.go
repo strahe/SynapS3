@@ -49,17 +49,20 @@ func (r *BunTaskRepo) ClaimPending(ctx context.Context, taskType model.TaskType,
 
 	task := new(model.Task)
 	// Atomic claim: UPDATE ... WHERE id = (subquery) RETURNING *
+	// The scheduled_at filter ensures tasks with future backoff are not claimed prematurely.
 	err := r.db.NewRaw(
 		`UPDATE tasks SET status = ?, claimed_at = ?, lease_until = ?, started_at = ?
 		 WHERE id = (
 		     SELECT id FROM tasks
-		     WHERE type = ? AND status = ?
+		     WHERE type = ? AND status = ? AND scheduled_at <= ?
 		     ORDER BY scheduled_at ASC
 		     LIMIT 1
 		 )
+		 AND status = ?
 		 RETURNING *`,
 		model.TaskStatusRunning, now, leaseUntil, now,
-		taskType, model.TaskStatusPending,
+		taskType, model.TaskStatusPending, now,
+		model.TaskStatusPending,
 	).Scan(ctx, task)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -124,4 +127,26 @@ func (r *BunTaskRepo) ReleaseExpiredLeases(ctx context.Context) (int, error) {
 	}
 	rows, _ := res.RowsAffected()
 	return int(rows), nil
+}
+
+// Requeue resets a failed task back to pending with a scheduled backoff delay.
+func (r *BunTaskRepo) Requeue(ctx context.Context, taskID int64, backoff time.Duration) error {
+	now := time.Now()
+	res, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusPending).
+		Set("scheduled_at = ?", now.Add(backoff)).
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
+		Where("id = ? AND status = ?", taskID, model.TaskStatusFailed).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("requeuing task: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("requeuing task %d: not in failed state", taskID)
+	}
+	return nil
 }

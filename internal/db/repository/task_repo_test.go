@@ -161,3 +161,39 @@ func TestTaskRepo_ReleaseExpiredLeases(t *testing.T) {
 		t.Fatal("expected to reclaim released task")
 	}
 }
+
+func TestTaskRepo_Requeue(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seeded := seedTask(t, repos, model.TaskTypeUploadToSP)
+
+	// Claim and fail the task first
+	claimed, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, 5*time.Minute)
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+	if err := repos.Tasks.Fail(ctx, claimed.ID, "test error"); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+
+	// Requeue with backoff
+	if err := repos.Tasks.Requeue(ctx, seeded.ID, 30*time.Second); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+
+	task, _ := repos.Tasks.GetByID(ctx, seeded.ID)
+	if task.Status != model.TaskStatusPending {
+		t.Errorf("expected pending after requeue, got %s", task.Status)
+	}
+	if task.ClaimedAt != nil {
+		t.Error("expected claimed_at to be nil after requeue")
+	}
+
+	// Requeue of non-failed task should error
+	err := repos.Tasks.Requeue(ctx, seeded.ID, time.Second)
+	if err == nil {
+		t.Fatal("expected error requeuing non-failed task")
+	}
+}

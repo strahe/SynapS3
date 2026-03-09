@@ -42,9 +42,14 @@ worker:
     concurrency: 2
     poll_interval: "30s"
     max_retries: 10
+  proofset:
+    concurrency: 1
+    poll_interval: "30s"
+    max_retries: 5
   evictor:
-    enabled: true
-    interval: "1m"
+    concurrency: 2
+    poll_interval: "1m"
+    max_retries: 3
 
 logging:
   level: "info"                # debug | info | warn | error

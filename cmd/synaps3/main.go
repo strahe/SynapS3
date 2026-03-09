@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/buildinfo"
 	"github.com/strahe/synaps3/internal/cache"
@@ -15,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/state"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
 	"github.com/urfave/cli/v3"
@@ -105,7 +108,7 @@ func loadConfigAndDB(ctx context.Context, configPath string) (*config.Config, *b
 	}
 
 	if err := db.Ping(ctx, database); err != nil {
-		database.Close()
+		_ = database.Close()
 		return nil, nil, fmt.Errorf("pinging database: %w", err)
 	}
 
@@ -117,7 +120,7 @@ func runMigrate(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	slog.Info("running database migrations")
 	if err := db.RunMigrations(ctx, database); err != nil {
@@ -132,7 +135,7 @@ func runServe(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Set up structured logging so migration and runtime logs use the configured level/format.
 	logger := setupLogger(cfg.Logging)
@@ -166,8 +169,23 @@ func runServe(ctx context.Context, configPath string) error {
 	// Build state machine.
 	sm := state.NewObjectStateMachine()
 
+	// Initialize Filecoin SDK clients (optional — nil when private key is not configured).
+	var storageClient synapse.StorageClient
+	var proofSetClient synapse.ProofSetClient
+	if cfg.Filecoin.PrivateKey != "" {
+		bundle, sdkErr := initSDK(ctx, cfg.Filecoin, logger)
+		if sdkErr != nil {
+			return fmt.Errorf("initializing Filecoin SDK: %w", sdkErr)
+		}
+		defer bundle.Close()
+		storageClient = bundle.Storage
+		proofSetClient = bundle.ProofSet
+	} else {
+		logger.Warn("Filecoin private key not configured, SDK features disabled (uploads and proof-sets will not work)")
+	}
+
 	// Create backend.
-	be := backend.New(repos, localCache, sm, logger)
+	be := backend.New(repos, localCache, sm, storageClient, proofSetClient, logger)
 
 	// Set up IAM (simple root-only for now).
 	rootCfg := middlewares.RootUserConfig{
@@ -192,10 +210,15 @@ func runServe(ctx context.Context, configPath string) error {
 	}
 
 	// Start background workers.
-	wm := worker.NewManager(logger,
-		worker.NewUploader(database, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger),
-		worker.NewOnChain(database, cfg.Worker.OnChain.Concurrency, cfg.Worker.OnChain.PollInterval, logger),
-		worker.NewEvictor(database, localCache, cfg.Worker.Evictor.Interval, logger),
+	wm := worker.NewManager(repos, cfg.Cache.EvictAfterOnChain, logger,
+		worker.NewUploader(repos, localCache, storageClient, sm,
+			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger),
+		worker.NewOnChain(repos, proofSetClient, sm, cfg.Cache.EvictAfterOnChain,
+			cfg.Worker.OnChain.Concurrency, cfg.Worker.OnChain.PollInterval, logger),
+		worker.NewEvictor(repos, localCache, sm,
+			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
+		worker.NewProofSetWorker(repos, proofSetClient, localCache,
+			cfg.Worker.ProofSet.Concurrency, cfg.Worker.ProofSet.PollInterval, logger),
 	)
 	go wm.Start(ctx)
 
@@ -249,4 +272,21 @@ func setupLogger(cfg config.LoggingConfig) *slog.Logger {
 	}
 
 	return slog.New(handler)
+}
+
+// initSDK parses the Filecoin private key and constructs the SDK ClientBundle.
+func initSDK(ctx context.Context, cfg config.FilecoinConfig, logger *slog.Logger) (*synapse.ClientBundle, error) {
+	keyHex := strings.TrimPrefix(cfg.PrivateKey, "0x")
+	key, err := crypto.HexToECDSA(keyHex)
+	if err != nil {
+		return nil, fmt.Errorf("parsing private key: %w", err)
+	}
+
+	bundle, err := synapse.NewClientBundle(ctx, key, cfg.RPCURL, cfg.ProviderURL, cfg.Network)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Info("Filecoin SDK initialized", "network", cfg.Network)
+	return bundle, nil
 }

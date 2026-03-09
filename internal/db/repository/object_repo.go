@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -74,6 +75,21 @@ func (r *BunObjectRepo) UpsertAndBumpGeneration(ctx context.Context, obj *model.
 	return existing.ID, newGen, nil
 }
 
+func (r *BunObjectRepo) GetByID(ctx context.Context, id int64) (*model.Object, error) {
+	obj := new(model.Object)
+	err := r.db.NewSelect().
+		Model(obj).
+		Where("id = ?", id).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting object by ID: %w", err)
+	}
+	return obj, nil
+}
+
 func (r *BunObjectRepo) GetByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error) {
 	obj := new(model.Object)
 	err := r.db.NewSelect().
@@ -89,7 +105,7 @@ func (r *BunObjectRepo) GetByBucketAndKey(ctx context.Context, bucketID int64, k
 	return obj, nil
 }
 
-func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix string, maxKeys int) ([]model.Object, error) {
+func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error) {
 	var objects []model.Object
 	q := r.db.NewSelect().
 		Model(&objects).
@@ -97,7 +113,11 @@ func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix
 		OrderExpr("key ASC")
 
 	if prefix != "" {
-		q = q.Where("key LIKE ?", prefix+"%")
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+		q = q.Where("key LIKE ? ESCAPE '\\'", escaped+"%")
+	}
+	if afterKey != "" {
+		q = q.Where("key > ?", afterKey)
 	}
 	if maxKeys > 0 {
 		q = q.Limit(maxKeys)
@@ -120,12 +140,12 @@ func (r *BunObjectRepo) SoftDelete(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (r *BunObjectRepo) UpdateState(ctx context.Context, id int64, from, to model.ObjectState) error {
+func (r *BunObjectRepo) UpdateState(ctx context.Context, id int64, generation int64, from, to model.ObjectState) error {
 	q := r.db.NewUpdate().
 		Model((*model.Object)(nil)).
 		Set("state = ?", to).
 		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND state = ?", id, from)
+		Where("id = ? AND generation = ? AND state = ?", id, generation, from)
 
 	// Clear FailedAtState when retrying from failed state.
 	if from == model.ObjectStateFailed {
@@ -138,12 +158,12 @@ func (r *BunObjectRepo) UpdateState(ctx context.Context, id int64, from, to mode
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("state transition %s→%s failed: object %d not in expected state", from, to, id)
+		return fmt.Errorf("state transition %s→%s failed: object %d gen %d not in expected state", from, to, id, generation)
 	}
 	return nil
 }
 
-func (r *BunObjectRepo) UpdateStateToFailed(ctx context.Context, id int64, from model.ObjectState, lastError string) error {
+func (r *BunObjectRepo) UpdateStateToFailed(ctx context.Context, id int64, generation int64, from model.ObjectState, lastError string) error {
 	res, err := r.db.NewUpdate().
 		Model((*model.Object)(nil)).
 		Set("state = ?", model.ObjectStateFailed).
@@ -151,14 +171,61 @@ func (r *BunObjectRepo) UpdateStateToFailed(ctx context.Context, id int64, from 
 		Set("last_error = ?", lastError).
 		Set("retry_count = retry_count + 1").
 		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND state = ?", id, from).
+		Where("id = ? AND generation = ? AND state = ?", id, generation, from).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("updating object state to failed: %w", err)
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("state transition %s→failed failed: object %d not in expected state", from, id)
+		return fmt.Errorf("state transition %s→failed failed: object %d gen %d not in expected state", from, id, generation)
 	}
 	return nil
+}
+
+func (r *BunObjectRepo) SetPieceCIDAndTransition(ctx context.Context, id int64, generation int64, pieceCID string, from, to model.ObjectState) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("piece_cid = ?", pieceCID).
+		Set("state = ?", to).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND generation = ? AND state = ?", id, generation, from).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("setting piece CID and transitioning state: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("SetPieceCIDAndTransition %s→%s failed: object %d gen %d not in expected state", from, to, id, generation)
+	}
+	return nil
+}
+
+func (r *BunObjectRepo) ListByState(ctx context.Context, state model.ObjectState, limit int) ([]model.Object, error) {
+	var objects []model.Object
+	q := r.db.NewSelect().
+		Model(&objects).
+		Where("state = ?", state).
+		OrderExpr("updated_at ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing objects by state: %w", err)
+	}
+	return objects, nil
+}
+
+func (r *BunObjectRepo) ResetStaleStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error) {
+	res, err := r.db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("state = ?", toState).
+		Set("updated_at = ?", time.Now()).
+		Where("state = ? AND updated_at < ?", fromState, staleBefore).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("resetting stale %s states: %w", fromState, err)
+	}
+	rows, _ := res.RowsAffected()
+	return int(rows), nil
 }

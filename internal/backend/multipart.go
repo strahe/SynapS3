@@ -21,7 +21,7 @@ func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3resp
 	bucketName := derefStr(input.Bucket)
 	keyName := derefStr(input.Key)
 
-	bucket, err := b.getBucket(ctx, bucketName)
+	bucket, err := b.requireActiveBucket(ctx, bucketName)
 	if err != nil {
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
@@ -137,7 +137,7 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 		}
 		return s3response.CopyPartResult{}, fmt.Errorf("reading copy source: %w", cacheErr)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	// TODO: support CopySourceRange for partial copies
 	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, rc)
@@ -276,6 +276,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 			RefGeneration:  gen,
 			IdempotencyKey: fmt.Sprintf("upload:%d:%d", id, gen),
 			Status:         model.TaskStatusPending,
+			MaxRetries:     5,
 			ScheduledAt:    time.Now(),
 		}
 		if err := txRepos.Tasks.Create(ctx, task); err != nil {
@@ -284,8 +285,10 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 
 		return txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted)
 	}); err != nil {
-		// Best-effort cleanup of assembled cache file on tx failure
-		_ = b.cache.Delete(ctx, bucketName, keyName)
+		// Best-effort cleanup of assembled cache file on tx failure (only if first generation)
+		if newGen == 1 {
+			_ = b.cache.Delete(ctx, bucketName, keyName)
+		}
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	completed = true
@@ -400,7 +403,7 @@ func (b *SynapseBackend) ListParts(ctx context.Context, input *s3.ListPartsInput
 	if input.PartNumberMarker != nil {
 		if v := *input.PartNumberMarker; v != "" {
 			// PartNumberMarker is a string in the AWS SDK; parse to int
-			fmt.Sscanf(v, "%d", &partMarker)
+			_, _ = fmt.Sscanf(v, "%d", &partMarker)
 		}
 	}
 

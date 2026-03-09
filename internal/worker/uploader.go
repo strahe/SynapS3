@@ -2,26 +2,41 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
-	"github.com/uptrace/bun"
+	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/state"
+	"github.com/strahe/synaps3/internal/synapse"
+	"golang.org/x/sync/errgroup"
 )
 
-// Uploader polls the task queue for upload_to_sp tasks and processes them.
+// Uploader claims upload_to_sp tasks, uploads objects to the Storage Provider,
+// records the PieceCID, and chains to add_roots.
 type Uploader struct {
-	db           *bun.DB
+	repos        *repository.Repositories
+	cache        cache.Cache
+	storage      synapse.StorageClient
+	stateMachine *state.Machine
 	concurrency  int
 	pollInterval time.Duration
+	leaseTTL     time.Duration
 	logger       *slog.Logger
 }
 
 // NewUploader creates a new SP upload worker.
-func NewUploader(db *bun.DB, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
+func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
 	return &Uploader{
-		db:           db,
+		repos:        repos,
+		cache:        c,
+		storage:      sc,
+		stateMachine: sm,
 		concurrency:  concurrency,
 		pollInterval: pollInterval,
+		leaseTTL:     10 * time.Minute,
 		logger:       logger,
 	}
 }
@@ -33,10 +48,122 @@ func (u *Uploader) Run(ctx context.Context) error {
 }
 
 func (u *Uploader) tick(ctx context.Context) error {
-	// TODO: claim pending upload_to_sp tasks with lease semantics,
-	// verify object generation, upload to SP via go-synapse SDK.
-	// State transitions: cached → uploading (claim), then uploading → uploaded (success)
-	// or uploading → failed (error). Use state.TransitionState for all changes.
-	u.logger.Debug("uploader tick")
-	return nil
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(u.concurrency)
+
+	for range u.concurrency {
+		task, err := u.repos.Tasks.ClaimPending(gctx, model.TaskTypeUploadToSP, u.leaseTTL)
+		if err != nil {
+			u.logger.Error("claiming upload task", "error", err)
+			break
+		}
+		if task == nil {
+			break
+		}
+
+		g.Go(func() error {
+			u.processTask(gctx, task)
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
+	logger := u.logger.With("taskID", task.ID, "objectID", task.RefID, "gen", task.RefGeneration)
+
+	if u.storage == nil {
+		logger.Warn("storage client not configured, failing task")
+		_ = u.repos.Tasks.Fail(ctx, task.ID, "storage client not configured")
+		return
+	}
+
+	// Get object metadata to read from cache
+	obj, err := u.repos.Objects.GetByID(ctx, task.RefID)
+	if err != nil || obj == nil {
+		logger.Warn("object not found for upload task", "error", err)
+		_ = u.repos.Tasks.Fail(ctx, task.ID, "object not found")
+		return
+	}
+
+	// Verify generation matches
+	if obj.Generation != task.RefGeneration {
+		logger.Warn("stale generation, skipping", "objGen", obj.Generation)
+		_ = u.repos.Tasks.Fail(ctx, task.ID, "stale generation")
+		return
+	}
+
+	// Look up bucket for cache path
+	bucket, err := u.repos.Buckets.GetByID(ctx, obj.BucketID)
+	if err != nil || bucket == nil {
+		logger.Error("bucket not found", "bucketID", obj.BucketID, "error", err)
+		_ = u.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
+		return
+	}
+
+	// Transition cached → uploading (on retry, object may already be in uploading state)
+	if obj.State != model.ObjectStateUploading {
+		if err := state.TransitionState(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+			model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+			logger.Warn("state transition cached→uploading failed", "error", err)
+			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			return
+		}
+	}
+
+	// Read from cache
+	rc, _, err := u.cache.Get(ctx, bucket.Name, obj.Key)
+	if err != nil {
+		logger.Error("cache read failed", "error", err)
+		_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+			model.ObjectStateUploading, fmt.Sprintf("cache read: %v", err))
+		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		return
+	}
+	defer func() { _ = rc.Close() }()
+
+	// Upload to SP
+	result, err := u.storage.Upload(ctx, rc, nil)
+	if err != nil {
+		logger.Error("SP upload failed", "error", err)
+		if task.RetryCount+1 >= task.MaxRetries {
+			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+				model.ObjectStateUploading, fmt.Sprintf("SP upload: %v (max retries reached)", err))
+			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		} else {
+			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			_ = u.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
+		}
+		return
+	}
+
+	// Atomic: set PieceCID + transition uploading → uploaded
+	pieceCID := result.PieceCID.String()
+	if err := u.repos.Objects.SetPieceCIDAndTransition(ctx, task.RefID, task.RefGeneration,
+		pieceCID, model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
+		logger.Error("SetPieceCIDAndTransition failed", "error", err)
+		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		return
+	}
+
+	// Chain: enqueue add_roots task
+	chainTask := &model.Task{
+		Type:           model.TaskTypeAddRoots,
+		RefType:        "object",
+		RefID:          task.RefID,
+		RefGeneration:  task.RefGeneration,
+		IdempotencyKey: fmt.Sprintf("add_roots:%d:%d", task.RefID, task.RefGeneration),
+		Status:         model.TaskStatusPending,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := u.repos.Tasks.Create(ctx, chainTask); err != nil {
+		logger.Error("enqueuing add_roots task", "error", err)
+		_ = u.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("chain task creation: %v", err))
+		return
+	}
+
+	_ = u.repos.Tasks.Complete(ctx, task.ID)
+	logger.Info("upload completed", "pieceCID", pieceCID)
 }

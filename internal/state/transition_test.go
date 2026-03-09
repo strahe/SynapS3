@@ -13,22 +13,25 @@ type mockStateUpdater struct {
 	updateStateCalled     bool
 	updateFailedCalled    bool
 	lastID                int64
+	lastGeneration        int64
 	lastFrom, lastTo      model.ObjectState
 	lastError             string
 	returnErr             error
 }
 
-func (m *mockStateUpdater) UpdateState(_ context.Context, id int64, from, to model.ObjectState) error {
+func (m *mockStateUpdater) UpdateState(_ context.Context, id int64, generation int64, from, to model.ObjectState) error {
 	m.updateStateCalled = true
 	m.lastID = id
+	m.lastGeneration = generation
 	m.lastFrom = from
 	m.lastTo = to
 	return m.returnErr
 }
 
-func (m *mockStateUpdater) UpdateStateToFailed(_ context.Context, id int64, from model.ObjectState, lastError string) error {
+func (m *mockStateUpdater) UpdateStateToFailed(_ context.Context, id int64, generation int64, from model.ObjectState, lastError string) error {
 	m.updateFailedCalled = true
 	m.lastID = id
+	m.lastGeneration = generation
 	m.lastFrom = from
 	m.lastError = lastError
 	return m.returnErr
@@ -39,15 +42,15 @@ func TestTransitionState_ValidTransition(t *testing.T) {
 	u := &mockStateUpdater{}
 	ctx := context.Background()
 
-	err := TransitionState(ctx, m, u, 42, model.ObjectStateCached, model.ObjectStateUploading)
+	err := TransitionState(ctx, m, u, 42, 1, model.ObjectStateCached, model.ObjectStateUploading)
 	if err != nil {
 		t.Fatalf("TransitionState: %v", err)
 	}
 	if !u.updateStateCalled {
 		t.Error("UpdateState was not called")
 	}
-	if u.lastID != 42 || u.lastFrom != model.ObjectStateCached || u.lastTo != model.ObjectStateUploading {
-		t.Errorf("wrong args: id=%d from=%s to=%s", u.lastID, u.lastFrom, u.lastTo)
+	if u.lastID != 42 || u.lastGeneration != 1 || u.lastFrom != model.ObjectStateCached || u.lastTo != model.ObjectStateUploading {
+		t.Errorf("wrong args: id=%d gen=%d from=%s to=%s", u.lastID, u.lastGeneration, u.lastFrom, u.lastTo)
 	}
 }
 
@@ -56,7 +59,7 @@ func TestTransitionState_InvalidTransition(t *testing.T) {
 	u := &mockStateUpdater{}
 	ctx := context.Background()
 
-	err := TransitionState(ctx, m, u, 1, model.ObjectStateCached, model.ObjectStateUploaded)
+	err := TransitionState(ctx, m, u, 1, 1, model.ObjectStateCached, model.ObjectStateUploaded)
 	if err == nil {
 		t.Fatal("TransitionState should have failed for invalid transition")
 	}
@@ -71,7 +74,7 @@ func TestTransitionState_DBError(t *testing.T) {
 	u := &mockStateUpdater{returnErr: dbErr}
 	ctx := context.Background()
 
-	err := TransitionState(ctx, m, u, 1, model.ObjectStateCached, model.ObjectStateUploading)
+	err := TransitionState(ctx, m, u, 1, 1, model.ObjectStateCached, model.ObjectStateUploading)
 	if !errors.Is(err, dbErr) {
 		t.Errorf("expected db error, got: %v", err)
 	}
@@ -82,7 +85,7 @@ func TestTransitionState_RejectsFailedTarget(t *testing.T) {
 	u := &mockStateUpdater{}
 	ctx := context.Background()
 
-	err := TransitionState(ctx, m, u, 1, model.ObjectStateUploading, model.ObjectStateFailed)
+	err := TransitionState(ctx, m, u, 1, 1, model.ObjectStateUploading, model.ObjectStateFailed)
 	if err == nil {
 		t.Fatal("TransitionState should reject →failed; use TransitionToFailed instead")
 	}
@@ -96,7 +99,7 @@ func TestTransitionToFailed_Valid(t *testing.T) {
 	u := &mockStateUpdater{}
 	ctx := context.Background()
 
-	err := TransitionToFailed(ctx, m, u, 99, model.ObjectStateUploading, "upload timeout")
+	err := TransitionToFailed(ctx, m, u, 99, 1, model.ObjectStateUploading, "upload timeout")
 	if err != nil {
 		t.Fatalf("TransitionToFailed: %v", err)
 	}
@@ -116,7 +119,7 @@ func TestTransitionToFailed_InvalidSource(t *testing.T) {
 	u := &mockStateUpdater{}
 	ctx := context.Background()
 
-	err := TransitionToFailed(ctx, m, u, 1, model.ObjectStateCached, "should not work")
+	err := TransitionToFailed(ctx, m, u, 1, 1, model.ObjectStateCached, "should not work")
 	if err == nil {
 		t.Fatal("TransitionToFailed should reject cached→failed")
 	}

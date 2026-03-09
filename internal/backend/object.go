@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	cid "github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/versity/versitygw/s3err"
@@ -21,7 +23,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 	bucketName := derefStr(input.Bucket)
 	keyName := derefStr(input.Key)
 
-	bucket, err := b.getBucket(ctx, bucketName)
+	bucket, err := b.requireActiveBucket(ctx, bucketName)
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -71,6 +73,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 			RefGeneration:  newGen,
 			IdempotencyKey: fmt.Sprintf("upload:%d:%d", objectID, newGen),
 			Status:         model.TaskStatusPending,
+			MaxRetries:     5,
 			ScheduledAt:    time.Now(),
 		}
 		return txRepos.Tasks.Create(ctx, task)
@@ -130,8 +133,42 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		return nil, fmt.Errorf("reading from cache: %w", cacheErr)
 	}
 
-	// Cache miss — object has been evicted, download from SP.
-	// TODO: implement download from Storage Provider via go-synapse.
+	// Cache miss — object has been evicted, try SP download if PieceCID is available.
+	if obj.PieceCID != nil && *obj.PieceCID != "" && b.storage != nil {
+		pieceCID, parseErr := cid.Decode(*obj.PieceCID)
+		if parseErr != nil {
+			b.logger.Warn("invalid PieceCID, cannot download from SP", "key", *input.Key, "pieceCID", *obj.PieceCID)
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+
+		data, dlErr := b.storage.Download(ctx, pieceCID, nil)
+		if dlErr != nil {
+			b.logger.Warn("SP download failed", "key", *input.Key, "err", dlErr)
+			return nil, s3err.GetAPIError(s3err.ErrInternalError)
+		}
+
+		// Best-effort cache rehydration (no FSM state change).
+		// Capture locals to avoid dangling pointer if VersityGW reuses input after handler returns.
+		bucketName, keyName, objID, objGen := *input.Bucket, *input.Key, obj.ID, obj.Generation
+		go func() {
+			cur, _ := b.repos.Objects.GetByID(context.Background(), objID)
+			if cur != nil && cur.Generation == objGen {
+				_, _ = b.cache.Put(context.Background(), bucketName, keyName, bytes.NewReader(data))
+			}
+		}()
+
+		etag := fmt.Sprintf(`"%s"`, obj.ETag)
+		contentType := obj.ContentType
+		size := int64(len(data))
+
+		return &s3.GetObjectOutput{
+			Body:          io.NopCloser(bytes.NewReader(data)),
+			ContentLength: &size,
+			ETag:          &etag,
+			ContentType:   &contentType,
+		}, nil
+	}
+
 	return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 }
 
@@ -232,20 +269,24 @@ func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsI
 	}
 
 	prefix := derefStr(input.Prefix)
-	objects, err := b.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, int(maxKeys)+1)
-	if err != nil {
-		return s3response.ListObjectsResult{}, fmt.Errorf("listing objects: %w", err)
+	marker := derefStr(input.Marker)
+
+	// MaxKeys=0 is valid in S3 (used to probe bucket existence).
+	if maxKeys <= 0 {
+		isTruncated := false
+		result := s3response.ListObjectsResult{
+			Name:        input.Bucket,
+			Prefix:      input.Prefix,
+			Marker:      input.Marker,
+			MaxKeys:     &maxKeys,
+			IsTruncated: &isTruncated,
+		}
+		return result, nil
 	}
 
-	// Apply marker filter (ListByBucket doesn't handle marker).
-	if input.Marker != nil && *input.Marker != "" {
-		filtered := objects[:0]
-		for _, obj := range objects {
-			if obj.Key > *input.Marker {
-				filtered = append(filtered, obj)
-			}
-		}
-		objects = filtered
+	objects, err := b.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, marker, int(maxKeys)+1)
+	if err != nil {
+		return s3response.ListObjectsResult{}, fmt.Errorf("listing objects: %w", err)
 	}
 
 	isTruncated := false
@@ -301,7 +342,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		return s3response.CopyObjectOutput{}, err
 	}
 
-	dstBucket, err := b.getBucket(ctx, dstBucketName)
+	dstBucket, err := b.requireActiveBucket(ctx, dstBucketName)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
@@ -324,7 +365,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		}
 		return s3response.CopyObjectOutput{}, fmt.Errorf("reading source from cache: %w", cacheErr)
 	}
-	defer srcReader.Close()
+	defer func() { _ = srcReader.Close() }()
 
 	// Write to destination cache
 	cacheInfo, err := b.cache.Put(ctx, dstBucketName, dstKey, srcReader)
@@ -376,12 +417,17 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 			RefGeneration:  gen,
 			IdempotencyKey: fmt.Sprintf("upload:%d:%d", id, gen),
 			Status:         model.TaskStatusPending,
+			MaxRetries:     5,
 			ScheduledAt:    time.Now(),
 		}
 		return txRepos.Tasks.Create(ctx, task)
 	}); err != nil {
-		// Best-effort cleanup of destination cache file on tx failure
-		_ = b.cache.Delete(ctx, dstBucketName, dstKey)
+		// Only clean up cache for truly new objects (gen 1).
+		// For overwrites, the rename already destroyed the old file;
+		// deleting the new file would cause data loss.
+		if newGen == 1 {
+			_ = b.cache.Delete(ctx, dstBucketName, dstKey)
+		}
 		return s3response.CopyObjectOutput{}, err
 	}
 
@@ -428,26 +474,32 @@ func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObject
 	}
 
 	prefix := derefStr(input.Prefix)
-	objects, err := b.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, int(maxKeys)+1)
-	if err != nil {
-		return s3response.ListObjectsV2Result{}, fmt.Errorf("listing objects v2: %w", err)
-	}
 
-	// Apply start-after / continuation-token filter.
+	// Determine afterKey from continuation token or start-after.
 	afterKey := ""
 	if input.ContinuationToken != nil && *input.ContinuationToken != "" {
 		afterKey = *input.ContinuationToken
 	} else if input.StartAfter != nil && *input.StartAfter != "" {
 		afterKey = *input.StartAfter
 	}
-	if afterKey != "" {
-		filtered := objects[:0]
-		for _, obj := range objects {
-			if obj.Key > afterKey {
-				filtered = append(filtered, obj)
-			}
+
+	// MaxKeys=0 is valid in S3.
+	if maxKeys <= 0 {
+		isTruncated := false
+		zero := int32(0)
+		result := s3response.ListObjectsV2Result{
+			Name:        input.Bucket,
+			Prefix:      input.Prefix,
+			MaxKeys:     &maxKeys,
+			KeyCount:    &zero,
+			IsTruncated: &isTruncated,
 		}
-		objects = filtered
+		return result, nil
+	}
+
+	objects, err := b.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, afterKey, int(maxKeys)+1)
+	if err != nil {
+		return s3response.ListObjectsV2Result{}, fmt.Errorf("listing objects v2: %w", err)
 	}
 
 	isTruncated := false
@@ -484,13 +536,27 @@ func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObject
 	return result, nil
 }
 
-// getBucket retrieves an active bucket by name.
+// getBucket retrieves a bucket visible to S3 clients.
+// Rejects deleted, create_failed, and delete_failed statuses.
 func (b *SynapseBackend) getBucket(ctx context.Context, name string) (*model.Bucket, error) {
 	bucket, err := b.repos.Buckets.GetByName(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("querying bucket: %w", err)
 	}
-	if bucket == nil || bucket.Status == model.BucketStatusDeleted {
+	if bucket == nil || !bucket.Status.IsVisible() {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	}
+	return bucket, nil
+}
+
+// requireActiveBucket retrieves a bucket that accepts write operations.
+// Only active buckets are writable; creating/deleting/failed buckets are rejected.
+func (b *SynapseBackend) requireActiveBucket(ctx context.Context, name string) (*model.Bucket, error) {
+	bucket, err := b.repos.Buckets.GetByName(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("querying bucket: %w", err)
+	}
+	if bucket == nil || !bucket.Status.IsWritable() {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 	return bucket, nil

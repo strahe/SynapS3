@@ -52,7 +52,7 @@ func TestPutGetRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	got, _ := io.ReadAll(rc)
 	if !bytes.Equal(got, data) {
@@ -88,7 +88,7 @@ func TestPutOverwrite(t *testing.T) {
 	}
 
 	rc, _, _ := fs.Get(ctx, "bkt", "key")
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	got, _ := io.ReadAll(rc)
 	if !bytes.Equal(got, data2) {
 		t.Errorf("Get after overwrite = %q, want %q", got, data2)
@@ -100,7 +100,7 @@ func TestDeleteAndExists(t *testing.T) {
 	ctx := context.Background()
 	data := []byte("to-delete")
 
-	fs.Put(ctx, "bkt", "key", bytes.NewReader(data))
+	_, _ = fs.Put(ctx, "bkt", "key", bytes.NewReader(data))
 
 	if !fs.Exists(ctx, "bkt", "key") {
 		t.Error("Exists = false after Put, want true")
@@ -150,22 +150,22 @@ func TestUsedBytesTracking(t *testing.T) {
 	d1 := []byte("aaaa") // 4 bytes
 	d2 := []byte("bbbbbbb") // 7 bytes
 
-	fs.Put(ctx, "b", "k1", bytes.NewReader(d1))
+	_, _ = fs.Put(ctx, "b", "k1", bytes.NewReader(d1))
 	if fs.UsedBytes() != 4 {
 		t.Errorf("after k1: UsedBytes = %d, want 4", fs.UsedBytes())
 	}
 
-	fs.Put(ctx, "b", "k2", bytes.NewReader(d2))
+	_, _ = fs.Put(ctx, "b", "k2", bytes.NewReader(d2))
 	if fs.UsedBytes() != 11 {
 		t.Errorf("after k2: UsedBytes = %d, want 11", fs.UsedBytes())
 	}
 
-	fs.Delete(ctx, "b", "k1")
+	_ = fs.Delete(ctx, "b", "k1")
 	if fs.UsedBytes() != 7 {
 		t.Errorf("after delete k1: UsedBytes = %d, want 7", fs.UsedBytes())
 	}
 
-	fs.Delete(ctx, "b", "k2")
+	_ = fs.Delete(ctx, "b", "k2")
 	if fs.UsedBytes() != 0 {
 		t.Errorf("after delete k2: UsedBytes = %d, want 0", fs.UsedBytes())
 	}
@@ -197,9 +197,9 @@ func TestDeleteBucketDirAccounting(t *testing.T) {
 	fs := newTestCache(t)
 	ctx := context.Background()
 
-	fs.Put(ctx, "bkt", "a", bytes.NewReader([]byte("aaa")))
-	fs.Put(ctx, "bkt", "b", bytes.NewReader([]byte("bbbbb")))
-	fs.Put(ctx, "other", "c", bytes.NewReader([]byte("cc")))
+	_, _ = fs.Put(ctx, "bkt", "a", bytes.NewReader([]byte("aaa")))
+	_, _ = fs.Put(ctx, "bkt", "b", bytes.NewReader([]byte("bbbbb")))
+	_, _ = fs.Put(ctx, "other", "c", bytes.NewReader([]byte("cc")))
 
 	if fs.UsedBytes() != 10 {
 		t.Fatalf("UsedBytes = %d, want 10", fs.UsedBytes())
@@ -282,12 +282,12 @@ func TestStartupWalk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs1.Put(ctx, "b", "k1", bytes.NewReader([]byte("aaaa")))
-	fs1.Put(ctx, "b", "k2", bytes.NewReader([]byte("bbb")))
+	_, _ = fs1.Put(ctx, "b", "k1", bytes.NewReader([]byte("aaaa")))
+	_, _ = fs1.Put(ctx, "b", "k2", bytes.NewReader([]byte("bbb")))
 
 	// Simulate a stale temp file.
 	tmpFile := filepath.Join(dir, "b", ".synaps3-stale.tmp")
-	os.WriteFile(tmpFile, []byte("stale"), 0o644)
+	_ = os.WriteFile(tmpFile, []byte("stale"), 0o644)
 
 	// Create a new cache from the same dir — should recover usedBytes and remove temp.
 	fs2, err := NewFilesystem(dir, 0)
@@ -404,7 +404,7 @@ func TestConcurrentPuts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get after concurrent puts: %v", err)
 	}
-	rc.Close()
+	_ = rc.Close()
 
 	if info.Size != 100 {
 		t.Errorf("Size = %d, want 100", info.Size)
@@ -430,7 +430,7 @@ func TestNestedKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get nested key: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	got, _ := io.ReadAll(rc)
 	if !bytes.Equal(got, data) {
@@ -506,7 +506,7 @@ func TestPutPartAndAssemble(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get assembled: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	got, _ := io.ReadAll(rc)
 	if !bytes.Equal(got, expectedData) {
 		t.Errorf("assembled data mismatch")
@@ -520,7 +520,7 @@ func TestPutPartOverwrite(t *testing.T) {
 	data1 := []byte("version1")
 	data2 := []byte("v2")
 
-	fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data1))
+	_, _ = fs.PutPart(ctx, "up-ow", 1, bytes.NewReader(data1))
 	if fs.UsedBytes() != int64(len(data1)) {
 		t.Errorf("UsedBytes = %d, want %d", fs.UsedBytes(), len(data1))
 	}
@@ -543,8 +543,8 @@ func TestDeleteUpload(t *testing.T) {
 	fs := newTestCache(t)
 	ctx := context.Background()
 
-	fs.PutPart(ctx, "up-del", 1, bytes.NewReader([]byte("aaa")))
-	fs.PutPart(ctx, "up-del", 2, bytes.NewReader([]byte("bbbbb")))
+	_, _ = fs.PutPart(ctx, "up-del", 1, bytes.NewReader([]byte("aaa")))
+	_, _ = fs.PutPart(ctx, "up-del", 2, bytes.NewReader([]byte("bbbbb")))
 
 	if fs.UsedBytes() != 8 {
 		t.Fatalf("UsedBytes = %d, want 8", fs.UsedBytes())
@@ -575,8 +575,8 @@ func TestAssemblePartsUsedBytes(t *testing.T) {
 
 	p1 := []byte("part1")
 	p2 := []byte("part2")
-	fs.PutPart(ctx, "up-ub", 1, bytes.NewReader(p1))
-	fs.PutPart(ctx, "up-ub", 2, bytes.NewReader(p2))
+	_, _ = fs.PutPart(ctx, "up-ub", 1, bytes.NewReader(p1))
+	_, _ = fs.PutPart(ctx, "up-ub", 2, bytes.NewReader(p2))
 	partsSize := int64(len(p1) + len(p2))
 
 	_, _, err := fs.AssembleParts(ctx, "bkt", "key", "up-ub", []int{1, 2})
@@ -591,7 +591,7 @@ func TestAssemblePartsUsedBytes(t *testing.T) {
 	}
 
 	// After deleting the upload, only the assembled object remains
-	fs.DeleteUpload(ctx, "up-ub")
+	_ = fs.DeleteUpload(ctx, "up-ub")
 	if fs.UsedBytes() != int64(len(p1)+len(p2)) {
 		t.Errorf("UsedBytes after cleanup = %d, want %d", fs.UsedBytes(), len(p1)+len(p2))
 	}
