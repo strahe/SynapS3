@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/buildinfo"
 	"github.com/strahe/synaps3/internal/cache"
@@ -222,11 +223,21 @@ func runServe(ctx context.Context, configPath string) error {
 	)
 	go wm.Start(ctx)
 
+	// Start admin server (healthz + metrics).
+	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, logger)
+	errCh := make(chan error, 2)
+	go func() {
+		if err := adminSrv.Run(ctx); err != nil {
+			errCh <- fmt.Errorf("admin server error: %w", err)
+		}
+	}()
+
 	// Start S3 server.
-	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("S3 server listening", "port", cfg.Server.Port)
-		errCh <- srv.ServeMultiPort([]string{cfg.Server.Port})
+		if err := srv.ServeMultiPort([]string{cfg.Server.Port}); err != nil {
+			errCh <- fmt.Errorf("S3 server error: %w", err)
+		}
 	}()
 
 	// Wait for shutdown signal or server error.
@@ -234,7 +245,7 @@ func runServe(ctx context.Context, configPath string) error {
 	case <-ctx.Done():
 		logger.Info("received shutdown signal")
 	case err := <-errCh:
-		return fmt.Errorf("S3 server error: %w", err)
+		return err
 	}
 
 	// Graceful shutdown.

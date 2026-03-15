@@ -54,3 +54,6 @@ worker:
 logging:
   level: "info"                # debug | info | warn | error
   format: "json"               # json | text
+
+admin:
+  addr: ":9090"                # admin HTTP server (healthz + metrics)

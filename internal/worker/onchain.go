@@ -2,12 +2,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"time"
 
 	cid "github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
@@ -78,6 +80,7 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 	if o.proofSet == nil {
 		logger.Warn("proof set client not configured, failing task")
 		_ = o.repos.Tasks.Fail(ctx, task.ID, "proof set client not configured")
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
@@ -85,18 +88,53 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 	if err != nil || obj == nil {
 		logger.Warn("object not found for add_roots task", "error", err)
 		_ = o.repos.Tasks.Fail(ctx, task.ID, "object not found")
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
 	if obj.Generation != task.RefGeneration {
 		logger.Warn("stale generation, skipping")
 		_ = o.repos.Tasks.Fail(ctx, task.ID, "stale generation")
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
+		return
+	}
+
+	// Recovery: if a previous run succeeded at on-chain submission but failed
+	// to create the evict task, skip on-chain work and just re-create the evict task.
+	if obj.State == model.ObjectStateOnChained {
+		logger.Info("object already onchained, recovering evict task creation")
+		if o.evictAfterOnChain {
+			chainTask := &model.Task{
+				Type:           model.TaskTypeEvictCache,
+				RefType:        "object",
+				RefID:          task.RefID,
+				RefGeneration:  task.RefGeneration,
+				IdempotencyKey: fmt.Sprintf("evict_cache:%d:%d", task.RefID, task.RefGeneration),
+				Status:         model.TaskStatusPending,
+				MaxRetries:     5,
+				ScheduledAt:    time.Now(),
+			}
+			if err := o.repos.Tasks.Create(ctx, chainTask); err != nil {
+				if errors.Is(err, repository.ErrAlreadyExists) {
+					logger.Info("evict task already exists during recovery")
+				} else {
+					logger.Error("recovery evict task creation failed", "error", err)
+					_ = o.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("recovery evict task: %v", err))
+					admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
+					return
+				}
+			}
+		}
+		_ = o.repos.Tasks.Complete(ctx, task.ID)
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "success").Inc()
+		logger.Info("onchained-state recovery completed")
 		return
 	}
 
 	if obj.PieceCID == nil || *obj.PieceCID == "" {
 		logger.Error("object has no PieceCID")
 		_ = o.repos.Tasks.Fail(ctx, task.ID, "no PieceCID")
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
@@ -105,11 +143,13 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 	if err != nil || bucket == nil {
 		logger.Error("bucket not found", "bucketID", obj.BucketID, "error", err)
 		_ = o.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 	if bucket.ProofSetID == nil || *bucket.ProofSetID == "" {
 		logger.Warn("bucket has no ProofSetID yet")
 		_ = o.repos.Tasks.Fail(ctx, task.ID, "bucket has no ProofSetID")
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
@@ -117,6 +157,7 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 	if _, ok := proofSetID.SetString(*bucket.ProofSetID, 10); !ok {
 		logger.Error("invalid ProofSetID", "proofSetID", *bucket.ProofSetID)
 		_ = o.repos.Tasks.Fail(ctx, task.ID, "invalid ProofSetID")
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
@@ -126,6 +167,7 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 			model.ObjectStateUploaded, model.ObjectStateOnChaining); err != nil {
 			logger.Warn("state transition uploaded→onchaining failed", "error", err)
 			_ = o.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 			return
 		}
 	}
@@ -137,6 +179,7 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 		_ = state.TransitionToFailed(ctx, o.stateMachine, o.repos.Objects, task.RefID, task.RefGeneration,
 			model.ObjectStateOnChaining, fmt.Sprintf("invalid PieceCID: %v", err))
 		_ = o.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
@@ -154,6 +197,7 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 			_ = o.repos.Tasks.Fail(ctx, task.ID, err.Error())
 			_ = o.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
 		}
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
@@ -162,6 +206,7 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 		model.ObjectStateOnChaining, model.ObjectStateOnChained); err != nil {
 		logger.Error("state transition onchaining→onchained failed", "error", err)
 		_ = o.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return
 	}
 
@@ -178,12 +223,18 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 			ScheduledAt:    time.Now(),
 		}
 		if err := o.repos.Tasks.Create(ctx, chainTask); err != nil {
-			logger.Error("enqueuing evict_cache task", "error", err)
-			_ = o.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("chain task creation: %v", err))
-			return
+			if errors.Is(err, repository.ErrAlreadyExists) {
+				logger.Info("evict task already exists, completing onchain task")
+			} else {
+				logger.Error("enqueuing evict_cache task", "error", err)
+				_ = o.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("chain task creation: %v", err))
+				admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
+				return
+			}
 		}
 	}
 
 	_ = o.repos.Tasks.Complete(ctx, task.ID)
+	admin.WorkerTasksProcessed.WithLabelValues("onchain", "success").Inc()
 	logger.Info("on-chain submission completed")
 }

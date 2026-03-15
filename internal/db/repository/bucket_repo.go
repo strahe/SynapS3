@@ -20,6 +20,9 @@ var _ BucketRepository = (*BunBucketRepo)(nil)
 func (r *BunBucketRepo) Create(ctx context.Context, bucket *model.Bucket) error {
 	_, err := r.db.NewInsert().Model(bucket).Exec(ctx)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("inserting bucket %q: %w", bucket.Name, ErrAlreadyExists)
+		}
 		return fmt.Errorf("inserting bucket: %w", err)
 	}
 	return nil

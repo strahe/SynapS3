@@ -10,13 +10,13 @@ import (
 
 // mockStateUpdater implements StateUpdater for testing.
 type mockStateUpdater struct {
-	updateStateCalled     bool
-	updateFailedCalled    bool
-	lastID                int64
-	lastGeneration        int64
-	lastFrom, lastTo      model.ObjectState
-	lastError             string
-	returnErr             error
+	updateStateCalled  bool
+	updateFailedCalled bool
+	lastID             int64
+	lastGeneration     int64
+	lastFrom, lastTo   model.ObjectState
+	lastError          string
+	returnErr          error
 }
 
 func (m *mockStateUpdater) UpdateState(_ context.Context, id int64, generation int64, from, to model.ObjectState) error {

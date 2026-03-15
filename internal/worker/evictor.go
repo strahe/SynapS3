@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -73,12 +74,14 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	if err != nil || obj == nil {
 		logger.Warn("object not found for evict task", "error", err)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "object not found")
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
 	if obj.Generation != task.RefGeneration {
 		logger.Warn("stale generation, skipping")
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "stale generation")
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
@@ -86,11 +89,13 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	if obj.State != model.ObjectStateOnChained {
 		logger.Warn("object not in onchained state", "state", obj.State)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "not onchained")
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 	if obj.PieceCID == nil || *obj.PieceCID == "" {
 		logger.Error("object has no PieceCID, refusing to evict")
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "no PieceCID")
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
@@ -98,6 +103,7 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	if err != nil || bucket == nil {
 		logger.Error("bucket not found", "bucketID", obj.BucketID, "error", err)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
@@ -113,6 +119,7 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
 			_ = e.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
 		}
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
@@ -121,5 +128,6 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	}
 
 	_ = e.repos.Tasks.Complete(ctx, task.ID)
+	admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
 	logger.Info("cache eviction completed")
 }

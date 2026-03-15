@@ -20,6 +20,9 @@ var _ TaskRepository = (*BunTaskRepo)(nil)
 func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
 	_, err := r.db.NewInsert().Model(task).Exec(ctx)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("inserting task %q: %w", task.IdempotencyKey, ErrAlreadyExists)
+		}
 		return fmt.Errorf("inserting task: %w", err)
 	}
 	return nil

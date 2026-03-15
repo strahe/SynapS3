@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	cid "github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/versity/versitygw/s3err"
@@ -28,11 +29,16 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		return s3response.PutObjectOutput{}, err
 	}
 
-	// Write to local cache with fsync.
-	cacheInfo, err := b.cache.Put(ctx, bucketName, keyName, input.Body)
+	// Write to local cache staging (fsync'd temp file, NOT yet at final path).
+	staged, err := b.cache.PutStaged(ctx, bucketName, keyName, input.Body)
 	if err != nil {
-		return s3response.PutObjectOutput{}, fmt.Errorf("caching object: %w", err)
+		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		return s3response.PutObjectOutput{}, fmt.Errorf("staging object: %w", err)
 	}
+	// Ensure cleanup if we don't commit.
+	defer func() { _ = staged.Rollback() }()
+
+	cacheInfo := staged.Info
 
 	// Build metadata map from input.
 	meta := make(map[string]string)
@@ -78,18 +84,24 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		}
 		return txRepos.Tasks.Create(ctx, task)
 	}); err != nil {
-		// Only clean up cache for truly new objects (gen 1).
-		// For overwrites (gen > 1), the rename already destroyed the old file;
-		// deleting the new file would cause data loss.
-		// When newGen == 0 (upsert itself failed), we can't distinguish new vs overwrite,
-		// so we leave the file. TODO: implement orphan reconciliation (compare cache files against DB).
-		if newGen == 1 {
-			_ = b.cache.Delete(ctx, bucketName, keyName)
-		}
+		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		// Rollback is handled by defer — staged file is removed, old file untouched.
 		return s3response.PutObjectOutput{}, err
 	}
 
+	// DB transaction committed — publish the cache file atomically.
+	if err := staged.Commit(); err != nil {
+		// DB has the new generation but cache rename failed. Return error so the
+		// client retries — the retry will create gen N+1 which works correctly.
+		// Without this, the client sees 200 OK but the object is unservable
+		// (no cache file, uploader will also fail on cache miss).
+		b.logger.Error("cache commit failed after DB tx", "bucket", bucketName, "key", keyName, "error", err)
+		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		return s3response.PutObjectOutput{}, fmt.Errorf("committing cache file: %w", err)
+	}
+
 	b.logger.Info("object stored", "bucket", bucketName, "key", keyName, "size", cacheInfo.Size, "gen", newGen)
+	admin.ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
 
 	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)
 	return s3response.PutObjectOutput{
@@ -112,12 +124,15 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		return nil, fmt.Errorf("querying object: %w", err)
 	}
 	if obj == nil {
+		admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
 	// Try local cache first (no TOCTOU — call Get directly, handle ErrNotExist).
 	rc, _, cacheErr := b.cache.Get(ctx, *input.Bucket, *input.Key)
 	if cacheErr == nil {
+		admin.CacheHitsTotal.Inc()
+		admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
 		etag := fmt.Sprintf(`"%s"`, obj.ETag)
 		contentType := obj.ContentType
 
@@ -130,37 +145,44 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 	}
 
 	if !os.IsNotExist(cacheErr) {
+		admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
 		return nil, fmt.Errorf("reading from cache: %w", cacheErr)
 	}
 
 	// Cache miss — object has been evicted, try SP download if PieceCID is available.
+	admin.CacheMissesTotal.Inc()
 	if obj.PieceCID != nil && *obj.PieceCID != "" && b.storage != nil {
 		pieceCID, parseErr := cid.Decode(*obj.PieceCID)
 		if parseErr != nil {
 			b.logger.Warn("invalid PieceCID, cannot download from SP", "key", *input.Key, "pieceCID", *obj.PieceCID)
+			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
 
+		// NOTE: storage.Download loads the entire object into memory (SDK limitation).
+		// For very large objects this can cause high memory pressure. A streaming
+		// download API is needed in go-synapse to fully resolve this.
 		data, dlErr := b.storage.Download(ctx, pieceCID, nil)
 		if dlErr != nil {
 			b.logger.Warn("SP download failed", "key", *input.Key, "err", dlErr)
+			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
 			return nil, s3err.GetAPIError(s3err.ErrInternalError)
 		}
 
-		// Best-effort cache rehydration (no FSM state change).
-		// Capture locals to avoid dangling pointer if VersityGW reuses input after handler returns.
-		bucketName, keyName, objID, objGen := *input.Bucket, *input.Key, obj.ID, obj.Generation
-		go func() {
-			cur, _ := b.repos.Objects.GetByID(context.Background(), objID)
-			if cur != nil && cur.Generation == objGen {
-				_, _ = b.cache.Put(context.Background(), bucketName, keyName, bytes.NewReader(data))
+		// Synchronous best-effort cache rehydration with generation check.
+		// Re-check generation to avoid overwriting a concurrent PutObject's newer data.
+		cur, _ := b.repos.Objects.GetByID(ctx, obj.ID)
+		if cur != nil && cur.Generation == obj.Generation {
+			if _, putErr := b.cache.Put(ctx, *input.Bucket, *input.Key, bytes.NewReader(data)); putErr != nil {
+				b.logger.Warn("cache rehydration failed (best-effort)", "key", *input.Key, "error", putErr)
 			}
-		}()
+		}
 
 		etag := fmt.Sprintf(`"%s"`, obj.ETag)
 		contentType := obj.ContentType
 		size := int64(len(data))
 
+		admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
 		return &s3.GetObjectOutput{
 			Body:          io.NopCloser(bytes.NewReader(data)),
 			ContentLength: &size,
@@ -169,6 +191,7 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		}, nil
 	}
 
+	admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
 	return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 }
 
@@ -224,6 +247,7 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 		_ = b.cache.Delete(ctx, *input.Bucket, *input.Key)
 	}
 
+	admin.ObjectOperationsTotal.WithLabelValues("delete", "success").Inc()
 	return &s3.DeleteObjectOutput{}, nil
 }
 
@@ -367,11 +391,13 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 	}
 	defer func() { _ = srcReader.Close() }()
 
-	// Write to destination cache
-	cacheInfo, err := b.cache.Put(ctx, dstBucketName, dstKey, srcReader)
+	// Write to destination cache (staged — not committed until DB tx succeeds)
+	staged, err := b.cache.PutStaged(ctx, dstBucketName, dstKey, srcReader)
 	if err != nil {
-		return s3response.CopyObjectOutput{}, fmt.Errorf("caching copy destination: %w", err)
+		return s3response.CopyObjectOutput{}, fmt.Errorf("staging copy destination: %w", err)
 	}
+	defer func() { _ = staged.Rollback() }()
+	cacheInfo := staged.Info
 
 	// Determine metadata: COPY (default) preserves source, REPLACE uses request metadata
 	meta := make(map[string]string)
@@ -422,13 +448,11 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		}
 		return txRepos.Tasks.Create(ctx, task)
 	}); err != nil {
-		// Only clean up cache for truly new objects (gen 1).
-		// For overwrites, the rename already destroyed the old file;
-		// deleting the new file would cause data loss.
-		if newGen == 1 {
-			_ = b.cache.Delete(ctx, dstBucketName, dstKey)
-		}
 		return s3response.CopyObjectOutput{}, err
+	}
+
+	if err := staged.Commit(); err != nil {
+		return s3response.CopyObjectOutput{}, fmt.Errorf("committing copy cache: %w", err)
 	}
 
 	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)

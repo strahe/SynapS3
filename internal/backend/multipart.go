@@ -139,7 +139,7 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 	}
 	defer func() { _ = rc.Close() }()
 
-	// TODO: support CopySourceRange for partial copies
+	// NOTE: CopySourceRange for partial copies is not yet supported (future enhancement).
 	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, rc)
 	if err != nil {
 		return s3response.CopyPartResult{}, fmt.Errorf("caching copied part: %w", err)

@@ -100,13 +100,13 @@ func TestObjectStateMachine_InvalidTransitions(t *testing.T) {
 	m := NewObjectStateMachine()
 
 	invalid := []struct{ from, to model.ObjectState }{
-		{model.ObjectStateCached, model.ObjectStateUploaded},       // skip uploading
-		{model.ObjectStateCached, model.ObjectStateOnChained},      // skip everything
-		{model.ObjectStateCacheEvicted, model.ObjectStateCached},   // can't revive
-		{model.ObjectStateOnChained, model.ObjectStateUploading},   // backwards
-		{model.ObjectStateCached, model.ObjectStateFailed},         // can't fail from cached
-		{model.ObjectStateCached, model.ObjectStateCacheEvicted},   // can't evict uncached
-		{model.ObjectStateUploading, model.ObjectStateOnChaining},  // skip uploaded
+		{model.ObjectStateCached, model.ObjectStateUploaded},      // skip uploading
+		{model.ObjectStateCached, model.ObjectStateOnChained},     // skip everything
+		{model.ObjectStateCacheEvicted, model.ObjectStateCached},  // can't revive
+		{model.ObjectStateOnChained, model.ObjectStateUploading},  // backwards
+		{model.ObjectStateCached, model.ObjectStateFailed},        // can't fail from cached
+		{model.ObjectStateCached, model.ObjectStateCacheEvicted},  // can't evict uncached
+		{model.ObjectStateUploading, model.ObjectStateOnChaining}, // skip uploaded
 	}
 	for _, tt := range invalid {
 		if m.CanTransition(string(tt.from), string(tt.to)) {

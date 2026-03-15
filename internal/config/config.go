@@ -20,6 +20,7 @@ type Config struct {
 	Cache    CacheConfig    `koanf:"cache"`
 	Worker   WorkerConfig   `koanf:"worker"`
 	Logging  LoggingConfig  `koanf:"logging"`
+	Admin    AdminConfig    `koanf:"admin"`
 }
 
 type ServerConfig struct {
@@ -78,6 +79,10 @@ type LoggingConfig struct {
 	Format string `koanf:"format"` // json | text
 }
 
+type AdminConfig struct {
+	Addr string `koanf:"addr"`
+}
+
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
@@ -127,6 +132,9 @@ func DefaultConfig() *Config {
 		Logging: LoggingConfig{
 			Level:  "info",
 			Format: "json",
+		},
+		Admin: AdminConfig{
+			Addr: ":9090",
 		},
 	}
 }

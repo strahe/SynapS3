@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -26,7 +27,9 @@ func (b *SynapseBackend) CreateBucket(ctx context.Context, input *s3.CreateBucke
 			Status: model.BucketStatusCreating,
 		}
 		if err := txRepos.Buckets.Create(ctx, bucket); err != nil {
-			// TODO: distinguish duplicate-key error → BucketAlreadyExists
+			if errors.Is(err, repository.ErrAlreadyExists) {
+				return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
+			}
 			return fmt.Errorf("creating bucket %q: %w", name, err)
 		}
 		bucketID = bucket.ID

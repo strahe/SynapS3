@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/data-preservation-programs/go-synapse/pdp"
+	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -74,6 +75,7 @@ func (p *ProofSetWorker) processTask(ctx context.Context, task *model.Task) {
 	if p.proofSet == nil {
 		p.logger.Warn("proof set client not configured, failing task", "taskID", task.ID)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, "proof set client not configured")
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
@@ -85,6 +87,7 @@ func (p *ProofSetWorker) processTask(ctx context.Context, task *model.Task) {
 	default:
 		p.logger.Error("unknown task type", "type", task.Type)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, "unknown task type")
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 	}
 }
 
@@ -95,12 +98,14 @@ func (p *ProofSetWorker) processCreate(ctx context.Context, task *model.Task) {
 	if err != nil || bucket == nil {
 		logger.Error("bucket not found", "error", err)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
 	if bucket.Status != model.BucketStatusCreating {
 		logger.Warn("bucket not in creating status", "status", bucket.Status)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, "bucket not in creating status")
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
@@ -116,6 +121,7 @@ func (p *ProofSetWorker) processCreate(ctx context.Context, task *model.Task) {
 			_ = p.repos.Tasks.Fail(ctx, task.ID, err.Error())
 			_ = p.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
 		}
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
@@ -128,10 +134,12 @@ func (p *ProofSetWorker) processCreate(ctx context.Context, task *model.Task) {
 	}); err != nil {
 		logger.Error("atomic SetProofSetID+UpdateStatus failed", "error", err)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
 	_ = p.repos.Tasks.Complete(ctx, task.ID)
+	admin.WorkerTasksProcessed.WithLabelValues("proofset", "success").Inc()
 	logger.Info("proof set created", "proofSetID", proofSetID)
 }
 
@@ -142,12 +150,14 @@ func (p *ProofSetWorker) processDelete(ctx context.Context, task *model.Task) {
 	if err != nil || bucket == nil {
 		logger.Error("bucket not found", "error", err)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
 	if bucket.Status != model.BucketStatusDeleting {
 		logger.Warn("bucket not in deleting status", "status", bucket.Status)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, "bucket not in deleting status")
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
@@ -156,10 +166,12 @@ func (p *ProofSetWorker) processDelete(ctx context.Context, task *model.Task) {
 		if err := p.repos.Buckets.HardDelete(ctx, bucket.ID); err != nil {
 			logger.Error("HardDelete failed", "error", err)
 			_ = p.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 			return
 		}
 		_ = p.cache.DeleteBucketDir(ctx, bucket.Name)
 		_ = p.repos.Tasks.Complete(ctx, task.ID)
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "success").Inc()
 		logger.Info("bucket hard-deleted (no proof set)")
 		return
 	}
@@ -168,6 +180,7 @@ func (p *ProofSetWorker) processDelete(ctx context.Context, task *model.Task) {
 	if _, ok := proofSetID.SetString(*bucket.ProofSetID, 10); !ok {
 		logger.Error("invalid ProofSetID", "proofSetID", *bucket.ProofSetID)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, "invalid ProofSetID")
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
@@ -182,6 +195,7 @@ func (p *ProofSetWorker) processDelete(ctx context.Context, task *model.Task) {
 			_ = p.repos.Tasks.Fail(ctx, task.ID, err.Error())
 			_ = p.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
 		}
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 
@@ -189,10 +203,12 @@ func (p *ProofSetWorker) processDelete(ctx context.Context, task *model.Task) {
 	if err := p.repos.Buckets.HardDelete(ctx, bucket.ID); err != nil {
 		logger.Error("HardDelete failed after proof set deletion", "error", err)
 		_ = p.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		admin.WorkerTasksProcessed.WithLabelValues("proofset", "failure").Inc()
 		return
 	}
 	_ = p.cache.DeleteBucketDir(ctx, bucket.Name)
 
 	_ = p.repos.Tasks.Complete(ctx, task.ID)
+	admin.WorkerTasksProcessed.WithLabelValues("proofset", "success").Inc()
 	logger.Info("proof set deleted and bucket removed")
 }

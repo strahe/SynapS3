@@ -20,6 +20,23 @@ type ObjectInfo struct {
 	Checksum string // SHA-256 hex digest
 }
 
+// StagedObject represents a cached file that has been written to a temp location
+// but not yet committed to the final cache path. This enables atomic "write then
+// commit" workflows where a DB transaction runs between write and commit.
+type StagedObject struct {
+	Info     *ObjectInfo
+	commit   func() error
+	rollback func() error
+}
+
+// Commit renames the staged file to the final cache path (atomic).
+// Must be called exactly once. After Commit, Rollback is a no-op.
+func (s *StagedObject) Commit() error { return s.commit() }
+
+// Rollback removes the staged temp file without affecting the final cache path.
+// Safe to call multiple times and after Commit (no-op if already committed).
+func (s *StagedObject) Rollback() error { return s.rollback() }
+
 // Cache defines the interface for local object caching.
 // Implementations must be safe for concurrent use.
 type Cache interface {
@@ -29,6 +46,14 @@ type Cache interface {
 	// Returns ErrCacheFull if the cache has reached its maximum capacity.
 	// Returns ErrInvalidPath if bucket/key would escape the cache root.
 	Put(ctx context.Context, bucket, key string, r io.Reader) (*ObjectInfo, error)
+
+	// PutStaged writes data to a temp file (fsync'd) without replacing the
+	// existing cache entry. Returns a StagedObject whose Commit method
+	// atomically renames the temp file to the final path. If Commit is not
+	// called, Rollback removes the temp file.
+	// This is used when a DB transaction must succeed before the cache
+	// entry is published, preventing overwrite data loss on tx failure.
+	PutStaged(ctx context.Context, bucket, key string, r io.Reader) (*StagedObject, error)
 
 	// Get opens a cached object for reading. Returns os.ErrNotExist if the
 	// object is not in the cache.

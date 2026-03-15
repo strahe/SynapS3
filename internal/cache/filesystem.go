@@ -109,6 +109,11 @@ func NewFilesystem(dir string, maxBytes int64) (*Filesystem, error) {
 	return f, nil
 }
 
+// RootDir returns the absolute path of the cache root directory.
+func (f *Filesystem) RootDir() string {
+	return f.root
+}
+
 // safePath validates and returns the absolute path for bucket/key.
 // Returns ErrInvalidPath if the result escapes the cache root.
 func (f *Filesystem) safePath(parts ...string) (string, error) {
@@ -136,6 +141,18 @@ func fsyncDir(dir string) error {
 }
 
 func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (*ObjectInfo, error) {
+	staged, err := f.PutStaged(ctx, bucket, key, r)
+	if err != nil {
+		return nil, err
+	}
+	if err := staged.Commit(); err != nil {
+		_ = staged.Rollback()
+		return nil, err
+	}
+	return staged.Info, nil
+}
+
+func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Reader) (*StagedObject, error) {
 	dst, err := f.safePath(bucket, key)
 	if err != nil {
 		return nil, err
@@ -145,15 +162,19 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
-	// Serialize same-key operations to prevent usedBytes accounting drift.
-	mu := f.shardFor(bucket, key)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Check for existing file to handle overwrite accounting (safe under per-key lock).
-	var oldSize int64
+	// Approximate old file size for capacity estimation (no shard lock).
+	// This is racy but safe: Commit does the authoritative capacity check.
+	var oldSizeApprox int64
 	if stat, statErr := os.Stat(dst); statErr == nil {
-		oldSize = stat.Size()
+		oldSizeApprox = stat.Size()
+	}
+
+	// Pre-flight capacity check (without shard lock — approximate).
+	if f.maxBytes > 0 {
+		avail := f.maxBytes - f.usedBytes.Load() + oldSizeApprox
+		if avail <= 0 {
+			return nil, ErrCacheFull
+		}
 	}
 
 	// Use os.CreateTemp for unique temp files.
@@ -173,11 +194,10 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 	sha256Hash := sha256.New()
 	w := io.MultiWriter(file, md5Hash, sha256Hash)
 
-	// Bound the write to prevent disk exhaustion from oversized uploads.
-	// Remaining capacity accounts for the old file being replaced.
+	// Bound the write to prevent disk exhaustion.
 	src := r
 	if f.maxBytes > 0 {
-		avail := f.maxBytes - f.usedBytes.Load() + oldSize
+		avail := f.maxBytes - f.usedBytes.Load() + oldSizeApprox
 		if avail <= 0 {
 			return nil, ErrCacheFull
 		}
@@ -192,50 +212,14 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 		return nil, fmt.Errorf("writing cache file: %w", err)
 	}
 
-	// Atomically pre-reserve capacity. Add first, check, rollback if exceeded.
-	delta := n - oldSize
-	var reserved bool
-	if f.maxBytes > 0 && delta > 0 {
-		newUsed := f.usedBytes.Add(delta)
-		if newUsed > f.maxBytes {
-			f.usedBytes.Add(-delta)
-			return nil, ErrCacheFull
-		}
-		reserved = true
-	}
-
-	// fsync to guarantee durability before acking to caller.
+	// fsync to guarantee durability before returning.
 	if err := file.Sync(); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
 		return nil, fmt.Errorf("fsync cache file: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
 		return nil, fmt.Errorf("closing cache file: %w", err)
 	}
 	file = nil // prevent defer cleanup
-
-	if err := os.Rename(tmpPath, dst); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
-		_ = os.Remove(tmpPath)
-		return nil, fmt.Errorf("renaming temp to final: %w", err)
-	}
-
-	// Fsync parent directory to ensure the rename is durable.
-	if err := fsyncDir(dir); err != nil {
-		slog.Warn("fsync parent dir failed", "dir", dir, "error", err)
-	}
-
-	// Apply remaining accounting (shrink or unlimited mode).
-	if !reserved {
-		f.usedBytes.Add(delta)
-	}
 
 	info := &ObjectInfo{
 		Path:     dst,
@@ -244,8 +228,65 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 		Checksum: hex.EncodeToString(sha256Hash.Sum(nil)),
 	}
 
-	slog.Debug("cached object", "bucket", bucket, "key", key, "size", n)
-	return info, nil
+	committed := false
+	return &StagedObject{
+		Info: info,
+		commit: func() error {
+			if committed {
+				return nil
+			}
+
+			// Acquire shard lock for atomic rename and accounting.
+			mu := f.shardFor(bucket, key)
+			mu.Lock()
+			defer mu.Unlock()
+
+			// Determine old file size for accounting.
+			var oldSize int64
+			if stat, statErr := os.Stat(dst); statErr == nil {
+				oldSize = stat.Size()
+			}
+
+			// Reserve capacity.
+			delta := n - oldSize
+			var reserved bool
+			if f.maxBytes > 0 && delta > 0 {
+				newUsed := f.usedBytes.Add(delta)
+				if newUsed > f.maxBytes {
+					f.usedBytes.Add(-delta)
+					return ErrCacheFull
+				}
+				reserved = true
+			}
+
+			if err := os.Rename(tmpPath, dst); err != nil {
+				if reserved {
+					f.usedBytes.Add(-delta)
+				}
+				return fmt.Errorf("renaming temp to final: %w", err)
+			}
+
+			// Fsync parent directory to ensure the rename is durable.
+			if err := fsyncDir(dir); err != nil {
+				slog.Warn("fsync parent dir failed", "dir", dir, "error", err)
+			}
+
+			// Apply remaining accounting (shrink or unlimited mode).
+			if !reserved {
+				f.usedBytes.Add(delta)
+			}
+
+			committed = true
+			slog.Debug("cached object", "bucket", bucket, "key", key, "size", n)
+			return nil
+		},
+		rollback: func() error {
+			if committed {
+				return nil
+			}
+			return os.Remove(tmpPath)
+		},
+	}, nil
 }
 
 func (f *Filesystem) Get(_ context.Context, bucket, key string) (io.ReadCloser, *ObjectInfo, error) {

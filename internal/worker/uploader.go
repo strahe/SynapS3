@@ -2,10 +2,12 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -76,6 +78,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	if u.storage == nil {
 		logger.Warn("storage client not configured, failing task")
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "storage client not configured")
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 
@@ -84,6 +87,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	if err != nil || obj == nil {
 		logger.Warn("object not found for upload task", "error", err)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "object not found")
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 
@@ -91,6 +95,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	if obj.Generation != task.RefGeneration {
 		logger.Warn("stale generation, skipping", "objGen", obj.Generation)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "stale generation")
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 
@@ -99,6 +104,36 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	if err != nil || bucket == nil {
 		logger.Error("bucket not found", "bucketID", obj.BucketID, "error", err)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		return
+	}
+
+	// Recovery: if object is already uploaded (previous run succeeded at upload but
+	// failed to create the chain task), skip upload and just re-create the chain task.
+	if obj.State == model.ObjectStateUploaded {
+		logger.Info("object already uploaded, recovering chain task creation")
+		chainTask := &model.Task{
+			Type:           model.TaskTypeAddRoots,
+			RefType:        "object",
+			RefID:          task.RefID,
+			RefGeneration:  task.RefGeneration,
+			IdempotencyKey: fmt.Sprintf("add_roots:%d:%d", task.RefID, task.RefGeneration),
+			Status:         model.TaskStatusPending,
+			MaxRetries:     5,
+			ScheduledAt:    time.Now(),
+		}
+		if err := u.repos.Tasks.Create(ctx, chainTask); err != nil {
+			if errors.Is(err, repository.ErrAlreadyExists) {
+				// Chain task already exists — this upload task is done.
+				logger.Info("chain task already exists, completing upload task")
+			} else {
+				_ = u.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("recovery chain task creation: %v", err))
+				admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+				return
+			}
+		}
+		_ = u.repos.Tasks.Complete(ctx, task.ID)
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
 		return
 	}
 
@@ -108,6 +143,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 			model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 			logger.Warn("state transition cached→uploading failed", "error", err)
 			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 			return
 		}
 	}
@@ -119,6 +155,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
 			model.ObjectStateUploading, fmt.Sprintf("cache read: %v", err))
 		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 	defer func() { _ = rc.Close() }()
@@ -135,6 +172,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
 			_ = u.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
 		}
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 
@@ -144,6 +182,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		pieceCID, model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
 		logger.Error("SetPieceCIDAndTransition failed", "error", err)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 
@@ -159,11 +198,18 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		ScheduledAt:    time.Now(),
 	}
 	if err := u.repos.Tasks.Create(ctx, chainTask); err != nil {
-		logger.Error("enqueuing add_roots task", "error", err)
-		_ = u.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("chain task creation: %v", err))
-		return
+		if errors.Is(err, repository.ErrAlreadyExists) {
+			// Chain task already exists (e.g., from reconciliation) — treat as success.
+			logger.Info("chain task already exists, completing upload task")
+		} else {
+			logger.Error("enqueuing add_roots task", "error", err)
+			_ = u.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("chain task creation: %v", err))
+			admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+			return
+		}
 	}
 
 	_ = u.repos.Tasks.Complete(ctx, task.ID)
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
 	logger.Info("upload completed", "pieceCID", pieceCID)
 }

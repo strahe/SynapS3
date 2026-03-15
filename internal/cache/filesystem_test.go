@@ -147,7 +147,7 @@ func TestUsedBytesTracking(t *testing.T) {
 		t.Fatalf("initial UsedBytes = %d, want 0", fs.UsedBytes())
 	}
 
-	d1 := []byte("aaaa") // 4 bytes
+	d1 := []byte("aaaa")    // 4 bytes
 	d2 := []byte("bbbbbbb") // 7 bytes
 
 	_, _ = fs.Put(ctx, "b", "k1", bytes.NewReader(d1))
