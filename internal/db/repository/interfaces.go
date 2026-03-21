@@ -46,6 +46,8 @@ type ObjectRepository interface {
 	// ResetStaleStates resets objects stuck in an intermediate state back to a safe state.
 	// Used during startup recovery for objects that were mid-transition when the process crashed.
 	ResetStaleStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
+	// CountByState returns object counts grouped by state.
+	CountByState(ctx context.Context) ([]ObjectStateCount, error)
 }
 
 // TaskRepository defines persistence operations for Task entities.
@@ -64,6 +66,27 @@ type TaskRepository interface {
 	Requeue(ctx context.Context, taskID int64, backoff time.Duration) error
 	// ReleaseExpiredLeases resets running tasks whose lease has expired back to pending.
 	ReleaseExpiredLeases(ctx context.Context) (int, error)
+	// FailTerminal marks a running task as dead-letter (permanently failed after max retries).
+	FailTerminal(ctx context.Context, taskID int64, lastError string) error
+	// ListDeadLetters returns dead-letter tasks, ordered by most recent first.
+	ListDeadLetters(ctx context.Context, limit int) ([]model.Task, error)
+	// RetryDeadLetter resets a dead-letter task back to pending for manual retry.
+	RetryDeadLetter(ctx context.Context, taskID int64) error
+	// CountByStatus returns task counts grouped by type and status.
+	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+}
+
+// TaskStatusCount holds a task count grouped by type and status.
+type TaskStatusCount struct {
+	Type   string `bun:"type"`
+	Status string `bun:"status"`
+	Count  int64  `bun:"count"`
+}
+
+// ObjectStateCount holds an object count grouped by state.
+type ObjectStateCount struct {
+	State string `bun:"state"`
+	Count int64  `bun:"count"`
 }
 
 // MultipartUploadRepository defines persistence operations for multipart upload entities.

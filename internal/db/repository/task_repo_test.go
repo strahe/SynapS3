@@ -197,3 +197,190 @@ func TestTaskRepo_Requeue(t *testing.T) {
 		t.Fatal("expected error requeuing non-failed task")
 	}
 }
+
+func TestTaskRepo_FailTerminal(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUploadToSP)
+	claimed, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, 5*time.Minute)
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	if err := repos.Tasks.FailTerminal(ctx, claimed.ID, "max retries reached"); err != nil {
+		t.Fatalf("FailTerminal: %v", err)
+	}
+
+	task, _ := repos.Tasks.GetByID(ctx, claimed.ID)
+	if task.Status != model.TaskStatusDeadLetter {
+		t.Errorf("expected dead_letter, got %s", task.Status)
+	}
+	if task.LastError == nil || *task.LastError != "max retries reached" {
+		t.Error("expected last_error to be set")
+	}
+	if task.RetryCount != 1 {
+		t.Errorf("expected retry_count 1, got %d", task.RetryCount)
+	}
+	if task.CompletedAt == nil {
+		t.Error("expected completed_at to be set")
+	}
+}
+
+func TestTaskRepo_FailTerminal_NotRunning(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seeded := seedTask(t, repos, model.TaskTypeUploadToSP)
+	err := repos.Tasks.FailTerminal(ctx, seeded.ID, "should fail")
+	if err == nil {
+		t.Fatal("expected error marking pending task as dead-letter")
+	}
+}
+
+func TestTaskRepo_ListDeadLetters(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Initially empty
+	tasks, err := repos.Tasks.ListDeadLetters(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListDeadLetters empty: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("expected 0 dead-letter tasks, got %d", len(tasks))
+	}
+
+	// Create a dead-letter task
+	seedTask(t, repos, model.TaskTypeUploadToSP)
+	claimed, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, 5*time.Minute)
+	_ = repos.Tasks.FailTerminal(ctx, claimed.ID, "permanent failure")
+
+	tasks, err = repos.Tasks.ListDeadLetters(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 dead-letter task, got %d", len(tasks))
+	}
+	if tasks[0].ID != claimed.ID {
+		t.Errorf("expected task ID %d, got %d", claimed.ID, tasks[0].ID)
+	}
+
+	// Test limit
+	seedTask(t, repos, model.TaskTypeAddRoots)
+	claimed2, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeAddRoots, 5*time.Minute)
+	_ = repos.Tasks.FailTerminal(ctx, claimed2.ID, "permanent failure 2")
+
+	tasks, err = repos.Tasks.ListDeadLetters(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListDeadLetters limit: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task with limit=1, got %d", len(tasks))
+	}
+}
+
+func TestTaskRepo_RetryDeadLetter(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Create and move to dead-letter
+	seedTask(t, repos, model.TaskTypeUploadToSP)
+	claimed, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, 5*time.Minute)
+	_ = repos.Tasks.FailTerminal(ctx, claimed.ID, "permanent failure")
+
+	// Retry
+	if err := repos.Tasks.RetryDeadLetter(ctx, claimed.ID); err != nil {
+		t.Fatalf("RetryDeadLetter: %v", err)
+	}
+
+	task, _ := repos.Tasks.GetByID(ctx, claimed.ID)
+	if task.Status != model.TaskStatusPending {
+		t.Errorf("expected pending after retry, got %s", task.Status)
+	}
+	if task.RetryCount != 0 {
+		t.Errorf("expected retry_count 0, got %d", task.RetryCount)
+	}
+	if task.ClaimedAt != nil {
+		t.Error("expected claimed_at to be nil")
+	}
+	if task.LastError != nil {
+		t.Error("expected last_error to be nil")
+	}
+	if task.CompletedAt != nil {
+		t.Error("expected completed_at to be nil")
+	}
+
+	// Can be claimed again
+	reclaimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending after retry: %v", err)
+	}
+	if reclaimed == nil {
+		t.Fatal("expected to reclaim retried task")
+	}
+}
+
+func TestTaskRepo_RetryDeadLetter_NotDeadLetter(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seeded := seedTask(t, repos, model.TaskTypeUploadToSP)
+	err := repos.Tasks.RetryDeadLetter(ctx, seeded.ID)
+	if err == nil {
+		t.Fatal("expected error retrying non-dead-letter task")
+	}
+}
+
+func TestTaskRepo_CountByStatus(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Empty table — should return empty slice.
+	counts, err := repos.Tasks.CountByStatus(ctx)
+	if err != nil {
+		t.Fatalf("CountByStatus empty: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Fatalf("expected 0 counts, got %d", len(counts))
+	}
+
+	// Seed tasks of different types and statuses.
+	seedTask(t, repos, model.TaskTypeUploadToSP)
+	seedTask(t, repos, model.TaskTypeUploadToSP)
+	seedTask(t, repos, model.TaskTypeAddRoots)
+
+	// Claim one upload task to get a running status.
+	claimed, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, 5*time.Minute)
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	counts, err = repos.Tasks.CountByStatus(ctx)
+	if err != nil {
+		t.Fatalf("CountByStatus: %v", err)
+	}
+
+	// Build lookup map for verification.
+	lookup := make(map[string]int64)
+	for _, c := range counts {
+		lookup[c.Type+"/"+c.Status] = c.Count
+	}
+
+	if lookup[string(model.TaskTypeUploadToSP)+"/"+string(model.TaskStatusPending)] != 1 {
+		t.Errorf("expected 1 pending upload_to_sp, got %d", lookup[string(model.TaskTypeUploadToSP)+"/"+string(model.TaskStatusPending)])
+	}
+	if lookup[string(model.TaskTypeUploadToSP)+"/"+string(model.TaskStatusRunning)] != 1 {
+		t.Errorf("expected 1 running upload_to_sp, got %d", lookup[string(model.TaskTypeUploadToSP)+"/"+string(model.TaskStatusRunning)])
+	}
+	if lookup[string(model.TaskTypeAddRoots)+"/"+string(model.TaskStatusPending)] != 1 {
+		t.Errorf("expected 1 pending add_roots, got %d", lookup[string(model.TaskTypeAddRoots)+"/"+string(model.TaskStatusPending)])
+	}
+}

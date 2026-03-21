@@ -229,3 +229,17 @@ func (r *BunObjectRepo) ResetStaleStates(ctx context.Context, fromState, toState
 	rows, _ := res.RowsAffected()
 	return int(rows), nil
 }
+
+// CountByState returns object counts grouped by state (excluding soft-deleted).
+func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, error) {
+	var counts []ObjectStateCount
+	err := r.db.NewSelect().
+		Model((*model.Object)(nil)).
+		ColumnExpr("state, COUNT(*) AS count").
+		GroupExpr("state").
+		Scan(ctx, &counts)
+	if err != nil {
+		return nil, fmt.Errorf("counting objects by state: %w", err)
+	}
+	return counts, nil
+}

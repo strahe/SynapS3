@@ -47,7 +47,7 @@ func newIntegrationBackend(t *testing.T) *integrationBackend {
 	pc := &testutil.MockProofSetClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, fsCache, sm, sc, pc, logger)
+	b := backend.New(repos, fsCache, sm, sc, pc, 0, logger)
 	return &integrationBackend{
 		backend: b,
 		repos:   repos,
@@ -673,6 +673,519 @@ func TestIntegration_MultipartUpload_Abort(t *testing.T) {
 	}
 	if len(objects) != 0 {
 		t.Fatalf("expected 0 objects after abort, got %d", len(objects))
+	}
+}
+
+func TestIntegration_StringAndShutdown(t *testing.T) {
+	ib := newIntegrationBackend(t)
+
+	s := ib.backend.String()
+	if s == "" {
+		t.Fatal("expected non-empty String()")
+	}
+
+	// Shutdown should not panic.
+	ib.backend.Shutdown()
+}
+
+func TestIntegration_ListMultipartUploads(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Create 3 multipart uploads
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("multi-key-%d", i)
+		_, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+			Bucket: strPtr("bucket"),
+			Key:    &key,
+		})
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload %d: %v", i, err)
+		}
+	}
+
+	// ListMultipartUploads
+	listOut, err := ib.backend.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket: strPtr("bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListMultipartUploads: %v", err)
+	}
+	if len(listOut.Uploads) != 3 {
+		t.Fatalf("expected 3 uploads, got %d", len(listOut.Uploads))
+	}
+	if listOut.IsTruncated {
+		t.Fatal("expected IsTruncated=false")
+	}
+
+	// Verify MaxUploads pagination
+	maxUploads := int32(1)
+	listOut2, err := ib.backend.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket:     strPtr("bucket"),
+		MaxUploads: &maxUploads,
+	})
+	if err != nil {
+		t.Fatalf("ListMultipartUploads paginated: %v", err)
+	}
+	if len(listOut2.Uploads) != 1 {
+		t.Fatalf("expected 1 upload in paginated result, got %d", len(listOut2.Uploads))
+	}
+	if !listOut2.IsTruncated {
+		t.Fatal("expected IsTruncated=true for paginated result")
+	}
+}
+
+func TestIntegration_ListParts(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Create multipart upload
+	createOut, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: strPtr("bucket"),
+		Key:    strPtr("parts-file"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	uploadID := createOut.UploadId
+
+	// Upload 3 parts
+	for i := int32(1); i <= 3; i++ {
+		partNum := i
+		body := fmt.Sprintf("part-%d-data", i)
+		_, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:     strPtr("bucket"),
+			Key:        strPtr("parts-file"),
+			UploadId:   &uploadID,
+			PartNumber: &partNum,
+			Body:       strings.NewReader(body),
+		})
+		if err != nil {
+			t.Fatalf("UploadPart %d: %v", i, err)
+		}
+	}
+
+	// ListParts
+	listOut, err := ib.backend.ListParts(ctx, &s3.ListPartsInput{
+		Bucket:   strPtr("bucket"),
+		Key:      strPtr("parts-file"),
+		UploadId: &uploadID,
+	})
+	if err != nil {
+		t.Fatalf("ListParts: %v", err)
+	}
+	if len(listOut.Parts) != 3 {
+		t.Fatalf("expected 3 parts, got %d", len(listOut.Parts))
+	}
+	for i, p := range listOut.Parts {
+		if p.PartNumber != i+1 {
+			t.Fatalf("part %d: expected PartNumber=%d, got %d", i, i+1, p.PartNumber)
+		}
+		if p.ETag == "" {
+			t.Fatalf("part %d: expected non-empty ETag", i)
+		}
+		if p.Size <= 0 {
+			t.Fatalf("part %d: expected Size>0, got %d", i, p.Size)
+		}
+	}
+
+	// ListParts with MaxParts pagination
+	maxParts := int32(1)
+	listOut2, err := ib.backend.ListParts(ctx, &s3.ListPartsInput{
+		Bucket:   strPtr("bucket"),
+		Key:      strPtr("parts-file"),
+		UploadId: &uploadID,
+		MaxParts: &maxParts,
+	})
+	if err != nil {
+		t.Fatalf("ListParts paginated: %v", err)
+	}
+	if len(listOut2.Parts) != 1 {
+		t.Fatalf("expected 1 part in paginated result, got %d", len(listOut2.Parts))
+	}
+	if !listOut2.IsTruncated {
+		t.Fatal("expected IsTruncated=true for paginated ListParts")
+	}
+}
+
+func TestIntegration_UploadPartCopy(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Put a source object
+	putObject(t, ib.backend, "bucket", "copy-src", "source-data-for-part-copy")
+
+	// Create a multipart upload
+	createOut, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: strPtr("bucket"),
+		Key:    strPtr("copy-dst"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	uploadID := createOut.UploadId
+
+	// UploadPartCopy: copy source into part 1
+	partNum := int32(1)
+	copySource := "bucket/copy-src"
+	partCopyOut, err := ib.backend.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		Bucket:     strPtr("bucket"),
+		Key:        strPtr("copy-dst"),
+		UploadId:   &uploadID,
+		PartNumber: &partNum,
+		CopySource: &copySource,
+	})
+	if err != nil {
+		t.Fatalf("UploadPartCopy: %v", err)
+	}
+	if partCopyOut.ETag == nil || *partCopyOut.ETag == "" {
+		t.Fatal("expected non-empty ETag from UploadPartCopy")
+	}
+
+	// Complete the multipart upload with the copied part
+	_, _, err = ib.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   strPtr("bucket"),
+		Key:      strPtr("copy-dst"),
+		UploadId: &uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{
+				{PartNumber: &partNum, ETag: partCopyOut.ETag},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload: %v", err)
+	}
+
+	// Verify the assembled object has the same data as the source
+	body := getObjectBody(t, ib.backend, "bucket", "copy-dst")
+	if body != "source-data-for-part-copy" {
+		t.Fatalf("expected body=source-data-for-part-copy, got %q", body)
+	}
+}
+
+func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Put source with specific content type
+	srcBucket := "bucket"
+	srcKey := "original.txt"
+	_, err := ib.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket:      &srcBucket,
+		Key:         &srcKey,
+		Body:        strings.NewReader("copy-me"),
+		ContentType: strPtr("text/plain"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	srcObj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "original.txt")
+	if err != nil || srcObj == nil {
+		t.Fatalf("expected src object, got err=%v", err)
+	}
+
+	// Copy to destination
+	copySource := "bucket/original.txt"
+	dstBucket := "bucket"
+	dstKey := "copy.txt"
+	copyOut, err := ib.backend.CopyObject(ctx, s3response.CopyObjectInput{
+		Bucket:     &dstBucket,
+		Key:        &dstKey,
+		CopySource: &copySource,
+	})
+	if err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+
+	// Verify CopyObjectResult output
+	if copyOut.CopyObjectResult == nil {
+		t.Fatal("expected CopyObjectResult to be non-nil")
+	}
+	if copyOut.CopyObjectResult.ETag == nil || *copyOut.CopyObjectResult.ETag == "" {
+		t.Fatal("expected CopyObjectResult.ETag to be non-empty")
+	}
+
+	// Verify destination metadata matches source
+	dstObj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "copy.txt")
+	if err != nil || dstObj == nil {
+		t.Fatalf("expected dst object, got err=%v", err)
+	}
+
+	if dstObj.Size != srcObj.Size {
+		t.Fatalf("size mismatch: src=%d dst=%d", srcObj.Size, dstObj.Size)
+	}
+	if dstObj.ETag != srcObj.ETag {
+		t.Fatalf("etag mismatch: src=%s dst=%s", srcObj.ETag, dstObj.ETag)
+	}
+	if dstObj.ContentType != srcObj.ContentType {
+		t.Fatalf("content-type mismatch: src=%s dst=%s", srcObj.ContentType, dstObj.ContentType)
+	}
+	if dstObj.State != model.ObjectStateCached {
+		t.Fatalf("expected dst state=cached, got %s", dstObj.State)
+	}
+	if dstObj.Generation != 1 {
+		t.Fatalf("expected dst generation=1, got %d", dstObj.Generation)
+	}
+
+	// Verify body matches
+	body := getObjectBody(t, ib.backend, "bucket", "copy.txt")
+	if body != "copy-me" {
+		t.Fatalf("expected body=copy-me, got %q", body)
+	}
+}
+
+func TestIntegration_DeleteObjects_Batch(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Put 3 objects
+	putObject(t, ib.backend, "bucket", "file-a", "aaa")
+	putObject(t, ib.backend, "bucket", "file-b", "bbb")
+	putObject(t, ib.backend, "bucket", "file-c", "ccc")
+
+	// Batch delete file-a and file-c
+	result, err := ib.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: strPtr("bucket"),
+		Delete: &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: strPtr("file-a")},
+				{Key: strPtr("file-c")},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+
+	// Verify result
+	if len(result.Deleted) != 2 {
+		t.Fatalf("expected 2 deleted, got %d", len(result.Deleted))
+	}
+	if len(result.Error) != 0 {
+		t.Fatalf("expected 0 errors, got %d", len(result.Error))
+	}
+
+	// Verify deleted keys in result
+	deletedKeys := map[string]bool{}
+	for _, d := range result.Deleted {
+		deletedKeys[*d.Key] = true
+	}
+	if !deletedKeys["file-a"] || !deletedKeys["file-c"] {
+		t.Fatalf("expected file-a and file-c in deleted result, got %v", deletedKeys)
+	}
+
+	// Verify deleted objects not visible via ListObjects
+	listOut, err := ib.backend.ListObjects(ctx, &s3.ListObjectsInput{
+		Bucket: strPtr("bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(listOut.Contents) != 1 {
+		t.Fatalf("expected 1 remaining object, got %d", len(listOut.Contents))
+	}
+	if *listOut.Contents[0].Key != "file-b" {
+		t.Fatalf("expected remaining key=file-b, got %s", *listOut.Contents[0].Key)
+	}
+
+	// Verify cache files removed for deleted objects
+	if ib.cache.Exists(ctx, "bucket", "file-a") {
+		t.Fatal("expected cache for file-a to be removed")
+	}
+	if ib.cache.Exists(ctx, "bucket", "file-c") {
+		t.Fatal("expected cache for file-c to be removed")
+	}
+
+	// Verify remaining object still readable
+	body := getObjectBody(t, ib.backend, "bucket", "file-b")
+	if body != "bbb" {
+		t.Fatalf("expected body=bbb, got %q", body)
+	}
+}
+
+func TestIntegration_ListObjectsV2_Pagination(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Put 5 objects with lexicographic keys
+	keys := []string{"obj-a", "obj-b", "obj-c", "obj-d", "obj-e"}
+	for _, k := range keys {
+		putObject(t, ib.backend, "bucket", k, "data-"+k)
+	}
+
+	// Page 1: MaxKeys=2
+	maxKeys := int32(2)
+	out1, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  strPtr("bucket"),
+		MaxKeys: &maxKeys,
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2 page 1: %v", err)
+	}
+	if *out1.KeyCount != 2 {
+		t.Fatalf("page 1: expected KeyCount=2, got %d", *out1.KeyCount)
+	}
+	if !*out1.IsTruncated {
+		t.Fatal("page 1: expected IsTruncated=true")
+	}
+	if out1.NextContinuationToken == nil || *out1.NextContinuationToken == "" {
+		t.Fatal("page 1: expected NextContinuationToken")
+	}
+
+	// Collect all keys through pagination
+	var allKeys []string
+	for _, obj := range out1.Contents {
+		allKeys = append(allKeys, *obj.Key)
+	}
+
+	// Page 2
+	out2, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:            strPtr("bucket"),
+		MaxKeys:           &maxKeys,
+		ContinuationToken: out1.NextContinuationToken,
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2 page 2: %v", err)
+	}
+	if *out2.KeyCount != 2 {
+		t.Fatalf("page 2: expected KeyCount=2, got %d", *out2.KeyCount)
+	}
+	if !*out2.IsTruncated {
+		t.Fatal("page 2: expected IsTruncated=true")
+	}
+	for _, obj := range out2.Contents {
+		allKeys = append(allKeys, *obj.Key)
+	}
+
+	// Page 3 (last page, should have 1 object)
+	out3, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:            strPtr("bucket"),
+		MaxKeys:           &maxKeys,
+		ContinuationToken: out2.NextContinuationToken,
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2 page 3: %v", err)
+	}
+	if *out3.KeyCount != 1 {
+		t.Fatalf("page 3: expected KeyCount=1, got %d", *out3.KeyCount)
+	}
+	if *out3.IsTruncated {
+		t.Fatal("page 3: expected IsTruncated=false")
+	}
+	for _, obj := range out3.Contents {
+		allKeys = append(allKeys, *obj.Key)
+	}
+
+	// Verify we got all 5 keys in order
+	if len(allKeys) != 5 {
+		t.Fatalf("expected 5 total keys, got %d: %v", len(allKeys), allKeys)
+	}
+	for i, k := range keys {
+		if allKeys[i] != k {
+			t.Fatalf("key[%d]: expected %s, got %s", i, k, allKeys[i])
+		}
+	}
+}
+
+func TestIntegration_HeadObject(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	testutil.SeedBucket(t, ib.db, "bucket")
+
+	content := "hello-head-object"
+	bucketName := "bucket"
+	keyName := "head-key"
+	_, err := ib.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket:      &bucketName,
+		Key:         &keyName,
+		Body:        strings.NewReader(content),
+		ContentType: strPtr("application/json"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// HeadObject
+	headOut, err := ib.backend.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: strPtr("bucket"),
+		Key:    strPtr("head-key"),
+	})
+	if err != nil {
+		t.Fatalf("HeadObject: %v", err)
+	}
+
+	// Verify ContentLength
+	if headOut.ContentLength == nil || *headOut.ContentLength != int64(len(content)) {
+		t.Fatalf("expected ContentLength=%d, got %v", len(content), headOut.ContentLength)
+	}
+
+	// Verify ETag is non-empty and quoted
+	if headOut.ETag == nil || *headOut.ETag == "" {
+		t.Fatal("expected ETag to be non-empty")
+	}
+	if !strings.HasPrefix(*headOut.ETag, `"`) || !strings.HasSuffix(*headOut.ETag, `"`) {
+		t.Fatalf("expected ETag to be quoted, got %s", *headOut.ETag)
+	}
+
+	// Verify ContentType
+	if headOut.ContentType == nil || *headOut.ContentType != "application/json" {
+		t.Fatalf("expected ContentType=application/json, got %v", headOut.ContentType)
+	}
+
+	// Verify LastModified is set
+	if headOut.LastModified == nil || headOut.LastModified.IsZero() {
+		t.Fatal("expected LastModified to be set")
+	}
+}
+
+func TestIntegration_GetObject_CacheMiss_NoPieceCID(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Put object so it's in DB and cache
+	putObject(t, ib.backend, "bucket", "evicted-key", "some data")
+
+	obj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "evicted-key")
+	if err != nil || obj == nil {
+		t.Fatalf("expected object in DB, got err=%v", err)
+	}
+	// Confirm PieceCID is nil (hasn't been uploaded to SP yet)
+	if obj.PieceCID != nil {
+		t.Fatalf("expected PieceCID=nil before upload, got %v", obj.PieceCID)
+	}
+
+	// Manually delete from cache to simulate a cache miss
+	if err := ib.cache.Delete(ctx, "bucket", "evicted-key"); err != nil {
+		t.Fatalf("cache delete: %v", err)
+	}
+	if ib.cache.Exists(ctx, "bucket", "evicted-key") {
+		t.Fatal("expected cache file to be gone")
+	}
+
+	// GetObject should fail — object is in DB but no cache and no PieceCID for SP download
+	_, err = ib.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: strPtr("bucket"),
+		Key:    strPtr("evicted-key"),
+	})
+	if err == nil {
+		t.Fatal("expected GetObject to fail on cache miss with no PieceCID")
 	}
 }
 

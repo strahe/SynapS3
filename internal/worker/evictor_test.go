@@ -161,6 +161,35 @@ func TestEvictor_NoPieceCID(t *testing.T) {
 	}
 }
 
+func TestEvictor_BucketNotFound(t *testing.T) {
+	mc := &testutil.MockCache{
+		DeleteFunc: func(_ context.Context, _, _ string) error {
+			return nil
+		},
+	}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	bucket, objID, gen := seedOnChainedObject(t, env)
+
+	// Hard-delete the bucket so evictor can't find it
+	ctx := context.Background()
+	if err := env.repos.Buckets.HardDelete(ctx, bucket.ID); err != nil {
+		t.Fatalf("hard-deleting bucket: %v", err)
+	}
+
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, gen, 5, 0)
+
+	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
+	if got.Status != model.TaskStatusFailed {
+		t.Errorf("expected task failed, got %s", got.Status)
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "bucket not found") {
+		t.Errorf("expected bucket not found error, got %v", got.LastError)
+	}
+}
+
 func TestEvictor_CacheDeleteFailure(t *testing.T) {
 	mc := &testutil.MockCache{
 		DeleteFunc: func(_ context.Context, _, _ string) error {

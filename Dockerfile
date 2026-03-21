@@ -22,13 +22,16 @@ RUN CGO_ENABLED=1 go build -trimpath \
 # Runtime stage
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata wget
 
 COPY --from=builder /synaps3 /usr/local/bin/synaps3
 
 RUN mkdir -p /var/lib/synaps3/cache
 
-EXPOSE 8080
+EXPOSE 8080 9090
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD wget -q --spider http://localhost:9090/healthz || exit 1
 
 ENTRYPOINT ["synaps3"]
-CMD ["--config", "/etc/synaps3/config.yaml"]
+CMD ["serve", "--config", "/etc/synaps3/config.yaml"]

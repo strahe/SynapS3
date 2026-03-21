@@ -79,8 +79,8 @@ cp config.example.yaml config.yaml
 
 ```bash
 docker build -t synaps3 .
-docker run -p 8080:8080 \
-  -v /path/to/config.yaml:/etc/synaps3/config.yaml \
+docker run -p 8080:8080 -p 9090:9090 \
+  -v /path/to/config.yaml:/etc/synaps3/config.yaml:ro \
   -v /path/to/cache:/var/lib/synaps3/cache \
   synaps3
 ```
@@ -185,6 +185,150 @@ SynapS3 implements the following S3 operations:
 | `AbortMultipartUpload` | Cancels the upload and cleans up staged parts |
 | `ListMultipartUploads` | Lists in-progress multipart uploads for a bucket |
 | `ListParts` | Lists uploaded parts for a given UploadID |
+
+## Production Deployment
+
+### Recommended Configuration
+
+For production deployments, use **PostgreSQL** as the database backend:
+
+```yaml
+database:
+  driver: postgres
+  dsn: "postgres://synaps3:password@db:5432/synaps3?sslmode=require"
+  max_open_conns: 25
+  max_idle_conns: 10
+
+cache:
+  dir: /data/synaps3/cache
+  max_size_gb: 500
+  eviction_policy: lru
+  evict_after_onchain: true
+  max_sp_download_size: 1073741824  # 1 GiB (0 = unlimited)
+
+worker:
+  upload:
+    concurrency: 4
+    poll_interval: 5s
+  onchain:
+    concurrency: 2
+    poll_interval: 10s
+  evictor:
+    concurrency: 2
+    poll_interval: 30s
+  proofset:
+    concurrency: 1
+    poll_interval: 30s
+
+logging:
+  level: info
+  format: json
+
+admin:
+  addr: "127.0.0.1:9090"  # Bind to localhost only; use a reverse proxy for external access
+```
+
+### Docker Production
+
+> **Security note**: The admin port exposes unauthenticated write endpoints (`/admin/dead-letters/{id}/retry`).
+> In production, keep admin bound to `127.0.0.1` and use a reverse proxy with authentication,
+> or override with `addr: ":9090"` only within a trusted network.
+
+```bash
+docker build -t synaps3 .
+docker run -d \
+  --name synaps3 \
+  -p 8080:8080 \
+  -v /etc/synaps3/config.yaml:/etc/synaps3/config.yaml:ro \
+  -v /data/synaps3/cache:/var/lib/synaps3/cache \
+  synaps3
+```
+
+The container includes a built-in health check (`/healthz` on port 9090). Docker and Kubernetes will automatically monitor and restart unhealthy instances.
+
+### Monitoring
+
+SynapS3 exposes Prometheus metrics on the admin port (default `127.0.0.1:9090`):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `synaps3_backend_object_operations_total` | Counter | S3 operations by type and status |
+| `synaps3_cache_used_bytes` | Gauge | Current cache disk usage |
+| `synaps3_cache_hits_total` / `misses_total` | Counter | Cache hit/miss ratio |
+| `synaps3_worker_tasks_processed_total` | Counter | Tasks processed by worker and result |
+| `synaps3_worker_task_duration_seconds` | Histogram | Per-task processing latency |
+| `synaps3_worker_dead_letter_total` | Counter | Tasks that exceeded max retries |
+| `synaps3_task_queue_depth` | Gauge | Pending tasks by type and status |
+| `synaps3_object_state_distribution` | Gauge | Object counts by pipeline state |
+
+**Prometheus scrape config:**
+
+```yaml
+scrape_configs:
+  - job_name: synaps3
+    static_configs:
+      - targets: ['synaps3:9090']
+    metrics_path: /metrics
+```
+
+### Failure Modes
+
+| Scenario | Behavior | Recovery |
+|----------|----------|----------|
+| **SP unreachable** | Upload tasks retry with exponential backoff (10s→5m). After max retries, task enters dead-letter. | Fix SP connectivity, then retry via admin API. |
+| **RPC node down** | OnChain tasks retry with backoff. ProofSet operations pause. | RPC recovery triggers automatic retry. |
+| **Database full** | PutObject returns 500. Workers pause (task claims fail). | Free disk space or scale database. |
+| **Cache disk full** | PutObject writes fail. GetObject still serves cached objects. | Increase disk, lower `max_size_gb`, or enable `evict_after_onchain`. |
+| **Process crash** | On restart, Manager resets stale states and reconciles orphaned tasks. | Automatic — no manual intervention needed. |
+
+### Admin API
+
+The admin server runs on a separate port (default `127.0.0.1:9090`) and provides:
+
+#### `GET /healthz`
+
+Returns system health status. Checks database connectivity, cache directory existence, and worker liveness.
+
+```json
+// Healthy (200)
+{"status":"ok"}
+
+// Unhealthy (503)
+{"status":"unhealthy","errors":["worker/onchain: not responding"]}
+```
+
+Workers are considered unhealthy if they haven't completed a poll cycle within `3 × poll_interval`.
+
+#### `GET /metrics`
+
+Prometheus-format metrics endpoint. See [Monitoring](#monitoring) for available metrics.
+
+#### `GET /admin/dead-letters?limit=100`
+
+Lists tasks that have permanently failed after exhausting all retries.
+
+```json
+[
+  {
+    "id": 42,
+    "type": "upload_to_sp",
+    "ref_type": "object",
+    "ref_id": 7,
+    "status": "dead_letter",
+    "last_error": "SP upload: connection refused (max retries reached)",
+    "retry_count": 5,
+    "created_at": "2025-01-15T10:30:00Z"
+  }
+]
+```
+
+#### `POST /admin/dead-letters/{id}/retry`
+
+Requeues a dead-letter task for another attempt. Returns `200` on success.
+
+```json
+{"status":"requeued"}
+```
 
 ## Development
 

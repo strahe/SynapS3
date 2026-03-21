@@ -18,6 +18,7 @@ func NewObjectStateMachine() *Machine {
 		Transition{From: string(model.ObjectStateUploading), To: string(model.ObjectStateFailed)},
 		Transition{From: string(model.ObjectStateUploaded), To: string(model.ObjectStateFailed)},
 		Transition{From: string(model.ObjectStateOnChaining), To: string(model.ObjectStateFailed)},
+		Transition{From: string(model.ObjectStateOnChained), To: string(model.ObjectStateFailed)},
 
 		// Retry from failure: back to the step that failed
 		Transition{From: string(model.ObjectStateFailed), To: string(model.ObjectStateUploading)},

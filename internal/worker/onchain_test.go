@@ -245,6 +245,31 @@ func TestOnChain_AddRootsFailure_Retry(t *testing.T) {
 	}
 }
 
+func TestOnChain_AddRootsFailure_MaxRetries(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedUploadedObject(t, env)
+
+	task := seedTask(t, env, model.TaskTypeAddRoots, objID, gen, 5, 4)
+
+	env.proof.AddRootsFunc = func(_ context.Context, _ *big.Int, _ []pdp.Root) (*pdp.AddRootsResult, error) {
+		return nil, errors.New("permanent chain failure")
+	}
+
+	oc := worker.NewOnChain(env.repos, env.proof, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, oc, task.ID, 5*time.Second)
+
+	ctx := context.Background()
+	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
+	if got.Status != model.TaskStatusDeadLetter {
+		t.Errorf("expected task dead_letter, got %s", got.Status)
+	}
+
+	obj, _ := env.repos.Objects.GetByID(ctx, objID)
+	if obj.State != model.ObjectStateFailed {
+		t.Errorf("expected object state failed, got %s", obj.State)
+	}
+}
+
 func TestOnChain_EvictChainTaskFailure(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, gen := seedUploadedObject(t, env)

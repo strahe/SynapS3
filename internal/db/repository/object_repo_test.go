@@ -497,3 +497,97 @@ func TestRepos_WithTx(t *testing.T) {
 		t.Fatal("expected bucket after commit")
 	}
 }
+
+func TestObjectRepo_CountByState(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Empty table.
+	counts, err := repos.Objects.CountByState(ctx)
+	if err != nil {
+		t.Fatalf("CountByState empty: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Fatalf("expected 0 counts, got %d", len(counts))
+	}
+
+	bucket := seedBucket(t, db, "countstate-bucket")
+
+	// Seed three objects (all start as "cached").
+	for _, key := range []string{"a.txt", "b.txt", "c.txt"} {
+		obj := &model.Object{
+			BucketID:    bucket.ID,
+			Key:         key,
+			Size:        1,
+			ETag:        "e",
+			Checksum:    "c",
+			ContentType: "text/plain",
+			CachePath:   "/cache/" + key,
+			MaxRetries:  5,
+		}
+		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+			t.Fatalf("upsert %s: %v", key, err)
+		}
+	}
+
+	// Transition one to uploading.
+	objs, _ := repos.Objects.ListByState(ctx, model.ObjectStateCached, 1)
+	if len(objs) == 0 {
+		t.Fatal("expected at least one cached object")
+	}
+	if err := repos.Objects.UpdateState(ctx, objs[0].ID, objs[0].Generation, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+
+	counts, err = repos.Objects.CountByState(ctx)
+	if err != nil {
+		t.Fatalf("CountByState: %v", err)
+	}
+
+	lookup := make(map[string]int64)
+	for _, c := range counts {
+		lookup[c.State] = c.Count
+	}
+
+	if lookup[string(model.ObjectStateCached)] != 2 {
+		t.Errorf("expected 2 cached, got %d", lookup[string(model.ObjectStateCached)])
+	}
+	if lookup[string(model.ObjectStateUploading)] != 1 {
+		t.Errorf("expected 1 uploading, got %d", lookup[string(model.ObjectStateUploading)])
+	}
+}
+
+func TestObjectRepo_CountByState_ExcludesSoftDeleted(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "countdel-bucket")
+	obj := &model.Object{
+		BucketID:    bucket.ID,
+		Key:         "del.txt",
+		Size:        1,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/del.txt",
+		MaxRetries:  5,
+	}
+	id, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	if err := repos.Objects.SoftDelete(ctx, id); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+
+	counts, err := repos.Objects.CountByState(ctx)
+	if err != nil {
+		t.Fatalf("CountByState: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Errorf("expected 0 counts after soft-delete, got %d", len(counts))
+	}
+}

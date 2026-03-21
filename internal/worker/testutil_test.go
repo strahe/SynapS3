@@ -1,6 +1,7 @@
 package worker_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/cache"
@@ -53,6 +54,16 @@ func newTestWorkerEnvWithMockCache(t *testing.T, mc *testutil.MockCache) *testWo
 		proof:   pc,
 	}
 }
+
+// stubWorker is a minimal Worker implementation for manager-level tests.
+type stubWorker struct {
+	name      string
+	isHealthy bool
+}
+
+func (s *stubWorker) Name() string                    { return s.name }
+func (s *stubWorker) Run(_ context.Context) error      { return nil }
+func (s *stubWorker) Healthy() bool                    { return s.isHealthy }
 
 func newWorkerTestCache(t *testing.T, maxBytes int64) cache.Cache {
 	t.Helper()

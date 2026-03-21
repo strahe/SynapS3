@@ -101,8 +101,8 @@ func TestProofSet_CreateFailure_MaxRetries(t *testing.T) {
 	runWorkerUntilTask(t, env, pw, task.ID, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("expected task failed, got %s", got.Status)
+	if got.Status != model.TaskStatusDeadLetter {
+		t.Errorf("expected task dead_letter, got %s", got.Status)
 	}
 
 	b, _ := env.repos.Buckets.GetByID(ctx, bucket.ID)
@@ -175,6 +175,95 @@ func TestProofSet_DeleteNoProofSet(t *testing.T) {
 	b, _ := env.repos.Buckets.GetByID(ctx, bucket.ID)
 	if b != nil {
 		t.Errorf("expected bucket to be hard-deleted, but found status=%s", b.Status)
+	}
+}
+
+func TestProofSet_DeleteFailure_Retry(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+
+	proofSetID := "77"
+	bucket := &model.Bucket{Name: "ps-del-retry-bucket", Status: model.BucketStatusDeleting, ProofSetID: &proofSetID}
+	if err := env.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("creating bucket: %v", err)
+	}
+
+	task := seedBucketTask(t, env, model.TaskTypeDeleteProofSet, bucket.ID, 5, 0)
+
+	env.proof.DeleteProofSetFunc = func(_ context.Context, _ *big.Int, _ []byte) error {
+		return errors.New("chain congested")
+	}
+
+	pw := worker.NewProofSetWorker(env.repos, env.proof, env.cache, 1, 50*time.Millisecond, slog.Default())
+	runCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	_ = pw.Run(runCtx)
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	}
+	if got.RetryCount != 1 {
+		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
+	}
+
+	b, _ := env.repos.Buckets.GetByID(context.Background(), bucket.ID)
+	if b.Status != model.BucketStatusDeleting {
+		t.Errorf("expected bucket still deleting, got %s", b.Status)
+	}
+}
+
+func TestProofSet_DeleteFailure_MaxRetries(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+
+	proofSetID := "88"
+	bucket := &model.Bucket{Name: "ps-del-maxretry-bucket", Status: model.BucketStatusDeleting, ProofSetID: &proofSetID}
+	if err := env.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("creating bucket: %v", err)
+	}
+
+	task := seedBucketTask(t, env, model.TaskTypeDeleteProofSet, bucket.ID, 5, 4)
+
+	env.proof.DeleteProofSetFunc = func(_ context.Context, _ *big.Int, _ []byte) error {
+		return errors.New("permanent failure")
+	}
+
+	pw := worker.NewProofSetWorker(env.repos, env.proof, env.cache, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, pw, task.ID, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
+	if got.Status != model.TaskStatusDeadLetter {
+		t.Errorf("expected task dead_letter, got %s", got.Status)
+	}
+
+	b, _ := env.repos.Buckets.GetByID(ctx, bucket.ID)
+	if b.Status != model.BucketStatusDeleteFailed {
+		t.Errorf("expected bucket delete_failed, got %s", b.Status)
+	}
+}
+
+func TestProofSet_DeleteInvalidProofSetID(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+
+	badID := "not-a-number"
+	bucket := &model.Bucket{Name: "ps-del-badid-bucket", Status: model.BucketStatusDeleting, ProofSetID: &badID}
+	if err := env.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("creating bucket: %v", err)
+	}
+
+	task := seedBucketTask(t, env, model.TaskTypeDeleteProofSet, bucket.ID, 5, 0)
+
+	pw := worker.NewProofSetWorker(env.repos, env.proof, env.cache, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, pw, task.ID, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
+	if got.Status != model.TaskStatusFailed {
+		t.Errorf("expected task failed, got %s", got.Status)
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "invalid ProofSetID") {
+		t.Errorf("expected invalid ProofSetID error, got %v", got.LastError)
 	}
 }
 

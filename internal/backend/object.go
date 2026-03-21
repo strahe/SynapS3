@@ -152,6 +152,15 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 	// Cache miss — object has been evicted, try SP download if PieceCID is available.
 	admin.CacheMissesTotal.Inc()
 	if obj.PieceCID != nil && *obj.PieceCID != "" && b.storage != nil {
+		// Size guard: prevent OOM from downloading very large objects into memory.
+		// go-synapse's Download() loads the entire payload into []byte.
+		if b.maxSPDownloadSize > 0 && obj.Size > b.maxSPDownloadSize {
+			b.logger.Warn("object too large for SP download",
+				"key", *input.Key, "size", obj.Size, "limit", b.maxSPDownloadSize)
+			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
+			return nil, s3err.GetAPIError(s3err.ErrEntityTooLarge)
+		}
+
 		pieceCID, parseErr := cid.Decode(*obj.PieceCID)
 		if parseErr != nil {
 			b.logger.Warn("invalid PieceCID, cannot download from SP", "key", *input.Key, "pieceCID", *obj.PieceCID)

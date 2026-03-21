@@ -29,6 +29,7 @@ type OnChain struct {
 	pollInterval      time.Duration
 	leaseTTL          time.Duration
 	logger            *slog.Logger
+	*livenessTracker
 }
 
 // NewOnChain creates a new on-chain worker.
@@ -42,6 +43,7 @@ func NewOnChain(repos *repository.Repositories, pc synapse.ProofSetClient, sm *s
 		pollInterval:      pollInterval,
 		leaseTTL:          15 * time.Minute,
 		logger:            logger,
+		livenessTracker:   newLivenessTracker(pollInterval),
 	}
 }
 
@@ -52,6 +54,7 @@ func (o *OnChain) Run(ctx context.Context) error {
 }
 
 func (o *OnChain) tick(ctx context.Context) error {
+	o.recordTick()
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
 
@@ -71,10 +74,19 @@ func (o *OnChain) tick(ctx context.Context) error {
 		})
 	}
 
-	return g.Wait()
+	err := g.Wait()
+	return err
 }
 
+// Healthy returns true if the worker has ticked recently.
+func (o *OnChain) Healthy() bool { return o.healthy() }
+
 func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
+	start := time.Now()
+	defer func() {
+		admin.WorkerTaskDuration.WithLabelValues("onchain").Observe(time.Since(start).Seconds())
+	}()
+
 	logger := o.logger.With("taskID", task.ID, "objectID", task.RefID, "gen", task.RefGeneration)
 
 	if o.proofSet == nil {
@@ -192,10 +204,14 @@ func (o *OnChain) processTask(ctx context.Context, task *model.Task) {
 		if task.RetryCount+1 >= task.MaxRetries {
 			_ = state.TransitionToFailed(ctx, o.stateMachine, o.repos.Objects, task.RefID, task.RefGeneration,
 				model.ObjectStateOnChaining, fmt.Sprintf("AddRoots: %v (max retries reached)", err))
-			_ = o.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			if ftErr := o.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+				logger.Error("failed to mark task as dead-letter", "error", ftErr)
+			} else {
+				admin.DeadLetterTotal.WithLabelValues("onchain", string(model.TaskTypeAddRoots)).Inc()
+			}
 		} else {
 			_ = o.repos.Tasks.Fail(ctx, task.ID, err.Error())
-			_ = o.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
+			_ = o.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
 		}
 		admin.WorkerTasksProcessed.WithLabelValues("onchain", "failure").Inc()
 		return

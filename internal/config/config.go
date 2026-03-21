@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,11 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+)
+
+const (
+	// defaultMaxSPDownloadSize is the maximum object size (1 GiB) for SP download on cache miss.
+	defaultMaxSPDownloadSize int64 = 1 << 30
 )
 
 type Config struct {
@@ -59,6 +65,7 @@ type CacheConfig struct {
 	MaxSizeGB         int    `koanf:"max_size_gb"`
 	EvictionPolicy    string `koanf:"eviction_policy"` // lru | manual | none
 	EvictAfterOnChain bool   `koanf:"evict_after_onchain"`
+	MaxSPDownloadSize int64  `koanf:"max_sp_download_size"` // max bytes for SP download, 0 = unlimited
 }
 
 type WorkerConfig struct {
@@ -106,6 +113,7 @@ func DefaultConfig() *Config {
 			MaxSizeGB:         100,
 			EvictionPolicy:    "lru",
 			EvictAfterOnChain: true,
+			MaxSPDownloadSize: defaultMaxSPDownloadSize,
 		},
 		Worker: WorkerConfig{
 			Upload: WorkerPoolConfig{
@@ -134,7 +142,7 @@ func DefaultConfig() *Config {
 			Format: "json",
 		},
 		Admin: AdminConfig{
-			Addr: ":9090",
+			Addr: "127.0.0.1:9090",
 		},
 	}
 }
@@ -169,4 +177,93 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// Validate checks the Config for invalid or missing values and returns all
+// validation errors joined together so the operator can fix them in one pass.
+func (c *Config) Validate() error {
+	var errs []error
+
+	// TLS: cert and key required when enabled.
+	if c.Server.TLS.Enabled {
+		if strings.TrimSpace(c.Server.TLS.CertFile) == "" {
+			errs = append(errs, errors.New("server.tls.cert_file must be set when TLS is enabled"))
+		}
+		if strings.TrimSpace(c.Server.TLS.KeyFile) == "" {
+			errs = append(errs, errors.New("server.tls.key_file must be set when TLS is enabled"))
+		}
+	}
+
+	// Cache.
+	if strings.TrimSpace(c.Cache.Dir) == "" {
+		errs = append(errs, errors.New("cache.dir must be non-empty"))
+	}
+	if c.Cache.MaxSizeGB < 1 {
+		errs = append(errs, fmt.Errorf("cache.max_size_gb must be >= 1, got %d", c.Cache.MaxSizeGB))
+	}
+	if c.Cache.MaxSPDownloadSize < 0 {
+		errs = append(errs, fmt.Errorf("cache.max_sp_download_size must be >= 0, got %d", c.Cache.MaxSPDownloadSize))
+	}
+
+	// Eviction policy.
+	switch strings.ToLower(c.Cache.EvictionPolicy) {
+	case "lru", "manual", "none":
+	default:
+		errs = append(errs, fmt.Errorf("cache.eviction_policy must be one of [lru, manual, none], got %q", c.Cache.EvictionPolicy))
+	}
+
+	// Database.
+	if strings.TrimSpace(c.Database.DSN) == "" {
+		errs = append(errs, errors.New("database.dsn must be non-empty"))
+	}
+	switch c.Database.Driver {
+	case "postgres", "sqlite":
+	default:
+		errs = append(errs, fmt.Errorf("database.driver must be postgres or sqlite, got %q", c.Database.Driver))
+	}
+	if c.Database.MaxOpenConns < 1 {
+		errs = append(errs, fmt.Errorf("database.max_open_conns must be >= 1, got %d", c.Database.MaxOpenConns))
+	}
+	if c.Database.MaxIdleConns < 0 {
+		errs = append(errs, fmt.Errorf("database.max_idle_conns must be >= 0, got %d", c.Database.MaxIdleConns))
+	}
+	if c.Database.MaxIdleConns > c.Database.MaxOpenConns {
+		errs = append(errs, fmt.Errorf("database.max_idle_conns (%d) must not exceed max_open_conns (%d)", c.Database.MaxIdleConns, c.Database.MaxOpenConns))
+	}
+
+	// Filecoin network.
+	switch strings.ToLower(c.Filecoin.Network) {
+	case "calibration", "mainnet":
+	default:
+		errs = append(errs, fmt.Errorf("filecoin.network must be calibration or mainnet, got %q", c.Filecoin.Network))
+	}
+
+	// S3 credentials.
+	if strings.TrimSpace(c.S3.AccessKey) == "" {
+		errs = append(errs, errors.New("s3.access_key must be non-empty"))
+	}
+	if strings.TrimSpace(c.S3.SecretKey) == "" {
+		errs = append(errs, errors.New("s3.secret_key must be non-empty"))
+	}
+
+	// Worker pools.
+	validatePool := func(name string, p WorkerPoolConfig) {
+		if p.Concurrency < 1 {
+			errs = append(errs, fmt.Errorf("worker.%s.concurrency must be >= 1, got %d", name, p.Concurrency))
+		}
+		if p.PollInterval <= 0 {
+			errs = append(errs, fmt.Errorf("worker.%s.poll_interval must be > 0, got %s", name, p.PollInterval))
+		}
+	}
+	validatePool("upload", c.Worker.Upload)
+	validatePool("onchain", c.Worker.OnChain)
+	validatePool("proofset", c.Worker.ProofSet)
+	validatePool("evictor", c.Worker.Evictor)
+
+	// Admin.
+	if strings.TrimSpace(c.Admin.Addr) == "" {
+		errs = append(errs, errors.New("admin.addr must be non-empty"))
+	}
+
+	return errors.Join(errs...)
 }

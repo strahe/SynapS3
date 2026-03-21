@@ -42,7 +42,6 @@ func TestObjectStateMachine_FailureTransitions(t *testing.T) {
 	// States that cannot transition to failed.
 	cannotFail := []model.ObjectState{
 		model.ObjectStateCached,
-		model.ObjectStateOnChained,
 		model.ObjectStateFailed,
 		model.ObjectStateCacheEvicted,
 	}
@@ -145,7 +144,7 @@ func TestObjectStateMachine_NextStates(t *testing.T) {
 		{model.ObjectStateUploading, []string{"failed", "uploaded"}},
 		{model.ObjectStateUploaded, []string{"cache_evicted", "failed", "onchaining"}},
 		{model.ObjectStateOnChaining, []string{"cache_evicted", "failed", "onchained"}},
-		{model.ObjectStateOnChained, []string{"cache_evicted"}},
+		{model.ObjectStateOnChained, []string{"cache_evicted", "failed"}},
 		{model.ObjectStateFailed, []string{"onchaining", "uploading"}},
 		{model.ObjectStateCacheEvicted, nil},
 	}

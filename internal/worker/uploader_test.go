@@ -278,7 +278,8 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objID, gen := seedObjectInDB(t, env, model.BucketStatusActive)
-	task := seedTask(t, env, model.TaskTypeUploadToSP, objID, gen, 5, 0)
+	// RetryCount at max-1 so this attempt triggers dead-letter terminal path.
+	task := seedTask(t, env, model.TaskTypeUploadToSP, objID, gen, 5, 4)
 
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
 		t.Error("upload should not be called after cache read failure")
@@ -290,8 +291,8 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 
 	ctx := context.Background()
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("expected task failed, got %s", got.Status)
+	if got.Status != model.TaskStatusDeadLetter {
+		t.Errorf("expected task dead_letter, got %s", got.Status)
 	}
 
 	obj, _ := env.repos.Objects.GetByID(ctx, objID)
@@ -340,8 +341,8 @@ func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 
 	ctx := context.Background()
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("expected task failed, got %s", got.Status)
+	if got.Status != model.TaskStatusDeadLetter {
+		t.Errorf("expected task dead_letter, got %s", got.Status)
 	}
 
 	obj, _ := env.repos.Objects.GetByID(ctx, objID)

@@ -45,4 +45,37 @@ var (
 		Name:      "tasks_processed_total",
 		Help:      "Total tasks processed by worker type and result",
 	}, []string{"worker", "result"})
+
+	// DeadLetterTotal counts tasks that entered dead-letter status by worker type and task type.
+	DeadLetterTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "synaps3",
+		Subsystem: "worker",
+		Name:      "dead_letter_total",
+		Help:      "Total tasks that entered dead-letter status",
+	}, []string{"worker", "task_type"})
+
+	// TaskQueueDepth tracks pending task count by type and status.
+	TaskQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "synaps3",
+		Subsystem: "task",
+		Name:      "queue_depth",
+		Help:      "Number of tasks by type and status",
+	}, []string{"type", "status"})
+
+	// WorkerTaskDuration tracks per-task processing duration in seconds.
+	WorkerTaskDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "synaps3",
+		Subsystem: "worker",
+		Name:      "task_duration_seconds",
+		Help:      "Task processing duration in seconds by worker",
+		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 0.1s to ~200s
+	}, []string{"worker"})
+
+	// ObjectStateDistribution tracks object count by state.
+	ObjectStateDistribution = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "synaps3",
+		Subsystem: "object",
+		Name:      "state_distribution",
+		Help:      "Number of objects by state",
+	}, []string{"state"})
 )

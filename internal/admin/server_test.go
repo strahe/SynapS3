@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -8,9 +9,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
 )
 
@@ -24,12 +28,19 @@ type stubCache struct {
 func (s *stubCache) RootDir() string  { return s.rootDir }
 func (s *stubCache) UsedBytes() int64 { return s.usedByte }
 
+// stubWorkerHealth implements WorkerHealthChecker for tests.
+type stubWorkerHealth struct {
+	health map[string]bool
+}
+
+func (s *stubWorkerHealth) WorkerHealth() map[string]bool { return s.health }
+
 func TestHealthz_Healthy(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir, usedByte: 42}
 
-	srv := New(":0", db, sc, testLogger())
+	srv := New(":0", db, sc, repository.NewRepositories(db), nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -65,7 +76,7 @@ func TestHealthz_DBDown(t *testing.T) {
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir}
 
-	srv := New(":0", db, sc, testLogger())
+	srv := New(":0", db, sc, repository.NewRepositories(db), nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -99,11 +110,13 @@ func TestMetrics_Endpoint(t *testing.T) {
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir}
 
-	srv := New(":0", db, sc, testLogger())
+	srv := New(":0", db, sc, repository.NewRepositories(db), nil, testLogger())
 
 	// Increment metrics so we can verify their presence.
 	ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
 	WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
+	WorkerTaskDuration.WithLabelValues("uploader").Observe(0.5)
+	WorkerTaskDuration.WithLabelValues("uploader").Observe(0.5)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
@@ -151,7 +164,7 @@ func TestHealthz_CacheDirMissing(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	sc := &stubCache{rootDir: "/nonexistent/path/that/does/not/exist"}
 
-	srv := New(":0", db, sc, testLogger())
+	srv := New(":0", db, sc, repository.NewRepositories(db), nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -186,6 +199,160 @@ func TestHealthz_CacheDirMissing(t *testing.T) {
 	}
 }
 
+func TestHealthz_WorkerUnhealthy(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	cacheDir := t.TempDir()
+	sc := &stubCache{rootDir: cacheDir}
+	wh := &stubWorkerHealth{health: map[string]bool{
+		"uploader": true,
+		"onchain":  false,
+	}}
+
+	srv := New(":0", db, sc, repository.NewRepositories(db), wh, testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", srv.handleHealthz)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+
+	var hr healthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
+		t.Fatal(err)
+	}
+	if hr.Status != "unhealthy" {
+		t.Fatalf("expected unhealthy, got %q", hr.Status)
+	}
+	found := false
+	for _, e := range hr.Errors {
+		if strings.Contains(e, "worker/onchain") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected worker/onchain error in errors, got %v", hr.Errors)
+	}
+}
+
+func TestHealthz_WorkerHealthy(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	cacheDir := t.TempDir()
+	sc := &stubCache{rootDir: cacheDir}
+	wh := &stubWorkerHealth{health: map[string]bool{
+		"uploader": true,
+		"onchain":  true,
+		"evictor":  true,
+		"proofset": true,
+	}}
+
+	srv := New(":0", db, sc, repository.NewRepositories(db), wh, testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", srv.handleHealthz)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var hr healthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
+		t.Fatal(err)
+	}
+	if hr.Status != "ok" {
+		t.Fatalf("expected status ok, got %q", hr.Status)
+	}
+}
+
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestRefreshMetrics(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	cacheDir := t.TempDir()
+	sc := &stubCache{rootDir: cacheDir}
+
+	repos := repository.NewRepositories(db)
+	srv := New(":0", db, sc, repos, nil, testLogger())
+
+	ctx := context.Background()
+
+	// Seed a pending task.
+	task := &model.Task{
+		Type:           model.TaskTypeUploadToSP,
+		RefType:        "object",
+		RefID:          1,
+		RefGeneration:  1,
+		IdempotencyKey: "test-refresh-task",
+		Status:         model.TaskStatusPending,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("seeding task: %v", err)
+	}
+
+	// Seed an object.
+	bucket := &model.Bucket{Name: "metrics-bucket", Status: model.BucketStatusActive}
+	if _, err := db.NewInsert().Model(bucket).Exec(ctx); err != nil {
+		t.Fatalf("seeding bucket: %v", err)
+	}
+	obj := &model.Object{
+		BucketID:    bucket.ID,
+		Key:         "metrics.txt",
+		Size:        1,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/metrics.txt",
+		MaxRetries:  5,
+	}
+	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+		t.Fatalf("seeding object: %v", err)
+	}
+
+	// Call refreshMetrics and verify gauges via /metrics endpoint.
+	srv.refreshMetrics(ctx)
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.Handler())
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(body)
+	for _, metric := range []string{
+		"synaps3_task_queue_depth",
+		"synaps3_object_state_distribution",
+	} {
+		if !strings.Contains(text, metric) {
+			t.Errorf("metrics output missing %q", metric)
+		}
+	}
 }

@@ -27,19 +27,21 @@ type Uploader struct {
 	pollInterval time.Duration
 	leaseTTL     time.Duration
 	logger       *slog.Logger
+	*livenessTracker
 }
 
 // NewUploader creates a new SP upload worker.
 func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
 	return &Uploader{
-		repos:        repos,
-		cache:        c,
-		storage:      sc,
-		stateMachine: sm,
-		concurrency:  concurrency,
-		pollInterval: pollInterval,
-		leaseTTL:     10 * time.Minute,
-		logger:       logger,
+		repos:           repos,
+		cache:           c,
+		storage:         sc,
+		stateMachine:    sm,
+		concurrency:     concurrency,
+		pollInterval:    pollInterval,
+		leaseTTL:        10 * time.Minute,
+		logger:          logger,
+		livenessTracker: newLivenessTracker(pollInterval),
 	}
 }
 
@@ -50,6 +52,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 }
 
 func (u *Uploader) tick(ctx context.Context) error {
+	u.recordTick()
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(u.concurrency)
 
@@ -69,10 +72,19 @@ func (u *Uploader) tick(ctx context.Context) error {
 		})
 	}
 
-	return g.Wait()
+	err := g.Wait()
+	return err
 }
 
+// Healthy returns true if the worker has ticked recently.
+func (u *Uploader) Healthy() bool { return u.healthy() }
+
 func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
+	start := time.Now()
+	defer func() {
+		admin.WorkerTaskDuration.WithLabelValues("uploader").Observe(time.Since(start).Seconds())
+	}()
+
 	logger := u.logger.With("taskID", task.ID, "objectID", task.RefID, "gen", task.RefGeneration)
 
 	if u.storage == nil {
@@ -152,9 +164,18 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	rc, _, err := u.cache.Get(ctx, bucket.Name, obj.Key)
 	if err != nil {
 		logger.Error("cache read failed", "error", err)
-		_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
-			model.ObjectStateUploading, fmt.Sprintf("cache read: %v", err))
-		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		if task.RetryCount+1 >= task.MaxRetries {
+			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+				model.ObjectStateUploading, fmt.Sprintf("cache read: %v (max retries reached)", err))
+			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+				logger.Error("failed to mark task as dead-letter", "error", ftErr)
+			} else {
+				admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUploadToSP)).Inc()
+			}
+		} else {
+			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
+		}
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
@@ -167,10 +188,14 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		if task.RetryCount+1 >= task.MaxRetries {
 			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
 				model.ObjectStateUploading, fmt.Sprintf("SP upload: %v (max retries reached)", err))
-			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+				logger.Error("failed to mark task as dead-letter", "error", ftErr)
+			} else {
+				admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUploadToSP)).Inc()
+			}
 		} else {
 			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
-			_ = u.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
+			_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
 		}
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
@@ -181,7 +206,18 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	if err := u.repos.Objects.SetPieceCIDAndTransition(ctx, task.RefID, task.RefGeneration,
 		pieceCID, model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
 		logger.Error("SetPieceCIDAndTransition failed", "error", err)
-		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		if task.RetryCount+1 >= task.MaxRetries {
+			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+				model.ObjectStateUploading, fmt.Sprintf("SetPieceCIDAndTransition: %v (max retries reached)", err))
+			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+				logger.Error("failed to mark task as dead-letter", "error", ftErr)
+			} else {
+				admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUploadToSP)).Inc()
+			}
+		} else {
+			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
+		}
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}

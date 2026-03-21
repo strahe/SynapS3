@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -23,18 +24,20 @@ type Evictor struct {
 	pollInterval time.Duration
 	leaseTTL     time.Duration
 	logger       *slog.Logger
+	*livenessTracker
 }
 
 // NewEvictor creates a new cache evictor worker.
 func NewEvictor(repos *repository.Repositories, c cache.Cache, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Evictor {
 	return &Evictor{
-		repos:        repos,
-		cache:        c,
-		stateMachine: sm,
-		concurrency:  concurrency,
-		pollInterval: pollInterval,
-		leaseTTL:     5 * time.Minute,
-		logger:       logger,
+		repos:           repos,
+		cache:           c,
+		stateMachine:    sm,
+		concurrency:     concurrency,
+		pollInterval:    pollInterval,
+		leaseTTL:        5 * time.Minute,
+		logger:          logger,
+		livenessTracker: newLivenessTracker(pollInterval),
 	}
 }
 
@@ -45,6 +48,7 @@ func (e *Evictor) Run(ctx context.Context) error {
 }
 
 func (e *Evictor) tick(ctx context.Context) error {
+	e.recordTick()
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(e.concurrency)
 
@@ -64,10 +68,19 @@ func (e *Evictor) tick(ctx context.Context) error {
 		})
 	}
 
-	return g.Wait()
+	err := g.Wait()
+	return err
 }
 
+// Healthy returns true if the worker has ticked recently.
+func (e *Evictor) Healthy() bool { return e.healthy() }
+
 func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
+	start := time.Now()
+	defer func() {
+		admin.WorkerTaskDuration.WithLabelValues("evictor").Observe(time.Since(start).Seconds())
+	}()
+
 	logger := e.logger.With("taskID", task.ID, "objectID", task.RefID, "gen", task.RefGeneration)
 
 	obj, err := e.repos.Objects.GetByID(ctx, task.RefID)
@@ -114,10 +127,16 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		model.ObjectStateOnChained, model.ObjectStateCacheEvicted); err != nil {
 		logger.Error("state transition onchained→cache_evicted failed", "error", err)
 		if task.RetryCount+1 >= task.MaxRetries {
-			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			_ = state.TransitionToFailed(ctx, e.stateMachine, e.repos.Objects, task.RefID, task.RefGeneration,
+				model.ObjectStateOnChained, fmt.Sprintf("cache eviction: %v (max retries reached)", err))
+			if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+				logger.Error("failed to mark task as dead-letter", "error", ftErr)
+			} else {
+				admin.DeadLetterTotal.WithLabelValues("evictor", string(model.TaskTypeEvictCache)).Inc()
+			}
 		} else {
 			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
-			_ = e.repos.Tasks.Requeue(ctx, task.ID, time.Duration(task.RetryCount+1)*30*time.Second)
+			_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
 		}
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return

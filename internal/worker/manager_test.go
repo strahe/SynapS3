@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
 )
@@ -158,6 +159,71 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	}
 	if task.RefID != obj.ID || task.RefGeneration != 1 {
 		t.Errorf("task refs mismatch: got refID=%d gen=%d, want %d/1", task.RefID, task.RefGeneration, obj.ID)
+	}
+}
+
+func TestManager_WorkerHealth(t *testing.T) {
+	repos := testutil.NewTestRepos(t)
+	w1 := &stubWorker{name: "alpha", isHealthy: true}
+	w2 := &stubWorker{name: "beta", isHealthy: false}
+	w3 := &stubWorker{name: "gamma", isHealthy: true}
+
+	mgr := worker.NewManager(repos, false, slog.Default(), w1, w2, w3)
+	health := mgr.WorkerHealth()
+
+	if len(health) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(health))
+	}
+	if !health["alpha"] {
+		t.Error("expected alpha healthy")
+	}
+	if health["beta"] {
+		t.Error("expected beta unhealthy")
+	}
+	if !health["gamma"] {
+		t.Error("expected gamma healthy")
+	}
+}
+
+func TestManager_WorkerHealth_Empty(t *testing.T) {
+	repos := testutil.NewTestRepos(t)
+	mgr := worker.NewManager(repos, false, slog.Default())
+	health := mgr.WorkerHealth()
+	if len(health) != 0 {
+		t.Errorf("expected empty map, got %d entries", len(health))
+	}
+}
+
+func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
+	repos := testutil.NewTestRepos(t)
+	mc := &testutil.MockCache{}
+	sm := state.NewObjectStateMachine()
+	logger := slog.Default()
+	poll := 50 * time.Millisecond
+
+	up := worker.NewUploader(repos, mc, nil, sm, 1, poll, logger)
+	oc := worker.NewOnChain(repos, nil, sm, false, 1, poll, logger)
+	ps := worker.NewProofSetWorker(repos, nil, mc, 1, poll, logger)
+	ev := worker.NewEvictor(repos, mc, sm, 1, poll, logger)
+
+	mgr := worker.NewManager(repos, false, logger, up, oc, ps, ev)
+	health := mgr.WorkerHealth()
+
+	expected := map[string]bool{
+		"uploader": true,
+		"onchain":  true,
+		"proofset": true,
+		"evictor":  true,
+	}
+	for name, wantHealthy := range expected {
+		got, ok := health[name]
+		if !ok {
+			t.Errorf("missing worker %q in health map", name)
+			continue
+		}
+		if got != wantHealthy {
+			t.Errorf("worker %q: expected healthy=%v, got %v", name, wantHealthy, got)
+		}
 	}
 }
 

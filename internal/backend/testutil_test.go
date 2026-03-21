@@ -32,7 +32,7 @@ func newTestBackend(t *testing.T) *testBackend {
 	pc := &testutil.MockProofSetClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, fsCache, sm, sc, pc, logger)
+	b := backend.New(repos, fsCache, sm, sc, pc, 0, logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -52,7 +52,7 @@ func newTestBackendWithMockCache(t *testing.T, mc *testutil.MockCache) *testBack
 	pc := &testutil.MockProofSetClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, mc, sm, sc, pc, logger)
+	b := backend.New(repos, mc, sm, sc, pc, 0, logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -70,7 +70,7 @@ func newTestBackendWithSDK(t *testing.T, sc synapse.StorageClient, pc synapse.Pr
 	sm := state.NewObjectStateMachine()
 	logger := slog.Default()
 
-	b := backend.New(repos, fsCache, sm, sc, pc, logger)
+	b := backend.New(repos, fsCache, sm, sc, pc, 0, logger)
 	// Note: sc/pc are passed to backend.New but may not be MockStorageClient/MockProofSetClient,
 	// so we don't store them in the typed mock fields.
 	return &testBackend{

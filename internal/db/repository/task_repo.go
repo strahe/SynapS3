@@ -132,6 +132,71 @@ func (r *BunTaskRepo) ReleaseExpiredLeases(ctx context.Context) (int, error) {
 	return int(rows), nil
 }
 
+// FailTerminal marks a running task as dead-letter (permanently failed after max retries).
+func (r *BunTaskRepo) FailTerminal(ctx context.Context, taskID int64, lastError string) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusDeadLetter).
+		Set("last_error = ?", lastError).
+		Set("retry_count = retry_count + 1").
+		Set("completed_at = ?", time.Now()).
+		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("marking task dead-letter: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("marking task %d dead-letter: not in running state", taskID)
+	}
+	return nil
+}
+
+// ListDeadLetters returns dead-letter tasks, ordered by most recent first.
+func (r *BunTaskRepo) ListDeadLetters(ctx context.Context, limit int) ([]model.Task, error) {
+	var tasks []model.Task
+	q := r.db.NewSelect().
+		Model(&tasks).
+		Where("status = ?", model.TaskStatusDeadLetter).
+		OrderExpr("COALESCE(completed_at, started_at, scheduled_at) DESC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	err := q.Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing dead-letter tasks: %w", err)
+	}
+	return tasks, nil
+}
+
+// RetryDeadLetter resets a dead-letter task back to pending for manual retry.
+// TODO: This only resets the task status. If the worker also transitioned the
+// object/bucket to a failed state, the retried task will be rejected because
+// the entity is no longer in the expected source state. A full retry mechanism
+// should atomically reset both task and entity state.
+func (r *BunTaskRepo) RetryDeadLetter(ctx context.Context, taskID int64) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusPending).
+		Set("retry_count = 0").
+		Set("scheduled_at = ?", time.Now()).
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
+		Set("completed_at = NULL").
+		Set("last_error = NULL").
+		Where("id = ? AND status = ?", taskID, model.TaskStatusDeadLetter).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("retrying dead-letter task: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("retrying dead-letter task %d: %w", taskID, ErrNotFound)
+	}
+	return nil
+}
+
 // Requeue resets a failed task back to pending with a scheduled backoff delay.
 func (r *BunTaskRepo) Requeue(ctx context.Context, taskID int64, backoff time.Duration) error {
 	now := time.Now()
@@ -152,4 +217,18 @@ func (r *BunTaskRepo) Requeue(ctx context.Context, taskID int64, backoff time.Du
 		return fmt.Errorf("requeuing task %d: not in failed state", taskID)
 	}
 	return nil
+}
+
+// CountByStatus returns task counts grouped by type and status.
+func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, error) {
+	var counts []TaskStatusCount
+	err := r.db.NewSelect().
+		TableExpr("tasks").
+		ColumnExpr("type, status, COUNT(*) AS count").
+		GroupExpr("type, status").
+		Scan(ctx, &counts)
+	if err != nil {
+		return nil, fmt.Errorf("counting tasks by status: %w", err)
+	}
+	return counts, nil
 }

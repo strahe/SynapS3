@@ -97,6 +97,8 @@ func versionCommand() *cli.Command {
 }
 
 // loadConfigAndDB is the shared setup used by serve and migrate.
+// It loads config and opens the database but does NOT run full config validation,
+// so that commands like "migrate" only need DB-related config (not S3 credentials etc.).
 func loadConfigAndDB(ctx context.Context, configPath string) (*config.Config, *bun.DB, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -137,6 +139,11 @@ func runServe(ctx context.Context, configPath string) error {
 		return err
 	}
 	defer func() { _ = database.Close() }()
+
+	// Full config validation — only required for serve, not migrate.
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("validating config: %w", err)
+	}
 
 	// Set up structured logging so migration and runtime logs use the configured level/format.
 	logger := setupLogger(cfg.Logging)
@@ -186,7 +193,7 @@ func runServe(ctx context.Context, configPath string) error {
 	}
 
 	// Create backend.
-	be := backend.New(repos, localCache, sm, storageClient, proofSetClient, logger)
+	be := backend.New(repos, localCache, sm, storageClient, proofSetClient, cfg.Cache.MaxSPDownloadSize, logger)
 
 	// Set up IAM (simple root-only for now).
 	rootCfg := middlewares.RootUserConfig{
@@ -224,7 +231,7 @@ func runServe(ctx context.Context, configPath string) error {
 	go wm.Start(ctx)
 
 	// Start admin server (healthz + metrics).
-	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, logger)
+	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, repos, wm, logger)
 	errCh := make(chan error, 2)
 	go func() {
 		if err := adminSrv.Run(ctx); err != nil {

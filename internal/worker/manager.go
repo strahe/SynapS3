@@ -17,6 +17,8 @@ type Worker interface {
 	Name() string
 	// Run starts the worker loop; it should block until ctx is cancelled.
 	Run(ctx context.Context) error
+	// Healthy returns true if the worker has ticked recently.
+	Healthy() bool
 }
 
 // Manager coordinates the lifecycle of all background workers.
@@ -98,6 +100,14 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 	if m.evictAfterOnChain {
 		m.reconcileTasks(ctx, model.ObjectStateOnChained, model.TaskTypeEvictCache, "evict_cache")
 	}
+
+	// Log dead-letter task count for operator awareness
+	deadLetters, err := m.repos.Tasks.ListDeadLetters(ctx, 100)
+	if err != nil {
+		m.logger.Error("failed to check dead-letter tasks", "error", err)
+	} else if len(deadLetters) > 0 {
+		m.logger.Warn("dead-letter tasks found on startup, review via GET /admin/dead-letters", "count", len(deadLetters))
+	}
 }
 
 // reconcileTasks finds objects in the given state and ensures each has a corresponding
@@ -130,6 +140,15 @@ func (m *Manager) reconcileTasks(ctx context.Context, objState model.ObjectState
 	if created > 0 {
 		m.logger.Info("reconciled missing tasks", "state", objState, "type", taskType, "created", created)
 	}
+}
+
+// WorkerHealth returns a map of worker name → healthy status.
+func (m *Manager) WorkerHealth() map[string]bool {
+	health := make(map[string]bool, len(m.workers))
+	for _, w := range m.workers {
+		health[w.Name()] = w.Healthy()
+	}
+	return health
 }
 
 // pollLoop is a helper that calls fn on a fixed interval until ctx is cancelled.
