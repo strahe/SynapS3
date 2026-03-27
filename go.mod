@@ -100,7 +100,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.10 // indirect
 	github.com/aws/smithy-go v1.24.2 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
-	github.com/data-preservation-programs/go-synapse v0.0.0-00010101000000-000000000000
+	github.com/data-preservation-programs/go-synapse v0.0.0-20260326143334-8c86c7fc3b17
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
@@ -153,5 +153,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/data-preservation-programs/go-synapse => ./go-synapse

@@ -1,5 +1,6 @@
 # SynapS3 Configuration Example
-# Override any value with environment variables: SYNAPS3_<SECTION>_<KEY>
+# Environment overrides are limited; prefer editing this file directly when any path segment contains `_`.
+# Shell-style placeholders such as ${VAR} are not expanded from YAML.
 # e.g. SYNAPS3_SERVER_PORT=:9090
 
 server:
@@ -17,7 +18,7 @@ s3:
 filecoin:
   network: "calibration"       # calibration | mainnet
   rpc_url: "https://api.calibration.node.glif.io/rpc/v1"
-  private_key: "${SYNAPS3_FILECOIN_PRIVATE_KEY}"
+  private_key: "0xREPLACE_WITH_YOUR_FILECOIN_PRIVATE_KEY"
   provider_url: "https://your-storage-provider.example.com"
 
 database:
@@ -56,4 +57,4 @@ logging:
   format: "json"               # json | text
 
 admin:
-  addr: ":9090"                # admin HTTP server (healthz + metrics)
+  addr: "127.0.0.1:9090"       # admin HTTP server (healthz + metrics); bind externally only behind auth/proxy

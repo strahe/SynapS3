@@ -325,4 +325,3 @@ func TestValidate_MaxIdleConns_ExceedsMaxOpen(t *testing.T) {
 		t.Fatalf("expected max_idle_conns error, got: %v", err)
 	}
 }
-
