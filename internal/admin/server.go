@@ -2,9 +2,9 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
 )
 
@@ -25,12 +26,14 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr         string
-	db           *bun.DB
-	cache        cache.Cache
-	repos        *repository.Repositories
-	workerHealth WorkerHealthChecker
-	logger       *slog.Logger
+	addr          string
+	db            *bun.DB
+	cache         cache.Cache
+	cacheMaxBytes int64
+	repos         *repository.Repositories
+	workerHealth  WorkerHealthChecker
+	logger        *slog.Logger
+	startedAt     time.Time
 
 	// Track previously seen label sets to zero stale entries on refresh.
 	prevTaskLabels   map[[2]string]struct{}
@@ -38,14 +41,16 @@ type Server struct {
 }
 
 // New creates a new admin HTTP server.
-func New(addr string, db *bun.DB, c cache.Cache, repos *repository.Repositories, wh WorkerHealthChecker, logger *slog.Logger) *Server {
+func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, logger *slog.Logger) *Server {
 	return &Server{
-		addr:         addr,
-		db:           db,
-		cache:        c,
-		repos:        repos,
-		workerHealth: wh,
-		logger:       logger,
+		addr:          addr,
+		db:            db,
+		cache:         c,
+		cacheMaxBytes: cacheMaxBytes,
+		repos:         repos,
+		workerHealth:  wh,
+		logger:        logger,
+		startedAt:     time.Now(),
 	}
 }
 
@@ -59,6 +64,26 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.HandleFunc("GET /admin/dead-letters", s.handleListDeadLetters)
 	mux.HandleFunc("POST /admin/dead-letters/{id}/retry", s.handleRetryDeadLetter)
+
+	// Dashboard API
+	mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
+	mux.HandleFunc("GET /api/v1/buckets", s.handleAPIBuckets)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
+	mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
+	mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
+	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryDeadLetter) // only retries dead_letter tasks
+	mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
+	mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
+	mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
+
+	// Serve embedded SPA frontend (fallback for non-API routes)
+	distFS := ui.DistFS()
+	if sub, err := fs.Sub(distFS, "dist"); err == nil {
+		// Check if the embedded FS has content (production build)
+		if entries, err := fs.ReadDir(sub, "."); err == nil && len(entries) > 0 {
+			mux.Handle("/", spaFileServer(sub))
+		}
+	}
 
 	srv := &http.Server{
 		Addr:              s.addr,
@@ -128,15 +153,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	resp := healthResponse{Status: "ok"}
+	status := http.StatusOK
 	if len(errs) > 0 {
 		resp.Status = "unhealthy"
 		resp.Errors = errs
-		w.WriteHeader(http.StatusServiceUnavailable)
-	} else {
-		w.WriteHeader(http.StatusOK)
+		status = http.StatusServiceUnavailable
 	}
 
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, status, resp)
 }
 
 // cacheRootDir extracts the root directory from a filesystem cache.
@@ -166,35 +190,58 @@ func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
 	tasks, err := s.repos.Tasks.ListDeadLetters(r.Context(), limit)
 	if err != nil {
 		s.logger.Error("failed to list dead-letter tasks", "error", err)
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(tasks)
+	// Map to DTO to ensure consistent snake_case JSON and avoid exposing internal fields.
+	items := make([]taskListItem, 0, len(tasks))
+	for _, t := range tasks {
+		item := taskListItem{
+			ID:            t.ID,
+			Type:          string(t.Type),
+			RefType:       t.RefType,
+			RefID:         t.RefID,
+			RefGeneration: t.RefGeneration,
+			Status:        string(t.Status),
+			RetryCount:    t.RetryCount,
+			MaxRetries:    t.MaxRetries,
+			LastError:     t.LastError,
+			ScheduledAt:   t.ScheduledAt.Format(time.RFC3339),
+		}
+		if t.ClaimedAt != nil {
+			v := t.ClaimedAt.Format(time.RFC3339)
+			item.ClaimedAt = &v
+		}
+		if t.CompletedAt != nil {
+			v := t.CompletedAt.Format(time.RFC3339)
+			item.CompletedAt = &v
+		}
+		items = append(items, item)
+	}
+
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (s *Server) handleRetryDeadLetter(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
 		return
 	}
 
 	if err := s.repos.Tasks.RetryDeadLetter(r.Context(), id); err != nil {
 		s.logger.Error("failed to retry dead-letter task", "taskID", id, "error", err)
 		if errors.Is(err, repository.ErrNotFound) {
-			http.Error(w, `{"error":"not found or not in dead_letter state"}`, http.StatusNotFound)
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found or not in dead_letter state"})
 		} else {
-			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		}
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"requeued"}`))
+	writeJSON(w, http.StatusOK, map[string]string{"status": "requeued"})
 }
 
 func (s *Server) refreshMetricsLoop(ctx context.Context) {

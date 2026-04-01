@@ -591,3 +591,298 @@ func TestObjectRepo_CountByState_ExcludesSoftDeleted(t *testing.T) {
 		t.Errorf("expected 0 counts after soft-delete, got %d", len(counts))
 	}
 }
+
+func TestObjectRepo_TotalSize(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Empty table should return 0.
+	total, err := repos.Objects.TotalSize(ctx)
+	if err != nil {
+		t.Fatalf("TotalSize empty: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("expected 0, got %d", total)
+	}
+
+	bucket := seedBucket(t, db, "totalsize-bucket")
+
+	// Insert objects with known sizes.
+	for _, tc := range []struct {
+		key  string
+		size int64
+	}{
+		{"a.txt", 100},
+		{"b.txt", 250},
+		{"c.txt", 650},
+	} {
+		obj := &model.Object{
+			BucketID:    bucket.ID,
+			Key:         tc.key,
+			Size:        tc.size,
+			ETag:        "e",
+			Checksum:    "c",
+			ContentType: "text/plain",
+			CachePath:   "/cache/" + tc.key,
+			MaxRetries:  5,
+		}
+		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+			t.Fatalf("upsert %s: %v", tc.key, err)
+		}
+	}
+
+	total, err = repos.Objects.TotalSize(ctx)
+	if err != nil {
+		t.Fatalf("TotalSize: %v", err)
+	}
+	if total != 1000 {
+		t.Errorf("expected 1000, got %d", total)
+	}
+
+	// Soft-deleted objects should be excluded.
+	objs, _ := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 1)
+	if err := repos.Objects.SoftDelete(ctx, objs[0].ID); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+
+	total, err = repos.Objects.TotalSize(ctx)
+	if err != nil {
+		t.Fatalf("TotalSize after delete: %v", err)
+	}
+	if total != 900 {
+		t.Errorf("expected 900 after soft-delete, got %d", total)
+	}
+}
+
+func TestObjectRepo_CountByBucket(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucketA := seedBucket(t, db, "count-bucket-a")
+	bucketB := seedBucket(t, db, "count-bucket-b")
+
+	// Empty bucket.
+	count, err := repos.Objects.CountByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("CountByBucket empty: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0, got %d", count)
+	}
+
+	// Insert 3 objects in bucket A and 1 in bucket B.
+	for _, key := range []string{"a1.txt", "a2.txt", "a3.txt"} {
+		obj := &model.Object{
+			BucketID:    bucketA.ID,
+			Key:         key,
+			Size:        10,
+			ETag:        "e",
+			Checksum:    "c",
+			ContentType: "text/plain",
+			CachePath:   "/cache/" + key,
+			MaxRetries:  5,
+		}
+		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+			t.Fatalf("upsert %s: %v", key, err)
+		}
+	}
+	objB := &model.Object{
+		BucketID:    bucketB.ID,
+		Key:         "b1.txt",
+		Size:        10,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/b1.txt",
+		MaxRetries:  5,
+	}
+	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, objB); err != nil {
+		t.Fatalf("upsert b1.txt: %v", err)
+	}
+
+	countA, err := repos.Objects.CountByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("CountByBucket A: %v", err)
+	}
+	if countA != 3 {
+		t.Errorf("expected 3 in bucket A, got %d", countA)
+	}
+
+	countB, err := repos.Objects.CountByBucket(ctx, bucketB.ID)
+	if err != nil {
+		t.Fatalf("CountByBucket B: %v", err)
+	}
+	if countB != 1 {
+		t.Errorf("expected 1 in bucket B, got %d", countB)
+	}
+
+	// Soft-deleted objects should be excluded.
+	objs, _ := repos.Objects.ListByBucket(ctx, bucketA.ID, "", "", 1)
+	if err := repos.Objects.SoftDelete(ctx, objs[0].ID); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+
+	countA, err = repos.Objects.CountByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("CountByBucket after delete: %v", err)
+	}
+	if countA != 2 {
+		t.Errorf("expected 2 after soft-delete, got %d", countA)
+	}
+}
+
+func TestObjectRepo_TotalSizeByBucket(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucketA := seedBucket(t, db, "szbucket-a")
+	bucketB := seedBucket(t, db, "szbucket-b")
+
+	// Empty bucket.
+	total, err := repos.Objects.TotalSizeByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("TotalSizeByBucket empty: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("expected 0, got %d", total)
+	}
+
+	// Bucket A: 100 + 200 = 300
+	for _, tc := range []struct {
+		key  string
+		size int64
+	}{
+		{"x.txt", 100},
+		{"y.txt", 200},
+	} {
+		obj := &model.Object{
+			BucketID:    bucketA.ID,
+			Key:         tc.key,
+			Size:        tc.size,
+			ETag:        "e",
+			Checksum:    "c",
+			ContentType: "text/plain",
+			CachePath:   "/cache/" + tc.key,
+			MaxRetries:  5,
+		}
+		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+			t.Fatalf("upsert %s: %v", tc.key, err)
+		}
+	}
+
+	// Bucket B: 500
+	objB := &model.Object{
+		BucketID:    bucketB.ID,
+		Key:         "z.txt",
+		Size:        500,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/z.txt",
+		MaxRetries:  5,
+	}
+	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, objB); err != nil {
+		t.Fatalf("upsert z.txt: %v", err)
+	}
+
+	totalA, err := repos.Objects.TotalSizeByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("TotalSizeByBucket A: %v", err)
+	}
+	if totalA != 300 {
+		t.Errorf("expected 300 for bucket A, got %d", totalA)
+	}
+
+	totalB, err := repos.Objects.TotalSizeByBucket(ctx, bucketB.ID)
+	if err != nil {
+		t.Fatalf("TotalSizeByBucket B: %v", err)
+	}
+	if totalB != 500 {
+		t.Errorf("expected 500 for bucket B, got %d", totalB)
+	}
+
+	// Soft-deleted objects should be excluded.
+	objs, _ := repos.Objects.ListByBucket(ctx, bucketA.ID, "", "", 1)
+	if err := repos.Objects.SoftDelete(ctx, objs[0].ID); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+
+	totalA, err = repos.Objects.TotalSizeByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("TotalSizeByBucket after delete: %v", err)
+	}
+	if totalA != 200 {
+		t.Errorf("expected 200 after soft-delete, got %d", totalA)
+	}
+}
+
+func TestObjectRepo_AggregateByBucket(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucketA := seedBucket(t, db, "aggbucket-a")
+	bucketB := seedBucket(t, db, "aggbucket-b")
+	bucketEmpty := seedBucket(t, db, "aggbucket-empty")
+
+	// Bucket A: 2 objects, sizes 100 + 200
+	for _, tc := range []struct {
+		key  string
+		size int64
+	}{
+		{"a1.txt", 100},
+		{"a2.txt", 200},
+	} {
+		obj := &model.Object{
+			BucketID:    bucketA.ID,
+			Key:         tc.key,
+			Size:        tc.size,
+			ETag:        "e",
+			Checksum:    "c",
+			ContentType: "text/plain",
+			CachePath:   "/cache/" + tc.key,
+			MaxRetries:  5,
+		}
+		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+			t.Fatalf("upsert %s: %v", tc.key, err)
+		}
+	}
+
+	// Bucket B: 1 object, size 500
+	objB := &model.Object{
+		BucketID:    bucketB.ID,
+		Key:         "b1.txt",
+		Size:        500,
+		ETag:        "e",
+		Checksum:    "c",
+		ContentType: "text/plain",
+		CachePath:   "/cache/b1.txt",
+		MaxRetries:  5,
+	}
+	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, objB); err != nil {
+		t.Fatalf("upsert b1.txt: %v", err)
+	}
+
+	stats, err := repos.Objects.AggregateByBucket(ctx)
+	if err != nil {
+		t.Fatalf("AggregateByBucket: %v", err)
+	}
+
+	// Bucket A: count=2, total_size=300
+	if s := stats[bucketA.ID]; s.Count != 2 || s.TotalSize != 300 {
+		t.Errorf("bucket A: expected count=2 size=300, got count=%d size=%d", s.Count, s.TotalSize)
+	}
+
+	// Bucket B: count=1, total_size=500
+	if s := stats[bucketB.ID]; s.Count != 1 || s.TotalSize != 500 {
+		t.Errorf("bucket B: expected count=1 size=500, got count=%d size=%d", s.Count, s.TotalSize)
+	}
+
+	// Empty bucket should not appear in stats.
+	if s, ok := stats[bucketEmpty.ID]; ok {
+		t.Errorf("empty bucket should not be in stats, got count=%d size=%d", s.Count, s.TotalSize)
+	}
+}

@@ -37,3 +37,9 @@ bin/
 synaps3.db*
 /cache/
 config.yaml
+
+# Frontend build artifacts
+ui/node_modules/
+ui/dist/
+ui/src/routeTree.gen.ts
+ui/tsconfig.tsbuildinfo

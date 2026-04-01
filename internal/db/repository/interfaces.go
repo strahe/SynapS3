@@ -13,6 +13,10 @@ type BucketRepository interface {
 	GetByName(ctx context.Context, name string) (*model.Bucket, error)
 	GetByID(ctx context.Context, id int64) (*model.Bucket, error)
 	ListActive(ctx context.Context) ([]model.Bucket, error)
+	// List returns all buckets regardless of status.
+	List(ctx context.Context) ([]model.Bucket, error)
+	// CountByStatus returns bucket counts grouped by status.
+	CountByStatus(ctx context.Context) ([]BucketStatusCount, error)
 	SoftDelete(ctx context.Context, id int64) error
 	// UpdateStatus atomically transitions bucket status using CAS.
 	UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error
@@ -48,6 +52,20 @@ type ObjectRepository interface {
 	ResetStaleStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
 	// CountByState returns object counts grouped by state.
 	CountByState(ctx context.Context) ([]ObjectStateCount, error)
+	// TotalSize returns the sum of all non-deleted object sizes in bytes.
+	TotalSize(ctx context.Context) (int64, error)
+	// CountByBucket returns the number of non-deleted objects in a bucket.
+	CountByBucket(ctx context.Context, bucketID int64) (int64, error)
+	// TotalSizeByBucket returns the sum of non-deleted object sizes in a bucket.
+	TotalSizeByBucket(ctx context.Context, bucketID int64) (int64, error)
+	// AggregateByBucket returns object count and total size for all buckets in a single query.
+	AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error)
+}
+
+// BucketObjectStats holds aggregate object metrics for a single bucket.
+type BucketObjectStats struct {
+	Count     int64 `bun:"count"`
+	TotalSize int64 `bun:"total_size"`
 }
 
 // TaskRepository defines persistence operations for Task entities.
@@ -74,6 +92,9 @@ type TaskRepository interface {
 	RetryDeadLetter(ctx context.Context, taskID int64) error
 	// CountByStatus returns task counts grouped by type and status.
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+	// List returns tasks with optional filters, paginated by offset/limit.
+	// Returns the matching tasks and the total count (for pagination).
+	List(ctx context.Context, taskType string, status string, limit, offset int) ([]model.Task, int, error)
 }
 
 // TaskStatusCount holds a task count grouped by type and status.
@@ -87,6 +108,12 @@ type TaskStatusCount struct {
 type ObjectStateCount struct {
 	State string `bun:"state"`
 	Count int64  `bun:"count"`
+}
+
+// BucketStatusCount holds a bucket count grouped by status.
+type BucketStatusCount struct {
+	Status string `bun:"status"`
+	Count  int64  `bun:"count"`
 }
 
 // MultipartUploadRepository defines persistence operations for multipart upload entities.

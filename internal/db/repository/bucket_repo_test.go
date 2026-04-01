@@ -195,3 +195,101 @@ func TestBucketRepo_SoftDelete(t *testing.T) {
 		t.Errorf("expected 0 active, got %d", len(list))
 	}
 }
+
+func TestBucketRepo_List(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Empty table.
+	list, err := repos.Buckets.List(ctx)
+	if err != nil {
+		t.Fatalf("List empty: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected 0 buckets, got %d", len(list))
+	}
+
+	// Create buckets with different statuses.
+	for _, tc := range []struct {
+		name   string
+		status model.BucketStatus
+	}{
+		{"alpha", model.BucketStatusActive},
+		{"beta", model.BucketStatusCreating},
+		{"gamma", model.BucketStatusDeleted},
+		{"delta", model.BucketStatusDeleting},
+	} {
+		b := &model.Bucket{Name: tc.name, Status: tc.status}
+		if err := repos.Buckets.Create(ctx, b); err != nil {
+			t.Fatalf("Create(%s): %v", tc.name, err)
+		}
+	}
+
+	list, err = repos.Buckets.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 4 {
+		t.Errorf("expected 4 buckets, got %d", len(list))
+	}
+
+	// Verify ordered by name ASC.
+	expectedNames := []string{"alpha", "beta", "delta", "gamma"}
+	for i, name := range expectedNames {
+		if list[i].Name != name {
+			t.Errorf("list[%d].Name = %q, want %q", i, list[i].Name, name)
+		}
+	}
+}
+
+func TestBucketRepo_CountByStatus(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Empty table.
+	counts, err := repos.Buckets.CountByStatus(ctx)
+	if err != nil {
+		t.Fatalf("CountByStatus empty: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Fatalf("expected 0 counts, got %d", len(counts))
+	}
+
+	// Seed buckets: 2 active, 1 creating, 1 deleted.
+	for _, tc := range []struct {
+		name   string
+		status model.BucketStatus
+	}{
+		{"a1", model.BucketStatusActive},
+		{"a2", model.BucketStatusActive},
+		{"c1", model.BucketStatusCreating},
+		{"d1", model.BucketStatusDeleted},
+	} {
+		b := &model.Bucket{Name: tc.name, Status: tc.status}
+		if err := repos.Buckets.Create(ctx, b); err != nil {
+			t.Fatalf("Create(%s): %v", tc.name, err)
+		}
+	}
+
+	counts, err = repos.Buckets.CountByStatus(ctx)
+	if err != nil {
+		t.Fatalf("CountByStatus: %v", err)
+	}
+
+	lookup := make(map[string]int64)
+	for _, c := range counts {
+		lookup[c.Status] = c.Count
+	}
+
+	if lookup[string(model.BucketStatusActive)] != 2 {
+		t.Errorf("expected 2 active, got %d", lookup[string(model.BucketStatusActive)])
+	}
+	if lookup[string(model.BucketStatusCreating)] != 1 {
+		t.Errorf("expected 1 creating, got %d", lookup[string(model.BucketStatusCreating)])
+	}
+	if lookup[string(model.BucketStatusDeleted)] != 1 {
+		t.Errorf("expected 1 deleted, got %d", lookup[string(model.BucketStatusDeleted)])
+	}
+}

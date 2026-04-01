@@ -10,15 +10,21 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build test lint fmt clean run
+.PHONY: all build test lint fmt clean run ui-install ui-build ui-dev
 
 all: build
 
-build:
+ui-install:
+	cd ui && npm install
+
+ui-build: ui-install
+	cd ui && npm run build
+
+build: ui-build
 	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) $(PKG)
 
 test:
-	go test -race -count=1 ./...
+	go test -race -count=1 ./cmd/... ./internal/...
 
 lint:
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
@@ -30,9 +36,14 @@ fmt:
 
 clean:
 	rm -rf bin/
+	rm -rf ui/dist/
+	rm -rf ui/node_modules/
 
 run: build
 	./bin/$(BINARY) serve --config config.example.yaml
+
+ui-dev:
+	cd ui && npm run dev
 
 .PHONY: migrate
 migrate: build

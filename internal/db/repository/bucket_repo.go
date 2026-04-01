@@ -130,3 +130,28 @@ func (r *BunBucketRepo) HardDelete(ctx context.Context, id int64) error {
 	}
 	return nil
 }
+
+func (r *BunBucketRepo) List(ctx context.Context) ([]model.Bucket, error) {
+	var buckets []model.Bucket
+	err := r.db.NewSelect().
+		Model(&buckets).
+		OrderExpr("name ASC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing all buckets: %w", err)
+	}
+	return buckets, nil
+}
+
+func (r *BunBucketRepo) CountByStatus(ctx context.Context) ([]BucketStatusCount, error) {
+	var counts []BucketStatusCount
+	err := r.db.NewSelect().
+		TableExpr("buckets").
+		ColumnExpr("status, COUNT(*) AS count").
+		GroupExpr("status").
+		Scan(ctx, &counts)
+	if err != nil {
+		return nil, fmt.Errorf("counting buckets by status: %w", err)
+	}
+	return counts, nil
+}

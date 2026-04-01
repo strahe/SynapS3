@@ -30,6 +30,8 @@ go run ./cmd/synaps3 serve --config config.yaml
 
 The default S3 endpoint is `http://localhost:8080`.
 
+The built-in dashboard is available at `http://localhost:9090` (admin port) and provides an overview of system health, bucket/object browsing, and task monitoring.
+
 Start with [`config.example.yaml`](config.example.yaml) and see [`docs/configuration.md`](docs/configuration.md) for the main settings.
 
 ## S3 API Compatibility

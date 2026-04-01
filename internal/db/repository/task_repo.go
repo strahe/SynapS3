@@ -232,3 +232,27 @@ func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, err
 	}
 	return counts, nil
 }
+
+// List returns tasks with optional type/status filters, paginated by offset/limit.
+func (r *BunTaskRepo) List(ctx context.Context, taskType string, status string, limit, offset int) ([]model.Task, int, error) {
+	applyFilters := func(q *bun.SelectQuery) *bun.SelectQuery {
+		if taskType != "" {
+			q = q.Where("type = ?", taskType)
+		}
+		if status != "" {
+			q = q.Where("status = ?", status)
+		}
+		return q
+	}
+
+	total, err := applyFilters(r.db.NewSelect().Model((*model.Task)(nil))).Count(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("counting tasks: %w", err)
+	}
+	var tasks []model.Task
+	err = applyFilters(r.db.NewSelect().Model(&tasks)).OrderExpr("id DESC").Limit(limit).Offset(offset).Scan(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("listing tasks: %w", err)
+	}
+	return tasks, total, nil
+}

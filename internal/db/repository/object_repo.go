@@ -243,3 +243,66 @@ func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, e
 	}
 	return counts, nil
 }
+
+// TotalSize returns the sum of all non-deleted object sizes in bytes.
+func (r *BunObjectRepo) TotalSize(ctx context.Context) (int64, error) {
+	var total int64
+	err := r.db.NewSelect().
+		Model((*model.Object)(nil)).
+		ColumnExpr("COALESCE(SUM(size), 0)").
+		Scan(ctx, &total)
+	if err != nil {
+		return 0, fmt.Errorf("computing total object size: %w", err)
+	}
+	return total, nil
+}
+
+// CountByBucket returns the number of non-deleted objects in a bucket.
+func (r *BunObjectRepo) CountByBucket(ctx context.Context, bucketID int64) (int64, error) {
+	count, err := r.db.NewSelect().
+		Model((*model.Object)(nil)).
+		Where("bucket_id = ?", bucketID).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting objects in bucket %d: %w", bucketID, err)
+	}
+	return int64(count), nil
+}
+
+// TotalSizeByBucket returns the sum of non-deleted object sizes in a bucket.
+func (r *BunObjectRepo) TotalSizeByBucket(ctx context.Context, bucketID int64) (int64, error) {
+	var total int64
+	err := r.db.NewSelect().
+		Model((*model.Object)(nil)).
+		ColumnExpr("COALESCE(SUM(size), 0)").
+		Where("bucket_id = ?", bucketID).
+		Scan(ctx, &total)
+	if err != nil {
+		return 0, fmt.Errorf("computing total size for bucket %d: %w", bucketID, err)
+	}
+	return total, nil
+}
+
+// AggregateByBucket returns object count and total size for all buckets in a single query.
+func (r *BunObjectRepo) AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error) {
+	var rows []struct {
+		BucketID  int64 `bun:"bucket_id"`
+		Count     int64 `bun:"count"`
+		TotalSize int64 `bun:"total_size"`
+	}
+	err := r.db.NewSelect().
+		Model((*model.Object)(nil)).
+		ColumnExpr("bucket_id").
+		ColumnExpr("COUNT(*) AS count").
+		ColumnExpr("COALESCE(SUM(size), 0) AS total_size").
+		GroupExpr("bucket_id").
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating objects by bucket: %w", err)
+	}
+	result := make(map[int64]BucketObjectStats, len(rows))
+	for _, r := range rows {
+		result[r.BucketID] = BucketObjectStats{Count: r.Count, TotalSize: r.TotalSize}
+	}
+	return result, nil
+}

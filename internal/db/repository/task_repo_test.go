@@ -338,6 +338,98 @@ func TestTaskRepo_RetryDeadLetter_NotDeadLetter(t *testing.T) {
 	}
 }
 
+func TestTaskRepo_List(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	// Empty table.
+	tasks, total, err := repos.Tasks.List(ctx, "", "", 10, 0)
+	if err != nil {
+		t.Fatalf("List empty: %v", err)
+	}
+	if total != 0 || len(tasks) != 0 {
+		t.Fatalf("expected 0/0, got %d/%d", len(tasks), total)
+	}
+
+	// Seed tasks: 2 upload_to_sp (pending), 1 add_roots (pending).
+	seedTask(t, repos, model.TaskTypeUploadToSP)
+	seedTask(t, repos, model.TaskTypeUploadToSP)
+	seedTask(t, repos, model.TaskTypeAddRoots)
+
+	// Claim one upload task to make it running.
+	claimed, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, 5*time.Minute)
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	// List all — should return 3.
+	tasks, total, err = repos.Tasks.List(ctx, "", "", 10, 0)
+	if err != nil {
+		t.Fatalf("List all: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("expected total 3, got %d", total)
+	}
+	if len(tasks) != 3 {
+		t.Errorf("expected 3 tasks, got %d", len(tasks))
+	}
+
+	// Filter by type.
+	_, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUploadToSP), "", 10, 0)
+	if err != nil {
+		t.Fatalf("List by type: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("expected 2 upload_to_sp, got %d", total)
+	}
+
+	// Filter by status.
+	_, total, err = repos.Tasks.List(ctx, "", string(model.TaskStatusPending), 10, 0)
+	if err != nil {
+		t.Fatalf("List by status: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("expected 2 pending, got %d", total)
+	}
+
+	// Filter by type + status.
+	tasks, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUploadToSP), string(model.TaskStatusRunning), 10, 0)
+	if err != nil {
+		t.Fatalf("List by type+status: %v", err)
+	}
+	if total != 1 {
+		t.Errorf("expected 1 running upload_to_sp, got %d", total)
+	}
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
+	}
+
+	// Pagination: limit 2, offset 0.
+	tasks, total, err = repos.Tasks.List(ctx, "", "", 2, 0)
+	if err != nil {
+		t.Fatalf("List paginated: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("expected total 3, got %d", total)
+	}
+	if len(tasks) != 2 {
+		t.Errorf("expected 2 tasks with limit=2, got %d", len(tasks))
+	}
+
+	// Pagination: limit 2, offset 2 — should return 1.
+	tasks, total, err = repos.Tasks.List(ctx, "", "", 2, 2)
+	if err != nil {
+		t.Fatalf("List paginated offset: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("expected total 3, got %d", total)
+	}
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task at offset 2, got %d", len(tasks))
+	}
+}
+
 func TestTaskRepo_CountByStatus(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

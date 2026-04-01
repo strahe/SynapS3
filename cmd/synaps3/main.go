@@ -231,7 +231,7 @@ func runServe(ctx context.Context, configPath string) error {
 	go wm.Start(ctx)
 
 	// Start admin server (healthz + metrics).
-	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, repos, wm, logger)
+	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, logger)
 	errCh := make(chan error, 2)
 	go func() {
 		if err := adminSrv.Run(ctx); err != nil {

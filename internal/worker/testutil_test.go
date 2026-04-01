@@ -61,9 +61,9 @@ type stubWorker struct {
 	isHealthy bool
 }
 
-func (s *stubWorker) Name() string                    { return s.name }
-func (s *stubWorker) Run(_ context.Context) error      { return nil }
-func (s *stubWorker) Healthy() bool                    { return s.isHealthy }
+func (s *stubWorker) Name() string                { return s.name }
+func (s *stubWorker) Run(_ context.Context) error { return nil }
+func (s *stubWorker) Healthy() bool               { return s.isHealthy }
 
 func newWorkerTestCache(t *testing.T, maxBytes int64) cache.Cache {
 	t.Helper()

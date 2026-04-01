@@ -1,4 +1,13 @@
-# Build stage
+# Build stage — frontend
+FROM node:22-alpine AS frontend
+
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/ .
+RUN npm run build
+
+# Build stage — Go binary
 FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache gcc musl-dev git
@@ -8,6 +17,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+COPY --from=frontend /ui/dist /src/ui/dist
 
 ARG VERSION=dev
 ARG COMMIT=unknown
