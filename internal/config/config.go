@@ -104,7 +104,7 @@ func DefaultConfig() *Config {
 		},
 		Database: DatabaseConfig{
 			Driver:       "sqlite",
-			DSN:          "file:synaps3.db?_pragma=journal_mode(WAL)",
+			DSN:          "file:synaps3.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
 			MaxOpenConns: 25,
 			MaxIdleConns: 5,
 		},

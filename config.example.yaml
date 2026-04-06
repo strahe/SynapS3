@@ -23,7 +23,7 @@ filecoin:
 
 database:
   driver: "sqlite"             # postgres | sqlite
-  dsn: "file:synaps3.db?_pragma=journal_mode(WAL)"
+  dsn: "file:synaps3.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
   # dsn: "postgres://user:pass@localhost:5432/synaps3?sslmode=disable"
   max_open_conns: 25
   max_idle_conns: 5

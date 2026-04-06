@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/migrations"
@@ -34,7 +35,7 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 		db = bun.NewDB(sqldb, pgdialect.New())
 
 	case "sqlite":
-		sqldb, err = sql.Open("sqlite", cfg.DSN)
+		sqldb, err = sql.Open("sqlite", ensureSQLiteBusyTimeout(cfg.DSN))
 		if err != nil {
 			return nil, fmt.Errorf("opening sqlite connection: %w", err)
 		}
@@ -75,4 +76,15 @@ func RunMigrations(ctx context.Context, db *bun.DB) error {
 // Ping verifies the database connection is alive.
 func Ping(ctx context.Context, db *bun.DB) error {
 	return db.PingContext(ctx)
+}
+
+func ensureSQLiteBusyTimeout(dsn string) string {
+	lower := strings.ToLower(dsn)
+	if strings.Contains(lower, "busy_timeout(") || strings.Contains(lower, "busy_timeout=") {
+		return dsn
+	}
+	if strings.Contains(dsn, "?") {
+		return dsn + "&_pragma=busy_timeout(5000)"
+	}
+	return dsn + "?_pragma=busy_timeout(5000)"
 }

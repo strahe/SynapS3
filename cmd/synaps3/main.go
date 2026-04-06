@@ -49,6 +49,7 @@ func main() {
 		Commands: []*cli.Command{
 			serveCommand(),
 			migrateCommand(),
+			providerCommand(),
 			versionCommand(),
 		},
 	}
