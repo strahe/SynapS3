@@ -583,7 +583,7 @@ func (b *SynapseBackend) getBucket(ctx context.Context, name string) (*model.Buc
 }
 
 // requireActiveBucket retrieves a bucket that accepts write operations.
-// Only active buckets are writable; creating/deleting/failed buckets are rejected.
+// Active and creating buckets are writable; deleting/failed buckets are rejected.
 func (b *SynapseBackend) requireActiveBucket(ctx context.Context, name string) (*model.Bucket, error) {
 	bucket, err := b.repos.Buckets.GetByName(ctx, name)
 	if err != nil {

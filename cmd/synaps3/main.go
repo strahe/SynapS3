@@ -213,6 +213,7 @@ func runServe(ctx context.Context, configPath string) error {
 		nil, // event sender
 		nil, // metrics manager
 		s3api.WithHealth("/health"),
+		s3api.WithConcurrencyLimiter(cfg.Server.MaxConnections, cfg.Server.MaxRequests),
 	)
 	if err != nil {
 		return fmt.Errorf("creating S3 server: %w", err)

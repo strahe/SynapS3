@@ -30,8 +30,10 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port string    `koanf:"port"`
-	TLS  TLSConfig `koanf:"tls"`
+	Port           string    `koanf:"port"`
+	TLS            TLSConfig `koanf:"tls"`
+	MaxConnections int       `koanf:"max_connections"`
+	MaxRequests    int       `koanf:"max_requests"`
 }
 
 type TLSConfig struct {
@@ -93,7 +95,9 @@ type AdminConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Port: ":8080",
+			Port:           ":8080",
+			MaxConnections: 250000,
+			MaxRequests:    100000,
 		},
 		S3: S3Config{
 			Region: "us-east-1",
@@ -183,6 +187,17 @@ func Load(path string) (*Config, error) {
 // validation errors joined together so the operator can fix them in one pass.
 func (c *Config) Validate() error {
 	var errs []error
+
+	// Server concurrency.
+	if c.Server.MaxConnections < 1 {
+		errs = append(errs, fmt.Errorf("server.max_connections must be >= 1, got %d", c.Server.MaxConnections))
+	}
+	if c.Server.MaxRequests < 1 {
+		errs = append(errs, fmt.Errorf("server.max_requests must be >= 1, got %d", c.Server.MaxRequests))
+	}
+	if c.Server.MaxRequests > c.Server.MaxConnections {
+		errs = append(errs, fmt.Errorf("server.max_requests (%d) must not exceed server.max_connections (%d)", c.Server.MaxRequests, c.Server.MaxConnections))
+	}
 
 	// TLS: cert and key required when enabled.
 	if c.Server.TLS.Enabled {

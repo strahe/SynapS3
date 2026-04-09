@@ -30,9 +30,10 @@ func (s BucketStatus) IsVisible() bool {
 }
 
 // IsWritable returns true for bucket statuses that allow write operations
-// (PutObject, multipart uploads, etc). Only active buckets accept writes.
+// (PutObject, multipart uploads, etc). Active and creating buckets accept writes;
+// creating buckets allow data ingest while the proof set is being provisioned.
 func (s BucketStatus) IsWritable() bool {
-	return s == BucketStatusActive
+	return s == BucketStatusActive || s == BucketStatusCreating
 }
 
 // Bucket maps an S3 bucket to a Filecoin ProofSet.

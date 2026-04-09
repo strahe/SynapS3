@@ -80,12 +80,17 @@ func (b *SynapseBackend) DeleteBucket(ctx context.Context, bucket string) error 
 		return err
 	}
 
-	// Only active buckets can be deleted. Reject creating/deleting/failed states.
-	if bkt.Status != model.BucketStatusActive {
+	// Only writable buckets can be deleted. Reject deleting/failed states.
+	if !bkt.Status.IsWritable() {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 
-	// Atomic: empty check + status CAS (active→deleting) + enqueue delete_proof_set task.
+	// Atomic: empty check + status CAS → enqueue delete_proof_set task.
+	// TODO: When deleting a "creating" bucket, any pending create_proof_set task
+	// should be cancelled within this transaction to prevent a race where the
+	// create worker creates an on-chain ProofSet that will never be cleaned up.
+	// TaskRepository currently lacks a CancelByRef method; add one when workers
+	// are implemented.
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
 		objects, err := txRepos.Objects.ListByBucket(ctx, bkt.ID, "", "", 1)
 		if err != nil {
@@ -95,7 +100,7 @@ func (b *SynapseBackend) DeleteBucket(ctx context.Context, bucket string) error 
 			return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 		}
 
-		if err := txRepos.Buckets.UpdateStatus(ctx, bkt.ID, model.BucketStatusActive, model.BucketStatusDeleting); err != nil {
+		if err := txRepos.Buckets.UpdateStatus(ctx, bkt.ID, bkt.Status, model.BucketStatusDeleting); err != nil {
 			return fmt.Errorf("transitioning bucket to deleting: %w", err)
 		}
 

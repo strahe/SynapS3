@@ -184,14 +184,14 @@ func TestDeleteBucket_NotActive(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "creating-bucket", Status: model.BucketStatusCreating}
+	bkt := &model.Bucket{Name: "deleting-bucket", Status: model.BucketStatusDeleting}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
 
-	err := tb.backend.DeleteBucket(ctx, "creating-bucket")
+	err := tb.backend.DeleteBucket(ctx, "deleting-bucket")
 	if err == nil {
-		t.Fatal("expected error deleting non-active bucket")
+		t.Fatal("expected error deleting non-writable bucket")
 	}
 
 	apiErr, ok := err.(s3err.APIError)
@@ -201,6 +201,33 @@ func TestDeleteBucket_NotActive(t *testing.T) {
 	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	if apiErr.Code != want.Code {
 		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
+	}
+}
+
+func TestDeleteBucket_CreatingBucket(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	bkt := &model.Bucket{Name: "creating-bucket", Status: model.BucketStatusCreating}
+	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
+		t.Fatalf("seeding bucket: %v", err)
+	}
+
+	err := tb.backend.DeleteBucket(ctx, "creating-bucket")
+	if err != nil {
+		t.Fatalf("DeleteBucket on creating bucket: %v", err)
+	}
+
+	// Verify status transitioned to deleting.
+	updated, err := tb.repos.Buckets.GetByName(ctx, "creating-bucket")
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	if updated == nil {
+		t.Fatal("bucket not found after deletion")
+	}
+	if updated.Status != model.BucketStatusDeleting {
+		t.Errorf("bucket status = %q, want %q", updated.Status, model.BucketStatusDeleting)
 	}
 }
 

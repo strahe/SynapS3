@@ -5,6 +5,8 @@
 
 server:
   port: ":8080"
+  max_connections: 250000   # max concurrent TCP connections (Fiber)
+  max_requests: 100000      # max in-flight S3 requests (semaphore; excess gets 503 SlowDown)
   tls:
     enabled: false
     cert_file: ""

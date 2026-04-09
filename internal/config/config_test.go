@@ -325,3 +325,53 @@ func TestValidate_MaxIdleConns_ExceedsMaxOpen(t *testing.T) {
 		t.Fatalf("expected max_idle_conns error, got: %v", err)
 	}
 }
+
+func TestDefaultConfig_ServerConcurrency(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Server.MaxConnections != 250000 {
+		t.Errorf("Server.MaxConnections = %d, want 250000", cfg.Server.MaxConnections)
+	}
+	if cfg.Server.MaxRequests != 100000 {
+		t.Errorf("Server.MaxRequests = %d, want 100000", cfg.Server.MaxRequests)
+	}
+}
+
+func TestValidate_MaxConnections_Zero(t *testing.T) {
+	cfg := validConfig()
+	cfg.Server.MaxConnections = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for zero MaxConnections")
+	}
+	if !strings.Contains(err.Error(), "max_connections") {
+		t.Fatalf("expected max_connections error, got: %v", err)
+	}
+}
+
+func TestValidate_MaxRequests_Zero(t *testing.T) {
+	cfg := validConfig()
+	cfg.Server.MaxRequests = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for zero MaxRequests")
+	}
+	if !strings.Contains(err.Error(), "max_requests") {
+		t.Fatalf("expected max_requests error, got: %v", err)
+	}
+}
+
+func TestValidate_MaxRequests_ExceedsMaxConnections(t *testing.T) {
+	cfg := validConfig()
+	cfg.Server.MaxConnections = 100
+	cfg.Server.MaxRequests = 200
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for MaxRequests > MaxConnections")
+	}
+	if !strings.Contains(err.Error(), "max_requests") {
+		t.Fatalf("expected max_requests error, got: %v", err)
+	}
+}
