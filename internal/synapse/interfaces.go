@@ -24,3 +24,36 @@ type ProofSetClient interface {
 	AddRoots(ctx context.Context, proofSetID *big.Int, roots []pdp.Root) (*pdp.AddRootsResult, error)
 	DeleteProofSet(ctx context.Context, proofSetID *big.Int, extraData []byte) error
 }
+
+// WalletQuerier provides on-chain wallet state for the admin dashboard.
+type WalletQuerier interface {
+	GetWalletInfo(ctx context.Context) (*WalletInfo, error)
+}
+
+// WalletInfo holds a snapshot of the wallet's on-chain state.
+// Fields are nil when the corresponding RPC call failed; see Errors for details.
+type WalletInfo struct {
+	Address         string
+	Network         string
+	ChainID         int64
+	Nonce           *uint64
+	PaymentsAddress string
+	USDFCAddress    string
+	USDFCDecimals   uint8
+	FILBalance      *big.Int
+	USDFCBalance    *big.Int
+	FILAccount      *TokenAccountInfo
+	USDFCAccount    *TokenAccountInfo
+	Errors          map[string]string
+}
+
+// TokenAccountInfo holds the PDP payments contract account state for a single token.
+type TokenAccountInfo struct {
+	Funds             *big.Int
+	AvailableFunds    *big.Int
+	LockupCurrent     *big.Int
+	LockupRate        *big.Int
+	LockupLastSettled *big.Int
+	FundedUntilEpoch  *big.Int
+	CurrentLockupRate *big.Int
+}

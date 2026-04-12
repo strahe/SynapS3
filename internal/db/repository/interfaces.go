@@ -24,6 +24,8 @@ type BucketRepository interface {
 	SetProofSetID(ctx context.Context, id int64, proofSetID string) error
 	// HardDelete permanently removes a bucket row (used after proof set deletion).
 	HardDelete(ctx context.Context, id int64) error
+	// CountWithProofSet returns the number of buckets that have a non-null proof set ID.
+	CountWithProofSet(ctx context.Context) (int, error)
 }
 
 // ObjectRepository defines persistence operations for Object entities.

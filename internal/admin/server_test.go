@@ -40,7 +40,7 @@ func TestHealthz_Healthy(t *testing.T) {
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir, usedByte: 42}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, testLogger())
+	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -76,7 +76,7 @@ func TestHealthz_DBDown(t *testing.T) {
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, testLogger())
+	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -110,7 +110,7 @@ func TestMetrics_Endpoint(t *testing.T) {
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, testLogger())
+	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, testLogger())
 
 	// Increment metrics so we can verify their presence.
 	ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
@@ -164,7 +164,7 @@ func TestHealthz_CacheDirMissing(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	sc := &stubCache{rootDir: "/nonexistent/path/that/does/not/exist"}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, testLogger())
+	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -208,7 +208,7 @@ func TestHealthz_WorkerUnhealthy(t *testing.T) {
 		"onchain":  false,
 	}}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, testLogger())
+	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -254,7 +254,7 @@ func TestHealthz_WorkerHealthy(t *testing.T) {
 		"proofset": true,
 	}}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, testLogger())
+	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, nil, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -290,7 +290,7 @@ func TestRefreshMetrics(t *testing.T) {
 	sc := &stubCache{rootDir: cacheDir}
 
 	repos := repository.NewRepositories(db)
-	srv := New(":0", db, sc, 107374182400, repos, nil, testLogger())
+	srv := New(":0", db, sc, 107374182400, repos, nil, nil, testLogger())
 
 	ctx := context.Background()
 

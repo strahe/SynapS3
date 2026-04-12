@@ -293,3 +293,37 @@ func TestBucketRepo_CountByStatus(t *testing.T) {
 		t.Errorf("expected 1 deleted, got %d", lookup[string(model.BucketStatusDeleted)])
 	}
 }
+
+func TestBucketRepo_CountWithProofSet_ExcludesDeletedBuckets(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name       string
+		status     model.BucketStatus
+		proofSetID *string
+	}{
+		{name: "active-with-proof", status: model.BucketStatusActive, proofSetID: strptr("ps-1")},
+		{name: "deleting-with-proof", status: model.BucketStatusDeleting, proofSetID: strptr("ps-2")},
+		{name: "deleted-with-proof", status: model.BucketStatusDeleted, proofSetID: strptr("ps-3")},
+		{name: "active-without-proof", status: model.BucketStatusActive, proofSetID: nil},
+	} {
+		b := &model.Bucket{Name: tc.name, Status: tc.status, ProofSetID: tc.proofSetID}
+		if err := repos.Buckets.Create(ctx, b); err != nil {
+			t.Fatalf("Create(%s): %v", tc.name, err)
+		}
+	}
+
+	count, err := repos.Buckets.CountWithProofSet(ctx)
+	if err != nil {
+		t.Fatalf("CountWithProofSet: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 buckets with proof sets, got %d", count)
+	}
+}
+
+func strptr(s string) *string {
+	return &s
+}

@@ -1,6 +1,6 @@
 import { createRootRouteWithContext, Link, Outlet } from '@tanstack/react-router'
 import type { QueryClient } from '@tanstack/react-query'
-import { LayoutDashboard, Database, ListTodo, HardDrive } from 'lucide-react'
+import { LayoutDashboard, Database, ListTodo, HardDrive, Wallet } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useState, useEffect } from 'react'
 
@@ -16,6 +16,7 @@ const navItems = [
   { to: '/' as const, label: 'Overview', icon: LayoutDashboard },
   { to: '/buckets' as const, label: 'Buckets', icon: Database },
   { to: '/tasks' as const, label: 'Tasks', icon: ListTodo },
+  { to: '/wallet' as const, label: 'Wallet', icon: Wallet },
 ]
 
 function RootLayout() {

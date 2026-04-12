@@ -155,3 +155,15 @@ func (r *BunBucketRepo) CountByStatus(ctx context.Context) ([]BucketStatusCount,
 	}
 	return counts, nil
 }
+
+func (r *BunBucketRepo) CountWithProofSet(ctx context.Context) (int, error) {
+	count, err := r.db.NewSelect().
+		Model((*model.Bucket)(nil)).
+		Where("proof_set_id IS NOT NULL").
+		Where("status != ?", model.BucketStatusDeleted).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting buckets with proof set: %w", err)
+	}
+	return count, nil
+}

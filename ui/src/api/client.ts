@@ -74,6 +74,39 @@ export interface TaskStatusCount {
   count: number
 }
 
+export interface TokenAccountData {
+  funds: string | null
+  available_funds: string | null
+  lockup_current: string | null
+  lockup_rate: string | null
+  lockup_last_settled: string | null
+  funded_until_epoch: string | null
+  current_lockup_rate: string | null
+}
+
+export interface WalletBusiness {
+  proof_set_count: number
+  onchain_tasks_pending: number
+  onchain_tasks_completed: number
+}
+
+export interface WalletData {
+  configured: boolean
+  address?: string
+  network?: string
+  chain_id?: number
+  nonce: number | null
+  payments_address?: string
+  usdfc_address?: string
+  usdfc_decimals: number
+  fil_balance: string | null
+  usdfc_balance: string | null
+  fil_account: TokenAccountData | null
+  usdfc_account: TokenAccountData | null
+  business?: WalletBusiness
+  partial_errors?: Record<string, string>
+}
+
 export const api = {
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
@@ -106,4 +139,5 @@ export const api = {
   getSystemInfo: () => fetchJSON<OverviewData['system']>('/system/info'),
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
+  getWallet: () => fetchJSON<WalletData>('/wallet'),
 }

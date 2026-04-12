@@ -40,3 +40,11 @@ export function useTaskStats() {
     refetchInterval: 10_000,
   })
 }
+
+export function useWallet() {
+  return useQuery({
+    queryKey: ['wallet'],
+    queryFn: api.getWallet,
+    refetchInterval: 30_000,
+  })
+}

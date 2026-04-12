@@ -39,3 +39,43 @@ export function timeAgo(dateStr: string): string {
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
   return `${Math.floor(diff / 86400)}d ago`
 }
+
+/**
+ * Format an attoFIL string (18 decimals) to a human-readable FIL amount.
+ * Uses pure string arithmetic to avoid JS floating-point precision loss.
+ */
+export function formatAttoFIL(raw: string | null | undefined): string {
+  return formatTokenAmount(raw, 18, 'FIL')
+}
+
+/**
+ * Format a token amount string with the given decimal places.
+ * Operates on the raw string to preserve full precision.
+ */
+export function formatTokenAmount(raw: string | null | undefined, decimals: number, suffix?: string): string {
+  if (raw == null || raw === '') return '—'
+  // Reject negative values — chain balances should never be negative
+  if (raw.startsWith('-')) return '—'
+  // Pad left to ensure we have enough digits
+  const padded = raw.padStart(decimals + 1, '0')
+  const intPart = padded.slice(0, padded.length - decimals) || '0'
+  const fracPart = padded.slice(padded.length - decimals)
+  // Trim trailing zeros but keep up to 8 significant fractional digits for display
+  const trimmed = fracPart.replace(/0+$/, '')
+  const displayFrac = trimmed.length > 8 ? trimmed.slice(0, 8) : trimmed
+  // Detect dust: non-zero sub-unit amount below display precision
+  if (intPart === '0' && displayFrac.replace(/0/g, '') === '' && trimmed.replace(/0/g, '') !== '') {
+    const threshold = `< 0.${'0'.repeat(7)}1`
+    return suffix ? `${threshold} ${suffix}` : threshold
+  }
+  const formatted = displayFrac.length > 0 ? `${intPart}.${displayFrac}` : intPart
+  return suffix ? `${formatted} ${suffix}` : formatted
+}
+
+/**
+ * Shorten a hex address for display: 0x1234...abcd
+ */
+export function shortenAddress(addr: string): string {
+  if (addr.length <= 12) return addr
+  return `${addr.slice(0, 6)}...${addr.slice(-4)}`
+}

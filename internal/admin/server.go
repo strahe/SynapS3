@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
 )
@@ -32,6 +33,7 @@ type Server struct {
 	cacheMaxBytes int64
 	repos         *repository.Repositories
 	workerHealth  WorkerHealthChecker
+	wallet        synapse.WalletQuerier
 	logger        *slog.Logger
 	startedAt     time.Time
 
@@ -41,7 +43,7 @@ type Server struct {
 }
 
 // New creates a new admin HTTP server.
-func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, logger *slog.Logger) *Server {
+func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, logger *slog.Logger) *Server {
 	return &Server{
 		addr:          addr,
 		db:            db,
@@ -49,6 +51,7 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		cacheMaxBytes: cacheMaxBytes,
 		repos:         repos,
 		workerHealth:  wh,
+		wallet:        wallet,
 		logger:        logger,
 		startedAt:     time.Now(),
 	}
@@ -75,6 +78,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
 	mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
 	mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
+	mux.HandleFunc("GET /api/v1/wallet", s.handleAPIWallet)
 
 	// Serve embedded SPA frontend (fallback for non-API routes)
 	distFS := ui.DistFS()
