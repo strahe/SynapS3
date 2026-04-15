@@ -68,6 +68,10 @@ func activateBucket(t *testing.T, repos *repository.Repositories, bucketID int64
 	if err := repos.Buckets.UpdateStatus(ctx, bucketID, model.BucketStatusCreating, model.BucketStatusActive); err != nil {
 		t.Fatalf("activating bucket: %v", err)
 	}
+	// Complete the create_proof_set task so the bucket has no in-flight work.
+	if err := repos.Tasks.CompleteByRef(ctx, "bucket", bucketID, model.TaskTypeCreateProofSet); err != nil {
+		t.Fatalf("completing create_proof_set task: %v", err)
+	}
 }
 
 // findTasks queries all tasks matching the given ref type and ref ID.

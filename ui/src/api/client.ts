@@ -1,7 +1,15 @@
 const BASE = '/api/v1'
 
-async function fetchJSON<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`)
+async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (init?.body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers,
+  })
   if (!res.ok) {
     const body = await res.json().catch(() => ({} as Record<string, string>))
     throw new Error((body as Record<string, string>).error || `API error: ${res.status}`)
@@ -26,6 +34,16 @@ export interface BucketItem {
   object_count: number
   total_size_bytes: number
   created_at: string
+}
+
+export interface BucketDetail extends BucketItem {
+  updated_at: string
+}
+
+export interface BucketMutationResponse {
+  id: number
+  name: string
+  status: string
 }
 
 export interface ObjectItem {
@@ -110,6 +128,20 @@ export interface WalletData {
 export const api = {
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
+  getBucket: (name: string) => fetchJSON<BucketDetail>(`/buckets/${encodeURIComponent(name)}`),
+  createBucket: (name: string) =>
+    fetchJSON<BucketMutationResponse>('/buckets', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+  deleteBucket: (name: string, params: { recursive?: boolean } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.recursive) sp.set('recursive', 'true')
+    const qs = sp.toString()
+    return fetchJSON<BucketMutationResponse>(`/buckets/${encodeURIComponent(name)}${qs ? `?${qs}` : ''}`, {
+      method: 'DELETE',
+    })
+  },
   getBucketObjects: (name: string, params: { prefix?: string; after?: string; limit?: number }) => {
     const sp = new URLSearchParams()
     if (params.prefix) sp.set('prefix', params.prefix)
@@ -128,14 +160,7 @@ export const api = {
     return fetchJSON<TaskListResponse>(`/tasks${qs ? `?${qs}` : ''}`)
   },
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
-  retryTask: async (id: number) => {
-    const res = await fetch(`${BASE}/tasks/${id}/retry`, { method: 'POST' })
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({} as Record<string, string>))
-      throw new Error((body as Record<string, string>).error || `API error: ${res.status}`)
-    }
-    return res.json()
-  },
+  retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
   getSystemInfo: () => fetchJSON<OverviewData['system']>('/system/info'),
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),

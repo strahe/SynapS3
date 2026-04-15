@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
 
 export function useOverview() {
@@ -17,11 +17,46 @@ export function useBuckets() {
   })
 }
 
+export function useBucket(name: string) {
+  return useQuery({
+    queryKey: ['bucket', name],
+    queryFn: () => api.getBucket(name),
+    enabled: Boolean(name),
+    refetchInterval: 15_000,
+  })
+}
+
 export function useBucketObjects(name: string, prefix: string, after: string, limit = 50) {
   return useQuery({
     queryKey: ['objects', name, prefix, after, limit],
     queryFn: () => api.getBucketObjects(name, { prefix, after, limit }),
     refetchInterval: 15_000,
+  })
+}
+
+export function useCreateBucket() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: (name: string) => api.createBucket(name),
+    onSuccess: (bucket) => {
+      qc.invalidateQueries({ queryKey: ['buckets'] })
+      qc.invalidateQueries({ queryKey: ['bucket', bucket.name] })
+    },
+  })
+}
+
+export function useDeleteBucket() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ name, recursive }: { name: string; recursive: boolean }) =>
+      api.deleteBucket(name, { recursive }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['buckets'] })
+      qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objects', variables.name] })
+    },
   })
 }
 

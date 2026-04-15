@@ -233,6 +233,33 @@ func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, err
 	return counts, nil
 }
 
+func (r *BunTaskRepo) CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error) {
+	count, err := r.db.NewSelect().
+		TableExpr("tasks AS t").
+		Join("JOIN objects AS o ON o.id = t.ref_id").
+		Where("t.ref_type = ?", "object").
+		Where("o.bucket_id = ?", bucketID).
+		Where("t.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting active object tasks by bucket: %w", err)
+	}
+	return int64(count), nil
+}
+
+func (r *BunTaskRepo) CountActiveBucketTasksByBucketID(ctx context.Context, bucketID int64) (int64, error) {
+	count, err := r.db.NewSelect().
+		TableExpr("tasks").
+		Where("ref_type = ?", "bucket").
+		Where("ref_id = ?", bucketID).
+		Where("status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting active bucket tasks by bucket ID: %w", err)
+	}
+	return int64(count), nil
+}
+
 // List returns tasks with optional type/status filters, paginated by offset/limit.
 func (r *BunTaskRepo) List(ctx context.Context, taskType string, status string, limit, offset int) ([]model.Task, int, error) {
 	applyFilters := func(q *bun.SelectQuery) *bun.SelectQuery {
@@ -255,4 +282,24 @@ func (r *BunTaskRepo) List(ctx context.Context, taskType string, status string, 
 		return nil, 0, fmt.Errorf("listing tasks: %w", err)
 	}
 	return tasks, total, nil
+}
+
+func (r *BunTaskRepo) CompleteByRef(ctx context.Context, refType string, refID int64, taskType model.TaskType) error {
+	now := time.Now()
+	res, err := r.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusCompleted).
+		Set("completed_at = ?", now).
+		Where("ref_type = ?", refType).
+		Where("ref_id = ?", refID).
+		Where("type = ?", taskType).
+		Where("status IN (?, ?)", model.TaskStatusPending, model.TaskStatusRunning).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("completing tasks by ref: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no matching %s task for %s/%d: %w", taskType, refType, refID, ErrNotFound)
+	}
+	return nil
 }

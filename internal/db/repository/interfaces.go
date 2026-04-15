@@ -94,6 +94,15 @@ type TaskRepository interface {
 	RetryDeadLetter(ctx context.Context, taskID int64) error
 	// CountByStatus returns task counts grouped by type and status.
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+	// CountActiveObjectTasksByBucket returns the number of pending/running object tasks
+	// whose referenced objects belong to the given bucket, including soft-deleted
+	// objects that still have in-flight work.
+	CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error)
+	// CountActiveBucketTasksByBucketID returns the number of pending/running tasks
+	// that directly reference the given bucket (ref_type=bucket, ref_id=bucketID).
+	CountActiveBucketTasksByBucketID(ctx context.Context, bucketID int64) (int64, error)
+	// CompleteByRef marks all pending/running tasks matching the given ref as completed.
+	CompleteByRef(ctx context.Context, refType string, refID int64, taskType model.TaskType) error
 	// List returns tasks with optional filters, paginated by offset/limit.
 	// Returns the matching tasks and the total count (for pagination).
 	List(ctx context.Context, taskType string, status string, limit, offset int) ([]model.Task, int, error)
@@ -123,6 +132,8 @@ type MultipartUploadRepository interface {
 	Create(ctx context.Context, upload *model.MultipartUpload) error
 	GetByUploadID(ctx context.Context, uploadID string) (*model.MultipartUpload, error)
 	ListByBucket(ctx context.Context, bucketID int64, prefix, keyMarker, uploadIDMarker string, maxUploads int) ([]model.MultipartUpload, error)
+	// CountActiveByBucket returns initiated/completing multipart uploads for the given bucket.
+	CountActiveByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// SetStatus atomically transitions status using CAS (compare-and-swap) to prevent races.
 	SetStatus(ctx context.Context, uploadID string, from, to model.MultipartStatus) error
 	Delete(ctx context.Context, uploadID string) error

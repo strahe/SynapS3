@@ -3,6 +3,7 @@ package backend
 import (
 	"log/slog"
 
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/state"
@@ -17,6 +18,7 @@ type SynapseBackend struct {
 
 	repos             *repository.Repositories
 	cache             cache.Cache
+	bucketLifecycle   *bucketlifecycle.Service
 	stateMachine      *state.Machine
 	storage           synapse.StorageClient
 	proofSet          synapse.ProofSetClient
@@ -29,6 +31,7 @@ func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc sy
 	return &SynapseBackend{
 		repos:             repos,
 		cache:             c,
+		bucketLifecycle:   bucketlifecycle.New(repos, c, logger),
 		stateMachine:      sm,
 		storage:           sc,
 		proofSet:          pc,

@@ -75,6 +75,21 @@ func (r *BunMultipartRepo) ListByBucket(
 	return uploads, nil
 }
 
+func (r *BunMultipartRepo) CountActiveByBucket(ctx context.Context, bucketID int64) (int64, error) {
+	count, err := r.db.NewSelect().
+		Model((*model.MultipartUpload)(nil)).
+		Where("bucket_id = ?", bucketID).
+		Where("status IN (?)", bun.List([]model.MultipartStatus{
+			model.MultipartStatusInitiated,
+			model.MultipartStatusCompleting,
+		})).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting active multipart uploads by bucket: %w", err)
+	}
+	return int64(count), nil
+}
+
 // SetStatus atomically transitions a multipart upload from one status to another (CAS).
 // Returns an error if the upload is not in the expected 'from' status.
 func (r *BunMultipartRepo) SetStatus(ctx context.Context, uploadID string, from, to model.MultipartStatus) error {

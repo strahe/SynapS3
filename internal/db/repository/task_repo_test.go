@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -474,5 +475,257 @@ func TestTaskRepo_CountByStatus(t *testing.T) {
 	}
 	if lookup[string(model.TaskTypeAddRoots)+"/"+string(model.TaskStatusPending)] != 1 {
 		t.Errorf("expected 1 pending add_roots, got %d", lookup[string(model.TaskTypeAddRoots)+"/"+string(model.TaskStatusPending)])
+	}
+}
+
+func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucketA := seedBucket(t, db, "task-bucket-a")
+	bucketB := seedBucket(t, db, "task-bucket-b")
+
+	objectA, generationA, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
+		BucketID:    bucketA.ID,
+		Key:         "a.txt",
+		Size:        1,
+		ETag:        "etag-a",
+		Checksum:    "checksum-a",
+		ContentType: "text/plain",
+		CachePath:   "/cache/a.txt",
+		State:       model.ObjectStateOnChained,
+	})
+	if err != nil {
+		t.Fatalf("UpsertAndBumpGeneration objectA: %v", err)
+	}
+
+	objectB, generationB, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
+		BucketID:    bucketB.ID,
+		Key:         "b.txt",
+		Size:        1,
+		ETag:        "etag-b",
+		Checksum:    "checksum-b",
+		ContentType: "text/plain",
+		CachePath:   "/cache/b.txt",
+		State:       model.ObjectStateOnChained,
+	})
+	if err != nil {
+		t.Fatalf("UpsertAndBumpGeneration objectB: %v", err)
+	}
+
+	for _, task := range []*model.Task{
+		{
+			Type:           model.TaskTypeEvictCache,
+			RefType:        "object",
+			RefID:          objectA,
+			RefGeneration:  generationA,
+			IdempotencyKey: "count-active-pending",
+			Status:         model.TaskStatusPending,
+		},
+		{
+			Type:           model.TaskTypeAddRoots,
+			RefType:        "object",
+			RefID:          objectA,
+			RefGeneration:  generationA,
+			IdempotencyKey: "count-active-running",
+			Status:         model.TaskStatusRunning,
+		},
+		{
+			Type:           model.TaskTypeUploadToSP,
+			RefType:        "object",
+			RefID:          objectA,
+			RefGeneration:  generationA,
+			IdempotencyKey: "count-active-completed",
+			Status:         model.TaskStatusCompleted,
+		},
+		{
+			Type:           model.TaskTypeDeleteProofSet,
+			RefType:        "bucket",
+			RefID:          bucketA.ID,
+			RefGeneration:  0,
+			IdempotencyKey: "count-active-bucket-task",
+			Status:         model.TaskStatusPending,
+		},
+		{
+			Type:           model.TaskTypeEvictCache,
+			RefType:        "object",
+			RefID:          objectB,
+			RefGeneration:  generationB,
+			IdempotencyKey: "count-active-other-bucket",
+			Status:         model.TaskStatusPending,
+		},
+	} {
+		if err := repos.Tasks.Create(ctx, task); err != nil {
+			t.Fatalf("Tasks.Create(%s): %v", task.IdempotencyKey, err)
+		}
+	}
+
+	count, err := repos.Tasks.CountActiveObjectTasksByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("CountActiveObjectTasksByBucket: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("active object task count = %d, want 2", count)
+	}
+}
+
+func TestTaskRepo_CountActiveObjectTasksByBucket_IncludesSoftDeletedObjects(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "soft-deleted-task-bucket")
+	objectID, generation, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
+		BucketID:    bucket.ID,
+		Key:         "ghost.txt",
+		Size:        4,
+		ETag:        "etag-ghost",
+		Checksum:    "checksum-ghost",
+		ContentType: "text/plain",
+		CachePath:   "/cache/ghost.txt",
+		State:       model.ObjectStateCached,
+		MaxRetries:  5,
+	})
+	if err != nil {
+		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
+	}
+	if err := repos.Objects.SoftDelete(ctx, objectID); err != nil {
+		t.Fatalf("Objects.SoftDelete: %v", err)
+	}
+	if err := repos.Tasks.Create(ctx, &model.Task{
+		Type:           model.TaskTypeUploadToSP,
+		RefType:        "object",
+		RefID:          objectID,
+		RefGeneration:  generation,
+		IdempotencyKey: "soft-deleted-object-task",
+		Status:         model.TaskStatusPending,
+	}); err != nil {
+		t.Fatalf("Tasks.Create: %v", err)
+	}
+
+	count, err := repos.Tasks.CountActiveObjectTasksByBucket(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("CountActiveObjectTasksByBucket: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("active object task count = %d, want 1", count)
+	}
+}
+
+func TestTaskRepo_CountActiveBucketTasksByBucketID(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucketA := seedBucket(t, db, "bucket-task-a")
+	bucketB := seedBucket(t, db, "bucket-task-b")
+
+	for _, task := range []*model.Task{
+		{
+			Type:           model.TaskTypeCreateProofSet,
+			RefType:        "bucket",
+			RefID:          bucketA.ID,
+			IdempotencyKey: "create-ps-a",
+			Status:         model.TaskStatusPending,
+		},
+		{
+			Type:           model.TaskTypeDeleteProofSet,
+			RefType:        "bucket",
+			RefID:          bucketA.ID,
+			IdempotencyKey: "delete-ps-a",
+			Status:         model.TaskStatusRunning,
+		},
+		{
+			Type:           model.TaskTypeCreateProofSet,
+			RefType:        "bucket",
+			RefID:          bucketA.ID,
+			IdempotencyKey: "create-ps-a-completed",
+			Status:         model.TaskStatusCompleted,
+		},
+		{
+			Type:           model.TaskTypeCreateProofSet,
+			RefType:        "bucket",
+			RefID:          bucketB.ID,
+			IdempotencyKey: "create-ps-b",
+			Status:         model.TaskStatusPending,
+		},
+	} {
+		if err := repos.Tasks.Create(ctx, task); err != nil {
+			t.Fatalf("Tasks.Create(%s): %v", task.IdempotencyKey, err)
+		}
+	}
+
+	count, err := repos.Tasks.CountActiveBucketTasksByBucketID(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("CountActiveBucketTasksByBucketID: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("active bucket task count = %d, want 2 (pending create + running delete)", count)
+	}
+
+	countB, err := repos.Tasks.CountActiveBucketTasksByBucketID(ctx, bucketB.ID)
+	if err != nil {
+		t.Fatalf("CountActiveBucketTasksByBucketID bucketB: %v", err)
+	}
+	if countB != 1 {
+		t.Fatalf("active bucket task count for B = %d, want 1", countB)
+	}
+}
+
+func TestTaskRepo_CompleteByRef(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "complete-ref-bucket")
+
+	// Seed a pending bucket-scoped task.
+	pendingTask := &model.Task{
+		Type:           model.TaskTypeCreateProofSet,
+		RefType:        "bucket",
+		RefID:          bucket.ID,
+		RefGeneration:  0,
+		IdempotencyKey: "cbr-pending-" + time.Now().Format(time.RFC3339Nano),
+		Status:         model.TaskStatusPending,
+	}
+	if err := repos.Tasks.Create(ctx, pendingTask); err != nil {
+		t.Fatalf("seed pending task: %v", err)
+	}
+
+	// Happy path: complete the pending task by ref.
+	if err := repos.Tasks.CompleteByRef(ctx, "bucket", bucket.ID, model.TaskTypeCreateProofSet); err != nil {
+		t.Fatalf("CompleteByRef (happy): %v", err)
+	}
+
+	// Verify the task is now completed.
+	got, err := repos.Tasks.GetByID(ctx, pendingTask.ID)
+	if err != nil {
+		t.Fatalf("GetByID after complete: %v", err)
+	}
+	if got.Status != model.TaskStatusCompleted {
+		t.Fatalf("status = %s, want completed", got.Status)
+	}
+	if got.CompletedAt.IsZero() {
+		t.Fatal("CompletedAt should be set after CompleteByRef")
+	}
+
+	// Idempotency: calling again on already-completed task returns ErrNotFound
+	// because no pending/running rows match.
+	err = repos.Tasks.CompleteByRef(ctx, "bucket", bucket.ID, model.TaskTypeCreateProofSet)
+	if err == nil {
+		t.Fatal("CompleteByRef on completed task should return error")
+	}
+	if !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("CompleteByRef on completed = %v, want ErrNotFound", err)
+	}
+
+	// Zero-match: non-existent ref returns ErrNotFound.
+	err = repos.Tasks.CompleteByRef(ctx, "bucket", 999999, model.TaskTypeCreateProofSet)
+	if err == nil {
+		t.Fatal("CompleteByRef on non-existent ref should return error")
+	}
+	if !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("CompleteByRef non-existent = %v, want ErrNotFound", err)
 	}
 }

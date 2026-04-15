@@ -1,10 +1,15 @@
 package admin
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/db/repository"
 )
 
@@ -18,10 +23,31 @@ type bucketListItem struct {
 	CreatedAt      string  `json:"created_at"`
 }
 
-func (s *Server) handleAPIBuckets(w http.ResponseWriter, r *http.Request) {
+type bucketCreateRequest struct {
+	Name string `json:"name"`
+}
+
+type bucketMutationResponse struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+type bucketDetailResponse struct {
+	ID             int64   `json:"id"`
+	Name           string  `json:"name"`
+	Status         string  `json:"status"`
+	ProofSetID     *string `json:"proof_set_id"`
+	ObjectCount    int64   `json:"object_count"`
+	TotalSizeBytes int64   `json:"total_size_bytes"`
+	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
+}
+
+func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	buckets, err := s.repos.Buckets.ListActive(ctx)
+	buckets, err := s.repos.Buckets.List(ctx)
 	if err != nil {
 		s.logger.Error("api: failed to list buckets", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -37,6 +63,9 @@ func (s *Server) handleAPIBuckets(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]bucketListItem, 0, len(buckets))
 	for _, b := range buckets {
+		if !b.Status.IsAdminVisible() {
+			continue
+		}
 		stats := statsMap[b.ID]
 		items = append(items, bucketListItem{
 			ID:             b.ID,
@@ -50,6 +79,126 @@ func (s *Server) handleAPIBuckets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, items)
+}
+
+// bucketNameRe matches valid S3-compatible bucket names (3-63 chars, lowercase
+// alphanumeric and hyphens, no leading/trailing hyphen).
+var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
+
+func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var req bucketCreateRequest
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bucket name is required"})
+		return
+	}
+	if !bucketNameRe.MatchString(name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name: must be 3-63 lowercase alphanumeric characters or hyphens, cannot start or end with a hyphen"})
+		return
+	}
+
+	bucket, err := s.bucketLifecycle.Create(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, repository.ErrAlreadyExists) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket already exists"})
+			return
+		}
+		s.logger.Error("api: failed to create bucket", "error", err, "name", name)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, bucketMutationResponse{
+		ID:     bucket.ID,
+		Name:   bucket.Name,
+		Status: string(bucket.Status),
+	})
+}
+
+func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket detail", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	objectCount, err := s.repos.Objects.CountByBucket(ctx, bucket.ID)
+	if err != nil {
+		s.logger.Error("api: failed to count bucket objects", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	totalSize, err := s.repos.Objects.TotalSizeByBucket(ctx, bucket.ID)
+	if err != nil {
+		s.logger.Error("api: failed to sum bucket object size", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, bucketDetailResponse{
+		ID:             bucket.ID,
+		Name:           bucket.Name,
+		Status:         string(bucket.Status),
+		ProofSetID:     bucket.ProofSetID,
+		ObjectCount:    objectCount,
+		TotalSizeBytes: totalSize,
+		CreatedAt:      bucket.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:      bucket.UpdatedAt.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) handleAPIDeleteBucket(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	bucket, err := s.bucketLifecycle.Delete(r.Context(), bucketName, bucketlifecycle.DeleteOptions{
+		Recursive: r.URL.Query().Get("recursive") == "true",
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, bucketlifecycle.ErrBucketNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		case errors.Is(err, bucketlifecycle.ErrBucketDeleteBlocked):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket has in-flight work (lifecycle tasks, object processing, or multipart uploads)"})
+		case errors.Is(err, bucketlifecycle.ErrBucketTooLarge):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket has too many objects for recursive delete; empty it in batches first"})
+		case errors.Is(err, bucketlifecycle.ErrBucketNotDeletable):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket is not deletable in its current state"})
+		case errors.Is(err, bucketlifecycle.ErrBucketNotEmpty):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket not empty"})
+		default:
+			s.logger.Error("api: failed to delete bucket", "error", err, "name", bucketName)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, bucketMutationResponse{
+		ID:     bucket.ID,
+		Name:   bucket.Name,
+		Status: string(bucket.Status),
+	})
 }
 
 type objectListItem struct {
@@ -73,6 +222,10 @@ type objectListResponse struct {
 func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
 
 	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
 	if err != nil {
@@ -84,7 +237,7 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
 		return
 	}
-	if !bucket.Status.IsVisible() {
+	if !bucket.Status.IsAdminVisible() {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
 		return
 	}

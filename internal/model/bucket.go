@@ -29,6 +29,13 @@ func (s BucketStatus) IsVisible() bool {
 	}
 }
 
+// IsAdminVisible returns true for bucket statuses that should remain visible in
+// admin surfaces. Failed states stay operator-visible for diagnosis/recovery;
+// only fully deleted buckets are hidden.
+func (s BucketStatus) IsAdminVisible() bool {
+	return s != BucketStatusDeleted
+}
+
 // IsWritable returns true for bucket statuses that allow write operations
 // (PutObject, multipart uploads, etc). Active and creating buckets accept writes;
 // creating buckets allow data ingest while the proof set is being provisioned.

@@ -117,6 +117,42 @@ func TestMultipartRepo_ListByBucket(t *testing.T) {
 	}
 }
 
+func TestMultipartRepo_CountActiveByBucket(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucketA := seedBucket(t, db, "count-mp-a")
+	bucketB := seedBucket(t, db, "count-mp-b")
+	ctx := context.Background()
+
+	for _, upload := range []*model.MultipartUpload{
+		{BucketID: bucketA.ID, Key: "a-1", UploadID: "count-mp-a-1", Status: model.MultipartStatusInitiated},
+		{BucketID: bucketA.ID, Key: "a-2", UploadID: "count-mp-a-2", Status: model.MultipartStatusCompleting},
+		{BucketID: bucketA.ID, Key: "a-3", UploadID: "count-mp-a-3", Status: model.MultipartStatusCompleted},
+		{BucketID: bucketA.ID, Key: "a-4", UploadID: "count-mp-a-4", Status: model.MultipartStatusAborted},
+		{BucketID: bucketB.ID, Key: "b-1", UploadID: "count-mp-b-1", Status: model.MultipartStatusInitiated},
+	} {
+		if err := repos.Multiparts.Create(ctx, upload); err != nil {
+			t.Fatalf("Create(%s): %v", upload.UploadID, err)
+		}
+	}
+
+	countA, err := repos.Multiparts.CountActiveByBucket(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("CountActiveByBucket bucketA: %v", err)
+	}
+	if countA != 2 {
+		t.Fatalf("active multipart count for bucketA = %d, want 2", countA)
+	}
+
+	countB, err := repos.Multiparts.CountActiveByBucket(ctx, bucketB.ID)
+	if err != nil {
+		t.Fatalf("CountActiveByBucket bucketB: %v", err)
+	}
+	if countB != 1 {
+		t.Fatalf("active multipart count for bucketB = %d, want 1", countB)
+	}
+}
+
 func TestMultipartRepo_Parts_CRUD(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

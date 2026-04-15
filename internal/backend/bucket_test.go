@@ -204,7 +204,7 @@ func TestDeleteBucket_NotActive(t *testing.T) {
 	}
 }
 
-func TestDeleteBucket_CreatingBucket(t *testing.T) {
+func TestDeleteBucket_CreatingBucketRejected(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
@@ -214,20 +214,28 @@ func TestDeleteBucket_CreatingBucket(t *testing.T) {
 	}
 
 	err := tb.backend.DeleteBucket(ctx, "creating-bucket")
-	if err != nil {
-		t.Fatalf("DeleteBucket on creating bucket: %v", err)
+	if err == nil {
+		t.Fatal("expected error deleting creating bucket")
 	}
 
-	// Verify status transitioned to deleting.
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	if apiErr.Code != want.Code {
+		t.Fatalf("error code = %q, want %q", apiErr.Code, want.Code)
+	}
+
 	updated, err := tb.repos.Buckets.GetByName(ctx, "creating-bucket")
 	if err != nil {
 		t.Fatalf("GetByName: %v", err)
 	}
 	if updated == nil {
-		t.Fatal("bucket not found after deletion")
+		t.Fatal("bucket should remain present")
 	}
-	if updated.Status != model.BucketStatusDeleting {
-		t.Errorf("bucket status = %q, want %q", updated.Status, model.BucketStatusDeleting)
+	if updated.Status != model.BucketStatusCreating {
+		t.Errorf("bucket status = %q, want %q", updated.Status, model.BucketStatusCreating)
 	}
 }
 

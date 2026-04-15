@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -27,15 +28,16 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr          string
-	db            *bun.DB
-	cache         cache.Cache
-	cacheMaxBytes int64
-	repos         *repository.Repositories
-	workerHealth  WorkerHealthChecker
-	wallet        synapse.WalletQuerier
-	logger        *slog.Logger
-	startedAt     time.Time
+	addr            string
+	db              *bun.DB
+	cache           cache.Cache
+	cacheMaxBytes   int64
+	repos           *repository.Repositories
+	bucketLifecycle *bucketlifecycle.Service
+	workerHealth    WorkerHealthChecker
+	wallet          synapse.WalletQuerier
+	logger          *slog.Logger
+	startedAt       time.Time
 
 	// Track previously seen label sets to zero stale entries on refresh.
 	prevTaskLabels   map[[2]string]struct{}
@@ -45,15 +47,16 @@ type Server struct {
 // New creates a new admin HTTP server.
 func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, logger *slog.Logger) *Server {
 	return &Server{
-		addr:          addr,
-		db:            db,
-		cache:         c,
-		cacheMaxBytes: cacheMaxBytes,
-		repos:         repos,
-		workerHealth:  wh,
-		wallet:        wallet,
-		logger:        logger,
-		startedAt:     time.Now(),
+		addr:            addr,
+		db:              db,
+		cache:           c,
+		cacheMaxBytes:   cacheMaxBytes,
+		repos:           repos,
+		bucketLifecycle: bucketlifecycle.New(repos, c, logger),
+		workerHealth:    wh,
+		wallet:          wallet,
+		logger:          logger,
+		startedAt:       time.Now(),
 	}
 }
 
@@ -70,7 +73,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// Dashboard API
 	mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
-	mux.HandleFunc("GET /api/v1/buckets", s.handleAPIBuckets)
+	mux.HandleFunc("GET /api/v1/buckets", s.handleAPIListBuckets)
+	mux.HandleFunc("POST /api/v1/buckets", s.handleAPICreateBucket)
+	mux.HandleFunc("GET /api/v1/buckets/{name}", s.handleAPIGetBucket)
+	mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 	mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
 	mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
