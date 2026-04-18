@@ -22,6 +22,7 @@ type Uploader struct {
 	repos        *repository.Repositories
 	cache        cache.Cache
 	storage      synapse.StorageClient
+	wallet       synapse.WalletQuerier // optional; nil skips balance pre-check
 	stateMachine *state.Machine
 	concurrency  int
 	pollInterval time.Duration
@@ -31,11 +32,12 @@ type Uploader struct {
 }
 
 // NewUploader creates a new SP upload worker.
-func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
+func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
 	return &Uploader{
 		repos:           repos,
 		cache:           c,
 		storage:         sc,
+		wallet:          wallet,
 		stateMachine:    sm,
 		concurrency:     concurrency,
 		pollInterval:    pollInterval,
@@ -160,6 +162,22 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		}
 	}
 
+	// Pre-flight: check payment account has deposited funds.
+	// This is a fast-fail gate for the obvious zero-balance case, not exact cost estimation.
+	if u.wallet != nil {
+		info, wErr := u.wallet.GetWalletInfo(ctx)
+		if wErr != nil {
+			logger.Warn("wallet balance pre-check failed, proceeding with upload", "error", wErr)
+		} else if info != nil && info.USDFCAccount != nil &&
+			info.USDFCAccount.Funds != nil && info.USDFCAccount.Funds.Sign() == 0 {
+			msg := "insufficient payment account balance: USDFC deposited funds = 0, please deposit USDFC into your payment account before uploading"
+			logger.Warn(msg)
+			_ = u.repos.Tasks.Fail(ctx, task.ID, msg)
+			admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+			return
+		}
+	}
+
 	// Read from cache
 	rc, _, err := u.cache.Get(ctx, bucket.Name, obj.Key)
 	if err != nil {
@@ -184,17 +202,18 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	// Upload to SP
 	result, err := u.storage.Upload(ctx, rc, nil)
 	if err != nil {
-		logger.Error("SP upload failed", "error", err)
+		enriched := decodeRevertReason(err.Error())
+		logger.Error("SP upload failed", "error", enriched)
 		if task.RetryCount+1 >= task.MaxRetries {
 			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
-				model.ObjectStateUploading, fmt.Sprintf("SP upload: %v (max retries reached)", err))
-			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+				model.ObjectStateUploading, fmt.Sprintf("SP upload: %v (max retries reached)", enriched))
+			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, enriched); ftErr != nil {
 				logger.Error("failed to mark task as dead-letter", "error", ftErr)
 			} else {
 				admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUploadToSP)).Inc()
 			}
 		} else {
-			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			_ = u.repos.Tasks.Fail(ctx, task.ID, enriched)
 			_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
 		}
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()

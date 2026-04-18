@@ -17,6 +17,7 @@ import (
 var (
 	_ synapse.StorageClient  = (*MockStorageClient)(nil)
 	_ synapse.ProofSetClient = (*MockProofSetClient)(nil)
+	_ synapse.WalletQuerier  = (*MockWalletQuerier)(nil)
 	_ cache.Cache            = (*MockCache)(nil)
 )
 
@@ -66,6 +67,18 @@ func (m *MockProofSetClient) DeleteProofSet(ctx context.Context, proofSetID *big
 		return m.DeleteProofSetFunc(ctx, proofSetID, extraData)
 	}
 	return errors.New("MockProofSetClient.DeleteProofSet not configured")
+}
+
+// MockWalletQuerier is a configurable test double for synapse.WalletQuerier.
+type MockWalletQuerier struct {
+	GetWalletInfoFunc func(ctx context.Context) (*synapse.WalletInfo, error)
+}
+
+func (m *MockWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.WalletInfo, error) {
+	if m.GetWalletInfoFunc != nil {
+		return m.GetWalletInfoFunc(ctx)
+	}
+	return nil, errors.New("MockWalletQuerier.GetWalletInfo not configured")
 }
 
 // MockCache is a configurable test double for cache.Cache.

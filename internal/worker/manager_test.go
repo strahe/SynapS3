@@ -201,7 +201,7 @@ func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
 	logger := slog.Default()
 	poll := 50 * time.Millisecond
 
-	up := worker.NewUploader(repos, mc, nil, sm, 1, poll, logger)
+	up := worker.NewUploader(repos, mc, nil, nil, sm, 1, poll, logger)
 	oc := worker.NewOnChain(repos, nil, sm, false, 1, poll, logger)
 	ps := worker.NewProofSetWorker(repos, nil, mc, 1, poll, logger)
 	ev := worker.NewEvictor(repos, mc, sm, 1, poll, logger)

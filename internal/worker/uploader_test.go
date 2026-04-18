@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
 )
@@ -181,7 +183,7 @@ func TestUploader_HappyPath(t *testing.T) {
 		return &storage.UploadResult{PieceCID: pieceCID, Size: 11}, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, env.sm, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	ctx := context.Background()
@@ -241,7 +243,7 @@ func TestUploader_StaleGeneration(t *testing.T) {
 		return nil, errors.New("should not be called")
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, env.sm, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
@@ -258,7 +260,7 @@ func TestUploader_NilStorageClient(t *testing.T) {
 	_, objID, gen := seedCachedObject(t, env)
 	task := seedTask(t, env, model.TaskTypeUploadToSP, objID, gen, 5, 0)
 
-	uploader := worker.NewUploader(env.repos, env.cache, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, nil, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
@@ -286,7 +288,7 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 		return nil, errors.New("should not be called")
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, env.sm, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	ctx := context.Background()
@@ -310,7 +312,7 @@ func TestUploader_SPUploadFailure_Retry(t *testing.T) {
 		return nil, errors.New("SP unavailable")
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, env.sm, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
 	// After Fail+Requeue, task goes back to pending with future ScheduledAt.
 	// Use a short Run since runWorkerUntilTask won't see it leave pending.
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -336,7 +338,7 @@ func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 		return nil, errors.New("SP permanent failure")
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, env.sm, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	ctx := context.Background()
@@ -376,7 +378,7 @@ func TestUploader_ChainTaskCreationFailure(t *testing.T) {
 		t.Fatalf("creating conflict task: %v", err)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, env.sm, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	// ErrAlreadyExists is treated as idempotent success — task completes
@@ -388,5 +390,91 @@ func TestUploader_ChainTaskCreationFailure(t *testing.T) {
 	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
 	if obj.State != model.ObjectStateUploaded {
 		t.Errorf("expected object in uploaded state, got %s", obj.State)
+	}
+}
+
+func TestUploader_ZeroBalance_FailsTask(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUploadToSP, objID, gen, 5, 0)
+
+	wallet := &testutil.MockWalletQuerier{
+		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
+			return &synapse.WalletInfo{
+				USDFCAccount: &synapse.TokenAccountInfo{
+					Funds: big.NewInt(0),
+				},
+			}, nil
+		},
+	}
+
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		t.Fatal("upload should not be called when balance is zero")
+		return nil, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusFailed {
+		t.Errorf("expected task failed for zero balance, got %s", got.Status)
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "insufficient payment account balance") {
+		le := ""
+		if got.LastError != nil {
+			le = *got.LastError
+		}
+		t.Errorf("expected balance error message, got: %s", le)
+	}
+}
+
+func TestUploader_WalletError_ProceedsWithUpload(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUploadToSP, objID, gen, 5, 0)
+
+	wallet := &testutil.MockWalletQuerier{
+		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
+			return nil, errors.New("RPC timeout")
+		},
+	}
+
+	pieceCID := testCID(t)
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		return &storage.UploadResult{PieceCID: pieceCID, Size: 11}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusCompleted {
+		t.Errorf("expected task completed (wallet error should not block upload), got %s", got.Status)
+	}
+}
+
+func TestUploader_WalletNilInfo_NoPanic(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUploadToSP, objID, gen, 5, 0)
+
+	wallet := &testutil.MockWalletQuerier{
+		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
+			return nil, nil // (nil, nil) — edge case
+		},
+	}
+
+	pieceCID := testCID(t)
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		return &storage.UploadResult{PieceCID: pieceCID, Size: 11}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusCompleted {
+		t.Errorf("expected task completed (nil info should not panic), got %s", got.Status)
 	}
 }

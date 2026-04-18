@@ -223,7 +223,7 @@ func runServe(ctx context.Context, configPath string) error {
 
 	// Start background workers.
 	wm := worker.NewManager(repos, cfg.Cache.EvictAfterOnChain, logger,
-		worker.NewUploader(repos, localCache, storageClient, sm,
+		worker.NewUploader(repos, localCache, storageClient, walletQuerier, sm,
 			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger),
 		worker.NewOnChain(repos, proofSetClient, sm, cfg.Cache.EvictAfterOnChain,
 			cfg.Worker.OnChain.Concurrency, cfg.Worker.OnChain.PollInterval, logger),

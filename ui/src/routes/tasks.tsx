@@ -2,10 +2,17 @@ import { createFileRoute } from '@tanstack/react-router'
 import { useTasks } from '@/hooks/queries'
 import { cn } from '@/lib/utils'
 import { timeAgo } from '@/lib/utils'
-import { Loader2, RefreshCw, RotateCcw } from 'lucide-react'
+import { Loader2, RefreshCw, RotateCcw, Copy, Check } from 'lucide-react'
 import { useQueryClient, useMutation } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import { api } from '@/api/client'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog'
 
 export const Route = createFileRoute('/tasks')({
   component: TasksPage,
@@ -40,6 +47,7 @@ function TasksPage() {
   const qc = useQueryClient()
 
   const [retryingId, setRetryingId] = useState<number | null>(null)
+  const [errorDialogText, setErrorDialogText] = useState<string | null>(null)
   const retryMutation = useMutation({
     mutationFn: (taskId: number) => {
       setRetryingId(taskId)
@@ -135,8 +143,15 @@ function TasksPage() {
                       </span>
                     </td>
                     <td className="px-4 py-3 text-right">{t.retry_count}/{t.max_retries}</td>
-                    <td className="max-w-xs truncate px-4 py-3 text-xs text-muted-foreground" title={t.last_error ?? undefined}>
-                      {t.last_error ?? '—'}
+                    <td className="max-w-xs px-4 py-3 text-xs text-muted-foreground">
+                      {t.last_error ? (
+                        <button
+                          onClick={() => setErrorDialogText(t.last_error!)}
+                          className="max-w-full cursor-pointer truncate text-left hover:text-foreground"
+                        >
+                          {t.last_error}
+                        </button>
+                      ) : '—'}
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">{timeAgo(t.scheduled_at)}</td>
                     <td className="px-4 py-3">
@@ -188,6 +203,58 @@ function TasksPage() {
           )}
         </>
       )}
+
+      <ErrorDetailDialog
+        errorText={errorDialogText}
+        onClose={() => setErrorDialogText(null)}
+      />
     </div>
+  )
+}
+
+function ErrorDetailDialog({ errorText, onClose }: { errorText: string | null; onClose: () => void }) {
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => { setCopied(false) }, [errorText])
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current)
+    }
+  }, [])
+
+  const handleCopy = useCallback(async () => {
+    if (!errorText) return
+    try {
+      await navigator.clipboard.writeText(errorText)
+      setCopied(true)
+      if (timerRef.current) clearTimeout(timerRef.current)
+      timerRef.current = setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // Clipboard API may fail on non-HTTPS
+    }
+  }, [errorText])
+
+  return (
+    <Dialog open={errorText !== null} onOpenChange={(open) => { if (!open) onClose() }}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Error Details</DialogTitle>
+        </DialogHeader>
+        <div className="max-h-80 overflow-auto rounded-md border border-border bg-muted/50 p-3">
+          <pre className="whitespace-pre-wrap break-all font-mono text-xs">{errorText}</pre>
+        </div>
+        <DialogFooter>
+          <button
+            onClick={handleCopy}
+            className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
