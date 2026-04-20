@@ -47,6 +47,8 @@ type ObjectRepository interface {
 	// SetPieceCIDAndTransition atomically sets the PieceCID and transitions state in one CAS update.
 	// This prevents split-write races where a stale worker could set PieceCID on a newer generation.
 	SetPieceCIDAndTransition(ctx context.Context, id int64, generation int64, pieceCID string, from, to model.ObjectState) error
+	// SetStorageInfoAndTransition atomically stores the object retrieval information and transitions state.
+	SetStorageInfoAndTransition(ctx context.Context, id int64, generation int64, pieceCID string, retrievalURL string, from, to model.ObjectState) error
 	// ListByState returns objects in the given state, limited to limit rows.
 	ListByState(ctx context.Context, state model.ObjectState, limit int) ([]model.Object, error)
 	// ResetStaleStates resets objects stuck in an intermediate state back to a safe state.

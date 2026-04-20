@@ -1,6 +1,7 @@
 package backend_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,12 +13,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/data-preservation-programs/go-synapse/storage"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synapse-go/storage"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -187,16 +188,21 @@ func TestGetObject_NotFound(t *testing.T) {
 }
 
 func TestGetObject_SPFallback(t *testing.T) {
-	// Use mock cache: Put succeeds normally, Get returns os.ErrNotExist to simulate cache miss.
-	// But for the initial PutObject we need a real cache. So we use a mock cache
-	// that only returns miss on Get, plus we seed the object directly in the DB.
+	// Use mock cache: first Get returns os.ErrNotExist (cache miss), Put succeeds
+	// and stashes the data, second Get returns the rehydrated data.
+	var rehydrated []byte
 	mc := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
-			return nil, nil, os.ErrNotExist
+			if rehydrated == nil {
+				return nil, nil, os.ErrNotExist
+			}
+			return io.NopCloser(bytes.NewReader(rehydrated)), &cache.ObjectInfo{
+				Path: "/fake/path", Size: int64(len(rehydrated)), ETag: "fakemd5", Checksum: "fakesha256",
+			}, nil
 		},
 		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
-			// Consume the reader and return a dummy ObjectInfo.
 			data, _ := io.ReadAll(r)
+			rehydrated = data
 			return &cache.ObjectInfo{
 				Path:     "/fake/path",
 				Size:     int64(len(data)),
@@ -233,8 +239,15 @@ func TestGetObject_SPFallback(t *testing.T) {
 	}
 
 	// Configure mock storage client to return data.
-	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) ([]byte, error) {
-		return []byte("hello"), nil
+	if _, err := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ?`, "https://provider.example/pieces/1", obj.ID); err != nil {
+		t.Fatalf("setting retrieval_url: %v", err)
+	}
+
+	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
+		if opts == nil || opts.URL != "https://provider.example/pieces/1" {
+			return nil, fmt.Errorf("expected retrieval URL opts, got %#v", opts)
+		}
+		return io.NopCloser(bytes.NewReader([]byte("hello"))), nil
 	}
 
 	out, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
@@ -249,6 +262,88 @@ func TestGetObject_SPFallback(t *testing.T) {
 	data, _ := io.ReadAll(out.Body)
 	if string(data) != "hello" {
 		t.Errorf("body = %q, want %q", string(data), "hello")
+	}
+}
+
+func TestGetObject_SPFallback_GenerationMismatchDoesNotServeStaleData(t *testing.T) {
+	var latestReady bool
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			if !latestReady {
+				return nil, nil, os.ErrNotExist
+			}
+			data := []byte("new")
+			return io.NopCloser(bytes.NewReader(data)), &cache.ObjectInfo{
+				Path: "/fake/new", Size: int64(len(data)), ETag: "new", Checksum: "new",
+			}, nil
+		},
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+			data, _ := io.ReadAll(r)
+			return &cache.ObjectInfo{Path: "/fake/path", Size: int64(len(data)), ETag: "fakemd5", Checksum: "fakesha256"}, nil
+		},
+		DeleteFunc:          func(_ context.Context, _, _ string) error { return nil },
+		ExistsFunc:          func(_ context.Context, _, _ string) bool { return latestReady },
+		CreateBucketDirFunc: func(_ context.Context, _ string) error { return nil },
+		DeleteUploadFunc:    func(_ context.Context, _ string) error { return nil },
+	}
+	tb := newTestBackendWithMockCache(t, mc)
+	ctx := context.Background()
+	bkt := seedActiveBucket(t, tb, "sp-race-bucket")
+
+	pieceCIDStr := buildDummyCID(t)
+	obj := &model.Object{
+		BucketID:    bkt.ID,
+		Key:         "remote-file.txt",
+		Size:        3,
+		ETag:        "abc123",
+		Checksum:    "sha256hex",
+		ContentType: "text/plain",
+		CachePath:   "/fake/path",
+		State:       model.ObjectStateCached,
+		PieceCID:    &pieceCIDStr,
+	}
+	objID, _, err := tb.repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if err != nil {
+		t.Fatalf("seeding object: %v", err)
+	}
+	if _, err := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ?`, "https://provider.example/pieces/old", objID); err != nil {
+		t.Fatalf("setting retrieval_url: %v", err)
+	}
+
+	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
+		latestReady = true
+		replacement := &model.Object{
+			BucketID:    bkt.ID,
+			Key:         "remote-file.txt",
+			Size:        3,
+			ETag:        "new",
+			Checksum:    "new",
+			ContentType: "text/plain",
+			CachePath:   "/fake/new",
+			State:       model.ObjectStateCached,
+		}
+		newID, newGen, upsertErr := tb.repos.Objects.UpsertAndBumpGeneration(ctx, replacement)
+		if upsertErr != nil {
+			t.Fatalf("bumping generation: %v", upsertErr)
+		}
+		if _, execErr := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ? AND generation = ?`, "https://provider.example/pieces/new", newID, newGen); execErr != nil {
+			t.Fatalf("updating new retrieval_url: %v", execErr)
+		}
+		return io.NopCloser(bytes.NewReader([]byte("old"))), nil
+	}
+
+	out, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("sp-race-bucket"),
+		Key:    aws.String("remote-file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	defer func() { _ = out.Body.Close() }()
+
+	data, _ := io.ReadAll(out.Body)
+	if string(data) != "new" {
+		t.Fatalf("body = %q, want latest content", string(data))
 	}
 }
 
@@ -276,8 +371,11 @@ func TestGetObject_SPFallback_DownloadFailure(t *testing.T) {
 	if _, _, err := tb.repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
 		t.Fatalf("seeding object: %v", err)
 	}
+	if _, err := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE bucket_id = ? AND key = ?`, "https://provider.example/pieces/fail", bkt.ID, "fail-dl.txt"); err != nil {
+		t.Fatalf("setting retrieval_url: %v", err)
+	}
 
-	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) ([]byte, error) {
+	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
 		return nil, errors.New("provider unreachable")
 	}
 
@@ -310,7 +408,7 @@ func TestGetObject_NilStorage(t *testing.T) {
 		CreateBucketDirFunc: func(_ context.Context, _ string) error { return nil },
 	}
 	// Use newTestBackendWithSDK with nil StorageClient.
-	tb := newTestBackendWithSDK(t, nil, nil)
+	tb := newTestBackendWithSDK(t, nil)
 	// But we need the mock cache. Rebuild the backend with mock cache and nil storage.
 	_ = tb
 	tb2 := newTestBackendWithMockCache(t, mc)
@@ -388,77 +486,6 @@ func TestHeadObject_NotFound(t *testing.T) {
 	want := s3err.GetAPIError(s3err.ErrNoSuchKey)
 	if apiErr.Code != want.Code {
 		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
-	}
-}
-
-// ---------- DeleteObject ----------
-
-func TestDeleteObject_HappyPath(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "del-obj-bucket")
-	putTestObject(t, tb, "del-obj-bucket", "doomed.txt", "bye")
-
-	_, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String("del-obj-bucket"),
-		Key:    aws.String("doomed.txt"),
-	})
-	if err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
-
-	// Object should be soft-deleted (not visible via normal query).
-	bkt, _ := tb.repos.Buckets.GetByName(ctx, "del-obj-bucket")
-	obj, _ := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "doomed.txt")
-	if obj != nil {
-		t.Error("object should be invisible after soft delete")
-	}
-
-	// Cache file should be cleaned up.
-	if tb.cache.Exists(ctx, "del-obj-bucket", "doomed.txt") {
-		t.Error("cache file still exists after delete")
-	}
-}
-
-func TestDeleteObject_Idempotent(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "idempotent-bucket")
-
-	// Delete a non-existent key — should succeed (S3 semantics).
-	_, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String("idempotent-bucket"),
-		Key:    aws.String("nonexistent"),
-	})
-	if err != nil {
-		t.Fatalf("DeleteObject of non-existent key should succeed: %v", err)
-	}
-}
-
-func TestDeleteObjects_Mixed(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "batch-del-bucket")
-	putTestObject(t, tb, "batch-del-bucket", "exists.txt", "data")
-
-	key1, key2 := "exists.txt", "ghost.txt"
-	result, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String("batch-del-bucket"),
-		Delete: &types.Delete{
-			Objects: []types.ObjectIdentifier{
-				{Key: &key1},
-				{Key: &key2},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("DeleteObjects: %v", err)
-	}
-	if len(result.Deleted) != 2 {
-		t.Errorf("deleted count = %d, want 2 (both succeed per S3 semantics)", len(result.Deleted))
-	}
-	if len(result.Error) != 0 {
-		t.Errorf("error count = %d, want 0", len(result.Error))
 	}
 }
 

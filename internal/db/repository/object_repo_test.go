@@ -252,7 +252,7 @@ func TestObjectRepo_UpdateState(t *testing.T) {
 	}
 
 	// Invalid transition (wrong from state).
-	err = repos.Objects.UpdateState(ctx, id, 1, model.ObjectStateCached, model.ObjectStateUploaded)
+	err = repos.Objects.UpdateState(ctx, id, 1, model.ObjectStateCached, model.ObjectStateStored)
 	if err == nil {
 		t.Fatal("expected error for invalid state transition")
 	}
@@ -285,7 +285,7 @@ func TestObjectRepo_SetPieceCIDAndTransition(t *testing.T) {
 	}
 
 	// SetPieceCIDAndTransition uploading→uploaded
-	if err := repos.Objects.SetPieceCIDAndTransition(ctx, id, gen, "baga6ea4seaq123", model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
+	if err := repos.Objects.SetPieceCIDAndTransition(ctx, id, gen, "baga6ea4seaq123", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatalf("SetPieceCIDAndTransition: %v", err)
 	}
 
@@ -293,12 +293,12 @@ func TestObjectRepo_SetPieceCIDAndTransition(t *testing.T) {
 	if got.PieceCID == nil || *got.PieceCID != "baga6ea4seaq123" {
 		t.Errorf("PieceCID = %v, want %q", got.PieceCID, "baga6ea4seaq123")
 	}
-	if got.State != model.ObjectStateUploaded {
-		t.Errorf("State = %s, want uploaded", got.State)
+	if got.State != model.ObjectStateStored {
+		t.Errorf("State = %s, want stored", got.State)
 	}
 
 	// Stale generation should fail
-	err = repos.Objects.SetPieceCIDAndTransition(ctx, id, gen-1, "stale", model.ObjectStateUploaded, model.ObjectStateOnChaining)
+	err = repos.Objects.SetPieceCIDAndTransition(ctx, id, gen-1, "stale", model.ObjectStateStored, model.ObjectStateCacheEvicted)
 	if err == nil {
 		t.Fatal("expected error for stale generation")
 	}
@@ -413,7 +413,7 @@ func TestObjectRepo_UpdateState_StaleGeneration(t *testing.T) {
 	}
 
 	// Stale generation should fail
-	err = repos.Objects.UpdateState(ctx, id, gen-1, model.ObjectStateUploading, model.ObjectStateUploaded)
+	err = repos.Objects.UpdateState(ctx, id, gen-1, model.ObjectStateUploading, model.ObjectStateStored)
 	if err == nil {
 		t.Fatal("expected error for stale generation")
 	}

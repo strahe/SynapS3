@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/db/repository"
 )
 
@@ -167,37 +166,8 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPIDeleteBucket(w http.ResponseWriter, r *http.Request) {
-	bucketName := r.PathValue("name")
-	if !bucketNameRe.MatchString(bucketName) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
-		return
-	}
-	bucket, err := s.bucketLifecycle.Delete(r.Context(), bucketName, bucketlifecycle.DeleteOptions{
-		Recursive: r.URL.Query().Get("recursive") == "true",
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, bucketlifecycle.ErrBucketNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
-		case errors.Is(err, bucketlifecycle.ErrBucketDeleteBlocked):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket has in-flight work (lifecycle tasks, object processing, or multipart uploads)"})
-		case errors.Is(err, bucketlifecycle.ErrBucketTooLarge):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket has too many objects for recursive delete; empty it in batches first"})
-		case errors.Is(err, bucketlifecycle.ErrBucketNotDeletable):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket is not deletable in its current state"})
-		case errors.Is(err, bucketlifecycle.ErrBucketNotEmpty):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket not empty"})
-		default:
-			s.logger.Error("api: failed to delete bucket", "error", err, "name", bucketName)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		}
-		return
-	}
-
-	writeJSON(w, http.StatusOK, bucketMutationResponse{
-		ID:     bucket.ID,
-		Name:   bucket.Name,
-		Status: string(bucket.Status),
+	writeJSON(w, http.StatusNotImplemented, map[string]string{
+		"error": "bucket deletion is not currently supported",
 	})
 }
 

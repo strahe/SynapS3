@@ -142,7 +142,7 @@ func TestValidate_WorkerConcurrency_Zero(t *testing.T) {
 
 func TestValidate_WorkerPollInterval_Zero(t *testing.T) {
 	cfg := validConfig()
-	cfg.Worker.OnChain.PollInterval = 0
+	cfg.Worker.Evictor.PollInterval = 0
 
 	err := cfg.Validate()
 	if err == nil {
@@ -296,19 +296,6 @@ func TestValidate_DatabaseDSN_Empty(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "database.dsn") {
 		t.Fatalf("expected database.dsn error, got: %v", err)
-	}
-}
-
-func TestValidate_MaxSPDownloadSize_Negative(t *testing.T) {
-	cfg := validConfig()
-	cfg.Cache.MaxSPDownloadSize = -1
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error for negative MaxSPDownloadSize")
-	}
-	if !strings.Contains(err.Error(), "max_sp_download_size") {
-		t.Fatalf("expected max_sp_download_size error, got: %v", err)
 	}
 }
 

@@ -59,7 +59,7 @@ func TestTransitionState_InvalidTransition(t *testing.T) {
 	u := &mockStateUpdater{}
 	ctx := context.Background()
 
-	err := TransitionState(ctx, m, u, 1, 1, model.ObjectStateCached, model.ObjectStateUploaded)
+	err := TransitionState(ctx, m, u, 1, 1, model.ObjectStateCached, model.ObjectStateStored)
 	if err == nil {
 		t.Fatal("TransitionState should have failed for invalid transition")
 	}
@@ -111,6 +111,26 @@ func TestTransitionToFailed_Valid(t *testing.T) {
 	}
 	if u.lastError != "upload timeout" {
 		t.Errorf("lastError = %q, want %q", u.lastError, "upload timeout")
+	}
+}
+
+func TestTransitionToFailed_FromStored(t *testing.T) {
+	m := NewObjectStateMachine()
+	u := &mockStateUpdater{}
+	ctx := context.Background()
+
+	err := TransitionToFailed(ctx, m, u, 99, 2, model.ObjectStateStored, "eviction retries exhausted")
+	if err != nil {
+		t.Fatalf("TransitionToFailed: %v", err)
+	}
+	if !u.updateFailedCalled {
+		t.Error("UpdateStateToFailed was not called")
+	}
+	if u.lastFrom != model.ObjectStateStored {
+		t.Errorf("lastFrom = %s, want stored", u.lastFrom)
+	}
+	if u.lastError != "eviction retries exhausted" {
+		t.Errorf("lastError = %q, want %q", u.lastError, "eviction retries exhausted")
 	}
 }
 

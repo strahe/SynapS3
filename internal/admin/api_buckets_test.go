@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -60,22 +59,8 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if bucket == nil {
 		t.Fatal("expected bucket to be created")
 	}
-	if bucket.Status != model.BucketStatusCreating {
-		t.Fatalf("bucket status = %s, want %s", bucket.Status, model.BucketStatusCreating)
-	}
-
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeCreateProofSet), "", 10, 0)
-	if err != nil {
-		t.Fatalf("Tasks.List: %v", err)
-	}
-	if total != 1 {
-		t.Fatalf("create_proof_set total = %d, want 1", total)
-	}
-	if len(tasks) != 1 {
-		t.Fatalf("returned tasks len = %d, want 1", len(tasks))
-	}
-	if tasks[0].RefType != "bucket" || tasks[0].RefID != bucket.ID {
-		t.Fatalf("task refs = %s/%d, want bucket/%d", tasks[0].RefType, tasks[0].RefID, bucket.ID)
+	if bucket.Status != model.BucketStatusActive {
+		t.Fatalf("bucket status = %s, want %s", bucket.Status, model.BucketStatusActive)
 	}
 }
 
@@ -152,15 +137,14 @@ func TestAPIBucketDetail(t *testing.T) {
 	}
 }
 
-func TestAPIBuckets_ListIncludesFailedBuckets(t *testing.T) {
+func TestAPIBuckets_ListAllBuckets(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
 	for _, bucket := range []*model.Bucket{
-		{Name: "active-bucket", Status: model.BucketStatusActive},
-		{Name: "create-failed-bucket", Status: model.BucketStatusCreateFailed},
-		{Name: "delete-failed-bucket", Status: model.BucketStatusDeleteFailed},
-		{Name: "deleted-bucket", Status: model.BucketStatusDeleted},
+		{Name: "alpha-bucket", Status: model.BucketStatusActive},
+		{Name: "beta-bucket", Status: model.BucketStatusActive},
+		{Name: "gamma-bucket", Status: model.BucketStatusActive},
 	} {
 		if err := repos.Buckets.Create(ctx, bucket); err != nil {
 			t.Fatalf("Buckets.Create(%s): %v", bucket.Name, err)
@@ -193,25 +177,18 @@ func TestAPIBuckets_ListIncludesFailedBuckets(t *testing.T) {
 		got[item.Name] = item.Status
 	}
 
-	if got["active-bucket"] != string(model.BucketStatusActive) {
-		t.Fatalf("active-bucket status = %q, want %q", got["active-bucket"], model.BucketStatusActive)
-	}
-	if got["create-failed-bucket"] != string(model.BucketStatusCreateFailed) {
-		t.Fatalf("create-failed-bucket status = %q, want %q", got["create-failed-bucket"], model.BucketStatusCreateFailed)
-	}
-	if got["delete-failed-bucket"] != string(model.BucketStatusDeleteFailed) {
-		t.Fatalf("delete-failed-bucket status = %q, want %q", got["delete-failed-bucket"], model.BucketStatusDeleteFailed)
-	}
-	if _, exists := got["deleted-bucket"]; exists {
-		t.Fatal("deleted bucket should be hidden from admin bucket list")
+	for _, name := range []string{"alpha-bucket", "beta-bucket", "gamma-bucket"} {
+		if got[name] != string(model.BucketStatusActive) {
+			t.Fatalf("%s status = %q, want %q", name, got[name], model.BucketStatusActive)
+		}
 	}
 }
 
-func TestAPIBucketDetail_AllowsFailedBucket(t *testing.T) {
+func TestAPIBucketDetail_ActiveBucket(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "failed-detail-bucket", Status: model.BucketStatusCreateFailed}
+	bucket := &model.Bucket{Name: "active-detail-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -219,7 +196,7 @@ func TestAPIBucketDetail_AllowsFailedBucket(t *testing.T) {
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/failed-detail-bucket")
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/active-detail-bucket")
 	if err != nil {
 		t.Fatalf("GET bucket detail: %v", err)
 	}
@@ -239,16 +216,16 @@ func TestAPIBucketDetail_AllowsFailedBucket(t *testing.T) {
 	if body.Name != bucket.Name {
 		t.Fatalf("name = %q, want %q", body.Name, bucket.Name)
 	}
-	if body.Status != string(model.BucketStatusCreateFailed) {
-		t.Fatalf("status = %q, want %q", body.Status, model.BucketStatusCreateFailed)
+	if body.Status != string(model.BucketStatusActive) {
+		t.Fatalf("status = %q, want %q", body.Status, model.BucketStatusActive)
 	}
 }
 
-func TestAPIBucketObjects_AllowsFailedBucket(t *testing.T) {
+func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "failed-objects-bucket", Status: model.BucketStatusDeleteFailed}
+	bucket := &model.Bucket{Name: "objects-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -260,7 +237,7 @@ func TestAPIBucketObjects_AllowsFailedBucket(t *testing.T) {
 		Checksum:    "checksum-kept",
 		ContentType: "text/plain",
 		CachePath:   "/cache/kept.txt",
-		State:       model.ObjectStateOnChained,
+		State:       model.ObjectStateStored,
 		MaxRetries:  5,
 	}); err != nil {
 		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
@@ -269,7 +246,7 @@ func TestAPIBucketObjects_AllowsFailedBucket(t *testing.T) {
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/failed-objects-bucket/objects")
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/objects-bucket/objects")
 	if err != nil {
 		t.Fatalf("GET bucket objects: %v", err)
 	}
@@ -291,7 +268,7 @@ func TestAPIBucketObjects_AllowsFailedBucket(t *testing.T) {
 	}
 }
 
-func TestAPIBucket_DeleteEmptyBucket(t *testing.T) {
+func TestAPIBucket_DeleteReturnsNotImplemented(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
@@ -306,459 +283,81 @@ func TestAPIBucket_DeleteEmptyBucket(t *testing.T) {
 
 	srv.handleAPIDeleteBucket(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusNotImplemented, rr.Body.String())
 	}
 
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body["error"] == "" {
+		t.Fatal("expected error message in response")
+	}
+
+	// Bucket should remain unchanged.
 	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
 	if err != nil {
 		t.Fatalf("GetByName: %v", err)
 	}
 	if updated == nil {
-		t.Fatal("expected bucket to remain visible in deleting state")
+		t.Fatal("expected bucket to still exist")
 	}
-	if updated.Status != model.BucketStatusDeleting {
-		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusDeleting)
-	}
-
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeDeleteProofSet), "", 10, 0)
-	if err != nil {
-		t.Fatalf("Tasks.List: %v", err)
-	}
-	if total != 1 {
-		t.Fatalf("delete_proof_set total = %d, want 1", total)
-	}
-	if len(tasks) != 1 {
-		t.Fatalf("returned tasks len = %d, want 1", len(tasks))
-	}
-	if tasks[0].RefType != "bucket" || tasks[0].RefID != bucket.ID {
-		t.Fatalf("task refs = %s/%d, want bucket/%d", tasks[0].RefType, tasks[0].RefID, bucket.ID)
+	if updated.Status != model.BucketStatusActive {
+		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusActive)
 	}
 }
 
-func TestAPIBucket_DeleteRecursiveSafeBucket(t *testing.T) {
+func TestAPIBucket_DeleteRecursiveReturnsNotImplemented(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "recursive-safe-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	cached, err := srv.cache.Put(ctx, bucket.Name, "safe.txt", strings.NewReader("hello"))
-	if err != nil {
-		t.Fatalf("cache.Put: %v", err)
-	}
-	pieceCID := "baga-piece"
-	for _, obj := range []*model.Object{
-		{
-			BucketID:    bucket.ID,
-			Key:         "safe.txt",
-			Size:        5,
-			ETag:        "etag-safe",
-			Checksum:    "checksum-safe",
-			ContentType: "text/plain",
-			CachePath:   cached.Path,
-			PieceCID:    &pieceCID,
-			State:       model.ObjectStateOnChained,
-			MaxRetries:  5,
-		},
-		{
-			BucketID:    bucket.ID,
-			Key:         "failed.txt",
-			Size:        3,
-			ETag:        "etag-failed",
-			Checksum:    "checksum-failed",
-			ContentType: "text/plain",
-			CachePath:   "/cache/failed.txt",
-			State:       model.ObjectStateFailed,
-			MaxRetries:  5,
-		},
-		{
-			BucketID:    bucket.ID,
-			Key:         "cached.txt",
-			Size:        4,
-			ETag:        "etag-cached",
-			Checksum:    "checksum-cached",
-			ContentType: "text/plain",
-			CachePath:   "/cache/cached.txt",
-			State:       model.ObjectStateCached,
-			MaxRetries:  5,
-		},
-	} {
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("Objects.UpsertAndBumpGeneration(%s): %v", obj.Key, err)
-		}
-	}
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/recursive-safe-bucket?recursive=true", nil)
-	req.SetPathValue("name", bucket.Name)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIDeleteBucket(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-
-	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated == nil {
-		t.Fatal("expected bucket to remain visible in deleting state")
-	}
-	if updated.Status != model.BucketStatusDeleting {
-		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusDeleting)
-	}
-
-	objects, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
-	if err != nil {
-		t.Fatalf("Objects.ListByBucket: %v", err)
-	}
-	if len(objects) != 0 {
-		t.Fatalf("visible objects len = %d, want 0", len(objects))
-	}
-	if srv.cache.Exists(ctx, bucket.Name, "safe.txt") {
-		t.Fatal("expected cached object to be removed during recursive delete")
-	}
-}
-
-func TestAPIBucket_DeleteRecursiveBlockedByInFlightObject(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "recursive-blocked-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "recursive-delete-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 
 	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
 		BucketID:    bucket.ID,
-		Key:         "uploading.txt",
-		Size:        9,
-		ETag:        "etag-uploading",
-		Checksum:    "checksum-uploading",
-		ContentType: "text/plain",
-		CachePath:   "/cache/uploading.txt",
-		State:       model.ObjectStateUploaded,
-		MaxRetries:  5,
-	}); err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/recursive-blocked-bucket?recursive=true", nil)
-	req.SetPathValue("name", bucket.Name)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIDeleteBucket(rr, req)
-
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
-	}
-
-	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated == nil {
-		t.Fatal("expected bucket to remain present")
-	}
-	if updated.Status != model.BucketStatusActive {
-		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusActive)
-	}
-
-	objects, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
-	if err != nil {
-		t.Fatalf("Objects.ListByBucket: %v", err)
-	}
-	if len(objects) != 1 {
-		t.Fatalf("visible objects len = %d, want 1", len(objects))
-	}
-
-	_, total, err := repos.Tasks.List(ctx, string(model.TaskTypeDeleteProofSet), "", 10, 0)
-	if err != nil {
-		t.Fatalf("Tasks.List: %v", err)
-	}
-	if total != 0 {
-		t.Fatalf("delete_proof_set total = %d, want 0", total)
-	}
-}
-
-func TestAPIBucket_DeleteRecursiveBlockedByInFlightTask(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "recursive-task-blocked-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	objectID, generation, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "stable.txt",
-		Size:        9,
-		ETag:        "etag-stable",
-		Checksum:    "checksum-stable",
-		ContentType: "text/plain",
-		CachePath:   "/cache/stable.txt",
-		State:       model.ObjectStateOnChained,
-		MaxRetries:  5,
-	})
-	if err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
-	}
-
-	if err := repos.Tasks.Create(ctx, &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		RefType:        "object",
-		RefID:          objectID,
-		RefGeneration:  generation,
-		IdempotencyKey: "evict-cache-blocker",
-		Status:         model.TaskStatusPending,
-		MaxRetries:     5,
-		ScheduledAt:    time.Now(),
-	}); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/recursive-task-blocked-bucket?recursive=true", nil)
-	req.SetPathValue("name", bucket.Name)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIDeleteBucket(rr, req)
-
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
-	}
-
-	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated == nil {
-		t.Fatal("expected bucket to remain present")
-	}
-	if updated.Status != model.BucketStatusActive {
-		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusActive)
-	}
-
-	objects, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
-	if err != nil {
-		t.Fatalf("Objects.ListByBucket: %v", err)
-	}
-	if len(objects) != 1 {
-		t.Fatalf("visible objects len = %d, want 1", len(objects))
-	}
-
-	_, total, err := repos.Tasks.List(ctx, string(model.TaskTypeDeleteProofSet), "", 10, 0)
-	if err != nil {
-		t.Fatalf("Tasks.List: %v", err)
-	}
-	if total != 0 {
-		t.Fatalf("delete_proof_set total = %d, want 0", total)
-	}
-}
-
-func TestAPIBucket_DeleteBlockedByBucketLifecycleTask(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "lifecycle-blocked-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	if err := repos.Tasks.Create(ctx, &model.Task{
-		Type:           model.TaskTypeCreateProofSet,
-		RefType:        "bucket",
-		RefID:          bucket.ID,
-		IdempotencyKey: "create-ps-blocker",
-		Status:         model.TaskStatusPending,
-		MaxRetries:     5,
-		ScheduledAt:    time.Now(),
-	}); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/lifecycle-blocked-bucket", nil)
-	req.SetPathValue("name", bucket.Name)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIDeleteBucket(rr, req)
-
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
-	}
-
-	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated.Status != model.BucketStatusActive {
-		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusActive)
-	}
-}
-
-func TestAPIBucket_DeleteCreatingBucketRejected(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"creating-delete-bucket"}`))
-	createReq.Header.Set("Content-Type", "application/json")
-	createRR := httptest.NewRecorder()
-	srv.handleAPICreateBucket(createRR, createReq)
-	if createRR.Code != http.StatusCreated {
-		t.Fatalf("create status = %d, want %d, body=%s", createRR.Code, http.StatusCreated, createRR.Body.String())
-	}
-
-	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/creating-delete-bucket", nil)
-	deleteReq.SetPathValue("name", "creating-delete-bucket")
-	deleteRR := httptest.NewRecorder()
-	srv.handleAPIDeleteBucket(deleteRR, deleteReq)
-
-	if deleteRR.Code != http.StatusConflict {
-		t.Fatalf("delete status = %d, want %d, body=%s", deleteRR.Code, http.StatusConflict, deleteRR.Body.String())
-	}
-
-	updated, err := repos.Buckets.GetByName(ctx, "creating-delete-bucket")
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated == nil {
-		t.Fatal("expected bucket to remain present")
-	}
-	if updated.Status != model.BucketStatusCreating {
-		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusCreating)
-	}
-
-	createTasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeCreateProofSet), "", 10, 0)
-	if err != nil {
-		t.Fatalf("Tasks.List(create_proof_set): %v", err)
-	}
-	if total != 1 || len(createTasks) != 1 {
-		t.Fatalf("create_proof_set tasks = total %d len %d, want 1/1", total, len(createTasks))
-	}
-
-	_, deleteTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeDeleteProofSet), "", 10, 0)
-	if err != nil {
-		t.Fatalf("Tasks.List(delete_proof_set): %v", err)
-	}
-	if deleteTotal != 0 {
-		t.Fatalf("delete_proof_set total = %d, want 0", deleteTotal)
-	}
-}
-
-func TestAPIBucket_DeleteRecursiveBlockedBySoftDeletedObjectTask(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "soft-deleted-task-blocked-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	objectID, generation, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "ghost.txt",
+		Key:         "file.txt",
 		Size:        5,
-		ETag:        "etag-ghost",
-		Checksum:    "checksum-ghost",
+		ETag:        "etag-file",
+		Checksum:    "checksum-file",
 		ContentType: "text/plain",
-		CachePath:   "/cache/ghost.txt",
-		State:       model.ObjectStateCached,
+		CachePath:   "/cache/file.txt",
+		State:       model.ObjectStateStored,
 		MaxRetries:  5,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
 	}
-	if err := repos.Tasks.Create(ctx, &model.Task{
-		Type:           model.TaskTypeUploadToSP,
-		RefType:        "object",
-		RefID:          objectID,
-		RefGeneration:  generation,
-		IdempotencyKey: "soft-deleted-object-blocker",
-		Status:         model.TaskStatusPending,
-		MaxRetries:     5,
-		ScheduledAt:    time.Now(),
-	}); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-	if err := repos.Objects.SoftDelete(ctx, objectID); err != nil {
-		t.Fatalf("Objects.SoftDelete: %v", err)
-	}
 
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/soft-deleted-task-blocked-bucket?recursive=true", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/recursive-delete-bucket?recursive=true", nil)
 	req.SetPathValue("name", bucket.Name)
 	rr := httptest.NewRecorder()
+
 	srv.handleAPIDeleteBucket(rr, req)
 
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusNotImplemented, rr.Body.String())
 	}
 
+	// Bucket and objects should remain unchanged.
 	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
 	if err != nil {
 		t.Fatalf("GetByName: %v", err)
 	}
 	if updated == nil {
-		t.Fatal("expected bucket to remain present")
+		t.Fatal("expected bucket to still exist")
 	}
 	if updated.Status != model.BucketStatusActive {
 		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusActive)
 	}
 
-	_, deleteTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeDeleteProofSet), "", 10, 0)
+	objects, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
 	if err != nil {
-		t.Fatalf("Tasks.List(delete_proof_set): %v", err)
+		t.Fatalf("Objects.ListByBucket: %v", err)
 	}
-	if deleteTotal != 0 {
-		t.Fatalf("delete_proof_set total = %d, want 0", deleteTotal)
-	}
-}
-
-func TestAPIBucket_DeleteBlockedByActiveMultipartUpload(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "multipart-blocked-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	if err := repos.Multiparts.Create(ctx, &model.MultipartUpload{
-		BucketID: bucket.ID,
-		Key:      "large.bin",
-		UploadID: "multipart-blocker",
-		Status:   model.MultipartStatusInitiated,
-	}); err != nil {
-		t.Fatalf("Multiparts.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/multipart-blocked-bucket", nil)
-	req.SetPathValue("name", bucket.Name)
-	rr := httptest.NewRecorder()
-	srv.handleAPIDeleteBucket(rr, req)
-
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
-	}
-
-	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated == nil {
-		t.Fatal("expected bucket to remain present")
-	}
-	if updated.Status != model.BucketStatusActive {
-		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusActive)
-	}
-
-	_, deleteTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeDeleteProofSet), "", 10, 0)
-	if err != nil {
-		t.Fatalf("Tasks.List(delete_proof_set): %v", err)
-	}
-	if deleteTotal != 0 {
-		t.Fatalf("delete_proof_set total = %d, want 0", deleteTotal)
+	if len(objects) != 1 {
+		t.Fatalf("visible objects len = %d, want 1", len(objects))
 	}
 }

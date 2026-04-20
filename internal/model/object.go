@@ -16,9 +16,7 @@ type ObjectState string
 const (
 	ObjectStateCached       ObjectState = "cached"
 	ObjectStateUploading    ObjectState = "uploading"
-	ObjectStateUploaded     ObjectState = "uploaded"
-	ObjectStateOnChaining   ObjectState = "onchaining"
-	ObjectStateOnChained    ObjectState = "onchained"
+	ObjectStateStored       ObjectState = "stored"
 	ObjectStateFailed       ObjectState = "failed"
 	ObjectStateCacheEvicted ObjectState = "cache_evicted"
 )
@@ -38,6 +36,7 @@ type Object struct {
 	Metadata      map[string]string `bun:"type:jsonb"`
 	CachePath     string            `bun:",notnull"`
 	PieceCID      *string           `bun:",nullzero"`
+	RetrievalURL  *string           `bun:",nullzero"`
 	State         ObjectState       `bun:",notnull,default:'cached'"`
 	FailedAtState *ObjectState      `bun:",nullzero"`
 	RetryCount    int               `bun:",notnull,default:0"`

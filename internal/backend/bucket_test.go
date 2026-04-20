@@ -30,8 +30,8 @@ func TestCreateBucket_HappyPath(t *testing.T) {
 	if bucket == nil {
 		t.Fatal("bucket not found in DB")
 	}
-	if bucket.Status != model.BucketStatusCreating {
-		t.Errorf("bucket status = %q, want %q", bucket.Status, model.BucketStatusCreating)
+	if bucket.Status != model.BucketStatusActive {
+		t.Errorf("bucket status = %q, want %q", bucket.Status, model.BucketStatusActive)
 	}
 }
 
@@ -126,34 +126,7 @@ func TestHeadBucket_NotFound(t *testing.T) {
 	}
 }
 
-func TestHeadBucket_InvisibleStatus(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	// Seed a bucket with "deleted" status — invisible to S3 clients.
-	bkt := &model.Bucket{Name: "deleted-bucket", Status: model.BucketStatusDeleted}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	_, err := tb.backend.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String("deleted-bucket"),
-	})
-	if err == nil {
-		t.Fatal("expected error for invisible bucket")
-	}
-
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("expected APIError, got %T: %v", err, err)
-	}
-	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
-	if apiErr.Code != want.Code {
-		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
-	}
-}
-
-func TestDeleteBucket_HappyPath(t *testing.T) {
+func TestDeleteBucket_NotSupported(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
@@ -163,118 +136,8 @@ func TestDeleteBucket_HappyPath(t *testing.T) {
 	}
 
 	err := tb.backend.DeleteBucket(ctx, "del-bucket")
-	if err != nil {
-		t.Fatalf("DeleteBucket: %v", err)
-	}
-
-	// Verify status transitioned to deleting.
-	updated, err := tb.repos.Buckets.GetByName(ctx, "del-bucket")
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated == nil {
-		t.Fatal("bucket not found after deletion")
-	}
-	if updated.Status != model.BucketStatusDeleting {
-		t.Errorf("bucket status = %q, want %q", updated.Status, model.BucketStatusDeleting)
-	}
-}
-
-func TestDeleteBucket_NotActive(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	bkt := &model.Bucket{Name: "deleting-bucket", Status: model.BucketStatusDeleting}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	err := tb.backend.DeleteBucket(ctx, "deleting-bucket")
 	if err == nil {
-		t.Fatal("expected error deleting non-writable bucket")
-	}
-
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("expected APIError, got %T: %v", err, err)
-	}
-	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
-	if apiErr.Code != want.Code {
-		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
-	}
-}
-
-func TestDeleteBucket_CreatingBucketRejected(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	bkt := &model.Bucket{Name: "creating-bucket", Status: model.BucketStatusCreating}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	err := tb.backend.DeleteBucket(ctx, "creating-bucket")
-	if err == nil {
-		t.Fatal("expected error deleting creating bucket")
-	}
-
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("expected APIError, got %T: %v", err, err)
-	}
-	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
-	if apiErr.Code != want.Code {
-		t.Fatalf("error code = %q, want %q", apiErr.Code, want.Code)
-	}
-
-	updated, err := tb.repos.Buckets.GetByName(ctx, "creating-bucket")
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated == nil {
-		t.Fatal("bucket should remain present")
-	}
-	if updated.Status != model.BucketStatusCreating {
-		t.Errorf("bucket status = %q, want %q", updated.Status, model.BucketStatusCreating)
-	}
-}
-
-func TestDeleteBucket_NotEmpty(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	bkt := &model.Bucket{Name: "notempty-bucket", Status: model.BucketStatusActive}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	// Insert an object so the bucket is not empty.
-	obj := &model.Object{
-		BucketID:    bkt.ID,
-		Key:         "some-file.txt",
-		Size:        10,
-		ETag:        "abc123",
-		Checksum:    "sha256hex",
-		ContentType: "text/plain",
-		CachePath:   "/fake/path",
-		State:       model.ObjectStateCached,
-	}
-	if _, _, err := tb.repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-		t.Fatalf("seeding object: %v", err)
-	}
-
-	err := tb.backend.DeleteBucket(ctx, "notempty-bucket")
-	if err == nil {
-		t.Fatal("expected error deleting non-empty bucket")
-	}
-
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("expected APIError, got %T: %v", err, err)
-	}
-	want := s3err.GetAPIError(s3err.ErrBucketNotEmpty)
-	if apiErr.Code != want.Code {
-		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
+		t.Fatal("expected error from DeleteBucket (not supported)")
 	}
 }
 
@@ -295,21 +158,11 @@ func TestListBuckets_OnlyActive(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	// Seed buckets with various statuses.
-	for _, tc := range []struct {
-		name   string
-		status model.BucketStatus
-	}{
-		{"active-1", model.BucketStatusActive},
-		{"active-2", model.BucketStatusActive},
-		{"creating-1", model.BucketStatusCreating},
-		{"deleting-1", model.BucketStatusDeleting},
-		{"deleted-1", model.BucketStatusDeleted},
-		{"cfailed-1", model.BucketStatusCreateFailed},
-	} {
-		b := &model.Bucket{Name: tc.name, Status: tc.status}
+	// Seed active buckets.
+	for _, name := range []string{"active-1", "active-2", "active-3"} {
+		b := &model.Bucket{Name: name, Status: model.BucketStatusActive}
 		if err := tb.repos.Buckets.Create(ctx, b); err != nil {
-			t.Fatalf("seeding bucket %q: %v", tc.name, err)
+			t.Fatalf("seeding bucket %q: %v", name, err)
 		}
 	}
 
@@ -318,21 +171,14 @@ func TestListBuckets_OnlyActive(t *testing.T) {
 		t.Fatalf("ListBuckets: %v", err)
 	}
 
-	// ListActive returns active + creating + deleting (visible statuses).
-	// deleted and create_failed should be excluded.
 	names := make(map[string]bool)
 	for _, entry := range result.Buckets.Bucket {
 		names[entry.Name] = true
 	}
 
-	for _, want := range []string{"active-1", "active-2", "creating-1", "deleting-1"} {
+	for _, want := range []string{"active-1", "active-2", "active-3"} {
 		if !names[want] {
 			t.Errorf("expected bucket %q in list", want)
-		}
-	}
-	for _, notWant := range []string{"deleted-1", "cfailed-1"} {
-		if names[notWant] {
-			t.Errorf("bucket %q should not appear in list", notWant)
 		}
 	}
 }

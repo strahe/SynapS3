@@ -58,6 +58,7 @@ func (r *BunObjectRepo) UpsertAndBumpGeneration(ctx context.Context, obj *model.
 		Set("metadata = ?", obj.Metadata).
 		Set("cache_path = ?", obj.CachePath).
 		Set("piece_cid = NULL").
+		Set("retrieval_url = NULL").
 		Set("state = ?", model.ObjectStateCached).
 		Set("retry_count = 0").
 		Set("max_retries = ?", obj.MaxRetries).
@@ -197,6 +198,25 @@ func (r *BunObjectRepo) SetPieceCIDAndTransition(ctx context.Context, id int64, 
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("SetPieceCIDAndTransition %s→%s failed: object %d gen %d not in expected state", from, to, id, generation)
+	}
+	return nil
+}
+
+func (r *BunObjectRepo) SetStorageInfoAndTransition(ctx context.Context, id int64, generation int64, pieceCID string, retrievalURL string, from, to model.ObjectState) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("piece_cid = ?", pieceCID).
+		Set("retrieval_url = ?", retrievalURL).
+		Set("state = ?", to).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND generation = ? AND state = ?", id, generation, from).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("setting storage info and transitioning state: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("SetStorageInfoAndTransition %s→%s failed: object %d gen %d not in expected state", from, to, id, generation)
 	}
 	return nil
 }

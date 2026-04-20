@@ -270,7 +270,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		newGen = gen
 
 		task := &model.Task{
-			Type:           model.TaskTypeUploadToSP,
+			Type:           model.TaskTypeUpload,
 			RefType:        "object",
 			RefID:          id,
 			RefGeneration:  gen,

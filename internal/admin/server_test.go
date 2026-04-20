@@ -296,7 +296,7 @@ func TestRefreshMetrics(t *testing.T) {
 
 	// Seed a pending task.
 	task := &model.Task{
-		Type:           model.TaskTypeUploadToSP,
+		Type:           model.TaskTypeUpload,
 		RefType:        "object",
 		RefID:          1,
 		RefGeneration:  1,

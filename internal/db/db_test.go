@@ -39,7 +39,7 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	for i := 0; i < 100; i++ {
 		task := &model.Task{
-			Type:           model.TaskTypeUploadToSP,
+			Type:           model.TaskTypeUpload,
 			RefType:        "object",
 			RefID:          int64(i + 1),
 			RefGeneration:  1,
@@ -61,7 +61,7 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, time.Minute)
+				task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
 				if err != nil {
 					if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
 						busyCount.Add(1)

@@ -28,13 +28,12 @@ type walletResponse struct {
 }
 
 type tokenAccountDTO struct {
-	Funds             *string `json:"funds"`
-	AvailableFunds    *string `json:"available_funds"`
-	LockupCurrent     *string `json:"lockup_current"`
-	LockupRate        *string `json:"lockup_rate"`
-	LockupLastSettled *string `json:"lockup_last_settled"`
-	FundedUntilEpoch  *string `json:"funded_until_epoch"`
-	CurrentLockupRate *string `json:"current_lockup_rate"`
+	Funds               *string `json:"funds"`
+	AvailableFunds      *string `json:"available_funds"`
+	LockupCurrent       *string `json:"lockup_current"`
+	LockupRate          *string `json:"lockup_rate"`
+	LockupLastSettledAt *string `json:"lockup_last_settled_at"`
+	FundedUntilEpoch    *string `json:"funded_until_epoch"`
 }
 
 type walletBusinessDTO struct {
@@ -96,19 +95,16 @@ func (s *Server) handleAPIWallet(w http.ResponseWriter, r *http.Request) {
 			resp.PartialErrors = make(map[string]string)
 		}
 		resp.PartialErrors["task_counts"] = "database query failed"
-	} else {
-		for _, tc := range taskCounts {
-			switch model.TaskType(tc.Type) {
-			case model.TaskTypeCreateProofSet, model.TaskTypeAddRoots, model.TaskTypeDeleteProofSet:
-			default:
-				continue
-			}
-			switch tc.Status {
-			case "pending", "running":
-				biz.OnchainTasksPending += int(tc.Count)
-			case "completed":
-				biz.OnchainTasksCompleted += int(tc.Count)
-			}
+	}
+	for _, tc := range taskCounts {
+		if model.TaskType(tc.Type) != model.TaskTypeUpload {
+			continue
+		}
+		switch tc.Status {
+		case string(model.TaskStatusPending), string(model.TaskStatusRunning):
+			biz.OnchainTasksPending += int(tc.Count)
+		case string(model.TaskStatusCompleted):
+			biz.OnchainTasksCompleted += int(tc.Count)
 		}
 	}
 	resp.Business = biz
@@ -131,12 +127,11 @@ func convertTokenAccountDTO(acct *synapse.TokenAccountInfo) *tokenAccountDTO {
 		return nil
 	}
 	return &tokenAccountDTO{
-		Funds:             bigIntToString(acct.Funds),
-		AvailableFunds:    bigIntToString(acct.AvailableFunds),
-		LockupCurrent:     bigIntToString(acct.LockupCurrent),
-		LockupRate:        bigIntToString(acct.LockupRate),
-		LockupLastSettled: bigIntToString(acct.LockupLastSettled),
-		FundedUntilEpoch:  bigIntToString(acct.FundedUntilEpoch),
-		CurrentLockupRate: bigIntToString(acct.CurrentLockupRate),
+		Funds:               bigIntToString(acct.Funds),
+		AvailableFunds:      bigIntToString(acct.AvailableFunds),
+		LockupCurrent:       bigIntToString(acct.LockupCurrent),
+		LockupRate:          bigIntToString(acct.LockupRate),
+		LockupLastSettledAt: bigIntToString(acct.LockupLastSettledAt),
+		FundedUntilEpoch:    bigIntToString(acct.FundedUntilEpoch),
 	}
 }

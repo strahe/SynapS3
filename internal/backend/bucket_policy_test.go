@@ -54,27 +54,6 @@ func TestGetBucketAcl_NonExistentBucket(t *testing.T) {
 	}
 }
 
-func TestGetBucketAcl_DeletingBucket(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	bkt := &model.Bucket{Name: "deleting-acl", Status: model.BucketStatusDeleting}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	// Deleting bucket is visible, so GetBucketAcl should succeed.
-	data, err := tb.backend.GetBucketAcl(ctx, &s3.GetBucketAclInput{
-		Bucket: aws.String("deleting-acl"),
-	})
-	if err != nil {
-		t.Fatalf("GetBucketAcl on deleting bucket: %v", err)
-	}
-	if data != nil {
-		t.Errorf("expected nil ACL data, got %v", data)
-	}
-}
-
 // --- PutBucketAcl ---
 
 func TestPutBucketAcl_WritableBucket(t *testing.T) {
@@ -88,30 +67,6 @@ func TestPutBucketAcl_WritableBucket(t *testing.T) {
 
 	if err := tb.backend.PutBucketAcl(ctx, "put-acl-bucket", nil); err != nil {
 		t.Fatalf("PutBucketAcl: %v", err)
-	}
-}
-
-func TestPutBucketAcl_DeletingBucket(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	bkt := &model.Bucket{Name: "put-acl-deleting", Status: model.BucketStatusDeleting}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	err := tb.backend.PutBucketAcl(ctx, "put-acl-deleting", nil)
-	if err == nil {
-		t.Fatal("expected error writing ACL on non-writable bucket")
-	}
-
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("expected APIError, got %T: %v", err, err)
-	}
-	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
-	if apiErr.Code != want.Code {
-		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
 	}
 }
 
@@ -261,27 +216,6 @@ func TestGetObjectAcl_VisibleBucket(t *testing.T) {
 	}
 }
 
-func TestGetObjectAcl_DeletingBucket(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	bkt := &model.Bucket{Name: "obj-acl-deleting", Status: model.BucketStatusDeleting}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	// Deleting bucket is visible; read-only GetObjectAcl should succeed.
-	out, err := tb.backend.GetObjectAcl(ctx, &s3.GetObjectAclInput{
-		Bucket: aws.String("obj-acl-deleting"),
-	})
-	if err != nil {
-		t.Fatalf("GetObjectAcl on deleting bucket: %v", err)
-	}
-	if out == nil {
-		t.Fatal("expected non-nil output")
-	}
-}
-
 // --- PutObjectAcl ---
 
 func TestPutObjectAcl_WritableBucket(t *testing.T) {
@@ -298,31 +232,5 @@ func TestPutObjectAcl_WritableBucket(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("PutObjectAcl: %v", err)
-	}
-}
-
-func TestPutObjectAcl_DeletingBucket(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-
-	bkt := &model.Bucket{Name: "put-obj-acl-del", Status: model.BucketStatusDeleting}
-	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
-		t.Fatalf("seeding bucket: %v", err)
-	}
-
-	err := tb.backend.PutObjectAcl(ctx, &s3.PutObjectAclInput{
-		Bucket: aws.String("put-obj-acl-del"),
-	})
-	if err == nil {
-		t.Fatal("expected error writing object ACL on non-writable bucket")
-	}
-
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("expected APIError, got %T: %v", err, err)
-	}
-	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
-	if apiErr.Code != want.Code {
-		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
 	}
 }

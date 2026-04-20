@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -42,20 +41,6 @@ func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInp
 	}
 
 	return &s3.HeadBucketOutput{}, nil
-}
-
-func (b *SynapseBackend) DeleteBucket(ctx context.Context, bucket string) error {
-	_, err := b.bucketLifecycle.Delete(ctx, bucket, bucketlifecycle.DeleteOptions{})
-	if err != nil {
-		switch {
-		case errors.Is(err, bucketlifecycle.ErrBucketNotFound), errors.Is(err, bucketlifecycle.ErrBucketNotDeletable):
-			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		case errors.Is(err, bucketlifecycle.ErrBucketNotEmpty), errors.Is(err, bucketlifecycle.ErrBucketDeleteBlocked):
-			return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
-		}
-		return err
-	}
-	return nil
 }
 
 func (b *SynapseBackend) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {

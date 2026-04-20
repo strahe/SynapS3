@@ -62,11 +62,7 @@ func (r *BunBucketRepo) ListActive(ctx context.Context) ([]model.Bucket, error) 
 	var buckets []model.Bucket
 	err := r.db.NewSelect().
 		Model(&buckets).
-		Where("status IN (?)", bun.List([]model.BucketStatus{
-			model.BucketStatusActive,
-			model.BucketStatusCreating,
-			model.BucketStatusDeleting,
-		})).
+		Where("status = ?", model.BucketStatusActive).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing active buckets: %w", err)
@@ -75,13 +71,12 @@ func (r *BunBucketRepo) ListActive(ctx context.Context) ([]model.Bucket, error) 
 }
 
 func (r *BunBucketRepo) SoftDelete(ctx context.Context, id int64) error {
-	_, err := r.db.NewUpdate().
+	_, err := r.db.NewDelete().
 		Model((*model.Bucket)(nil)).
-		Set("status = ?", model.BucketStatusDeleted).
 		Where("id = ?", id).
 		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("soft-deleting bucket: %w", err)
+		return fmt.Errorf("deleting bucket: %w", err)
 	}
 	return nil
 }
@@ -160,7 +155,6 @@ func (r *BunBucketRepo) CountWithProofSet(ctx context.Context) (int, error) {
 	count, err := r.db.NewSelect().
 		Model((*model.Bucket)(nil)).
 		Where("proof_set_id IS NOT NULL").
-		Where("status != ?", model.BucketStatusDeleted).
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("counting buckets with proof set: %w", err)

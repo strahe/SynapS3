@@ -4,69 +4,38 @@ import (
 	"context"
 	"errors"
 	"io"
-	"math/big"
 
-	"github.com/data-preservation-programs/go-synapse/pdp"
-	"github.com/data-preservation-programs/go-synapse/storage"
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synapse-go/storage"
 )
 
 // Compile-time interface checks.
 var (
-	_ synapse.StorageClient  = (*MockStorageClient)(nil)
-	_ synapse.ProofSetClient = (*MockProofSetClient)(nil)
-	_ synapse.WalletQuerier  = (*MockWalletQuerier)(nil)
-	_ cache.Cache            = (*MockCache)(nil)
+	_ synapse.StorageClient = (*MockStorageClient)(nil)
+	_ synapse.WalletQuerier = (*MockWalletQuerier)(nil)
+	_ cache.Cache           = (*MockCache)(nil)
 )
 
 // MockStorageClient is a configurable test double for synapse.StorageClient.
 type MockStorageClient struct {
-	UploadFunc   func(ctx context.Context, data io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
-	DownloadFunc func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) ([]byte, error)
+	UploadFunc   func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
+	DownloadFunc func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
 }
 
-func (m *MockStorageClient) Upload(ctx context.Context, data io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
+func (m *MockStorageClient) Upload(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
 	if m.UploadFunc != nil {
-		return m.UploadFunc(ctx, data, opts)
+		return m.UploadFunc(ctx, r, opts)
 	}
 	return nil, errors.New("MockStorageClient.Upload not configured")
 }
 
-func (m *MockStorageClient) Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) ([]byte, error) {
+func (m *MockStorageClient) Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
 	if m.DownloadFunc != nil {
 		return m.DownloadFunc(ctx, pieceCID, opts)
 	}
 	return nil, errors.New("MockStorageClient.Download not configured")
-}
-
-// MockProofSetClient is a configurable test double for synapse.ProofSetClient.
-type MockProofSetClient struct {
-	CreateProofSetFunc func(ctx context.Context, opts pdp.CreateProofSetOptions) (*pdp.ProofSetResult, error)
-	AddRootsFunc       func(ctx context.Context, proofSetID *big.Int, roots []pdp.Root) (*pdp.AddRootsResult, error)
-	DeleteProofSetFunc func(ctx context.Context, proofSetID *big.Int, extraData []byte) error
-}
-
-func (m *MockProofSetClient) CreateProofSet(ctx context.Context, opts pdp.CreateProofSetOptions) (*pdp.ProofSetResult, error) {
-	if m.CreateProofSetFunc != nil {
-		return m.CreateProofSetFunc(ctx, opts)
-	}
-	return nil, errors.New("MockProofSetClient.CreateProofSet not configured")
-}
-
-func (m *MockProofSetClient) AddRoots(ctx context.Context, proofSetID *big.Int, roots []pdp.Root) (*pdp.AddRootsResult, error) {
-	if m.AddRootsFunc != nil {
-		return m.AddRootsFunc(ctx, proofSetID, roots)
-	}
-	return nil, errors.New("MockProofSetClient.AddRoots not configured")
-}
-
-func (m *MockProofSetClient) DeleteProofSet(ctx context.Context, proofSetID *big.Int, extraData []byte) error {
-	if m.DeleteProofSetFunc != nil {
-		return m.DeleteProofSetFunc(ctx, proofSetID, extraData)
-	}
-	return errors.New("MockProofSetClient.DeleteProofSet not configured")
 }
 
 // MockWalletQuerier is a configurable test double for synapse.WalletQuerier.

@@ -21,7 +21,7 @@ filecoin:
   network: "calibration"       # calibration | mainnet
   rpc_url: "https://api.calibration.node.glif.io/rpc/v1"
   private_key: "0xREPLACE_WITH_YOUR_FILECOIN_PRIVATE_KEY"
-  provider_url: "https://your-storage-provider.example.com"
+  source: "synaps3"
 
 database:
   driver: "sqlite"             # postgres | sqlite
@@ -34,20 +34,11 @@ cache:
   dir: "./cache"
   max_size_gb: 100
   eviction_policy: "lru"       # lru | manual | none
-  evict_after_onchain: true
 
 worker:
   upload:
     concurrency: 4
     poll_interval: "5s"
-    max_retries: 5
-  onchain:
-    concurrency: 2
-    poll_interval: "30s"
-    max_retries: 10
-  proofset:
-    concurrency: 1
-    poll_interval: "30s"
     max_retries: 5
   evictor:
     concurrency: 2

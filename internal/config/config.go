@@ -13,11 +13,6 @@ import (
 	"github.com/knadh/koanf/v2"
 )
 
-const (
-	// defaultMaxSPDownloadSize is the maximum object size (1 GiB) for SP download on cache miss.
-	defaultMaxSPDownloadSize int64 = 1 << 30
-)
-
 type Config struct {
 	Server   ServerConfig   `koanf:"server"`
 	S3       S3Config       `koanf:"s3"`
@@ -49,10 +44,10 @@ type S3Config struct {
 }
 
 type FilecoinConfig struct {
-	Network     string `koanf:"network"` // calibration | mainnet
-	RPCURL      string `koanf:"rpc_url"`
-	PrivateKey  string `koanf:"private_key"`
-	ProviderURL string `koanf:"provider_url"`
+	Network    string `koanf:"network"` // calibration | mainnet
+	RPCURL     string `koanf:"rpc_url"`
+	PrivateKey string `koanf:"private_key"`
+	Source     string `koanf:"source"`
 }
 
 type DatabaseConfig struct {
@@ -63,18 +58,14 @@ type DatabaseConfig struct {
 }
 
 type CacheConfig struct {
-	Dir               string `koanf:"dir"`
-	MaxSizeGB         int    `koanf:"max_size_gb"`
-	EvictionPolicy    string `koanf:"eviction_policy"` // lru | manual | none
-	EvictAfterOnChain bool   `koanf:"evict_after_onchain"`
-	MaxSPDownloadSize int64  `koanf:"max_sp_download_size"` // max bytes for SP download, 0 = unlimited
+	Dir            string `koanf:"dir"`
+	MaxSizeGB      int    `koanf:"max_size_gb"`
+	EvictionPolicy string `koanf:"eviction_policy"` // lru | manual | none
 }
 
 type WorkerConfig struct {
-	Upload   WorkerPoolConfig `koanf:"upload"`
-	OnChain  WorkerPoolConfig `koanf:"onchain"`
-	ProofSet WorkerPoolConfig `koanf:"proofset"`
-	Evictor  WorkerPoolConfig `koanf:"evictor"`
+	Upload  WorkerPoolConfig `koanf:"upload"`
+	Evictor WorkerPoolConfig `koanf:"evictor"`
 }
 
 type WorkerPoolConfig struct {
@@ -105,6 +96,7 @@ func DefaultConfig() *Config {
 		Filecoin: FilecoinConfig{
 			Network: "calibration",
 			RPCURL:  "https://api.calibration.node.glif.io/rpc/v1",
+			Source:  "synaps3",
 		},
 		Database: DatabaseConfig{
 			Driver:       "sqlite",
@@ -113,26 +105,14 @@ func DefaultConfig() *Config {
 			MaxIdleConns: 5,
 		},
 		Cache: CacheConfig{
-			Dir:               "/var/lib/synaps3/cache",
-			MaxSizeGB:         100,
-			EvictionPolicy:    "lru",
-			EvictAfterOnChain: true,
-			MaxSPDownloadSize: defaultMaxSPDownloadSize,
+			Dir:            "/var/lib/synaps3/cache",
+			MaxSizeGB:      100,
+			EvictionPolicy: "lru",
 		},
 		Worker: WorkerConfig{
 			Upload: WorkerPoolConfig{
 				Concurrency:  4,
 				PollInterval: 5 * time.Second,
-				MaxRetries:   5,
-			},
-			OnChain: WorkerPoolConfig{
-				Concurrency:  2,
-				PollInterval: 30 * time.Second,
-				MaxRetries:   10,
-			},
-			ProofSet: WorkerPoolConfig{
-				Concurrency:  1,
-				PollInterval: 30 * time.Second,
 				MaxRetries:   5,
 			},
 			Evictor: WorkerPoolConfig{
@@ -216,9 +196,6 @@ func (c *Config) Validate() error {
 	if c.Cache.MaxSizeGB < 1 {
 		errs = append(errs, fmt.Errorf("cache.max_size_gb must be >= 1, got %d", c.Cache.MaxSizeGB))
 	}
-	if c.Cache.MaxSPDownloadSize < 0 {
-		errs = append(errs, fmt.Errorf("cache.max_sp_download_size must be >= 0, got %d", c.Cache.MaxSPDownloadSize))
-	}
 
 	// Eviction policy.
 	switch strings.ToLower(c.Cache.EvictionPolicy) {
@@ -271,8 +248,6 @@ func (c *Config) Validate() error {
 		}
 	}
 	validatePool("upload", c.Worker.Upload)
-	validatePool("onchain", c.Worker.OnChain)
-	validatePool("proofset", c.Worker.ProofSet)
 	validatePool("evictor", c.Worker.Evictor)
 
 	// Admin.

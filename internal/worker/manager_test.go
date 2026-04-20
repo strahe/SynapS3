@@ -36,7 +36,7 @@ func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 
 	// Create a task and claim it, then manually set its lease_until to the past
 	task := &model.Task{
-		Type:           model.TaskTypeUploadToSP,
+		Type:           model.TaskTypeUpload,
 		RefType:        "object",
 		RefID:          obj.ID,
 		RefGeneration:  1,
@@ -62,7 +62,7 @@ func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 	}
 
 	// Start manager with no workers — returns immediately after recovery
-	mgr := worker.NewManager(repos, false, slog.Default())
+	mgr := worker.NewManager(repos, slog.Default(), false)
 	mgr.Start(ctx)
 
 	// Task should be back to pending
@@ -112,7 +112,7 @@ func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
 	}
 
 	// Start manager — recovery should reset uploading → cached
-	mgr := worker.NewManager(repos, false, slog.Default())
+	mgr := worker.NewManager(repos, slog.Default(), false)
 	mgr.Start(ctx)
 
 	got, err := repos.Objects.GetByID(ctx, obj.ID)
@@ -132,7 +132,7 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 
 	bucket := testutil.SeedBucket(t, db, "mgr-reconcile-bucket")
 
-	// Create an object in "cached" state (should have an upload_to_sp task)
+	// Create an object in "cached" state (should have an upload task)
 	obj := &model.Object{
 		BucketID:   bucket.ID,
 		Key:        "mgr-reconcile-key",
@@ -146,16 +146,16 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	}
 
 	// No task exists yet — manager should create one during reconciliation
-	mgr := worker.NewManager(repos, false, slog.Default())
+	mgr := worker.NewManager(repos, slog.Default(), false)
 	mgr.Start(ctx)
 
 	// Claim the task created by reconciliation
-	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, time.Minute)
+	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming task: %v", err)
 	}
 	if task == nil {
-		t.Fatal("expected reconciliation to create missing upload_to_sp task")
+		t.Fatal("expected reconciliation to create missing upload task")
 	}
 	if task.RefID != obj.ID || task.RefGeneration != 1 {
 		t.Errorf("task refs mismatch: got refID=%d gen=%d, want %d/1", task.RefID, task.RefGeneration, obj.ID)
@@ -168,7 +168,7 @@ func TestManager_WorkerHealth(t *testing.T) {
 	w2 := &stubWorker{name: "beta", isHealthy: false}
 	w3 := &stubWorker{name: "gamma", isHealthy: true}
 
-	mgr := worker.NewManager(repos, false, slog.Default(), w1, w2, w3)
+	mgr := worker.NewManager(repos, slog.Default(), false, w1, w2, w3)
 	health := mgr.WorkerHealth()
 
 	if len(health) != 3 {
@@ -187,7 +187,7 @@ func TestManager_WorkerHealth(t *testing.T) {
 
 func TestManager_WorkerHealth_Empty(t *testing.T) {
 	repos := testutil.NewTestRepos(t)
-	mgr := worker.NewManager(repos, false, slog.Default())
+	mgr := worker.NewManager(repos, slog.Default(), false)
 	health := mgr.WorkerHealth()
 	if len(health) != 0 {
 		t.Errorf("expected empty map, got %d entries", len(health))
@@ -201,18 +201,14 @@ func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
 	logger := slog.Default()
 	poll := 50 * time.Millisecond
 
-	up := worker.NewUploader(repos, mc, nil, nil, sm, 1, poll, logger)
-	oc := worker.NewOnChain(repos, nil, sm, false, 1, poll, logger)
-	ps := worker.NewProofSetWorker(repos, nil, mc, 1, poll, logger)
+	up := worker.NewUploader(repos, mc, nil, nil, sm, true, 1, poll, logger)
 	ev := worker.NewEvictor(repos, mc, sm, 1, poll, logger)
 
-	mgr := worker.NewManager(repos, false, logger, up, oc, ps, ev)
+	mgr := worker.NewManager(repos, logger, true, up, ev)
 	health := mgr.WorkerHealth()
 
 	expected := map[string]bool{
 		"uploader": true,
-		"onchain":  true,
-		"proofset": true,
 		"evictor":  true,
 	}
 	for name, wantHealthy := range expected {
@@ -249,7 +245,7 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 
 	// Pre-create the task with the same idempotency key the manager would use
 	existingTask := &model.Task{
-		Type:           model.TaskTypeUploadToSP,
+		Type:           model.TaskTypeUpload,
 		RefType:        "object",
 		RefID:          obj.ID,
 		RefGeneration:  1,
@@ -263,11 +259,11 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 	}
 
 	// Start manager — reconciliation should skip (idempotency dedup)
-	mgr := worker.NewManager(repos, false, slog.Default())
+	mgr := worker.NewManager(repos, slog.Default(), false)
 	mgr.Start(ctx)
 
 	// Claim the task — should be exactly one (the pre-existing one)
-	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, time.Minute)
+	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming task: %v", err)
 	}
@@ -279,8 +275,71 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 	}
 
 	// No second task should be claimable
-	dup, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUploadToSP, time.Minute)
+	dup, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
 	if dup != nil {
 		t.Error("expected no duplicate task after idempotency dedup")
+	}
+}
+
+func TestManager_ReconcileTasks_AutoEvictGuard(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-off")
+	obj := &model.Object{
+		BucketID:   bucket.ID,
+		Key:        "stored-no-evict",
+		Size:       100,
+		ETag:       "etag5",
+		State:      model.ObjectStateStored,
+		Generation: 1,
+	}
+	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
+		t.Fatalf("inserting object: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr.Start(ctx)
+
+	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	if err != nil {
+		t.Fatalf("claiming evict task: %v", err)
+	}
+	if task != nil {
+		t.Fatal("expected no evict_cache task when autoEvict is disabled")
+	}
+}
+
+func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-on")
+	obj := &model.Object{
+		BucketID:   bucket.ID,
+		Key:        "stored-with-evict",
+		Size:       100,
+		ETag:       "etag6",
+		State:      model.ObjectStateStored,
+		Generation: 1,
+	}
+	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
+		t.Fatalf("inserting object: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), true)
+	mgr.Start(ctx)
+
+	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	if err != nil {
+		t.Fatalf("claiming evict task: %v", err)
+	}
+	if task == nil {
+		t.Fatal("expected evict_cache task when autoEvict is enabled")
+	}
+	if task.RefID != obj.ID || task.RefGeneration != obj.Generation {
+		t.Fatalf("evict task refs = (%d,%d), want (%d,%d)", task.RefID, task.RefGeneration, obj.ID, obj.Generation)
 	}
 }

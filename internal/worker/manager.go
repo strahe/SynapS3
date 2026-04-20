@@ -23,19 +23,19 @@ type Worker interface {
 
 // Manager coordinates the lifecycle of all background workers.
 type Manager struct {
-	repos             *repository.Repositories
-	evictAfterOnChain bool
-	workers           []Worker
-	logger            *slog.Logger
+	repos     *repository.Repositories
+	workers   []Worker
+	logger    *slog.Logger
+	autoEvict bool
 }
 
 // NewManager creates a new worker manager.
-func NewManager(repos *repository.Repositories, evictAfterOnChain bool, logger *slog.Logger, workers ...Worker) *Manager {
+func NewManager(repos *repository.Repositories, logger *slog.Logger, autoEvict bool, workers ...Worker) *Manager {
 	return &Manager{
-		repos:             repos,
-		evictAfterOnChain: evictAfterOnChain,
-		workers:           workers,
-		logger:            logger,
+		repos:     repos,
+		workers:   workers,
+		logger:    logger,
+		autoEvict: autoEvict,
 	}
 }
 
@@ -84,21 +84,10 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Info("reset stale uploading objects to cached", "count", n)
 	}
 
-	// onchaining → uploaded (on-chain submission was interrupted)
-	if n, err := m.repos.Objects.ResetStaleStates(ctx,
-		model.ObjectStateOnChaining, model.ObjectStateUploaded, staleThreshold); err != nil {
-		m.logger.Error("failed to reset onchaining objects", "error", err)
-	} else if n > 0 {
-		m.logger.Info("reset stale onchaining objects to uploaded", "count", n)
-	}
-
-	// Reconcile: ensure objects in cached/uploaded/onchained have corresponding tasks.
-	// The idempotency key prefix must match the format used during normal task creation
-	// (object.go uses "upload:", uploader.go uses "add_roots:", onchain.go uses "evict_cache:").
-	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUploadToSP, "upload")
-	m.reconcileTasks(ctx, model.ObjectStateUploaded, model.TaskTypeAddRoots, "add_roots")
-	if m.evictAfterOnChain {
-		m.reconcileTasks(ctx, model.ObjectStateOnChained, model.TaskTypeEvictCache, "evict_cache")
+	// Reconcile: ensure objects in cached/stored have corresponding tasks.
+	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUpload, "upload")
+	if m.autoEvict {
+		m.reconcileTasks(ctx, model.ObjectStateStored, model.TaskTypeEvictCache, "evict_cache")
 	}
 
 	// Log dead-letter task count for operator awareness

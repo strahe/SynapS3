@@ -13,17 +13,20 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synapse-go/storage"
 	"golang.org/x/sync/errgroup"
 )
 
-// Uploader claims upload_to_sp tasks, uploads objects to the Storage Provider,
-// records the PieceCID, and chains to add_roots.
+// Uploader claims upload tasks, uploads objects to Storage Providers via the
+// synapse-go SDK (which handles both SP upload and on-chain commit), records the
+// PieceCID, and optionally enqueues cache eviction.
 type Uploader struct {
 	repos        *repository.Repositories
 	cache        cache.Cache
 	storage      synapse.StorageClient
 	wallet       synapse.WalletQuerier // optional; nil skips balance pre-check
 	stateMachine *state.Machine
+	autoEvict    bool
 	concurrency  int
 	pollInterval time.Duration
 	leaseTTL     time.Duration
@@ -31,14 +34,15 @@ type Uploader struct {
 	*livenessTracker
 }
 
-// NewUploader creates a new SP upload worker.
-func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
+// NewUploader creates a new upload worker.
+func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, autoEvict bool, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
 	return &Uploader{
 		repos:           repos,
 		cache:           c,
 		storage:         sc,
 		wallet:          wallet,
 		stateMachine:    sm,
+		autoEvict:       autoEvict,
 		concurrency:     concurrency,
 		pollInterval:    pollInterval,
 		leaseTTL:        10 * time.Minute,
@@ -59,7 +63,7 @@ func (u *Uploader) tick(ctx context.Context) error {
 	g.SetLimit(u.concurrency)
 
 	for range u.concurrency {
-		task, err := u.repos.Tasks.ClaimPending(gctx, model.TaskTypeUploadToSP, u.leaseTTL)
+		task, err := u.repos.Tasks.ClaimPending(gctx, model.TaskTypeUpload, u.leaseTTL)
 		if err != nil {
 			u.logger.Error("claiming upload task", "error", err)
 			break
@@ -96,7 +100,6 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	// Get object metadata to read from cache
 	obj, err := u.repos.Objects.GetByID(ctx, task.RefID)
 	if err != nil || obj == nil {
 		logger.Warn("object not found for upload task", "error", err)
@@ -105,7 +108,6 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	// Verify generation matches
 	if obj.Generation != task.RefGeneration {
 		logger.Warn("stale generation, skipping", "objGen", obj.Generation)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "stale generation")
@@ -113,41 +115,11 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	// Look up bucket for cache path
 	bucket, err := u.repos.Buckets.GetByID(ctx, obj.BucketID)
 	if err != nil || bucket == nil {
 		logger.Error("bucket not found", "bucketID", obj.BucketID, "error", err)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
-		return
-	}
-
-	// Recovery: if object is already uploaded (previous run succeeded at upload but
-	// failed to create the chain task), skip upload and just re-create the chain task.
-	if obj.State == model.ObjectStateUploaded {
-		logger.Info("object already uploaded, recovering chain task creation")
-		chainTask := &model.Task{
-			Type:           model.TaskTypeAddRoots,
-			RefType:        "object",
-			RefID:          task.RefID,
-			RefGeneration:  task.RefGeneration,
-			IdempotencyKey: fmt.Sprintf("add_roots:%d:%d", task.RefID, task.RefGeneration),
-			Status:         model.TaskStatusPending,
-			MaxRetries:     5,
-			ScheduledAt:    time.Now(),
-		}
-		if err := u.repos.Tasks.Create(ctx, chainTask); err != nil {
-			if errors.Is(err, repository.ErrAlreadyExists) {
-				// Chain task already exists — this upload task is done.
-				logger.Info("chain task already exists, completing upload task")
-			} else {
-				_ = u.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("recovery chain task creation: %v", err))
-				admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
-				return
-			}
-		}
-		_ = u.repos.Tasks.Complete(ctx, task.ID)
-		admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
 		return
 	}
 
@@ -163,7 +135,6 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	}
 
 	// Pre-flight: check payment account has deposited funds.
-	// This is a fast-fail gate for the obvious zero-balance case, not exact cost estimation.
 	if u.wallet != nil {
 		info, wErr := u.wallet.GetWalletInfo(ctx)
 		if wErr != nil {
@@ -181,90 +152,112 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	// Read from cache
 	rc, _, err := u.cache.Get(ctx, bucket.Name, obj.Key)
 	if err != nil {
-		logger.Error("cache read failed", "error", err)
-		if task.RetryCount+1 >= task.MaxRetries {
-			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
-				model.ObjectStateUploading, fmt.Sprintf("cache read: %v (max retries reached)", err))
-			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
-				logger.Error("failed to mark task as dead-letter", "error", ftErr)
-			} else {
-				admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUploadToSP)).Inc()
-			}
-		} else {
-			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
-			_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
-		}
-		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "cache read", err)
 		return
 	}
 	defer func() { _ = rc.Close() }()
 
-	// Upload to SP
-	result, err := u.storage.Upload(ctx, rc, nil)
+	// Upload to provider (SDK handles store + on-chain commit)
+	uploadOpts := &storage.UploadOptions{
+		DataSetMetadata: map[string]string{"bucket": bucket.Name},
+	}
+	result, err := u.storage.Upload(ctx, rc, uploadOpts)
 	if err != nil {
-		enriched := decodeRevertReason(err.Error())
-		logger.Error("SP upload failed", "error", enriched)
-		if task.RetryCount+1 >= task.MaxRetries {
-			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
-				model.ObjectStateUploading, fmt.Sprintf("SP upload: %v (max retries reached)", enriched))
-			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, enriched); ftErr != nil {
-				logger.Error("failed to mark task as dead-letter", "error", ftErr)
-			} else {
-				admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUploadToSP)).Inc()
-			}
-		} else {
-			_ = u.repos.Tasks.Fail(ctx, task.ID, enriched)
-			_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
-		}
-		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload",
+			fmt.Errorf("%s", decodeRevertReason(err.Error())))
+		return
+	}
+	if result == nil {
+		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload", errors.New("upload returned nil result"))
+		return
+	}
+	if !result.Complete {
+		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload",
+			fmt.Errorf("upload incomplete: %d/%d copies committed", result.SuccessCount(), requestedCopies(result)))
 		return
 	}
 
-	// Atomic: set PieceCID + transition uploading → uploaded
 	pieceCID := result.PieceCID.String()
-	if err := u.repos.Objects.SetPieceCIDAndTransition(ctx, task.RefID, task.RefGeneration,
-		pieceCID, model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
-		logger.Error("SetPieceCIDAndTransition failed", "error", err)
-		if task.RetryCount+1 >= task.MaxRetries {
-			_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
-				model.ObjectStateUploading, fmt.Sprintf("SetPieceCIDAndTransition: %v (max retries reached)", err))
-			if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
-				logger.Error("failed to mark task as dead-letter", "error", ftErr)
-			} else {
-				admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUploadToSP)).Inc()
-			}
-		} else {
-			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
-			_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
-		}
-		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+	retrievalURL := firstRetrievalURL(result)
+	if retrievalURL == "" {
+		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload", errors.New("upload completed without retrieval URL"))
 		return
 	}
 
-	// Chain: enqueue add_roots task
-	chainTask := &model.Task{
-		Type:           model.TaskTypeAddRoots,
-		RefType:        "object",
-		RefID:          task.RefID,
-		RefGeneration:  task.RefGeneration,
-		IdempotencyKey: fmt.Sprintf("add_roots:%d:%d", task.RefID, task.RefGeneration),
-		Status:         model.TaskStatusPending,
-		MaxRetries:     5,
-		ScheduledAt:    time.Now(),
+	// Atomic: update storage info + transition uploading → stored
+	if err := u.repos.Objects.SetStorageInfoAndTransition(ctx, task.RefID, task.RefGeneration,
+		pieceCID, retrievalURL, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "state transition uploading→stored", err)
+		return
 	}
-	if err := u.repos.Tasks.Create(ctx, chainTask); err != nil {
-		if errors.Is(err, repository.ErrAlreadyExists) {
-			// Chain task already exists (e.g., from reconciliation) — treat as success.
-			logger.Info("chain task already exists, completing upload task")
-		} else {
-			logger.Error("enqueuing add_roots task", "error", err)
-			_ = u.repos.Tasks.Fail(ctx, task.ID, fmt.Sprintf("chain task creation: %v", err))
-			admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
-			return
+
+	// Lazy-populate bucket ProofSetID from first upload result
+	if bucket.ProofSetID == nil && len(result.Copies) > 0 && result.Copies[0].DataSetID != nil {
+		dsID := result.Copies[0].DataSetID.String()
+		if updateErr := u.repos.Buckets.SetProofSetID(ctx, bucket.ID, dsID); updateErr != nil {
+			logger.Warn("failed to populate bucket ProofSetID (non-fatal)", "error", updateErr)
+		}
+	}
+
+	// Enqueue cache eviction task
+	if u.autoEvict {
+		evictTask := &model.Task{
+			Type:           model.TaskTypeEvictCache,
+			RefType:        "object",
+			RefID:          task.RefID,
+			RefGeneration:  task.RefGeneration,
+			IdempotencyKey: fmt.Sprintf("evict_cache:%d:%d", task.RefID, task.RefGeneration),
+			Status:         model.TaskStatusPending,
+			MaxRetries:     3,
+			ScheduledAt:    time.Now(),
+		}
+		if err := u.repos.Tasks.Create(ctx, evictTask); err != nil {
+			if !errors.Is(err, repository.ErrAlreadyExists) {
+				logger.Warn("failed to enqueue eviction task (non-fatal)", "error", err)
+			}
 		}
 	}
 
 	_ = u.repos.Tasks.Complete(ctx, task.ID)
+	logger.Info("upload complete", "pieceCID", pieceCID)
 	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
-	logger.Info("upload completed", "pieceCID", pieceCID)
+}
+
+func requestedCopies(result *storage.UploadResult) int {
+	if result == nil {
+		return 0
+	}
+	if result.RequestedCopies > 0 {
+		return result.RequestedCopies
+	}
+	return len(result.Copies)
+}
+
+func firstRetrievalURL(result *storage.UploadResult) string {
+	if result == nil {
+		return ""
+	}
+	for _, copy := range result.Copies {
+		if copy.RetrievalURL != "" {
+			return copy.RetrievalURL
+		}
+	}
+	return ""
+}
+
+func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, logger *slog.Logger, currentState model.ObjectState, stage string, err error) {
+	logger.Error(stage+" failed", "error", err)
+	if task.RetryCount+1 >= task.MaxRetries {
+		_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+			currentState, fmt.Sprintf("%s: %v (max retries reached)", stage, err))
+		if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+			logger.Error("failed to mark task as dead-letter", "error", ftErr)
+		} else {
+			admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUpload)).Inc()
+		}
+	} else {
+		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
+	}
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 }

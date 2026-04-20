@@ -6,12 +6,18 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
-	"github.com/data-preservation-programs/go-synapse/constants"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/knadh/koanf/parsers/yaml"
+	kfile "github.com/knadh/koanf/providers/file"
+	"github.com/knadh/koanf/v2"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/provider"
+	"github.com/strahe/synapse-go/chain"
+	"github.com/strahe/synapse-go/spregistry"
 	"github.com/urfave/cli/v3"
 )
 
@@ -70,11 +76,27 @@ func runProviderList(ctx context.Context, cmd *cli.Command) error {
 
 	_, _ = fmt.Fprintf(os.Stderr, "Querying %s network (%s)...\n", network, maskRPCURL(rpcURL))
 
-	reg, closer, err := provider.NewRegistryService(ctx, rpcURL, network)
+	c, err := parseChain(network)
 	if err != nil {
-		return fmt.Errorf("connecting to registry: %w", err)
+		return err
 	}
-	defer closer()
+
+	ethClient, err := ethclient.DialContext(ctx, rpcURL)
+	if err != nil {
+		return fmt.Errorf("connecting to RPC: %w", err)
+	}
+	defer ethClient.Close()
+
+	addrs := c.Addresses()
+	svc, err := spregistry.New(spregistry.Options{
+		Client:  ethClient,
+		Address: addrs.SPRegistry,
+	})
+	if err != nil {
+		return fmt.Errorf("creating registry service: %w", err)
+	}
+
+	reg := provider.NewRegistryService(svc)
 
 	opts := provider.ListOptions{
 		ActiveOnly: cmd.Bool("active"),
@@ -122,25 +144,65 @@ func resolveRPCAndNetwork(cmd *cli.Command) (rpcURL, network string, err error) 
 	} else {
 		network = "calibration"
 	}
+	network = normalizeNetwork(network)
 
 	// Validate network.
-	net := constants.Network(network)
-	if net != constants.NetworkCalibration && net != constants.NetworkMainnet {
-		return "", "", fmt.Errorf("unsupported network %q (supported: calibration, mainnet)", network)
+	if _, parseErr := parseChain(network); parseErr != nil {
+		return "", "", parseErr
 	}
 
 	// Resolve RPC URL.
 	if cmd.IsSet("rpc-url") {
 		rpcURL = cmd.String("rpc-url")
-	} else if cfg != nil && cfg.Filecoin.RPCURL != "" {
+	} else if envRPCURL, ok := os.LookupEnv("SYNAPS3_FILECOIN_RPC_URL"); ok && strings.TrimSpace(envRPCURL) != "" {
+		rpcURL = strings.TrimSpace(envRPCURL)
+	} else if cfg != nil && configFileSetsRPCURL(configPath) {
 		rpcURL = cfg.Filecoin.RPCURL
-	} else if defaultURL, ok := constants.RPCURLs[net]; ok {
-		rpcURL = defaultURL
 	} else {
-		return "", "", fmt.Errorf("no RPC URL available for network %q; use --rpc-url", network)
+		// Use well-known default RPC URLs.
+		defaults := map[string]string{
+			"calibration": "https://api.calibration.node.glif.io/rpc/v1",
+			"mainnet":     "https://api.node.glif.io/rpc/v1",
+		}
+		if defaultURL, ok := defaults[network]; ok {
+			rpcURL = defaultURL
+		} else {
+			return "", "", fmt.Errorf("no RPC URL available for network %q; use --rpc-url", network)
+		}
 	}
 
 	return rpcURL, network, nil
+}
+
+func normalizeNetwork(network string) string {
+	return strings.ToLower(strings.TrimSpace(network))
+}
+
+func configFileSetsRPCURL(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+
+	k := koanf.New(".")
+	if err := k.Load(kfile.Provider(path), yaml.Parser()); err != nil {
+		return false
+	}
+	return strings.TrimSpace(k.String("filecoin.rpc_url")) != ""
+}
+
+// parseChain converts a network name string to a chain.Chain constant.
+func parseChain(network string) (chain.Chain, error) {
+	switch network {
+	case "calibration":
+		return chain.Calibration, nil
+	case "mainnet":
+		return chain.Mainnet, nil
+	default:
+		return 0, fmt.Errorf("unsupported network %q (supported: calibration, mainnet)", network)
+	}
 }
 
 func outputJSON(providers []provider.ProviderDetail) error {

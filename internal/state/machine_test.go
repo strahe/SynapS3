@@ -12,10 +12,8 @@ func TestObjectStateMachine_HappyPath(t *testing.T) {
 
 	transitions := []struct{ from, to model.ObjectState }{
 		{model.ObjectStateCached, model.ObjectStateUploading},
-		{model.ObjectStateUploading, model.ObjectStateUploaded},
-		{model.ObjectStateUploaded, model.ObjectStateOnChaining},
-		{model.ObjectStateOnChaining, model.ObjectStateOnChained},
-		{model.ObjectStateOnChained, model.ObjectStateCacheEvicted},
+		{model.ObjectStateUploading, model.ObjectStateStored},
+		{model.ObjectStateStored, model.ObjectStateCacheEvicted},
 	}
 	for _, tt := range transitions {
 		if err := m.Validate(string(tt.from), string(tt.to)); err != nil {
@@ -30,8 +28,7 @@ func TestObjectStateMachine_FailureTransitions(t *testing.T) {
 	// States that can transition to failed.
 	canFail := []model.ObjectState{
 		model.ObjectStateUploading,
-		model.ObjectStateUploaded,
-		model.ObjectStateOnChaining,
+		model.ObjectStateStored,
 	}
 	for _, from := range canFail {
 		if err := m.Validate(string(from), string(model.ObjectStateFailed)); err != nil {
@@ -58,7 +55,6 @@ func TestObjectStateMachine_RetryFromFailed(t *testing.T) {
 	// Allowed retries from failed.
 	allowed := []model.ObjectState{
 		model.ObjectStateUploading,
-		model.ObjectStateOnChaining,
 	}
 	for _, to := range allowed {
 		if err := m.Validate(string(model.ObjectStateFailed), string(to)); err != nil {
@@ -69,8 +65,7 @@ func TestObjectStateMachine_RetryFromFailed(t *testing.T) {
 	// Disallowed retries.
 	disallowed := []model.ObjectState{
 		model.ObjectStateCached,
-		model.ObjectStateUploaded,
-		model.ObjectStateOnChained,
+		model.ObjectStateStored,
 		model.ObjectStateCacheEvicted,
 	}
 	for _, to := range disallowed {
@@ -80,32 +75,16 @@ func TestObjectStateMachine_RetryFromFailed(t *testing.T) {
 	}
 }
 
-func TestObjectStateMachine_EvictionShortcuts(t *testing.T) {
-	m := NewObjectStateMachine()
-
-	// Early eviction from uploaded or onchaining.
-	earlyEvict := []model.ObjectState{
-		model.ObjectStateUploaded,
-		model.ObjectStateOnChaining,
-	}
-	for _, from := range earlyEvict {
-		if err := m.Validate(string(from), string(model.ObjectStateCacheEvicted)); err != nil {
-			t.Errorf("%s→cache_evicted: unexpected error: %v", from, err)
-		}
-	}
-}
-
 func TestObjectStateMachine_InvalidTransitions(t *testing.T) {
 	m := NewObjectStateMachine()
 
 	invalid := []struct{ from, to model.ObjectState }{
-		{model.ObjectStateCached, model.ObjectStateUploaded},      // skip uploading
-		{model.ObjectStateCached, model.ObjectStateOnChained},     // skip everything
-		{model.ObjectStateCacheEvicted, model.ObjectStateCached},  // can't revive
-		{model.ObjectStateOnChained, model.ObjectStateUploading},  // backwards
-		{model.ObjectStateCached, model.ObjectStateFailed},        // can't fail from cached
-		{model.ObjectStateCached, model.ObjectStateCacheEvicted},  // can't evict uncached
-		{model.ObjectStateUploading, model.ObjectStateOnChaining}, // skip uploaded
+		{model.ObjectStateCached, model.ObjectStateStored},          // must go through uploading
+		{model.ObjectStateCached, model.ObjectStateCacheEvicted},    // can't evict from cached
+		{model.ObjectStateCacheEvicted, model.ObjectStateCached},    // can't revive
+		{model.ObjectStateStored, model.ObjectStateUploading},       // backwards
+		{model.ObjectStateCached, model.ObjectStateFailed},          // can't fail from cached
+		{model.ObjectStateUploading, model.ObjectStateCacheEvicted}, // must go through stored
 	}
 	for _, tt := range invalid {
 		if m.CanTransition(string(tt.from), string(tt.to)) {
@@ -120,9 +99,7 @@ func TestObjectStateMachine_SameStateSelfTransition(t *testing.T) {
 	allStates := []model.ObjectState{
 		model.ObjectStateCached,
 		model.ObjectStateUploading,
-		model.ObjectStateUploaded,
-		model.ObjectStateOnChaining,
-		model.ObjectStateOnChained,
+		model.ObjectStateStored,
 		model.ObjectStateFailed,
 		model.ObjectStateCacheEvicted,
 	}
@@ -141,11 +118,9 @@ func TestObjectStateMachine_NextStates(t *testing.T) {
 		expected []string
 	}{
 		{model.ObjectStateCached, []string{"uploading"}},
-		{model.ObjectStateUploading, []string{"failed", "uploaded"}},
-		{model.ObjectStateUploaded, []string{"cache_evicted", "failed", "onchaining"}},
-		{model.ObjectStateOnChaining, []string{"cache_evicted", "failed", "onchained"}},
-		{model.ObjectStateOnChained, []string{"cache_evicted", "failed"}},
-		{model.ObjectStateFailed, []string{"onchaining", "uploading"}},
+		{model.ObjectStateUploading, []string{"failed", "stored"}},
+		{model.ObjectStateStored, []string{"cache_evicted", "failed"}},
+		{model.ObjectStateFailed, []string{"uploading"}},
 		{model.ObjectStateCacheEvicted, nil},
 	}
 	for _, tt := range tests {

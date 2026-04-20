@@ -1,16 +1,17 @@
 package backend_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/data-preservation-programs/go-synapse/storage"
 	cid "github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/backend"
@@ -19,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synapse-go/storage"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/s3response"
 )
@@ -29,7 +31,6 @@ type integrationBackend struct {
 	repos   *repository.Repositories
 	cache   cache.Cache
 	storage *testutil.MockStorageClient
-	proof   *testutil.MockProofSetClient
 	db      *bun.DB
 }
 
@@ -44,33 +45,15 @@ func newIntegrationBackend(t *testing.T) *integrationBackend {
 	}
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
-	pc := &testutil.MockProofSetClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, fsCache, sm, sc, pc, 0, logger)
+	b := backend.New(repos, fsCache, sm, sc, logger)
 	return &integrationBackend{
 		backend: b,
 		repos:   repos,
 		cache:   fsCache,
 		storage: sc,
-		proof:   pc,
 		db:      db,
-	}
-}
-
-// activateBucket transitions a bucket from creating → active by setting proof set ID and status.
-func activateBucket(t *testing.T, repos *repository.Repositories, bucketID int64) {
-	t.Helper()
-	ctx := context.Background()
-	if err := repos.Buckets.SetProofSetID(ctx, bucketID, "42"); err != nil {
-		t.Fatalf("setting proof set ID: %v", err)
-	}
-	if err := repos.Buckets.UpdateStatus(ctx, bucketID, model.BucketStatusCreating, model.BucketStatusActive); err != nil {
-		t.Fatalf("activating bucket: %v", err)
-	}
-	// Complete the create_proof_set task so the bucket has no in-flight work.
-	if err := repos.Tasks.CompleteByRef(ctx, "bucket", bucketID, model.TaskTypeCreateProofSet); err != nil {
-		t.Fatalf("completing create_proof_set task: %v", err)
 	}
 }
 
@@ -84,20 +67,6 @@ func findTasks(t *testing.T, db *bun.DB, refType string, refID int64) []model.Ta
 		Scan(context.Background())
 	if err != nil {
 		t.Fatalf("querying tasks: %v", err)
-	}
-	return tasks
-}
-
-// findTasksByType queries all tasks matching the given type.
-func findTasksByType(t *testing.T, db *bun.DB, taskType model.TaskType) []model.Task {
-	t.Helper()
-	var tasks []model.Task
-	err := db.NewSelect().Model(&tasks).
-		Where("type = ?", taskType).
-		OrderExpr("id ASC").
-		Scan(context.Background())
-	if err != nil {
-		t.Fatalf("querying tasks by type: %v", err)
 	}
 	return tasks
 }
@@ -159,8 +128,8 @@ func TestIntegration_FullWritePath(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 upload task, got %d", len(tasks))
 	}
-	if tasks[0].Type != model.TaskTypeUploadToSP {
-		t.Fatalf("expected task type upload_to_sp, got %s", tasks[0].Type)
+	if tasks[0].Type != model.TaskTypeUpload {
+		t.Fatalf("expected task type upload, got %s", tasks[0].Type)
 	}
 	if tasks[0].RefGeneration != 1 {
 		t.Fatalf("expected task gen=1, got %d", tasks[0].RefGeneration)
@@ -171,35 +140,22 @@ func TestIntegration_FullWritePath(t *testing.T) {
 		t.Fatalf("cached→uploading: %v", err)
 	}
 
-	// Simulate uploader sets PieceCID: uploading → uploaded
-	if err := ib.repos.Objects.SetPieceCIDAndTransition(ctx, obj.ID, 1, "bafk2test123", model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
-		t.Fatalf("uploading→uploaded: %v", err)
+	// Simulate uploader sets PieceCID: uploading → stored
+	if err := ib.repos.Objects.SetPieceCIDAndTransition(ctx, obj.ID, 1, "bafk2test123", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("uploading→stored: %v", err)
 	}
 
 	obj, _ = ib.repos.Objects.GetByID(ctx, obj.ID)
-	if obj.State != model.ObjectStateUploaded {
-		t.Fatalf("expected state=uploaded, got %s", obj.State)
+	if obj.State != model.ObjectStateStored {
+		t.Fatalf("expected state=stored, got %s", obj.State)
 	}
 	if obj.PieceCID == nil || *obj.PieceCID != "bafk2test123" {
 		t.Fatalf("expected PieceCID=bafk2test123, got %v", obj.PieceCID)
 	}
 
-	// 3. Simulate onchain: uploaded → onchaining → onchained
-	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateUploaded, model.ObjectStateOnChaining); err != nil {
-		t.Fatalf("uploaded→onchaining: %v", err)
-	}
-	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateOnChaining, model.ObjectStateOnChained); err != nil {
-		t.Fatalf("onchaining→onchained: %v", err)
-	}
-
-	obj, _ = ib.repos.Objects.GetByID(ctx, obj.ID)
-	if obj.State != model.ObjectStateOnChained {
-		t.Fatalf("expected state=onchained, got %s", obj.State)
-	}
-
-	// 4. Simulate evictor: onchained → cache_evicted, remove cache file
-	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateOnChained, model.ObjectStateCacheEvicted); err != nil {
-		t.Fatalf("onchained→cache_evicted: %v", err)
+	// 3. Simulate evictor: stored → cache_evicted, remove cache file
+	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+		t.Fatalf("stored→cache_evicted: %v", err)
 	}
 	if err := ib.cache.Delete(ctx, "test-bucket", "test-key"); err != nil {
 		t.Fatalf("cache delete: %v", err)
@@ -286,16 +242,13 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	}
 	testPieceCID := cid.NewCidV1(cid.Raw, mh)
 
-	if err := ib.repos.Objects.SetPieceCIDAndTransition(ctx, obj.ID, 1, testPieceCID.String(), model.ObjectStateUploading, model.ObjectStateUploaded); err != nil {
+	if err := ib.repos.Objects.SetPieceCIDAndTransition(ctx, obj.ID, 1, testPieceCID.String(), model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatal(err)
 	}
-	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateUploaded, model.ObjectStateOnChaining); err != nil {
+	if _, err := ib.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ?`, "https://provider.example/pieces/test", obj.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateOnChaining, model.ObjectStateOnChained); err != nil {
-		t.Fatal(err)
-	}
-	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateOnChained, model.ObjectStateCacheEvicted); err != nil {
+	if err := ib.repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
 		t.Fatal(err)
 	}
 
@@ -308,9 +261,9 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	}
 
 	// Configure mock SP download to return the original content
-	ib.storage.DownloadFunc = func(_ context.Context, pc cid.Cid, _ *storage.DownloadOptions) ([]byte, error) {
+	ib.storage.DownloadFunc = func(_ context.Context, pc cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
 		if pc.Equals(testPieceCID) {
-			return []byte(content), nil
+			return io.NopCloser(bytes.NewReader([]byte(content))), nil
 		}
 		return nil, fmt.Errorf("unexpected CID: %s", pc)
 	}
@@ -321,10 +274,18 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 		t.Fatalf("expected body=%q, got %q", content, body)
 	}
 
-	// Cache rehydration is synchronous (happens inside GetObject), so the file
-	// should already be present after the call returns.
-	if !ib.cache.Exists(ctx, "test-bucket", "test-key") {
-		t.Fatal("expected cache to be rehydrated after cold read (synchronous rehydration)")
+	// Cache rehydration is async (TeeReader goroutine writes while body is consumed).
+	// Poll with a timeout to avoid flakiness.
+	rehydrated := false
+	for i := 0; i < 200; i++ {
+		if ib.cache.Exists(ctx, "test-bucket", "test-key") {
+			rehydrated = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rehydrated {
+		t.Fatal("expected cache to be rehydrated after cold read (timed out)")
 	}
 }
 
@@ -367,8 +328,8 @@ func TestIntegration_CopyObjectPath(t *testing.T) {
 	if len(dstTasks) == 0 {
 		t.Fatal("expected upload task for dst object")
 	}
-	if dstTasks[0].Type != model.TaskTypeUploadToSP {
-		t.Fatalf("expected upload_to_sp task, got %s", dstTasks[0].Type)
+	if dstTasks[0].Type != model.TaskTypeUpload {
+		t.Fatalf("expected upload task, got %s", dstTasks[0].Type)
 	}
 
 	// GetObject on dest should return the same data
@@ -378,55 +339,20 @@ func TestIntegration_CopyObjectPath(t *testing.T) {
 	}
 }
 
-func TestIntegration_DeletePath(t *testing.T) {
+func TestIntegration_DeletePath_NotSupported(t *testing.T) {
 	ib := newIntegrationBackend(t)
 	ctx := context.Background()
 
-	bucket := testutil.SeedBucket(t, ib.db, "bucket")
-
-	// Put object
+	testutil.SeedBucket(t, ib.db, "bucket")
 	putObject(t, ib.backend, "bucket", "key", "data")
 
-	// Verify visible via ListObjects
-	listOut, err := ib.backend.ListObjects(ctx, &s3.ListObjectsInput{
-		Bucket: strPtr("bucket"),
-	})
-	if err != nil {
-		t.Fatalf("ListObjects: %v", err)
-	}
-	if len(listOut.Contents) != 1 {
-		t.Fatalf("expected 1 object in list, got %d", len(listOut.Contents))
-	}
-
-	// Delete
-	_, err = ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+	// DeleteObject should return an error (501 Not Implemented)
+	_, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: strPtr("bucket"),
 		Key:    strPtr("key"),
 	})
-	if err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
-
-	// Verify not visible via ListObjects
-	listOut, err = ib.backend.ListObjects(ctx, &s3.ListObjectsInput{
-		Bucket: strPtr("bucket"),
-	})
-	if err != nil {
-		t.Fatalf("ListObjects after delete: %v", err)
-	}
-	if len(listOut.Contents) != 0 {
-		t.Fatalf("expected 0 objects after delete, got %d", len(listOut.Contents))
-	}
-
-	// Verify cache file removed
-	if ib.cache.Exists(ctx, "bucket", "key") {
-		t.Fatal("expected cache file to be removed after delete")
-	}
-
-	// Verify DB object is soft-deleted (GetByBucketAndKey should return nil due to soft delete)
-	obj, _ := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "key")
-	if obj != nil {
-		t.Fatal("expected soft-deleted object to be invisible")
+	if err == nil {
+		t.Fatal("expected DeleteObject to return error (not supported)")
 	}
 }
 
@@ -434,7 +360,7 @@ func TestIntegration_BucketLifecycle(t *testing.T) {
 	ib := newIntegrationBackend(t)
 	ctx := context.Background()
 
-	// 1. CreateBucket
+	// 1. CreateBucket — bucket should be immediately active
 	err := ib.backend.CreateBucket(ctx, &s3.CreateBucketInput{
 		Bucket: strPtr("my-bucket"),
 	}, nil)
@@ -442,25 +368,16 @@ func TestIntegration_BucketLifecycle(t *testing.T) {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 
-	// Verify bucket in creating status
+	// Verify bucket in active status
 	bkt, err := ib.repos.Buckets.GetByName(ctx, "my-bucket")
 	if err != nil || bkt == nil {
 		t.Fatalf("expected bucket, got err=%v", err)
 	}
-	if bkt.Status != model.BucketStatusCreating {
-		t.Fatalf("expected status=creating, got %s", bkt.Status)
+	if bkt.Status != model.BucketStatusActive {
+		t.Fatalf("expected status=active, got %s", bkt.Status)
 	}
 
-	// Verify create_proof_set task exists
-	cpsTasks := findTasksByType(t, ib.db, model.TaskTypeCreateProofSet)
-	if len(cpsTasks) == 0 {
-		t.Fatal("expected create_proof_set task")
-	}
-
-	// 2. Simulate proofset worker: set proof set ID + activate
-	activateBucket(t, ib.repos, bkt.ID)
-
-	// HeadBucket should succeed
+	// 2. HeadBucket should succeed
 	_, err = ib.backend.HeadBucket(ctx, &s3.HeadBucketInput{
 		Bucket: strPtr("my-bucket"),
 	})
@@ -468,7 +385,7 @@ func TestIntegration_BucketLifecycle(t *testing.T) {
 		t.Fatalf("HeadBucket: %v", err)
 	}
 
-	// Bucket should appear in ListBuckets
+	// 3. Bucket should appear in ListBuckets
 	listOut, err := ib.backend.ListBuckets(ctx, s3response.ListBucketsInput{})
 	if err != nil {
 		t.Fatalf("ListBuckets: %v", err)
@@ -484,45 +401,13 @@ func TestIntegration_BucketLifecycle(t *testing.T) {
 		t.Fatal("expected my-bucket in ListBuckets")
 	}
 
-	// 3. PutObject + DeleteObject to make bucket empty for deletion
+	// 4. PutObject should succeed on active bucket
 	putObject(t, ib.backend, "my-bucket", "temp-key", "temp")
-	_, err = ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: strPtr("my-bucket"),
-		Key:    strPtr("temp-key"),
-	})
-	if err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
 
-	// 4. DeleteBucket
+	// 5. DeleteBucket should return error (not supported)
 	err = ib.backend.DeleteBucket(ctx, "my-bucket")
-	if err != nil {
-		t.Fatalf("DeleteBucket: %v", err)
-	}
-
-	// Verify status=deleting
-	bkt, _ = ib.repos.Buckets.GetByName(ctx, "my-bucket")
-	if bkt.Status != model.BucketStatusDeleting {
-		t.Fatalf("expected status=deleting, got %s", bkt.Status)
-	}
-
-	// Verify delete_proof_set task exists
-	dpsTasks := findTasksByType(t, ib.db, model.TaskTypeDeleteProofSet)
-	if len(dpsTasks) == 0 {
-		t.Fatal("expected delete_proof_set task")
-	}
-
-	// 5. Simulate proofset worker: hard delete bucket
-	if err := ib.repos.Buckets.HardDelete(ctx, bkt.ID); err != nil {
-		t.Fatalf("HardDelete: %v", err)
-	}
-
-	// HeadBucket should return NoSuchBucket
-	_, err = ib.backend.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: strPtr("my-bucket"),
-	})
 	if err == nil {
-		t.Fatal("expected HeadBucket to fail after hard delete")
+		t.Fatal("expected DeleteBucket to return error (not supported)")
 	}
 }
 
@@ -948,74 +833,24 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 	}
 }
 
-func TestIntegration_DeleteObjects_Batch(t *testing.T) {
+func TestIntegration_DeleteObjects_Batch_NotSupported(t *testing.T) {
 	ib := newIntegrationBackend(t)
 	ctx := context.Background()
 
 	testutil.SeedBucket(t, ib.db, "bucket")
-
-	// Put 3 objects
 	putObject(t, ib.backend, "bucket", "file-a", "aaa")
-	putObject(t, ib.backend, "bucket", "file-b", "bbb")
-	putObject(t, ib.backend, "bucket", "file-c", "ccc")
 
-	// Batch delete file-a and file-c
-	result, err := ib.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+	// DeleteObjects should return an error (501 Not Implemented)
+	_, err := ib.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 		Bucket: strPtr("bucket"),
 		Delete: &types.Delete{
 			Objects: []types.ObjectIdentifier{
 				{Key: strPtr("file-a")},
-				{Key: strPtr("file-c")},
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("DeleteObjects: %v", err)
-	}
-
-	// Verify result
-	if len(result.Deleted) != 2 {
-		t.Fatalf("expected 2 deleted, got %d", len(result.Deleted))
-	}
-	if len(result.Error) != 0 {
-		t.Fatalf("expected 0 errors, got %d", len(result.Error))
-	}
-
-	// Verify deleted keys in result
-	deletedKeys := map[string]bool{}
-	for _, d := range result.Deleted {
-		deletedKeys[*d.Key] = true
-	}
-	if !deletedKeys["file-a"] || !deletedKeys["file-c"] {
-		t.Fatalf("expected file-a and file-c in deleted result, got %v", deletedKeys)
-	}
-
-	// Verify deleted objects not visible via ListObjects
-	listOut, err := ib.backend.ListObjects(ctx, &s3.ListObjectsInput{
-		Bucket: strPtr("bucket"),
-	})
-	if err != nil {
-		t.Fatalf("ListObjects: %v", err)
-	}
-	if len(listOut.Contents) != 1 {
-		t.Fatalf("expected 1 remaining object, got %d", len(listOut.Contents))
-	}
-	if *listOut.Contents[0].Key != "file-b" {
-		t.Fatalf("expected remaining key=file-b, got %s", *listOut.Contents[0].Key)
-	}
-
-	// Verify cache files removed for deleted objects
-	if ib.cache.Exists(ctx, "bucket", "file-a") {
-		t.Fatal("expected cache for file-a to be removed")
-	}
-	if ib.cache.Exists(ctx, "bucket", "file-c") {
-		t.Fatal("expected cache for file-c to be removed")
-	}
-
-	// Verify remaining object still readable
-	body := getObjectBody(t, ib.backend, "bucket", "file-b")
-	if body != "bbb" {
-		t.Fatalf("expected body=bbb, got %q", body)
+	if err == nil {
+		t.Fatal("expected DeleteObjects to return error (not supported)")
 	}
 }
 

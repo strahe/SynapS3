@@ -78,12 +78,6 @@ func TestBucketRepo_ListActive(t *testing.T) {
 			t.Fatalf("Create(%s): %v", name, err)
 		}
 	}
-	// Add a deleted bucket — should not appear in ListActive.
-	del := &model.Bucket{Name: "deleted", Status: model.BucketStatusDeleted}
-	if err := repos.Buckets.Create(ctx, del); err != nil {
-		t.Fatalf("Create(deleted): %v", err)
-	}
-
 	list, err := repos.Buckets.ListActive(ctx)
 	if err != nil {
 		t.Fatalf("ListActive: %v", err)
@@ -103,19 +97,13 @@ func TestBucketRepo_UpdateStatus(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// CAS succeeds: active → creating
-	if err := repos.Buckets.UpdateStatus(ctx, bucket.ID, model.BucketStatusActive, model.BucketStatusCreating); err != nil {
-		t.Fatalf("UpdateStatus active→creating: %v", err)
+	// CAS succeeds: active → active (no-op transition)
+	if err := repos.Buckets.UpdateStatus(ctx, bucket.ID, model.BucketStatusActive, model.BucketStatusActive); err != nil {
+		t.Fatalf("UpdateStatus active→active: %v", err)
 	}
 	got, _ := repos.Buckets.GetByID(ctx, bucket.ID)
-	if got.Status != model.BucketStatusCreating {
-		t.Errorf("expected creating, got %s", got.Status)
-	}
-
-	// CAS fails: wrong from state
-	err := repos.Buckets.UpdateStatus(ctx, bucket.ID, model.BucketStatusActive, model.BucketStatusDeleting)
-	if err == nil {
-		t.Fatal("expected error for wrong from state")
+	if got.Status != model.BucketStatusActive {
+		t.Errorf("expected active, got %s", got.Status)
 	}
 }
 
@@ -179,11 +167,8 @@ func TestBucketRepo_SoftDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByID after delete: %v", err)
 	}
-	if got == nil {
-		t.Fatal("expected bucket to still exist")
-	}
-	if got.Status != model.BucketStatusDeleted {
-		t.Errorf("expected status %q, got %q", model.BucketStatusDeleted, got.Status)
+	if got != nil {
+		t.Fatal("expected bucket to be deleted")
 	}
 
 	// Should not appear in ListActive.
@@ -210,19 +195,11 @@ func TestBucketRepo_List(t *testing.T) {
 		t.Fatalf("expected 0 buckets, got %d", len(list))
 	}
 
-	// Create buckets with different statuses.
-	for _, tc := range []struct {
-		name   string
-		status model.BucketStatus
-	}{
-		{"alpha", model.BucketStatusActive},
-		{"beta", model.BucketStatusCreating},
-		{"gamma", model.BucketStatusDeleted},
-		{"delta", model.BucketStatusDeleting},
-	} {
-		b := &model.Bucket{Name: tc.name, Status: tc.status}
+	// Create multiple active buckets.
+	for _, name := range []string{"alpha", "beta", "gamma", "delta"} {
+		b := &model.Bucket{Name: name, Status: model.BucketStatusActive}
 		if err := repos.Buckets.Create(ctx, b); err != nil {
-			t.Fatalf("Create(%s): %v", tc.name, err)
+			t.Fatalf("Create(%s): %v", name, err)
 		}
 	}
 
@@ -257,19 +234,11 @@ func TestBucketRepo_CountByStatus(t *testing.T) {
 		t.Fatalf("expected 0 counts, got %d", len(counts))
 	}
 
-	// Seed buckets: 2 active, 1 creating, 1 deleted.
-	for _, tc := range []struct {
-		name   string
-		status model.BucketStatus
-	}{
-		{"a1", model.BucketStatusActive},
-		{"a2", model.BucketStatusActive},
-		{"c1", model.BucketStatusCreating},
-		{"d1", model.BucketStatusDeleted},
-	} {
-		b := &model.Bucket{Name: tc.name, Status: tc.status}
+	// Seed buckets: 3 active.
+	for _, name := range []string{"a1", "a2", "a3"} {
+		b := &model.Bucket{Name: name, Status: model.BucketStatusActive}
 		if err := repos.Buckets.Create(ctx, b); err != nil {
-			t.Fatalf("Create(%s): %v", tc.name, err)
+			t.Fatalf("Create(%s): %v", name, err)
 		}
 	}
 
@@ -283,14 +252,8 @@ func TestBucketRepo_CountByStatus(t *testing.T) {
 		lookup[c.Status] = c.Count
 	}
 
-	if lookup[string(model.BucketStatusActive)] != 2 {
-		t.Errorf("expected 2 active, got %d", lookup[string(model.BucketStatusActive)])
-	}
-	if lookup[string(model.BucketStatusCreating)] != 1 {
-		t.Errorf("expected 1 creating, got %d", lookup[string(model.BucketStatusCreating)])
-	}
-	if lookup[string(model.BucketStatusDeleted)] != 1 {
-		t.Errorf("expected 1 deleted, got %d", lookup[string(model.BucketStatusDeleted)])
+	if lookup[string(model.BucketStatusActive)] != 3 {
+		t.Errorf("expected 3 active, got %d", lookup[string(model.BucketStatusActive)])
 	}
 }
 
@@ -305,8 +268,7 @@ func TestBucketRepo_CountWithProofSet_ExcludesDeletedBuckets(t *testing.T) {
 		proofSetID *string
 	}{
 		{name: "active-with-proof", status: model.BucketStatusActive, proofSetID: strptr("ps-1")},
-		{name: "deleting-with-proof", status: model.BucketStatusDeleting, proofSetID: strptr("ps-2")},
-		{name: "deleted-with-proof", status: model.BucketStatusDeleted, proofSetID: strptr("ps-3")},
+		{name: "active-with-proof-2", status: model.BucketStatusActive, proofSetID: strptr("ps-2")},
 		{name: "active-without-proof", status: model.BucketStatusActive, proofSetID: nil},
 	} {
 		b := &model.Bucket{Name: tc.name, Status: tc.status, ProofSetID: tc.proofSetID}

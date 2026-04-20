@@ -98,10 +98,10 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	// Dual safety check: must be onchained AND have PieceCID
-	if obj.State != model.ObjectStateOnChained {
-		logger.Warn("object not in onchained state", "state", obj.State)
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "not onchained")
+	// Dual safety check: must be stored AND have PieceCID
+	if obj.State != model.ObjectStateStored {
+		logger.Warn("object not in stored state", "state", obj.State)
+		_ = e.repos.Tasks.Fail(ctx, task.ID, "not stored")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
@@ -124,11 +124,11 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	// This prevents a TOCTOU race where a concurrent PutObject could write new data
 	// between our generation check and cache deletion.
 	if err := state.TransitionState(ctx, e.stateMachine, e.repos.Objects, task.RefID, task.RefGeneration,
-		model.ObjectStateOnChained, model.ObjectStateCacheEvicted); err != nil {
-		logger.Error("state transition onchained→cache_evicted failed", "error", err)
+		model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+		logger.Error("state transition stored→cache_evicted failed", "error", err)
 		if task.RetryCount+1 >= task.MaxRetries {
 			_ = state.TransitionToFailed(ctx, e.stateMachine, e.repos.Objects, task.RefID, task.RefGeneration,
-				model.ObjectStateOnChained, fmt.Sprintf("cache eviction: %v (max retries reached)", err))
+				model.ObjectStateStored, fmt.Sprintf("cache eviction: %v (max retries reached)", err))
 			if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
 				logger.Error("failed to mark task as dead-letter", "error", ftErr)
 			} else {

@@ -10,38 +10,17 @@ import (
 type BucketStatus string
 
 const (
-	BucketStatusActive       BucketStatus = "active"
-	BucketStatusCreating     BucketStatus = "creating"
-	BucketStatusDeleting     BucketStatus = "deleting"
-	BucketStatusDeleted      BucketStatus = "deleted"
-	BucketStatusCreateFailed BucketStatus = "create_failed"
-	BucketStatusDeleteFailed BucketStatus = "delete_failed"
+	BucketStatusActive BucketStatus = "active"
 )
 
-// IsVisible returns true for bucket statuses that should be visible to S3 clients
-// (i.e., for HeadBucket, GetObject read operations).
-func (s BucketStatus) IsVisible() bool {
-	switch s {
-	case BucketStatusActive, BucketStatusCreating, BucketStatusDeleting:
-		return true
-	default:
-		return false
-	}
-}
+// IsVisible returns true — all buckets are active and visible.
+func (s BucketStatus) IsVisible() bool { return true }
 
-// IsAdminVisible returns true for bucket statuses that should remain visible in
-// admin surfaces. Failed states stay operator-visible for diagnosis/recovery;
-// only fully deleted buckets are hidden.
-func (s BucketStatus) IsAdminVisible() bool {
-	return s != BucketStatusDeleted
-}
+// IsAdminVisible returns true — all buckets are visible to admin.
+func (s BucketStatus) IsAdminVisible() bool { return true }
 
-// IsWritable returns true for bucket statuses that allow write operations
-// (PutObject, multipart uploads, etc). Active and creating buckets accept writes;
-// creating buckets allow data ingest while the proof set is being provisioned.
-func (s BucketStatus) IsWritable() bool {
-	return s == BucketStatusActive || s == BucketStatusCreating
-}
+// IsWritable returns true — all active buckets accept writes.
+func (s BucketStatus) IsWritable() bool { return true }
 
 // Bucket maps an S3 bucket to a Filecoin ProofSet.
 type Bucket struct {

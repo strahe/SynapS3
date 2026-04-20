@@ -2,69 +2,48 @@ package synapse
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"errors"
-	"math/big"
 	"sync"
 	"time"
 
-	"github.com/data-preservation-programs/go-synapse/payments"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/strahe/synapse-go/chain"
+	"github.com/strahe/synapse-go/payments"
 )
 
 type walletQuerier struct {
-	ethClient       *ethclient.Client
-	payments        *payments.Service
-	address         common.Address
-	network         string
-	chainID         int64
-	paymentsAddress common.Address
-	usdfcAddress    common.Address
+	payments *payments.Service
+	address  common.Address
+	chain    chain.Chain
 }
 
-// NewWalletQuerier creates a WalletQuerier backed by go-synapse payments.Service.
-func NewWalletQuerier(
-	ethClient *ethclient.Client,
-	privateKey *ecdsa.PrivateKey,
-	network string,
-	chainID int64,
-	paymentsAddress common.Address,
-) (WalletQuerier, error) {
-	paySvc, err := payments.NewService(ethClient, privateKey, big.NewInt(chainID), paymentsAddress)
-	if err != nil {
-		return nil, err
-	}
-
+// NewWalletQuerier creates a WalletQuerier backed by synapse-go payments.Service.
+func NewWalletQuerier(paySvc *payments.Service, address common.Address, c chain.Chain) WalletQuerier {
 	return &walletQuerier{
-		ethClient:       ethClient,
-		payments:        paySvc,
-		address:         crypto.PubkeyToAddress(privateKey.PublicKey),
-		network:         network,
-		chainID:         chainID,
-		paymentsAddress: paySvc.PaymentsAddress(),
-		usdfcAddress:    paySvc.USDFCAddress(),
-	}, nil
+		payments: paySvc,
+		address:  address,
+		chain:    c,
+	}
 }
 
 // GetWalletInfo queries on-chain state in parallel. Individual RPC failures
 // produce nil fields and entries in the Errors map instead of aborting.
 func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) {
+	addrs := w.chain.Addresses()
+
 	info := &WalletInfo{
 		Address:         w.address.Hex(),
-		Network:         w.network,
-		ChainID:         w.chainID,
-		PaymentsAddress: w.paymentsAddress.Hex(),
-		USDFCAddress:    w.usdfcAddress.Hex(),
-		USDFCDecimals:   payments.TokenDecimals,
+		Network:         w.chain.String(),
+		ChainID:         w.chain.ChainID(),
+		PaymentsAddress: addrs.Payments.Hex(),
+		USDFCAddress:    addrs.USDFC.Hex(),
+		USDFCDecimals:   18,
 		Errors:          make(map[string]string),
 	}
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Apply a 15-second timeout to prevent hanging on slow RPC nodes.
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -74,23 +53,11 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 		mu.Unlock()
 	}
 
-	wg.Add(5)
+	wg.Add(4)
 
 	go func() {
 		defer wg.Done()
-		nonce, err := w.ethClient.NonceAt(ctx, w.address, nil)
-		if err != nil {
-			setErr("nonce", err)
-			return
-		}
-		mu.Lock()
-		info.Nonce = &nonce
-		mu.Unlock()
-	}()
-
-	go func() {
-		defer wg.Done()
-		bal, err := w.payments.WalletBalance(ctx, payments.TokenFIL)
+		bal, err := w.payments.WalletBalance(ctx, payments.ZeroAddress, w.address)
 		if err != nil {
 			setErr("fil_balance", err)
 			return
@@ -102,7 +69,7 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 
 	go func() {
 		defer wg.Done()
-		bal, err := w.payments.WalletBalance(ctx, payments.TokenUSDFC)
+		bal, err := w.payments.WalletBalance(ctx, addrs.USDFC, w.address)
 		if err != nil {
 			setErr("usdfc_balance", err)
 			return
@@ -114,25 +81,25 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 
 	go func() {
 		defer wg.Done()
-		acct, err := w.payments.AccountInfo(ctx, payments.TokenFIL)
+		acct, err := w.payments.AccountInfo(ctx, payments.ZeroAddress, w.address)
 		if err != nil {
 			setErr("fil_account", err)
 			return
 		}
 		mu.Lock()
-		info.FILAccount = convertAccountInfo(acct)
+		info.FILAccount = convertAccountState(acct)
 		mu.Unlock()
 	}()
 
 	go func() {
 		defer wg.Done()
-		acct, err := w.payments.AccountInfo(ctx, payments.TokenUSDFC)
+		acct, err := w.payments.AccountInfo(ctx, addrs.USDFC, w.address)
 		if err != nil {
 			setErr("usdfc_account", err)
 			return
 		}
 		mu.Lock()
-		info.USDFCAccount = convertAccountInfo(acct)
+		info.USDFCAccount = convertAccountState(acct)
 		mu.Unlock()
 	}()
 
@@ -140,18 +107,17 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 	return info, nil
 }
 
-func convertAccountInfo(acct *payments.AccountInfo) *TokenAccountInfo {
+func convertAccountState(acct *payments.AccountState) *TokenAccountInfo {
 	if acct == nil {
 		return nil
 	}
 	return &TokenAccountInfo{
-		Funds:             acct.Funds,
-		AvailableFunds:    acct.AvailableFunds,
-		LockupCurrent:     acct.LockupCurrent,
-		LockupRate:        acct.LockupRate,
-		LockupLastSettled: acct.LockupLastSettled,
-		FundedUntilEpoch:  acct.FundedUntilEpoch,
-		CurrentLockupRate: acct.CurrentLockupRate,
+		Funds:               acct.Funds,
+		AvailableFunds:      acct.AvailableFunds(),
+		LockupCurrent:       acct.LockupCurrent,
+		LockupRate:          acct.LockupRate,
+		LockupLastSettledAt: acct.LockupLastSettledAt,
+		FundedUntilEpoch:    acct.FundedUntilEpoch,
 	}
 }
 

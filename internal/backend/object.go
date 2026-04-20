@@ -1,13 +1,14 @@
 package backend
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -16,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synapse-go/storage"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -73,7 +75,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 
 		// Enqueue upload task with correct idempotency key: upload:objectID:generation.
 		task := &model.Task{
-			Type:           model.TaskTypeUploadToSP,
+			Type:           model.TaskTypeUpload,
 			RefType:        "object",
 			RefID:          objectID,
 			RefGeneration:  newGen,
@@ -110,6 +112,10 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 }
 
 func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+	return b.getObject(ctx, input, true)
+}
+
+func (b *SynapseBackend) getObject(ctx context.Context, input *s3.GetObjectInput, allowRestart bool) (*s3.GetObjectOutput, error) {
 	if input.Bucket == nil || input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
 	}
@@ -151,16 +157,7 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 
 	// Cache miss — object has been evicted, try SP download if PieceCID is available.
 	admin.CacheMissesTotal.Inc()
-	if obj.PieceCID != nil && *obj.PieceCID != "" && b.storage != nil {
-		// Size guard: prevent OOM from downloading very large objects into memory.
-		// go-synapse's Download() loads the entire payload into []byte.
-		if b.maxSPDownloadSize > 0 && obj.Size > b.maxSPDownloadSize {
-			b.logger.Warn("object too large for SP download",
-				"key", *input.Key, "size", obj.Size, "limit", b.maxSPDownloadSize)
-			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
-			return nil, s3err.GetAPIError(s3err.ErrEntityTooLarge)
-		}
-
+	if obj.PieceCID != nil && *obj.PieceCID != "" && obj.RetrievalURL != nil && *obj.RetrievalURL != "" && b.storage != nil {
 		pieceCID, parseErr := cid.Decode(*obj.PieceCID)
 		if parseErr != nil {
 			b.logger.Warn("invalid PieceCID, cannot download from SP", "key", *input.Key, "pieceCID", *obj.PieceCID)
@@ -168,33 +165,36 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
 
-		// NOTE: storage.Download loads the entire object into memory (SDK limitation).
-		// For very large objects this can cause high memory pressure. A streaming
-		// download API is needed in go-synapse to fully resolve this.
-		data, dlErr := b.storage.Download(ctx, pieceCID, nil)
+		rc, dlErr := b.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: *obj.RetrievalURL})
 		if dlErr != nil {
 			b.logger.Warn("SP download failed", "key", *input.Key, "err", dlErr)
 			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
 			return nil, s3err.GetAPIError(s3err.ErrInternalError)
 		}
 
-		// Synchronous best-effort cache rehydration with generation check.
-		// Re-check generation to avoid overwriting a concurrent PutObject's newer data.
-		cur, _ := b.repos.Objects.GetByID(ctx, obj.ID)
-		if cur != nil && cur.Generation == obj.Generation {
-			if _, putErr := b.cache.Put(ctx, *input.Bucket, *input.Key, bytes.NewReader(data)); putErr != nil {
-				b.logger.Warn("cache rehydration failed (best-effort)", "key", *input.Key, "error", putErr)
+		cur, dbErr := b.repos.Objects.GetByID(ctx, obj.ID)
+		if dbErr != nil {
+			b.logger.Warn("generation check failed, skipping cache rehydration", "key", *input.Key, "error", dbErr)
+		}
+		if cur != nil && cur.Generation != obj.Generation {
+			_ = rc.Close()
+			if allowRestart {
+				return b.getObject(ctx, input, false)
 			}
+			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
 
 		etag := fmt.Sprintf(`"%s"`, obj.ETag)
 		contentType := obj.ContentType
-		size := int64(len(data))
-
+		body := rc
+		if dbErr == nil && cur != nil && cur.Generation == obj.Generation {
+			body = b.streamAndRehydrate(ctx, *input.Bucket, *input.Key, rc)
+		}
 		admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
 		return &s3.GetObjectOutput{
-			Body:          io.NopCloser(bytes.NewReader(data)),
-			ContentLength: &size,
+			Body:          body,
+			ContentLength: &obj.Size,
 			ETag:          &etag,
 			ContentType:   &contentType,
 		}, nil
@@ -232,58 +232,6 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 		ContentType:   &contentType,
 		LastModified:  &lastModified,
 	}, nil
-}
-
-func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
-	if input.Bucket == nil || input.Key == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
-	}
-
-	bucket, err := b.getBucket(ctx, *input.Bucket)
-	if err != nil {
-		return nil, err
-	}
-
-	// Soft-delete object (Bun soft_delete tag handles setting deleted_at).
-	obj, err := b.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, *input.Key)
-	if err != nil {
-		return nil, fmt.Errorf("querying object: %w", err)
-	}
-	if obj != nil {
-		if err := b.repos.Objects.SoftDelete(ctx, obj.ID); err != nil {
-			return nil, fmt.Errorf("deleting object: %w", err)
-		}
-		_ = b.cache.Delete(ctx, *input.Bucket, *input.Key)
-	}
-
-	admin.ObjectOperationsTotal.WithLabelValues("delete", "success").Inc()
-	return &s3.DeleteObjectOutput{}, nil
-}
-
-func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
-	var result s3response.DeleteResult
-
-	for _, obj := range input.Delete.Objects {
-		key := *obj.Key
-		_, err := b.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: input.Bucket,
-			Key:    &key,
-		})
-		if err != nil {
-			code := "InternalError"
-			msg := err.Error()
-			result.Error = append(result.Error, types.Error{
-				Key:     &key,
-				Code:    &code,
-				Message: &msg,
-			})
-		} else {
-			result.Deleted = append(result.Deleted, types.DeletedObject{
-				Key: &key,
-			})
-		}
-	}
-	return result, nil
 }
 
 func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
@@ -446,7 +394,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		newGen = gen
 
 		task := &model.Task{
-			Type:           model.TaskTypeUploadToSP,
+			Type:           model.TaskTypeUpload,
 			RefType:        "object",
 			RefID:          id,
 			RefGeneration:  gen,
@@ -612,3 +560,53 @@ func derefStr(s *string) string {
 // Ensure Body is consumed for PutObject, as it might come from
 // a streaming source. This is a no-op helper.
 var _ io.Reader = (*io.LimitedReader)(nil)
+
+func (b *SynapseBackend) streamAndRehydrate(ctx context.Context, bucket, key string, rc io.ReadCloser) io.ReadCloser {
+	pr, pw := io.Pipe()
+	body := &teeReadCloser{
+		reader:     io.TeeReader(rc, pw),
+		source:     rc,
+		pipeWriter: pw,
+	}
+
+	go func() {
+		if _, err := b.cache.Put(ctx, bucket, key, pr); err != nil {
+			b.logger.Warn("cache rehydration failed (best-effort)", "key", key, "error", err)
+			_, _ = io.Copy(io.Discard, pr)
+		}
+		_ = pr.Close()
+	}()
+
+	return body
+}
+
+type teeReadCloser struct {
+	reader     io.Reader
+	source     io.ReadCloser
+	pipeWriter *io.PipeWriter
+	closeOnce  sync.Once
+}
+
+func (t *teeReadCloser) Read(p []byte) (int, error) {
+	n, err := t.reader.Read(p)
+	if err != nil {
+		t.closePipe(err)
+	}
+	return n, err
+}
+
+func (t *teeReadCloser) Close() error {
+	t.closePipe(io.ErrClosedPipe)
+	return t.source.Close()
+}
+
+func (t *teeReadCloser) closePipe(err error) {
+	t.closeOnce.Do(func() {
+		switch {
+		case err == nil || errors.Is(err, io.EOF):
+			_ = t.pipeWriter.Close()
+		default:
+			_ = t.pipeWriter.CloseWithError(err)
+		}
+	})
+}

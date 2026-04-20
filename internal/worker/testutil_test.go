@@ -8,6 +8,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/uptrace/bun"
 )
 
 // testWorkerEnv holds all components needed to test workers.
@@ -16,42 +17,42 @@ type testWorkerEnv struct {
 	cache   cache.Cache
 	sm      *state.Machine
 	storage *testutil.MockStorageClient
-	proof   *testutil.MockProofSetClient
+	db      *bun.DB
 }
 
 // newTestWorkerEnv constructs a test environment with in-memory SQLite
 // and a real filesystem cache.
 func newTestWorkerEnv(t *testing.T) *testWorkerEnv {
 	t.Helper()
-	repos := testutil.NewTestRepos(t)
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
 	fsCache := newWorkerTestCache(t, 1<<30)
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
-	pc := &testutil.MockProofSetClient{}
 
 	return &testWorkerEnv{
 		repos:   repos,
 		cache:   fsCache,
 		sm:      sm,
 		storage: sc,
-		proof:   pc,
+		db:      db,
 	}
 }
 
 // newTestWorkerEnvWithMockCache constructs a test environment with mock cache.
 func newTestWorkerEnvWithMockCache(t *testing.T, mc *testutil.MockCache) *testWorkerEnv {
 	t.Helper()
-	repos := testutil.NewTestRepos(t)
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
-	pc := &testutil.MockProofSetClient{}
 
 	return &testWorkerEnv{
 		repos:   repos,
 		cache:   mc,
 		sm:      sm,
 		storage: sc,
-		proof:   pc,
+		db:      db,
 	}
 }
 
