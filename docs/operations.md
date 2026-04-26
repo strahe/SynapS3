@@ -5,21 +5,20 @@ This document covers the runtime behavior of SynapS3: how data moves through the
 ## Storage Pipeline
 
 ```text
-PutObject -> cache write + DB commit -> upload worker -> on-chain worker -> cache eviction
+PutObject -> cache write + DB commit -> upload worker (synapse-go SP + on-chain commit) -> cache eviction
 ```
 
 ### Object flow
 
 1. `PutObject` writes the payload to the local filesystem cache, then commits metadata and an upload task to the database.
-2. The uploader worker sends the cached file to the Storage Provider and records the resulting PieceCID.
-3. The on-chain worker submits the data root to the bucket ProofSet lifecycle.
-4. The evictor removes the local cache entry after on-chain storage is confirmed.
-5. `GetObject` serves cached data first and can download from the provider on eligible cache misses once the object has a `PieceCID` and the size is within `max_sp_download_size`.
+2. The uploader worker calls `synapse-go` storage upload, which handles provider storage and on-chain commit, then records the resulting PieceCID and retrieval URL.
+3. The evictor removes the local cache entry after the object reaches `stored`.
+4. `GetObject` serves cached data first and can download from the provider on eligible cache misses once the object has both a `PieceCID` and retrieval URL. URL-based downloads are validated by `synapse-go` against the PieceCID.
 
 ### Bucket flow
 
-- `CreateBucket` enqueues async ProofSet creation
-- `DeleteBucket` enqueues async ProofSet deletion
+- `CreateBucket` creates an active metadata row and cache namespace.
+- `DeleteBucket` is not supported in the current lifecycle.
 
 ## Production Deployment
 
@@ -36,22 +35,22 @@ cache:
   dir: /var/lib/synaps3/cache
   max_size_gb: 500
   eviction_policy: lru
-  evict_after_onchain: true
-  max_sp_download_size: 1073741824  # 1 GiB (0 = unlimited)
+
+filecoin:
+  network: calibration
+  rpc_url: "https://api.calibration.node.glif.io/rpc/v1"
+  private_key: "0x..."
+  source: synaps3
+  with_cdn: false
+  allow_private_networks: false  # set true only for trusted private SP retrieval URLs
 
 worker:
   upload:
     concurrency: 4
     poll_interval: 5s
-  onchain:
-    concurrency: 2
-    poll_interval: 30s
   evictor:
     concurrency: 2
     poll_interval: 1m
-  proofset:
-    concurrency: 1
-    poll_interval: 30s
 
 logging:
   level: info
@@ -108,7 +107,8 @@ scrape_configs:
 | Scenario | Behavior | Recovery |
 | --- | --- | --- |
 | Storage Provider unreachable | Upload tasks retry with backoff and can end in dead-letter after max retries; eligible cache-miss `GetObject` requests can also fail | Restore provider connectivity, then retry via admin API |
-| RPC node down | On-chain tasks retry with backoff | Restore RPC connectivity |
+| RPC node down | Upload tasks can fail while `synapse-go` waits for on-chain commit | Restore RPC connectivity, then retry via admin API |
+| Private retrieval URL blocked | URL-based provider downloads reject private-network addresses unless explicitly allowed | Set `filecoin.allow_private_networks: true` only for trusted private deployments |
 | Database full | Writes fail and worker claims stop progressing | Free space or scale the database |
 | Cache disk full | `PutObject` fails while cached reads continue | Increase disk, lower cache size, or evict more aggressively |
 | Process crash | Startup recovery reconciles stale states and orphaned tasks | Automatic on restart |
@@ -130,7 +130,7 @@ Healthy:
 Unhealthy:
 
 ```json
-{"status":"unhealthy","errors":["worker/onchain: not responding"]}
+{"status":"unhealthy","errors":["worker/uploader: not responding"]}
 ```
 
 ### `GET /metrics`
@@ -145,7 +145,7 @@ Lists tasks that exhausted retries and entered dead-letter status.
 [
   {
     "ID": 42,
-    "Type": "upload_to_sp",
+    "Type": "upload",
     "RefType": "object",
     "RefID": 7,
     "RefGeneration": 1,

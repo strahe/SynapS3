@@ -44,10 +44,12 @@ type S3Config struct {
 }
 
 type FilecoinConfig struct {
-	Network    string `koanf:"network"` // calibration | mainnet
-	RPCURL     string `koanf:"rpc_url"`
-	PrivateKey string `koanf:"private_key"`
-	Source     string `koanf:"source"`
+	Network              string `koanf:"network"` // calibration | mainnet
+	RPCURL               string `koanf:"rpc_url"`
+	PrivateKey           string `koanf:"private_key"`
+	Source               string `koanf:"source"`
+	WithCDN              bool   `koanf:"with_cdn"`
+	AllowPrivateNetworks bool   `koanf:"allow_private_networks"`
 }
 
 type DatabaseConfig struct {

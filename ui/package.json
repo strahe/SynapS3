@@ -2,6 +2,9 @@
   "name": "synaps3-dashboard",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "pnpm": ">=10 <11"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

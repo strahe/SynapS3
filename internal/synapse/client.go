@@ -5,23 +5,35 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/strahe/synapse-go"
+	sdk "github.com/strahe/synapse-go"
 )
 
-// NewClient creates a synapse.Client from config fields.
-func NewClient(ctx context.Context, privateKey, rpcURL, source string, logger *slog.Logger) (*synapse.Client, error) {
-	opts := []synapse.ClientOption{
-		synapse.WithPrivateKeyHex(privateKey),
-		synapse.WithRPCURL(rpcURL),
+// ClientConfig contains SynapS3 runtime settings forwarded into synapse-go.
+type ClientConfig struct {
+	PrivateKey           string
+	RPCURL               string
+	Source               string
+	WithCDN              bool
+	AllowPrivateNetworks bool
+	Logger               *slog.Logger
+}
+
+// NewClient creates a synapse-go Client from config fields.
+func NewClient(ctx context.Context, cfg ClientConfig) (*sdk.Client, error) {
+	opts := []sdk.ClientOption{
+		sdk.WithPrivateKeyHex(cfg.PrivateKey),
+		sdk.WithRPCURL(cfg.RPCURL),
+		sdk.WithCDN(cfg.WithCDN),
+		sdk.WithAllowPrivateNetworks(cfg.AllowPrivateNetworks),
 	}
-	if source != "" {
-		opts = append(opts, synapse.WithSource(source))
+	if cfg.Source != "" {
+		opts = append(opts, sdk.WithSource(cfg.Source))
 	}
-	if logger != nil {
-		opts = append(opts, synapse.WithLogger(logger))
+	if cfg.Logger != nil {
+		opts = append(opts, sdk.WithLogger(cfg.Logger))
 	}
 
-	client, err := synapse.New(ctx, opts...)
+	client, err := sdk.New(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating synapse client: %w", err)
 	}

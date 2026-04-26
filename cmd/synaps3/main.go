@@ -181,7 +181,14 @@ func runServe(ctx context.Context, configPath string) error {
 	var storageClient synapse.StorageClient
 	var walletQuerier synapse.WalletQuerier
 	if cfg.Filecoin.PrivateKey != "" {
-		client, sdkErr := synapse.NewClient(ctx, cfg.Filecoin.PrivateKey, cfg.Filecoin.RPCURL, cfg.Filecoin.Source, logger)
+		client, sdkErr := synapse.NewClient(ctx, synapse.ClientConfig{
+			PrivateKey:           cfg.Filecoin.PrivateKey,
+			RPCURL:               cfg.Filecoin.RPCURL,
+			Source:               cfg.Filecoin.Source,
+			WithCDN:              cfg.Filecoin.WithCDN,
+			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+			Logger:               logger,
+		})
 		if sdkErr != nil {
 			return fmt.Errorf("initializing Filecoin SDK: %w", sdkErr)
 		}

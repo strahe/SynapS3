@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -210,6 +212,33 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.Database.Driver != "postgres" {
 		t.Errorf("Database.Driver = %q, want %q", cfg.Database.Driver, "postgres")
+	}
+}
+
+func TestLoad_FilecoinSDKOptions(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfgYAML := []byte(`filecoin:
+  source: "synaps3-test"
+  with_cdn: true
+  allow_private_networks: true
+`)
+	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load(%q) failed: %v", cfgPath, err)
+	}
+	if cfg.Filecoin.Source != "synaps3-test" {
+		t.Fatalf("filecoin.source = %q, want synaps3-test", cfg.Filecoin.Source)
+	}
+	if !cfg.Filecoin.WithCDN {
+		t.Fatal("filecoin.with_cdn = false, want true")
+	}
+	if !cfg.Filecoin.AllowPrivateNetworks {
+		t.Fatal("filecoin.allow_private_networks = false, want true")
 	}
 }
 

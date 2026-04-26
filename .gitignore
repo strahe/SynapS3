@@ -39,6 +39,7 @@ synaps3.db*
 config.yaml
 
 # Frontend build artifacts
+.pnpm-store/
 ui/node_modules/
 ui/dist/
 ui/src/routeTree.gen.ts

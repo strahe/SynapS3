@@ -40,9 +40,9 @@ Start with [`config.example.yaml`](config.example.yaml) and see [`docs/configura
 
 | Operation | Status | Notes |
 | --- | --- | --- |
-| `CreateBucket` | Supported | Creates the bucket and starts async ProofSet creation |
+| `CreateBucket` | Supported | Creates an active bucket and cache namespace |
 | `HeadBucket` | Supported | Returns bucket metadata |
-| `DeleteBucket` | Supported | Marks the bucket for removal and starts async ProofSet deletion |
+| `DeleteBucket` | Not supported | Bucket deletion is intentionally disabled in the current lifecycle |
 | `ListBuckets` | Supported | Lists active buckets |
 
 ### Object Operations

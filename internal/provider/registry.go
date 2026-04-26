@@ -2,12 +2,15 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synapse-go/spregistry"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 // ListOptions controls provider listing behavior.
@@ -33,7 +36,14 @@ type ProviderDetail struct {
 
 // RegistryService wraps the synapse-go spregistry.Service for provider listing.
 type RegistryService struct {
-	svc *spregistry.Service
+	svc registryProviderSource
+}
+
+type registryProviderSource interface {
+	GetPDPProviders(ctx context.Context, onlyActive bool, opts sdktypes.ListOptions) (*spregistry.PaginatedPDPProviders, error)
+	GetProviderCount(ctx context.Context) (*big.Int, error)
+	GetPDPProvider(ctx context.Context, providerID sdktypes.ProviderID) (*spregistry.PDPProvider, error)
+	GetProvider(ctx context.Context, providerID sdktypes.ProviderID) (*spregistry.ProviderInfo, error)
 }
 
 // NewRegistryService creates a RegistryService from a synapse-go SPRegistry service.
@@ -51,12 +61,12 @@ func ListProviders(ctx context.Context, reg *RegistryService, opts ListOptions) 
 
 func listActiveProviders(ctx context.Context, reg *RegistryService) ([]ProviderDetail, error) {
 	var all []ProviderDetail
-	offset := big.NewInt(0)
-	limit := big.NewInt(50)
+	var offset uint64
+	const limit uint64 = 50
 	var skipped int
 
 	for {
-		page, err := reg.svc.GetPDPProviders(ctx, true, offset, limit)
+		page, err := reg.svc.GetPDPProviders(ctx, true, sdktypes.ListOptions{Offset: offset, Limit: limit})
 		if err != nil {
 			return nil, fmt.Errorf("fetching active PDP providers: %w", err)
 		}
@@ -71,7 +81,7 @@ func listActiveProviders(ctx context.Context, reg *RegistryService) ([]ProviderD
 		if !page.HasMore {
 			break
 		}
-		offset = new(big.Int).Add(offset, limit)
+		offset += limit
 	}
 	if skipped > 0 {
 		fmt.Fprintf(os.Stderr, "Warning: %d provider(s) skipped due to invalid provider IDs\n", skipped)
@@ -89,34 +99,41 @@ func listAllProviders(ctx context.Context, reg *RegistryService) ([]ProviderDeta
 	if !count.IsInt64() || count.Sign() <= 0 {
 		return nil, fmt.Errorf("provider count invalid: %s", count.String())
 	}
-	n := int(count.Int64())
-	details := make([]ProviderDetail, 0, n)
+	n := uint64(count.Int64())
+	if n > maxIntUint64() {
+		return nil, fmt.Errorf("provider count too large: %s", count.String())
+	}
+	details := make([]ProviderDetail, 0)
 
-	for id := 1; id <= n; id++ {
-		p, err := reg.svc.GetPDPProvider(ctx, big.NewInt(int64(id)))
+	for id := uint64(1); id <= n; id++ {
+		providerID := sdktypes.ProviderID(id)
+		p, err := reg.svc.GetPDPProvider(ctx, providerID)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			if errors.Is(err, spregistry.ErrNotFound) {
+				detail, detailErr := providerInfoDetail(ctx, reg, providerID, int(id))
+				if detailErr != nil {
+					skipped++
+					continue
+				}
+				details = append(details, detail)
+				continue
 			}
 			skipped++
 			continue
 		}
 		if p == nil {
-			// Provider has no PDP product — add basic info.
-			info, err := reg.svc.GetProvider(ctx, big.NewInt(int64(id)))
-			if err != nil || info == nil {
-				skipped++
-				continue
-			}
-			detail, err := providerInfoToDetailWithFallback(info, id)
-			if err != nil {
+			detail, detailErr := providerInfoDetail(ctx, reg, providerID, int(id))
+			if detailErr != nil {
 				skipped++
 				continue
 			}
 			details = append(details, detail)
 			continue
 		}
-		detail, err := pdpProviderToDetailWithFallback(*p, id)
+		detail, err := pdpProviderToDetailWithFallback(*p, int(id))
 		if err != nil {
 			skipped++
 			continue
@@ -160,6 +177,17 @@ func providerInfoToDetail(info *spregistry.ProviderInfo) (ProviderDetail, error)
 	return providerInfoToDetailWithFallback(info, 0)
 }
 
+func providerInfoDetail(ctx context.Context, reg *RegistryService, providerID sdktypes.ProviderID, fallbackID int) (ProviderDetail, error) {
+	info, err := reg.svc.GetProvider(ctx, providerID)
+	if err != nil {
+		return ProviderDetail{}, err
+	}
+	if info == nil {
+		return ProviderDetail{}, fmt.Errorf("provider info missing")
+	}
+	return providerInfoToDetailWithFallback(info, fallbackID)
+}
+
 func providerInfoToDetailWithFallback(info *spregistry.ProviderInfo, fallbackID int) (ProviderDetail, error) {
 	id, err := providerID(info.ID, fallbackID)
 	if err != nil {
@@ -175,14 +203,21 @@ func providerInfoToDetailWithFallback(info *spregistry.ProviderInfo, fallbackID 
 	}, nil
 }
 
-func providerID(v *big.Int, fallback int) (int, error) {
-	if v == nil || !v.IsInt64() || v.Sign() <= 0 {
+func providerID(v sdktypes.ProviderID, fallback int) (int, error) {
+	if v == 0 {
 		if fallback > 0 {
 			return fallback, nil
 		}
 		return 0, fmt.Errorf("invalid provider ID")
 	}
-	return int(v.Int64()), nil
+	if uint64(v) > maxIntUint64() {
+		return 0, fmt.Errorf("invalid provider ID")
+	}
+	return int(v), nil
+}
+
+func maxIntUint64() uint64 {
+	return uint64(math.MaxInt)
 }
 
 // FormatSize converts a byte count to a human-readable size string (e.g., "1 MiB", "32 GiB").

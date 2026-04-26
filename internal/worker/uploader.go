@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/admin"
@@ -191,9 +192,9 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	// Lazy-populate bucket ProofSetID from first upload result
-	if bucket.ProofSetID == nil && len(result.Copies) > 0 && result.Copies[0].DataSetID != nil {
-		dsID := result.Copies[0].DataSetID.String()
+	// Lazy-populate bucket ProofSetID from the primary upload result.
+	if dataSetID, ok := result.PrimaryDataSetID(); bucket.ProofSetID == nil && ok && dataSetID != 0 {
+		dsID := strconv.FormatUint(uint64(dataSetID), 10)
 		if updateErr := u.repos.Buckets.SetProofSetID(ctx, bucket.ID, dsID); updateErr != nil {
 			logger.Warn("failed to populate bucket ProofSetID (non-fatal)", "error", updateErr)
 		}

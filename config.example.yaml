@@ -22,6 +22,8 @@ filecoin:
   rpc_url: "https://api.calibration.node.glif.io/rpc/v1"
   private_key: "0xREPLACE_WITH_YOUR_FILECOIN_PRIVATE_KEY"
   source: "synaps3"
+  with_cdn: false                 # default CDN hint for synapse-go uploads
+  allow_private_networks: false   # opt-in only for trusted private SP retrieval URLs
 
 database:
   driver: "sqlite"             # postgres | sqlite

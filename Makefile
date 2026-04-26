@@ -15,10 +15,10 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
 all: build
 
 ui-install:
-	cd ui && npm install
+	cd ui && pnpm install --frozen-lockfile
 
 ui-build: ui-install
-	cd ui && npm run build
+	cd ui && pnpm run build
 
 build: ui-build
 	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) $(PKG)
@@ -43,7 +43,7 @@ run: build
 	./bin/$(BINARY) serve --config config.example.yaml
 
 ui-dev:
-	cd ui && npm run dev
+	cd ui && pnpm run dev
 
 .PHONY: migrate
 migrate: build

@@ -39,7 +39,7 @@ internal/db/           Database bootstrap and migrations
 internal/db/repository/Repository interfaces and implementations
 internal/model/        Domain models
 internal/state/        Object lifecycle state machine
-internal/synapse/      go-synapse wrappers
+internal/synapse/      synapse-go SDK boundary
 internal/worker/       Background workers
 internal/buildinfo/    Version metadata
 ```

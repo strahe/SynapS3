@@ -20,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/storage"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 func testCID(t *testing.T) cid.Cid {
@@ -154,7 +155,7 @@ func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskI
 
 func TestUploader_HappyPath(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
+	bucket, objID, gen := seedCachedObject(t, env)
 	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
 
 	pieceCID := testCID(t)
@@ -164,7 +165,15 @@ func TestUploader_HappyPath(t *testing.T) {
 			Size:     11,
 			Complete: true,
 			Copies: []storage.CopyResult{
-				{RetrievalURL: "https://provider.example/pieces/1"},
+				{
+					Role:      storage.CopyRoleSecondary,
+					DataSetID: sdktypes.DataSetID(777),
+				},
+				{
+					Role:         storage.CopyRolePrimary,
+					DataSetID:    sdktypes.DataSetID(123),
+					RetrievalURL: "https://provider.example/pieces/1",
+				},
 			},
 		}, nil
 	}
@@ -202,6 +211,13 @@ func TestUploader_HappyPath(t *testing.T) {
 	}
 	if retrievalURL != "https://provider.example/pieces/1" {
 		t.Fatalf("retrieval_url = %q, want persisted URL", retrievalURL)
+	}
+	gotBucket, err := env.repos.Buckets.GetByID(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	if gotBucket.ProofSetID == nil || *gotBucket.ProofSetID != "123" {
+		t.Fatalf("bucket ProofSetID = %v, want primary DataSetID 123", gotBucket.ProofSetID)
 	}
 
 	// With autoEvict=true, an evict_cache task should be created
