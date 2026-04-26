@@ -1,13 +1,9 @@
-import { type FormEvent, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { type FormEvent, useState } from 'react'
 import type { BucketItem } from '@/api/client'
-import { useBuckets, useCreateBucket, useDeleteBucket } from '@/hooks/queries'
-import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
-import { useQueryClient } from '@tanstack/react-query'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import {
   Dialog,
   DialogContent,
@@ -17,6 +13,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { useBuckets, useCreateBucket, useDeleteBucket } from '@/hooks/queries'
+import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/')({
   component: BucketsPage,
@@ -83,9 +83,7 @@ function CreateBucketDialog() {
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Create Bucket</DialogTitle>
-          <DialogDescription>
-            A new proof set will be created on-chain for this bucket.
-          </DialogDescription>
+          <DialogDescription>A new proof set will be created on-chain for this bucket.</DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
@@ -99,11 +97,14 @@ function CreateBucketDialog() {
               disabled={createBucket.isPending}
             />
           </div>
-          {error && (
-            <p className="text-sm text-destructive">{error}</p>
-          )}
+          {error && <p className="text-sm text-destructive">{error}</p>}
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={createBucket.isPending}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleOpenChange(false)}
+              disabled={createBucket.isPending}
+            >
               Cancel
             </Button>
             <Button type="submit" disabled={createBucket.isPending}>
@@ -150,7 +151,7 @@ function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
         onError: (mutationError) => {
           setError(mutationError instanceof Error ? mutationError.message : 'Failed to delete bucket')
         },
-      },
+      }
     )
   }
 
@@ -184,11 +185,14 @@ function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
             disabled={deleteBucket.isPending}
           />
         </div>
-        {error && (
-          <p className="text-sm text-destructive">{error}</p>
-        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
         <DialogFooter>
-          <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={deleteBucket.isPending}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            disabled={deleteBucket.isPending}
+          >
             Cancel
           </Button>
           <Button variant="destructive" onClick={handleDelete} disabled={!nameMatches || deleteBucket.isPending}>
@@ -210,16 +214,14 @@ function BucketsPage() {
       <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <h1 className="text-2xl font-bold">Buckets</h1>
-          <p className="text-sm text-muted-foreground">Create buckets, delete them safely, and drill into their files.</p>
+          <p className="text-sm text-muted-foreground">
+            Create buckets, delete them safely, and drill into their files.
+          </p>
         </div>
 
         <div className="flex items-center gap-2">
           <CreateBucketDialog />
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => qc.invalidateQueries({ queryKey: ['buckets'] })}
-          >
+          <Button variant="outline" size="sm" onClick={() => qc.invalidateQueries({ queryKey: ['buckets'] })}>
             <RefreshCw className="h-4 w-4" /> Refresh
           </Button>
         </div>
@@ -246,44 +248,58 @@ function BucketsPage() {
               </tr>
             </thead>
             <tbody>
-              {data && data.length > 0 ? data.map((bucket) => {
-                const canDelete = deletableBucketStatuses.has(bucket.status)
+              {data && data.length > 0 ? (
+                data.map((bucket) => {
+                  const canDelete = deletableBucketStatuses.has(bucket.status)
 
-                return (
-                  <tr key={bucket.id} className="border-b border-border hover:bg-muted/30">
-                    <td className="px-4 py-3">
-                      <Link
-                        to="/buckets/$name"
-                        params={{ name: bucket.name }}
-                        className="font-medium text-primary hover:underline"
-                      >
-                        {bucket.name}
-                      </Link>
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={cn('inline-block rounded-full px-2 py-0.5 text-xs font-medium', statusColor[bucket.status] ?? 'bg-gray-100 text-gray-800')}>
-                        {bucket.status}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
-                      {bucket.proof_set_id ?? '—'}
-                    </td>
-                    <td className="px-4 py-3 text-right">{formatNumber(bucket.object_count)}</td>
-                    <td className="px-4 py-3 text-right">{formatBytes(bucket.total_size_bytes)}</td>
-                    <td className="px-4 py-3 text-muted-foreground" title={bucket.created_at}>{timeAgo(bucket.created_at)}</td>
-                    <td className="px-4 py-3">
-                      {canDelete ? (
-                        <DeleteBucketDialog bucket={bucket} />
-                      ) : (
-                        <Button variant="destructive" size="xs" disabled title="Only active or creating buckets can be deleted">
-                          <Trash2 className="h-3 w-3" />
-                          Delete
-                        </Button>
-                      )}
-                    </td>
-                  </tr>
-                )
-              }) : (
+                  return (
+                    <tr key={bucket.id} className="border-b border-border hover:bg-muted/30">
+                      <td className="px-4 py-3">
+                        <Link
+                          to="/buckets/$name"
+                          params={{ name: bucket.name }}
+                          className="font-medium text-primary hover:underline"
+                        >
+                          {bucket.name}
+                        </Link>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={cn(
+                            'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
+                            statusColor[bucket.status] ?? 'bg-gray-100 text-gray-800'
+                          )}
+                        >
+                          {bucket.status}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
+                        {bucket.proof_set_id ?? '—'}
+                      </td>
+                      <td className="px-4 py-3 text-right">{formatNumber(bucket.object_count)}</td>
+                      <td className="px-4 py-3 text-right">{formatBytes(bucket.total_size_bytes)}</td>
+                      <td className="px-4 py-3 text-muted-foreground" title={bucket.created_at}>
+                        {timeAgo(bucket.created_at)}
+                      </td>
+                      <td className="px-4 py-3">
+                        {canDelete ? (
+                          <DeleteBucketDialog bucket={bucket} />
+                        ) : (
+                          <Button
+                            variant="destructive"
+                            size="xs"
+                            disabled
+                            title="Only active or creating buckets can be deleted"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            Delete
+                          </Button>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })
+              ) : (
                 <tr>
                   <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
                     No buckets found

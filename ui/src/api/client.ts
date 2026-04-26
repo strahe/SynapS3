@@ -11,7 +11,7 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
     headers,
   })
   if (!res.ok) {
-    const body = await res.json().catch(() => ({} as Record<string, string>))
+    const body = await res.json().catch(() => ({}) as Record<string, string>)
     throw new Error((body as Record<string, string>).error || `API error: ${res.status}`)
   }
   return res.json() as Promise<T>

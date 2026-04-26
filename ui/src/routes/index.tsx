@@ -1,8 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router'
+import { CheckCircle, Database, FileBox, HardDrive, Loader2, XCircle } from 'lucide-react'
+import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { useOverview } from '@/hooks/queries'
-import { formatBytes, formatNumber, formatDuration } from '@/lib/utils'
-import { Database, FileBox, HardDrive, CheckCircle, XCircle, Loader2 } from 'lucide-react'
-import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import { formatBytes, formatDuration, formatNumber } from '@/lib/utils'
 
 export const Route = createFileRoute('/')({
   component: OverviewPage,
@@ -39,11 +39,7 @@ function OverviewPage() {
   }
 
   if (error || !data) {
-    return (
-      <div className="flex h-full items-center justify-center text-destructive">
-        Failed to load overview data
-      </div>
-    )
+    return <div className="flex h-full items-center justify-center text-destructive">Failed to load overview data</div>
   }
 
   const objStateData = Object.entries(data.objects.by_state).map(([name, value]) => ({ name, value }))
@@ -74,7 +70,15 @@ function OverviewPage() {
           {objStateData.length > 0 ? (
             <ResponsiveContainer width="100%" height={240}>
               <PieChart>
-                <Pie data={objStateData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label={({ name, value }) => `${name}: ${value}`}>
+                <Pie
+                  data={objStateData}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  outerRadius={80}
+                  label={({ name, value }) => `${name}: ${value}`}
+                >
                   {objStateData.map((entry) => (
                     <Cell key={entry.name} fill={STATE_COLORS[entry.name] ?? '#6b7280'} />
                   ))}
@@ -155,7 +159,17 @@ function OverviewPage() {
   )
 }
 
-function StatCard({ icon: Icon, label, value, sub }: { icon: React.ElementType; label: string; value: string; sub?: string }) {
+function StatCard({
+  icon: Icon,
+  label,
+  value,
+  sub,
+}: {
+  icon: React.ElementType
+  label: string
+  value: string
+  sub?: string
+}) {
   return (
     <div className="rounded-lg border border-border bg-card p-4">
       <div className="flex items-center gap-2 text-muted-foreground">

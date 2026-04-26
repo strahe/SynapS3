@@ -1,8 +1,8 @@
-import { createRootRouteWithContext, Link, Outlet } from '@tanstack/react-router'
 import type { QueryClient } from '@tanstack/react-query'
-import { LayoutDashboard, Database, ListTodo, HardDrive, Wallet } from 'lucide-react'
+import { createRootRouteWithContext, Link, Outlet } from '@tanstack/react-router'
+import { Database, HardDrive, LayoutDashboard, ListTodo, Wallet } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { cn } from '@/lib/utils'
-import { useState, useEffect } from 'react'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -41,7 +41,7 @@ function RootLayout() {
       <aside
         className={cn(
           'flex flex-col border-r border-border bg-sidebar transition-all duration-200',
-          collapsed ? 'w-14' : 'w-60',
+          collapsed ? 'w-14' : 'w-60'
         )}
       >
         <div className="flex h-14 items-center gap-2 border-b border-border px-3">
@@ -62,6 +62,7 @@ function RootLayout() {
         </nav>
         <div className="border-t border-border p-2">
           <button
+            type="button"
             onClick={() => setCollapsed(!collapsed)}
             className="flex w-full items-center justify-center rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-sidebar-accent"
           >

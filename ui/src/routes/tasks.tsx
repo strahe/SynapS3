@@ -1,18 +1,11 @@
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
-import { useTasks } from '@/hooks/queries'
-import { cn } from '@/lib/utils'
-import { timeAgo } from '@/lib/utils'
-import { Loader2, RefreshCw, RotateCcw, Copy, Check } from 'lucide-react'
-import { useQueryClient, useMutation } from '@tanstack/react-query'
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { Check, Copy, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '@/api/client'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { useTasks } from '@/hooks/queries'
+import { cn, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/tasks')({
   component: TasksPage,
@@ -67,6 +60,7 @@ function TasksPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Tasks</h1>
         <button
+          type="button"
           onClick={() => qc.invalidateQueries({ queryKey: ['tasks'] })}
           className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"
         >
@@ -78,11 +72,15 @@ function TasksPage() {
       <div className="flex gap-1 rounded-lg border border-border bg-muted/50 p-1">
         {statusTabs.map((tab) => (
           <button
+            type="button"
             key={tab}
-            onClick={() => { setStatus(tab); setOffset(0) }}
+            onClick={() => {
+              setStatus(tab)
+              setOffset(0)
+            }}
             className={cn(
               'rounded-md px-3 py-1.5 text-sm transition-colors',
-              status === tab ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground hover:text-foreground',
+              status === tab ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground hover:text-foreground'
             )}
           >
             {statusLabels[tab]}
@@ -92,10 +90,16 @@ function TasksPage() {
 
       {/* Type filter */}
       <div className="flex items-center gap-2">
-        <label className="text-sm text-muted-foreground">Type:</label>
+        <label htmlFor="task-type-filter" className="text-sm text-muted-foreground">
+          Type:
+        </label>
         <select
+          id="task-type-filter"
           value={taskType}
-          onChange={(e) => { setTaskType(e.target.value); setOffset(0) }}
+          onChange={(e) => {
+            setTaskType(e.target.value)
+            setOffset(0)
+          }}
           className="rounded-md border border-border bg-background px-2 py-1 text-sm"
         >
           <option value="">All</option>
@@ -130,43 +134,60 @@ function TasksPage() {
                 </tr>
               </thead>
               <tbody>
-                {data && data.tasks.length > 0 ? data.tasks.map((t) => (
-                  <tr key={t.id} className="border-b border-border hover:bg-muted/30">
-                    <td className="px-4 py-3 font-mono text-xs">{t.id}</td>
-                    <td className="px-4 py-3">{t.type}</td>
-                    <td className="px-4 py-3 text-muted-foreground">
-                      {t.ref_type}:{t.ref_id}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={cn('inline-block rounded-full px-2 py-0.5 text-xs font-medium', statusColor[t.status] ?? 'bg-gray-100 text-gray-800')}>
-                        {t.status}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-right">{t.retry_count}/{t.max_retries}</td>
-                    <td className="max-w-xs px-4 py-3 text-xs text-muted-foreground">
-                      {t.last_error ? (
-                        <button
-                          onClick={() => setErrorDialogText(t.last_error!)}
-                          className="max-w-full cursor-pointer truncate text-left hover:text-foreground"
+                {data && data.tasks.length > 0 ? (
+                  data.tasks.map((t) => (
+                    <tr key={t.id} className="border-b border-border hover:bg-muted/30">
+                      <td className="px-4 py-3 font-mono text-xs">{t.id}</td>
+                      <td className="px-4 py-3">{t.type}</td>
+                      <td className="px-4 py-3 text-muted-foreground">
+                        {t.ref_type}:{t.ref_id}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={cn(
+                            'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
+                            statusColor[t.status] ?? 'bg-gray-100 text-gray-800'
+                          )}
                         >
-                          {t.last_error}
-                        </button>
-                      ) : '—'}
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground">{timeAgo(t.scheduled_at)}</td>
-                    <td className="px-4 py-3">
-                      {t.status === 'dead_letter' && (
-                        <button
-                          onClick={() => retryMutation.mutate(t.id)}
-                          disabled={retryingId === t.id}
-                          className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
-                        >
-                          <RotateCcw className="h-3 w-3" /> Retry
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                )) : (
+                          {t.status}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        {t.retry_count}/{t.max_retries}
+                      </td>
+                      <td className="max-w-xs px-4 py-3 text-xs text-muted-foreground">
+                        {t.last_error ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (t.last_error) {
+                                setErrorDialogText(t.last_error)
+                              }
+                            }}
+                            className="max-w-full cursor-pointer truncate text-left hover:text-foreground"
+                          >
+                            {t.last_error}
+                          </button>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground">{timeAgo(t.scheduled_at)}</td>
+                      <td className="px-4 py-3">
+                        {t.status === 'dead_letter' && (
+                          <button
+                            type="button"
+                            onClick={() => retryMutation.mutate(t.id)}
+                            disabled={retryingId === t.id}
+                            className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+                          >
+                            <RotateCcw className="h-3 w-3" /> Retry
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                ) : (
                   <tr>
                     <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
                       No tasks found
@@ -185,6 +206,7 @@ function TasksPage() {
               </span>
               <div className="flex gap-2">
                 <button
+                  type="button"
                   disabled={offset === 0}
                   onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
                   className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
@@ -192,6 +214,7 @@ function TasksPage() {
                   ← Prev
                 </button>
                 <button
+                  type="button"
                   disabled={currentPage >= totalPages}
                   onClick={() => setOffset(offset + PAGE_SIZE)}
                   className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
@@ -204,10 +227,7 @@ function TasksPage() {
         </>
       )}
 
-      <ErrorDetailDialog
-        errorText={errorDialogText}
-        onClose={() => setErrorDialogText(null)}
-      />
+      <ErrorDetailDialog errorText={errorDialogText} onClose={() => setErrorDialogText(null)} />
     </div>
   )
 }
@@ -216,7 +236,11 @@ function ErrorDetailDialog({ errorText, onClose }: { errorText: string | null; o
   const [copied, setCopied] = useState(false)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  useEffect(() => { setCopied(false) }, [errorText])
+  useEffect(() => {
+    if (errorText !== null) {
+      setCopied(false)
+    }
+  }, [errorText])
 
   useEffect(() => {
     return () => {
@@ -237,7 +261,12 @@ function ErrorDetailDialog({ errorText, onClose }: { errorText: string | null; o
   }, [errorText])
 
   return (
-    <Dialog open={errorText !== null} onOpenChange={(open) => { if (!open) onClose() }}>
+    <Dialog
+      open={errorText !== null}
+      onOpenChange={(open) => {
+        if (!open) onClose()
+      }}
+    >
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Error Details</DialogTitle>
@@ -247,6 +276,7 @@ function ErrorDetailDialog({ errorText, onClose }: { errorText: string | null; o
         </div>
         <DialogFooter>
           <button
+            type="button"
             onClick={handleCopy}
             className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"
           >

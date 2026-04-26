@@ -50,8 +50,7 @@ export function useDeleteBucket() {
   const qc = useQueryClient()
 
   return useMutation({
-    mutationFn: ({ name, recursive }: { name: string; recursive: boolean }) =>
-      api.deleteBucket(name, { recursive }),
+    mutationFn: ({ name, recursive }: { name: string; recursive: boolean }) => api.deleteBucket(name, { recursive }),
     onSuccess: (_, variables) => {
       qc.invalidateQueries({ queryKey: ['buckets'] })
       qc.invalidateQueries({ queryKey: ['bucket', variables.name] })

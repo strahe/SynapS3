@@ -32,15 +32,6 @@ go.work.sum
 # .vscode/
 
 # SynapS3 build & runtime
-.serena/
 bin/
-synaps3.db*
-/cache/
 config.yaml
-
-# Frontend build artifacts
 .pnpm-store/
-ui/node_modules/
-ui/dist/
-ui/src/routeTree.gen.ts
-ui/tsconfig.tsbuildinfo

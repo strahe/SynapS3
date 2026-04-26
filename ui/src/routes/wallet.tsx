@@ -1,8 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router'
+import { AlertTriangle, Check, Copy, Loader2, Wallet } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useWallet } from '@/hooks/queries'
 import { formatAttoFIL, formatTokenAmount } from '@/lib/utils'
-import { Loader2, Wallet, Copy, Check, AlertTriangle } from 'lucide-react'
-import { useState, useCallback, useRef, useEffect } from 'react'
 
 export const Route = createFileRoute('/wallet')({
   component: WalletPage,
@@ -20,11 +20,7 @@ function WalletPage() {
   }
 
   if (error || !data) {
-    return (
-      <div className="flex h-full items-center justify-center text-destructive">
-        Failed to load wallet data
-      </div>
-    )
+    return <div className="flex h-full items-center justify-center text-destructive">Failed to load wallet data</div>
   }
 
   if (!data.configured) {
@@ -89,7 +85,12 @@ function WalletPage() {
           <AccountCard title="PDP Account — FIL" account={data.fil_account} decimals={18} symbol="FIL" />
         )}
         {data.usdfc_account && (
-          <AccountCard title="PDP Account — USDFC" account={data.usdfc_account} decimals={data.usdfc_decimals ?? 18} symbol="USDFC" />
+          <AccountCard
+            title="PDP Account — USDFC"
+            account={data.usdfc_account}
+            decimals={data.usdfc_decimals ?? 18}
+            symbol="USDFC"
+          />
         )}
         {!data.fil_account && !data.usdfc_account && (
           <div className="col-span-2 rounded-lg border border-border bg-card p-5">
@@ -106,9 +107,7 @@ function WalletPage() {
             {data.payments_address && (
               <IdentityField label="Payments Contract" value={data.payments_address} copyable />
             )}
-            {data.usdfc_address && (
-              <IdentityField label="USDFC Token" value={data.usdfc_address} copyable />
-            )}
+            {data.usdfc_address && <IdentityField label="USDFC Token" value={data.usdfc_address} copyable />}
           </dl>
         </div>
       )}
@@ -130,7 +129,12 @@ function WalletPage() {
 
 // --- Sub-components ---
 
-function IdentityField({ label, value, copyable, badge }: {
+function IdentityField({
+  label,
+  value,
+  copyable,
+  badge,
+}: {
   label: string
   value: string
   copyable?: boolean
@@ -171,6 +175,7 @@ function IdentityField({ label, value, copyable, badge }: {
         )}
         {copyable && value !== '—' && (
           <button
+            type="button"
             onClick={handleCopy}
             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
             title="Copy to clipboard"
@@ -184,7 +189,12 @@ function IdentityField({ label, value, copyable, badge }: {
   )
 }
 
-function BalanceCard({ title, amount, raw, color }: {
+function BalanceCard({
+  title,
+  amount,
+  raw,
+  color,
+}: {
   title: string
   amount: string
   raw: string | null
@@ -196,9 +206,7 @@ function BalanceCard({ title, amount, raw, color }: {
         <Wallet className="h-4 w-4" />
         <span className="text-sm">{title}</span>
       </div>
-      <div className={`mt-2 text-2xl font-bold ${raw == null ? 'text-muted-foreground' : color}`}>
-        {amount}
-      </div>
+      <div className={`mt-2 text-2xl font-bold ${raw == null ? 'text-muted-foreground' : color}`}>{amount}</div>
     </div>
   )
 }
@@ -206,15 +214,24 @@ function BalanceCard({ title, amount, raw, color }: {
 // uint256.max sentinel — Solidity uses this to mean "unlimited/∞"
 const UINT256_MAX = '115792089237316195423570985008687907853269984665640564039457584007913129639935'
 
-function AccountCard({ title, account, decimals, symbol }: {
+function AccountCard({
+  title,
+  account,
+  decimals,
+  symbol,
+}: {
   title: string
-  account: { funds: string | null; available_funds: string | null; lockup_current: string | null; lockup_rate: string | null; funded_until_epoch: string | null }
+  account: {
+    funds: string | null
+    available_funds: string | null
+    lockup_current: string | null
+    lockup_rate: string | null
+    funded_until_epoch: string | null
+  }
   decimals: number
   symbol: string
 }) {
-  const fundedDisplay = account.funded_until_epoch === UINT256_MAX
-    ? '∞'
-    : (account.funded_until_epoch ?? '—')
+  const fundedDisplay = account.funded_until_epoch === UINT256_MAX ? '∞' : (account.funded_until_epoch ?? '—')
 
   return (
     <div className="rounded-lg border border-border bg-card p-5">

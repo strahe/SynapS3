@@ -10,12 +10,12 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build test lint fmt clean run ui-install ui-build ui-dev
+.PHONY: all build test lint fmt check clean run ui-install ui-build ui-dev
 
 all: build
 
 ui-install:
-	cd ui && pnpm install --frozen-lockfile
+	cd ui && pnpm install --frozen-lockfile --config.confirmModulesPurge=false
 
 ui-build: ui-install
 	cd ui && pnpm run build
@@ -28,11 +28,21 @@ test:
 
 lint:
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
-	golangci-lint run ./...
+	golangci-lint run
+	cd ui && pnpm run check
 
 fmt:
-	gofmt -s -w .
-	goimports -w .
+	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
+	golangci-lint fmt
+	cd ui && pnpm run format
+
+check:
+	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
+	golangci-lint config verify
+	golangci-lint fmt --diff
+	golangci-lint run
+	cd ui && pnpm run check
+	$(MAKE) test
 
 clean:
 	rm -rf bin/

@@ -1,12 +1,8 @@
-import { useState } from 'react'
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Loader2, RefreshCw, ChevronRight, Folder, Trash2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
-import { useBucket, useBucketObjects, useDeleteBucket } from '@/hooks/queries'
-import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { ChevronRight, Folder, Loader2, RefreshCw, Trash2 } from 'lucide-react'
+import { useState } from 'react'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import {
   Dialog,
   DialogContent,
@@ -16,6 +12,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { useBucket, useBucketObjects, useDeleteBucket } from '@/hooks/queries'
+import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/$name')({
   component: ObjectBrowserPage,
@@ -75,7 +75,7 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
         onError: (mutationError) => {
           setError(mutationError instanceof Error ? mutationError.message : 'Failed to delete bucket')
         },
-      },
+      }
     )
   }
 
@@ -109,11 +109,14 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
             disabled={deleteBucket.isPending}
           />
         </div>
-        {error && (
-          <p className="text-sm text-destructive">{error}</p>
-        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
         <DialogFooter>
-          <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={deleteBucket.isPending}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            disabled={deleteBucket.isPending}
+          >
             Cancel
           </Button>
           <Button variant="destructive" onClick={handleDelete} disabled={!nameMatches || deleteBucket.isPending}>
@@ -150,34 +153,44 @@ function ObjectBrowserPage() {
   const canDelete = bucket.data?.status === 'active'
 
   const folders = new Set<string>()
-  const files = objects.data?.objects.filter((object) => {
-    const rest = object.key.slice(prefix.length)
-    const slashIdx = rest.indexOf('/')
-    if (slashIdx >= 0) {
-      folders.add(prefix + rest.substring(0, slashIdx + 1))
-      return false
-    }
-    return true
-  }) ?? []
+  const files =
+    objects.data?.objects.filter((object) => {
+      const rest = object.key.slice(prefix.length)
+      const slashIdx = rest.indexOf('/')
+      if (slashIdx >= 0) {
+        folders.add(prefix + rest.substring(0, slashIdx + 1))
+        return false
+      }
+      return true
+    }) ?? []
 
   return (
     <div className="space-y-4 p-6">
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-1 text-sm">
-          <Link to="/buckets" className="text-primary hover:underline">Buckets</Link>
+          <Link to="/buckets" className="text-primary hover:underline">
+            Buckets
+          </Link>
           <ChevronRight className="h-4 w-4 text-muted-foreground" />
-          <button onClick={() => navigateToPrefix('')} className="text-primary hover:underline">{name}</button>
-          {prefixParts.map((part, index) => (
-            <span key={part + index} className="flex items-center gap-1">
-              <ChevronRight className="h-4 w-4 text-muted-foreground" />
-              <button
-                onClick={() => navigateToPrefix(prefixParts.slice(0, index + 1).join('/') + '/')}
-                className="text-primary hover:underline"
-              >
-                {part}
-              </button>
-            </span>
-          ))}
+          <button type="button" onClick={() => navigateToPrefix('')} className="text-primary hover:underline">
+            {name}
+          </button>
+          {prefixParts.map((part, index) => {
+            const targetPrefix = `${prefixParts.slice(0, index + 1).join('/')}/`
+
+            return (
+              <span key={targetPrefix} className="flex items-center gap-1">
+                <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                <button
+                  type="button"
+                  onClick={() => navigateToPrefix(targetPrefix)}
+                  className="text-primary hover:underline"
+                >
+                  {part}
+                </button>
+              </span>
+            )
+          })}
         </div>
 
         <div className="flex items-center gap-2">
@@ -208,7 +221,12 @@ function ObjectBrowserPage() {
               <h1 className="text-2xl font-bold">{bucket.data.name}</h1>
               <p className="text-sm text-muted-foreground">Inspect metadata and browse files in this bucket.</p>
             </div>
-            <span className={cn('inline-block rounded-full px-2 py-0.5 text-xs font-medium', bucketStatusColor[bucket.data.status] ?? 'bg-gray-100 text-gray-800')}>
+            <span
+              className={cn(
+                'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
+                bucketStatusColor[bucket.data.status] ?? 'bg-gray-100 text-gray-800'
+              )}
+            >
               {bucket.data.status}
             </span>
           </div>
@@ -228,11 +246,15 @@ function ObjectBrowserPage() {
             </div>
             <div>
               <dt className="text-sm text-muted-foreground">Created</dt>
-              <dd className="text-sm text-muted-foreground" title={bucket.data.created_at}>{timeAgo(bucket.data.created_at)}</dd>
+              <dd className="text-sm text-muted-foreground" title={bucket.data.created_at}>
+                {timeAgo(bucket.data.created_at)}
+              </dd>
             </div>
             <div>
               <dt className="text-sm text-muted-foreground">Updated</dt>
-              <dd className="text-sm text-muted-foreground" title={bucket.data.updated_at}>{timeAgo(bucket.data.updated_at)}</dd>
+              <dd className="text-sm text-muted-foreground" title={bucket.data.updated_at}>
+                {timeAgo(bucket.data.updated_at)}
+              </dd>
             </div>
             <div>
               <dt className="text-sm text-muted-foreground">Current path</dt>
@@ -291,19 +313,34 @@ function ObjectBrowserPage() {
                     <td className="px-4 py-3 font-mono text-xs">{object.key.slice(prefix.length)}</td>
                     <td className="px-4 py-3 text-right">{formatBytes(object.size)}</td>
                     <td className="px-4 py-3">
-                      <span className={cn('inline-block rounded-full px-2 py-0.5 text-xs font-medium', stateColor[object.state] ?? 'bg-gray-100 text-gray-800')}>
+                      <span
+                        className={cn(
+                          'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
+                          stateColor[object.state] ?? 'bg-gray-100 text-gray-800'
+                        )}
+                      >
                         {object.state}
                       </span>
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">{object.content_type}</td>
-                    <td className="max-w-40 truncate px-4 py-3 font-mono text-xs text-muted-foreground" title={object.etag}>
+                    <td
+                      className="max-w-40 truncate px-4 py-3 font-mono text-xs text-muted-foreground"
+                      title={object.etag}
+                    >
                       {object.etag}
                     </td>
-                    <td className="max-w-52 truncate px-4 py-3 font-mono text-xs text-muted-foreground" title={object.piece_cid ?? undefined}>
+                    <td
+                      className="max-w-52 truncate px-4 py-3 font-mono text-xs text-muted-foreground"
+                      title={object.piece_cid ?? undefined}
+                    >
                       {object.piece_cid ?? '—'}
                     </td>
-                    <td className="px-4 py-3 text-muted-foreground" title={object.created_at}>{timeAgo(object.created_at)}</td>
-                    <td className="px-4 py-3 text-muted-foreground" title={object.updated_at}>{timeAgo(object.updated_at)}</td>
+                    <td className="px-4 py-3 text-muted-foreground" title={object.created_at}>
+                      {timeAgo(object.created_at)}
+                    </td>
+                    <td className="px-4 py-3 text-muted-foreground" title={object.updated_at}>
+                      {timeAgo(object.updated_at)}
+                    </td>
                   </tr>
                 ))}
                 {folders.size === 0 && files.length === 0 && (
@@ -324,7 +361,16 @@ function ObjectBrowserPage() {
               </Button>
             )}
             {objects.data?.has_more && objects.data.next_marker && (
-              <Button variant="outline" size="sm" className="ml-auto" onClick={() => setMarker(objects.data!.next_marker!)}>
+              <Button
+                variant="outline"
+                size="sm"
+                className="ml-auto"
+                onClick={() => {
+                  if (objects.data?.next_marker) {
+                    setMarker(objects.data.next_marker)
+                  }
+                }}
+              >
                 Next page →
               </Button>
             )}
