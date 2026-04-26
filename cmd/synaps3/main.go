@@ -26,6 +26,8 @@ import (
 	"github.com/versity/versitygw/s3api/middlewares"
 )
 
+const defaultS3MultipartMaxParts = 10000
+
 func main() {
 	root := &cli.Command{
 		Name:        "synaps3",
@@ -133,6 +135,14 @@ func runMigrate(ctx context.Context, configPath string) error {
 	return nil
 }
 
+func s3ServerOptions(cfg config.ServerConfig) []s3api.Option {
+	return []s3api.Option{
+		s3api.WithHealth("/health"),
+		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
+		s3api.WithMpMaxParts(defaultS3MultipartMaxParts),
+	}
+}
+
 func runServe(ctx context.Context, configPath string) error {
 	cfg, database, err := loadConfigAndDB(ctx, configPath)
 	if err != nil {
@@ -207,6 +217,7 @@ func runServe(ctx context.Context, configPath string) error {
 		Access: cfg.S3.AccessKey,
 		Secret: cfg.S3.SecretKey,
 	}
+	s3Opts := s3ServerOptions(cfg.Server)
 
 	// Create VersityGW S3 server.
 	srv, err := s3api.New(
@@ -218,8 +229,7 @@ func runServe(ctx context.Context, configPath string) error {
 		nil, // admin logger
 		nil, // event sender
 		nil, // metrics manager
-		s3api.WithHealth("/health"),
-		s3api.WithConcurrencyLimiter(cfg.Server.MaxConnections, cfg.Server.MaxRequests),
+		s3Opts...,
 	)
 	if err != nil {
 		return fmt.Errorf("creating S3 server: %w", err)
