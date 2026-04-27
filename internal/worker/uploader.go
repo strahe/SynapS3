@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"strconv"
 	"time"
 
@@ -158,13 +159,13 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		info, wErr := u.wallet.GetWalletInfo(ctx)
 		if wErr != nil {
 			logger.Warn("wallet balance pre-check failed, proceeding with upload", "error", wErr)
-		} else if info != nil && info.USDFCAccount != nil &&
-			info.USDFCAccount.Funds != nil && info.USDFCAccount.Funds.Sign() == 0 {
-			msg := "insufficient payment account balance: USDFC deposited funds = 0, please deposit USDFC into your payment account before uploading"
-			logger.Warn(msg)
-			_ = u.repos.Tasks.Fail(ctx, task.ID, msg)
-			admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
-			return
+		} else if info != nil {
+			available := availableUSDFCFunds(info.USDFCAccount)
+			if available != nil && available.Sign() == 0 {
+				msg := "insufficient payment account balance: USDFC available funds = 0; deposit USDFC into your payment account or wait for locked funds to become available before uploading"
+				u.handleBalancePreflightFailure(ctx, task, logger, errors.New(msg))
+				return
+			}
 		}
 	}
 
@@ -262,6 +263,42 @@ func firstRetrievalURL(result *storage.UploadResult) string {
 		}
 	}
 	return ""
+}
+
+func availableUSDFCFunds(acct *synapse.TokenAccountInfo) *big.Int {
+	if acct == nil {
+		return nil
+	}
+	if acct.AvailableFunds != nil {
+		available := new(big.Int).Set(acct.AvailableFunds)
+		if available.Sign() < 0 {
+			return big.NewInt(0)
+		}
+		return available
+	}
+	if acct.Funds == nil || acct.LockupCurrent == nil {
+		return nil
+	}
+	available := new(big.Int).Sub(acct.Funds, acct.LockupCurrent)
+	if available.Sign() < 0 {
+		return big.NewInt(0)
+	}
+	return available
+}
+
+func (u *Uploader) handleBalancePreflightFailure(ctx context.Context, task *model.Task, logger *slog.Logger, err error) {
+	logger.Warn("wallet balance pre-check failed", "error", err)
+	if task.RetryCount+1 >= task.MaxRetries {
+		if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+			logger.Error("failed to mark task as dead-letter", "error", ftErr)
+		} else {
+			admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUpload)).Inc()
+		}
+	} else {
+		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
+	}
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 }
 
 func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, logger *slog.Logger, currentState model.ObjectState, stage string, err error) {

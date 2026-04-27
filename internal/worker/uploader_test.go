@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/big"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,6 +146,43 @@ func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskI
 				continue
 			}
 			if task != nil && task.Status != model.TaskStatusPending && task.Status != model.TaskStatusRunning {
+				cancel()
+				<-done
+				return
+			}
+		}
+	}
+}
+
+// runWorkerUntilTaskRetryCount runs a worker until the task has recorded at
+// least the requested retry count, then cancels the worker.
+func runWorkerUntilTaskRetryCount(t *testing.T, env *testWorkerEnv, w worker.Worker, taskID int64, retryCount int, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = w.Run(ctx)
+		close(done)
+	}()
+
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("timed out waiting for task %d retry_count >= %d", taskID, retryCount)
+		case <-ticker.C:
+			task, err := env.repos.Tasks.GetByID(context.Background(), taskID)
+			if err != nil {
+				continue
+			}
+			if task != nil && task.RetryCount >= retryCount {
 				cancel()
 				<-done
 				return
@@ -462,7 +500,7 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 	}
 }
 
-func TestUploader_ZeroBalance_FailsTask(t *testing.T) {
+func TestUploader_ZeroAvailableFunds_RequeuesTask(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, gen := seedCachedObject(t, env)
 	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
@@ -471,30 +509,224 @@ func TestUploader_ZeroBalance_FailsTask(t *testing.T) {
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
 			return &synapse.WalletInfo{
 				USDFCAccount: &synapse.TokenAccountInfo{
-					Funds: big.NewInt(0),
+					Funds:          big.NewInt(0),
+					AvailableFunds: big.NewInt(0),
+					LockupCurrent:  big.NewInt(0),
 				},
 			}, nil
 		},
 	}
 
+	var uploadCalled atomic.Bool
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
-		t.Fatal("upload should not be called when balance is zero")
-		return nil, nil
+		uploadCalled.Store(true)
+		return nil, errors.New("upload should not be called when available funds are zero")
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
+
+	if uploadCalled.Load() {
+		t.Fatal("upload should not be called when available funds are zero")
+	}
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	}
+	if got.RetryCount != 1 {
+		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "USDFC available funds = 0") {
+		le := ""
+		if got.LastError != nil {
+			le = *got.LastError
+		}
+		t.Errorf("expected balance error message, got: %s", le)
+	}
+
+	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+	if obj.State != model.ObjectStateUploading {
+		t.Errorf("expected object to remain uploading for retry, got %s", obj.State)
+	}
+}
+
+func TestUploader_LockedAvailableFunds_RequeuesTask(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+
+	wallet := &testutil.MockWalletQuerier{
+		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
+			return &synapse.WalletInfo{
+				USDFCAccount: &synapse.TokenAccountInfo{
+					Funds:          big.NewInt(100),
+					AvailableFunds: big.NewInt(0),
+					LockupCurrent:  big.NewInt(100),
+				},
+			}, nil
+		},
+	}
+
+	var uploadCalled atomic.Bool
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		uploadCalled.Store(true)
+		return nil, errors.New("upload should not be called when funds are locked")
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
+
+	if uploadCalled.Load() {
+		t.Fatal("upload should not be called when available funds are zero")
+	}
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	}
+	if got.RetryCount != 1 {
+		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
+	}
+}
+
+func TestUploader_AvailableFundsFallback_RequeuesTask(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+
+	wallet := &testutil.MockWalletQuerier{
+		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
+			return &synapse.WalletInfo{
+				USDFCAccount: &synapse.TokenAccountInfo{
+					Funds:         big.NewInt(100),
+					LockupCurrent: big.NewInt(100),
+				},
+			}, nil
+		},
+	}
+
+	var uploadCalled atomic.Bool
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		uploadCalled.Store(true)
+		return nil, errors.New("upload should not be called when fallback available funds are zero")
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
+
+	if uploadCalled.Load() {
+		t.Fatal("upload should not be called when fallback available funds are zero")
+	}
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	}
+	if got.RetryCount != 1 {
+		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
+	}
+}
+
+func TestUploader_NegativeAvailableFunds_RequeuesTask(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+
+	wallet := &testutil.MockWalletQuerier{
+		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
+			return &synapse.WalletInfo{
+				USDFCAccount: &synapse.TokenAccountInfo{
+					Funds:          big.NewInt(100),
+					AvailableFunds: big.NewInt(-1),
+					LockupCurrent:  big.NewInt(101),
+				},
+			}, nil
+		},
+	}
+
+	var uploadCalled atomic.Bool
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		uploadCalled.Store(true)
+		return nil, errors.New("upload should not be called when available funds are negative")
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
+
+	if uploadCalled.Load() {
+		t.Fatal("upload should not be called when available funds are negative")
+	}
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	}
+}
+
+func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, gen := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 1, 0)
+
+	var walletCalls atomic.Int32
+	wallet := &testutil.MockWalletQuerier{
+		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
+			if walletCalls.Add(1) == 1 {
+				return &synapse.WalletInfo{
+					USDFCAccount: &synapse.TokenAccountInfo{
+						Funds:          big.NewInt(0),
+						AvailableFunds: big.NewInt(0),
+						LockupCurrent:  big.NewInt(0),
+					},
+				}, nil
+			}
+			return &synapse.WalletInfo{
+				USDFCAccount: &synapse.TokenAccountInfo{
+					Funds:          big.NewInt(100),
+					AvailableFunds: big.NewInt(100),
+					LockupCurrent:  big.NewInt(0),
+				},
+			}, nil
+		},
+	}
+
+	pieceCID := testCID(t)
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		return &storage.UploadResult{
+			PieceCID:        pieceCID,
+			Complete:        true,
+			RequestedCopies: 1,
+			Copies: []storage.CopyResult{
+				{RetrievalURL: "https://sp.example/piece"},
+			},
+		}, nil
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("expected task failed for zero balance, got %s", got.Status)
+	if got.Status != model.TaskStatusDeadLetter {
+		t.Fatalf("expected task dead_letter, got %s", got.Status)
 	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "insufficient payment account balance") {
-		le := ""
-		if got.LastError != nil {
-			le = *got.LastError
-		}
-		t.Errorf("expected balance error message, got: %s", le)
+	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+	if obj.State != model.ObjectStateUploading {
+		t.Fatalf("expected object to remain uploading for manual retry, got %s", obj.State)
+	}
+
+	if err := env.repos.Tasks.RetryDeadLetter(context.Background(), task.ID); err != nil {
+		t.Fatalf("retrying dead-letter task: %v", err)
+	}
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	got, _ = env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusCompleted {
+		t.Fatalf("expected retried task completed, got %s", got.Status)
+	}
+	obj, _ = env.repos.Objects.GetByID(context.Background(), objID)
+	if obj.State != model.ObjectStateStored {
+		t.Fatalf("expected retried object stored, got %s", obj.State)
 	}
 }
 
