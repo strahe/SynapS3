@@ -23,20 +23,33 @@ type Worker interface {
 
 // Manager coordinates the lifecycle of all background workers.
 type Manager struct {
-	repos     *repository.Repositories
-	workers   []Worker
-	logger    *slog.Logger
-	autoEvict bool
+	repos            *repository.Repositories
+	workers          []Worker
+	logger           *slog.Logger
+	autoEvict        bool
+	uploadMaxRetries int
+	evictMaxRetries  int
 }
+
+const defaultUploadMaxRetries = 5
 
 // NewManager creates a new worker manager.
 func NewManager(repos *repository.Repositories, logger *slog.Logger, autoEvict bool, workers ...Worker) *Manager {
 	return &Manager{
-		repos:     repos,
-		workers:   workers,
-		logger:    logger,
-		autoEvict: autoEvict,
+		repos:            repos,
+		workers:          workers,
+		logger:           logger,
+		autoEvict:        autoEvict,
+		uploadMaxRetries: defaultUploadMaxRetries,
+		evictMaxRetries:  defaultEvictMaxRetries,
 	}
+}
+
+// WithTaskMaxRetries configures max retries for tasks recreated during startup reconciliation.
+func (m *Manager) WithTaskMaxRetries(uploadMaxRetries, evictMaxRetries int) *Manager {
+	m.uploadMaxRetries = uploadMaxRetries
+	m.evictMaxRetries = evictMaxRetries
+	return m
 }
 
 // Start launches all registered workers and blocks until ctx is cancelled.
@@ -117,7 +130,7 @@ func (m *Manager) reconcileTasks(ctx context.Context, objState model.ObjectState
 			RefGeneration:  obj.Generation,
 			IdempotencyKey: fmt.Sprintf("%s:%d:%d", keyPrefix, obj.ID, obj.Generation),
 			Status:         model.TaskStatusPending,
-			MaxRetries:     5,
+			MaxRetries:     m.maxRetriesForTaskType(taskType),
 			ScheduledAt:    time.Now(),
 		}
 		if err := m.repos.Tasks.Create(ctx, task); err != nil {
@@ -129,6 +142,13 @@ func (m *Manager) reconcileTasks(ctx context.Context, objState model.ObjectState
 	if created > 0 {
 		m.logger.Info("reconciled missing tasks", "state", objState, "type", taskType, "created", created)
 	}
+}
+
+func (m *Manager) maxRetriesForTaskType(taskType model.TaskType) int {
+	if taskType == model.TaskTypeEvictCache {
+		return m.evictMaxRetries
+	}
+	return m.uploadMaxRetries
 }
 
 // WorkerHealth returns a map of worker name → healthy status.

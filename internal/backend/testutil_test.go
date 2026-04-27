@@ -25,6 +25,10 @@ type testBackend struct {
 // newTestBackend constructs a SynapseBackend backed by in-memory SQLite
 // and a real filesystem cache rooted at t.TempDir().
 func newTestBackend(t *testing.T) *testBackend {
+	return newTestBackendWithOptions(t)
+}
+
+func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBackend {
 	t.Helper()
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -33,7 +37,7 @@ func newTestBackend(t *testing.T) *testBackend {
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, fsCache, sm, sc, logger)
+	b := backend.New(repos, fsCache, sm, sc, logger, opts...)
 	return &testBackend{
 		backend: b,
 		repos:   repos,

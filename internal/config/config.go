@@ -3,9 +3,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -192,129 +194,248 @@ func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir bool) err
 // Load reads configuration from a YAML file (if it exists) and overlays
 // environment variables prefixed with SYNAPS3_.
 func Load(path string) (*Config, error) {
+	return load(path, true)
+}
+
+// LoadFile reads configuration from YAML only, without environment overlays.
+func LoadFile(path string) (*Config, error) {
+	return load(path, false)
+}
+
+func load(path string, includeEnv bool) (*Config, error) {
+	cfg, _, err := loadWithOptions(path, includeEnv, true)
+	return cfg, err
+}
+
+func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Config, PersistedFieldPresence, error) {
 	k := koanf.New(".")
 	cfg := defaultConfig()
+	fileLoaded := false
 
 	// Load from YAML file if provided and exists.
 	if path != "" {
 		if _, err := os.Stat(path); err == nil {
 			if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
-				return nil, fmt.Errorf("loading config file %s: %w", path, err)
+				return nil, PersistedFieldPresence{}, fmt.Errorf("loading config file %s: %w", path, err)
 			}
+			fileLoaded = true
+		}
+	}
+	presence := persistedFieldPresence(k, fileLoaded)
+
+	if includeEnv {
+		// Overlay environment variables: SYNAPS3_SERVER_PORT → server.port
+		if err := k.Load(env.Provider("SYNAPS3_", ".", func(s string) string {
+			if field, ok := EnvFieldForName(s); ok {
+				return field
+			}
+			return strings.ReplaceAll(
+				strings.ToLower(strings.TrimPrefix(s, "SYNAPS3_")),
+				"_", ".",
+			)
+		}), nil); err != nil {
+			return nil, PersistedFieldPresence{}, fmt.Errorf("loading env vars: %w", err)
 		}
 	}
 
-	// Overlay environment variables: SYNAPS3_SERVER_PORT → server.port
-	if err := k.Load(env.Provider("SYNAPS3_", ".", func(s string) string {
-		return strings.ReplaceAll(
-			strings.ToLower(strings.TrimPrefix(s, "SYNAPS3_")),
-			"_", ".",
-		)
-	}), nil); err != nil {
-		return nil, fmt.Errorf("loading env vars: %w", err)
-	}
-
 	if err := k.Unmarshal("", cfg); err != nil {
-		return nil, fmt.Errorf("unmarshalling config: %w", err)
+		return nil, PersistedFieldPresence{}, fmt.Errorf("unmarshalling config: %w", err)
 	}
-	if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir")); err != nil {
-		return nil, fmt.Errorf("loading default runtime paths: %w", err)
+	if applyRuntimeDefaults {
+		if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir")); err != nil {
+			return nil, PersistedFieldPresence{}, fmt.Errorf("loading default runtime paths: %w", err)
+		}
 	}
 
-	return cfg, nil
+	return cfg, presence, nil
 }
 
-// Validate checks the Config for invalid or missing values and returns all
-// validation errors joined together so the operator can fix them in one pass.
-func (c *Config) Validate() error {
-	var errs []error
+func persistedFieldPresence(k *koanf.Koanf, fileLoaded bool) PersistedFieldPresence {
+	if !fileLoaded {
+		return PersistedFieldPresence{}
+	}
+	return PersistedFieldPresence{
+		S3AccessKey:        k.Exists("s3.access_key"),
+		S3SecretKey:        k.Exists("s3.secret_key"),
+		FilecoinPrivateKey: k.Exists("filecoin.private_key"),
+		DatabaseDriver:     k.Exists("database.driver"),
+		DatabaseDSN:        k.Exists("database.dsn"),
+		DatabaseMaxOpen:    k.Exists("database.max_open_conns"),
+		DatabaseMaxIdle:    k.Exists("database.max_idle_conns"),
+		AdminAddr:          k.Exists("admin.addr"),
+	}
+}
+
+// FieldValidationErrors returns validation errors tied to dotted config paths.
+func (c *Config) FieldValidationErrors() []FieldError {
+	var errs []FieldError
+
+	add := func(field, message string) {
+		errs = append(errs, FieldError{Field: field, Message: message})
+	}
+
+	// S3 listen address.
+	if msg := validateListenAddress(c.Server.Port); msg != "" {
+		add("server.port", msg)
+	}
 
 	// Server concurrency.
 	if c.Server.MaxConnections < 1 {
-		errs = append(errs, fmt.Errorf("server.max_connections must be >= 1, got %d", c.Server.MaxConnections))
+		add("server.max_connections", fmt.Sprintf("must be >= 1, got %d", c.Server.MaxConnections))
 	}
 	if c.Server.MaxRequests < 1 {
-		errs = append(errs, fmt.Errorf("server.max_requests must be >= 1, got %d", c.Server.MaxRequests))
+		add("server.max_requests", fmt.Sprintf("must be >= 1, got %d", c.Server.MaxRequests))
 	}
 	if c.Server.MaxRequests > c.Server.MaxConnections {
-		errs = append(errs, fmt.Errorf("server.max_requests (%d) must not exceed server.max_connections (%d)", c.Server.MaxRequests, c.Server.MaxConnections))
+		add("server.max_requests", fmt.Sprintf("(%d) must not exceed server.max_connections (%d)", c.Server.MaxRequests, c.Server.MaxConnections))
 	}
 
 	// TLS: cert and key required when enabled.
 	if c.Server.TLS.Enabled {
 		if strings.TrimSpace(c.Server.TLS.CertFile) == "" {
-			errs = append(errs, errors.New("server.tls.cert_file must be set when TLS is enabled"))
+			add("server.tls.cert_file", "must be set when TLS is enabled")
 		}
 		if strings.TrimSpace(c.Server.TLS.KeyFile) == "" {
-			errs = append(errs, errors.New("server.tls.key_file must be set when TLS is enabled"))
+			add("server.tls.key_file", "must be set when TLS is enabled")
 		}
 	}
 
 	// Cache.
 	if strings.TrimSpace(c.Cache.Dir) == "" {
-		errs = append(errs, errors.New("cache.dir must be non-empty"))
+		add("cache.dir", "must be non-empty")
 	}
 	if c.Cache.MaxSizeGB < 1 {
-		errs = append(errs, fmt.Errorf("cache.max_size_gb must be >= 1, got %d", c.Cache.MaxSizeGB))
+		add("cache.max_size_gb", fmt.Sprintf("must be >= 1, got %d", c.Cache.MaxSizeGB))
 	}
 
 	// Eviction policy.
 	switch strings.ToLower(c.Cache.EvictionPolicy) {
 	case "lru", "manual", "none":
 	default:
-		errs = append(errs, fmt.Errorf("cache.eviction_policy must be one of [lru, manual, none], got %q", c.Cache.EvictionPolicy))
+		add("cache.eviction_policy", fmt.Sprintf("must be one of [lru, manual, none], got %q", c.Cache.EvictionPolicy))
 	}
 
 	// Database.
 	if strings.TrimSpace(c.Database.DSN) == "" {
-		errs = append(errs, errors.New("database.dsn must be non-empty"))
+		add("database.dsn", "must be non-empty")
 	}
 	switch c.Database.Driver {
 	case "postgres", "sqlite":
 	default:
-		errs = append(errs, fmt.Errorf("database.driver must be postgres or sqlite, got %q", c.Database.Driver))
+		add("database.driver", fmt.Sprintf("must be postgres or sqlite, got %q", c.Database.Driver))
 	}
 	if c.Database.MaxOpenConns < 1 {
-		errs = append(errs, fmt.Errorf("database.max_open_conns must be >= 1, got %d", c.Database.MaxOpenConns))
+		add("database.max_open_conns", fmt.Sprintf("must be >= 1, got %d", c.Database.MaxOpenConns))
 	}
 	if c.Database.MaxIdleConns < 0 {
-		errs = append(errs, fmt.Errorf("database.max_idle_conns must be >= 0, got %d", c.Database.MaxIdleConns))
+		add("database.max_idle_conns", fmt.Sprintf("must be >= 0, got %d", c.Database.MaxIdleConns))
 	}
 	if c.Database.MaxIdleConns > c.Database.MaxOpenConns {
-		errs = append(errs, fmt.Errorf("database.max_idle_conns (%d) must not exceed max_open_conns (%d)", c.Database.MaxIdleConns, c.Database.MaxOpenConns))
+		add("database.max_idle_conns", fmt.Sprintf("(%d) must not exceed max_open_conns (%d)", c.Database.MaxIdleConns, c.Database.MaxOpenConns))
 	}
 
 	// Filecoin network.
 	switch strings.ToLower(c.Filecoin.Network) {
 	case "calibration", "mainnet":
 	default:
-		errs = append(errs, fmt.Errorf("filecoin.network must be calibration or mainnet, got %q", c.Filecoin.Network))
+		add("filecoin.network", fmt.Sprintf("must be calibration or mainnet, got %q", c.Filecoin.Network))
+	}
+	if msg := validateRPCURL(c.Filecoin.RPCURL); msg != "" {
+		add("filecoin.rpc_url", msg)
+	}
+	if strings.TrimSpace(c.Filecoin.Source) == "" {
+		add("filecoin.source", "must be non-empty")
+	}
+	if strings.TrimSpace(c.Filecoin.PrivateKey) == "" {
+		add("filecoin.private_key", "must be non-empty")
 	}
 
 	// S3 credentials.
+	if strings.TrimSpace(c.S3.Region) == "" {
+		add("s3.region", "must be non-empty")
+	}
 	if strings.TrimSpace(c.S3.AccessKey) == "" {
-		errs = append(errs, errors.New("s3.access_key must be non-empty"))
+		add("s3.access_key", "must be non-empty")
 	}
 	if strings.TrimSpace(c.S3.SecretKey) == "" {
-		errs = append(errs, errors.New("s3.secret_key must be non-empty"))
+		add("s3.secret_key", "must be non-empty")
 	}
 
 	// Worker pools.
 	validatePool := func(name string, p WorkerPoolConfig) {
 		if p.Concurrency < 1 {
-			errs = append(errs, fmt.Errorf("worker.%s.concurrency must be >= 1, got %d", name, p.Concurrency))
+			add(fmt.Sprintf("worker.%s.concurrency", name), fmt.Sprintf("must be >= 1, got %d", p.Concurrency))
 		}
 		if p.PollInterval <= 0 {
-			errs = append(errs, fmt.Errorf("worker.%s.poll_interval must be > 0, got %s", name, p.PollInterval))
+			add(fmt.Sprintf("worker.%s.poll_interval", name), fmt.Sprintf("must be > 0, got %s", p.PollInterval))
+		}
+		if p.MaxRetries < 0 {
+			add(fmt.Sprintf("worker.%s.max_retries", name), fmt.Sprintf("must be >= 0, got %d", p.MaxRetries))
 		}
 	}
 	validatePool("upload", c.Worker.Upload)
 	validatePool("evictor", c.Worker.Evictor)
 
-	// Admin.
-	if strings.TrimSpace(c.Admin.Addr) == "" {
-		errs = append(errs, errors.New("admin.addr must be non-empty"))
+	// Logging.
+	switch c.Logging.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		add("logging.level", fmt.Sprintf("must be one of [debug, info, warn, error], got %q", c.Logging.Level))
+	}
+	switch c.Logging.Format {
+	case "json", "text":
+	default:
+		add("logging.format", fmt.Sprintf("must be json or text, got %q", c.Logging.Format))
 	}
 
+	// Admin.
+	if strings.TrimSpace(c.Admin.Addr) == "" {
+		add("admin.addr", "must be non-empty")
+	}
+
+	return errs
+}
+
+func validateListenAddress(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "must be non-empty"
+	}
+	_, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "must be a host:port address such as :8080"
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "port must be between 1 and 65535"
+	}
+	return ""
+}
+
+func validateRPCURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "must be non-empty"
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "must be an absolute URL"
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "ws", "wss":
+	default:
+		return "scheme must be one of [http, https, ws, wss]"
+	}
+	return ""
+}
+
+// Validate checks the Config for invalid or missing values and returns all
+// validation errors joined together so the operator can fix them in one pass.
+func (c *Config) Validate() error {
+	fieldErrs := c.FieldValidationErrors()
+	errs := make([]error, 0, len(fieldErrs))
+	for _, fieldErr := range fieldErrs {
+		errs = append(errs, fieldErr)
+	}
 	return errors.Join(errs...)
 }

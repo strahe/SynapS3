@@ -112,7 +112,7 @@ func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
 	}
 
 	// Start manager — recovery should reset uploading → cached
-	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	got, err := repos.Objects.GetByID(ctx, obj.ID)
@@ -146,7 +146,7 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	}
 
 	// No task exists yet — manager should create one during reconciliation
-	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	// Claim the task created by reconciliation
@@ -159,6 +159,9 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	}
 	if task.RefID != obj.ID || task.RefGeneration != 1 {
 		t.Errorf("task refs mismatch: got refID=%d gen=%d, want %d/1", task.RefID, task.RefGeneration, obj.ID)
+	}
+	if task.MaxRetries != 9 {
+		t.Fatalf("task MaxRetries = %d, want 9", task.MaxRetries)
 	}
 }
 
@@ -329,7 +332,7 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 		t.Fatalf("inserting object: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), true)
+	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
@@ -341,5 +344,8 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	}
 	if task.RefID != obj.ID || task.RefGeneration != obj.Generation {
 		t.Fatalf("evict task refs = (%d,%d), want (%d,%d)", task.RefID, task.RefGeneration, obj.ID, obj.Generation)
+	}
+	if task.MaxRetries != 4 {
+		t.Fatalf("evict task MaxRetries = %d, want 4", task.MaxRetries)
 	}
 }

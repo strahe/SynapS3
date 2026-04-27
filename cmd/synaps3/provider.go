@@ -122,18 +122,22 @@ func runProviderList(ctx context.Context, cmd *cli.Command) error {
 }
 
 // resolveRPCAndNetwork determines the RPC URL and network from CLI flags and config.
-// Priority: CLI flag > config file > built-in defaults.
+// Priority: CLI flag > SYNAPS3_FILECOIN_RPC_URL > config file > built-in defaults.
 func resolveRPCAndNetwork(cmd *cli.Command) (rpcURL, network string, err error) {
 	// Try loading config (optional — command works without it).
 	var cfg *config.Config
-	configPath := cmd.Root().String("config")
-	if loaded, err := config.Load(configPath); err != nil {
-		// Distinguish file-not-found (OK) from parse errors (warn).
-		if _, statErr := os.Stat(configPath); statErr == nil {
-			_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to load config %s: %v, using defaults\n", configPath, err)
-		}
+	var src config.Source
+	if resolved, err := configSourceFromCommand(cmd); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to resolve config: %v, using defaults\n", err)
 	} else {
-		cfg = loaded
+		src = resolved
+		if loaded, err := config.LoadSource(src); err != nil {
+			if src.Exists || src.Explicit {
+				_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to load config %s: %v, using defaults\n", src.Path, err)
+			}
+		} else {
+			cfg = loaded
+		}
 	}
 
 	// Resolve network.
@@ -156,7 +160,7 @@ func resolveRPCAndNetwork(cmd *cli.Command) (rpcURL, network string, err error) 
 		rpcURL = cmd.String("rpc-url")
 	} else if envRPCURL, ok := os.LookupEnv("SYNAPS3_FILECOIN_RPC_URL"); ok && strings.TrimSpace(envRPCURL) != "" {
 		rpcURL = strings.TrimSpace(envRPCURL)
-	} else if cfg != nil && configFileSetsRPCURL(configPath) {
+	} else if cfg != nil && configFileSetsRPCURL(src.Path) {
 		rpcURL = cfg.Filecoin.RPCURL
 	} else {
 		// Use well-known default RPC URLs.

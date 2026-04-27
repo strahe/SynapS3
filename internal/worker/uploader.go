@@ -22,34 +22,52 @@ import (
 // synapse-go SDK (which handles both SP upload and on-chain commit), records the
 // PieceCID, and optionally enqueues cache eviction.
 type Uploader struct {
-	repos        *repository.Repositories
-	cache        cache.Cache
-	storage      synapse.StorageClient
-	wallet       synapse.WalletQuerier // optional; nil skips balance pre-check
-	stateMachine *state.Machine
-	autoEvict    bool
-	concurrency  int
-	pollInterval time.Duration
-	leaseTTL     time.Duration
-	logger       *slog.Logger
+	repos           *repository.Repositories
+	cache           cache.Cache
+	storage         synapse.StorageClient
+	wallet          synapse.WalletQuerier // optional; nil skips balance pre-check
+	stateMachine    *state.Machine
+	autoEvict       bool
+	evictMaxRetries int
+	concurrency     int
+	pollInterval    time.Duration
+	leaseTTL        time.Duration
+	logger          *slog.Logger
 	*livenessTracker
 }
 
+const defaultEvictMaxRetries = 3
+
+// UploaderOption configures uploader behavior.
+type UploaderOption func(*Uploader)
+
+// WithEvictMaxRetries configures max retries for cache eviction tasks created after upload.
+func WithEvictMaxRetries(maxRetries int) UploaderOption {
+	return func(u *Uploader) {
+		u.evictMaxRetries = maxRetries
+	}
+}
+
 // NewUploader creates a new upload worker.
-func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, autoEvict bool, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Uploader {
-	return &Uploader{
+func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, autoEvict bool, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
+	u := &Uploader{
 		repos:           repos,
 		cache:           c,
 		storage:         sc,
 		wallet:          wallet,
 		stateMachine:    sm,
 		autoEvict:       autoEvict,
+		evictMaxRetries: defaultEvictMaxRetries,
 		concurrency:     concurrency,
 		pollInterval:    pollInterval,
 		leaseTTL:        10 * time.Minute,
 		logger:          logger,
 		livenessTracker: newLivenessTracker(pollInterval),
 	}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 func (u *Uploader) Name() string { return "uploader" }
@@ -209,7 +227,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 			RefGeneration:  task.RefGeneration,
 			IdempotencyKey: fmt.Sprintf("evict_cache:%d:%d", task.RefID, task.RefGeneration),
 			Status:         model.TaskStatusPending,
-			MaxRetries:     3,
+			MaxRetries:     u.evictMaxRetries,
 			ScheduledAt:    time.Now(),
 		}
 		if err := u.repos.Tasks.Create(ctx, evictTask); err != nil {

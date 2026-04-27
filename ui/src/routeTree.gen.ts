@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as WalletRouteImport } from './routes/wallet'
 import { Route as TasksRouteImport } from './routes/tasks'
+import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as BucketsRouteImport } from './routes/buckets'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as BucketsIndexRouteImport } from './routes/buckets.index'
@@ -24,6 +25,11 @@ const WalletRoute = WalletRouteImport.update({
 const TasksRoute = TasksRouteImport.update({
   id: '/tasks',
   path: '/tasks',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsRoute = SettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
   getParentRoute: () => rootRouteImport,
 } as any)
 const BucketsRoute = BucketsRouteImport.update({
@@ -50,6 +56,7 @@ const BucketsNameRoute = BucketsNameRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
+  '/settings': typeof SettingsRoute
   '/tasks': typeof TasksRoute
   '/wallet': typeof WalletRoute
   '/buckets/$name': typeof BucketsNameRoute
@@ -57,6 +64,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/tasks': typeof TasksRoute
   '/wallet': typeof WalletRoute
   '/buckets/$name': typeof BucketsNameRoute
@@ -66,6 +74,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
+  '/settings': typeof SettingsRoute
   '/tasks': typeof TasksRoute
   '/wallet': typeof WalletRoute
   '/buckets/$name': typeof BucketsNameRoute
@@ -76,16 +85,18 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/buckets'
+    | '/settings'
     | '/tasks'
     | '/wallet'
     | '/buckets/$name'
     | '/buckets/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/tasks' | '/wallet' | '/buckets/$name' | '/buckets'
+  to: '/' | '/settings' | '/tasks' | '/wallet' | '/buckets/$name' | '/buckets'
   id:
     | '__root__'
     | '/'
     | '/buckets'
+    | '/settings'
     | '/tasks'
     | '/wallet'
     | '/buckets/$name'
@@ -95,6 +106,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   BucketsRoute: typeof BucketsRouteWithChildren
+  SettingsRoute: typeof SettingsRoute
   TasksRoute: typeof TasksRoute
   WalletRoute: typeof WalletRoute
 }
@@ -113,6 +125,13 @@ declare module '@tanstack/react-router' {
       path: '/tasks'
       fullPath: '/tasks'
       preLoaderRoute: typeof TasksRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/buckets': {
@@ -162,6 +181,7 @@ const BucketsRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   BucketsRoute: BucketsRouteWithChildren,
+  SettingsRoute: SettingsRoute,
   TasksRoute: TasksRoute,
   WalletRoute: WalletRoute,
 }

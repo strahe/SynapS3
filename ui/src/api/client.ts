@@ -11,8 +11,12 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
     headers,
   })
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}) as Record<string, string>)
-    throw new Error((body as Record<string, string>).error || `API error: ${res.status}`)
+    const body = await res.json().catch(() => ({}) as Record<string, unknown>)
+    const errorBody = body as { error?: string; fields?: SettingsFieldError[] }
+    const fieldText = Array.isArray(errorBody.fields)
+      ? errorBody.fields.map((field) => `${field.field}: ${field.message}`).join(', ')
+      : ''
+    throw new Error([errorBody.error || `API error: ${res.status}`, fieldText].filter(Boolean).join(' - '))
   }
   return res.json() as Promise<T>
 }
@@ -125,6 +129,125 @@ export interface WalletData {
   partial_errors?: Record<string, string>
 }
 
+export interface SettingsFieldError {
+  field: string
+  message: string
+}
+
+export interface SettingsData {
+  mode: 'ready' | 'setup'
+  config_path: string
+  writable: boolean
+  restart_required: boolean
+  config: SettingsEditableConfig
+  manual: SettingsManualConfig
+  secrets: SettingsSecretStatus
+  env_managed: Record<string, string>
+  validation_errors?: SettingsFieldError[]
+  write_header: string
+  write_header_value: string
+}
+
+export interface SettingsEditableConfig {
+  server: SettingsServerConfig
+  s3: SettingsS3Config
+  filecoin: SettingsFilecoinConfig
+  cache: SettingsCacheConfig
+  worker: SettingsWorkerConfig
+  logging: SettingsLoggingConfig
+}
+
+export interface SettingsServerConfig {
+  port: string
+  tls: SettingsTLSConfig
+  max_connections: number
+  max_requests: number
+}
+
+export interface SettingsTLSConfig {
+  enabled: boolean
+  cert_file: string
+  key_file: string
+}
+
+export interface SettingsS3Config {
+  region: string
+}
+
+export interface SettingsFilecoinConfig {
+  network: string
+  rpc_url: string
+  source: string
+  with_cdn: boolean
+  allow_private_networks: boolean
+}
+
+export interface SettingsCacheConfig {
+  dir: string
+  max_size_gb: number
+  eviction_policy: string
+}
+
+export interface SettingsWorkerConfig {
+  upload: SettingsWorkerPoolConfig
+  evictor: SettingsWorkerPoolConfig
+}
+
+export interface SettingsWorkerPoolConfig {
+  concurrency: number
+  poll_interval: string
+  max_retries: number
+}
+
+export interface SettingsLoggingConfig {
+  level: string
+  format: string
+}
+
+export interface SettingsManualField {
+  configured: boolean
+  field: string
+  env?: string
+}
+
+export interface SettingsManualConfig {
+  database: {
+    driver: string
+    dsn: string
+    dsn_configured: boolean
+    max_open_conns: number
+    max_idle_conns: number
+  }
+  admin: { addr_configured: boolean }
+  s3_access_key: SettingsManualField
+  s3_secret_key: SettingsManualField
+  filecoin_private_key: SettingsManualField
+  config_doc: string
+}
+
+export interface SettingsSecretStatus {
+  s3_access_key_configured: boolean
+  s3_secret_key_configured: boolean
+  filecoin_private_key_configured: boolean
+}
+
+export type SettingsUpdatePayload = Partial<{
+  server: Partial<{
+    port: string
+    tls: Partial<SettingsTLSConfig>
+    max_connections: number
+    max_requests: number
+  }>
+  s3: Partial<SettingsS3Config>
+  filecoin: Partial<SettingsFilecoinConfig>
+  cache: Partial<SettingsCacheConfig>
+  worker: Partial<{
+    upload: Partial<SettingsWorkerPoolConfig>
+    evictor: Partial<SettingsWorkerPoolConfig>
+  }>
+  logging: Partial<SettingsLoggingConfig>
+}>
+
 export const api = {
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
@@ -165,4 +288,13 @@ export const api = {
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
   getWallet: () => fetchJSON<WalletData>('/wallet'),
+  getSettings: () => fetchJSON<SettingsData>('/settings'),
+  updateSettings: (payload: SettingsUpdatePayload) =>
+    fetchJSON<SettingsData>('/settings', {
+      method: 'PUT',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
 }

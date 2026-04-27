@@ -1,5 +1,5 @@
 # SynapS3 Configuration Example
-# Environment overrides are limited; prefer editing this file directly when any path segment contains `_`.
+# Environment overrides use the SYNAPS3_ prefix; common underscore-containing keys have explicit mappings.
 # Shell-style placeholders such as ${VAR} are not expanded from YAML.
 # e.g. SYNAPS3_SERVER_PORT=:9090
 

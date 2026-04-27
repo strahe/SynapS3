@@ -36,6 +36,8 @@ type Server struct {
 	bucketLifecycle *bucketlifecycle.Service
 	workerHealth    WorkerHealthChecker
 	wallet          synapse.WalletQuerier
+	settings        *SettingsService
+	setupOnly       bool
 	logger          *slog.Logger
 	startedAt       time.Time
 
@@ -60,31 +62,57 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 	}
 }
 
+// NewSetup creates an admin HTTP server for first-run/setup mode.
+func NewSetup(addr string, settings *SettingsService, logger *slog.Logger) *Server {
+	return &Server{
+		addr:      addr,
+		settings:  settings,
+		setupOnly: true,
+		logger:    logger,
+		startedAt: time.Now(),
+	}
+}
+
+// WithSettings enables settings API routes on a full admin server.
+func (s *Server) WithSettings(settings *SettingsService) *Server {
+	s.settings = settings
+	return s
+}
+
 // Run starts the admin HTTP server. Blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	// Start periodic metrics refresh
-	go s.refreshMetricsLoop(ctx)
+	if !s.setupOnly {
+		go s.refreshMetricsLoop(ctx)
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.Handle("GET /metrics", promhttp.Handler())
-	mux.HandleFunc("GET /admin/dead-letters", s.handleListDeadLetters)
-	mux.HandleFunc("POST /admin/dead-letters/{id}/retry", s.handleRetryDeadLetter)
+	if s.setupOnly {
+		mux.HandleFunc("GET /healthz", s.handleSetupHealthz)
+	} else {
+		mux.HandleFunc("GET /healthz", s.handleHealthz)
+		mux.Handle("GET /metrics", promhttp.Handler())
+		mux.HandleFunc("GET /admin/dead-letters", s.handleListDeadLetters)
+		mux.HandleFunc("POST /admin/dead-letters/{id}/retry", s.handleRetryDeadLetter)
 
-	// Dashboard API
-	mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
-	mux.HandleFunc("GET /api/v1/buckets", s.handleAPIListBuckets)
-	mux.HandleFunc("POST /api/v1/buckets", s.handleAPICreateBucket)
-	mux.HandleFunc("GET /api/v1/buckets/{name}", s.handleAPIGetBucket)
-	mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
-	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
-	mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
-	mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
-	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryDeadLetter) // only retries dead_letter tasks
-	mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
-	mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
-	mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
-	mux.HandleFunc("GET /api/v1/wallet", s.handleAPIWallet)
+		// Dashboard API
+		mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
+		mux.HandleFunc("GET /api/v1/buckets", s.handleAPIListBuckets)
+		mux.HandleFunc("POST /api/v1/buckets", s.handleAPICreateBucket)
+		mux.HandleFunc("GET /api/v1/buckets/{name}", s.handleAPIGetBucket)
+		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
+		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
+		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
+		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
+		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryDeadLetter) // only retries dead_letter tasks
+		mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
+		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
+		mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
+		mux.HandleFunc("GET /api/v1/wallet", s.handleAPIWallet)
+	}
+	if s.settings != nil {
+		mux.HandleFunc("GET /api/v1/settings", s.handleAPIGetSettings)
+		mux.HandleFunc("PUT /api/v1/settings", s.handleAPIUpdateSettings)
+	}
 
 	// Serve embedded SPA frontend (fallback for non-API routes)
 	distFS := ui.DistFS()
@@ -171,6 +199,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, status, resp)
+}
+
+func (s *Server) handleSetupHealthz(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, healthResponse{Status: "setup"})
 }
 
 // cacheRootDir extracts the root directory from a filesystem cache.

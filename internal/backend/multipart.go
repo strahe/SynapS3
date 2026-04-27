@@ -260,7 +260,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 			Metadata:    upload.Metadata,
 			CachePath:   cacheInfo.Path,
 			State:       model.ObjectStateCached,
-			MaxRetries:  5,
+			MaxRetries:  b.uploadMaxRetries,
 		}
 
 		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
@@ -276,7 +276,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 			RefGeneration:  gen,
 			IdempotencyKey: fmt.Sprintf("upload:%d:%d", id, gen),
 			Status:         model.TaskStatusPending,
-			MaxRetries:     5,
+			MaxRetries:     b.uploadMaxRetries,
 			ScheduledAt:    time.Now(),
 		}
 		if err := txRepos.Tasks.Create(ctx, task); err != nil {

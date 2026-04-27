@@ -5,15 +5,17 @@ SynapS3 loads configuration from YAML and supports a limited set of environment-
 ## Loading Rules
 
 - Pass the config file with `--config`
-- Environment variables use the `SYNAPS3_` prefix and replace every `_` with `.`
-- Because of that mapping, env overrides work reliably only for paths where every segment has no underscore
-- Any path segment containing `_` becomes ambiguous after the mapping, so keys such as `filecoin.rpc_url`, `filecoin.private_key`, `filecoin.with_cdn`, `filecoin.allow_private_networks`, `s3.access_key`, `s3.secret_key`, `database.max_open_conns`, and `worker.upload.max_retries` should stay in YAML for now
+- Environment variables use the `SYNAPS3_` prefix
+- Common underscore-containing keys such as `filecoin.rpc_url`, `s3.secret_key`, `cache.max_size_gb`, and worker `max_retries` have explicit env mappings
+- Unknown `SYNAPS3_` variables still use the legacy fallback mapping that lowercases the name and replaces `_` with `.`
 
 Examples:
 
 ```text
 SYNAPS3_DATABASE_DSN      -> database.dsn
 SYNAPS3_SERVER_PORT       -> server.port
+SYNAPS3_FILECOIN_RPC_URL  -> filecoin.rpc_url
+SYNAPS3_S3_SECRET_KEY     -> s3.secret_key
 SYNAPS3_FILECOIN_NETWORK  -> filecoin.network
 SYNAPS3_WORKER_UPLOAD_CONCURRENCY -> worker.upload.concurrency
 ```
@@ -62,6 +64,6 @@ export SYNAPS3_SERVER_PORT=:8080
 
 1. Copy `config.example.yaml` to `config.yaml`
 2. Fill in S3 and Filecoin credentials
-3. Use environment variables only for deployment-specific overrides that do not rely on underscore-containing leaf keys
+3. Use environment variables for deployment-specific overrides and keep long-lived local settings in YAML
 
 For production deployment, monitoring, and admin endpoints, see [Operations](operations.md).

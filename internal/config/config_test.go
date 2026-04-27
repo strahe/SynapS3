@@ -18,6 +18,7 @@ func validConfig() *Config {
 	}
 	cfg.S3.AccessKey = "minioadmin"
 	cfg.S3.SecretKey = "minioadmin"
+	cfg.Filecoin.PrivateKey = "filecoin-private-key"
 	return cfg
 }
 
@@ -121,6 +122,19 @@ func TestValidate_EmptySecretKey(t *testing.T) {
 	}
 }
 
+func TestValidate_EmptyFilecoinPrivateKey(t *testing.T) {
+	cfg := validConfig()
+	cfg.Filecoin.PrivateKey = ""
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for empty filecoin private_key")
+	}
+	if !strings.Contains(err.Error(), "filecoin.private_key") {
+		t.Fatalf("expected filecoin.private_key error, got: %v", err)
+	}
+}
+
 func TestValidate_InvalidNetwork(t *testing.T) {
 	cfg := validConfig()
 	cfg.Filecoin.Network = "devnet"
@@ -157,6 +171,75 @@ func TestValidate_WorkerPollInterval_Zero(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "poll_interval") {
 		t.Fatalf("expected poll_interval error, got: %v", err)
+	}
+}
+
+func TestValidate_EditableSettingsFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		field  string
+		mutate func(*Config)
+	}{
+		{
+			name:  "server port",
+			field: "server.port",
+			mutate: func(cfg *Config) {
+				cfg.Server.Port = "not-a-port"
+			},
+		},
+		{
+			name:  "s3 region",
+			field: "s3.region",
+			mutate: func(cfg *Config) {
+				cfg.S3.Region = ""
+			},
+		},
+		{
+			name:  "filecoin rpc url",
+			field: "filecoin.rpc_url",
+			mutate: func(cfg *Config) {
+				cfg.Filecoin.RPCURL = "ftp://example.invalid/rpc"
+			},
+		},
+		{
+			name:  "filecoin source",
+			field: "filecoin.source",
+			mutate: func(cfg *Config) {
+				cfg.Filecoin.Source = ""
+			},
+		},
+		{
+			name:  "worker max retries",
+			field: "worker.upload.max_retries",
+			mutate: func(cfg *Config) {
+				cfg.Worker.Upload.MaxRetries = -1
+			},
+		},
+		{
+			name:  "logging level",
+			field: "logging.level",
+			mutate: func(cfg *Config) {
+				cfg.Logging.Level = "verbose"
+			},
+		},
+		{
+			name:  "logging format",
+			field: "logging.format",
+			mutate: func(cfg *Config) {
+				cfg.Logging.Format = "xml"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(cfg)
+
+			if !hasConfigFieldError(cfg.FieldValidationErrors(), tt.field) {
+				t.Fatalf("FieldValidationErrors() missing %q: %#v", tt.field, cfg.FieldValidationErrors())
+			}
+		})
 	}
 }
 
@@ -250,6 +333,54 @@ func TestLoad_EnvOverridePaths(t *testing.T) {
 	}
 	if cfg.Cache.Dir != cacheDir {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, cacheDir)
+	}
+}
+
+func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
+	t.Setenv("SYNAPS3_SERVER_MAX_CONNECTIONS", "42")
+	t.Setenv("SYNAPS3_SERVER_MAX_REQUESTS", "24")
+	t.Setenv("SYNAPS3_SERVER_TLS_CERT_FILE", "/tmp/cert.pem")
+	t.Setenv("SYNAPS3_SERVER_TLS_KEY_FILE", "/tmp/key.pem")
+	t.Setenv("SYNAPS3_S3_ACCESS_KEY", "env-access")
+	t.Setenv("SYNAPS3_S3_SECRET_KEY", "env-secret")
+	t.Setenv("SYNAPS3_FILECOIN_RPC_URL", "https://rpc.env.example")
+	t.Setenv("SYNAPS3_FILECOIN_PRIVATE_KEY", "env-private")
+	t.Setenv("SYNAPS3_FILECOIN_WITH_CDN", "true")
+	t.Setenv("SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS", "true")
+	t.Setenv("SYNAPS3_CACHE_MAX_SIZE_GB", "7")
+	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "manual")
+	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
+	t.Setenv("SYNAPS3_WORKER_UPLOAD_MAX_RETRIES", "8")
+	t.Setenv("SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL", "2m")
+	t.Setenv("SYNAPS3_WORKER_EVICTOR_MAX_RETRIES", "6")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load('') with underscore env overrides failed: %v", err)
+	}
+	if cfg.Server.MaxConnections != 42 || cfg.Server.MaxRequests != 24 {
+		t.Fatalf("server concurrency = %d/%d, want 42/24", cfg.Server.MaxConnections, cfg.Server.MaxRequests)
+	}
+	if cfg.Server.TLS.CertFile != "/tmp/cert.pem" || cfg.Server.TLS.KeyFile != "/tmp/key.pem" {
+		t.Fatalf("tls files = %#v, want env values", cfg.Server.TLS)
+	}
+	if cfg.S3.AccessKey != "env-access" || cfg.S3.SecretKey != "env-secret" {
+		t.Fatalf("s3 credentials = %#v, want env values", cfg.S3)
+	}
+	if cfg.Filecoin.RPCURL != "https://rpc.env.example" || cfg.Filecoin.PrivateKey != "env-private" {
+		t.Fatalf("filecoin config = %#v, want env values", cfg.Filecoin)
+	}
+	if !cfg.Filecoin.WithCDN || !cfg.Filecoin.AllowPrivateNetworks {
+		t.Fatalf("filecoin booleans = %#v, want true values", cfg.Filecoin)
+	}
+	if cfg.Cache.MaxSizeGB != 7 || cfg.Cache.EvictionPolicy != "manual" {
+		t.Fatalf("cache config = %#v, want env values", cfg.Cache)
+	}
+	if cfg.Worker.Upload.PollInterval != 9*time.Second || cfg.Worker.Upload.MaxRetries != 8 {
+		t.Fatalf("upload worker = %#v, want env values", cfg.Worker.Upload)
+	}
+	if cfg.Worker.Evictor.PollInterval != 2*time.Minute || cfg.Worker.Evictor.MaxRetries != 6 {
+		t.Fatalf("evictor worker = %#v, want env values", cfg.Worker.Evictor)
 	}
 }
 
@@ -561,6 +692,15 @@ func assertSQLiteDSNPath(t *testing.T, dsn, wantPath string) {
 	if len(pragmas) != 2 || pragmas[0] != "journal_mode(WAL)" || pragmas[1] != "busy_timeout(5000)" {
 		t.Fatalf("DSN _pragma values = %#v, want journal_mode(WAL), busy_timeout(5000)", pragmas)
 	}
+}
+
+func hasConfigFieldError(errs []FieldError, field string) bool {
+	for _, err := range errs {
+		if err.Field == field {
+			return true
+		}
+	}
+	return false
 }
 
 func TestValidate_MaxRequests_ExceedsMaxConnections(t *testing.T) {

@@ -9,12 +9,14 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	synaps3backend "github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -94,6 +96,32 @@ func TestPutObject_HappyPath(t *testing.T) {
 	// Verify cache file exists.
 	if !tb.cache.Exists(ctx, "put-bucket", "greeting.txt") {
 		t.Error("cache file does not exist")
+	}
+}
+
+func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
+	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(11))
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "put-retries-bucket")
+
+	_, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: aws.String("put-retries-bucket"),
+		Key:    aws.String("file.txt"),
+		Body:   strings.NewReader("data"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	task, err := tb.repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if task == nil {
+		t.Fatal("expected upload task")
+	}
+	if task.MaxRetries != 11 {
+		t.Fatalf("task MaxRetries = %d, want 11", task.MaxRetries)
 	}
 }
 
@@ -662,6 +690,49 @@ func TestCopyObject_HappyPath(t *testing.T) {
 	if dstObj.State != model.ObjectStateCached {
 		t.Errorf("dst state = %q, want %q", dstObj.State, model.ObjectStateCached)
 	}
+}
+
+func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
+	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(13))
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "copy-retry-src")
+	seedActiveBucket(t, tb, "copy-retry-dst")
+	putTestObject(t, tb, "copy-retry-src", "original.txt", "copy me")
+
+	_, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
+		Bucket:     aws.String("copy-retry-dst"),
+		Key:        aws.String("copied.txt"),
+		CopySource: aws.String("/copy-retry-src/original.txt"),
+	})
+	if err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+
+	dstBkt, err := tb.repos.Buckets.GetByName(ctx, "copy-retry-dst")
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	dstObj, err := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey: %v", err)
+	}
+	if dstObj.MaxRetries != 13 {
+		t.Fatalf("object MaxRetries = %d, want 13", dstObj.MaxRetries)
+	}
+
+	tasks, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), string(model.TaskStatusPending), 10, 0)
+	if err != nil {
+		t.Fatalf("List tasks: %v", err)
+	}
+	for _, task := range tasks {
+		if task.RefType == "object" && task.RefID == dstObj.ID {
+			if task.MaxRetries != 13 {
+				t.Fatalf("copy upload task MaxRetries = %d, want 13", task.MaxRetries)
+			}
+			return
+		}
+	}
+	t.Fatalf("copy upload task for object %d not found in %#v", dstObj.ID, tasks)
 }
 
 func TestCopyObject_MetadataReplace(t *testing.T) {

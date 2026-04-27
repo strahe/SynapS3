@@ -82,3 +82,22 @@ export function useWallet() {
     refetchInterval: 30_000,
   })
 }
+
+export function useSettings() {
+  return useQuery({
+    queryKey: ['settings'],
+    queryFn: api.getSettings,
+    refetchInterval: 30_000,
+  })
+}
+
+export function useUpdateSettings() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: api.updateSettings,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+  })
+}

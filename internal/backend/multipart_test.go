@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	synaps3backend "github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/versity/versitygw/s3response"
 )
@@ -88,7 +90,7 @@ func TestUploadPart_HappyPath(t *testing.T) {
 // ---------- CompleteMultipartUpload ----------
 
 func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
-	tb := newTestBackend(t)
+	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(12))
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "cmp-bucket")
 
@@ -150,6 +152,16 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 	if obj.State != model.ObjectStateCached {
 		t.Errorf("object state = %q, want %q", obj.State, model.ObjectStateCached)
+	}
+	task, err := tb.repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if task == nil {
+		t.Fatal("expected upload task")
+	}
+	if task.MaxRetries != 12 {
+		t.Fatalf("task MaxRetries = %d, want 12", task.MaxRetries)
 	}
 }
 

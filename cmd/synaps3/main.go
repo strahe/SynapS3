@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3api"
 	"github.com/versity/versitygw/s3api/middlewares"
+	"github.com/versity/versitygw/s3api/utils"
 )
 
 const defaultS3MultipartMaxParts = 10000
@@ -45,7 +47,11 @@ func main() {
 			if cmd.Args().Len() > 0 {
 				return fmt.Errorf("unknown command %q, run --help for available commands", cmd.Args().First())
 			}
-			return runServe(ctx, cmd.String("config"))
+			src, err := configSourceFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return runServe(ctx, src)
 		},
 		Commands: []*cli.Command{
 			serveCommand(),
@@ -69,7 +75,11 @@ func serveCommand() *cli.Command {
 			if cmd.Args().Len() > 0 {
 				return fmt.Errorf("unexpected argument %q, serve takes no positional arguments", cmd.Args().First())
 			}
-			return runServe(ctx, cmd.Root().String("config"))
+			src, err := configSourceFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return runServe(ctx, src)
 		},
 	}
 }
@@ -82,7 +92,11 @@ func migrateCommand() *cli.Command {
 			if cmd.Args().Len() > 0 {
 				return fmt.Errorf("unexpected argument %q, migrate takes no positional arguments", cmd.Args().First())
 			}
-			return runMigrate(ctx, cmd.Root().String("config"))
+			src, err := configSourceFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return runMigrate(ctx, src)
 		},
 	}
 }
@@ -98,11 +112,16 @@ func versionCommand() *cli.Command {
 	}
 }
 
+func configSourceFromCommand(cmd *cli.Command) (config.Source, error) {
+	root := cmd.Root()
+	return config.ResolveSource(root.String("config"), root.IsSet("config"))
+}
+
 // loadConfigAndDB is the shared setup used by serve and migrate.
 // It loads config and opens the database but does NOT run full config validation,
 // so that commands like "migrate" only need DB-related config (not S3 credentials etc.).
-func loadConfigAndDB(ctx context.Context, configPath string) (*config.Config, *bun.DB, error) {
-	cfg, err := config.Load(configPath)
+func loadConfigAndDB(ctx context.Context, src config.Source) (*config.Config, *bun.DB, error) {
+	cfg, err := config.LoadSource(src)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
@@ -120,8 +139,8 @@ func loadConfigAndDB(ctx context.Context, configPath string) (*config.Config, *b
 	return cfg, database, nil
 }
 
-func runMigrate(ctx context.Context, configPath string) error {
-	_, database, err := loadConfigAndDB(ctx, configPath)
+func runMigrate(ctx context.Context, src config.Source) error {
+	_, database, err := loadConfigAndDB(ctx, src)
 	if err != nil {
 		return err
 	}
@@ -135,24 +154,40 @@ func runMigrate(ctx context.Context, configPath string) error {
 	return nil
 }
 
-func s3ServerOptions(cfg config.ServerConfig) []s3api.Option {
-	return []s3api.Option{
+func s3ServerOptions(cfg config.ServerConfig) ([]s3api.Option, error) {
+	opts := []s3api.Option{
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
 		s3api.WithMpMaxParts(defaultS3MultipartMaxParts),
 	}
+	if cfg.TLS.Enabled {
+		cs := utils.NewCertStorage()
+		if err := cs.SetCertificate(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
+			return nil, fmt.Errorf("loading S3 TLS certificate: %w", err)
+		}
+		opts = append(opts, s3api.WithTLS(cs))
+	}
+	return opts, nil
 }
 
-func runServe(ctx context.Context, configPath string) error {
-	cfg, database, err := loadConfigAndDB(ctx, configPath)
+func runServe(ctx context.Context, src config.Source) error {
+	cfg, database, err := loadConfigAndDB(ctx, src)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = database.Close() }()
 
+	settingsSvc, err := admin.NewSettingsService(cfg, src)
+	if err != nil {
+		return fmt.Errorf("initialising settings service: %w", err)
+	}
+
 	// Full config validation — only required for serve, not migrate.
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("validating config: %w", err)
+	if fieldErrs := cfg.FieldValidationErrors(); len(fieldErrs) > 0 {
+		if shouldStartSetupMode(fieldErrs) {
+			return runSetupMode(ctx, cfg, settingsSvc, fieldErrs)
+		}
+		return fmt.Errorf("validating config: %w", joinFieldErrors(fieldErrs))
 	}
 
 	// Set up structured logging so migration and runtime logs use the configured level/format.
@@ -187,37 +222,36 @@ func runServe(ctx context.Context, configPath string) error {
 	// Build state machine.
 	sm := state.NewObjectStateMachine()
 
-	// Initialize Filecoin SDK clients (optional — nil when private key is not configured).
-	var storageClient synapse.StorageClient
-	var walletQuerier synapse.WalletQuerier
-	if cfg.Filecoin.PrivateKey != "" {
-		client, sdkErr := synapse.NewClient(ctx, synapse.ClientConfig{
-			PrivateKey:           cfg.Filecoin.PrivateKey,
-			RPCURL:               cfg.Filecoin.RPCURL,
-			Source:               cfg.Filecoin.Source,
-			WithCDN:              cfg.Filecoin.WithCDN,
-			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-			Logger:               logger,
-		})
-		if sdkErr != nil {
-			return fmt.Errorf("initializing Filecoin SDK: %w", sdkErr)
-		}
-		defer func() { _ = client.Close() }()
-		storageClient = client.Storage()
-		walletQuerier = synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain())
-	} else {
-		logger.Warn("Filecoin private key not configured, SDK features disabled (uploads will not work)")
+	// Initialize Filecoin SDK clients.
+	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
+		PrivateKey:           cfg.Filecoin.PrivateKey,
+		RPCURL:               cfg.Filecoin.RPCURL,
+		Source:               cfg.Filecoin.Source,
+		WithCDN:              cfg.Filecoin.WithCDN,
+		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+		Logger:               logger,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing Filecoin SDK: %w", err)
 	}
+	defer func() { _ = client.Close() }()
+	storageClient := client.Storage()
+	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain())
 
 	// Create backend.
-	be := backend.New(repos, localCache, sm, storageClient, logger)
+	be := backend.New(repos, localCache, sm, storageClient, logger,
+		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
+	)
 
 	// Set up IAM (simple root-only for now).
 	rootCfg := middlewares.RootUserConfig{
 		Access: cfg.S3.AccessKey,
 		Secret: cfg.S3.SecretKey,
 	}
-	s3Opts := s3ServerOptions(cfg.Server)
+	s3Opts, err := s3ServerOptions(cfg.Server)
+	if err != nil {
+		return err
+	}
 
 	// Create VersityGW S3 server.
 	srv, err := s3api.New(
@@ -239,14 +273,15 @@ func runServe(ctx context.Context, configPath string) error {
 	autoEvict := isAutoEvictEnabled(cfg.Cache.EvictionPolicy)
 	wm := worker.NewManager(repos, logger, autoEvict,
 		worker.NewUploader(repos, localCache, storageClient, walletQuerier, sm, autoEvict,
-			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger),
+			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
+			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries)),
 		worker.NewEvictor(repos, localCache, sm,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
-	)
+	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
 	go wm.Start(ctx)
 
 	// Start admin server (healthz + metrics).
-	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, logger)
+	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, logger).WithSettings(settingsSvc)
 	errCh := make(chan error, 2)
 	go func() {
 		if err := adminSrv.Run(ctx); err != nil {
@@ -279,6 +314,74 @@ func runServe(ctx context.Context, configPath string) error {
 
 	logger.Info("SynapS3 stopped")
 	return nil
+}
+
+func runSetupMode(ctx context.Context, cfg *config.Config, settingsSvc *admin.SettingsService, fieldErrs []config.FieldError) error {
+	logger := setupLogger(cfg.Logging)
+	slog.SetDefault(logger)
+
+	logger.Warn("starting SynapS3 admin setup mode", "validation_errors", len(fieldErrs), "admin_addr", cfg.Admin.Addr)
+
+	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	adminSrv := admin.NewSetup(cfg.Admin.Addr, settingsSvc, logger)
+	if err := adminSrv.Run(ctx); err != nil {
+		return fmt.Errorf("admin setup server error: %w", err)
+	}
+	return nil
+}
+
+func shouldStartSetupMode(errs []config.FieldError) bool {
+	if len(errs) == 0 {
+		return false
+	}
+
+	for _, fieldErr := range errs {
+		if !setupModeAllowedField(fieldErr.Field) {
+			return false
+		}
+	}
+	return true
+}
+
+func setupModeAllowedField(field string) bool {
+	switch field {
+	case "server.port",
+		"server.max_connections",
+		"server.max_requests",
+		"server.tls.cert_file",
+		"server.tls.key_file",
+		"s3.region",
+		"s3.access_key",
+		"s3.secret_key",
+		"cache.dir",
+		"cache.max_size_gb",
+		"cache.eviction_policy",
+		"filecoin.network",
+		"filecoin.rpc_url",
+		"filecoin.private_key",
+		"filecoin.source",
+		"worker.upload.concurrency",
+		"worker.upload.poll_interval",
+		"worker.upload.max_retries",
+		"worker.evictor.concurrency",
+		"worker.evictor.poll_interval",
+		"worker.evictor.max_retries",
+		"logging.level",
+		"logging.format":
+		return true
+	default:
+		return false
+	}
+}
+
+func joinFieldErrors(fieldErrs []config.FieldError) error {
+	errs := make([]error, 0, len(fieldErrs))
+	for _, fieldErr := range fieldErrs {
+		errs = append(errs, fieldErr)
+	}
+	return errors.Join(errs...)
 }
 
 func isAutoEvictEnabled(policy string) bool {

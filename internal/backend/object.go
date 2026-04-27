@@ -63,7 +63,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 			Metadata:    meta,
 			CachePath:   cacheInfo.Path,
 			State:       model.ObjectStateCached,
-			MaxRetries:  5,
+			MaxRetries:  b.uploadMaxRetries,
 		}
 
 		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
@@ -81,7 +81,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 			RefGeneration:  newGen,
 			IdempotencyKey: fmt.Sprintf("upload:%d:%d", objectID, newGen),
 			Status:         model.TaskStatusPending,
-			MaxRetries:     5,
+			MaxRetries:     b.uploadMaxRetries,
 			ScheduledAt:    time.Now(),
 		}
 		return txRepos.Tasks.Create(ctx, task)
@@ -384,7 +384,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 			Metadata:    meta,
 			CachePath:   cacheInfo.Path,
 			State:       model.ObjectStateCached,
-			MaxRetries:  5,
+			MaxRetries:  b.uploadMaxRetries,
 		}
 
 		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
@@ -400,7 +400,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 			RefGeneration:  gen,
 			IdempotencyKey: fmt.Sprintf("upload:%d:%d", id, gen),
 			Status:         model.TaskStatusPending,
-			MaxRetries:     5,
+			MaxRetries:     b.uploadMaxRetries,
 			ScheduledAt:    time.Now(),
 		}
 		return txRepos.Tasks.Create(ctx, task)

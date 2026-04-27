@@ -178,7 +178,7 @@ func TestUploader_HappyPath(t *testing.T) {
 		}, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default(), worker.WithEvictMaxRetries(7))
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	ctx := context.Background()
@@ -231,6 +231,9 @@ func TestUploader_HappyPath(t *testing.T) {
 	if evictTask.RefID != objID || evictTask.RefGeneration != gen {
 		t.Errorf("evict task refs mismatch: got refID=%d gen=%d, want %d/%d",
 			evictTask.RefID, evictTask.RefGeneration, objID, gen)
+	}
+	if evictTask.MaxRetries != 7 {
+		t.Fatalf("evict task MaxRetries = %d, want 7", evictTask.MaxRetries)
 	}
 }
 
