@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,54 @@ func newTestCache(t *testing.T) *Filesystem {
 		t.Fatalf("NewFilesystem: %v", err)
 	}
 	return fs
+}
+
+func TestNewFilesystemCreatesRootWithPrivatePermissions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "synaps3-cache")
+
+	fs, err := NewFilesystem(root, 0)
+	if err != nil {
+		t.Fatalf("NewFilesystem: %v", err)
+	}
+	if fs.RootDir() != root {
+		t.Fatalf("RootDir() = %q, want %q", fs.RootDir(), root)
+	}
+
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("Stat(%q): %v", root, err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", root)
+	}
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("cache root mode = %o, want 700", got)
+		}
+	}
+}
+
+func TestNewFilesystemTightensExistingRootPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+
+	root := filepath.Join(t.TempDir(), "synaps3-cache")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	if _, err := NewFilesystem(root, 0); err != nil {
+		t.Fatalf("NewFilesystem: %v", err)
+	}
+
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("Stat(%q): %v", root, err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("existing cache root mode = %o, want 700", got)
+	}
 }
 
 func TestPutGetRoundtrip(t *testing.T) {
@@ -180,8 +229,14 @@ func TestBucketDir(t *testing.T) {
 	}
 
 	p := filepath.Join(fs.root, "mybucket")
-	if _, err := os.Stat(p); err != nil {
+	info, err := os.Stat(p)
+	if err != nil {
 		t.Errorf("bucket dir not created: %v", err)
+	}
+	if runtime.GOOS != "windows" && info != nil {
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("bucket dir mode = %o, want 700", got)
+		}
 	}
 
 	if err := fs.DeleteBucketDir(ctx, "mybucket"); err != nil {

@@ -32,6 +32,8 @@ The default S3 endpoint is `http://localhost:8080`.
 
 The built-in dashboard is available at `http://localhost:9090` (admin port) and provides an overview of system health, bucket/object browsing, and task monitoring.
 
+By default, local runtime data is stored under `~/.synaps3/`: SQLite files in `db/` and cached objects in `cache/`. Set `database.dsn` or `cache.dir` if you need explicit paths.
+
 Start with [`config.example.yaml`](config.example.yaml) and see [`docs/configuration.md`](docs/configuration.md) for the main settings.
 
 ## S3 API Compatibility

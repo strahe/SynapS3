@@ -3,7 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -85,7 +87,19 @@ type AdminConfig struct {
 	Addr string `koanf:"addr"`
 }
 
-func DefaultConfig() *Config {
+const appDataDirName = ".synaps3"
+
+var userHomeDir = os.UserHomeDir
+
+func DefaultConfig() (*Config, error) {
+	cfg := defaultConfig()
+	if err := applyDefaultRuntimePaths(cfg, false, false); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func defaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Port:           ":8080",
@@ -102,12 +116,10 @@ func DefaultConfig() *Config {
 		},
 		Database: DatabaseConfig{
 			Driver:       "sqlite",
-			DSN:          "file:synaps3.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
 			MaxOpenConns: 25,
 			MaxIdleConns: 5,
 		},
 		Cache: CacheConfig{
-			Dir:            "/var/lib/synaps3/cache",
 			MaxSizeGB:      100,
 			EvictionPolicy: "lru",
 		},
@@ -133,11 +145,55 @@ func DefaultConfig() *Config {
 	}
 }
 
+func defaultAppDataDir() (string, error) {
+	home, err := userHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving user home directory: %w", err)
+	}
+	if strings.TrimSpace(home) == "" {
+		return "", errors.New("resolving user home directory: empty path")
+	}
+	return filepath.Join(home, appDataDirName), nil
+}
+
+func defaultSQLiteDSN(appDataDir string) string {
+	dbPath := filepath.Join(appDataDir, "db", "synaps3.db")
+	urlPath := filepath.ToSlash(dbPath)
+	if filepath.VolumeName(dbPath) != "" && !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+
+	u := url.URL{
+		Scheme: "file",
+		Path:   urlPath,
+	}
+	u.RawQuery = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	return u.String()
+}
+
+func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir bool) error {
+	if hasDatabaseDSN && hasCacheDir {
+		return nil
+	}
+
+	appDataDir, err := defaultAppDataDir()
+	if err != nil {
+		return err
+	}
+	if !hasDatabaseDSN {
+		cfg.Database.DSN = defaultSQLiteDSN(appDataDir)
+	}
+	if !hasCacheDir {
+		cfg.Cache.Dir = filepath.Join(appDataDir, "cache")
+	}
+	return nil
+}
+
 // Load reads configuration from a YAML file (if it exists) and overlays
 // environment variables prefixed with SYNAPS3_.
 func Load(path string) (*Config, error) {
 	k := koanf.New(".")
-	cfg := DefaultConfig()
+	cfg := defaultConfig()
 
 	// Load from YAML file if provided and exists.
 	if path != "" {
@@ -160,6 +216,9 @@ func Load(path string) (*Config, error) {
 
 	if err := k.Unmarshal("", cfg); err != nil {
 		return nil, fmt.Errorf("unmarshalling config: %w", err)
+	}
+	if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir")); err != nil {
+		return nil, fmt.Errorf("loading default runtime paths: %w", err)
 	}
 
 	return cfg, nil

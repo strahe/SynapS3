@@ -3,7 +3,9 @@ package db
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,5 +86,95 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	}
 	if claimedCount.Load() != 100 {
 		t.Fatalf("expected all tasks claimed, got %d", claimedCount.Load())
+	}
+}
+
+func TestNew_SQLiteCreatesParentDirectory(t *testing.T) {
+	t.Parallel()
+
+	dbDir := filepath.Join(t.TempDir(), "nested", "db")
+	cfg := config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.ToSlash(filepath.Join(dbDir, "synaps3.db")) + "?_pragma=journal_mode(WAL)",
+		MaxOpenConns: 1,
+		MaxIdleConns: 1,
+	}
+
+	db, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	info, err := os.Stat(dbDir)
+	if err != nil {
+		t.Fatalf("expected sqlite directory to exist: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("sqlite path %s is not a directory", dbDir)
+	}
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("sqlite directory mode = %o, want 700", got)
+		}
+	}
+}
+
+func TestNew_SQLiteMemoryDSNDoesNotCreateDirectories(t *testing.T) {
+	cwd := t.TempDir()
+	oldCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldCWD); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+
+	cfg := config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:memory-dir/named?mode=memory&cache=shared",
+		MaxOpenConns: 1,
+		MaxIdleConns: 1,
+	}
+
+	db, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, err := os.Stat(filepath.Join(cwd, "memory-dir")); !os.IsNotExist(err) {
+		t.Fatalf("memory DSN created directory unexpectedly, stat error = %v", err)
+	}
+}
+
+func TestSQLiteFilePathTreatsWindowsDrivePathAsFilePath(t *testing.T) {
+	path, ok, err := sqliteFilePath(`C:\synaps3\db\synaps3.db?_pragma=journal_mode(WAL)`)
+	if err != nil {
+		t.Fatalf("sqliteFilePath() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("sqliteFilePath() ok = false, want true")
+	}
+	if path == "" {
+		t.Fatal("sqliteFilePath() path is empty")
+	}
+}
+
+func TestSQLiteFilePathTreatsWindowsFileURIAsFilePath(t *testing.T) {
+	path, ok, err := sqliteFilePath("file:C:/synaps3/db/synaps3.db?_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatalf("sqliteFilePath() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("sqliteFilePath() ok = false, want true")
+	}
+	if filepath.ToSlash(path) != "C:/synaps3/db/synaps3.db" {
+		t.Fatalf("sqliteFilePath() path = %q, want C:/synaps3/db/synaps3.db", filepath.ToSlash(path))
 	}
 }

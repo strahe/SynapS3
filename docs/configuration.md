@@ -18,6 +18,23 @@ SYNAPS3_FILECOIN_NETWORK  -> filecoin.network
 SYNAPS3_WORKER_UPLOAD_CONCURRENCY -> worker.upload.concurrency
 ```
 
+## Default Runtime Data
+
+When `database.dsn` and `cache.dir` are omitted, SynapS3 stores local runtime data under the current user's home directory:
+
+```text
+~/.synaps3/
+  db/
+    synaps3.db
+    synaps3.db-shm
+    synaps3.db-wal
+  cache/
+```
+
+The application creates the default database and cache directories automatically. SQLite WAL and SHM files are expected and live beside the database file. Explicit `database.dsn` and `cache.dir` values still take precedence, including relative paths, which remain relative to the process working directory.
+
+SynapS3 does not automatically migrate old local `./synaps3.db*` or `./cache` data. Move those files manually if you want to keep existing local state.
+
 ## Main Sections
 
 | Section | Key Fields | Purpose |
@@ -44,7 +61,7 @@ export SYNAPS3_SERVER_PORT=:8080
 ## Recommended Workflow
 
 1. Copy `config.example.yaml` to `config.yaml`
-2. Fill in database, S3, and Filecoin credentials
+2. Fill in S3 and Filecoin credentials
 3. Use environment variables only for deployment-specific overrides that do not rely on underscore-containing leaf keys
 
 For production deployment, monitoring, and admin endpoints, see [Operations](operations.md).

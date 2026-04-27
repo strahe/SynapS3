@@ -27,13 +27,15 @@ filecoin:
 
 database:
   driver: "sqlite"             # postgres | sqlite
-  dsn: "file:synaps3.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+  # Omit dsn to use the default SQLite path under ~/.synaps3/db/.
+  # dsn: "file:/absolute/path/to/synaps3.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
   # dsn: "postgres://user:pass@localhost:5432/synaps3?sslmode=disable"
   max_open_conns: 25
   max_idle_conns: 5
 
 cache:
-  dir: "./cache"
+  # Omit dir to use the default cache path under ~/.synaps3/cache/.
+  # dir: "/absolute/path/to/cache"
   max_size_gb: 100
   eviction_policy: "lru"       # lru | manual | none
 

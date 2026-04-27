@@ -20,6 +20,8 @@ make clean    # Remove build artifacts
 make migrate  # Build binary and run database migrations with config.example.yaml
 ```
 
+`config.example.yaml` leaves the default SQLite and cache paths unset, so `make run` and `make migrate` use `~/.synaps3/db/` and `~/.synaps3/cache/` unless you explicitly configure different paths.
+
 ## Running Tests
 
 ```bash

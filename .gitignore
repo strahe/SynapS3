@@ -34,4 +34,6 @@ go.work.sum
 # SynapS3 build & runtime
 bin/
 config.yaml
+/synaps3.db*
+/cache/
 .pnpm-store/

@@ -5,6 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/strahe/synaps3/internal/config"
@@ -35,6 +39,9 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 		db = bun.NewDB(sqldb, pgdialect.New())
 
 	case "sqlite":
+		if err := ensureSQLiteDir(cfg.DSN); err != nil {
+			return nil, err
+		}
 		sqldb, err = sql.Open("sqlite", ensureSQLiteBusyTimeout(cfg.DSN))
 		if err != nil {
 			return nil, fmt.Errorf("opening sqlite connection: %w", err)
@@ -76,6 +83,76 @@ func RunMigrations(ctx context.Context, db *bun.DB) error {
 // Ping verifies the database connection is alive.
 func Ping(ctx context.Context, db *bun.DB) error {
 	return db.PingContext(ctx)
+}
+
+func ensureSQLiteDir(dsn string) error {
+	path, ok, err := sqliteFilePath(dsn)
+	if err != nil {
+		return fmt.Errorf("resolving sqlite database path: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating sqlite database directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+func sqliteFilePath(dsn string) (string, bool, error) {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" || dsn == ":memory:" {
+		return "", false, nil
+	}
+
+	if strings.HasPrefix(strings.ToLower(dsn), "file:") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", false, err
+		}
+		if strings.EqualFold(u.Query().Get("mode"), "memory") {
+			return "", false, nil
+		}
+
+		path := u.Path
+		if u.Opaque != "" {
+			path = u.Opaque
+		}
+		if path == "" || path == ":memory:" {
+			return "", false, nil
+		}
+		if u.Host != "" && u.Host != "localhost" {
+			return "", false, nil
+		}
+		return filepath.FromSlash(normalizeFileURLPath(path)), true, nil
+	}
+
+	path, rawQuery, hasQuery := strings.Cut(dsn, "?")
+	if hasQuery {
+		values, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return "", false, err
+		}
+		if strings.EqualFold(values.Get("mode"), "memory") {
+			return "", false, nil
+		}
+	}
+	if path == "" || path == ":memory:" {
+		return "", false, nil
+	}
+	return path, true, nil
+}
+
+func normalizeFileURLPath(path string) string {
+	if runtime.GOOS == "windows" && len(path) >= 4 && path[0] == '/' && path[2] == ':' {
+		return path[1:]
+	}
+	return path
 }
 
 func ensureSQLiteBusyTimeout(dsn string) string {

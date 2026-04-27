@@ -13,10 +13,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
+
+const privateDirMode os.FileMode = 0o700
 
 // errLimitReader wraps an io.Reader and returns ErrCacheFull when the
 // read limit is exceeded. Used to bound temp file writes during Put.
@@ -67,7 +70,7 @@ func NewFilesystem(dir string, maxBytes int64) (*Filesystem, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving cache root %s: %w", dir, err)
 	}
-	if err := os.MkdirAll(absRoot, 0o755); err != nil {
+	if err := ensurePrivateDir(absRoot); err != nil {
 		return nil, fmt.Errorf("creating cache root %s: %w", absRoot, err)
 	}
 
@@ -107,6 +110,26 @@ func NewFilesystem(dir string, maxBytes int64) (*Filesystem, error) {
 	slog.Info("cache initialized", "root", absRoot, "files", fileCount, "bytes", totalBytes, "stale_tmp_removed", tmpRemoved)
 
 	return f, nil
+}
+
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, privateDirMode); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	if info.Mode().Perm() != privateDirMode {
+		return os.Chmod(path, privateDirMode)
+	}
+	return nil
 }
 
 // RootDir returns the absolute path of the cache root directory.
@@ -158,7 +181,7 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 		return nil, err
 	}
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
@@ -368,7 +391,7 @@ func (f *Filesystem) CreateBucketDir(_ context.Context, bucket string) error {
 	if err != nil {
 		return err
 	}
-	return os.MkdirAll(p, 0o755)
+	return ensurePrivateDir(p)
 }
 
 func (f *Filesystem) DeleteBucketDir(_ context.Context, bucket string) error {
@@ -430,7 +453,7 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 		return nil, err
 	}
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
@@ -532,7 +555,7 @@ func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID stri
 		return nil, nil, err
 	}
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return nil, nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 

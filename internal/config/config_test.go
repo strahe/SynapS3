@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +12,10 @@ import (
 
 // validConfig returns a Config that passes Validate().
 func validConfig() *Config {
-	cfg := DefaultConfig()
+	cfg, err := DefaultConfig()
+	if err != nil {
+		panic(err)
+	}
 	cfg.S3.AccessKey = "minioadmin"
 	cfg.S3.SecretKey = "minioadmin"
 	return cfg
@@ -176,12 +181,18 @@ func TestValidate_MultipleErrors(t *testing.T) {
 }
 
 func TestLoad_DefaultConfig(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
+
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("Load('') failed: %v", err)
 	}
 
-	def := DefaultConfig()
+	def, err := DefaultConfig()
+	if err != nil {
+		t.Fatalf("DefaultConfig() failed: %v", err)
+	}
 	if cfg.Server.Port != def.Server.Port {
 		t.Errorf("Server.Port = %q, want %q", cfg.Server.Port, def.Server.Port)
 	}
@@ -196,6 +207,12 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	}
 	if cfg.Worker.Upload.PollInterval != def.Worker.Upload.PollInterval {
 		t.Errorf("Worker.Upload.PollInterval = %s, want %s", cfg.Worker.Upload.PollInterval, def.Worker.Upload.PollInterval)
+	}
+
+	wantAppDir := filepath.Join(home, ".synaps3")
+	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
+	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
+		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
 	}
 }
 
@@ -212,6 +229,139 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.Database.Driver != "postgres" {
 		t.Errorf("Database.Driver = %q, want %q", cfg.Database.Driver, "postgres")
+	}
+}
+
+func TestLoad_EnvOverridePaths(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
+
+	dbDSN := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "custom.db"))
+	cacheDir := filepath.Join(t.TempDir(), "custom-cache")
+	t.Setenv("SYNAPS3_DATABASE_DSN", dbDSN)
+	t.Setenv("SYNAPS3_CACHE_DIR", cacheDir)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load('') with path env overrides failed: %v", err)
+	}
+	if cfg.Database.DSN != dbDSN {
+		t.Errorf("Database.DSN = %q, want %q", cfg.Database.DSN, dbDSN)
+	}
+	if cfg.Cache.Dir != cacheDir {
+		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, cacheDir)
+	}
+}
+
+func TestLoad_PartialYAMLKeepsDefaultPaths(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfgYAML := []byte(`server:
+  port: ":9999"
+`)
+	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load(%q) failed: %v", cfgPath, err)
+	}
+	if cfg.Server.Port != ":9999" {
+		t.Fatalf("Server.Port = %q, want :9999", cfg.Server.Port)
+	}
+	wantAppDir := filepath.Join(home, ".synaps3")
+	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
+	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
+		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
+	}
+}
+
+func TestLoad_ConfigExampleKeepsDefaultPaths(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
+
+	cfg, err := Load("../../config.example.yaml")
+	if err != nil {
+		t.Fatalf("Load(config.example.yaml) failed: %v", err)
+	}
+
+	wantAppDir := filepath.Join(home, ".synaps3")
+	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
+	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
+		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
+	}
+}
+
+func TestLoad_YAMLOverridesDefaultPaths(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	dbDSN := "file:" + filepath.ToSlash(filepath.Join(dir, "custom", "synaps3.db"))
+	cacheDir := filepath.Join(dir, "custom-cache")
+	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
+	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load(%q) failed: %v", cfgPath, err)
+	}
+	if cfg.Database.DSN != dbDSN {
+		t.Errorf("Database.DSN = %q, want %q", cfg.Database.DSN, dbDSN)
+	}
+	if cfg.Cache.Dir != filepath.ToSlash(cacheDir) {
+		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.ToSlash(cacheDir))
+	}
+}
+
+func TestLoad_DefaultRuntimePathsHomeError(t *testing.T) {
+	original := userHomeDir
+	userHomeDir = func() (string, error) {
+		return "", errors.New("no home")
+	}
+	t.Cleanup(func() { userHomeDir = original })
+
+	_, err := Load("")
+	if err == nil {
+		t.Fatal("expected Load to fail when user home is unavailable")
+	}
+	if !strings.Contains(err.Error(), "user home") {
+		t.Fatalf("expected user home error, got: %v", err)
+	}
+}
+
+func TestLoad_ExplicitRuntimePathsDoNotRequireHome(t *testing.T) {
+	original := userHomeDir
+	userHomeDir = func() (string, error) {
+		return "", errors.New("no home")
+	}
+	t.Cleanup(func() { userHomeDir = original })
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	dbDSN := "file:" + filepath.ToSlash(filepath.Join(dir, "custom", "synaps3.db"))
+	cacheDir := filepath.Join(dir, "custom-cache")
+	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
+	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load(%q) failed with explicit runtime paths: %v", cfgPath, err)
+	}
+	if cfg.Database.DSN != dbDSN {
+		t.Errorf("Database.DSN = %q, want %q", cfg.Database.DSN, dbDSN)
+	}
+	if cfg.Cache.Dir != filepath.ToSlash(cacheDir) {
+		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.ToSlash(cacheDir))
 	}
 }
 
@@ -343,7 +493,10 @@ func TestValidate_MaxIdleConns_ExceedsMaxOpen(t *testing.T) {
 }
 
 func TestDefaultConfig_ServerConcurrency(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg, err := DefaultConfig()
+	if err != nil {
+		t.Fatalf("DefaultConfig() failed: %v", err)
+	}
 	if cfg.Server.MaxConnections != 250000 {
 		t.Errorf("Server.MaxConnections = %d, want 250000", cfg.Server.MaxConnections)
 	}
@@ -375,6 +528,38 @@ func TestValidate_MaxRequests_Zero(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "max_requests") {
 		t.Fatalf("expected max_requests error, got: %v", err)
+	}
+}
+
+func withUserHomeDir(t *testing.T, home string) {
+	t.Helper()
+	original := userHomeDir
+	userHomeDir = func() (string, error) {
+		return home, nil
+	}
+	t.Cleanup(func() { userHomeDir = original })
+}
+
+func assertSQLiteDSNPath(t *testing.T, dsn, wantPath string) {
+	t.Helper()
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parsing DSN %q: %v", dsn, err)
+	}
+	if u.Scheme != "file" {
+		t.Fatalf("DSN scheme = %q, want file", u.Scheme)
+	}
+	parsedPath := u.Path
+	if parsedPath == "" {
+		parsedPath = u.Opaque
+	}
+	if filepath.Clean(filepath.FromSlash(parsedPath)) != filepath.Clean(wantPath) {
+		t.Fatalf("DSN path = %q, want %q", filepath.FromSlash(parsedPath), wantPath)
+	}
+	pragmas := u.Query()["_pragma"]
+	if len(pragmas) != 2 || pragmas[0] != "journal_mode(WAL)" || pragmas[1] != "busy_timeout(5000)" {
+		t.Fatalf("DSN _pragma values = %#v, want journal_mode(WAL), busy_timeout(5000)", pragmas)
 	}
 }
 
