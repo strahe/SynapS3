@@ -98,6 +98,41 @@ func TestResolveRPCAndNetwork_UsesExplicitConfigRPCURL(t *testing.T) {
 	}
 }
 
+func TestResolveRPCAndNetwork_UsesDefaultRPCWhenEnvOverridesConfigNetwork(t *testing.T) {
+	t.Setenv("SYNAPS3_FILECOIN_NETWORK", "calibration")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfgYAML := "filecoin:\n  network: mainnet\n  rpc_url: https://api.node.glif.io/rpc/v1\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var (
+		gotRPC     string
+		gotNetwork string
+	)
+	cmd := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config"},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			var err error
+			gotRPC, gotNetwork, err = resolveRPCAndNetwork(cmd)
+			return err
+		},
+	}
+
+	if err := cmd.Run(context.Background(), []string{"synaps3", "--config", cfgPath}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if gotNetwork != "calibration" {
+		t.Fatalf("network = %q, want calibration", gotNetwork)
+	}
+	if gotRPC != "https://api.calibration.node.glif.io/rpc/v1" {
+		t.Fatalf("rpcURL = %q, want calibration default RPC", gotRPC)
+	}
+}
+
 func TestResolveRPCAndNetwork_UsesFallbackAppDataConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -136,6 +171,73 @@ func TestResolveRPCAndNetwork_UsesFallbackAppDataConfig(t *testing.T) {
 	}
 	if gotRPC != "https://fallback.example.test/rpc" {
 		t.Fatalf("rpcURL = %q, want fallback app data RPC", gotRPC)
+	}
+}
+
+func TestConfigSourceFromCommand_DefaultIgnoresWorkingDirectoryConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+
+	if err := os.WriteFile("config.yaml", []byte("filecoin:\n  network: mainnet\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile cwd config: %v", err)
+	}
+
+	var got config.Source
+	cmd := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Value: "config.yaml"},
+		},
+		Action: func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			got, err = configSourceFromCommand(cmd)
+			return err
+		},
+	}
+
+	if err := cmd.Run(context.Background(), []string{"synaps3"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := filepath.Join(home, ".synaps3", "config.yaml")
+	if got.Path != want {
+		t.Fatalf("source path = %q, want %q", got.Path, want)
+	}
+	if got.Exists {
+		t.Fatal("Exists = true, want false for ignored cwd config")
+	}
+	if !got.GeneratedDefault {
+		t.Fatal("GeneratedDefault = false, want true")
+	}
+}
+
+func TestConfigSourceFromCommand_ExplicitRelativeConfigBecomesAbsolute(t *testing.T) {
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+
+	var got config.Source
+	cmd := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Value: "config.yaml"},
+		},
+		Action: func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			got, err = configSourceFromCommand(cmd)
+			return err
+		},
+	}
+
+	if err := cmd.Run(context.Background(), []string{"synaps3", "--config", "config.yaml"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := filepath.Join(cwd, "config.yaml")
+	if got.Path != want {
+		t.Fatalf("source path = %q, want %q", got.Path, want)
+	}
+	if !got.Explicit {
+		t.Fatal("Explicit = false, want true")
 	}
 }
 

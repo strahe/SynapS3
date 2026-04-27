@@ -112,6 +112,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.settings != nil {
 		mux.HandleFunc("GET /api/v1/settings", s.handleAPIGetSettings)
 		mux.HandleFunc("PUT /api/v1/settings", s.handleAPIUpdateSettings)
+		mux.HandleFunc("POST /api/v1/settings/s3-credentials", s.handleAPIGenerateS3Credentials)
 	}
 
 	// Serve embedded SPA frontend (fallback for non-API routes)

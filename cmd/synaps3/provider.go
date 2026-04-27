@@ -141,8 +141,13 @@ func resolveRPCAndNetwork(cmd *cli.Command) (rpcURL, network string, err error) 
 	}
 
 	// Resolve network.
+	networkOverridden := false
 	if cmd.IsSet("network") {
 		network = cmd.String("network")
+		networkOverridden = true
+	} else if envNetwork, ok := os.LookupEnv("SYNAPS3_FILECOIN_NETWORK"); ok && strings.TrimSpace(envNetwork) != "" {
+		network = envNetwork
+		networkOverridden = true
 	} else if cfg != nil && cfg.Filecoin.Network != "" {
 		network = cfg.Filecoin.Network
 	} else {
@@ -160,15 +165,10 @@ func resolveRPCAndNetwork(cmd *cli.Command) (rpcURL, network string, err error) 
 		rpcURL = cmd.String("rpc-url")
 	} else if envRPCURL, ok := os.LookupEnv("SYNAPS3_FILECOIN_RPC_URL"); ok && strings.TrimSpace(envRPCURL) != "" {
 		rpcURL = strings.TrimSpace(envRPCURL)
-	} else if cfg != nil && configFileSetsRPCURL(src.Path) {
+	} else if !networkOverridden && cfg != nil && configFileSetsRPCURL(src.Path) {
 		rpcURL = cfg.Filecoin.RPCURL
 	} else {
-		// Use well-known default RPC URLs.
-		defaults := map[string]string{
-			"calibration": "https://api.calibration.node.glif.io/rpc/v1",
-			"mainnet":     "https://api.node.glif.io/rpc/v1",
-		}
-		if defaultURL, ok := defaults[network]; ok {
+		if defaultURL, ok := config.DefaultFilecoinRPCURL(network); ok {
 			rpcURL = defaultURL
 		} else {
 			return "", "", fmt.Errorf("no RPC URL available for network %q; use --rpc-url", network)

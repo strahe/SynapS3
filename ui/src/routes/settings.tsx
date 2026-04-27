@@ -1,21 +1,82 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, CheckCircle2, Loader2, Save } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
-import type { SettingsData, SettingsEditableConfig, SettingsFieldError, SettingsUpdatePayload } from '@/api/client'
+import { AlertTriangle, Check, CheckCircle2, Copy, Info, KeyRound, Loader2, Save } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  SettingsData,
+  SettingsEditableConfig,
+  SettingsFieldError,
+  SettingsS3Credentials,
+  SettingsUpdatePayload,
+} from '@/api/client'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { useSettings, useUpdateSettings } from '@/hooks/queries'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useGenerateS3Credentials, useSettings, useUpdateSettings } from '@/hooks/queries'
 import { cn } from '@/lib/utils'
 
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
 })
 
+const tabFields = {
+  s3: ['s3.access_key', 's3.secret_key', 's3.region'],
+  server: [
+    'server.port',
+    'server.max_connections',
+    'server.max_requests',
+    'server.tls.enabled',
+    'server.tls.cert_file',
+    'server.tls.key_file',
+  ],
+  filecoin: [
+    'filecoin.network',
+    'filecoin.rpc_url',
+    'filecoin.private_key',
+    'filecoin.source',
+    'filecoin.with_cdn',
+    'filecoin.allow_private_networks',
+  ],
+  cache: ['cache.dir', 'cache.max_size_gb', 'cache.eviction_policy'],
+  workers: [
+    'worker.upload.concurrency',
+    'worker.upload.poll_interval',
+    'worker.upload.max_retries',
+    'worker.evictor.concurrency',
+    'worker.evictor.poll_interval',
+    'worker.evictor.max_retries',
+  ],
+  logging: ['logging.level', 'logging.format'],
+  runtime: ['database.driver', 'database.dsn', 'database.max_open_conns', 'database.max_idle_conns', 'admin.addr'],
+} as const
+
 function SettingsPage() {
   const { data, isLoading, error } = useSettings()
   const updateSettings = useUpdateSettings()
+  const generateS3Credentials = useGenerateS3Credentials()
   const [form, setForm] = useState<SettingsEditableConfig | null>(null)
+  const [generatedCredentials, setGeneratedCredentials] = useState<SettingsS3Credentials | null>(null)
+  const [confirmGenerateOpen, setConfirmGenerateOpen] = useState(false)
   const formDirty = Boolean(form && data && JSON.stringify(form) !== JSON.stringify(data.config))
 
   useEffect(() => {
@@ -37,6 +98,10 @@ function SettingsPage() {
   }
 
   const submitDisabled = !data.writable || updateSettings.isPending
+  const generateDisabled =
+    !data.writable ||
+    generateS3Credentials.isPending ||
+    Boolean(data.env_managed['s3.access_key'] || data.env_managed['s3.secret_key'])
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -46,8 +111,49 @@ function SettingsPage() {
     })
   }
 
+  function handleGenerateS3Credentials() {
+    if (generateDisabled) return
+    generateS3Credentials.mutate(undefined, {
+      onSuccess: (result) => {
+        setForm((current) => {
+          if (!current || !data) return result.settings.config
+          return JSON.stringify(current) === JSON.stringify(data.config) ? result.settings.config : current
+        })
+        setGeneratedCredentials(result.credentials)
+        setConfirmGenerateOpen(false)
+      },
+    })
+  }
+
+  function handleFilecoinNetworkChange(network: string) {
+    if (!data) return
+    const defaults = data.defaults.filecoin_rpc_urls
+    const rpcURLLocked = Boolean(data.env_managed['filecoin.rpc_url'])
+
+    setForm((current) => {
+      if (!current) return current
+
+      const currentNetwork = normalizeNetworkName(current.filecoin.network)
+      const nextNetwork = normalizeNetworkName(network)
+      const currentRPCURL = current.filecoin.rpc_url.trim()
+      const previousDefaultRPCURL = defaults[currentNetwork]
+      const nextDefaultRPCURL = defaults[nextNetwork]
+      const currentRPCURLIsDefault = currentRPCURL === '' || currentRPCURL === previousDefaultRPCURL
+
+      return {
+        ...current,
+        filecoin: {
+          ...current.filecoin,
+          network,
+          rpc_url:
+            !rpcURLLocked && nextDefaultRPCURL && currentRPCURLIsDefault ? nextDefaultRPCURL : current.filecoin.rpc_url,
+        },
+      }
+    })
+  }
+
   return (
-    <form className="space-y-6 p-6" onSubmit={handleSubmit}>
+    <form className="flex flex-col gap-6 p-6" onSubmit={handleSubmit}>
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold">Settings</h1>
@@ -59,112 +165,169 @@ function SettingsPage() {
         </Button>
       </div>
 
-      <StatusBanners data={data} mutationError={updateSettings.error} />
+      <StatusBanners data={data} mutationError={updateSettings.error ?? generateS3Credentials.error ?? null} />
 
-      <Section title="Manual Credentials">
-        <div className="grid gap-3 md:grid-cols-3">
-          <ManualStatus label="S3 Access Key" field={data.manual.s3_access_key} configPath={data.config_path} />
-          <ManualStatus label="S3 Secret Key" field={data.manual.s3_secret_key} configPath={data.config_path} />
-          <ManualStatus
-            label="Filecoin Private Key"
-            field={data.manual.filecoin_private_key}
-            configPath={data.config_path}
+      <Tabs defaultValue="s3" className="gap-4">
+        <TabsList className="w-full justify-start overflow-x-auto">
+          <SettingsTabTrigger value="s3" label="S3" data={data} errors={fieldErrors} missing={s3Missing(data)} />
+          <SettingsTabTrigger value="server" label="Server" data={data} errors={fieldErrors} />
+          <SettingsTabTrigger
+            value="filecoin"
+            label="Filecoin"
+            data={data}
+            errors={fieldErrors}
+            missing={!data.secrets.filecoin_private_key_configured}
           />
-        </div>
-      </Section>
+          <SettingsTabTrigger value="cache" label="Cache" data={data} errors={fieldErrors} />
+          <SettingsTabTrigger value="workers" label="Workers" data={data} errors={fieldErrors} />
+          <SettingsTabTrigger value="logging" label="Logging" data={data} errors={fieldErrors} />
+          <SettingsTabTrigger value="runtime" label="Runtime" data={data} errors={fieldErrors} />
+        </TabsList>
 
-      <div className="grid gap-4 xl:grid-cols-2">
-        <Section title="Server">
-          <div className="grid gap-4 md:grid-cols-2">
-            <TextField
-              label="S3 Port"
-              field="server.port"
-              value={form.server.port}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, server: { ...form.server, port: value } })}
-            />
-            <NumberField
-              label="Max Connections"
-              field="server.max_connections"
-              value={form.server.max_connections}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, server: { ...form.server, max_connections: value } })}
-            />
-            <NumberField
-              label="Max Requests"
-              field="server.max_requests"
-              value={form.server.max_requests}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, server: { ...form.server, max_requests: value } })}
-            />
-            <CheckboxField
-              label="TLS Enabled"
-              field="server.tls.enabled"
-              checked={form.server.tls.enabled}
-              data={data}
-              onChange={(checked) =>
-                setForm({ ...form, server: { ...form.server, tls: { ...form.server.tls, enabled: checked } } })
-              }
-            />
-            <TextField
-              label="TLS Cert File"
-              field="server.tls.cert_file"
-              value={form.server.tls.cert_file}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) =>
-                setForm({ ...form, server: { ...form.server, tls: { ...form.server.tls, cert_file: value } } })
-              }
-            />
-            <TextField
-              label="TLS Key File"
-              field="server.tls.key_file"
-              value={form.server.tls.key_file}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) =>
-                setForm({ ...form, server: { ...form.server, tls: { ...form.server.tls, key_file: value } } })
-              }
-            />
-          </div>
-        </Section>
+        <TabsContent value="s3">
+          <Section title="S3">
+            <div className="grid gap-4 lg:grid-cols-[1fr_1fr]">
+              <CredentialStatusCard data={data} label="S3 Access Key" field={data.manual.s3_access_key} />
+              <CredentialStatusCard data={data} label="S3 Secret Key" field={data.manual.s3_secret_key} />
+            </div>
+            <div className="mt-4 grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
+              <TextField
+                label="Region"
+                field="s3.region"
+                value={form.s3.region}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, s3: { ...form.s3, region: value } })}
+              />
+              <AlertDialog open={confirmGenerateOpen} onOpenChange={setConfirmGenerateOpen}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={generateDisabled}
+                  onClick={() => setConfirmGenerateOpen(true)}
+                >
+                  {generateS3Credentials.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <KeyRound className="h-4 w-4" />
+                  )}
+                  Generate S3 credentials
+                </Button>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Generate S3 credentials?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This rotates the S3 Access Key and Secret Key stored in the config file.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel type="button">Cancel</AlertDialogCancel>
+                    <AlertDialogAction type="button" onClick={handleGenerateS3Credentials}>
+                      Generate
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </div>
+          </Section>
+        </TabsContent>
 
-        <Section title="Filecoin">
-          <div className="grid gap-4 md:grid-cols-2">
-            <SelectField
-              label="Network"
-              field="filecoin.network"
-              value={form.filecoin.network}
-              options={['calibration', 'mainnet']}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, network: value } })}
-            />
-            <TextField
-              label="RPC URL"
-              field="filecoin.rpc_url"
-              value={form.filecoin.rpc_url}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, rpc_url: value } })}
-            />
-            <TextField
-              label="Source"
-              field="filecoin.source"
-              value={form.filecoin.source}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, source: value } })}
-            />
-            <div className="grid gap-3">
+        <TabsContent value="server">
+          <Section title="Server">
+            <div className="grid gap-4 md:grid-cols-2">
+              <TextField
+                label="S3 Port"
+                field="server.port"
+                value={form.server.port}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, server: { ...form.server, port: value } })}
+              />
+              <NumberField
+                label="Max Connections"
+                field="server.max_connections"
+                value={form.server.max_connections}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, server: { ...form.server, max_connections: value } })}
+              />
+              <NumberField
+                label="Max Requests"
+                field="server.max_requests"
+                value={form.server.max_requests}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, server: { ...form.server, max_requests: value } })}
+              />
+              <CheckboxField
+                label="TLS Enabled"
+                field="server.tls.enabled"
+                checked={form.server.tls.enabled}
+                data={data}
+                errors={fieldErrors}
+                onChange={(checked) =>
+                  setForm({ ...form, server: { ...form.server, tls: { ...form.server.tls, enabled: checked } } })
+                }
+              />
+              <TextField
+                label="TLS Cert File"
+                field="server.tls.cert_file"
+                value={form.server.tls.cert_file}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) =>
+                  setForm({ ...form, server: { ...form.server, tls: { ...form.server.tls, cert_file: value } } })
+                }
+              />
+              <TextField
+                label="TLS Key File"
+                field="server.tls.key_file"
+                value={form.server.tls.key_file}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) =>
+                  setForm({ ...form, server: { ...form.server, tls: { ...form.server.tls, key_file: value } } })
+                }
+              />
+            </div>
+          </Section>
+        </TabsContent>
+
+        <TabsContent value="filecoin">
+          <Section title="Filecoin">
+            <div className="grid gap-4 md:grid-cols-2">
+              <CredentialStatusCard data={data} label="Filecoin Private Key" field={data.manual.filecoin_private_key} />
+              <SelectField
+                label="Network"
+                field="filecoin.network"
+                value={form.filecoin.network}
+                options={['calibration', 'mainnet']}
+                data={data}
+                errors={fieldErrors}
+                onChange={handleFilecoinNetworkChange}
+              />
+              <TextField
+                label="RPC URL"
+                field="filecoin.rpc_url"
+                value={form.filecoin.rpc_url}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, rpc_url: value } })}
+              />
+              <TextField
+                label="Source"
+                field="filecoin.source"
+                value={form.filecoin.source}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, source: value } })}
+              />
               <CheckboxField
                 label="Use CDN"
                 field="filecoin.with_cdn"
                 checked={form.filecoin.with_cdn}
                 data={data}
+                errors={fieldErrors}
                 onChange={(checked) => setForm({ ...form, filecoin: { ...form.filecoin, with_cdn: checked } })}
               />
               <CheckboxField
@@ -172,118 +335,131 @@ function SettingsPage() {
                 field="filecoin.allow_private_networks"
                 checked={form.filecoin.allow_private_networks}
                 data={data}
+                errors={fieldErrors}
                 onChange={(checked) =>
                   setForm({ ...form, filecoin: { ...form.filecoin, allow_private_networks: checked } })
                 }
               />
             </div>
-          </div>
-        </Section>
+          </Section>
+        </TabsContent>
 
-        <Section title="S3">
-          <TextField
-            label="Region"
-            field="s3.region"
-            value={form.s3.region}
-            data={data}
-            errors={fieldErrors}
-            onChange={(value) => setForm({ ...form, s3: { ...form.s3, region: value } })}
-          />
-        </Section>
+        <TabsContent value="cache">
+          <Section title="Cache">
+            <div className="grid gap-4 md:grid-cols-2">
+              <TextField
+                label="Directory"
+                field="cache.dir"
+                value={form.cache.dir}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, cache: { ...form.cache, dir: value } })}
+              />
+              <NumberField
+                label="Max Size GB"
+                field="cache.max_size_gb"
+                value={form.cache.max_size_gb}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, cache: { ...form.cache, max_size_gb: value } })}
+              />
+              <SelectField
+                label="Eviction Policy"
+                field="cache.eviction_policy"
+                value={form.cache.eviction_policy}
+                options={['lru', 'manual', 'none']}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, cache: { ...form.cache, eviction_policy: value } })}
+              />
+            </div>
+          </Section>
+        </TabsContent>
 
-        <Section title="Cache">
-          <div className="grid gap-4 md:grid-cols-2">
-            <TextField
-              label="Directory"
-              field="cache.dir"
-              value={form.cache.dir}
+        <TabsContent value="workers">
+          <div className="grid gap-4 xl:grid-cols-2">
+            <WorkerSection
+              title="Upload Worker"
+              prefix="worker.upload"
+              value={form.worker.upload}
               data={data}
               errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, cache: { ...form.cache, dir: value } })}
+              onChange={(value) => setForm({ ...form, worker: { ...form.worker, upload: value } })}
             />
-            <NumberField
-              label="Max Size GB"
-              field="cache.max_size_gb"
-              value={form.cache.max_size_gb}
+            <WorkerSection
+              title="Evictor Worker"
+              prefix="worker.evictor"
+              value={form.worker.evictor}
               data={data}
               errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, cache: { ...form.cache, max_size_gb: value } })}
-            />
-            <SelectField
-              label="Eviction Policy"
-              field="cache.eviction_policy"
-              value={form.cache.eviction_policy}
-              options={['lru', 'manual', 'none']}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, cache: { ...form.cache, eviction_policy: value } })}
-            />
-          </div>
-        </Section>
-
-        <WorkerSection
-          title="Upload Worker"
-          prefix="worker.upload"
-          value={form.worker.upload}
-          data={data}
-          errors={fieldErrors}
-          onChange={(value) => setForm({ ...form, worker: { ...form.worker, upload: value } })}
-        />
-
-        <WorkerSection
-          title="Evictor Worker"
-          prefix="worker.evictor"
-          value={form.worker.evictor}
-          data={data}
-          errors={fieldErrors}
-          onChange={(value) => setForm({ ...form, worker: { ...form.worker, evictor: value } })}
-        />
-
-        <Section title="Logging">
-          <div className="grid gap-4 md:grid-cols-2">
-            <SelectField
-              label="Level"
-              field="logging.level"
-              value={form.logging.level}
-              options={['debug', 'info', 'warn', 'error']}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, logging: { ...form.logging, level: value } })}
-            />
-            <SelectField
-              label="Format"
-              field="logging.format"
-              value={form.logging.format}
-              options={['json', 'text']}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, logging: { ...form.logging, format: value } })}
+              onChange={(value) => setForm({ ...form, worker: { ...form.worker, evictor: value } })}
             />
           </div>
-        </Section>
+        </TabsContent>
 
-        <Section title="Manual Runtime">
-          <dl className="space-y-3 text-sm">
-            <ReadOnlyRow label="Database Driver" value={data.manual.database.driver} />
-            <ReadOnlyRow label="Database DSN" value={data.manual.database.dsn_configured ? 'Configured' : 'Missing'} />
-            <ReadOnlyRow
-              label="Database Pool"
-              value={`${data.manual.database.max_idle_conns}/${data.manual.database.max_open_conns}`}
-            />
-            <ReadOnlyRow label="Admin Address" value={data.manual.admin.addr_configured ? 'Configured' : 'Missing'} />
-          </dl>
-        </Section>
-      </div>
+        <TabsContent value="logging">
+          <Section title="Logging">
+            <div className="grid gap-4 md:grid-cols-2">
+              <SelectField
+                label="Level"
+                field="logging.level"
+                value={form.logging.level}
+                options={['debug', 'info', 'warn', 'error']}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, logging: { ...form.logging, level: value } })}
+              />
+              <SelectField
+                label="Format"
+                field="logging.format"
+                value={form.logging.format}
+                options={['json', 'text']}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, logging: { ...form.logging, format: value } })}
+              />
+            </div>
+          </Section>
+        </TabsContent>
+
+        <TabsContent value="runtime">
+          <Section title="Runtime">
+            <div className="grid gap-4 md:grid-cols-2">
+              <ReadOnlyRow data={data} field="database.driver" value={data.manual.database.driver} />
+              <ReadOnlyRow
+                data={data}
+                field="database.dsn"
+                value={data.manual.database.dsn_configured ? 'Configured' : 'Missing'}
+              />
+              <ReadOnlyRow
+                data={data}
+                field="database.max_idle_conns"
+                value={`${data.manual.database.max_idle_conns}/${data.manual.database.max_open_conns}`}
+              />
+              <ReadOnlyRow
+                data={data}
+                field="admin.addr"
+                value={data.manual.admin.addr_configured ? 'Configured' : 'Missing'}
+              />
+            </div>
+          </Section>
+        </TabsContent>
+      </Tabs>
+
+      <GeneratedCredentialsDialog
+        credentials={generatedCredentials}
+        onOpenChange={(open) => !open && setGeneratedCredentials(null)}
+      />
     </form>
   )
 }
 
 function StatusBanners({ data, mutationError }: { data: SettingsData; mutationError: Error | null }) {
   return (
-    <div className="space-y-3">
+    <div className="flex flex-col gap-3">
       {data.mode === 'setup' && (
         <Banner tone="warning" icon={AlertTriangle}>
-          Setup mode is active. Save non-secret settings here, configure credentials outside the browser, then restart.
+          Setup mode is active. Save settings here, then restart the service.
         </Banner>
       )}
       {!data.writable && (
@@ -302,6 +478,29 @@ function StatusBanners({ data, mutationError }: { data: SettingsData; mutationEr
         </Banner>
       )}
     </div>
+  )
+}
+
+function SettingsTabTrigger({
+  value,
+  label,
+  data,
+  errors,
+  missing = false,
+}: {
+  value: keyof typeof tabFields
+  label: string
+  data: SettingsData
+  errors: Record<string, string>
+  missing?: boolean
+}) {
+  const hasWarning = missing || tabFields[value].some((field) => Boolean(errors[field] || data.env_managed[field]))
+
+  return (
+    <TabsTrigger value={value}>
+      {label}
+      {hasWarning && <AlertTriangle className="h-3.5 w-3.5 text-yellow-500" aria-label={`${label} needs attention`} />}
+    </TabsTrigger>
   )
 }
 
@@ -413,23 +612,24 @@ function CheckboxField({
   field,
   checked,
   data,
+  errors,
   onChange,
 }: {
   label: string
   field: string
   checked: boolean
   data: SettingsData
+  errors: Record<string, string>
   onChange: (checked: boolean) => void
 }) {
   const disabled = fieldDisabled(data, field)
   return (
-    <label className="flex min-h-8 items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-sm">
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
-      <span>{label}</span>
-      {data.env_managed[field] && (
-        <span className="ml-auto truncate text-xs text-muted-foreground">{data.env_managed[field]}</span>
-      )}
-    </label>
+    <FieldShell label={label} field={field} data={data} errors={errors}>
+      <label className="flex min-h-8 items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-sm">
+        <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
+        <span>{data.metadata[field]?.label ?? label}</span>
+      </label>
+    </FieldShell>
   )
 }
 
@@ -446,15 +646,26 @@ function FieldShell({
   errors: Record<string, string>
   children: React.ReactNode
 }) {
+  const meta = data.metadata[field]
+  const envOverride = data.env_managed[field]
+  const displayLabel = meta?.label ?? label
+
   return (
-    <div className="space-y-1.5">
+    <div className="flex flex-col gap-1.5">
       <div className="flex items-center justify-between gap-2">
-        <Label className="text-xs text-muted-foreground">{label}</Label>
-        {data.env_managed[field] && (
-          <span className="truncate text-xs text-muted-foreground">{data.env_managed[field]}</span>
-        )}
+        <div className="flex min-w-0 items-center gap-1.5">
+          <Label className="truncate text-xs text-muted-foreground">{displayLabel}</Label>
+          {meta && <InfoTooltip metadata={meta} />}
+        </div>
+        {envOverride && <EnvOverrideBadge env={envOverride} />}
       </div>
       {children}
+      {envOverride && (
+        <p className="flex items-center gap-1 text-xs text-yellow-600">
+          <AlertTriangle className="h-3.5 w-3.5" />
+          Overridden by {envOverride}
+        </p>
+      )}
       {errors[field] && <p className="text-xs text-destructive">{errors[field]}</p>}
     </div>
   )
@@ -477,7 +688,7 @@ function WorkerSection({
 }) {
   return (
     <Section title={title}>
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-1">
         <NumberField
           label="Concurrency"
           field={`${prefix}.concurrency`}
@@ -507,33 +718,166 @@ function WorkerSection({
   )
 }
 
-function ManualStatus({
+function CredentialStatusCard({
   label,
   field,
-  configPath,
+  data,
 }: {
   label: string
-  field: { configured: boolean; env?: string }
-  configPath: string
+  field: { configured: boolean; field: string; env?: string }
+  data: SettingsData
 }) {
+  const meta = data.metadata[field.field]
+  const envOverride = data.env_managed[field.field] || field.env
+  const setupHint = credentialSetupHint(data, field, meta)
   return (
     <div className="rounded-md border border-border p-3">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-sm font-medium">{label}</span>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate text-sm font-medium">{meta?.label ?? label}</span>
+          {meta && <InfoTooltip metadata={meta} />}
+        </div>
         <span className={cn('text-xs font-medium', field.configured ? 'text-green-500' : 'text-yellow-500')}>
           {field.configured ? 'Configured' : 'Missing'}
         </span>
       </div>
-      <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{field.env ?? configPath}</p>
+      {envOverride ? (
+        <p className="mt-2 flex items-center gap-1 break-all text-xs text-yellow-600">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          Overridden by {envOverride}
+        </p>
+      ) : setupHint ? (
+        <p className="mt-2 break-all text-xs text-muted-foreground">{setupHint}</p>
+      ) : (
+        <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{data.config_path}</p>
+      )}
     </div>
   )
 }
 
-function ReadOnlyRow({ label, value }: { label: string; value: string }) {
+function credentialSetupHint(
+  data: SettingsData,
+  field: { configured: boolean; field: string; env?: string },
+  metadata?: SettingsData['metadata'][string]
+) {
+  if (field.configured || metadata?.editable !== false) return ''
+  const env = metadata?.env || field.env
+  const envHint = env ? ` or set ${env}` : ''
+  return `Set ${field.field} in ${data.config_path}${envHint}, then restart SynapS3.`
+}
+
+function ReadOnlyRow({ data, field, value }: { data: SettingsData; field: string; value: string }) {
+  const meta = data.metadata[field]
+  const envOverride = data.env_managed[field]
   return (
-    <div className="grid gap-2 sm:grid-cols-[150px_1fr]">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="break-all font-mono">{value}</dd>
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <Label className="truncate text-xs text-muted-foreground">{meta?.label ?? field}</Label>
+          {meta && <InfoTooltip metadata={meta} />}
+        </div>
+        {envOverride && <EnvOverrideBadge env={envOverride} />}
+      </div>
+      <div className="min-h-8 rounded-lg border border-input bg-muted/40 px-2.5 py-1 font-mono text-sm break-all">
+        {value}
+      </div>
+      {envOverride && (
+        <p className="flex items-center gap-1 text-xs text-yellow-600">
+          <AlertTriangle className="h-3.5 w-3.5" />
+          Overridden by {envOverride}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function InfoTooltip({ metadata }: { metadata: SettingsData['metadata'][string] }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button type="button" className="rounded text-muted-foreground hover:text-foreground" aria-label="Field info">
+          <Info className="h-3.5 w-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-xs">
+        <div className="flex flex-col gap-1">
+          <span>{metadata.description}</span>
+          {metadata.env && <span className="font-mono opacity-80">{metadata.env}</span>}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function EnvOverrideBadge({ env }: { env: string }) {
+  return (
+    <span className="inline-flex max-w-48 items-center gap-1 truncate rounded-md border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-xs text-yellow-600">
+      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+      <span className="truncate">{env}</span>
+    </span>
+  )
+}
+
+function GeneratedCredentialsDialog({
+  credentials,
+  onOpenChange,
+}: {
+  credentials: SettingsS3Credentials | null
+  onOpenChange: (open: boolean) => void
+}) {
+  return (
+    <Dialog open={Boolean(credentials)} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>S3 credentials generated</DialogTitle>
+          <DialogDescription>These credentials are shown once.</DialogDescription>
+        </DialogHeader>
+        {credentials && (
+          <div className="flex flex-col gap-3">
+            <CopyableSecret label="Access Key" value={credentials.access_key} />
+            <CopyableSecret label="Secret Key" value={credentials.secret_key} />
+          </div>
+        )}
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button type="button">Close</Button>
+          </DialogClose>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function CopyableSecret({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current)
+    }
+  }, [])
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      if (timerRef.current) clearTimeout(timerRef.current)
+      timerRef.current = setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // Clipboard API can be unavailable in some browser contexts.
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Label className="text-xs text-muted-foreground">{label}</Label>
+      <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 p-2">
+        <code className="min-w-0 flex-1 break-all text-xs">{value}</code>
+        <Button type="button" variant="ghost" size="icon-sm" onClick={handleCopy} aria-label={`Copy ${label}`}>
+          {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+        </Button>
+      </div>
     </div>
   )
 }
@@ -548,9 +892,9 @@ function Banner({
   children: React.ReactNode
 }) {
   const classes = {
-    warning: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-600 dark:text-yellow-500',
+    warning: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-600',
     danger: 'border-destructive/30 bg-destructive/10 text-destructive',
-    success: 'border-green-500/30 bg-green-500/10 text-green-600 dark:text-green-500',
+    success: 'border-green-500/30 bg-green-500/10 text-green-600',
   }
 
   return (
@@ -561,6 +905,10 @@ function Banner({
   )
 }
 
+function s3Missing(data: SettingsData) {
+  return !data.secrets.s3_access_key_configured || !data.secrets.s3_secret_key_configured
+}
+
 function toFieldErrorMap(errors: SettingsFieldError[]) {
   const out: Record<string, string> = {}
   for (const error of errors) out[error.field] = error.message
@@ -569,6 +917,10 @@ function toFieldErrorMap(errors: SettingsFieldError[]) {
 
 function fieldDisabled(data: SettingsData, field: string) {
   return !data.writable || Boolean(data.env_managed[field])
+}
+
+function normalizeNetworkName(network: string) {
+  return network.trim().toLowerCase()
 }
 
 function buildSettingsPayload(form: SettingsEditableConfig, envManaged: Record<string, string>): SettingsUpdatePayload {

@@ -142,10 +142,24 @@ export interface SettingsData {
   config: SettingsEditableConfig
   manual: SettingsManualConfig
   secrets: SettingsSecretStatus
+  metadata: Record<string, SettingsFieldMetadata>
+  defaults: SettingsDefaults
   env_managed: Record<string, string>
   validation_errors?: SettingsFieldError[]
   write_header: string
   write_header_value: string
+}
+
+export interface SettingsFieldMetadata {
+  label: string
+  description: string
+  env?: string
+  editable: boolean
+  secret: boolean
+}
+
+export interface SettingsDefaults {
+  filecoin_rpc_urls: Record<string, string>
 }
 
 export interface SettingsEditableConfig {
@@ -231,6 +245,16 @@ export interface SettingsSecretStatus {
   filecoin_private_key_configured: boolean
 }
 
+export interface SettingsS3Credentials {
+  access_key: string
+  secret_key: string
+}
+
+export interface SettingsS3CredentialsResponse {
+  settings: SettingsData
+  credentials: SettingsS3Credentials
+}
+
 export type SettingsUpdatePayload = Partial<{
   server: Partial<{
     port: string
@@ -296,5 +320,13 @@ export const api = {
         'X-SynapS3-Settings-Write': '1',
       },
       body: JSON.stringify(payload),
+    }),
+  generateS3Credentials: () =>
+    fetchJSON<SettingsS3CredentialsResponse>('/settings/s3-credentials', {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify({}),
     }),
 }

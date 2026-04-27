@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ const (
 
 type SettingsService struct {
 	mu              sync.Mutex
+	writeMu         sync.Mutex
 	source          config.Source
 	effective       *config.Config
 	persisted       *config.Config
@@ -49,8 +52,8 @@ func (s *SettingsService) Snapshot(writable bool) settingsResponse {
 }
 
 func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (settingsResponse, []config.FieldError, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	persisted, fieldPresence, err := config.LoadFileForSettings(s.source.Path)
 	if err != nil {
@@ -70,11 +73,12 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 		}
 		return true
 	}
-	setString := func(field string, target *string, value *string) {
+	setString := func(field string, target *string, value *string) bool {
 		if value == nil || !checkField(field) {
-			return
+			return false
 		}
 		*target = *value
+		return true
 	}
 	setInt := func(field string, target *int, value *int) {
 		if value == nil || !checkField(field) {
@@ -121,7 +125,9 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.Filecoin.AllowPrivateNetworks)
 	}
 	if req.Cache != nil {
-		setString("cache.dir", &next.Cache.Dir, req.Cache.Dir)
+		if setString("cache.dir", &next.Cache.Dir, req.Cache.Dir) {
+			fieldPresence.CacheDir = true
+		}
 		setInt("cache.max_size_gb", &next.Cache.MaxSizeGB, req.Cache.MaxSizeGB)
 		setString("cache.eviction_policy", &next.Cache.EvictionPolicy, req.Cache.EvictionPolicy)
 	}
@@ -138,7 +144,7 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 		fieldErrs = editableValidationErrors(next)
 	}
 	if len(fieldErrs) > 0 {
-		resp := s.snapshotFromConfigLocked(next, writable)
+		resp := s.snapshotFromConfig(next, writable)
 		resp.ValidationErrors = fieldErrs
 		return resp, fieldErrs, nil
 	}
@@ -154,11 +160,72 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 	if err != nil {
 		return settingsResponse{}, nil, fmt.Errorf("reloading persisted config: %w", err)
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.effective = cloneConfig(effective)
 	s.persisted = cloneConfig(persisted)
 	s.restartRequired = true
 
 	return s.snapshotLocked(writable), nil, nil
+}
+
+func (s *SettingsService) GenerateS3Credentials(writable bool) (settingsS3CredentialsResponse, []config.FieldError, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	persisted, fieldPresence, err := config.LoadFileForSettings(s.source.Path)
+	if err != nil {
+		return settingsS3CredentialsResponse{}, nil, fmt.Errorf("loading current config: %w", err)
+	}
+	next := cloneConfig(persisted)
+	managed := config.EnvManagedFieldPaths()
+	var fieldErrs []config.FieldError
+	for _, field := range []string{"s3.access_key", "s3.secret_key"} {
+		if envName, ok := managed[field]; ok {
+			fieldErrs = append(fieldErrs, config.FieldError{
+				Field:   field,
+				Message: "is managed by " + envName,
+			})
+		}
+	}
+	if len(fieldErrs) > 0 {
+		resp := s.snapshotFromConfig(next, writable)
+		resp.ValidationErrors = fieldErrs
+		return settingsS3CredentialsResponse{Settings: resp}, fieldErrs, nil
+	}
+
+	credentials, err := generateS3Credentials()
+	if err != nil {
+		return settingsS3CredentialsResponse{}, nil, err
+	}
+	next.S3.AccessKey = credentials.AccessKey
+	next.S3.SecretKey = credentials.SecretKey
+	fieldPresence.S3AccessKey = true
+	fieldPresence.S3SecretKey = true
+
+	if err := config.SaveForSettings(s.source.Path, next, fieldPresence); err != nil {
+		return settingsS3CredentialsResponse{}, nil, err
+	}
+	effective, err := config.LoadSource(s.source)
+	if err != nil {
+		return settingsS3CredentialsResponse{}, nil, fmt.Errorf("reloading saved config: %w", err)
+	}
+	persisted, _, err = config.LoadFileForSettings(s.source.Path)
+	if err != nil {
+		return settingsS3CredentialsResponse{}, nil, fmt.Errorf("reloading persisted config: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.effective = cloneConfig(effective)
+	s.persisted = cloneConfig(persisted)
+	s.restartRequired = true
+
+	return settingsS3CredentialsResponse{
+		Settings:    s.snapshotLocked(writable),
+		Credentials: credentials,
+	}, nil, nil
 }
 
 func applyWorkerPoolUpdate(
@@ -180,6 +247,13 @@ func (s *SettingsService) snapshotLocked(writable bool) settingsResponse {
 	return s.snapshotFromConfigLocked(s.effective, writable)
 }
 
+func (s *SettingsService) snapshotFromConfig(cfg *config.Config, writable bool) settingsResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.snapshotFromConfigLocked(cfg, writable)
+}
+
 func (s *SettingsService) snapshotFromConfigLocked(cfg *config.Config, writable bool) settingsResponse {
 	validationErrs := cfg.FieldValidationErrors()
 	mode := "ready"
@@ -195,6 +269,8 @@ func (s *SettingsService) snapshotFromConfigLocked(cfg *config.Config, writable 
 		Config:            toSettingsEditableConfig(cfg),
 		Manual:            toSettingsManualConfig(cfg),
 		Secrets:           toSettingsSecretStatus(cfg),
+		Metadata:          config.FieldMetadataByPath(),
+		Defaults:          settingsDefaults{FilecoinRPCURLs: config.DefaultFilecoinRPCURLs()},
 		EnvManaged:        config.EnvManagedFieldPaths(),
 		ValidationErrors:  validationErrs,
 		WritableHeader:    settingsWriteHeader,
@@ -211,17 +287,23 @@ func cloneConfig(cfg *config.Config) *config.Config {
 }
 
 type settingsResponse struct {
-	Mode              string                 `json:"mode"`
-	ConfigPath        string                 `json:"config_path"`
-	Writable          bool                   `json:"writable"`
-	RestartRequired   bool                   `json:"restart_required"`
-	Config            settingsEditableConfig `json:"config"`
-	Manual            settingsManualConfig   `json:"manual"`
-	Secrets           settingsSecretStatus   `json:"secrets"`
-	EnvManaged        map[string]string      `json:"env_managed"`
-	ValidationErrors  []config.FieldError    `json:"validation_errors,omitempty"`
-	WritableHeader    string                 `json:"write_header"`
-	WritableHeaderVal string                 `json:"write_header_value"`
+	Mode              string                          `json:"mode"`
+	ConfigPath        string                          `json:"config_path"`
+	Writable          bool                            `json:"writable"`
+	RestartRequired   bool                            `json:"restart_required"`
+	Config            settingsEditableConfig          `json:"config"`
+	Manual            settingsManualConfig            `json:"manual"`
+	Secrets           settingsSecretStatus            `json:"secrets"`
+	Metadata          map[string]config.FieldMetadata `json:"metadata"`
+	Defaults          settingsDefaults                `json:"defaults"`
+	EnvManaged        map[string]string               `json:"env_managed"`
+	ValidationErrors  []config.FieldError             `json:"validation_errors,omitempty"`
+	WritableHeader    string                          `json:"write_header"`
+	WritableHeaderVal string                          `json:"write_header_value"`
+}
+
+type settingsDefaults struct {
+	FilecoinRPCURLs map[string]string `json:"filecoin_rpc_urls"`
 }
 
 type settingsEditableConfig struct {
@@ -311,6 +393,16 @@ type settingsSecretStatus struct {
 	S3AccessKeyConfigured        bool `json:"s3_access_key_configured"`
 	S3SecretKeyConfigured        bool `json:"s3_secret_key_configured"`
 	FilecoinPrivateKeyConfigured bool `json:"filecoin_private_key_configured"`
+}
+
+type settingsS3CredentialsResponse struct {
+	Settings    settingsResponse      `json:"settings"`
+	Credentials settingsS3Credentials `json:"credentials"`
+}
+
+type settingsS3Credentials struct {
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
 }
 
 type settingsUpdateRequest struct {
@@ -491,6 +583,26 @@ func configuredLabel(value string) string {
 	return "configured"
 }
 
+func generateS3Credentials() (settingsS3Credentials, error) {
+	accessKey, err := randomURLToken(16)
+	if err != nil {
+		return settingsS3Credentials{}, fmt.Errorf("generating S3 access key: %w", err)
+	}
+	secretKey, err := randomURLToken(32)
+	if err != nil {
+		return settingsS3Credentials{}, fmt.Errorf("generating S3 secret key: %w", err)
+	}
+	return settingsS3Credentials{AccessKey: accessKey, SecretKey: secretKey}, nil
+}
+
+func randomURLToken(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
 type settingsErrorResponse struct {
 	Error  string              `json:"error"`
 	Fields []config.FieldError `json:"fields,omitempty"`
@@ -539,6 +651,51 @@ func (s *Server) handleAPIUpdateSettings(w http.ResponseWriter, r *http.Request)
 	resp, fieldErrs, err := s.settings.Update(req, true)
 	if err != nil {
 		s.logger.Error("failed to save settings", "error", err)
+		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
+		return
+	}
+	if len(fieldErrs) > 0 {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings", Fields: fieldErrs})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAPIGenerateS3Credentials(w http.ResponseWriter, r *http.Request) {
+	if s.settings == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "settings not available"})
+		return
+	}
+	if !s.settingsWritable() {
+		writeJSON(w, http.StatusForbidden, settingsErrorResponse{Error: "settings writes require loopback admin binding"})
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "settings writes require application/json"})
+		return
+	}
+	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "missing settings write header"})
+		return
+	}
+
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	var req struct{}
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings payload"})
+		return
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings payload"})
+		return
+	}
+
+	resp, fieldErrs, err := s.settings.GenerateS3Credentials(true)
+	if err != nil {
+		s.logger.Error("failed to generate S3 credentials", "error", err)
 		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
 		return
 	}

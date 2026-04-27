@@ -21,5 +21,15 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined
+          if (id.includes('@tanstack')) return 'tanstack'
+          if (id.includes('recharts') || id.includes('victory-vendor') || id.includes('/d3-')) return 'charts'
+          return 'vendor'
+        },
+      },
+    },
   },
 })

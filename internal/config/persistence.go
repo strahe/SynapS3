@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"go.yaml.in/yaml/v3"
@@ -36,21 +35,15 @@ func (e FieldError) Error() string {
 // ResolveSource chooses the config source for startup and settings persistence.
 func ResolveSource(path string, explicit bool) (Source, error) {
 	if explicit {
-		exists, err := fileExists(path)
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return Source{}, fmt.Errorf("resolving config path %s: %w", path, err)
+		}
+		exists, err := fileExists(absPath)
 		if err != nil {
 			return Source{}, err
 		}
-		return Source{Path: path, Explicit: true, Exists: exists}, nil
-	}
-
-	if path != "" {
-		exists, err := fileExists(path)
-		if err != nil {
-			return Source{}, err
-		}
-		if exists {
-			return Source{Path: path, Exists: true}, nil
-		}
+		return Source{Path: absPath, Explicit: true, Exists: exists}, nil
 	}
 
 	appDataDir, err := defaultAppDataDir()
@@ -81,6 +74,7 @@ type PersistedFieldPresence struct {
 	DatabaseDSN        bool
 	DatabaseMaxOpen    bool
 	DatabaseMaxIdle    bool
+	CacheDir           bool
 	AdminAddr          bool
 }
 
@@ -139,14 +133,14 @@ type saveOptions struct {
 }
 
 // LoadFileForSettings reads YAML for settings persistence without environment
-// overlays. Existing config files do not get synthesized runtime paths, because
-// settings writes must not change absent manual fields such as database.dsn.
+// overlays. Runtime defaults are applied for validation and UI display, while
+// field presence lets settings writes preserve omitted YAML fields.
 func LoadFileForSettings(path string) (*Config, PersistedFieldPresence, error) {
 	exists, err := fileExists(path)
 	if err != nil {
 		return nil, PersistedFieldPresence{}, err
 	}
-	cfg, presence, err := loadWithOptions(path, false, !exists)
+	cfg, presence, err := loadWithOptions(path, false, true)
 	if err != nil {
 		return nil, PersistedFieldPresence{}, err
 	}
@@ -154,57 +148,6 @@ func LoadFileForSettings(path string) (*Config, PersistedFieldPresence, error) {
 		presence = fullPersistedFieldPresence()
 	}
 	return cfg, presence, nil
-}
-
-var envFieldPaths = map[string]string{
-	"SYNAPS3_SERVER_PORT":                     "server.port",
-	"SYNAPS3_SERVER_MAX_CONNECTIONS":          "server.max_connections",
-	"SYNAPS3_SERVER_MAX_REQUESTS":             "server.max_requests",
-	"SYNAPS3_SERVER_TLS_ENABLED":              "server.tls.enabled",
-	"SYNAPS3_SERVER_TLS_CERT_FILE":            "server.tls.cert_file",
-	"SYNAPS3_SERVER_TLS_KEY_FILE":             "server.tls.key_file",
-	"SYNAPS3_S3_ACCESS_KEY":                   "s3.access_key",
-	"SYNAPS3_S3_SECRET_KEY":                   "s3.secret_key",
-	"SYNAPS3_S3_REGION":                       "s3.region",
-	"SYNAPS3_FILECOIN_NETWORK":                "filecoin.network",
-	"SYNAPS3_FILECOIN_RPC_URL":                "filecoin.rpc_url",
-	"SYNAPS3_FILECOIN_PRIVATE_KEY":            "filecoin.private_key",
-	"SYNAPS3_FILECOIN_SOURCE":                 "filecoin.source",
-	"SYNAPS3_FILECOIN_WITH_CDN":               "filecoin.with_cdn",
-	"SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS": "filecoin.allow_private_networks",
-	"SYNAPS3_DATABASE_DRIVER":                 "database.driver",
-	"SYNAPS3_DATABASE_DSN":                    "database.dsn",
-	"SYNAPS3_DATABASE_MAX_OPEN_CONNS":         "database.max_open_conns",
-	"SYNAPS3_DATABASE_MAX_IDLE_CONNS":         "database.max_idle_conns",
-	"SYNAPS3_CACHE_DIR":                       "cache.dir",
-	"SYNAPS3_CACHE_MAX_SIZE_GB":               "cache.max_size_gb",
-	"SYNAPS3_CACHE_EVICTION_POLICY":           "cache.eviction_policy",
-	"SYNAPS3_WORKER_UPLOAD_CONCURRENCY":       "worker.upload.concurrency",
-	"SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL":     "worker.upload.poll_interval",
-	"SYNAPS3_WORKER_UPLOAD_MAX_RETRIES":       "worker.upload.max_retries",
-	"SYNAPS3_WORKER_EVICTOR_CONCURRENCY":      "worker.evictor.concurrency",
-	"SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL":    "worker.evictor.poll_interval",
-	"SYNAPS3_WORKER_EVICTOR_MAX_RETRIES":      "worker.evictor.max_retries",
-	"SYNAPS3_LOGGING_LEVEL":                   "logging.level",
-	"SYNAPS3_LOGGING_FORMAT":                  "logging.format",
-	"SYNAPS3_ADMIN_ADDR":                      "admin.addr",
-}
-
-// EnvFieldForName returns the config field path for a supported SYNAPS3_ env var.
-func EnvFieldForName(envName string) (string, bool) {
-	field, ok := envFieldPaths[strings.ToUpper(envName)]
-	return field, ok
-}
-
-// EnvManagedFieldPaths returns recognized config fields currently controlled by env vars.
-func EnvManagedFieldPaths() map[string]string {
-	managed := make(map[string]string)
-	for envName, field := range envFieldPaths {
-		if _, ok := os.LookupEnv(envName); ok {
-			managed[field] = envName
-		}
-	}
-	return managed
 }
 
 func fileExists(path string) (bool, error) {
@@ -271,9 +214,9 @@ type yamlDatabaseConfig struct {
 }
 
 type yamlCacheConfig struct {
-	Dir            string `yaml:"dir"`
-	MaxSizeGB      int    `yaml:"max_size_gb"`
-	EvictionPolicy string `yaml:"eviction_policy"`
+	Dir            *string `yaml:"dir,omitempty"`
+	MaxSizeGB      int     `yaml:"max_size_gb"`
+	EvictionPolicy string  `yaml:"eviction_policy"`
 }
 
 type yamlWorkerConfig struct {
@@ -333,7 +276,7 @@ func toYAMLConfig(cfg *Config, opts saveOptions) yamlConfig {
 			MaxIdleConns: optionalInt(cfg.Database.MaxIdleConns, presence.DatabaseMaxIdle),
 		},
 		Cache: yamlCacheConfig{
-			Dir:            cfg.Cache.Dir,
+			Dir:            optionalString(cfg.Cache.Dir, presence.CacheDir),
 			MaxSizeGB:      cfg.Cache.MaxSizeGB,
 			EvictionPolicy: cfg.Cache.EvictionPolicy,
 		},
@@ -384,6 +327,7 @@ func fullPersistedFieldPresence() PersistedFieldPresence {
 		DatabaseDSN:        true,
 		DatabaseMaxOpen:    true,
 		DatabaseMaxIdle:    true,
+		CacheDir:           true,
 		AdminAddr:          true,
 	}
 }

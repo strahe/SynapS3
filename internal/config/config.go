@@ -93,6 +93,26 @@ const appDataDirName = ".synaps3"
 
 var userHomeDir = os.UserHomeDir
 
+var defaultFilecoinRPCURLs = map[string]string{
+	"calibration": "https://api.calibration.node.glif.io/rpc/v1",
+	"mainnet":     "https://api.node.glif.io/rpc/v1",
+}
+
+// DefaultFilecoinRPCURL returns the built-in RPC URL for a Filecoin network.
+func DefaultFilecoinRPCURL(network string) (string, bool) {
+	rpcURL, ok := defaultFilecoinRPCURLs[strings.ToLower(strings.TrimSpace(network))]
+	return rpcURL, ok
+}
+
+// DefaultFilecoinRPCURLs returns a copy of the built-in Filecoin RPC URL map.
+func DefaultFilecoinRPCURLs() map[string]string {
+	out := make(map[string]string, len(defaultFilecoinRPCURLs))
+	for network, rpcURL := range defaultFilecoinRPCURLs {
+		out[network] = rpcURL
+	}
+	return out
+}
+
 func DefaultConfig() (*Config, error) {
 	cfg := defaultConfig()
 	if err := applyDefaultRuntimePaths(cfg, false, false); err != nil {
@@ -113,7 +133,7 @@ func defaultConfig() *Config {
 		},
 		Filecoin: FilecoinConfig{
 			Network: "calibration",
-			RPCURL:  "https://api.calibration.node.glif.io/rpc/v1",
+			RPCURL:  defaultFilecoinRPCURLs["calibration"],
 			Source:  "synaps3",
 		},
 		Database: DatabaseConfig{
@@ -262,6 +282,7 @@ func persistedFieldPresence(k *koanf.Koanf, fileLoaded bool) PersistedFieldPrese
 		DatabaseDSN:        k.Exists("database.dsn"),
 		DatabaseMaxOpen:    k.Exists("database.max_open_conns"),
 		DatabaseMaxIdle:    k.Exists("database.max_idle_conns"),
+		CacheDir:           k.Exists("cache.dir"),
 		AdminAddr:          k.Exists("admin.addr"),
 	}
 }

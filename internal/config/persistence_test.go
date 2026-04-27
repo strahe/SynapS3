@@ -12,15 +12,18 @@ import (
 func TestResolveSource_ExplicitPathWinsEvenWhenMissing(t *testing.T) {
 	home := t.TempDir()
 	withUserHomeDir(t, home)
+	dir := t.TempDir()
+	t.Chdir(dir)
 
-	cfgPath := filepath.Join(t.TempDir(), "custom.yaml")
+	cfgPath := "custom.yaml"
 	src, err := ResolveSource(cfgPath, true)
 	if err != nil {
 		t.Fatalf("ResolveSource() error = %v", err)
 	}
 
-	if src.Path != cfgPath {
-		t.Fatalf("Path = %q, want %q", src.Path, cfgPath)
+	wantPath := filepath.Join(dir, cfgPath)
+	if src.Path != wantPath {
+		t.Fatalf("Path = %q, want %q", src.Path, wantPath)
 	}
 	if !src.Explicit {
 		t.Fatal("Explicit = false, want true")
@@ -33,7 +36,9 @@ func TestResolveSource_ExplicitPathWinsEvenWhenMissing(t *testing.T) {
 	}
 }
 
-func TestResolveSource_DefaultUsesExistingConfigYAML(t *testing.T) {
+func TestResolveSource_DefaultIgnoresExistingConfigYAMLInWorkingDirectory(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
 	dir := t.TempDir()
 	t.Chdir(dir)
 
@@ -46,17 +51,18 @@ func TestResolveSource_DefaultUsesExistingConfigYAML(t *testing.T) {
 		t.Fatalf("ResolveSource() error = %v", err)
 	}
 
-	if src.Path != "config.yaml" {
-		t.Fatalf("Path = %q, want config.yaml", src.Path)
+	want := filepath.Join(home, ".synaps3", "config.yaml")
+	if src.Path != want {
+		t.Fatalf("Path = %q, want %q", src.Path, want)
 	}
 	if src.Explicit {
 		t.Fatal("Explicit = true, want false")
 	}
-	if !src.Exists {
-		t.Fatal("Exists = false, want true")
+	if src.Exists {
+		t.Fatal("Exists = true, want false")
 	}
-	if src.GeneratedDefault {
-		t.Fatal("GeneratedDefault = true, want false")
+	if !src.GeneratedDefault {
+		t.Fatal("GeneratedDefault = false, want true")
 	}
 }
 
@@ -153,6 +159,51 @@ func TestEnvManagedFieldPaths_ReturnsRecognizedOverrides(t *testing.T) {
 		if managed[want] == "" {
 			t.Fatalf("EnvManagedFieldPaths() missing %q in %#v", want, managed)
 		}
+	}
+}
+
+func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
+	metadata := FieldMetadataByPath()
+	tests := []struct {
+		env   string
+		field string
+	}{
+		{env: "SYNAPS3_SERVER_PORT", field: "server.port"},
+		{env: "SYNAPS3_S3_ACCESS_KEY", field: "s3.access_key"},
+		{env: "SYNAPS3_S3_SECRET_KEY", field: "s3.secret_key"},
+		{env: "SYNAPS3_FILECOIN_PRIVATE_KEY", field: "filecoin.private_key"},
+		{env: "SYNAPS3_CACHE_MAX_SIZE_GB", field: "cache.max_size_gb"},
+		{env: "SYNAPS3_ADMIN_ADDR", field: "admin.addr"},
+	}
+
+	for _, tt := range tests {
+		field, ok := EnvFieldForName(tt.env)
+		if !ok {
+			t.Fatalf("EnvFieldForName(%q) missing", tt.env)
+		}
+		if field != tt.field {
+			t.Fatalf("EnvFieldForName(%q) = %q, want %q", tt.env, field, tt.field)
+		}
+		meta, ok := metadata[tt.field]
+		if !ok {
+			t.Fatalf("FieldMetadataByPath() missing %q", tt.field)
+		}
+		if meta.Env != tt.env {
+			t.Fatalf("metadata[%q].Env = %q, want %q", tt.field, meta.Env, tt.env)
+		}
+		if strings.TrimSpace(meta.Label) == "" || strings.TrimSpace(meta.Description) == "" {
+			t.Fatalf("metadata[%q] must include label and description: %#v", tt.field, meta)
+		}
+	}
+
+	if !metadata["s3.secret_key"].Secret {
+		t.Fatal("s3.secret_key Secret = false, want true")
+	}
+	if metadata["s3.access_key"].Editable || metadata["s3.secret_key"].Editable {
+		t.Fatal("S3 credential metadata Editable = true, want false")
+	}
+	if metadata["filecoin.private_key"].Editable {
+		t.Fatal("filecoin.private_key Editable = true, want false")
 	}
 }
 

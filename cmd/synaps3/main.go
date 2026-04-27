@@ -39,8 +39,7 @@ func main() {
 			&cli.StringFlag{
 				Name:    "config",
 				Aliases: []string{"c"},
-				Value:   "config.yaml",
-				Usage:   "path to config file",
+				Usage:   "path to config file; defaults to ~/.synaps3/config.yaml",
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {

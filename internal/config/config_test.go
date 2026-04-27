@@ -29,6 +29,25 @@ func TestValidate_DefaultConfig(t *testing.T) {
 	}
 }
 
+func TestDefaultFilecoinRPCURLsReturnsKnownNetworkCopy(t *testing.T) {
+	defaults := DefaultFilecoinRPCURLs()
+	if defaults["calibration"] != "https://api.calibration.node.glif.io/rpc/v1" {
+		t.Fatalf("calibration rpc = %q", defaults["calibration"])
+	}
+	if defaults["mainnet"] != "https://api.node.glif.io/rpc/v1" {
+		t.Fatalf("mainnet rpc = %q", defaults["mainnet"])
+	}
+
+	defaults["mainnet"] = "https://mutated.example.invalid"
+	got, ok := DefaultFilecoinRPCURL(" Mainnet ")
+	if !ok {
+		t.Fatal("DefaultFilecoinRPCURL(Mainnet) ok = false, want true")
+	}
+	if got != "https://api.node.glif.io/rpc/v1" {
+		t.Fatalf("mainnet rpc after caller mutation = %q", got)
+	}
+}
+
 func TestValidate_TLS_MissingCert(t *testing.T) {
 	cfg := validConfig()
 	cfg.Server.TLS.Enabled = true

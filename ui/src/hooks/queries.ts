@@ -101,3 +101,14 @@ export function useUpdateSettings() {
     },
   })
 }
+
+export function useGenerateS3Credentials() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: api.generateS3Credentials,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+  })
+}

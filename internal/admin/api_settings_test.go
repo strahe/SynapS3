@@ -66,6 +66,71 @@ func TestSettingsGETRedactsSecretsAndReportsManualStatus(t *testing.T) {
 	}
 }
 
+func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
+	cfg := validSettingsConfig(t)
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIGetSettings(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp settingsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	tests := []struct {
+		field  string
+		env    string
+		secret bool
+	}{
+		{field: "server.port", env: "SYNAPS3_SERVER_PORT"},
+		{field: "s3.access_key", env: "SYNAPS3_S3_ACCESS_KEY", secret: true},
+		{field: "s3.secret_key", env: "SYNAPS3_S3_SECRET_KEY", secret: true},
+		{field: "filecoin.private_key", env: "SYNAPS3_FILECOIN_PRIVATE_KEY", secret: true},
+		{field: "cache.dir", env: "SYNAPS3_CACHE_DIR"},
+	}
+	for _, tt := range tests {
+		meta, ok := resp.Metadata[tt.field]
+		if !ok {
+			t.Fatalf("metadata missing %q in %#v", tt.field, resp.Metadata)
+		}
+		if meta.Env != tt.env {
+			t.Fatalf("metadata[%q].Env = %q, want %q", tt.field, meta.Env, tt.env)
+		}
+		if meta.Secret != tt.secret {
+			t.Fatalf("metadata[%q].Secret = %v, want %v", tt.field, meta.Secret, tt.secret)
+		}
+		if strings.TrimSpace(meta.Label) == "" || strings.TrimSpace(meta.Description) == "" {
+			t.Fatalf("metadata[%q] must include label and description: %#v", tt.field, meta)
+		}
+	}
+}
+
+func TestSettingsGETIncludesFilecoinRPCDefaults(t *testing.T) {
+	cfg := validSettingsConfig(t)
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIGetSettings(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp settingsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	for network, want := range config.DefaultFilecoinRPCURLs() {
+		if got := resp.Defaults.FilecoinRPCURLs[network]; got != want {
+			t.Fatalf("default rpc for %s = %q, want %q", network, got, want)
+		}
+	}
+}
+
 func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {
 	t.Setenv("SYNAPS3_S3_ACCESS_KEY", "env-access")
 	t.Setenv("SYNAPS3_S3_SECRET_KEY", "env-secret")
@@ -97,6 +162,145 @@ func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {
 	}
 	if resp.Manual.Filecoin.Env != "SYNAPS3_FILECOIN_PRIVATE_KEY" {
 		t.Fatalf("filecoin env = %q, want SYNAPS3_FILECOIN_PRIVATE_KEY", resp.Manual.Filecoin.Env)
+	}
+}
+
+func TestSettingsGenerateS3CredentialsPersistsAndReturnsPlaintextOnce(t *testing.T) {
+	cfg := validSettingsConfig(t)
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	if err := config.Save(source.Path, cfg); err != nil {
+		t.Fatalf("Save initial config: %v", err)
+	}
+	source.Exists = true
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/s3-credentials", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIGenerateS3Credentials(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp settingsS3CredentialsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if strings.TrimSpace(resp.Credentials.AccessKey) == "" || strings.TrimSpace(resp.Credentials.SecretKey) == "" {
+		t.Fatalf("generated credentials must be returned once: %#v", resp.Credentials)
+	}
+	if resp.Credentials.AccessKey == cfg.S3.AccessKey || resp.Credentials.SecretKey == cfg.S3.SecretKey {
+		t.Fatalf("generated credentials should rotate existing credentials")
+	}
+	if !resp.Settings.RestartRequired {
+		t.Fatal("RestartRequired = false, want true")
+	}
+	if !resp.Settings.Secrets.S3AccessKeyConfigured || !resp.Settings.Secrets.S3SecretKeyConfigured {
+		t.Fatalf("secret status = %#v, want S3 credentials configured", resp.Settings.Secrets)
+	}
+
+	loaded, err := config.LoadFile(source.Path)
+	if err != nil {
+		t.Fatalf("LoadFile(saved): %v", err)
+	}
+	if loaded.S3.AccessKey != resp.Credentials.AccessKey {
+		t.Fatalf("saved access_key = %q, want generated access key", loaded.S3.AccessKey)
+	}
+	if loaded.S3.SecretKey != resp.Credentials.SecretKey {
+		t.Fatalf("saved secret_key = %q, want generated secret key", loaded.S3.SecretKey)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
+	rr = httptest.NewRecorder()
+	srv.handleAPIGetSettings(rr, req)
+	if strings.Contains(rr.Body.String(), resp.Credentials.AccessKey) || strings.Contains(rr.Body.String(), resp.Credentials.SecretKey) {
+		t.Fatalf("settings GET leaked generated credentials: %s", rr.Body.String())
+	}
+}
+
+func TestSettingsGenerateS3CredentialsPreservesOmittedCacheDir(t *testing.T) {
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	initial := []byte(`
+s3:
+  access_key: manual-access
+  secret_key: manual-secret
+  region: us-east-1
+filecoin:
+  private_key: manual-filecoin-private-key
+`)
+	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
+		t.Fatalf("WriteFile initial config: %v", err)
+	}
+	cfg, err := config.LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if strings.TrimSpace(cfg.Cache.Dir) == "" {
+		t.Fatal("runtime cache dir default was not applied")
+	}
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/s3-credentials", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIGenerateS3Credentials(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	data, err := os.ReadFile(source.Path)
+	if err != nil {
+		t.Fatalf("ReadFile saved config: %v", err)
+	}
+	if strings.Contains(string(data), "dir:") {
+		t.Fatalf("settings generated credentials materialized cache.dir in YAML:\n%s", string(data))
+	}
+	restarted, err := config.LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource(saved): %v", err)
+	}
+	if strings.TrimSpace(restarted.Cache.Dir) == "" {
+		t.Fatal("cache.dir default was lost after restart")
+	}
+	if hasFieldError(restarted.FieldValidationErrors(), "cache.dir") {
+		t.Fatalf("restarted config has cache.dir validation error: %#v", restarted.FieldValidationErrors())
+	}
+}
+
+func TestSettingsGenerateS3CredentialsRejectsEnvManagedFields(t *testing.T) {
+	t.Setenv("SYNAPS3_S3_SECRET_KEY", "env-secret")
+
+	cfg := validSettingsConfig(t)
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	if err := config.Save(source.Path, cfg); err != nil {
+		t.Fatalf("Save initial config: %v", err)
+	}
+	source.Exists = true
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/s3-credentials", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIGenerateS3Credentials(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "s3.secret_key") || !strings.Contains(rr.Body.String(), "SYNAPS3_S3_SECRET_KEY") {
+		t.Fatalf("body should mention env-managed secret key: %s", rr.Body.String())
+	}
+	loaded, err := config.LoadFile(source.Path)
+	if err != nil {
+		t.Fatalf("LoadFile(saved): %v", err)
+	}
+	if loaded.S3.AccessKey != cfg.S3.AccessKey || loaded.S3.SecretKey != cfg.S3.SecretKey {
+		t.Fatalf("credentials changed despite env rejection: %#v", loaded.S3)
 	}
 }
 
@@ -302,6 +506,57 @@ cache:
 	text := string(data)
 	if strings.Contains(text, "dsn:") {
 		t.Fatalf("settings PUT materialized database.dsn in YAML:\n%s", text)
+	}
+}
+
+func TestSettingsPUTUsesRuntimeDefaultForOmittedCacheDir(t *testing.T) {
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	initial := []byte(`
+s3:
+  access_key: manual-access
+  secret_key: manual-secret
+  region: us-east-1
+filecoin:
+  private_key: manual-filecoin-private-key
+`)
+	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
+		t.Fatalf("WriteFile initial config: %v", err)
+	}
+	cfg, err := config.LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if strings.TrimSpace(cfg.Cache.Dir) == "" {
+		t.Fatal("runtime cache dir default was not applied")
+	}
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"logging":{"format":"text"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUpdateSettings(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	data, err := os.ReadFile(source.Path)
+	if err != nil {
+		t.Fatalf("ReadFile saved config: %v", err)
+	}
+	if strings.Contains(string(data), "dir:") {
+		t.Fatalf("settings PUT materialized cache.dir in YAML:\n%s", string(data))
+	}
+	restarted, err := config.LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource(saved): %v", err)
+	}
+	if strings.TrimSpace(restarted.Cache.Dir) == "" {
+		t.Fatal("cache.dir default was lost after restart")
+	}
+	if restarted.Logging.Format != "text" {
+		t.Fatalf("logging.format = %q, want text", restarted.Logging.Format)
 	}
 }
 

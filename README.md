@@ -19,7 +19,7 @@ Writes land in the local cache and metadata database first, then background work
 
 ## Quick Start
 
-1. Copy the example config and fill in your database, S3, and Filecoin settings.
+1. Copy the example config and fill in your S3 and Filecoin settings.
 2. Start SynapS3 with the config file.
 3. Point your S3 client at the SynapS3 endpoint.
 
@@ -33,6 +33,8 @@ The default S3 endpoint is `http://localhost:8080`.
 The built-in dashboard is available at `http://localhost:9090` (admin port) and provides an overview of system health, bucket/object browsing, and task monitoring.
 
 By default, local runtime data is stored under `~/.synaps3/`: SQLite files in `db/` and cached objects in `cache/`. Set `database.dsn` or `cache.dir` if you need explicit paths.
+
+If `--config` is omitted, SynapS3 uses `~/.synaps3/config.yaml`. A `config.yaml` in the current directory is only loaded when you pass it explicitly with `--config config.yaml`.
 
 Start with [`config.example.yaml`](config.example.yaml) and see [`docs/configuration.md`](docs/configuration.md) for the main settings.
 
