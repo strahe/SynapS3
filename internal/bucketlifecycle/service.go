@@ -37,8 +37,13 @@ func New(repos *repository.Repositories, c cache.Cache, logger *slog.Logger) *Se
 }
 
 func (s *Service) Create(ctx context.Context, name string) (*model.Bucket, error) {
+	return s.CreateWithACL(ctx, name, nil)
+}
+
+func (s *Service) CreateWithACL(ctx context.Context, name string, acl []byte) (*model.Bucket, error) {
 	bucket := &model.Bucket{
 		Name:   name,
+		ACL:    acl,
 		Status: model.BucketStatusActive,
 	}
 

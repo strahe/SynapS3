@@ -1,8 +1,6 @@
 package admin
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +13,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/securetoken"
 )
 
 const (
@@ -49,6 +48,13 @@ func (s *SettingsService) Snapshot(writable bool) settingsResponse {
 	defer s.mu.Unlock()
 
 	return s.snapshotLocked(writable)
+}
+
+func (s *SettingsService) S3IAMDir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.effective.S3.IAMDir
 }
 
 func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (settingsResponse, []config.FieldError, error) {
@@ -116,6 +122,9 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 	}
 	if req.S3 != nil {
 		setString("s3.region", &next.S3.Region, req.S3.Region)
+		if setString("s3.iam_dir", &next.S3.IAMDir, req.S3.IAMDir) {
+			fieldPresence.S3IAMDir = true
+		}
 	}
 	if req.Filecoin != nil {
 		setString("filecoin.network", &next.Filecoin.Network, req.Filecoin.Network)
@@ -291,6 +300,7 @@ type settingsResponse struct {
 	ConfigPath        string                          `json:"config_path"`
 	Writable          bool                            `json:"writable"`
 	RestartRequired   bool                            `json:"restart_required"`
+	S3Users           settingsS3UsersStatus           `json:"s3_users"`
 	Config            settingsEditableConfig          `json:"config"`
 	Manual            settingsManualConfig            `json:"manual"`
 	Secrets           settingsSecretStatus            `json:"secrets"`
@@ -304,6 +314,11 @@ type settingsResponse struct {
 
 type settingsDefaults struct {
 	FilecoinRPCURLs map[string]string `json:"filecoin_rpc_urls"`
+}
+
+type settingsS3UsersStatus struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 type settingsEditableConfig struct {
@@ -330,6 +345,7 @@ type settingsTLSConfig struct {
 
 type settingsS3Config struct {
 	Region string `json:"region"`
+	IAMDir string `json:"iam_dir"`
 }
 
 type settingsFilecoinConfig struct {
@@ -429,6 +445,7 @@ type settingsTLSUpdate struct {
 
 type settingsS3Update struct {
 	Region *string `json:"region,omitempty"`
+	IAMDir *string `json:"iam_dir,omitempty"`
 }
 
 type settingsFilecoinUpdate struct {
@@ -473,7 +490,10 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 			MaxConnections: cfg.Server.MaxConnections,
 			MaxRequests:    cfg.Server.MaxRequests,
 		},
-		S3: settingsS3Config{Region: cfg.S3.Region},
+		S3: settingsS3Config{
+			Region: cfg.S3.Region,
+			IAMDir: cfg.S3.IAMDir,
+		},
 		Filecoin: settingsFilecoinConfig{
 			Network:              cfg.Filecoin.Network,
 			RPCURL:               cfg.Filecoin.RPCURL,
@@ -551,6 +571,7 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"server.tls.cert_file":         {},
 		"server.tls.key_file":          {},
 		"s3.region":                    {},
+		"s3.iam_dir":                   {},
 		"cache.dir":                    {},
 		"cache.max_size_gb":            {},
 		"cache.eviction_policy":        {},
@@ -584,23 +605,15 @@ func configuredLabel(value string) string {
 }
 
 func generateS3Credentials() (settingsS3Credentials, error) {
-	accessKey, err := randomURLToken(16)
+	accessKey, err := securetoken.URL(16)
 	if err != nil {
 		return settingsS3Credentials{}, fmt.Errorf("generating S3 access key: %w", err)
 	}
-	secretKey, err := randomURLToken(32)
+	secretKey, err := securetoken.URL(32)
 	if err != nil {
 		return settingsS3Credentials{}, fmt.Errorf("generating S3 secret key: %w", err)
 	}
 	return settingsS3Credentials{AccessKey: accessKey, SecretKey: secretKey}, nil
-}
-
-func randomURLToken(n int) (string, error) {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 type settingsErrorResponse struct {
@@ -613,7 +626,7 @@ func (s *Server) handleAPIGetSettings(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "settings not available"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.settings.Snapshot(s.settingsWritable()))
+	writeJSON(w, http.StatusOK, s.decorateSettingsResponse(s.settings.Snapshot(s.settingsWritable())))
 }
 
 func (s *Server) handleAPIUpdateSettings(w http.ResponseWriter, r *http.Request) {
@@ -658,7 +671,7 @@ func (s *Server) handleAPIUpdateSettings(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings", Fields: fieldErrs})
 		return
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, s.decorateSettingsResponse(resp))
 }
 
 func (s *Server) handleAPIGenerateS3Credentials(w http.ResponseWriter, r *http.Request) {
@@ -703,7 +716,13 @@ func (s *Server) handleAPIGenerateS3Credentials(w http.ResponseWriter, r *http.R
 		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings", Fields: fieldErrs})
 		return
 	}
+	resp.Settings = s.decorateSettingsResponse(resp.Settings)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) decorateSettingsResponse(resp settingsResponse) settingsResponse {
+	resp.S3Users = s.s3UsersStatus()
+	return resp
 }
 
 func (s *Server) settingsWritable() bool {

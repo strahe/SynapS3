@@ -18,13 +18,14 @@ SYNAPS3_DATABASE_DSN      -> database.dsn
 SYNAPS3_SERVER_PORT       -> server.port
 SYNAPS3_FILECOIN_RPC_URL  -> filecoin.rpc_url
 SYNAPS3_S3_SECRET_KEY     -> s3.secret_key
+SYNAPS3_S3_IAM_DIR        -> s3.iam_dir
 SYNAPS3_FILECOIN_NETWORK  -> filecoin.network
 SYNAPS3_WORKER_UPLOAD_CONCURRENCY -> worker.upload.concurrency
 ```
 
 ## Default Runtime Data
 
-When `database.dsn` and `cache.dir` are omitted, SynapS3 stores local runtime data under the current user's home directory:
+When `database.dsn`, `cache.dir`, and `s3.iam_dir` are omitted, SynapS3 stores local runtime data under the current user's home directory:
 
 ```text
 ~/.synaps3/
@@ -33,9 +34,11 @@ When `database.dsn` and `cache.dir` are omitted, SynapS3 stores local runtime da
     synaps3.db-shm
     synaps3.db-wal
   cache/
+  iam/
+    users.json
 ```
 
-The application creates the default database and cache directories automatically. SQLite WAL and SHM files are expected and live beside the database file. Explicit `database.dsn` and `cache.dir` values still take precedence, including relative paths, which remain relative to the process working directory.
+The application creates the default database, cache, and IAM directories automatically. SQLite WAL and SHM files are expected and live beside the database file. Explicit `database.dsn`, `cache.dir`, and `s3.iam_dir` values still take precedence, including relative paths, which remain relative to the process working directory.
 
 SynapS3 does not automatically migrate old local `./synaps3.db*` or `./cache` data. Move those files manually if you want to keep existing local state.
 
@@ -45,7 +48,7 @@ SynapS3 does not automatically migrate old local `./synaps3.db*` or `./cache` da
 | --- | --- | --- |
 | `database` | `driver`, `dsn`, `max_open_conns`, `max_idle_conns` | Database connection settings |
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local disk cache behavior |
-| `s3` | `access_key`, `secret_key`, `region` | S3 authentication settings |
+| `s3` | `access_key`, `secret_key`, `region`, `iam_dir` | S3 authentication and VersityGW users.json settings |
 | `server` | `port`, `tls.enabled`, `tls.cert_file`, `tls.key_file` | S3 server bind address and TLS |
 | `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks` | synapse-go client settings |
 | `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker tuning |

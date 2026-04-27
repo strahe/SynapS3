@@ -386,7 +386,7 @@ func TestIntegration_BucketLifecycle(t *testing.T) {
 	}
 
 	// 3. Bucket should appear in ListBuckets
-	listOut, err := ib.backend.ListBuckets(ctx, s3response.ListBucketsInput{})
+	listOut, err := ib.backend.ListBuckets(ctx, s3response.ListBucketsInput{IsAdmin: true})
 	if err != nil {
 		t.Fatalf("ListBuckets: %v", err)
 	}

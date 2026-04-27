@@ -316,6 +316,9 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
 	}
+	if cfg.S3.IAMDir != filepath.Join(wantAppDir, "iam") {
+		t.Errorf("S3.IAMDir = %q, want %q", cfg.S3.IAMDir, filepath.Join(wantAppDir, "iam"))
+	}
 }
 
 func TestLoad_EnvOverride(t *testing.T) {
@@ -340,8 +343,10 @@ func TestLoad_EnvOverridePaths(t *testing.T) {
 
 	dbDSN := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "custom.db"))
 	cacheDir := filepath.Join(t.TempDir(), "custom-cache")
+	iamDir := filepath.Join(t.TempDir(), "custom-iam")
 	t.Setenv("SYNAPS3_DATABASE_DSN", dbDSN)
 	t.Setenv("SYNAPS3_CACHE_DIR", cacheDir)
+	t.Setenv("SYNAPS3_S3_IAM_DIR", iamDir)
 
 	cfg, err := Load("")
 	if err != nil {
@@ -352,6 +357,9 @@ func TestLoad_EnvOverridePaths(t *testing.T) {
 	}
 	if cfg.Cache.Dir != cacheDir {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, cacheDir)
+	}
+	if cfg.S3.IAMDir != iamDir {
+		t.Errorf("S3.IAMDir = %q, want %q", cfg.S3.IAMDir, iamDir)
 	}
 }
 
@@ -454,7 +462,8 @@ func TestLoad_YAMLOverridesDefaultPaths(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.yaml")
 	dbDSN := "file:" + filepath.ToSlash(filepath.Join(dir, "custom", "synaps3.db"))
 	cacheDir := filepath.Join(dir, "custom-cache")
-	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
+	iamDir := filepath.Join(dir, "custom-iam")
+	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ns3:\n  iam_dir: \"" + filepath.ToSlash(iamDir) + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
 	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -468,6 +477,9 @@ func TestLoad_YAMLOverridesDefaultPaths(t *testing.T) {
 	}
 	if cfg.Cache.Dir != filepath.ToSlash(cacheDir) {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.ToSlash(cacheDir))
+	}
+	if cfg.S3.IAMDir != filepath.ToSlash(iamDir) {
+		t.Errorf("S3.IAMDir = %q, want %q", cfg.S3.IAMDir, filepath.ToSlash(iamDir))
 	}
 }
 
@@ -498,7 +510,8 @@ func TestLoad_ExplicitRuntimePathsDoNotRequireHome(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.yaml")
 	dbDSN := "file:" + filepath.ToSlash(filepath.Join(dir, "custom", "synaps3.db"))
 	cacheDir := filepath.Join(dir, "custom-cache")
-	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
+	iamDir := filepath.Join(dir, "custom-iam")
+	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ns3:\n  iam_dir: \"" + filepath.ToSlash(iamDir) + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
 	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -512,6 +525,184 @@ func TestLoad_ExplicitRuntimePathsDoNotRequireHome(t *testing.T) {
 	}
 	if cfg.Cache.Dir != filepath.ToSlash(cacheDir) {
 		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.ToSlash(cacheDir))
+	}
+	if cfg.S3.IAMDir != filepath.ToSlash(iamDir) {
+		t.Errorf("S3.IAMDir = %q, want %q", cfg.S3.IAMDir, filepath.ToSlash(iamDir))
+	}
+}
+
+func TestBootstrapS3RootCredentialsGeneratesMissingKeys(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
+
+	source := Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	initial := []byte(`
+s3:
+  region: us-east-1
+filecoin:
+  private_key: manual-filecoin-private-key
+`)
+	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
+		t.Fatalf("WriteFile initial config: %v", err)
+	}
+
+	changed, err := BootstrapS3RootCredentials(source.Path)
+	if err != nil {
+		t.Fatalf("BootstrapS3RootCredentials: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+
+	loaded, err := LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if strings.TrimSpace(loaded.S3.AccessKey) == "" {
+		t.Fatal("S3.AccessKey was not generated")
+	}
+	if strings.TrimSpace(loaded.S3.SecretKey) == "" {
+		t.Fatal("S3.SecretKey was not generated")
+	}
+	if hasFieldError(loaded.FieldValidationErrors(), "s3.access_key") || hasFieldError(loaded.FieldValidationErrors(), "s3.secret_key") {
+		t.Fatalf("generated config still has S3 credential validation errors: %#v", loaded.FieldValidationErrors())
+	}
+}
+
+func TestBootstrapS3RootCredentialsOnlyFillsMissingField(t *testing.T) {
+	withUserHomeDir(t, t.TempDir())
+
+	source := Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	initial := []byte(`
+s3:
+  access_key: existing-root-access
+  region: us-east-1
+filecoin:
+  private_key: manual-filecoin-private-key
+`)
+	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
+		t.Fatalf("WriteFile initial config: %v", err)
+	}
+
+	changed, err := BootstrapS3RootCredentials(source.Path)
+	if err != nil {
+		t.Fatalf("BootstrapS3RootCredentials: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+
+	loaded, err := LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if loaded.S3.AccessKey != "existing-root-access" {
+		t.Fatalf("S3.AccessKey = %q, want existing-root-access", loaded.S3.AccessKey)
+	}
+	if strings.TrimSpace(loaded.S3.SecretKey) == "" {
+		t.Fatal("S3.SecretKey was not generated")
+	}
+}
+
+func TestBootstrapS3RootCredentialsDoesNotOverrideEnvManagedEmptyValues(t *testing.T) {
+	withUserHomeDir(t, t.TempDir())
+	t.Setenv("SYNAPS3_S3_ACCESS_KEY", "")
+	t.Setenv("SYNAPS3_S3_SECRET_KEY", "")
+
+	source := Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	initial := []byte(`
+s3:
+  region: us-east-1
+filecoin:
+  private_key: manual-filecoin-private-key
+`)
+	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
+		t.Fatalf("WriteFile initial config: %v", err)
+	}
+
+	changed, err := BootstrapS3RootCredentials(source.Path)
+	if err != nil {
+		t.Fatalf("BootstrapS3RootCredentials: %v", err)
+	}
+	if changed {
+		t.Fatal("changed = true, want false for env-managed S3 credentials")
+	}
+
+	loaded, err := LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if !hasFieldError(loaded.FieldValidationErrors(), "s3.access_key") || !hasFieldError(loaded.FieldValidationErrors(), "s3.secret_key") {
+		t.Fatalf("env-managed empty credentials should still validate as missing: %#v", loaded.FieldValidationErrors())
+	}
+}
+
+func TestBootstrapS3RootCredentialsDoesNotMaterializeRuntimeDefaultPaths(t *testing.T) {
+	home := t.TempDir()
+	withUserHomeDir(t, home)
+
+	source := Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	initial := []byte(`
+s3:
+  region: us-east-1
+filecoin:
+  private_key: manual-filecoin-private-key
+`)
+	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
+		t.Fatalf("WriteFile initial config: %v", err)
+	}
+
+	if _, err := BootstrapS3RootCredentials(source.Path); err != nil {
+		t.Fatalf("BootstrapS3RootCredentials: %v", err)
+	}
+	data, err := os.ReadFile(source.Path)
+	if err != nil {
+		t.Fatalf("ReadFile saved config: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "  dir:") {
+		t.Fatalf("bootstrap materialized cache.dir in YAML:\n%s", text)
+	}
+	if strings.Contains(text, "iam_dir:") {
+		t.Fatalf("bootstrap materialized s3.iam_dir in YAML:\n%s", text)
+	}
+
+	loaded, err := LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if loaded.S3.IAMDir != filepath.Join(home, ".synaps3", "iam") {
+		t.Fatalf("S3.IAMDir = %q, want runtime default", loaded.S3.IAMDir)
+	}
+	if loaded.Cache.Dir != filepath.Join(home, ".synaps3", "cache") {
+		t.Fatalf("Cache.Dir = %q, want runtime default", loaded.Cache.Dir)
+	}
+}
+
+func TestBootstrapS3RootCredentialsLeavesNonS3SetupErrors(t *testing.T) {
+	withUserHomeDir(t, t.TempDir())
+
+	source := Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	initial := []byte(`
+s3:
+  region: us-east-1
+`)
+	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
+		t.Fatalf("WriteFile initial config: %v", err)
+	}
+
+	if _, err := BootstrapS3RootCredentials(source.Path); err != nil {
+		t.Fatalf("BootstrapS3RootCredentials: %v", err)
+	}
+	loaded, err := LoadSource(source)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if hasFieldError(loaded.FieldValidationErrors(), "s3.access_key") || hasFieldError(loaded.FieldValidationErrors(), "s3.secret_key") {
+		t.Fatalf("bootstrap should resolve S3 root key validation errors: %#v", loaded.FieldValidationErrors())
+	}
+	if !hasFieldError(loaded.FieldValidationErrors(), "filecoin.private_key") {
+		t.Fatalf("bootstrap should leave filecoin setup validation error: %#v", loaded.FieldValidationErrors())
 	}
 }
 
@@ -540,6 +731,15 @@ func TestLoad_FilecoinSDKOptions(t *testing.T) {
 	if !cfg.Filecoin.AllowPrivateNetworks {
 		t.Fatal("filecoin.allow_private_networks = false, want true")
 	}
+}
+
+func hasFieldError(errs []FieldError, field string) bool {
+	for _, err := range errs {
+		if err.Field == field {
+			return true
+		}
+	}
+	return false
 }
 
 func TestValidate_CacheDir_Empty(t *testing.T) {

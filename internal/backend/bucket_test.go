@@ -2,11 +2,13 @@ package backend_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -145,7 +147,7 @@ func TestListBuckets_Empty(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	result, err := tb.backend.ListBuckets(ctx, s3response.ListBucketsInput{})
+	result, err := tb.backend.ListBuckets(ctx, s3response.ListBucketsInput{IsAdmin: true})
 	if err != nil {
 		t.Fatalf("ListBuckets: %v", err)
 	}
@@ -166,7 +168,7 @@ func TestListBuckets_OnlyActive(t *testing.T) {
 		}
 	}
 
-	result, err := tb.backend.ListBuckets(ctx, s3response.ListBucketsInput{})
+	result, err := tb.backend.ListBuckets(ctx, s3response.ListBucketsInput{IsAdmin: true})
 	if err != nil {
 		t.Fatalf("ListBuckets: %v", err)
 	}
@@ -180,5 +182,60 @@ func TestListBuckets_OnlyActive(t *testing.T) {
 		if !names[want] {
 			t.Errorf("expected bucket %q in list", want)
 		}
+	}
+}
+
+func TestListBucketsFiltersNonAdminByACLOwner(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	for _, seed := range []struct {
+		name  string
+		owner string
+		acl   []byte
+	}{
+		{name: "owner-a-bucket", owner: "owner-a"},
+		{name: "owner-b-bucket", owner: "owner-b"},
+		{name: "legacy-root-bucket"},
+		{name: "malformed-acl-bucket", acl: []byte("{")},
+	} {
+		b := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive}
+		switch {
+		case seed.acl != nil:
+			b.ACL = seed.acl
+		case seed.owner != "":
+			data, err := json.Marshal(auth.ACL{Owner: seed.owner})
+			if err != nil {
+				t.Fatalf("Marshal ACL: %v", err)
+			}
+			b.ACL = data
+		}
+		if err := tb.repos.Buckets.Create(ctx, b); err != nil {
+			t.Fatalf("seeding bucket %q: %v", seed.name, err)
+		}
+	}
+
+	result, err := tb.backend.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "owner-a"})
+	if err != nil {
+		t.Fatalf("ListBuckets: %v", err)
+	}
+	if len(result.Buckets.Bucket) != 1 || result.Buckets.Bucket[0].Name != "owner-a-bucket" {
+		t.Fatalf("filtered buckets = %#v, want only owner-a-bucket", result.Buckets.Bucket)
+	}
+
+	emptyOwnerResult, err := tb.backend.ListBuckets(ctx, s3response.ListBucketsInput{})
+	if err != nil {
+		t.Fatalf("ListBuckets empty owner: %v", err)
+	}
+	if len(emptyOwnerResult.Buckets.Bucket) != 0 {
+		t.Fatalf("empty owner buckets = %#v, want none", emptyOwnerResult.Buckets.Bucket)
+	}
+
+	adminResult, err := tb.backend.ListBuckets(ctx, s3response.ListBucketsInput{IsAdmin: true})
+	if err != nil {
+		t.Fatalf("ListBuckets admin: %v", err)
+	}
+	if len(adminResult.Buckets.Bucket) != 4 {
+		t.Fatalf("admin buckets = %#v, want all four buckets", adminResult.Buckets.Bucket)
 	}
 }

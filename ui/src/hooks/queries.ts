@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import type { S3UserRole } from '@/api/client'
 import { api } from '@/api/client'
 
 export function useOverview() {
@@ -109,6 +110,59 @@ export function useGenerateS3Credentials() {
     mutationFn: api.generateS3Credentials,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+  })
+}
+
+export function useS3Users(enabled = true) {
+  return useQuery({
+    queryKey: ['s3Users'],
+    queryFn: api.getS3Users,
+    enabled,
+    refetchInterval: 30_000,
+  })
+}
+
+export function useCreateS3User() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: (payload: { role?: S3UserRole }) => api.createS3User(payload),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['s3Users'] })
+    },
+  })
+}
+
+export function useUpdateS3User() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ accessKey, role }: { accessKey: string; role: S3UserRole }) => api.updateS3User(accessKey, { role }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['s3Users'] })
+    },
+  })
+}
+
+export function useRotateS3UserSecret() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: (accessKey: string) => api.rotateS3UserSecret(accessKey),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['s3Users'] })
+    },
+  })
+}
+
+export function useDeleteS3User() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: (accessKey: string) => api.deleteS3User(accessKey),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['s3Users'] })
     },
   })
 }

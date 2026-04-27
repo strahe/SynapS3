@@ -70,6 +70,12 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_S3_REGION",
 		Editable:    true,
 	},
+	"s3.iam_dir": {
+		Label:       "IAM Directory",
+		Description: "Directory where SynapS3 stores VersityGW S3 user records.",
+		Env:         "SYNAPS3_S3_IAM_DIR",
+		Editable:    true,
+	},
 	"filecoin.network": {
 		Label:       "Network",
 		Description: "Filecoin network used by synapse-go.",

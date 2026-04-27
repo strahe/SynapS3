@@ -22,6 +22,8 @@ type BucketRepository interface {
 	UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error
 	// SetProofSetID sets the proof set ID for a bucket.
 	SetProofSetID(ctx context.Context, id int64, proofSetID string) error
+	// SetACL stores the bucket ACL JSON blob used by VersityGW access control.
+	SetACL(ctx context.Context, name string, acl []byte) error
 	// HardDelete permanently removes a bucket row (used after proof set deletion).
 	HardDelete(ctx context.Context, id int64) error
 	// CountWithProofSet returns the number of buckets that have a non-null proof set ID.

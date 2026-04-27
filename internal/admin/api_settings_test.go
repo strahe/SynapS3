@@ -89,6 +89,7 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		{field: "server.port", env: "SYNAPS3_SERVER_PORT"},
 		{field: "s3.access_key", env: "SYNAPS3_S3_ACCESS_KEY", secret: true},
 		{field: "s3.secret_key", env: "SYNAPS3_S3_SECRET_KEY", secret: true},
+		{field: "s3.iam_dir", env: "SYNAPS3_S3_IAM_DIR"},
 		{field: "filecoin.private_key", env: "SYNAPS3_FILECOIN_PRIVATE_KEY", secret: true},
 		{field: "cache.dir", env: "SYNAPS3_CACHE_DIR"},
 	}
@@ -106,6 +107,29 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		if strings.TrimSpace(meta.Label) == "" || strings.TrimSpace(meta.Description) == "" {
 			t.Fatalf("metadata[%q] must include label and description: %#v", tt.field, meta)
 		}
+	}
+	if !resp.Metadata["s3.iam_dir"].Editable {
+		t.Fatal("metadata[s3.iam_dir].Editable = false, want true")
+	}
+}
+
+func TestSettingsGETReportsS3UsersUnavailableInSetupMode(t *testing.T) {
+	cfg := validSettingsConfig(t)
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIGetSettings(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp settingsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if resp.S3Users.Available || strings.TrimSpace(resp.S3Users.Reason) == "" {
+		t.Fatalf("S3Users = %#v, want unavailable with reason", resp.S3Users)
 	}
 }
 
@@ -239,6 +263,9 @@ filecoin:
 	}
 	if strings.TrimSpace(cfg.Cache.Dir) == "" {
 		t.Fatal("runtime cache dir default was not applied")
+	}
+	if strings.TrimSpace(cfg.S3.IAMDir) == "" {
+		t.Fatal("runtime s3.iam_dir default was not applied")
 	}
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
 
@@ -545,8 +572,12 @@ filecoin:
 	if err != nil {
 		t.Fatalf("ReadFile saved config: %v", err)
 	}
-	if strings.Contains(string(data), "dir:") {
-		t.Fatalf("settings PUT materialized cache.dir in YAML:\n%s", string(data))
+	text := string(data)
+	if strings.Contains(text, "  dir:") {
+		t.Fatalf("settings PUT materialized cache.dir in YAML:\n%s", text)
+	}
+	if strings.Contains(text, "iam_dir:") {
+		t.Fatalf("settings PUT materialized s3.iam_dir in YAML:\n%s", text)
 	}
 	restarted, err := config.LoadSource(source)
 	if err != nil {
@@ -554,6 +585,9 @@ filecoin:
 	}
 	if strings.TrimSpace(restarted.Cache.Dir) == "" {
 		t.Fatal("cache.dir default was lost after restart")
+	}
+	if strings.TrimSpace(restarted.S3.IAMDir) == "" {
+		t.Fatal("s3.iam_dir default was lost after restart")
 	}
 	if restarted.Logging.Format != "text" {
 		t.Fatalf("logging.format = %q, want text", restarted.Logging.Format)
@@ -663,6 +697,7 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "server tls cert file", envName: "SYNAPS3_SERVER_TLS_CERT_FILE", payload: `{"server":{"tls":{"cert_file":"/tmp/cert.pem"}}}`, field: "server.tls.cert_file"},
 		{name: "server tls key file", envName: "SYNAPS3_SERVER_TLS_KEY_FILE", payload: `{"server":{"tls":{"key_file":"/tmp/key.pem"}}}`, field: "server.tls.key_file"},
 		{name: "s3 region", envName: "SYNAPS3_S3_REGION", payload: `{"s3":{"region":"eu-west-1"}}`, field: "s3.region"},
+		{name: "s3 iam dir", envName: "SYNAPS3_S3_IAM_DIR", payload: `{"s3":{"iam_dir":"/tmp/synaps3-iam"}}`, field: "s3.iam_dir"},
 		{name: "filecoin network", envName: "SYNAPS3_FILECOIN_NETWORK", payload: `{"filecoin":{"network":"mainnet"}}`, field: "filecoin.network"},
 		{name: "filecoin rpc url", envName: "SYNAPS3_FILECOIN_RPC_URL", payload: `{"filecoin":{"rpc_url":"https://rpc.example.invalid"}}`, field: "filecoin.rpc_url"},
 		{name: "filecoin source", envName: "SYNAPS3_FILECOIN_SOURCE", payload: `{"filecoin":{"source":"other"}}`, field: "filecoin.source"},
@@ -714,7 +749,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":"not-a-port"},
-		"s3":{"region":""},
+		"s3":{"region":"","iam_dir":""},
 		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","source":""},
 		"worker":{"upload":{"max_retries":-1}},
 		"logging":{"level":"verbose","format":"xml"}
@@ -732,6 +767,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 	for _, want := range []string{
 		"server.port",
 		"s3.region",
+		"s3.iam_dir",
 		"filecoin.rpc_url",
 		"filecoin.source",
 		"worker.upload.max_retries",

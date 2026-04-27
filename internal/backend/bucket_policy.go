@@ -5,26 +5,26 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
 
-// GetBucketAcl returns the ACL for the specified bucket.
-// Currently returns an empty ACL; the middleware falls back to root-user ownership.
+// GetBucketAcl returns the persisted ACL for the specified bucket.
 func (b *SynapseBackend) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) ([]byte, error) {
 	if input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 
-	if _, err := b.getBucket(ctx, *input.Bucket); err != nil {
+	bkt, err := b.getBucket(ctx, *input.Bucket)
+	if err != nil {
 		return nil, err
 	}
 
-	return nil, nil
+	return bkt.ACL, nil
 }
 
-// PutBucketAcl accepts and discards ACL updates.
-// ACL enforcement is not yet implemented.
+// PutBucketAcl persists bucket ACL updates used by VersityGW access control.
 func (b *SynapseBackend) PutBucketAcl(ctx context.Context, bucket string, data []byte) error {
 	bkt, err := b.getBucket(ctx, bucket)
 	if err != nil {
@@ -34,6 +34,24 @@ func (b *SynapseBackend) PutBucketAcl(ctx context.Context, bucket string, data [
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 
+	return b.repos.Buckets.SetACL(ctx, bucket, data)
+}
+
+func (b *SynapseBackend) ChangeBucketOwner(ctx context.Context, bucket, owner string) error {
+	return auth.UpdateBucketACLOwner(ctx, b, bucket, owner)
+}
+
+func (b *SynapseBackend) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
+	if _, err := b.getBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+	return nil, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
+}
+
+func (b *SynapseBackend) DeleteBucketPolicy(ctx context.Context, bucket string) error {
+	if _, err := b.getBucket(ctx, bucket); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -55,13 +73,13 @@ func (b *SynapseBackend) GetObjectLockConfiguration(ctx context.Context, bucket 
 	return nil, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound)
 }
 
-// GetBucketOwnershipControls returns the default BucketOwnerEnforced ownership.
+// GetBucketOwnershipControls returns an ACL-compatible ownership mode.
 func (b *SynapseBackend) GetBucketOwnershipControls(ctx context.Context, bucket string) (types.ObjectOwnership, error) {
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return "", err
 	}
 
-	return types.ObjectOwnershipBucketOwnerEnforced, nil
+	return types.ObjectOwnershipBucketOwnerPreferred, nil
 }
 
 // GetObjectAcl returns an empty ACL for the specified object.

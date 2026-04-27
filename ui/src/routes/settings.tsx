@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, Check, CheckCircle2, Copy, Info, KeyRound, Loader2, Save } from 'lucide-react'
+import { AlertTriangle, Check, CheckCircle2, Copy, Info, Loader2, Save } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   SettingsData,
@@ -8,16 +8,7 @@ import type {
   SettingsS3Credentials,
   SettingsUpdatePayload,
 } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { S3SettingsPanel } from '@/components/settings/S3SettingsPanel'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -40,7 +31,7 @@ export const Route = createFileRoute('/settings')({
 })
 
 const tabFields = {
-  s3: ['s3.access_key', 's3.secret_key', 's3.region'],
+  s3: ['s3.access_key', 's3.secret_key', 's3.region', 's3.iam_dir'],
   server: [
     'server.port',
     'server.max_connections',
@@ -106,7 +97,7 @@ function SettingsPage() {
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!data || !form || submitDisabled) return
-    updateSettings.mutate(buildSettingsPayload(form, data.env_managed), {
+    updateSettings.mutate(buildSettingsPayload(form, data.config, data.env_managed), {
       onSuccess: (saved) => setForm(saved.config),
     })
   }
@@ -185,51 +176,18 @@ function SettingsPage() {
         </TabsList>
 
         <TabsContent value="s3">
-          <Section title="S3">
-            <div className="grid gap-4 lg:grid-cols-[1fr_1fr]">
-              <CredentialStatusCard data={data} label="S3 Access Key" field={data.manual.s3_access_key} />
-              <CredentialStatusCard data={data} label="S3 Secret Key" field={data.manual.s3_secret_key} />
-            </div>
-            <div className="mt-4 grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
-              <TextField
-                label="Region"
-                field="s3.region"
-                value={form.s3.region}
-                data={data}
-                errors={fieldErrors}
-                onChange={(value) => setForm({ ...form, s3: { ...form.s3, region: value } })}
-              />
-              <AlertDialog open={confirmGenerateOpen} onOpenChange={setConfirmGenerateOpen}>
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={generateDisabled}
-                  onClick={() => setConfirmGenerateOpen(true)}
-                >
-                  {generateS3Credentials.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <KeyRound className="h-4 w-4" />
-                  )}
-                  Generate S3 credentials
-                </Button>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Generate S3 credentials?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This rotates the S3 Access Key and Secret Key stored in the config file.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel type="button">Cancel</AlertDialogCancel>
-                    <AlertDialogAction type="button" onClick={handleGenerateS3Credentials}>
-                      Generate
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            </div>
-          </Section>
+          <S3SettingsPanel
+            data={data}
+            value={form.s3}
+            errors={fieldErrors}
+            generateRootOpen={confirmGenerateOpen}
+            generateRootDisabled={generateDisabled}
+            generateRootPending={generateS3Credentials.isPending}
+            onChange={(s3) => setForm({ ...form, s3 })}
+            onCredentials={setGeneratedCredentials}
+            onGenerateRoot={handleGenerateS3Credentials}
+            onGenerateRootOpenChange={setConfirmGenerateOpen}
+          />
         </TabsContent>
 
         <TabsContent value="server">
@@ -923,7 +881,11 @@ function normalizeNetworkName(network: string) {
   return network.trim().toLowerCase()
 }
 
-function buildSettingsPayload(form: SettingsEditableConfig, envManaged: Record<string, string>): SettingsUpdatePayload {
+function buildSettingsPayload(
+  form: SettingsEditableConfig,
+  initial: SettingsEditableConfig,
+  envManaged: Record<string, string>
+): SettingsUpdatePayload {
   const include = (field: string) => !envManaged[field]
   const payload: SettingsUpdatePayload = {}
 
@@ -938,6 +900,7 @@ function buildSettingsPayload(form: SettingsEditableConfig, envManaged: Record<s
 
   payload.s3 = {}
   if (include('s3.region')) payload.s3.region = form.s3.region
+  if (include('s3.iam_dir') && form.s3.iam_dir !== initial.s3.iam_dir) payload.s3.iam_dir = form.s3.iam_dir
 
   payload.filecoin = {}
   if (include('filecoin.network')) payload.filecoin.network = form.filecoin.network
@@ -948,7 +911,7 @@ function buildSettingsPayload(form: SettingsEditableConfig, envManaged: Record<s
     payload.filecoin.allow_private_networks = form.filecoin.allow_private_networks
 
   payload.cache = {}
-  if (include('cache.dir')) payload.cache.dir = form.cache.dir
+  if (include('cache.dir') && form.cache.dir !== initial.cache.dir) payload.cache.dir = form.cache.dir
   if (include('cache.max_size_gb')) payload.cache.max_size_gb = form.cache.max_size_gb
   if (include('cache.eviction_policy')) payload.cache.eviction_policy = form.cache.eviction_policy
 

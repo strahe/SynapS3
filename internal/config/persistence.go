@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/strahe/synaps3/internal/securetoken"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -69,6 +71,7 @@ func LoadSource(src Source) (*Config, error) {
 type PersistedFieldPresence struct {
 	S3AccessKey        bool
 	S3SecretKey        bool
+	S3IAMDir           bool
 	FilecoinPrivateKey bool
 	DatabaseDriver     bool
 	DatabaseDSN        bool
@@ -150,6 +153,48 @@ func LoadFileForSettings(path string) (*Config, PersistedFieldPresence, error) {
 	return cfg, presence, nil
 }
 
+// BootstrapS3RootCredentials generates missing config-backed root S3
+// credentials. Environment-managed fields are never overwritten.
+func BootstrapS3RootCredentials(path string) (bool, error) {
+	cfg, presence, err := loadWithOptions(path, false, true)
+	if err != nil {
+		return false, err
+	}
+
+	managed := EnvManagedFieldPaths()
+	changed := false
+	if strings.TrimSpace(cfg.S3.AccessKey) == "" {
+		if _, ok := managed["s3.access_key"]; !ok {
+			accessKey, err := securetoken.URL(16)
+			if err != nil {
+				return false, fmt.Errorf("generating S3 root access key: %w", err)
+			}
+			cfg.S3.AccessKey = accessKey
+			presence.S3AccessKey = true
+			changed = true
+		}
+	}
+	if strings.TrimSpace(cfg.S3.SecretKey) == "" {
+		if _, ok := managed["s3.secret_key"]; !ok {
+			secretKey, err := securetoken.URL(32)
+			if err != nil {
+				return false, fmt.Errorf("generating S3 root secret key: %w", err)
+			}
+			cfg.S3.SecretKey = secretKey
+			presence.S3SecretKey = true
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+
+	if err := SaveForSettings(path, cfg, presence); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func fileExists(path string) (bool, error) {
 	if path == "" {
 		return false, nil
@@ -195,6 +240,7 @@ type yamlS3Config struct {
 	AccessKey *string `yaml:"access_key,omitempty"`
 	SecretKey *string `yaml:"secret_key,omitempty"`
 	Region    string  `yaml:"region"`
+	IAMDir    *string `yaml:"iam_dir,omitempty"`
 }
 
 type yamlFilecoinConfig struct {
@@ -260,6 +306,7 @@ func toYAMLConfig(cfg *Config, opts saveOptions) yamlConfig {
 			AccessKey: optionalString(cfg.S3.AccessKey, presence.S3AccessKey),
 			SecretKey: optionalString(cfg.S3.SecretKey, presence.S3SecretKey),
 			Region:    cfg.S3.Region,
+			IAMDir:    optionalString(cfg.S3.IAMDir, presence.S3IAMDir),
 		},
 		Filecoin: yamlFilecoinConfig{
 			Network:              cfg.Filecoin.Network,
@@ -322,6 +369,7 @@ func fullPersistedFieldPresence() PersistedFieldPresence {
 	return PersistedFieldPresence{
 		S3AccessKey:        true,
 		S3SecretKey:        true,
+		S3IAMDir:           true,
 		FilecoinPrivateKey: true,
 		DatabaseDriver:     true,
 		DatabaseDSN:        true,

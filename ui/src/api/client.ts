@@ -18,6 +18,7 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
       : ''
     throw new Error([errorBody.error || `API error: ${res.status}`, fieldText].filter(Boolean).join(' - '))
   }
+  if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
 
@@ -139,6 +140,7 @@ export interface SettingsData {
   config_path: string
   writable: boolean
   restart_required: boolean
+  s3_users: SettingsS3UsersStatus
   config: SettingsEditableConfig
   manual: SettingsManualConfig
   secrets: SettingsSecretStatus
@@ -160,6 +162,11 @@ export interface SettingsFieldMetadata {
 
 export interface SettingsDefaults {
   filecoin_rpc_urls: Record<string, string>
+}
+
+export interface SettingsS3UsersStatus {
+  available: boolean
+  reason?: string
 }
 
 export interface SettingsEditableConfig {
@@ -186,6 +193,7 @@ export interface SettingsTLSConfig {
 
 export interface SettingsS3Config {
   region: string
+  iam_dir: string
 }
 
 export interface SettingsFilecoinConfig {
@@ -253,6 +261,17 @@ export interface SettingsS3Credentials {
 export interface SettingsS3CredentialsResponse {
   settings: SettingsData
   credentials: SettingsS3Credentials
+}
+
+export type S3UserRole = 'user' | 'userplus' | 'admin'
+
+export interface S3User {
+  access_key: string
+  role: S3UserRole
+}
+
+export interface S3UserCredentials extends SettingsS3Credentials {
+  role: S3UserRole
 }
 
 export type SettingsUpdatePayload = Partial<{
@@ -328,5 +347,37 @@ export const api = {
         'X-SynapS3-Settings-Write': '1',
       },
       body: JSON.stringify({}),
+    }),
+  getS3Users: () => fetchJSON<S3User[]>('/s3-users'),
+  createS3User: (payload: { role?: S3UserRole } = {}) =>
+    fetchJSON<S3UserCredentials>('/s3-users', {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
+  updateS3User: (accessKey: string, payload: { role: S3UserRole }) =>
+    fetchJSON<S3User>(`/s3-users/${encodeURIComponent(accessKey)}`, {
+      method: 'PUT',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
+  rotateS3UserSecret: (accessKey: string) =>
+    fetchJSON<S3UserCredentials>(`/s3-users/${encodeURIComponent(accessKey)}/secret`, {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify({}),
+    }),
+  deleteS3User: (accessKey: string) =>
+    fetchJSON<void>(`/s3-users/${encodeURIComponent(accessKey)}`, {
+      method: 'DELETE',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
     }),
 }

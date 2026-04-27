@@ -19,6 +19,7 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
+	"github.com/versity/versitygw/auth"
 )
 
 // WorkerHealthChecker provides worker liveness info. Implemented by worker.Manager.
@@ -37,6 +38,9 @@ type Server struct {
 	workerHealth    WorkerHealthChecker
 	wallet          synapse.WalletQuerier
 	settings        *SettingsService
+	s3IAM           auth.IAMService
+	s3RootAccess    string
+	s3IAMDir        string
 	setupOnly       bool
 	logger          *slog.Logger
 	startedAt       time.Time
@@ -79,6 +83,14 @@ func (s *Server) WithSettings(settings *SettingsService) *Server {
 	return s
 }
 
+// WithS3IAM enables S3 user management API routes.
+func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess, iamDir string) *Server {
+	s.s3IAM = iam
+	s.s3RootAccess = rootAccess
+	s.s3IAMDir = iamDir
+	return s
+}
+
 // Run starts the admin HTTP server. Blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	if !s.setupOnly {
@@ -108,6 +120,13 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
 		mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
 		mux.HandleFunc("GET /api/v1/wallet", s.handleAPIWallet)
+		if s.s3IAM != nil {
+			mux.HandleFunc("GET /api/v1/s3-users", s.handleAPIListS3Users)
+			mux.HandleFunc("POST /api/v1/s3-users", s.handleAPICreateS3User)
+			mux.HandleFunc("PUT /api/v1/s3-users/{accessKey}", s.handleAPIUpdateS3User)
+			mux.HandleFunc("POST /api/v1/s3-users/{accessKey}/secret", s.handleAPIRotateS3UserSecret)
+			mux.HandleFunc("DELETE /api/v1/s3-users/{accessKey}", s.handleAPIDeleteS3User)
+		}
 	}
 	if s.settings != nil {
 		mux.HandleFunc("GET /api/v1/settings", s.handleAPIGetSettings)

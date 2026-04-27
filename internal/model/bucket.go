@@ -29,6 +29,7 @@ type Bucket struct {
 	ID         int64        `bun:",pk,autoincrement"`
 	Name       string       `bun:",unique,notnull"`
 	ProofSetID *string      `bun:",nullzero"` // assigned after on-chain creation
+	ACL        []byte       `bun:",nullzero"`
 	Status     BucketStatus `bun:",notnull,default:'active'"`
 	CreatedAt  time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt  time.Time    `bun:",nullzero,notnull,default:current_timestamp"`

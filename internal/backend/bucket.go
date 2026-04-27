@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -17,7 +18,7 @@ func (b *SynapseBackend) CreateBucket(ctx context.Context, input *s3.CreateBucke
 	}
 	name := *input.Bucket
 
-	_, err := b.bucketLifecycle.Create(ctx, name)
+	_, err := b.bucketLifecycle.CreateWithACL(ctx, name, defaultACL)
 	if err != nil {
 		if errors.Is(err, repository.ErrAlreadyExists) {
 			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
@@ -56,6 +57,21 @@ func (b *SynapseBackend) ListBuckets(ctx context.Context, input s3response.ListB
 		},
 	}
 	for _, bkt := range buckets {
+		if !input.IsAdmin {
+			if input.Owner == "" || len(bkt.ACL) == 0 {
+				continue
+			}
+			acl, err := auth.ParseACL(bkt.ACL)
+			if err != nil {
+				if b.logger != nil {
+					b.logger.Warn("skipping bucket with malformed ACL", "bucket", bkt.Name, "error", err)
+				}
+				continue
+			}
+			if acl.Owner == "" || acl.Owner != input.Owner {
+				continue
+			}
+		}
 		result.Buckets.Bucket = append(result.Buckets.Bucket, s3response.ListAllMyBucketsEntry{
 			Name:         bkt.Name,
 			CreationDate: bkt.CreatedAt,

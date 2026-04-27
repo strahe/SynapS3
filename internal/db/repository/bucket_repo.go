@@ -115,6 +115,23 @@ func (r *BunBucketRepo) SetProofSetID(ctx context.Context, id int64, proofSetID 
 	return nil
 }
 
+func (r *BunBucketRepo) SetACL(ctx context.Context, name string, acl []byte) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("acl = ?", acl).
+		Set("updated_at = ?", time.Now().UTC()).
+		Where("name = ?", name).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("setting bucket ACL: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("setting bucket ACL: bucket %q not found", name)
+	}
+	return nil
+}
+
 func (r *BunBucketRepo) HardDelete(ctx context.Context, id int64) error {
 	_, err := r.db.NewDelete().
 		Model((*model.Bucket)(nil)).
