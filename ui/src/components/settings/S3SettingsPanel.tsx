@@ -1,5 +1,4 @@
-import { AlertTriangle, Info, Loader2, Plus } from 'lucide-react'
-import type * as React from 'react'
+import { AlertTriangle, Loader2, Plus } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import type {
   S3User,
@@ -9,6 +8,13 @@ import type {
   SettingsEditableConfig,
   SettingsS3Credentials,
 } from '@/api/client'
+import { StatusBadge } from '@/components/app/StatusBadge'
+import {
+  SettingsBanner as Banner,
+  SettingsFieldShell as FieldShell,
+  SettingsSection as S3Section,
+  SettingsSelect,
+} from '@/components/settings/settings-form'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -31,9 +37,8 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useCreateS3User, useDeleteS3User, useRotateS3UserSecret, useS3Users, useUpdateS3User } from '@/hooks/queries'
-import { cn } from '@/lib/utils'
 import { syncClosedRoleDraft } from './change-role-draft'
 
 const s3UserRoles: S3UserRole[] = ['userplus', 'user', 'admin']
@@ -143,7 +148,11 @@ function S3UsersSection({
             <Dialog open={createOpen} onOpenChange={setCreateOpen}>
               <DialogTrigger asChild>
                 <Button type="button" disabled={!s3UsersAvailable || createUser.isPending}>
-                  {createUser.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                  {createUser.isPending ? (
+                    <Loader2 data-icon="inline-start" className="animate-spin" />
+                  ) : (
+                    <Plus data-icon="inline-start" />
+                  )}
                   Create S3 user
                 </Button>
               </DialogTrigger>
@@ -172,7 +181,7 @@ function S3UsersSection({
                     Cancel
                   </Button>
                   <Button type="button" disabled={!s3UsersAvailable || createUser.isPending} onClick={handleCreateUser}>
-                    {createUser.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+                    {createUser.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
                     Create user
                   </Button>
                 </DialogFooter>
@@ -180,49 +189,49 @@ function S3UsersSection({
             </Dialog>
           </div>
 
-          <div className="overflow-x-auto rounded-md border border-border">
-            <table className="w-full min-w-[48rem] text-left text-sm">
-              <thead className="border-b border-border bg-muted/40 text-xs text-muted-foreground">
-                <tr>
-                  <th className="px-3 py-2 font-medium">Access Key</th>
-                  <th className="w-36 px-3 py-2 font-medium">Role</th>
-                  <th className="w-24 px-3 py-2 text-right font-medium">Buckets</th>
-                  <th className="w-72 px-3 py-2 text-right font-medium">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
+          <div className="overflow-hidden rounded-md border border-border">
+            <Table className="min-w-[48rem]">
+              <TableHeader>
+                <TableRow className="bg-muted/40">
+                  <TableHead className="px-3">Access Key</TableHead>
+                  <TableHead className="w-36 px-3">Role</TableHead>
+                  <TableHead className="w-24 px-3 text-right">Buckets</TableHead>
+                  <TableHead className="w-72 px-3 text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {!s3UsersAvailable ? (
-                  <tr>
-                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={4}>
+                  <TableRow>
+                    <TableCell className="h-24 text-center text-muted-foreground" colSpan={4}>
                       User list unavailable.
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 ) : isLoading ? (
-                  <tr>
-                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={4}>
+                  <TableRow>
+                    <TableCell className="h-24 text-center text-muted-foreground" colSpan={4}>
                       <Loader2 className="mx-auto h-5 w-5 animate-spin" />
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 ) : users.length === 0 ? (
-                  <tr>
-                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={4}>
+                  <TableRow>
+                    <TableCell className="h-24 text-center text-muted-foreground" colSpan={4}>
                       No additional S3 users.
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 ) : (
                   users.map((user) => {
                     const rotating = rotateUserSecret.isPending && rotateUserSecret.variables === user.access_key
                     const deleting = deleteUser.isPending && deleteUser.variables === user.access_key
                     return (
-                      <tr key={user.access_key} className="border-b border-border last:border-b-0">
-                        <td className="max-w-0 px-3 py-2">
+                      <TableRow key={user.access_key}>
+                        <TableCell className="max-w-0 px-3">
                           <code className="block truncate text-xs">{user.access_key}</code>
-                        </td>
-                        <td className="px-3 py-2">
+                        </TableCell>
+                        <TableCell className="px-3">
                           <RolePill role={user.role} />
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{user.bucket_count}</td>
-                        <td className="px-3 py-2">
+                        </TableCell>
+                        <TableCell className="px-3 text-right tabular-nums">{user.bucket_count}</TableCell>
+                        <TableCell className="px-3">
                           <div className="flex justify-end gap-2">
                             <ChangeRoleDialog user={user} disabled={!s3UsersAvailable} />
                             <Button
@@ -232,7 +241,7 @@ function S3UsersSection({
                               disabled={!s3UsersAvailable || rotating}
                               onClick={() => handleRotateUser(user)}
                             >
-                              {rotating && <Loader2 className="h-3 w-3 animate-spin" />}
+                              {rotating && <Loader2 data-icon="inline-start" className="animate-spin" />}
                               Rotate secret
                             </Button>
                             <Button
@@ -247,17 +256,17 @@ function S3UsersSection({
                               }
                               onClick={() => setDeleteTarget(user)}
                             >
-                              {deleting && <Loader2 className="h-3 w-3 animate-spin" />}
+                              {deleting && <Loader2 data-icon="inline-start" className="animate-spin" />}
                               Delete
                             </Button>
                           </div>
-                        </td>
-                      </tr>
+                        </TableCell>
+                      </TableRow>
                     )
                   })
                 )}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
         </div>
       </S3Section>
@@ -345,15 +354,6 @@ function ChangeRoleDialog({ user, disabled }: { user: S3User; disabled?: boolean
   )
 }
 
-function S3Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="rounded-lg border border-border bg-card p-4">
-      <h2 className="mb-4 text-sm font-medium text-muted-foreground">{title}</h2>
-      {children}
-    </section>
-  )
-}
-
 function TextField({
   label,
   field,
@@ -382,44 +382,6 @@ function TextField({
   )
 }
 
-function FieldShell({
-  label,
-  field,
-  data,
-  errors,
-  children,
-}: {
-  label: string
-  field: string
-  data: SettingsData
-  errors: Record<string, string>
-  children: React.ReactNode
-}) {
-  const meta = data.metadata[field]
-  const envOverride = data.env_managed[field]
-  const displayLabel = meta?.label ?? label
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <Label className="truncate text-xs text-muted-foreground">{displayLabel}</Label>
-          {meta && <InfoTooltip metadata={meta} />}
-        </div>
-        {envOverride && <EnvOverrideBadge env={envOverride} />}
-      </div>
-      {children}
-      {envOverride && (
-        <p className="flex items-center gap-1 text-xs text-yellow-600">
-          <AlertTriangle className="h-3.5 w-3.5" />
-          Overridden by {envOverride}
-        </p>
-      )}
-      {errors[field] && <p className="text-xs text-destructive">{errors[field]}</p>}
-    </div>
-  )
-}
-
 function RoleSelect({
   id,
   value,
@@ -432,28 +394,18 @@ function RoleSelect({
   onChange: (value: S3UserRole) => void
 }) {
   return (
-    <select
+    <SettingsSelect
       id={id}
       value={value}
       disabled={disabled}
-      onChange={(event) => onChange(event.target.value as S3UserRole)}
-      className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
-    >
-      {s3UserRoles.map((role) => (
-        <option key={role} value={role}>
-          {roleLabel(role)}
-        </option>
-      ))}
-    </select>
+      options={s3UserRoles.map((role) => ({ value: role, label: roleLabel(role) }))}
+      onChange={(next) => onChange(next as S3UserRole)}
+    />
   )
 }
 
 function RolePill({ role }: { role: string }) {
-  return (
-    <span className="inline-flex rounded-md border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium">
-      {roleLabel(role)}
-    </span>
-  )
+  return <StatusBadge tone="neutral">{roleLabel(role)}</StatusBadge>
 }
 
 function roleLabel(role: string) {
@@ -480,55 +432,6 @@ function roleDescription(role: string) {
     default:
       return 'Unknown S3 role.'
   }
-}
-
-function Banner({
-  tone,
-  icon: Icon,
-  children,
-}: {
-  tone: 'warning' | 'danger'
-  icon: typeof AlertTriangle
-  children: React.ReactNode
-}) {
-  const classes = {
-    warning: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-600',
-    danger: 'border-destructive/30 bg-destructive/10 text-destructive',
-  }
-
-  return (
-    <div className={cn('flex items-start gap-3 rounded-lg border p-3 text-sm', classes[tone])}>
-      <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-      <div>{children}</div>
-    </div>
-  )
-}
-
-function InfoTooltip({ metadata }: { metadata: SettingsData['metadata'][string] }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button type="button" className="rounded text-muted-foreground hover:text-foreground" aria-label="Field info">
-          <Info className="h-3.5 w-3.5" />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-xs">
-        <div className="flex flex-col gap-1">
-          <span>{metadata.description}</span>
-          {metadata.env && <span className="font-mono opacity-80">{metadata.env}</span>}
-        </div>
-      </TooltipContent>
-    </Tooltip>
-  )
-}
-
-function EnvOverrideBadge({ env }: { env: string }) {
-  return (
-    <span className="inline-flex max-w-48 items-center gap-1 truncate rounded-md border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-xs text-yellow-600">
-      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-      <span className="truncate">{env}</span>
-    </span>
-  )
 }
 
 function fieldDisabled(data: SettingsData, field: string) {

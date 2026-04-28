@@ -1,6 +1,11 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, Check, Copy, Loader2, Wallet } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { AlertTriangle, Loader2, Wallet } from 'lucide-react'
+import { CopyButton } from '@/components/app/CopyButton'
+import { PageHeader } from '@/components/app/PageHeader'
+import { StatusBadge } from '@/components/app/StatusBadge'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { useWallet } from '@/hooks/queries'
 import { formatAttoFIL, formatTokenAmount } from '@/lib/utils'
 
@@ -25,61 +30,68 @@ function WalletPage() {
 
   if (!data.configured) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-4 text-muted-foreground">
-        <Wallet className="h-12 w-12" />
-        <p className="text-lg">Wallet not configured</p>
-        <p className="text-sm">Set your Filecoin private key in the configuration to enable wallet features.</p>
-      </div>
+      <Empty className="h-full border-0">
+        <EmptyHeader>
+          <EmptyMedia variant="icon">
+            <Wallet />
+          </EmptyMedia>
+          <EmptyTitle>Wallet not configured</EmptyTitle>
+          <EmptyDescription>
+            Set your Filecoin private key in the configuration to enable wallet features.
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
     )
   }
 
   return (
-    <div className="space-y-6 p-6">
-      <h1 className="text-2xl font-bold">Wallet</h1>
+    <div className="flex flex-col gap-6 p-6">
+      <PageHeader title="Wallet" />
 
-      {/* Partial errors banner */}
       {data.partial_errors && Object.keys(data.partial_errors).length > 0 && (
-        <div className="flex items-start gap-3 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4">
-          <AlertTriangle className="h-5 w-5 shrink-0 text-yellow-500" />
-          <div className="space-y-1">
-            <p className="text-sm font-medium text-yellow-500">Some data could not be retrieved</p>
-            {Object.entries(data.partial_errors).map(([key, msg]) => (
-              <p key={key} className="text-xs text-muted-foreground">
-                <span className="font-mono">{key}</span>: {msg}
-              </p>
-            ))}
-          </div>
-        </div>
+        <Alert>
+          <AlertTriangle />
+          <AlertTitle>Some data could not be retrieved</AlertTitle>
+          <AlertDescription>
+            <div className="flex flex-col gap-1">
+              {Object.entries(data.partial_errors).map(([key, msg]) => (
+                <p key={key} className="text-xs text-muted-foreground">
+                  <span className="font-mono">{key}</span>: {msg}
+                </p>
+              ))}
+            </div>
+          </AlertDescription>
+        </Alert>
       )}
 
-      {/* Identity card */}
-      <div className="rounded-lg border border-border bg-card p-5">
-        <h2 className="mb-4 text-sm font-medium text-muted-foreground">Identity</h2>
-        <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <IdentityField label="Address" value={data.address ?? '—'} copyable />
-          <IdentityField label="Network" value={data.network ?? '—'} badge />
-          <IdentityField label="Chain ID" value={data.chain_id?.toString() ?? '—'} />
-          <IdentityField label="Nonce" value={data.nonce?.toString() ?? '—'} />
-        </dl>
-      </div>
+      <Card>
+        <CardHeader>
+          <CardTitle>Identity</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+            <IdentityField
+              label="Address"
+              value={data.address ?? '—'}
+              copyable
+              className="sm:col-span-2 lg:col-span-3"
+            />
+            <IdentityField label="Network" value={data.network ?? '—'} badge />
+            <IdentityField label="Chain ID" value={data.chain_id?.toString() ?? '—'} />
+            <IdentityField label="Nonce" value={data.nonce?.toString() ?? '—'} />
+          </dl>
+        </CardContent>
+      </Card>
 
-      {/* Balance cards */}
       <div className="grid gap-4 sm:grid-cols-2">
-        <BalanceCard
-          title="FIL Balance"
-          amount={formatAttoFIL(data.fil_balance)}
-          raw={data.fil_balance}
-          color="text-blue-500"
-        />
+        <BalanceCard title="FIL Balance" amount={formatAttoFIL(data.fil_balance)} raw={data.fil_balance} />
         <BalanceCard
           title="USDFC Balance"
           amount={formatTokenAmount(data.usdfc_balance, data.usdfc_decimals ?? 18, 'USDFC')}
           raw={data.usdfc_balance}
-          color="text-green-500"
         />
       </div>
 
-      {/* PDP Contract Accounts */}
       <div className="grid gap-4 lg:grid-cols-2">
         {data.fil_account && (
           <AccountCard title="PDP Account — FIL" account={data.fil_account} decimals={18} symbol="FIL" />
@@ -93,35 +105,43 @@ function WalletPage() {
           />
         )}
         {!data.fil_account && !data.usdfc_account && (
-          <div className="col-span-2 rounded-lg border border-border bg-card p-5">
-            <p className="text-sm text-muted-foreground">PDP account data unavailable</p>
-          </div>
+          <Card className="col-span-2">
+            <CardContent>
+              <p className="text-sm text-muted-foreground">PDP account data unavailable</p>
+            </CardContent>
+          </Card>
         )}
       </div>
 
-      {/* Contract Addresses */}
       {(data.payments_address || data.usdfc_address) && (
-        <div className="rounded-lg border border-border bg-card p-5">
-          <h2 className="mb-4 text-sm font-medium text-muted-foreground">Contract Addresses</h2>
-          <dl className="grid gap-4 sm:grid-cols-2">
-            {data.payments_address && (
-              <IdentityField label="Payments Contract" value={data.payments_address} copyable />
-            )}
-            {data.usdfc_address && <IdentityField label="USDFC Token" value={data.usdfc_address} copyable />}
-          </dl>
-        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>Contract Addresses</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <dl className="grid gap-4 sm:grid-cols-2">
+              {data.payments_address && (
+                <IdentityField label="Payments Contract" value={data.payments_address} copyable />
+              )}
+              {data.usdfc_address && <IdentityField label="USDFC Token" value={data.usdfc_address} copyable />}
+            </dl>
+          </CardContent>
+        </Card>
       )}
 
-      {/* Business stats */}
       {data.business && (
-        <div className="rounded-lg border border-border bg-card p-5">
-          <h2 className="mb-4 text-sm font-medium text-muted-foreground">Business Stats</h2>
-          <div className="grid gap-4 sm:grid-cols-3">
-            <StatItem label="Proof Sets" value={data.business.proof_set_count} />
-            <StatItem label="On-chain Tasks Pending" value={data.business.onchain_tasks_pending} />
-            <StatItem label="On-chain Tasks Completed" value={data.business.onchain_tasks_completed} />
-          </div>
-        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>Business Stats</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <StatItem label="Proof Sets" value={data.business.proof_set_count} />
+              <StatItem label="On-chain Tasks Pending" value={data.business.onchain_tasks_pending} />
+              <StatItem label="On-chain Tasks Completed" value={data.business.onchain_tasks_completed} />
+            </div>
+          </CardContent>
+        </Card>
       )}
     </div>
   )
@@ -134,80 +154,46 @@ function IdentityField({
   value,
   copyable,
   badge,
+  className,
 }: {
   label: string
   value: string
   copyable?: boolean
   badge?: boolean
+  className?: string
 }) {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [])
-
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(value)
-      setCopied(true)
-      if (timerRef.current) clearTimeout(timerRef.current)
-      timerRef.current = setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Clipboard API may fail on non-HTTPS contexts
-    }
-  }, [value])
-
   return (
-    <div>
+    <div className={className}>
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 flex items-center gap-2">
+      <dd className="mt-1 flex min-w-0 items-center gap-2">
         {badge ? (
-          <span className="inline-flex items-center rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary capitalize">
+          <StatusBadge tone="info" className="capitalize">
             {value}
-          </span>
+          </StatusBadge>
         ) : (
-          <span className="font-mono text-sm break-all" title={value}>
+          <span className="min-w-0 truncate font-mono text-sm" title={value}>
             {value}
           </span>
         )}
-        {copyable && value !== '—' && (
-          <button
-            type="button"
-            onClick={handleCopy}
-            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-            title="Copy to clipboard"
-            aria-label={copied ? 'Copied' : 'Copy to clipboard'}
-          >
-            {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
-          </button>
-        )}
+        {copyable && value !== '—' && <CopyButton value={value} label={label} size="icon-xs" />}
       </dd>
     </div>
   )
 }
 
-function BalanceCard({
-  title,
-  amount,
-  raw,
-  color,
-}: {
-  title: string
-  amount: string
-  raw: string | null
-  color: string
-}) {
+function BalanceCard({ title, amount, raw }: { title: string; amount: string; raw: string | null }) {
   return (
-    <div className="rounded-lg border border-border bg-card p-5">
-      <div className="flex items-center gap-2 text-muted-foreground">
-        <Wallet className="h-4 w-4" />
-        <span className="text-sm">{title}</span>
-      </div>
-      <div className={`mt-2 text-2xl font-bold ${raw == null ? 'text-muted-foreground' : color}`}>{amount}</div>
-    </div>
+    <Card>
+      <CardContent>
+        <div className="flex items-center gap-2 text-muted-foreground">
+          <Wallet className="size-4" />
+          <span className="text-sm">{title}</span>
+        </div>
+        <div className={raw == null ? 'mt-2 text-2xl font-bold text-muted-foreground' : 'mt-2 text-2xl font-bold'}>
+          {amount}
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -234,16 +220,24 @@ function AccountCard({
   const fundedDisplay = account.funded_until_epoch === UINT256_MAX ? '∞' : (account.funded_until_epoch ?? '—')
 
   return (
-    <div className="rounded-lg border border-border bg-card p-5">
-      <h3 className="mb-4 text-sm font-medium text-muted-foreground">{title}</h3>
-      <dl className="space-y-3 text-sm">
-        <AccountRow label="Total Deposited" value={formatTokenAmount(account.funds, decimals, symbol)} />
-        <AccountRow label="Available" value={formatTokenAmount(account.available_funds, decimals, symbol)} highlight />
-        <AccountRow label="Locked" value={formatTokenAmount(account.lockup_current, decimals, symbol)} />
-        <AccountRow label="Lock Rate" value={formatTokenAmount(account.lockup_rate, decimals, `${symbol}/epoch`)} />
-        <AccountRow label="Funded Until Epoch" value={fundedDisplay} />
-      </dl>
-    </div>
+    <Card>
+      <CardHeader>
+        <CardTitle>{title}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <dl className="flex flex-col gap-3 text-sm">
+          <AccountRow label="Total Deposited" value={formatTokenAmount(account.funds, decimals, symbol)} />
+          <AccountRow
+            label="Available"
+            value={formatTokenAmount(account.available_funds, decimals, symbol)}
+            highlight
+          />
+          <AccountRow label="Locked" value={formatTokenAmount(account.lockup_current, decimals, symbol)} />
+          <AccountRow label="Lock Rate" value={formatTokenAmount(account.lockup_rate, decimals, `${symbol}/epoch`)} />
+          <AccountRow label="Funded Until Epoch" value={fundedDisplay} />
+        </dl>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -251,7 +245,7 @@ function AccountRow({ label, value, highlight }: { label: string; value: string;
   return (
     <div className="flex items-center justify-between">
       <dt className="text-muted-foreground">{label}</dt>
-      <dd className={`font-mono ${highlight ? 'font-semibold text-green-500' : ''}`}>{value}</dd>
+      <dd className={highlight ? 'font-mono font-semibold text-primary' : 'font-mono'}>{value}</dd>
     </div>
   )
 }

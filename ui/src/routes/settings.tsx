@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, Check, CheckCircle2, Copy, Info, Loader2, Save } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { AlertTriangle, CheckCircle2, Loader2, Save } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 import type {
   SettingsData,
   SettingsEditableConfig,
@@ -8,7 +8,19 @@ import type {
   SettingsS3Credentials,
   SettingsUpdatePayload,
 } from '@/api/client'
+import { PageHeader } from '@/components/app/PageHeader'
+import { StatusBadge } from '@/components/app/StatusBadge'
 import { S3SettingsPanel } from '@/components/settings/S3SettingsPanel'
+import {
+  SettingsBanner as Banner,
+  SettingsFieldShell as FieldShell,
+  SettingsSection as Section,
+  SettingsCheckbox,
+  SettingsReadOnlyField,
+  SettingsSelect,
+  SettingsStatusField,
+  SettingsValueField,
+} from '@/components/settings/settings-form'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -20,11 +32,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useSettings, useUpdateSettings } from '@/hooks/queries'
-import { cn } from '@/lib/utils'
 
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
@@ -125,16 +134,20 @@ function SettingsPage() {
 
   return (
     <form className="flex flex-col gap-6 p-6" onSubmit={handleSubmit}>
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold">Settings</h1>
-          <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{data.config_path}</p>
-        </div>
-        <Button type="submit" disabled={submitDisabled}>
-          {updateSettings.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-          Save
-        </Button>
-      </div>
+      <PageHeader
+        title="Settings"
+        description={<span className="break-all font-mono text-xs">{data.config_path}</span>}
+        actions={
+          <Button type="submit" disabled={submitDisabled}>
+            {updateSettings.isPending ? (
+              <Loader2 data-icon="inline-start" className="animate-spin" />
+            ) : (
+              <Save data-icon="inline-start" />
+            )}
+            Save
+          </Button>
+        }
+      />
 
       <StatusBanners data={data} mutationError={updateSettings.error ?? null} />
 
@@ -432,17 +445,8 @@ function SettingsTabTrigger({
   return (
     <TabsTrigger value={value}>
       {label}
-      {hasWarning && <AlertTriangle className="h-3.5 w-3.5 text-yellow-500" aria-label={`${label} needs attention`} />}
+      {hasWarning && <AlertTriangle data-icon="inline-end" aria-label={`${label} needs attention`} />}
     </TabsTrigger>
-  )
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="rounded-lg border border-border bg-card p-4">
-      <h2 className="mb-4 text-sm font-medium text-muted-foreground">{title}</h2>
-      {children}
-    </section>
   )
 }
 
@@ -523,19 +527,13 @@ function SelectField({
   const disabled = fieldDisabled(data, field)
   return (
     <FieldShell label={label} field={field} data={data} errors={errors}>
-      <select
+      <SettingsSelect
         value={value}
+        options={options}
         disabled={disabled}
-        aria-invalid={Boolean(errors[field])}
-        onChange={(e) => onChange(e.target.value)}
-        className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
-      >
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {option}
-          </option>
-        ))}
-      </select>
+        invalid={Boolean(errors[field])}
+        onChange={onChange}
+      />
     </FieldShell>
   )
 }
@@ -558,49 +556,13 @@ function CheckboxField({
   const disabled = fieldDisabled(data, field)
   return (
     <FieldShell label={label} field={field} data={data} errors={errors}>
-      <label className="flex min-h-8 items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-sm">
-        <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
-        <span>{data.metadata[field]?.label ?? label}</span>
-      </label>
+      <SettingsCheckbox
+        checked={checked}
+        disabled={disabled}
+        label={data.metadata[field]?.label ?? label}
+        onChange={onChange}
+      />
     </FieldShell>
-  )
-}
-
-function FieldShell({
-  label,
-  field,
-  data,
-  errors,
-  children,
-}: {
-  label: string
-  field: string
-  data: SettingsData
-  errors: Record<string, string>
-  children: React.ReactNode
-}) {
-  const meta = data.metadata[field]
-  const envOverride = data.env_managed[field]
-  const displayLabel = meta?.label ?? label
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <Label className="truncate text-xs text-muted-foreground">{displayLabel}</Label>
-          {meta && <InfoTooltip metadata={meta} />}
-        </div>
-        {envOverride && <EnvOverrideBadge env={envOverride} />}
-      </div>
-      {children}
-      {envOverride && (
-        <p className="flex items-center gap-1 text-xs text-yellow-600">
-          <AlertTriangle className="h-3.5 w-3.5" />
-          Overridden by {envOverride}
-        </p>
-      )}
-      {errors[field] && <p className="text-xs text-destructive">{errors[field]}</p>}
-    </div>
   )
 }
 
@@ -664,27 +626,26 @@ function CredentialStatusCard({
   const envOverride = data.env_managed[field.field] || field.env
   const setupHint = credentialSetupHint(data, field, meta)
   return (
-    <div className="rounded-md border border-border p-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <span className="truncate text-sm font-medium">{meta?.label ?? label}</span>
-          {meta && <InfoTooltip metadata={meta} />}
-        </div>
-        <span className={cn('text-xs font-medium', field.configured ? 'text-green-500' : 'text-yellow-500')}>
+    <SettingsStatusField
+      label={meta?.label ?? label}
+      metadata={meta}
+      status={
+        <StatusBadge tone={field.configured ? 'success' : 'warning'}>
           {field.configured ? 'Configured' : 'Missing'}
-        </span>
-      </div>
+        </StatusBadge>
+      }
+    >
       {envOverride ? (
-        <p className="mt-2 flex items-center gap-1 break-all text-xs text-yellow-600">
-          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+        <span className="flex items-center gap-1">
+          <AlertTriangle className="size-3.5" />
           Overridden by {envOverride}
-        </p>
+        </span>
       ) : setupHint ? (
-        <p className="mt-2 break-all text-xs text-muted-foreground">{setupHint}</p>
+        setupHint
       ) : (
-        <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{data.config_path}</p>
+        <span className="font-mono">{data.config_path}</span>
       )}
-    </div>
+    </SettingsStatusField>
   )
 }
 
@@ -700,55 +661,7 @@ function credentialSetupHint(
 }
 
 function ReadOnlyRow({ data, field, value }: { data: SettingsData; field: string; value: string }) {
-  const meta = data.metadata[field]
-  const envOverride = data.env_managed[field]
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <Label className="truncate text-xs text-muted-foreground">{meta?.label ?? field}</Label>
-          {meta && <InfoTooltip metadata={meta} />}
-        </div>
-        {envOverride && <EnvOverrideBadge env={envOverride} />}
-      </div>
-      <div className="min-h-8 rounded-lg border border-input bg-muted/40 px-2.5 py-1 font-mono text-sm break-all">
-        {value}
-      </div>
-      {envOverride && (
-        <p className="flex items-center gap-1 text-xs text-yellow-600">
-          <AlertTriangle className="h-3.5 w-3.5" />
-          Overridden by {envOverride}
-        </p>
-      )}
-    </div>
-  )
-}
-
-function InfoTooltip({ metadata }: { metadata: SettingsData['metadata'][string] }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button type="button" className="rounded text-muted-foreground hover:text-foreground" aria-label="Field info">
-          <Info className="h-3.5 w-3.5" />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-xs">
-        <div className="flex flex-col gap-1">
-          <span>{metadata.description}</span>
-          {metadata.env && <span className="font-mono opacity-80">{metadata.env}</span>}
-        </div>
-      </TooltipContent>
-    </Tooltip>
-  )
-}
-
-function EnvOverrideBadge({ env }: { env: string }) {
-  return (
-    <span className="inline-flex max-w-48 items-center gap-1 truncate rounded-md border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-xs text-yellow-600">
-      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-      <span className="truncate">{env}</span>
-    </span>
-  )
+  return <SettingsReadOnlyField data={data} field={field} value={value} />
 }
 
 function GeneratedCredentialsDialog({
@@ -767,12 +680,7 @@ function GeneratedCredentialsDialog({
         </DialogHeader>
         {credentials && (
           <div className="flex flex-col gap-3">
-            {credentials.role && (
-              <div className="flex flex-col gap-1.5">
-                <Label className="text-xs text-muted-foreground">Role</Label>
-                <div className="rounded-md border border-border bg-muted/40 p-2 text-sm">{credentials.role}</div>
-              </div>
-            )}
+            {credentials.role && <SettingsValueField label="Role" value={credentials.role} />}
             <CopyableSecret label="Access Key" value={credentials.access_key} />
             <CopyableSecret label="Secret Key" value={credentials.secret_key} />
           </div>
@@ -788,60 +696,7 @@ function GeneratedCredentialsDialog({
 }
 
 function CopyableSecret({ label, value }: { label: string; value: string }) {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [])
-
-  async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(value)
-      setCopied(true)
-      if (timerRef.current) clearTimeout(timerRef.current)
-      timerRef.current = setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Clipboard API can be unavailable in some browser contexts.
-    }
-  }
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      <Label className="text-xs text-muted-foreground">{label}</Label>
-      <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 p-2">
-        <code className="min-w-0 flex-1 break-all text-xs">{value}</code>
-        <Button type="button" variant="ghost" size="icon-sm" onClick={handleCopy} aria-label={`Copy ${label}`}>
-          {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-        </Button>
-      </div>
-    </div>
-  )
-}
-
-function Banner({
-  tone,
-  icon: Icon,
-  children,
-}: {
-  tone: 'warning' | 'danger' | 'success'
-  icon: typeof AlertTriangle
-  children: React.ReactNode
-}) {
-  const classes = {
-    warning: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-600',
-    danger: 'border-destructive/30 bg-destructive/10 text-destructive',
-    success: 'border-green-500/30 bg-green-500/10 text-green-600',
-  }
-
-  return (
-    <div className={cn('flex items-start gap-3 rounded-lg border p-3 text-sm', classes[tone])}>
-      <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-      <div>{children}</div>
-    </div>
-  )
+  return <SettingsValueField label={label} value={value} copy mono />
 }
 
 function s3Missing(data: SettingsData) {

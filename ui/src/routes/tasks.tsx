@@ -3,31 +3,38 @@ import { createFileRoute } from '@tanstack/react-router'
 import { Check, Copy, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '@/api/client'
+import { PageHeader } from '@/components/app/PageHeader'
+import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
+import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
+import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTasks } from '@/hooks/queries'
-import { cn, timeAgo } from '@/lib/utils'
+import { timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/tasks')({
   component: TasksPage,
 })
 
-const statusTabs = ['', 'pending', 'running', 'completed', 'failed', 'dead_letter'] as const
+const taskTypeTabs = ['all', 'upload', 'evict_cache'] as const
+const taskTypeLabels: Record<string, string> = {
+  all: 'All',
+  upload: 'Upload',
+  evict_cache: 'Evict Cache',
+}
+
+const statusOptions = ['all', 'pending', 'running', 'completed', 'failed', 'cancelled', 'dead_letter'] as const
 const statusLabels: Record<string, string> = {
-  '': 'All',
+  all: 'All',
   pending: 'Pending',
   running: 'Running',
   completed: 'Completed',
   failed: 'Failed',
+  cancelled: 'Cancelled',
   dead_letter: 'Dead Letter',
-}
-
-const statusColor: Record<string, string> = {
-  pending: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300',
-  running: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300',
-  completed: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300',
-  failed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300',
-  dead_letter: 'bg-red-200 text-red-900 dark:bg-red-950 dark:text-red-300',
-  cancelled: 'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300',
 }
 
 const PAGE_SIZE = 50
@@ -56,59 +63,59 @@ function TasksPage() {
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1
 
   return (
-    <div className="space-y-4 p-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Tasks</h1>
-        <button
-          type="button"
-          onClick={() => qc.invalidateQueries({ queryKey: ['tasks'] })}
-          className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"
-        >
-          <RefreshCw className="h-4 w-4" /> Refresh
-        </button>
-      </div>
+    <div className="flex flex-col gap-4 p-6">
+      <PageHeader
+        title="Tasks"
+        actions={
+          <Button variant="outline" size="sm" onClick={() => qc.invalidateQueries({ queryKey: ['tasks'] })}>
+            <RefreshCw data-icon="inline-start" /> Refresh
+          </Button>
+        }
+      />
 
-      {/* Status tabs */}
-      <div className="flex gap-1 rounded-lg border border-border bg-muted/50 p-1">
-        {statusTabs.map((tab) => (
-          <button
-            type="button"
-            key={tab}
-            onClick={() => {
-              setStatus(tab)
-              setOffset(0)
-            }}
-            className={cn(
-              'rounded-md px-3 py-1.5 text-sm transition-colors',
-              status === tab ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            {statusLabels[tab]}
-          </button>
-        ))}
-      </div>
-
-      {/* Type filter */}
-      <div className="flex items-center gap-2">
-        <label htmlFor="task-type-filter" className="text-sm text-muted-foreground">
-          Type:
-        </label>
-        <select
-          id="task-type-filter"
-          value={taskType}
-          onChange={(e) => {
-            setTaskType(e.target.value)
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <Tabs
+          value={taskType || 'all'}
+          onValueChange={(value) => {
+            setTaskType(value === 'all' ? '' : value)
             setOffset(0)
           }}
-          className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+          className="min-w-0"
         >
-          <option value="">All</option>
-          <option value="upload_to_sp">Upload to SP</option>
-          <option value="create_proof_set">Create Proof Set</option>
-          <option value="add_roots">Add Roots</option>
-          <option value="evict_cache">Evict Cache</option>
-          <option value="delete_proof_set">Delete Proof Set</option>
-        </select>
+          <TabsList className="max-w-full justify-start overflow-x-auto">
+            {taskTypeTabs.map((tab) => (
+              <TabsTrigger key={tab} value={tab}>
+                {taskTypeLabels[tab]}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
+
+        <div className="flex items-center gap-2">
+          <Label htmlFor="task-status-filter" className="text-sm text-muted-foreground">
+            Status:
+          </Label>
+          <Select
+            value={status || 'all'}
+            onValueChange={(value) => {
+              setStatus(value === 'all' ? '' : value)
+              setOffset(0)
+            }}
+          >
+            <SelectTrigger id="task-status-filter" className="w-44">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {statusOptions.map((option) => (
+                  <SelectItem key={option} value={option}>
+                    {statusLabels[option]}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </div>
       </div>
 
       {isLoading ? (
@@ -119,109 +126,111 @@ function TasksPage() {
         <div className="text-destructive">Failed to load tasks</div>
       ) : (
         <>
-          <div className="overflow-x-auto rounded-lg border border-border">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border bg-muted/50">
-                  <th className="px-4 py-3 text-left font-medium">ID</th>
-                  <th className="px-4 py-3 text-left font-medium">Type</th>
-                  <th className="px-4 py-3 text-left font-medium">Ref</th>
-                  <th className="px-4 py-3 text-left font-medium">Status</th>
-                  <th className="px-4 py-3 text-right font-medium">Retries</th>
-                  <th className="px-4 py-3 text-left font-medium">Error</th>
-                  <th className="px-4 py-3 text-left font-medium">Scheduled</th>
-                  <th className="px-4 py-3 text-left font-medium">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
+          <div className="overflow-hidden rounded-lg border border-border">
+            <Table>
+              <TableHeader>
+                <TableRow className="bg-muted/50">
+                  <TableHead className="px-4">ID</TableHead>
+                  <TableHead className="px-4">Type</TableHead>
+                  <TableHead className="px-4">Ref</TableHead>
+                  <TableHead className="px-4">Status</TableHead>
+                  <TableHead className="px-4 text-right">Retries</TableHead>
+                  <TableHead className="px-4">Error</TableHead>
+                  <TableHead className="px-4">Scheduled</TableHead>
+                  <TableHead className="px-4">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {data && data.tasks.length > 0 ? (
                   data.tasks.map((t) => (
-                    <tr key={t.id} className="border-b border-border hover:bg-muted/30">
-                      <td className="px-4 py-3 font-mono text-xs">{t.id}</td>
-                      <td className="px-4 py-3">{t.type}</td>
-                      <td className="px-4 py-3 text-muted-foreground">
+                    <TableRow key={t.id}>
+                      <TableCell className="px-4 font-mono text-xs">{t.id}</TableCell>
+                      <TableCell className="px-4">{t.type}</TableCell>
+                      <TableCell className="px-4 text-muted-foreground">
                         {t.ref_type}:{t.ref_id}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={cn(
-                            'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
-                            statusColor[t.status] ?? 'bg-gray-100 text-gray-800'
-                          )}
-                        >
-                          {t.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-right">
+                      </TableCell>
+                      <TableCell className="px-4">
+                        <StatusBadge tone={taskStatusTone(t.status)}>{t.status}</StatusBadge>
+                      </TableCell>
+                      <TableCell className="px-4 text-right">
                         {t.retry_count}/{t.max_retries}
-                      </td>
-                      <td className="max-w-xs px-4 py-3 text-xs text-muted-foreground">
+                      </TableCell>
+                      <TableCell className="max-w-xs px-4 text-xs text-muted-foreground">
                         {t.last_error ? (
-                          <button
+                          <Button
                             type="button"
+                            variant="link"
                             onClick={() => {
                               if (t.last_error) {
                                 setErrorDialogText(t.last_error)
                               }
                             }}
-                            className="max-w-full cursor-pointer truncate text-left hover:text-foreground"
+                            className="h-auto max-w-full justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
                           >
-                            {t.last_error}
-                          </button>
+                            <span className="truncate">{t.last_error}</span>
+                          </Button>
                         ) : (
                           '—'
                         )}
-                      </td>
-                      <td className="px-4 py-3 text-muted-foreground">{timeAgo(t.scheduled_at)}</td>
-                      <td className="px-4 py-3">
+                      </TableCell>
+                      <TableCell className="px-4 text-muted-foreground">{timeAgo(t.scheduled_at)}</TableCell>
+                      <TableCell className="px-4">
                         {t.status === 'dead_letter' && (
-                          <button
+                          <Button
                             type="button"
+                            variant="outline"
+                            size="xs"
                             onClick={() => retryMutation.mutate(t.id)}
                             disabled={retryingId === t.id}
-                            className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
                           >
-                            <RotateCcw className="h-3 w-3" /> Retry
-                          </button>
+                            <RotateCcw data-icon="inline-start" /> Retry
+                          </Button>
                         )}
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   ))
                 ) : (
-                  <tr>
-                    <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
+                  <TableRow>
+                    <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
                       No tasks found
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 )}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
 
-          {/* Pagination */}
           {totalPages > 1 && (
             <div className="flex items-center justify-between">
               <span className="text-sm text-muted-foreground">
                 Page {currentPage} of {totalPages} ({data?.total} total)
               </span>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  disabled={offset === 0}
-                  onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
-                  className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
-                >
-                  ← Prev
-                </button>
-                <button
-                  type="button"
-                  disabled={currentPage >= totalPages}
-                  onClick={() => setOffset(offset + PAGE_SIZE)}
-                  className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
-                >
-                  Next →
-                </button>
-              </div>
+              <Pagination className="mx-0 w-auto justify-end">
+                <PaginationContent>
+                  <PaginationItem>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={offset === 0}
+                      onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                    >
+                      Prev
+                    </Button>
+                  </PaginationItem>
+                  <PaginationItem>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={currentPage >= totalPages}
+                      onClick={() => setOffset(offset + PAGE_SIZE)}
+                    >
+                      Next
+                    </Button>
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
             </div>
           )}
         </>
@@ -275,14 +284,10 @@ function ErrorDetailDialog({ errorText, onClose }: { errorText: string | null; o
           <pre className="whitespace-pre-wrap break-all font-mono text-xs">{errorText}</pre>
         </div>
         <DialogFooter>
-          <button
-            type="button"
-            onClick={handleCopy}
-            className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"
-          >
-            {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+          <Button type="button" variant="outline" onClick={handleCopy}>
+            {copied ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
             {copied ? 'Copied' : 'Copy'}
-          </button>
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

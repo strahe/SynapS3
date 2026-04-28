@@ -1,9 +1,21 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { ChevronRight, Folder, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { Folder, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import { Fragment, useEffect, useState } from 'react'
 import { internalRootOwnerAccessKey } from '@/api/client'
+import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
+import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
+import { PageHeader } from '@/components/app/PageHeader'
+import { bucketStatusTone, objectStateTone, StatusBadge } from '@/components/app/StatusBadge'
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbSeparator,
+} from '@/components/ui/breadcrumb'
 import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -15,31 +27,13 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBucket, useBucketObjects, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
-import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
+import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/$name')({
   component: ObjectBrowserPage,
 })
-
-const stateColor: Record<string, string> = {
-  cached: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300',
-  uploading: 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-300',
-  uploaded: 'bg-violet-100 text-violet-800 dark:bg-violet-900 dark:text-violet-300',
-  onchaining: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300',
-  onchained: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300',
-  failed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300',
-  cache_evicted: 'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300',
-}
-
-const bucketStatusColor: Record<string, string> = {
-  active: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300',
-  creating: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300',
-  deleting: 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-300',
-  deleted: 'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300',
-  create_failed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300',
-  delete_failed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300',
-}
 
 function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: string; objectCount: number }) {
   const [open, setOpen] = useState(false)
@@ -84,7 +78,7 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button variant="destructive" size="sm">
-          <Trash2 className="h-4 w-4" />
+          <Trash2 data-icon="inline-start" />
           Delete
         </Button>
       </DialogTrigger>
@@ -97,7 +91,7 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
               : 'This empty bucket will be marked for deletion and its proof set removed on-chain. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-2">
+        <div className="flex flex-col gap-2">
           <Label htmlFor="confirm-delete-detail">
             Type <span className="font-mono font-semibold">{bucketName}</span> to confirm
           </Label>
@@ -121,7 +115,7 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
             Cancel
           </Button>
           <Button variant="destructive" onClick={handleDelete} disabled={!nameMatches || deleteBucket.isPending}>
-            {deleteBucket.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+            {deleteBucket.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
             Delete bucket
           </Button>
         </DialogFooter>
@@ -182,7 +176,7 @@ function ChangeBucketOwnerDetailDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button variant="outline" size="sm">
-          <UserRound className="h-4 w-4" />
+          <UserRound data-icon="inline-start" />
           {ownerAccessKey ? 'Change owner' : 'Assign owner'}
         </Button>
       </DialogTrigger>
@@ -193,21 +187,13 @@ function ChangeBucketOwnerDetailDialog({
         </DialogHeader>
         <div className="flex flex-col gap-2">
           <Label htmlFor="bucket-detail-owner">Owner</Label>
-          <select
+          <BucketOwnerSelect
             id="bucket-detail-owner"
             value={selectedOwner}
-            onChange={(event) => setSelectedOwner(event.target.value)}
+            onChange={setSelectedOwner}
             disabled={updateOwner.isPending || usersLoading}
-            className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
-          >
-            <option value="">Select owner</option>
-            <option value={internalRootOwnerAccessKey}>Internal root</option>
-            {users.map((user) => (
-              <option key={user.access_key} value={user.access_key}>
-                {user.access_key} ({user.role})
-              </option>
-            ))}
-          </select>
+            users={users}
+          />
           {users.length === 0 && !usersLoading && (
             <p className="text-xs text-muted-foreground">
               No S3 users yet. Internal root can be used as fallback owner.
@@ -230,7 +216,7 @@ function ChangeBucketOwnerDetailDialog({
             onClick={handleUpdate}
             disabled={!selectedOwner || selectedOwner === ownerAccessKey || updateOwner.isPending}
           >
-            {updateOwner.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+            {updateOwner.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
             Save owner
           </Button>
         </DialogFooter>
@@ -275,51 +261,33 @@ function ObjectBrowserPage() {
     }) ?? []
 
   return (
-    <div className="space-y-4 p-6">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-1 text-sm">
-          <Link to="/buckets" className="text-primary hover:underline">
-            Buckets
-          </Link>
-          <ChevronRight className="h-4 w-4 text-muted-foreground" />
-          <button type="button" onClick={() => navigateToPrefix('')} className="text-primary hover:underline">
-            {name}
-          </button>
-          {prefixParts.map((part, index) => {
-            const targetPrefix = `${prefixParts.slice(0, index + 1).join('/')}/`
+    <div className="flex flex-col gap-4 p-6">
+      <BucketBreadcrumb name={name} prefixParts={prefixParts} navigateToPrefix={navigateToPrefix} />
 
-            return (
-              <span key={targetPrefix} className="flex items-center gap-1">
-                <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                <button
-                  type="button"
-                  onClick={() => navigateToPrefix(targetPrefix)}
-                  className="text-primary hover:underline"
-                >
-                  {part}
-                </button>
-              </span>
-            )
-          })}
-        </div>
-
-        <div className="flex items-center gap-2">
-          {bucket.data && (
-            <ChangeBucketOwnerDetailDialog bucketName={name} ownerAccessKey={bucket.data.owner_access_key} />
-          )}
-          {canDelete ? (
-            <DeleteBucketDetailDialog bucketName={name} objectCount={bucket.data?.object_count ?? 0} />
-          ) : (
-            <Button variant="destructive" size="sm" disabled>
-              <Trash2 className="h-4 w-4" />
-              Delete
+      <PageHeader
+        title={name}
+        meta={
+          bucket.data && <StatusBadge tone={bucketStatusTone(bucket.data.status)}>{bucket.data.status}</StatusBadge>
+        }
+        actions={
+          <>
+            {bucket.data && (
+              <ChangeBucketOwnerDetailDialog bucketName={name} ownerAccessKey={bucket.data.owner_access_key} />
+            )}
+            {canDelete ? (
+              <DeleteBucketDetailDialog bucketName={name} objectCount={bucket.data?.object_count ?? 0} />
+            ) : (
+              <Button variant="destructive" size="sm" disabled>
+                <Trash2 data-icon="inline-start" />
+                Delete
+              </Button>
+            )}
+            <Button variant="outline" size="sm" onClick={handleRefresh}>
+              <RefreshCw data-icon="inline-start" /> Refresh
             </Button>
-          )}
-          <Button variant="outline" size="sm" onClick={handleRefresh}>
-            <RefreshCw className="h-4 w-4" /> Refresh
-          </Button>
-        </div>
-      </div>
+          </>
+        }
+      />
 
       {bucket.isLoading ? (
         <div className="flex h-32 items-center justify-center">
@@ -328,65 +296,55 @@ function ObjectBrowserPage() {
       ) : bucket.error ? (
         <div className="text-destructive">Failed to load bucket details</div>
       ) : bucket.data ? (
-        <div className="rounded-lg border border-border p-4">
-          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <h1 className="text-2xl font-bold">{bucket.data.name}</h1>
-              <p className="text-sm text-muted-foreground">Inspect metadata and browse files in this bucket.</p>
-            </div>
-            <span
-              className={cn(
-                'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
-                bucketStatusColor[bucket.data.status] ?? 'bg-gray-100 text-gray-800'
-              )}
-            >
-              {bucket.data.status}
-            </span>
-          </div>
-
-          <dl className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <div>
-              <dt className="text-sm text-muted-foreground">Owner</dt>
-              <dd className="text-sm font-medium">
-                {bucket.data.owner_access_key === internalRootOwnerAccessKey ? (
-                  <span className="text-xs text-muted-foreground">Internal root</span>
-                ) : bucket.data.owner_access_key ? (
-                  <code className="text-xs text-muted-foreground">{bucket.data.owner_access_key}</code>
-                ) : (
-                  <span className="text-xs text-yellow-600">Unassigned</span>
-                )}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-sm text-muted-foreground">Proof Set</dt>
-              <dd className="font-mono text-xs text-muted-foreground">{bucket.data.proof_set_id ?? '—'}</dd>
-            </div>
-            <div>
-              <dt className="text-sm text-muted-foreground">Objects</dt>
-              <dd className="text-sm font-medium">{formatNumber(bucket.data.object_count)}</dd>
-            </div>
-            <div>
-              <dt className="text-sm text-muted-foreground">Total size</dt>
-              <dd className="text-sm font-medium">{formatBytes(bucket.data.total_size_bytes)}</dd>
-            </div>
-            <div>
-              <dt className="text-sm text-muted-foreground">Created</dt>
-              <dd className="text-sm text-muted-foreground" title={bucket.data.created_at}>
-                {timeAgo(bucket.data.created_at)}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-sm text-muted-foreground">Updated</dt>
-              <dd className="text-sm text-muted-foreground" title={bucket.data.updated_at}>
-                {timeAgo(bucket.data.updated_at)}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-sm text-muted-foreground">Current path</dt>
-              <dd className="font-mono text-xs text-muted-foreground">{prefix || '/'}</dd>
-            </div>
-          </dl>
-        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>Bucket details</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <dl className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              <div>
+                <dt className="text-sm text-muted-foreground">Owner</dt>
+                <dd className="text-sm font-medium">
+                  {bucket.data.owner_access_key === internalRootOwnerAccessKey ? (
+                    <StatusBadge tone="neutral">Internal root</StatusBadge>
+                  ) : bucket.data.owner_access_key ? (
+                    <code className="text-xs text-muted-foreground">{bucket.data.owner_access_key}</code>
+                  ) : (
+                    <StatusBadge tone="warning">Unassigned</StatusBadge>
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm text-muted-foreground">Proof Set</dt>
+                <dd className="font-mono text-xs text-muted-foreground">{bucket.data.proof_set_id ?? '—'}</dd>
+              </div>
+              <div>
+                <dt className="text-sm text-muted-foreground">Objects</dt>
+                <dd className="text-sm font-medium">{formatNumber(bucket.data.object_count)}</dd>
+              </div>
+              <div>
+                <dt className="text-sm text-muted-foreground">Total size</dt>
+                <dd className="text-sm font-medium">{formatBytes(bucket.data.total_size_bytes)}</dd>
+              </div>
+              <div>
+                <dt className="text-sm text-muted-foreground">Created</dt>
+                <dd className="text-sm text-muted-foreground" title={bucket.data.created_at}>
+                  {timeAgo(bucket.data.created_at)}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm text-muted-foreground">Updated</dt>
+                <dd className="text-sm text-muted-foreground" title={bucket.data.updated_at}>
+                  {timeAgo(bucket.data.updated_at)}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm text-muted-foreground">Current path</dt>
+                <dd className="font-mono text-xs text-muted-foreground">{prefix || '/'}</dd>
+              </div>
+            </dl>
+          </CardContent>
+        </Card>
       ) : null}
 
       {objects.isLoading ? (
@@ -397,92 +355,87 @@ function ObjectBrowserPage() {
         <div className="text-destructive">Failed to load objects</div>
       ) : (
         <>
-          <div className="overflow-x-auto rounded-lg border border-border">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border bg-muted/50">
-                  <th className="px-4 py-3 text-left font-medium">Key</th>
-                  <th className="px-4 py-3 text-right font-medium">Size</th>
-                  <th className="px-4 py-3 text-left font-medium">State</th>
-                  <th className="px-4 py-3 text-left font-medium">Type</th>
-                  <th className="px-4 py-3 text-left font-medium">ETag</th>
-                  <th className="px-4 py-3 text-left font-medium">Piece CID</th>
-                  <th className="px-4 py-3 text-left font-medium">Created</th>
-                  <th className="px-4 py-3 text-left font-medium">Updated</th>
-                </tr>
-              </thead>
-              <tbody>
+          <div className="overflow-hidden rounded-lg border border-border">
+            <Table>
+              <TableHeader>
+                <TableRow className="bg-muted/50">
+                  <TableHead className="px-4">Key</TableHead>
+                  <TableHead className="px-4 text-right">Size</TableHead>
+                  <TableHead className="px-4">State</TableHead>
+                  <TableHead className="px-4">Type</TableHead>
+                  <TableHead className="px-4">ETag</TableHead>
+                  <TableHead className="px-4">Piece CID</TableHead>
+                  <TableHead className="px-4">Created</TableHead>
+                  <TableHead className="px-4">Updated</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {[...folders].sort().map((folder) => (
-                  <tr
-                    key={folder}
-                    className="cursor-pointer border-b border-border hover:bg-muted/30"
-                    onClick={() => navigateToPrefix(folder)}
-                  >
-                    <td className="px-4 py-3">
-                      <span className="flex items-center gap-2 text-primary">
-                        <Folder className="h-4 w-4" />
+                  <TableRow key={folder}>
+                    <TableCell className="px-4">
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0"
+                        onClick={() => navigateToPrefix(folder)}
+                      >
+                        <Folder data-icon="inline-start" />
                         {folder.slice(prefix.length)}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-right text-muted-foreground">—</td>
-                    <td className="px-4 py-3">—</td>
-                    <td className="px-4 py-3">—</td>
-                    <td className="px-4 py-3">—</td>
-                    <td className="px-4 py-3">—</td>
-                    <td className="px-4 py-3">—</td>
-                    <td className="px-4 py-3">—</td>
-                  </tr>
+                      </Button>
+                    </TableCell>
+                    <TableCell className="px-4 text-right text-muted-foreground">—</TableCell>
+                    <TableCell className="px-4">—</TableCell>
+                    <TableCell className="px-4">—</TableCell>
+                    <TableCell className="px-4">—</TableCell>
+                    <TableCell className="px-4">—</TableCell>
+                    <TableCell className="px-4">—</TableCell>
+                    <TableCell className="px-4">—</TableCell>
+                  </TableRow>
                 ))}
                 {files.map((object) => (
-                  <tr key={object.id} className="border-b border-border hover:bg-muted/30">
-                    <td className="px-4 py-3 font-mono text-xs">{object.key.slice(prefix.length)}</td>
-                    <td className="px-4 py-3 text-right">{formatBytes(object.size)}</td>
-                    <td className="px-4 py-3">
-                      <span
-                        className={cn(
-                          'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
-                          stateColor[object.state] ?? 'bg-gray-100 text-gray-800'
-                        )}
-                      >
-                        {object.state}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground">{object.content_type}</td>
-                    <td
-                      className="max-w-40 truncate px-4 py-3 font-mono text-xs text-muted-foreground"
+                  <TableRow key={object.id}>
+                    <TableCell className="px-4 font-mono text-xs">{object.key.slice(prefix.length)}</TableCell>
+                    <TableCell className="px-4 text-right">{formatBytes(object.size)}</TableCell>
+                    <TableCell className="px-4">
+                      <StatusBadge tone={objectStateTone(object.state)}>{object.state}</StatusBadge>
+                    </TableCell>
+                    <TableCell className="px-4 text-muted-foreground">{object.content_type}</TableCell>
+                    <TableCell
+                      className="max-w-40 truncate px-4 font-mono text-xs text-muted-foreground"
                       title={object.etag}
                     >
                       {object.etag}
-                    </td>
-                    <td
-                      className="max-w-52 truncate px-4 py-3 font-mono text-xs text-muted-foreground"
+                    </TableCell>
+                    <TableCell
+                      className="max-w-52 truncate px-4 font-mono text-xs text-muted-foreground"
                       title={object.piece_cid ?? undefined}
                     >
                       {object.piece_cid ?? '—'}
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground" title={object.created_at}>
+                    </TableCell>
+                    <TableCell className="px-4 text-muted-foreground" title={object.created_at}>
                       {timeAgo(object.created_at)}
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground" title={object.updated_at}>
+                    </TableCell>
+                    <TableCell className="px-4 text-muted-foreground" title={object.updated_at}>
                       {timeAgo(object.updated_at)}
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 ))}
                 {folders.size === 0 && files.length === 0 && (
-                  <tr>
-                    <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
+                  <TableRow>
+                    <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
                       No objects found
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 )}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
 
           <div className="flex justify-between">
             {marker && (
               <Button variant="outline" size="sm" onClick={() => setMarker('')}>
-                ← First page
+                First page
               </Button>
             )}
             {objects.data?.has_more && objects.data.next_marker && (
@@ -496,12 +449,77 @@ function ObjectBrowserPage() {
                   }
                 }}
               >
-                Next page →
+                Next page
               </Button>
             )}
           </div>
         </>
       )}
     </div>
+  )
+}
+
+function BucketBreadcrumb({
+  name,
+  prefixParts,
+  navigateToPrefix,
+}: {
+  name: string
+  prefixParts: string[]
+  navigateToPrefix: (prefix: string) => void
+}) {
+  return (
+    <Breadcrumb>
+      <BreadcrumbList>
+        <BreadcrumbItem>
+          <BreadcrumbLink asChild>
+            <Link to="/buckets">Buckets</Link>
+          </BreadcrumbLink>
+        </BreadcrumbItem>
+        <BreadcrumbSeparator />
+        <BreadcrumbItem>
+          {prefixParts.length > 0 ? (
+            <BreadcrumbLink asChild>
+              <Button
+                type="button"
+                variant="link"
+                className="h-auto p-0 text-sm font-normal"
+                onClick={() => navigateToPrefix('')}
+              >
+                {name}
+              </Button>
+            </BreadcrumbLink>
+          ) : (
+            <BreadcrumbCurrentPage>{name}</BreadcrumbCurrentPage>
+          )}
+        </BreadcrumbItem>
+        {prefixParts.map((part, index) => {
+          const targetPrefix = `${prefixParts.slice(0, index + 1).join('/')}/`
+          const isLast = index === prefixParts.length - 1
+
+          return (
+            <Fragment key={targetPrefix}>
+              <BreadcrumbSeparator />
+              <BreadcrumbItem>
+                {isLast ? (
+                  <BreadcrumbCurrentPage>{part}</BreadcrumbCurrentPage>
+                ) : (
+                  <BreadcrumbLink asChild>
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="h-auto p-0 text-sm font-normal"
+                      onClick={() => navigateToPrefix(targetPrefix)}
+                    >
+                      {part}
+                    </Button>
+                  </BreadcrumbLink>
+                )}
+              </BreadcrumbItem>
+            </Fragment>
+          )
+        })}
+      </BreadcrumbList>
+    </Breadcrumb>
   )
 }

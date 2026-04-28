@@ -2,8 +2,22 @@ import type { QueryClient } from '@tanstack/react-query'
 import { createRootRouteWithContext, Link, Outlet, useLocation } from '@tanstack/react-router'
 import { AlertTriangle, Database, HardDrive, LayoutDashboard, ListTodo, Loader2, Settings, Wallet } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarRail,
+  SidebarTrigger,
+  useSidebar,
+} from '@/components/ui/sidebar'
 import { useSettings } from '@/hooks/queries'
-import { cn } from '@/lib/utils'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -20,11 +34,19 @@ const navItems = [
   { to: '/wallet' as const, label: 'Wallet', icon: Wallet },
   { to: '/settings' as const, label: 'Settings', icon: Settings },
 ]
+type NavItem = (typeof navItems)[number]
 
-const setupNavItems = [{ to: '/settings' as const, label: 'Settings', icon: Settings }]
+const setupNavItems: NavItem[] = [{ to: '/settings', label: 'Settings', icon: Settings }]
+const sidebarCookieName = 'sidebar_state'
+
+function readSidebarDefaultOpen() {
+  if (typeof document === 'undefined') return true
+
+  const cookie = document.cookie.split('; ').find((row) => row.startsWith(`${sidebarCookieName}=`))
+  return cookie ? cookie.split('=')[1] === 'true' : true
+}
 
 function RootLayout() {
-  const [collapsed, setCollapsed] = useState(false)
   const [dark, setDark] = useState(false)
   const location = useLocation()
   const { data: settings, isLoading: settingsLoading } = useSettings()
@@ -43,44 +65,28 @@ function RootLayout() {
     document.documentElement.classList.toggle('dark', dark)
   }, [dark])
 
-  return (
-    <div className="flex h-screen overflow-hidden">
-      {/* Sidebar */}
-      <aside
-        className={cn(
-          'flex flex-col border-r border-border bg-sidebar transition-all duration-200',
-          collapsed ? 'w-14' : 'w-60'
-        )}
-      >
-        <div className="flex h-14 items-center gap-2 border-b border-border px-3">
-          <HardDrive className="h-6 w-6 shrink-0 text-sidebar-primary" />
-          {!collapsed && <span className="font-semibold text-sidebar-foreground">SynapS3</span>}
-        </div>
-        <nav className="flex-1 space-y-1 p-2">
-          {activeNavItems.map((item) => (
-            <Link
-              key={item.to}
-              to={item.to}
-              className="flex items-center gap-3 rounded-md px-3 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-accent [&.active]:bg-sidebar-accent [&.active]:font-medium"
-            >
-              <item.icon className="h-4 w-4 shrink-0" />
-              {!collapsed && <span>{item.label}</span>}
-            </Link>
-          ))}
-        </nav>
-        <div className="border-t border-border p-2">
-          <button
-            type="button"
-            onClick={() => setCollapsed(!collapsed)}
-            className="flex w-full items-center justify-center rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-sidebar-accent"
-          >
-            {collapsed ? '→' : '← Collapse'}
-          </button>
-        </div>
-      </aside>
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== 'b' || (!event.metaKey && !event.ctrlKey)) return
+      if (!(event.target instanceof HTMLElement)) return
+      if (event.target.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]')) {
+        event.stopPropagation()
+      }
+    }
 
-      {/* Main content */}
-      <main className="flex-1 overflow-auto">
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  return (
+    <SidebarProvider defaultOpen={readSidebarDefaultOpen()}>
+      <AppSidebar activeNavItems={activeNavItems} pathname={location.pathname} />
+
+      <SidebarInset className="overflow-auto">
+        <div className="flex h-14 items-center gap-2 border-b border-border px-4 md:hidden">
+          <SidebarTrigger />
+          <span className="font-semibold">SynapS3</span>
+        </div>
         {settingsLoading ? (
           <ShellLoading />
         ) : setupMode && location.pathname !== '/settings' ? (
@@ -88,8 +94,56 @@ function RootLayout() {
         ) : (
           <Outlet />
         )}
-      </main>
-    </div>
+      </SidebarInset>
+    </SidebarProvider>
+  )
+}
+
+function AppSidebar({ activeNavItems, pathname }: { activeNavItems: NavItem[]; pathname: string }) {
+  const { isMobile, setOpenMobile } = useSidebar()
+  const closeMobileSidebar = () => {
+    if (isMobile) setOpenMobile(false)
+  }
+
+  return (
+    <Sidebar collapsible="icon">
+      <SidebarHeader>
+        <div className="flex items-center gap-2 group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:gap-1">
+          <SidebarMenu className="min-w-0 flex-1 group-data-[collapsible=icon]:flex-none">
+            <SidebarMenuItem>
+              <SidebarMenuButton asChild size="lg" tooltip="SynapS3">
+                <Link to="/" onClick={closeMobileSidebar}>
+                  <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-sidebar-primary text-sidebar-primary-foreground">
+                    <HardDrive />
+                  </span>
+                  <span className="truncate font-semibold group-data-[collapsible=icon]:hidden">SynapS3</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+          <SidebarTrigger className="shrink-0" />
+        </div>
+      </SidebarHeader>
+      <SidebarContent>
+        <SidebarMenu className="p-2">
+          {activeNavItems.map((item) => (
+            <SidebarMenuItem key={item.to}>
+              <SidebarMenuButton
+                asChild
+                isActive={pathname === item.to || (item.to !== '/' && pathname.startsWith(item.to))}
+                tooltip={item.label}
+              >
+                <Link to={item.to} onClick={closeMobileSidebar}>
+                  <item.icon />
+                  <span className="group-data-[collapsible=icon]:hidden">{item.label}</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
+        </SidebarMenu>
+      </SidebarContent>
+      <SidebarRail />
+    </Sidebar>
   )
 }
 
@@ -104,24 +158,17 @@ function ShellLoading() {
 function SetupRequired({ configPath }: { configPath: string }) {
   return (
     <div className="flex h-full items-center justify-center p-6">
-      <div className="max-w-xl rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-5">
-        <div className="flex items-start gap-3">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-yellow-500" />
-          <div className="space-y-2">
-            <h1 className="font-semibold text-foreground">Setup required</h1>
-            <p className="text-sm text-muted-foreground">
-              SynapS3 is running in setup mode. Complete configuration in Settings, then restart the service.
-            </p>
-            <p className="break-all font-mono text-xs text-muted-foreground">{configPath}</p>
-            <Link
-              to="/settings"
-              className="inline-flex rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground"
-            >
-              Open Settings
-            </Link>
-          </div>
-        </div>
-      </div>
+      <Alert className="max-w-xl">
+        <AlertTriangle />
+        <AlertTitle>Setup required</AlertTitle>
+        <AlertDescription className="flex flex-col items-start gap-3">
+          <span>SynapS3 is running in setup mode. Complete configuration in Settings, then restart the service.</span>
+          <span className="break-all font-mono text-xs">{configPath}</span>
+          <Button asChild>
+            <Link to="/settings">Open Settings</Link>
+          </Button>
+        </AlertDescription>
+      </Alert>
     </div>
   )
 }

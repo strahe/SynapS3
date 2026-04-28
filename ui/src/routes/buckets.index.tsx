@@ -3,6 +3,9 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { Loader2, Plus, RefreshCw, Trash2, UserRound } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
 import { type BucketItem, internalRootOwnerAccessKey } from '@/api/client'
+import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
+import { PageHeader } from '@/components/app/PageHeader'
+import { bucketStatusTone, StatusBadge } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -15,21 +18,13 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBuckets, useCreateBucket, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
-import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
+import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/')({
   component: BucketsPage,
 })
-
-const statusColor: Record<string, string> = {
-  active: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300',
-  creating: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300',
-  deleting: 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-300',
-  deleted: 'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300',
-  create_failed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300',
-  delete_failed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300',
-}
 
 const deletableBucketStatuses = new Set(['active'])
 
@@ -86,7 +81,7 @@ function CreateBucketDialog() {
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button size="sm">
-          <Plus className="h-4 w-4" />
+          <Plus data-icon="inline-start" />
           Create Bucket
         </Button>
       </DialogTrigger>
@@ -109,21 +104,13 @@ function CreateBucketDialog() {
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="bucket-owner">Owner</Label>
-            <select
+            <BucketOwnerSelect
               id="bucket-owner"
               value={ownerAccessKey}
-              onChange={(event) => setOwnerAccessKey(event.target.value)}
+              onChange={setOwnerAccessKey}
               disabled={createBucket.isPending || usersLoading}
-              className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
-            >
-              <option value="">Select owner</option>
-              <option value={internalRootOwnerAccessKey}>Internal root</option>
-              {users.map((user) => (
-                <option key={user.access_key} value={user.access_key}>
-                  {user.access_key} ({user.role})
-                </option>
-              ))}
-            </select>
+              users={users}
+            />
             {users.length === 0 && !usersLoading && (
               <p className="text-xs text-muted-foreground">
                 No S3 users yet. Internal root can be used as fallback owner.
@@ -142,7 +129,7 @@ function CreateBucketDialog() {
               Cancel
             </Button>
             <Button type="submit" disabled={createBucket.isPending || usersLoading}>
-              {createBucket.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              {createBucket.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
               Create
             </Button>
           </DialogFooter>
@@ -198,7 +185,7 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button variant="outline" size="xs">
-          <UserRound className="h-3 w-3" />
+          <UserRound data-icon="inline-start" />
           {bucket.owner_access_key ? 'Change owner' : 'Assign owner'}
         </Button>
       </DialogTrigger>
@@ -209,21 +196,13 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
         </DialogHeader>
         <div className="flex flex-col gap-2">
           <Label htmlFor={`owner-${bucket.id}`}>Owner</Label>
-          <select
+          <BucketOwnerSelect
             id={`owner-${bucket.id}`}
             value={ownerAccessKey}
-            onChange={(event) => setOwnerAccessKey(event.target.value)}
+            onChange={setOwnerAccessKey}
             disabled={updateOwner.isPending || usersLoading}
-            className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
-          >
-            <option value="">Select owner</option>
-            <option value={internalRootOwnerAccessKey}>Internal root</option>
-            {users.map((user) => (
-              <option key={user.access_key} value={user.access_key}>
-                {user.access_key} ({user.role})
-              </option>
-            ))}
-          </select>
+            users={users}
+          />
           {users.length === 0 && !usersLoading && (
             <p className="text-xs text-muted-foreground">
               No S3 users yet. Internal root can be used as fallback owner.
@@ -246,7 +225,7 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
             onClick={handleUpdate}
             disabled={!ownerAccessKey || ownerAccessKey === bucket.owner_access_key || updateOwner.isPending}
           >
-            {updateOwner.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+            {updateOwner.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
             Save owner
           </Button>
         </DialogFooter>
@@ -296,7 +275,7 @@ function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button variant="destructive" size="xs">
-          <Trash2 className="h-3 w-3" />
+          <Trash2 data-icon="inline-start" />
           Delete
         </Button>
       </DialogTrigger>
@@ -309,7 +288,7 @@ function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
               : 'This empty bucket will be marked for deletion and its proof set removed on-chain. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-2">
+        <div className="flex flex-col gap-2">
           <Label htmlFor={`confirm-delete-${bucket.id}`}>
             Type <span className="font-mono font-semibold">{bucket.name}</span> to confirm
           </Label>
@@ -333,7 +312,7 @@ function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
             Cancel
           </Button>
           <Button variant="destructive" onClick={handleDelete} disabled={!nameMatches || deleteBucket.isPending}>
-            {deleteBucket.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+            {deleteBucket.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
             Delete bucket
           </Button>
         </DialogFooter>
@@ -347,22 +326,18 @@ function BucketsPage() {
   const qc = useQueryClient()
 
   return (
-    <div className="space-y-4 p-6">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">Buckets</h1>
-          <p className="text-sm text-muted-foreground">
-            Create buckets, delete them safely, and drill into their files.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <CreateBucketDialog />
-          <Button variant="outline" size="sm" onClick={() => qc.invalidateQueries({ queryKey: ['buckets'] })}>
-            <RefreshCw className="h-4 w-4" /> Refresh
-          </Button>
-        </div>
-      </div>
+    <div className="flex flex-col gap-4 p-6">
+      <PageHeader
+        title="Buckets"
+        actions={
+          <>
+            <CreateBucketDialog />
+            <Button variant="outline" size="sm" onClick={() => qc.invalidateQueries({ queryKey: ['buckets'] })}>
+              <RefreshCw data-icon="inline-start" /> Refresh
+            </Button>
+          </>
+        }
+      />
 
       {isLoading ? (
         <div className="flex h-60 items-center justify-center">
@@ -371,28 +346,28 @@ function BucketsPage() {
       ) : error ? (
         <div className="text-destructive">Failed to load buckets</div>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-border">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-border bg-muted/50">
-                <th className="px-4 py-3 text-left font-medium">Name</th>
-                <th className="px-4 py-3 text-left font-medium">Owner</th>
-                <th className="px-4 py-3 text-left font-medium">Status</th>
-                <th className="px-4 py-3 text-left font-medium">Proof Set</th>
-                <th className="px-4 py-3 text-right font-medium">Objects</th>
-                <th className="px-4 py-3 text-right font-medium">Size</th>
-                <th className="px-4 py-3 text-left font-medium">Created</th>
-                <th className="px-4 py-3 text-left font-medium">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
+        <div className="overflow-hidden rounded-lg border border-border">
+          <Table>
+            <TableHeader>
+              <TableRow className="bg-muted/50">
+                <TableHead className="px-4">Name</TableHead>
+                <TableHead className="px-4">Owner</TableHead>
+                <TableHead className="px-4">Status</TableHead>
+                <TableHead className="px-4">Proof Set</TableHead>
+                <TableHead className="px-4 text-right">Objects</TableHead>
+                <TableHead className="px-4 text-right">Size</TableHead>
+                <TableHead className="px-4">Created</TableHead>
+                <TableHead className="px-4">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {data && data.length > 0 ? (
                 data.map((bucket) => {
                   const canDelete = deletableBucketStatuses.has(bucket.status)
 
                   return (
-                    <tr key={bucket.id} className="border-b border-border hover:bg-muted/30">
-                      <td className="px-4 py-3">
+                    <TableRow key={bucket.id}>
+                      <TableCell className="px-4">
                         <Link
                           to="/buckets/$name"
                           params={{ name: bucket.name }}
@@ -400,29 +375,22 @@ function BucketsPage() {
                         >
                           {bucket.name}
                         </Link>
-                      </td>
-                      <td className="px-4 py-3">
+                      </TableCell>
+                      <TableCell className="px-4">
                         <OwnerCell ownerAccessKey={bucket.owner_access_key} />
-                      </td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={cn(
-                            'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
-                            statusColor[bucket.status] ?? 'bg-gray-100 text-gray-800'
-                          )}
-                        >
-                          {bucket.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
+                      </TableCell>
+                      <TableCell className="px-4">
+                        <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
+                      </TableCell>
+                      <TableCell className="px-4 font-mono text-xs text-muted-foreground">
                         {bucket.proof_set_id ?? '—'}
-                      </td>
-                      <td className="px-4 py-3 text-right">{formatNumber(bucket.object_count)}</td>
-                      <td className="px-4 py-3 text-right">{formatBytes(bucket.total_size_bytes)}</td>
-                      <td className="px-4 py-3 text-muted-foreground" title={bucket.created_at}>
+                      </TableCell>
+                      <TableCell className="px-4 text-right">{formatNumber(bucket.object_count)}</TableCell>
+                      <TableCell className="px-4 text-right">{formatBytes(bucket.total_size_bytes)}</TableCell>
+                      <TableCell className="px-4 text-muted-foreground" title={bucket.created_at}>
                         {timeAgo(bucket.created_at)}
-                      </td>
-                      <td className="px-4 py-3">
+                      </TableCell>
+                      <TableCell className="px-4">
                         <div className="flex flex-wrap items-center gap-2">
                           <ChangeBucketOwnerDialog bucket={bucket} />
                           {canDelete ? (
@@ -434,24 +402,24 @@ function BucketsPage() {
                               disabled
                               title="Only active or creating buckets can be deleted"
                             >
-                              <Trash2 className="h-3 w-3" />
+                              <Trash2 data-icon="inline-start" />
                               Delete
                             </Button>
                           )}
                         </div>
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   )
                 })
               ) : (
-                <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
+                <TableRow>
+                  <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
                     No buckets found
-                  </td>
-                </tr>
+                  </TableCell>
+                </TableRow>
               )}
-            </tbody>
-          </table>
+            </TableBody>
+          </Table>
         </div>
       )}
     </div>
@@ -460,10 +428,10 @@ function BucketsPage() {
 
 function OwnerCell({ ownerAccessKey }: { ownerAccessKey: string | null }) {
   if (!ownerAccessKey) {
-    return <span className="text-xs font-medium text-yellow-600">Unassigned</span>
+    return <StatusBadge tone="warning">Unassigned</StatusBadge>
   }
   if (ownerAccessKey === internalRootOwnerAccessKey) {
-    return <span className="text-xs font-medium text-muted-foreground">Internal root</span>
+    return <StatusBadge tone="neutral">Internal root</StatusBadge>
   }
   return <code className="block max-w-56 truncate text-xs text-muted-foreground">{ownerAccessKey}</code>
 }
