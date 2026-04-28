@@ -12,6 +12,7 @@ import (
 // inside a database transaction with a clone of Repositories backed by the tx.
 type Repositories struct {
 	Buckets    BucketRepository
+	S3Accounts S3AccountRepository
 	Objects    ObjectRepository
 	Tasks      TaskRepository
 	Multiparts MultipartUploadRepository
@@ -23,6 +24,7 @@ type Repositories struct {
 func NewRepositories(db bun.IDB) *Repositories {
 	return &Repositories{
 		Buckets:    &BunBucketRepo{db: db},
+		S3Accounts: &BunS3AccountRepo{db: db},
 		Objects:    &BunObjectRepo{db: db},
 		Tasks:      &BunTaskRepo{db: db},
 		Multiparts: &BunMultipartRepo{db: db},

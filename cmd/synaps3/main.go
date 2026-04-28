@@ -17,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/worker"
@@ -169,36 +170,13 @@ func s3ServerOptions(cfg config.ServerConfig) ([]s3api.Option, error) {
 	return opts, nil
 }
 
-func newS3IAMService(cfg config.S3Config) (auth.IAMService, error) {
-	if err := os.MkdirAll(cfg.IAMDir, 0o700); err != nil {
-		return nil, fmt.Errorf("creating S3 IAM directory %s: %w", cfg.IAMDir, err)
-	}
-
-	iam, err := auth.NewInternal(auth.Account{
-		Access: cfg.AccessKey,
-		Secret: cfg.SecretKey,
-		Role:   auth.RoleAdmin,
-	}, cfg.IAMDir)
+func newS3IAMService(ctx context.Context, repos *repository.Repositories) (auth.IAMService, auth.Account, error) {
+	iam := s3iam.NewService(repos)
+	root, err := iam.EnsureRootAccount(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("initializing S3 IAM: %w", err)
+		return nil, auth.Account{}, fmt.Errorf("initializing S3 IAM: %w", err)
 	}
-	return iam, nil
-}
-
-func bootstrapS3RootCredentials(src config.Source, cfg *config.Config) (*config.Config, bool, error) {
-	changed, err := config.BootstrapS3RootCredentials(src.Path)
-	if err != nil {
-		return nil, false, fmt.Errorf("bootstrapping S3 root credentials: %w", err)
-	}
-	if !changed {
-		return cfg, false, nil
-	}
-
-	reloaded, err := config.LoadSource(src)
-	if err != nil {
-		return nil, true, fmt.Errorf("reloading bootstrapped config: %w", err)
-	}
-	return reloaded, true, nil
+	return iam, root, nil
 }
 
 func runServe(ctx context.Context, src config.Source) error {
@@ -207,11 +185,6 @@ func runServe(ctx context.Context, src config.Source) error {
 		return err
 	}
 	defer func() { _ = database.Close() }()
-
-	cfg, _, err = bootstrapS3RootCredentials(src, cfg)
-	if err != nil {
-		return err
-	}
 
 	settingsSvc, err := admin.NewSettingsService(cfg, src)
 	if err != nil {
@@ -279,12 +252,8 @@ func runServe(ctx context.Context, src config.Source) error {
 		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
 	)
 
-	// Set up IAM for root auth plus persisted non-root S3 users.
-	rootCfg := middlewares.RootUserConfig{
-		Access: cfg.S3.AccessKey,
-		Secret: cfg.S3.SecretKey,
-	}
-	iamSvc, err := newS3IAMService(cfg.S3)
+	// Set up DB-backed IAM for root auth plus persisted non-root S3 users.
+	iamSvc, rootAccount, err := newS3IAMService(ctx, repos)
 	if err != nil {
 		return err
 	}
@@ -293,6 +262,10 @@ func runServe(ctx context.Context, src config.Source) error {
 			logger.Error("error shutting down S3 IAM service", "error", err)
 		}
 	}()
+	rootCfg := middlewares.RootUserConfig{
+		Access: rootAccount.Access,
+		Secret: rootAccount.Secret,
+	}
 
 	s3Opts, err := s3ServerOptions(cfg.Server)
 	if err != nil {
@@ -329,7 +302,7 @@ func runServe(ctx context.Context, src config.Source) error {
 	// Start admin server (healthz + metrics).
 	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, logger).
 		WithSettings(settingsSvc).
-		WithS3IAM(iamSvc, cfg.S3.AccessKey, cfg.S3.IAMDir)
+		WithS3IAM(iamSvc, rootAccount.Access)
 	errCh := make(chan error, 2)
 	go func() {
 		if err := adminSrv.Run(ctx); err != nil {
@@ -401,9 +374,6 @@ func setupModeAllowedField(field string) bool {
 		"server.tls.cert_file",
 		"server.tls.key_file",
 		"s3.region",
-		"s3.access_key",
-		"s3.secret_key",
-		"s3.iam_dir",
 		"cache.dir",
 		"cache.max_size_gb",
 		"cache.eviction_policy",

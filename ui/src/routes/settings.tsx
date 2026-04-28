@@ -23,7 +23,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useGenerateS3Credentials, useSettings, useUpdateSettings } from '@/hooks/queries'
+import { useSettings, useUpdateSettings } from '@/hooks/queries'
 import { cn } from '@/lib/utils'
 
 export const Route = createFileRoute('/settings')({
@@ -31,7 +31,7 @@ export const Route = createFileRoute('/settings')({
 })
 
 const tabFields = {
-  s3: ['s3.access_key', 's3.secret_key', 's3.region', 's3.iam_dir'],
+  s3: ['s3.region'],
   server: [
     'server.port',
     'server.max_connections',
@@ -64,10 +64,8 @@ const tabFields = {
 function SettingsPage() {
   const { data, isLoading, error } = useSettings()
   const updateSettings = useUpdateSettings()
-  const generateS3Credentials = useGenerateS3Credentials()
   const [form, setForm] = useState<SettingsEditableConfig | null>(null)
   const [generatedCredentials, setGeneratedCredentials] = useState<SettingsS3Credentials | null>(null)
-  const [confirmGenerateOpen, setConfirmGenerateOpen] = useState(false)
   const formDirty = Boolean(form && data && JSON.stringify(form) !== JSON.stringify(data.config))
 
   useEffect(() => {
@@ -89,30 +87,12 @@ function SettingsPage() {
   }
 
   const submitDisabled = !data.writable || updateSettings.isPending
-  const generateDisabled =
-    !data.writable ||
-    generateS3Credentials.isPending ||
-    Boolean(data.env_managed['s3.access_key'] || data.env_managed['s3.secret_key'])
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!data || !form || submitDisabled) return
     updateSettings.mutate(buildSettingsPayload(form, data.config, data.env_managed), {
       onSuccess: (saved) => setForm(saved.config),
-    })
-  }
-
-  function handleGenerateS3Credentials() {
-    if (generateDisabled) return
-    generateS3Credentials.mutate(undefined, {
-      onSuccess: (result) => {
-        setForm((current) => {
-          if (!current || !data) return result.settings.config
-          return JSON.stringify(current) === JSON.stringify(data.config) ? result.settings.config : current
-        })
-        setGeneratedCredentials(result.credentials)
-        setConfirmGenerateOpen(false)
-      },
     })
   }
 
@@ -156,7 +136,7 @@ function SettingsPage() {
         </Button>
       </div>
 
-      <StatusBanners data={data} mutationError={updateSettings.error ?? generateS3Credentials.error ?? null} />
+      <StatusBanners data={data} mutationError={updateSettings.error ?? null} />
 
       <Tabs defaultValue="s3" className="gap-4">
         <TabsList className="w-full justify-start overflow-x-auto">
@@ -180,13 +160,8 @@ function SettingsPage() {
             data={data}
             value={form.s3}
             errors={fieldErrors}
-            generateRootOpen={confirmGenerateOpen}
-            generateRootDisabled={generateDisabled}
-            generateRootPending={generateS3Credentials.isPending}
             onChange={(s3) => setForm({ ...form, s3 })}
             onCredentials={setGeneratedCredentials}
-            onGenerateRoot={handleGenerateS3Credentials}
-            onGenerateRootOpenChange={setConfirmGenerateOpen}
           />
         </TabsContent>
 
@@ -792,6 +767,12 @@ function GeneratedCredentialsDialog({
         </DialogHeader>
         {credentials && (
           <div className="flex flex-col gap-3">
+            {credentials.role && (
+              <div className="flex flex-col gap-1.5">
+                <Label className="text-xs text-muted-foreground">Role</Label>
+                <div className="rounded-md border border-border bg-muted/40 p-2 text-sm">{credentials.role}</div>
+              </div>
+            )}
             <CopyableSecret label="Access Key" value={credentials.access_key} />
             <CopyableSecret label="Secret Key" value={credentials.secret_key} />
           </div>
@@ -864,7 +845,7 @@ function Banner({
 }
 
 function s3Missing(data: SettingsData) {
-  return !data.secrets.s3_access_key_configured || !data.secrets.s3_secret_key_configured
+  return Boolean(data.validation_errors?.some((error) => error.field.startsWith('s3.')))
 }
 
 function toFieldErrorMap(errors: SettingsFieldError[]) {
@@ -900,7 +881,6 @@ function buildSettingsPayload(
 
   payload.s3 = {}
   if (include('s3.region')) payload.s3.region = form.s3.region
-  if (include('s3.iam_dir') && form.s3.iam_dir !== initial.s3.iam_dir) payload.s3.iam_dir = form.s3.iam_dir
 
   payload.filecoin = {}
   if (include('filecoin.network')) payload.filecoin.network = form.filecoin.network

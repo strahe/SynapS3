@@ -1,5 +1,7 @@
 const BASE = '/api/v1'
 
+export const internalRootOwnerAccessKey = '__internal_root__'
+
 async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   if (init?.body !== undefined && !headers.has('Content-Type')) {
@@ -34,6 +36,7 @@ export interface OverviewData {
 export interface BucketItem {
   id: number
   name: string
+  owner_access_key: string | null
   status: string
   proof_set_id: string | null
   object_count: number
@@ -48,6 +51,7 @@ export interface BucketDetail extends BucketItem {
 export interface BucketMutationResponse {
   id: number
   name: string
+  owner_access_key: string | null
   status: string
 }
 
@@ -193,7 +197,6 @@ export interface SettingsTLSConfig {
 
 export interface SettingsS3Config {
   region: string
-  iam_dir: string
 }
 
 export interface SettingsFilecoinConfig {
@@ -241,26 +244,18 @@ export interface SettingsManualConfig {
     max_idle_conns: number
   }
   admin: { addr_configured: boolean }
-  s3_access_key: SettingsManualField
-  s3_secret_key: SettingsManualField
   filecoin_private_key: SettingsManualField
   config_doc: string
 }
 
 export interface SettingsSecretStatus {
-  s3_access_key_configured: boolean
-  s3_secret_key_configured: boolean
   filecoin_private_key_configured: boolean
 }
 
 export interface SettingsS3Credentials {
   access_key: string
   secret_key: string
-}
-
-export interface SettingsS3CredentialsResponse {
-  settings: SettingsData
-  credentials: SettingsS3Credentials
+  role?: S3UserRole
 }
 
 export type S3UserRole = 'user' | 'userplus' | 'admin'
@@ -268,6 +263,7 @@ export type S3UserRole = 'user' | 'userplus' | 'admin'
 export interface S3User {
   access_key: string
   role: S3UserRole
+  bucket_count: number
 }
 
 export interface S3UserCredentials extends SettingsS3Credentials {
@@ -295,10 +291,21 @@ export const api = {
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
   getBucket: (name: string) => fetchJSON<BucketDetail>(`/buckets/${encodeURIComponent(name)}`),
-  createBucket: (name: string) =>
+  createBucket: (payload: { name: string; owner_access_key: string }) =>
     fetchJSON<BucketMutationResponse>('/buckets', {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
+  updateBucketOwner: (name: string, ownerAccessKey: string) =>
+    fetchJSON<BucketMutationResponse>(`/buckets/${encodeURIComponent(name)}/owner`, {
+      method: 'PUT',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify({ owner_access_key: ownerAccessKey }),
     }),
   deleteBucket: (name: string, params: { recursive?: boolean } = {}) => {
     const sp = new URLSearchParams()
@@ -339,14 +346,6 @@ export const api = {
         'X-SynapS3-Settings-Write': '1',
       },
       body: JSON.stringify(payload),
-    }),
-  generateS3Credentials: () =>
-    fetchJSON<SettingsS3CredentialsResponse>('/settings/s3-credentials', {
-      method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
-      body: JSON.stringify({}),
     }),
   getS3Users: () => fetchJSON<S3User[]>('/s3-users'),
   createS3User: (payload: { role?: S3UserRole } = {}) =>

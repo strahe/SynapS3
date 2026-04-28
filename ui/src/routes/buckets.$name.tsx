@@ -1,7 +1,8 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { ChevronRight, Folder, Loader2, RefreshCw, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { ChevronRight, Folder, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { internalRootOwnerAccessKey } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -14,7 +15,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { useBucket, useBucketObjects, useDeleteBucket } from '@/hooks/queries'
+import { useBucket, useBucketObjects, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
 import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/$name')({
@@ -129,6 +130,115 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
   )
 }
 
+function ChangeBucketOwnerDetailDialog({
+  bucketName,
+  ownerAccessKey,
+}: {
+  bucketName: string
+  ownerAccessKey: string | null
+}) {
+  const [open, setOpen] = useState(false)
+  const [selectedOwner, setSelectedOwner] = useState(ownerAccessKey ?? '')
+  const [error, setError] = useState<string | null>(null)
+  const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
+  const updateOwner = useUpdateBucketOwner()
+
+  useEffect(() => {
+    if (!open) {
+      setSelectedOwner(ownerAccessKey ?? '')
+      setError(null)
+    }
+  }, [ownerAccessKey, open])
+
+  const reset = () => {
+    setSelectedOwner(ownerAccessKey ?? '')
+    setError(null)
+    updateOwner.reset()
+  }
+
+  const handleOpenChange = (next: boolean) => {
+    reset()
+    setOpen(next)
+  }
+
+  const handleUpdate = () => {
+    if (!selectedOwner || selectedOwner === ownerAccessKey) return
+    setError(null)
+    updateOwner.mutate(
+      { name: bucketName, ownerAccessKey: selectedOwner },
+      {
+        onSuccess: () => {
+          setOpen(false)
+          reset()
+        },
+        onError: (mutationError) => {
+          setError(mutationError instanceof Error ? mutationError.message : 'Failed to update owner')
+        },
+      }
+    )
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogTrigger asChild>
+        <Button variant="outline" size="sm">
+          <UserRound className="h-4 w-4" />
+          {ownerAccessKey ? 'Change owner' : 'Assign owner'}
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{ownerAccessKey ? 'Change bucket owner' : 'Assign bucket owner'}</DialogTitle>
+          <DialogDescription>Transfer full control of "{bucketName}" to an existing S3 user.</DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="bucket-detail-owner">Owner</Label>
+          <select
+            id="bucket-detail-owner"
+            value={selectedOwner}
+            onChange={(event) => setSelectedOwner(event.target.value)}
+            disabled={updateOwner.isPending || usersLoading}
+            className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
+          >
+            <option value="">Select owner</option>
+            <option value={internalRootOwnerAccessKey}>Internal root</option>
+            {users.map((user) => (
+              <option key={user.access_key} value={user.access_key}>
+                {user.access_key} ({user.role})
+              </option>
+            ))}
+          </select>
+          {users.length === 0 && !usersLoading && (
+            <p className="text-xs text-muted-foreground">
+              No S3 users yet. Internal root can be used as fallback owner.
+            </p>
+          )}
+          {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
+        </div>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            disabled={updateOwner.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={handleUpdate}
+            disabled={!selectedOwner || selectedOwner === ownerAccessKey || updateOwner.isPending}
+          >
+            {updateOwner.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+            Save owner
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function ObjectBrowserPage() {
   const { name } = Route.useParams()
   const [prefix, setPrefix] = useState('')
@@ -194,6 +304,9 @@ function ObjectBrowserPage() {
         </div>
 
         <div className="flex items-center gap-2">
+          {bucket.data && (
+            <ChangeBucketOwnerDetailDialog bucketName={name} ownerAccessKey={bucket.data.owner_access_key} />
+          )}
           {canDelete ? (
             <DeleteBucketDetailDialog bucketName={name} objectCount={bucket.data?.object_count ?? 0} />
           ) : (
@@ -232,6 +345,18 @@ function ObjectBrowserPage() {
           </div>
 
           <dl className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <div>
+              <dt className="text-sm text-muted-foreground">Owner</dt>
+              <dd className="text-sm font-medium">
+                {bucket.data.owner_access_key === internalRootOwnerAccessKey ? (
+                  <span className="text-xs text-muted-foreground">Internal root</span>
+                ) : bucket.data.owner_access_key ? (
+                  <code className="text-xs text-muted-foreground">{bucket.data.owner_access_key}</code>
+                ) : (
+                  <span className="text-xs text-yellow-600">Unassigned</span>
+                )}
+              </dd>
+            </div>
             <div>
               <dt className="text-sm text-muted-foreground">Proof Set</dt>
               <dd className="font-mono text-xs text-muted-foreground">{bucket.data.proof_set_id ?? '—'}</dd>

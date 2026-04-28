@@ -13,11 +13,7 @@ server:
     key_file: ""
 
 s3:
-  access_key: "admin"
-  secret_key: "password"
   region: "us-east-1"
-  # Omit iam_dir to use the default VersityGW users.json path under ~/.synaps3/iam/.
-  # iam_dir: "/absolute/path/to/iam"
 
 filecoin:
   network: "calibration"       # calibration | mainnet

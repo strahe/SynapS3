@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/versity/versitygw/auth"
 )
 
 // BucketRepository defines persistence operations for Bucket entities.
@@ -15,6 +16,8 @@ type BucketRepository interface {
 	ListActive(ctx context.Context) ([]model.Bucket, error)
 	// List returns all buckets regardless of status.
 	List(ctx context.Context) ([]model.Bucket, error)
+	// ListACLs returns the minimal bucket fields needed to derive ACL owners.
+	ListACLs(ctx context.Context) ([]BucketACLSnapshot, error)
 	// CountByStatus returns bucket counts grouped by status.
 	CountByStatus(ctx context.Context) ([]BucketStatusCount, error)
 	SoftDelete(ctx context.Context, id int64) error
@@ -24,10 +27,33 @@ type BucketRepository interface {
 	SetProofSetID(ctx context.Context, id int64, proofSetID string) error
 	// SetACL stores the bucket ACL JSON blob used by VersityGW access control.
 	SetACL(ctx context.Context, name string, acl []byte) error
+	// SetOwnerAndACL stores both the authoritative owner and compatible ACL.
+	SetOwnerAndACL(ctx context.Context, name string, ownerAccessKey *string, acl []byte) error
+	// CountByOwner returns bucket count for the authoritative owner access key.
+	CountByOwner(ctx context.Context, ownerAccessKey string) (int, error)
+	// AggregateCountsByOwner returns bucket counts grouped by authoritative owner access key.
+	AggregateCountsByOwner(ctx context.Context) (map[string]int, error)
 	// HardDelete permanently removes a bucket row (used after proof set deletion).
 	HardDelete(ctx context.Context, id int64) error
 	// CountWithProofSet returns the number of buckets that have a non-null proof set ID.
 	CountWithProofSet(ctx context.Context) (int, error)
+}
+
+// S3AccountRepository defines persistence operations for S3 IAM accounts.
+type S3AccountRepository interface {
+	Create(ctx context.Context, account *model.S3Account) error
+	GetByAccessKey(ctx context.Context, accessKey string) (*model.S3Account, error)
+	GetRoot(ctx context.Context) (*model.S3Account, error)
+	ListNonRoot(ctx context.Context) ([]model.S3Account, error)
+	Update(ctx context.Context, accessKey string, update S3AccountUpdate) error
+	Delete(ctx context.Context, accessKey string) error
+	LockByAccessKey(ctx context.Context, accessKey string) (*model.S3Account, error)
+}
+
+// S3AccountUpdate holds mutable S3 account fields.
+type S3AccountUpdate struct {
+	SecretKey *string
+	Role      auth.Role
 }
 
 // ObjectRepository defines persistence operations for Object entities.
@@ -72,6 +98,13 @@ type ObjectRepository interface {
 type BucketObjectStats struct {
 	Count     int64 `bun:"count"`
 	TotalSize int64 `bun:"total_size"`
+}
+
+// BucketACLSnapshot holds the minimal bucket fields needed for ACL owner scans.
+type BucketACLSnapshot struct {
+	Name   string             `bun:"name"`
+	Status model.BucketStatus `bun:"status"`
+	ACL    []byte             `bun:"acl"`
 }
 
 // TaskRepository defines persistence operations for Task entities.

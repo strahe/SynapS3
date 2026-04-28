@@ -1,8 +1,8 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react'
-import { type FormEvent, useState } from 'react'
-import type { BucketItem } from '@/api/client'
+import { Loader2, Plus, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import { type FormEvent, useEffect, useState } from 'react'
+import { type BucketItem, internalRootOwnerAccessKey } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -15,7 +15,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { useBuckets, useCreateBucket, useDeleteBucket } from '@/hooks/queries'
+import { useBuckets, useCreateBucket, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
 import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/')({
@@ -36,12 +36,15 @@ const deletableBucketStatuses = new Set(['active'])
 function CreateBucketDialog() {
   const [open, setOpen] = useState(false)
   const [bucketName, setBucketName] = useState('')
+  const [ownerAccessKey, setOwnerAccessKey] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
   const createBucket = useCreateBucket()
   const navigate = useNavigate()
 
   const reset = () => {
     setBucketName('')
+    setOwnerAccessKey('')
     setError(null)
     createBucket.reset()
   }
@@ -58,18 +61,25 @@ function CreateBucketDialog() {
       setError('Bucket name is required')
       return
     }
+    if (!ownerAccessKey) {
+      setError('Bucket owner is required')
+      return
+    }
 
     setError(null)
-    createBucket.mutate(name, {
-      onSuccess: (bucket) => {
-        setOpen(false)
-        reset()
-        navigate({ to: '/buckets/$name', params: { name: bucket.name } })
-      },
-      onError: (mutationError) => {
-        setError(mutationError instanceof Error ? mutationError.message : 'Failed to create bucket')
-      },
-    })
+    createBucket.mutate(
+      { name, ownerAccessKey },
+      {
+        onSuccess: (bucket) => {
+          setOpen(false)
+          reset()
+          navigate({ to: '/buckets/$name', params: { name: bucket.name } })
+        },
+        onError: (mutationError) => {
+          setError(mutationError instanceof Error ? mutationError.message : 'Failed to create bucket')
+        },
+      }
+    )
   }
 
   return (
@@ -83,10 +93,10 @@ function CreateBucketDialog() {
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Create Bucket</DialogTitle>
-          <DialogDescription>A new proof set will be created on-chain for this bucket.</DialogDescription>
+          <DialogDescription>Choose the S3 user that will own and manage this bucket.</DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-2">
+        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+          <div className="flex flex-col gap-2">
             <Label htmlFor="bucket-name">Bucket name</Label>
             <Input
               id="bucket-name"
@@ -96,6 +106,30 @@ function CreateBucketDialog() {
               autoFocus
               disabled={createBucket.isPending}
             />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="bucket-owner">Owner</Label>
+            <select
+              id="bucket-owner"
+              value={ownerAccessKey}
+              onChange={(event) => setOwnerAccessKey(event.target.value)}
+              disabled={createBucket.isPending || usersLoading}
+              className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
+            >
+              <option value="">Select owner</option>
+              <option value={internalRootOwnerAccessKey}>Internal root</option>
+              {users.map((user) => (
+                <option key={user.access_key} value={user.access_key}>
+                  {user.access_key} ({user.role})
+                </option>
+              ))}
+            </select>
+            {users.length === 0 && !usersLoading && (
+              <p className="text-xs text-muted-foreground">
+                No S3 users yet. Internal root can be used as fallback owner.
+              </p>
+            )}
+            {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
           <DialogFooter>
@@ -107,12 +141,115 @@ function CreateBucketDialog() {
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={createBucket.isPending}>
+            <Button type="submit" disabled={createBucket.isPending || usersLoading}>
               {createBucket.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
               Create
             </Button>
           </DialogFooter>
         </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
+  const [open, setOpen] = useState(false)
+  const [ownerAccessKey, setOwnerAccessKey] = useState(bucket.owner_access_key ?? '')
+  const [error, setError] = useState<string | null>(null)
+  const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
+  const updateOwner = useUpdateBucketOwner()
+
+  useEffect(() => {
+    if (!open) {
+      setOwnerAccessKey(bucket.owner_access_key ?? '')
+      setError(null)
+    }
+  }, [bucket.owner_access_key, open])
+
+  const reset = () => {
+    setOwnerAccessKey(bucket.owner_access_key ?? '')
+    setError(null)
+    updateOwner.reset()
+  }
+
+  const handleOpenChange = (next: boolean) => {
+    reset()
+    setOpen(next)
+  }
+
+  const handleUpdate = () => {
+    if (!ownerAccessKey || ownerAccessKey === bucket.owner_access_key) return
+    setError(null)
+    updateOwner.mutate(
+      { name: bucket.name, ownerAccessKey },
+      {
+        onSuccess: () => {
+          setOpen(false)
+          reset()
+        },
+        onError: (mutationError) => {
+          setError(mutationError instanceof Error ? mutationError.message : 'Failed to update owner')
+        },
+      }
+    )
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogTrigger asChild>
+        <Button variant="outline" size="xs">
+          <UserRound className="h-3 w-3" />
+          {bucket.owner_access_key ? 'Change owner' : 'Assign owner'}
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{bucket.owner_access_key ? 'Change bucket owner' : 'Assign bucket owner'}</DialogTitle>
+          <DialogDescription>Transfer full control of "{bucket.name}" to an existing S3 user.</DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor={`owner-${bucket.id}`}>Owner</Label>
+          <select
+            id={`owner-${bucket.id}`}
+            value={ownerAccessKey}
+            onChange={(event) => setOwnerAccessKey(event.target.value)}
+            disabled={updateOwner.isPending || usersLoading}
+            className="h-8 w-full rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:bg-input/50 disabled:opacity-50"
+          >
+            <option value="">Select owner</option>
+            <option value={internalRootOwnerAccessKey}>Internal root</option>
+            {users.map((user) => (
+              <option key={user.access_key} value={user.access_key}>
+                {user.access_key} ({user.role})
+              </option>
+            ))}
+          </select>
+          {users.length === 0 && !usersLoading && (
+            <p className="text-xs text-muted-foreground">
+              No S3 users yet. Internal root can be used as fallback owner.
+            </p>
+          )}
+          {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
+        </div>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            disabled={updateOwner.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={handleUpdate}
+            disabled={!ownerAccessKey || ownerAccessKey === bucket.owner_access_key || updateOwner.isPending}
+          >
+            {updateOwner.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+            Save owner
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   )
@@ -239,6 +376,7 @@ function BucketsPage() {
             <thead>
               <tr className="border-b border-border bg-muted/50">
                 <th className="px-4 py-3 text-left font-medium">Name</th>
+                <th className="px-4 py-3 text-left font-medium">Owner</th>
                 <th className="px-4 py-3 text-left font-medium">Status</th>
                 <th className="px-4 py-3 text-left font-medium">Proof Set</th>
                 <th className="px-4 py-3 text-right font-medium">Objects</th>
@@ -264,6 +402,9 @@ function BucketsPage() {
                         </Link>
                       </td>
                       <td className="px-4 py-3">
+                        <OwnerCell ownerAccessKey={bucket.owner_access_key} />
+                      </td>
+                      <td className="px-4 py-3">
                         <span
                           className={cn(
                             'inline-block rounded-full px-2 py-0.5 text-xs font-medium',
@@ -282,26 +423,29 @@ function BucketsPage() {
                         {timeAgo(bucket.created_at)}
                       </td>
                       <td className="px-4 py-3">
-                        {canDelete ? (
-                          <DeleteBucketDialog bucket={bucket} />
-                        ) : (
-                          <Button
-                            variant="destructive"
-                            size="xs"
-                            disabled
-                            title="Only active or creating buckets can be deleted"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                            Delete
-                          </Button>
-                        )}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <ChangeBucketOwnerDialog bucket={bucket} />
+                          {canDelete ? (
+                            <DeleteBucketDialog bucket={bucket} />
+                          ) : (
+                            <Button
+                              variant="destructive"
+                              size="xs"
+                              disabled
+                              title="Only active or creating buckets can be deleted"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              Delete
+                            </Button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   )
                 })
               ) : (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
+                  <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
                     No buckets found
                   </td>
                 </tr>
@@ -312,4 +456,14 @@ function BucketsPage() {
       )}
     </div>
   )
+}
+
+function OwnerCell({ ownerAccessKey }: { ownerAccessKey: string | null }) {
+  if (!ownerAccessKey) {
+    return <span className="text-xs font-medium text-yellow-600">Unassigned</span>
+  }
+  if (ownerAccessKey === internalRootOwnerAccessKey) {
+    return <span className="text-xs font-medium text-muted-foreground">Internal root</span>
+  }
+  return <code className="block max-w-56 truncate text-xs text-muted-foreground">{ownerAccessKey}</code>
 }

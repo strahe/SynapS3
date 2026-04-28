@@ -2,10 +2,12 @@ package repository_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/versity/versitygw/auth"
 )
 
 func TestBucketRepo_CreateAndGetByName(t *testing.T) {
@@ -254,6 +256,86 @@ func TestBucketRepo_CountByStatus(t *testing.T) {
 
 	if lookup[string(model.BucketStatusActive)] != 3 {
 		t.Errorf("expected 3 active, got %d", lookup[string(model.BucketStatusActive)])
+	}
+}
+
+func TestBucketRepo_AggregateCountsByOwner(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	for _, accessKey := range []string{"owner-a", "owner-b"} {
+		if err := repos.S3Accounts.Create(ctx, &model.S3Account{
+			AccessKey: accessKey,
+			SecretKey: "secret-" + accessKey,
+			Role:      auth.RoleUserPlus,
+		}); err != nil {
+			t.Fatalf("S3Accounts.Create(%s): %v", accessKey, err)
+		}
+	}
+
+	for _, seed := range []struct {
+		name  string
+		owner *string
+	}{
+		{name: "owner-a-one", owner: strptr("owner-a")},
+		{name: "owner-a-two", owner: strptr("owner-a")},
+		{name: "owner-b-one", owner: strptr("owner-b")},
+		{name: "unassigned", owner: nil},
+	} {
+		b := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive, OwnerAccessKey: seed.owner}
+		if err := repos.Buckets.Create(ctx, b); err != nil {
+			t.Fatalf("Create(%s): %v", seed.name, err)
+		}
+	}
+
+	counts, err := repos.Buckets.AggregateCountsByOwner(ctx)
+	if err != nil {
+		t.Fatalf("AggregateCountsByOwner: %v", err)
+	}
+	if len(counts) != 2 {
+		t.Fatalf("len = %d, want 2", len(counts))
+	}
+	if counts["owner-a"] != 2 {
+		t.Fatalf("owner-a count = %d, want 2", counts["owner-a"])
+	}
+	if counts["owner-b"] != 1 {
+		t.Fatalf("owner-b count = %d, want 1", counts["owner-b"])
+	}
+	if _, ok := counts[""]; ok {
+		t.Fatal("unexpected aggregate entry for empty owner")
+	}
+}
+
+func TestBucketRepo_ListACLsReturnsOnlyOwnershipFields(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	acl, err := json.Marshal(auth.ACL{Owner: "owner-access"})
+	if err != nil {
+		t.Fatalf("Marshal ACL: %v", err)
+	}
+	for _, bucket := range []*model.Bucket{
+		{Name: "owned", Status: model.BucketStatusActive, ACL: acl, ProofSetID: strptr("proof-set")},
+		{Name: "unassigned", Status: model.BucketStatusActive},
+	} {
+		if err := repos.Buckets.Create(ctx, bucket); err != nil {
+			t.Fatalf("Create(%s): %v", bucket.Name, err)
+		}
+	}
+
+	snapshots, err := repos.Buckets.ListACLs(ctx)
+	if err != nil {
+		t.Fatalf("ListACLs: %v", err)
+	}
+	if len(snapshots) != 2 {
+		t.Fatalf("len = %d, want 2", len(snapshots))
+	}
+	if snapshots[0].Name != "owned" || snapshots[0].Status != model.BucketStatusActive || string(snapshots[0].ACL) != string(acl) {
+		t.Fatalf("owned snapshot = %#v, want name/status/acl", snapshots[0])
+	}
+	if snapshots[1].Name != "unassigned" || snapshots[1].ACL != nil {
+		t.Fatalf("unassigned snapshot = %#v, want nil ACL", snapshots[1])
 	}
 }
 

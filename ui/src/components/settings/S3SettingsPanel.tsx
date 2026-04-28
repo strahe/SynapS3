@@ -1,4 +1,4 @@
-import { AlertTriangle, ChevronDown, Info, KeyRound, Loader2, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
+import { AlertTriangle, Info, Loader2, Plus } from 'lucide-react'
 import type * as React from 'react'
 import { useEffect, useState } from 'react'
 import type {
@@ -20,11 +20,21 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useCreateS3User, useDeleteS3User, useRotateS3UserSecret, useS3Users, useUpdateS3User } from '@/hooks/queries'
 import { cn } from '@/lib/utils'
+import { syncClosedRoleDraft } from './change-role-draft'
 
 const s3UserRoles: S3UserRole[] = ['userplus', 'user', 'admin']
 
@@ -32,24 +42,14 @@ export function S3SettingsPanel({
   data,
   value,
   errors,
-  generateRootOpen,
-  generateRootDisabled,
-  generateRootPending,
   onChange,
   onCredentials,
-  onGenerateRoot,
-  onGenerateRootOpenChange,
 }: {
   data: SettingsData
   value: SettingsEditableConfig['s3']
   errors: Record<string, string>
-  generateRootOpen: boolean
-  generateRootDisabled: boolean
-  generateRootPending: boolean
   onChange: (value: SettingsEditableConfig['s3']) => void
   onCredentials: (credentials: SettingsS3Credentials) => void
-  onGenerateRoot: () => void
-  onGenerateRootOpenChange: (open: boolean) => void
 }) {
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,24rem)]">
@@ -66,53 +66,8 @@ export function S3SettingsPanel({
               errors={errors}
               onChange={(region) => onChange({ ...value, region })}
             />
-            <TextField
-              label="IAM Directory"
-              field="s3.iam_dir"
-              value={value.iam_dir}
-              data={data}
-              errors={errors}
-              onChange={(iam_dir) => onChange({ ...value, iam_dir })}
-            />
           </div>
         </S3Section>
-
-        <details className="group rounded-lg border border-border bg-card">
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4 text-sm font-medium">
-            Advanced Root Credentials
-            <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
-          </summary>
-          <div className="flex flex-col gap-4 border-t border-border p-4">
-            <RootCredentialStatus data={data} label="Root Access Key" field={data.manual.s3_access_key} />
-            <RootCredentialStatus data={data} label="Root Secret Key" field={data.manual.s3_secret_key} />
-            <AlertDialog open={generateRootOpen} onOpenChange={onGenerateRootOpenChange}>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={generateRootDisabled}
-                onClick={() => onGenerateRootOpenChange(true)}
-              >
-                {generateRootPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-                Rotate root key
-              </Button>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Rotate root S3 credentials?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    Root credentials are config-backed recovery credentials. Existing S3 users are unchanged. Restart
-                    SynapS3 after rotating root credentials.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel type="button">Cancel</AlertDialogCancel>
-                  <AlertDialogAction type="button" onClick={onGenerateRoot}>
-                    Rotate
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          </div>
-        </details>
       </div>
     </div>
   )
@@ -129,22 +84,13 @@ function S3UsersSection({
   const unavailableReason = data.s3_users.reason || 'S3 user management is currently unavailable.'
   const { data: users = [], isLoading, error } = useS3Users(s3UsersAvailable)
   const createUser = useCreateS3User()
-  const updateUser = useUpdateS3User()
   const rotateUserSecret = useRotateS3UserSecret()
   const deleteUser = useDeleteS3User()
+  const [createOpen, setCreateOpen] = useState(false)
   const [createRole, setCreateRole] = useState<S3UserRole>('userplus')
-  const [roleDrafts, setRoleDrafts] = useState<Record<string, S3UserRole>>({})
   const [deleteTarget, setDeleteTarget] = useState<S3User | null>(null)
 
-  useEffect(() => {
-    setRoleDrafts((current) => {
-      const next: Record<string, S3UserRole> = {}
-      for (const user of users) next[user.access_key] = current[user.access_key] ?? user.role
-      return next
-    })
-  }, [users])
-
-  const mutationError = createUser.error ?? updateUser.error ?? rotateUserSecret.error ?? deleteUser.error ?? null
+  const mutationError = createUser.error ?? rotateUserSecret.error ?? deleteUser.error ?? null
   const errorMessage = error instanceof Error ? error.message : mutationError?.message
 
   function handleCreateUser() {
@@ -155,15 +101,10 @@ function S3UsersSection({
         onSuccess: (credentials: S3UserCredentials) => {
           onCredentials(credentials)
           setCreateRole('userplus')
+          setCreateOpen(false)
         },
       }
     )
-  }
-
-  function handleUpdateUser(user: S3User) {
-    const role = roleDrafts[user.access_key] ?? user.role
-    if (!s3UsersAvailable || role === user.role) return
-    updateUser.mutate({ accessKey: user.access_key, role })
   }
 
   function handleRotateUser(user: S3User) {
@@ -174,7 +115,7 @@ function S3UsersSection({
   }
 
   function handleDeleteUser() {
-    if (!deleteTarget || !s3UsersAvailable) return
+    if (!deleteTarget || deleteTarget.bucket_count > 0 || !s3UsersAvailable) return
     deleteUser.mutate(deleteTarget.access_key, {
       onSuccess: () => setDeleteTarget(null),
     })
@@ -195,53 +136,81 @@ function S3UsersSection({
             </Banner>
           )}
 
-          <div className="grid gap-3 md:grid-cols-[minmax(12rem,18rem)_auto] md:items-end">
-            <div className="flex flex-col gap-1.5">
-              <Label className="text-xs text-muted-foreground">Role</Label>
-              <RoleSelect
-                value={createRole}
-                disabled={!s3UsersAvailable || createUser.isPending}
-                onChange={setCreateRole}
-              />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="text-sm text-muted-foreground">
+              Manage S3 access keys used by clients. Secrets are only shown when created or rotated.
             </div>
-            <Button type="button" disabled={!s3UsersAvailable || createUser.isPending} onClick={handleCreateUser}>
-              {createUser.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Create user
-            </Button>
+            <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+              <DialogTrigger asChild>
+                <Button type="button" disabled={!s3UsersAvailable || createUser.isPending}>
+                  {createUser.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                  Create S3 user
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Create S3 user</DialogTitle>
+                  <DialogDescription>Select the role for this access key. The secret is shown once.</DialogDescription>
+                </DialogHeader>
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="create-s3-user-role">Role</Label>
+                  <RoleSelect
+                    id="create-s3-user-role"
+                    value={createRole}
+                    disabled={!s3UsersAvailable || createUser.isPending}
+                    onChange={setCreateRole}
+                  />
+                  <p className="text-xs text-muted-foreground">{roleDescription(createRole)}</p>
+                </div>
+                <DialogFooter>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setCreateOpen(false)}
+                    disabled={createUser.isPending}
+                  >
+                    Cancel
+                  </Button>
+                  <Button type="button" disabled={!s3UsersAvailable || createUser.isPending} onClick={handleCreateUser}>
+                    {createUser.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+                    Create user
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </div>
 
           <div className="overflow-x-auto rounded-md border border-border">
-            <table className="w-full min-w-[42rem] text-left text-sm">
+            <table className="w-full min-w-[48rem] text-left text-sm">
               <thead className="border-b border-border bg-muted/40 text-xs text-muted-foreground">
                 <tr>
                   <th className="px-3 py-2 font-medium">Access Key</th>
-                  <th className="w-44 px-3 py-2 font-medium">Role</th>
-                  <th className="w-32 px-3 py-2 text-right font-medium">Actions</th>
+                  <th className="w-36 px-3 py-2 font-medium">Role</th>
+                  <th className="w-24 px-3 py-2 text-right font-medium">Buckets</th>
+                  <th className="w-72 px-3 py-2 text-right font-medium">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {!s3UsersAvailable ? (
                   <tr>
-                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={3}>
+                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={4}>
                       User list unavailable.
                     </td>
                   </tr>
                 ) : isLoading ? (
                   <tr>
-                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={3}>
+                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={4}>
                       <Loader2 className="mx-auto h-5 w-5 animate-spin" />
                     </td>
                   </tr>
                 ) : users.length === 0 ? (
                   <tr>
-                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={3}>
+                    <td className="px-3 py-6 text-center text-muted-foreground" colSpan={4}>
                       No additional S3 users.
                     </td>
                   </tr>
                 ) : (
                   users.map((user) => {
-                    const draftRole = roleDrafts[user.access_key] ?? user.role
-                    const updating = updateUser.isPending && updateUser.variables?.accessKey === user.access_key
                     const rotating = rotateUserSecret.isPending && rotateUserSecret.variables === user.access_key
                     const deleting = deleteUser.isPending && deleteUser.variables === user.access_key
                     return (
@@ -250,36 +219,37 @@ function S3UsersSection({
                           <code className="block truncate text-xs">{user.access_key}</code>
                         </td>
                         <td className="px-3 py-2">
-                          <RoleSelect
-                            value={draftRole}
-                            disabled={!s3UsersAvailable || updating}
-                            onChange={(role) => setRoleDrafts((current) => ({ ...current, [user.access_key]: role }))}
-                          />
+                          <RolePill role={user.role} />
                         </td>
+                        <td className="px-3 py-2 text-right tabular-nums">{user.bucket_count}</td>
                         <td className="px-3 py-2">
-                          <div className="flex justify-end gap-1">
-                            <IconActionButton
-                              label="Update role"
-                              disabled={!s3UsersAvailable || draftRole === user.role || updating}
-                              onClick={() => handleUpdateUser(user)}
-                              icon={updating ? Loader2 : Save}
-                              spinning={updating}
-                            />
-                            <IconActionButton
-                              label="Rotate secret"
+                          <div className="flex justify-end gap-2">
+                            <ChangeRoleDialog user={user} disabled={!s3UsersAvailable} />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="xs"
                               disabled={!s3UsersAvailable || rotating}
                               onClick={() => handleRotateUser(user)}
-                              icon={rotating ? Loader2 : RotateCcw}
-                              spinning={rotating}
-                            />
-                            <IconActionButton
-                              label="Delete user"
+                            >
+                              {rotating && <Loader2 className="h-3 w-3 animate-spin" />}
+                              Rotate secret
+                            </Button>
+                            <Button
+                              type="button"
                               variant="destructive"
-                              disabled={!s3UsersAvailable || deleting}
+                              size="xs"
+                              disabled={!s3UsersAvailable || deleting || user.bucket_count > 0}
+                              title={
+                                user.bucket_count > 0
+                                  ? "Transfer this user's buckets before deleting the user."
+                                  : undefined
+                              }
                               onClick={() => setDeleteTarget(user)}
-                              icon={deleting ? Loader2 : Trash2}
-                              spinning={deleting}
-                            />
+                            >
+                              {deleting && <Loader2 className="h-3 w-3 animate-spin" />}
+                              Delete
+                            </Button>
                           </div>
                         </td>
                       </tr>
@@ -311,6 +281,67 @@ function S3UsersSection({
         </AlertDialogContent>
       </AlertDialog>
     </>
+  )
+}
+
+function ChangeRoleDialog({ user, disabled }: { user: S3User; disabled?: boolean }) {
+  const updateUser = useUpdateS3User()
+  const [open, setOpen] = useState(false)
+  const [role, setRole] = useState<S3UserRole>(user.role)
+  const updating = updateUser.isPending && updateUser.variables?.accessKey === user.access_key
+
+  useEffect(() => {
+    setRole((currentRole) => syncClosedRoleDraft(open, currentRole, user.role))
+  }, [open, user.role])
+
+  const handleOpenChange = (next: boolean) => {
+    if (!next) {
+      updateUser.reset()
+    }
+    setOpen(next)
+  }
+
+  const handleUpdate = () => {
+    if (role === user.role) return
+    updateUser.mutate(
+      { accessKey: user.access_key, role },
+      {
+        onSuccess: () => setOpen(false),
+      }
+    )
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogTrigger asChild>
+        <Button type="button" variant="outline" size="xs" disabled={disabled}>
+          Change role
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Change S3 user role</DialogTitle>
+          <DialogDescription>
+            Existing bucket ownership is unchanged. The role controls whether this key can create new buckets.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor={`role-${user.access_key}`}>Role</Label>
+          <RoleSelect id={`role-${user.access_key}`} value={role} disabled={updating} onChange={setRole} />
+          <p className="text-xs text-muted-foreground">{roleDescription(role)}</p>
+        </div>
+        {updateUser.error && <p className="text-sm text-destructive">{updateUser.error.message}</p>}
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={updating}>
+            Cancel
+          </Button>
+          <Button type="button" disabled={role === user.role || updating} onClick={handleUpdate}>
+            {updating && <Loader2 className="h-4 w-4 animate-spin" />}
+            Save role
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -389,52 +420,20 @@ function FieldShell({
   )
 }
 
-function RootCredentialStatus({
-  label,
-  field,
-  data,
-}: {
-  label: string
-  field: { configured: boolean; field: string; env?: string }
-  data: SettingsData
-}) {
-  const meta = data.metadata[field.field]
-  const envOverride = data.env_managed[field.field] || field.env
-
-  return (
-    <div className="flex flex-col gap-1.5 rounded-md border border-border p-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <span className="truncate text-sm font-medium">{meta?.label ?? label}</span>
-          {meta && <InfoTooltip metadata={meta} />}
-        </div>
-        <span className={cn('text-xs font-medium', field.configured ? 'text-green-500' : 'text-yellow-500')}>
-          {field.configured ? 'Configured' : 'Missing'}
-        </span>
-      </div>
-      {envOverride ? (
-        <p className="flex items-center gap-1 break-all text-xs text-yellow-600">
-          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-          Overridden by {envOverride}
-        </p>
-      ) : (
-        <p className="break-all font-mono text-xs text-muted-foreground">{data.config_path}</p>
-      )}
-    </div>
-  )
-}
-
 function RoleSelect({
+  id,
   value,
   disabled,
   onChange,
 }: {
+  id?: string
   value: S3UserRole
   disabled?: boolean
   onChange: (value: S3UserRole) => void
 }) {
   return (
     <select
+      id={id}
       value={value}
       disabled={disabled}
       onChange={(event) => onChange(event.target.value as S3UserRole)}
@@ -442,38 +441,45 @@ function RoleSelect({
     >
       {s3UserRoles.map((role) => (
         <option key={role} value={role}>
-          {role}
+          {roleLabel(role)}
         </option>
       ))}
     </select>
   )
 }
 
-function IconActionButton({
-  label,
-  icon: Icon,
-  spinning = false,
-  variant = 'ghost',
-  disabled,
-  onClick,
-}: {
-  label: string
-  icon: typeof Save
-  spinning?: boolean
-  variant?: React.ComponentProps<typeof Button>['variant']
-  disabled?: boolean
-  onClick: () => void
-}) {
+function RolePill({ role }: { role: string }) {
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button type="button" variant={variant} size="icon-sm" disabled={disabled} onClick={onClick} aria-label={label}>
-          <Icon className={cn('h-4 w-4', spinning && 'animate-spin')} />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
+    <span className="inline-flex rounded-md border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium">
+      {roleLabel(role)}
+    </span>
   )
+}
+
+function roleLabel(role: string) {
+  switch (role) {
+    case 'admin':
+      return 'Admin'
+    case 'user':
+      return 'User'
+    case 'userplus':
+      return 'User+'
+    default:
+      return role || 'Unknown'
+  }
+}
+
+function roleDescription(role: string) {
+  switch (role) {
+    case 'admin':
+      return 'Can administer S3 API operations and access all buckets.'
+    case 'user':
+      return 'Can access buckets it owns, but cannot create new buckets.'
+    case 'userplus':
+      return 'Can create buckets and access buckets it owns.'
+    default:
+      return 'Unknown S3 role.'
+  }
 }
 
 function Banner({

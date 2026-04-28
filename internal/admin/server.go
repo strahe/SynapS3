@@ -40,7 +40,6 @@ type Server struct {
 	settings        *SettingsService
 	s3IAM           auth.IAMService
 	s3RootAccess    string
-	s3IAMDir        string
 	setupOnly       bool
 	logger          *slog.Logger
 	startedAt       time.Time
@@ -84,10 +83,9 @@ func (s *Server) WithSettings(settings *SettingsService) *Server {
 }
 
 // WithS3IAM enables S3 user management API routes.
-func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess, iamDir string) *Server {
+func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	s.s3IAM = iam
 	s.s3RootAccess = rootAccess
-	s.s3IAMDir = iamDir
 	return s
 }
 
@@ -111,6 +109,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/buckets", s.handleAPIListBuckets)
 		mux.HandleFunc("POST /api/v1/buckets", s.handleAPICreateBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}", s.handleAPIGetBucket)
+		mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", s.handleAPIUpdateBucketOwner)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
@@ -131,7 +130,6 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.settings != nil {
 		mux.HandleFunc("GET /api/v1/settings", s.handleAPIGetSettings)
 		mux.HandleFunc("PUT /api/v1/settings", s.handleAPIUpdateSettings)
-		mux.HandleFunc("POST /api/v1/settings/s3-credentials", s.handleAPIGenerateS3Credentials)
 	}
 
 	// Serve embedded SPA frontend (fallback for non-API routes)

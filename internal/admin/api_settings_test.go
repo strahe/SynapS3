@@ -26,8 +26,6 @@ func newSettingsAPITestServer(t *testing.T, addr string, cfg *config.Config, sou
 
 func TestSettingsGETRedactsSecretsAndReportsManualStatus(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	cfg.S3.AccessKey = "access-value"
-	cfg.S3.SecretKey = "secret-value"
 	cfg.Filecoin.PrivateKey = "private-key-value"
 	cfg.Database.DSN = "postgres://synaps3:db-password@example.invalid:5432/synaps3?sslmode=disable"
 	cfg.Admin.Addr = "10.20.30.40:19090"
@@ -42,7 +40,7 @@ func TestSettingsGETRedactsSecretsAndReportsManualStatus(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	for _, leaked := range []string{"access-value", "secret-value", "private-key-value", "db-password", cfg.Database.DSN, cfg.Admin.Addr} {
+	for _, leaked := range []string{"private-key-value", "db-password", cfg.Database.DSN, cfg.Admin.Addr} {
 		if strings.Contains(body, leaked) {
 			t.Fatalf("settings response leaked %q: %s", leaked, body)
 		}
@@ -55,8 +53,8 @@ func TestSettingsGETRedactsSecretsAndReportsManualStatus(t *testing.T) {
 	if resp.Mode != "ready" {
 		t.Fatalf("Mode = %q, want ready", resp.Mode)
 	}
-	if !resp.Secrets.S3AccessKeyConfigured || !resp.Secrets.S3SecretKeyConfigured || !resp.Secrets.FilecoinPrivateKeyConfigured {
-		t.Fatalf("secret status = %#v, want all configured", resp.Secrets)
+	if !resp.Secrets.FilecoinPrivateKeyConfigured {
+		t.Fatalf("secret status = %#v, want filecoin private key configured", resp.Secrets)
 	}
 	if resp.Config.S3.Region != cfg.S3.Region {
 		t.Fatalf("S3 region = %q, want %q", resp.Config.S3.Region, cfg.S3.Region)
@@ -87,9 +85,7 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		secret bool
 	}{
 		{field: "server.port", env: "SYNAPS3_SERVER_PORT"},
-		{field: "s3.access_key", env: "SYNAPS3_S3_ACCESS_KEY", secret: true},
-		{field: "s3.secret_key", env: "SYNAPS3_S3_SECRET_KEY", secret: true},
-		{field: "s3.iam_dir", env: "SYNAPS3_S3_IAM_DIR"},
+		{field: "s3.region", env: "SYNAPS3_S3_REGION"},
 		{field: "filecoin.private_key", env: "SYNAPS3_FILECOIN_PRIVATE_KEY", secret: true},
 		{field: "cache.dir", env: "SYNAPS3_CACHE_DIR"},
 	}
@@ -107,9 +103,6 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		if strings.TrimSpace(meta.Label) == "" || strings.TrimSpace(meta.Description) == "" {
 			t.Fatalf("metadata[%q] must include label and description: %#v", tt.field, meta)
 		}
-	}
-	if !resp.Metadata["s3.iam_dir"].Editable {
-		t.Fatal("metadata[s3.iam_dir].Editable = false, want true")
 	}
 }
 
@@ -156,13 +149,9 @@ func TestSettingsGETIncludesFilecoinRPCDefaults(t *testing.T) {
 }
 
 func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {
-	t.Setenv("SYNAPS3_S3_ACCESS_KEY", "env-access")
-	t.Setenv("SYNAPS3_S3_SECRET_KEY", "env-secret")
 	t.Setenv("SYNAPS3_FILECOIN_PRIVATE_KEY", "env-private")
 
 	cfg := validSettingsConfig(t)
-	cfg.S3.AccessKey = "env-access"
-	cfg.S3.SecretKey = "env-secret"
 	cfg.Filecoin.PrivateKey = "env-private"
 
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
@@ -178,156 +167,8 @@ func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-	if resp.Manual.S3Access.Env != "SYNAPS3_S3_ACCESS_KEY" {
-		t.Fatalf("s3 access env = %q, want SYNAPS3_S3_ACCESS_KEY", resp.Manual.S3Access.Env)
-	}
-	if resp.Manual.S3Secret.Env != "SYNAPS3_S3_SECRET_KEY" {
-		t.Fatalf("s3 secret env = %q, want SYNAPS3_S3_SECRET_KEY", resp.Manual.S3Secret.Env)
-	}
 	if resp.Manual.Filecoin.Env != "SYNAPS3_FILECOIN_PRIVATE_KEY" {
 		t.Fatalf("filecoin env = %q, want SYNAPS3_FILECOIN_PRIVATE_KEY", resp.Manual.Filecoin.Env)
-	}
-}
-
-func TestSettingsGenerateS3CredentialsPersistsAndReturnsPlaintextOnce(t *testing.T) {
-	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
-	if err := config.Save(source.Path, cfg); err != nil {
-		t.Fatalf("Save initial config: %v", err)
-	}
-	source.Exists = true
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/s3-credentials", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIGenerateS3Credentials(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
-	}
-	var resp settingsS3CredentialsResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if strings.TrimSpace(resp.Credentials.AccessKey) == "" || strings.TrimSpace(resp.Credentials.SecretKey) == "" {
-		t.Fatalf("generated credentials must be returned once: %#v", resp.Credentials)
-	}
-	if resp.Credentials.AccessKey == cfg.S3.AccessKey || resp.Credentials.SecretKey == cfg.S3.SecretKey {
-		t.Fatalf("generated credentials should rotate existing credentials")
-	}
-	if !resp.Settings.RestartRequired {
-		t.Fatal("RestartRequired = false, want true")
-	}
-	if !resp.Settings.Secrets.S3AccessKeyConfigured || !resp.Settings.Secrets.S3SecretKeyConfigured {
-		t.Fatalf("secret status = %#v, want S3 credentials configured", resp.Settings.Secrets)
-	}
-
-	loaded, err := config.LoadFile(source.Path)
-	if err != nil {
-		t.Fatalf("LoadFile(saved): %v", err)
-	}
-	if loaded.S3.AccessKey != resp.Credentials.AccessKey {
-		t.Fatalf("saved access_key = %q, want generated access key", loaded.S3.AccessKey)
-	}
-	if loaded.S3.SecretKey != resp.Credentials.SecretKey {
-		t.Fatalf("saved secret_key = %q, want generated secret key", loaded.S3.SecretKey)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
-	rr = httptest.NewRecorder()
-	srv.handleAPIGetSettings(rr, req)
-	if strings.Contains(rr.Body.String(), resp.Credentials.AccessKey) || strings.Contains(rr.Body.String(), resp.Credentials.SecretKey) {
-		t.Fatalf("settings GET leaked generated credentials: %s", rr.Body.String())
-	}
-}
-
-func TestSettingsGenerateS3CredentialsPreservesOmittedCacheDir(t *testing.T) {
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
-	initial := []byte(`
-s3:
-  access_key: manual-access
-  secret_key: manual-secret
-  region: us-east-1
-filecoin:
-  private_key: manual-filecoin-private-key
-`)
-	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
-		t.Fatalf("WriteFile initial config: %v", err)
-	}
-	cfg, err := config.LoadSource(source)
-	if err != nil {
-		t.Fatalf("LoadSource: %v", err)
-	}
-	if strings.TrimSpace(cfg.Cache.Dir) == "" {
-		t.Fatal("runtime cache dir default was not applied")
-	}
-	if strings.TrimSpace(cfg.S3.IAMDir) == "" {
-		t.Fatal("runtime s3.iam_dir default was not applied")
-	}
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/s3-credentials", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIGenerateS3Credentials(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
-	}
-	data, err := os.ReadFile(source.Path)
-	if err != nil {
-		t.Fatalf("ReadFile saved config: %v", err)
-	}
-	if strings.Contains(string(data), "dir:") {
-		t.Fatalf("settings generated credentials materialized cache.dir in YAML:\n%s", string(data))
-	}
-	restarted, err := config.LoadSource(source)
-	if err != nil {
-		t.Fatalf("LoadSource(saved): %v", err)
-	}
-	if strings.TrimSpace(restarted.Cache.Dir) == "" {
-		t.Fatal("cache.dir default was lost after restart")
-	}
-	if hasFieldError(restarted.FieldValidationErrors(), "cache.dir") {
-		t.Fatalf("restarted config has cache.dir validation error: %#v", restarted.FieldValidationErrors())
-	}
-}
-
-func TestSettingsGenerateS3CredentialsRejectsEnvManagedFields(t *testing.T) {
-	t.Setenv("SYNAPS3_S3_SECRET_KEY", "env-secret")
-
-	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
-	if err := config.Save(source.Path, cfg); err != nil {
-		t.Fatalf("Save initial config: %v", err)
-	}
-	source.Exists = true
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/s3-credentials", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIGenerateS3Credentials(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400, body=%s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "s3.secret_key") || !strings.Contains(rr.Body.String(), "SYNAPS3_S3_SECRET_KEY") {
-		t.Fatalf("body should mention env-managed secret key: %s", rr.Body.String())
-	}
-	loaded, err := config.LoadFile(source.Path)
-	if err != nil {
-		t.Fatalf("LoadFile(saved): %v", err)
-	}
-	if loaded.S3.AccessKey != cfg.S3.AccessKey || loaded.S3.SecretKey != cfg.S3.SecretKey {
-		t.Fatalf("credentials changed despite env rejection: %#v", loaded.S3)
 	}
 }
 
@@ -437,14 +278,10 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	if loaded.Worker.Upload.PollInterval.String() != "9s" {
 		t.Fatalf("saved worker.upload.poll_interval = %s, want 9s", loaded.Worker.Upload.PollInterval)
 	}
-	if loaded.S3.SecretKey != cfg.S3.SecretKey {
-		t.Fatalf("saved secret key changed")
-	}
 }
 
 func TestSettingsPUTPreservesManualFieldsChangedOnDiskAfterServiceStart(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	cfg.S3.SecretKey = "old-secret"
 	cfg.Filecoin.PrivateKey = "old-private-key"
 	cfg.Database.DSN = "postgres://synaps3:old-password@example.invalid:5432/synaps3"
 	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
@@ -455,7 +292,6 @@ func TestSettingsPUTPreservesManualFieldsChangedOnDiskAfterServiceStart(t *testi
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
 
 	manual := *cfg
-	manual.S3.SecretKey = "new-secret"
 	manual.Filecoin.PrivateKey = "new-private-key"
 	manual.Database.DSN = "postgres://synaps3:new-password@example.invalid:5432/synaps3"
 	if err := config.Save(source.Path, &manual); err != nil {
@@ -479,9 +315,6 @@ func TestSettingsPUTPreservesManualFieldsChangedOnDiskAfterServiceStart(t *testi
 	if loaded.Cache.MaxSizeGB != 9 {
 		t.Fatalf("cache.max_size_gb = %d, want 9", loaded.Cache.MaxSizeGB)
 	}
-	if loaded.S3.SecretKey != manual.S3.SecretKey {
-		t.Fatalf("s3.secret_key = %q, want preserved manual value", loaded.S3.SecretKey)
-	}
 	if loaded.Filecoin.PrivateKey != manual.Filecoin.PrivateKey {
 		t.Fatalf("filecoin.private_key = %q, want preserved manual value", loaded.Filecoin.PrivateKey)
 	}
@@ -496,8 +329,6 @@ func TestSettingsPUTDoesNotMaterializeMissingManualDatabaseDSN(t *testing.T) {
 	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
 	initial := []byte(`
 s3:
-  access_key: manual-access
-  secret_key: manual-secret
   region: us-east-1
 filecoin:
   private_key: manual-filecoin-private-key
@@ -540,8 +371,6 @@ func TestSettingsPUTUsesRuntimeDefaultForOmittedCacheDir(t *testing.T) {
 	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
 	initial := []byte(`
 s3:
-  access_key: manual-access
-  secret_key: manual-secret
   region: us-east-1
 filecoin:
   private_key: manual-filecoin-private-key
@@ -576,18 +405,12 @@ filecoin:
 	if strings.Contains(text, "  dir:") {
 		t.Fatalf("settings PUT materialized cache.dir in YAML:\n%s", text)
 	}
-	if strings.Contains(text, "iam_dir:") {
-		t.Fatalf("settings PUT materialized s3.iam_dir in YAML:\n%s", text)
-	}
 	restarted, err := config.LoadSource(source)
 	if err != nil {
 		t.Fatalf("LoadSource(saved): %v", err)
 	}
 	if strings.TrimSpace(restarted.Cache.Dir) == "" {
 		t.Fatal("cache.dir default was lost after restart")
-	}
-	if strings.TrimSpace(restarted.S3.IAMDir) == "" {
-		t.Fatal("s3.iam_dir default was lost after restart")
 	}
 	if restarted.Logging.Format != "text" {
 		t.Fatalf("logging.format = %q, want text", restarted.Logging.Format)
@@ -610,7 +433,7 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 	if err != nil {
 		t.Fatalf("LoadSource: %v", err)
 	}
-	for _, want := range []string{"s3.access_key", "s3.secret_key", "filecoin.private_key"} {
+	for _, want := range []string{"filecoin.private_key"} {
 		if !hasFieldError(cfg.FieldValidationErrors(), want) {
 			t.Fatalf("default config validation errors = %#v, want missing manual credential %q", cfg.FieldValidationErrors(), want)
 		}
@@ -637,12 +460,10 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 	if persisted.S3.Region != "ap-southeast-1" || persisted.Cache.MaxSizeGB != 12 {
 		t.Fatalf("persisted settings = %#v", persisted)
 	}
-	if persisted.S3.AccessKey != "" || persisted.S3.SecretKey != "" || persisted.Filecoin.PrivateKey != "" {
-		t.Fatalf("manual secrets should remain empty until edited outside the browser: %#v %#v", persisted.S3, persisted.Filecoin)
+	if persisted.Filecoin.PrivateKey != "" {
+		t.Fatalf("manual secrets should remain empty until edited outside the browser: %#v", persisted.Filecoin)
 	}
 
-	persisted.S3.AccessKey = "manual-access"
-	persisted.S3.SecretKey = "manual-secret"
 	persisted.Filecoin.PrivateKey = "manual-filecoin-private-key"
 	if err := config.Save(source.Path, persisted); err != nil {
 		t.Fatalf("Save manual secrets: %v", err)
@@ -656,8 +477,8 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 	if restarted.S3.Region != "eu-west-1" {
 		t.Fatalf("env S3 region = %q, want eu-west-1", restarted.S3.Region)
 	}
-	if restarted.S3.SecretKey != "manual-secret" || restarted.Filecoin.PrivateKey != "manual-filecoin-private-key" {
-		t.Fatalf("manual secrets were not loaded after restart: %#v %#v", restarted.S3, restarted.Filecoin)
+	if restarted.Filecoin.PrivateKey != "manual-filecoin-private-key" {
+		t.Fatalf("manual secrets were not loaded after restart: %#v", restarted.Filecoin)
 	}
 
 	srv = newSettingsAPITestServer(t, "127.0.0.1:9090", restarted, source)
@@ -678,8 +499,8 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 	if persisted.Cache.MaxSizeGB != 13 {
 		t.Fatalf("cache.max_size_gb = %d, want 13", persisted.Cache.MaxSizeGB)
 	}
-	if persisted.S3.SecretKey != "manual-secret" || persisted.Filecoin.PrivateKey != "manual-filecoin-private-key" {
-		t.Fatalf("manual secrets were overwritten: %#v %#v", persisted.S3, persisted.Filecoin)
+	if persisted.Filecoin.PrivateKey != "manual-filecoin-private-key" {
+		t.Fatalf("manual secrets were overwritten: %#v", persisted.Filecoin)
 	}
 }
 
@@ -697,7 +518,6 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "server tls cert file", envName: "SYNAPS3_SERVER_TLS_CERT_FILE", payload: `{"server":{"tls":{"cert_file":"/tmp/cert.pem"}}}`, field: "server.tls.cert_file"},
 		{name: "server tls key file", envName: "SYNAPS3_SERVER_TLS_KEY_FILE", payload: `{"server":{"tls":{"key_file":"/tmp/key.pem"}}}`, field: "server.tls.key_file"},
 		{name: "s3 region", envName: "SYNAPS3_S3_REGION", payload: `{"s3":{"region":"eu-west-1"}}`, field: "s3.region"},
-		{name: "s3 iam dir", envName: "SYNAPS3_S3_IAM_DIR", payload: `{"s3":{"iam_dir":"/tmp/synaps3-iam"}}`, field: "s3.iam_dir"},
 		{name: "filecoin network", envName: "SYNAPS3_FILECOIN_NETWORK", payload: `{"filecoin":{"network":"mainnet"}}`, field: "filecoin.network"},
 		{name: "filecoin rpc url", envName: "SYNAPS3_FILECOIN_RPC_URL", payload: `{"filecoin":{"rpc_url":"https://rpc.example.invalid"}}`, field: "filecoin.rpc_url"},
 		{name: "filecoin source", envName: "SYNAPS3_FILECOIN_SOURCE", payload: `{"filecoin":{"source":"other"}}`, field: "filecoin.source"},
@@ -749,7 +569,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":"not-a-port"},
-		"s3":{"region":"","iam_dir":""},
+		"s3":{"region":""},
 		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","source":""},
 		"worker":{"upload":{"max_retries":-1}},
 		"logging":{"level":"verbose","format":"xml"}
@@ -767,7 +587,6 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 	for _, want := range []string{
 		"server.port",
 		"s3.region",
-		"s3.iam_dir",
 		"filecoin.rpc_url",
 		"filecoin.source",
 		"worker.upload.max_retries",
@@ -804,8 +623,6 @@ func validSettingsConfig(t *testing.T) *config.Config {
 	if err != nil {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
-	cfg.S3.AccessKey = "admin"
-	cfg.S3.SecretKey = "password"
 	cfg.Filecoin.PrivateKey = "filecoin-private-key"
 	return cfg
 }

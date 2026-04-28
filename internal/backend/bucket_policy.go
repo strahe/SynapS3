@@ -2,9 +2,12 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -34,7 +37,57 @@ func (b *SynapseBackend) PutBucketAcl(ctx context.Context, bucket string, data [
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 
+	if owner, err := ownerFromACL(data); err != nil {
+		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+	} else if owner != "" {
+		if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+			account, err := txRepos.S3Accounts.LockByAccessKey(ctx, owner)
+			if err != nil {
+				return err
+			}
+			if account == nil {
+				return auth.ErrNoSuchUser
+			}
+			return txRepos.Buckets.SetOwnerAndACL(ctx, bucket, &owner, data)
+		}); err != nil {
+			if errors.Is(err, auth.ErrNoSuchUser) {
+				return s3err.GetAPIError(s3err.ErrAccessDenied)
+			}
+			return err
+		}
+		return nil
+	}
+
+	if bkt.OwnerAccessKey != nil && *bkt.OwnerAccessKey != "" {
+		acl, err := aclPreservingOwner(data, *bkt.OwnerAccessKey)
+		if err != nil {
+			return s3err.GetAPIError(s3err.ErrInvalidArgument)
+		}
+		data = acl
+	}
 	return b.repos.Buckets.SetACL(ctx, bucket, data)
+}
+
+func aclPreservingOwner(data []byte, owner string) ([]byte, error) {
+	acl := auth.ACL{}
+	if len(data) > 0 {
+		parsed, err := auth.ParseACL(data)
+		if err != nil {
+			return nil, err
+		}
+		acl = parsed
+	}
+	acl.Owner = owner
+	if len(acl.Grantees) == 0 {
+		// Store owner-only ACLs with an explicit FULL_CONTROL grant so VersityGW's
+		// ACL verifier has a concrete owner grant to match on subsequent requests.
+		acl.Grantees = []auth.Grantee{{
+			Permission: auth.PermissionFullControl,
+			Access:     owner,
+			Type:       types.TypeCanonicalUser,
+		}}
+	}
+	return json.Marshal(acl)
 }
 
 func (b *SynapseBackend) ChangeBucketOwner(ctx context.Context, bucket, owner string) error {
@@ -80,6 +133,27 @@ func (b *SynapseBackend) GetBucketOwnershipControls(ctx context.Context, bucket 
 	}
 
 	return types.ObjectOwnershipBucketOwnerPreferred, nil
+}
+
+func (b *SynapseBackend) PutBucketOwnershipControls(ctx context.Context, bucket string, ownership types.ObjectOwnership) error {
+	if _, err := b.getBucket(ctx, bucket); err != nil {
+		return err
+	}
+	switch ownership {
+	case types.ObjectOwnershipBucketOwnerPreferred:
+		return nil
+	case types.ObjectOwnershipBucketOwnerEnforced, types.ObjectOwnershipObjectWriter:
+		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+	default:
+		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+}
+
+func (b *SynapseBackend) DeleteBucketOwnershipControls(ctx context.Context, bucket string) error {
+	if _, err := b.getBucket(ctx, bucket); err != nil {
+		return err
+	}
+	return nil
 }
 
 // GetObjectAcl returns an empty ACL for the specified object.

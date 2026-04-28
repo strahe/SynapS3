@@ -42,10 +42,7 @@ type TLSConfig struct {
 }
 
 type S3Config struct {
-	AccessKey string `koanf:"access_key"`
-	SecretKey string `koanf:"secret_key"`
-	Region    string `koanf:"region"`
-	IAMDir    string `koanf:"iam_dir"`
+	Region string `koanf:"region"`
 }
 
 type FilecoinConfig struct {
@@ -116,7 +113,7 @@ func DefaultFilecoinRPCURLs() map[string]string {
 
 func DefaultConfig() (*Config, error) {
 	cfg := defaultConfig()
-	if err := applyDefaultRuntimePaths(cfg, false, false, false); err != nil {
+	if err := applyDefaultRuntimePaths(cfg, false, false); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -194,11 +191,10 @@ func defaultSQLiteDSN(appDataDir string) string {
 	return u.String()
 }
 
-func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir, hasS3IAMDir bool) error {
+func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir bool) error {
 	hasDatabaseDSN = hasDatabaseDSN || strings.TrimSpace(cfg.Database.DSN) != ""
 	hasCacheDir = hasCacheDir || strings.TrimSpace(cfg.Cache.Dir) != ""
-	hasS3IAMDir = hasS3IAMDir || strings.TrimSpace(cfg.S3.IAMDir) != ""
-	if hasDatabaseDSN && hasCacheDir && hasS3IAMDir {
+	if hasDatabaseDSN && hasCacheDir {
 		return nil
 	}
 
@@ -211,9 +207,6 @@ func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir, hasS3IAM
 	}
 	if !hasCacheDir {
 		cfg.Cache.Dir = filepath.Join(appDataDir, "cache")
-	}
-	if !hasS3IAMDir {
-		cfg.S3.IAMDir = filepath.Join(appDataDir, "iam")
 	}
 	return nil
 }
@@ -269,7 +262,7 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 		return nil, PersistedFieldPresence{}, fmt.Errorf("unmarshalling config: %w", err)
 	}
 	if applyRuntimeDefaults {
-		if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir"), k.Exists("s3.iam_dir")); err != nil {
+		if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir")); err != nil {
 			return nil, PersistedFieldPresence{}, fmt.Errorf("loading default runtime paths: %w", err)
 		}
 	}
@@ -282,9 +275,6 @@ func persistedFieldPresence(k *koanf.Koanf, fileLoaded bool) PersistedFieldPrese
 		return PersistedFieldPresence{}
 	}
 	return PersistedFieldPresence{
-		S3AccessKey:        k.Exists("s3.access_key"),
-		S3SecretKey:        k.Exists("s3.secret_key"),
-		S3IAMDir:           k.Exists("s3.iam_dir"),
 		FilecoinPrivateKey: k.Exists("filecoin.private_key"),
 		DatabaseDriver:     k.Exists("database.driver"),
 		DatabaseDSN:        k.Exists("database.dsn"),
@@ -382,15 +372,6 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	// S3 credentials.
 	if strings.TrimSpace(c.S3.Region) == "" {
 		add("s3.region", "must be non-empty")
-	}
-	if strings.TrimSpace(c.S3.AccessKey) == "" {
-		add("s3.access_key", "must be non-empty")
-	}
-	if strings.TrimSpace(c.S3.SecretKey) == "" {
-		add("s3.secret_key", "must be non-empty")
-	}
-	if strings.TrimSpace(c.S3.IAMDir) == "" {
-		add("s3.iam_dir", "must be non-empty")
 	}
 
 	// Worker pools.

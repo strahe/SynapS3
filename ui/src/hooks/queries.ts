@@ -39,10 +39,26 @@ export function useCreateBucket() {
   const qc = useQueryClient()
 
   return useMutation({
-    mutationFn: (name: string) => api.createBucket(name),
+    mutationFn: (payload: { name: string; ownerAccessKey: string }) =>
+      api.createBucket({ name: payload.name, owner_access_key: payload.ownerAccessKey }),
     onSuccess: (bucket) => {
       qc.invalidateQueries({ queryKey: ['buckets'] })
       qc.invalidateQueries({ queryKey: ['bucket', bucket.name] })
+      qc.invalidateQueries({ queryKey: ['s3Users'] })
+    },
+  })
+}
+
+export function useUpdateBucketOwner() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ name, ownerAccessKey }: { name: string; ownerAccessKey: string }) =>
+      api.updateBucketOwner(name, ownerAccessKey),
+    onSuccess: (bucket) => {
+      qc.invalidateQueries({ queryKey: ['buckets'] })
+      qc.invalidateQueries({ queryKey: ['bucket', bucket.name] })
+      qc.invalidateQueries({ queryKey: ['s3Users'] })
     },
   })
 }
@@ -103,17 +119,6 @@ export function useUpdateSettings() {
   })
 }
 
-export function useGenerateS3Credentials() {
-  const qc = useQueryClient()
-
-  return useMutation({
-    mutationFn: api.generateS3Credentials,
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['settings'] })
-    },
-  })
-}
-
 export function useS3Users(enabled = true) {
   return useQuery({
     queryKey: ['s3Users'],
@@ -163,6 +168,7 @@ export function useDeleteS3User() {
     mutationFn: (accessKey: string) => api.deleteS3User(accessKey),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['s3Users'] })
+      qc.invalidateQueries({ queryKey: ['buckets'] })
     },
   })
 }

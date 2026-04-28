@@ -22,7 +22,7 @@ import (
 func NewTestDB(t *testing.T) *bun.DB {
 	t.Helper()
 
-	sqldb, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	sqldb, err := sql.Open("sqlite", "file::memory:?cache=shared&_pragma=foreign_keys(1)")
 	if err != nil {
 		t.Fatalf("opening test db: %v", err)
 	}

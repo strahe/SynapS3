@@ -132,6 +132,57 @@ func (r *BunBucketRepo) SetACL(ctx context.Context, name string, acl []byte) err
 	return nil
 }
 
+func (r *BunBucketRepo) SetOwnerAndACL(ctx context.Context, name string, ownerAccessKey *string, acl []byte) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("owner_access_key = ?", ownerAccessKey).
+		Set("acl = ?", acl).
+		Set("updated_at = ?", time.Now().UTC()).
+		Where("name = ?", name).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("setting bucket owner and ACL: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("setting bucket owner and ACL: bucket %q not found", name)
+	}
+	return nil
+}
+
+func (r *BunBucketRepo) CountByOwner(ctx context.Context, ownerAccessKey string) (int, error) {
+	count, err := r.db.NewSelect().
+		Model((*model.Bucket)(nil)).
+		Where("owner_access_key = ?", ownerAccessKey).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting buckets by owner: %w", err)
+	}
+	return count, nil
+}
+
+func (r *BunBucketRepo) AggregateCountsByOwner(ctx context.Context) (map[string]int, error) {
+	var rows []struct {
+		OwnerAccessKey string `bun:"owner_access_key"`
+		Count          int    `bun:"count"`
+	}
+	err := r.db.NewSelect().
+		TableExpr("buckets").
+		ColumnExpr("owner_access_key, COUNT(*) AS count").
+		Where("owner_access_key IS NOT NULL").
+		Where("owner_access_key <> ''").
+		GroupExpr("owner_access_key").
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating bucket counts by owner: %w", err)
+	}
+	counts := make(map[string]int, len(rows))
+	for _, row := range rows {
+		counts[row.OwnerAccessKey] = row.Count
+	}
+	return counts, nil
+}
+
 func (r *BunBucketRepo) HardDelete(ctx context.Context, id int64) error {
 	_, err := r.db.NewDelete().
 		Model((*model.Bucket)(nil)).
@@ -151,6 +202,19 @@ func (r *BunBucketRepo) List(ctx context.Context) ([]model.Bucket, error) {
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing all buckets: %w", err)
+	}
+	return buckets, nil
+}
+
+func (r *BunBucketRepo) ListACLs(ctx context.Context) ([]BucketACLSnapshot, error) {
+	var buckets []BucketACLSnapshot
+	err := r.db.NewSelect().
+		TableExpr("buckets").
+		Column("name", "status", "acl").
+		OrderExpr("name ASC").
+		Scan(ctx, &buckets)
+	if err != nil {
+		return nil, fmt.Errorf("listing bucket ACL snapshots: %w", err)
 	}
 	return buckets, nil
 }

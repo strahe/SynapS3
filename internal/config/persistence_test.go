@@ -152,10 +152,9 @@ func TestEnvManagedFieldPaths_ReturnsRecognizedOverrides(t *testing.T) {
 	t.Setenv("SYNAPS3_CACHE_DIR", "/tmp/synaps3-cache")
 	t.Setenv("SYNAPS3_FILECOIN_NETWORK", "mainnet")
 	t.Setenv("SYNAPS3_FILECOIN_RPC_URL", "https://rpc.example.invalid")
-	t.Setenv("SYNAPS3_S3_SECRET_KEY", "secret")
 
 	managed := EnvManagedFieldPaths()
-	for _, want := range []string{"server.port", "cache.dir", "filecoin.network", "filecoin.rpc_url", "s3.secret_key"} {
+	for _, want := range []string{"server.port", "cache.dir", "filecoin.network", "filecoin.rpc_url"} {
 		if managed[want] == "" {
 			t.Fatalf("EnvManagedFieldPaths() missing %q in %#v", want, managed)
 		}
@@ -169,8 +168,7 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 		field string
 	}{
 		{env: "SYNAPS3_SERVER_PORT", field: "server.port"},
-		{env: "SYNAPS3_S3_ACCESS_KEY", field: "s3.access_key"},
-		{env: "SYNAPS3_S3_SECRET_KEY", field: "s3.secret_key"},
+		{env: "SYNAPS3_S3_REGION", field: "s3.region"},
 		{env: "SYNAPS3_FILECOIN_PRIVATE_KEY", field: "filecoin.private_key"},
 		{env: "SYNAPS3_CACHE_MAX_SIZE_GB", field: "cache.max_size_gb"},
 		{env: "SYNAPS3_ADMIN_ADDR", field: "admin.addr"},
@@ -196,12 +194,6 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 		}
 	}
 
-	if !metadata["s3.secret_key"].Secret {
-		t.Fatal("s3.secret_key Secret = false, want true")
-	}
-	if metadata["s3.access_key"].Editable || metadata["s3.secret_key"].Editable {
-		t.Fatal("S3 credential metadata Editable = true, want false")
-	}
 	if metadata["filecoin.private_key"].Editable {
 		t.Fatal("filecoin.private_key Editable = true, want false")
 	}
@@ -220,7 +212,7 @@ func TestFieldValidationErrors_ReportsFieldNames(t *testing.T) {
 		fields = append(fields, err.Field)
 	}
 
-	for _, want := range []string{"server.max_connections", "s3.access_key", "s3.secret_key", "filecoin.private_key"} {
+	for _, want := range []string{"server.max_connections", "filecoin.private_key"} {
 		if !slices.Contains(fields, want) {
 			t.Fatalf("fields = %#v, want %q", fields, want)
 		}

@@ -61,6 +61,12 @@ func (s *Service) CreateWithACL(ctx context.Context, name string, acl []byte) (*
 	return bucket, nil
 }
 
+func (s *Service) EnsureCacheBucketDir(ctx context.Context, name string) {
+	if err := s.cache.CreateBucketDir(ctx, name); err != nil && s.logger != nil {
+		s.logger.Warn("pre-creating cache dir failed (non-fatal)", "bucket", name, "error", err)
+	}
+}
+
 func (s *Service) Delete(_ context.Context, _ string, _ DeleteOptions) (*model.Bucket, error) {
 	return nil, ErrDeleteNotSupported
 }

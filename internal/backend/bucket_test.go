@@ -86,6 +86,73 @@ func TestCreateBucket_DuplicateKey(t *testing.T) {
 	}
 }
 
+func TestCreateBucket_DuplicateOwnedBucketReturnsAlreadyExists(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedS3Account(t, tb, "same-owner")
+	firstACL, err := json.Marshal(auth.ACL{Owner: "same-owner"})
+	if err != nil {
+		t.Fatalf("Marshal first ACL: %v", err)
+	}
+	secondACL, err := json.Marshal(auth.ACL{Owner: "same-owner"})
+	if err != nil {
+		t.Fatalf("Marshal second ACL: %v", err)
+	}
+
+	err = tb.backend.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String("same-owner-bucket"),
+	}, firstACL)
+	if err != nil {
+		t.Fatalf("first CreateBucket: %v", err)
+	}
+
+	err = tb.backend.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String("same-owner-bucket"),
+	}, secondACL)
+	if err == nil {
+		t.Fatal("expected error for duplicate bucket")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	want := s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
+	if apiErr.Code != want.Code {
+		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
+	}
+}
+
+func TestCreateBucketRejectsUnknownOwnerFromStaleAuth(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	acl, err := json.Marshal(auth.ACL{Owner: "missing-owner"})
+	if err != nil {
+		t.Fatalf("Marshal ACL: %v", err)
+	}
+
+	err = tb.backend.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String("stale-auth-bucket"),
+	}, acl)
+	if err == nil {
+		t.Fatal("expected error for deleted owner")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	want := s3err.GetAPIError(s3err.ErrAccessDenied)
+	if apiErr.Code != want.Code {
+		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
+	}
+	bucket, err := tb.repos.Buckets.GetByName(ctx, "stale-auth-bucket")
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	if bucket != nil {
+		t.Fatalf("bucket was created for deleted owner: %#v", bucket)
+	}
+}
+
 func TestHeadBucket_Exists(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
@@ -185,9 +252,11 @@ func TestListBuckets_OnlyActive(t *testing.T) {
 	}
 }
 
-func TestListBucketsFiltersNonAdminByACLOwner(t *testing.T) {
+func TestListBucketsFiltersNonAdminByOwnerAccessKey(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
+	seedS3Account(t, tb, "owner-a")
+	seedS3Account(t, tb, "owner-b")
 
 	for _, seed := range []struct {
 		name  string
@@ -209,6 +278,7 @@ func TestListBucketsFiltersNonAdminByACLOwner(t *testing.T) {
 				t.Fatalf("Marshal ACL: %v", err)
 			}
 			b.ACL = data
+			b.OwnerAccessKey = &seed.owner
 		}
 		if err := tb.repos.Buckets.Create(ctx, b); err != nil {
 			t.Fatalf("seeding bucket %q: %v", seed.name, err)

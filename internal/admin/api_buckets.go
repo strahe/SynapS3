@@ -3,18 +3,25 @@ package admin
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
+	"github.com/versity/versitygw/auth"
 )
+
+const internalRootOwnerAccessKey = "__internal_root__"
 
 type bucketListItem struct {
 	ID             int64   `json:"id"`
 	Name           string  `json:"name"`
+	OwnerAccessKey *string `json:"owner_access_key"`
 	Status         string  `json:"status"`
 	ProofSetID     *string `json:"proof_set_id"`
 	ObjectCount    int64   `json:"object_count"`
@@ -23,24 +30,31 @@ type bucketListItem struct {
 }
 
 type bucketCreateRequest struct {
-	Name string `json:"name"`
+	Name           string `json:"name"`
+	OwnerAccessKey string `json:"owner_access_key"`
 }
 
 type bucketMutationResponse struct {
-	ID     int64  `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	ID             int64   `json:"id"`
+	Name           string  `json:"name"`
+	OwnerAccessKey *string `json:"owner_access_key"`
+	Status         string  `json:"status"`
 }
 
 type bucketDetailResponse struct {
 	ID             int64   `json:"id"`
 	Name           string  `json:"name"`
+	OwnerAccessKey *string `json:"owner_access_key"`
 	Status         string  `json:"status"`
 	ProofSetID     *string `json:"proof_set_id"`
 	ObjectCount    int64   `json:"object_count"`
 	TotalSizeBytes int64   `json:"total_size_bytes"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
+}
+
+type bucketOwnerUpdateRequest struct {
+	OwnerAccessKey string `json:"owner_access_key"`
 }
 
 func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +83,7 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 		items = append(items, bucketListItem{
 			ID:             b.ID,
 			Name:           b.Name,
+			OwnerAccessKey: s.adminOwnerAccessKey(b.OwnerAccessKey),
 			Status:         string(b.Status),
 			ProofSetID:     b.ProofSetID,
 			ObjectCount:    stats.Count,
@@ -85,11 +100,11 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
 
 func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if !s.requireBucketWrite(w, r) {
+		return
+	}
 	var req bucketCreateRequest
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeBucketStrictJSON(w, r, &req) {
 		return
 	}
 
@@ -102,22 +117,55 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name: must be 3-63 lowercase alphanumeric characters or hyphens, cannot start or end with a hyphen"})
 		return
 	}
+	ownerAccessKey := strings.TrimSpace(req.OwnerAccessKey)
+	actualOwnerAccessKey, ok := s.resolveS3BucketOwner(w, ownerAccessKey, http.StatusBadRequest)
+	if !ok {
+		return
+	}
+	acl, err := bucketOwnerACL(actualOwnerAccessKey)
+	if err != nil {
+		s.logger.Error("api: failed to build bucket ACL", "error", err, "owner", actualOwnerAccessKey)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 
-	bucket, err := s.bucketLifecycle.Create(r.Context(), name)
+	var bucket *model.Bucket
+	err = s.repos.WithTx(r.Context(), func(txRepos *repository.Repositories) error {
+		owner, err := txRepos.S3Accounts.LockByAccessKey(r.Context(), actualOwnerAccessKey)
+		if err != nil {
+			return err
+		}
+		if owner == nil {
+			return auth.ErrNoSuchUser
+		}
+		bucket = &model.Bucket{
+			Name:           name,
+			ACL:            acl,
+			OwnerAccessKey: &actualOwnerAccessKey,
+			Status:         model.BucketStatusActive,
+		}
+		return txRepos.Buckets.Create(r.Context(), bucket)
+	})
 	if err != nil {
 		if errors.Is(err, repository.ErrAlreadyExists) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket already exists"})
+			return
+		}
+		if errors.Is(err, auth.ErrNoSuchUser) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "S3 owner not found"})
 			return
 		}
 		s.logger.Error("api: failed to create bucket", "error", err, "name", name)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	s.bucketLifecycle.EnsureCacheBucketDir(r.Context(), name)
 
 	writeJSON(w, http.StatusCreated, bucketMutationResponse{
-		ID:     bucket.ID,
-		Name:   bucket.Name,
-		Status: string(bucket.Status),
+		ID:             bucket.ID,
+		Name:           bucket.Name,
+		OwnerAccessKey: s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		Status:         string(bucket.Status),
 	})
 }
 
@@ -156,6 +204,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
 		ID:             bucket.ID,
 		Name:           bucket.Name,
+		OwnerAccessKey: s.adminOwnerAccessKey(bucket.OwnerAccessKey),
 		Status:         string(bucket.Status),
 		ProofSetID:     bucket.ProofSetID,
 		ObjectCount:    objectCount,
@@ -165,9 +214,152 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleAPIUpdateBucketOwner(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	if !s.requireBucketWrite(w, r) {
+		return
+	}
+
+	var req bucketOwnerUpdateRequest
+	if !decodeBucketStrictJSON(w, r, &req) {
+		return
+	}
+	ownerAccessKey := strings.TrimSpace(req.OwnerAccessKey)
+
+	actualOwnerAccessKey, ok := s.resolveS3BucketOwner(w, ownerAccessKey, http.StatusNotFound)
+	if !ok {
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for owner update", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	acl, err := bucketOwnerACL(actualOwnerAccessKey)
+	if err != nil {
+		s.logger.Error("api: failed to build bucket ACL", "error", err, "owner", actualOwnerAccessKey)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if err := s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		owner, err := txRepos.S3Accounts.LockByAccessKey(ctx, actualOwnerAccessKey)
+		if err != nil {
+			return err
+		}
+		if owner == nil {
+			return auth.ErrNoSuchUser
+		}
+		return txRepos.Buckets.SetOwnerAndACL(ctx, bucketName, &actualOwnerAccessKey, acl)
+	}); err != nil {
+		if errors.Is(err, auth.ErrNoSuchUser) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "S3 owner not found"})
+			return
+		}
+		s.logger.Error("api: failed to update bucket owner", "error", err, "name", bucketName, "owner", actualOwnerAccessKey)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, bucketMutationResponse{
+		ID:             bucket.ID,
+		Name:           bucket.Name,
+		OwnerAccessKey: s.adminOwnerAccessKey(&actualOwnerAccessKey),
+		Status:         string(bucket.Status),
+	})
+}
+
 func (s *Server) handleAPIDeleteBucket(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotImplemented, map[string]string{
 		"error": "bucket deletion is not currently supported",
+	})
+}
+
+func decodeBucketStrictJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return false
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return false
+	}
+	return true
+}
+
+func (s *Server) requireBucketWrite(w http.ResponseWriter, r *http.Request) bool {
+	if !s.settingsWritable() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "bucket writes require loopback admin binding"})
+		return false
+	}
+	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing settings write header"})
+		return false
+	}
+	return true
+}
+
+func (s *Server) resolveS3BucketOwner(w http.ResponseWriter, accessKey string, missingStatus int) (string, bool) {
+	if strings.TrimSpace(accessKey) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner_access_key is required"})
+		return "", false
+	}
+	if s.s3IAM == nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "S3 user management is unavailable"})
+		return "", false
+	}
+	if accessKey == internalRootOwnerAccessKey {
+		if strings.TrimSpace(s.s3RootAccess) == "" {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "internal root owner is unavailable"})
+			return "", false
+		}
+		return s.s3RootAccess, true
+	}
+	if _, err := s.s3IAM.GetUserAccount(accessKey); err != nil {
+		if errors.Is(err, auth.ErrNoSuchUser) {
+			writeJSON(w, missingStatus, map[string]string{"error": "S3 owner not found"})
+			return "", false
+		}
+		s.logger.Error("api: failed to load S3 owner", "error", err, "owner", accessKey)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return "", false
+	}
+	return accessKey, true
+}
+
+func (s *Server) adminOwnerAccessKey(owner *string) *string {
+	if owner == nil {
+		return nil
+	}
+	if s.isS3RootAccess(*owner) {
+		root := internalRootOwnerAccessKey
+		return &root
+	}
+	return owner
+}
+
+func bucketOwnerACL(owner string) ([]byte, error) {
+	return json.Marshal(auth.ACL{
+		Owner: owner,
+		Grantees: []auth.Grantee{{
+			Permission: auth.PermissionFullControl,
+			Access:     owner,
+			Type:       types.TypeCanonicalUser,
+		}},
 	})
 }
 

@@ -12,7 +12,7 @@ func TestShouldStartSetupModeAllowsMissingManualCredentials(t *testing.T) {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
 
-	for _, want := range []string{"s3.access_key", "s3.secret_key", "filecoin.private_key"} {
+	for _, want := range []string{"filecoin.private_key"} {
 		if !hasServeConfigFieldError(cfg.FieldValidationErrors(), want) {
 			t.Fatalf("FieldValidationErrors() missing %q: %#v", want, cfg.FieldValidationErrors())
 		}
@@ -77,8 +77,6 @@ func validServeConfig(t *testing.T) *config.Config {
 	if err != nil {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
-	cfg.S3.AccessKey = "admin"
-	cfg.S3.SecretKey = "password"
 	cfg.Filecoin.PrivateKey = "filecoin-private-key"
 	return cfg
 }

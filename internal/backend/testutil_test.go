@@ -7,10 +7,12 @@ import (
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
+	"github.com/versity/versitygw/auth"
 )
 
 // testBackend holds all components needed to test the SynapseBackend.
@@ -94,4 +96,15 @@ func newTestCache(t *testing.T, maxBytes int64) cache.Cache {
 		t.Fatalf("creating test cache: %v", err)
 	}
 	return c
+}
+
+func seedS3Account(t *testing.T, tb *testBackend, accessKey string) {
+	t.Helper()
+	if err := tb.repos.S3Accounts.Create(t.Context(), &model.S3Account{
+		AccessKey: accessKey,
+		SecretKey: "secret-" + accessKey,
+		Role:      auth.RoleUserPlus,
+	}); err != nil {
+		t.Fatalf("S3Accounts.Create(%s): %v", accessKey, err)
+	}
 }

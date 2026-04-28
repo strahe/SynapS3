@@ -52,28 +52,10 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Editable:    true,
 		Secret:      true,
 	},
-	"s3.access_key": {
-		Label:       "S3 Access Key",
-		Description: "Root S3 access key clients use when authenticating to SynapS3.",
-		Env:         "SYNAPS3_S3_ACCESS_KEY",
-		Secret:      true,
-	},
-	"s3.secret_key": {
-		Label:       "S3 Secret Key",
-		Description: "Root S3 secret key clients use when authenticating to SynapS3.",
-		Env:         "SYNAPS3_S3_SECRET_KEY",
-		Secret:      true,
-	},
 	"s3.region": {
 		Label:       "Region",
 		Description: "S3 region reported by the gateway.",
 		Env:         "SYNAPS3_S3_REGION",
-		Editable:    true,
-	},
-	"s3.iam_dir": {
-		Label:       "IAM Directory",
-		Description: "Directory where SynapS3 stores VersityGW S3 user records.",
-		Env:         "SYNAPS3_S3_IAM_DIR",
 		Editable:    true,
 	},
 	"filecoin.network": {

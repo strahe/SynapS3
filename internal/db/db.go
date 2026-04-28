@@ -42,7 +42,7 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 		if err := ensureSQLiteDir(cfg.DSN); err != nil {
 			return nil, err
 		}
-		sqldb, err = sql.Open("sqlite", ensureSQLiteBusyTimeout(cfg.DSN))
+		sqldb, err = sql.Open("sqlite", ensureSQLitePragmas(cfg.DSN))
 		if err != nil {
 			return nil, fmt.Errorf("opening sqlite connection: %w", err)
 		}
@@ -155,13 +155,19 @@ func normalizeFileURLPath(path string) string {
 	return path
 }
 
-func ensureSQLiteBusyTimeout(dsn string) string {
+func ensureSQLitePragmas(dsn string) string {
+	dsn = ensureSQLitePragma(dsn, "foreign_keys(1)", "foreign_keys=")
+	return ensureSQLitePragma(dsn, "busy_timeout(5000)", "busy_timeout=")
+}
+
+func ensureSQLitePragma(dsn, pragma, assignment string) string {
 	lower := strings.ToLower(dsn)
-	if strings.Contains(lower, "busy_timeout(") || strings.Contains(lower, "busy_timeout=") {
+	name := strings.TrimSuffix(strings.SplitN(pragma, "(", 2)[0], "(")
+	if strings.Contains(lower, name+"(") || strings.Contains(lower, assignment) {
 		return dsn
 	}
 	if strings.Contains(dsn, "?") {
-		return dsn + "&_pragma=busy_timeout(5000)"
+		return dsn + "&_pragma=" + pragma
 	}
-	return dsn + "?_pragma=busy_timeout(5000)"
+	return dsn + "?_pragma=" + pragma
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -18,14 +19,67 @@ func (b *SynapseBackend) CreateBucket(ctx context.Context, input *s3.CreateBucke
 	}
 	name := *input.Bucket
 
-	_, err := b.bucketLifecycle.CreateWithACL(ctx, name, defaultACL)
+	owner, err := ownerFromACL(defaultACL)
+	if err != nil {
+		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+	if owner != "" {
+		err = b.createBucketWithOwner(ctx, name, owner, defaultACL)
+	} else {
+		err = b.createBucketWithOwner(ctx, name, "", defaultACL)
+	}
 	if err != nil {
 		if errors.Is(err, repository.ErrAlreadyExists) {
 			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
 		}
+		if errors.Is(err, auth.ErrNoSuchUser) {
+			return s3err.GetAPIError(s3err.ErrAccessDenied)
+		}
 		return err
 	}
 	return nil
+}
+
+func (b *SynapseBackend) createBucketWithOwner(ctx context.Context, name, owner string, acl []byte) error {
+	var ownerPtr *string
+	if owner != "" {
+		ownerPtr = &owner
+	}
+	var bucket *model.Bucket
+	err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		if owner != "" {
+			account, err := txRepos.S3Accounts.LockByAccessKey(ctx, owner)
+			if err != nil {
+				return err
+			}
+			if account == nil {
+				return auth.ErrNoSuchUser
+			}
+		}
+		bucket = &model.Bucket{
+			Name:           name,
+			ACL:            acl,
+			OwnerAccessKey: ownerPtr,
+			Status:         model.BucketStatusActive,
+		}
+		return txRepos.Buckets.Create(ctx, bucket)
+	})
+	if err != nil {
+		return err
+	}
+	b.bucketLifecycle.EnsureCacheBucketDir(ctx, bucket.Name)
+	return nil
+}
+
+func ownerFromACL(data []byte) (string, error) {
+	if len(data) == 0 {
+		return "", nil
+	}
+	acl, err := auth.ParseACL(data)
+	if err != nil {
+		return "", err
+	}
+	return acl.Owner, nil
 }
 
 func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
@@ -58,23 +112,37 @@ func (b *SynapseBackend) ListBuckets(ctx context.Context, input s3response.ListB
 	}
 	for _, bkt := range buckets {
 		if !input.IsAdmin {
-			if input.Owner == "" || len(bkt.ACL) == 0 {
+			if input.Owner == "" || bkt.OwnerAccessKey == nil {
 				continue
 			}
-			acl, err := auth.ParseACL(bkt.ACL)
-			if err != nil {
-				if b.logger != nil {
-					b.logger.Warn("skipping bucket with malformed ACL", "bucket", bkt.Name, "error", err)
-				}
-				continue
-			}
-			if acl.Owner == "" || acl.Owner != input.Owner {
+			if *bkt.OwnerAccessKey != input.Owner {
 				continue
 			}
 		}
 		result.Buckets.Bucket = append(result.Buckets.Bucket, s3response.ListAllMyBucketsEntry{
 			Name:         bkt.Name,
 			CreationDate: bkt.CreatedAt,
+		})
+	}
+
+	return result, nil
+}
+
+func (b *SynapseBackend) ListBucketsAndOwners(ctx context.Context) ([]s3response.Bucket, error) {
+	buckets, err := b.repos.Buckets.ListActive(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing buckets: %w", err)
+	}
+
+	result := make([]s3response.Bucket, 0, len(buckets))
+	for _, bkt := range buckets {
+		owner := ""
+		if bkt.OwnerAccessKey != nil {
+			owner = *bkt.OwnerAccessKey
+		}
+		result = append(result, s3response.Bucket{
+			Name:  bkt.Name,
+			Owner: owner,
 		})
 	}
 
