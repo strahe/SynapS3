@@ -27,3 +27,10 @@ test('bucket write mutations send settings write header', async () => {
   assert.equal(calls[1]?.method, 'PUT')
   assert.equal(calls[1]?.headers.get('X-SynapS3-Settings-Write'), '1')
 })
+
+test('object download URL encodes bucket name and object key', () => {
+  assert.equal(
+    api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),
+    '/api/v1/buckets/bucket-a/objects/download?key=reports%2FApril%20summary.txt'
+  )
+})

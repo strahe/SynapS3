@@ -322,6 +322,8 @@ export const api = {
     const qs = sp.toString()
     return fetchJSON<ObjectListResponse>(`/buckets/${encodeURIComponent(name)}/objects${qs ? `?${qs}` : ''}`)
   },
+  getObjectDownloadUrl: (name: string, key: string) =>
+    `${BASE}/buckets/${encodeURIComponent(name)}/objects/download?key=${encodeURIComponent(key)}`,
   getTasks: (params: { type?: string; status?: string; limit?: number; offset?: number }) => {
     const sp = new URLSearchParams()
     if (params.type) sp.set('type', params.type)

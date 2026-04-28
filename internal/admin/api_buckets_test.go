@@ -3,14 +3,18 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/versity/versitygw/auth"
@@ -57,11 +61,49 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", srv.handleAPIUpdateBucketOwner)
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}", srv.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", srv.handleAPIBucketObjects)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
 	return mux
 }
 
 func setBucketWriteHeaders(req *http.Request) {
 	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+}
+
+type writeDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (r *writeDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return nil
+}
+
+func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repositories, bucketName, key, body string) *cache.ObjectInfo {
+	t.Helper()
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: bucketName, Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	info, err := srv.cache.Put(ctx, bucket.Name, key, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("cache.Put: %v", err)
+	}
+	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
+		BucketID:    bucket.ID,
+		Key:         key,
+		Size:        info.Size,
+		ETag:        info.ETag,
+		Checksum:    info.Checksum,
+		ContentType: "text/plain",
+		CachePath:   info.Path,
+		State:       model.ObjectStateCached,
+		MaxRetries:  5,
+	}); err != nil {
+		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
+	}
+	return info
 }
 
 func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
@@ -665,6 +707,160 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	if body.Objects[0].Key != "kept.txt" {
 		t.Fatalf("key = %q, want %q", body.Objects[0].Key, "kept.txt")
 	}
+}
+
+func TestAPIBucketObjectDownload_FromCache(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	info := seedCachedDownloadObject(t, srv, repos, "download-bucket", "folder/report.txt", "hello admin")
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/download-bucket/objects/download?key=" + url.QueryEscape("folder/report.txt"))
+	if err != nil {
+		t.Fatalf("GET object download: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	body := readBody(t, resp.Body)
+	if body != "hello admin" {
+		t.Fatalf("body = %q, want %q", body, "hello admin")
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/plain" {
+		t.Fatalf("Content-Type = %q, want text/plain", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "11" {
+		t.Fatalf("Content-Length = %q, want 11", got)
+	}
+	if got := resp.Header.Get("ETag"); got != `"`+info.ETag+`"` {
+		t.Fatalf("ETag = %q, want quoted object etag", got)
+	}
+	if got := resp.Header.Get("Content-Disposition"); !strings.Contains(got, "attachment") || !strings.Contains(got, "report.txt") {
+		t.Fatalf("Content-Disposition = %q, want attachment filename", got)
+	}
+}
+
+func TestAPIBucketObjectDownload_RequiresLoopbackBinding(t *testing.T) {
+	srv, _ := newBucketAPITestServer(t)
+	srv.addr = "0.0.0.0:9090"
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/download-bucket/objects/download?key=file.txt", nil)
+	req.SetPathValue("name", "download-bucket")
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIDownloadObject(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
+	}
+}
+
+func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "deadline-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
+		BucketID:    bucket.ID,
+		Key:         "folder/report.txt",
+		Size:        11,
+		ETag:        "etag",
+		Checksum:    "checksum",
+		ContentType: "text/plain",
+		CachePath:   "/cache/report.txt",
+		State:       model.ObjectStateCached,
+		MaxRetries:  5,
+	}); err != nil {
+		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
+	}
+	var rr *writeDeadlineRecorder
+	mockCache := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			if rr == nil || len(rr.deadlines) != 1 || !rr.deadlines[0].IsZero() {
+				t.Fatalf("write deadline was not cleared before object read: %#v", rr)
+			}
+			return io.NopCloser(strings.NewReader("hello admin")), &cache.ObjectInfo{
+				Path: "/cache/report.txt", Size: 11, ETag: "etag", Checksum: "checksum",
+			}, nil
+		},
+	}
+	srv.cache = mockCache
+	srv.objectReader = objectreader.New(repos, mockCache, nil, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/deadline-bucket/objects/download?key="+url.QueryEscape("folder/report.txt"), nil)
+	req.SetPathValue("name", "deadline-bucket")
+	rr = &writeDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	srv.handleAPIDownloadObject(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if len(rr.deadlines) != 1 {
+		t.Fatalf("write deadline calls = %d, want 1", len(rr.deadlines))
+	}
+	if !rr.deadlines[0].IsZero() {
+		t.Fatalf("write deadline = %v, want zero deadline", rr.deadlines[0])
+	}
+}
+
+func TestAPIBucketObjectDownload_NotFound(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "download-missing-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/download-missing-bucket/objects/download?key=missing.txt", nil)
+	req.SetPathValue("name", bucket.Name)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIDownloadObject(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+}
+
+func TestAPIBucketObjectDownload_RejectsInvalidRequest(t *testing.T) {
+	srv, _ := newBucketAPITestServer(t)
+
+	for _, tc := range []struct {
+		name       string
+		bucketName string
+		target     string
+	}{
+		{name: "invalid bucket", bucketName: "BadBucket", target: "/api/v1/buckets/BadBucket/objects/download?key=file.txt"},
+		{name: "missing key", bucketName: "valid-bucket", target: "/api/v1/buckets/valid-bucket/objects/download"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			req.SetPathValue("name", tc.bucketName)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIDownloadObject(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+			}
+		})
+	}
+}
+
+func readBody(t *testing.T, r io.Reader) string {
+	t.Helper()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	return string(data)
 }
 
 func TestAPIBucket_DeleteReturnsNotImplemented(t *testing.T) {

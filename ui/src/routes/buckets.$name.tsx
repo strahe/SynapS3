@@ -1,8 +1,8 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Folder, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import { Download, Folder, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
-import { internalRootOwnerAccessKey } from '@/api/client'
+import { api, internalRootOwnerAccessKey } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
@@ -367,6 +367,7 @@ function ObjectBrowserPage() {
                   <TableHead className="px-4">Piece CID</TableHead>
                   <TableHead className="px-4">Created</TableHead>
                   <TableHead className="px-4">Updated</TableHead>
+                  <TableHead className="px-4 text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -391,6 +392,7 @@ function ObjectBrowserPage() {
                     <TableCell className="px-4">—</TableCell>
                     <TableCell className="px-4">—</TableCell>
                     <TableCell className="px-4">—</TableCell>
+                    <TableCell className="px-4 text-right">—</TableCell>
                   </TableRow>
                 ))}
                 {files.map((object) => (
@@ -419,11 +421,22 @@ function ObjectBrowserPage() {
                     <TableCell className="px-4 text-muted-foreground" title={object.updated_at}>
                       {timeAgo(object.updated_at)}
                     </TableCell>
+                    <TableCell className="px-4 text-right">
+                      <Button variant="ghost" size="icon-sm" asChild>
+                        <a
+                          href={api.getObjectDownloadUrl(name, object.key)}
+                          aria-label={`Download ${object.key}`}
+                          title="Download"
+                        >
+                          <Download />
+                        </a>
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))}
                 {folders.size === 0 && files.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
+                    <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
                       No objects found
                     </TableCell>
                   </TableRow>

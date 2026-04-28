@@ -301,6 +301,7 @@ func runServe(ctx context.Context, src config.Source) error {
 
 	// Start admin server (healthz + metrics).
 	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, logger).
+		WithObjectStorage(storageClient).
 		WithSettings(settingsSvc).
 		WithS3IAM(iamSvc, rootAccount.Access)
 	errCh := make(chan error, 2)

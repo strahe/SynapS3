@@ -16,10 +16,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"github.com/prometheus/client_golang/prometheus"
 	synaps3backend "github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/testutil"
+	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/storage"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -53,6 +54,26 @@ func putTestObject(t *testing.T, tb *testBackend, bucket, key, body string) stri
 		t.Fatalf("PutObject(%s/%s): %v", bucket, key, err)
 	}
 	return out.ETag
+}
+
+func counterValue(t *testing.T, name string) float64 {
+	t.Helper()
+	metricFamilies, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range metricFamilies {
+		if family.GetName() != name {
+			continue
+		}
+		var total float64
+		for _, metric := range family.GetMetric() {
+			total += metric.GetCounter().GetValue()
+		}
+		return total
+	}
+	t.Fatalf("metric %q not found", name)
+	return 0
 }
 
 // ---------- PutObject ----------
@@ -126,7 +147,7 @@ func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 }
 
 func TestPutObject_CacheFull(t *testing.T) {
-	mc := &testutil.MockCache{
+	mc := &synaps3testutil.MockCache{
 		PutStagedFunc: func(_ context.Context, _, _ string, _ io.Reader) (*cache.StagedObject, error) {
 			return nil, cache.ErrCacheFull
 		},
@@ -219,7 +240,7 @@ func TestGetObject_SPFallback(t *testing.T) {
 	// Use mock cache: first Get returns os.ErrNotExist (cache miss), Put succeeds
 	// and stashes the data, second Get returns the rehydrated data.
 	var rehydrated []byte
-	mc := &testutil.MockCache{
+	mc := &synaps3testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			if rehydrated == nil {
 				return nil, nil, os.ErrNotExist
@@ -295,7 +316,7 @@ func TestGetObject_SPFallback(t *testing.T) {
 
 func TestGetObject_SPFallback_GenerationMismatchDoesNotServeStaleData(t *testing.T) {
 	var latestReady bool
-	mc := &testutil.MockCache{
+	mc := &synaps3testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			if !latestReady {
 				return nil, nil, os.ErrNotExist
@@ -376,7 +397,7 @@ func TestGetObject_SPFallback_GenerationMismatchDoesNotServeStaleData(t *testing
 }
 
 func TestGetObject_SPFallback_DownloadFailure(t *testing.T) {
-	mc := &testutil.MockCache{
+	mc := &synaps3testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},
@@ -407,6 +428,7 @@ func TestGetObject_SPFallback_DownloadFailure(t *testing.T) {
 		return nil, errors.New("provider unreachable")
 	}
 
+	missesBefore := counterValue(t, "synaps3_cache_misses_total")
 	_, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("sp-fail-bucket"),
 		Key:    aws.String("fail-dl.txt"),
@@ -422,10 +444,14 @@ func TestGetObject_SPFallback_DownloadFailure(t *testing.T) {
 	if apiErr.Code != want.Code {
 		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
 	}
+	missesAfter := counterValue(t, "synaps3_cache_misses_total")
+	if missesAfter != missesBefore+1 {
+		t.Fatalf("cache misses = %v, want %v", missesAfter, missesBefore+1)
+	}
 }
 
 func TestGetObject_NilStorage(t *testing.T) {
-	mc := &testutil.MockCache{
+	mc := &synaps3testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
 		},

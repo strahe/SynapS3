@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
@@ -32,6 +33,7 @@ type Server struct {
 	addr            string
 	db              *bun.DB
 	cache           cache.Cache
+	objectReader    *objectreader.Reader
 	cacheMaxBytes   int64
 	repos           *repository.Repositories
 	bucketLifecycle *bucketlifecycle.Service
@@ -55,6 +57,7 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		addr:            addr,
 		db:              db,
 		cache:           c,
+		objectReader:    objectreader.New(repos, c, nil, logger),
 		cacheMaxBytes:   cacheMaxBytes,
 		repos:           repos,
 		bucketLifecycle: bucketlifecycle.New(repos, c, logger),
@@ -63,6 +66,12 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		logger:          logger,
 		startedAt:       time.Now(),
 	}
+}
+
+// WithObjectStorage enables provider-backed object reads for admin downloads.
+func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
+	s.objectReader = objectreader.New(s.repos, s.cache, storage, s.logger)
+	return s
 }
 
 // NewSetup creates an admin HTTP server for first-run/setup mode.
@@ -112,6 +121,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", s.handleAPIUpdateBucketOwner)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
+		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", s.handleAPIDownloadObject)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryDeadLetter) // only retries dead_letter tasks

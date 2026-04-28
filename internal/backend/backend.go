@@ -6,6 +6,7 @@ import (
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/versity/versitygw/backend"
@@ -18,6 +19,7 @@ type SynapseBackend struct {
 
 	repos            *repository.Repositories
 	cache            cache.Cache
+	objectReader     *objectreader.Reader
 	bucketLifecycle  *bucketlifecycle.Service
 	stateMachine     *state.Machine
 	storage          synapse.StorageClient
@@ -42,6 +44,7 @@ func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc sy
 	b := &SynapseBackend{
 		repos:            repos,
 		cache:            c,
+		objectReader:     objectreader.New(repos, c, sc, logger),
 		bucketLifecycle:  bucketlifecycle.New(repos, c, logger),
 		stateMachine:     sm,
 		storage:          sc,

@@ -30,12 +30,12 @@ var (
 		Help:      "Total cache hits (object found locally)",
 	})
 
-	// CacheMissesTotal counts cache misses (SP fallback required).
+	// CacheMissesTotal counts cache misses (object not found locally).
 	CacheMissesTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "synaps3",
 		Subsystem: "cache",
 		Name:      "misses_total",
-		Help:      "Total cache misses (SP fallback required)",
+		Help:      "Total cache misses (object not found locally)",
 	})
 
 	// WorkerTasksProcessed counts tasks processed by worker type and result.

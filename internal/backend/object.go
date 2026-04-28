@@ -8,16 +8,14 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	cid "github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synapse-go/storage"
+	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -112,96 +110,47 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 }
 
 func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
-	return b.getObject(ctx, input, true)
-}
-
-func (b *SynapseBackend) getObject(ctx context.Context, input *s3.GetObjectInput, allowRestart bool) (*s3.GetObjectOutput, error) {
 	if input.Bucket == nil || input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
 	}
 
-	bucket, err := b.getBucket(ctx, *input.Bucket)
+	out, err := b.objectReader.Open(ctx, *input.Bucket, *input.Key, objectreader.S3Visibility)
 	if err != nil {
-		return nil, err
-	}
-
-	obj, err := b.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, *input.Key)
-	if err != nil {
-		return nil, fmt.Errorf("querying object: %w", err)
-	}
-	if obj == nil {
-		admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
-		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
-	}
-
-	// Try local cache first (no TOCTOU — call Get directly, handle ErrNotExist).
-	rc, _, cacheErr := b.cache.Get(ctx, *input.Bucket, *input.Key)
-	if cacheErr == nil {
-		admin.CacheHitsTotal.Inc()
-		admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
-		etag := fmt.Sprintf(`"%s"`, obj.ETag)
-		contentType := obj.ContentType
-
-		return &s3.GetObjectOutput{
-			Body:          rc,
-			ContentLength: &obj.Size,
-			ETag:          &etag,
-			ContentType:   &contentType,
-		}, nil
-	}
-
-	if !os.IsNotExist(cacheErr) {
-		admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
-		return nil, fmt.Errorf("reading from cache: %w", cacheErr)
-	}
-
-	// Cache miss — object has been evicted, try SP download if PieceCID is available.
-	admin.CacheMissesTotal.Inc()
-	if obj.PieceCID != nil && *obj.PieceCID != "" && obj.RetrievalURL != nil && *obj.RetrievalURL != "" && b.storage != nil {
-		pieceCID, parseErr := cid.Decode(*obj.PieceCID)
-		if parseErr != nil {
-			b.logger.Warn("invalid PieceCID, cannot download from SP", "key", *input.Key, "pieceCID", *obj.PieceCID)
-			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		if errors.Is(err, objectreader.ErrCacheMiss) {
+			admin.CacheMissesTotal.Inc()
 		}
-
-		rc, dlErr := b.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: *obj.RetrievalURL})
-		if dlErr != nil {
-			b.logger.Warn("SP download failed", "key", *input.Key, "err", dlErr)
-			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
+		admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
+		switch {
+		case errors.Is(err, objectreader.ErrInvalidArgument):
+			return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		case errors.Is(err, objectreader.ErrNoSuchBucket):
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		case errors.Is(err, objectreader.ErrNoSuchKey):
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		case errors.Is(err, objectreader.ErrProviderDownload):
 			return nil, s3err.GetAPIError(s3err.ErrInternalError)
+		default:
+			return nil, err
 		}
-
-		cur, dbErr := b.repos.Objects.GetByID(ctx, obj.ID)
-		if dbErr != nil {
-			b.logger.Warn("generation check failed, skipping cache rehydration", "key", *input.Key, "error", dbErr)
-		}
-		if cur != nil && cur.Generation != obj.Generation {
-			_ = rc.Close()
-			if allowRestart {
-				return b.getObject(ctx, input, false)
-			}
-			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
-		}
-
-		etag := fmt.Sprintf(`"%s"`, obj.ETag)
-		contentType := obj.ContentType
-		body := rc
-		if dbErr == nil && cur != nil && cur.Generation == obj.Generation {
-			body = b.streamAndRehydrate(ctx, *input.Bucket, *input.Key, rc)
-		}
-		admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
-		return &s3.GetObjectOutput{
-			Body:          body,
-			ContentLength: &obj.Size,
-			ETag:          &etag,
-			ContentType:   &contentType,
-		}, nil
 	}
 
-	admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
-	return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	if out.CacheMiss {
+		admin.CacheMissesTotal.Inc()
+	}
+	switch out.Source {
+	case objectreader.SourceCache:
+		admin.CacheHitsTotal.Inc()
+	}
+
+	admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
+	etag := fmt.Sprintf(`"%s"`, out.ETag)
+	contentType := out.ContentType
+	return &s3.GetObjectOutput{
+		Body:          out.Body,
+		ContentLength: &out.Size,
+		ETag:          &etag,
+		ContentType:   &contentType,
+	}, nil
 }
 
 func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
@@ -560,53 +509,3 @@ func derefStr(s *string) string {
 // Ensure Body is consumed for PutObject, as it might come from
 // a streaming source. This is a no-op helper.
 var _ io.Reader = (*io.LimitedReader)(nil)
-
-func (b *SynapseBackend) streamAndRehydrate(ctx context.Context, bucket, key string, rc io.ReadCloser) io.ReadCloser {
-	pr, pw := io.Pipe()
-	body := &teeReadCloser{
-		reader:     io.TeeReader(rc, pw),
-		source:     rc,
-		pipeWriter: pw,
-	}
-
-	go func() {
-		if _, err := b.cache.Put(ctx, bucket, key, pr); err != nil {
-			b.logger.Warn("cache rehydration failed (best-effort)", "key", key, "error", err)
-			_, _ = io.Copy(io.Discard, pr)
-		}
-		_ = pr.Close()
-	}()
-
-	return body
-}
-
-type teeReadCloser struct {
-	reader     io.Reader
-	source     io.ReadCloser
-	pipeWriter *io.PipeWriter
-	closeOnce  sync.Once
-}
-
-func (t *teeReadCloser) Read(p []byte) (int, error) {
-	n, err := t.reader.Read(p)
-	if err != nil {
-		t.closePipe(err)
-	}
-	return n, err
-}
-
-func (t *teeReadCloser) Close() error {
-	t.closePipe(io.ErrClosedPipe)
-	return t.source.Close()
-}
-
-func (t *teeReadCloser) closePipe(err error) {
-	t.closeOnce.Do(func() {
-		switch {
-		case err == nil || errors.Is(err, io.EOF):
-			_ = t.pipeWriter.Close()
-		default:
-			_ = t.pipeWriter.CloseWithError(err)
-		}
-	})
-}

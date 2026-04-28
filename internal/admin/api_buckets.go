@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/versity/versitygw/auth"
 )
 
@@ -449,4 +452,59 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if !s.settingsWritable() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "object downloads require loopback admin binding"})
+		return
+	}
+
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "object key is required"})
+		return
+	}
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		s.logger.Warn("api: failed to clear object download write deadline", "error", err, "bucket", bucketName, "key", key)
+	}
+
+	reader := s.objectReader
+	if reader == nil {
+		reader = objectreader.New(s.repos, s.cache, nil, s.logger)
+	}
+
+	out, err := reader.Open(ctx, bucketName, key, objectreader.AdminVisibility)
+	if err != nil {
+		switch {
+		case errors.Is(err, objectreader.ErrInvalidArgument):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		case errors.Is(err, objectreader.ErrNoSuchBucket), errors.Is(err, objectreader.ErrNoSuchKey):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "object not found"})
+		default:
+			s.logger.Error("api: failed to open object download", "error", err, "bucket", bucketName, "key", key)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		}
+		return
+	}
+	defer func() { _ = out.Body.Close() }()
+
+	filename := path.Base(key)
+	if filename == "." || filename == "/" || filename == "" {
+		filename = "download"
+	}
+	w.Header().Set("Content-Type", out.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(out.Size, 10))
+	w.Header().Set("ETag", `"`+out.ETag+`"`)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, out.Body); err != nil {
+		s.logger.Warn("api: object download stream failed", "error", err, "bucket", bucketName, "key", key)
+	}
 }
