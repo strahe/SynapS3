@@ -96,6 +96,7 @@ export function useWallet() {
   return useQuery({
     queryKey: ['wallet'],
     queryFn: api.getWallet,
+    staleTime: 10_000,
     refetchInterval: 30_000,
   })
 }

@@ -1,6 +1,6 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { createRootRouteWithContext, Link, Outlet, useLocation } from '@tanstack/react-router'
-import { AlertTriangle, Database, HardDrive, LayoutDashboard, ListTodo, Loader2, Settings, Wallet } from 'lucide-react'
+import { AlertTriangle, Database, HardDrive, LayoutDashboard, ListTodo, Settings, Wallet } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -18,6 +18,7 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar'
 import { useSettings } from '@/hooks/queries'
+import { rootContentKind } from './-root-content'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -52,6 +53,7 @@ function RootLayout() {
   const { data: settings, isLoading: settingsLoading } = useSettings()
   const setupMode = settings?.mode === 'setup'
   const activeNavItems = settingsLoading || setupMode ? setupNavItems : navItems
+  const contentKind = rootContentKind(settings, location.pathname)
 
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)')
@@ -87,13 +89,7 @@ function RootLayout() {
           <SidebarTrigger />
           <span className="font-semibold">SynapS3</span>
         </div>
-        {settingsLoading ? (
-          <ShellLoading />
-        ) : setupMode && location.pathname !== '/settings' ? (
-          <SetupRequired configPath={settings.config_path} />
-        ) : (
-          <Outlet />
-        )}
+        {contentKind === 'setup-required' ? <SetupRequired configPath={settings?.config_path ?? ''} /> : <Outlet />}
       </SidebarInset>
     </SidebarProvider>
   )
@@ -144,14 +140,6 @@ function AppSidebar({ activeNavItems, pathname }: { activeNavItems: NavItem[]; p
       </SidebarContent>
       <SidebarRail />
     </Sidebar>
-  )
-}
-
-function ShellLoading() {
-  return (
-    <div className="flex h-full items-center justify-center">
-      <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-    </div>
   )
 }
 

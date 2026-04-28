@@ -42,6 +42,7 @@ check:
 	golangci-lint fmt --diff
 	golangci-lint run
 	cd ui && pnpm run check
+	cd ui && pnpm run test
 	$(MAKE) test
 
 clean:

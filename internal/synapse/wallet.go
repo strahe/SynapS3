@@ -3,6 +3,7 @@ package synapse
 import (
 	"context"
 	"errors"
+	"math/big"
 	"sync"
 	"time"
 
@@ -11,8 +12,13 @@ import (
 	"github.com/strahe/synapse-go/payments"
 )
 
+type walletPayments interface {
+	WalletBalance(ctx context.Context, token, account common.Address) (*big.Int, error)
+	AccountInfo(ctx context.Context, token, owner common.Address) (*payments.AccountState, error)
+}
+
 type walletQuerier struct {
-	payments *payments.Service
+	payments walletPayments
 	address  common.Address
 	chain    chain.Chain
 }
@@ -53,19 +59,7 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 		mu.Unlock()
 	}
 
-	wg.Add(4)
-
-	go func() {
-		defer wg.Done()
-		bal, err := w.payments.WalletBalance(ctx, payments.ZeroAddress, w.address)
-		if err != nil {
-			setErr("fil_balance", err)
-			return
-		}
-		mu.Lock()
-		info.FILBalance = bal
-		mu.Unlock()
-	}()
+	wg.Add(3)
 
 	go func() {
 		defer wg.Done()
@@ -84,10 +78,15 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 		acct, err := w.payments.AccountInfo(ctx, payments.ZeroAddress, w.address)
 		if err != nil {
 			setErr("fil_account", err)
+			setErr("fil_balance", err)
 			return
 		}
+		filAccount := convertAccountState(acct)
 		mu.Lock()
-		info.FILAccount = convertAccountState(acct)
+		info.FILAccount = filAccount
+		if filAccount != nil {
+			info.FILBalance = filAccount.Funds
+		}
 		mu.Unlock()
 	}()
 

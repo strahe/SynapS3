@@ -106,9 +106,8 @@ export interface TokenAccountData {
   available_funds: string | null
   lockup_current: string | null
   lockup_rate: string | null
-  lockup_last_settled: string | null
+  lockup_last_settled_at: string | null
   funded_until_epoch: string | null
-  current_lockup_rate: string | null
 }
 
 export interface WalletBusiness {

@@ -1,11 +1,12 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, Loader2, Wallet } from 'lucide-react'
+import { AlertTriangle, Wallet } from 'lucide-react'
 import { CopyButton } from '@/components/app/CopyButton'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useWallet } from '@/hooks/queries'
 import { formatAttoFIL, formatTokenAmount } from '@/lib/utils'
 
@@ -17,11 +18,7 @@ function WalletPage() {
   const { data, isLoading, error } = useWallet()
 
   if (isLoading) {
-    return (
-      <div className="flex h-full items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-      </div>
-    )
+    return <WalletSkeleton />
   }
 
   if (error || !data) {
@@ -148,6 +145,90 @@ function WalletPage() {
 }
 
 // --- Sub-components ---
+
+function WalletSkeleton() {
+  return (
+    <div className="flex flex-col gap-6 p-6">
+      <PageHeader title="Wallet" />
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Identity</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+            <SkeletonField className="sm:col-span-2 lg:col-span-3" />
+            <SkeletonField />
+            <SkeletonField />
+            <SkeletonField />
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <SkeletonBalanceCard />
+        <SkeletonBalanceCard />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <SkeletonAccountCard />
+        <SkeletonAccountCard />
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Business Stats</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Skeleton className="mx-auto h-12 w-24" />
+            <Skeleton className="mx-auto h-12 w-24" />
+            <Skeleton className="mx-auto h-12 w-24" />
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function SkeletonField({ className }: { className?: string }) {
+  return (
+    <div className={className}>
+      <Skeleton className="h-3 w-20" />
+      <Skeleton className="mt-2 h-5 w-full max-w-72" />
+    </div>
+  )
+}
+
+function SkeletonBalanceCard() {
+  return (
+    <Card>
+      <CardContent>
+        <Skeleton className="h-4 w-28" />
+        <Skeleton className="mt-3 h-8 w-40" />
+      </CardContent>
+    </Card>
+  )
+}
+
+function SkeletonAccountCard() {
+  return (
+    <Card>
+      <CardHeader>
+        <Skeleton className="h-5 w-40" />
+      </CardHeader>
+      <CardContent>
+        <div className="flex flex-col gap-3">
+          <Skeleton className="h-5 w-full" />
+          <Skeleton className="h-5 w-full" />
+          <Skeleton className="h-5 w-full" />
+          <Skeleton className="h-5 w-full" />
+          <Skeleton className="h-5 w-full" />
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
 
 function IdentityField({
   label,

@@ -59,7 +59,7 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		repos:           repos,
 		bucketLifecycle: bucketlifecycle.New(repos, c, logger),
 		workerHealth:    wh,
-		wallet:          wallet,
+		wallet:          newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
 		logger:          logger,
 		startedAt:       time.Now(),
 	}
