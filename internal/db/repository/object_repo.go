@@ -143,6 +143,7 @@ func (r *BunObjectRepo) FindReusableStoredVersion(ctx context.Context, bucketID 
 		Model(version).
 		Where("bucket_id = ? AND size = ? AND checksum = ?", bucketID, size, checksum).
 		Where("state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
+		Where("in_filecoin = ?", true).
 		Where("piece_cid IS NOT NULL AND piece_cid <> ''").
 		Where("retrieval_url IS NOT NULL AND retrieval_url <> ''").
 		OrderExpr("created_at DESC").
@@ -167,6 +168,7 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 		Join("JOIN tasks AS task ON task.ref_type = ? AND task.ref_version_id = object_version.version_id", "object").
 		Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
 		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateCached, model.ObjectStateUploading})).
+		Where("object_version.in_cache = ?", true).
 		Where("task.type = ?", model.TaskTypeUpload).
 		Where("task.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
 		OrderExpr("object_version.created_at DESC").
@@ -332,6 +334,12 @@ func (r *BunObjectRepo) UpdateVersionStateToFailed(ctx context.Context, versionI
 	})
 }
 
+func (r *BunObjectRepo) SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error {
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		return setVersionCachePresence(ctx, db, versionID, inCache)
+	})
+}
+
 func (r *BunObjectRepo) SetVersionStorageInfoAndTransition(ctx context.Context, versionID string, pieceCID string, retrievalURL string, from, to model.ObjectState) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		now := time.Now()
@@ -339,6 +347,7 @@ func (r *BunObjectRepo) SetVersionStorageInfoAndTransition(ctx context.Context, 
 			Model((*model.ObjectVersion)(nil)).
 			Set("piece_cid = ?", pieceCID).
 			Set("retrieval_url = ?", retrievalURL).
+			Set("in_filecoin = ?", true).
 			Set("state = ?", to).
 			Set("updated_at = ?", now).
 			Where("version_id = ? AND state = ?", versionID, from).
@@ -355,6 +364,7 @@ func (r *BunObjectRepo) SetVersionStorageInfoAndTransition(ctx context.Context, 
 			Model((*model.Object)(nil)).
 			Set("piece_cid = ?", pieceCID).
 			Set("retrieval_url = ?", retrievalURL).
+			Set("in_filecoin = ?", true).
 			Set("state = ?", to).
 			Set("updated_at = ?", now).
 			Where("current_version_id = ?", versionID).
@@ -388,6 +398,7 @@ func (r *BunObjectRepo) SetStorageInfoForUploadingContent(ctx context.Context, b
 			Model((*model.Object)(nil)).
 			Set("piece_cid = ?", pieceCID).
 			Set("retrieval_url = ?", retrievalURL).
+			Set("in_filecoin = ?", true).
 			Set("state = ?", model.ObjectStateStored).
 			Set("updated_at = ?", now).
 			Where("current_version_id IN (?)", bun.List(versionIDs)).
@@ -490,8 +501,10 @@ func (r *BunObjectRepo) ResetStaleVersionStates(ctx context.Context, fromState, 
 			Set("state = ?", toState).
 			Set("updated_at = ?", now).
 			Where("current_version_id IN (?)", bun.List(versionIDs))
+		mirror = applyCacheLocationForState(mirror, toState)
 		if fromState == model.ObjectStateFailed {
 			mirror = mirror.Set("failed_at_state = NULL")
+			mirror = mirror.Set("last_error = NULL")
 		}
 		if _, err := mirror.Exec(ctx); err != nil {
 			return fmt.Errorf("mirroring stale version reset to current objects: %w", err)
@@ -684,6 +697,8 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 		Set("cache_key = ?", version.CacheKey).
 		Set("piece_cid = ?", version.PieceCID).
 		Set("retrieval_url = ?", version.RetrievalURL).
+		Set("in_cache = ?", version.InCache).
+		Set("in_filecoin = ?", version.InFilecoin).
 		Set("state = ?", version.State).
 		Set("failed_at_state = NULL").
 		Set("last_error = NULL").
@@ -706,6 +721,12 @@ func normalizeObjectVersion(version *model.ObjectVersion) {
 	version.LastError = nil
 	if version.State == "" {
 		version.State = model.ObjectStateCached
+	}
+	if version.State != model.ObjectStateCacheEvicted {
+		version.InCache = true
+	}
+	if version.PieceCID != nil && *version.PieceCID != "" && version.RetrievalURL != nil && *version.RetrievalURL != "" {
+		version.InFilecoin = true
 	}
 	if version.ContentType == "" {
 		version.ContentType = "application/octet-stream"
@@ -753,8 +774,10 @@ func updateVersionState(ctx context.Context, db bun.IDB, versionID string, from,
 		Set("state = ?", to).
 		Set("updated_at = ?", now).
 		Where("version_id = ? AND state = ?", versionID, from)
+	q = applyCacheLocationForState(q, to)
 	if from == model.ObjectStateFailed {
 		q = q.Set("failed_at_state = NULL")
+		q = q.Set("last_error = NULL")
 	}
 	res, err := q.Exec(ctx)
 	if err != nil {
@@ -770,8 +793,10 @@ func updateVersionState(ctx context.Context, db bun.IDB, versionID string, from,
 		Set("state = ?", to).
 		Set("updated_at = ?", now).
 		Where("current_version_id = ?", versionID)
+	mirror = applyCacheLocationForState(mirror, to)
 	if from == model.ObjectStateFailed {
 		mirror = mirror.Set("failed_at_state = NULL")
+		mirror = mirror.Set("last_error = NULL")
 	}
 	if _, err := mirror.Exec(ctx); err != nil {
 		return fmt.Errorf("mirroring version state to current object: %w", err)
@@ -784,10 +809,11 @@ func resetStaleVersions(ctx context.Context, db bun.IDB, fromState, toState mode
 	var rows []struct {
 		VersionID string `bun:"version_id"`
 	}
-	query := `UPDATE object_versions SET state = ?, updated_at = ? WHERE state = ? AND updated_at < ? RETURNING version_id`
+	cacheColumn := cacheLocationSQLForState(toState)
+	query := `UPDATE object_versions SET state = ?, updated_at = ?` + cacheColumn + ` WHERE state = ? AND updated_at < ? RETURNING version_id`
 	args := []interface{}{toState, now, fromState, staleBefore}
 	if fromState == model.ObjectStateFailed {
-		query = `UPDATE object_versions SET state = ?, failed_at_state = NULL, updated_at = ? WHERE state = ? AND updated_at < ? RETURNING version_id`
+		query = `UPDATE object_versions SET state = ?, failed_at_state = NULL, last_error = NULL, updated_at = ?` + cacheColumn + ` WHERE state = ? AND updated_at < ? RETURNING version_id`
 	}
 	if err := db.NewRaw(query, args...).Scan(ctx, &rows); err != nil {
 		if err == sql.ErrNoRows {
@@ -806,11 +832,11 @@ func setStorageInfoForUploadingContent(ctx context.Context, db bun.IDB, bucketID
 	now := time.Now()
 	var refs []ObjectVersionRef
 	query := `UPDATE object_versions
-		SET piece_cid = ?, retrieval_url = ?, state = ?, updated_at = ?
+		SET piece_cid = ?, retrieval_url = ?, in_filecoin = ?, state = ?, updated_at = ?
 		WHERE bucket_id = ? AND size = ? AND checksum = ? AND state = ?
 		RETURNING object_id, version_id`
 	err := db.NewRaw(query,
-		pieceCID, retrievalURL, model.ObjectStateStored, now,
+		pieceCID, retrievalURL, true, model.ObjectStateStored, now,
 		bucketID, size, checksum, model.ObjectStateUploading,
 	).Scan(ctx, &refs)
 	if err != nil {
@@ -835,8 +861,56 @@ func objectFromVersion(version *model.ObjectVersion) *model.Object {
 		CacheKey:         version.CacheKey,
 		PieceCID:         version.PieceCID,
 		RetrievalURL:     version.RetrievalURL,
+		InCache:          version.InCache,
+		InFilecoin:       version.InFilecoin,
 		State:            version.State,
 		FailedAtState:    version.FailedAtState,
 		LastError:        version.LastError,
+	}
+}
+
+func setVersionCachePresence(ctx context.Context, db bun.IDB, versionID string, inCache bool) error {
+	res, err := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("in_cache = ?", inCache).
+		Where("version_id = ?", versionID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("setting version cache presence: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("setting version cache presence: version %s not found", versionID)
+	}
+
+	if _, err := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("in_cache = ?", inCache).
+		Where("current_version_id = ?", versionID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("mirroring version cache presence to current object: %w", err)
+	}
+	return nil
+}
+
+func applyCacheLocationForState(q *bun.UpdateQuery, state model.ObjectState) *bun.UpdateQuery {
+	switch state {
+	case model.ObjectStateCached:
+		return q.Set("in_cache = ?", true)
+	case model.ObjectStateCacheEvicted:
+		return q.Set("in_cache = ?", false)
+	default:
+		return q
+	}
+}
+
+func cacheLocationSQLForState(state model.ObjectState) string {
+	switch state {
+	case model.ObjectStateCached:
+		return ", in_cache = TRUE"
+	case model.ObjectStateCacheEvicted:
+		return ", in_cache = FALSE"
+	default:
+		return ""
 	}
 }

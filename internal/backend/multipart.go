@@ -261,6 +261,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 			CacheKey:     cacheKey,
 			PieceCID:     reuse.PieceCID,
 			RetrievalURL: reuse.RetrievalURL,
+			InCache:      true,
 			State:        reuse.State,
 		}
 		createdState = version.State

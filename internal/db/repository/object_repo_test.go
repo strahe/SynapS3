@@ -75,6 +75,9 @@ func TestObjectRepo_CreateVersionAndSetCurrent_SecondUploadKeepsVersionHistory(t
 	if gotV1.ObjectID != objectID || gotV2.ObjectID != objectID {
 		t.Fatalf("version object ids = %d/%d, want %d", gotV1.ObjectID, gotV2.ObjectID, objectID)
 	}
+	if !gotV1.InCache || !gotV2.InCache || !current.InCache {
+		t.Fatalf("new versions should be marked in cache: v1=%v v2=%v current=%v", gotV1.InCache, gotV2.InCache, current.InCache)
+	}
 }
 
 func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.T) {
@@ -386,6 +389,17 @@ func TestObjectRepo_FindReusableActiveUploadVersionRequiresActiveTask(t *testing
 	if got == nil || got.VersionID != version.VersionID {
 		t.Fatalf("active reusable = %#v, want %s", got, version.VersionID)
 	}
+
+	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
+		t.Fatalf("SetVersionCachePresence: %v", err)
+	}
+	got, err = repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableActiveUploadVersion with missing cache: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("active reusable with missing cache = %#v, want nil", got)
+	}
 }
 
 func TestObjectRepo_SetStorageInfoForUploadingContentUpdatesMatchingVersions(t *testing.T) {
@@ -429,6 +443,9 @@ func TestObjectRepo_SetStorageInfoForUploadingContentUpdatesMatchingVersions(t *
 		if got.PieceCID == nil || *got.PieceCID != "piece-shared" {
 			t.Fatalf("version %s piece = %v, want piece-shared", versionID, got.PieceCID)
 		}
+		if !got.InFilecoin {
+			t.Fatalf("version %s in_filecoin = false, want true", versionID)
+		}
 	}
 
 	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
@@ -440,6 +457,9 @@ func TestObjectRepo_SetStorageInfoForUploadingContentUpdatesMatchingVersions(t *
 	}
 	if current.PieceCID == nil || *current.PieceCID != "piece-shared" {
 		t.Fatalf("current piece = %v, want piece-shared", current.PieceCID)
+	}
+	if !current.InFilecoin {
+		t.Fatal("current in_filecoin = false, want true")
 	}
 }
 
@@ -514,6 +534,12 @@ func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t 
 		}
 		if got.State != model.ObjectStateFailed {
 			t.Fatalf("version %s state = %s, want failed", versionID, got.State)
+		}
+		if got.FailedAtState == nil || *got.FailedAtState != model.ObjectStateUploading {
+			t.Fatalf("version %s failed_at_state = %#v, want uploading", versionID, got.FailedAtState)
+		}
+		if got.LastError == nil || *got.LastError != "upload failed" {
+			t.Fatalf("version %s last_error = %#v, want upload failed", versionID, got.LastError)
 		}
 	}
 	gotIndependent, err := repos.Objects.GetVersionByID(ctx, independent.VersionID)
@@ -604,6 +630,49 @@ func TestObjectRepo_VersionStateUpdatesOnlyMirrorCurrentVersion(t *testing.T) {
 	}
 }
 
+func TestObjectRepo_UpdateVersionStateFromFailedClearsFailureDetails(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "failed-retry-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000013", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionStateToFailed(ctx, version.VersionID, model.ObjectStateUploading, "upload failed"); err != nil {
+		t.Fatalf("failed: %v", err)
+	}
+
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateFailed, model.ObjectStateUploading); err != nil {
+		t.Fatalf("retry uploading: %v", err)
+	}
+
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("version after retry: got=%v err=%v", got, err)
+	}
+	if got.FailedAtState != nil {
+		t.Fatalf("version failed_at_state = %#v, want nil", got.FailedAtState)
+	}
+	if got.LastError != nil {
+		t.Fatalf("version last_error = %#v, want nil", got.LastError)
+	}
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil || current == nil {
+		t.Fatalf("current after retry: got=%v err=%v", current, err)
+	}
+	if current.FailedAtState != nil {
+		t.Fatalf("current failed_at_state = %#v, want nil", current.FailedAtState)
+	}
+	if current.LastError != nil {
+		t.Fatalf("current last_error = %#v, want nil", current.LastError)
+	}
+}
+
 func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -632,6 +701,9 @@ func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(
 	if current.PieceCID != nil || current.RetrievalURL != nil || current.State != model.ObjectStateCached {
 		t.Fatalf("old storage update polluted current snapshot: piece=%v url=%v state=%s", current.PieceCID, current.RetrievalURL, current.State)
 	}
+	if current.InFilecoin {
+		t.Fatal("old storage update polluted current in_filecoin")
+	}
 
 	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("current version upload transition: %v", err)
@@ -648,6 +720,84 @@ func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(
 	}
 	if current.State != model.ObjectStateStored {
 		t.Fatalf("current state = %s, want stored", current.State)
+	}
+	if !current.InFilecoin {
+		t.Fatal("current in_filecoin = false, want true")
+	}
+}
+
+func TestObjectRepo_SetVersionCachePresenceMirrorsOnlyCurrentVersion(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "cache-location-bucket")
+
+	oldVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000023", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("old version: %v", err)
+	}
+	currentVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000024", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("current version: %v", err)
+	}
+
+	if err := repos.Objects.SetVersionCachePresence(ctx, oldVersion.VersionID, false); err != nil {
+		t.Fatalf("old SetVersionCachePresence: %v", err)
+	}
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey: %v", err)
+	}
+	if !current.InCache {
+		t.Fatal("old cache update polluted current in_cache")
+	}
+
+	if err := repos.Objects.SetVersionCachePresence(ctx, currentVersion.VersionID, false); err != nil {
+		t.Fatalf("current SetVersionCachePresence: %v", err)
+	}
+	current, err = repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey after current cache update: %v", err)
+	}
+	if current.InCache {
+		t.Fatal("current in_cache = true, want false")
+	}
+}
+
+func TestObjectRepo_UpdateVersionStateMarksCacheEvictedLocation(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "cache-evicted-location-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000025", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, version.VersionID, "piece", "https://provider.example/piece", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("stored: %v", err)
+	}
+
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+		t.Fatalf("cache evicted: %v", err)
+	}
+
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("version: got=%v err=%v", got, err)
+	}
+	if got.InCache {
+		t.Fatal("version in_cache = true, want false")
+	}
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey: %v", err)
+	}
+	if current.State != model.ObjectStateCacheEvicted || current.InCache {
+		t.Fatalf("current state/cache = %s/%v, want cache_evicted/false", current.State, current.InCache)
 	}
 }
 
@@ -681,6 +831,47 @@ func TestObjectRepo_ListAndResetVersionsByState(t *testing.T) {
 	}
 	if reset != 2 {
 		t.Fatalf("reset count = %d, want 2", reset)
+	}
+}
+
+func TestObjectRepo_ResetStaleVersionStatesFromFailedClearsFailureDetails(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "failed-stale-reset-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000033", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionStateToFailed(ctx, version.VersionID, model.ObjectStateUploading, "upload failed"); err != nil {
+		t.Fatalf("failed: %v", err)
+	}
+
+	reset, err := repos.Objects.ResetStaleVersionStates(ctx, model.ObjectStateFailed, model.ObjectStateUploading, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ResetStaleVersionStates: %v", err)
+	}
+	if reset != 1 {
+		t.Fatalf("reset count = %d, want 1", reset)
+	}
+
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("version after reset: got=%v err=%v", got, err)
+	}
+	if got.FailedAtState != nil || got.LastError != nil {
+		t.Fatalf("version failure details = failed_at_state:%#v last_error:%#v, want nil", got.FailedAtState, got.LastError)
+	}
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil || current == nil {
+		t.Fatalf("current after reset: got=%v err=%v", current, err)
+	}
+	if current.FailedAtState != nil || current.LastError != nil {
+		t.Fatalf("current failure details = failed_at_state:%#v last_error:%#v, want nil", current.FailedAtState, current.LastError)
 	}
 }
 

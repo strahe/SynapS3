@@ -58,6 +58,9 @@ func TestEvictor_HappyPath(t *testing.T) {
 	if obj.State != model.ObjectStateCacheEvicted {
 		t.Errorf("expected object state cache_evicted, got %s", obj.State)
 	}
+	if obj.InCache {
+		t.Error("expected object cache location to be false after successful eviction")
+	}
 }
 
 func TestEvictor_MissingVersion(t *testing.T) {
@@ -174,34 +177,50 @@ func TestEvictor_BucketNotFound(t *testing.T) {
 	}
 }
 
-func TestEvictor_CacheDeleteFailure(t *testing.T) {
-	mc := &testutil.MockCache{
-		DeleteFunc: func(_ context.Context, _, _ string) error {
-			return errors.New("permission denied")
-		},
-		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
-			return nil, nil, errors.New("not needed")
-		},
-	}
-	env := newTestWorkerEnvWithMockCache(t, mc)
-	_, objID, versionID := seedStoredObject(t, env)
+func TestEvictor_CacheDeleteFailureLeavesObjectUnchangedAndKeepsTaskRecoverable(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		retryCount  int
+		wantStatus  model.TaskStatus
+		wantRetries int
+	}{
+		{name: "requeue", retryCount: 0, wantStatus: model.TaskStatusPending, wantRetries: 1},
+		{name: "dead letter", retryCount: 4, wantStatus: model.TaskStatusDeadLetter, wantRetries: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &testutil.MockCache{
+				DeleteFunc: func(_ context.Context, _, _ string) error {
+					return errors.New("permission denied")
+				},
+				GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+					return nil, nil, errors.New("not needed")
+				},
+			}
+			env := newTestWorkerEnvWithMockCache(t, mc)
+			_, objID, versionID := seedStoredObject(t, env)
 
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+			task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, tc.retryCount)
 
-	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
+			evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			_ = evictor.Run(ctx)
 
-	ctx := context.Background()
+			got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+			if got.Status != tc.wantStatus {
+				t.Errorf("expected task %s after cache delete failure, got %s", tc.wantStatus, got.Status)
+			}
+			if got.RetryCount != tc.wantRetries {
+				t.Errorf("expected retry_count=%d, got %d", tc.wantRetries, got.RetryCount)
+			}
 
-	// Cache delete failure is non-fatal: task still completes
-	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusCompleted {
-		t.Errorf("expected task completed despite cache delete failure, got %s", got.Status)
-	}
-
-	// Object should still be in cache_evicted state
-	obj, _ := env.repos.Objects.GetByID(ctx, objID)
-	if obj.State != model.ObjectStateCacheEvicted {
-		t.Errorf("expected object state cache_evicted, got %s", obj.State)
+			obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+			if obj.State != model.ObjectStateStored {
+				t.Errorf("expected object state stored after cache delete failure, got %s", obj.State)
+			}
+			if !obj.InCache {
+				t.Error("expected object cache location to remain true after cache delete failure")
+			}
+		})
 	}
 }

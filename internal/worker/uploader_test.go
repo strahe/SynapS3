@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -242,6 +243,9 @@ func TestUploader_HappyPath(t *testing.T) {
 	if obj.PieceCID == nil || *obj.PieceCID != pieceCID.String() {
 		t.Errorf("expected PieceCID %s, got %v", pieceCID.String(), obj.PieceCID)
 	}
+	if !obj.InFilecoin {
+		t.Error("expected object filecoin location to be true after upload")
+	}
 	var retrievalURL string
 	if err := env.db.NewSelect().
 		TableExpr("objects").
@@ -333,6 +337,9 @@ func TestUploader_StoresVersionsFollowingActiveUpload(t *testing.T) {
 		if got.PieceCID == nil || *got.PieceCID != pieceCID.String() {
 			t.Fatalf("version %s piece = %v, want %s", versionID, got.PieceCID, pieceCID.String())
 		}
+		if !got.InFilecoin {
+			t.Fatalf("version %s in_filecoin = false, want true", versionID)
+		}
 	}
 
 	current, err := env.repos.Objects.GetByID(ctx, objID)
@@ -341,6 +348,9 @@ func TestUploader_StoresVersionsFollowingActiveUpload(t *testing.T) {
 	}
 	if current.CurrentVersionID != followerVersionID || current.State != model.ObjectStateStored {
 		t.Fatalf("current object = version:%s state:%s, want %s stored", current.CurrentVersionID, current.State, followerVersionID)
+	}
+	if !current.InFilecoin {
+		t.Fatal("current object in_filecoin = false, want true")
 	}
 
 	evictTasks, _, err := env.repos.Tasks.List(ctx, string(model.TaskTypeEvictCache), "", 10, 0)
@@ -552,6 +562,42 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 	obj, _ := env.repos.Objects.GetByID(ctx, objID)
 	if obj.State != model.ObjectStateFailed {
 		t.Errorf("expected object state failed, got %s", obj.State)
+	}
+}
+
+func TestUploader_CacheMissMarksCacheLocationAbsent(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+	}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
+
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		t.Error("upload should not be called after cache miss")
+		return nil, errors.New("should not be called")
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	}
+
+	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+	if obj.State != model.ObjectStateUploading {
+		t.Errorf("expected object state uploading after cache miss retry, got %s", obj.State)
+	}
+	if obj.InCache {
+		t.Error("expected current object cache location to be false after cache miss")
+	}
+	version, _ := env.repos.Objects.GetVersionByID(context.Background(), versionID)
+	if version.InCache {
+		t.Error("expected version cache location to be false after cache miss")
 	}
 }
 

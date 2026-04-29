@@ -106,10 +106,16 @@ func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID str
 
 	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
 	if cacheErr == nil {
+		if !version.InCache {
+			r.markCachePresence(ctx, version.VersionID, true)
+		}
 		return resultFromVersion(version, body, SourceCache, false), nil
 	}
 	if !os.IsNotExist(cacheErr) {
 		return nil, fmt.Errorf("%w: %w", ErrCacheRead, cacheErr)
+	}
+	if version.InCache {
+		r.markCachePresence(ctx, version.VersionID, false)
 	}
 
 	if version.PieceCID == nil || *version.PieceCID == "" || version.RetrievalURL == nil || *version.RetrievalURL == "" || r.storage == nil {
@@ -127,7 +133,7 @@ func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID str
 		return nil, fmt.Errorf("%w: %w: %w", ErrCacheMiss, ErrProviderDownload, err)
 	}
 
-	body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, rc)
+	body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, version.VersionID, rc)
 	return resultFromVersion(version, body, SourceProvider, true), nil
 }
 
@@ -154,12 +160,18 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 
 	body, _, cacheErr := r.cache.Get(ctx, bucketName, obj.CacheKey)
 	if cacheErr == nil {
+		if !obj.InCache {
+			r.markCachePresence(ctx, obj.CurrentVersionID, true)
+		}
 		return resultFromObject(obj, body, SourceCache, cacheMiss), nil
 	}
 	if !os.IsNotExist(cacheErr) {
 		return nil, fmt.Errorf("%w: %w", ErrCacheRead, cacheErr)
 	}
 	cacheMiss = true
+	if obj.InCache {
+		r.markCachePresence(ctx, obj.CurrentVersionID, false)
+	}
 
 	if obj.PieceCID == nil || *obj.PieceCID == "" || obj.RetrievalURL == nil || *obj.RetrievalURL == "" || r.storage == nil {
 		return nil, cacheMissError(ErrNoSuchKey)
@@ -190,7 +202,7 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 
 	body = rc
 	if dbErr == nil && cur != nil && cur.CurrentVersionID == obj.CurrentVersionID {
-		body = r.streamAndRehydrate(ctx, bucketName, obj.CacheKey, rc)
+		body = r.streamAndRehydrate(ctx, bucketName, obj.CacheKey, obj.CurrentVersionID, rc)
 	}
 	return resultFromObject(obj, body, SourceProvider, cacheMiss), nil
 }
@@ -227,7 +239,7 @@ func cacheMissError(err error) error {
 	return fmt.Errorf("%w: %w", ErrCacheMiss, err)
 }
 
-func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, cacheKey string, rc io.ReadCloser) io.ReadCloser {
+func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, cacheKey, versionID string, rc io.ReadCloser) io.ReadCloser {
 	pr, pw := io.Pipe()
 	done := make(chan struct{})
 	body := &teeReadCloser{
@@ -242,11 +254,23 @@ func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, cacheKey string
 		if _, err := r.cache.Put(ctx, bucket, cacheKey, pr); err != nil {
 			r.logger.Warn("cache rehydration failed (best-effort)", "cacheKey", cacheKey, "error", err)
 			_, _ = io.Copy(io.Discard, pr)
+			_ = pr.Close()
+			return
 		}
+		r.markCachePresence(ctx, versionID, true)
 		_ = pr.Close()
 	}()
 
 	return body
+}
+
+func (r *Reader) markCachePresence(ctx context.Context, versionID string, inCache bool) {
+	if r == nil || r.repos == nil || r.repos.Objects == nil || versionID == "" {
+		return
+	}
+	if err := r.repos.Objects.SetVersionCachePresence(ctx, versionID, inCache); err != nil {
+		r.logger.Warn("cache location update failed", "versionID", versionID, "inCache", inCache, "error", err)
+	}
 }
 
 type teeReadCloser struct {

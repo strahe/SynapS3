@@ -62,6 +62,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", srv.handleAPIUpdateBucketOwner)
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}", srv.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", srv.handleAPIBucketObjects)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/status-detail", srv.handleAPIBucketObjectStatusDetail)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", srv.handleAPIBucketObjectVersions)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
 	return mux
@@ -733,7 +734,13 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	seedAdminObjectVersion(t, repos, bucket, "kept.txt", 4, "etag-kept", "checksum-kept", "text/plain", "", model.ObjectStateStored)
+	_, versionID := seedAdminObjectVersion(t, repos, bucket, "kept.txt", 4, "etag-kept", "checksum-kept", "text/plain", "", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark uploading: %v", err)
+	}
+	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, versionID, "piece-kept", "https://provider.example/kept", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("mark stored: %v", err)
+	}
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -748,7 +755,15 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	var body objectListResponse
+	var body struct {
+		Objects []struct {
+			Key              string         `json:"key"`
+			CurrentVersionID string         `json:"current_version_id"`
+			Status           string         `json:"status"`
+			Location         objectLocation `json:"location"`
+		} `json:"objects"`
+		Folders []objectFolderItem `json:"folders"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
@@ -761,11 +776,38 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	if body.Objects[0].CurrentVersionID == "" {
 		t.Fatal("expected current version id")
 	}
+	if body.Objects[0].Status != "success" {
+		t.Fatalf("status = %q, want success", body.Objects[0].Status)
+	}
+	if !body.Objects[0].Location.Cache || !body.Objects[0].Location.Filecoin {
+		t.Fatalf("location = %#v, want cache and filecoin", body.Objects[0].Location)
+	}
 	if len(body.Folders) != 0 {
 		t.Fatalf("folders len = %d, want 0 for flat object list", len(body.Folders))
 	}
 	if body.Folders == nil {
 		t.Fatal("folders should be an empty array, not null")
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/objects-bucket/objects")
+	if err != nil {
+		t.Fatalf("GET bucket objects raw: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var raw struct {
+		Objects []map[string]any `json:"objects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("Decode raw: %v", err)
+	}
+	if _, ok := raw.Objects[0]["state"]; ok {
+		t.Fatal("object list exposed raw state")
+	}
+	if _, ok := raw.Objects[0]["storage"]; ok {
+		t.Fatal("object list exposed storage instead of location")
+	}
+	if _, ok := raw.Objects[0]["attention"]; ok {
+		t.Fatal("object list exposed attention")
 	}
 }
 
@@ -1020,7 +1062,13 @@ func TestAPIBucketObjectVersions(t *testing.T) {
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, oldVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", "", model.ObjectStateStored)
+	_, oldVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", "", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, oldVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("old uploading: %v", err)
+	}
+	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, oldVersionID, "piece-old", "https://provider.example/old", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("old stored: %v", err)
+	}
 	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 7, "etag-current", "checksum-current", "text/plain", "", model.ObjectStateCached)
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -1036,7 +1084,14 @@ func TestAPIBucketObjectVersions(t *testing.T) {
 		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
 	}
 
-	var body objectVersionListResponse
+	var body struct {
+		Versions []struct {
+			VersionID string         `json:"version_id"`
+			Status    string         `json:"status"`
+			Location  objectLocation `json:"location"`
+			IsCurrent bool           `json:"is_current"`
+		} `json:"versions"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
@@ -1048,6 +1103,138 @@ func TestAPIBucketObjectVersions(t *testing.T) {
 	}
 	if body.Versions[1].VersionID != oldVersionID || body.Versions[1].IsCurrent {
 		t.Fatalf("second version = %#v, want old %s", body.Versions[1], oldVersionID)
+	}
+	if body.Versions[0].Status != "uploading" {
+		t.Fatalf("current version status = %q, want uploading", body.Versions[0].Status)
+	}
+	if !body.Versions[0].Location.Cache || body.Versions[0].Location.Filecoin {
+		t.Fatalf("current version location = %#v, want cache only", body.Versions[0].Location)
+	}
+	if body.Versions[1].Status != "success" {
+		t.Fatalf("old version status = %q, want success", body.Versions[1].Status)
+	}
+	if !body.Versions[1].Location.Cache || !body.Versions[1].Location.Filecoin {
+		t.Fatalf("old version location = %#v, want cache and filecoin", body.Versions[1].Location)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/versions-bucket/objects/versions?key=" + url.QueryEscape("file.txt"))
+	if err != nil {
+		t.Fatalf("GET object versions raw: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var raw struct {
+		Versions []map[string]any `json:"versions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("Decode raw: %v", err)
+	}
+	if _, ok := raw.Versions[0]["state"]; ok {
+		t.Fatal("version list exposed raw state")
+	}
+	if _, ok := raw.Versions[0]["storage"]; ok {
+		t.Fatal("version list exposed storage instead of location")
+	}
+}
+
+func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "status-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, warningVersionID := seedAdminObjectVersion(t, repos, bucket, "warning.txt", 4, "etag-warning", "checksum-warning", "text/plain", "", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, warningVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("warning uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionStateToFailed(ctx, warningVersionID, model.ObjectStateUploading, "provider rejected piece"); err != nil {
+		t.Fatalf("warning failed: %v", err)
+	}
+
+	unavailable := &model.ObjectVersion{
+		VersionID:   "01J000000000000000UNAVAIL",
+		BucketID:    bucket.ID,
+		Key:         "unavailable.txt",
+		Size:        1,
+		ETag:        "etag-unavailable",
+		Checksum:    "checksum-unavailable",
+		ContentType: "text/plain",
+		CacheKey:    "cache-unavailable",
+		State:       model.ObjectStateStored,
+		InCache:     false,
+		InFilecoin:  false,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unavailable); err != nil {
+		t.Fatalf("unavailable version: %v", err)
+	}
+	if err := repos.Objects.SetVersionCachePresence(ctx, unavailable.VersionID, false); err != nil {
+		t.Fatalf("unavailable cache presence: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var list struct {
+		Objects []struct {
+			Key    string `json:"key"`
+			Status string `json:"status"`
+		} `json:"objects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("Decode list: %v", err)
+	}
+
+	statusByKey := map[string]string{}
+	for _, object := range list.Objects {
+		statusByKey[object.Key] = object.Status
+	}
+	if statusByKey["warning.txt"] != "warning" {
+		t.Fatalf("warning status = %q, want warning", statusByKey["warning.txt"])
+	}
+	if statusByKey["unavailable.txt"] != "unavailable" {
+		t.Fatalf("unavailable status = %q, want unavailable", statusByKey["unavailable.txt"])
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(warningVersionID))
+	if err != nil {
+		t.Fatalf("GET status detail: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status detail code = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var detail objectStatusDetailResponse
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		t.Fatalf("Decode detail: %v", err)
+	}
+	if detail.VersionID != warningVersionID || detail.Status != "warning" {
+		t.Fatalf("detail = %#v, want version %s warning", detail, warningVersionID)
+	}
+	if detail.FailedAtState == nil || *detail.FailedAtState != string(model.ObjectStateUploading) {
+		t.Fatalf("failed_at_state = %#v, want uploading", detail.FailedAtState)
+	}
+	if detail.Message == nil || *detail.Message != "provider rejected piece" {
+		t.Fatalf("message = %#v, want provider rejected piece", detail.Message)
+	}
+
+	otherBucket := &model.Bucket{Name: "other-status-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
+		t.Fatalf("other bucket: %v", err)
+	}
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/other-status-bucket/objects/status-detail?version_id=" + url.QueryEscape(warningVersionID))
+	if err != nil {
+		t.Fatalf("GET status detail wrong bucket: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("wrong bucket status detail code = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
 

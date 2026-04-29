@@ -94,6 +94,7 @@ type ObjectRepository interface {
 	ListVersionsByKey(ctx context.Context, bucketID int64, key string, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
 	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
 	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
+	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error
 	SetVersionStorageInfoAndTransition(ctx context.Context, versionID string, pieceCID string, retrievalURL string, from, to model.ObjectState) error
 	SetStorageInfoForUploadingContent(ctx context.Context, bucketID int64, size int64, checksum string, pieceCID string, retrievalURL string) ([]ObjectVersionRef, error)
 	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)

@@ -34,6 +34,8 @@ type Object struct {
 	CacheKey         string            `bun:",notnull"`
 	PieceCID         *string           `bun:",nullzero"`
 	RetrievalURL     *string           `bun:",nullzero"`
+	InCache          bool              `bun:",notnull,default:true"`
+	InFilecoin       bool              `bun:",notnull,default:false"`
 	State            ObjectState       `bun:",notnull,default:'cached'"`
 	FailedAtState    *ObjectState      `bun:",nullzero"`
 	LastError        *string           `bun:",nullzero"`
@@ -59,6 +61,8 @@ type ObjectVersion struct {
 	CacheKey      string            `bun:",notnull"`
 	PieceCID      *string           `bun:",nullzero"`
 	RetrievalURL  *string           `bun:",nullzero"`
+	InCache       bool              `bun:",notnull,default:true"`
+	InFilecoin    bool              `bun:",notnull,default:false"`
 	State         ObjectState       `bun:",notnull,default:'cached'"`
 	FailedAtState *ObjectState      `bun:",nullzero"`
 	LastError     *string           `bun:",nullzero"`

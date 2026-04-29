@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -113,13 +112,9 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	// CAS transition first, then delete this version's cache key.
-	if err := state.TransitionState(ctx, e.stateMachine, e.repos.Objects, task.RefVersionID,
-		model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
-		logger.Error("state transition stored→cache_evicted failed", "error", err)
+	if err := e.cache.Delete(ctx, bucket.Name, version.CacheKey); err != nil {
+		logger.Warn("cache delete failed", "error", err)
 		if task.RetryCount+1 >= task.MaxRetries {
-			_ = state.TransitionToFailed(ctx, e.stateMachine, e.repos.Objects, task.RefVersionID,
-				model.ObjectStateStored, fmt.Sprintf("cache eviction: %v (max retries reached)", err))
 			if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
 				logger.Error("failed to mark task as dead-letter", "error", ftErr)
 			} else {
@@ -133,8 +128,28 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	if err := e.cache.Delete(ctx, bucket.Name, version.CacheKey); err != nil {
-		logger.Warn("cache delete failed (state already transitioned)", "error", err)
+	// Delete first; the DB transition records both lifecycle and cache location atomically.
+	if err := state.TransitionState(ctx, e.stateMachine, e.repos.Objects, task.RefVersionID,
+		model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+		logger.Error("state transition stored→cache_evicted failed", "error", err)
+		if latest, latestErr := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID); latestErr == nil && latest != nil && latest.State == model.ObjectStateCacheEvicted {
+			_ = e.repos.Tasks.Complete(ctx, task.ID)
+			admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
+			logger.Info("cache eviction already recorded")
+			return
+		}
+		if task.RetryCount+1 >= task.MaxRetries {
+			if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+				logger.Error("failed to mark task as dead-letter", "error", ftErr)
+			} else {
+				admin.DeadLetterTotal.WithLabelValues("evictor", string(model.TaskTypeEvictCache)).Inc()
+			}
+		} else {
+			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
+		}
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
+		return
 	}
 
 	_ = e.repos.Tasks.Complete(ctx, task.ID)

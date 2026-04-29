@@ -44,6 +44,15 @@ export function useBucketObjectVersions(name: string, key: string, versionMarker
   })
 }
 
+export function useObjectStatusDetail(name: string, versionId: string, enabled = true) {
+  return useQuery({
+    queryKey: ['objectStatusDetail', name, versionId],
+    queryFn: () => api.getObjectStatusDetail(name, versionId),
+    enabled: Boolean(name && versionId && enabled),
+    staleTime: Number.POSITIVE_INFINITY,
+  })
+}
+
 export function useCreateBucket() {
   const qc = useQueryClient()
 

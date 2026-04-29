@@ -372,16 +372,47 @@ func bucketOwnerACL(owner string) ([]byte, error) {
 }
 
 type objectListItem struct {
-	ID               int64   `json:"id"`
-	Key              string  `json:"key"`
-	CurrentVersionID string  `json:"current_version_id"`
-	Size             int64   `json:"size"`
-	State            string  `json:"state"`
-	ContentType      string  `json:"content_type"`
-	ETag             string  `json:"etag"`
-	PieceCID         *string `json:"piece_cid,omitempty"`
-	CreatedAt        string  `json:"created_at"`
-	UpdatedAt        string  `json:"updated_at"`
+	ID               int64          `json:"id"`
+	Key              string         `json:"key"`
+	CurrentVersionID string         `json:"current_version_id"`
+	Size             int64          `json:"size"`
+	Status           string         `json:"status"`
+	Location         objectLocation `json:"location"`
+	ContentType      string         `json:"content_type"`
+	ETag             string         `json:"etag"`
+	PieceCID         *string        `json:"piece_cid,omitempty"`
+	CreatedAt        string         `json:"created_at"`
+	UpdatedAt        string         `json:"updated_at"`
+}
+
+type objectLocation struct {
+	Cache    bool `json:"cache"`
+	Filecoin bool `json:"filecoin"`
+}
+
+type objectStatusDetailResponse struct {
+	VersionID     string  `json:"version_id"`
+	Status        string  `json:"status"`
+	FailedAtState *string `json:"failed_at_state,omitempty"`
+	Message       *string `json:"message,omitempty"`
+	UpdatedAt     string  `json:"updated_at"`
+}
+
+func objectAdminStatus(state model.ObjectState, inCache, inFilecoin bool) string {
+	if state == model.ObjectStateFailed {
+		return "warning"
+	}
+	if !inCache && !inFilecoin {
+		return "unavailable"
+	}
+	switch state {
+	case model.ObjectStateCached, model.ObjectStateUploading:
+		return "uploading"
+	case model.ObjectStateStored, model.ObjectStateCacheEvicted:
+		return "success"
+	default:
+		return "unavailable"
+	}
 }
 
 type objectFolderItem struct {
@@ -465,7 +496,8 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 			Key:              o.Key,
 			CurrentVersionID: o.CurrentVersionID,
 			Size:             o.Size,
-			State:            string(o.State),
+			Status:           objectAdminStatus(o.State, o.InCache, o.InFilecoin),
+			Location:         objectLocation{Cache: o.InCache, Filecoin: o.InFilecoin},
 			ContentType:      o.ContentType,
 			ETag:             o.ETag,
 			PieceCID:         o.PieceCID,
@@ -618,22 +650,72 @@ func adminListingFolderName(commonPrefix, prefix, delimiter string) string {
 }
 
 type objectVersionListItem struct {
-	VersionID   string  `json:"version_id"`
-	Key         string  `json:"key"`
-	Size        int64   `json:"size"`
-	State       string  `json:"state"`
-	ContentType string  `json:"content_type"`
-	ETag        string  `json:"etag"`
-	PieceCID    *string `json:"piece_cid,omitempty"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
-	IsCurrent   bool    `json:"is_current"`
+	VersionID   string         `json:"version_id"`
+	Key         string         `json:"key"`
+	Size        int64          `json:"size"`
+	Status      string         `json:"status"`
+	Location    objectLocation `json:"location"`
+	ContentType string         `json:"content_type"`
+	ETag        string         `json:"etag"`
+	PieceCID    *string        `json:"piece_cid,omitempty"`
+	CreatedAt   string         `json:"created_at"`
+	UpdatedAt   string         `json:"updated_at"`
+	IsCurrent   bool           `json:"is_current"`
 }
 
 type objectVersionListResponse struct {
 	Versions          []objectVersionListItem `json:"versions"`
 	HasMore           bool                    `json:"has_more"`
 	NextVersionMarker string                  `json:"next_version_marker,omitempty"`
+}
+
+func (s *Server) handleAPIBucketObjectStatusDetail(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	versionID := strings.TrimSpace(r.URL.Query().Get("version_id"))
+	if versionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "version_id is required"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	version, err := s.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil {
+		s.logger.Error("api: failed to get object version status detail", "error", err, "bucket", bucketName, "versionID", versionID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if version == nil || version.BucketID != bucket.ID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object version not found"})
+		return
+	}
+
+	var failedAtState *string
+	if version.FailedAtState != nil {
+		state := string(*version.FailedAtState)
+		failedAtState = &state
+	}
+	writeJSON(w, http.StatusOK, objectStatusDetailResponse{
+		VersionID:     version.VersionID,
+		Status:        objectAdminStatus(version.State, version.InCache, version.InFilecoin),
+		FailedAtState: failedAtState,
+		Message:       version.LastError,
+		UpdatedAt:     version.UpdatedAt.Format(time.RFC3339),
+	})
 }
 
 func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Request) {
@@ -685,7 +767,8 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 			VersionID:   v.VersionID,
 			Key:         v.Key,
 			Size:        v.Size,
-			State:       string(v.State),
+			Status:      objectAdminStatus(v.State, v.InCache, v.InFilecoin),
+			Location:    objectLocation{Cache: v.InCache, Filecoin: v.InFilecoin},
 			ContentType: v.ContentType,
 			ETag:        v.ETag,
 			PieceCID:    v.PieceCID,

@@ -1,6 +1,9 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import {
+  CheckCircle2,
+  CircleSlash,
+  Clock3,
   Download,
   FileIcon,
   Folder,
@@ -9,15 +12,16 @@ import {
   MoreHorizontal,
   RefreshCw,
   Trash2,
+  TriangleAlert,
   UserRound,
 } from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
-import { api, type ObjectFolderItem, type ObjectItem } from '@/api/client'
+import { api, type ObjectFolderItem, type ObjectItem, type ObjectStatus } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
-import { bucketStatusTone, objectStateTone, StatusBadge } from '@/components/app/StatusBadge'
+import { bucketStatusTone, StatusBadge } from '@/components/app/StatusBadge'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -48,10 +52,12 @@ import { Label } from '@/components/ui/label'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   useBucket,
   useBucketObjects,
   useBucketObjectVersions,
+  useObjectStatusDetail,
   useDeleteBucket,
   useS3Users,
   useUpdateBucketOwner,
@@ -331,19 +337,19 @@ function ObjectVersionsDialog({
           <div className="overflow-hidden rounded-md border border-border">
             <Table className="table-fixed">
               <colgroup>
-                <col className="w-[19%]" />
-                <col className="w-[9%]" />
-                <col className="w-[12%]" />
+                <col className="w-[22%]" />
+                <col className="w-[8%]" />
+                <col className="w-[15%]" />
                 <col className="w-[18%]" />
                 <col className="w-[20%]" />
-                <col className="w-[12%]" />
                 <col className="w-[10%]" />
+                <col className="w-[7%]" />
               </colgroup>
               <TableHeader>
                 <TableRow className="bg-muted/50">
                   <TableHead className="px-2">Version</TableHead>
                   <TableHead className="px-2 text-right">Size</TableHead>
-                  <TableHead className="px-2">State</TableHead>
+                  <TableHead className="px-2">Location</TableHead>
                   <TableHead className="px-2">ETag</TableHead>
                   <TableHead className="px-2">Piece CID</TableHead>
                   <TableHead className="px-2">Created</TableHead>
@@ -356,6 +362,12 @@ function ObjectVersionsDialog({
                     <TableCell className="overflow-hidden px-2" title={version.version_id}>
                       <div className="flex min-w-0 items-center gap-2">
                         <span className="min-w-0 truncate font-mono text-xs">{version.version_id}</span>
+                        <ObjectStatusIcon
+                          bucketName={bucketName}
+                          versionID={version.version_id}
+                          status={version.status}
+                          compact
+                        />
                         {version.is_current && (
                           <StatusBadge tone="success" className="shrink-0">
                             Current
@@ -365,9 +377,7 @@ function ObjectVersionsDialog({
                     </TableCell>
                     <TableCell className="overflow-hidden px-2 text-right">{formatBytes(version.size)}</TableCell>
                     <TableCell className="overflow-hidden px-2">
-                      <StatusBadge tone={objectStateTone(version.state)} className="max-w-full truncate">
-                        {version.state}
-                      </StatusBadge>
+                      <LocationBadges location={version.location} />
                     </TableCell>
                     <TableCell
                       className="overflow-hidden truncate px-2 font-mono text-xs text-muted-foreground"
@@ -425,6 +435,119 @@ function ObjectVersionsDialog({
       </DialogContent>
     </Dialog>
   )
+}
+
+function LocationBadges({ location }: { location: { cache: boolean; filecoin: boolean } }) {
+  if (!location.cache && !location.filecoin) {
+    return <StatusBadge tone="neutral">None</StatusBadge>
+  }
+
+  return (
+    <div className="flex min-w-0 flex-wrap gap-1">
+      {location.cache && <StatusBadge tone="info">Cache</StatusBadge>}
+      {location.filecoin && <StatusBadge tone="success">Filecoin</StatusBadge>}
+    </div>
+  )
+}
+
+function ObjectStatusIcon({
+  bucketName,
+  versionID,
+  status,
+  compact = false,
+}: {
+  bucketName: string
+  versionID: string
+  status: ObjectStatus
+  compact?: boolean
+}) {
+  const [detailEnabled, setDetailEnabled] = useState(false)
+  const detail = useObjectStatusDetail(bucketName, versionID, status === 'warning' && detailEnabled)
+  const label = objectStatusLabel(status)
+
+  const loadDetail = () => {
+    if (status === 'warning') setDetailEnabled(true)
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className={
+            compact
+              ? 'inline-flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+              : 'inline-flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+          }
+          aria-label={`${label} status`}
+          onMouseEnter={loadDetail}
+          onFocus={loadDetail}
+          onClick={loadDetail}
+        >
+          {objectStatusIcon(status, compact)}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-sm items-start whitespace-normal text-left">
+        <div className="flex max-w-xs flex-col gap-1">
+          <span className="font-medium">{label}</span>
+          {status === 'warning' && (
+            <span className="break-words opacity-90">
+              {detail.isLoading
+                ? 'Loading issue details'
+                : detail.error
+                  ? 'Failed to load issue details'
+                  : detail.data?.message
+                    ? `${failureStageLabel(detail.data.failed_at_state)}: ${detail.data.message}`
+                    : 'No issue details recorded'}
+            </span>
+          )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function objectStatusIcon(status: ObjectStatus, compact = false) {
+  const sizeClass = compact ? 'size-3.5' : 'size-4'
+  switch (status) {
+    case 'success':
+      return <CheckCircle2 className={`${sizeClass} text-status-success`} />
+    case 'warning':
+      return <TriangleAlert className={`${sizeClass} text-status-warning`} />
+    case 'unavailable':
+      return <CircleSlash className={`${sizeClass} text-status-danger`} />
+    case 'uploading':
+    default:
+      return <Clock3 className={`${sizeClass} text-status-info`} />
+  }
+}
+
+function objectStatusLabel(status: ObjectStatus) {
+  switch (status) {
+    case 'success':
+      return 'Success'
+    case 'warning':
+      return 'Warning'
+    case 'unavailable':
+      return 'Unavailable'
+    case 'uploading':
+      return 'Uploading'
+  }
+}
+
+function failureStageLabel(state?: string) {
+  switch (state) {
+    case 'uploading':
+      return 'Failed while uploading'
+    case 'stored':
+      return 'Failed after storage'
+    case 'cached':
+      return 'Failed while cached'
+    case 'cache_evicted':
+      return 'Failed after cache eviction'
+    default:
+      return 'Failure'
+  }
 }
 
 function ObjectBrowserPage() {
@@ -595,15 +718,15 @@ function ObjectBrowserTable({
       ) : (
         <div className="rounded-md border border-border">
           <ScrollArea className="w-full">
-            <Table className="min-w-[760px]">
+            <Table className="min-w-[780px]">
               <TableHeader>
                 <TableRow className="bg-muted/50">
-                  <TableHead className="w-[38%] px-4">Name</TableHead>
-                  <TableHead className="w-[12%] px-4 text-right">Size</TableHead>
-                  <TableHead className="w-[14%] px-4">State</TableHead>
-                  <TableHead className="w-[16%] px-4">Type</TableHead>
-                  <TableHead className="w-[14%] px-4">Updated</TableHead>
-                  <TableHead className="w-[6%] px-4 text-right">Actions</TableHead>
+                  <TableHead className="w-[35%] px-4">Name</TableHead>
+                  <TableHead className="w-[10%] px-4 text-right">Size</TableHead>
+                  <TableHead className="w-[18%] px-4">Location</TableHead>
+                  <TableHead className="w-[18%] px-4">Type</TableHead>
+                  <TableHead className="w-[12%] px-4">Updated</TableHead>
+                  <TableHead className="w-[7%] px-4 text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -640,11 +763,17 @@ function ObjectBrowserTable({
                         <span className="min-w-0 truncate" title={object.key}>
                           {objectDisplayName(object.key, prefix)}
                         </span>
+                        <ObjectStatusIcon
+                          bucketName={bucketName}
+                          versionID={object.current_version_id}
+                          status={object.status}
+                          compact
+                        />
                       </div>
                     </TableCell>
                     <TableCell className="px-4 text-right">{formatBytes(object.size)}</TableCell>
                     <TableCell className="px-4">
-                      <StatusBadge tone={objectStateTone(object.state)}>{object.state}</StatusBadge>
+                      <LocationBadges location={object.location} />
                     </TableCell>
                     <TableCell className="px-4 text-muted-foreground">
                       <span className="block max-w-48 truncate" title={object.content_type}>
@@ -745,7 +874,7 @@ function ObjectBrowserSkeleton() {
     <div className="rounded-md border border-border p-4">
       <div className="flex flex-col gap-3">
         {objectBrowserSkeletonRows.map((row) => (
-          <div key={row} className="grid grid-cols-[1fr_6rem_8rem_10rem_8rem_3rem] items-center gap-4">
+          <div key={row} className="grid grid-cols-[1fr_6rem_9rem_10rem_8rem_3rem] items-center gap-4">
             <Skeleton className="h-6 w-full" />
             <Skeleton className="h-6 w-full" />
             <Skeleton className="h-6 w-full" />

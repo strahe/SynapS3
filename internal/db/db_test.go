@@ -117,6 +117,11 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 				t.Fatalf("%s.%s should not exist", table, column)
 			}
 		}
+		for _, column := range []string{"in_cache", "in_filecoin"} {
+			if !columns[column] {
+				t.Fatalf("%s.%s should exist", table, column)
+			}
+		}
 	}
 
 	indexes := sqliteIndexes(t, db, "objects")

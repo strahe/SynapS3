@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"os"
 	"strconv"
 	"time"
 
@@ -175,6 +176,11 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	// Read from cache
 	rc, _, err := u.cache.Get(ctx, bucket.Name, version.CacheKey)
 	if err != nil {
+		if os.IsNotExist(err) && version.InCache {
+			if markErr := u.repos.Objects.SetVersionCachePresence(ctx, task.RefVersionID, false); markErr != nil {
+				logger.Warn("failed to mark cache location absent", "error", markErr)
+			}
+		}
 		u.handleFailure(ctx, task, version, logger, "cache read", err)
 		return
 	}

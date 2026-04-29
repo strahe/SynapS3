@@ -57,12 +57,20 @@ export interface BucketMutationResponse {
   status: string
 }
 
+export interface ObjectLocation {
+  cache: boolean
+  filecoin: boolean
+}
+
+export type ObjectStatus = 'uploading' | 'success' | 'warning' | 'unavailable'
+
 export interface ObjectItem {
   id: number
   key: string
   current_version_id: string
   size: number
-  state: string
+  status: ObjectStatus
+  location: ObjectLocation
   content_type: string
   etag: string
   piece_cid?: string
@@ -86,7 +94,8 @@ export interface ObjectVersionItem {
   version_id: string
   key: string
   size: number
-  state: string
+  status: ObjectStatus
+  location: ObjectLocation
   content_type: string
   etag: string
   piece_cid?: string
@@ -99,6 +108,14 @@ export interface ObjectVersionListResponse {
   versions: ObjectVersionItem[]
   has_more: boolean
   next_version_marker?: string
+}
+
+export interface ObjectStatusDetail {
+  version_id: string
+  status: ObjectStatus
+  failed_at_state?: string
+  message?: string
+  updated_at: string
 }
 
 export interface TaskItem {
@@ -360,6 +377,10 @@ export const api = {
       `/buckets/${encodeURIComponent(name)}/objects/versions?${sp.toString()}`
     )
   },
+  getObjectStatusDetail: (name: string, versionId: string) =>
+    fetchJSON<ObjectStatusDetail>(
+      `/buckets/${encodeURIComponent(name)}/objects/status-detail?version_id=${encodeURIComponent(versionId)}`
+    ),
   getObjectDownloadUrl: (name: string, key: string, versionId?: string) => {
     const params = [`key=${encodeURIComponent(key)}`]
     if (versionId) params.push(`version_id=${encodeURIComponent(versionId)}`)

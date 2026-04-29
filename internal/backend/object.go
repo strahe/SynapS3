@@ -75,6 +75,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 			CacheKey:     cacheKey,
 			PieceCID:     reuse.PieceCID,
 			RetrievalURL: reuse.RetrievalURL,
+			InCache:      true,
 			State:        reuse.State,
 		}
 		createdState = version.State
@@ -432,6 +433,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 			CacheKey:     cacheKey,
 			PieceCID:     reuse.PieceCID,
 			RetrievalURL: reuse.RetrievalURL,
+			InCache:      true,
 			State:        reuse.State,
 		}
 		createdState = version.State
@@ -673,6 +675,8 @@ func objectSnapshotVersion(obj *model.Object) *model.ObjectVersion {
 		CacheKey:     obj.CacheKey,
 		PieceCID:     obj.PieceCID,
 		RetrievalURL: obj.RetrievalURL,
+		InCache:      obj.InCache,
+		InFilecoin:   obj.InFilecoin,
 		State:        obj.State,
 		CreatedAt:    obj.UpdatedAt,
 		UpdatedAt:    obj.UpdatedAt,

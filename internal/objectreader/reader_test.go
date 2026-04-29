@@ -95,6 +95,187 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	if got.ContentType != "text/plain" || got.ETag != "object-etag" || got.Size != 6 {
 		t.Fatalf("metadata = %#v", got)
 	}
+	dbVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || dbVersion == nil {
+		t.Fatalf("version after rehydrate: version=%v err=%v", dbVersion, err)
+	}
+	if !dbVersion.InCache {
+		t.Fatal("version in_cache = false, want true after successful rehydrate")
+	}
+}
+
+func TestOpenCacheHitDoesNotRewritePresentCacheLocation(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "cache-hit-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR08",
+		BucketID:    bucket.ID,
+		Key:         "cached.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR08",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	objects := &countingObjectRepo{ObjectRepository: repos.Objects}
+	repos.Objects = objects
+
+	reader := New(repos, mc, nil, slog.Default())
+	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_ = got.Body.Close()
+	if objects.cachePresenceWrites != 0 {
+		t.Fatalf("cache presence writes after Open cache hit = %d, want 0", objects.cachePresenceWrites)
+	}
+
+	got, err = reader.OpenVersion(ctx, bucket.Name, version.Key, version.VersionID, S3Visibility)
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	_ = got.Body.Close()
+	if objects.cachePresenceWrites != 0 {
+		t.Fatalf("cache presence writes after OpenVersion cache hit = %d, want 0", objects.cachePresenceWrites)
+	}
+}
+
+type countingObjectRepo struct {
+	repository.ObjectRepository
+
+	cachePresenceWrites int
+}
+
+func (r *countingObjectRepo) SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error {
+	r.cachePresenceWrites++
+	return r.ObjectRepository.SetVersionCachePresence(ctx, versionID, inCache)
+}
+
+func TestOpenCacheMissMarksCacheLocationAbsent(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "cache-miss-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR06",
+		BucketID:    bucket.ID,
+		Key:         "missing-cache.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR06",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+
+	reader := New(repos, mc, nil, slog.Default())
+	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+	if err == nil {
+		_ = got.Body.Close()
+		t.Fatal("Open succeeded, want missing cache error")
+	}
+	if !errors.Is(err, ErrNoSuchKey) {
+		t.Fatalf("Open error = %v, want ErrNoSuchKey", err)
+	}
+
+	dbVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || dbVersion == nil {
+		t.Fatalf("version after cache miss: version=%v err=%v", dbVersion, err)
+	}
+	if dbVersion.InCache {
+		t.Fatal("version in_cache = true, want false after confirmed cache miss")
+	}
+}
+
+func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+			_, _ = io.Copy(io.Discard, r)
+			return nil, errors.New("cache full")
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "rehydrate-fail-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	pieceCID := buildTestCID(t)
+	version := &model.ObjectVersion{
+		VersionID:    "01J0000000000000000000OR07",
+		BucketID:     bucket.ID,
+		Key:          "remote.txt",
+		Size:         6,
+		ETag:         "object-etag",
+		Checksum:     "object-checksum",
+		ContentType:  "text/plain",
+		CacheKey:     ".versions/01J0000000000000000000OR07",
+		State:        model.ObjectStateStored,
+		PieceCID:     &pieceCID,
+		RetrievalURL: stringPtr("https://provider.example/piece"),
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
+		t.Fatalf("SetVersionCachePresence: %v", err)
+	}
+
+	storageClient := &testutil.MockStorageClient{
+		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
+		},
+	}
+	reader := New(repos, mc, storageClient, slog.Default())
+	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, readErr := io.ReadAll(got.Body)
+	closeErr := got.Body.Close()
+	if readErr != nil {
+		t.Fatalf("ReadAll: %v", readErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("Body.Close: %v", closeErr)
+	}
+
+	dbVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || dbVersion == nil {
+		t.Fatalf("version after failed rehydrate: version=%v err=%v", dbVersion, err)
+	}
+	if dbVersion.InCache {
+		t.Fatal("version in_cache = true, want false when rehydrate fails")
+	}
 }
 
 func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing.T) {
