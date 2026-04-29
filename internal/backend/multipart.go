@@ -130,7 +130,7 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
-	rc, _, cacheErr := b.cache.Get(ctx, srcBucketName, srcKey)
+	rc, _, cacheErr := b.cache.Get(ctx, srcBucketName, srcObj.CacheKey)
 	if cacheErr != nil {
 		if os.IsNotExist(cacheErr) {
 			return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
@@ -231,8 +231,11 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		}
 	}
 
-	// Assemble parts in cache
-	cacheInfo, _, err := b.cache.AssembleParts(ctx, bucketName, keyName, uploadID, partNumbers)
+	versionID := model.NewVersionID()
+	cacheKey := versionCacheKey(versionID)
+
+	// Assemble parts into a version-specific cache key.
+	cacheInfo, _, err := b.cache.AssembleParts(ctx, bucketName, cacheKey, uploadID, partNumbers)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("assembling parts: %w", err)
 	}
@@ -247,10 +250,11 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("computing multipart ETag: %w", err)
 	}
 
-	// Atomic: upsert object + enqueue task + finalize upload status
-	var newGen int64
+	// Atomic: create object version + enqueue task + finalize upload status
+	var write repository.ObjectVersionWriteResult
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		obj := &model.Object{
+		version := &model.ObjectVersion{
+			VersionID:   versionID,
 			BucketID:    upload.BucketID,
 			Key:         keyName,
 			Size:        cacheInfo.Size,
@@ -258,23 +262,25 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 			Checksum:    cacheInfo.Checksum,
 			ContentType: upload.ContentType,
 			Metadata:    upload.Metadata,
-			CachePath:   cacheInfo.Path,
+			CacheKey:    cacheKey,
 			State:       model.ObjectStateCached,
-			MaxRetries:  b.uploadMaxRetries,
 		}
 
-		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
+		var err error
+		write, err = txRepos.Objects.CreateVersionAndSetCurrentIfChanged(ctx, version)
 		if err != nil {
-			return fmt.Errorf("upserting assembled object: %w", err)
+			return fmt.Errorf("creating assembled object version: %w", err)
 		}
-		newGen = gen
+		if !write.Created {
+			return txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted)
+		}
 
 		task := &model.Task{
 			Type:           model.TaskTypeUpload,
 			RefType:        "object",
-			RefID:          id,
-			RefGeneration:  gen,
-			IdempotencyKey: fmt.Sprintf("upload:%d:%d", id, gen),
+			RefID:          write.ObjectID,
+			RefVersionID:   versionID,
+			IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
 			Status:         model.TaskStatusPending,
 			MaxRetries:     b.uploadMaxRetries,
 			ScheduledAt:    time.Now(),
@@ -285,19 +291,29 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 
 		return txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted)
 	}); err != nil {
-		// Best-effort cleanup of assembled cache file on tx failure (only if first generation)
-		if newGen == 1 {
-			_ = b.cache.Delete(ctx, bucketName, keyName)
-		}
+		b.deleteVersionCacheBestEffort(ctx, bucketName, cacheKey, "orphaned multipart version cache file after complete tx failure")
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	completed = true
+
+	if !write.Created {
+		b.deleteVersionCacheBestEffort(ctx, bucketName, cacheKey, "orphaned duplicate multipart version cache file")
+		_ = b.cache.DeleteUpload(ctx, uploadID)
+
+		etag := fmt.Sprintf(`"%s"`, write.ETag)
+		b.logger.Info("multipart object unchanged", "bucket", bucketName, "key", keyName, "uploadID", uploadID, "versionID", write.VersionID)
+		return s3response.CompleteMultipartUploadResult{
+			Bucket: &bucketName,
+			Key:    &keyName,
+			ETag:   &etag,
+		}, "", nil
+	}
 
 	// Clean up multipart parts from cache (best-effort)
 	_ = b.cache.DeleteUpload(ctx, uploadID)
 
 	etag := fmt.Sprintf(`"%s"`, s3ETag)
-	b.logger.Info("multipart upload completed", "bucket", bucketName, "key", keyName, "uploadID", uploadID, "parts", len(partNumbers), "gen", newGen)
+	b.logger.Info("multipart upload completed", "bucket", bucketName, "key", keyName, "uploadID", uploadID, "parts", len(partNumbers), "versionID", versionID)
 
 	return s3response.CompleteMultipartUploadResult{
 		Bucket: &bucketName,

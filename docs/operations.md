@@ -144,22 +144,16 @@ Lists tasks that exhausted retries and entered dead-letter status.
 ```json
 [
   {
-    "ID": 42,
-    "Type": "upload",
-    "RefType": "object",
-    "RefID": 7,
-    "RefGeneration": 1,
-    "IdempotencyKey": "upload:7:1",
-    "Payload": null,
-    "Status": "dead_letter",
-    "RetryCount": 5,
-    "MaxRetries": 5,
-    "LastError": "SP upload: connection refused (max retries reached)",
-    "ScheduledAt": "2025-01-15T10:30:00Z",
-    "ClaimedAt": null,
-    "LeaseUntil": null,
-    "StartedAt": null,
-    "CompletedAt": null
+    "id": 42,
+    "type": "upload",
+    "ref_type": "object",
+    "ref_id": 7,
+    "ref_version_id": "01HX7Y8Z9ABCDEFGHJKMNPQRS",
+    "status": "dead_letter",
+    "retry_count": 5,
+    "max_retries": 5,
+    "last_error": "SP upload: connection refused (max retries reached)",
+    "scheduled_at": "2025-01-15T10:30:00Z"
   }
 ]
 ```

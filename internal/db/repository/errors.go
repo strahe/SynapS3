@@ -13,6 +13,8 @@ var ErrAlreadyExists = errors.New("already exists")
 // ErrNotFound is returned when a CAS update matches zero rows (entity missing or wrong state).
 var ErrNotFound = errors.New("not found")
 
+var errConcurrentObjectCreate = errors.New("concurrent object create")
+
 // isUniqueViolation detects unique constraint violations for both PostgreSQL and SQLite.
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
@@ -20,4 +22,23 @@ func isUniqueViolation(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint")
+}
+
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
+}
+
+func shouldRetryObjectWrite(err error, canRestartTx bool) bool {
+	if isSQLiteBusy(err) {
+		return true
+	}
+	return canRestartTx && errors.Is(err, errConcurrentObjectCreate)
+}
+
+func shouldRetryRepositoryTx(err error) bool {
+	return errors.Is(err, errConcurrentObjectCreate)
 }

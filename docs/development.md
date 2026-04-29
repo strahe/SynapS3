@@ -27,7 +27,7 @@ make migrate  # Build binary and run database migrations with config.example.yam
 ```bash
 go test -race -count=1 ./...
 go test ./internal/db/repository -count=1
-go test ./internal/db/repository -run '^TestObjectRepo_UpsertAndBumpGeneration_Overwrite$' -count=1
+go test ./internal/db/repository -run '^TestObjectRepo_CreateVersionAndSetCurrent_SecondUploadKeepsVersionHistory$' -count=1
 ```
 
 ## Project Structure

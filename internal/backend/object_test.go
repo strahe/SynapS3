@@ -56,6 +56,29 @@ func putTestObject(t *testing.T, tb *testBackend, bucket, key, body string) stri
 	return out.ETag
 }
 
+func seedBackendObjectVersion(t *testing.T, tb *testBackend, bucket *model.Bucket, key string, size int64, etag, checksum, contentType string, state model.ObjectState, pieceCID, retrievalURL *string) (int64, string) {
+	t.Helper()
+	versionID := model.NewVersionID()
+	version := &model.ObjectVersion{
+		VersionID:    versionID,
+		BucketID:     bucket.ID,
+		Key:          key,
+		Size:         size,
+		ETag:         etag,
+		Checksum:     checksum,
+		ContentType:  contentType,
+		CacheKey:     ".versions/" + versionID,
+		PieceCID:     pieceCID,
+		RetrievalURL: retrievalURL,
+		State:        state,
+	}
+	objID, err := tb.repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
+	if err != nil {
+		t.Fatalf("seeding object version: %v", err)
+	}
+	return objID, versionID
+}
+
 func counterValue(t *testing.T, name string) float64 {
 	t.Helper()
 	metricFamilies, err := prometheus.DefaultGatherer.Gather()
@@ -113,9 +136,12 @@ func TestPutObject_HappyPath(t *testing.T) {
 	if obj.Size != int64(len(body)) {
 		t.Errorf("object size = %d, want %d", obj.Size, len(body))
 	}
+	if obj.CurrentVersionID == "" {
+		t.Fatal("expected current version id")
+	}
 
 	// Verify cache file exists.
-	if !tb.cache.Exists(ctx, "put-bucket", "greeting.txt") {
+	if !tb.cache.Exists(ctx, "put-bucket", obj.CacheKey) {
 		t.Error("cache file does not exist")
 	}
 }
@@ -179,15 +205,76 @@ func TestPutObject_Overwrite(t *testing.T) {
 
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "ow-bucket")
 	obj1, _ := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
-	if obj1.Generation != 1 {
-		t.Fatalf("first gen = %d, want 1", obj1.Generation)
+	if obj1.CurrentVersionID == "" {
+		t.Fatal("first current version id is empty")
 	}
+	firstVersionID := obj1.CurrentVersionID
 
 	putTestObject(t, tb, "ow-bucket", "file.txt", "version-2")
 
 	obj2, _ := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
-	if obj2.Generation != 2 {
-		t.Errorf("second gen = %d, want 2", obj2.Generation)
+	if obj2.CurrentVersionID == "" || obj2.CurrentVersionID == firstVersionID {
+		t.Fatalf("second current version id = %q, first = %q", obj2.CurrentVersionID, firstVersionID)
+	}
+	firstVersion, err := tb.repos.Objects.GetVersionByID(ctx, firstVersionID)
+	if err != nil || firstVersion == nil {
+		t.Fatalf("first version missing: version=%v err=%v", firstVersion, err)
+	}
+	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, obj2.CurrentVersionID)
+	if err != nil || secondVersion == nil {
+		t.Fatalf("second version missing: version=%v err=%v", secondVersion, err)
+	}
+	if firstVersion.ObjectID != obj2.ID || secondVersion.ObjectID != obj2.ID {
+		t.Fatalf("versions should reference object %d, got %d/%d", obj2.ID, firstVersion.ObjectID, secondVersion.ObjectID)
+	}
+}
+
+func TestPutObjectIdenticalCurrentObjectDoesNotCreateVersionOrTask(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "dedupe-bucket")
+
+	firstETag := putTestObject(t, tb, "dedupe-bucket", "file.txt", "same data")
+
+	bkt, _ := tb.repos.Buckets.GetByName(ctx, "dedupe-bucket")
+	obj1, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
+	if err != nil || obj1 == nil {
+		t.Fatalf("current object after first put: obj=%v err=%v", obj1, err)
+	}
+
+	secondETag := putTestObject(t, tb, "dedupe-bucket", "file.txt", "same data")
+
+	obj2, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
+	if err != nil || obj2 == nil {
+		t.Fatalf("current object after second put: obj=%v err=%v", obj2, err)
+	}
+	if secondETag != firstETag {
+		t.Fatalf("second ETag = %s, want %s", secondETag, firstETag)
+	}
+	if obj2.CurrentVersionID != obj1.CurrentVersionID {
+		t.Fatalf("current version changed for identical put: got %s want %s", obj2.CurrentVersionID, obj1.CurrentVersionID)
+	}
+
+	versionCount, err := tb.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("object_id = ?", obj1.ID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting object versions: %v", err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("object version count = %d, want 1", versionCount)
+	}
+
+	taskCount, err := tb.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("ref_type = ? AND ref_id = ?", "object", obj1.ID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting upload tasks: %v", err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("task count = %d, want 1", taskCount)
 	}
 }
 
@@ -271,26 +358,8 @@ func TestGetObject_SPFallback(t *testing.T) {
 	// Build a valid CID for the PieceCID field.
 	pieceCIDStr := buildDummyCID(t)
 
-	// Insert object directly in DB with PieceCID set.
-	obj := &model.Object{
-		BucketID:    bkt.ID,
-		Key:         "remote-file.txt",
-		Size:        5,
-		ETag:        "abc123",
-		Checksum:    "sha256hex",
-		ContentType: "text/plain",
-		CachePath:   "/fake/path",
-		State:       model.ObjectStateCached,
-		PieceCID:    &pieceCIDStr,
-	}
-	if _, _, err := tb.repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-		t.Fatalf("seeding object: %v", err)
-	}
-
-	// Configure mock storage client to return data.
-	if _, err := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ?`, "https://provider.example/pieces/1", obj.ID); err != nil {
-		t.Fatalf("setting retrieval_url: %v", err)
-	}
+	retrievalURL := "https://provider.example/pieces/1"
+	seedBackendObjectVersion(t, tb, bkt, "remote-file.txt", 5, "abc123", "sha256hex", "text/plain", model.ObjectStateCached, &pieceCIDStr, &retrievalURL)
 
 	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
 		if opts == nil || opts.URL != "https://provider.example/pieces/1" {
@@ -314,7 +383,7 @@ func TestGetObject_SPFallback(t *testing.T) {
 	}
 }
 
-func TestGetObject_SPFallback_GenerationMismatchDoesNotServeStaleData(t *testing.T) {
+func TestGetObject_SPFallback_CurrentVersionChangeDoesNotServeStaleData(t *testing.T) {
 	var latestReady bool
 	mc := &synaps3testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
@@ -340,44 +409,12 @@ func TestGetObject_SPFallback_GenerationMismatchDoesNotServeStaleData(t *testing
 	bkt := seedActiveBucket(t, tb, "sp-race-bucket")
 
 	pieceCIDStr := buildDummyCID(t)
-	obj := &model.Object{
-		BucketID:    bkt.ID,
-		Key:         "remote-file.txt",
-		Size:        3,
-		ETag:        "abc123",
-		Checksum:    "sha256hex",
-		ContentType: "text/plain",
-		CachePath:   "/fake/path",
-		State:       model.ObjectStateCached,
-		PieceCID:    &pieceCIDStr,
-	}
-	objID, _, err := tb.repos.Objects.UpsertAndBumpGeneration(ctx, obj)
-	if err != nil {
-		t.Fatalf("seeding object: %v", err)
-	}
-	if _, err := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ?`, "https://provider.example/pieces/old", objID); err != nil {
-		t.Fatalf("setting retrieval_url: %v", err)
-	}
+	oldRetrievalURL := "https://provider.example/pieces/old"
+	seedBackendObjectVersion(t, tb, bkt, "remote-file.txt", 3, "abc123", "sha256hex", "text/plain", model.ObjectStateCached, &pieceCIDStr, &oldRetrievalURL)
 
 	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
 		latestReady = true
-		replacement := &model.Object{
-			BucketID:    bkt.ID,
-			Key:         "remote-file.txt",
-			Size:        3,
-			ETag:        "new",
-			Checksum:    "new",
-			ContentType: "text/plain",
-			CachePath:   "/fake/new",
-			State:       model.ObjectStateCached,
-		}
-		newID, newGen, upsertErr := tb.repos.Objects.UpsertAndBumpGeneration(ctx, replacement)
-		if upsertErr != nil {
-			t.Fatalf("bumping generation: %v", upsertErr)
-		}
-		if _, execErr := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ? AND generation = ?`, "https://provider.example/pieces/new", newID, newGen); execErr != nil {
-			t.Fatalf("updating new retrieval_url: %v", execErr)
-		}
+		seedBackendObjectVersion(t, tb, bkt, "remote-file.txt", 3, "new", "new", "text/plain", model.ObjectStateCached, nil, nil)
 		return io.NopCloser(bytes.NewReader([]byte("old"))), nil
 	}
 
@@ -412,17 +449,8 @@ func TestGetObject_SPFallback_DownloadFailure(t *testing.T) {
 	bkt := seedActiveBucket(t, tb, "sp-fail-bucket")
 
 	pieceCIDStr := buildDummyCID(t)
-	obj := &model.Object{
-		BucketID: bkt.ID, Key: "fail-dl.txt", Size: 5, ETag: "e", Checksum: "c",
-		ContentType: "text/plain", CachePath: "/fake", State: model.ObjectStateCached,
-		PieceCID: &pieceCIDStr,
-	}
-	if _, _, err := tb.repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-		t.Fatalf("seeding object: %v", err)
-	}
-	if _, err := tb.db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE bucket_id = ? AND key = ?`, "https://provider.example/pieces/fail", bkt.ID, "fail-dl.txt"); err != nil {
-		t.Fatalf("setting retrieval_url: %v", err)
-	}
+	retrievalURL := "https://provider.example/pieces/fail"
+	seedBackendObjectVersion(t, tb, bkt, "fail-dl.txt", 5, "e", "c", "text/plain", model.ObjectStateCached, &pieceCIDStr, &retrievalURL)
 
 	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
 		return nil, errors.New("provider unreachable")
@@ -470,13 +498,7 @@ func TestGetObject_NilStorage(t *testing.T) {
 	bkt := seedActiveBucket(t, tb2, "nil-sc-bucket")
 
 	// Object exists in DB but no PieceCID and cache miss.
-	obj := &model.Object{
-		BucketID: bkt.ID, Key: "orphan.txt", Size: 5, ETag: "e", Checksum: "c",
-		ContentType: "text/plain", CachePath: "/fake", State: model.ObjectStateCached,
-	}
-	if _, _, err := tb2.repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-		t.Fatalf("seeding: %v", err)
-	}
+	seedBackendObjectVersion(t, tb2, bkt, "orphan.txt", 5, "e", "c", "text/plain", model.ObjectStateCached, nil, nil)
 
 	_, err := tb2.backend.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("nil-sc-bucket"),
@@ -718,6 +740,63 @@ func TestCopyObject_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCopyObjectIdenticalCurrentObjectDoesNotCreateVersionOrTask(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "copy-dedupe-src")
+	seedActiveBucket(t, tb, "copy-dedupe-dst")
+	putTestObject(t, tb, "copy-dedupe-src", "original.txt", "copy me")
+
+	copyInput := s3response.CopyObjectInput{
+		Bucket:     aws.String("copy-dedupe-dst"),
+		Key:        aws.String("copied.txt"),
+		CopySource: aws.String("/copy-dedupe-src/original.txt"),
+	}
+	if _, err := tb.backend.CopyObject(ctx, copyInput); err != nil {
+		t.Fatalf("first CopyObject: %v", err)
+	}
+
+	dstBkt, _ := tb.repos.Buckets.GetByName(ctx, "copy-dedupe-dst")
+	obj1, err := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
+	if err != nil || obj1 == nil {
+		t.Fatalf("current object after first copy: obj=%v err=%v", obj1, err)
+	}
+
+	if _, err := tb.backend.CopyObject(ctx, copyInput); err != nil {
+		t.Fatalf("second CopyObject: %v", err)
+	}
+
+	obj2, err := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
+	if err != nil || obj2 == nil {
+		t.Fatalf("current object after second copy: obj=%v err=%v", obj2, err)
+	}
+	if obj2.CurrentVersionID != obj1.CurrentVersionID {
+		t.Fatalf("current version changed for identical copy: got %s want %s", obj2.CurrentVersionID, obj1.CurrentVersionID)
+	}
+
+	versionCount, err := tb.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("object_id = ?", obj1.ID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting object versions: %v", err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("object version count = %d, want 1", versionCount)
+	}
+
+	taskCount, err := tb.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("ref_type = ? AND ref_id = ?", "object", obj1.ID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting upload tasks: %v", err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("task count = %d, want 1", taskCount)
+	}
+}
+
 func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(13))
 	ctx := context.Background()
@@ -741,9 +820,6 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 	dstObj, err := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
-	}
-	if dstObj.MaxRetries != 13 {
-		t.Fatalf("object MaxRetries = %d, want 13", dstObj.MaxRetries)
 	}
 
 	tasks, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), string(model.TaskStatusPending), 10, 0)

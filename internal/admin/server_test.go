@@ -299,7 +299,7 @@ func TestRefreshMetrics(t *testing.T) {
 		Type:           model.TaskTypeUpload,
 		RefType:        "object",
 		RefID:          1,
-		RefGeneration:  1,
+		RefVersionID:   "01J000000000000000TASK001",
 		IdempotencyKey: "test-refresh-task",
 		Status:         model.TaskStatusPending,
 		ScheduledAt:    time.Now(),
@@ -313,17 +313,19 @@ func TestRefreshMetrics(t *testing.T) {
 	if _, err := db.NewInsert().Model(bucket).Exec(ctx); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
-	obj := &model.Object{
+	versionID := model.NewVersionID()
+	version := &model.ObjectVersion{
+		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         "metrics.txt",
 		Size:        1,
 		ETag:        "e",
 		Checksum:    "c",
 		ContentType: "text/plain",
-		CachePath:   "/cache/metrics.txt",
-		MaxRetries:  5,
+		CacheKey:    ".versions/" + versionID,
+		State:       model.ObjectStateCached,
 	}
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
 		t.Fatalf("seeding object: %v", err)
 	}
 

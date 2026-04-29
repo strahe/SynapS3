@@ -29,6 +29,14 @@ func up001Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating objects table: %w", err)
 	}
 
+	// Create object_versions table.
+	if _, err := db.NewCreateTable().
+		Model((*model.ObjectVersion)(nil)).
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating object_versions table: %w", err)
+	}
+
 	// Create tasks table.
 	if _, err := db.NewCreateTable().
 		Model((*model.Task)(nil)).
@@ -46,6 +54,26 @@ func up001Init(ctx context.Context, db *bun.DB) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating unique index on objects: %w", err)
+	}
+
+	// Index for future version listing by object.
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_object_created").
+		ColumnExpr("object_id, created_at DESC, version_id DESC").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating index on object versions: %w", err)
+	}
+
+	// Index for version state queries.
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_state_updated").
+		Column("state", "updated_at").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating state index on object versions: %w", err)
 	}
 
 	// Index for task polling: status + scheduled_at.
@@ -68,7 +96,7 @@ func up001Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating index on task leases: %w", err)
 	}
 
-	// Index for object state queries (workers scan by state).
+	// Index for current object state aggregates.
 	if _, err := db.NewCreateIndex().
 		Model((*model.Object)(nil)).
 		Index("idx_objects_state").
@@ -123,6 +151,7 @@ func down001Init(ctx context.Context, db *bun.DB) error {
 		(*model.MultipartPart)(nil),
 		(*model.MultipartUpload)(nil),
 		(*model.Task)(nil),
+		(*model.ObjectVersion)(nil),
 		(*model.Object)(nil),
 		(*model.Bucket)(nil),
 	} {

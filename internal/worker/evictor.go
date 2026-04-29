@@ -81,53 +81,44 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTaskDuration.WithLabelValues("evictor").Observe(time.Since(start).Seconds())
 	}()
 
-	logger := e.logger.With("taskID", task.ID, "objectID", task.RefID, "gen", task.RefGeneration)
+	logger := e.logger.With("taskID", task.ID, "objectID", task.RefID, "versionID", task.RefVersionID)
 
-	obj, err := e.repos.Objects.GetByID(ctx, task.RefID)
-	if err != nil || obj == nil {
-		logger.Warn("object not found for evict task", "error", err)
+	version, err := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
+	if err != nil || version == nil {
+		logger.Warn("object version not found for evict task", "error", err)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "object not found")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
-	if obj.Generation != task.RefGeneration {
-		logger.Warn("stale generation, skipping")
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "stale generation")
-		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
-		return
-	}
-
 	// Dual safety check: must be stored AND have PieceCID
-	if obj.State != model.ObjectStateStored {
-		logger.Warn("object not in stored state", "state", obj.State)
+	if version.State != model.ObjectStateStored {
+		logger.Warn("object version not in stored state", "state", version.State)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "not stored")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
-	if obj.PieceCID == nil || *obj.PieceCID == "" {
-		logger.Error("object has no PieceCID, refusing to evict")
+	if version.PieceCID == nil || *version.PieceCID == "" {
+		logger.Error("object version has no PieceCID, refusing to evict")
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "no PieceCID")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
-	bucket, err := e.repos.Buckets.GetByID(ctx, obj.BucketID)
+	bucket, err := e.repos.Buckets.GetByID(ctx, version.BucketID)
 	if err != nil || bucket == nil {
-		logger.Error("bucket not found", "bucketID", obj.BucketID, "error", err)
+		logger.Error("bucket not found", "bucketID", version.BucketID, "error", err)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
-	// CAS transition first (acts as generation guard), then delete cache.
-	// This prevents a TOCTOU race where a concurrent PutObject could write new data
-	// between our generation check and cache deletion.
-	if err := state.TransitionState(ctx, e.stateMachine, e.repos.Objects, task.RefID, task.RefGeneration,
+	// CAS transition first, then delete this version's cache key.
+	if err := state.TransitionState(ctx, e.stateMachine, e.repos.Objects, task.RefVersionID,
 		model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
 		logger.Error("state transition stored→cache_evicted failed", "error", err)
 		if task.RetryCount+1 >= task.MaxRetries {
-			_ = state.TransitionToFailed(ctx, e.stateMachine, e.repos.Objects, task.RefID, task.RefGeneration,
+			_ = state.TransitionToFailed(ctx, e.stateMachine, e.repos.Objects, task.RefVersionID,
 				model.ObjectStateStored, fmt.Sprintf("cache eviction: %v (max retries reached)", err))
 			if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
 				logger.Error("failed to mark task as dead-letter", "error", ftErr)
@@ -142,7 +133,7 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	if err := e.cache.Delete(ctx, bucket.Name, obj.Key); err != nil {
+	if err := e.cache.Delete(ctx, bucket.Name, version.CacheKey); err != nil {
 		logger.Warn("cache delete failed (state already transitioned)", "error", err)
 	}
 

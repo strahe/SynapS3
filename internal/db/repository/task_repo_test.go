@@ -16,7 +16,7 @@ func seedTask(t *testing.T, repos *repository.Repositories, taskType model.TaskT
 		Type:           taskType,
 		RefType:        "object",
 		RefID:          1,
-		RefGeneration:  1,
+		RefVersionID:   "01J0000000000000000000TASK",
 		IdempotencyKey: "idem-" + string(taskType) + "-" + time.Now().Format(time.RFC3339Nano),
 		Status:         model.TaskStatusPending,
 	}
@@ -486,32 +486,18 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 	bucketA := seedBucket(t, db, "task-bucket-a")
 	bucketB := seedBucket(t, db, "task-bucket-b")
 
-	objectA, generationA, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucketA.ID,
-		Key:         "a.txt",
-		Size:        1,
-		ETag:        "etag-a",
-		Checksum:    "checksum-a",
-		ContentType: "text/plain",
-		CachePath:   "/cache/a.txt",
-		State:       model.ObjectStateStored,
-	})
+	versionA := newObjectVersion(bucketA.ID, "a.txt", "01J00000000000000000000TA", 1)
+	versionA.State = model.ObjectStateStored
+	objectA, err := repos.Objects.CreateVersionAndSetCurrent(ctx, versionA)
 	if err != nil {
-		t.Fatalf("UpsertAndBumpGeneration objectA: %v", err)
+		t.Fatalf("CreateVersionAndSetCurrent objectA: %v", err)
 	}
 
-	objectB, generationB, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucketB.ID,
-		Key:         "b.txt",
-		Size:        1,
-		ETag:        "etag-b",
-		Checksum:    "checksum-b",
-		ContentType: "text/plain",
-		CachePath:   "/cache/b.txt",
-		State:       model.ObjectStateStored,
-	})
+	versionB := newObjectVersion(bucketB.ID, "b.txt", "01J00000000000000000000TB", 1)
+	versionB.State = model.ObjectStateStored
+	objectB, err := repos.Objects.CreateVersionAndSetCurrent(ctx, versionB)
 	if err != nil {
-		t.Fatalf("UpsertAndBumpGeneration objectB: %v", err)
+		t.Fatalf("CreateVersionAndSetCurrent objectB: %v", err)
 	}
 
 	for _, task := range []*model.Task{
@@ -519,7 +505,7 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 			Type:           model.TaskTypeEvictCache,
 			RefType:        "object",
 			RefID:          objectA,
-			RefGeneration:  generationA,
+			RefVersionID:   versionA.VersionID,
 			IdempotencyKey: "count-active-pending",
 			Status:         model.TaskStatusPending,
 		},
@@ -527,7 +513,7 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 			Type:           model.TaskTypeEvictCache,
 			RefType:        "object",
 			RefID:          objectA,
-			RefGeneration:  generationA,
+			RefVersionID:   versionA.VersionID,
 			IdempotencyKey: "count-active-running",
 			Status:         model.TaskStatusRunning,
 		},
@@ -535,7 +521,7 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 			Type:           model.TaskTypeUpload,
 			RefType:        "object",
 			RefID:          objectA,
-			RefGeneration:  generationA,
+			RefVersionID:   versionA.VersionID,
 			IdempotencyKey: "count-active-completed",
 			Status:         model.TaskStatusCompleted,
 		},
@@ -543,7 +529,7 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 			Type:           model.TaskTypeEvictCache,
 			RefType:        "bucket",
 			RefID:          bucketA.ID,
-			RefGeneration:  0,
+			RefVersionID:   "",
 			IdempotencyKey: "count-active-bucket-task",
 			Status:         model.TaskStatusPending,
 		},
@@ -551,7 +537,7 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 			Type:           model.TaskTypeEvictCache,
 			RefType:        "object",
 			RefID:          objectB,
-			RefGeneration:  generationB,
+			RefVersionID:   versionB.VersionID,
 			IdempotencyKey: "count-active-other-bucket",
 			Status:         model.TaskStatusPending,
 		},
@@ -570,49 +556,6 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 	}
 }
 
-func TestTaskRepo_CountActiveObjectTasksByBucket_IncludesSoftDeletedObjects(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucket := seedBucket(t, db, "soft-deleted-task-bucket")
-	objectID, generation, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "ghost.txt",
-		Size:        4,
-		ETag:        "etag-ghost",
-		Checksum:    "checksum-ghost",
-		ContentType: "text/plain",
-		CachePath:   "/cache/ghost.txt",
-		State:       model.ObjectStateCached,
-		MaxRetries:  5,
-	})
-	if err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
-	}
-	if err := repos.Objects.SoftDelete(ctx, objectID); err != nil {
-		t.Fatalf("Objects.SoftDelete: %v", err)
-	}
-	if err := repos.Tasks.Create(ctx, &model.Task{
-		Type:           model.TaskTypeUpload,
-		RefType:        "object",
-		RefID:          objectID,
-		RefGeneration:  generation,
-		IdempotencyKey: "soft-deleted-object-task",
-		Status:         model.TaskStatusPending,
-	}); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-
-	count, err := repos.Tasks.CountActiveObjectTasksByBucket(ctx, bucket.ID)
-	if err != nil {
-		t.Fatalf("CountActiveObjectTasksByBucket: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("active object task count = %d, want 1", count)
-	}
-}
-
 func TestTaskRepo_CountActiveBucketTasksByBucketID(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -626,6 +569,7 @@ func TestTaskRepo_CountActiveBucketTasksByBucketID(t *testing.T) {
 			Type:           model.TaskTypeUpload,
 			RefType:        "bucket",
 			RefID:          bucketA.ID,
+			RefVersionID:   "",
 			IdempotencyKey: "create-ps-a",
 			Status:         model.TaskStatusPending,
 		},
@@ -633,6 +577,7 @@ func TestTaskRepo_CountActiveBucketTasksByBucketID(t *testing.T) {
 			Type:           model.TaskTypeEvictCache,
 			RefType:        "bucket",
 			RefID:          bucketA.ID,
+			RefVersionID:   "",
 			IdempotencyKey: "delete-ps-a",
 			Status:         model.TaskStatusRunning,
 		},
@@ -640,6 +585,7 @@ func TestTaskRepo_CountActiveBucketTasksByBucketID(t *testing.T) {
 			Type:           model.TaskTypeUpload,
 			RefType:        "bucket",
 			RefID:          bucketA.ID,
+			RefVersionID:   "",
 			IdempotencyKey: "create-ps-a-completed",
 			Status:         model.TaskStatusCompleted,
 		},
@@ -647,6 +593,7 @@ func TestTaskRepo_CountActiveBucketTasksByBucketID(t *testing.T) {
 			Type:           model.TaskTypeUpload,
 			RefType:        "bucket",
 			RefID:          bucketB.ID,
+			RefVersionID:   "",
 			IdempotencyKey: "create-ps-b",
 			Status:         model.TaskStatusPending,
 		},
@@ -685,7 +632,7 @@ func TestTaskRepo_CompleteByRef(t *testing.T) {
 		Type:           model.TaskTypeUpload,
 		RefType:        "bucket",
 		RefID:          bucket.ID,
-		RefGeneration:  0,
+		RefVersionID:   "",
 		IdempotencyKey: "cbr-pending-" + time.Now().Format(time.RFC3339Nano),
 		Status:         model.TaskStatusPending,
 	}

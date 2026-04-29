@@ -51,8 +51,7 @@ type Cache interface {
 	// existing cache entry. Returns a StagedObject whose Commit method
 	// atomically renames the temp file to the final path. If Commit is not
 	// called, Rollback removes the temp file.
-	// This is used when a DB transaction must succeed before the cache
-	// entry is published, preventing overwrite data loss on tx failure.
+	// Callers choose whether to commit before or after their DB transaction.
 	PutStaged(ctx context.Context, bucket, key string, r io.Reader) (*StagedObject, error)
 
 	// Get opens a cached object for reading. Returns os.ErrNotExist if the

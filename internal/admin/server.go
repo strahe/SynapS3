@@ -268,16 +268,16 @@ func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
 	items := make([]taskListItem, 0, len(tasks))
 	for _, t := range tasks {
 		item := taskListItem{
-			ID:            t.ID,
-			Type:          string(t.Type),
-			RefType:       t.RefType,
-			RefID:         t.RefID,
-			RefGeneration: t.RefGeneration,
-			Status:        string(t.Status),
-			RetryCount:    t.RetryCount,
-			MaxRetries:    t.MaxRetries,
-			LastError:     t.LastError,
-			ScheduledAt:   t.ScheduledAt.Format(time.RFC3339),
+			ID:           t.ID,
+			Type:         string(t.Type),
+			RefType:      t.RefType,
+			RefID:        t.RefID,
+			RefVersionID: t.RefVersionID,
+			Status:       string(t.Status),
+			RetryCount:   t.RetryCount,
+			MaxRetries:   t.MaxRetries,
+			LastError:    t.LastError,
+			ScheduledAt:  t.ScheduledAt.Format(time.RFC3339),
 		}
 		if t.ClaimedAt != nil {
 			v := t.ClaimedAt.Format(time.RFC3339)

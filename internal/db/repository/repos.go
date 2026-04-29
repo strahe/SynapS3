@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/uptrace/bun"
 )
@@ -41,8 +42,27 @@ func (r *Repositories) WithTx(ctx context.Context, fn func(txRepos *Repositories
 		return fmt.Errorf("WithTx requires *bun.DB, got %T", r.db)
 	}
 
-	return bunDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		txRepos := NewRepositories(tx)
-		return fn(txRepos)
-	})
+	for attempt := 0; ; attempt++ {
+		err := bunDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+			txRepos := NewRepositories(tx)
+			return fn(txRepos)
+		})
+		if err == nil {
+			return nil
+		}
+		if !shouldRetryRepositoryTx(err) || attempt >= 19 {
+			return err
+		}
+		delay := time.Duration(attempt+1) * 25 * time.Millisecond
+		if delay > 200*time.Millisecond {
+			delay = 200 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

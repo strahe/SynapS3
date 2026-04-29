@@ -165,6 +165,87 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCompleteMultipartUploadIdenticalCurrentObjectDoesNotCreateVersionOrTask(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "cmp-dedupe-bucket")
+
+	completeOnePart := func() {
+		t.Helper()
+		initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+			Bucket: aws.String("cmp-dedupe-bucket"),
+			Key:    aws.String("assembled.bin"),
+		})
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload: %v", err)
+		}
+
+		partNum := int32(1)
+		partOut, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:     aws.String("cmp-dedupe-bucket"),
+			Key:        aws.String("assembled.bin"),
+			UploadId:   aws.String(initResult.UploadId),
+			PartNumber: &partNum,
+			Body:       strings.NewReader("same multipart data"),
+		})
+		if err != nil {
+			t.Fatalf("UploadPart: %v", err)
+		}
+
+		_, _, err = tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   aws.String("cmp-dedupe-bucket"),
+			Key:      aws.String("assembled.bin"),
+			UploadId: aws.String(initResult.UploadId),
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: []types.CompletedPart{{PartNumber: &partNum, ETag: partOut.ETag}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CompleteMultipartUpload: %v", err)
+		}
+	}
+
+	completeOnePart()
+
+	bkt, _ := tb.repos.Buckets.GetByName(ctx, "cmp-dedupe-bucket")
+	obj1, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "assembled.bin")
+	if err != nil || obj1 == nil {
+		t.Fatalf("current object after first complete: obj=%v err=%v", obj1, err)
+	}
+
+	completeOnePart()
+
+	obj2, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "assembled.bin")
+	if err != nil || obj2 == nil {
+		t.Fatalf("current object after second complete: obj=%v err=%v", obj2, err)
+	}
+	if obj2.CurrentVersionID != obj1.CurrentVersionID {
+		t.Fatalf("current version changed for identical multipart complete: got %s want %s", obj2.CurrentVersionID, obj1.CurrentVersionID)
+	}
+
+	versionCount, err := tb.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("object_id = ?", obj1.ID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting object versions: %v", err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("object version count = %d, want 1", versionCount)
+	}
+
+	taskCount, err := tb.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("ref_type = ? AND ref_id = ?", "object", obj1.ID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting upload tasks: %v", err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("task count = %d, want 1", taskCount)
+	}
+}
+
 // ---------- AbortMultipartUpload ----------
 
 func TestAbortMultipartUpload_HappyPath(t *testing.T) {

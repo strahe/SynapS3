@@ -86,11 +86,11 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Info("released expired task leases", "count", released)
 	}
 
-	// Reset stale object states (objects stuck mid-transition from a crash)
+	// Reset stale version states (versions stuck mid-transition from a crash)
 	staleThreshold := time.Now().Add(-10 * time.Minute)
 
 	// uploading → cached (upload was interrupted)
-	if n, err := m.repos.Objects.ResetStaleStates(ctx,
+	if n, err := m.repos.Objects.ResetStaleVersionStates(ctx,
 		model.ObjectStateUploading, model.ObjectStateCached, staleThreshold); err != nil {
 		m.logger.Error("failed to reset uploading objects", "error", err)
 	} else if n > 0 {
@@ -112,23 +112,23 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 	}
 }
 
-// reconcileTasks finds objects in the given state and ensures each has a corresponding
+// reconcileTasks finds object versions in the given state and ensures each has a corresponding
 // pending task. Uses idempotency keys to safely skip objects that already have tasks.
 // keyPrefix must match the prefix used by the normal task creation path for deduplication.
 func (m *Manager) reconcileTasks(ctx context.Context, objState model.ObjectState, taskType model.TaskType, keyPrefix string) {
-	objects, err := m.repos.Objects.ListByState(ctx, objState, 100)
+	versions, err := m.repos.Objects.ListVersionsByState(ctx, objState, 100)
 	if err != nil {
 		m.logger.Error("failed to list objects for reconciliation", "state", objState, "error", err)
 		return
 	}
 	created := 0
-	for _, obj := range objects {
+	for _, version := range versions {
 		task := &model.Task{
 			Type:           taskType,
 			RefType:        "object",
-			RefID:          obj.ID,
-			RefGeneration:  obj.Generation,
-			IdempotencyKey: fmt.Sprintf("%s:%d:%d", keyPrefix, obj.ID, obj.Generation),
+			RefID:          version.ObjectID,
+			RefVersionID:   version.VersionID,
+			IdempotencyKey: fmt.Sprintf("%s:%s", keyPrefix, version.VersionID),
 			Status:         model.TaskStatusPending,
 			MaxRetries:     m.maxRetriesForTaskType(taskType),
 			ScheduledAt:    time.Now(),

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,12 +41,13 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 
 	repos := repository.NewRepositories(db)
 	for i := 0; i < 100; i++ {
+		versionID := fmt.Sprintf("01J00000000000000000%06d", i+1)
 		task := &model.Task{
 			Type:           model.TaskTypeUpload,
 			RefType:        "object",
 			RefID:          int64(i + 1),
-			RefGeneration:  1,
-			IdempotencyKey: fmt.Sprintf("upload:%d:1", i+1),
+			RefVersionID:   versionID,
+			IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
 			Status:         model.TaskStatusPending,
 			MaxRetries:     3,
 			ScheduledAt:    time.Now(),
@@ -86,6 +88,43 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	}
 	if claimedCount.Load() != 100 {
 		t.Fatalf("expected all tasks claimed, got %d", claimedCount.Load())
+	}
+}
+
+func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
+	cfg := config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.Join(t.TempDir(), "schema.db") + "?_pragma=journal_mode(WAL)",
+		MaxOpenConns: 1,
+		MaxIdleConns: 1,
+	}
+
+	db, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	if err := RunMigrations(ctx, db); err != nil {
+		t.Fatalf("RunMigrations() error = %v", err)
+	}
+
+	for _, table := range []string{"objects", "object_versions"} {
+		columns := sqliteColumns(t, db, table)
+		for _, column := range []string{"retry_count", "max_retries"} {
+			if columns[column] {
+				t.Fatalf("%s.%s should not exist", table, column)
+			}
+		}
+	}
+
+	indexes := sqliteIndexes(t, db, "objects")
+	if indexes["idx_objects_bucket_key_list"] {
+		t.Fatal("idx_objects_bucket_key_list should not exist")
+	}
+	if !indexes["idx_objects_bucket_key"] {
+		t.Fatal("idx_objects_bucket_key should exist")
 	}
 }
 
@@ -177,4 +216,60 @@ func TestSQLiteFilePathTreatsWindowsFileURIAsFilePath(t *testing.T) {
 	if filepath.ToSlash(path) != "C:/synaps3/db/synaps3.db" {
 		t.Fatalf("sqliteFilePath() path = %q, want C:/synaps3/db/synaps3.db", filepath.ToSlash(path))
 	}
+}
+
+type sqliteQueryer interface {
+	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+}
+
+func sqliteColumns(t *testing.T, db sqliteQueryer, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), "PRAGMA table_info("+table+")")
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan column info for %s: %v", table, err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate columns for %s: %v", table, err)
+	}
+	return columns
+}
+
+func sqliteIndexes(t *testing.T, db sqliteQueryer, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), "PRAGMA index_list("+table+")")
+	if err != nil {
+		t.Fatalf("PRAGMA index_list(%s): %v", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	indexes := make(map[string]bool)
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan index info for %s: %v", table, err)
+		}
+		indexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate indexes for %s: %v", table, err)
+	}
+	return indexes
 }

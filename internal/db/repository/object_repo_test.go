@@ -2,455 +2,547 @@ package repository_test
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/sqlitedialect"
+	"github.com/uptrace/bun/migrate"
 )
 
-func TestObjectRepo_UpsertAndBumpGeneration_NewObject(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucket := seedBucket(t, db, "obj-bucket")
-
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "hello.txt",
-		Size:        42,
-		ETag:        "abc123",
-		Checksum:    "sha256-xxx",
+func newObjectVersion(bucketID int64, key, versionID string, size int64) *model.ObjectVersion {
+	return &model.ObjectVersion{
+		VersionID:   versionID,
+		BucketID:    bucketID,
+		Key:         key,
+		Size:        size,
+		ETag:        "etag-" + versionID,
+		Checksum:    "checksum-" + versionID,
 		ContentType: "text/plain",
-		CachePath:   "/cache/hello.txt",
-		MaxRetries:  5,
-	}
-
-	id, gen, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
-	if err != nil {
-		t.Fatalf("UpsertAndBumpGeneration (new): %v", err)
-	}
-	if id == 0 {
-		t.Fatal("expected non-zero ID")
-	}
-	if gen != 1 {
-		t.Errorf("expected generation 1, got %d", gen)
+		CacheKey:    ".versions/" + versionID,
+		State:       model.ObjectStateCached,
 	}
 }
 
-func TestObjectRepo_UpsertAndBumpGeneration_Overwrite(t *testing.T) {
+func TestObjectRepo_CreateVersionAndSetCurrent_SecondUploadKeepsVersionHistory(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
+	bucket := seedBucket(t, db, "version-bucket")
 
-	bucket := seedBucket(t, db, "overwrite-bucket")
-
-	obj1 := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "file.txt",
-		Size:        10,
-		ETag:        "e1",
-		Checksum:    "c1",
-		ContentType: "text/plain",
-		CachePath:   "/cache/v1",
-		MaxRetries:  5,
-	}
-	id1, gen1, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj1)
+	v1 := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000001", 10)
+	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, v1)
 	if err != nil {
-		t.Fatalf("first upsert: %v", err)
+		t.Fatalf("first CreateVersionAndSetCurrent: %v", err)
 	}
-
-	obj2 := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "file.txt",
-		Size:        20,
-		ETag:        "e2",
-		Checksum:    "c2",
-		ContentType: "application/octet-stream",
-		CachePath:   "/cache/v2",
-		MaxRetries:  5,
-	}
-	id2, gen2, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj2)
+	v2 := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000002", 20)
+	objectID2, err := repos.Objects.CreateVersionAndSetCurrent(ctx, v2)
 	if err != nil {
-		t.Fatalf("second upsert: %v", err)
+		t.Fatalf("second CreateVersionAndSetCurrent: %v", err)
+	}
+	if objectID2 != objectID {
+		t.Fatalf("object id changed on second upload: got %d want %d", objectID2, objectID)
 	}
 
-	if id2 != id1 {
-		t.Errorf("expected same ID on overwrite (%d), got %d", id1, id2)
-	}
-	if gen2 != gen1+1 {
-		t.Errorf("expected generation %d, got %d", gen1+1, gen2)
-	}
-
-	// Verify updated fields.
-	got, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
-	if got.Size != 20 {
-		t.Errorf("expected size 20, got %d", got.Size)
+	if current.CurrentVersionID != v2.VersionID {
+		t.Fatalf("current version = %s, want %s", current.CurrentVersionID, v2.VersionID)
 	}
-	if got.ETag != "e2" {
-		t.Errorf("expected etag e2, got %s", got.ETag)
+	if current.Size != 20 || current.ETag != v2.ETag || current.CacheKey != v2.CacheKey {
+		t.Fatalf("current snapshot not refreshed: size=%d etag=%s cache=%s", current.Size, current.ETag, current.CacheKey)
+	}
+
+	gotV1, err := repos.Objects.GetVersionByID(ctx, v1.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(v1): %v", err)
+	}
+	gotV2, err := repos.Objects.GetVersionByID(ctx, v2.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(v2): %v", err)
+	}
+	if gotV1 == nil || gotV2 == nil {
+		t.Fatal("expected both versions to remain queryable")
+	}
+	if gotV1.ObjectID != objectID || gotV2.ObjectID != objectID {
+		t.Fatalf("version object ids = %d/%d, want %d", gotV1.ObjectID, gotV2.ObjectID, objectID)
 	}
 }
 
-func TestObjectRepo_UpsertAndBumpGeneration_ReuploadAfterDelete(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
+func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.T) {
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("opening sqlite db: %v", err)
+	}
+	sqldb.SetMaxOpenConns(8)
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
 	ctx := context.Background()
-
-	bucket := seedBucket(t, db, "reupload-bucket")
-
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "deleted.txt",
-		Size:        10,
-		ETag:        "e1",
-		Checksum:    "c1",
-		ContentType: "text/plain",
-		CachePath:   "/cache/d1",
-		MaxRetries:  5,
+	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
 	}
-	id1, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("running migrations: %v", err)
+	}
+
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "concurrent-version-bucket")
+
+	const writers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	objectIDs := make(chan int64, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			versionID := "01J00000000000000000000C" + string(rune('A'+i))
+			objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "same-key.txt", versionID, int64(i+1)))
+			if err != nil {
+				errs <- err
+				return
+			}
+			objectIDs <- objectID
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	close(objectIDs)
+
+	for err := range errs {
+		t.Fatalf("CreateVersionAndSetCurrent concurrent error: %v", err)
+	}
+
+	var objectID int64
+	for id := range objectIDs {
+		if objectID == 0 {
+			objectID = id
+			continue
+		}
+		if id != objectID {
+			t.Fatalf("concurrent object IDs differ: got %d want %d", id, objectID)
+		}
+	}
+
+	versionCount, err := db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("object_id = ?", objectID).
+		Count(ctx)
 	if err != nil {
-		t.Fatalf("initial upsert: %v", err)
+		t.Fatalf("counting versions: %v", err)
 	}
-
-	// Soft-delete.
-	if err := repos.Objects.SoftDelete(ctx, id1); err != nil {
-		t.Fatalf("SoftDelete: %v", err)
-	}
-
-	// Should not be visible.
-	got, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "deleted.txt")
-	if err != nil {
-		t.Fatalf("GetByBucketAndKey after delete: %v", err)
-	}
-	if got != nil {
-		t.Fatal("expected nil after soft delete")
-	}
-
-	// Re-upload: should reclaim the row.
-	obj2 := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "deleted.txt",
-		Size:        20,
-		ETag:        "e2",
-		Checksum:    "c2",
-		ContentType: "text/plain",
-		CachePath:   "/cache/d2",
-		MaxRetries:  5,
-	}
-	id2, gen2, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj2)
-	if err != nil {
-		t.Fatalf("re-upload upsert: %v", err)
-	}
-	if id2 != id1 {
-		t.Errorf("expected same ID %d, got %d", id1, id2)
-	}
-	if gen2 != 2 {
-		t.Errorf("expected generation 2, got %d", gen2)
-	}
-
-	// Should now be visible again.
-	got, err = repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "deleted.txt")
-	if err != nil {
-		t.Fatalf("GetByBucketAndKey after re-upload: %v", err)
-	}
-	if got == nil {
-		t.Fatal("expected object to be visible after re-upload")
+	if versionCount != writers {
+		t.Fatalf("version count = %d, want %d", versionCount, writers)
 	}
 }
 
-func TestObjectRepo_ListByBucket(t *testing.T) {
+func TestObjectRepo_CreateVersionAndSetCurrentIfChanged_ConcurrentIdenticalWriteReusesCurrent(t *testing.T) {
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("opening sqlite db: %v", err)
+	}
+	sqldb.SetMaxOpenConns(8)
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("running migrations: %v", err)
+	}
+
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "concurrent-dedupe-bucket")
+
+	const writers = 8
+	var wg sync.WaitGroup
+	results := make(chan repository.ObjectVersionWriteResult, writers)
+	errs := make(chan error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			versionID := "01J00000000000000000000D" + string(rune('A'+i))
+			version := newObjectVersion(bucket.ID, "same-key.txt", versionID, 100)
+			version.ETag = "same-etag"
+			version.Checksum = "same-checksum"
+			result, err := repos.Objects.CreateVersionAndSetCurrentIfChanged(ctx, version)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- result
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	close(results)
+
+	for err := range errs {
+		t.Fatalf("CreateVersionAndSetCurrentIfChanged concurrent error: %v", err)
+	}
+
+	var objectID int64
+	created := 0
+	for result := range results {
+		if objectID == 0 {
+			objectID = result.ObjectID
+		}
+		if result.ObjectID != objectID {
+			t.Fatalf("concurrent object IDs differ: got %d want %d", result.ObjectID, objectID)
+		}
+		if result.Created {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created result count = %d, want 1", created)
+	}
+
+	versionCount, err := db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("object_id = ?", objectID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting versions: %v", err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("version count = %d, want 1", versionCount)
+	}
+}
+
+func TestObjectRepo_ListByBucketReadsCurrentSnapshotOnly(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-
 	bucket := seedBucket(t, db, "list-bucket")
 
-	for _, key := range []string{"a.txt", "b.txt", "dir/c.txt"} {
-		obj := &model.Object{
-			BucketID:    bucket.ID,
-			Key:         key,
-			Size:        1,
-			ETag:        "e",
-			Checksum:    "c",
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + key,
-			MaxRetries:  5,
-		}
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("upsert %s: %v", key, err)
+	for _, tc := range []struct {
+		key  string
+		size int64
+	}{
+		{"a.txt", 1},
+		{"b.txt", 2},
+		{"dir/c.txt", 3},
+	} {
+		v := newObjectVersion(bucket.ID, tc.key, "01J0000000000000000000000"+string(rune('3'+tc.size)), tc.size)
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, v); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent(%s): %v", tc.key, err)
 		}
 	}
+	latestB := newObjectVersion(bucket.ID, "b.txt", "01J00000000000000000000009", 22)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, latestB); err != nil {
+		t.Fatalf("second b.txt upload: %v", err)
+	}
 
-	// List all.
 	all, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket: %v", err)
 	}
 	if len(all) != 3 {
-		t.Errorf("expected 3 objects, got %d", len(all))
+		t.Fatalf("object count = %d, want 3 current keys", len(all))
+	}
+	if all[1].Key != "b.txt" || all[1].CurrentVersionID != latestB.VersionID || all[1].Size != 22 {
+		t.Fatalf("b.txt current snapshot = key:%s version:%s size:%d", all[1].Key, all[1].CurrentVersionID, all[1].Size)
 	}
 
-	// List with prefix.
 	prefixed, err := repos.Objects.ListByBucket(ctx, bucket.ID, "dir/", "", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket(prefix): %v", err)
 	}
-	if len(prefixed) != 1 {
-		t.Errorf("expected 1 prefixed object, got %d", len(prefixed))
+	if len(prefixed) != 1 || prefixed[0].Key != "dir/c.txt" {
+		t.Fatalf("prefixed keys = %#v", prefixed)
 	}
 
-	// List with limit.
-	limited, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 2)
-	if err != nil {
-		t.Fatalf("ListByBucket(limit): %v", err)
-	}
-	if len(limited) != 2 {
-		t.Errorf("expected 2 limited objects, got %d", len(limited))
-	}
-
-	// List with afterKey (pagination).
 	afterKey, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "a.txt", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket(afterKey): %v", err)
 	}
-	if len(afterKey) != 2 {
-		t.Errorf("expected 2 objects after 'a.txt', got %d", len(afterKey))
+	if len(afterKey) != 2 || afterKey[0].Key != "b.txt" {
+		t.Fatalf("afterKey result = %#v", afterKey)
 	}
 }
 
-func TestObjectRepo_UpdateState(t *testing.T) {
+func TestObjectRepo_VersionStateUpdatesOnlyMirrorCurrentVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-
 	bucket := seedBucket(t, db, "state-bucket")
 
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "state.txt",
-		Size:        1,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/state.txt",
-		MaxRetries:  5,
+	v1 := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000011", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, v1); err != nil {
+		t.Fatalf("first version: %v", err)
 	}
-	id, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	v2 := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000012", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, v2); err != nil {
+		t.Fatalf("second version: %v", err)
+	}
+
+	if err := repos.Objects.UpdateVersionState(ctx, v1.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState(old): %v", err)
+	}
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
-		t.Fatalf("upsert: %v", err)
+		t.Fatalf("GetByBucketAndKey: %v", err)
+	}
+	if current.CurrentVersionID != v2.VersionID || current.State != model.ObjectStateCached {
+		t.Fatalf("old version update polluted current snapshot: version=%s state=%s", current.CurrentVersionID, current.State)
 	}
 
-	// Valid transition.
-	if err := repos.Objects.UpdateState(ctx, id, 1, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateState: %v", err)
+	if err := repos.Objects.UpdateVersionState(ctx, v2.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState(current): %v", err)
 	}
-
-	// Invalid transition (wrong from state).
-	err = repos.Objects.UpdateState(ctx, id, 1, model.ObjectStateCached, model.ObjectStateStored)
-	if err == nil {
-		t.Fatal("expected error for invalid state transition")
+	current, err = repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey after current update: %v", err)
+	}
+	if current.State != model.ObjectStateUploading {
+		t.Fatalf("current state = %s, want uploading", current.State)
 	}
 }
 
-func TestObjectRepo_SetPieceCIDAndTransition(t *testing.T) {
+func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
+	bucket := seedBucket(t, db, "storage-bucket")
 
-	bucket := seedBucket(t, db, "piececid-bucket")
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "piececid.txt",
-		Size:        1,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/piececid.txt",
-		MaxRetries:  5,
+	oldVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000021", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("old version: %v", err)
 	}
-	id, gen, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	currentVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000022", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("current version: %v", err)
+	}
+
+	if err := repos.Objects.UpdateVersionState(ctx, oldVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("old version upload transition: %v", err)
+	}
+	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, oldVersion.VersionID, "piece-old", "https://old.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("old SetVersionStorageInfoAndTransition: %v", err)
+	}
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
-		t.Fatalf("upsert: %v", err)
+		t.Fatalf("GetByBucketAndKey: %v", err)
+	}
+	if current.PieceCID != nil || current.RetrievalURL != nil || current.State != model.ObjectStateCached {
+		t.Fatalf("old storage update polluted current snapshot: piece=%v url=%v state=%s", current.PieceCID, current.RetrievalURL, current.State)
 	}
 
-	// Transition cached→uploading first
-	if err := repos.Objects.UpdateState(ctx, id, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateState: %v", err)
+	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("current version upload transition: %v", err)
 	}
-
-	// SetPieceCIDAndTransition uploading→uploaded
-	if err := repos.Objects.SetPieceCIDAndTransition(ctx, id, gen, "baga6ea4seaq123", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("SetPieceCIDAndTransition: %v", err)
+	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, currentVersion.VersionID, "piece-current", "https://current.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("current SetVersionStorageInfoAndTransition: %v", err)
 	}
-
-	got, _ := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "piececid.txt")
-	if got.PieceCID == nil || *got.PieceCID != "baga6ea4seaq123" {
-		t.Errorf("PieceCID = %v, want %q", got.PieceCID, "baga6ea4seaq123")
+	current, err = repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey after current storage: %v", err)
 	}
-	if got.State != model.ObjectStateStored {
-		t.Errorf("State = %s, want stored", got.State)
+	if current.PieceCID == nil || *current.PieceCID != "piece-current" || current.RetrievalURL == nil || *current.RetrievalURL != "https://current.example" {
+		t.Fatalf("current storage info = piece:%v url:%v", current.PieceCID, current.RetrievalURL)
 	}
-
-	// Stale generation should fail
-	err = repos.Objects.SetPieceCIDAndTransition(ctx, id, gen-1, "stale", model.ObjectStateStored, model.ObjectStateCacheEvicted)
-	if err == nil {
-		t.Fatal("expected error for stale generation")
+	if current.State != model.ObjectStateStored {
+		t.Fatalf("current state = %s, want stored", current.State)
 	}
 }
 
-func TestObjectRepo_ListByState(t *testing.T) {
+func TestObjectRepo_ListAndResetVersionsByState(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
+	bucket := seedBucket(t, db, "version-state-bucket")
 
-	bucket := seedBucket(t, db, "liststate-bucket")
-	for i, key := range []string{"a.txt", "b.txt", "c.txt"} {
-		obj := &model.Object{
-			BucketID:    bucket.ID,
-			Key:         key,
-			Size:        int64(i + 1),
-			ETag:        "e",
-			Checksum:    "c",
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + key,
-			MaxRetries:  5,
+	for _, versionID := range []string{"01J00000000000000000000031", "01J00000000000000000000032"} {
+		v := newObjectVersion(bucket.ID, "file-"+versionID+".txt", versionID, 1)
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, v); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent(%s): %v", versionID, err)
 		}
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("upsert %s: %v", key, err)
+		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+			t.Fatalf("UpdateVersionState(%s): %v", versionID, err)
 		}
 	}
 
-	// All should be in "cached" state by default
-	list, err := repos.Objects.ListByState(ctx, model.ObjectStateCached, 10)
+	versions, err := repos.Objects.ListVersionsByState(ctx, model.ObjectStateUploading, 10)
 	if err != nil {
-		t.Fatalf("ListByState: %v", err)
+		t.Fatalf("ListVersionsByState: %v", err)
 	}
-	if len(list) != 3 {
-		t.Errorf("expected 3 cached objects, got %d", len(list))
+	if len(versions) != 2 {
+		t.Fatalf("uploading version count = %d, want 2", len(versions))
 	}
 
-	// With limit
-	list2, err := repos.Objects.ListByState(ctx, model.ObjectStateCached, 2)
+	reset, err := repos.Objects.ResetStaleVersionStates(ctx, model.ObjectStateUploading, model.ObjectStateCached, time.Now().Add(time.Hour))
 	if err != nil {
-		t.Fatalf("ListByState with limit: %v", err)
+		t.Fatalf("ResetStaleVersionStates: %v", err)
 	}
-	if len(list2) != 2 {
-		t.Errorf("expected 2 objects with limit, got %d", len(list2))
+	if reset != 2 {
+		t.Fatalf("reset count = %d, want 2", reset)
 	}
 }
 
-func TestObjectRepo_ResetStaleStates(t *testing.T) {
+func TestObjectRepo_ResetStaleVersionStatesDoesNotMirrorOldVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
+	bucket := seedBucket(t, db, "stale-current-bucket")
 
-	bucket := seedBucket(t, db, "stale-bucket")
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "stale.txt",
-		Size:        1,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/stale.txt",
-		MaxRetries:  5,
+	oldVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000051", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("old version: %v", err)
 	}
-	id, gen, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if err := repos.Objects.UpdateVersionState(ctx, oldVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("old uploading: %v", err)
+	}
+
+	currentVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000052", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("current version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("current uploading: %v", err)
+	}
+	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, currentVersion.VersionID, "piece-current", "https://current.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("current stored: %v", err)
+	}
+
+	reset, err := repos.Objects.ResetStaleVersionStates(ctx, model.ObjectStateUploading, model.ObjectStateCached, time.Now().Add(time.Hour))
 	if err != nil {
-		t.Fatalf("upsert: %v", err)
+		t.Fatalf("ResetStaleVersionStates: %v", err)
+	}
+	if reset != 1 {
+		t.Fatalf("reset count = %d, want 1", reset)
 	}
 
-	// Move to uploading
-	if err := repos.Objects.UpdateState(ctx, id, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateState: %v", err)
-	}
-
-	// Reset stale uploading→cached (with future threshold — everything is stale)
-	count, err := repos.Objects.ResetStaleStates(ctx, model.ObjectStateUploading, model.ObjectStateCached, time.Now().Add(time.Hour))
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
-		t.Fatalf("ResetStaleStates: %v", err)
+		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("expected 1 reset, got %d", count)
-	}
-
-	got, _ := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "stale.txt")
-	if got.State != model.ObjectStateCached {
-		t.Errorf("expected cached after reset, got %s", got.State)
+	if current.CurrentVersionID != currentVersion.VersionID || current.State != model.ObjectStateStored {
+		t.Fatalf("current snapshot polluted: version=%s state=%s", current.CurrentVersionID, current.State)
 	}
 }
 
-func TestObjectRepo_UpdateState_StaleGeneration(t *testing.T) {
+func TestObjectRepo_ResetStaleVersionStatesDoesNotMirrorSkippedRows(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
+	bucket := seedBucket(t, db, "stale-skip-bucket")
 
-	bucket := seedBucket(t, db, "stalegen-bucket")
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "gentest.txt",
-		Size:        1,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/gentest.txt",
-		MaxRetries:  5,
+	currentVersion := newObjectVersion(bucket.ID, "current.txt", "01J00000000000000000000061", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("current version: %v", err)
 	}
-	id, gen, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("current uploading: %v", err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("state = ?", model.ObjectStateStored).
+		Where("current_version_id = ?", currentVersion.VersionID).
+		Exec(ctx); err != nil {
+		t.Fatalf("seeding current snapshot state: %v", err)
+	}
+
+	otherVersion := newObjectVersion(bucket.ID, "other.txt", "01J00000000000000000000062", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, otherVersion); err != nil {
+		t.Fatalf("other version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, otherVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("other uploading: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE TRIGGER skip_current_stale_reset
+		BEFORE UPDATE OF state ON object_versions
+		WHEN OLD.version_id = '01J00000000000000000000061'
+		BEGIN
+			SELECT RAISE(IGNORE);
+		END;
+	`); err != nil {
+		t.Fatalf("creating skip trigger: %v", err)
+	}
+
+	reset, err := repos.Objects.ResetStaleVersionStates(ctx, model.ObjectStateUploading, model.ObjectStateCached, time.Now().Add(time.Hour))
 	if err != nil {
-		t.Fatalf("upsert: %v", err)
+		t.Fatalf("ResetStaleVersionStates: %v", err)
+	}
+	if reset != 1 {
+		t.Fatalf("reset count = %d, want 1", reset)
 	}
 
-	// Valid generation should succeed
-	if err := repos.Objects.UpdateState(ctx, id, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateState: %v", err)
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "current.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey(current): %v", err)
+	}
+	if current.State != model.ObjectStateStored {
+		t.Fatalf("skipped current snapshot state = %s, want stored", current.State)
 	}
 
-	// Stale generation should fail
-	err = repos.Objects.UpdateState(ctx, id, gen-1, model.ObjectStateUploading, model.ObjectStateStored)
-	if err == nil {
-		t.Fatal("expected error for stale generation")
+	other, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "other.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey(other): %v", err)
+	}
+	if other.State != model.ObjectStateCached {
+		t.Fatalf("updated current snapshot state = %s, want cached", other.State)
 	}
 }
 
-func TestObjectRepo_SoftDelete_ExcludesFromList(t *testing.T) {
+func TestObjectRepo_CurrentStatsUseObjectsSnapshot(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
+	bucketA := seedBucket(t, db, "stats-a")
+	bucketB := seedBucket(t, db, "stats-b")
 
-	bucket := seedBucket(t, db, "softdel-bucket")
-
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "gone.txt",
-		Size:        1,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/gone.txt",
-		MaxRetries:  5,
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucketA.ID, "a.txt", "01J00000000000000000000041", 100)); err != nil {
+		t.Fatalf("create a v1: %v", err)
 	}
-	id, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucketA.ID, "a.txt", "01J00000000000000000000042", 250)); err != nil {
+		t.Fatalf("create a v2: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucketB.ID, "b.txt", "01J00000000000000000000043", 500)); err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+
+	countA, err := repos.Objects.CountByBucket(ctx, bucketA.ID)
 	if err != nil {
-		t.Fatalf("upsert: %v", err)
+		t.Fatalf("CountByBucket: %v", err)
+	}
+	if countA != 1 {
+		t.Fatalf("bucket A current count = %d, want 1", countA)
 	}
 
-	if err := repos.Objects.SoftDelete(ctx, id); err != nil {
-		t.Fatalf("SoftDelete: %v", err)
-	}
-
-	list, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
+	totalA, err := repos.Objects.TotalSizeByBucket(ctx, bucketA.ID)
 	if err != nil {
-		t.Fatalf("ListByBucket: %v", err)
+		t.Fatalf("TotalSizeByBucket: %v", err)
 	}
-	if len(list) != 0 {
-		t.Errorf("expected 0 objects after soft delete, got %d", len(list))
+	if totalA != 250 {
+		t.Fatalf("bucket A current size = %d, want 250", totalA)
+	}
+
+	stats, err := repos.Objects.AggregateByBucket(ctx)
+	if err != nil {
+		t.Fatalf("AggregateByBucket: %v", err)
+	}
+	if got := stats[bucketA.ID]; got.Count != 1 || got.TotalSize != 250 {
+		t.Fatalf("bucket A aggregate = count:%d size:%d", got.Count, got.TotalSize)
+	}
+	if got := stats[bucketB.ID]; got.Count != 1 || got.TotalSize != 500 {
+		t.Fatalf("bucket B aggregate = count:%d size:%d", got.Count, got.TotalSize)
 	}
 }
 
@@ -459,19 +551,17 @@ func TestRepos_WithTx(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	// WithTx should roll back on error.
 	err := repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
 		b := &model.Bucket{Name: "tx-bucket", Status: model.BucketStatusActive}
 		if err := txRepos.Buckets.Create(ctx, b); err != nil {
 			return err
 		}
-		return context.Canceled // force rollback
+		return context.Canceled
 	})
 	if err == nil {
 		t.Fatal("expected error from WithTx")
 	}
 
-	// Bucket should not exist after rollback.
 	got, err := repos.Buckets.GetByName(ctx, "tx-bucket")
 	if err != nil {
 		t.Fatalf("GetByName: %v", err)
@@ -480,7 +570,6 @@ func TestRepos_WithTx(t *testing.T) {
 		t.Fatal("expected nil after rollback")
 	}
 
-	// WithTx should commit on success.
 	err = repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
 		b := &model.Bucket{Name: "tx-committed", Status: model.BucketStatusActive}
 		return txRepos.Buckets.Create(ctx, b)
@@ -495,394 +584,5 @@ func TestRepos_WithTx(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("expected bucket after commit")
-	}
-}
-
-func TestObjectRepo_CountByState(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	// Empty table.
-	counts, err := repos.Objects.CountByState(ctx)
-	if err != nil {
-		t.Fatalf("CountByState empty: %v", err)
-	}
-	if len(counts) != 0 {
-		t.Fatalf("expected 0 counts, got %d", len(counts))
-	}
-
-	bucket := seedBucket(t, db, "countstate-bucket")
-
-	// Seed three objects (all start as "cached").
-	for _, key := range []string{"a.txt", "b.txt", "c.txt"} {
-		obj := &model.Object{
-			BucketID:    bucket.ID,
-			Key:         key,
-			Size:        1,
-			ETag:        "e",
-			Checksum:    "c",
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + key,
-			MaxRetries:  5,
-		}
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("upsert %s: %v", key, err)
-		}
-	}
-
-	// Transition one to uploading.
-	objs, _ := repos.Objects.ListByState(ctx, model.ObjectStateCached, 1)
-	if len(objs) == 0 {
-		t.Fatal("expected at least one cached object")
-	}
-	if err := repos.Objects.UpdateState(ctx, objs[0].ID, objs[0].Generation, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateState: %v", err)
-	}
-
-	counts, err = repos.Objects.CountByState(ctx)
-	if err != nil {
-		t.Fatalf("CountByState: %v", err)
-	}
-
-	lookup := make(map[string]int64)
-	for _, c := range counts {
-		lookup[c.State] = c.Count
-	}
-
-	if lookup[string(model.ObjectStateCached)] != 2 {
-		t.Errorf("expected 2 cached, got %d", lookup[string(model.ObjectStateCached)])
-	}
-	if lookup[string(model.ObjectStateUploading)] != 1 {
-		t.Errorf("expected 1 uploading, got %d", lookup[string(model.ObjectStateUploading)])
-	}
-}
-
-func TestObjectRepo_CountByState_ExcludesSoftDeleted(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucket := seedBucket(t, db, "countdel-bucket")
-	obj := &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "del.txt",
-		Size:        1,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/del.txt",
-		MaxRetries:  5,
-	}
-	id, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj)
-	if err != nil {
-		t.Fatalf("upsert: %v", err)
-	}
-
-	if err := repos.Objects.SoftDelete(ctx, id); err != nil {
-		t.Fatalf("SoftDelete: %v", err)
-	}
-
-	counts, err := repos.Objects.CountByState(ctx)
-	if err != nil {
-		t.Fatalf("CountByState: %v", err)
-	}
-	if len(counts) != 0 {
-		t.Errorf("expected 0 counts after soft-delete, got %d", len(counts))
-	}
-}
-
-func TestObjectRepo_TotalSize(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	// Empty table should return 0.
-	total, err := repos.Objects.TotalSize(ctx)
-	if err != nil {
-		t.Fatalf("TotalSize empty: %v", err)
-	}
-	if total != 0 {
-		t.Fatalf("expected 0, got %d", total)
-	}
-
-	bucket := seedBucket(t, db, "totalsize-bucket")
-
-	// Insert objects with known sizes.
-	for _, tc := range []struct {
-		key  string
-		size int64
-	}{
-		{"a.txt", 100},
-		{"b.txt", 250},
-		{"c.txt", 650},
-	} {
-		obj := &model.Object{
-			BucketID:    bucket.ID,
-			Key:         tc.key,
-			Size:        tc.size,
-			ETag:        "e",
-			Checksum:    "c",
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + tc.key,
-			MaxRetries:  5,
-		}
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("upsert %s: %v", tc.key, err)
-		}
-	}
-
-	total, err = repos.Objects.TotalSize(ctx)
-	if err != nil {
-		t.Fatalf("TotalSize: %v", err)
-	}
-	if total != 1000 {
-		t.Errorf("expected 1000, got %d", total)
-	}
-
-	// Soft-deleted objects should be excluded.
-	objs, _ := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 1)
-	if err := repos.Objects.SoftDelete(ctx, objs[0].ID); err != nil {
-		t.Fatalf("SoftDelete: %v", err)
-	}
-
-	total, err = repos.Objects.TotalSize(ctx)
-	if err != nil {
-		t.Fatalf("TotalSize after delete: %v", err)
-	}
-	if total != 900 {
-		t.Errorf("expected 900 after soft-delete, got %d", total)
-	}
-}
-
-func TestObjectRepo_CountByBucket(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucketA := seedBucket(t, db, "count-bucket-a")
-	bucketB := seedBucket(t, db, "count-bucket-b")
-
-	// Empty bucket.
-	count, err := repos.Objects.CountByBucket(ctx, bucketA.ID)
-	if err != nil {
-		t.Fatalf("CountByBucket empty: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("expected 0, got %d", count)
-	}
-
-	// Insert 3 objects in bucket A and 1 in bucket B.
-	for _, key := range []string{"a1.txt", "a2.txt", "a3.txt"} {
-		obj := &model.Object{
-			BucketID:    bucketA.ID,
-			Key:         key,
-			Size:        10,
-			ETag:        "e",
-			Checksum:    "c",
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + key,
-			MaxRetries:  5,
-		}
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("upsert %s: %v", key, err)
-		}
-	}
-	objB := &model.Object{
-		BucketID:    bucketB.ID,
-		Key:         "b1.txt",
-		Size:        10,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/b1.txt",
-		MaxRetries:  5,
-	}
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, objB); err != nil {
-		t.Fatalf("upsert b1.txt: %v", err)
-	}
-
-	countA, err := repos.Objects.CountByBucket(ctx, bucketA.ID)
-	if err != nil {
-		t.Fatalf("CountByBucket A: %v", err)
-	}
-	if countA != 3 {
-		t.Errorf("expected 3 in bucket A, got %d", countA)
-	}
-
-	countB, err := repos.Objects.CountByBucket(ctx, bucketB.ID)
-	if err != nil {
-		t.Fatalf("CountByBucket B: %v", err)
-	}
-	if countB != 1 {
-		t.Errorf("expected 1 in bucket B, got %d", countB)
-	}
-
-	// Soft-deleted objects should be excluded.
-	objs, _ := repos.Objects.ListByBucket(ctx, bucketA.ID, "", "", 1)
-	if err := repos.Objects.SoftDelete(ctx, objs[0].ID); err != nil {
-		t.Fatalf("SoftDelete: %v", err)
-	}
-
-	countA, err = repos.Objects.CountByBucket(ctx, bucketA.ID)
-	if err != nil {
-		t.Fatalf("CountByBucket after delete: %v", err)
-	}
-	if countA != 2 {
-		t.Errorf("expected 2 after soft-delete, got %d", countA)
-	}
-}
-
-func TestObjectRepo_TotalSizeByBucket(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucketA := seedBucket(t, db, "szbucket-a")
-	bucketB := seedBucket(t, db, "szbucket-b")
-
-	// Empty bucket.
-	total, err := repos.Objects.TotalSizeByBucket(ctx, bucketA.ID)
-	if err != nil {
-		t.Fatalf("TotalSizeByBucket empty: %v", err)
-	}
-	if total != 0 {
-		t.Fatalf("expected 0, got %d", total)
-	}
-
-	// Bucket A: 100 + 200 = 300
-	for _, tc := range []struct {
-		key  string
-		size int64
-	}{
-		{"x.txt", 100},
-		{"y.txt", 200},
-	} {
-		obj := &model.Object{
-			BucketID:    bucketA.ID,
-			Key:         tc.key,
-			Size:        tc.size,
-			ETag:        "e",
-			Checksum:    "c",
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + tc.key,
-			MaxRetries:  5,
-		}
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("upsert %s: %v", tc.key, err)
-		}
-	}
-
-	// Bucket B: 500
-	objB := &model.Object{
-		BucketID:    bucketB.ID,
-		Key:         "z.txt",
-		Size:        500,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/z.txt",
-		MaxRetries:  5,
-	}
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, objB); err != nil {
-		t.Fatalf("upsert z.txt: %v", err)
-	}
-
-	totalA, err := repos.Objects.TotalSizeByBucket(ctx, bucketA.ID)
-	if err != nil {
-		t.Fatalf("TotalSizeByBucket A: %v", err)
-	}
-	if totalA != 300 {
-		t.Errorf("expected 300 for bucket A, got %d", totalA)
-	}
-
-	totalB, err := repos.Objects.TotalSizeByBucket(ctx, bucketB.ID)
-	if err != nil {
-		t.Fatalf("TotalSizeByBucket B: %v", err)
-	}
-	if totalB != 500 {
-		t.Errorf("expected 500 for bucket B, got %d", totalB)
-	}
-
-	// Soft-deleted objects should be excluded.
-	objs, _ := repos.Objects.ListByBucket(ctx, bucketA.ID, "", "", 1)
-	if err := repos.Objects.SoftDelete(ctx, objs[0].ID); err != nil {
-		t.Fatalf("SoftDelete: %v", err)
-	}
-
-	totalA, err = repos.Objects.TotalSizeByBucket(ctx, bucketA.ID)
-	if err != nil {
-		t.Fatalf("TotalSizeByBucket after delete: %v", err)
-	}
-	if totalA != 200 {
-		t.Errorf("expected 200 after soft-delete, got %d", totalA)
-	}
-}
-
-func TestObjectRepo_AggregateByBucket(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucketA := seedBucket(t, db, "aggbucket-a")
-	bucketB := seedBucket(t, db, "aggbucket-b")
-	bucketEmpty := seedBucket(t, db, "aggbucket-empty")
-
-	// Bucket A: 2 objects, sizes 100 + 200
-	for _, tc := range []struct {
-		key  string
-		size int64
-	}{
-		{"a1.txt", 100},
-		{"a2.txt", 200},
-	} {
-		obj := &model.Object{
-			BucketID:    bucketA.ID,
-			Key:         tc.key,
-			Size:        tc.size,
-			ETag:        "e",
-			Checksum:    "c",
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + tc.key,
-			MaxRetries:  5,
-		}
-		if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, obj); err != nil {
-			t.Fatalf("upsert %s: %v", tc.key, err)
-		}
-	}
-
-	// Bucket B: 1 object, size 500
-	objB := &model.Object{
-		BucketID:    bucketB.ID,
-		Key:         "b1.txt",
-		Size:        500,
-		ETag:        "e",
-		Checksum:    "c",
-		ContentType: "text/plain",
-		CachePath:   "/cache/b1.txt",
-		MaxRetries:  5,
-	}
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, objB); err != nil {
-		t.Fatalf("upsert b1.txt: %v", err)
-	}
-
-	stats, err := repos.Objects.AggregateByBucket(ctx)
-	if err != nil {
-		t.Fatalf("AggregateByBucket: %v", err)
-	}
-
-	// Bucket A: count=2, total_size=300
-	if s := stats[bucketA.ID]; s.Count != 2 || s.TotalSize != 300 {
-		t.Errorf("bucket A: expected count=2 size=300, got count=%d size=%d", s.Count, s.TotalSize)
-	}
-
-	// Bucket B: count=1, total_size=500
-	if s := stats[bucketB.ID]; s.Count != 1 || s.TotalSize != 500 {
-		t.Errorf("bucket B: expected count=1 size=500, got count=%d size=%d", s.Count, s.TotalSize)
-	}
-
-	// Empty bucket should not appear in stats.
-	if s, ok := stats[bucketEmpty.ID]; ok {
-		t.Errorf("empty bucket should not be in stats, got count=%d size=%d", s.Count, s.TotalSize)
 	}
 }

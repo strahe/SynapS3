@@ -34,7 +34,7 @@ type Task struct {
 	Type           TaskType               `bun:",notnull"`
 	RefType        string                 `bun:",notnull"` // "object" or "bucket"
 	RefID          int64                  `bun:",notnull"`
-	RefGeneration  int64                  `bun:",notnull"`
+	RefVersionID   string                 `bun:",notnull"`
 	IdempotencyKey string                 `bun:",unique,notnull"`
 	Payload        map[string]interface{} `bun:"type:jsonb"`
 	Status         TaskStatus             `bun:",notnull,default:'pending'"`

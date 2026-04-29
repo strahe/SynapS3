@@ -35,7 +35,7 @@ func testCID(t *testing.T) cid.Cid {
 
 // seedCachedObject creates a bucket, writes a file into the filesystem cache,
 // and inserts an object in "cached" state.
-func seedCachedObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, int64) {
+func seedCachedObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -46,31 +46,33 @@ func seedCachedObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, i
 
 	key := "hello.txt"
 	data := []byte("hello world")
+	versionID := model.NewVersionID()
+	cacheKey := ".versions/" + versionID
 
-	info, err := env.cache.Put(ctx, bucket.Name, key, bytes.NewReader(data))
+	info, err := env.cache.Put(ctx, bucket.Name, cacheKey, bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("cache put: %v", err)
 	}
 
-	obj := &model.Object{
+	version := &model.ObjectVersion{
+		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         key,
 		Size:        int64(len(data)),
 		ETag:        info.ETag,
 		Checksum:    info.Checksum,
 		ContentType: "text/plain",
-		CachePath:   info.Path,
-		MaxRetries:  5,
+		CacheKey:    cacheKey,
 	}
-	objID, gen, err := env.repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	objID, err := env.repos.Objects.CreateVersionAndSetCurrent(ctx, version)
 	if err != nil {
-		t.Fatalf("upserting object: %v", err)
+		t.Fatalf("creating object version: %v", err)
 	}
-	return bucket, objID, gen
+	return bucket, objID, versionID
 }
 
 // seedObjectInDB inserts a bucket and object into the DB only (no cache write).
-func seedObjectInDB(t *testing.T, env *testWorkerEnv, bucketStatus model.BucketStatus) (*model.Bucket, int64, int64) {
+func seedObjectInDB(t *testing.T, env *testWorkerEnv, bucketStatus model.BucketStatus) (*model.Bucket, int64, string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -79,33 +81,34 @@ func seedObjectInDB(t *testing.T, env *testWorkerEnv, bucketStatus model.BucketS
 		t.Fatalf("creating bucket: %v", err)
 	}
 
-	obj := &model.Object{
+	versionID := model.NewVersionID()
+	version := &model.ObjectVersion{
+		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         "hello.txt",
 		Size:        11,
 		ETag:        "abc123",
 		Checksum:    "sha256-test",
 		ContentType: "text/plain",
-		CachePath:   "/fake/path",
-		MaxRetries:  5,
+		CacheKey:    ".versions/" + versionID,
 	}
-	objID, gen, err := env.repos.Objects.UpsertAndBumpGeneration(ctx, obj)
+	objID, err := env.repos.Objects.CreateVersionAndSetCurrent(ctx, version)
 	if err != nil {
-		t.Fatalf("upserting object: %v", err)
+		t.Fatalf("creating object version: %v", err)
 	}
-	return bucket, objID, gen
+	return bucket, objID, versionID
 }
 
 // seedTask creates a pending task of the given type.
-func seedTask(t *testing.T, env *testWorkerEnv, taskType model.TaskType, refID, gen int64, maxRetries, retryCount int) *model.Task {
+func seedTask(t *testing.T, env *testWorkerEnv, taskType model.TaskType, refID int64, versionID string, maxRetries, retryCount int) *model.Task {
 	t.Helper()
 	ctx := context.Background()
 	task := &model.Task{
 		Type:           taskType,
 		RefType:        "object",
 		RefID:          refID,
-		RefGeneration:  gen,
-		IdempotencyKey: fmt.Sprintf("%s:%d:%d", taskType, refID, gen),
+		RefVersionID:   versionID,
+		IdempotencyKey: fmt.Sprintf("%s:%s", taskType, versionID),
 		Status:         model.TaskStatusPending,
 		RetryCount:     retryCount,
 		MaxRetries:     maxRetries,
@@ -193,8 +196,8 @@ func runWorkerUntilTaskRetryCount(t *testing.T, env *testWorkerEnv, w worker.Wor
 
 func TestUploader_HappyPath(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	bucket, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	bucket, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	pieceCID := testCID(t)
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
@@ -266,9 +269,9 @@ func TestUploader_HappyPath(t *testing.T) {
 	if evictTask == nil {
 		t.Fatal("expected evict_cache task to exist")
 	}
-	if evictTask.RefID != objID || evictTask.RefGeneration != gen {
-		t.Errorf("evict task refs mismatch: got refID=%d gen=%d, want %d/%d",
-			evictTask.RefID, evictTask.RefGeneration, objID, gen)
+	if evictTask.RefID != objID || evictTask.RefVersionID != versionID {
+		t.Errorf("evict task refs mismatch: got refID=%d version=%s, want %d/%s",
+			evictTask.RefID, evictTask.RefVersionID, objID, versionID)
 	}
 	if evictTask.MaxRetries != 7 {
 		t.Fatalf("evict task MaxRetries = %d, want 7", evictTask.MaxRetries)
@@ -277,8 +280,8 @@ func TestUploader_HappyPath(t *testing.T) {
 
 func TestUploader_PartialSuccessDoesNotMarkObjectStored(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 1, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 1, 0)
 
 	pieceCID := testCID(t)
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
@@ -322,7 +325,7 @@ func TestUploader_PartialSuccessDoesNotMarkObjectStored(t *testing.T) {
 	}
 }
 
-func TestUploader_StaleGeneration(t *testing.T) {
+func TestUploader_MissingVersion(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, _ := seedCachedObject(t, env)
 
@@ -330,8 +333,8 @@ func TestUploader_StaleGeneration(t *testing.T) {
 		Type:           model.TaskTypeUpload,
 		RefType:        "object",
 		RefID:          objID,
-		RefGeneration:  0, // stale — object is at gen 1
-		IdempotencyKey: fmt.Sprintf("upload:%d:0", objID),
+		RefVersionID:   "01J000000000000000MISSING1",
+		IdempotencyKey: fmt.Sprintf("upload:%d:missing", objID),
 		Status:         model.TaskStatusPending,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
@@ -341,7 +344,7 @@ func TestUploader_StaleGeneration(t *testing.T) {
 	}
 
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
-		t.Error("upload should not be called for stale generation")
+		t.Error("upload should not be called for missing version")
 		return nil, errors.New("should not be called")
 	}
 
@@ -352,15 +355,15 @@ func TestUploader_StaleGeneration(t *testing.T) {
 	if got.Status != model.TaskStatusFailed {
 		t.Errorf("expected task failed, got %s", got.Status)
 	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "stale generation") {
-		t.Errorf("expected stale generation error, got %v", got.LastError)
+	if got.LastError == nil || !strings.Contains(*got.LastError, "object not found") {
+		t.Errorf("expected object not found error, got %v", got.LastError)
 	}
 }
 
 func TestUploader_NilStorageClient(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	uploader := worker.NewUploader(env.repos, env.cache, nil, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
@@ -381,9 +384,9 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 		},
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
-	_, objID, gen := seedObjectInDB(t, env, model.BucketStatusActive)
+	_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
 	// RetryCount at max-1 so this attempt triggers dead-letter terminal path.
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 4)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 4)
 
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
 		t.Error("upload should not be called after cache read failure")
@@ -407,8 +410,8 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 
 func TestUploader_SPUploadFailure_Retry(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
 		return nil, errors.New("SP unavailable")
@@ -432,9 +435,9 @@ func TestUploader_SPUploadFailure_Retry(t *testing.T) {
 
 func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
+	_, objID, versionID := seedCachedObject(t, env)
 
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 4)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 4)
 
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
 		return nil, errors.New("SP permanent failure")
@@ -457,8 +460,8 @@ func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 
 func TestUploader_EvictTaskIdempotency(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	pieceCID := testCID(t)
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
@@ -475,8 +478,8 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 		Type:           model.TaskTypeEvictCache,
 		RefType:        "object",
 		RefID:          objID,
-		RefGeneration:  gen,
-		IdempotencyKey: fmt.Sprintf("evict_cache:%d:%d", objID, gen),
+		RefVersionID:   versionID,
+		IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
 		Status:         model.TaskStatusPending,
 		MaxRetries:     3,
 		ScheduledAt:    time.Now(),
@@ -502,8 +505,8 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 
 func TestUploader_ZeroAvailableFunds_RequeuesTask(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
@@ -553,8 +556,8 @@ func TestUploader_ZeroAvailableFunds_RequeuesTask(t *testing.T) {
 
 func TestUploader_LockedAvailableFunds_RequeuesTask(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
@@ -592,8 +595,8 @@ func TestUploader_LockedAvailableFunds_RequeuesTask(t *testing.T) {
 
 func TestUploader_AvailableFundsFallback_RequeuesTask(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
@@ -630,8 +633,8 @@ func TestUploader_AvailableFundsFallback_RequeuesTask(t *testing.T) {
 
 func TestUploader_NegativeAvailableFunds_RequeuesTask(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
@@ -666,8 +669,8 @@ func TestUploader_NegativeAvailableFunds_RequeuesTask(t *testing.T) {
 
 func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 1, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 1, 0)
 
 	var walletCalls atomic.Int32
 	wallet := &testutil.MockWalletQuerier{
@@ -732,8 +735,8 @@ func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testin
 
 func TestUploader_WalletError_ProceedsWithUpload(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
@@ -762,8 +765,8 @@ func TestUploader_WalletError_ProceedsWithUpload(t *testing.T) {
 
 func TestUploader_WalletNilInfo_NoPanic(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	_, objID, gen := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, gen, 5, 0)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {

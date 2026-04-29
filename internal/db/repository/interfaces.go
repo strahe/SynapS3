@@ -56,39 +56,36 @@ type S3AccountUpdate struct {
 	Role      auth.Role
 }
 
-// ObjectRepository defines persistence operations for Object entities.
-// Soft-deleted objects are automatically excluded from queries by the Bun soft_delete tag.
-type ObjectRepository interface {
-	// UpsertAndBumpGeneration atomically inserts or updates an object, incrementing its
-	// generation counter. If the object was previously soft-deleted, its DeletedAt is cleared.
-	// Returns the object ID and new generation.
-	UpsertAndBumpGeneration(ctx context.Context, obj *model.Object) (id int64, generation int64, err error)
+// ObjectVersionWriteResult reports whether a write created a new version or
+// reused the current snapshot.
+type ObjectVersionWriteResult struct {
+	ObjectID  int64
+	VersionID string
+	ETag      string
+	Created   bool
+}
 
+// ObjectRepository defines persistence operations for current object snapshots
+// and internal object versions.
+type ObjectRepository interface {
+	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (objectID int64, err error)
+	CreateVersionAndSetCurrentIfChanged(ctx context.Context, version *model.ObjectVersion) (ObjectVersionWriteResult, error)
 	GetByID(ctx context.Context, id int64) (*model.Object, error)
 	GetByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error)
+	GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error)
 	ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error)
-	SoftDelete(ctx context.Context, id int64) error
-	UpdateState(ctx context.Context, id int64, generation int64, from, to model.ObjectState) error
-	// UpdateStateToFailed transitions an object to ObjectStateFailed while
-	// recording which state it failed from (FailedAtState) and the error message.
-	UpdateStateToFailed(ctx context.Context, id int64, generation int64, from model.ObjectState, lastError string) error
-	// SetPieceCIDAndTransition atomically sets the PieceCID and transitions state in one CAS update.
-	// This prevents split-write races where a stale worker could set PieceCID on a newer generation.
-	SetPieceCIDAndTransition(ctx context.Context, id int64, generation int64, pieceCID string, from, to model.ObjectState) error
-	// SetStorageInfoAndTransition atomically stores the object retrieval information and transitions state.
-	SetStorageInfoAndTransition(ctx context.Context, id int64, generation int64, pieceCID string, retrievalURL string, from, to model.ObjectState) error
-	// ListByState returns objects in the given state, limited to limit rows.
-	ListByState(ctx context.Context, state model.ObjectState, limit int) ([]model.Object, error)
-	// ResetStaleStates resets objects stuck in an intermediate state back to a safe state.
-	// Used during startup recovery for objects that were mid-transition when the process crashed.
-	ResetStaleStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
+	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
+	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
+	SetVersionStorageInfoAndTransition(ctx context.Context, versionID string, pieceCID string, retrievalURL string, from, to model.ObjectState) error
+	ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error)
+	ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
 	// CountByState returns object counts grouped by state.
 	CountByState(ctx context.Context) ([]ObjectStateCount, error)
-	// TotalSize returns the sum of all non-deleted object sizes in bytes.
+	// TotalSize returns the sum of current object sizes in bytes.
 	TotalSize(ctx context.Context) (int64, error)
-	// CountByBucket returns the number of non-deleted objects in a bucket.
+	// CountByBucket returns the number of current objects in a bucket.
 	CountByBucket(ctx context.Context, bucketID int64) (int64, error)
-	// TotalSizeByBucket returns the sum of non-deleted object sizes in a bucket.
+	// TotalSizeByBucket returns the sum of current object sizes in a bucket.
 	TotalSizeByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// AggregateByBucket returns object count and total size for all buckets in a single query.
 	AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error)
@@ -131,9 +128,8 @@ type TaskRepository interface {
 	RetryDeadLetter(ctx context.Context, taskID int64) error
 	// CountByStatus returns task counts grouped by type and status.
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
-	// CountActiveObjectTasksByBucket returns the number of pending/running object tasks
-	// whose referenced objects belong to the given bucket, including soft-deleted
-	// objects that still have in-flight work.
+	// CountActiveObjectTasksByBucket returns pending/running object tasks
+	// whose referenced current object belongs to the given bucket.
 	CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// CountActiveBucketTasksByBucketID returns the number of pending/running tasks
 	// that directly reference the given bucket (ref_type=bucket, ref_id=bucketID).

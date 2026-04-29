@@ -98,7 +98,7 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 		return nil, ErrNoSuchKey
 	}
 
-	body, _, cacheErr := r.cache.Get(ctx, bucketName, key)
+	body, _, cacheErr := r.cache.Get(ctx, bucketName, obj.CacheKey)
 	if cacheErr == nil {
 		return resultFromObject(obj, body, SourceCache, cacheMiss), nil
 	}
@@ -124,9 +124,9 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 
 	cur, dbErr := r.repos.Objects.GetByID(ctx, obj.ID)
 	if dbErr != nil {
-		r.logger.Warn("generation check failed, skipping cache rehydration", "key", key, "error", dbErr)
+		r.logger.Warn("version check failed, skipping cache rehydration", "key", key, "error", dbErr)
 	}
-	if dbErr == nil && (cur == nil || cur.Generation != obj.Generation) {
+	if dbErr == nil && (cur == nil || cur.CurrentVersionID != obj.CurrentVersionID) {
 		_ = rc.Close()
 		if allowRestart && cur != nil {
 			return r.open(ctx, bucketName, key, visible, false, true)
@@ -135,8 +135,8 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 	}
 
 	body = rc
-	if dbErr == nil && cur != nil && cur.Generation == obj.Generation {
-		body = r.streamAndRehydrate(ctx, bucketName, key, rc)
+	if dbErr == nil && cur != nil && cur.CurrentVersionID == obj.CurrentVersionID {
+		body = r.streamAndRehydrate(ctx, bucketName, obj.CacheKey, rc)
 	}
 	return resultFromObject(obj, body, SourceProvider, cacheMiss), nil
 }
@@ -157,7 +157,7 @@ func cacheMissError(err error) error {
 	return fmt.Errorf("%w: %w", ErrCacheMiss, err)
 }
 
-func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, key string, rc io.ReadCloser) io.ReadCloser {
+func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, cacheKey string, rc io.ReadCloser) io.ReadCloser {
 	pr, pw := io.Pipe()
 	done := make(chan struct{})
 	body := &teeReadCloser{
@@ -169,8 +169,8 @@ func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, key string, rc 
 
 	go func() {
 		defer close(done)
-		if _, err := r.cache.Put(ctx, bucket, key, pr); err != nil {
-			r.logger.Warn("cache rehydration failed (best-effort)", "key", key, "error", err)
+		if _, err := r.cache.Put(ctx, bucket, cacheKey, pr); err != nil {
+			r.logger.Warn("cache rehydration failed (best-effort)", "cacheKey", cacheKey, "error", err)
 			_, _ = io.Copy(io.Discard, pr)
 		}
 		_ = pr.Close()

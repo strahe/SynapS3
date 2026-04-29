@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -29,13 +30,15 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		return s3response.PutObjectOutput{}, err
 	}
 
-	// Write to local cache staging (fsync'd temp file, NOT yet at final path).
-	staged, err := b.cache.PutStaged(ctx, bucketName, keyName, input.Body)
+	versionID := model.NewVersionID()
+	cacheKey := versionCacheKey(versionID)
+
+	// Write to a version-specific cache key so overwrites cannot affect older tasks.
+	staged, err := b.cache.PutStaged(ctx, bucketName, cacheKey, input.Body)
 	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
 		return s3response.PutObjectOutput{}, fmt.Errorf("staging object: %w", err)
 	}
-	// Ensure cleanup if we don't commit.
 	defer func() { _ = staged.Rollback() }()
 
 	cacheInfo := staged.Info
@@ -45,39 +48,44 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 	if input.Metadata != nil {
 		meta = input.Metadata
 	}
+	contentType := stringOrDefault(input.ContentType, "application/octet-stream")
 
-	var objectID int64
-	var newGen int64
+	if err := staged.Commit(); err != nil {
+		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		return s3response.PutObjectOutput{}, fmt.Errorf("committing cache file: %w", err)
+	}
 
 	// Atomic transaction: upsert object + enqueue task.
+	var write repository.ObjectVersionWriteResult
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		obj := &model.Object{
+		version := &model.ObjectVersion{
+			VersionID:   versionID,
 			BucketID:    bucket.ID,
 			Key:         keyName,
 			Size:        cacheInfo.Size,
 			ETag:        cacheInfo.ETag,
 			Checksum:    cacheInfo.Checksum,
-			ContentType: stringOrDefault(input.ContentType, "application/octet-stream"),
+			ContentType: contentType,
 			Metadata:    meta,
-			CachePath:   cacheInfo.Path,
+			CacheKey:    cacheKey,
 			State:       model.ObjectStateCached,
-			MaxRetries:  b.uploadMaxRetries,
 		}
 
-		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
+		var err error
+		write, err = txRepos.Objects.CreateVersionAndSetCurrentIfChanged(ctx, version)
 		if err != nil {
-			return fmt.Errorf("upserting object: %w", err)
+			return fmt.Errorf("creating object version: %w", err)
 		}
-		objectID = id
-		newGen = gen
+		if !write.Created {
+			return nil
+		}
 
-		// Enqueue upload task with correct idempotency key: upload:objectID:generation.
 		task := &model.Task{
 			Type:           model.TaskTypeUpload,
 			RefType:        "object",
-			RefID:          objectID,
-			RefGeneration:  newGen,
-			IdempotencyKey: fmt.Sprintf("upload:%d:%d", objectID, newGen),
+			RefID:          write.ObjectID,
+			RefVersionID:   versionID,
+			IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
 			Status:         model.TaskStatusPending,
 			MaxRetries:     b.uploadMaxRetries,
 			ScheduledAt:    time.Now(),
@@ -85,22 +93,19 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		return txRepos.Tasks.Create(ctx, task)
 	}); err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
-		// Rollback is handled by defer — staged file is removed, old file untouched.
+		b.deleteVersionCacheBestEffort(ctx, bucketName, cacheKey, "orphaned version cache file after put tx failure")
 		return s3response.PutObjectOutput{}, err
 	}
 
-	// DB transaction committed — publish the cache file atomically.
-	if err := staged.Commit(); err != nil {
-		// DB has the new generation but cache rename failed. Return error so the
-		// client retries — the retry will create gen N+1 which works correctly.
-		// Without this, the client sees 200 OK but the object is unservable
-		// (no cache file, uploader will also fail on cache miss).
-		b.logger.Error("cache commit failed after DB tx", "bucket", bucketName, "key", keyName, "error", err)
-		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
-		return s3response.PutObjectOutput{}, fmt.Errorf("committing cache file: %w", err)
+	if !write.Created {
+		b.deleteVersionCacheBestEffort(ctx, bucketName, cacheKey, "orphaned duplicate version cache file")
+		b.logger.Info("object unchanged", "bucket", bucketName, "key", keyName, "versionID", write.VersionID)
+		admin.ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
+		etag := fmt.Sprintf(`"%s"`, write.ETag)
+		return s3response.PutObjectOutput{ETag: etag}, nil
 	}
 
-	b.logger.Info("object stored", "bucket", bucketName, "key", keyName, "size", cacheInfo.Size, "gen", newGen)
+	b.logger.Info("object stored", "bucket", bucketName, "key", keyName, "size", cacheInfo.Size, "versionID", versionID)
 	admin.ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
 
 	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)
@@ -287,7 +292,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 	}
 
 	// Read source data from cache
-	srcReader, _, cacheErr := b.cache.Get(ctx, srcBucketName, srcKey)
+	srcReader, _, cacheErr := b.cache.Get(ctx, srcBucketName, srcObj.CacheKey)
 	if cacheErr != nil {
 		if os.IsNotExist(cacheErr) {
 			// Cache miss — SP fallback is a future feature
@@ -297,8 +302,10 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 	}
 	defer func() { _ = srcReader.Close() }()
 
-	// Write to destination cache (staged — not committed until DB tx succeeds)
-	staged, err := b.cache.PutStaged(ctx, dstBucketName, dstKey, srcReader)
+	// Write to a version-specific destination cache key.
+	versionID := model.NewVersionID()
+	cacheKey := versionCacheKey(versionID)
+	staged, err := b.cache.PutStaged(ctx, dstBucketName, cacheKey, srcReader)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, fmt.Errorf("staging copy destination: %w", err)
 	}
@@ -321,9 +328,14 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		}
 	}
 
-	var newGen int64
+	if err := staged.Commit(); err != nil {
+		return s3response.CopyObjectOutput{}, fmt.Errorf("committing copy cache: %w", err)
+	}
+
+	var write repository.ObjectVersionWriteResult
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		obj := &model.Object{
+		version := &model.ObjectVersion{
+			VersionID:   versionID,
 			BucketID:    dstBucket.ID,
 			Key:         dstKey,
 			Size:        cacheInfo.Size,
@@ -331,39 +343,51 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 			Checksum:    cacheInfo.Checksum,
 			ContentType: contentType,
 			Metadata:    meta,
-			CachePath:   cacheInfo.Path,
+			CacheKey:    cacheKey,
 			State:       model.ObjectStateCached,
-			MaxRetries:  b.uploadMaxRetries,
 		}
 
-		id, gen, err := txRepos.Objects.UpsertAndBumpGeneration(ctx, obj)
+		var err error
+		write, err = txRepos.Objects.CreateVersionAndSetCurrentIfChanged(ctx, version)
 		if err != nil {
-			return fmt.Errorf("upserting copy destination: %w", err)
+			return fmt.Errorf("creating copy destination version: %w", err)
 		}
-		newGen = gen
+		if !write.Created {
+			return nil
+		}
 
 		task := &model.Task{
 			Type:           model.TaskTypeUpload,
 			RefType:        "object",
-			RefID:          id,
-			RefGeneration:  gen,
-			IdempotencyKey: fmt.Sprintf("upload:%d:%d", id, gen),
+			RefID:          write.ObjectID,
+			RefVersionID:   versionID,
+			IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
 			Status:         model.TaskStatusPending,
 			MaxRetries:     b.uploadMaxRetries,
 			ScheduledAt:    time.Now(),
 		}
 		return txRepos.Tasks.Create(ctx, task)
 	}); err != nil {
+		b.deleteVersionCacheBestEffort(ctx, dstBucketName, cacheKey, "orphaned version cache file after copy tx failure")
 		return s3response.CopyObjectOutput{}, err
 	}
 
-	if err := staged.Commit(); err != nil {
-		return s3response.CopyObjectOutput{}, fmt.Errorf("committing copy cache: %w", err)
+	if !write.Created {
+		b.deleteVersionCacheBestEffort(ctx, dstBucketName, cacheKey, "orphaned duplicate copy version cache file")
+		etag := fmt.Sprintf(`"%s"`, write.ETag)
+		lastModified := time.Now()
+		b.logger.Info("copy destination unchanged", "src", srcBucketName+"/"+srcKey, "dst", dstBucketName+"/"+dstKey, "versionID", write.VersionID)
+		return s3response.CopyObjectOutput{
+			CopyObjectResult: &s3response.CopyObjectResult{
+				ETag:         &etag,
+				LastModified: &lastModified,
+			},
+		}, nil
 	}
 
 	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)
 	lastModified := time.Now()
-	b.logger.Info("object copied", "src", srcBucketName+"/"+srcKey, "dst", dstBucketName+"/"+dstKey, "gen", newGen)
+	b.logger.Info("object copied", "src", srcBucketName+"/"+srcKey, "dst", dstBucketName+"/"+dstKey, "versionID", versionID)
 
 	return s3response.CopyObjectOutput{
 		CopyObjectResult: &s3response.CopyObjectResult{
@@ -504,6 +528,16 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func versionCacheKey(versionID string) string {
+	return path.Join(".versions", versionID)
+}
+
+func (b *SynapseBackend) deleteVersionCacheBestEffort(ctx context.Context, bucketName, cacheKey, message string) {
+	if cleanupErr := b.cache.Delete(ctx, bucketName, cacheKey); cleanupErr != nil {
+		b.logger.Warn(message, "bucket", bucketName, "cacheKey", cacheKey, "error", cleanupErr)
+	}
 }
 
 // Ensure Body is consumed for PutObject, as it might come from

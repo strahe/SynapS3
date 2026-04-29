@@ -111,7 +111,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTaskDuration.WithLabelValues("uploader").Observe(time.Since(start).Seconds())
 	}()
 
-	logger := u.logger.With("taskID", task.ID, "objectID", task.RefID, "gen", task.RefGeneration)
+	logger := u.logger.With("taskID", task.ID, "objectID", task.RefID, "versionID", task.RefVersionID)
 
 	if u.storage == nil {
 		logger.Warn("storage client not configured, failing task")
@@ -120,32 +120,25 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	obj, err := u.repos.Objects.GetByID(ctx, task.RefID)
-	if err != nil || obj == nil {
-		logger.Warn("object not found for upload task", "error", err)
+	version, err := u.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
+	if err != nil || version == nil {
+		logger.Warn("object version not found for upload task", "error", err)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "object not found")
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 
-	if obj.Generation != task.RefGeneration {
-		logger.Warn("stale generation, skipping", "objGen", obj.Generation)
-		_ = u.repos.Tasks.Fail(ctx, task.ID, "stale generation")
-		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
-		return
-	}
-
-	bucket, err := u.repos.Buckets.GetByID(ctx, obj.BucketID)
+	bucket, err := u.repos.Buckets.GetByID(ctx, version.BucketID)
 	if err != nil || bucket == nil {
-		logger.Error("bucket not found", "bucketID", obj.BucketID, "error", err)
+		logger.Error("bucket not found", "bucketID", version.BucketID, "error", err)
 		_ = u.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
 
 	// Transition cached → uploading (on retry, object may already be in uploading state)
-	if obj.State != model.ObjectStateUploading {
-		if err := state.TransitionState(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+	if version.State != model.ObjectStateUploading {
+		if err := state.TransitionState(ctx, u.stateMachine, u.repos.Objects, task.RefVersionID,
 			model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 			logger.Warn("state transition cached→uploading failed", "error", err)
 			_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
@@ -170,7 +163,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	}
 
 	// Read from cache
-	rc, _, err := u.cache.Get(ctx, bucket.Name, obj.Key)
+	rc, _, err := u.cache.Get(ctx, bucket.Name, version.CacheKey)
 	if err != nil {
 		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "cache read", err)
 		return
@@ -205,7 +198,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	}
 
 	// Atomic: update storage info + transition uploading → stored
-	if err := u.repos.Objects.SetStorageInfoAndTransition(ctx, task.RefID, task.RefGeneration,
+	if err := u.repos.Objects.SetVersionStorageInfoAndTransition(ctx, task.RefVersionID,
 		pieceCID, retrievalURL, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "state transition uploading→stored", err)
 		return
@@ -225,8 +218,8 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 			Type:           model.TaskTypeEvictCache,
 			RefType:        "object",
 			RefID:          task.RefID,
-			RefGeneration:  task.RefGeneration,
-			IdempotencyKey: fmt.Sprintf("evict_cache:%d:%d", task.RefID, task.RefGeneration),
+			RefVersionID:   task.RefVersionID,
+			IdempotencyKey: fmt.Sprintf("evict_cache:%s", task.RefVersionID),
 			Status:         model.TaskStatusPending,
 			MaxRetries:     u.evictMaxRetries,
 			ScheduledAt:    time.Now(),
@@ -304,7 +297,7 @@ func (u *Uploader) handleBalancePreflightFailure(ctx context.Context, task *mode
 func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, logger *slog.Logger, currentState model.ObjectState, stage string, err error) {
 	logger.Error(stage+" failed", "error", err)
 	if task.RetryCount+1 >= task.MaxRetries {
-		_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefID, task.RefGeneration,
+		_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefVersionID,
 			currentState, fmt.Sprintf("%s: %v (max retries reached)", stage, err))
 		if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
 			logger.Error("failed to mark task as dead-letter", "error", ftErr)

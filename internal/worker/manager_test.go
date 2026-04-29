@@ -20,27 +20,16 @@ func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create a bucket and object for the task
 	bucket := testutil.SeedBucket(t, db, "mgr-lease-bucket")
-	obj := &model.Object{
-		BucketID:   bucket.ID,
-		Key:        "mgr-lease-key",
-		Size:       100,
-		ETag:       "etag1",
-		State:      model.ObjectStateCached,
-		Generation: 1,
-	}
-	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
-		t.Fatalf("inserting object: %v", err)
-	}
+	objID, versionID := seedManagerVersion(t, repos, bucket, "mgr-lease-key", model.ObjectStateCached)
 
 	// Create a task and claim it, then manually set its lease_until to the past
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
 		RefType:        "object",
-		RefID:          obj.ID,
-		RefGeneration:  1,
-		IdempotencyKey: "upload:lease:1",
+		RefID:          objID,
+		RefVersionID:   versionID,
+		IdempotencyKey: "upload:" + versionID,
 		Status:         model.TaskStatusRunning,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
@@ -82,30 +71,18 @@ func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-stale-bucket")
-
-	// Create an object in "uploading" state
-	obj := &model.Object{
-		BucketID:   bucket.ID,
-		Key:        "mgr-stale-key",
-		Size:       100,
-		ETag:       "etag2",
-		State:      model.ObjectStateCached,
-		Generation: 1,
-	}
-	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
-		t.Fatalf("inserting object: %v", err)
-	}
+	objID, versionID := seedManagerVersion(t, repos, bucket, "mgr-stale-key", model.ObjectStateCached)
 
 	// Transition to uploading
-	if err := repos.Objects.UpdateState(ctx, obj.ID, 1, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("transition: %v", err)
 	}
 
 	// Manually set updated_at to more than 10 minutes ago (stale threshold)
 	staleTime := time.Now().Add(-15 * time.Minute)
-	_, err := db.NewUpdate().Model((*model.Object)(nil)).
+	_, err := db.NewUpdate().Model((*model.ObjectVersion)(nil)).
 		Set("updated_at = ?", staleTime).
-		Where("id = ?", obj.ID).
+		Where("version_id = ?", versionID).
 		Exec(ctx)
 	if err != nil {
 		t.Fatalf("setting stale timestamp: %v", err)
@@ -115,7 +92,7 @@ func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	got, err := repos.Objects.GetByID(ctx, obj.ID)
+	got, err := repos.Objects.GetByID(ctx, objID)
 	if err != nil {
 		t.Fatalf("getting object: %v", err)
 	}
@@ -131,19 +108,7 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-reconcile-bucket")
-
-	// Create an object in "cached" state (should have an upload task)
-	obj := &model.Object{
-		BucketID:   bucket.ID,
-		Key:        "mgr-reconcile-key",
-		Size:       100,
-		ETag:       "etag3",
-		State:      model.ObjectStateCached,
-		Generation: 1,
-	}
-	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
-		t.Fatalf("inserting object: %v", err)
-	}
+	objID, versionID := seedManagerVersion(t, repos, bucket, "mgr-reconcile-key", model.ObjectStateCached)
 
 	// No task exists yet — manager should create one during reconciliation
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
@@ -157,8 +122,8 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	if task == nil {
 		t.Fatal("expected reconciliation to create missing upload task")
 	}
-	if task.RefID != obj.ID || task.RefGeneration != 1 {
-		t.Errorf("task refs mismatch: got refID=%d gen=%d, want %d/1", task.RefID, task.RefGeneration, obj.ID)
+	if task.RefID != objID || task.RefVersionID != versionID {
+		t.Errorf("task refs mismatch: got refID=%d version=%s, want %d/%s", task.RefID, task.RefVersionID, objID, versionID)
 	}
 	if task.MaxRetries != 9 {
 		t.Fatalf("task MaxRetries = %d, want 9", task.MaxRetries)
@@ -233,26 +198,15 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-dedup-bucket")
-
-	obj := &model.Object{
-		BucketID:   bucket.ID,
-		Key:        "mgr-dedup-key",
-		Size:       100,
-		ETag:       "etag4",
-		State:      model.ObjectStateCached,
-		Generation: 1,
-	}
-	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
-		t.Fatalf("inserting object: %v", err)
-	}
+	objID, versionID := seedManagerVersion(t, repos, bucket, "mgr-dedup-key", model.ObjectStateCached)
 
 	// Pre-create the task with the same idempotency key the manager would use
 	existingTask := &model.Task{
 		Type:           model.TaskTypeUpload,
 		RefType:        "object",
-		RefID:          obj.ID,
-		RefGeneration:  1,
-		IdempotencyKey: fmt.Sprintf("upload:%d:%d", obj.ID, int64(1)),
+		RefID:          objID,
+		RefVersionID:   versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
 		Status:         model.TaskStatusPending,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
@@ -290,17 +244,7 @@ func TestManager_ReconcileTasks_AutoEvictGuard(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-off")
-	obj := &model.Object{
-		BucketID:   bucket.ID,
-		Key:        "stored-no-evict",
-		Size:       100,
-		ETag:       "etag5",
-		State:      model.ObjectStateStored,
-		Generation: 1,
-	}
-	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
-		t.Fatalf("inserting object: %v", err)
-	}
+	seedManagerVersion(t, repos, bucket, "stored-no-evict", model.ObjectStateStored)
 
 	mgr := worker.NewManager(repos, slog.Default(), false)
 	mgr.Start(ctx)
@@ -320,17 +264,7 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-on")
-	obj := &model.Object{
-		BucketID:   bucket.ID,
-		Key:        "stored-with-evict",
-		Size:       100,
-		ETag:       "etag6",
-		State:      model.ObjectStateStored,
-		Generation: 1,
-	}
-	if _, err := db.NewInsert().Model(obj).Exec(ctx); err != nil {
-		t.Fatalf("inserting object: %v", err)
-	}
+	objID, versionID := seedManagerVersion(t, repos, bucket, "stored-with-evict", model.ObjectStateStored)
 
 	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
@@ -342,10 +276,31 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	if task == nil {
 		t.Fatal("expected evict_cache task when autoEvict is enabled")
 	}
-	if task.RefID != obj.ID || task.RefGeneration != obj.Generation {
-		t.Fatalf("evict task refs = (%d,%d), want (%d,%d)", task.RefID, task.RefGeneration, obj.ID, obj.Generation)
+	if task.RefID != objID || task.RefVersionID != versionID {
+		t.Fatalf("evict task refs = (%d,%s), want (%d,%s)", task.RefID, task.RefVersionID, objID, versionID)
 	}
 	if task.MaxRetries != 4 {
 		t.Fatalf("evict task MaxRetries = %d, want 4", task.MaxRetries)
 	}
+}
+
+func seedManagerVersion(t *testing.T, repos *repository.Repositories, bucket *model.Bucket, key string, state model.ObjectState) (int64, string) {
+	t.Helper()
+	versionID := model.NewVersionID()
+	version := &model.ObjectVersion{
+		VersionID:   versionID,
+		BucketID:    bucket.ID,
+		Key:         key,
+		Size:        100,
+		ETag:        "etag-" + key,
+		Checksum:    "checksum-" + key,
+		ContentType: "text/plain",
+		CacheKey:    ".versions/" + versionID,
+		State:       state,
+	}
+	objID, err := repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
+	if err != nil {
+		t.Fatalf("creating object version: %v", err)
+	}
+	return objID, versionID
 }

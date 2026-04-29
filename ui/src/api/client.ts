@@ -78,7 +78,7 @@ export interface TaskItem {
   type: string
   ref_type: string
   ref_id: number
-  ref_generation: number
+  ref_version_id: string
   status: string
   retry_count: number
   max_retries: number

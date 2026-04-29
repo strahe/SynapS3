@@ -42,23 +42,22 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 	pieceCID := buildTestCID(t)
-	objectID, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "remote.txt",
-		Size:        6,
-		ETag:        "object-etag",
-		Checksum:    "object-checksum",
-		ContentType: "text/plain",
-		CachePath:   "/cache/remote.txt",
-		State:       model.ObjectStateStored,
-		PieceCID:    &pieceCID,
-		MaxRetries:  5,
-	})
-	if err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
+	version := &model.ObjectVersion{
+		VersionID:    "01J0000000000000000000OR01",
+		BucketID:     bucket.ID,
+		Key:          "remote.txt",
+		Size:         6,
+		ETag:         "object-etag",
+		Checksum:     "object-checksum",
+		ContentType:  "text/plain",
+		CacheKey:     ".versions/01J0000000000000000000OR01",
+		State:        model.ObjectStateStored,
+		PieceCID:     &pieceCID,
+		RetrievalURL: stringPtr("https://provider.example/piece"),
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ?`, "https://provider.example/piece", objectID); err != nil {
-		t.Fatalf("setting retrieval_url: %v", err)
+	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 
 	storageClient := &testutil.MockStorageClient{
@@ -98,7 +97,7 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	}
 }
 
-func TestOpenTreatsDeletedObjectAfterProviderDownloadAsMissing(t *testing.T) {
+func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing.T) {
 	mc := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return nil, nil, os.ErrNotExist
@@ -119,36 +118,46 @@ func TestOpenTreatsDeletedObjectAfterProviderDownloadAsMissing(t *testing.T) {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 	pieceCID := buildTestCID(t)
-	objectID, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "deleted.txt",
-		Size:        6,
-		ETag:        "object-etag",
-		Checksum:    "object-checksum",
-		ContentType: "text/plain",
-		CachePath:   "/cache/deleted.txt",
-		State:       model.ObjectStateStored,
-		PieceCID:    &pieceCID,
-		MaxRetries:  5,
-	})
-	if err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
+	version := &model.ObjectVersion{
+		VersionID:    "01J0000000000000000000OR02",
+		BucketID:     bucket.ID,
+		Key:          "changed.txt",
+		Size:         6,
+		ETag:         "object-etag",
+		Checksum:     "object-checksum",
+		ContentType:  "text/plain",
+		CacheKey:     ".versions/01J0000000000000000000OR02",
+		State:        model.ObjectStateStored,
+		PieceCID:     &pieceCID,
+		RetrievalURL: stringPtr("https://provider.example/deleted"),
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE objects SET retrieval_url = ? WHERE id = ?`, "https://provider.example/deleted", objectID); err != nil {
-		t.Fatalf("setting retrieval_url: %v", err)
+	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
-			if err := repos.Objects.SoftDelete(ctx, objectID); err != nil {
-				t.Fatalf("Objects.SoftDelete: %v", err)
+			replacement := &model.ObjectVersion{
+				VersionID:   "01J0000000000000000000OR03",
+				BucketID:    bucket.ID,
+				Key:         "changed.txt",
+				Size:        3,
+				ETag:        "new-etag",
+				Checksum:    "new-checksum",
+				ContentType: "text/plain",
+				CacheKey:    ".versions/01J0000000000000000000OR03",
+				State:       model.ObjectStateStored,
+			}
+			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
+				t.Fatalf("Objects.CreateVersionAndSetCurrent replacement: %v", err)
 			}
 			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
 		},
 	}
 	reader := New(repos, mc, storageClient, slog.Default())
 
-	got, err := reader.Open(ctx, bucket.Name, "deleted.txt", S3Visibility)
+	got, err := reader.Open(ctx, bucket.Name, "changed.txt", S3Visibility)
 	if err == nil {
 		_ = got.Body.Close()
 		t.Fatal("Open returned deleted object, want not found")
@@ -156,6 +165,10 @@ func TestOpenTreatsDeletedObjectAfterProviderDownloadAsMissing(t *testing.T) {
 	if !errors.Is(err, ErrNoSuchKey) {
 		t.Fatalf("Open error = %v, want ErrNoSuchKey", err)
 	}
+}
+
+func stringPtr(v string) *string {
+	return &v
 }
 
 func TestTeeReadCloserReadReturnsEOFBeforeRehydrationCompletes(t *testing.T) {

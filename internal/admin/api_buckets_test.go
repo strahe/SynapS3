@@ -79,6 +79,30 @@ func (r *writeDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
 	return nil
 }
 
+func seedAdminObjectVersion(t *testing.T, repos *repository.Repositories, bucket *model.Bucket, key string, size int64, etag, checksum, contentType, cacheKey string, state model.ObjectState) (int64, string) {
+	t.Helper()
+	versionID := model.NewVersionID()
+	if cacheKey == "" {
+		cacheKey = ".versions/" + versionID
+	}
+	version := &model.ObjectVersion{
+		VersionID:   versionID,
+		BucketID:    bucket.ID,
+		Key:         key,
+		Size:        size,
+		ETag:        etag,
+		Checksum:    checksum,
+		ContentType: contentType,
+		CacheKey:    cacheKey,
+		State:       state,
+	}
+	objID, err := repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
+	if err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	return objID, versionID
+}
+
 func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repositories, bucketName, key, body string) *cache.ObjectInfo {
 	t.Helper()
 	ctx := context.Background()
@@ -86,22 +110,24 @@ func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repos
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	info, err := srv.cache.Put(ctx, bucket.Name, key, strings.NewReader(body))
+	versionID := model.NewVersionID()
+	cacheKey := ".versions/" + versionID
+	info, err := srv.cache.Put(ctx, bucket.Name, cacheKey, strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("cache.Put: %v", err)
 	}
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         key,
 		Size:        info.Size,
 		ETag:        info.ETag,
 		Checksum:    info.Checksum,
 		ContentType: "text/plain",
-		CachePath:   info.Path,
+		CacheKey:    cacheKey,
 		State:       model.ObjectStateCached,
-		MaxRetries:  5,
 	}); err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	return info
 }
@@ -290,20 +316,7 @@ func TestAPIBucketDetail(t *testing.T) {
 		{key: "a.txt", size: 5},
 		{key: "b.txt", size: 7},
 	} {
-		_, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-			BucketID:    bucket.ID,
-			Key:         tc.key,
-			Size:        tc.size,
-			ETag:        tc.key,
-			Checksum:    tc.key,
-			ContentType: "text/plain",
-			CachePath:   "/cache/" + tc.key,
-			State:       model.ObjectStateCached,
-			MaxRetries:  5,
-		})
-		if err != nil {
-			t.Fatalf("Objects.UpsertAndBumpGeneration(%s): %v", tc.key, err)
-		}
+		seedAdminObjectVersion(t, repos, bucket, tc.key, tc.size, tc.key, tc.key, "text/plain", "", model.ObjectStateCached)
 	}
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -670,19 +683,7 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "kept.txt",
-		Size:        4,
-		ETag:        "etag-kept",
-		Checksum:    "checksum-kept",
-		ContentType: "text/plain",
-		CachePath:   "/cache/kept.txt",
-		State:       model.ObjectStateStored,
-		MaxRetries:  5,
-	}); err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
-	}
+	seedAdminObjectVersion(t, repos, bucket, "kept.txt", 4, "etag-kept", "checksum-kept", "text/plain", "", model.ObjectStateStored)
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -765,19 +766,7 @@ func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "folder/report.txt",
-		Size:        11,
-		ETag:        "etag",
-		Checksum:    "checksum",
-		ContentType: "text/plain",
-		CachePath:   "/cache/report.txt",
-		State:       model.ObjectStateCached,
-		MaxRetries:  5,
-	}); err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
-	}
+	seedAdminObjectVersion(t, repos, bucket, "folder/report.txt", 11, "etag", "checksum", "text/plain", "", model.ObjectStateCached)
 	var rr *writeDeadlineRecorder
 	mockCache := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
@@ -912,19 +901,7 @@ func TestAPIBucket_DeleteRecursiveReturnsNotImplemented(t *testing.T) {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 
-	if _, _, err := repos.Objects.UpsertAndBumpGeneration(ctx, &model.Object{
-		BucketID:    bucket.ID,
-		Key:         "file.txt",
-		Size:        5,
-		ETag:        "etag-file",
-		Checksum:    "checksum-file",
-		ContentType: "text/plain",
-		CachePath:   "/cache/file.txt",
-		State:       model.ObjectStateStored,
-		MaxRetries:  5,
-	}); err != nil {
-		t.Fatalf("Objects.UpsertAndBumpGeneration: %v", err)
-	}
+	seedAdminObjectVersion(t, repos, bucket, "file.txt", 5, "etag-file", "checksum-file", "text/plain", "", model.ObjectStateStored)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/recursive-delete-bucket?recursive=true", nil)
 	req.SetPathValue("name", bucket.Name)

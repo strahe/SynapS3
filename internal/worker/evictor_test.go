@@ -15,22 +15,22 @@ import (
 	"github.com/strahe/synaps3/internal/worker"
 )
 
-// seedStoredObject creates a bucket+object in "stored" state with PieceCID.
-func seedStoredObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, int64) {
+// seedStoredObject creates a bucket+object version in stored state with PieceCID.
+func seedStoredObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, string) {
 	t.Helper()
 	ctx := context.Background()
 
-	bucket, objID, gen := seedObjectInDB(t, env, model.BucketStatusActive)
+	bucket, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
 
 	// Transition through the pipeline: cached → uploading → stored (with PieceCID)
-	if err := env.repos.Objects.UpdateState(ctx, objID, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("transition to uploading: %v", err)
 	}
 	pieceCID := testCID(t).String()
-	if err := env.repos.Objects.SetPieceCIDAndTransition(ctx, objID, gen, pieceCID, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("SetPieceCIDAndTransition: %v", err)
+	if err := env.repos.Objects.SetVersionStorageInfoAndTransition(ctx, versionID, pieceCID, "https://provider.example/pieces/1", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("SetVersionStorageInfoAndTransition: %v", err)
 	}
-	return bucket, objID, gen
+	return bucket, objID, versionID
 }
 
 func TestEvictor_HappyPath(t *testing.T) {
@@ -40,9 +40,9 @@ func TestEvictor_HappyPath(t *testing.T) {
 		},
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
-	_, objID, gen := seedStoredObject(t, env)
+	_, objID, versionID := seedStoredObject(t, env)
 
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, gen, 5, 0)
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
 
 	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
@@ -60,7 +60,7 @@ func TestEvictor_HappyPath(t *testing.T) {
 	}
 }
 
-func TestEvictor_StaleGeneration(t *testing.T) {
+func TestEvictor_MissingVersion(t *testing.T) {
 	mc := &testutil.MockCache{}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objID, _ := seedStoredObject(t, env)
@@ -69,8 +69,8 @@ func TestEvictor_StaleGeneration(t *testing.T) {
 		Type:           model.TaskTypeEvictCache,
 		RefType:        "object",
 		RefID:          objID,
-		RefGeneration:  0, // stale
-		IdempotencyKey: "evict_cache:stale:0",
+		RefVersionID:   "01J000000000000000MISSING1",
+		IdempotencyKey: "evict_cache:missing",
 		Status:         model.TaskStatusPending,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
@@ -86,8 +86,8 @@ func TestEvictor_StaleGeneration(t *testing.T) {
 	if got.Status != model.TaskStatusFailed {
 		t.Errorf("expected task failed, got %s", got.Status)
 	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "stale generation") {
-		t.Errorf("expected stale generation error, got %v", got.LastError)
+	if got.LastError == nil || !strings.Contains(*got.LastError, "object not found") {
+		t.Errorf("expected object not found error, got %v", got.LastError)
 	}
 }
 
@@ -95,14 +95,14 @@ func TestEvictor_WrongState(t *testing.T) {
 	mc := &testutil.MockCache{}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	// Object in "uploading" state, not "stored"
-	_, objID, gen := seedObjectInDB(t, env, model.BucketStatusActive)
+	_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
 	ctx := context.Background()
 
-	if err := env.repos.Objects.UpdateState(ctx, objID, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("transition: %v", err)
 	}
 
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, gen, 5, 0)
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
 
 	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
@@ -122,16 +122,16 @@ func TestEvictor_NoPieceCID(t *testing.T) {
 	ctx := context.Background()
 
 	// Create object in stored state without PieceCID
-	_, objID, gen := seedObjectInDB(t, env, model.BucketStatusActive)
-	if err := env.repos.Objects.UpdateState(ctx, objID, gen, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("transition: %v", err)
 	}
 	// Skip PieceCID setting, go directly to stored
-	if err := env.repos.Objects.UpdateState(ctx, objID, gen, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatalf("transition: %v", err)
 	}
 
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, gen, 5, 0)
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
 
 	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
@@ -152,7 +152,7 @@ func TestEvictor_BucketNotFound(t *testing.T) {
 		},
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
-	bucket, objID, gen := seedStoredObject(t, env)
+	bucket, objID, versionID := seedStoredObject(t, env)
 
 	// Hard-delete the bucket so evictor can't find it
 	ctx := context.Background()
@@ -160,7 +160,7 @@ func TestEvictor_BucketNotFound(t *testing.T) {
 		t.Fatalf("hard-deleting bucket: %v", err)
 	}
 
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, gen, 5, 0)
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
 
 	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
@@ -184,9 +184,9 @@ func TestEvictor_CacheDeleteFailure(t *testing.T) {
 		},
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
-	_, objID, gen := seedStoredObject(t, env)
+	_, objID, versionID := seedStoredObject(t, env)
 
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, gen, 5, 0)
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
 
 	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
