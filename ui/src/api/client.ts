@@ -46,6 +46,8 @@ export interface BucketItem {
 
 export interface BucketDetail extends BucketItem {
   updated_at: string
+  versioning_status: string
+  versioning_enforced: boolean
 }
 
 export interface BucketMutationResponse {
@@ -58,6 +60,7 @@ export interface BucketMutationResponse {
 export interface ObjectItem {
   id: number
   key: string
+  current_version_id: string
   size: number
   state: string
   content_type: string
@@ -71,6 +74,25 @@ export interface ObjectListResponse {
   objects: ObjectItem[]
   has_more: boolean
   next_marker?: string
+}
+
+export interface ObjectVersionItem {
+  version_id: string
+  key: string
+  size: number
+  state: string
+  content_type: string
+  etag: string
+  piece_cid?: string
+  created_at: string
+  updated_at: string
+  is_current: boolean
+}
+
+export interface ObjectVersionListResponse {
+  versions: ObjectVersionItem[]
+  has_more: boolean
+  next_version_marker?: string
 }
 
 export interface TaskItem {
@@ -322,8 +344,20 @@ export const api = {
     const qs = sp.toString()
     return fetchJSON<ObjectListResponse>(`/buckets/${encodeURIComponent(name)}/objects${qs ? `?${qs}` : ''}`)
   },
-  getObjectDownloadUrl: (name: string, key: string) =>
-    `${BASE}/buckets/${encodeURIComponent(name)}/objects/download?key=${encodeURIComponent(key)}`,
+  getBucketObjectVersions: (name: string, params: { key: string; limit?: number; version_marker?: string }) => {
+    const sp = new URLSearchParams()
+    sp.set('key', params.key)
+    if (params.limit) sp.set('limit', params.limit.toString())
+    if (params.version_marker) sp.set('version_marker', params.version_marker)
+    return fetchJSON<ObjectVersionListResponse>(
+      `/buckets/${encodeURIComponent(name)}/objects/versions?${sp.toString()}`
+    )
+  },
+  getObjectDownloadUrl: (name: string, key: string, versionId?: string) => {
+    const params = [`key=${encodeURIComponent(key)}`]
+    if (versionId) params.push(`version_id=${encodeURIComponent(versionId)}`)
+    return `${BASE}/buckets/${encodeURIComponent(name)}/objects/download?${params.join('&')}`
+  },
   getTasks: (params: { type?: string; status?: string; limit?: number; offset?: number }) => {
     const sp = new URLSearchParams()
     if (params.type) sp.set('type', params.type)

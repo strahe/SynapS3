@@ -22,6 +22,7 @@ var (
 	ErrInvalidArgument  = errors.New("object reader: invalid argument")
 	ErrNoSuchBucket     = errors.New("object reader: bucket not found")
 	ErrNoSuchKey        = errors.New("object reader: object not found")
+	ErrNoSuchVersion    = errors.New("object reader: object version not found")
 	ErrCacheRead        = errors.New("object reader: cache read failed")
 	ErrCacheMiss        = errors.New("object reader: cache miss")
 	ErrProviderDownload = errors.New("object reader: provider download failed")
@@ -48,6 +49,8 @@ type Result struct {
 	Body         io.ReadCloser
 	Size         int64
 	ETag         string
+	Checksum     string
+	VersionID    string
 	ContentType  string
 	LastModified time.Time
 	Source       Source
@@ -75,6 +78,57 @@ func New(repos *repository.Repositories, cache cache.Cache, storage synapse.Stor
 
 func (r *Reader) Open(ctx context.Context, bucketName, key string, visible BucketVisibility) (*Result, error) {
 	return r.open(ctx, bucketName, key, visible, true, false)
+}
+
+func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility) (*Result, error) {
+	if versionID == "" {
+		return nil, ErrInvalidArgument
+	}
+	if r == nil || r.repos == nil || r.cache == nil || bucketName == "" || visible == nil {
+		return nil, ErrInvalidArgument
+	}
+
+	bucket, err := r.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		return nil, fmt.Errorf("querying bucket: %w", err)
+	}
+	if bucket == nil || !visible(bucket.Status) {
+		return nil, ErrNoSuchBucket
+	}
+
+	version, err := r.repos.Objects.GetVersionByBucketKeyAndID(ctx, bucket.ID, key, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying object version: %w", err)
+	}
+	if version == nil {
+		return nil, ErrNoSuchVersion
+	}
+
+	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
+	if cacheErr == nil {
+		return resultFromVersion(version, body, SourceCache, false), nil
+	}
+	if !os.IsNotExist(cacheErr) {
+		return nil, fmt.Errorf("%w: %w", ErrCacheRead, cacheErr)
+	}
+
+	if version.PieceCID == nil || *version.PieceCID == "" || version.RetrievalURL == nil || *version.RetrievalURL == "" || r.storage == nil {
+		return nil, cacheMissError(ErrNoSuchVersion)
+	}
+	pieceCID, err := cid.Decode(*version.PieceCID)
+	if err != nil {
+		r.logger.Warn("invalid PieceCID, cannot download version from provider", "key", key, "versionID", versionID, "pieceCID", *version.PieceCID)
+		return nil, cacheMissError(ErrNoSuchVersion)
+	}
+
+	rc, err := r.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: *version.RetrievalURL})
+	if err != nil {
+		r.logger.Warn("provider download failed", "key", key, "versionID", versionID, "err", err)
+		return nil, fmt.Errorf("%w: %w: %w", ErrCacheMiss, ErrProviderDownload, err)
+	}
+
+	body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, rc)
+	return resultFromVersion(version, body, SourceProvider, true), nil
 }
 
 func (r *Reader) open(ctx context.Context, bucketName, key string, visible BucketVisibility, allowRestart bool, cacheMiss bool) (*Result, error) {
@@ -146,8 +200,24 @@ func resultFromObject(obj *model.Object, body io.ReadCloser, source Source, cach
 		Body:         body,
 		Size:         obj.Size,
 		ETag:         obj.ETag,
+		Checksum:     obj.Checksum,
+		VersionID:    obj.CurrentVersionID,
 		ContentType:  obj.ContentType,
 		LastModified: obj.UpdatedAt,
+		Source:       source,
+		CacheMiss:    cacheMiss,
+	}
+}
+
+func resultFromVersion(version *model.ObjectVersion, body io.ReadCloser, source Source, cacheMiss bool) *Result {
+	return &Result{
+		Body:         body,
+		Size:         version.Size,
+		ETag:         version.ETag,
+		Checksum:     version.Checksum,
+		VersionID:    version.VersionID,
+		ContentType:  version.ContentType,
+		LastModified: version.CreatedAt,
 		Source:       source,
 		CacheMiss:    cacheMiss,
 	}

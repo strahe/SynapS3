@@ -136,6 +136,16 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
+	if version.State == model.ObjectStateStored || version.State == model.ObjectStateCacheEvicted {
+		if version.State == model.ObjectStateStored {
+			u.enqueueEvictTask(ctx, logger, task.RefID, task.RefVersionID)
+		}
+		_ = u.repos.Tasks.Complete(ctx, task.ID)
+		logger.Info("upload task already satisfied", "state", version.State)
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
+		return
+	}
+
 	// Transition cached → uploading (on retry, object may already be in uploading state)
 	if version.State != model.ObjectStateUploading {
 		if err := state.TransitionState(ctx, u.stateMachine, u.repos.Objects, task.RefVersionID,
@@ -165,7 +175,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	// Read from cache
 	rc, _, err := u.cache.Get(ctx, bucket.Name, version.CacheKey)
 	if err != nil {
-		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "cache read", err)
+		u.handleFailure(ctx, task, version, logger, "cache read", err)
 		return
 	}
 	defer func() { _ = rc.Close() }()
@@ -176,16 +186,16 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	}
 	result, err := u.storage.Upload(ctx, rc, uploadOpts)
 	if err != nil {
-		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload",
+		u.handleFailure(ctx, task, version, logger, "upload",
 			fmt.Errorf("%s", decodeRevertReason(err.Error())))
 		return
 	}
 	if result == nil {
-		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload", errors.New("upload returned nil result"))
+		u.handleFailure(ctx, task, version, logger, "upload", errors.New("upload returned nil result"))
 		return
 	}
 	if !result.Complete {
-		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload",
+		u.handleFailure(ctx, task, version, logger, "upload",
 			fmt.Errorf("upload incomplete: %d/%d copies committed", result.SuccessCount(), requestedCopies(result)))
 		return
 	}
@@ -193,14 +203,25 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	pieceCID := result.PieceCID.String()
 	retrievalURL := firstRetrievalURL(result)
 	if retrievalURL == "" {
-		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "upload", errors.New("upload completed without retrieval URL"))
+		u.handleFailure(ctx, task, version, logger, "upload", errors.New("upload completed without retrieval URL"))
 		return
 	}
 
-	// Atomic: update storage info + transition uploading → stored
-	if err := u.repos.Objects.SetVersionStorageInfoAndTransition(ctx, task.RefVersionID,
-		pieceCID, retrievalURL, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		u.handleFailure(ctx, task, logger, model.ObjectStateUploading, "state transition uploading→stored", err)
+	updatedRefs, err := u.repos.Objects.SetStorageInfoForUploadingContent(ctx, version.BucketID, version.Size, version.Checksum, pieceCID, retrievalURL)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			latest, latestErr := u.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
+			if latestErr == nil && latest != nil && (latest.State == model.ObjectStateStored || latest.State == model.ObjectStateCacheEvicted) {
+				if latest.State == model.ObjectStateStored {
+					u.enqueueEvictTask(ctx, logger, latest.ObjectID, latest.VersionID)
+				}
+				_ = u.repos.Tasks.Complete(ctx, task.ID)
+				logger.Info("upload task content already stored", "state", latest.State)
+				admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
+				return
+			}
+		}
+		u.handleFailure(ctx, task, version, logger, "state transition uploading→stored", err)
 		return
 	}
 
@@ -214,26 +235,33 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 
 	// Enqueue cache eviction task
 	if u.autoEvict {
-		evictTask := &model.Task{
-			Type:           model.TaskTypeEvictCache,
-			RefType:        "object",
-			RefID:          task.RefID,
-			RefVersionID:   task.RefVersionID,
-			IdempotencyKey: fmt.Sprintf("evict_cache:%s", task.RefVersionID),
-			Status:         model.TaskStatusPending,
-			MaxRetries:     u.evictMaxRetries,
-			ScheduledAt:    time.Now(),
-		}
-		if err := u.repos.Tasks.Create(ctx, evictTask); err != nil {
-			if !errors.Is(err, repository.ErrAlreadyExists) {
-				logger.Warn("failed to enqueue eviction task (non-fatal)", "error", err)
-			}
+		for _, ref := range updatedRefs {
+			u.enqueueEvictTask(ctx, logger, ref.ObjectID, ref.VersionID)
 		}
 	}
 
 	_ = u.repos.Tasks.Complete(ctx, task.ID)
 	logger.Info("upload complete", "pieceCID", pieceCID)
 	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
+}
+
+func (u *Uploader) enqueueEvictTask(ctx context.Context, logger *slog.Logger, objectID int64, versionID string) {
+	if !u.autoEvict {
+		return
+	}
+	evictTask := &model.Task{
+		Type:           model.TaskTypeEvictCache,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   versionID,
+		IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
+		Status:         model.TaskStatusPending,
+		MaxRetries:     u.evictMaxRetries,
+		ScheduledAt:    time.Now(),
+	}
+	if err := u.repos.Tasks.Create(ctx, evictTask); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+		logger.Warn("failed to enqueue eviction task (non-fatal)", "error", err, "versionID", versionID)
+	}
 }
 
 func requestedCopies(result *storage.UploadResult) int {
@@ -294,11 +322,10 @@ func (u *Uploader) handleBalancePreflightFailure(ctx context.Context, task *mode
 	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 }
 
-func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, logger *slog.Logger, currentState model.ObjectState, stage string, err error) {
+func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, version *model.ObjectVersion, logger *slog.Logger, stage string, err error) {
 	logger.Error(stage+" failed", "error", err)
 	if task.RetryCount+1 >= task.MaxRetries {
-		_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefVersionID,
-			currentState, fmt.Sprintf("%s: %v (max retries reached)", stage, err))
+		u.failUploadingContent(ctx, task, version, logger, fmt.Sprintf("%s: %v (max retries reached)", stage, err))
 		if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
 			logger.Error("failed to mark task as dead-letter", "error", ftErr)
 		} else {
@@ -309,4 +336,14 @@ func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, logger *
 		_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
 	}
 	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+}
+
+func (u *Uploader) failUploadingContent(ctx context.Context, task *model.Task, version *model.ObjectVersion, logger *slog.Logger, lastError string) {
+	refs, err := u.repos.Objects.FailUploadingContentFollowers(ctx, version.BucketID, version.Size, version.Checksum, task.RefVersionID, lastError)
+	if err == nil {
+		logger.Info("marked matching uploading versions failed", "count", len(refs))
+		return
+	}
+	logger.Warn("failed to mark matching uploading versions failed", "error", err)
+	_ = state.TransitionToFailed(ctx, u.stateMachine, u.repos.Objects, task.RefVersionID, model.ObjectStateUploading, lastError)
 }

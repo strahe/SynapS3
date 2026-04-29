@@ -247,9 +247,13 @@ func runServe(ctx context.Context, src config.Source) error {
 	storageClient := client.Storage()
 	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain())
 
+	autoEvict := isAutoEvictEnabled(cfg.Cache.EvictionPolicy)
+
 	// Create backend.
 	be := backend.New(repos, localCache, sm, storageClient, logger,
 		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
+		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
+		backend.WithAutoEvict(autoEvict),
 	)
 
 	// Set up DB-backed IAM for root auth plus persisted non-root S3 users.
@@ -289,7 +293,6 @@ func runServe(ctx context.Context, src config.Source) error {
 	}
 
 	// Start background workers.
-	autoEvict := isAutoEvictEnabled(cfg.Cache.EvictionPolicy)
 	wm := worker.NewManager(repos, logger, autoEvict,
 		worker.NewUploader(repos, localCache, storageClient, walletQuerier, sm, autoEvict,
 			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,

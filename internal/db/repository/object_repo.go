@@ -122,6 +122,66 @@ func (r *BunObjectRepo) GetVersionByID(ctx context.Context, versionID string) (*
 	return version, nil
 }
 
+func (r *BunObjectRepo) GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	err := r.db.NewSelect().
+		Model(version).
+		Where("bucket_id = ? AND key = ? AND version_id = ?", bucketID, key, versionID).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting object version by bucket+key+ID: %w", err)
+	}
+	return version, nil
+}
+
+func (r *BunObjectRepo) FindReusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	err := r.db.NewSelect().
+		Model(version).
+		Where("bucket_id = ? AND size = ? AND checksum = ?", bucketID, size, checksum).
+		Where("state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
+		Where("piece_cid IS NOT NULL AND piece_cid <> ''").
+		Where("retrieval_url IS NOT NULL AND retrieval_url <> ''").
+		OrderExpr("created_at DESC").
+		OrderExpr("version_id DESC").
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("finding reusable stored object version: %w", err)
+	}
+	return version, nil
+}
+
+func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	err := r.db.NewSelect().
+		Model(version).
+		ModelTableExpr("object_versions AS object_version").
+		ColumnExpr("object_version.*").
+		Join("JOIN tasks AS task ON task.ref_type = ? AND task.ref_version_id = object_version.version_id", "object").
+		Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
+		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateCached, model.ObjectStateUploading})).
+		Where("task.type = ?", model.TaskTypeUpload).
+		Where("task.status IN (?)", bun.List([]model.TaskStatus{model.TaskStatusPending, model.TaskStatusRunning})).
+		OrderExpr("object_version.created_at DESC").
+		OrderExpr("object_version.version_id DESC").
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("finding reusable active upload object version: %w", err)
+	}
+	return version, nil
+}
+
 func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error) {
 	var objects []model.Object
 	q := r.db.NewSelect().
@@ -144,6 +204,81 @@ func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix
 		return nil, fmt.Errorf("listing objects: %w", err)
 	}
 	return objects, nil
+}
+
+func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error) {
+	var rows []ObjectVersionListItem
+	q := r.db.NewSelect().
+		Model(&rows).
+		ModelTableExpr("object_versions AS object_version").
+		ColumnExpr("object_version.*").
+		ColumnExpr("object.current_version_id AS current_version_id").
+		Join("JOIN objects AS object ON object.id = object_version.object_id").
+		Where("object_version.bucket_id = ?", bucketID).
+		OrderExpr("object_version.key ASC").
+		OrderExpr("object_version.created_at DESC").
+		OrderExpr("object_version.version_id DESC")
+
+	if prefix != "" {
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+		q = q.Where("object_version.key LIKE ? ESCAPE '\\'", escaped+"%")
+	}
+	if keyMarker != "" {
+		if versionIDMarker == "" {
+			q = q.Where("object_version.key > ?", keyMarker)
+		} else {
+			marker, err := r.GetVersionByBucketKeyAndID(ctx, bucketID, keyMarker, versionIDMarker)
+			if err != nil {
+				return nil, err
+			}
+			if marker == nil {
+				q = q.Where("object_version.key > ?", keyMarker)
+			} else {
+				q = q.Where("(object_version.key > ?) OR (object_version.key = ? AND (object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?)))",
+					keyMarker, keyMarker, marker.CreatedAt, marker.CreatedAt, marker.VersionID)
+			}
+		}
+	}
+	if maxKeys > 0 {
+		q = q.Limit(maxKeys)
+	}
+
+	if err := q.Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing object versions: %w", err)
+	}
+	return rows, nil
+}
+
+func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, key string, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error) {
+	var rows []ObjectVersionListItem
+	q := r.db.NewSelect().
+		Model(&rows).
+		ModelTableExpr("object_versions AS object_version").
+		ColumnExpr("object_version.*").
+		ColumnExpr("object.current_version_id AS current_version_id").
+		Join("JOIN objects AS object ON object.id = object_version.object_id").
+		Where("object_version.bucket_id = ? AND object_version.key = ?", bucketID, key).
+		OrderExpr("object_version.created_at DESC").
+		OrderExpr("object_version.version_id DESC")
+
+	if afterVersionID != "" {
+		marker, err := r.GetVersionByBucketKeyAndID(ctx, bucketID, key, afterVersionID)
+		if err != nil {
+			return nil, err
+		}
+		if marker != nil {
+			q = q.Where("(object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?))",
+				marker.CreatedAt, marker.CreatedAt, marker.VersionID)
+		}
+	}
+	if maxKeys > 0 {
+		q = q.Limit(maxKeys)
+	}
+
+	if err := q.Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing object versions by key: %w", err)
+	}
+	return rows, nil
 }
 
 func (r *BunObjectRepo) UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error {
@@ -218,6 +353,97 @@ func (r *BunObjectRepo) SetVersionStorageInfoAndTransition(ctx context.Context, 
 		}
 		return nil
 	})
+}
+
+func (r *BunObjectRepo) SetStorageInfoForUploadingContent(ctx context.Context, bucketID int64, size int64, checksum string, pieceCID string, retrievalURL string) ([]ObjectVersionRef, error) {
+	var refs []ObjectVersionRef
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		updated, err := setStorageInfoForUploadingContent(ctx, db, bucketID, size, checksum, pieceCID, retrievalURL)
+		if err != nil {
+			return err
+		}
+		refs = updated
+		if len(refs) == 0 {
+			return fmt.Errorf("no uploading object versions matched content: %w", ErrNotFound)
+		}
+
+		versionIDs := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			versionIDs = append(versionIDs, ref.VersionID)
+		}
+
+		now := time.Now()
+		_, err = db.NewUpdate().
+			Model((*model.Object)(nil)).
+			Set("piece_cid = ?", pieceCID).
+			Set("retrieval_url = ?", retrievalURL).
+			Set("state = ?", model.ObjectStateStored).
+			Set("updated_at = ?", now).
+			Where("current_version_id IN (?)", bun.List(versionIDs)).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("mirroring content storage info to current objects: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+func (r *BunObjectRepo) FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error) {
+	var refs []ObjectVersionRef
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		now := time.Now()
+		query := `UPDATE object_versions SET state = ?, failed_at_state = ?, last_error = ?, updated_at = ? WHERE bucket_id = ? AND size = ? AND checksum = ? AND state = ? AND (version_id = ? OR NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.ref_type = ? AND tasks.ref_version_id = object_versions.version_id AND tasks.type = ? AND tasks.status IN (?, ?))) RETURNING object_id, version_id`
+		err := db.NewRaw(query,
+			model.ObjectStateFailed,
+			model.ObjectStateUploading,
+			lastError,
+			now,
+			bucketID,
+			size,
+			checksum,
+			model.ObjectStateUploading,
+			leaderVersionID,
+			"object",
+			model.TaskTypeUpload,
+			model.TaskStatusPending,
+			model.TaskStatusRunning,
+		).Scan(ctx, &refs)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("no uploading object versions matched content: %w", ErrNotFound)
+			}
+			return fmt.Errorf("failing uploading object versions: %w", err)
+		}
+		if len(refs) == 0 {
+			return fmt.Errorf("no uploading object versions matched content: %w", ErrNotFound)
+		}
+
+		versionIDs := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			versionIDs = append(versionIDs, ref.VersionID)
+		}
+
+		_, err = db.NewUpdate().
+			Model((*model.Object)(nil)).
+			Set("state = ?", model.ObjectStateFailed).
+			Set("failed_at_state = ?", model.ObjectStateUploading).
+			Set("last_error = ?", lastError).
+			Set("updated_at = ?", now).
+			Where("current_version_id IN (?)", bun.List(versionIDs)).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("mirroring failed content state to current objects: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return refs, nil
 }
 
 func (r *BunObjectRepo) ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error) {
@@ -563,6 +789,26 @@ func resetStaleVersions(ctx context.Context, db bun.IDB, fromState, toState mode
 		versionIDs = append(versionIDs, row.VersionID)
 	}
 	return versionIDs, nil
+}
+
+func setStorageInfoForUploadingContent(ctx context.Context, db bun.IDB, bucketID int64, size int64, checksum string, pieceCID string, retrievalURL string) ([]ObjectVersionRef, error) {
+	now := time.Now()
+	var refs []ObjectVersionRef
+	query := `UPDATE object_versions
+		SET piece_cid = ?, retrieval_url = ?, state = ?, updated_at = ?
+		WHERE bucket_id = ? AND size = ? AND checksum = ? AND state = ?
+		RETURNING object_id, version_id`
+	err := db.NewRaw(query,
+		pieceCID, retrievalURL, model.ObjectStateStored, now,
+		bucketID, size, checksum, model.ObjectStateUploading,
+	).Scan(ctx, &refs)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("setting storage info for uploading content: %w", err)
+	}
+	return refs, nil
 }
 
 func objectFromVersion(version *model.ObjectVersion) *model.Object {

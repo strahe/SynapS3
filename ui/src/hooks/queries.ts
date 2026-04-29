@@ -35,6 +35,15 @@ export function useBucketObjects(name: string, prefix: string, after: string, li
   })
 }
 
+export function useBucketObjectVersions(name: string, key: string, versionMarker: string, limit = 50, enabled = true) {
+  return useQuery({
+    queryKey: ['objectVersions', name, key, versionMarker, limit],
+    queryFn: () => api.getBucketObjectVersions(name, { key, version_marker: versionMarker, limit }),
+    enabled: Boolean(name && key && enabled),
+    refetchInterval: 15_000,
+  })
+}
+
 export function useCreateBucket() {
   const qc = useQueryClient()
 

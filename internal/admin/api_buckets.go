@@ -45,15 +45,17 @@ type bucketMutationResponse struct {
 }
 
 type bucketDetailResponse struct {
-	ID             int64   `json:"id"`
-	Name           string  `json:"name"`
-	OwnerAccessKey *string `json:"owner_access_key"`
-	Status         string  `json:"status"`
-	ProofSetID     *string `json:"proof_set_id"`
-	ObjectCount    int64   `json:"object_count"`
-	TotalSizeBytes int64   `json:"total_size_bytes"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
+	ID                 int64   `json:"id"`
+	Name               string  `json:"name"`
+	OwnerAccessKey     *string `json:"owner_access_key"`
+	Status             string  `json:"status"`
+	ProofSetID         *string `json:"proof_set_id"`
+	ObjectCount        int64   `json:"object_count"`
+	TotalSizeBytes     int64   `json:"total_size_bytes"`
+	CreatedAt          string  `json:"created_at"`
+	UpdatedAt          string  `json:"updated_at"`
+	VersioningStatus   string  `json:"versioning_status"`
+	VersioningEnforced bool    `json:"versioning_enforced"`
 }
 
 type bucketOwnerUpdateRequest struct {
@@ -205,15 +207,17 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
-		ID:             bucket.ID,
-		Name:           bucket.Name,
-		OwnerAccessKey: s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		Status:         string(bucket.Status),
-		ProofSetID:     bucket.ProofSetID,
-		ObjectCount:    objectCount,
-		TotalSizeBytes: totalSize,
-		CreatedAt:      bucket.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:      bucket.UpdatedAt.Format(time.RFC3339),
+		ID:                 bucket.ID,
+		Name:               bucket.Name,
+		OwnerAccessKey:     s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		Status:             string(bucket.Status),
+		ProofSetID:         bucket.ProofSetID,
+		ObjectCount:        objectCount,
+		TotalSizeBytes:     totalSize,
+		CreatedAt:          bucket.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:          bucket.UpdatedAt.Format(time.RFC3339),
+		VersioningStatus:   "Enabled",
+		VersioningEnforced: true,
 	})
 }
 
@@ -367,15 +371,16 @@ func bucketOwnerACL(owner string) ([]byte, error) {
 }
 
 type objectListItem struct {
-	ID          int64   `json:"id"`
-	Key         string  `json:"key"`
-	Size        int64   `json:"size"`
-	State       string  `json:"state"`
-	ContentType string  `json:"content_type"`
-	ETag        string  `json:"etag"`
-	PieceCID    *string `json:"piece_cid,omitempty"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
+	ID               int64   `json:"id"`
+	Key              string  `json:"key"`
+	CurrentVersionID string  `json:"current_version_id"`
+	Size             int64   `json:"size"`
+	State            string  `json:"state"`
+	ContentType      string  `json:"content_type"`
+	ETag             string  `json:"etag"`
+	PieceCID         *string `json:"piece_cid,omitempty"`
+	CreatedAt        string  `json:"created_at"`
+	UpdatedAt        string  `json:"updated_at"`
 }
 
 type objectListResponse struct {
@@ -431,15 +436,16 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 	items := make([]objectListItem, 0, len(objects))
 	for _, o := range objects {
 		items = append(items, objectListItem{
-			ID:          o.ID,
-			Key:         o.Key,
-			Size:        o.Size,
-			State:       string(o.State),
-			ContentType: o.ContentType,
-			ETag:        o.ETag,
-			PieceCID:    o.PieceCID,
-			CreatedAt:   o.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:   o.UpdatedAt.Format(time.RFC3339),
+			ID:               o.ID,
+			Key:              o.Key,
+			CurrentVersionID: o.CurrentVersionID,
+			Size:             o.Size,
+			State:            string(o.State),
+			ContentType:      o.ContentType,
+			ETag:             o.ETag,
+			PieceCID:         o.PieceCID,
+			CreatedAt:        o.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:        o.UpdatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -451,6 +457,94 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 		resp.NextMarker = items[len(items)-1].Key
 	}
 
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type objectVersionListItem struct {
+	VersionID   string  `json:"version_id"`
+	Key         string  `json:"key"`
+	Size        int64   `json:"size"`
+	State       string  `json:"state"`
+	ContentType string  `json:"content_type"`
+	ETag        string  `json:"etag"`
+	PieceCID    *string `json:"piece_cid,omitempty"`
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
+	IsCurrent   bool    `json:"is_current"`
+}
+
+type objectVersionListResponse struct {
+	Versions          []objectVersionListItem `json:"versions"`
+	HasMore           bool                    `json:"has_more"`
+	NextVersionMarker string                  `json:"next_version_marker,omitempty"`
+}
+
+func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "object key is required"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	afterVersionID := r.URL.Query().Get("version_marker")
+
+	versions, err := s.repos.Objects.ListVersionsByKey(ctx, bucket.ID, key, afterVersionID, limit+1)
+	if err != nil {
+		s.logger.Error("api: failed to list object versions", "error", err, "bucket", bucketName, "key", key)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+
+	hasMore := len(versions) > limit
+	if hasMore {
+		versions = versions[:limit]
+	}
+	items := make([]objectVersionListItem, 0, len(versions))
+	for _, v := range versions {
+		items = append(items, objectVersionListItem{
+			VersionID:   v.VersionID,
+			Key:         v.Key,
+			Size:        v.Size,
+			State:       string(v.State),
+			ContentType: v.ContentType,
+			ETag:        v.ETag,
+			PieceCID:    v.PieceCID,
+			CreatedAt:   v.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:   v.UpdatedAt.Format(time.RFC3339),
+			IsCurrent:   v.VersionID == v.CurrentVersionID,
+		})
+	}
+
+	resp := objectVersionListResponse{
+		Versions: items,
+		HasMore:  hasMore,
+	}
+	if hasMore && len(items) > 0 {
+		resp.NextVersionMarker = items[len(items)-1].VersionID
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -480,12 +574,19 @@ func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request)
 		reader = objectreader.New(s.repos, s.cache, nil, s.logger)
 	}
 
-	out, err := reader.Open(ctx, bucketName, key, objectreader.AdminVisibility)
+	versionID := r.URL.Query().Get("version_id")
+	var out *objectreader.Result
+	var err error
+	if versionID != "" {
+		out, err = reader.OpenVersion(ctx, bucketName, key, versionID, objectreader.AdminVisibility)
+	} else {
+		out, err = reader.Open(ctx, bucketName, key, objectreader.AdminVisibility)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, objectreader.ErrInvalidArgument):
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
-		case errors.Is(err, objectreader.ErrNoSuchBucket), errors.Is(err, objectreader.ErrNoSuchKey):
+		case errors.Is(err, objectreader.ErrNoSuchBucket), errors.Is(err, objectreader.ErrNoSuchKey), errors.Is(err, objectreader.ErrNoSuchVersion):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "object not found"})
 		default:
 			s.logger.Error("api: failed to open object download", "error", err, "bucket", bucketName, "key", key)

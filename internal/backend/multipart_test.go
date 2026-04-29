@@ -3,6 +3,7 @@ package backend_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -87,6 +88,69 @@ func TestUploadPart_HappyPath(t *testing.T) {
 	}
 }
 
+func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "up-copy-version-bucket")
+
+	firstOut := putTestObjectOutput(t, tb, "up-copy-version-bucket", "source.txt", "old")
+	putTestObject(t, tb, "up-copy-version-bucket", "source.txt", "new")
+
+	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String("up-copy-version-bucket"),
+		Key:    aws.String("copied.bin"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+
+	partNum := int32(1)
+	partOut, err := tb.backend.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		Bucket:     aws.String("up-copy-version-bucket"),
+		Key:        aws.String("copied.bin"),
+		UploadId:   aws.String(initResult.UploadId),
+		PartNumber: &partNum,
+		CopySource: aws.String("/up-copy-version-bucket/source.txt?versionId=" + firstOut.VersionID),
+	})
+	if err != nil {
+		t.Fatalf("UploadPartCopy: %v", err)
+	}
+	if partOut.CopySourceVersionId != firstOut.VersionID {
+		t.Fatalf("CopySourceVersionId = %q, want %s", partOut.CopySourceVersionId, firstOut.VersionID)
+	}
+
+	_, versionID, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String("up-copy-version-bucket"),
+		Key:      aws.String("copied.bin"),
+		UploadId: aws.String(initResult.UploadId),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{PartNumber: &partNum, ETag: partOut.ETag}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload: %v", err)
+	}
+	if versionID == "" {
+		t.Fatal("expected complete multipart version ID")
+	}
+
+	out, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("up-copy-version-bucket"),
+		Key:    aws.String("copied.bin"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject copied part: %v", err)
+	}
+	defer func() { _ = out.Body.Close() }()
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		t.Fatalf("read copied body: %v", err)
+	}
+	if string(body) != "old" {
+		t.Fatalf("copied body = %q, want old", string(body))
+	}
+}
+
 // ---------- CompleteMultipartUpload ----------
 
 func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
@@ -123,7 +187,7 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 
 	// Complete.
 	pn1, pn2 := int32(1), int32(2)
-	completeResult, _, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	completeResult, versionID, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String("cmp-bucket"),
 		Key:      aws.String("assembled.bin"),
 		UploadId: aws.String(uploadID),
@@ -139,6 +203,9 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 	if completeResult.ETag == nil || *completeResult.ETag == "" {
 		t.Error("expected non-empty ETag in complete result")
+	}
+	if versionID == "" {
+		t.Error("expected non-empty version ID")
 	}
 
 	// Verify object created in DB.
@@ -165,12 +232,12 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 }
 
-func TestCompleteMultipartUploadIdenticalCurrentObjectDoesNotCreateVersionOrTask(t *testing.T) {
+func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "cmp-dedupe-bucket")
 
-	completeOnePart := func() {
+	completeOnePart := func() string {
 		t.Helper()
 		initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
 			Bucket: aws.String("cmp-dedupe-bucket"),
@@ -192,7 +259,7 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectDoesNotCreateVersionOrTask
 			t.Fatalf("UploadPart: %v", err)
 		}
 
-		_, _, err = tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		_, versionID, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket:   aws.String("cmp-dedupe-bucket"),
 			Key:      aws.String("assembled.bin"),
 			UploadId: aws.String(initResult.UploadId),
@@ -203,9 +270,13 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectDoesNotCreateVersionOrTask
 		if err != nil {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
+		if versionID == "" {
+			t.Fatal("expected complete multipart version ID")
+		}
+		return versionID
 	}
 
-	completeOnePart()
+	firstVersionID := completeOnePart()
 
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "cmp-dedupe-bucket")
 	obj1, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "assembled.bin")
@@ -213,14 +284,17 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectDoesNotCreateVersionOrTask
 		t.Fatalf("current object after first complete: obj=%v err=%v", obj1, err)
 	}
 
-	completeOnePart()
+	secondVersionID := completeOnePart()
+	if secondVersionID == firstVersionID {
+		t.Fatalf("second version id = %s, want different from first", secondVersionID)
+	}
 
 	obj2, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "assembled.bin")
 	if err != nil || obj2 == nil {
 		t.Fatalf("current object after second complete: obj=%v err=%v", obj2, err)
 	}
-	if obj2.CurrentVersionID != obj1.CurrentVersionID {
-		t.Fatalf("current version changed for identical multipart complete: got %s want %s", obj2.CurrentVersionID, obj1.CurrentVersionID)
+	if obj2.CurrentVersionID == obj1.CurrentVersionID {
+		t.Fatalf("current version did not change for identical multipart complete: %s", obj2.CurrentVersionID)
 	}
 
 	versionCount, err := tb.db.NewSelect().
@@ -230,8 +304,8 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectDoesNotCreateVersionOrTask
 	if err != nil {
 		t.Fatalf("counting object versions: %v", err)
 	}
-	if versionCount != 1 {
-		t.Fatalf("object version count = %d, want 1", versionCount)
+	if versionCount != 2 {
+		t.Fatalf("object version count = %d, want 2", versionCount)
 	}
 
 	taskCount, err := tb.db.NewSelect().
@@ -243,6 +317,14 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectDoesNotCreateVersionOrTask
 	}
 	if taskCount != 1 {
 		t.Fatalf("task count = %d, want 1", taskCount)
+	}
+
+	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, secondVersionID)
+	if err != nil || secondVersion == nil {
+		t.Fatalf("second version: version=%v err=%v", secondVersion, err)
+	}
+	if secondVersion.State != model.ObjectStateUploading {
+		t.Fatalf("second version state = %s, want uploading", secondVersion.State)
 	}
 }
 

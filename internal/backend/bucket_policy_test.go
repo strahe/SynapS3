@@ -495,12 +495,47 @@ func TestGetBucketVersioning_ExistingBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetBucketVersioning: %v", err)
 	}
-	// SynapS3 does not support versioning; expect nil fields.
-	if out.Status != nil {
-		t.Errorf("Status = %v, want nil", out.Status)
+	if out.Status == nil || *out.Status != types.BucketVersioningStatusEnabled {
+		t.Errorf("Status = %v, want Enabled", out.Status)
 	}
 	if out.MFADelete != nil {
 		t.Errorf("MFADelete = %v, want nil", out.MFADelete)
+	}
+}
+
+func TestPutBucketVersioningEnabledIsNoop(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	bkt := &model.Bucket{Name: "put-ver-bucket", Status: model.BucketStatusActive}
+	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
+		t.Fatalf("seeding bucket: %v", err)
+	}
+
+	if err := tb.backend.PutBucketVersioning(ctx, "put-ver-bucket", types.BucketVersioningStatusEnabled); err != nil {
+		t.Fatalf("PutBucketVersioning(Enabled): %v", err)
+	}
+}
+
+func TestPutBucketVersioningSuspendedRejected(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	bkt := &model.Bucket{Name: "put-ver-suspended-bucket", Status: model.BucketStatusActive}
+	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
+		t.Fatalf("seeding bucket: %v", err)
+	}
+
+	err := tb.backend.PutBucketVersioning(ctx, "put-ver-suspended-bucket", types.BucketVersioningStatusSuspended)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	if apiErr.Code != "InvalidBucketState" {
+		t.Fatalf("error code = %q, want InvalidBucketState", apiErr.Code)
 	}
 }
 

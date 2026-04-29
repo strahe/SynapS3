@@ -1,8 +1,8 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Download, Folder, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import { Download, Folder, History, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
-import { api, internalRootOwnerAccessKey } from '@/api/client'
+import { api, internalRootOwnerAccessKey, type ObjectItem } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
@@ -28,7 +28,14 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { useBucket, useBucketObjects, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
+import {
+  useBucket,
+  useBucketObjects,
+  useBucketObjectVersions,
+  useDeleteBucket,
+  useS3Users,
+  useUpdateBucketOwner,
+} from '@/hooks/queries'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/$name')({
@@ -225,6 +232,137 @@ function ChangeBucketOwnerDetailDialog({
   )
 }
 
+function ObjectVersionsDialog({ bucketName, object }: { bucketName: string; object: ObjectItem }) {
+  const [open, setOpen] = useState(false)
+  const [versionMarker, setVersionMarker] = useState('')
+  const versions = useBucketObjectVersions(bucketName, object.key, versionMarker, 50, open)
+
+  useEffect(() => {
+    if (open) setVersionMarker('')
+  }, [open])
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="icon-sm" aria-label={`Versions for ${object.key}`} title="Versions">
+          <History />
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-6xl lg:p-6">
+        <DialogHeader>
+          <DialogTitle>Object versions</DialogTitle>
+          <DialogDescription className="pr-8">
+            <span className="block max-w-full truncate font-mono text-xs" title={object.key}>
+              {object.key}
+            </span>
+          </DialogDescription>
+        </DialogHeader>
+        {versions.isLoading ? (
+          <div className="flex h-40 items-center justify-center">
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+          </div>
+        ) : versions.error ? (
+          <div className="text-sm text-destructive">Failed to load object versions</div>
+        ) : (
+          <div className="overflow-hidden rounded-md border border-border">
+            <Table className="table-fixed">
+              <colgroup>
+                <col className="w-[19%]" />
+                <col className="w-[9%]" />
+                <col className="w-[12%]" />
+                <col className="w-[18%]" />
+                <col className="w-[20%]" />
+                <col className="w-[12%]" />
+                <col className="w-[10%]" />
+              </colgroup>
+              <TableHeader>
+                <TableRow className="bg-muted/50">
+                  <TableHead className="px-2">Version</TableHead>
+                  <TableHead className="px-2 text-right">Size</TableHead>
+                  <TableHead className="px-2">State</TableHead>
+                  <TableHead className="px-2">ETag</TableHead>
+                  <TableHead className="px-2">Piece CID</TableHead>
+                  <TableHead className="px-2">Created</TableHead>
+                  <TableHead className="px-2 text-right">Download</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {versions.data?.versions.map((version) => (
+                  <TableRow key={version.version_id}>
+                    <TableCell className="overflow-hidden px-2" title={version.version_id}>
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="min-w-0 truncate font-mono text-xs">{version.version_id}</span>
+                        {version.is_current && (
+                          <StatusBadge tone="success" className="shrink-0">
+                            Current
+                          </StatusBadge>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell className="overflow-hidden px-2 text-right">{formatBytes(version.size)}</TableCell>
+                    <TableCell className="overflow-hidden px-2">
+                      <StatusBadge tone={objectStateTone(version.state)} className="max-w-full truncate">
+                        {version.state}
+                      </StatusBadge>
+                    </TableCell>
+                    <TableCell
+                      className="overflow-hidden truncate px-2 font-mono text-xs text-muted-foreground"
+                      title={version.etag}
+                    >
+                      {version.etag}
+                    </TableCell>
+                    <TableCell
+                      className="overflow-hidden truncate px-2 font-mono text-xs text-muted-foreground"
+                      title={version.piece_cid ?? undefined}
+                    >
+                      {version.piece_cid ?? '—'}
+                    </TableCell>
+                    <TableCell
+                      className="overflow-hidden truncate px-2 text-muted-foreground"
+                      title={version.created_at}
+                    >
+                      {timeAgo(version.created_at)}
+                    </TableCell>
+                    <TableCell className="px-2 text-right">
+                      <Button variant="ghost" size="icon-sm" asChild>
+                        <a
+                          href={api.getObjectDownloadUrl(bucketName, object.key, version.version_id)}
+                          aria-label={`Download ${object.key} version ${version.version_id}`}
+                          title="Download"
+                        >
+                          <Download />
+                        </a>
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {versions.data?.versions.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={7} className="h-20 text-center text-muted-foreground">
+                      No versions found
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+        {versions.data?.has_more && versions.data.next_version_marker && (
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setVersionMarker(versions.data.next_version_marker ?? '')}
+            >
+              Next page
+            </Button>
+          </DialogFooter>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function ObjectBrowserPage() {
   const { name } = Route.useParams()
   const [prefix, setPrefix] = useState('')
@@ -327,6 +465,12 @@ function ObjectBrowserPage() {
                 <dd className="text-sm font-medium">{formatBytes(bucket.data.total_size_bytes)}</dd>
               </div>
               <div>
+                <dt className="text-sm text-muted-foreground">Versioning</dt>
+                <dd className="text-sm font-medium">
+                  <StatusBadge tone="success">{bucket.data.versioning_status}</StatusBadge>
+                </dd>
+              </div>
+              <div>
                 <dt className="text-sm text-muted-foreground">Created</dt>
                 <dd className="text-sm text-muted-foreground" title={bucket.data.created_at}>
                   {timeAgo(bucket.data.created_at)}
@@ -363,6 +507,7 @@ function ObjectBrowserPage() {
                   <TableHead className="px-4 text-right">Size</TableHead>
                   <TableHead className="px-4">State</TableHead>
                   <TableHead className="px-4">Type</TableHead>
+                  <TableHead className="px-4">Current Version</TableHead>
                   <TableHead className="px-4">ETag</TableHead>
                   <TableHead className="px-4">Piece CID</TableHead>
                   <TableHead className="px-4">Created</TableHead>
@@ -392,6 +537,7 @@ function ObjectBrowserPage() {
                     <TableCell className="px-4">—</TableCell>
                     <TableCell className="px-4">—</TableCell>
                     <TableCell className="px-4">—</TableCell>
+                    <TableCell className="px-4">—</TableCell>
                     <TableCell className="px-4 text-right">—</TableCell>
                   </TableRow>
                 ))}
@@ -403,6 +549,12 @@ function ObjectBrowserPage() {
                       <StatusBadge tone={objectStateTone(object.state)}>{object.state}</StatusBadge>
                     </TableCell>
                     <TableCell className="px-4 text-muted-foreground">{object.content_type}</TableCell>
+                    <TableCell
+                      className="max-w-52 truncate px-4 font-mono text-xs text-muted-foreground"
+                      title={object.current_version_id}
+                    >
+                      {object.current_version_id}
+                    </TableCell>
                     <TableCell
                       className="max-w-40 truncate px-4 font-mono text-xs text-muted-foreground"
                       title={object.etag}
@@ -422,21 +574,24 @@ function ObjectBrowserPage() {
                       {timeAgo(object.updated_at)}
                     </TableCell>
                     <TableCell className="px-4 text-right">
-                      <Button variant="ghost" size="icon-sm" asChild>
-                        <a
-                          href={api.getObjectDownloadUrl(name, object.key)}
-                          aria-label={`Download ${object.key}`}
-                          title="Download"
-                        >
-                          <Download />
-                        </a>
-                      </Button>
+                      <div className="flex justify-end gap-1">
+                        <ObjectVersionsDialog bucketName={name} object={object} />
+                        <Button variant="ghost" size="icon-sm" asChild>
+                          <a
+                            href={api.getObjectDownloadUrl(name, object.key)}
+                            aria-label={`Download ${object.key}`}
+                            title="Download"
+                          >
+                            <Download />
+                          </a>
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
                 {folders.size === 0 && files.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
+                    <TableCell colSpan={10} className="h-24 text-center text-muted-foreground">
                       No objects found
                     </TableCell>
                   </TableRow>

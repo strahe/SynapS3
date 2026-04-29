@@ -24,10 +24,15 @@ type SynapseBackend struct {
 	stateMachine     *state.Machine
 	storage          synapse.StorageClient
 	uploadMaxRetries int
+	evictMaxRetries  int
+	autoEvict        bool
 	logger           *slog.Logger
 }
 
-const defaultUploadMaxRetries = 5
+const (
+	defaultUploadMaxRetries = 5
+	defaultEvictMaxRetries  = 3
+)
 
 // Option configures SynapseBackend runtime behavior.
 type Option func(*SynapseBackend)
@@ -36,6 +41,20 @@ type Option func(*SynapseBackend)
 func WithUploadMaxRetries(maxRetries int) Option {
 	return func(b *SynapseBackend) {
 		b.uploadMaxRetries = maxRetries
+	}
+}
+
+// WithEvictMaxRetries configures max retries for newly-created cache eviction tasks.
+func WithEvictMaxRetries(maxRetries int) Option {
+	return func(b *SynapseBackend) {
+		b.evictMaxRetries = maxRetries
+	}
+}
+
+// WithAutoEvict configures whether stored objects enqueue cache eviction tasks.
+func WithAutoEvict(autoEvict bool) Option {
+	return func(b *SynapseBackend) {
+		b.autoEvict = autoEvict
 	}
 }
 
@@ -49,6 +68,7 @@ func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc sy
 		stateMachine:     sm,
 		storage:          sc,
 		uploadMaxRetries: defaultUploadMaxRetries,
+		evictMaxRetries:  defaultEvictMaxRetries,
 		logger:           logger,
 	}
 	for _, opt := range opts {

@@ -276,6 +276,288 @@ func TestObjectRepo_ListByBucketReadsCurrentSnapshotOnly(t *testing.T) {
 	}
 }
 
+func TestObjectRepo_GetVersionByBucketKeyAndIDScopesVersion(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "version-scope-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000071", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+
+	got, err := repos.Objects.GetVersionByBucketKeyAndID(ctx, bucket.ID, "file.txt", version.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByBucketKeyAndID: %v", err)
+	}
+	if got == nil || got.VersionID != version.VersionID {
+		t.Fatalf("scoped version = %#v, want %s", got, version.VersionID)
+	}
+
+	mismatch, err := repos.Objects.GetVersionByBucketKeyAndID(ctx, bucket.ID, "other.txt", version.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByBucketKeyAndID mismatch: %v", err)
+	}
+	if mismatch != nil {
+		t.Fatalf("mismatched key returned %#v, want nil", mismatch)
+	}
+}
+
+func TestObjectRepo_FindReusableStoredVersionRequiresStoredChainInfo(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "reuse-version-bucket")
+
+	cached := newObjectVersion(bucket.ID, "cached.txt", "01J00000000000000000000072", 10)
+	cached.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, cached); err != nil {
+		t.Fatalf("create cached version: %v", err)
+	}
+
+	stored := newObjectVersion(bucket.ID, "stored.txt", "01J00000000000000000000073", 10)
+	stored.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, stored); err != nil {
+		t.Fatalf("create stored version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, stored.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("stored uploading: %v", err)
+	}
+	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, stored.VersionID, "piece-reuse", "https://provider.example/reuse", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("stored chain info: %v", err)
+	}
+
+	got, err := repos.Objects.FindReusableStoredVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableStoredVersion: %v", err)
+	}
+	if got == nil || got.VersionID != stored.VersionID {
+		t.Fatalf("reusable version = %#v, want %s", got, stored.VersionID)
+	}
+}
+
+func TestObjectRepo_FindReusableActiveUploadVersionRequiresActiveTask(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "active-reuse-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000007A", 10)
+	version.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+
+	got, err := repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableActiveUploadVersion without task: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("active reusable without task = %#v, want nil", got)
+	}
+
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		RefType:        "object",
+		RefID:          version.ObjectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: "upload:" + version.VersionID,
+		Status:         model.TaskStatusPending,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("create upload task: %v", err)
+	}
+
+	got, err = repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableActiveUploadVersion: %v", err)
+	}
+	if got == nil || got.VersionID != version.VersionID {
+		t.Fatalf("active reusable = %#v, want %s", got, version.VersionID)
+	}
+}
+
+func TestObjectRepo_SetStorageInfoForUploadingContentUpdatesMatchingVersions(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "content-storage-bucket")
+
+	oldVersion := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000007B", 10)
+	oldVersion.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("old version: %v", err)
+	}
+	currentVersion := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000007C", 10)
+	currentVersion.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("current version: %v", err)
+	}
+	for _, versionID := range []string{oldVersion.VersionID, currentVersion.VersionID} {
+		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+			t.Fatalf("mark %s uploading: %v", versionID, err)
+		}
+	}
+
+	refs, err := repos.Objects.SetStorageInfoForUploadingContent(ctx, bucket.ID, 10, "same-checksum", "piece-shared", "https://provider.example/shared")
+	if err != nil {
+		t.Fatalf("SetStorageInfoForUploadingContent: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("updated refs len = %d, want 2", len(refs))
+	}
+
+	for _, versionID := range []string{oldVersion.VersionID, currentVersion.VersionID} {
+		got, err := repos.Objects.GetVersionByID(ctx, versionID)
+		if err != nil || got == nil {
+			t.Fatalf("version %s: got=%v err=%v", versionID, got, err)
+		}
+		if got.State != model.ObjectStateStored {
+			t.Fatalf("version %s state = %s, want stored", versionID, got.State)
+		}
+		if got.PieceCID == nil || *got.PieceCID != "piece-shared" {
+			t.Fatalf("version %s piece = %v, want piece-shared", versionID, got.PieceCID)
+		}
+	}
+
+	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetByBucketAndKey: %v", err)
+	}
+	if current.CurrentVersionID != currentVersion.VersionID || current.State != model.ObjectStateStored {
+		t.Fatalf("current snapshot = version:%s state:%s, want %s stored", current.CurrentVersionID, current.State, currentVersion.VersionID)
+	}
+	if current.PieceCID == nil || *current.PieceCID != "piece-shared" {
+		t.Fatalf("current piece = %v, want piece-shared", current.PieceCID)
+	}
+}
+
+func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "content-failure-bucket")
+
+	leader := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000007D", 10)
+	leader.Checksum = "same-checksum"
+	objID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, leader)
+	if err != nil {
+		t.Fatalf("leader version: %v", err)
+	}
+	follower := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000007E", 10)
+	follower.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("follower version: %v", err)
+	}
+	independent := newObjectVersion(bucket.ID, "other.txt", "01J0000000000000000000007F", 10)
+	independent.Checksum = "same-checksum"
+	independentObjID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, independent)
+	if err != nil {
+		t.Fatalf("independent version: %v", err)
+	}
+	for _, versionID := range []string{leader.VersionID, follower.VersionID, independent.VersionID} {
+		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+			t.Fatalf("mark %s uploading: %v", versionID, err)
+		}
+	}
+
+	for _, task := range []*model.Task{
+		{
+			Type:           model.TaskTypeUpload,
+			RefType:        "object",
+			RefID:          objID,
+			RefVersionID:   leader.VersionID,
+			IdempotencyKey: "upload:" + leader.VersionID,
+			Status:         model.TaskStatusRunning,
+			MaxRetries:     1,
+			ScheduledAt:    time.Now(),
+		},
+		{
+			Type:           model.TaskTypeUpload,
+			RefType:        "object",
+			RefID:          independentObjID,
+			RefVersionID:   independent.VersionID,
+			IdempotencyKey: "upload:" + independent.VersionID,
+			Status:         model.TaskStatusPending,
+			MaxRetries:     1,
+			ScheduledAt:    time.Now(),
+		},
+	} {
+		if err := repos.Tasks.Create(ctx, task); err != nil {
+			t.Fatalf("create upload task for %s: %v", task.RefVersionID, err)
+		}
+	}
+
+	refs, err := repos.Objects.FailUploadingContentFollowers(ctx, bucket.ID, 10, "same-checksum", leader.VersionID, "upload failed")
+	if err != nil {
+		t.Fatalf("FailUploadingContentFollowers: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("failed refs len = %d, want 2", len(refs))
+	}
+
+	for _, versionID := range []string{leader.VersionID, follower.VersionID} {
+		got, err := repos.Objects.GetVersionByID(ctx, versionID)
+		if err != nil || got == nil {
+			t.Fatalf("version %s: got=%v err=%v", versionID, got, err)
+		}
+		if got.State != model.ObjectStateFailed {
+			t.Fatalf("version %s state = %s, want failed", versionID, got.State)
+		}
+	}
+	gotIndependent, err := repos.Objects.GetVersionByID(ctx, independent.VersionID)
+	if err != nil || gotIndependent == nil {
+		t.Fatalf("independent version: got=%v err=%v", gotIndependent, err)
+	}
+	if gotIndependent.State != model.ObjectStateUploading {
+		t.Fatalf("independent state = %s, want uploading", gotIndependent.State)
+	}
+}
+
+func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "version-list-bucket")
+
+	oldVersion := newObjectVersion(bucket.ID, "a.txt", "01J00000000000000000000074", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("create old version: %v", err)
+	}
+	currentVersion := newObjectVersion(bucket.ID, "a.txt", "01J00000000000000000000075", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("create current version: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "b.txt", "01J00000000000000000000076", 30)); err != nil {
+		t.Fatalf("create b version: %v", err)
+	}
+
+	rows, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "", "", 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByBucket: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows len = %d, want 3", len(rows))
+	}
+	if rows[0].Key != "a.txt" || rows[0].VersionID != currentVersion.VersionID {
+		t.Fatalf("first row = %s/%s, want current a.txt", rows[0].Key, rows[0].VersionID)
+	}
+	if rows[0].CurrentVersionID != currentVersion.VersionID {
+		t.Fatalf("current marker = %s, want %s", rows[0].CurrentVersionID, currentVersion.VersionID)
+	}
+
+	page, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", rows[0].Key, rows[0].VersionID, 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByBucket marker: %v", err)
+	}
+	if len(page) == 0 || page[0].VersionID != oldVersion.VersionID {
+		t.Fatalf("marker page first = %#v, want old version", page)
+	}
+}
+
 func TestObjectRepo_VersionStateUpdatesOnlyMirrorCurrentVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

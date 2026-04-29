@@ -278,6 +278,153 @@ func TestUploader_HappyPath(t *testing.T) {
 	}
 }
 
+func TestUploader_StoresVersionsFollowingActiveUpload(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	bucket, objID, leaderVersionID := seedCachedObject(t, env)
+	ctx := context.Background()
+
+	leader, err := env.repos.Objects.GetVersionByID(ctx, leaderVersionID)
+	if err != nil || leader == nil {
+		t.Fatalf("leader version: version=%v err=%v", leader, err)
+	}
+
+	followerVersionID := model.NewVersionID()
+	follower := &model.ObjectVersion{
+		VersionID:   followerVersionID,
+		BucketID:    bucket.ID,
+		Key:         leader.Key,
+		Size:        leader.Size,
+		ETag:        leader.ETag,
+		Checksum:    leader.Checksum,
+		ContentType: leader.ContentType,
+		CacheKey:    ".versions/" + followerVersionID,
+		State:       model.ObjectStateUploading,
+	}
+	followerObjID, err := env.repos.Objects.CreateVersionAndSetCurrent(ctx, follower)
+	if err != nil {
+		t.Fatalf("creating follower version: %v", err)
+	}
+	if followerObjID != objID {
+		t.Fatalf("follower object id = %d, want %d", followerObjID, objID)
+	}
+
+	task := seedTask(t, env, model.TaskTypeUpload, objID, leaderVersionID, 5, 0)
+	pieceCID := testCID(t)
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		return &storage.UploadResult{
+			PieceCID: pieceCID,
+			Size:     leader.Size,
+			Complete: true,
+			Copies:   []storage.CopyResult{{RetrievalURL: "https://provider.example/pieces/shared"}},
+		}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	for _, versionID := range []string{leaderVersionID, followerVersionID} {
+		got, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+		if err != nil || got == nil {
+			t.Fatalf("version %s: got=%v err=%v", versionID, got, err)
+		}
+		if got.State != model.ObjectStateStored {
+			t.Fatalf("version %s state = %s, want stored", versionID, got.State)
+		}
+		if got.PieceCID == nil || *got.PieceCID != pieceCID.String() {
+			t.Fatalf("version %s piece = %v, want %s", versionID, got.PieceCID, pieceCID.String())
+		}
+	}
+
+	current, err := env.repos.Objects.GetByID(ctx, objID)
+	if err != nil {
+		t.Fatalf("get current object: %v", err)
+	}
+	if current.CurrentVersionID != followerVersionID || current.State != model.ObjectStateStored {
+		t.Fatalf("current object = version:%s state:%s, want %s stored", current.CurrentVersionID, current.State, followerVersionID)
+	}
+
+	evictTasks, _, err := env.repos.Tasks.List(ctx, string(model.TaskTypeEvictCache), "", 10, 0)
+	if err != nil {
+		t.Fatalf("list evict tasks: %v", err)
+	}
+	if len(evictTasks) != 2 {
+		t.Fatalf("evict task count = %d, want 2", len(evictTasks))
+	}
+	seen := map[string]bool{}
+	for _, task := range evictTasks {
+		seen[task.RefVersionID] = true
+	}
+	for _, versionID := range []string{leaderVersionID, followerVersionID} {
+		if !seen[versionID] {
+			t.Fatalf("missing evict task for version %s", versionID)
+		}
+	}
+}
+
+func TestUploader_TerminalUploadFailureFailsVersionsFollowingActiveUpload(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	bucket, objID, leaderVersionID := seedCachedObject(t, env)
+	ctx := context.Background()
+
+	leader, err := env.repos.Objects.GetVersionByID(ctx, leaderVersionID)
+	if err != nil || leader == nil {
+		t.Fatalf("leader version: version=%v err=%v", leader, err)
+	}
+
+	followerVersionID := model.NewVersionID()
+	follower := &model.ObjectVersion{
+		VersionID:   followerVersionID,
+		BucketID:    bucket.ID,
+		Key:         leader.Key,
+		Size:        leader.Size,
+		ETag:        leader.ETag,
+		Checksum:    leader.Checksum,
+		ContentType: leader.ContentType,
+		CacheKey:    ".versions/" + followerVersionID,
+		State:       model.ObjectStateUploading,
+	}
+	if _, err := env.repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("creating follower version: %v", err)
+	}
+
+	task := seedTask(t, env, model.TaskTypeUpload, objID, leaderVersionID, 1, 0)
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		return nil, errors.New("SP permanent failure")
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	gotTask, err := env.repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if gotTask.Status != model.TaskStatusDeadLetter {
+		t.Fatalf("task status = %s, want dead_letter", gotTask.Status)
+	}
+
+	for _, versionID := range []string{leaderVersionID, followerVersionID} {
+		got, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+		if err != nil || got == nil {
+			t.Fatalf("version %s: got=%v err=%v", versionID, got, err)
+		}
+		if got.State != model.ObjectStateFailed {
+			t.Fatalf("version %s state = %s, want failed", versionID, got.State)
+		}
+		if got.FailedAtState == nil || *got.FailedAtState != model.ObjectStateUploading {
+			t.Fatalf("version %s FailedAtState = %v, want uploading", versionID, got.FailedAtState)
+		}
+	}
+
+	current, err := env.repos.Objects.GetByID(ctx, objID)
+	if err != nil {
+		t.Fatalf("get current object: %v", err)
+	}
+	if current.CurrentVersionID != followerVersionID || current.State != model.ObjectStateFailed {
+		t.Fatalf("current object = version:%s state:%s, want %s failed", current.CurrentVersionID, current.State, followerVersionID)
+	}
+}
+
 func TestUploader_PartialSuccessDoesNotMarkObjectStored(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, versionID := seedCachedObject(t, env)

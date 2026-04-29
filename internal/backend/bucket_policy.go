@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -108,13 +109,33 @@ func (b *SynapseBackend) DeleteBucketPolicy(ctx context.Context, bucket string) 
 	return nil
 }
 
-// GetBucketVersioning reports that versioning is not configured.
+// PutBucketVersioning accepts Enabled because SynapS3 enforces versioning for every bucket.
+func (b *SynapseBackend) PutBucketVersioning(ctx context.Context, bucket string, status types.BucketVersioningStatus) error {
+	if _, err := b.getBucket(ctx, bucket); err != nil {
+		return err
+	}
+	switch status {
+	case types.BucketVersioningStatusEnabled:
+		return nil
+	case types.BucketVersioningStatusSuspended:
+		return s3err.APIError{
+			Code:           "InvalidBucketState",
+			Description:    "Bucket versioning is always enabled in SynapS3.",
+			HTTPStatusCode: http.StatusBadRequest,
+		}
+	default:
+		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+}
+
+// GetBucketVersioning reports that SynapS3 buckets are always versioning-enabled.
 func (b *SynapseBackend) GetBucketVersioning(ctx context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
 	if _, err := b.getBucket(ctx, bucket); err != nil {
 		return s3response.GetBucketVersioningOutput{}, err
 	}
 
-	return s3response.GetBucketVersioningOutput{}, nil
+	status := types.BucketVersioningStatusEnabled
+	return s3response.GetBucketVersioningOutput{Status: &status}, nil
 }
 
 // GetObjectLockConfiguration reports that object lock is not configured.

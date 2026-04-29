@@ -167,6 +167,85 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 	}
 }
 
+func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+			data, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("reading rehydrate body: %v", err)
+			}
+			return &cache.ObjectInfo{Path: "/cache/version.txt", Size: int64(len(data)), ETag: "etag", Checksum: "checksum"}, nil
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "version-reader-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	pieceCID := buildTestCID(t)
+	oldVersion := &model.ObjectVersion{
+		VersionID:    "01J0000000000000000000OR04",
+		BucketID:     bucket.ID,
+		Key:          "changed.txt",
+		Size:         3,
+		ETag:         "old-etag",
+		Checksum:     "old-checksum",
+		ContentType:  "text/plain",
+		CacheKey:     ".versions/01J0000000000000000000OR04",
+		State:        model.ObjectStateStored,
+		PieceCID:     &pieceCID,
+		RetrievalURL: stringPtr("https://provider.example/old"),
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent old: %v", err)
+	}
+
+	storageClient := &testutil.MockStorageClient{
+		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
+			replacement := &model.ObjectVersion{
+				VersionID:   "01J0000000000000000000OR05",
+				BucketID:    bucket.ID,
+				Key:         "changed.txt",
+				Size:        3,
+				ETag:        "new-etag",
+				Checksum:    "new-checksum",
+				ContentType: "text/plain",
+				CacheKey:    ".versions/01J0000000000000000000OR05",
+				State:       model.ObjectStateStored,
+			}
+			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
+				t.Fatalf("Objects.CreateVersionAndSetCurrent replacement: %v", err)
+			}
+			return io.NopCloser(bytes.NewReader([]byte("old"))), nil
+		},
+	}
+	reader := New(repos, mc, storageClient, slog.Default())
+
+	got, err := reader.OpenVersion(ctx, bucket.Name, "changed.txt", oldVersion.VersionID, S3Visibility)
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	body, err := io.ReadAll(got.Body)
+	closeErr := got.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("Body.Close: %v", closeErr)
+	}
+	if string(body) != "old" {
+		t.Fatalf("body = %q, want explicitly requested old version", string(body))
+	}
+	if got.VersionID != oldVersion.VersionID {
+		t.Fatalf("VersionID = %s, want %s", got.VersionID, oldVersion.VersionID)
+	}
+}
+
 func stringPtr(v string) *string {
 	return &v
 }

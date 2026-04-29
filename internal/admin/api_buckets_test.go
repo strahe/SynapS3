@@ -61,6 +61,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", srv.handleAPIUpdateBucketOwner)
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}", srv.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", srv.handleAPIBucketObjects)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", srv.handleAPIBucketObjectVersions)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
 	return mux
 }
@@ -661,8 +662,10 @@ func TestAPIBucketDetail_ActiveBucket(t *testing.T) {
 	}
 
 	var body struct {
-		Name   string `json:"name"`
-		Status string `json:"status"`
+		Name               string `json:"name"`
+		Status             string `json:"status"`
+		VersioningStatus   string `json:"versioning_status"`
+		VersioningEnforced bool   `json:"versioning_enforced"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
@@ -672,6 +675,9 @@ func TestAPIBucketDetail_ActiveBucket(t *testing.T) {
 	}
 	if body.Status != string(model.BucketStatusActive) {
 		t.Fatalf("status = %q, want %q", body.Status, model.BucketStatusActive)
+	}
+	if body.VersioningStatus != "Enabled" || !body.VersioningEnforced {
+		t.Fatalf("versioning = %q enforced=%v, want Enabled/enforced", body.VersioningStatus, body.VersioningEnforced)
 	}
 }
 
@@ -708,6 +714,48 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	if body.Objects[0].Key != "kept.txt" {
 		t.Fatalf("key = %q, want %q", body.Objects[0].Key, "kept.txt")
 	}
+	if body.Objects[0].CurrentVersionID == "" {
+		t.Fatal("expected current version id")
+	}
+}
+
+func TestAPIBucketObjectVersions(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "versions-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, oldVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", "", model.ObjectStateStored)
+	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 7, "etag-current", "checksum-current", "text/plain", "", model.ObjectStateCached)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/versions-bucket/objects/versions?key=" + url.QueryEscape("file.txt"))
+	if err != nil {
+		t.Fatalf("GET object versions: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+
+	var body objectVersionListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Versions) != 2 {
+		t.Fatalf("versions len = %d, want 2", len(body.Versions))
+	}
+	if body.Versions[0].VersionID != currentVersionID || !body.Versions[0].IsCurrent {
+		t.Fatalf("first version = %#v, want current %s", body.Versions[0], currentVersionID)
+	}
+	if body.Versions[1].VersionID != oldVersionID || body.Versions[1].IsCurrent {
+		t.Fatalf("second version = %#v, want old %s", body.Versions[1], oldVersionID)
+	}
 }
 
 func TestAPIBucketObjectDownload_FromCache(t *testing.T) {
@@ -741,6 +789,71 @@ func TestAPIBucketObjectDownload_FromCache(t *testing.T) {
 	}
 	if got := resp.Header.Get("Content-Disposition"); !strings.Contains(got, "attachment") || !strings.Contains(got, "report.txt") {
 		t.Fatalf("Content-Disposition = %q, want attachment filename", got)
+	}
+}
+
+func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "download-version-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	oldVersionID := model.NewVersionID()
+	oldCacheKey := ".versions/" + oldVersionID
+	oldInfo, err := srv.cache.Put(ctx, bucket.Name, oldCacheKey, strings.NewReader("old admin"))
+	if err != nil {
+		t.Fatalf("cache.Put old: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+		VersionID:   oldVersionID,
+		BucketID:    bucket.ID,
+		Key:         "folder/report.txt",
+		Size:        oldInfo.Size,
+		ETag:        oldInfo.ETag,
+		Checksum:    oldInfo.Checksum,
+		ContentType: "text/plain",
+		CacheKey:    oldCacheKey,
+		State:       model.ObjectStateCached,
+	}); err != nil {
+		t.Fatalf("create old version: %v", err)
+	}
+	newVersionID := model.NewVersionID()
+	newCacheKey := ".versions/" + newVersionID
+	newInfo, err := srv.cache.Put(ctx, bucket.Name, newCacheKey, strings.NewReader("new admin"))
+	if err != nil {
+		t.Fatalf("cache.Put new: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+		VersionID:   newVersionID,
+		BucketID:    bucket.ID,
+		Key:         "folder/report.txt",
+		Size:        newInfo.Size,
+		ETag:        newInfo.ETag,
+		Checksum:    newInfo.Checksum,
+		ContentType: "text/plain",
+		CacheKey:    newCacheKey,
+		State:       model.ObjectStateCached,
+	}); err != nil {
+		t.Fatalf("create new version: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	target := ts.URL + "/api/v1/buckets/download-version-bucket/objects/download?key=" + url.QueryEscape("folder/report.txt") + "&version_id=" + url.QueryEscape(oldVersionID)
+	resp, err := http.Get(target)
+	if err != nil {
+		t.Fatalf("GET object download version: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	if body := readBody(t, resp.Body); body != "old admin" {
+		t.Fatalf("body = %q, want old admin", body)
 	}
 }
 

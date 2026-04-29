@@ -65,6 +65,18 @@ type ObjectVersionWriteResult struct {
 	Created   bool
 }
 
+// ObjectVersionListItem pairs a version row with the current-version marker for its object.
+type ObjectVersionListItem struct {
+	model.ObjectVersion `bun:",extend"`
+	CurrentVersionID    string `bun:"current_version_id"`
+}
+
+// ObjectVersionRef identifies a version and its current object row.
+type ObjectVersionRef struct {
+	ObjectID  int64  `bun:"object_id"`
+	VersionID string `bun:"version_id"`
+}
+
 // ObjectRepository defines persistence operations for current object snapshots
 // and internal object versions.
 type ObjectRepository interface {
@@ -73,10 +85,17 @@ type ObjectRepository interface {
 	GetByID(ctx context.Context, id int64) (*model.Object, error)
 	GetByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error)
 	GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error)
+	GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
+	FindReusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
+	FindReusableActiveUploadVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
 	ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error)
+	ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error)
+	ListVersionsByKey(ctx context.Context, bucketID int64, key string, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
 	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
 	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
 	SetVersionStorageInfoAndTransition(ctx context.Context, versionID string, pieceCID string, retrievalURL string, from, to model.ObjectState) error
+	SetStorageInfoForUploadingContent(ctx context.Context, bucketID int64, size int64, checksum string, pieceCID string, retrievalURL string) ([]ObjectVersionRef, error)
+	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)
 	ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error)
 	ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
 	// CountByState returns object counts grouped by state.

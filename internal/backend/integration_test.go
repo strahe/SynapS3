@@ -320,13 +320,14 @@ func TestIntegration_CopyObjectPath(t *testing.T) {
 		t.Fatalf("expected dst etag=%s, got %s", srcETag, dstObj.ETag)
 	}
 
-	// Verify upload task created for destination
-	dstTasks := findTasks(t, ib.db, "object", dstObj.ID)
-	if len(dstTasks) == 0 {
-		t.Fatal("expected upload task for dst object")
+	if dstObj.State != model.ObjectStateUploading {
+		t.Fatalf("expected dst state=uploading, got %s", dstObj.State)
 	}
-	if dstTasks[0].Type != model.TaskTypeUpload {
-		t.Fatalf("expected upload task, got %s", dstTasks[0].Type)
+
+	// Same-bucket copies of content with an active upload follow the source task.
+	dstTasks := findTasks(t, ib.db, "object", dstObj.ID)
+	if len(dstTasks) != 0 {
+		t.Fatalf("expected no destination upload task, got %d", len(dstTasks))
 	}
 
 	// GetObject on dest should return the same data
@@ -816,8 +817,8 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 	if dstObj.ContentType != srcObj.ContentType {
 		t.Fatalf("content-type mismatch: src=%s dst=%s", srcObj.ContentType, dstObj.ContentType)
 	}
-	if dstObj.State != model.ObjectStateCached {
-		t.Fatalf("expected dst state=cached, got %s", dstObj.State)
+	if dstObj.State != model.ObjectStateUploading {
+		t.Fatalf("expected dst state=uploading, got %s", dstObj.State)
 	}
 	if dstObj.CurrentVersionID == "" {
 		t.Fatal("expected destination current version id")
