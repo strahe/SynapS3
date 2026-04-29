@@ -5,6 +5,7 @@ import { type FormEvent, useEffect, useState } from 'react'
 import { type BucketItem, internalRootOwnerAccessKey } from '@/api/client'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
+import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import {
@@ -20,6 +21,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBuckets, useCreateBucket, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
+import { ownerLabel } from '@/lib/s3-owner'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/')({
@@ -142,20 +144,20 @@ function CreateBucketDialog() {
 function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
   const [open, setOpen] = useState(false)
   const [ownerAccessKey, setOwnerAccessKey] = useState(bucket.owner_access_key ?? '')
-  const [error, setError] = useState<string | null>(null)
+  const [reviewing, setReviewing] = useState(false)
   const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
   const updateOwner = useUpdateBucketOwner()
 
   useEffect(() => {
     if (!open) {
       setOwnerAccessKey(bucket.owner_access_key ?? '')
-      setError(null)
+      setReviewing(false)
     }
   }, [bucket.owner_access_key, open])
 
   const reset = () => {
     setOwnerAccessKey(bucket.owner_access_key ?? '')
-    setError(null)
+    setReviewing(false)
     updateOwner.reset()
   }
 
@@ -166,16 +168,17 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
 
   const handleUpdate = () => {
     if (!ownerAccessKey || ownerAccessKey === bucket.owner_access_key) return
-    setError(null)
+    if (!reviewing) {
+      setReviewing(true)
+      return
+    }
     updateOwner.mutate(
       { name: bucket.name, ownerAccessKey },
       {
         onSuccess: () => {
+          setReviewing(false)
           setOpen(false)
           reset()
-        },
-        onError: (mutationError) => {
-          setError(mutationError instanceof Error ? mutationError.message : 'Failed to update owner')
         },
       }
     )
@@ -191,34 +194,54 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{bucket.owner_access_key ? 'Change bucket owner' : 'Assign bucket owner'}</DialogTitle>
-          <DialogDescription>Transfer full control of "{bucket.name}" to an existing S3 user.</DialogDescription>
+          <DialogTitle>
+            {reviewing
+              ? 'Review bucket owner'
+              : bucket.owner_access_key
+                ? 'Change bucket owner'
+                : 'Assign bucket owner'}
+          </DialogTitle>
+          <DialogDescription>
+            {reviewing
+              ? 'Confirm the owner that will receive full control of this bucket.'
+              : `Transfer full control of "${bucket.name}" to an existing S3 user.`}
+          </DialogDescription>
         </DialogHeader>
-        <div className="flex flex-col gap-2">
-          <Label htmlFor={`owner-${bucket.id}`}>Owner</Label>
-          <BucketOwnerSelect
-            id={`owner-${bucket.id}`}
-            value={ownerAccessKey}
-            onChange={setOwnerAccessKey}
-            disabled={updateOwner.isPending || usersLoading}
-            users={users}
+        {reviewing ? (
+          <ReviewDetails
+            rows={[
+              { id: 'bucket', label: 'Bucket', value: bucket.name },
+              { id: 'current-owner', label: 'Current owner', value: ownerLabel(bucket.owner_access_key) },
+              { id: 'new-owner', label: 'New owner', value: ownerLabel(ownerAccessKey) },
+            ]}
           />
-          {users.length === 0 && !usersLoading && (
-            <p className="text-xs text-muted-foreground">
-              No S3 users yet. Internal root can be used as fallback owner.
-            </p>
-          )}
-          {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
-        </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        ) : (
+          <div className="flex flex-col gap-2">
+            <Label htmlFor={`owner-${bucket.id}`}>Owner</Label>
+            <BucketOwnerSelect
+              id={`owner-${bucket.id}`}
+              value={ownerAccessKey}
+              onChange={setOwnerAccessKey}
+              disabled={updateOwner.isPending || usersLoading}
+              users={users}
+            />
+            {users.length === 0 && !usersLoading && (
+              <p className="text-xs text-muted-foreground">
+                No S3 users yet. Internal root can be used as fallback owner.
+              </p>
+            )}
+            {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
+          </div>
+        )}
+        {updateOwner.error && <p className="text-sm text-destructive">{updateOwner.error.message}</p>}
         <DialogFooter>
           <Button
             type="button"
             variant="outline"
-            onClick={() => handleOpenChange(false)}
+            onClick={() => (reviewing ? setReviewing(false) : handleOpenChange(false))}
             disabled={updateOwner.isPending}
           >
-            Cancel
+            {reviewing ? 'Back' : 'Cancel'}
           </Button>
           <Button
             type="button"
@@ -226,7 +249,7 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
             disabled={!ownerAccessKey || ownerAccessKey === bucket.owner_access_key || updateOwner.isPending}
           >
             {updateOwner.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            Save owner
+            {reviewing ? 'Confirm owner' : 'Review'}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -6,6 +6,7 @@ import { api, internalRootOwnerAccessKey, type ObjectItem } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
+import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, objectStateTone, StatusBadge } from '@/components/app/StatusBadge'
 import {
   Breadcrumb,
@@ -36,6 +37,7 @@ import {
   useS3Users,
   useUpdateBucketOwner,
 } from '@/hooks/queries'
+import { ownerLabel } from '@/lib/s3-owner'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/buckets/$name')({
@@ -140,20 +142,20 @@ function ChangeBucketOwnerDetailDialog({
 }) {
   const [open, setOpen] = useState(false)
   const [selectedOwner, setSelectedOwner] = useState(ownerAccessKey ?? '')
-  const [error, setError] = useState<string | null>(null)
+  const [reviewing, setReviewing] = useState(false)
   const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
   const updateOwner = useUpdateBucketOwner()
 
   useEffect(() => {
     if (!open) {
       setSelectedOwner(ownerAccessKey ?? '')
-      setError(null)
+      setReviewing(false)
     }
   }, [ownerAccessKey, open])
 
   const reset = () => {
     setSelectedOwner(ownerAccessKey ?? '')
-    setError(null)
+    setReviewing(false)
     updateOwner.reset()
   }
 
@@ -164,16 +166,17 @@ function ChangeBucketOwnerDetailDialog({
 
   const handleUpdate = () => {
     if (!selectedOwner || selectedOwner === ownerAccessKey) return
-    setError(null)
+    if (!reviewing) {
+      setReviewing(true)
+      return
+    }
     updateOwner.mutate(
       { name: bucketName, ownerAccessKey: selectedOwner },
       {
         onSuccess: () => {
+          setReviewing(false)
           setOpen(false)
           reset()
-        },
-        onError: (mutationError) => {
-          setError(mutationError instanceof Error ? mutationError.message : 'Failed to update owner')
         },
       }
     )
@@ -189,34 +192,50 @@ function ChangeBucketOwnerDetailDialog({
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{ownerAccessKey ? 'Change bucket owner' : 'Assign bucket owner'}</DialogTitle>
-          <DialogDescription>Transfer full control of "{bucketName}" to an existing S3 user.</DialogDescription>
+          <DialogTitle>
+            {reviewing ? 'Review bucket owner' : ownerAccessKey ? 'Change bucket owner' : 'Assign bucket owner'}
+          </DialogTitle>
+          <DialogDescription>
+            {reviewing
+              ? 'Confirm the owner that will receive full control of this bucket.'
+              : `Transfer full control of "${bucketName}" to an existing S3 user.`}
+          </DialogDescription>
         </DialogHeader>
-        <div className="flex flex-col gap-2">
-          <Label htmlFor="bucket-detail-owner">Owner</Label>
-          <BucketOwnerSelect
-            id="bucket-detail-owner"
-            value={selectedOwner}
-            onChange={setSelectedOwner}
-            disabled={updateOwner.isPending || usersLoading}
-            users={users}
+        {reviewing ? (
+          <ReviewDetails
+            rows={[
+              { id: 'bucket', label: 'Bucket', value: bucketName },
+              { id: 'current-owner', label: 'Current owner', value: ownerLabel(ownerAccessKey) },
+              { id: 'new-owner', label: 'New owner', value: ownerLabel(selectedOwner) },
+            ]}
           />
-          {users.length === 0 && !usersLoading && (
-            <p className="text-xs text-muted-foreground">
-              No S3 users yet. Internal root can be used as fallback owner.
-            </p>
-          )}
-          {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
-        </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        ) : (
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="bucket-detail-owner">Owner</Label>
+            <BucketOwnerSelect
+              id="bucket-detail-owner"
+              value={selectedOwner}
+              onChange={setSelectedOwner}
+              disabled={updateOwner.isPending || usersLoading}
+              users={users}
+            />
+            {users.length === 0 && !usersLoading && (
+              <p className="text-xs text-muted-foreground">
+                No S3 users yet. Internal root can be used as fallback owner.
+              </p>
+            )}
+            {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
+          </div>
+        )}
+        {updateOwner.error && <p className="text-sm text-destructive">{updateOwner.error.message}</p>}
         <DialogFooter>
           <Button
             type="button"
             variant="outline"
-            onClick={() => handleOpenChange(false)}
+            onClick={() => (reviewing ? setReviewing(false) : handleOpenChange(false))}
             disabled={updateOwner.isPending}
           >
-            Cancel
+            {reviewing ? 'Back' : 'Cancel'}
           </Button>
           <Button
             type="button"
@@ -224,7 +243,7 @@ function ChangeBucketOwnerDetailDialog({
             disabled={!selectedOwner || selectedOwner === ownerAccessKey || updateOwner.isPending}
           >
             {updateOwner.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            Save owner
+            {reviewing ? 'Confirm owner' : 'Review'}
           </Button>
         </DialogFooter>
       </DialogContent>

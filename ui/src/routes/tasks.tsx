@@ -2,8 +2,10 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { Check, Copy, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from '@/api/client'
+import { api, type TaskItem } from '@/api/client'
+import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { PageHeader } from '@/components/app/PageHeader'
+import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -46,21 +48,25 @@ function TasksPage() {
   const { data, isLoading, error } = useTasks(taskType, status, PAGE_SIZE, offset)
   const qc = useQueryClient()
 
-  const [retryingId, setRetryingId] = useState<number | null>(null)
+  const [retryTarget, setRetryTarget] = useState<TaskItem | null>(null)
   const [errorDialogText, setErrorDialogText] = useState<string | null>(null)
   const retryMutation = useMutation({
-    mutationFn: (taskId: number) => {
-      setRetryingId(taskId)
-      return api.retryTask(taskId)
-    },
+    mutationFn: (taskId: number) => api.retryTask(taskId),
+    onSuccess: () => setRetryTarget(null),
     onSettled: () => {
-      setRetryingId(null)
       qc.invalidateQueries({ queryKey: ['tasks'] })
     },
   })
+  const retryPending = retryMutation.isPending
 
   const totalPages = data ? Math.ceil(data.total / PAGE_SIZE) : 0
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1
+
+  function openRetryDialog(task: TaskItem) {
+    if (retryPending) return
+    retryMutation.reset()
+    setRetryTarget(task)
+  }
 
   return (
     <div className="flex flex-col gap-4 p-6">
@@ -180,8 +186,8 @@ function TasksPage() {
                             type="button"
                             variant="outline"
                             size="xs"
-                            onClick={() => retryMutation.mutate(t.id)}
-                            disabled={retryingId === t.id}
+                            onClick={() => openRetryDialog(t)}
+                            disabled={retryPending}
                           >
                             <RotateCcw data-icon="inline-start" /> Retry
                           </Button>
@@ -236,9 +242,45 @@ function TasksPage() {
         </>
       )}
 
+      <DangerActionAlertDialog
+        open={Boolean(retryTarget)}
+        onOpenChange={(open) => !open && setRetryTarget(null)}
+        title="Retry dead-letter task?"
+        description={retryTarget ? retryTaskDescription(retryTarget) : ''}
+        confirmLabel="Retry task"
+        pending={Boolean(retryTarget && retryMutation.isPending && retryMutation.variables === retryTarget.id)}
+        error={retryMutation.error?.message}
+        onConfirm={() => {
+          if (retryTarget && !retryPending) retryMutation.mutate(retryTarget.id)
+        }}
+      >
+        {retryTarget && (
+          <ReviewDetails
+            rows={[
+              { id: 'task-id', label: 'Task ID', value: retryTarget.id.toString() },
+              { id: 'type', label: 'Type', value: retryTarget.type },
+              { id: 'ref', label: 'Ref', value: `${retryTarget.ref_type}:${retryTarget.ref_id}` },
+              { id: 'retries', label: 'Retries', value: `${retryTarget.retry_count}/${retryTarget.max_retries}` },
+              { id: 'last-error', label: 'Last error', value: retryTarget.last_error ?? 'None' },
+            ]}
+          />
+        )}
+      </DangerActionAlertDialog>
+
       <ErrorDetailDialog errorText={errorDialogText} onClose={() => setErrorDialogText(null)} />
     </div>
   )
+}
+
+function retryTaskDescription(task: TaskItem) {
+  switch (task.type) {
+    case 'upload':
+      return 'This will requeue upload work and may trigger provider and on-chain operations again.'
+    case 'evict_cache':
+      return 'This will requeue cache eviction work and may remove local cached data.'
+    default:
+      return 'This will requeue the dead-letter task for background processing.'
+  }
 }
 
 function ErrorDetailDialog({ errorText, onClose }: { errorText: string | null; onClose: () => void }) {

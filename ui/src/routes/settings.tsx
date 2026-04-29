@@ -5,9 +5,11 @@ import type {
   SettingsData,
   SettingsEditableConfig,
   SettingsFieldError,
+  SettingsFieldMetadata,
   SettingsS3Credentials,
   SettingsUpdatePayload,
 } from '@/api/client'
+import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { S3SettingsPanel } from '@/components/settings/S3SettingsPanel'
@@ -34,6 +36,12 @@ import {
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSettings, useUpdateSettings } from '@/hooks/queries'
+import {
+  classifySettingsRisk,
+  collectSettingsRiskChanges,
+  type SettingsRiskChange,
+  settingsRiskNeedsStrongConfirmation,
+} from '@/lib/risk-confirmation'
 
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
@@ -75,7 +83,10 @@ function SettingsPage() {
   const updateSettings = useUpdateSettings()
   const [form, setForm] = useState<SettingsEditableConfig | null>(null)
   const [generatedCredentials, setGeneratedCredentials] = useState<SettingsS3Credentials | null>(null)
+  const [pendingSettingsPayload, setPendingSettingsPayload] = useState<SettingsUpdatePayload | null>(null)
+  const [pendingRiskChanges, setPendingRiskChanges] = useState<SettingsRiskChange[]>([])
   const formDirty = Boolean(form && data && JSON.stringify(form) !== JSON.stringify(data.config))
+  const strongRiskConfirmation = settingsRiskNeedsStrongConfirmation(pendingRiskChanges)
 
   useEffect(() => {
     if (data && (!form || !formDirty)) setForm(data.config)
@@ -100,8 +111,31 @@ function SettingsPage() {
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!data || !form || submitDisabled) return
-    updateSettings.mutate(buildSettingsPayload(form, data.config, data.env_managed), {
+    updateSettings.reset()
+    const payload = buildSettingsPayload(form, data.config, data.env_managed)
+    const riskChanges = collectSettingsRiskChanges(data.config, form, data.env_managed, data.metadata)
+    if (riskChanges.length > 0) {
+      setPendingSettingsPayload(payload)
+      setPendingRiskChanges(riskChanges)
+      return
+    }
+    saveSettings(payload)
+  }
+
+  function saveSettings(payload: SettingsUpdatePayload) {
+    updateSettings.mutate(payload, {
       onSuccess: (saved) => setForm(saved.config),
+    })
+  }
+
+  function handleConfirmRiskSettings() {
+    if (!pendingSettingsPayload) return
+    updateSettings.mutate(pendingSettingsPayload, {
+      onSuccess: (saved) => {
+        setForm(saved.config)
+        setPendingSettingsPayload(null)
+        setPendingRiskChanges([])
+      },
     })
   }
 
@@ -396,6 +430,31 @@ function SettingsPage() {
         credentials={generatedCredentials}
         onOpenChange={(open) => !open && setGeneratedCredentials(null)}
       />
+
+      <DangerActionAlertDialog
+        open={Boolean(pendingSettingsPayload)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingSettingsPayload(null)
+            setPendingRiskChanges([])
+          }
+        }}
+        title={strongRiskConfirmation ? 'Save high-risk settings?' : 'Save reviewed settings?'}
+        description={
+          strongRiskConfirmation
+            ? 'Review these high-risk settings before saving. Type SAVE to confirm. Changes are written to the config file and may require a restart.'
+            : 'Review these settings before saving. Changes are written to the config file and may require a restart.'
+        }
+        confirmLabel="Save settings"
+        typedTarget={strongRiskConfirmation ? 'SAVE' : undefined}
+        typedTargetLabel="Type to confirm"
+        pending={updateSettings.isPending}
+        error={updateSettings.error?.message}
+        contentClassName="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-2xl"
+        onConfirm={handleConfirmRiskSettings}
+      >
+        <SettingsRiskChangeList changes={pendingRiskChanges} metadata={data.metadata} />
+      </DangerActionAlertDialog>
     </form>
   )
 }
@@ -646,6 +705,56 @@ function CredentialStatusCard({
         <span className="font-mono">{data.config_path}</span>
       )}
     </SettingsStatusField>
+  )
+}
+
+function SettingsRiskChangeList({
+  changes,
+  metadata,
+}: {
+  changes: SettingsRiskChange[]
+  metadata: Record<string, SettingsFieldMetadata>
+}) {
+  if (changes.length === 0) return null
+
+  return (
+    <div className="max-h-[60vh] overflow-y-auto rounded-md border border-border">
+      <div className="divide-y divide-border">
+        {changes.map((change) => {
+          const confirmation = classifySettingsRisk(change)
+          const description = metadata[change.field]?.description
+
+          return (
+            <div key={change.field} className="grid gap-3 p-3">
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{change.label}</span>
+                  <StatusBadge tone={confirmation === 'strong' ? 'danger' : 'warning'}>
+                    {confirmation === 'strong' ? 'Strong confirmation' : 'Review'}
+                  </StatusBadge>
+                </div>
+                <code className="block break-all text-xs text-muted-foreground">{change.field}</code>
+                {description && <p className="break-words text-xs text-muted-foreground">{description}</p>}
+              </div>
+              <p className="break-words text-xs text-muted-foreground">{change.reason}</p>
+              <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+                <RiskValue label="From" value={change.from} />
+                <RiskValue label="To" value={change.to} />
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function RiskValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 space-y-1">
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      <code className="block min-h-8 break-all rounded-md bg-muted px-2 py-1.5 text-xs">{value || '(empty)'}</code>
+    </div>
   )
 }
 
