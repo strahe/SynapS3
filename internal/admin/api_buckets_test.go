@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -131,6 +132,49 @@ func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repos
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	return info
+}
+
+type recordingObjectListRepo struct {
+	repository.ObjectRepository
+
+	keys           []string
+	listCalls      int
+	atOrAfterCalls int
+}
+
+func (r *recordingObjectListRepo) scanCalls() int {
+	return r.listCalls + r.atOrAfterCalls
+}
+
+func (r *recordingObjectListRepo) ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error) {
+	r.listCalls++
+	return r.list(prefix, func(key string) bool {
+		return afterKey == "" || key > afterKey
+	}, maxKeys), nil
+}
+
+func (r *recordingObjectListRepo) ListByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.Object, error) {
+	r.atOrAfterCalls++
+	return r.list(prefix, func(key string) bool {
+		return fromKey == "" || key >= fromKey
+	}, maxKeys), nil
+}
+
+func (r *recordingObjectListRepo) list(prefix string, include func(string) bool, maxKeys int) []model.Object {
+	objects := make([]model.Object, 0)
+	for _, key := range r.keys {
+		if prefix != "" && !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if !include(key) {
+			continue
+		}
+		objects = append(objects, model.Object{Key: key})
+		if maxKeys > 0 && len(objects) >= maxKeys {
+			break
+		}
+	}
+	return objects
 }
 
 func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
@@ -716,6 +760,255 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	}
 	if body.Objects[0].CurrentVersionID == "" {
 		t.Fatal("expected current version id")
+	}
+	if len(body.Folders) != 0 {
+		t.Fatalf("folders len = %d, want 0 for flat object list", len(body.Folders))
+	}
+	if body.Folders == nil {
+		t.Fatal("folders should be an empty array, not null")
+	}
+}
+
+func TestAPIBucketObjectsDelimiterReturnsCurrentLevelFoldersAndFiles(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "folder-list-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "docs/guide.md", 4, "etag-doc", "checksum-doc", "text/markdown", "", model.ObjectStateStored)
+	seedAdminObjectVersion(t, repos, bucket, "photos/", 0, "etag-marker", "checksum-marker", "application/x-directory", "", model.ObjectStateCached)
+	seedAdminObjectVersion(t, repos, bucket, "photos/2026/a.jpg", 7, "etag-photo", "checksum-photo", "image/jpeg", "", model.ObjectStateStored)
+	seedAdminObjectVersion(t, repos, bucket, "root.txt", 5, "etag-root", "checksum-root", "text/plain", "", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/folder-list-bucket/objects?delimiter=/")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Folders) != 2 {
+		t.Fatalf("folders len = %d, want 2: %#v", len(body.Folders), body.Folders)
+	}
+	if body.Folders[0].Name != "docs" || body.Folders[0].Prefix != "docs/" {
+		t.Fatalf("first folder = %#v, want docs/", body.Folders[0])
+	}
+	if body.Folders[1].Name != "photos" || body.Folders[1].Prefix != "photos/" {
+		t.Fatalf("second folder = %#v, want photos/", body.Folders[1])
+	}
+	if len(body.Objects) != 1 || body.Objects[0].Key != "root.txt" {
+		t.Fatalf("objects = %#v, want root.txt only", body.Objects)
+	}
+}
+
+func TestAPIBucketObjectsDelimiterPrefixReturnsNestedLevel(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "nested-folder-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "photos/", 0, "etag-marker", "checksum-marker", "application/x-directory", "", model.ObjectStateCached)
+	seedAdminObjectVersion(t, repos, bucket, "photos/cover.jpg", 5, "etag-cover", "checksum-cover", "image/jpeg", "", model.ObjectStateStored)
+	seedAdminObjectVersion(t, repos, bucket, "photos/2026/a.jpg", 7, "etag-photo", "checksum-photo", "image/jpeg", "", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/nested-folder-bucket/objects?prefix=" + url.QueryEscape("photos/") + "&delimiter=/")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Folders) != 1 || body.Folders[0].Name != "2026" || body.Folders[0].Prefix != "photos/2026/" {
+		t.Fatalf("folders = %#v, want photos/2026/", body.Folders)
+	}
+	if len(body.Objects) != 1 || body.Objects[0].Key != "photos/cover.jpg" {
+		t.Fatalf("objects = %#v, want photos/cover.jpg only", body.Objects)
+	}
+}
+
+func TestAPIBucketObjectsDelimiterPreservesSlashOnlyFolderName(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "slash-folder-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "a//child.txt", 1, "etag-slash", "checksum-slash", "text/plain", "", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/slash-folder-bucket/objects?prefix=" + url.QueryEscape("a/") + "&delimiter=/")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Folders) != 1 || body.Folders[0].Name != "/" || body.Folders[0].Prefix != "a//" {
+		t.Fatalf("folders = %#v, want slash-only folder a//", body.Folders)
+	}
+}
+
+func TestAPIBucketObjectsRejectsUnsupportedDelimiter(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "unsupported-delimiter-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/unsupported-delimiter-bucket/objects?delimiter=:")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestAPIBucketObjectsDelimiterPaginationSkipsDuplicateFolders(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "folder-page-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "a/1.txt", 1, "etag-a1", "checksum-a1", "text/plain", "", model.ObjectStateStored)
+	seedAdminObjectVersion(t, repos, bucket, "a/2.txt", 1, "etag-a2", "checksum-a2", "text/plain", "", model.ObjectStateStored)
+	seedAdminObjectVersion(t, repos, bucket, "b/1.txt", 1, "etag-b1", "checksum-b1", "text/plain", "", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/folder-page-bucket/objects?delimiter=/&limit=1")
+	if err != nil {
+		t.Fatalf("GET page 1: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var page1 objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&page1); err != nil {
+		t.Fatalf("Decode page 1: %v", err)
+	}
+	if len(page1.Folders) != 1 || page1.Folders[0].Prefix != "a/" || len(page1.Objects) != 0 || !page1.HasMore || page1.NextMarker == "" {
+		t.Fatalf("page 1 = %#v, want a/ folder and next marker", page1)
+	}
+
+	resp2, err := http.Get(ts.URL + "/api/v1/buckets/folder-page-bucket/objects?delimiter=/&limit=1&after=" + url.QueryEscape(page1.NextMarker))
+	if err != nil {
+		t.Fatalf("GET page 2: %v", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+
+	var page2 objectListResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&page2); err != nil {
+		t.Fatalf("Decode page 2: %v", err)
+	}
+	if len(page2.Folders) != 1 || page2.Folders[0].Prefix != "b/" || len(page2.Objects) != 0 {
+		t.Fatalf("page 2 = %#v, want b/ folder only", page2)
+	}
+}
+
+func TestListBucketObjectEntriesSkipsEmittedFolderSubtree(t *testing.T) {
+	keys := make([]string, adminObjectListingBatchSize*2+1)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("a/%04d.txt", i)
+	}
+	objects := &recordingObjectListRepo{keys: keys}
+	srv := &Server{repos: &repository.Repositories{Objects: objects}}
+
+	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
+	if err != nil {
+		t.Fatalf("listBucketObjectEntries: %v", err)
+	}
+
+	if len(folders) != 1 || folders[0].Prefix != "a/" || len(files) != 0 || hasMore || nextMarker != "" {
+		t.Fatalf("listing = folders:%#v files:%#v hasMore:%v nextMarker:%q, want a/ folder only", folders, files, hasMore, nextMarker)
+	}
+	if objects.scanCalls() > 2 {
+		t.Fatalf("object list scans = %d, want at most 2 without walking every child batch", objects.scanCalls())
+	}
+}
+
+func TestListBucketObjectEntriesKeepsCurrentBatchAcrossSiblingFolders(t *testing.T) {
+	keys := make([]string, 50)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("dir-%02d/file.txt", i)
+	}
+	objects := &recordingObjectListRepo{keys: keys}
+	srv := &Server{repos: &repository.Repositories{Objects: objects}}
+
+	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
+	if err != nil {
+		t.Fatalf("listBucketObjectEntries: %v", err)
+	}
+
+	if len(folders) != 50 || len(files) != 0 || hasMore || nextMarker != "" {
+		t.Fatalf("listing = folders:%d files:%#v hasMore:%v nextMarker:%q, want 50 folders only", len(folders), files, hasMore, nextMarker)
+	}
+	if objects.scanCalls() != 1 {
+		t.Fatalf("object list scans = %d, want 1 for sibling folders in one batch", objects.scanCalls())
+	}
+}
+
+func TestListBucketObjectEntriesSkipsDuplicateRowsBeforeSiblingFolders(t *testing.T) {
+	keys := make([]string, 0, 100)
+	for i := 0; i < 50; i++ {
+		keys = append(keys, fmt.Sprintf("dir-%02d/a.txt", i), fmt.Sprintf("dir-%02d/b.txt", i))
+	}
+	objects := &recordingObjectListRepo{keys: keys}
+	srv := &Server{repos: &repository.Repositories{Objects: objects}}
+
+	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
+	if err != nil {
+		t.Fatalf("listBucketObjectEntries: %v", err)
+	}
+
+	if len(folders) != 50 || len(files) != 0 || hasMore || nextMarker != "" {
+		t.Fatalf("listing = folders:%d files:%#v hasMore:%v nextMarker:%q, want 50 folders only", len(folders), files, hasMore, nextMarker)
+	}
+	if objects.scanCalls() != 1 {
+		t.Fatalf("object list scans = %d, want 1 while duplicate folder rows fit in one batch", objects.scanCalls())
 	}
 }
 

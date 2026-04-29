@@ -1,8 +1,18 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Download, Folder, History, Loader2, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import {
+  Download,
+  FileIcon,
+  Folder,
+  History,
+  Loader2,
+  MoreHorizontal,
+  RefreshCw,
+  Trash2,
+  UserRound,
+} from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
-import { api, internalRootOwnerAccessKey, type ObjectItem } from '@/api/client'
+import { api, type ObjectFolderItem, type ObjectItem } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
@@ -16,7 +26,6 @@ import {
   BreadcrumbSeparator,
 } from '@/components/ui/breadcrumb'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -26,8 +35,18 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import {
   useBucket,
@@ -38,11 +57,33 @@ import {
   useUpdateBucketOwner,
 } from '@/hooks/queries'
 import { ownerLabel } from '@/lib/s3-owner'
+import { type BucketPrefixCrumb, bucketPrefixCrumbs } from '@/lib/s3-prefix'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
+type ObjectBrowserSearch = {
+  prefix?: string
+  marker?: string
+}
+
+const objectBrowserSkeletonRows = ['row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8']
+
 export const Route = createFileRoute('/buckets/$name')({
+  validateSearch: (search: Record<string, unknown>): ObjectBrowserSearch => ({
+    prefix: normalizePrefixSearch(search.prefix),
+    marker: normalizeSearchString(search.marker),
+  }),
   component: ObjectBrowserPage,
 })
+
+function normalizeSearchString(value: unknown) {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function normalizePrefixSearch(value: unknown) {
+  const prefix = normalizeSearchString(value)
+  if (!prefix) return undefined
+  return prefix.endsWith('/') ? prefix : `${prefix}/`
+}
 
 function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: string; objectCount: number }) {
   const [open, setOpen] = useState(false)
@@ -251,8 +292,17 @@ function ChangeBucketOwnerDetailDialog({
   )
 }
 
-function ObjectVersionsDialog({ bucketName, object }: { bucketName: string; object: ObjectItem }) {
-  const [open, setOpen] = useState(false)
+function ObjectVersionsDialog({
+  bucketName,
+  object,
+  open,
+  onOpenChange,
+}: {
+  bucketName: string
+  object: ObjectItem
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
   const [versionMarker, setVersionMarker] = useState('')
   const versions = useBucketObjectVersions(bucketName, object.key, versionMarker, 50, open)
 
@@ -261,12 +311,7 @@ function ObjectVersionsDialog({ bucketName, object }: { bucketName: string; obje
   }, [open])
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button variant="ghost" size="icon-sm" aria-label={`Versions for ${object.key}`} title="Versions">
-          <History />
-        </Button>
-      </DialogTrigger>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-6xl lg:p-6">
         <DialogHeader>
           <DialogTitle>Object versions</DialogTitle>
@@ -384,18 +429,37 @@ function ObjectVersionsDialog({ bucketName, object }: { bucketName: string; obje
 
 function ObjectBrowserPage() {
   const { name } = Route.useParams()
-  const [prefix, setPrefix] = useState('')
-  const [marker, setMarker] = useState('')
+  const search = Route.useSearch()
+  const navigate = useNavigate()
+  const prefix = search.prefix ?? ''
+  const marker = search.marker ?? ''
 
   const bucket = useBucket(name)
   const objects = useBucketObjects(name, prefix, marker)
   const qc = useQueryClient()
 
-  const prefixParts = prefix.split('/').filter(Boolean)
+  const pathCrumbs = bucketPrefixCrumbs(prefix)
 
   const navigateToPrefix = (newPrefix: string) => {
-    setPrefix(newPrefix)
-    setMarker('')
+    navigate({
+      to: '/buckets/$name',
+      params: { name },
+      search: {
+        prefix: newPrefix || undefined,
+        marker: undefined,
+      },
+    })
+  }
+
+  const navigateToMarker = (newMarker: string) => {
+    navigate({
+      to: '/buckets/$name',
+      params: { name },
+      search: {
+        prefix: prefix || undefined,
+        marker: newMarker || undefined,
+      },
+    })
   }
 
   const handleRefresh = () => {
@@ -405,24 +469,13 @@ function ObjectBrowserPage() {
 
   const canDelete = bucket.data?.status === 'active'
 
-  const folders = new Set<string>()
-  const files =
-    objects.data?.objects.filter((object) => {
-      const rest = object.key.slice(prefix.length)
-      const slashIdx = rest.indexOf('/')
-      if (slashIdx >= 0) {
-        folders.add(prefix + rest.substring(0, slashIdx + 1))
-        return false
-      }
-      return true
-    }) ?? []
-
   return (
     <div className="flex flex-col gap-4 p-6">
-      <BucketBreadcrumb name={name} prefixParts={prefixParts} navigateToPrefix={navigateToPrefix} />
+      <BucketBreadcrumb name={name} pathCrumbs={pathCrumbs} navigateToPrefix={navigateToPrefix} />
 
       <PageHeader
         title={name}
+        description={bucket.data ? <BucketMetaLine bucket={bucket.data} /> : undefined}
         meta={
           bucket.data && <StatusBadge tone={bucketStatusTone(bucket.data.status)}>{bucket.data.status}</StatusBadge>
         }
@@ -446,213 +499,344 @@ function ObjectBrowserPage() {
         }
       />
 
-      {bucket.isLoading ? (
-        <div className="flex h-32 items-center justify-center">
-          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-        </div>
-      ) : bucket.error ? (
-        <div className="text-destructive">Failed to load bucket details</div>
-      ) : bucket.data ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Bucket details</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <dl className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-              <div>
-                <dt className="text-sm text-muted-foreground">Owner</dt>
-                <dd className="text-sm font-medium">
-                  {bucket.data.owner_access_key === internalRootOwnerAccessKey ? (
-                    <StatusBadge tone="neutral">Internal root</StatusBadge>
-                  ) : bucket.data.owner_access_key ? (
-                    <code className="text-xs text-muted-foreground">{bucket.data.owner_access_key}</code>
-                  ) : (
-                    <StatusBadge tone="warning">Unassigned</StatusBadge>
-                  )}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-sm text-muted-foreground">Proof Set</dt>
-                <dd className="font-mono text-xs text-muted-foreground">{bucket.data.proof_set_id ?? '—'}</dd>
-              </div>
-              <div>
-                <dt className="text-sm text-muted-foreground">Objects</dt>
-                <dd className="text-sm font-medium">{formatNumber(bucket.data.object_count)}</dd>
-              </div>
-              <div>
-                <dt className="text-sm text-muted-foreground">Total size</dt>
-                <dd className="text-sm font-medium">{formatBytes(bucket.data.total_size_bytes)}</dd>
-              </div>
-              <div>
-                <dt className="text-sm text-muted-foreground">Versioning</dt>
-                <dd className="text-sm font-medium">
-                  <StatusBadge tone="success">{bucket.data.versioning_status}</StatusBadge>
-                </dd>
-              </div>
-              <div>
-                <dt className="text-sm text-muted-foreground">Created</dt>
-                <dd className="text-sm text-muted-foreground" title={bucket.data.created_at}>
-                  {timeAgo(bucket.data.created_at)}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-sm text-muted-foreground">Updated</dt>
-                <dd className="text-sm text-muted-foreground" title={bucket.data.updated_at}>
-                  {timeAgo(bucket.data.updated_at)}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-sm text-muted-foreground">Current path</dt>
-                <dd className="font-mono text-xs text-muted-foreground">{prefix || '/'}</dd>
-              </div>
-            </dl>
-          </CardContent>
-        </Card>
-      ) : null}
+      {bucket.error && <div className="text-sm text-destructive">Failed to load bucket details</div>}
 
       {objects.isLoading ? (
-        <div className="flex h-60 items-center justify-center">
-          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-        </div>
+        <ObjectBrowserSkeleton />
       ) : objects.error ? (
         <div className="text-destructive">Failed to load objects</div>
       ) : (
-        <>
-          <div className="overflow-hidden rounded-lg border border-border">
-            <Table>
-              <TableHeader>
-                <TableRow className="bg-muted/50">
-                  <TableHead className="px-4">Key</TableHead>
-                  <TableHead className="px-4 text-right">Size</TableHead>
-                  <TableHead className="px-4">State</TableHead>
-                  <TableHead className="px-4">Type</TableHead>
-                  <TableHead className="px-4">Current Version</TableHead>
-                  <TableHead className="px-4">ETag</TableHead>
-                  <TableHead className="px-4">Piece CID</TableHead>
-                  <TableHead className="px-4">Created</TableHead>
-                  <TableHead className="px-4">Updated</TableHead>
-                  <TableHead className="px-4 text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {[...folders].sort().map((folder) => (
-                  <TableRow key={folder}>
-                    <TableCell className="px-4">
-                      <Button
-                        type="button"
-                        variant="link"
-                        size="sm"
-                        className="h-auto p-0"
-                        onClick={() => navigateToPrefix(folder)}
-                      >
-                        <Folder data-icon="inline-start" />
-                        {folder.slice(prefix.length)}
-                      </Button>
-                    </TableCell>
-                    <TableCell className="px-4 text-right text-muted-foreground">—</TableCell>
-                    <TableCell className="px-4">—</TableCell>
-                    <TableCell className="px-4">—</TableCell>
-                    <TableCell className="px-4">—</TableCell>
-                    <TableCell className="px-4">—</TableCell>
-                    <TableCell className="px-4">—</TableCell>
-                    <TableCell className="px-4">—</TableCell>
-                    <TableCell className="px-4">—</TableCell>
-                    <TableCell className="px-4 text-right">—</TableCell>
-                  </TableRow>
-                ))}
-                {files.map((object) => (
-                  <TableRow key={object.id}>
-                    <TableCell className="px-4 font-mono text-xs">{object.key.slice(prefix.length)}</TableCell>
-                    <TableCell className="px-4 text-right">{formatBytes(object.size)}</TableCell>
-                    <TableCell className="px-4">
-                      <StatusBadge tone={objectStateTone(object.state)}>{object.state}</StatusBadge>
-                    </TableCell>
-                    <TableCell className="px-4 text-muted-foreground">{object.content_type}</TableCell>
-                    <TableCell
-                      className="max-w-52 truncate px-4 font-mono text-xs text-muted-foreground"
-                      title={object.current_version_id}
-                    >
-                      {object.current_version_id}
-                    </TableCell>
-                    <TableCell
-                      className="max-w-40 truncate px-4 font-mono text-xs text-muted-foreground"
-                      title={object.etag}
-                    >
-                      {object.etag}
-                    </TableCell>
-                    <TableCell
-                      className="max-w-52 truncate px-4 font-mono text-xs text-muted-foreground"
-                      title={object.piece_cid ?? undefined}
-                    >
-                      {object.piece_cid ?? '—'}
-                    </TableCell>
-                    <TableCell className="px-4 text-muted-foreground" title={object.created_at}>
-                      {timeAgo(object.created_at)}
-                    </TableCell>
-                    <TableCell className="px-4 text-muted-foreground" title={object.updated_at}>
-                      {timeAgo(object.updated_at)}
-                    </TableCell>
-                    <TableCell className="px-4 text-right">
-                      <div className="flex justify-end gap-1">
-                        <ObjectVersionsDialog bucketName={name} object={object} />
-                        <Button variant="ghost" size="icon-sm" asChild>
-                          <a
-                            href={api.getObjectDownloadUrl(name, object.key)}
-                            aria-label={`Download ${object.key}`}
-                            title="Download"
-                          >
-                            <Download />
-                          </a>
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {folders.size === 0 && files.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={10} className="h-24 text-center text-muted-foreground">
-                      No objects found
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
-
-          <div className="flex justify-between">
-            {marker && (
-              <Button variant="outline" size="sm" onClick={() => setMarker('')}>
-                First page
-              </Button>
-            )}
-            {objects.data?.has_more && objects.data.next_marker && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="ml-auto"
-                onClick={() => {
-                  if (objects.data?.next_marker) {
-                    setMarker(objects.data.next_marker)
-                  }
-                }}
-              >
-                Next page
-              </Button>
-            )}
-          </div>
-        </>
+        <ObjectBrowserTable
+          bucketName={name}
+          prefix={prefix}
+          folders={objects.data?.folders ?? []}
+          files={objects.data?.objects ?? []}
+          hasMore={objects.data?.has_more ?? false}
+          nextMarker={objects.data?.next_marker}
+          marker={marker}
+          navigateToPrefix={navigateToPrefix}
+          navigateToMarker={navigateToMarker}
+        />
       )}
     </div>
   )
 }
 
+function BucketMetaLine({ bucket }: { bucket: NonNullable<ReturnType<typeof useBucket>['data']> }) {
+  const details = [
+    formatObjectCount(bucket.object_count),
+    formatBytes(bucket.total_size_bytes),
+    `Versioning ${bucket.versioning_status.toLowerCase()}`,
+    bucket.proof_set_id ? `Proof set ${bucket.proof_set_id}` : undefined,
+  ].filter(Boolean)
+
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+      {details.map((detail, index) => (
+        <Fragment key={detail}>
+          {index > 0 && (
+            <span aria-hidden="true" className="text-border">
+              ·
+            </span>
+          )}
+          <span className="truncate">{detail}</span>
+        </Fragment>
+      ))}
+    </div>
+  )
+}
+
+function formatObjectCount(count: number) {
+  return `${formatNumber(count)} ${count === 1 ? 'object' : 'objects'}`
+}
+
+function ObjectBrowserTable({
+  bucketName,
+  prefix,
+  folders,
+  files,
+  hasMore,
+  nextMarker,
+  marker,
+  navigateToPrefix,
+  navigateToMarker,
+}: {
+  bucketName: string
+  prefix: string
+  folders: ObjectFolderItem[]
+  files: ObjectItem[]
+  hasMore: boolean
+  nextMarker?: string
+  marker: string
+  navigateToPrefix: (prefix: string) => void
+  navigateToMarker: (marker: string) => void
+}) {
+  const empty = folders.length === 0 && files.length === 0
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <ObjectPathBreadcrumb prefix={prefix} navigateToPrefix={navigateToPrefix} />
+        <p className="text-sm text-muted-foreground">{formatBrowserCount(folders.length, files.length)}</p>
+      </div>
+
+      {empty ? (
+        <div className="rounded-md border border-border">
+          <Empty className="h-64 border-0">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <Folder />
+              </EmptyMedia>
+              <EmptyTitle>No objects found</EmptyTitle>
+              <EmptyDescription>This path has no visible objects.</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </div>
+      ) : (
+        <div className="rounded-md border border-border">
+          <ScrollArea className="w-full">
+            <Table className="min-w-[760px]">
+              <TableHeader>
+                <TableRow className="bg-muted/50">
+                  <TableHead className="w-[38%] px-4">Name</TableHead>
+                  <TableHead className="w-[12%] px-4 text-right">Size</TableHead>
+                  <TableHead className="w-[14%] px-4">State</TableHead>
+                  <TableHead className="w-[16%] px-4">Type</TableHead>
+                  <TableHead className="w-[14%] px-4">Updated</TableHead>
+                  <TableHead className="w-[6%] px-4 text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {folders.map((folder) => (
+                  <TableRow key={folder.prefix}>
+                    <TableCell className="px-4">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-auto max-w-full justify-start gap-1.5 p-0 font-normal text-foreground hover:bg-transparent hover:text-foreground has-data-[icon=inline-start]:pl-0"
+                        onClick={() => navigateToPrefix(folder.prefix)}
+                      >
+                        <Folder data-icon="inline-start" className="text-status-info" />
+                        <span className="truncate font-medium">{folder.name}</span>
+                      </Button>
+                    </TableCell>
+                    <TableCell className="px-4 text-right text-muted-foreground">-</TableCell>
+                    <TableCell className="px-4 text-muted-foreground">-</TableCell>
+                    <TableCell className="px-4">
+                      <StatusBadge tone="info">Folder</StatusBadge>
+                    </TableCell>
+                    <TableCell className="px-4 text-muted-foreground">-</TableCell>
+                    <TableCell className="px-4 text-right">
+                      <FolderActions folder={folder} onOpen={() => navigateToPrefix(folder.prefix)} />
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {files.map((object) => (
+                  <TableRow key={object.id}>
+                    <TableCell className="px-4">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 truncate" title={object.key}>
+                          {objectDisplayName(object.key, prefix)}
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell className="px-4 text-right">{formatBytes(object.size)}</TableCell>
+                    <TableCell className="px-4">
+                      <StatusBadge tone={objectStateTone(object.state)}>{object.state}</StatusBadge>
+                    </TableCell>
+                    <TableCell className="px-4 text-muted-foreground">
+                      <span className="block max-w-48 truncate" title={object.content_type}>
+                        {object.content_type}
+                      </span>
+                    </TableCell>
+                    <TableCell className="px-4 text-muted-foreground" title={object.updated_at}>
+                      {timeAgo(object.updated_at)}
+                    </TableCell>
+                    <TableCell className="px-4 text-right">
+                      <ObjectActions bucketName={bucketName} object={object} />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <ScrollBar orientation="horizontal" />
+          </ScrollArea>
+        </div>
+      )}
+
+      <div className="flex justify-between">
+        {marker ? (
+          <Button variant="outline" size="sm" onClick={() => navigateToMarker('')}>
+            First page
+          </Button>
+        ) : (
+          <span />
+        )}
+        {hasMore && nextMarker && (
+          <Button variant="outline" size="sm" onClick={() => navigateToMarker(nextMarker)}>
+            Next page
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function FolderActions({ folder, onOpen }: { folder: ObjectFolderItem; onOpen: () => void }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${folder.name}`} title="Actions">
+          <MoreHorizontal />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-36">
+        <DropdownMenuGroup>
+          <DropdownMenuItem onSelect={onOpen}>
+            <Folder data-icon="inline-start" />
+            Open
+          </DropdownMenuItem>
+        </DropdownMenuGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function ObjectActions({ bucketName, object }: { bucketName: string; object: ObjectItem }) {
+  const [versionsOpen, setVersionsOpen] = useState(false)
+
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${object.key}`} title="Actions">
+            <MoreHorizontal />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuGroup>
+            <DropdownMenuItem asChild>
+              <a href={api.getObjectDownloadUrl(bucketName, object.key)} aria-label={`Download ${object.key}`}>
+                <Download data-icon="inline-start" />
+                Download
+              </a>
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setVersionsOpen(true)}>
+              <History data-icon="inline-start" />
+              Versions
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <ObjectVersionsDialog
+        bucketName={bucketName}
+        object={object}
+        open={versionsOpen}
+        onOpenChange={setVersionsOpen}
+      />
+    </>
+  )
+}
+
+function ObjectBrowserSkeleton() {
+  return (
+    <div className="rounded-md border border-border p-4">
+      <div className="flex flex-col gap-3">
+        {objectBrowserSkeletonRows.map((row) => (
+          <div key={row} className="grid grid-cols-[1fr_6rem_8rem_10rem_8rem_3rem] items-center gap-4">
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ObjectPathBreadcrumb({
+  prefix,
+  navigateToPrefix,
+}: {
+  prefix: string
+  navigateToPrefix: (prefix: string) => void
+}) {
+  const pathCrumbs = bucketPrefixCrumbs(prefix)
+
+  return (
+    <Breadcrumb className="min-w-0">
+      <BreadcrumbList className="text-xs">
+        <BreadcrumbItem>
+          {pathCrumbs.length > 0 ? (
+            <BreadcrumbLink asChild>
+              <Button
+                type="button"
+                variant="link"
+                className="h-auto p-0 text-xs font-normal"
+                onClick={() => navigateToPrefix('')}
+              >
+                /
+              </Button>
+            </BreadcrumbLink>
+          ) : (
+            <BreadcrumbCurrentPage className="text-muted-foreground">/</BreadcrumbCurrentPage>
+          )}
+        </BreadcrumbItem>
+        {pathCrumbs.map((crumb, index) => {
+          const isLast = index === pathCrumbs.length - 1
+
+          return (
+            <Fragment key={crumb.prefix}>
+              <BreadcrumbSeparator />
+              <BreadcrumbItem>
+                {isLast ? (
+                  <BreadcrumbCurrentPage>{crumb.label}</BreadcrumbCurrentPage>
+                ) : (
+                  <BreadcrumbLink asChild>
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="h-auto p-0 text-xs font-normal"
+                      onClick={() => navigateToPrefix(crumb.prefix)}
+                    >
+                      {crumb.label}
+                    </Button>
+                  </BreadcrumbLink>
+                )}
+              </BreadcrumbItem>
+            </Fragment>
+          )
+        })}
+      </BreadcrumbList>
+    </Breadcrumb>
+  )
+}
+
+function formatBrowserCount(folderCount: number, fileCount: number) {
+  return `${formatCountLabel(folderCount, 'folder')}, ${formatCountLabel(fileCount, 'file')}`
+}
+
+function formatCountLabel(count: number, noun: string) {
+  return `${formatNumber(count)} ${noun}${count === 1 ? '' : 's'}`
+}
+
+function objectDisplayName(key: string, prefix: string) {
+  const name = key.startsWith(prefix) ? key.slice(prefix.length) : key
+  return name || key
+}
+
 function BucketBreadcrumb({
   name,
-  prefixParts,
+  pathCrumbs,
   navigateToPrefix,
 }: {
   name: string
-  prefixParts: string[]
+  pathCrumbs: BucketPrefixCrumb[]
   navigateToPrefix: (prefix: string) => void
 }) {
   return (
@@ -665,7 +849,7 @@ function BucketBreadcrumb({
         </BreadcrumbItem>
         <BreadcrumbSeparator />
         <BreadcrumbItem>
-          {prefixParts.length > 0 ? (
+          {pathCrumbs.length > 0 ? (
             <BreadcrumbLink asChild>
               <Button
                 type="button"
@@ -680,25 +864,24 @@ function BucketBreadcrumb({
             <BreadcrumbCurrentPage>{name}</BreadcrumbCurrentPage>
           )}
         </BreadcrumbItem>
-        {prefixParts.map((part, index) => {
-          const targetPrefix = `${prefixParts.slice(0, index + 1).join('/')}/`
-          const isLast = index === prefixParts.length - 1
+        {pathCrumbs.map((crumb, index) => {
+          const isLast = index === pathCrumbs.length - 1
 
           return (
-            <Fragment key={targetPrefix}>
+            <Fragment key={crumb.prefix}>
               <BreadcrumbSeparator />
               <BreadcrumbItem>
                 {isLast ? (
-                  <BreadcrumbCurrentPage>{part}</BreadcrumbCurrentPage>
+                  <BreadcrumbCurrentPage>{crumb.label}</BreadcrumbCurrentPage>
                 ) : (
                   <BreadcrumbLink asChild>
                     <Button
                       type="button"
                       variant="link"
                       className="h-auto p-0 text-sm font-normal"
-                      onClick={() => navigateToPrefix(targetPrefix)}
+                      onClick={() => navigateToPrefix(crumb.prefix)}
                     >
-                      {part}
+                      {crumb.label}
                     </Button>
                   </BreadcrumbLink>
                 )}

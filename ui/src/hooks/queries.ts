@@ -27,10 +27,10 @@ export function useBucket(name: string) {
   })
 }
 
-export function useBucketObjects(name: string, prefix: string, after: string, limit = 50) {
+export function useBucketObjects(name: string, prefix: string, after: string, limit = 50, delimiter = '/') {
   return useQuery({
-    queryKey: ['objects', name, prefix, after, limit],
-    queryFn: () => api.getBucketObjects(name, { prefix, after, limit }),
+    queryKey: ['objects', name, prefix, delimiter, after, limit],
+    queryFn: () => api.getBucketObjects(name, { prefix, delimiter, after, limit }),
     refetchInterval: 15_000,
   })
 }

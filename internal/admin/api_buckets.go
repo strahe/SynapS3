@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -383,10 +384,16 @@ type objectListItem struct {
 	UpdatedAt        string  `json:"updated_at"`
 }
 
+type objectFolderItem struct {
+	Name   string `json:"name"`
+	Prefix string `json:"prefix"`
+}
+
 type objectListResponse struct {
-	Objects    []objectListItem `json:"objects"`
-	HasMore    bool             `json:"has_more"`
-	NextMarker string           `json:"next_marker,omitempty"`
+	Folders    []objectFolderItem `json:"folders"`
+	Objects    []objectListItem   `json:"objects"`
+	HasMore    bool               `json:"has_more"`
+	NextMarker string             `json:"next_marker,omitempty"`
 }
 
 func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) {
@@ -414,6 +421,11 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 
 	prefix := r.URL.Query().Get("prefix")
 	after := r.URL.Query().Get("after")
+	delimiter := r.URL.Query().Get("delimiter")
+	if delimiter != "" && delimiter != "/" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "delimiter must be /"})
+		return
+	}
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
@@ -421,16 +433,29 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	objects, err := s.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, after, limit+1)
-	if err != nil {
-		s.logger.Error("api: failed to list objects", "error", err, "bucket", bucketName)
+	folders := make([]objectFolderItem, 0)
+	var objects []model.Object
+	var hasMore bool
+	var nextMarker string
+	var listErr error
+	if delimiter == "" {
+		objects, listErr = s.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, after, limit+1)
+		if listErr == nil {
+			hasMore = len(objects) > limit
+			if hasMore {
+				objects = objects[:limit]
+			}
+			if hasMore && len(objects) > 0 {
+				nextMarker = objects[len(objects)-1].Key
+			}
+		}
+	} else {
+		folders, objects, hasMore, nextMarker, listErr = s.listBucketObjectEntries(ctx, bucket.ID, prefix, delimiter, after, limit)
+	}
+	if listErr != nil {
+		s.logger.Error("api: failed to list objects", "error", listErr, "bucket", bucketName)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
-	}
-
-	hasMore := len(objects) > limit
-	if hasMore {
-		objects = objects[:limit]
 	}
 
 	items := make([]objectListItem, 0, len(objects))
@@ -450,14 +475,146 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 	}
 
 	resp := objectListResponse{
+		Folders: folders,
 		Objects: items,
 		HasMore: hasMore,
 	}
-	if hasMore && len(items) > 0 {
-		resp.NextMarker = items[len(items)-1].Key
+	if hasMore {
+		resp.NextMarker = nextMarker
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+const adminObjectListingBatchSize = 1000
+
+func (s *Server) listBucketObjectEntries(ctx context.Context, bucketID int64, prefix, delimiter, afterKey string, maxKeys int) ([]objectFolderItem, []model.Object, bool, string, error) {
+	if maxKeys <= 0 {
+		return []objectFolderItem{}, []model.Object{}, false, "", nil
+	}
+
+	folders := make([]objectFolderItem, 0)
+	objects := make([]model.Object, 0)
+	seenFolders := make(map[string]struct{})
+	cursor := afterKey
+	lastMarker := afterKey
+	includeCursor := false
+
+	for {
+		var rows []model.Object
+		var err error
+		if includeCursor {
+			rows, err = s.repos.Objects.ListByBucketAtOrAfter(ctx, bucketID, prefix, cursor, adminObjectListingBatchSize)
+			includeCursor = false
+		} else {
+			rows, err = s.repos.Objects.ListByBucket(ctx, bucketID, prefix, cursor, adminObjectListingBatchSize)
+		}
+		if err != nil {
+			return nil, nil, false, "", err
+		}
+		if len(rows) == 0 {
+			return folders, objects, false, "", nil
+		}
+
+		resumeAtPrefixBound := false
+		for rowIndex := 0; rowIndex < len(rows); rowIndex++ {
+			obj := rows[rowIndex]
+			cursor = obj.Key
+			if prefix != "" && obj.Key == prefix {
+				lastMarker = obj.Key
+				continue
+			}
+
+			if commonPrefix, ok := adminListingCommonPrefix(obj.Key, prefix, delimiter); ok {
+				if afterKey != "" && commonPrefix <= afterKey {
+					rowIndex, cursor, lastMarker, includeCursor, resumeAtPrefixBound = adminListingAdvancePastCurrentPrefix(rows, rowIndex, commonPrefix, delimiter)
+					if resumeAtPrefixBound {
+						break
+					}
+					continue
+				}
+				if _, exists := seenFolders[commonPrefix]; exists {
+					rowIndex, cursor, lastMarker, includeCursor, resumeAtPrefixBound = adminListingAdvancePastCurrentPrefix(rows, rowIndex, commonPrefix, delimiter)
+					if resumeAtPrefixBound {
+						break
+					}
+					continue
+				}
+				if len(folders)+len(objects) >= maxKeys {
+					return folders, objects, true, lastMarker, nil
+				}
+				seenFolders[commonPrefix] = struct{}{}
+				folders = append(folders, objectFolderItem{
+					Name:   adminListingFolderName(commonPrefix, prefix, delimiter),
+					Prefix: commonPrefix,
+				})
+				rowIndex, cursor, lastMarker, includeCursor, resumeAtPrefixBound = adminListingAdvancePastCurrentPrefix(rows, rowIndex, commonPrefix, delimiter)
+				if resumeAtPrefixBound {
+					break
+				}
+				continue
+			}
+
+			if len(folders)+len(objects) >= maxKeys {
+				return folders, objects, true, lastMarker, nil
+			}
+			objects = append(objects, obj)
+			lastMarker = obj.Key
+		}
+
+		if resumeAtPrefixBound {
+			continue
+		}
+		if len(rows) < adminObjectListingBatchSize {
+			return folders, objects, false, "", nil
+		}
+	}
+}
+
+func adminListingAdvancePastCurrentPrefix(rows []model.Object, rowIndex int, commonPrefix, delimiter string) (int, string, string, bool, bool) {
+	lastIndex := rowIndex
+	for lastIndex+1 < len(rows) && strings.HasPrefix(rows[lastIndex+1].Key, commonPrefix) {
+		lastIndex++
+	}
+
+	cursor := rows[lastIndex].Key
+	if lastIndex != len(rows)-1 || len(rows) < adminObjectListingBatchSize {
+		return lastIndex, cursor, cursor, false, false
+	}
+	upper, ok := adminListingCommonPrefixUpperBound(commonPrefix, delimiter)
+	if !ok || upper <= cursor {
+		return lastIndex, cursor, cursor, false, false
+	}
+	return lastIndex, upper, cursor, true, true
+}
+
+func adminListingCommonPrefix(key, prefix, delimiter string) (string, bool) {
+	if delimiter == "" {
+		return "", false
+	}
+	suffix := strings.TrimPrefix(key, prefix)
+	before, _, found := strings.Cut(suffix, delimiter)
+	if !found {
+		return "", false
+	}
+	return prefix + before + delimiter, true
+}
+
+func adminListingCommonPrefixUpperBound(commonPrefix, delimiter string) (string, bool) {
+	if delimiter != "/" || !strings.HasSuffix(commonPrefix, delimiter) {
+		return "", false
+	}
+	// The admin API only accepts "/" as delimiter; "0" is the next ASCII byte after "/".
+	return strings.TrimSuffix(commonPrefix, delimiter) + "0", true
+}
+
+func adminListingFolderName(commonPrefix, prefix, delimiter string) string {
+	name := strings.TrimPrefix(commonPrefix, prefix)
+	trimmed := strings.TrimSuffix(name, delimiter)
+	if trimmed == "" {
+		return name
+	}
+	return trimmed
 }
 
 type objectVersionListItem struct {

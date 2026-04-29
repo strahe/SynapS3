@@ -34,3 +34,31 @@ test('object download URL encodes bucket name and object key', () => {
     '/api/v1/buckets/bucket-a/objects/download?key=reports%2FApril%20summary.txt'
   )
 })
+
+test('bucket object listing sends folder browser query parameters', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedURL = ''
+  globalThis.fetch = (async (input) => {
+    requestedURL = input.toString()
+    return new Response(JSON.stringify({ folders: [], objects: [], has_more: false }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    await api.getBucketObjects('bucket-a', {
+      prefix: 'reports/',
+      delimiter: '/',
+      after: 'reports/2026/a.txt',
+      limit: 50,
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(
+    requestedURL,
+    '/api/v1/buckets/bucket-a/objects?prefix=reports%2F&delimiter=%2F&after=reports%2F2026%2Fa.txt&limit=50'
+  )
+})

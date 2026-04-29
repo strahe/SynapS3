@@ -70,7 +70,13 @@ export interface ObjectItem {
   updated_at: string
 }
 
+export interface ObjectFolderItem {
+  name: string
+  prefix: string
+}
+
 export interface ObjectListResponse {
+  folders: ObjectFolderItem[]
   objects: ObjectItem[]
   has_more: boolean
   next_marker?: string
@@ -336,9 +342,10 @@ export const api = {
       method: 'DELETE',
     })
   },
-  getBucketObjects: (name: string, params: { prefix?: string; after?: string; limit?: number }) => {
+  getBucketObjects: (name: string, params: { prefix?: string; delimiter?: string; after?: string; limit?: number }) => {
     const sp = new URLSearchParams()
     if (params.prefix) sp.set('prefix', params.prefix)
+    if (params.delimiter) sp.set('delimiter', params.delimiter)
     if (params.after) sp.set('after', params.after)
     if (params.limit) sp.set('limit', params.limit.toString())
     const qs = sp.toString()

@@ -274,6 +274,14 @@ func TestObjectRepo_ListByBucketReadsCurrentSnapshotOnly(t *testing.T) {
 	if len(afterKey) != 2 || afterKey[0].Key != "b.txt" {
 		t.Fatalf("afterKey result = %#v", afterKey)
 	}
+
+	fromKey, err := repos.Objects.ListByBucketAtOrAfter(ctx, bucket.ID, "", "b.txt", 0)
+	if err != nil {
+		t.Fatalf("ListByBucketAtOrAfter(fromKey): %v", err)
+	}
+	if len(fromKey) != 2 || fromKey[0].Key != "b.txt" {
+		t.Fatalf("fromKey result = %#v, want b.txt first", fromKey)
+	}
 }
 
 func TestObjectRepo_GetVersionByBucketKeyAndIDScopesVersion(t *testing.T) {

@@ -183,6 +183,14 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 }
 
 func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error) {
+	return r.listByBucket(ctx, bucketID, prefix, afterKey, false, maxKeys)
+}
+
+func (r *BunObjectRepo) ListByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.Object, error) {
+	return r.listByBucket(ctx, bucketID, prefix, fromKey, true, maxKeys)
+}
+
+func (r *BunObjectRepo) listByBucket(ctx context.Context, bucketID int64, prefix string, keyBoundary string, includeBoundary bool, maxKeys int) ([]model.Object, error) {
 	var objects []model.Object
 	q := r.db.NewSelect().
 		Model(&objects).
@@ -193,13 +201,16 @@ func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
 		q = q.Where("key LIKE ? ESCAPE '\\'", escaped+"%")
 	}
-	if afterKey != "" {
-		q = q.Where("key > ?", afterKey)
+	if keyBoundary != "" {
+		if includeBoundary {
+			q = q.Where("key >= ?", keyBoundary)
+		} else {
+			q = q.Where("key > ?", keyBoundary)
+		}
 	}
 	if maxKeys > 0 {
 		q = q.Limit(maxKeys)
 	}
-
 	if err := q.Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing objects: %w", err)
 	}
