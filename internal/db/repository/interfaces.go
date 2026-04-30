@@ -57,7 +57,7 @@ type S3AccountUpdate struct {
 }
 
 // ObjectVersionWriteResult reports whether a write created a new version or
-// reused the current snapshot.
+// reused the current version.
 type ObjectVersionWriteResult struct {
 	ObjectID  int64
 	VersionID string
@@ -65,10 +65,9 @@ type ObjectVersionWriteResult struct {
 	Created   bool
 }
 
-// ObjectVersionListItem pairs a version row with the current-version marker for its object.
+// ObjectVersionListItem represents one object version row in listing queries.
 type ObjectVersionListItem struct {
 	model.ObjectVersion `bun:",extend"`
-	CurrentVersionID    string `bun:"current_version_id"`
 }
 
 // ObjectVersionRef identifies a version and its current object row.
@@ -77,19 +76,20 @@ type ObjectVersionRef struct {
 	VersionID string `bun:"version_id"`
 }
 
-// ObjectRepository defines persistence operations for current object snapshots
-// and internal object versions.
+// ObjectRepository defines persistence operations for object identities and versions.
 type ObjectRepository interface {
 	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (objectID int64, err error)
 	CreateVersionAndSetCurrentIfChanged(ctx context.Context, version *model.ObjectVersion) (ObjectVersionWriteResult, error)
-	GetByID(ctx context.Context, id int64) (*model.Object, error)
-	GetByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error)
+	GetObjectByID(ctx context.Context, id int64) (*model.Object, error)
+	GetObjectByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error)
+	GetCurrentVersionByObjectID(ctx context.Context, objectID int64) (*model.ObjectVersion, error)
+	GetCurrentVersionByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.ObjectVersion, error)
 	GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error)
 	GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
 	FindReusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
 	FindReusableActiveUploadVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
-	ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error)
-	ListByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.Object, error)
+	ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.ObjectVersion, error)
+	ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.ObjectVersion, error)
 	ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error)
 	ListVersionsByKey(ctx context.Context, bucketID int64, key string, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
 	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error

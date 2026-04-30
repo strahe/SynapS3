@@ -11,19 +11,19 @@ import (
 
 const listingBatchSize = 1000
 
-func (b *SynapseBackend) listCurrentObjects(ctx context.Context, bucketID int64, prefix, delimiter, afterKey string, maxKeys int) ([]model.Object, []types.CommonPrefix, bool, string, error) {
+func (b *SynapseBackend) listCurrentObjects(ctx context.Context, bucketID int64, prefix, delimiter, afterKey string, maxKeys int) ([]model.ObjectVersion, []types.CommonPrefix, bool, string, error) {
 	if maxKeys <= 0 {
 		return nil, nil, false, "", nil
 	}
 
-	var objects []model.Object
+	var objects []model.ObjectVersion
 	var prefixes []types.CommonPrefix
 	seenPrefixes := make(map[string]struct{})
 	cursor := afterKey
 	lastMarker := afterKey
 
 	for {
-		rows, err := b.repos.Objects.ListByBucket(ctx, bucketID, prefix, cursor, listingBatchSize)
+		rows, err := b.repos.Objects.ListCurrentVersionsByBucket(ctx, bucketID, prefix, cursor, listingBatchSize)
 		if err != nil {
 			return nil, nil, false, "", err
 		}

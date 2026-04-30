@@ -113,39 +113,39 @@ func TestIntegration_FullWritePath(t *testing.T) {
 	// 1. PutObject
 	putObject(t, ib.backend, "test-bucket", "test-key", "hello world")
 
-	obj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "test-key")
+	obj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "test-key")
 	if err != nil || obj == nil {
 		t.Fatalf("expected object in DB, got err=%v obj=%v", err, obj)
 	}
 	if obj.State != model.ObjectStateCached {
 		t.Fatalf("expected state=cached, got %s", obj.State)
 	}
-	if obj.CurrentVersionID == "" {
+	if obj.VersionID == "" {
 		t.Fatal("expected current version id")
 	}
 
-	tasks := findTasks(t, ib.db, "object", obj.ID)
+	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 upload task, got %d", len(tasks))
 	}
 	if tasks[0].Type != model.TaskTypeUpload {
 		t.Fatalf("expected task type upload, got %s", tasks[0].Type)
 	}
-	if tasks[0].RefVersionID != obj.CurrentVersionID {
-		t.Fatalf("expected task version=%s, got %s", obj.CurrentVersionID, tasks[0].RefVersionID)
+	if tasks[0].RefVersionID != obj.VersionID {
+		t.Fatalf("expected task version=%s, got %s", obj.VersionID, tasks[0].RefVersionID)
 	}
 
 	// 2. Simulate uploader: cached → uploading
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.CurrentVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("cached→uploading: %v", err)
 	}
 
 	// Simulate uploader sets PieceCID: uploading → stored
-	if err := ib.repos.Objects.SetVersionStorageInfoAndTransition(ctx, obj.CurrentVersionID, "bafk2test123", "https://provider.example/pieces/test", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+	if err := ib.repos.Objects.SetVersionStorageInfoAndTransition(ctx, obj.VersionID, "bafk2test123", "https://provider.example/pieces/test", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatalf("uploading→stored: %v", err)
 	}
 
-	obj, _ = ib.repos.Objects.GetByID(ctx, obj.ID)
+	obj, _ = ib.repos.Objects.GetCurrentVersionByObjectID(ctx, obj.ObjectID)
 	if obj.State != model.ObjectStateStored {
 		t.Fatalf("expected state=stored, got %s", obj.State)
 	}
@@ -154,14 +154,14 @@ func TestIntegration_FullWritePath(t *testing.T) {
 	}
 
 	// 3. Simulate evictor: stored → cache_evicted, remove cache file
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.CurrentVersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
 		t.Fatalf("stored→cache_evicted: %v", err)
 	}
 	if err := ib.cache.Delete(ctx, "test-bucket", obj.CacheKey); err != nil {
 		t.Fatalf("cache delete: %v", err)
 	}
 
-	obj, _ = ib.repos.Objects.GetByID(ctx, obj.ID)
+	obj, _ = ib.repos.Objects.GetCurrentVersionByObjectID(ctx, obj.ObjectID)
 	if obj.State != model.ObjectStateCacheEvicted {
 		t.Fatalf("expected state=cache_evicted, got %s", obj.State)
 	}
@@ -179,13 +179,13 @@ func TestIntegration_OverwritePath(t *testing.T) {
 	// First write
 	putObject(t, ib.backend, "bucket", "key", "v1")
 
-	obj, _ := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "key")
-	firstVersionID := obj.CurrentVersionID
+	obj, _ := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
+	firstVersionID := obj.VersionID
 	if firstVersionID == "" {
 		t.Fatal("expected current version id after first put")
 	}
 
-	tasks := findTasks(t, ib.db, "object", obj.ID)
+	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
 	if len(tasks) != 1 || tasks[0].RefVersionID != firstVersionID {
 		t.Fatalf("expected 1 task with first version, got %d tasks", len(tasks))
 	}
@@ -193,13 +193,13 @@ func TestIntegration_OverwritePath(t *testing.T) {
 	// Overwrite
 	putObject(t, ib.backend, "bucket", "key", "v2")
 
-	obj, _ = ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "key")
-	secondVersionID := obj.CurrentVersionID
+	obj, _ = ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
+	secondVersionID := obj.VersionID
 	if secondVersionID == "" || secondVersionID == firstVersionID {
 		t.Fatalf("expected new current version after overwrite, first=%s second=%s", firstVersionID, secondVersionID)
 	}
 
-	tasks = findTasks(t, ib.db, "object", obj.ID)
+	tasks = findTasks(t, ib.db, "object", obj.ObjectID)
 	if len(tasks) != 2 {
 		t.Fatalf("expected 2 tasks, got %d", len(tasks))
 	}
@@ -228,10 +228,10 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	// PutObject
 	putObject(t, ib.backend, "test-bucket", "test-key", content)
 
-	obj, _ := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "test-key")
+	obj, _ := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "test-key")
 
 	// Simulate full pipeline to cache_evicted
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.CurrentVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatal(err)
 	}
 
@@ -242,10 +242,10 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	}
 	testPieceCID := cid.NewCidV1(cid.Raw, mh)
 
-	if err := ib.repos.Objects.SetVersionStorageInfoAndTransition(ctx, obj.CurrentVersionID, testPieceCID.String(), "https://provider.example/pieces/test", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+	if err := ib.repos.Objects.SetVersionStorageInfoAndTransition(ctx, obj.VersionID, testPieceCID.String(), "https://provider.example/pieces/test", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatal(err)
 	}
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.CurrentVersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
 		t.Fatal(err)
 	}
 
@@ -309,7 +309,7 @@ func TestIntegration_CopyObjectPath(t *testing.T) {
 	}
 
 	// Verify destination object exists
-	dstObj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "dst-key")
+	dstObj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "dst-key")
 	if err != nil || dstObj == nil {
 		t.Fatalf("expected dst object, got err=%v", err)
 	}
@@ -325,7 +325,7 @@ func TestIntegration_CopyObjectPath(t *testing.T) {
 	}
 
 	// Same-bucket copies of content with an active upload follow the source task.
-	dstTasks := findTasks(t, ib.db, "object", dstObj.ID)
+	dstTasks := findTasks(t, ib.db, "object", dstObj.ObjectID)
 	if len(dstTasks) != 0 {
 		t.Fatalf("expected no destination upload task, got %d", len(dstTasks))
 	}
@@ -468,7 +468,7 @@ func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
 	}
 
 	// 5. Verify object exists with correct size
-	obj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "big-file")
+	obj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "big-file")
 	if err != nil || obj == nil {
 		t.Fatalf("expected object after complete, err=%v", err)
 	}
@@ -478,7 +478,7 @@ func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
 	}
 
 	// Verify upload task created
-	tasks := findTasks(t, ib.db, "object", obj.ID)
+	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
 	if len(tasks) == 0 {
 		t.Fatal("expected upload task for completed multipart object")
 	}
@@ -776,7 +776,7 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 		t.Fatalf("PutObject: %v", err)
 	}
 
-	srcObj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "original.txt")
+	srcObj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "original.txt")
 	if err != nil || srcObj == nil {
 		t.Fatalf("expected src object, got err=%v", err)
 	}
@@ -803,7 +803,7 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 	}
 
 	// Verify destination metadata matches source
-	dstObj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "copy.txt")
+	dstObj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "copy.txt")
 	if err != nil || dstObj == nil {
 		t.Fatalf("expected dst object, got err=%v", err)
 	}
@@ -820,7 +820,7 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 	if dstObj.State != model.ObjectStateUploading {
 		t.Fatalf("expected dst state=uploading, got %s", dstObj.State)
 	}
-	if dstObj.CurrentVersionID == "" {
+	if dstObj.VersionID == "" {
 		t.Fatal("expected destination current version id")
 	}
 
@@ -999,7 +999,7 @@ func TestIntegration_GetObject_CacheMiss_NoPieceCID(t *testing.T) {
 	// Put object so it's in DB and cache
 	putObject(t, ib.backend, "bucket", "evicted-key", "some data")
 
-	obj, err := ib.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "evicted-key")
+	obj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "evicted-key")
 	if err != nil || obj == nil {
 		t.Fatalf("expected object in DB, got err=%v", err)
 	}

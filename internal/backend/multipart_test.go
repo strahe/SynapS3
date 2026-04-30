@@ -210,7 +210,7 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 
 	// Verify object created in DB.
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "cmp-bucket")
-	obj, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "assembled.bin")
+	obj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "assembled.bin")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testi
 	firstVersionID := completeOnePart()
 
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "cmp-dedupe-bucket")
-	obj1, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "assembled.bin")
+	obj1, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "assembled.bin")
 	if err != nil || obj1 == nil {
 		t.Fatalf("current object after first complete: obj=%v err=%v", obj1, err)
 	}
@@ -289,17 +289,17 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testi
 		t.Fatalf("second version id = %s, want different from first", secondVersionID)
 	}
 
-	obj2, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "assembled.bin")
+	obj2, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "assembled.bin")
 	if err != nil || obj2 == nil {
 		t.Fatalf("current object after second complete: obj=%v err=%v", obj2, err)
 	}
-	if obj2.CurrentVersionID == obj1.CurrentVersionID {
-		t.Fatalf("current version did not change for identical multipart complete: %s", obj2.CurrentVersionID)
+	if obj2.VersionID == obj1.VersionID {
+		t.Fatalf("current version did not change for identical multipart complete: %s", obj2.VersionID)
 	}
 
 	versionCount, err := tb.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
-		Where("object_id = ?", obj1.ID).
+		Where("object_id = ?", obj1.ObjectID).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting object versions: %v", err)
@@ -310,7 +310,7 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testi
 
 	taskCount, err := tb.db.NewSelect().
 		Model((*model.Task)(nil)).
-		Where("ref_type = ? AND ref_id = ?", "object", obj1.ID).
+		Where("ref_type = ? AND ref_id = ?", "object", obj1.ObjectID).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting upload tasks: %v", err)

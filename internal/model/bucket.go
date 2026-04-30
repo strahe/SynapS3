@@ -35,5 +35,5 @@ type Bucket struct {
 	CreatedAt      time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt      time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
 
-	Owner *S3Account `bun:"rel:belongs-to,join:owner_access_key=access_key"`
+	Owner *S3Account `bun:"rel:belongs-to,join:owner_access_key=access_key,on_update:cascade,on_delete:restrict"`
 }

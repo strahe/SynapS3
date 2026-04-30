@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
 )
 
 func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
@@ -92,44 +93,86 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 }
 
 func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
-	cfg := config.DatabaseConfig{
-		Driver:       "sqlite",
-		DSN:          "file:" + filepath.Join(t.TempDir(), "schema.db") + "?_pragma=journal_mode(WAL)",
-		MaxOpenConns: 1,
-		MaxIdleConns: 1,
-	}
+	db := newMigratedSQLiteDB(t, "schema.db")
 
-	db, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	ctx := context.Background()
-	if err := RunMigrations(ctx, db); err != nil {
-		t.Fatalf("RunMigrations() error = %v", err)
-	}
-
-	for _, table := range []string{"objects", "object_versions"} {
-		columns := sqliteColumns(t, db, table)
-		for _, column := range []string{"retry_count", "max_retries"} {
-			if columns[column] {
-				t.Fatalf("%s.%s should not exist", table, column)
-			}
+	objectColumns := sqliteColumns(t, db, "objects")
+	for _, column := range []string{"current_version_id", "size", "e_tag", "checksum", "cache_key", "in_cache", "in_filecoin", "state"} {
+		if objectColumns[column] {
+			t.Fatalf("objects.%s should not exist", column)
 		}
-		for _, column := range []string{"in_cache", "in_filecoin"} {
-			if !columns[column] {
-				t.Fatalf("%s.%s should exist", table, column)
-			}
+	}
+	for _, column := range []string{"bucket_id", "key"} {
+		if !objectColumns[column] {
+			t.Fatalf("objects.%s should exist", column)
+		}
+	}
+
+	versionColumns := sqliteColumns(t, db, "object_versions")
+	for _, column := range []string{"is_current", "in_cache", "in_filecoin"} {
+		if !versionColumns[column] {
+			t.Fatalf("object_versions.%s should exist", column)
 		}
 	}
 
 	indexes := sqliteIndexes(t, db, "objects")
-	if indexes["idx_objects_bucket_key_list"] {
-		t.Fatal("idx_objects_bucket_key_list should not exist")
-	}
 	if !indexes["idx_objects_bucket_key"] {
 		t.Fatal("idx_objects_bucket_key should exist")
+	}
+	versionIndexes := sqliteIndexes(t, db, "object_versions")
+	if !versionIndexes["idx_object_versions_current_unique"] {
+		t.Fatal("idx_object_versions_current_unique should exist")
+	}
+	if !versionIndexes["idx_object_versions_current_bucket_key"] {
+		t.Fatal("idx_object_versions_current_bucket_key should exist")
+	}
+}
+
+func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T) {
+	db := newMigratedSQLiteDB(t, "object-version-constraints.db")
+	ctx := context.Background()
+
+	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (1, 'bucket-a')`)
+	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (2, 'bucket-b')`)
+	mustExec(t, db, `INSERT INTO objects (id, bucket_id, key) VALUES (1, 1, 'file.txt')`)
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, is_current) VALUES ('v1', 1, 1, 'file.txt', 1, 'etag-1', 'sum-1', '.versions/v1', TRUE)`)
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, is_current) VALUES ('v2', 1, 1, 'file.txt', 2, 'etag-2', 'sum-2', '.versions/v2', TRUE)`); err == nil {
+		t.Fatal("expected second current version for one object to fail")
+	}
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, is_current) VALUES ('v3', 1, 1, 'file.txt', 3, 'etag-3', 'sum-3', '.versions/v3', FALSE)`)
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key) VALUES ('wrong-bucket', 1, 2, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/wrong-bucket')`); err == nil {
+		t.Fatal("expected object_versions object/bucket/key mismatch to fail")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, in_filecoin) VALUES ('missing-provider', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/missing-provider', TRUE)`); err == nil {
+		t.Fatal("expected in_filecoin without provider metadata to fail")
+	}
+}
+
+func TestRunMigrations_TaskAndMultipartConstraints(t *testing.T) {
+	db := newMigratedSQLiteDB(t, "task-multipart-constraints.db")
+	ctx := context.Background()
+
+	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (1, 'bucket-a')`)
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO tasks (type, ref_type, ref_id, ref_version_id, idempotency_key) VALUES ('upload', 'object', 1, '', 'upload:missing-version')`); err == nil {
+		t.Fatal("expected object task without ref_version_id to fail")
+	}
+	mustExec(t, db, `INSERT INTO tasks (type, ref_type, ref_id, ref_version_id, idempotency_key) VALUES ('upload', 'bucket', 1, '', 'bucket:allowed')`)
+
+	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id) VALUES (1, 'large.bin', 'upload-1')`)
+	mustExec(t, db, `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag) VALUES ('upload-1', 1, 10, 'part-etag')`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag) VALUES ('upload-1', 10001, 10, 'bad-part')`); err == nil {
+		t.Fatal("expected multipart part_number > 10000 to fail")
+	}
+	mustExec(t, db, `DELETE FROM multipart_uploads WHERE upload_id = 'upload-1'`)
+
+	var partCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM multipart_parts WHERE upload_id = 'upload-1'`).Scan(&partCount); err != nil {
+		t.Fatalf("counting multipart parts: %v", err)
+	}
+	if partCount != 0 {
+		t.Fatalf("multipart parts after upload delete = %d, want 0", partCount)
 	}
 }
 
@@ -220,6 +263,34 @@ func TestSQLiteFilePathTreatsWindowsFileURIAsFilePath(t *testing.T) {
 	}
 	if filepath.ToSlash(path) != "C:/synaps3/db/synaps3.db" {
 		t.Fatalf("sqliteFilePath() path = %q, want C:/synaps3/db/synaps3.db", filepath.ToSlash(path))
+	}
+}
+
+func newMigratedSQLiteDB(t *testing.T, filename string) *bun.DB {
+	t.Helper()
+	cfg := config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.Join(t.TempDir(), filename) + "?_pragma=journal_mode(WAL)",
+		MaxOpenConns: 1,
+		MaxIdleConns: 1,
+	}
+
+	db, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := RunMigrations(context.Background(), db); err != nil {
+		t.Fatalf("RunMigrations() error = %v", err)
+	}
+	return db
+}
+
+func mustExec(t *testing.T, db *bun.DB, query string, args ...interface{}) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), query, args...); err != nil {
+		t.Fatalf("exec %q: %v", query, err)
 	}
 }
 

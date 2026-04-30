@@ -43,4 +43,6 @@ type MultipartPart struct {
 	Size       int64     `bun:",notnull"`
 	ETag       string    `bun:",notnull"`
 	CreatedAt  time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+
+	Upload *MultipartUpload `bun:"rel:belongs-to,join:upload_id=upload_id"`
 }

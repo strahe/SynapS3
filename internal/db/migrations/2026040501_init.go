@@ -1,0 +1,277 @@
+package migrations
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
+)
+
+func init() {
+	Migrations.MustRegister(up2026040501Init, down2026040501Init)
+}
+
+// up2026040501Init is the squashed development baseline schema.
+// Follow-up migrations should only be added after the first business release.
+func up2026040501Init(ctx context.Context, db *bun.DB) error {
+	// IAM and bucket ownership tables come first because buckets reference S3 accounts.
+	if _, err := db.NewCreateTable().
+		Model((*model.S3Account)(nil)).
+		IfNotExists().
+		ColumnExpr("CONSTRAINT chk_s3_accounts_role CHECK (role IN ('admin', 'user', 'userplus'))").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating s3_accounts table: %w", err)
+	}
+
+	if _, err := db.NewCreateTable().
+		Model((*model.Bucket)(nil)).
+		IfNotExists().
+		ForeignKey("(owner_access_key) REFERENCES s3_accounts(access_key) ON UPDATE CASCADE ON DELETE RESTRICT").
+		ColumnExpr("CONSTRAINT chk_buckets_status CHECK (status IN ('active'))").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating buckets table: %w", err)
+	}
+
+	// Objects are stable key identities; all mutable version data lives in object_versions.
+	if _, err := db.NewCreateTable().
+		Model((*model.Object)(nil)).
+		IfNotExists().
+		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating objects table: %w", err)
+	}
+
+	if _, err := db.NewCreateIndex().
+		Model((*model.Object)(nil)).
+		Index("idx_objects_bucket_key").
+		Column("bucket_id", "key").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating unique index on objects bucket/key: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.Object)(nil)).
+		Index("idx_objects_id_bucket_key").
+		Column("id", "bucket_id", "key").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating unique index on objects identity tuple: %w", err)
+	}
+
+	// Object versions are the source of truth for current data, lifecycle, and storage location.
+	if _, err := db.NewCreateTable().
+		Model((*model.ObjectVersion)(nil)).
+		IfNotExists().
+		ForeignKey("(object_id, bucket_id, key) REFERENCES objects(id, bucket_id, key) ON UPDATE CASCADE ON DELETE CASCADE").
+		ColumnExpr("CONSTRAINT chk_object_versions_state CHECK (state IN ('cached', 'uploading', 'stored', 'failed', 'cache_evicted'))").
+		ColumnExpr("CONSTRAINT chk_object_versions_size CHECK (size >= 0)").
+		ColumnExpr("CONSTRAINT chk_object_versions_filecoin CHECK (in_filecoin = FALSE OR (piece_cid IS NOT NULL AND piece_cid <> '' AND retrieval_url IS NOT NULL AND retrieval_url <> ''))").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating object_versions table: %w", err)
+	}
+
+	// Current-object reads use partial indexes over object_versions.is_current.
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_current_unique").
+		Column("object_id").
+		Where(boolTrueWhere(db, "is_current")).
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating current version unique index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_current_bucket_key").
+		Column("bucket_id", "key").
+		Where(boolTrueWhere(db, "is_current")).
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating current version listing index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_bucket_key_created").
+		ColumnExpr("bucket_id, key, created_at DESC, version_id DESC").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating version history index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_state_updated").
+		Column("state", "updated_at").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating version state index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_content_reuse").
+		ColumnExpr("bucket_id, size, checksum, state, created_at DESC, version_id DESC").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating version content reuse index: %w", err)
+	}
+
+	// Tasks are queue/audit records with polymorphic references, so no FK is declared here.
+	if _, err := db.NewCreateTable().
+		Model((*model.Task)(nil)).
+		IfNotExists().
+		ColumnExpr(`CONSTRAINT chk_tasks_type CHECK ("type" IN ('upload', 'evict_cache'))`).
+		ColumnExpr("CONSTRAINT chk_tasks_status CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'dead_letter'))").
+		ColumnExpr("CONSTRAINT chk_tasks_ref_type CHECK (ref_type IN ('object', 'bucket'))").
+		ColumnExpr("CONSTRAINT chk_tasks_object_ref_version CHECK (ref_type <> 'object' OR ref_version_id <> '')").
+		ColumnExpr("CONSTRAINT chk_tasks_retry_count CHECK (retry_count >= 0)").
+		ColumnExpr("CONSTRAINT chk_tasks_max_retries CHECK (max_retries >= 0)").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating tasks table: %w", err)
+	}
+
+	if _, err := db.NewCreateIndex().
+		Model((*model.Task)(nil)).
+		Index("idx_tasks_status_scheduled").
+		Column("status", "scheduled_at").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating task polling index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.Task)(nil)).
+		Index("idx_tasks_lease_until").
+		Column("lease_until").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating task lease index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.Task)(nil)).
+		Index("idx_tasks_ref_status").
+		Column("ref_type", "ref_id", "status").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating task ref status index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.Task)(nil)).
+		Index("idx_tasks_ref_version_type_status").
+		Column("ref_type", "ref_version_id", "type", "status").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating task ref version index: %w", err)
+	}
+
+	// Secondary IAM and bucket indexes are grouped here to keep table creation order clear.
+	if err := createS3AccountIndexes(ctx, db); err != nil {
+		return err
+	}
+	if err := createBucketIndexes(ctx, db); err != nil {
+		return err
+	}
+
+	// Multipart uploads keep parts separate and cascade-delete parts with their upload.
+	if _, err := db.NewCreateTable().
+		Model((*model.MultipartUpload)(nil)).
+		IfNotExists().
+		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
+		ColumnExpr("CONSTRAINT chk_multipart_uploads_status CHECK (status IN ('initiated', 'completing', 'completed', 'aborted'))").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating multipart_uploads table: %w", err)
+	}
+
+	if _, err := db.NewCreateTable().
+		Model((*model.MultipartPart)(nil)).
+		IfNotExists().
+		ForeignKey("(upload_id) REFERENCES multipart_uploads(upload_id) ON UPDATE CASCADE ON DELETE CASCADE").
+		ColumnExpr("CONSTRAINT chk_multipart_parts_part_number CHECK (part_number >= 1 AND part_number <= 10000)").
+		ColumnExpr("CONSTRAINT chk_multipart_parts_size CHECK (size >= 0)").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating multipart_parts table: %w", err)
+	}
+
+	if _, err := db.NewCreateIndex().
+		Model((*model.MultipartUpload)(nil)).
+		Index("idx_multipart_uploads_bucket_status_key_upload").
+		Column("bucket_id", "status", "key", "upload_id").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating multipart upload listing index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.MultipartPart)(nil)).
+		Index("idx_multipart_parts_upload_part").
+		Column("upload_id", "part_number").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating multipart part unique index: %w", err)
+	}
+
+	return nil
+}
+
+// down2026040501Init drops the baseline schema in reverse dependency order.
+func down2026040501Init(ctx context.Context, db *bun.DB) error {
+	for _, m := range []interface{}{
+		(*model.MultipartPart)(nil),
+		(*model.MultipartUpload)(nil),
+		(*model.Task)(nil),
+		(*model.ObjectVersion)(nil),
+		(*model.Object)(nil),
+		(*model.Bucket)(nil),
+		(*model.S3Account)(nil),
+	} {
+		if _, err := db.NewDropTable().Model(m).IfExists().Exec(ctx); err != nil {
+			return fmt.Errorf("dropping table %T: %w", m, err)
+		}
+	}
+	return nil
+}
+
+func createS3AccountIndexes(ctx context.Context, db *bun.DB) error {
+	if _, err := db.NewCreateIndex().
+		Model((*model.S3Account)(nil)).
+		Index("idx_s3_accounts_is_root").
+		Column("is_root").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating s3 account root index: %w", err)
+	}
+
+	if _, err := db.NewCreateIndex().
+		Model((*model.S3Account)(nil)).
+		Index("idx_s3_accounts_single_root").
+		Column("is_root").
+		Where(boolTrueWhere(db, "is_root")).
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating single root account index: %w", err)
+	}
+	return nil
+}
+
+func createBucketIndexes(ctx context.Context, db *bun.DB) error {
+	if _, err := db.NewCreateIndex().
+		Model((*model.Bucket)(nil)).
+		Index("idx_buckets_owner_access_key").
+		Column("owner_access_key").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating bucket owner index: %w", err)
+	}
+	return nil
+}
+
+// boolTrueWhere emits portable partial-index predicates for PostgreSQL and SQLite.
+func boolTrueWhere(db *bun.DB, column string) string {
+	if db.Dialect().Name() == dialect.PG {
+		return column + " IS TRUE"
+	}
+	return column + " = TRUE"
+}

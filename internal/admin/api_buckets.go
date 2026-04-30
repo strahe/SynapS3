@@ -465,12 +465,12 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 	}
 
 	folders := make([]objectFolderItem, 0)
-	var objects []model.Object
+	var objects []model.ObjectVersion
 	var hasMore bool
 	var nextMarker string
 	var listErr error
 	if delimiter == "" {
-		objects, listErr = s.repos.Objects.ListByBucket(ctx, bucket.ID, prefix, after, limit+1)
+		objects, listErr = s.repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, prefix, after, limit+1)
 		if listErr == nil {
 			hasMore = len(objects) > limit
 			if hasMore {
@@ -492,9 +492,9 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 	items := make([]objectListItem, 0, len(objects))
 	for _, o := range objects {
 		items = append(items, objectListItem{
-			ID:               o.ID,
+			ID:               o.ObjectID,
 			Key:              o.Key,
-			CurrentVersionID: o.CurrentVersionID,
+			CurrentVersionID: o.VersionID,
 			Size:             o.Size,
 			Status:           objectAdminStatus(o.State, o.InCache, o.InFilecoin),
 			Location:         objectLocation{Cache: o.InCache, Filecoin: o.InFilecoin},
@@ -520,26 +520,26 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 
 const adminObjectListingBatchSize = 1000
 
-func (s *Server) listBucketObjectEntries(ctx context.Context, bucketID int64, prefix, delimiter, afterKey string, maxKeys int) ([]objectFolderItem, []model.Object, bool, string, error) {
+func (s *Server) listBucketObjectEntries(ctx context.Context, bucketID int64, prefix, delimiter, afterKey string, maxKeys int) ([]objectFolderItem, []model.ObjectVersion, bool, string, error) {
 	if maxKeys <= 0 {
-		return []objectFolderItem{}, []model.Object{}, false, "", nil
+		return []objectFolderItem{}, []model.ObjectVersion{}, false, "", nil
 	}
 
 	folders := make([]objectFolderItem, 0)
-	objects := make([]model.Object, 0)
+	objects := make([]model.ObjectVersion, 0)
 	seenFolders := make(map[string]struct{})
 	cursor := afterKey
 	lastMarker := afterKey
 	includeCursor := false
 
 	for {
-		var rows []model.Object
+		var rows []model.ObjectVersion
 		var err error
 		if includeCursor {
-			rows, err = s.repos.Objects.ListByBucketAtOrAfter(ctx, bucketID, prefix, cursor, adminObjectListingBatchSize)
+			rows, err = s.repos.Objects.ListCurrentVersionsByBucketAtOrAfter(ctx, bucketID, prefix, cursor, adminObjectListingBatchSize)
 			includeCursor = false
 		} else {
-			rows, err = s.repos.Objects.ListByBucket(ctx, bucketID, prefix, cursor, adminObjectListingBatchSize)
+			rows, err = s.repos.Objects.ListCurrentVersionsByBucket(ctx, bucketID, prefix, cursor, adminObjectListingBatchSize)
 		}
 		if err != nil {
 			return nil, nil, false, "", err
@@ -603,7 +603,7 @@ func (s *Server) listBucketObjectEntries(ctx context.Context, bucketID int64, pr
 	}
 }
 
-func adminListingAdvancePastCurrentPrefix(rows []model.Object, rowIndex int, commonPrefix, delimiter string) (int, string, string, bool, bool) {
+func adminListingAdvancePastCurrentPrefix(rows []model.ObjectVersion, rowIndex int, commonPrefix, delimiter string) (int, string, string, bool, bool) {
 	lastIndex := rowIndex
 	for lastIndex+1 < len(rows) && strings.HasPrefix(rows[lastIndex+1].Key, commonPrefix) {
 		lastIndex++
@@ -774,7 +774,7 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 			PieceCID:    v.PieceCID,
 			CreatedAt:   v.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:   v.UpdatedAt.Format(time.RFC3339),
-			IsCurrent:   v.VersionID == v.CurrentVersionID,
+			IsCurrent:   v.IsCurrent,
 		})
 	}
 

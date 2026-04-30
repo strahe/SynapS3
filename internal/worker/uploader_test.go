@@ -233,7 +233,7 @@ func TestUploader_HappyPath(t *testing.T) {
 		t.Errorf("expected task completed, got %s", got.Status)
 	}
 
-	obj, err := env.repos.Objects.GetByID(ctx, objID)
+	obj, err := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if err != nil {
 		t.Fatalf("get object: %v", err)
 	}
@@ -248,9 +248,9 @@ func TestUploader_HappyPath(t *testing.T) {
 	}
 	var retrievalURL string
 	if err := env.db.NewSelect().
-		TableExpr("objects").
+		TableExpr("object_versions").
 		Column("retrieval_url").
-		Where("id = ?", objID).
+		Where("version_id = ?", versionID).
 		Scan(ctx, &retrievalURL); err != nil {
 		t.Fatalf("select retrieval_url: %v", err)
 	}
@@ -342,12 +342,12 @@ func TestUploader_StoresVersionsFollowingActiveUpload(t *testing.T) {
 		}
 	}
 
-	current, err := env.repos.Objects.GetByID(ctx, objID)
+	current, err := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if err != nil {
 		t.Fatalf("get current object: %v", err)
 	}
-	if current.CurrentVersionID != followerVersionID || current.State != model.ObjectStateStored {
-		t.Fatalf("current object = version:%s state:%s, want %s stored", current.CurrentVersionID, current.State, followerVersionID)
+	if current.VersionID != followerVersionID || current.State != model.ObjectStateStored {
+		t.Fatalf("current object = version:%s state:%s, want %s stored", current.VersionID, current.State, followerVersionID)
 	}
 	if !current.InFilecoin {
 		t.Fatal("current object in_filecoin = false, want true")
@@ -426,12 +426,12 @@ func TestUploader_TerminalUploadFailureFailsVersionsFollowingActiveUpload(t *tes
 		}
 	}
 
-	current, err := env.repos.Objects.GetByID(ctx, objID)
+	current, err := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if err != nil {
 		t.Fatalf("get current object: %v", err)
 	}
-	if current.CurrentVersionID != followerVersionID || current.State != model.ObjectStateFailed {
-		t.Fatalf("current object = version:%s state:%s, want %s failed", current.CurrentVersionID, current.State, followerVersionID)
+	if current.VersionID != followerVersionID || current.State != model.ObjectStateFailed {
+		t.Fatalf("current object = version:%s state:%s, want %s failed", current.VersionID, current.State, followerVersionID)
 	}
 }
 
@@ -465,7 +465,7 @@ func TestUploader_PartialSuccessDoesNotMarkObjectStored(t *testing.T) {
 		t.Fatalf("expected task dead-lettered, got %s", gotTask.Status)
 	}
 
-	obj, err := env.repos.Objects.GetByID(ctx, objID)
+	obj, err := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if err != nil {
 		t.Fatalf("get object: %v", err)
 	}
@@ -559,7 +559,7 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 		t.Errorf("expected task dead_letter, got %s", got.Status)
 	}
 
-	obj, _ := env.repos.Objects.GetByID(ctx, objID)
+	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if obj.State != model.ObjectStateFailed {
 		t.Errorf("expected object state failed, got %s", obj.State)
 	}
@@ -588,7 +588,7 @@ func TestUploader_CacheMissMarksCacheLocationAbsent(t *testing.T) {
 		t.Errorf("expected task requeued to pending, got %s", got.Status)
 	}
 
-	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
 	if obj.State != model.ObjectStateUploading {
 		t.Errorf("expected object state uploading after cache miss retry, got %s", obj.State)
 	}
@@ -645,7 +645,7 @@ func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 		t.Errorf("expected task dead_letter, got %s", got.Status)
 	}
 
-	obj, _ := env.repos.Objects.GetByID(ctx, objID)
+	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if obj.State != model.ObjectStateFailed {
 		t.Errorf("expected object state failed, got %s", obj.State)
 	}
@@ -690,7 +690,7 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 		t.Errorf("expected task completed (evict task already exists = idempotent), got %s", got.Status)
 	}
 
-	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
 	if obj.State != model.ObjectStateStored {
 		t.Errorf("expected object in stored state, got %s", obj.State)
 	}
@@ -741,7 +741,7 @@ func TestUploader_ZeroAvailableFunds_RequeuesTask(t *testing.T) {
 		t.Errorf("expected balance error message, got: %s", le)
 	}
 
-	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
 	if obj.State != model.ObjectStateUploading {
 		t.Errorf("expected object to remain uploading for retry, got %s", obj.State)
 	}
@@ -906,7 +906,7 @@ func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testin
 	if got.Status != model.TaskStatusDeadLetter {
 		t.Fatalf("expected task dead_letter, got %s", got.Status)
 	}
-	obj, _ := env.repos.Objects.GetByID(context.Background(), objID)
+	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
 	if obj.State != model.ObjectStateUploading {
 		t.Fatalf("expected object to remain uploading for manual retry, got %s", obj.State)
 	}
@@ -920,7 +920,7 @@ func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testin
 	if got.Status != model.TaskStatusCompleted {
 		t.Fatalf("expected retried task completed, got %s", got.Status)
 	}
-	obj, _ = env.repos.Objects.GetByID(context.Background(), objID)
+	obj, _ = env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
 	if obj.State != model.ObjectStateStored {
 		t.Fatalf("expected retried object stored, got %s", obj.State)
 	}

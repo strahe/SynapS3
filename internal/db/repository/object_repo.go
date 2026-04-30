@@ -77,7 +77,7 @@ func (r *BunObjectRepo) CreateVersionAndSetCurrentIfChanged(ctx context.Context,
 	}
 }
 
-func (r *BunObjectRepo) GetByID(ctx context.Context, id int64) (*model.Object, error) {
+func (r *BunObjectRepo) GetObjectByID(ctx context.Context, id int64) (*model.Object, error) {
 	obj := new(model.Object)
 	err := r.db.NewSelect().
 		Model(obj).
@@ -92,7 +92,7 @@ func (r *BunObjectRepo) GetByID(ctx context.Context, id int64) (*model.Object, e
 	return obj, nil
 }
 
-func (r *BunObjectRepo) GetByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error) {
+func (r *BunObjectRepo) GetObjectByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error) {
 	obj := new(model.Object)
 	err := r.db.NewSelect().
 		Model(obj).
@@ -105,6 +105,36 @@ func (r *BunObjectRepo) GetByBucketAndKey(ctx context.Context, bucketID int64, k
 		return nil, fmt.Errorf("selecting object by bucket+key: %w", err)
 	}
 	return obj, nil
+}
+
+func (r *BunObjectRepo) GetCurrentVersionByObjectID(ctx context.Context, objectID int64) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	err := r.db.NewSelect().
+		Model(version).
+		Where("object_id = ? AND is_current = ?", objectID, true).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting current object version by object ID: %w", err)
+	}
+	return version, nil
+}
+
+func (r *BunObjectRepo) GetCurrentVersionByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	err := r.db.NewSelect().
+		Model(version).
+		Where("bucket_id = ? AND key = ? AND is_current = ?", bucketID, key, true).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting current object version by bucket+key: %w", err)
+	}
+	return version, nil
 }
 
 func (r *BunObjectRepo) GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error) {
@@ -184,19 +214,19 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 	return version, nil
 }
 
-func (r *BunObjectRepo) ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error) {
-	return r.listByBucket(ctx, bucketID, prefix, afterKey, false, maxKeys)
+func (r *BunObjectRepo) ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.ObjectVersion, error) {
+	return r.listCurrentVersionsByBucket(ctx, bucketID, prefix, afterKey, false, maxKeys)
 }
 
-func (r *BunObjectRepo) ListByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.Object, error) {
-	return r.listByBucket(ctx, bucketID, prefix, fromKey, true, maxKeys)
+func (r *BunObjectRepo) ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.ObjectVersion, error) {
+	return r.listCurrentVersionsByBucket(ctx, bucketID, prefix, fromKey, true, maxKeys)
 }
 
-func (r *BunObjectRepo) listByBucket(ctx context.Context, bucketID int64, prefix string, keyBoundary string, includeBoundary bool, maxKeys int) ([]model.Object, error) {
-	var objects []model.Object
+func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyBoundary string, includeBoundary bool, maxKeys int) ([]model.ObjectVersion, error) {
+	var versions []model.ObjectVersion
 	q := r.db.NewSelect().
-		Model(&objects).
-		Where("bucket_id = ?", bucketID).
+		Model(&versions).
+		Where("bucket_id = ? AND is_current = ?", bucketID, true).
 		OrderExpr("key ASC")
 
 	if prefix != "" {
@@ -214,9 +244,9 @@ func (r *BunObjectRepo) listByBucket(ctx context.Context, bucketID int64, prefix
 		q = q.Limit(maxKeys)
 	}
 	if err := q.Scan(ctx); err != nil {
-		return nil, fmt.Errorf("listing objects: %w", err)
+		return nil, fmt.Errorf("listing current object versions: %w", err)
 	}
-	return objects, nil
+	return versions, nil
 }
 
 func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error) {
@@ -225,8 +255,6 @@ func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64
 		Model(&rows).
 		ModelTableExpr("object_versions AS object_version").
 		ColumnExpr("object_version.*").
-		ColumnExpr("object.current_version_id AS current_version_id").
-		Join("JOIN objects AS object ON object.id = object_version.object_id").
 		Where("object_version.bucket_id = ?", bucketID).
 		OrderExpr("object_version.key ASC").
 		OrderExpr("object_version.created_at DESC").
@@ -268,8 +296,6 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 		Model(&rows).
 		ModelTableExpr("object_versions AS object_version").
 		ColumnExpr("object_version.*").
-		ColumnExpr("object.current_version_id AS current_version_id").
-		Join("JOIN objects AS object ON object.id = object_version.object_id").
 		Where("object_version.bucket_id = ? AND object_version.key = ?", bucketID, key).
 		OrderExpr("object_version.created_at DESC").
 		OrderExpr("object_version.version_id DESC")
@@ -318,18 +344,6 @@ func (r *BunObjectRepo) UpdateVersionStateToFailed(ctx context.Context, versionI
 		if rows == 0 {
 			return fmt.Errorf("state transition %s→failed failed: version %s not in expected state", from, versionID)
 		}
-
-		_, err = db.NewUpdate().
-			Model((*model.Object)(nil)).
-			Set("state = ?", model.ObjectStateFailed).
-			Set("failed_at_state = ?", from).
-			Set("last_error = ?", lastError).
-			Set("updated_at = ?", now).
-			Where("current_version_id = ?", versionID).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("mirroring failed state to current object: %w", err)
-		}
 		return nil
 	})
 }
@@ -359,19 +373,6 @@ func (r *BunObjectRepo) SetVersionStorageInfoAndTransition(ctx context.Context, 
 		if rows == 0 {
 			return fmt.Errorf("SetVersionStorageInfoAndTransition %s→%s failed: version %s not in expected state", from, to, versionID)
 		}
-
-		_, err = db.NewUpdate().
-			Model((*model.Object)(nil)).
-			Set("piece_cid = ?", pieceCID).
-			Set("retrieval_url = ?", retrievalURL).
-			Set("in_filecoin = ?", true).
-			Set("state = ?", to).
-			Set("updated_at = ?", now).
-			Where("current_version_id = ?", versionID).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("mirroring storage info to current object: %w", err)
-		}
 		return nil
 	})
 }
@@ -386,25 +387,6 @@ func (r *BunObjectRepo) SetStorageInfoForUploadingContent(ctx context.Context, b
 		refs = updated
 		if len(refs) == 0 {
 			return fmt.Errorf("no uploading object versions matched content: %w", ErrNotFound)
-		}
-
-		versionIDs := make([]string, 0, len(refs))
-		for _, ref := range refs {
-			versionIDs = append(versionIDs, ref.VersionID)
-		}
-
-		now := time.Now()
-		_, err = db.NewUpdate().
-			Model((*model.Object)(nil)).
-			Set("piece_cid = ?", pieceCID).
-			Set("retrieval_url = ?", retrievalURL).
-			Set("in_filecoin = ?", true).
-			Set("state = ?", model.ObjectStateStored).
-			Set("updated_at = ?", now).
-			Where("current_version_id IN (?)", bun.List(versionIDs)).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("mirroring content storage info to current objects: %w", err)
 		}
 		return nil
 	})
@@ -443,23 +425,6 @@ func (r *BunObjectRepo) FailUploadingContentFollowers(ctx context.Context, bucke
 		if len(refs) == 0 {
 			return fmt.Errorf("no uploading object versions matched content: %w", ErrNotFound)
 		}
-
-		versionIDs := make([]string, 0, len(refs))
-		for _, ref := range refs {
-			versionIDs = append(versionIDs, ref.VersionID)
-		}
-
-		_, err = db.NewUpdate().
-			Model((*model.Object)(nil)).
-			Set("state = ?", model.ObjectStateFailed).
-			Set("failed_at_state = ?", model.ObjectStateUploading).
-			Set("last_error = ?", lastError).
-			Set("updated_at = ?", now).
-			Where("current_version_id IN (?)", bun.List(versionIDs)).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("mirroring failed content state to current objects: %w", err)
-		}
 		return nil
 	})
 	if err != nil {
@@ -491,24 +456,6 @@ func (r *BunObjectRepo) ResetStaleVersionStates(ctx context.Context, fromState, 
 			return err
 		}
 		reset = len(versionIDs)
-		if reset == 0 {
-			return nil
-		}
-
-		now := time.Now()
-		mirror := db.NewUpdate().
-			Model((*model.Object)(nil)).
-			Set("state = ?", toState).
-			Set("updated_at = ?", now).
-			Where("current_version_id IN (?)", bun.List(versionIDs))
-		mirror = applyCacheLocationForState(mirror, toState)
-		if fromState == model.ObjectStateFailed {
-			mirror = mirror.Set("failed_at_state = NULL")
-			mirror = mirror.Set("last_error = NULL")
-		}
-		if _, err := mirror.Exec(ctx); err != nil {
-			return fmt.Errorf("mirroring stale version reset to current objects: %w", err)
-		}
 		return nil
 	})
 	if err != nil {
@@ -521,12 +468,13 @@ func (r *BunObjectRepo) ResetStaleVersionStates(ctx context.Context, fromState, 
 func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, error) {
 	var counts []ObjectStateCount
 	err := r.db.NewSelect().
-		Model((*model.Object)(nil)).
+		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("state, COUNT(*) AS count").
+		Where("is_current = ?", true).
 		GroupExpr("state").
 		Scan(ctx, &counts)
 	if err != nil {
-		return nil, fmt.Errorf("counting objects by state: %w", err)
+		return nil, fmt.Errorf("counting current object versions by state: %w", err)
 	}
 	return counts, nil
 }
@@ -535,11 +483,12 @@ func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, e
 func (r *BunObjectRepo) TotalSize(ctx context.Context) (int64, error) {
 	var total int64
 	err := r.db.NewSelect().
-		Model((*model.Object)(nil)).
+		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("COALESCE(SUM(size), 0)").
+		Where("is_current = ?", true).
 		Scan(ctx, &total)
 	if err != nil {
-		return 0, fmt.Errorf("computing total object size: %w", err)
+		return 0, fmt.Errorf("computing total current object size: %w", err)
 	}
 	return total, nil
 }
@@ -547,11 +496,11 @@ func (r *BunObjectRepo) TotalSize(ctx context.Context) (int64, error) {
 // CountByBucket returns the number of current objects in a bucket.
 func (r *BunObjectRepo) CountByBucket(ctx context.Context, bucketID int64) (int64, error) {
 	count, err := r.db.NewSelect().
-		Model((*model.Object)(nil)).
-		Where("bucket_id = ?", bucketID).
+		Model((*model.ObjectVersion)(nil)).
+		Where("bucket_id = ? AND is_current = ?", bucketID, true).
 		Count(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("counting objects in bucket %d: %w", bucketID, err)
+		return 0, fmt.Errorf("counting current objects in bucket %d: %w", bucketID, err)
 	}
 	return int64(count), nil
 }
@@ -560,17 +509,17 @@ func (r *BunObjectRepo) CountByBucket(ctx context.Context, bucketID int64) (int6
 func (r *BunObjectRepo) TotalSizeByBucket(ctx context.Context, bucketID int64) (int64, error) {
 	var total int64
 	err := r.db.NewSelect().
-		Model((*model.Object)(nil)).
+		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("COALESCE(SUM(size), 0)").
-		Where("bucket_id = ?", bucketID).
+		Where("bucket_id = ? AND is_current = ?", bucketID, true).
 		Scan(ctx, &total)
 	if err != nil {
-		return 0, fmt.Errorf("computing total size for bucket %d: %w", bucketID, err)
+		return 0, fmt.Errorf("computing total current size for bucket %d: %w", bucketID, err)
 	}
 	return total, nil
 }
 
-// AggregateByBucket returns current object count and total size for all buckets.
+// AggregateByBucket returns current object count and total size for all buckets in a single query.
 func (r *BunObjectRepo) AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error) {
 	var rows []struct {
 		BucketID  int64 `bun:"bucket_id"`
@@ -578,14 +527,15 @@ func (r *BunObjectRepo) AggregateByBucket(ctx context.Context) (map[int64]Bucket
 		TotalSize int64 `bun:"total_size"`
 	}
 	err := r.db.NewSelect().
-		Model((*model.Object)(nil)).
+		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("bucket_id").
 		ColumnExpr("COUNT(*) AS count").
 		ColumnExpr("COALESCE(SUM(size), 0) AS total_size").
+		Where("is_current = ?", true).
 		GroupExpr("bucket_id").
 		Scan(ctx, &rows)
 	if err != nil {
-		return nil, fmt.Errorf("aggregating objects by bucket: %w", err)
+		return nil, fmt.Errorf("aggregating current objects by bucket: %w", err)
 	}
 	stats := make(map[int64]BucketObjectStats, len(rows))
 	for _, row := range rows {
@@ -613,13 +563,19 @@ func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, versio
 	if err != nil && err != sql.ErrNoRows {
 		return ObjectVersionWriteResult{}, fmt.Errorf("checking existing object: %w", err)
 	}
-	if err == nil && objectSnapshotMatchesVersion(existing, version) {
-		return ObjectVersionWriteResult{
-			ObjectID:  existing.ID,
-			VersionID: existing.CurrentVersionID,
-			ETag:      existing.ETag,
-			Created:   false,
-		}, nil
+	if err == nil {
+		current, currentErr := selectCurrentVersionByObjectID(ctx, db, existing.ID)
+		if currentErr != nil && currentErr != sql.ErrNoRows {
+			return ObjectVersionWriteResult{}, fmt.Errorf("checking current version: %w", currentErr)
+		}
+		if currentErr == nil && objectVersionMatchesVersion(current, version) {
+			return ObjectVersionWriteResult{
+				ObjectID:  existing.ID,
+				VersionID: current.VersionID,
+				ETag:      current.ETag,
+				Created:   false,
+			}, nil
+		}
 	}
 
 	result, err := createVersionAndSetCurrentFromExisting(ctx, db, version, existing, err)
@@ -630,6 +586,9 @@ func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, versio
 }
 
 func createVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (int64, error) {
+	if err := lockCurrentObjectIfExists(ctx, db, version.BucketID, version.Key); err != nil {
+		return 0, err
+	}
 	existing, err := selectObjectByBucketAndKey(ctx, db, version.BucketID, version.Key)
 	if err != nil && err != sql.ErrNoRows {
 		return 0, fmt.Errorf("checking existing object: %w", err)
@@ -647,7 +606,7 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 	now := time.Now()
 
 	if existingErr == sql.ErrNoRows {
-		obj := objectFromVersion(version)
+		obj := objectIdentityFromVersion(version)
 		obj.CreatedAt = now
 		obj.UpdatedAt = now
 		if _, insertErr := db.NewInsert().Model(obj).Exec(ctx); insertErr != nil {
@@ -655,58 +614,51 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 				return ObjectVersionWriteResult{}, fmt.Errorf("inserting new object: %w", insertErr)
 			}
 			return ObjectVersionWriteResult{}, fmt.Errorf("%w: inserting new object: %w", errConcurrentObjectCreate, insertErr)
-		} else {
-			version.ObjectID = obj.ID
-			if version.CreatedAt.IsZero() {
-				version.CreatedAt = now
-			}
-			if version.UpdatedAt.IsZero() {
-				version.UpdatedAt = now
-			}
-			if _, insertErr := db.NewInsert().Model(version).Exec(ctx); insertErr != nil {
-				return ObjectVersionWriteResult{}, fmt.Errorf("inserting object version: %w", insertErr)
-			}
-			return ObjectVersionWriteResult{
-				ObjectID:  obj.ID,
-				VersionID: version.VersionID,
-				ETag:      version.ETag,
-				Created:   true,
-			}, nil
 		}
+
+		version.ObjectID = obj.ID
+		version.IsCurrent = true
+		if version.CreatedAt.IsZero() {
+			version.CreatedAt = now
+		}
+		if version.UpdatedAt.IsZero() {
+			version.UpdatedAt = now
+		}
+		if _, insertErr := db.NewInsert().Model(version).Exec(ctx); insertErr != nil {
+			return ObjectVersionWriteResult{}, fmt.Errorf("inserting object version: %w", insertErr)
+		}
+		return ObjectVersionWriteResult{
+			ObjectID:  obj.ID,
+			VersionID: version.VersionID,
+			ETag:      version.ETag,
+			Created:   true,
+		}, nil
 	}
 
 	version.ObjectID = existing.ID
+	version.IsCurrent = true
 	if version.CreatedAt.IsZero() {
 		version.CreatedAt = now
 	}
 	if version.UpdatedAt.IsZero() {
 		version.UpdatedAt = now
 	}
+	if _, err := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("is_current = ?", false).
+		Where("object_id = ? AND is_current = ?", existing.ID, true).
+		Exec(ctx); err != nil {
+		return ObjectVersionWriteResult{}, fmt.Errorf("clearing previous current version: %w", err)
+	}
 	if _, insertErr := db.NewInsert().Model(version).Exec(ctx); insertErr != nil {
 		return ObjectVersionWriteResult{}, fmt.Errorf("inserting object version: %w", insertErr)
 	}
-
-	_, updateErr := db.NewUpdate().
+	if _, updateErr := db.NewUpdate().
 		Model((*model.Object)(nil)).
-		Set("current_version_id = ?", version.VersionID).
-		Set("size = ?", version.Size).
-		Set("e_tag = ?", version.ETag).
-		Set("checksum = ?", version.Checksum).
-		Set("content_type = ?", version.ContentType).
-		Set("metadata = ?", version.Metadata).
-		Set("cache_key = ?", version.CacheKey).
-		Set("piece_cid = ?", version.PieceCID).
-		Set("retrieval_url = ?", version.RetrievalURL).
-		Set("in_cache = ?", version.InCache).
-		Set("in_filecoin = ?", version.InFilecoin).
-		Set("state = ?", version.State).
-		Set("failed_at_state = NULL").
-		Set("last_error = NULL").
 		Set("updated_at = ?", now).
 		Where("id = ?", existing.ID).
-		Exec(ctx)
-	if updateErr != nil {
-		return ObjectVersionWriteResult{}, fmt.Errorf("updating current object snapshot: %w", updateErr)
+		Exec(ctx); updateErr != nil {
+		return ObjectVersionWriteResult{}, fmt.Errorf("updating object identity timestamp: %w", updateErr)
 	}
 	return ObjectVersionWriteResult{
 		ObjectID:  existing.ID,
@@ -745,6 +697,18 @@ func selectObjectByBucketAndKey(ctx context.Context, db bun.IDB, bucketID int64,
 	return obj, nil
 }
 
+func selectCurrentVersionByObjectID(ctx context.Context, db bun.IDB, objectID int64) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	err := db.NewSelect().
+		Model(version).
+		Where("object_id = ? AND is_current = ?", objectID, true).
+		Scan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return version, nil
+}
+
 func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, key string) error {
 	if _, err := db.NewUpdate().
 		Model((*model.Object)(nil)).
@@ -756,15 +720,15 @@ func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, 
 	return nil
 }
 
-func objectSnapshotMatchesVersion(obj *model.Object, version *model.ObjectVersion) bool {
-	if obj == nil || obj.State == model.ObjectStateFailed {
+func objectVersionMatchesVersion(current *model.ObjectVersion, version *model.ObjectVersion) bool {
+	if current == nil || current.State == model.ObjectStateFailed {
 		return false
 	}
-	return obj.Size == version.Size &&
-		obj.ETag == version.ETag &&
-		obj.Checksum == version.Checksum &&
-		obj.ContentType == version.ContentType &&
-		maps.Equal(obj.Metadata, version.Metadata)
+	return current.Size == version.Size &&
+		current.ETag == version.ETag &&
+		current.Checksum == version.Checksum &&
+		current.ContentType == version.ContentType &&
+		maps.Equal(current.Metadata, version.Metadata)
 }
 
 func updateVersionState(ctx context.Context, db bun.IDB, versionID string, from, to model.ObjectState) error {
@@ -786,20 +750,6 @@ func updateVersionState(ctx context.Context, db bun.IDB, versionID string, from,
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("state transition %s→%s failed: version %s not in expected state", from, to, versionID)
-	}
-
-	mirror := db.NewUpdate().
-		Model((*model.Object)(nil)).
-		Set("state = ?", to).
-		Set("updated_at = ?", now).
-		Where("current_version_id = ?", versionID)
-	mirror = applyCacheLocationForState(mirror, to)
-	if from == model.ObjectStateFailed {
-		mirror = mirror.Set("failed_at_state = NULL")
-		mirror = mirror.Set("last_error = NULL")
-	}
-	if _, err := mirror.Exec(ctx); err != nil {
-		return fmt.Errorf("mirroring version state to current object: %w", err)
 	}
 	return nil
 }
@@ -848,24 +798,10 @@ func setStorageInfoForUploadingContent(ctx context.Context, db bun.IDB, bucketID
 	return refs, nil
 }
 
-func objectFromVersion(version *model.ObjectVersion) *model.Object {
+func objectIdentityFromVersion(version *model.ObjectVersion) *model.Object {
 	return &model.Object{
-		BucketID:         version.BucketID,
-		Key:              version.Key,
-		CurrentVersionID: version.VersionID,
-		Size:             version.Size,
-		ETag:             version.ETag,
-		Checksum:         version.Checksum,
-		ContentType:      version.ContentType,
-		Metadata:         version.Metadata,
-		CacheKey:         version.CacheKey,
-		PieceCID:         version.PieceCID,
-		RetrievalURL:     version.RetrievalURL,
-		InCache:          version.InCache,
-		InFilecoin:       version.InFilecoin,
-		State:            version.State,
-		FailedAtState:    version.FailedAtState,
-		LastError:        version.LastError,
+		BucketID: version.BucketID,
+		Key:      version.Key,
 	}
 }
 
@@ -881,14 +817,6 @@ func setVersionCachePresence(ctx context.Context, db bun.IDB, versionID string, 
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("setting version cache presence: version %s not found", versionID)
-	}
-
-	if _, err := db.NewUpdate().
-		Model((*model.Object)(nil)).
-		Set("in_cache = ?", inCache).
-		Where("current_version_id = ?", versionID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("mirroring version cache presence to current object: %w", err)
 	}
 	return nil
 }

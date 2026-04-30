@@ -147,22 +147,22 @@ func (r *recordingObjectListRepo) scanCalls() int {
 	return r.listCalls + r.atOrAfterCalls
 }
 
-func (r *recordingObjectListRepo) ListByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.Object, error) {
+func (r *recordingObjectListRepo) ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.ObjectVersion, error) {
 	r.listCalls++
 	return r.list(prefix, func(key string) bool {
 		return afterKey == "" || key > afterKey
 	}, maxKeys), nil
 }
 
-func (r *recordingObjectListRepo) ListByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.Object, error) {
+func (r *recordingObjectListRepo) ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.ObjectVersion, error) {
 	r.atOrAfterCalls++
 	return r.list(prefix, func(key string) bool {
 		return fromKey == "" || key >= fromKey
 	}, maxKeys), nil
 }
 
-func (r *recordingObjectListRepo) list(prefix string, include func(string) bool, maxKeys int) []model.Object {
-	objects := make([]model.Object, 0)
+func (r *recordingObjectListRepo) list(prefix string, include func(string) bool, maxKeys int) []model.ObjectVersion {
+	objects := make([]model.ObjectVersion, 0)
 	for _, key := range r.keys {
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			continue
@@ -170,7 +170,7 @@ func (r *recordingObjectListRepo) list(prefix string, include func(string) bool,
 		if !include(key) {
 			continue
 		}
-		objects = append(objects, model.Object{Key: key})
+		objects = append(objects, model.ObjectVersion{Key: key})
 		if maxKeys > 0 && len(objects) >= maxKeys {
 			break
 		}
@@ -1518,9 +1518,9 @@ func TestAPIBucket_DeleteRecursiveReturnsNotImplemented(t *testing.T) {
 		t.Fatalf("bucket status = %s, want %s", updated.Status, model.BucketStatusActive)
 	}
 
-	objects, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
+	objects, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "", "", 0)
 	if err != nil {
-		t.Fatalf("Objects.ListByBucket: %v", err)
+		t.Fatalf("Objects.ListCurrentVersionsByBucket: %v", err)
 	}
 	if len(objects) != 1 {
 		t.Fatalf("visible objects len = %d, want 1", len(objects))

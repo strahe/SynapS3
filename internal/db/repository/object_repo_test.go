@@ -50,15 +50,15 @@ func TestObjectRepo_CreateVersionAndSetCurrent_SecondUploadKeepsVersionHistory(t
 		t.Fatalf("object id changed on second upload: got %d want %d", objectID2, objectID)
 	}
 
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
-	if current.CurrentVersionID != v2.VersionID {
-		t.Fatalf("current version = %s, want %s", current.CurrentVersionID, v2.VersionID)
+	if current.VersionID != v2.VersionID {
+		t.Fatalf("current version = %s, want %s", current.VersionID, v2.VersionID)
 	}
 	if current.Size != 20 || current.ETag != v2.ETag || current.CacheKey != v2.CacheKey {
-		t.Fatalf("current snapshot not refreshed: size=%d etag=%s cache=%s", current.Size, current.ETag, current.CacheKey)
+		t.Fatalf("current version not refreshed: size=%d etag=%s cache=%s", current.Size, current.ETag, current.CacheKey)
 	}
 
 	gotV1, err := repos.Objects.GetVersionByID(ctx, v1.VersionID)
@@ -227,7 +227,7 @@ func TestObjectRepo_CreateVersionAndSetCurrentIfChanged_ConcurrentIdenticalWrite
 	}
 }
 
-func TestObjectRepo_ListByBucketReadsCurrentSnapshotOnly(t *testing.T) {
+func TestObjectRepo_ListByBucketReadsCurrentVersionOnly(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -251,18 +251,18 @@ func TestObjectRepo_ListByBucketReadsCurrentSnapshotOnly(t *testing.T) {
 		t.Fatalf("second b.txt upload: %v", err)
 	}
 
-	all, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "", 0)
+	all, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "", "", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket: %v", err)
 	}
 	if len(all) != 3 {
 		t.Fatalf("object count = %d, want 3 current keys", len(all))
 	}
-	if all[1].Key != "b.txt" || all[1].CurrentVersionID != latestB.VersionID || all[1].Size != 22 {
-		t.Fatalf("b.txt current snapshot = key:%s version:%s size:%d", all[1].Key, all[1].CurrentVersionID, all[1].Size)
+	if all[1].Key != "b.txt" || all[1].VersionID != latestB.VersionID || all[1].Size != 22 {
+		t.Fatalf("b.txt current version = key:%s version:%s size:%d", all[1].Key, all[1].VersionID, all[1].Size)
 	}
 
-	prefixed, err := repos.Objects.ListByBucket(ctx, bucket.ID, "dir/", "", 0)
+	prefixed, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "dir/", "", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket(prefix): %v", err)
 	}
@@ -270,7 +270,7 @@ func TestObjectRepo_ListByBucketReadsCurrentSnapshotOnly(t *testing.T) {
 		t.Fatalf("prefixed keys = %#v", prefixed)
 	}
 
-	afterKey, err := repos.Objects.ListByBucket(ctx, bucket.ID, "", "a.txt", 0)
+	afterKey, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "", "a.txt", 0)
 	if err != nil {
 		t.Fatalf("ListByBucket(afterKey): %v", err)
 	}
@@ -278,7 +278,7 @@ func TestObjectRepo_ListByBucketReadsCurrentSnapshotOnly(t *testing.T) {
 		t.Fatalf("afterKey result = %#v", afterKey)
 	}
 
-	fromKey, err := repos.Objects.ListByBucketAtOrAfter(ctx, bucket.ID, "", "b.txt", 0)
+	fromKey, err := repos.Objects.ListCurrentVersionsByBucketAtOrAfter(ctx, bucket.ID, "", "b.txt", 0)
 	if err != nil {
 		t.Fatalf("ListByBucketAtOrAfter(fromKey): %v", err)
 	}
@@ -448,12 +448,12 @@ func TestObjectRepo_SetStorageInfoForUploadingContentUpdatesMatchingVersions(t *
 		}
 	}
 
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
-	if current.CurrentVersionID != currentVersion.VersionID || current.State != model.ObjectStateStored {
-		t.Fatalf("current snapshot = version:%s state:%s, want %s stored", current.CurrentVersionID, current.State, currentVersion.VersionID)
+	if current.VersionID != currentVersion.VersionID || current.State != model.ObjectStateStored {
+		t.Fatalf("current version = version:%s state:%s, want %s stored", current.VersionID, current.State, currentVersion.VersionID)
 	}
 	if current.PieceCID == nil || *current.PieceCID != "piece-shared" {
 		t.Fatalf("current piece = %v, want piece-shared", current.PieceCID)
@@ -579,8 +579,8 @@ func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
 	if rows[0].Key != "a.txt" || rows[0].VersionID != currentVersion.VersionID {
 		t.Fatalf("first row = %s/%s, want current a.txt", rows[0].Key, rows[0].VersionID)
 	}
-	if rows[0].CurrentVersionID != currentVersion.VersionID {
-		t.Fatalf("current marker = %s, want %s", rows[0].CurrentVersionID, currentVersion.VersionID)
+	if rows[0].VersionID != currentVersion.VersionID {
+		t.Fatalf("current marker = %s, want %s", rows[0].VersionID, currentVersion.VersionID)
 	}
 
 	page, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", rows[0].Key, rows[0].VersionID, 10)
@@ -610,18 +610,18 @@ func TestObjectRepo_VersionStateUpdatesOnlyMirrorCurrentVersion(t *testing.T) {
 	if err := repos.Objects.UpdateVersionState(ctx, v1.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("UpdateVersionState(old): %v", err)
 	}
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
-	if current.CurrentVersionID != v2.VersionID || current.State != model.ObjectStateCached {
-		t.Fatalf("old version update polluted current snapshot: version=%s state=%s", current.CurrentVersionID, current.State)
+	if current.VersionID != v2.VersionID || current.State != model.ObjectStateCached {
+		t.Fatalf("old version update polluted current version: version=%s state=%s", current.VersionID, current.State)
 	}
 
 	if err := repos.Objects.UpdateVersionState(ctx, v2.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("UpdateVersionState(current): %v", err)
 	}
-	current, err = repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err = repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey after current update: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestObjectRepo_UpdateVersionStateFromFailedClearsFailureDetails(t *testing.
 	if got.LastError != nil {
 		t.Fatalf("version last_error = %#v, want nil", got.LastError)
 	}
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil || current == nil {
 		t.Fatalf("current after retry: got=%v err=%v", current, err)
 	}
@@ -694,12 +694,12 @@ func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(
 	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, oldVersion.VersionID, "piece-old", "https://old.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatalf("old SetVersionStorageInfoAndTransition: %v", err)
 	}
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
 	if current.PieceCID != nil || current.RetrievalURL != nil || current.State != model.ObjectStateCached {
-		t.Fatalf("old storage update polluted current snapshot: piece=%v url=%v state=%s", current.PieceCID, current.RetrievalURL, current.State)
+		t.Fatalf("old storage update polluted current version: piece=%v url=%v state=%s", current.PieceCID, current.RetrievalURL, current.State)
 	}
 	if current.InFilecoin {
 		t.Fatal("old storage update polluted current in_filecoin")
@@ -711,7 +711,7 @@ func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(
 	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, currentVersion.VersionID, "piece-current", "https://current.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatalf("current SetVersionStorageInfoAndTransition: %v", err)
 	}
-	current, err = repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err = repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey after current storage: %v", err)
 	}
@@ -744,7 +744,7 @@ func TestObjectRepo_SetVersionCachePresenceMirrorsOnlyCurrentVersion(t *testing.
 	if err := repos.Objects.SetVersionCachePresence(ctx, oldVersion.VersionID, false); err != nil {
 		t.Fatalf("old SetVersionCachePresence: %v", err)
 	}
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
@@ -755,7 +755,7 @@ func TestObjectRepo_SetVersionCachePresenceMirrorsOnlyCurrentVersion(t *testing.
 	if err := repos.Objects.SetVersionCachePresence(ctx, currentVersion.VersionID, false); err != nil {
 		t.Fatalf("current SetVersionCachePresence: %v", err)
 	}
-	current, err = repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err = repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey after current cache update: %v", err)
 	}
@@ -792,7 +792,7 @@ func TestObjectRepo_UpdateVersionStateMarksCacheEvictedLocation(t *testing.T) {
 	if got.InCache {
 		t.Fatal("version in_cache = true, want false")
 	}
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
@@ -866,7 +866,7 @@ func TestObjectRepo_ResetStaleVersionStatesFromFailedClearsFailureDetails(t *tes
 	if got.FailedAtState != nil || got.LastError != nil {
 		t.Fatalf("version failure details = failed_at_state:%#v last_error:%#v, want nil", got.FailedAtState, got.LastError)
 	}
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil || current == nil {
 		t.Fatalf("current after reset: got=%v err=%v", current, err)
 	}
@@ -908,16 +908,16 @@ func TestObjectRepo_ResetStaleVersionStatesDoesNotMirrorOldVersion(t *testing.T)
 		t.Fatalf("reset count = %d, want 1", reset)
 	}
 
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "file.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
-	if current.CurrentVersionID != currentVersion.VersionID || current.State != model.ObjectStateStored {
-		t.Fatalf("current snapshot polluted: version=%s state=%s", current.CurrentVersionID, current.State)
+	if current.VersionID != currentVersion.VersionID || current.State != model.ObjectStateStored {
+		t.Fatalf("current version polluted: version=%s state=%s", current.VersionID, current.State)
 	}
 }
 
-func TestObjectRepo_ResetStaleVersionStatesDoesNotMirrorSkippedRows(t *testing.T) {
+func TestObjectRepo_ResetStaleVersionStatesLeavesSkippedVersionUnchanged(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -929,13 +929,6 @@ func TestObjectRepo_ResetStaleVersionStatesDoesNotMirrorSkippedRows(t *testing.T
 	}
 	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("current uploading: %v", err)
-	}
-	if _, err := db.NewUpdate().
-		Model((*model.Object)(nil)).
-		Set("state = ?", model.ObjectStateStored).
-		Where("current_version_id = ?", currentVersion.VersionID).
-		Exec(ctx); err != nil {
-		t.Fatalf("seeding current snapshot state: %v", err)
 	}
 
 	otherVersion := newObjectVersion(bucket.ID, "other.txt", "01J00000000000000000000062", 20)
@@ -965,24 +958,24 @@ func TestObjectRepo_ResetStaleVersionStatesDoesNotMirrorSkippedRows(t *testing.T
 		t.Fatalf("reset count = %d, want 1", reset)
 	}
 
-	current, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "current.txt")
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "current.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey(current): %v", err)
 	}
-	if current.State != model.ObjectStateStored {
-		t.Fatalf("skipped current snapshot state = %s, want stored", current.State)
+	if current.State != model.ObjectStateUploading {
+		t.Fatalf("skipped current version state = %s, want uploading", current.State)
 	}
 
-	other, err := repos.Objects.GetByBucketAndKey(ctx, bucket.ID, "other.txt")
+	other, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "other.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey(other): %v", err)
 	}
 	if other.State != model.ObjectStateCached {
-		t.Fatalf("updated current snapshot state = %s, want cached", other.State)
+		t.Fatalf("updated current version state = %s, want cached", other.State)
 	}
 }
 
-func TestObjectRepo_CurrentStatsUseObjectsSnapshot(t *testing.T) {
+func TestObjectRepo_CurrentStatsUseCurrentVersions(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()

@@ -150,49 +150,49 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 		return nil, ErrNoSuchBucket
 	}
 
-	obj, err := r.repos.Objects.GetByBucketAndKey(ctx, bucket.ID, key)
+	version, err := r.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, key)
 	if err != nil {
 		return nil, fmt.Errorf("querying object: %w", err)
 	}
-	if obj == nil {
+	if version == nil {
 		return nil, ErrNoSuchKey
 	}
 
-	body, _, cacheErr := r.cache.Get(ctx, bucketName, obj.CacheKey)
+	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
 	if cacheErr == nil {
-		if !obj.InCache {
-			r.markCachePresence(ctx, obj.CurrentVersionID, true)
+		if !version.InCache {
+			r.markCachePresence(ctx, version.VersionID, true)
 		}
-		return resultFromObject(obj, body, SourceCache, cacheMiss), nil
+		return resultFromVersion(version, body, SourceCache, cacheMiss), nil
 	}
 	if !os.IsNotExist(cacheErr) {
 		return nil, fmt.Errorf("%w: %w", ErrCacheRead, cacheErr)
 	}
 	cacheMiss = true
-	if obj.InCache {
-		r.markCachePresence(ctx, obj.CurrentVersionID, false)
+	if version.InCache {
+		r.markCachePresence(ctx, version.VersionID, false)
 	}
 
-	if obj.PieceCID == nil || *obj.PieceCID == "" || obj.RetrievalURL == nil || *obj.RetrievalURL == "" || r.storage == nil {
+	if version.PieceCID == nil || *version.PieceCID == "" || version.RetrievalURL == nil || *version.RetrievalURL == "" || r.storage == nil {
 		return nil, cacheMissError(ErrNoSuchKey)
 	}
-	pieceCID, err := cid.Decode(*obj.PieceCID)
+	pieceCID, err := cid.Decode(*version.PieceCID)
 	if err != nil {
-		r.logger.Warn("invalid PieceCID, cannot download from provider", "key", key, "pieceCID", *obj.PieceCID)
+		r.logger.Warn("invalid PieceCID, cannot download from provider", "key", key, "pieceCID", *version.PieceCID)
 		return nil, cacheMissError(ErrNoSuchKey)
 	}
 
-	rc, err := r.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: *obj.RetrievalURL})
+	rc, err := r.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: *version.RetrievalURL})
 	if err != nil {
 		r.logger.Warn("provider download failed", "key", key, "err", err)
 		return nil, fmt.Errorf("%w: %w: %w", ErrCacheMiss, ErrProviderDownload, err)
 	}
 
-	cur, dbErr := r.repos.Objects.GetByID(ctx, obj.ID)
+	cur, dbErr := r.repos.Objects.GetCurrentVersionByObjectID(ctx, version.ObjectID)
 	if dbErr != nil {
 		r.logger.Warn("version check failed, skipping cache rehydration", "key", key, "error", dbErr)
 	}
-	if dbErr == nil && (cur == nil || cur.CurrentVersionID != obj.CurrentVersionID) {
+	if dbErr == nil && (cur == nil || cur.VersionID != version.VersionID) {
 		_ = rc.Close()
 		if allowRestart && cur != nil {
 			return r.open(ctx, bucketName, key, visible, false, true)
@@ -201,24 +201,10 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 	}
 
 	body = rc
-	if dbErr == nil && cur != nil && cur.CurrentVersionID == obj.CurrentVersionID {
-		body = r.streamAndRehydrate(ctx, bucketName, obj.CacheKey, obj.CurrentVersionID, rc)
+	if dbErr == nil && cur != nil && cur.VersionID == version.VersionID {
+		body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, version.VersionID, rc)
 	}
-	return resultFromObject(obj, body, SourceProvider, cacheMiss), nil
-}
-
-func resultFromObject(obj *model.Object, body io.ReadCloser, source Source, cacheMiss bool) *Result {
-	return &Result{
-		Body:         body,
-		Size:         obj.Size,
-		ETag:         obj.ETag,
-		Checksum:     obj.Checksum,
-		VersionID:    obj.CurrentVersionID,
-		ContentType:  obj.ContentType,
-		LastModified: obj.UpdatedAt,
-		Source:       source,
-		CacheMiss:    cacheMiss,
-	}
+	return resultFromVersion(version, body, SourceProvider, cacheMiss), nil
 }
 
 func resultFromVersion(version *model.ObjectVersion, body io.ReadCloser, source Source, cacheMiss bool) *Result {

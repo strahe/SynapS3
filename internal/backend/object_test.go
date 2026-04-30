@@ -79,20 +79,20 @@ func touchVersionLifecycle(t *testing.T, tb *testBackend, ctx context.Context, v
 	return version
 }
 
-type getByBucketAndKeyAfterReadRepo struct {
+type getCurrentVersionByBucketAndKeyAfterReadRepo struct {
 	repository.ObjectRepository
 	calls          int
 	afterFirstRead func()
 }
 
-func (r *getByBucketAndKeyAfterReadRepo) GetByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error) {
+func (r *getCurrentVersionByBucketAndKeyAfterReadRepo) GetCurrentVersionByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.ObjectVersion, error) {
 	r.calls++
-	obj, err := r.ObjectRepository.GetByBucketAndKey(ctx, bucketID, key)
+	version, err := r.ObjectRepository.GetCurrentVersionByBucketAndKey(ctx, bucketID, key)
 	if r.calls == 1 && r.afterFirstRead != nil {
 		r.afterFirstRead()
 		r.afterFirstRead = nil
 	}
-	return obj, err
+	return version, err
 }
 
 func seedBackendObjectVersion(t *testing.T, tb *testBackend, bucket *model.Bucket, key string, size int64, etag, checksum, contentType string, state model.ObjectState, pieceCID, retrievalURL *string) (int64, string) {
@@ -165,7 +165,7 @@ func TestPutObject_HappyPath(t *testing.T) {
 
 	// Verify DB record.
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "put-bucket")
-	obj, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "greeting.txt")
+	obj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "greeting.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestPutObject_HappyPath(t *testing.T) {
 	if obj.Size != int64(len(body)) {
 		t.Errorf("object size = %d, want %d", obj.Size, len(body))
 	}
-	if obj.CurrentVersionID == "" {
+	if obj.VersionID == "" {
 		t.Fatal("expected current version id")
 	}
 
@@ -246,28 +246,28 @@ func TestPutObject_Overwrite(t *testing.T) {
 	putTestObject(t, tb, "ow-bucket", "file.txt", "version-1")
 
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "ow-bucket")
-	obj1, _ := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
-	if obj1.CurrentVersionID == "" {
+	obj1, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
+	if obj1.VersionID == "" {
 		t.Fatal("first current version id is empty")
 	}
-	firstVersionID := obj1.CurrentVersionID
+	firstVersionID := obj1.VersionID
 
 	putTestObject(t, tb, "ow-bucket", "file.txt", "version-2")
 
-	obj2, _ := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
-	if obj2.CurrentVersionID == "" || obj2.CurrentVersionID == firstVersionID {
-		t.Fatalf("second current version id = %q, first = %q", obj2.CurrentVersionID, firstVersionID)
+	obj2, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
+	if obj2.VersionID == "" || obj2.VersionID == firstVersionID {
+		t.Fatalf("second current version id = %q, first = %q", obj2.VersionID, firstVersionID)
 	}
 	firstVersion, err := tb.repos.Objects.GetVersionByID(ctx, firstVersionID)
 	if err != nil || firstVersion == nil {
 		t.Fatalf("first version missing: version=%v err=%v", firstVersion, err)
 	}
-	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, obj2.CurrentVersionID)
+	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, obj2.VersionID)
 	if err != nil || secondVersion == nil {
 		t.Fatalf("second version missing: version=%v err=%v", secondVersion, err)
 	}
-	if firstVersion.ObjectID != obj2.ID || secondVersion.ObjectID != obj2.ID {
-		t.Fatalf("versions should reference object %d, got %d/%d", obj2.ID, firstVersion.ObjectID, secondVersion.ObjectID)
+	if firstVersion.ObjectID != obj2.ObjectID || secondVersion.ObjectID != obj2.ObjectID {
+		t.Fatalf("versions should reference object %d, got %d/%d", obj2.ObjectID, firstVersion.ObjectID, secondVersion.ObjectID)
 	}
 }
 
@@ -279,14 +279,14 @@ func TestPutObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	firstOut := putTestObjectOutput(t, tb, "dedupe-bucket", "file.txt", "same data")
 
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "dedupe-bucket")
-	obj1, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
+	obj1, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || obj1 == nil {
 		t.Fatalf("current object after first put: obj=%v err=%v", obj1, err)
 	}
 
 	secondOut := putTestObjectOutput(t, tb, "dedupe-bucket", "file.txt", "same data")
 
-	obj2, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
+	obj2, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || obj2 == nil {
 		t.Fatalf("current object after second put: obj=%v err=%v", obj2, err)
 	}
@@ -296,13 +296,13 @@ func TestPutObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	if secondOut.VersionID == "" || secondOut.VersionID == firstOut.VersionID {
 		t.Fatalf("second VersionID = %q, first = %q", secondOut.VersionID, firstOut.VersionID)
 	}
-	if obj2.CurrentVersionID == obj1.CurrentVersionID {
-		t.Fatalf("current version did not change for identical put: %s", obj2.CurrentVersionID)
+	if obj2.VersionID == obj1.VersionID {
+		t.Fatalf("current version did not change for identical put: %s", obj2.VersionID)
 	}
 
 	versionCount, err := tb.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
-		Where("object_id = ?", obj1.ID).
+		Where("object_id = ?", obj1.ObjectID).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting object versions: %v", err)
@@ -313,7 +313,7 @@ func TestPutObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 
 	taskCount, err := tb.db.NewSelect().
 		Model((*model.Task)(nil)).
-		Where("ref_type = ? AND ref_id = ?", "object", obj1.ID).
+		Where("ref_type = ? AND ref_id = ?", "object", obj1.ObjectID).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting upload tasks: %v", err)
@@ -338,7 +338,7 @@ func TestPutObjectIdenticalUploadingContentFollowsActiveUploadTask(t *testing.T)
 
 	firstOut := putTestObjectOutput(t, tb, "uploading-reuse-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "uploading-reuse-bucket")
-	firstObj, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
+	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
 		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
 	}
@@ -391,14 +391,14 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 
 	firstOut := putTestObjectOutput(t, tb, "stored-reuse-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "stored-reuse-bucket")
-	firstObj, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
+	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
 		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
 	}
-	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.CurrentVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("mark first version uploading: %v", err)
 	}
-	if err := tb.repos.Objects.SetVersionStorageInfoAndTransition(ctx, firstObj.CurrentVersionID, "piece-shared", "https://provider.example/shared", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+	if err := tb.repos.Objects.SetVersionStorageInfoAndTransition(ctx, firstObj.VersionID, "piece-shared", "https://provider.example/shared", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatalf("mark first version stored: %v", err)
 	}
 
@@ -441,14 +441,14 @@ func TestPutObjectIdenticalStoredContentQueuesEvictWhenAutoEvictEnabled(t *testi
 
 	putTestObject(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "stored-reuse-evict-bucket")
-	firstObj, err := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "file.txt")
+	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
 		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
 	}
-	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.CurrentVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("mark first version uploading: %v", err)
 	}
-	if err := tb.repos.Objects.SetVersionStorageInfoAndTransition(ctx, firstObj.CurrentVersionID, "piece-shared", "https://provider.example/shared", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+	if err := tb.repos.Objects.SetVersionStorageInfoAndTransition(ctx, firstObj.VersionID, "piece-shared", "https://provider.example/shared", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		t.Fatalf("mark first version stored: %v", err)
 	}
 
@@ -1223,7 +1223,7 @@ func TestCopyObject_HappyPath(t *testing.T) {
 
 	// Verify destination object in DB.
 	dstBkt, _ := tb.repos.Buckets.GetByName(ctx, "dst-bucket")
-	dstObj, _ := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
+	dstObj, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
 	if dstObj == nil {
 		t.Fatal("destination object not found in DB")
 	}
@@ -1249,7 +1249,7 @@ func TestCopyObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	}
 
 	dstBkt, _ := tb.repos.Buckets.GetByName(ctx, "copy-dedupe-dst")
-	obj1, err := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
+	obj1, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
 	if err != nil || obj1 == nil {
 		t.Fatalf("current object after first copy: obj=%v err=%v", obj1, err)
 	}
@@ -1258,17 +1258,17 @@ func TestCopyObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 		t.Fatalf("second CopyObject: %v", err)
 	}
 
-	obj2, err := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
+	obj2, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
 	if err != nil || obj2 == nil {
 		t.Fatalf("current object after second copy: obj=%v err=%v", obj2, err)
 	}
-	if obj2.CurrentVersionID == obj1.CurrentVersionID {
-		t.Fatalf("current version did not change for identical copy: %s", obj2.CurrentVersionID)
+	if obj2.VersionID == obj1.VersionID {
+		t.Fatalf("current version did not change for identical copy: %s", obj2.VersionID)
 	}
 
 	versionCount, err := tb.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
-		Where("object_id = ?", obj1.ID).
+		Where("object_id = ?", obj1.ObjectID).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting object versions: %v", err)
@@ -1279,7 +1279,7 @@ func TestCopyObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 
 	taskCount, err := tb.db.NewSelect().
 		Model((*model.Task)(nil)).
-		Where("ref_type = ? AND ref_id = ?", "object", obj1.ID).
+		Where("ref_type = ? AND ref_id = ?", "object", obj1.ObjectID).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting upload tasks: %v", err)
@@ -1309,7 +1309,7 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByName: %v", err)
 	}
-	dstObj, err := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
+	dstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, dstBkt.ID, "copied.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
@@ -1319,14 +1319,14 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 		t.Fatalf("List tasks: %v", err)
 	}
 	for _, task := range tasks {
-		if task.RefType == "object" && task.RefID == dstObj.ID {
+		if task.RefType == "object" && task.RefID == dstObj.ObjectID {
 			if task.MaxRetries != 13 {
 				t.Fatalf("copy upload task MaxRetries = %d, want 13", task.MaxRetries)
 			}
 			return
 		}
 	}
-	t.Fatalf("copy upload task for object %d not found in %#v", dstObj.ID, tasks)
+	t.Fatalf("copy upload task for object %d not found in %#v", dstObj.ObjectID, tasks)
 }
 
 func TestCopyObject_MetadataReplace(t *testing.T) {
@@ -1353,7 +1353,7 @@ func TestCopyObject_MetadataReplace(t *testing.T) {
 	}
 
 	dstBkt, _ := tb.repos.Buckets.GetByName(ctx, "mr-dst")
-	dstObj, _ := tb.repos.Objects.GetByBucketAndKey(ctx, dstBkt.ID, "file.json")
+	dstObj, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, dstBkt.ID, "file.json")
 	if dstObj == nil {
 		t.Fatal("destination object not found")
 	}
@@ -1382,8 +1382,8 @@ func TestCopyObject_SameBucket(t *testing.T) {
 
 	// Verify both objects exist.
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "same-bucket")
-	src, _ := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "src.txt")
-	dst, _ := tb.repos.Objects.GetByBucketAndKey(ctx, bkt.ID, "dst.txt")
+	src, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "src.txt")
+	dst, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "dst.txt")
 	if src == nil || dst == nil {
 		t.Error("both source and destination objects should exist")
 	}
@@ -1433,7 +1433,7 @@ func TestCopyObjectBindsImplicitCurrentReadToResolvedVersion(t *testing.T) {
 	firstOut := putTestObjectOutput(t, tb, "copy-implicit-race-src", "original.txt", "old")
 	baseObjects := tb.repos.Objects
 	var hookErr error
-	tb.repos.Objects = &getByBucketAndKeyAfterReadRepo{
+	tb.repos.Objects = &getCurrentVersionByBucketAndKeyAfterReadRepo{
 		ObjectRepository: baseObjects,
 		afterFirstRead: func() {
 			newVersionID := model.NewVersionID()

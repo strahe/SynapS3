@@ -92,7 +92,7 @@ func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	got, err := repos.Objects.GetByID(ctx, objID)
+	got, err := repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if err != nil {
 		t.Fatalf("getting object: %v", err)
 	}

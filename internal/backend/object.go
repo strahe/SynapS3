@@ -262,7 +262,7 @@ func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsI
 		etag := fmt.Sprintf(`"%s"`, obj.ETag)
 		key := obj.Key
 		size := obj.Size
-		lastMod := obj.UpdatedAt
+		lastMod := obj.CreatedAt
 		result.Contents = append(result.Contents, s3response.Object{
 			Key:          &key,
 			LastModified: &lastMod,
@@ -326,7 +326,7 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 		etag := fmt.Sprintf(`"%s"`, row.ETag)
 		size := row.Size
 		lastModified := row.CreatedAt
-		isLatest := row.VersionID == row.CurrentVersionID
+		isLatest := row.IsCurrent
 		result.Versions = append(result.Versions, s3response.ObjectVersion{
 			Key:          &key,
 			VersionId:    &versionID,
@@ -550,7 +550,7 @@ func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObject
 		etag := fmt.Sprintf(`"%s"`, obj.ETag)
 		key := obj.Key
 		size := obj.Size
-		lastMod := obj.UpdatedAt
+		lastMod := obj.CreatedAt
 		result.Contents = append(result.Contents, s3response.Object{
 			Key:          &key,
 			LastModified: &lastMod,
@@ -642,45 +642,14 @@ func (b *SynapseBackend) versionForRead(ctx context.Context, bucketID int64, key
 		return version, nil
 	}
 
-	obj, err := b.repos.Objects.GetByBucketAndKey(ctx, bucketID, key)
+	version, err := b.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucketID, key)
 	if err != nil {
 		return nil, fmt.Errorf("querying object: %w", err)
 	}
-	if obj == nil {
+	if version == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	if obj.CurrentVersionID != "" {
-		version, err := b.repos.Objects.GetVersionByBucketKeyAndID(ctx, bucketID, key, obj.CurrentVersionID)
-		if err != nil {
-			return nil, fmt.Errorf("querying current object version: %w", err)
-		}
-		if version != nil {
-			return version, nil
-		}
-	}
-	return objectSnapshotVersion(obj), nil
-}
-
-func objectSnapshotVersion(obj *model.Object) *model.ObjectVersion {
-	return &model.ObjectVersion{
-		VersionID:    obj.CurrentVersionID,
-		ObjectID:     obj.ID,
-		BucketID:     obj.BucketID,
-		Key:          obj.Key,
-		Size:         obj.Size,
-		ETag:         obj.ETag,
-		Checksum:     obj.Checksum,
-		ContentType:  obj.ContentType,
-		Metadata:     obj.Metadata,
-		CacheKey:     obj.CacheKey,
-		PieceCID:     obj.PieceCID,
-		RetrievalURL: obj.RetrievalURL,
-		InCache:      obj.InCache,
-		InFilecoin:   obj.InFilecoin,
-		State:        obj.State,
-		CreatedAt:    obj.UpdatedAt,
-		UpdatedAt:    obj.UpdatedAt,
-	}
+	return version, nil
 }
 
 type versionStorageReuse struct {

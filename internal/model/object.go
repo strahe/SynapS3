@@ -18,29 +18,15 @@ const (
 	ObjectStateCacheEvicted ObjectState = "cache_evicted"
 )
 
-// Object stores the current metadata snapshot for an S3 object key.
+// Object stores the stable identity for an S3 object key.
 type Object struct {
 	bun.BaseModel `bun:"table:objects"`
 
-	ID               int64             `bun:",pk,autoincrement"`
-	BucketID         int64             `bun:",notnull"`
-	Key              string            `bun:",notnull"`
-	CurrentVersionID string            `bun:",notnull"`
-	Size             int64             `bun:",notnull"`
-	ETag             string            `bun:",notnull"`
-	Checksum         string            `bun:",notnull"`
-	ContentType      string            `bun:",notnull,default:'application/octet-stream'"`
-	Metadata         map[string]string `bun:"type:jsonb"`
-	CacheKey         string            `bun:",notnull"`
-	PieceCID         *string           `bun:",nullzero"`
-	RetrievalURL     *string           `bun:",nullzero"`
-	InCache          bool              `bun:",notnull,default:true"`
-	InFilecoin       bool              `bun:",notnull,default:false"`
-	State            ObjectState       `bun:",notnull,default:'cached'"`
-	FailedAtState    *ObjectState      `bun:",nullzero"`
-	LastError        *string           `bun:",nullzero"`
-	CreatedAt        time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt        time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
+	ID        int64     `bun:",pk,autoincrement"`
+	BucketID  int64     `bun:",notnull"`
+	Key       string    `bun:",notnull"`
+	CreatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Bucket *Bucket `bun:"rel:belongs-to,join:bucket_id=id"`
 }
@@ -63,6 +49,7 @@ type ObjectVersion struct {
 	RetrievalURL  *string           `bun:",nullzero"`
 	InCache       bool              `bun:",notnull,default:true"`
 	InFilecoin    bool              `bun:",notnull,default:false"`
+	IsCurrent     bool              `bun:",notnull,default:false"`
 	State         ObjectState       `bun:",notnull,default:'cached'"`
 	FailedAtState *ObjectState      `bun:",nullzero"`
 	LastError     *string           `bun:",nullzero"`
