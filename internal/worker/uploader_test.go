@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -203,6 +204,193 @@ func runWorkerUntilTaskRetryCount(t *testing.T, env *testWorkerEnv, w worker.Wor
 				return
 			}
 		}
+	}
+}
+
+func waitForSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func waitForTaskStatus(t *testing.T, env *testWorkerEnv, taskID int64, status model.TaskStatus, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			task, err := env.repos.Tasks.GetByID(context.Background(), taskID)
+			if err != nil {
+				t.Fatalf("timed out waiting for task %d to reach %s; last lookup error: %v", taskID, status, err)
+			}
+			if task == nil {
+				t.Fatalf("timed out waiting for task %d to reach %s; task not found", taskID, status)
+			}
+			t.Fatalf("timed out waiting for task %d to reach %s; current status %s", taskID, status, task.Status)
+		case <-ticker.C:
+			task, err := env.repos.Tasks.GetByID(context.Background(), taskID)
+			if err != nil || task == nil {
+				continue
+			}
+			if task.Status == status {
+				return
+			}
+		}
+	}
+}
+
+func uploadResultForCall(t *testing.T, call int32) *storage.UploadResult {
+	t.Helper()
+	id := uint64(1000 + call)
+	return &storage.UploadResult{
+		PieceCID: testCID(t),
+		Size:     11,
+		Complete: true,
+		Copies: []storage.CopyResult{{
+			ProviderID:   sdktypes.ProviderID(id),
+			DataSetID:    sdktypes.DataSetID(id),
+			PieceID:      sdktypes.PieceID(id),
+			Role:         storage.CopyRolePrimary,
+			RetrievalURL: fmt.Sprintf("https://provider.example/pieces/%d", call),
+		}},
+	}
+}
+
+func TestUploader_WaitsPollIntervalBeforeInitialClaim(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
+
+	uploadStarted := make(chan struct{})
+	var closeStarted sync.Once
+	var uploadCalls atomic.Int32
+	pollInterval := 100 * time.Millisecond
+
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		call := uploadCalls.Add(1)
+		closeStarted.Do(func() { close(uploadStarted) })
+		return uploadResultForCall(t, call), nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, pollInterval, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = uploader.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		waitForSignal(t, done, time.Second, "uploader shutdown")
+	}()
+
+	select {
+	case <-uploadStarted:
+		t.Fatal("uploader claimed upload task before initial poll interval elapsed")
+	case <-time.After(pollInterval / 2):
+	}
+
+	waitForTaskStatus(t, env, task.ID, model.TaskStatusCompleted, time.Second)
+}
+
+func TestUploader_ClaimsLaterPendingTaskWhileAnotherUploadRuns(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, firstObjID, firstVersionID := seedCachedObject(t, env)
+	firstTask := seedTask(t, env, model.TaskTypeUpload, firstObjID, firstVersionID, 5, 0)
+
+	firstUploadEntered := make(chan struct{})
+	releaseFirstUpload := make(chan struct{})
+	var releaseOnce sync.Once
+	var uploadCalls atomic.Int32
+
+	env.storage.UploadFunc = func(ctx context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		call := uploadCalls.Add(1)
+		if call == 1 {
+			close(firstUploadEntered)
+			select {
+			case <-releaseFirstUpload:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return uploadResultForCall(t, call), nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 2, 20*time.Millisecond, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = uploader.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(releaseFirstUpload) })
+		cancel()
+		waitForSignal(t, done, time.Second, "uploader shutdown")
+	}()
+
+	waitForSignal(t, firstUploadEntered, time.Second, "first upload to start")
+
+	_, secondObjID, secondVersionID := seedCachedObject(t, env)
+	secondTask := seedTask(t, env, model.TaskTypeUpload, secondObjID, secondVersionID, 5, 0)
+
+	waitForTaskStatus(t, env, secondTask.ID, model.TaskStatusCompleted, 500*time.Millisecond)
+
+	got, err := env.repos.Tasks.GetByID(context.Background(), firstTask.ID)
+	if err != nil {
+		t.Fatalf("get first task: %v", err)
+	}
+	if got.Status != model.TaskStatusRunning {
+		t.Fatalf("first task status = %s, want running while second task completed", got.Status)
+	}
+}
+
+func TestUploader_HealthyWhileUploadTaskIsActive(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, versionID := seedCachedObject(t, env)
+	_ = seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
+
+	uploadEntered := make(chan struct{})
+	releaseUpload := make(chan struct{})
+	var releaseOnce sync.Once
+	var uploadCalls atomic.Int32
+	pollInterval := 20 * time.Millisecond
+
+	env.storage.UploadFunc = func(ctx context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		call := uploadCalls.Add(1)
+		close(uploadEntered)
+		select {
+		case <-releaseUpload:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return uploadResultForCall(t, call), nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, pollInterval, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = uploader.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(releaseUpload) })
+		cancel()
+		waitForSignal(t, done, time.Second, "uploader shutdown")
+	}()
+
+	waitForSignal(t, uploadEntered, time.Second, "upload to start")
+	time.Sleep(4 * pollInterval)
+
+	if !uploader.Healthy() {
+		t.Fatal("uploader should remain healthy while upload task is active")
 	}
 }
 

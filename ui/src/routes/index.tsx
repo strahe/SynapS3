@@ -71,7 +71,7 @@ function OverviewPage() {
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Object State Distribution</CardTitle>
+            <CardTitle>Current Object Versions by State</CardTitle>
           </CardHeader>
           <CardContent>
             {objStateData.length > 0 ? (
@@ -101,7 +101,7 @@ function OverviewPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Task Pipeline Status</CardTitle>
+            <CardTitle>Tasks by Status</CardTitle>
           </CardHeader>
           <CardContent>
             {taskStatusData.length > 0 ? (

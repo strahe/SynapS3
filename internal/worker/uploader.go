@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"math/rand"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/strahe/synaps3/internal/admin"
@@ -18,7 +20,6 @@ import (
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synapse-go/storage"
-	"golang.org/x/sync/errgroup"
 )
 
 // Uploader claims upload tasks, persists upload provenance, and accepts complete
@@ -38,7 +39,10 @@ type Uploader struct {
 	*livenessTracker
 }
 
-const defaultEvictMaxRetries = 3
+const (
+	defaultEvictMaxRetries  = 3
+	uploadPollJitterDivisor = 5
+)
 
 // UploaderOption configures uploader behavior.
 type UploaderOption func(*Uploader)
@@ -75,32 +79,78 @@ func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.Stora
 func (u *Uploader) Name() string { return "uploader" }
 
 func (u *Uploader) Run(ctx context.Context) error {
-	return pollLoop(ctx, u.pollInterval, u.tick)
-}
-
-func (u *Uploader) tick(ctx context.Context) error {
-	u.recordTick()
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(u.concurrency)
-
+	var wg sync.WaitGroup
 	for range u.concurrency {
-		task, err := u.repos.Tasks.ClaimPending(gctx, model.TaskTypeUpload, u.leaseTTL)
-		if err != nil {
-			u.logger.Error("claiming upload task", "error", err)
-			break
-		}
-		if task == nil {
-			break
-		}
-
-		g.Go(func() error {
-			u.processTask(gctx, task)
-			return nil
-		})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			u.runSlot(ctx)
+		}()
 	}
 
-	err := g.Wait()
-	return err
+	wg.Wait()
+	return ctx.Err()
+}
+
+func (u *Uploader) runSlot(ctx context.Context) {
+	if !sleepUntilNextUploadPoll(ctx, u.pollInterval) {
+		return
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		u.recordTick()
+		task, err := u.repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, u.leaseTTL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			u.logger.Error("claiming upload task", "error", err)
+			if !sleepUntilNextUploadPoll(ctx, u.pollInterval) {
+				return
+			}
+			continue
+		}
+		if task == nil {
+			if !sleepUntilNextUploadPoll(ctx, u.pollInterval) {
+				return
+			}
+			continue
+		}
+
+		u.recordWorkStarted()
+		func() {
+			defer u.recordWorkFinished()
+			u.processTask(ctx, task)
+		}()
+	}
+}
+
+func sleepUntilNextUploadPoll(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(uploadPollSleepDuration(interval))
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func uploadPollSleepDuration(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return interval
+	}
+
+	maxJitter := interval / uploadPollJitterDivisor
+	if maxJitter <= 0 {
+		return interval
+	}
+	return interval + time.Duration(rand.Int63n(int64(maxJitter)+1))
 }
 
 // Healthy returns true if the worker has ticked recently.
