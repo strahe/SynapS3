@@ -43,22 +43,21 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	}
 	pieceCID := buildTestCID(t)
 	version := &model.ObjectVersion{
-		VersionID:    "01J0000000000000000000OR01",
-		BucketID:     bucket.ID,
-		Key:          "remote.txt",
-		Size:         6,
-		ETag:         "object-etag",
-		Checksum:     "object-checksum",
-		ContentType:  "text/plain",
-		CacheKey:     ".versions/01J0000000000000000000OR01",
-		State:        model.ObjectStateStored,
-		PieceCID:     &pieceCID,
-		RetrievalURL: stringPtr("https://provider.example/piece"),
+		VersionID:   "01J0000000000000000000OR01",
+		BucketID:    bucket.ID,
+		Key:         "remote.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR01",
+		State:       model.ObjectStateUploading,
 	}
 	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
 	if err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
+	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/piece")
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -231,21 +230,20 @@ func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
 	}
 	pieceCID := buildTestCID(t)
 	version := &model.ObjectVersion{
-		VersionID:    "01J0000000000000000000OR07",
-		BucketID:     bucket.ID,
-		Key:          "remote.txt",
-		Size:         6,
-		ETag:         "object-etag",
-		Checksum:     "object-checksum",
-		ContentType:  "text/plain",
-		CacheKey:     ".versions/01J0000000000000000000OR07",
-		State:        model.ObjectStateStored,
-		PieceCID:     &pieceCID,
-		RetrievalURL: stringPtr("https://provider.example/piece"),
+		VersionID:   "01J0000000000000000000OR07",
+		BucketID:    bucket.ID,
+		Key:         "remote.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR07",
+		State:       model.ObjectStateUploading,
 	}
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
+	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/piece")
 	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
 		t.Fatalf("SetVersionCachePresence: %v", err)
 	}
@@ -300,22 +298,21 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 	}
 	pieceCID := buildTestCID(t)
 	version := &model.ObjectVersion{
-		VersionID:    "01J0000000000000000000OR02",
-		BucketID:     bucket.ID,
-		Key:          "changed.txt",
-		Size:         6,
-		ETag:         "object-etag",
-		Checksum:     "object-checksum",
-		ContentType:  "text/plain",
-		CacheKey:     ".versions/01J0000000000000000000OR02",
-		State:        model.ObjectStateStored,
-		PieceCID:     &pieceCID,
-		RetrievalURL: stringPtr("https://provider.example/deleted"),
+		VersionID:   "01J0000000000000000000OR02",
+		BucketID:    bucket.ID,
+		Key:         "changed.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR02",
+		State:       model.ObjectStateUploading,
 	}
 	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
 	if err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
+	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/deleted")
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -328,7 +325,7 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 				Checksum:    "new-checksum",
 				ContentType: "text/plain",
 				CacheKey:    ".versions/01J0000000000000000000OR03",
-				State:       model.ObjectStateStored,
+				State:       model.ObjectStateCached,
 			}
 			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
 				t.Fatalf("Objects.CreateVersionAndSetCurrent replacement: %v", err)
@@ -370,21 +367,20 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 	}
 	pieceCID := buildTestCID(t)
 	oldVersion := &model.ObjectVersion{
-		VersionID:    "01J0000000000000000000OR04",
-		BucketID:     bucket.ID,
-		Key:          "changed.txt",
-		Size:         3,
-		ETag:         "old-etag",
-		Checksum:     "old-checksum",
-		ContentType:  "text/plain",
-		CacheKey:     ".versions/01J0000000000000000000OR04",
-		State:        model.ObjectStateStored,
-		PieceCID:     &pieceCID,
-		RetrievalURL: stringPtr("https://provider.example/old"),
+		VersionID:   "01J0000000000000000000OR04",
+		BucketID:    bucket.ID,
+		Key:         "changed.txt",
+		Size:        3,
+		ETag:        "old-etag",
+		Checksum:    "old-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR04",
+		State:       model.ObjectStateUploading,
 	}
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent old: %v", err)
 	}
+	acceptReaderVersionUpload(t, repos, oldVersion.VersionID, pieceCID, "https://provider.example/old")
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -397,7 +393,7 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 				Checksum:    "new-checksum",
 				ContentType: "text/plain",
 				CacheKey:    ".versions/01J0000000000000000000OR05",
-				State:       model.ObjectStateStored,
+				State:       model.ObjectStateCached,
 			}
 			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
 				t.Fatalf("Objects.CreateVersionAndSetCurrent replacement: %v", err)
@@ -427,8 +423,48 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 	}
 }
 
-func stringPtr(v string) *string {
-	return &v
+func acceptReaderVersionUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
+	}
+	providerID := "101"
+	dataSetID := "dataset-" + versionID
+	pieceID := "1"
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start upload attempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        &pieceCID,
+		RequestedCopies: 1,
+		Copies: []repository.StorageUploadCopyInput{{
+			ProviderID:   &providerID,
+			DataSetID:    &dataSetID,
+			PieceID:      &pieceID,
+			Role:         "primary",
+			RetrievalURL: &retrievalURL,
+		}},
+	}); err != nil {
+		t.Fatalf("record upload result: %v", err)
+	}
+	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    version.BucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("accept upload result: %v", err)
+	}
 }
 
 func TestTeeReadCloserReadReturnsEOFBeforeRehydrationCompletes(t *testing.T) {

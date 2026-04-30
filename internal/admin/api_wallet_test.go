@@ -29,12 +29,39 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := &model.Bucket{
-		Name:       "wallet-proofset",
-		Status:     model.BucketStatusActive,
-		ProofSetID: ptrString("proofset-1"),
+		Name:   "wallet-proofset",
+		Status: model.BucketStatusActive,
 	}
-	if _, err := db.NewInsert().Model(bucket).Exec(ctx); err != nil {
-		t.Fatalf("inserting bucket: %v", err)
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("creating bucket: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:    bucket.ID,
+		ContentSize: 1,
+		Checksum:    "wallet-checksum",
+	})
+	if err != nil {
+		t.Fatalf("start upload attempt: %v", err)
+	}
+	pieceCID := "piece-wallet"
+	providerID := "101"
+	dataSetID := "proofset-1"
+	pieceID := "1"
+	retrievalURL := "https://provider.example/wallet"
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        &pieceCID,
+		RequestedCopies: 1,
+		Copies: []repository.StorageUploadCopyInput{{
+			ProviderID:   &providerID,
+			DataSetID:    &dataSetID,
+			PieceID:      &pieceID,
+			Role:         "primary",
+			RetrievalURL: &retrievalURL,
+		}},
+	}); err != nil {
+		t.Fatalf("record upload result: %v", err)
 	}
 
 	tasks := []*model.Task{
@@ -115,8 +142,8 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 	if resp.Business == nil {
 		t.Fatal("business = nil, want populated")
 	}
-	if resp.Business.ProofSetCount != 1 {
-		t.Fatalf("proof_set_count = %d, want 1", resp.Business.ProofSetCount)
+	if resp.Business.DataSetCount != 1 {
+		t.Fatalf("data_set_count = %d, want 1", resp.Business.DataSetCount)
 	}
 	if resp.Business.OnchainTasksPending != 1 {
 		t.Fatalf("onchain_tasks_pending = %d, want 1", resp.Business.OnchainTasksPending)
@@ -124,8 +151,4 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 	if resp.Business.OnchainTasksCompleted != 1 {
 		t.Fatalf("onchain_tasks_completed = %d, want 1", resp.Business.OnchainTasksCompleted)
 	}
-}
-
-func ptrString(s string) *string {
-	return &s
 }

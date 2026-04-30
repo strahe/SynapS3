@@ -140,17 +140,14 @@ func TestIntegration_FullWritePath(t *testing.T) {
 		t.Fatalf("cached→uploading: %v", err)
 	}
 
-	// Simulate uploader sets PieceCID: uploading → stored
-	if err := ib.repos.Objects.SetVersionStorageInfoAndTransition(ctx, obj.VersionID, "bafk2test123", "https://provider.example/pieces/test", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("uploading→stored: %v", err)
-	}
+	acceptBackendVersionUpload(t, ib.repos, obj.VersionID, "bafk2test123", "https://provider.example/pieces/test")
 
 	obj, _ = ib.repos.Objects.GetCurrentVersionByObjectID(ctx, obj.ObjectID)
 	if obj.State != model.ObjectStateStored {
 		t.Fatalf("expected state=stored, got %s", obj.State)
 	}
-	if obj.PieceCID == nil || *obj.PieceCID != "bafk2test123" {
-		t.Fatalf("expected PieceCID=bafk2test123, got %v", obj.PieceCID)
+	if obj.StorageUploadID == nil || obj.PieceCID == nil || *obj.PieceCID != "bafk2test123" {
+		t.Fatalf("expected accepted upload with PieceCID=bafk2test123, got upload=%v piece=%v", obj.StorageUploadID, obj.PieceCID)
 	}
 
 	// 3. Simulate evictor: stored → cache_evicted, remove cache file
@@ -242,9 +239,7 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	}
 	testPieceCID := cid.NewCidV1(cid.Raw, mh)
 
-	if err := ib.repos.Objects.SetVersionStorageInfoAndTransition(ctx, obj.VersionID, testPieceCID.String(), "https://provider.example/pieces/test", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatal(err)
-	}
+	acceptBackendVersionUpload(t, ib.repos, obj.VersionID, testPieceCID.String(), "https://provider.example/pieces/test")
 	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
 		t.Fatal(err)
 	}

@@ -62,14 +62,19 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating unique index on objects identity tuple: %w", err)
 	}
 
-	// Object versions are the source of truth for current data, lifecycle, and storage location.
+	if err := createStorageProvenanceTables(ctx, db); err != nil {
+		return err
+	}
+
+	// Object versions are the source of truth for current data and lifecycle.
 	if _, err := db.NewCreateTable().
 		Model((*model.ObjectVersion)(nil)).
 		IfNotExists().
 		ForeignKey("(object_id, bucket_id, key) REFERENCES objects(id, bucket_id, key) ON UPDATE CASCADE ON DELETE CASCADE").
+		ForeignKey("(storage_upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE RESTRICT").
 		ColumnExpr("CONSTRAINT chk_object_versions_state CHECK (state IN ('cached', 'uploading', 'stored', 'failed', 'cache_evicted'))").
 		ColumnExpr("CONSTRAINT chk_object_versions_size CHECK (size >= 0)").
-		ColumnExpr("CONSTRAINT chk_object_versions_filecoin CHECK (in_filecoin = FALSE OR (piece_cid IS NOT NULL AND piece_cid <> '' AND retrieval_url IS NOT NULL AND retrieval_url <> ''))").
+		ColumnExpr("CONSTRAINT chk_object_versions_storage_upload_state CHECK ((state IN ('stored', 'cache_evicted') AND storage_upload_id IS NOT NULL) OR (state IN ('cached', 'uploading', 'failed') AND storage_upload_id IS NULL))").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating object_versions table: %w", err)
 	}
@@ -117,6 +122,14 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating version content reuse index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_storage_upload").
+		Column("storage_upload_id").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating version storage upload index: %w", err)
 	}
 
 	// Tasks are queue/audit records with polymorphic references, so no FK is declared here.
@@ -221,7 +234,11 @@ func down2026040501Init(ctx context.Context, db *bun.DB) error {
 		(*model.MultipartPart)(nil),
 		(*model.MultipartUpload)(nil),
 		(*model.Task)(nil),
+		(*model.StorageUploadFailure)(nil),
+		(*model.StorageUploadCopy)(nil),
 		(*model.ObjectVersion)(nil),
+		(*model.StorageDataSet)(nil),
+		(*model.StorageUpload)(nil),
 		(*model.Object)(nil),
 		(*model.Bucket)(nil),
 		(*model.S3Account)(nil),
@@ -264,6 +281,106 @@ func createBucketIndexes(ctx context.Context, db *bun.DB) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating bucket owner index: %w", err)
+	}
+	return nil
+}
+
+func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
+	if _, err := db.NewCreateTable().
+		Model((*model.StorageUpload)(nil)).
+		IfNotExists().
+		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_status CHECK (status IN ('running', 'complete', 'partial', 'failed', 'rejected', 'superseded'))").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_content_size CHECK (content_size >= 0)").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_requested_copies CHECK (requested_copies >= 0)").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage_uploads table: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUpload)(nil)).
+		Index("idx_storage_uploads_task_version_status").
+		Column("source_task_id", "source_version_id", "status", "accepted_at").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload task/version index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUpload)(nil)).
+		Index("idx_storage_uploads_content_status").
+		Column("bucket_id", "content_size", "checksum", "status", "accepted_at").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload content index: %w", err)
+	}
+
+	if _, err := db.NewCreateTable().
+		Model((*model.StorageDataSet)(nil)).
+		IfNotExists().
+		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
+		ForeignKey("(first_seen_upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE RESTRICT").
+		ForeignKey("(last_seen_upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE RESTRICT").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage_data_sets table: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageDataSet)(nil)).
+		Index("idx_storage_data_sets_provider_data_set").
+		Column("provider_id", "data_set_id").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage data set provider unique index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageDataSet)(nil)).
+		Index("idx_storage_data_sets_bucket_provider").
+		Column("bucket_id", "provider_id").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage data set bucket provider index: %w", err)
+	}
+
+	if _, err := db.NewCreateTable().
+		Model((*model.StorageUploadCopy)(nil)).
+		IfNotExists().
+		ForeignKey("(upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE CASCADE").
+		ForeignKey("(storage_data_set_id) REFERENCES storage_data_sets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage_upload_copies table: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUploadCopy)(nil)).
+		Index("idx_storage_upload_copies_upload_index").
+		Column("upload_id", "copy_index").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload copy unique index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUploadCopy)(nil)).
+		Index("idx_storage_upload_copies_upload_role_index").
+		Column("upload_id", "role", "copy_index").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload copy role index: %w", err)
+	}
+
+	if _, err := db.NewCreateTable().
+		Model((*model.StorageUploadFailure)(nil)).
+		IfNotExists().
+		ForeignKey("(upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE CASCADE").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage_upload_failures table: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUploadFailure)(nil)).
+		Index("idx_storage_upload_failures_upload_attempt").
+		Column("upload_id", "attempt_index").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload failure unique index: %w", err)
 	}
 	return nil
 }

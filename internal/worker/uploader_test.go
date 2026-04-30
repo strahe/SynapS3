@@ -17,6 +17,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -32,6 +33,16 @@ func testCID(t *testing.T) cid.Cid {
 		t.Fatalf("creating test multihash: %v", err)
 	}
 	return cid.NewCidV1(cid.Raw, mh)
+}
+
+func validUploadCopy(retrievalURL string) storage.CopyResult {
+	return storage.CopyResult{
+		ProviderID:   sdktypes.ProviderID(101),
+		DataSetID:    sdktypes.DataSetID(123),
+		PieceID:      sdktypes.PieceID(2001),
+		Role:         storage.CopyRolePrimary,
+		RetrievalURL: retrievalURL,
+	}
 }
 
 // seedCachedObject creates a bucket, writes a file into the filesystem cache,
@@ -197,7 +208,7 @@ func runWorkerUntilTaskRetryCount(t *testing.T, env *testWorkerEnv, w worker.Wor
 
 func TestUploader_HappyPath(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	bucket, objID, versionID := seedCachedObject(t, env)
+	_, objID, versionID := seedCachedObject(t, env)
 	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
 	pieceCID := testCID(t)
@@ -208,15 +219,26 @@ func TestUploader_HappyPath(t *testing.T) {
 			Complete: true,
 			Copies: []storage.CopyResult{
 				{
-					Role:      storage.CopyRoleSecondary,
-					DataSetID: sdktypes.DataSetID(777),
+					Role:       storage.CopyRoleSecondary,
+					ProviderID: sdktypes.ProviderID(202),
+					DataSetID:  sdktypes.DataSetID(777),
+					PieceID:    sdktypes.PieceID(3001),
 				},
 				{
+					ProviderID:   sdktypes.ProviderID(101),
 					Role:         storage.CopyRolePrimary,
 					DataSetID:    sdktypes.DataSetID(123),
+					PieceID:      sdktypes.PieceID(2001),
 					RetrievalURL: "https://provider.example/pieces/1",
 				},
 			},
+			FailedAttempts: []storage.FailedAttempt{{
+				ProviderID: sdktypes.ProviderID(303),
+				Role:       storage.CopyRoleSecondary,
+				Stage:      storage.CopyStagePull,
+				Err:        errors.New("pull timeout"),
+				Explicit:   true,
+			}},
 		}, nil
 	}
 
@@ -246,25 +268,39 @@ func TestUploader_HappyPath(t *testing.T) {
 	if !obj.InFilecoin {
 		t.Error("expected object filecoin location to be true after upload")
 	}
-	var retrievalURL string
-	if err := env.db.NewSelect().
-		TableExpr("object_versions").
-		Column("retrieval_url").
-		Where("version_id = ?", versionID).
-		Scan(ctx, &retrievalURL); err != nil {
-		t.Fatalf("select retrieval_url: %v", err)
+	if obj.StorageUploadID == nil {
+		t.Fatal("storage_upload_id is nil, want accepted upload")
 	}
-	if retrievalURL != "https://provider.example/pieces/1" {
-		t.Fatalf("retrieval_url = %q, want persisted URL", retrievalURL)
-	}
-	gotBucket, err := env.repos.Buckets.GetByID(ctx, bucket.ID)
+	copies, err := env.repos.Uploads.ListCopies(ctx, *obj.StorageUploadID)
 	if err != nil {
-		t.Fatalf("get bucket: %v", err)
+		t.Fatalf("list upload copies: %v", err)
 	}
-	if gotBucket.ProofSetID == nil || *gotBucket.ProofSetID != "123" {
-		t.Fatalf("bucket ProofSetID = %v, want primary DataSetID 123", gotBucket.ProofSetID)
+	if len(copies) != 2 {
+		t.Fatalf("copy count = %d, want 2", len(copies))
 	}
-
+	var primary *model.StorageUploadCopy
+	var secondary *model.StorageUploadCopy
+	for i := range copies {
+		if copies[i].Role == string(storage.CopyRolePrimary) {
+			primary = &copies[i]
+		}
+		if copies[i].Role == string(storage.CopyRoleSecondary) {
+			secondary = &copies[i]
+		}
+	}
+	if primary == nil || primary.ProviderID == nil || *primary.ProviderID != "101" || primary.DataSetID == nil || *primary.DataSetID != "123" || primary.PieceID == nil || *primary.PieceID != "2001" || primary.RetrievalURL == nil || *primary.RetrievalURL != "https://provider.example/pieces/1" {
+		t.Fatalf("primary copy = %#v, want persisted provider/data set/piece/retrieval URL", primary)
+	}
+	if secondary == nil || secondary.ProviderID == nil || *secondary.ProviderID != "202" || secondary.DataSetID == nil || *secondary.DataSetID != "777" || secondary.PieceID == nil || *secondary.PieceID != "3001" {
+		t.Fatalf("secondary copy = %#v, want independent provider/data set/piece", secondary)
+	}
+	var failures []model.StorageUploadFailure
+	if err := env.db.NewSelect().Model(&failures).Where("upload_id = ?", *obj.StorageUploadID).Scan(ctx); err != nil {
+		t.Fatalf("list upload failures: %v", err)
+	}
+	if len(failures) != 1 || failures[0].ProviderID == nil || *failures[0].ProviderID != "303" || failures[0].Stage == nil || *failures[0].Stage != string(storage.CopyStagePull) || failures[0].ErrorMessage == nil || *failures[0].ErrorMessage != "pull timeout" || !failures[0].Explicit {
+		t.Fatalf("upload failures = %#v, want persisted failed attempt", failures)
+	}
 	// With autoEvict=true, an evict_cache task should be created
 	evictTask, err := env.repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
@@ -319,7 +355,7 @@ func TestUploader_StoresVersionsFollowingActiveUpload(t *testing.T) {
 			PieceCID: pieceCID,
 			Size:     leader.Size,
 			Complete: true,
-			Copies:   []storage.CopyResult{{RetrievalURL: "https://provider.example/pieces/shared"}},
+			Copies:   []storage.CopyResult{validUploadCopy("https://provider.example/pieces/shared")},
 		}, nil
 	}
 
@@ -480,6 +516,189 @@ func TestUploader_PartialSuccessDoesNotMarkObjectStored(t *testing.T) {
 	if evictTask != nil {
 		t.Fatal("did not expect evict_cache task for partial upload")
 	}
+}
+
+func TestUploader_CompleteResultWithoutRetrievalURLDoesNotBindObject(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 1, 0)
+
+	pieceCID := testCID(t)
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		return &storage.UploadResult{
+			PieceCID:        pieceCID,
+			Size:            11,
+			RequestedCopies: 1,
+			Complete:        true,
+			Copies: []storage.CopyResult{{
+				ProviderID: sdktypes.ProviderID(101),
+				DataSetID:  sdktypes.DataSetID(123),
+				PieceID:    sdktypes.PieceID(2001),
+				Role:       storage.CopyRolePrimary,
+			}},
+		}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	ctx := context.Background()
+	obj, err := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
+	if err != nil || obj == nil {
+		t.Fatalf("get object: obj=%v err=%v", obj, err)
+	}
+	if obj.State != model.ObjectStateFailed {
+		t.Fatalf("object state = %s, want failed", obj.State)
+	}
+	if obj.StorageUploadID != nil || obj.InFilecoin {
+		t.Fatalf("object storage = upload:%v in_filecoin:%v, want unbound", obj.StorageUploadID, obj.InFilecoin)
+	}
+	var uploads []model.StorageUpload
+	if err := env.db.NewSelect().Model(&uploads).Where("source_version_id = ?", versionID).Scan(ctx); err != nil {
+		t.Fatalf("list storage uploads: %v", err)
+	}
+	if len(uploads) != 1 || uploads[0].Status != model.StorageUploadStatusRejected {
+		t.Fatalf("upload attempts = %#v, want one rejected attempt", uploads)
+	}
+}
+
+func TestUploader_CompleteResultWithZeroCopyIdentifiersDoesNotBindObject(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 1, 0)
+
+	pieceCID := testCID(t)
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		return &storage.UploadResult{
+			PieceCID:        pieceCID,
+			Size:            11,
+			RequestedCopies: 1,
+			Complete:        true,
+			Copies: []storage.CopyResult{{
+				Role:         storage.CopyRolePrimary,
+				RetrievalURL: "https://provider.example/pieces/zero-id",
+			}},
+		}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	ctx := context.Background()
+	obj, err := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
+	if err != nil || obj == nil {
+		t.Fatalf("get object: obj=%v err=%v", obj, err)
+	}
+	if obj.State != model.ObjectStateFailed {
+		t.Fatalf("object state = %s, want failed", obj.State)
+	}
+	if obj.StorageUploadID != nil || obj.InFilecoin {
+		t.Fatalf("object storage = upload:%v in_filecoin:%v, want unbound", obj.StorageUploadID, obj.InFilecoin)
+	}
+	var copies []model.StorageUploadCopy
+	if err := env.db.NewSelect().Model(&copies).Where("upload_id IN (SELECT id FROM storage_uploads WHERE source_version_id = ?)", versionID).Scan(ctx); err != nil {
+		t.Fatalf("list storage upload copies: %v", err)
+	}
+	if len(copies) != 1 || copies[0].ProviderID != nil || copies[0].DataSetID != nil || copies[0].PieceID != nil {
+		t.Fatalf("copy identifiers = %#v, want zero IDs stored as missing", copies)
+	}
+	var uploads []model.StorageUpload
+	if err := env.db.NewSelect().Model(&uploads).Where("source_version_id = ?", versionID).Scan(ctx); err != nil {
+		t.Fatalf("list storage uploads: %v", err)
+	}
+	if len(uploads) != 1 || uploads[0].Status != model.StorageUploadStatusRejected {
+		t.Fatalf("upload attempts = %#v, want one rejected attempt", uploads)
+	}
+}
+
+func TestUploader_AcceptFailureRetryDoesNotUploadAgain(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
+
+	uploads := &acceptFailingUploadRepo{StorageUploadRepository: env.repos.Uploads}
+	uploads.failAccept.Store(true)
+	env.repos.Uploads = uploads
+
+	pieceCID := testCID(t)
+	var uploadCalls int32
+	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
+		atomic.AddInt32(&uploadCalls, 1)
+		return &storage.UploadResult{
+			PieceCID:        pieceCID,
+			Size:            11,
+			RequestedCopies: 1,
+			Complete:        true,
+			Copies: []storage.CopyResult{{
+				ProviderID:   sdktypes.ProviderID(101),
+				DataSetID:    sdktypes.DataSetID(123),
+				PieceID:      sdktypes.PieceID(2001),
+				Role:         storage.CopyRolePrimary,
+				RetrievalURL: "https://provider.example/pieces/1",
+			}},
+		}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, false, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
+
+	if got := atomic.LoadInt32(&uploadCalls); got != 1 {
+		t.Fatalf("upload calls after accept failure = %d, want 1", got)
+	}
+	gotTask, err := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("get task after accept failure: %v", err)
+	}
+	if gotTask.Status != model.TaskStatusPending {
+		t.Fatalf("task status after accept failure = %s, want pending", gotTask.Status)
+	}
+	attempt, err := env.repos.Uploads.FindAcceptableUploadAttempt(context.Background(), task.ID, versionID)
+	if err != nil || attempt == nil {
+		t.Fatalf("acceptable upload after accept failure = %v err=%v", attempt, err)
+	}
+	if attempt.AcceptError == nil || *attempt.AcceptError == "" {
+		t.Fatalf("accept_error = %v, want recorded failure", attempt.AcceptError)
+	}
+	if _, err := env.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-time.Second)).
+		Where("id = ?", task.ID).
+		Exec(context.Background()); err != nil {
+		t.Fatalf("reschedule task retry: %v", err)
+	}
+
+	uploads.failAccept.Store(false)
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	if got := atomic.LoadInt32(&uploadCalls); got != 1 {
+		t.Fatalf("upload calls after accept retry = %d, want 1", got)
+	}
+	gotTask, err = env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("get task after accept retry: %v", err)
+	}
+	if gotTask.Status != model.TaskStatusCompleted {
+		t.Fatalf("task status after accept retry = %s, want completed", gotTask.Status)
+	}
+	obj, err := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
+	if err != nil || obj == nil {
+		t.Fatalf("get object after accept retry: obj=%v err=%v", obj, err)
+	}
+	if obj.State != model.ObjectStateStored || obj.StorageUploadID == nil {
+		t.Fatalf("object after accept retry = state:%s upload:%v, want stored with upload", obj.State, obj.StorageUploadID)
+	}
+}
+
+type acceptFailingUploadRepo struct {
+	repository.StorageUploadRepository
+	failAccept atomic.Bool
+}
+
+func (r *acceptFailingUploadRepo) AcceptCompleteUploadForContent(ctx context.Context, input repository.AcceptCompleteUploadInput) ([]repository.ObjectVersionRef, error) {
+	if r.failAccept.Load() {
+		return nil, errors.New("accept storage upload")
+	}
+	return r.StorageUploadRepository.AcceptCompleteUploadForContent(ctx, input)
 }
 
 func TestUploader_MissingVersion(t *testing.T) {
@@ -662,7 +881,7 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 			PieceCID: pieceCID,
 			Size:     11,
 			Complete: true,
-			Copies:   []storage.CopyResult{{RetrievalURL: "https://provider.example/pieces/1"}},
+			Copies:   []storage.CopyResult{validUploadCopy("https://provider.example/pieces/1")},
 		}, nil
 	}
 
@@ -894,7 +1113,7 @@ func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testin
 			Complete:        true,
 			RequestedCopies: 1,
 			Copies: []storage.CopyResult{
-				{RetrievalURL: "https://sp.example/piece"},
+				validUploadCopy("https://sp.example/piece"),
 			},
 		}, nil
 	}
@@ -943,7 +1162,7 @@ func TestUploader_WalletError_ProceedsWithUpload(t *testing.T) {
 			PieceCID: pieceCID,
 			Size:     11,
 			Complete: true,
-			Copies:   []storage.CopyResult{{RetrievalURL: "https://provider.example/pieces/1"}},
+			Copies:   []storage.CopyResult{validUploadCopy("https://provider.example/pieces/1")},
 		}, nil
 	}
 
@@ -973,7 +1192,7 @@ func TestUploader_WalletNilInfo_NoPanic(t *testing.T) {
 			PieceCID: pieceCID,
 			Size:     11,
 			Complete: true,
-			Copies:   []storage.CopyResult{{RetrievalURL: "https://provider.example/pieces/1"}},
+			Copies:   []storage.CopyResult{validUploadCopy("https://provider.example/pieces/1")},
 		}, nil
 	}
 

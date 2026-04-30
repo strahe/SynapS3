@@ -308,7 +308,7 @@ function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
           <DialogDescription>
             {recursive
               ? `This will recursively purge ${formatNumber(bucket.object_count)} object(s) and their cached data. Deletion is blocked while lifecycle tasks, object processing, or multipart uploads are in flight.`
-              : 'This empty bucket will be marked for deletion and its proof set removed on-chain. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
+              : 'This empty bucket will be marked for deletion. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-2">
@@ -376,7 +376,6 @@ function BucketsPage() {
                 <TableHead className="px-4">Name</TableHead>
                 <TableHead className="px-4">Owner</TableHead>
                 <TableHead className="px-4">Status</TableHead>
-                <TableHead className="px-4">Proof Set</TableHead>
                 <TableHead className="px-4 text-right">Objects</TableHead>
                 <TableHead className="px-4 text-right">Size</TableHead>
                 <TableHead className="px-4">Created</TableHead>
@@ -404,9 +403,6 @@ function BucketsPage() {
                       </TableCell>
                       <TableCell className="px-4">
                         <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
-                      </TableCell>
-                      <TableCell className="px-4 font-mono text-xs text-muted-foreground">
-                        {bucket.proof_set_id ?? '—'}
                       </TableCell>
                       <TableCell className="px-4 text-right">{formatNumber(bucket.object_count)}</TableCell>
                       <TableCell className="px-4 text-right">{formatBytes(bucket.total_size_bytes)}</TableCell>
@@ -436,7 +432,7 @@ function BucketsPage() {
                 })
               ) : (
                 <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={7} className="h-24 text-center text-muted-foreground">
                     No buckets found
                   </TableCell>
                 </TableRow>

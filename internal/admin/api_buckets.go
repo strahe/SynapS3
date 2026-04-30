@@ -27,7 +27,6 @@ type bucketListItem struct {
 	Name           string  `json:"name"`
 	OwnerAccessKey *string `json:"owner_access_key"`
 	Status         string  `json:"status"`
-	ProofSetID     *string `json:"proof_set_id"`
 	ObjectCount    int64   `json:"object_count"`
 	TotalSizeBytes int64   `json:"total_size_bytes"`
 	CreatedAt      string  `json:"created_at"`
@@ -50,7 +49,6 @@ type bucketDetailResponse struct {
 	Name               string  `json:"name"`
 	OwnerAccessKey     *string `json:"owner_access_key"`
 	Status             string  `json:"status"`
-	ProofSetID         *string `json:"proof_set_id"`
 	ObjectCount        int64   `json:"object_count"`
 	TotalSizeBytes     int64   `json:"total_size_bytes"`
 	CreatedAt          string  `json:"created_at"`
@@ -91,7 +89,6 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 			Name:           b.Name,
 			OwnerAccessKey: s.adminOwnerAccessKey(b.OwnerAccessKey),
 			Status:         string(b.Status),
-			ProofSetID:     b.ProofSetID,
 			ObjectCount:    stats.Count,
 			TotalSizeBytes: stats.TotalSize,
 			CreatedAt:      b.CreatedAt.Format(time.RFC3339),
@@ -212,7 +209,6 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		Name:               bucket.Name,
 		OwnerAccessKey:     s.adminOwnerAccessKey(bucket.OwnerAccessKey),
 		Status:             string(bucket.Status),
-		ProofSetID:         bucket.ProofSetID,
 		ObjectCount:        objectCount,
 		TotalSizeBytes:     totalSize,
 		CreatedAt:          bucket.CreatedAt.Format(time.RFC3339),

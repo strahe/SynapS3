@@ -133,7 +133,7 @@ function WalletPage() {
           </CardHeader>
           <CardContent>
             <div className="grid gap-4 sm:grid-cols-3">
-              <StatItem label="Proof Sets" value={data.business.proof_set_count} />
+              <StatItem label="Data Sets" value={data.business.data_set_count} />
               <StatItem label="On-chain Tasks Pending" value={data.business.onchain_tasks_pending} />
               <StatItem label="On-chain Tasks Completed" value={data.business.onchain_tasks_completed} />
             </div>

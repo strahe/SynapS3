@@ -28,7 +28,6 @@ func TestObjectStateMachine_FailureTransitions(t *testing.T) {
 	// States that can transition to failed.
 	canFail := []model.ObjectState{
 		model.ObjectStateUploading,
-		model.ObjectStateStored,
 	}
 	for _, from := range canFail {
 		if err := m.Validate(string(from), string(model.ObjectStateFailed)); err != nil {
@@ -39,6 +38,7 @@ func TestObjectStateMachine_FailureTransitions(t *testing.T) {
 	// States that cannot transition to failed.
 	cannotFail := []model.ObjectState{
 		model.ObjectStateCached,
+		model.ObjectStateStored,
 		model.ObjectStateFailed,
 		model.ObjectStateCacheEvicted,
 	}
@@ -84,6 +84,7 @@ func TestObjectStateMachine_InvalidTransitions(t *testing.T) {
 		{model.ObjectStateCacheEvicted, model.ObjectStateCached},    // can't revive
 		{model.ObjectStateStored, model.ObjectStateUploading},       // backwards
 		{model.ObjectStateCached, model.ObjectStateFailed},          // can't fail from cached
+		{model.ObjectStateStored, model.ObjectStateFailed},          // stored failures stay in task state
 		{model.ObjectStateUploading, model.ObjectStateCacheEvicted}, // must go through stored
 	}
 	for _, tt := range invalid {
@@ -119,7 +120,7 @@ func TestObjectStateMachine_NextStates(t *testing.T) {
 	}{
 		{model.ObjectStateCached, []string{"uploading"}},
 		{model.ObjectStateUploading, []string{"failed", "stored"}},
-		{model.ObjectStateStored, []string{"cache_evicted", "failed"}},
+		{model.ObjectStateStored, []string{"cache_evicted"}},
 		{model.ObjectStateFailed, []string{"uploading"}},
 		{model.ObjectStateCacheEvicted, nil},
 	}

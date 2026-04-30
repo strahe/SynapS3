@@ -38,7 +38,6 @@ export interface BucketItem {
   name: string
   owner_access_key: string | null
   status: string
-  proof_set_id: string | null
   object_count: number
   total_size_bytes: number
   created_at: string
@@ -156,7 +155,7 @@ export interface TokenAccountData {
 }
 
 export interface WalletBusiness {
-  proof_set_count: number
+  data_set_count: number
   onchain_tasks_pending: number
   onchain_tasks_completed: number
 }

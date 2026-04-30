@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,9 +21,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Uploader claims upload tasks, uploads objects to Storage Providers via the
-// synapse-go SDK (which handles both SP upload and on-chain commit), records the
-// PieceCID, and optionally enqueues cache eviction.
+// Uploader claims upload tasks, persists upload provenance, and accepts complete
+// uploads for object versions.
 type Uploader struct {
 	repos           *repository.Repositories
 	cache           cache.Cache
@@ -158,6 +158,16 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		}
 	}
 
+	pendingAccept, err := u.repos.Uploads.FindAcceptableUploadAttempt(ctx, task.ID, task.RefVersionID)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "find acceptable upload", err)
+		return
+	}
+	if pendingAccept != nil {
+		u.acceptUploadAttempt(ctx, task, version, pendingAccept, logger)
+		return
+	}
+
 	// Pre-flight: check payment account has deposited funds.
 	if u.wallet != nil {
 		info, wErr := u.wallet.GetWalletInfo(ctx)
@@ -186,69 +196,64 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	}
 	defer func() { _ = rc.Close() }()
 
+	attempt, err := u.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceTaskID:    task.ID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "start upload attempt", err)
+		return
+	}
+
 	// Upload to provider (SDK handles store + on-chain commit)
 	uploadOpts := &storage.UploadOptions{
 		DataSetMetadata: map[string]string{"bucket": bucket.Name},
 	}
 	result, err := u.storage.Upload(ctx, rc, uploadOpts)
 	if err != nil {
+		msg := decodeRevertReason(err.Error())
+		u.recordUploadFailure(ctx, logger, attempt.ID, msg)
 		u.handleFailure(ctx, task, version, logger, "upload",
-			fmt.Errorf("%s", decodeRevertReason(err.Error())))
+			fmt.Errorf("%s", msg))
 		return
 	}
 	if result == nil {
+		u.recordUploadFailure(ctx, logger, attempt.ID, "upload returned nil result")
 		u.handleFailure(ctx, task, version, logger, "upload", errors.New("upload returned nil result"))
 		return
 	}
+
+	recordInput := recordUploadResultInput(attempt.ID, result)
 	if !result.Complete {
-		u.handleFailure(ctx, task, version, logger, "upload",
-			fmt.Errorf("upload incomplete: %d/%d copies committed", result.SuccessCount(), requestedCopies(result)))
+		msg := fmt.Sprintf("upload incomplete: %d/%d copies committed", result.SuccessCount(), requestedCopies(result))
+		recordInput.ErrorMessage = &msg
+	}
+	if err := u.repos.Uploads.RecordUploadResult(ctx, recordInput); err != nil {
+		u.handleTaskFailure(ctx, task, logger, "record upload result", err)
 		return
 	}
 
-	pieceCID := result.PieceCID.String()
-	retrievalURL := firstRetrievalURL(result)
-	if retrievalURL == "" {
-		u.handleFailure(ctx, task, version, logger, "upload", errors.New("upload completed without retrieval URL"))
+	savedAttempt, err := u.repos.Uploads.GetByID(ctx, attempt.ID)
+	if err != nil || savedAttempt == nil {
+		if err == nil {
+			err = errors.New("upload attempt not found after result record")
+		}
+		u.handleTaskFailure(ctx, task, logger, "load upload attempt", err)
+		return
+	}
+	if savedAttempt.Status != model.StorageUploadStatusComplete {
+		err := fmt.Errorf("upload result status %s", savedAttempt.Status)
+		if savedAttempt.AcceptError != nil && *savedAttempt.AcceptError != "" {
+			err = fmt.Errorf("upload result status %s: %s", savedAttempt.Status, *savedAttempt.AcceptError)
+		}
+		u.handleFailure(ctx, task, version, logger, "upload", err)
 		return
 	}
 
-	updatedRefs, err := u.repos.Objects.SetStorageInfoForUploadingContent(ctx, version.BucketID, version.Size, version.Checksum, pieceCID, retrievalURL)
-	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
-			latest, latestErr := u.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
-			if latestErr == nil && latest != nil && (latest.State == model.ObjectStateStored || latest.State == model.ObjectStateCacheEvicted) {
-				if latest.State == model.ObjectStateStored {
-					u.enqueueEvictTask(ctx, logger, latest.ObjectID, latest.VersionID)
-				}
-				_ = u.repos.Tasks.Complete(ctx, task.ID)
-				logger.Info("upload task content already stored", "state", latest.State)
-				admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
-				return
-			}
-		}
-		u.handleFailure(ctx, task, version, logger, "state transition uploading→stored", err)
-		return
-	}
-
-	// Lazy-populate bucket ProofSetID from the primary upload result.
-	if dataSetID, ok := result.PrimaryDataSetID(); bucket.ProofSetID == nil && ok && dataSetID != 0 {
-		dsID := strconv.FormatUint(uint64(dataSetID), 10)
-		if updateErr := u.repos.Buckets.SetProofSetID(ctx, bucket.ID, dsID); updateErr != nil {
-			logger.Warn("failed to populate bucket ProofSetID (non-fatal)", "error", updateErr)
-		}
-	}
-
-	// Enqueue cache eviction task
-	if u.autoEvict {
-		for _, ref := range updatedRefs {
-			u.enqueueEvictTask(ctx, logger, ref.ObjectID, ref.VersionID)
-		}
-	}
-
-	_ = u.repos.Tasks.Complete(ctx, task.ID)
-	logger.Info("upload complete", "pieceCID", pieceCID)
-	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
+	u.acceptUploadAttempt(ctx, task, version, savedAttempt, logger)
 }
 
 func (u *Uploader) enqueueEvictTask(ctx context.Context, logger *slog.Logger, objectID int64, versionID string) {
@@ -270,6 +275,37 @@ func (u *Uploader) enqueueEvictTask(ctx context.Context, logger *slog.Logger, ob
 	}
 }
 
+func (u *Uploader) acceptUploadAttempt(ctx context.Context, task *model.Task, version *model.ObjectVersion, upload *model.StorageUpload, logger *slog.Logger) {
+	refs, err := u.repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:        upload.ID,
+		TaskID:          task.ID,
+		BucketID:        version.BucketID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+		AutoEvict:       u.autoEvict,
+		EvictMaxRetries: u.evictMaxRetries,
+	})
+	if err != nil {
+		if setErr := u.repos.Uploads.SetAcceptError(ctx, upload.ID, err.Error()); setErr != nil {
+			logger.Warn("failed to record upload accept error", "uploadID", upload.ID, "error", setErr)
+		}
+		u.handleTaskFailure(ctx, task, logger, "accept upload", err)
+		return
+	}
+	logger.Info("upload accepted", "uploadID", upload.ID, "versions", len(refs))
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
+}
+
+func (u *Uploader) recordUploadFailure(ctx context.Context, logger *slog.Logger, uploadID int64, message string) {
+	if err := u.repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:      uploadID,
+		ErrorMessage:  &message,
+		RawResultJSON: rawUploadErrorJSON(message),
+	}); err != nil {
+		logger.Warn("failed to record upload failure", "uploadID", uploadID, "error", err)
+	}
+}
+
 func requestedCopies(result *storage.UploadResult) int {
 	if result == nil {
 		return 0
@@ -280,16 +316,138 @@ func requestedCopies(result *storage.UploadResult) int {
 	return len(result.Copies)
 }
 
-func firstRetrievalURL(result *storage.UploadResult) string {
-	if result == nil {
-		return ""
+func recordUploadResultInput(uploadID int64, result *storage.UploadResult) repository.RecordUploadResultInput {
+	input := repository.RecordUploadResultInput{
+		UploadID:        uploadID,
+		Complete:        result.Complete,
+		RequestedCopies: requestedCopies(result),
+		RawResultJSON:   rawUploadResultJSON(result),
+	}
+	if result.PieceCID.Defined() {
+		pieceCID := result.PieceCID.String()
+		input.PieceCID = &pieceCID
+	}
+	input.Copies = make([]repository.StorageUploadCopyInput, 0, len(result.Copies))
+	for _, copy := range result.Copies {
+		input.Copies = append(input.Copies, repository.StorageUploadCopyInput{
+			ProviderID:   uintIDString(uint64(copy.ProviderID)),
+			DataSetID:    uintIDString(uint64(copy.DataSetID)),
+			PieceID:      uintIDString(uint64(copy.PieceID)),
+			Role:         string(copy.Role),
+			RetrievalURL: nonEmptyStringPtr(copy.RetrievalURL),
+			IsNewDataSet: copy.IsNewDataSet,
+		})
+	}
+	input.Failures = make([]repository.StorageUploadFailureInput, 0, len(result.FailedAttempts))
+	for _, failure := range result.FailedAttempts {
+		input.Failures = append(input.Failures, repository.StorageUploadFailureInput{
+			ProviderID:   uintIDString(uint64(failure.ProviderID)),
+			Role:         string(failure.Role),
+			Stage:        nonEmptyStringPtr(string(failure.Stage)),
+			ErrorMessage: errorStringPtr(failure.Err),
+			Explicit:     failure.Explicit,
+		})
+	}
+	return input
+}
+
+type uploadResultJSON struct {
+	PieceCID        string              `json:"piece_cid,omitempty"`
+	Size            int64               `json:"size"`
+	RequestedCopies int                 `json:"requested_copies"`
+	Complete        bool                `json:"complete"`
+	Copies          []uploadCopyJSON    `json:"copies,omitempty"`
+	FailedAttempts  []uploadFailureJSON `json:"failed_attempts,omitempty"`
+}
+
+type uploadCopyJSON struct {
+	ProviderID   string `json:"provider_id"`
+	DataSetID    string `json:"data_set_id"`
+	PieceID      string `json:"piece_id"`
+	Role         string `json:"role"`
+	RetrievalURL string `json:"retrieval_url,omitempty"`
+	IsNewDataSet bool   `json:"is_new_data_set"`
+}
+
+type uploadFailureJSON struct {
+	ProviderID string `json:"provider_id"`
+	Role       string `json:"role"`
+	Stage      string `json:"stage,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Explicit   bool   `json:"explicit"`
+}
+
+func rawUploadResultJSON(result *storage.UploadResult) []byte {
+	dto := uploadResultJSON{
+		Size:            result.Size,
+		RequestedCopies: requestedCopies(result),
+		Complete:        result.Complete,
+	}
+	if result.PieceCID.Defined() {
+		dto.PieceCID = result.PieceCID.String()
 	}
 	for _, copy := range result.Copies {
-		if copy.RetrievalURL != "" {
-			return copy.RetrievalURL
-		}
+		dto.Copies = append(dto.Copies, uploadCopyJSON{
+			ProviderID:   strconv.FormatUint(uint64(copy.ProviderID), 10),
+			DataSetID:    strconv.FormatUint(uint64(copy.DataSetID), 10),
+			PieceID:      strconv.FormatUint(uint64(copy.PieceID), 10),
+			Role:         string(copy.Role),
+			RetrievalURL: copy.RetrievalURL,
+			IsNewDataSet: copy.IsNewDataSet,
+		})
 	}
-	return ""
+	for _, failure := range result.FailedAttempts {
+		dto.FailedAttempts = append(dto.FailedAttempts, uploadFailureJSON{
+			ProviderID: strconv.FormatUint(uint64(failure.ProviderID), 10),
+			Role:       string(failure.Role),
+			Stage:      string(failure.Stage),
+			Error:      errorString(failure.Err),
+			Explicit:   failure.Explicit,
+		})
+	}
+	raw, err := json.Marshal(dto)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func rawUploadErrorJSON(message string) []byte {
+	raw, err := json.Marshal(map[string]string{"error": message})
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func uintIDString(id uint64) *string {
+	if id == 0 {
+		return nil
+	}
+	value := strconv.FormatUint(id, 10)
+	return &value
+}
+
+func nonEmptyStringPtr(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func errorStringPtr(err error) *string {
+	value := errorString(err)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func availableUSDFCFunds(acct *synapse.TokenAccountInfo) *big.Int {
@@ -315,6 +473,21 @@ func availableUSDFCFunds(acct *synapse.TokenAccountInfo) *big.Int {
 
 func (u *Uploader) handleBalancePreflightFailure(ctx context.Context, task *model.Task, logger *slog.Logger, err error) {
 	logger.Warn("wallet balance pre-check failed", "error", err)
+	if task.RetryCount+1 >= task.MaxRetries {
+		if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+			logger.Error("failed to mark task as dead-letter", "error", ftErr)
+		} else {
+			admin.DeadLetterTotal.WithLabelValues("uploader", string(model.TaskTypeUpload)).Inc()
+		}
+	} else {
+		_ = u.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		_ = u.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
+	}
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+}
+
+func (u *Uploader) handleTaskFailure(ctx context.Context, task *model.Task, logger *slog.Logger, stage string, err error) {
+	logger.Error(stage+" failed", "error", err)
 	if task.RetryCount+1 >= task.MaxRetries {
 		if ftErr := u.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
 			logger.Error("failed to mark task as dead-letter", "error", ftErr)

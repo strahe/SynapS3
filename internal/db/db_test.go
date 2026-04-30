@@ -108,9 +108,25 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	}
 
 	versionColumns := sqliteColumns(t, db, "object_versions")
-	for _, column := range []string{"is_current", "in_cache", "in_filecoin"} {
+	for _, column := range []string{"is_current", "in_cache", "storage_upload_id"} {
 		if !versionColumns[column] {
 			t.Fatalf("object_versions.%s should exist", column)
+		}
+	}
+	for _, column := range []string{"piece_cid", "retrieval_url", "in_filecoin"} {
+		if versionColumns[column] {
+			t.Fatalf("object_versions.%s should not exist", column)
+		}
+	}
+
+	bucketColumns := sqliteColumns(t, db, "buckets")
+	if bucketColumns["proof_set_id"] {
+		t.Fatal("buckets.proof_set_id should not exist")
+	}
+
+	for _, table := range []string{"storage_uploads", "storage_data_sets", "storage_upload_copies", "storage_upload_failures"} {
+		if columns := sqliteColumns(t, db, table); len(columns) == 0 {
+			t.Fatalf("%s table should exist", table)
 		}
 	}
 
@@ -124,6 +140,9 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	}
 	if !versionIndexes["idx_object_versions_current_bucket_key"] {
 		t.Fatal("idx_object_versions_current_bucket_key should exist")
+	}
+	if !versionIndexes["idx_object_versions_storage_upload"] {
+		t.Fatal("idx_object_versions_storage_upload should exist")
 	}
 }
 
@@ -144,8 +163,37 @@ func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T
 	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key) VALUES ('wrong-bucket', 1, 2, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/wrong-bucket')`); err == nil {
 		t.Fatal("expected object_versions object/bucket/key mismatch to fail")
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, in_filecoin) VALUES ('missing-provider', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/missing-provider', TRUE)`); err == nil {
-		t.Fatal("expected in_filecoin without provider metadata to fail")
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, state) VALUES ('stored-without-upload', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/stored-without-upload', 'stored')`); err == nil {
+		t.Fatal("expected stored object version without storage_upload_id to fail")
+	}
+
+	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, piece_cid, requested_copies) VALUES (1, 1, 'v-upload', 1, 'sum-1', 'complete', 'bafk2bzacefake', 1)`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, state, storage_upload_id) VALUES ('cached-with-upload', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/cached-with-upload', 'cached', 1)`); err == nil {
+		t.Fatal("expected cached object version with storage_upload_id to fail")
+	}
+}
+
+func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
+	db := newMigratedSQLiteDB(t, "storage-provenance-constraints.db")
+	ctx := context.Background()
+
+	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (1, 'bucket-a')`)
+	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (2, 'bucket-b')`)
+	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, piece_cid, requested_copies) VALUES (1, 1, 'v1', 10, 'sum-1', 'complete', 'bafk2bzacefake', 2)`)
+	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status) VALUES (2, 2, 'v2', 10, 'sum-2', 'running')`)
+	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, data_set_id, first_seen_upload_id, last_seen_upload_id) VALUES (1, 1, '101', '1001', 1, 1)`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, data_set_id, first_seen_upload_id, last_seen_upload_id) VALUES (2, '101', '1001', 2, 2)`); err == nil {
+		t.Fatal("expected provider/data_set reuse across buckets to fail")
+	}
+
+	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, data_set_id, piece_id, role, retrieval_url, is_new_data_set, storage_data_set_id) VALUES (1, 0, '101', '1001', '2001', 'primary', 'https://provider.example/piece', TRUE, 1)`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_copies (upload_id, copy_index, role) VALUES (1, 0, 'secondary')`); err == nil {
+		t.Fatal("expected duplicate copy_index for upload to fail")
+	}
+	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, role) VALUES (1, 1, 'secondary')`)
+	mustExec(t, db, `INSERT INTO storage_upload_failures (upload_id, attempt_index, provider_id, role, stage, error_message, explicit) VALUES (1, 0, '202', 'secondary', 'pull', 'pull failed', FALSE)`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_failures (upload_id, attempt_index, role) VALUES (1, 0, 'secondary')`); err == nil {
+		t.Fatal("expected duplicate failure attempt_index for upload to fail")
 	}
 }
 

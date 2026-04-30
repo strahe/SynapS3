@@ -88,6 +88,10 @@ func seedAdminObjectVersion(t *testing.T, repos *repository.Repositories, bucket
 	if cacheKey == "" {
 		cacheKey = ".versions/" + versionID
 	}
+	createState := state
+	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
+		createState = model.ObjectStateUploading
+	}
 	version := &model.ObjectVersion{
 		VersionID:   versionID,
 		BucketID:    bucket.ID,
@@ -97,13 +101,66 @@ func seedAdminObjectVersion(t *testing.T, repos *repository.Repositories, bucket
 		Checksum:    checksum,
 		ContentType: contentType,
 		CacheKey:    cacheKey,
-		State:       state,
+		State:       createState,
 	}
 	objID, err := repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
 	if err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
+	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
+		acceptAdminVersionUpload(t, repos, versionID, "piece-"+versionID, "https://provider.example/piece/"+versionID)
+		if state == model.ObjectStateCacheEvicted {
+			if err := repos.Objects.UpdateVersionState(context.Background(), versionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+				t.Fatalf("Objects.UpdateVersionState cache_evicted: %v", err)
+			}
+		}
+	}
 	return objID, versionID
+}
+
+func acceptAdminVersionUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageUpload {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start upload attempt: %v", err)
+	}
+	providerID := "101"
+	dataSetID := "dataset-" + versionID
+	pieceID := "1"
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        &pieceCID,
+		RequestedCopies: 1,
+		Copies: []repository.StorageUploadCopyInput{{
+			ProviderID:   &providerID,
+			DataSetID:    &dataSetID,
+			PieceID:      &pieceID,
+			Role:         "primary",
+			RetrievalURL: &retrievalURL,
+		}},
+	}); err != nil {
+		t.Fatalf("record upload result: %v", err)
+	}
+	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    version.BucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("accept upload result: %v", err)
+	}
+	return upload
 }
 
 func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repositories, bucketName, key, body string) *cache.ObjectInfo {
@@ -738,9 +795,7 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("mark uploading: %v", err)
 	}
-	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, versionID, "piece-kept", "https://provider.example/kept", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("mark stored: %v", err)
-	}
+	acceptAdminVersionUpload(t, repos, versionID, "piece-kept", "https://provider.example/kept")
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -1066,9 +1121,7 @@ func TestAPIBucketObjectVersions(t *testing.T) {
 	if err := repos.Objects.UpdateVersionState(ctx, oldVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("old uploading: %v", err)
 	}
-	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, oldVersionID, "piece-old", "https://provider.example/old", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("old stored: %v", err)
-	}
+	acceptAdminVersionUpload(t, repos, oldVersionID, "piece-old", "https://provider.example/old")
 	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 7, "etag-current", "checksum-current", "text/plain", "", model.ObjectStateCached)
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -1161,9 +1214,8 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 		Checksum:    "checksum-unavailable",
 		ContentType: "text/plain",
 		CacheKey:    "cache-unavailable",
-		State:       model.ObjectStateStored,
+		State:       model.ObjectStateCached,
 		InCache:     false,
-		InFilecoin:  false,
 	}
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unavailable); err != nil {
 		t.Fatalf("unavailable version: %v", err)

@@ -57,8 +57,8 @@ import {
   useBucket,
   useBucketObjects,
   useBucketObjectVersions,
-  useObjectStatusDetail,
   useDeleteBucket,
+  useObjectStatusDetail,
   useS3Users,
   useUpdateBucketOwner,
 } from '@/hooks/queries'
@@ -144,7 +144,7 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
           <DialogDescription>
             {recursive
               ? `This will recursively purge ${formatNumber(objectCount)} object(s) and their cached data. Deletion is blocked while lifecycle tasks, object processing, or multipart uploads are in flight.`
-              : 'This empty bucket will be marked for deletion and its proof set removed on-chain. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
+              : 'This empty bucket will be marked for deletion. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-2">
@@ -516,7 +516,6 @@ function objectStatusIcon(status: ObjectStatus, compact = false) {
       return <TriangleAlert className={`${sizeClass} text-status-warning`} />
     case 'unavailable':
       return <CircleSlash className={`${sizeClass} text-status-danger`} />
-    case 'uploading':
     default:
       return <Clock3 className={`${sizeClass} text-status-info`} />
   }
@@ -650,7 +649,6 @@ function BucketMetaLine({ bucket }: { bucket: NonNullable<ReturnType<typeof useB
     formatObjectCount(bucket.object_count),
     formatBytes(bucket.total_size_bytes),
     `Versioning ${bucket.versioning_status.toLowerCase()}`,
-    bucket.proof_set_id ? `Proof set ${bucket.proof_set_id}` : undefined,
   ].filter(Boolean)
 
   return (

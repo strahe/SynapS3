@@ -64,19 +64,18 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		}
 
 		version := &model.ObjectVersion{
-			VersionID:    versionID,
-			BucketID:     bucket.ID,
-			Key:          keyName,
-			Size:         cacheInfo.Size,
-			ETag:         cacheInfo.ETag,
-			Checksum:     cacheInfo.Checksum,
-			ContentType:  contentType,
-			Metadata:     meta,
-			CacheKey:     cacheKey,
-			PieceCID:     reuse.PieceCID,
-			RetrievalURL: reuse.RetrievalURL,
-			InCache:      true,
-			State:        reuse.State,
+			VersionID:       versionID,
+			BucketID:        bucket.ID,
+			Key:             keyName,
+			Size:            cacheInfo.Size,
+			ETag:            cacheInfo.ETag,
+			Checksum:        cacheInfo.Checksum,
+			ContentType:     contentType,
+			Metadata:        meta,
+			CacheKey:        cacheKey,
+			StorageUploadID: reuse.StorageUploadID,
+			InCache:         true,
+			State:           reuse.State,
 		}
 		createdState = version.State
 
@@ -422,19 +421,18 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		}
 
 		version := &model.ObjectVersion{
-			VersionID:    versionID,
-			BucketID:     dstBucket.ID,
-			Key:          dstKey,
-			Size:         cacheInfo.Size,
-			ETag:         cacheInfo.ETag,
-			Checksum:     cacheInfo.Checksum,
-			ContentType:  contentType,
-			Metadata:     meta,
-			CacheKey:     cacheKey,
-			PieceCID:     reuse.PieceCID,
-			RetrievalURL: reuse.RetrievalURL,
-			InCache:      true,
-			State:        reuse.State,
+			VersionID:       versionID,
+			BucketID:        dstBucket.ID,
+			Key:             dstKey,
+			Size:            cacheInfo.Size,
+			ETag:            cacheInfo.ETag,
+			Checksum:        cacheInfo.Checksum,
+			ContentType:     contentType,
+			Metadata:        meta,
+			CacheKey:        cacheKey,
+			StorageUploadID: reuse.StorageUploadID,
+			InCache:         true,
+			State:           reuse.State,
 		}
 		createdState = version.State
 
@@ -653,9 +651,8 @@ func (b *SynapseBackend) versionForRead(ctx context.Context, bucketID int64, key
 }
 
 type versionStorageReuse struct {
-	State        model.ObjectState
-	PieceCID     *string
-	RetrievalURL *string
+	State           model.ObjectState
+	StorageUploadID *int64
 }
 
 func (b *SynapseBackend) resolveVersionReuse(ctx context.Context, objects repository.ObjectRepository, bucketID int64, size int64, checksum string) (versionStorageReuse, error) {
@@ -670,8 +667,7 @@ func (b *SynapseBackend) resolveVersionReuse(ctx context.Context, objects reposi
 	}
 	if stored != nil {
 		reuse.State = model.ObjectStateStored
-		reuse.PieceCID = stored.PieceCID
-		reuse.RetrievalURL = stored.RetrievalURL
+		reuse.StorageUploadID = stored.StorageUploadID
 		return reuse, nil
 	}
 
@@ -702,11 +698,11 @@ func (b *SynapseBackend) completeFollowerIfStoredReuseWonRace(ctx context.Contex
 		b.logger.Warn("checking stored reuse after active upload follower write", "bucket", bucketName, "versionID", versionID, "error", err)
 		return
 	}
-	if reusable == nil || reusable.PieceCID == nil || reusable.RetrievalURL == nil {
+	if reusable == nil || reusable.StorageUploadID == nil {
 		return
 	}
 
-	if err := b.repos.Objects.SetVersionStorageInfoAndTransition(ctx, versionID, *reusable.PieceCID, *reusable.RetrievalURL, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+	if err := b.repos.Objects.SetVersionStorageUploadAndTransition(ctx, versionID, *reusable.StorageUploadID, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
 		b.logger.Debug("active upload follower already handled or still pending", "bucket", bucketName, "versionID", versionID, "error", err)
 		return
 	}

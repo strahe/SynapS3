@@ -15,21 +15,18 @@ import (
 	"github.com/strahe/synaps3/internal/worker"
 )
 
-// seedStoredObject creates a bucket+object version in stored state with PieceCID.
+// seedStoredObject creates a bucket+object version in stored state with an accepted upload.
 func seedStoredObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, string) {
 	t.Helper()
 	ctx := context.Background()
 
 	bucket, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
 
-	// Transition through the pipeline: cached → uploading → stored (with PieceCID)
 	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("transition to uploading: %v", err)
 	}
 	pieceCID := testCID(t).String()
-	if err := env.repos.Objects.SetVersionStorageInfoAndTransition(ctx, versionID, pieceCID, "https://provider.example/pieces/1", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("SetVersionStorageInfoAndTransition: %v", err)
-	}
+	acceptWorkerVersionUpload(t, env, versionID, pieceCID, "https://provider.example/pieces/1")
 	return bucket, objID, versionID
 }
 
@@ -119,19 +116,18 @@ func TestEvictor_WrongState(t *testing.T) {
 	}
 }
 
-func TestEvictor_NoPieceCID(t *testing.T) {
+func TestEvictor_NoReadableCopies(t *testing.T) {
 	mc := &testutil.MockCache{}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	ctx := context.Background()
 
-	// Create object in stored state without PieceCID
-	_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
-	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("transition: %v", err)
+	_, objID, versionID := seedStoredObject(t, env)
+	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil || version.StorageUploadID == nil {
+		t.Fatalf("stored version upload: version=%v err=%v", version, err)
 	}
-	// Skip PieceCID setting, go directly to stored
-	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("transition: %v", err)
+	if _, err := env.db.NewDelete().Model((*model.StorageUploadCopy)(nil)).Where("upload_id = ?", *version.StorageUploadID).Exec(ctx); err != nil {
+		t.Fatalf("remove readable copies: %v", err)
 	}
 
 	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
@@ -143,8 +139,8 @@ func TestEvictor_NoPieceCID(t *testing.T) {
 	if got.Status != model.TaskStatusFailed {
 		t.Errorf("expected task failed, got %s", got.Status)
 	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "no PieceCID") {
-		t.Errorf("expected no PieceCID error, got %v", got.LastError)
+	if got.LastError == nil || !strings.Contains(*got.LastError, "no readable upload copies") {
+		t.Errorf("expected no readable upload copies error, got %v", got.LastError)
 	}
 }
 

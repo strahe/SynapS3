@@ -335,9 +335,7 @@ func TestObjectRepo_FindReusableStoredVersionRequiresStoredChainInfo(t *testing.
 	if err := repos.Objects.UpdateVersionState(ctx, stored.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("stored uploading: %v", err)
 	}
-	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, stored.VersionID, "piece-reuse", "https://provider.example/reuse", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("stored chain info: %v", err)
-	}
+	acceptTestStorageUploadForVersion(t, repos, bucket.ID, stored, "piece-reuse")
 
 	got, err := repos.Objects.FindReusableStoredVersion(ctx, bucket.ID, 10, "same-checksum")
 	if err != nil {
@@ -345,6 +343,41 @@ func TestObjectRepo_FindReusableStoredVersionRequiresStoredChainInfo(t *testing.
 	}
 	if got == nil || got.VersionID != stored.VersionID {
 		t.Fatalf("reusable version = %#v, want %s", got, stored.VersionID)
+	}
+}
+
+func TestObjectRepo_SetVersionStorageUploadAndTransitionUsesNewUpload(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "reuse-storage-upload-bucket")
+
+	stored := newObjectVersion(bucket.ID, "stored.txt", "01J0000000000000000000007G", 10)
+	stored.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, stored); err != nil {
+		t.Fatalf("create stored version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, stored.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("stored uploading: %v", err)
+	}
+	uploadID := acceptTestStorageUploadForVersion(t, repos, bucket.ID, stored, "piece-reuse")
+
+	follower := newObjectVersion(bucket.ID, "follower.txt", "01J0000000000000000000007H", 10)
+	follower.Checksum = "same-checksum"
+	follower.State = model.ObjectStateUploading
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("create follower version: %v", err)
+	}
+
+	if err := repos.Objects.SetVersionStorageUploadAndTransition(ctx, follower.VersionID, uploadID, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+		t.Fatalf("SetVersionStorageUploadAndTransition: %v", err)
+	}
+	got, err := repos.Objects.GetVersionByID(ctx, follower.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("get follower: got=%v err=%v", got, err)
+	}
+	if got.StorageUploadID == nil || *got.StorageUploadID != uploadID || got.State != model.ObjectStateStored || !got.InFilecoin {
+		t.Fatalf("follower storage = state:%s upload:%v filecoin:%v, want stored with upload %d", got.State, got.StorageUploadID, got.InFilecoin, uploadID)
 	}
 }
 
@@ -402,7 +435,7 @@ func TestObjectRepo_FindReusableActiveUploadVersionRequiresActiveTask(t *testing
 	}
 }
 
-func TestObjectRepo_SetStorageInfoForUploadingContentUpdatesMatchingVersions(t *testing.T) {
+func TestObjectRepo_AcceptStorageUploadForContentUpdatesMatchingVersions(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -424,9 +457,34 @@ func TestObjectRepo_SetStorageInfoForUploadingContentUpdatesMatchingVersions(t *
 		}
 	}
 
-	refs, err := repos.Objects.SetStorageInfoForUploadingContent(ctx, bucket.ID, 10, "same-checksum", "piece-shared", "https://provider.example/shared")
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: currentVersion.VersionID,
+		ContentSize:     currentVersion.Size,
+		Checksum:        currentVersion.Checksum,
+	})
 	if err != nil {
-		t.Fatalf("SetStorageInfoForUploadingContent: %v", err)
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        strPtr("piece-shared"),
+		RequestedCopies: 1,
+		Copies: []repository.StorageUploadCopyInput{
+			{ProviderID: strPtr("101"), DataSetID: strPtr("1001-shared"), PieceID: strPtr("2001"), Role: "primary", RetrievalURL: strPtr("https://provider.example/shared")},
+		},
+	}); err != nil {
+		t.Fatalf("RecordUploadResult: %v", err)
+	}
+	refs, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: currentVersion.Size,
+		Checksum:    currentVersion.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("AcceptCompleteUploadForContent: %v", err)
 	}
 	if len(refs) != 2 {
 		t.Fatalf("updated refs len = %d, want 2", len(refs))
@@ -673,7 +731,7 @@ func TestObjectRepo_UpdateVersionStateFromFailedClearsFailureDetails(t *testing.
 	}
 }
 
-func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(t *testing.T) {
+func TestObjectRepo_AcceptStorageUploadMirrorsOnlyCurrentVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -691,15 +749,13 @@ func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(
 	if err := repos.Objects.UpdateVersionState(ctx, oldVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("old version upload transition: %v", err)
 	}
-	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, oldVersion.VersionID, "piece-old", "https://old.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("old SetVersionStorageInfoAndTransition: %v", err)
-	}
+	acceptTestStorageUploadForVersion(t, repos, bucket.ID, oldVersion, "piece-old")
 	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
-	if current.PieceCID != nil || current.RetrievalURL != nil || current.State != model.ObjectStateCached {
-		t.Fatalf("old storage update polluted current version: piece=%v url=%v state=%s", current.PieceCID, current.RetrievalURL, current.State)
+	if current.PieceCID != nil || current.State != model.ObjectStateCached {
+		t.Fatalf("old storage update polluted current version: piece=%v state=%s", current.PieceCID, current.State)
 	}
 	if current.InFilecoin {
 		t.Fatal("old storage update polluted current in_filecoin")
@@ -708,15 +764,13 @@ func TestObjectRepo_SetVersionStorageInfoAndTransitionMirrorsOnlyCurrentVersion(
 	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("current version upload transition: %v", err)
 	}
-	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, currentVersion.VersionID, "piece-current", "https://current.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("current SetVersionStorageInfoAndTransition: %v", err)
-	}
+	acceptTestStorageUploadForVersion(t, repos, bucket.ID, currentVersion, "piece-current")
 	current, err = repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
 	if err != nil {
 		t.Fatalf("GetByBucketAndKey after current storage: %v", err)
 	}
-	if current.PieceCID == nil || *current.PieceCID != "piece-current" || current.RetrievalURL == nil || *current.RetrievalURL != "https://current.example" {
-		t.Fatalf("current storage info = piece:%v url:%v", current.PieceCID, current.RetrievalURL)
+	if current.PieceCID == nil || *current.PieceCID != "piece-current" {
+		t.Fatalf("current storage info = piece:%v", current.PieceCID)
 	}
 	if current.State != model.ObjectStateStored {
 		t.Fatalf("current state = %s, want stored", current.State)
@@ -777,9 +831,7 @@ func TestObjectRepo_UpdateVersionStateMarksCacheEvictedLocation(t *testing.T) {
 	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("uploading: %v", err)
 	}
-	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, version.VersionID, "piece", "https://provider.example/piece", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("stored: %v", err)
-	}
+	acceptTestStorageUploadForVersion(t, repos, bucket.ID, version, "piece")
 
 	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
 		t.Fatalf("cache evicted: %v", err)
@@ -896,9 +948,7 @@ func TestObjectRepo_ResetStaleVersionStatesDoesNotMirrorOldVersion(t *testing.T)
 	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("current uploading: %v", err)
 	}
-	if err := repos.Objects.SetVersionStorageInfoAndTransition(ctx, currentVersion.VersionID, "piece-current", "https://current.example", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("current stored: %v", err)
-	}
+	acceptTestStorageUploadForVersion(t, repos, bucket.ID, currentVersion, "piece-current")
 
 	reset, err := repos.Objects.ResetStaleVersionStates(ctx, model.ObjectStateUploading, model.ObjectStateCached, time.Now().Add(time.Hour))
 	if err != nil {

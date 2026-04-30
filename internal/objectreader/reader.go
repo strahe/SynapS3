@@ -118,18 +118,11 @@ func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID str
 		r.markCachePresence(ctx, version.VersionID, false)
 	}
 
-	if version.PieceCID == nil || *version.PieceCID == "" || version.RetrievalURL == nil || *version.RetrievalURL == "" || r.storage == nil {
+	rc, err := r.downloadVersionFromProvider(ctx, key, version)
+	if errors.Is(err, ErrCacheMiss) {
 		return nil, cacheMissError(ErrNoSuchVersion)
 	}
-	pieceCID, err := cid.Decode(*version.PieceCID)
 	if err != nil {
-		r.logger.Warn("invalid PieceCID, cannot download version from provider", "key", key, "versionID", versionID, "pieceCID", *version.PieceCID)
-		return nil, cacheMissError(ErrNoSuchVersion)
-	}
-
-	rc, err := r.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: *version.RetrievalURL})
-	if err != nil {
-		r.logger.Warn("provider download failed", "key", key, "versionID", versionID, "err", err)
 		return nil, fmt.Errorf("%w: %w: %w", ErrCacheMiss, ErrProviderDownload, err)
 	}
 
@@ -173,18 +166,11 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 		r.markCachePresence(ctx, version.VersionID, false)
 	}
 
-	if version.PieceCID == nil || *version.PieceCID == "" || version.RetrievalURL == nil || *version.RetrievalURL == "" || r.storage == nil {
+	rc, err := r.downloadVersionFromProvider(ctx, key, version)
+	if errors.Is(err, ErrCacheMiss) {
 		return nil, cacheMissError(ErrNoSuchKey)
 	}
-	pieceCID, err := cid.Decode(*version.PieceCID)
 	if err != nil {
-		r.logger.Warn("invalid PieceCID, cannot download from provider", "key", key, "pieceCID", *version.PieceCID)
-		return nil, cacheMissError(ErrNoSuchKey)
-	}
-
-	rc, err := r.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: *version.RetrievalURL})
-	if err != nil {
-		r.logger.Warn("provider download failed", "key", key, "err", err)
 		return nil, fmt.Errorf("%w: %w: %w", ErrCacheMiss, ErrProviderDownload, err)
 	}
 
@@ -219,6 +205,39 @@ func resultFromVersion(version *model.ObjectVersion, body io.ReadCloser, source 
 		Source:       source,
 		CacheMiss:    cacheMiss,
 	}
+}
+
+func (r *Reader) downloadVersionFromProvider(ctx context.Context, key string, version *model.ObjectVersion) (io.ReadCloser, error) {
+	if version.StorageUploadID == nil || r.storage == nil {
+		return nil, ErrCacheMiss
+	}
+	copies, err := r.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
+	if err != nil {
+		return nil, err
+	}
+	if len(copies) == 0 {
+		return nil, ErrCacheMiss
+	}
+
+	var lastErr error
+	for _, copy := range copies {
+		pieceCID, err := cid.Decode(copy.PieceCID)
+		if err != nil {
+			r.logger.Warn("invalid PieceCID, skipping provider copy", "key", key, "versionID", version.VersionID, "pieceCID", copy.PieceCID, "copyIndex", copy.CopyIndex)
+			lastErr = err
+			continue
+		}
+		rc, err := r.storage.Download(ctx, pieceCID, &storage.DownloadOptions{URL: copy.RetrievalURL})
+		if err == nil {
+			return rc, nil
+		}
+		r.logger.Warn("provider download failed", "key", key, "versionID", version.VersionID, "copyIndex", copy.CopyIndex, "role", copy.Role, "err", err)
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrProviderDownload, lastErr)
+	}
+	return nil, ErrCacheMiss
 }
 
 func cacheMissError(err error) error {

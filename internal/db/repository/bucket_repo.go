@@ -98,23 +98,6 @@ func (r *BunBucketRepo) UpdateStatus(ctx context.Context, id int64, from, to mod
 	return nil
 }
 
-func (r *BunBucketRepo) SetProofSetID(ctx context.Context, id int64, proofSetID string) error {
-	res, err := r.db.NewUpdate().
-		Model((*model.Bucket)(nil)).
-		Set("proof_set_id = ?", proofSetID).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", id).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("setting proof set ID: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("setting proof set ID: bucket %d not found", id)
-	}
-	return nil
-}
-
 func (r *BunBucketRepo) SetACL(ctx context.Context, name string, acl []byte) error {
 	res, err := r.db.NewUpdate().
 		Model((*model.Bucket)(nil)).
@@ -232,13 +215,12 @@ func (r *BunBucketRepo) CountByStatus(ctx context.Context) ([]BucketStatusCount,
 	return counts, nil
 }
 
-func (r *BunBucketRepo) CountWithProofSet(ctx context.Context) (int, error) {
+func (r *BunBucketRepo) CountStorageDataSets(ctx context.Context) (int, error) {
 	count, err := r.db.NewSelect().
-		Model((*model.Bucket)(nil)).
-		Where("proof_set_id IS NOT NULL").
+		Model((*model.StorageDataSet)(nil)).
 		Count(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("counting buckets with proof set: %w", err)
+		return 0, fmt.Errorf("counting storage data sets: %w", err)
 	}
 	return count, nil
 }

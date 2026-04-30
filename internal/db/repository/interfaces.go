@@ -23,8 +23,6 @@ type BucketRepository interface {
 	SoftDelete(ctx context.Context, id int64) error
 	// UpdateStatus atomically transitions bucket status using CAS.
 	UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error
-	// SetProofSetID sets the proof set ID for a bucket.
-	SetProofSetID(ctx context.Context, id int64, proofSetID string) error
 	// SetACL stores the bucket ACL JSON blob used by VersityGW access control.
 	SetACL(ctx context.Context, name string, acl []byte) error
 	// SetOwnerAndACL stores both the authoritative owner and compatible ACL.
@@ -33,10 +31,10 @@ type BucketRepository interface {
 	CountByOwner(ctx context.Context, ownerAccessKey string) (int, error)
 	// AggregateCountsByOwner returns bucket counts grouped by authoritative owner access key.
 	AggregateCountsByOwner(ctx context.Context) (map[string]int, error)
-	// HardDelete permanently removes a bucket row (used after proof set deletion).
+	// HardDelete permanently removes a bucket row.
 	HardDelete(ctx context.Context, id int64) error
-	// CountWithProofSet returns the number of buckets that have a non-null proof set ID.
-	CountWithProofSet(ctx context.Context) (int, error)
+	// CountStorageDataSets returns provider-scoped data set count.
+	CountStorageDataSets(ctx context.Context) (int, error)
 }
 
 // S3AccountRepository defines persistence operations for S3 IAM accounts.
@@ -95,8 +93,7 @@ type ObjectRepository interface {
 	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
 	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
 	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error
-	SetVersionStorageInfoAndTransition(ctx context.Context, versionID string, pieceCID string, retrievalURL string, from, to model.ObjectState) error
-	SetStorageInfoForUploadingContent(ctx context.Context, bucketID int64, size int64, checksum string, pieceCID string, retrievalURL string) ([]ObjectVersionRef, error)
+	SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error
 	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)
 	ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error)
 	ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
@@ -110,6 +107,74 @@ type ObjectRepository interface {
 	TotalSizeByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// AggregateByBucket returns object count and total size for all buckets in a single query.
 	AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error)
+}
+
+type StartObjectUploadAttemptInput struct {
+	BucketID        int64
+	SourceTaskID    int64
+	SourceVersionID string
+	ContentSize     int64
+	Checksum        string
+}
+
+type RecordUploadResultInput struct {
+	UploadID        int64
+	Complete        bool
+	PieceCID        *string
+	RequestedCopies int
+	RawResultJSON   []byte
+	ErrorMessage    *string
+	Copies          []StorageUploadCopyInput
+	Failures        []StorageUploadFailureInput
+}
+
+type StorageUploadCopyInput struct {
+	ProviderID   *string
+	DataSetID    *string
+	PieceID      *string
+	Role         string
+	RetrievalURL *string
+	IsNewDataSet bool
+}
+
+type StorageUploadFailureInput struct {
+	ProviderID   *string
+	Role         string
+	Stage        *string
+	ErrorMessage *string
+	Explicit     bool
+}
+
+type ReadableStorageCopy struct {
+	UploadID     int64  `bun:"upload_id"`
+	PieceCID     string `bun:"piece_cid"`
+	CopyIndex    int    `bun:"copy_index"`
+	ProviderID   string `bun:"provider_id"`
+	DataSetID    string `bun:"data_set_id"`
+	PieceID      string `bun:"piece_id"`
+	Role         string `bun:"role"`
+	RetrievalURL string `bun:"retrieval_url"`
+}
+
+type AcceptCompleteUploadInput struct {
+	UploadID        int64
+	TaskID          int64
+	BucketID        int64
+	ContentSize     int64
+	Checksum        string
+	AutoEvict       bool
+	EvictMaxRetries int
+}
+
+type StorageUploadRepository interface {
+	StartObjectUploadAttempt(ctx context.Context, input StartObjectUploadAttemptInput) (*model.StorageUpload, error)
+	RecordUploadResult(ctx context.Context, input RecordUploadResultInput) error
+	AcceptCompleteUploadForContent(ctx context.Context, input AcceptCompleteUploadInput) ([]ObjectVersionRef, error)
+	FindAcceptableUploadAttempt(ctx context.Context, taskID int64, versionID string) (*model.StorageUpload, error)
+	SetAcceptError(ctx context.Context, uploadID int64, message string) error
+	GetByID(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
+	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
+	ListReadableCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
 }
 
 // BucketObjectStats holds aggregate object metrics for a single bucket.

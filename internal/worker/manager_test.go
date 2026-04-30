@@ -287,6 +287,10 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 func seedManagerVersion(t *testing.T, repos *repository.Repositories, bucket *model.Bucket, key string, state model.ObjectState) (int64, string) {
 	t.Helper()
 	versionID := model.NewVersionID()
+	createState := state
+	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
+		createState = model.ObjectStateUploading
+	}
 	version := &model.ObjectVersion{
 		VersionID:   versionID,
 		BucketID:    bucket.ID,
@@ -296,11 +300,65 @@ func seedManagerVersion(t *testing.T, repos *repository.Repositories, bucket *mo
 		Checksum:    "checksum-" + key,
 		ContentType: "text/plain",
 		CacheKey:    ".versions/" + versionID,
-		State:       state,
+		State:       createState,
 	}
 	objID, err := repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
 	if err != nil {
 		t.Fatalf("creating object version: %v", err)
 	}
+	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
+		acceptManagerVersionUpload(t, repos, versionID)
+		if state == model.ObjectStateCacheEvicted {
+			if err := repos.Objects.UpdateVersionState(context.Background(), versionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+				t.Fatalf("transition to cache_evicted: %v", err)
+			}
+		}
+	}
 	return objID, versionID
+}
+
+func acceptManagerVersionUpload(t *testing.T, repos *repository.Repositories, versionID string) {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
+	}
+	pieceCID := "piece-" + versionID
+	providerID := "101"
+	dataSetID := "dataset-" + versionID
+	pieceID := "1"
+	retrievalURL := "https://provider.example/piece/" + versionID
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start upload attempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        &pieceCID,
+		RequestedCopies: 1,
+		Copies: []repository.StorageUploadCopyInput{{
+			ProviderID:   &providerID,
+			DataSetID:    &dataSetID,
+			PieceID:      &pieceID,
+			Role:         "primary",
+			RetrievalURL: &retrievalURL,
+		}},
+	}); err != nil {
+		t.Fatalf("record upload result: %v", err)
+	}
+	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    version.BucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("accept upload result: %v", err)
+	}
 }

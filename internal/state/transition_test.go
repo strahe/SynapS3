@@ -111,23 +111,17 @@ func TestTransitionToFailed_Valid(t *testing.T) {
 	}
 }
 
-func TestTransitionToFailed_FromStored(t *testing.T) {
+func TestTransitionToFailed_FromStoredRejected(t *testing.T) {
 	m := NewObjectStateMachine()
 	u := &mockStateUpdater{}
 	ctx := context.Background()
 
 	err := TransitionToFailed(ctx, m, u, "version-1", model.ObjectStateStored, "eviction retries exhausted")
-	if err != nil {
-		t.Fatalf("TransitionToFailed: %v", err)
+	if err == nil {
+		t.Fatal("TransitionToFailed should reject stored→failed")
 	}
-	if !u.updateFailedCalled {
-		t.Error("UpdateStateToFailed was not called")
-	}
-	if u.lastFrom != model.ObjectStateStored {
-		t.Errorf("lastFrom = %s, want stored", u.lastFrom)
-	}
-	if u.lastError != "eviction retries exhausted" {
-		t.Errorf("lastError = %q, want %q", u.lastError, "eviction retries exhausted")
+	if u.updateFailedCalled {
+		t.Error("UpdateStateToFailed should not be called for stored→failed")
 	}
 }
 

@@ -109,10 +109,11 @@ func (r *BunObjectRepo) GetObjectByBucketAndKey(ctx context.Context, bucketID in
 
 func (r *BunObjectRepo) GetCurrentVersionByObjectID(ctx context.Context, objectID int64) (*model.ObjectVersion, error) {
 	version := new(model.ObjectVersion)
-	err := r.db.NewSelect().
+	q := r.db.NewSelect().
 		Model(version).
-		Where("object_id = ? AND is_current = ?", objectID, true).
-		Scan(ctx)
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.object_id = ? AND object_version.is_current = ?", objectID, true).Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -124,10 +125,11 @@ func (r *BunObjectRepo) GetCurrentVersionByObjectID(ctx context.Context, objectI
 
 func (r *BunObjectRepo) GetCurrentVersionByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.ObjectVersion, error) {
 	version := new(model.ObjectVersion)
-	err := r.db.NewSelect().
+	q := r.db.NewSelect().
 		Model(version).
-		Where("bucket_id = ? AND key = ? AND is_current = ?", bucketID, key, true).
-		Scan(ctx)
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.bucket_id = ? AND object_version.key = ? AND object_version.is_current = ?", bucketID, key, true).Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -139,10 +141,11 @@ func (r *BunObjectRepo) GetCurrentVersionByBucketAndKey(ctx context.Context, buc
 
 func (r *BunObjectRepo) GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error) {
 	version := new(model.ObjectVersion)
-	err := r.db.NewSelect().
+	q := r.db.NewSelect().
 		Model(version).
-		Where("version_id = ?", versionID).
-		Scan(ctx)
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.version_id = ?", versionID).Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -154,10 +157,11 @@ func (r *BunObjectRepo) GetVersionByID(ctx context.Context, versionID string) (*
 
 func (r *BunObjectRepo) GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error) {
 	version := new(model.ObjectVersion)
-	err := r.db.NewSelect().
+	q := r.db.NewSelect().
 		Model(version).
-		Where("bucket_id = ? AND key = ? AND version_id = ?", bucketID, key, versionID).
-		Scan(ctx)
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.bucket_id = ? AND object_version.key = ? AND object_version.version_id = ?", bucketID, key, versionID).Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -169,15 +173,16 @@ func (r *BunObjectRepo) GetVersionByBucketKeyAndID(ctx context.Context, bucketID
 
 func (r *BunObjectRepo) FindReusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error) {
 	version := new(model.ObjectVersion)
-	err := r.db.NewSelect().
+	q := r.db.NewSelect().
 		Model(version).
-		Where("bucket_id = ? AND size = ? AND checksum = ?", bucketID, size, checksum).
-		Where("state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
-		Where("in_filecoin = ?", true).
-		Where("piece_cid IS NOT NULL AND piece_cid <> ''").
-		Where("retrieval_url IS NOT NULL AND retrieval_url <> ''").
-		OrderExpr("created_at DESC").
-		OrderExpr("version_id DESC").
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
+		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
+		Where("storage_upload.status = ?", model.StorageUploadStatusComplete).
+		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
+		OrderExpr("object_version.created_at DESC").
+		OrderExpr("object_version.version_id DESC").
 		Limit(1).
 		Scan(ctx)
 	if err != nil {
@@ -226,18 +231,20 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 	var versions []model.ObjectVersion
 	q := r.db.NewSelect().
 		Model(&versions).
-		Where("bucket_id = ? AND is_current = ?", bucketID, true).
-		OrderExpr("key ASC")
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version").
+		Where("object_version.bucket_id = ? AND object_version.is_current = ?", bucketID, true).
+		OrderExpr("object_version.key ASC")
 
 	if prefix != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
-		q = q.Where("key LIKE ? ESCAPE '\\'", escaped+"%")
+		q = q.Where("object_version.key LIKE ? ESCAPE '\\'", escaped+"%")
 	}
 	if keyBoundary != "" {
 		if includeBoundary {
-			q = q.Where("key >= ?", keyBoundary)
+			q = q.Where("object_version.key >= ?", keyBoundary)
 		} else {
-			q = q.Where("key > ?", keyBoundary)
+			q = q.Where("object_version.key > ?", keyBoundary)
 		}
 	}
 	if maxKeys > 0 {
@@ -254,11 +261,11 @@ func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64
 	q := r.db.NewSelect().
 		Model(&rows).
 		ModelTableExpr("object_versions AS object_version").
-		ColumnExpr("object_version.*").
 		Where("object_version.bucket_id = ?", bucketID).
 		OrderExpr("object_version.key ASC").
 		OrderExpr("object_version.created_at DESC").
 		OrderExpr("object_version.version_id DESC")
+	q = withObjectVersionStorageColumns(q, "object_version")
 
 	if prefix != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
@@ -295,10 +302,10 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 	q := r.db.NewSelect().
 		Model(&rows).
 		ModelTableExpr("object_versions AS object_version").
-		ColumnExpr("object_version.*").
 		Where("object_version.bucket_id = ? AND object_version.key = ?", bucketID, key).
 		OrderExpr("object_version.created_at DESC").
 		OrderExpr("object_version.version_id DESC")
+	q = withObjectVersionStorageColumns(q, "object_version")
 
 	if afterVersionID != "" {
 		marker, err := r.GetVersionByBucketKeyAndID(ctx, bucketID, key, afterVersionID)
@@ -354,46 +361,27 @@ func (r *BunObjectRepo) SetVersionCachePresence(ctx context.Context, versionID s
 	})
 }
 
-func (r *BunObjectRepo) SetVersionStorageInfoAndTransition(ctx context.Context, versionID string, pieceCID string, retrievalURL string, from, to model.ObjectState) error {
+func (r *BunObjectRepo) SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		now := time.Now()
-		res, err := db.NewUpdate().
-			Model((*model.ObjectVersion)(nil)).
-			Set("piece_cid = ?", pieceCID).
-			Set("retrieval_url = ?", retrievalURL).
-			Set("in_filecoin = ?", true).
-			Set("state = ?", to).
-			Set("updated_at = ?", now).
-			Where("version_id = ? AND state = ?", versionID, from).
-			Exec(ctx)
+		query := `UPDATE object_versions
+			SET storage_upload_id = ?, state = ?, updated_at = ?
+			WHERE version_id = ? AND state = ?
+			  AND EXISTS (
+				SELECT 1 FROM storage_uploads
+				WHERE id = ? AND status = ?
+			  )
+			  AND ` + usableCopyExistsSQL("?")
+		res, err := db.NewRaw(query, storageUploadID, to, now, versionID, from, storageUploadID, model.StorageUploadStatusComplete, storageUploadID).Exec(ctx)
 		if err != nil {
-			return fmt.Errorf("setting version storage info and transitioning state: %w", err)
+			return fmt.Errorf("setting version storage upload and transitioning state: %w", err)
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			return fmt.Errorf("SetVersionStorageInfoAndTransition %s→%s failed: version %s not in expected state", from, to, versionID)
+			return fmt.Errorf("SetVersionStorageUploadAndTransition %s→%s failed: version %s not in expected state or upload not usable", from, to, versionID)
 		}
 		return nil
 	})
-}
-
-func (r *BunObjectRepo) SetStorageInfoForUploadingContent(ctx context.Context, bucketID int64, size int64, checksum string, pieceCID string, retrievalURL string) ([]ObjectVersionRef, error) {
-	var refs []ObjectVersionRef
-	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		updated, err := setStorageInfoForUploadingContent(ctx, db, bucketID, size, checksum, pieceCID, retrievalURL)
-		if err != nil {
-			return err
-		}
-		refs = updated
-		if len(refs) == 0 {
-			return fmt.Errorf("no uploading object versions matched content: %w", ErrNotFound)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return refs, nil
 }
 
 func (r *BunObjectRepo) FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error) {
@@ -437,8 +425,10 @@ func (r *BunObjectRepo) ListVersionsByState(ctx context.Context, state model.Obj
 	var versions []model.ObjectVersion
 	q := r.db.NewSelect().
 		Model(&versions).
-		Where("state = ?", state).
-		OrderExpr("updated_at ASC")
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version").
+		Where("object_version.state = ?", state).
+		OrderExpr("object_version.updated_at ASC")
 	if limit > 0 {
 		q = q.Limit(limit)
 	}
@@ -551,6 +541,18 @@ func (r *BunObjectRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) 
 		})
 	}
 	return fn(r.db)
+}
+
+func withObjectVersionStorageColumns(q *bun.SelectQuery, alias string) *bun.SelectQuery {
+	return q.
+		ColumnExpr(alias + ".*").
+		ColumnExpr("storage_upload.piece_cid AS piece_cid").
+		ColumnExpr("CASE WHEN " + alias + ".state IN ('stored', 'cache_evicted') AND storage_upload.status = 'complete' THEN TRUE ELSE FALSE END AS in_filecoin").
+		Join("LEFT JOIN storage_uploads AS storage_upload ON storage_upload.id = " + alias + ".storage_upload_id")
+}
+
+func usableCopyExistsSQL(uploadIDExpr string) string {
+	return "EXISTS (SELECT 1 FROM storage_upload_copies AS storage_copy WHERE storage_copy.upload_id = " + uploadIDExpr + " AND storage_copy.storage_data_set_id IS NOT NULL AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> '' AND storage_copy.data_set_id IS NOT NULL AND storage_copy.data_set_id <> '' AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> '' AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> '')"
 }
 
 func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (ObjectVersionWriteResult, error) {
@@ -677,9 +679,6 @@ func normalizeObjectVersion(version *model.ObjectVersion) {
 	if version.State != model.ObjectStateCacheEvicted {
 		version.InCache = true
 	}
-	if version.PieceCID != nil && *version.PieceCID != "" && version.RetrievalURL != nil && *version.RetrievalURL != "" {
-		version.InFilecoin = true
-	}
 	if version.ContentType == "" {
 		version.ContentType = "application/octet-stream"
 	}
@@ -699,10 +698,11 @@ func selectObjectByBucketAndKey(ctx context.Context, db bun.IDB, bucketID int64,
 
 func selectCurrentVersionByObjectID(ctx context.Context, db bun.IDB, objectID int64) (*model.ObjectVersion, error) {
 	version := new(model.ObjectVersion)
-	err := db.NewSelect().
+	q := db.NewSelect().
 		Model(version).
-		Where("object_id = ? AND is_current = ?", objectID, true).
-		Scan(ctx)
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.object_id = ? AND object_version.is_current = ?", objectID, true).Scan(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -776,26 +776,6 @@ func resetStaleVersions(ctx context.Context, db bun.IDB, fromState, toState mode
 		versionIDs = append(versionIDs, row.VersionID)
 	}
 	return versionIDs, nil
-}
-
-func setStorageInfoForUploadingContent(ctx context.Context, db bun.IDB, bucketID int64, size int64, checksum string, pieceCID string, retrievalURL string) ([]ObjectVersionRef, error) {
-	now := time.Now()
-	var refs []ObjectVersionRef
-	query := `UPDATE object_versions
-		SET piece_cid = ?, retrieval_url = ?, in_filecoin = ?, state = ?, updated_at = ?
-		WHERE bucket_id = ? AND size = ? AND checksum = ? AND state = ?
-		RETURNING object_id, version_id`
-	err := db.NewRaw(query,
-		pieceCID, retrievalURL, true, model.ObjectStateStored, now,
-		bucketID, size, checksum, model.ObjectStateUploading,
-	).Scan(ctx, &refs)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("setting storage info for uploading content: %w", err)
-	}
-	return refs, nil
 }
 
 func objectIdentityFromVersion(version *model.ObjectVersion) *model.Object {

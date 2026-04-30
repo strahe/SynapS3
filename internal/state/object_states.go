@@ -14,7 +14,6 @@ func NewObjectStateMachine() *Machine {
 
 		// Failure
 		Transition{From: string(model.ObjectStateUploading), To: string(model.ObjectStateFailed)},
-		Transition{From: string(model.ObjectStateStored), To: string(model.ObjectStateFailed)},
 
 		// Retry
 		Transition{From: string(model.ObjectStateFailed), To: string(model.ObjectStateUploading)},

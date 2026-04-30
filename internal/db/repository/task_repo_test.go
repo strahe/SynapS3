@@ -487,18 +487,24 @@ func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 	bucketB := seedBucket(t, db, "task-bucket-b")
 
 	versionA := newObjectVersion(bucketA.ID, "a.txt", "01J00000000000000000000TA", 1)
-	versionA.State = model.ObjectStateStored
 	objectA, err := repos.Objects.CreateVersionAndSetCurrent(ctx, versionA)
 	if err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent objectA: %v", err)
 	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionA.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("objectA uploading: %v", err)
+	}
+	acceptTestStorageUploadForVersion(t, repos, bucketA.ID, versionA, "piece-a")
 
 	versionB := newObjectVersion(bucketB.ID, "b.txt", "01J00000000000000000000TB", 1)
-	versionB.State = model.ObjectStateStored
 	objectB, err := repos.Objects.CreateVersionAndSetCurrent(ctx, versionB)
 	if err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent objectB: %v", err)
 	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionB.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("objectB uploading: %v", err)
+	}
+	acceptTestStorageUploadForVersion(t, repos, bucketB.ID, versionB, "piece-b")
 
 	for _, task := range []*model.Task{
 		{

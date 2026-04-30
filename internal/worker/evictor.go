@@ -90,16 +90,28 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	// Dual safety check: must be stored AND have PieceCID
 	if version.State != model.ObjectStateStored {
 		logger.Warn("object version not in stored state", "state", version.State)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "not stored")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
-	if version.PieceCID == nil || *version.PieceCID == "" {
-		logger.Error("object version has no PieceCID, refusing to evict")
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "no PieceCID")
+	if version.StorageUploadID == nil {
+		logger.Error("object version has no accepted upload, refusing to evict")
+		_ = e.repos.Tasks.Fail(ctx, task.ID, "no accepted upload")
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
+		return
+	}
+	copies, err := e.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
+	if err != nil {
+		logger.Error("storage upload copy lookup failed", "error", err)
+		_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
+		return
+	}
+	if len(copies) == 0 {
+		logger.Error("object version has no readable upload copies, refusing to evict")
+		_ = e.repos.Tasks.Fail(ctx, task.ID, "no readable upload copies")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}

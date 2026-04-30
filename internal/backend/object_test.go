@@ -98,24 +98,80 @@ func (r *getCurrentVersionByBucketAndKeyAfterReadRepo) GetCurrentVersionByBucket
 func seedBackendObjectVersion(t *testing.T, tb *testBackend, bucket *model.Bucket, key string, size int64, etag, checksum, contentType string, state model.ObjectState, pieceCID, retrievalURL *string) (int64, string) {
 	t.Helper()
 	versionID := model.NewVersionID()
+	createState := state
+	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
+		createState = model.ObjectStateUploading
+	}
 	version := &model.ObjectVersion{
-		VersionID:    versionID,
-		BucketID:     bucket.ID,
-		Key:          key,
-		Size:         size,
-		ETag:         etag,
-		Checksum:     checksum,
-		ContentType:  contentType,
-		CacheKey:     ".versions/" + versionID,
-		PieceCID:     pieceCID,
-		RetrievalURL: retrievalURL,
-		State:        state,
+		VersionID:   versionID,
+		BucketID:    bucket.ID,
+		Key:         key,
+		Size:        size,
+		ETag:        etag,
+		Checksum:    checksum,
+		ContentType: contentType,
+		CacheKey:    ".versions/" + versionID,
+		State:       createState,
 	}
 	objID, err := tb.repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
 	if err != nil {
 		t.Fatalf("seeding object version: %v", err)
 	}
+	if (state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted) && pieceCID != nil && retrievalURL != nil {
+		acceptBackendVersionUpload(t, tb.repos, versionID, *pieceCID, *retrievalURL)
+		if state == model.ObjectStateCacheEvicted {
+			if err := tb.repos.Objects.UpdateVersionState(context.Background(), versionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+				t.Fatalf("restore seeded cache evicted version: %v", err)
+			}
+		}
+	}
 	return objID, versionID
+}
+
+func acceptBackendVersionUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageUpload {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start upload attempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        &pieceCID,
+		RequestedCopies: 1,
+		Copies: []repository.StorageUploadCopyInput{{
+			ProviderID:   stringPtr("101"),
+			DataSetID:    stringPtr("dataset-" + versionID),
+			PieceID:      stringPtr("1"),
+			Role:         "primary",
+			RetrievalURL: &retrievalURL,
+		}},
+	}); err != nil {
+		t.Fatalf("record upload result: %v", err)
+	}
+	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    version.BucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("accept upload result: %v", err)
+	}
+	return upload
+}
+
+func stringPtr(value string) *string {
+	return &value
 }
 
 func counterValue(t *testing.T, name string) float64 {
@@ -398,9 +454,7 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("mark first version uploading: %v", err)
 	}
-	if err := tb.repos.Objects.SetVersionStorageInfoAndTransition(ctx, firstObj.VersionID, "piece-shared", "https://provider.example/shared", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("mark first version stored: %v", err)
-	}
+	acceptBackendVersionUpload(t, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
 
 	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", 10, 0)
 	if err != nil {
@@ -418,11 +472,8 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	if secondVersion.State != model.ObjectStateStored {
 		t.Fatalf("second version state = %s, want stored", secondVersion.State)
 	}
-	if secondVersion.PieceCID == nil || *secondVersion.PieceCID != "piece-shared" {
-		t.Fatalf("second version piece cid = %v, want piece-shared", secondVersion.PieceCID)
-	}
-	if secondVersion.RetrievalURL == nil || *secondVersion.RetrievalURL != "https://provider.example/shared" {
-		t.Fatalf("second version retrieval url = %v", secondVersion.RetrievalURL)
+	if secondVersion.StorageUploadID == nil {
+		t.Fatal("second version storage_upload_id is nil, want reused upload")
 	}
 
 	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", 10, 0)
@@ -448,9 +499,7 @@ func TestPutObjectIdenticalStoredContentQueuesEvictWhenAutoEvictEnabled(t *testi
 	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("mark first version uploading: %v", err)
 	}
-	if err := tb.repos.Objects.SetVersionStorageInfoAndTransition(ctx, firstObj.VersionID, "piece-shared", "https://provider.example/shared", model.ObjectStateUploading, model.ObjectStateStored); err != nil {
-		t.Fatalf("mark first version stored: %v", err)
-	}
+	acceptBackendVersionUpload(t, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
 
 	secondOut := putTestObjectOutput(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
 	task, err := tb.repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
@@ -599,7 +648,7 @@ func TestGetObject_SPFallback(t *testing.T) {
 	pieceCIDStr := buildDummyCID(t)
 
 	retrievalURL := "https://provider.example/pieces/1"
-	seedBackendObjectVersion(t, tb, bkt, "remote-file.txt", 5, "abc123", "sha256hex", "text/plain", model.ObjectStateCached, &pieceCIDStr, &retrievalURL)
+	seedBackendObjectVersion(t, tb, bkt, "remote-file.txt", 5, "abc123", "sha256hex", "text/plain", model.ObjectStateStored, &pieceCIDStr, &retrievalURL)
 
 	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
 		if opts == nil || opts.URL != "https://provider.example/pieces/1" {
@@ -650,7 +699,7 @@ func TestGetObject_SPFallback_CurrentVersionChangeDoesNotServeStaleData(t *testi
 
 	pieceCIDStr := buildDummyCID(t)
 	oldRetrievalURL := "https://provider.example/pieces/old"
-	seedBackendObjectVersion(t, tb, bkt, "remote-file.txt", 3, "abc123", "sha256hex", "text/plain", model.ObjectStateCached, &pieceCIDStr, &oldRetrievalURL)
+	seedBackendObjectVersion(t, tb, bkt, "remote-file.txt", 3, "abc123", "sha256hex", "text/plain", model.ObjectStateStored, &pieceCIDStr, &oldRetrievalURL)
 
 	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
 		latestReady = true
@@ -690,7 +739,7 @@ func TestGetObject_SPFallback_DownloadFailure(t *testing.T) {
 
 	pieceCIDStr := buildDummyCID(t)
 	retrievalURL := "https://provider.example/pieces/fail"
-	seedBackendObjectVersion(t, tb, bkt, "fail-dl.txt", 5, "e", "c", "text/plain", model.ObjectStateCached, &pieceCIDStr, &retrievalURL)
+	seedBackendObjectVersion(t, tb, bkt, "fail-dl.txt", 5, "e", "c", "text/plain", model.ObjectStateStored, &pieceCIDStr, &retrievalURL)
 
 	tb.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
 		return nil, errors.New("provider unreachable")

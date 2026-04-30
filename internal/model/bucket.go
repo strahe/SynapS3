@@ -22,13 +22,12 @@ func (s BucketStatus) IsAdminVisible() bool { return true }
 // IsWritable returns true — all active buckets accept writes.
 func (s BucketStatus) IsWritable() bool { return true }
 
-// Bucket maps an S3 bucket to a Filecoin ProofSet.
+// Bucket stores S3 bucket metadata.
 type Bucket struct {
 	bun.BaseModel `bun:"table:buckets"`
 
 	ID             int64        `bun:",pk,autoincrement"`
 	Name           string       `bun:",unique,notnull"`
-	ProofSetID     *string      `bun:",nullzero"` // assigned after on-chain creation
 	ACL            []byte       `bun:",nullzero"`
 	OwnerAccessKey *string      `bun:",nullzero"`
 	Status         BucketStatus `bun:",notnull,default:'active'"`

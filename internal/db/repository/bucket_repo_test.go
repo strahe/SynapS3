@@ -109,25 +109,6 @@ func TestBucketRepo_UpdateStatus(t *testing.T) {
 	}
 }
 
-func TestBucketRepo_SetProofSetID(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "proofset-id", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	if err := repos.Buckets.SetProofSetID(ctx, bucket.ID, "ps-12345"); err != nil {
-		t.Fatalf("SetProofSetID: %v", err)
-	}
-	got, _ := repos.Buckets.GetByID(ctx, bucket.ID)
-	if got.ProofSetID == nil || *got.ProofSetID != "ps-12345" {
-		t.Errorf("expected ProofSetID ps-12345, got %v", got.ProofSetID)
-	}
-}
-
 func TestBucketRepo_HardDelete(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -316,7 +297,7 @@ func TestBucketRepo_ListACLsReturnsOnlyOwnershipFields(t *testing.T) {
 		t.Fatalf("Marshal ACL: %v", err)
 	}
 	for _, bucket := range []*model.Bucket{
-		{Name: "owned", Status: model.BucketStatusActive, ACL: acl, ProofSetID: strptr("proof-set")},
+		{Name: "owned", Status: model.BucketStatusActive, ACL: acl},
 		{Name: "unassigned", Status: model.BucketStatusActive},
 	} {
 		if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -339,32 +320,43 @@ func TestBucketRepo_ListACLsReturnsOnlyOwnershipFields(t *testing.T) {
 	}
 }
 
-func TestBucketRepo_CountWithProofSet_ExcludesDeletedBuckets(t *testing.T) {
+func TestBucketRepo_CountStorageDataSets(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	for _, tc := range []struct {
-		name       string
-		status     model.BucketStatus
-		proofSetID *string
-	}{
-		{name: "active-with-proof", status: model.BucketStatusActive, proofSetID: strptr("ps-1")},
-		{name: "active-with-proof-2", status: model.BucketStatusActive, proofSetID: strptr("ps-2")},
-		{name: "active-without-proof", status: model.BucketStatusActive, proofSetID: nil},
-	} {
-		b := &model.Bucket{Name: tc.name, Status: tc.status, ProofSetID: tc.proofSetID}
-		if err := repos.Buckets.Create(ctx, b); err != nil {
-			t.Fatalf("Create(%s): %v", tc.name, err)
-		}
+	bucket := &model.Bucket{Name: "datasets-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create bucket: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "dataset-count",
+		ContentSize:     1,
+		Checksum:        "sum",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        strptr("bafk2bzacedatasetcount"),
+		RequestedCopies: 2,
+		Copies: []repository.StorageUploadCopyInput{
+			{ProviderID: strptr("101"), DataSetID: strptr("1001"), PieceID: strptr("2001"), Role: "primary", RetrievalURL: strptr("https://provider.example/1")},
+			{ProviderID: strptr("202"), DataSetID: strptr("2002"), PieceID: strptr("3001"), Role: "secondary", RetrievalURL: strptr("https://provider.example/2")},
+		},
+	}); err != nil {
+		t.Fatalf("RecordUploadResult: %v", err)
 	}
 
-	count, err := repos.Buckets.CountWithProofSet(ctx)
+	count, err := repos.Buckets.CountStorageDataSets(ctx)
 	if err != nil {
-		t.Fatalf("CountWithProofSet: %v", err)
+		t.Fatalf("CountStorageDataSets: %v", err)
 	}
 	if count != 2 {
-		t.Fatalf("expected 2 buckets with proof sets, got %d", count)
+		t.Fatalf("storage data set count = %d, want 2", count)
 	}
 }
 

@@ -37,7 +37,7 @@ type tokenAccountDTO struct {
 }
 
 type walletBusinessDTO struct {
-	ProofSetCount         int `json:"proof_set_count"`
+	DataSetCount          int `json:"data_set_count"`
 	OnchainTasksPending   int `json:"onchain_tasks_pending"`
 	OnchainTasksCompleted int `json:"onchain_tasks_completed"`
 }
@@ -78,14 +78,14 @@ func (s *Server) handleAPIWallet(w http.ResponseWriter, r *http.Request) {
 
 	// Business stats (best-effort, from local DB).
 	biz := &walletBusinessDTO{}
-	if cnt, dbErr := s.repos.Buckets.CountWithProofSet(r.Context()); dbErr != nil {
-		s.logger.Warn("failed to count buckets with proof set", "error", dbErr)
+	if cnt, dbErr := s.repos.Buckets.CountStorageDataSets(r.Context()); dbErr != nil {
+		s.logger.Warn("failed to count storage data sets", "error", dbErr)
 		if resp.PartialErrors == nil {
 			resp.PartialErrors = make(map[string]string)
 		}
-		resp.PartialErrors["proof_set_count"] = "database query failed"
+		resp.PartialErrors["data_set_count"] = "database query failed"
 	} else {
-		biz.ProofSetCount = cnt
+		biz.DataSetCount = cnt
 	}
 
 	taskCounts, dbErr := s.repos.Tasks.CountByStatus(r.Context())

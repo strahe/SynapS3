@@ -250,19 +250,18 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		}
 
 		version := &model.ObjectVersion{
-			VersionID:    versionID,
-			BucketID:     upload.BucketID,
-			Key:          keyName,
-			Size:         cacheInfo.Size,
-			ETag:         s3ETag,
-			Checksum:     cacheInfo.Checksum,
-			ContentType:  upload.ContentType,
-			Metadata:     upload.Metadata,
-			CacheKey:     cacheKey,
-			PieceCID:     reuse.PieceCID,
-			RetrievalURL: reuse.RetrievalURL,
-			InCache:      true,
-			State:        reuse.State,
+			VersionID:       versionID,
+			BucketID:        upload.BucketID,
+			Key:             keyName,
+			Size:            cacheInfo.Size,
+			ETag:            s3ETag,
+			Checksum:        cacheInfo.Checksum,
+			ContentType:     upload.ContentType,
+			Metadata:        upload.Metadata,
+			CacheKey:        cacheKey,
+			StorageUploadID: reuse.StorageUploadID,
+			InCache:         true,
+			State:           reuse.State,
 		}
 		createdState = version.State
 
