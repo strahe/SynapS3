@@ -17,6 +17,8 @@ import (
 	"github.com/knadh/koanf/v2"
 )
 
+const MaxFilecoinDefaultCopies = 8
+
 type Config struct {
 	Server   ServerConfig   `koanf:"server"`
 	S3       S3Config       `koanf:"s3"`
@@ -52,6 +54,7 @@ type FilecoinConfig struct {
 	Source               string `koanf:"source"`
 	WithCDN              bool   `koanf:"with_cdn"`
 	AllowPrivateNetworks bool   `koanf:"allow_private_networks"`
+	DefaultCopies        int    `koanf:"default_copies"`
 }
 
 type DatabaseConfig struct {
@@ -130,9 +133,10 @@ func defaultConfig() *Config {
 			Region: "us-east-1",
 		},
 		Filecoin: FilecoinConfig{
-			Network: "calibration",
-			RPCURL:  defaultFilecoinRPCURLs["calibration"],
-			Source:  "synaps3",
+			Network:       "calibration",
+			RPCURL:        defaultFilecoinRPCURLs["calibration"],
+			Source:        "synaps3",
+			DefaultCopies: 2,
 		},
 		Database: DatabaseConfig{
 			Driver:       "sqlite",
@@ -367,6 +371,12 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	if strings.TrimSpace(c.Filecoin.PrivateKey) == "" {
 		add("filecoin.private_key", "must be non-empty")
+	}
+	if c.Filecoin.DefaultCopies < 1 {
+		add("filecoin.default_copies", fmt.Sprintf("must be >= 1, got %d", c.Filecoin.DefaultCopies))
+	}
+	if c.Filecoin.DefaultCopies > MaxFilecoinDefaultCopies {
+		add("filecoin.default_copies", fmt.Sprintf("must be <= %d, got %d", MaxFilecoinDefaultCopies, c.Filecoin.DefaultCopies))
 	}
 
 	// S3 credentials.

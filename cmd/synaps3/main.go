@@ -244,7 +244,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("initializing Filecoin SDK: %w", err)
 	}
 	defer func() { _ = client.Close() }()
-	storageClient := client.Storage()
+	storageClient := synapse.AdaptStorageService(client.Storage())
 	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain())
 
 	autoEvict := isAutoEvictEnabled(cfg.Cache.EvictionPolicy)
@@ -296,7 +296,8 @@ func runServe(ctx context.Context, src config.Source) error {
 	wm := worker.NewManager(repos, logger, autoEvict,
 		worker.NewUploader(repos, localCache, storageClient, walletQuerier, sm, autoEvict,
 			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
-			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries)),
+			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
+			worker.WithTargetCopies(cfg.Filecoin.DefaultCopies)),
 		worker.NewEvictor(repos, localCache, sm,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
@@ -385,6 +386,7 @@ func setupModeAllowedField(field string) bool {
 		"filecoin.rpc_url",
 		"filecoin.private_key",
 		"filecoin.source",
+		"filecoin.default_copies",
 		"worker.upload.concurrency",
 		"worker.upload.poll_interval",
 		"worker.upload.max_retries",

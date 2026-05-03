@@ -22,6 +22,7 @@ filecoin:
   source: "synaps3"
   with_cdn: false                 # default CDN hint for synapse-go uploads
   allow_private_networks: false   # opt-in only for trusted private SP retrieval URLs
+  default_copies: 2               # default Filecoin copies for buckets without an explicit policy, 1-8
 
 database:
   driver: "sqlite"             # postgres | sqlite

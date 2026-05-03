@@ -85,6 +85,7 @@ type ObjectRepository interface {
 	GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error)
 	GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
 	FindReusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
+	FindReusableReplicatingVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
 	FindReusableActiveUploadVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
 	ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.ObjectVersion, error)
 	ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.ObjectVersion, error)
@@ -96,6 +97,7 @@ type ObjectRepository interface {
 	SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error
 	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)
 	ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error)
+	ListVersionsByStateAfter(ctx context.Context, state model.ObjectState, afterUpdatedAt time.Time, afterVersionID string, limit int) ([]model.ObjectVersion, error)
 	ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
 	// CountByState returns object counts grouped by state.
 	CountByState(ctx context.Context) ([]ObjectStateCount, error)
@@ -156,6 +158,79 @@ type ReadableStorageCopy struct {
 	RetrievalURL string `bun:"retrieval_url"`
 }
 
+type EnsureDataSetBindingInput struct {
+	BucketID          int64
+	ProviderID        string
+	CopyIndex         int
+	CreatedByUploadID int64
+}
+
+type MarkDataSetCreatingInput struct {
+	ID              int64
+	UploadID        int64
+	TransactionID   string
+	StatusURL       string
+	ClientDataSetID string
+}
+
+type MarkDataSetReadyInput struct {
+	ID              int64
+	UploadID        int64
+	DataSetID       string
+	ClientDataSetID string
+}
+
+type UploadCopyBindingInput struct {
+	StorageDataSetID int64
+	CopyIndex        int
+	Role             string
+	ProviderID       string
+}
+
+type MarkUploadCopyPieceReadyInput struct {
+	UploadID     int64
+	CopyIndex    int
+	PieceCID     string
+	PieceID      string
+	RetrievalURL string
+}
+
+type MarkUploadCopyCommittingInput struct {
+	UploadID            int64
+	CopyIndex           int
+	CommitExtraDataHex  string
+	CommitTransactionID string
+}
+
+type MarkUploadCopyCommittedInput struct {
+	UploadID            int64
+	CopyIndex           int
+	PieceCID            string
+	PieceID             string
+	RetrievalURL        string
+	CommitExtraDataHex  string
+	CommitTransactionID string
+}
+
+type BindPrimaryCommittedUploadInput struct {
+	UploadID    int64
+	BucketID    int64
+	ContentSize int64
+	Checksum    string
+}
+
+type BindPrimaryCommittedUploadForVersionInput struct {
+	UploadID    int64
+	BucketID    int64
+	ContentSize int64
+	Checksum    string
+	VersionID   string
+}
+
+type FinalizeUploadInput struct {
+	UploadID int64
+}
+
 type AcceptCompleteUploadInput struct {
 	UploadID        int64
 	TaskID          int64
@@ -171,10 +246,30 @@ type StorageUploadRepository interface {
 	RecordUploadResult(ctx context.Context, input RecordUploadResultInput) error
 	AcceptCompleteUploadForContent(ctx context.Context, input AcceptCompleteUploadInput) ([]ObjectVersionRef, error)
 	FindAcceptableUploadAttempt(ctx context.Context, taskID int64, versionID string) (*model.StorageUpload, error)
+	FindActiveUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error)
+	FindLatestUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error)
+	FindLatestUploadsBySourceVersions(ctx context.Context, versionIDs []string) (map[string]model.StorageUpload, error)
 	SetAcceptError(ctx context.Context, uploadID int64, message string) error
 	GetByID(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
+	GetByIDs(ctx context.Context, uploadIDs []int64) (map[int64]model.StorageUpload, error)
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
 	ListReadableCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
+	ListReadablePrimaryCopy(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
+	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
+	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
+	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
+	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
+	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
+	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error
+	CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error
+	GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error)
+	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
+	MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error
+	MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error
+	MarkUploadCopyFailed(ctx context.Context, uploadID int64, copyIndex int, lastError string) error
+	BindPrimaryCommittedUploadForContent(ctx context.Context, input BindPrimaryCommittedUploadInput) ([]ObjectVersionRef, error)
+	BindPrimaryCommittedUploadForVersion(ctx context.Context, input BindPrimaryCommittedUploadForVersionInput) ([]ObjectVersionRef, error)
+	FinalizeUploadIfAllCopiesCommitted(ctx context.Context, input FinalizeUploadInput) (bool, []ObjectVersionRef, error)
 }
 
 // BucketObjectStats holds aggregate object metrics for a single bucket.
@@ -224,7 +319,7 @@ type TaskRepository interface {
 	CompleteByRef(ctx context.Context, refType string, refID int64, taskType model.TaskType) error
 	// List returns tasks with optional filters, paginated by offset/limit.
 	// Returns the matching tasks and the total count (for pagination).
-	List(ctx context.Context, taskType string, status string, limit, offset int) ([]model.Task, int, error)
+	List(ctx context.Context, taskType string, stage string, status string, limit, offset int) ([]model.Task, int, error)
 }
 
 // TaskStatusCount holds a task count grouped by type and status.

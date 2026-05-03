@@ -64,6 +64,7 @@ const tabFields = {
     'filecoin.source',
     'filecoin.with_cdn',
     'filecoin.allow_private_networks',
+    'filecoin.default_copies',
   ],
   cache: ['cache.dir', 'cache.max_size_gb', 'cache.eviction_policy'],
   workers: [
@@ -301,6 +302,14 @@ function SettingsPage() {
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, source: value } })}
+              />
+              <NumberField
+                label="Default Copies"
+                field="filecoin.default_copies"
+                value={form.filecoin.default_copies}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, default_copies: value } })}
               />
               <CheckboxField
                 label="Use CDN"
@@ -850,6 +859,7 @@ function buildSettingsPayload(
   if (include('filecoin.network')) payload.filecoin.network = form.filecoin.network
   if (include('filecoin.rpc_url')) payload.filecoin.rpc_url = form.filecoin.rpc_url
   if (include('filecoin.source')) payload.filecoin.source = form.filecoin.source
+  if (include('filecoin.default_copies')) payload.filecoin.default_copies = form.filecoin.default_copies
   if (include('filecoin.with_cdn')) payload.filecoin.with_cdn = form.filecoin.with_cdn
   if (include('filecoin.allow_private_networks'))
     payload.filecoin.allow_private_networks = form.filecoin.allow_private_networks

@@ -13,6 +13,8 @@ type ObjectState string
 const (
 	ObjectStateCached       ObjectState = "cached"
 	ObjectStateUploading    ObjectState = "uploading"
+	ObjectStateCommitting   ObjectState = "committing"
+	ObjectStateReplicating  ObjectState = "replicating"
 	ObjectStateStored       ObjectState = "stored"
 	ObjectStateFailed       ObjectState = "failed"
 	ObjectStateCacheEvicted ObjectState = "cache_evicted"

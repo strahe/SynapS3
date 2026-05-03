@@ -90,7 +90,7 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	if version.State != model.ObjectStateStored {
+	if version.State != model.ObjectStateStored && version.State != model.ObjectStateReplicating {
 		logger.Warn("object version not in stored state", "state", version.State)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "not stored")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
@@ -102,7 +102,12 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
-	copies, err := e.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
+	var copies []repository.ReadableStorageCopy
+	if version.State == model.ObjectStateReplicating {
+		copies, err = e.repos.Uploads.ListReadablePrimaryCopy(ctx, *version.StorageUploadID)
+	} else {
+		copies, err = e.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
+	}
 	if err != nil {
 		logger.Error("storage upload copy lookup failed", "error", err)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
@@ -137,6 +142,28 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 			_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
 		}
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
+		return
+	}
+
+	if version.State == model.ObjectStateReplicating {
+		if err := e.repos.Objects.SetVersionCachePresence(ctx, task.RefVersionID, false); err != nil {
+			logger.Error("cache presence update after replicating eviction failed", "error", err)
+			if task.RetryCount+1 >= task.MaxRetries {
+				if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
+					logger.Error("failed to mark task as dead-letter", "error", ftErr)
+				} else {
+					admin.DeadLetterTotal.WithLabelValues("evictor", string(model.TaskTypeEvictCache)).Inc()
+				}
+			} else {
+				_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
+				_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
+			}
+			admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
+			return
+		}
+		_ = e.repos.Tasks.Complete(ctx, task.ID)
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
+		logger.Info("replicating cache evicted")
 		return
 	}
 

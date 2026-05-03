@@ -126,6 +126,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", s.handleAPIDownloadObject)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
+		mux.HandleFunc("GET /api/v1/tasks/{id}/ref-detail", s.handleAPITaskRefDetail)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryDeadLetter) // only retries dead_letter tasks
 		mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
 		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)

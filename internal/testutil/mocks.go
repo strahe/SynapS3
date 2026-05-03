@@ -20,8 +20,10 @@ var (
 
 // MockStorageClient is a configurable test double for synapse.StorageClient.
 type MockStorageClient struct {
-	UploadFunc   func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
-	DownloadFunc func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
+	UploadFunc         func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
+	DownloadFunc       func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
+	CreateContextsFunc func(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error)
+	CreateContextFunc  func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error)
 }
 
 func (m *MockStorageClient) Upload(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
@@ -36,6 +38,20 @@ func (m *MockStorageClient) Download(ctx context.Context, pieceCID cid.Cid, opts
 		return m.DownloadFunc(ctx, pieceCID, opts)
 	}
 	return nil, errors.New("MockStorageClient.Download not configured")
+}
+
+func (m *MockStorageClient) CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	if m.CreateContextsFunc != nil {
+		return m.CreateContextsFunc(ctx, opts)
+	}
+	return nil, errors.New("MockStorageClient.CreateContexts not configured")
+}
+
+func (m *MockStorageClient) CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	if m.CreateContextFunc != nil {
+		return m.CreateContextFunc(ctx, opts)
+	}
+	return nil, errors.New("MockStorageClient.CreateContext not configured")
 }
 
 // MockWalletQuerier is a configurable test double for synapse.WalletQuerier.

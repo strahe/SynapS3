@@ -327,6 +327,111 @@ func TestTaskRepo_RetryDeadLetter(t *testing.T) {
 	}
 }
 
+func TestTaskRepo_RetryDeadLetterClearsFailedUploadObject(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "retry-object-bucket")
+	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000RETRY", 10)
+	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading state: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionStateToFailed(ctx, version.VersionID, model.ObjectStateUploading, "create dataset failed"); err != nil {
+		t.Fatalf("failed state: %v", err)
+	}
+
+	stage := "ensure_dataset"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: "retry-object-failed",
+		Payload:        map[string]interface{}{"copy_index": 0},
+		Status:         model.TaskStatusDeadLetter,
+		RetryCount:     5,
+		MaxRetries:     5,
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+
+	if err := repos.Tasks.RetryDeadLetter(ctx, task.ID); err != nil {
+		t.Fatalf("RetryDeadLetter: %v", err)
+	}
+
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID: %v", err)
+	}
+	if got.State != model.ObjectStateUploading {
+		t.Fatalf("state = %s, want uploading", got.State)
+	}
+	if got.FailedAtState != nil || got.LastError != nil {
+		t.Fatalf("failure details = failed_at_state:%#v last_error:%#v, want nil", got.FailedAtState, got.LastError)
+	}
+}
+
+func TestTaskRepo_RetryPrimaryCommitDeadLetterRestoresCommittingState(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := seedBucket(t, db, "retry-commit-bucket")
+	version := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000COMMIT", 10)
+	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading state: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing state: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionStateToFailed(ctx, version.VersionID, model.ObjectStateCommitting, "commit failed"); err != nil {
+		t.Fatalf("failed state: %v", err)
+	}
+
+	stage := "primary_commit"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: "retry-primary-commit-failed",
+		Payload:        map[string]interface{}{"upload_id": 12},
+		Status:         model.TaskStatusDeadLetter,
+		RetryCount:     5,
+		MaxRetries:     5,
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+
+	if err := repos.Tasks.RetryDeadLetter(ctx, task.ID); err != nil {
+		t.Fatalf("RetryDeadLetter: %v", err)
+	}
+
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID: %v", err)
+	}
+	if got.State != model.ObjectStateCommitting {
+		t.Fatalf("state = %s, want committing", got.State)
+	}
+	if got.FailedAtState != nil || got.LastError != nil {
+		t.Fatalf("failure details = failed_at_state:%#v last_error:%#v, want nil", got.FailedAtState, got.LastError)
+	}
+}
+
 func TestTaskRepo_RetryDeadLetter_NotDeadLetter(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -345,7 +450,7 @@ func TestTaskRepo_List(t *testing.T) {
 	ctx := context.Background()
 
 	// Empty table.
-	tasks, total, err := repos.Tasks.List(ctx, "", "", 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, "", "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("List empty: %v", err)
 	}
@@ -365,7 +470,7 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 
 	// List all — should return 3.
-	tasks, total, err = repos.Tasks.List(ctx, "", "", 10, 0)
+	tasks, total, err = repos.Tasks.List(ctx, "", "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("List all: %v", err)
 	}
@@ -377,7 +482,7 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 
 	// Filter by type.
-	_, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", 10, 0)
+	_, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("List by type: %v", err)
 	}
@@ -386,7 +491,7 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 
 	// Filter by status.
-	_, total, err = repos.Tasks.List(ctx, "", string(model.TaskStatusPending), 10, 0)
+	_, total, err = repos.Tasks.List(ctx, "", "", string(model.TaskStatusPending), 10, 0)
 	if err != nil {
 		t.Fatalf("List by status: %v", err)
 	}
@@ -395,7 +500,7 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 
 	// Filter by type + status.
-	tasks, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUpload), string(model.TaskStatusRunning), 10, 0)
+	tasks, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", string(model.TaskStatusRunning), 10, 0)
 	if err != nil {
 		t.Fatalf("List by type+status: %v", err)
 	}
@@ -407,7 +512,7 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 
 	// Pagination: limit 2, offset 0.
-	tasks, total, err = repos.Tasks.List(ctx, "", "", 2, 0)
+	tasks, total, err = repos.Tasks.List(ctx, "", "", "", 2, 0)
 	if err != nil {
 		t.Fatalf("List paginated: %v", err)
 	}
@@ -419,7 +524,7 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 
 	// Pagination: limit 2, offset 2 — should return 1.
-	tasks, total, err = repos.Tasks.List(ctx, "", "", 2, 2)
+	tasks, total, err = repos.Tasks.List(ctx, "", "", "", 2, 2)
 	if err != nil {
 		t.Fatalf("List paginated offset: %v", err)
 	}
@@ -428,6 +533,69 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 	if len(tasks) != 1 {
 		t.Errorf("expected 1 task at offset 2, got %d", len(tasks))
+	}
+}
+
+func TestTaskRepo_ListFiltersByStage(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	primaryCommit := "primary_commit"
+	prepare := "prepare_upload"
+	for _, task := range []*model.Task{
+		{
+			Type:           model.TaskTypeUpload,
+			Stage:          &primaryCommit,
+			RefType:        "object",
+			RefID:          1,
+			RefVersionID:   "01J000000000000000STAGE01",
+			IdempotencyKey: "stage-primary-commit",
+			Status:         model.TaskStatusPending,
+			ScheduledAt:    time.Now(),
+		},
+		{
+			Type:           model.TaskTypeUpload,
+			Stage:          &prepare,
+			RefType:        "object",
+			RefID:          2,
+			RefVersionID:   "01J000000000000000STAGE02",
+			IdempotencyKey: "stage-prepare",
+			Status:         model.TaskStatusPending,
+			ScheduledAt:    time.Now(),
+		},
+		{
+			Type:           model.TaskTypeEvictCache,
+			RefType:        "object",
+			RefID:          3,
+			RefVersionID:   "01J000000000000000STAGE03",
+			IdempotencyKey: "stage-evict",
+			Status:         model.TaskStatusPending,
+			ScheduledAt:    time.Now(),
+		},
+	} {
+		if err := repos.Tasks.Create(ctx, task); err != nil {
+			t.Fatalf("Create task %q: %v", task.IdempotencyKey, err)
+		}
+	}
+
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), primaryCommit, string(model.TaskStatusPending), 10, 0)
+	if err != nil {
+		t.Fatalf("List by stage: %v", err)
+	}
+	if total != 1 || len(tasks) != 1 || tasks[0].IdempotencyKey != "stage-primary-commit" {
+		t.Fatalf("stage filtered tasks = total:%d tasks:%#v, want primary_commit only", total, tasks)
+	}
+
+	claimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("ClaimPending returned nil")
+	}
+	if claimed.Type != model.TaskTypeUpload {
+		t.Fatalf("claimed type = %s, want upload", claimed.Type)
 	}
 }
 

@@ -87,6 +87,7 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 		{field: "server.port", env: "SYNAPS3_SERVER_PORT"},
 		{field: "s3.region", env: "SYNAPS3_S3_REGION"},
 		{field: "filecoin.private_key", env: "SYNAPS3_FILECOIN_PRIVATE_KEY", secret: true},
+		{field: "filecoin.default_copies", env: "SYNAPS3_FILECOIN_DEFAULT_COPIES"},
 		{field: "cache.dir", env: "SYNAPS3_CACHE_DIR"},
 	}
 	for _, tt := range tests {
@@ -243,7 +244,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":":8088"},
-		"filecoin":{"network":"mainnet","with_cdn":true},
+		"filecoin":{"network":"mainnet","with_cdn":true,"default_copies":3},
 		"cache":{"max_size_gb":8},
 		"worker":{"upload":{"poll_interval":"9s"}},
 		"logging":{"format":"text"}
@@ -264,7 +265,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	if !resp.RestartRequired {
 		t.Fatal("RestartRequired = false, want true")
 	}
-	if resp.Config.Server.Port != ":8088" || resp.Config.Cache.MaxSizeGB != 8 {
+	if resp.Config.Server.Port != ":8088" || resp.Config.Cache.MaxSizeGB != 8 || resp.Config.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("updated config = %#v", resp.Config)
 	}
 
@@ -277,6 +278,9 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	}
 	if loaded.Worker.Upload.PollInterval.String() != "9s" {
 		t.Fatalf("saved worker.upload.poll_interval = %s, want 9s", loaded.Worker.Upload.PollInterval)
+	}
+	if loaded.Filecoin.DefaultCopies != 3 {
+		t.Fatalf("saved filecoin.default_copies = %d, want 3", loaded.Filecoin.DefaultCopies)
 	}
 }
 
@@ -523,6 +527,7 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "filecoin source", envName: "SYNAPS3_FILECOIN_SOURCE", payload: `{"filecoin":{"source":"other"}}`, field: "filecoin.source"},
 		{name: "filecoin cdn", envName: "SYNAPS3_FILECOIN_WITH_CDN", payload: `{"filecoin":{"with_cdn":true}}`, field: "filecoin.with_cdn"},
 		{name: "filecoin private networks", envName: "SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS", payload: `{"filecoin":{"allow_private_networks":true}}`, field: "filecoin.allow_private_networks"},
+		{name: "filecoin default copies", envName: "SYNAPS3_FILECOIN_DEFAULT_COPIES", payload: `{"filecoin":{"default_copies":3}}`, field: "filecoin.default_copies"},
 		{name: "cache dir", envName: "SYNAPS3_CACHE_DIR", payload: `{"cache":{"dir":"/tmp/cache"}}`, field: "cache.dir"},
 		{name: "cache max size", envName: "SYNAPS3_CACHE_MAX_SIZE_GB", payload: `{"cache":{"max_size_gb":8}}`, field: "cache.max_size_gb"},
 		{name: "cache eviction policy", envName: "SYNAPS3_CACHE_EVICTION_POLICY", payload: `{"cache":{"eviction_policy":"manual"}}`, field: "cache.eviction_policy"},
@@ -570,7 +575,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":"not-a-port"},
 		"s3":{"region":""},
-		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","source":""},
+		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","source":"","default_copies":0},
 		"worker":{"upload":{"max_retries":-1}},
 		"logging":{"level":"verbose","format":"xml"}
 	}`))
@@ -589,6 +594,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"s3.region",
 		"filecoin.rpc_url",
 		"filecoin.source",
+		"filecoin.default_copies",
 		"worker.upload.max_retries",
 		"logging.level",
 		"logging.format",

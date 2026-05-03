@@ -18,6 +18,7 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'filecoin.network': meta('Filecoin Network'),
   'filecoin.rpc_url': meta('Filecoin RPC URL'),
   'filecoin.allow_private_networks': meta('Allow Private Networks'),
+  'filecoin.default_copies': meta('Default Copies'),
   'cache.dir': meta('Cache Directory'),
   'cache.max_size_gb': meta('Cache Max Size'),
   'cache.eviction_policy': meta('Cache Eviction Policy'),
@@ -54,6 +55,7 @@ function baseConfig(): SettingsEditableConfig {
       source: 'synaps3',
       with_cdn: false,
       allow_private_networks: false,
+      default_copies: 2,
     },
     cache: {
       dir: '/var/lib/synaps3/cache',
@@ -129,6 +131,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.server.tls.key_file = '/certs/next.key'
   next.s3.region = 'us-west-2'
   next.filecoin.rpc_url = 'https://rpc.example.invalid'
+  next.filecoin.default_copies = 3
   next.cache.dir = '/data/cache'
   next.cache.max_size_gb = 50
   next.cache.eviction_policy = 'manual'
@@ -156,6 +159,7 @@ test('settings risk collection reports review-level infrastructure changes', () 
         'https://rpc.example.invalid',
         'medium',
       ],
+      ['filecoin.default_copies', 'Default Copies', '2', '3', 'medium'],
       ['cache.dir', 'Cache Directory', '/var/lib/synaps3/cache', '/data/cache', 'medium'],
       ['cache.max_size_gb', 'Cache Max Size', '100', '50', 'medium'],
       ['cache.eviction_policy', 'Cache Eviction Policy', 'lru', 'manual', 'medium'],

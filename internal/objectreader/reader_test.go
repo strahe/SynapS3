@@ -103,6 +103,79 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	}
 }
 
+func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+		PutFunc: func(_ context.Context, _, _ string, r io.Reader) (*cache.ObjectInfo, error) {
+			data, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("reading rehydrate body: %v", err)
+			}
+			return &cache.ObjectInfo{Path: "/cache/replicating.txt", Size: int64(len(data)), ETag: "etag", Checksum: "checksum"}, nil
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "replicating-reader-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	pieceCID := buildTestCID(t)
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR05",
+		BucketID:    bucket.ID,
+		Key:         "replicating.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR05",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	uploadID := bindReaderPrimaryCommittedUpload(t, repos, version.VersionID, pieceCID, "https://primary.example/piece")
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     uploadID,
+		CopyIndex:    1,
+		PieceCID:     pieceCID,
+		PieceID:      "2",
+		RetrievalURL: "https://secondary.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted secondary: %v", err)
+	}
+
+	storageClient := &testutil.MockStorageClient{
+		DownloadFunc: func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
+			if opts == nil || opts.URL != "https://primary.example/piece" {
+				t.Fatalf("DownloadOptions = %#v, want primary retrieval URL", opts)
+			}
+			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
+		},
+	}
+	reader := New(repos, mc, storageClient, slog.Default())
+
+	got, err := reader.Open(ctx, bucket.Name, "replicating.txt", S3Visibility)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	body, err := io.ReadAll(got.Body)
+	closeErr := got.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("Body.Close: %v", closeErr)
+	}
+	if string(body) != "remote" {
+		t.Fatalf("body = %q, want remote", string(body))
+	}
+}
+
 func TestOpenCacheHitDoesNotRewritePresentCacheLocation(t *testing.T) {
 	mc := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
@@ -465,6 +538,68 @@ func acceptReaderVersionUpload(t *testing.T, repos *repository.Repositories, ver
 	}); err != nil {
 		t.Fatalf("accept upload result: %v", err)
 	}
+}
+
+func bindReaderPrimaryCommittedUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for primary bind: version=%v err=%v", version, err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("mark committing: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start upload attempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("primary binding: %v", err)
+	}
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("secondary binding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+		t.Fatalf("primary ready: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: "2002", ClientDataSetID: "9002"}); err != nil {
+		t.Fatalf("secondary ready: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+	}); err != nil {
+		t.Fatalf("create copy rows: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		PieceID:      "1",
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("primary committed: %v", err)
+	}
+	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    version.BucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("bind primary committed: %v", err)
+	}
+	return upload.ID
 }
 
 func TestTeeReadCloserReadReturnsEOFBeforeRehydrationCompletes(t *testing.T) {

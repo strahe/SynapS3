@@ -14,8 +14,9 @@ import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/p
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useTasks } from '@/hooks/queries'
-import { timeAgo } from '@/lib/utils'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useTaskRefDetail, useTasks } from '@/hooks/queries'
+import { formatBytes, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/tasks')({
   component: TasksPage,
@@ -39,13 +40,115 @@ const statusLabels: Record<string, string> = {
   dead_letter: 'Dead Letter',
 }
 
-const PAGE_SIZE = 50
+const stageOptions = [
+  'all',
+  'prepare_upload',
+  'ensure_dataset',
+  'primary_store',
+  'primary_commit',
+  'secondary_pull',
+  'secondary_commit',
+  'legacy_upload',
+] as const
+
+const PAGE_SIZE = 20
+
+const taskStageLabels: Record<string, string> = {
+  prepare_upload: 'prepare',
+  ensure_dataset: 'dataset',
+  primary_store: 'primary store',
+  primary_commit: 'primary commit',
+  secondary_pull: 'secondary pull',
+  secondary_commit: 'secondary commit',
+  legacy_upload: 'legacy upload',
+}
+
+function taskStageLabel(task: TaskItem) {
+  const stage = task.stage ?? ''
+  const base = taskStageLabels[stage] ?? stage
+  if (typeof task.copy_index === 'number') return `${base} · copy ${task.copy_index}`
+  return base
+}
+
+function TaskRefCell({ task }: { task: TaskItem }) {
+  const [detailEnabled, setDetailEnabled] = useState(false)
+  const detail = useTaskRefDetail(task.id, detailEnabled)
+  const refLabel = `${task.ref_type}:${task.ref_id}`
+
+  const enableDetail = () => setDetailEnabled(true)
+
+  return (
+    <Tooltip
+      delayDuration={250}
+      onOpenChange={(open) => {
+        if (open) enableDetail()
+      }}
+    >
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="inline-flex max-w-48 truncate font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={enableDetail}
+          aria-label={`${refLabel} reference`}
+        >
+          {refLabel}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-sm items-start whitespace-normal text-left">
+        <TaskRefTooltipContent detail={detail} enabled={detailEnabled} />
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function TaskRefTooltipContent({ detail, enabled }: { detail: ReturnType<typeof useTaskRefDetail>; enabled: boolean }) {
+  if (!enabled || detail.isLoading || (detail.isFetching && !detail.data)) {
+    return <span>Loading reference</span>
+  }
+  if (detail.error || !detail.data?.object) {
+    return <span>Reference unavailable</span>
+  }
+
+  const object = detail.data.object
+  return (
+    <div className="grid max-w-xs grid-cols-[auto_1fr] gap-x-2 gap-y-1 text-xs">
+      <span className="text-muted-foreground">Bucket</span>
+      <span className="truncate font-medium">{object.bucket_name}</span>
+      <span className="text-muted-foreground">Key</span>
+      <span className="truncate font-medium">{object.key}</span>
+      <span className="text-muted-foreground">Version</span>
+      <span className="truncate font-mono">{object.version_id}</span>
+      <span className="text-muted-foreground">State</span>
+      <span>{object.state}</span>
+      {object.upload_status && (
+        <>
+          <span className="text-muted-foreground">Upload</span>
+          <span>{object.upload_status}</span>
+        </>
+      )}
+      <span className="text-muted-foreground">Size</span>
+      <span>{formatBytes(object.size)}</span>
+      <span className="text-muted-foreground">Location</span>
+      <span>{taskObjectLocationLabel(object.location)}</span>
+      <span className="text-muted-foreground">Updated</span>
+      <span>{timeAgo(object.updated_at)}</span>
+    </div>
+  )
+}
+
+function taskObjectLocationLabel(location: { cache: boolean; filecoin: boolean }) {
+  if (location.cache && location.filecoin) return 'Cache + Filecoin'
+  if (location.cache) return 'Cache'
+  if (location.filecoin) return 'Filecoin'
+  return 'None'
+}
 
 function TasksPage() {
   const [status, setStatus] = useState('')
   const [taskType, setTaskType] = useState('')
+  const [stage, setStage] = useState('')
   const [offset, setOffset] = useState(0)
-  const { data, isLoading, error } = useTasks(taskType, status, PAGE_SIZE, offset)
+  const { data, isLoading, error } = useTasks(taskType, stage, status, PAGE_SIZE, offset)
   const qc = useQueryClient()
 
   const [retryTarget, setRetryTarget] = useState<TaskItem | null>(null)
@@ -84,6 +187,7 @@ function TasksPage() {
           value={taskType || 'all'}
           onValueChange={(value) => {
             setTaskType(value === 'all' ? '' : value)
+            if (value !== 'upload') setStage('')
             setOffset(0)
           }}
           className="min-w-0"
@@ -97,7 +201,36 @@ function TasksPage() {
           </TabsList>
         </Tabs>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Label htmlFor="task-stage-filter" className="text-sm text-muted-foreground">
+            Stage:
+          </Label>
+          <Select
+            value={stage || 'all'}
+            disabled={taskType !== '' && taskType !== 'upload'}
+            onValueChange={(value) => {
+              if (value === 'all') {
+                setStage('')
+              } else {
+                setTaskType('upload')
+                setStage(value)
+              }
+              setOffset(0)
+            }}
+          >
+            <SelectTrigger id="task-stage-filter" className="w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {stageOptions.map((option) => (
+                  <SelectItem key={option} value={option}>
+                    {option === 'all' ? 'All' : (taskStageLabels[option] ?? option)}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
           <Label htmlFor="task-status-filter" className="text-sm text-muted-foreground">
             Status:
           </Label>
@@ -136,32 +269,40 @@ function TasksPage() {
             <Table>
               <TableHeader>
                 <TableRow className="bg-muted/50">
-                  <TableHead className="px-4">ID</TableHead>
-                  <TableHead className="px-4">Type</TableHead>
-                  <TableHead className="px-4">Ref</TableHead>
-                  <TableHead className="px-4">Status</TableHead>
-                  <TableHead className="px-4 text-right">Retries</TableHead>
-                  <TableHead className="px-4">Error</TableHead>
-                  <TableHead className="px-4">Scheduled</TableHead>
-                  <TableHead className="px-4">Actions</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">ID</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Type</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Stage</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Ref</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Status</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2 text-right">Retries</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Error</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Scheduled</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {data && data.tasks.length > 0 ? (
                   data.tasks.map((t) => (
                     <TableRow key={t.id}>
-                      <TableCell className="px-4 font-mono text-xs">{t.id}</TableCell>
-                      <TableCell className="px-4">{t.type}</TableCell>
-                      <TableCell className="px-4 text-muted-foreground">
-                        {t.ref_type}:{t.ref_id}
+                      <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">{t.id}</TableCell>
+                      <TableCell className="whitespace-nowrap px-3 py-2">{t.type}</TableCell>
+                      <TableCell className="whitespace-nowrap px-3 py-2">
+                        {t.stage ? (
+                          <span className="font-mono text-xs">{taskStageLabel(t)}</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
                       </TableCell>
-                      <TableCell className="px-4">
+                      <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                        <TaskRefCell task={t} />
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap px-3 py-2">
                         <StatusBadge tone={taskStatusTone(t.status)}>{t.status}</StatusBadge>
                       </TableCell>
-                      <TableCell className="px-4 text-right">
+                      <TableCell className="whitespace-nowrap px-3 py-2 text-right">
                         {t.retry_count}/{t.max_retries}
                       </TableCell>
-                      <TableCell className="max-w-xs px-4 text-xs text-muted-foreground">
+                      <TableCell className="max-w-xs whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
                         {t.last_error ? (
                           <Button
                             type="button"
@@ -179,8 +320,10 @@ function TasksPage() {
                           '—'
                         )}
                       </TableCell>
-                      <TableCell className="px-4 text-muted-foreground">{timeAgo(t.scheduled_at)}</TableCell>
-                      <TableCell className="px-4">
+                      <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                        {timeAgo(t.scheduled_at)}
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap px-3 py-2">
                         {t.status === 'dead_letter' && (
                           <Button
                             type="button"
@@ -197,7 +340,7 @@ function TasksPage() {
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
+                    <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
                       No tasks found
                     </TableCell>
                   </TableRow>

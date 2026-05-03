@@ -64,7 +64,7 @@ func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 	}
 }
 
-func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
+func TestManager_RecoverOnStartup_DoesNotResetStagedUploadingState(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 
@@ -88,7 +88,8 @@ func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
 		t.Fatalf("setting stale timestamp: %v", err)
 	}
 
-	// Start manager — recovery should reset uploading → cached
+	// Start manager. Staged uploads keep durable progress in upload/copy rows,
+	// so startup must not downgrade uploading back to cached.
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
@@ -96,8 +97,243 @@ func TestManager_RecoverOnStartup_ResetsStaleStates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getting object: %v", err)
 	}
-	if got.State != model.ObjectStateCached {
-		t.Errorf("expected object reset to cached, got %s", got.State)
+	if got.State != model.ObjectStateUploading {
+		t.Errorf("expected object to remain uploading, got %s", got.State)
+	}
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusPending), 10, 0)
+	if err != nil {
+		t.Fatalf("List prepare_upload tasks: %v", err)
+	}
+	if total != 1 || len(tasks) != 1 {
+		t.Fatalf("prepare_upload tasks total=%d tasks=%#v, want one orphan recovery task", total, tasks)
+	}
+	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || tasks[0].MaxRetries != 9 {
+		t.Fatalf("prepare_upload task = %#v, want recovered task for uploading version", tasks[0])
+	}
+}
+
+func TestManager_RecoverOnStartup_RequeuesOrphanCommittingState(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-orphan-commit-bucket")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "mgr-orphan-commit-key", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	got, err := repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
+	if err != nil {
+		t.Fatalf("getting object: %v", err)
+	}
+	if got.State != model.ObjectStateUploading {
+		t.Fatalf("object state = %s, want uploading", got.State)
+	}
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusPending), 10, 0)
+	if err != nil {
+		t.Fatalf("List prepare_upload tasks: %v", err)
+	}
+	if total != 1 || len(tasks) != 1 {
+		t.Fatalf("prepare_upload tasks total=%d tasks=%#v, want one orphan recovery task", total, tasks)
+	}
+	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID {
+		t.Fatalf("prepare_upload task = %#v, want recovered task for committing version", tasks[0])
+	}
+}
+
+func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-primary-commit-recover")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-primary-commit", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzaceprimaryrecover",
+		RetrievalURL: "https://primary.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "primary_commit", string(model.TaskStatusPending), 10, 0)
+	if err != nil {
+		t.Fatalf("List primary_commit tasks: %v", err)
+	}
+	if total != 1 || len(tasks) != 1 {
+		t.Fatalf("primary_commit tasks total=%d tasks=%#v, want one", total, tasks)
+	}
+	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || tasks[0].Payload["upload_id"] == nil {
+		t.Fatalf("primary_commit task = %#v, want recovered task for source version", tasks[0])
+	}
+}
+
+func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-secondary-recover")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-secondary", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("primary binding: %v", err)
+	}
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("secondary binding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacesecondaryrecover",
+		PieceID:      "301",
+		RetrievalURL: "https://primary.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ensure_dataset", string(model.TaskStatusPending), 10, 0)
+	if err != nil {
+		t.Fatalf("List ensure_dataset tasks: %v", err)
+	}
+	if total != 1 || len(tasks) != 1 {
+		t.Fatalf("ensure_dataset tasks total=%d tasks=%#v, want one secondary recovery task", total, tasks)
+	}
+	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || tasks[0].Payload["copy_index"] == nil {
+		t.Fatalf("ensure_dataset task = %#v, want recovered secondary task", tasks[0])
+	}
+}
+
+func TestManager_RecoverOnStartup_ReconcilesAllStagedUploads(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-staged-batch-recover")
+	for i := 0; i < 101; i++ {
+		_, versionID := seedManagerVersion(t, repos, bucket, fmt.Sprintf("recover-batch-%03d", i), model.ObjectStateCached)
+		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+			t.Fatalf("uploading %d: %v", i, err)
+		}
+		version, err := repos.Objects.GetVersionByID(ctx, versionID)
+		if err != nil || version == nil {
+			t.Fatalf("GetVersionByID %d: version=%v err=%v", i, version, err)
+		}
+		if _, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+			BucketID:        bucket.ID,
+			SourceVersionID: versionID,
+			ContentSize:     version.Size,
+			Checksum:        version.Checksum,
+		}); err != nil {
+			t.Fatalf("StartObjectUploadAttempt %d: %v", i, err)
+		}
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusPending), 200, 0)
+	if err != nil {
+		t.Fatalf("List prepare_upload tasks: %v", err)
+	}
+	if total != 101 || len(tasks) != 101 {
+		t.Fatalf("prepare_upload tasks total=%d len=%d, want 101", total, len(tasks))
+	}
+}
+
+func TestManager_RecoverOnStartup_UsesBoundedVersionBatches(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	objects := &boundedVersionListRepo{ObjectRepository: repos.Objects}
+	repos.Objects = objects
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(context.Background())
+
+	if objects.sawUnbounded {
+		t.Fatal("startup reconciliation requested an unbounded object version list")
 	}
 }
 
@@ -127,6 +363,9 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	}
 	if task.MaxRetries != 9 {
 		t.Fatalf("task MaxRetries = %d, want 9", task.MaxRetries)
+	}
+	if task.Stage == nil || *task.Stage != "prepare_upload" {
+		t.Fatalf("task Stage = %#v, want prepare_upload", task.Stage)
 	}
 }
 
@@ -284,6 +523,82 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	}
 }
 
+func TestManager_ReconcileTasks_AutoEvictIncludesReplicating(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-replicating")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "replicating-with-cache", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding primary: %v", err)
+	}
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding secondary: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+		t.Fatalf("MarkDataSetReady primary: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "piece-replicating-evict-reconcile",
+		PieceID:      "301",
+		RetrievalURL: "https://primary.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	if err != nil {
+		t.Fatalf("claiming evict task: %v", err)
+	}
+	if task == nil {
+		t.Fatal("expected evict_cache task for replicating version")
+	}
+	if task.RefID != objID || task.RefVersionID != versionID {
+		t.Fatalf("evict task refs = (%d,%s), want (%d,%s)", task.RefID, task.RefVersionID, objID, versionID)
+	}
+}
+
 func seedManagerVersion(t *testing.T, repos *repository.Repositories, bucket *model.Bucket, key string, state model.ObjectState) (int64, string) {
 	t.Helper()
 	versionID := model.NewVersionID()
@@ -361,4 +676,16 @@ func acceptManagerVersionUpload(t *testing.T, repos *repository.Repositories, ve
 	}); err != nil {
 		t.Fatalf("accept upload result: %v", err)
 	}
+}
+
+type boundedVersionListRepo struct {
+	repository.ObjectRepository
+	sawUnbounded bool
+}
+
+func (r *boundedVersionListRepo) ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error) {
+	if limit <= 0 {
+		r.sawUnbounded = true
+	}
+	return r.ObjectRepository.ListVersionsByState(ctx, state, limit)
 }

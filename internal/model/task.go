@@ -32,6 +32,7 @@ type Task struct {
 
 	ID             int64                  `bun:",pk,autoincrement"`
 	Type           TaskType               `bun:",notnull"`
+	Stage          *string                `bun:",nullzero"`
 	RefType        string                 `bun:",notnull"` // "object" or "bucket"
 	RefID          int64                  `bun:",notnull"`
 	RefVersionID   string                 `bun:",notnull"`

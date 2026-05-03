@@ -200,6 +200,7 @@ type yamlFilecoinConfig struct {
 	Source               string  `yaml:"source"`
 	WithCDN              bool    `yaml:"with_cdn"`
 	AllowPrivateNetworks bool    `yaml:"allow_private_networks"`
+	DefaultCopies        int     `yaml:"default_copies"`
 }
 
 type yamlDatabaseConfig struct {
@@ -262,6 +263,7 @@ func toYAMLConfig(cfg *Config, opts saveOptions) yamlConfig {
 			Source:               cfg.Filecoin.Source,
 			WithCDN:              cfg.Filecoin.WithCDN,
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+			DefaultCopies:        cfg.Filecoin.DefaultCopies,
 		},
 		Database: yamlDatabaseConfig{
 			Driver:       optionalString(cfg.Database.Driver, presence.DatabaseDriver),

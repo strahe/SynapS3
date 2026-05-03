@@ -68,6 +68,8 @@ export function objectStateTone(state: string): StatusTone {
     case 'onchained':
       return 'success'
     case 'uploading':
+    case 'committing':
+    case 'replicating':
     case 'onchaining':
       return 'warning'
     case 'failed':

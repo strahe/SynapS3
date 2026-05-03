@@ -10,12 +10,34 @@ import (
 type StorageUploadStatus string
 
 const (
-	StorageUploadStatusRunning    StorageUploadStatus = "running"
-	StorageUploadStatusComplete   StorageUploadStatus = "complete"
-	StorageUploadStatusPartial    StorageUploadStatus = "partial"
-	StorageUploadStatusFailed     StorageUploadStatus = "failed"
-	StorageUploadStatusRejected   StorageUploadStatus = "rejected"
-	StorageUploadStatusSuperseded StorageUploadStatus = "superseded"
+	StorageUploadStatusRunning            StorageUploadStatus = "running"
+	StorageUploadStatusStoredOnPrimary    StorageUploadStatus = "stored_on_primary"
+	StorageUploadStatusPrimaryCommitted   StorageUploadStatus = "primary_committed"
+	StorageUploadStatusPartial            StorageUploadStatus = "partial"
+	StorageUploadStatusAllCopiesCommitted StorageUploadStatus = "all_copies_committed"
+	StorageUploadStatusComplete           StorageUploadStatus = StorageUploadStatusAllCopiesCommitted
+	StorageUploadStatusFailed             StorageUploadStatus = "failed"
+	StorageUploadStatusRejected           StorageUploadStatus = "rejected"
+	StorageUploadStatusSuperseded         StorageUploadStatus = "superseded"
+)
+
+type StorageDataSetStatus string
+
+const (
+	StorageDataSetStatusPending  StorageDataSetStatus = "pending"
+	StorageDataSetStatusCreating StorageDataSetStatus = "creating"
+	StorageDataSetStatusReady    StorageDataSetStatus = "ready"
+	StorageDataSetStatusFailed   StorageDataSetStatus = "failed"
+)
+
+type StorageUploadCopyStatus string
+
+const (
+	StorageUploadCopyStatusPending    StorageUploadCopyStatus = "pending"
+	StorageUploadCopyStatusPieceReady StorageUploadCopyStatus = "piece_ready"
+	StorageUploadCopyStatusCommitting StorageUploadCopyStatus = "committing"
+	StorageUploadCopyStatusCommitted  StorageUploadCopyStatus = "committed"
+	StorageUploadCopyStatusFailed     StorageUploadCopyStatus = "failed"
 )
 
 // StorageUpload records one SDK upload attempt and its persisted outcome.
@@ -46,35 +68,45 @@ type StorageUpload struct {
 type StorageDataSet struct {
 	bun.BaseModel `bun:"table:storage_data_sets"`
 
-	ID                int64     `bun:",pk,autoincrement"`
-	BucketID          int64     `bun:",notnull"`
-	ProviderID        string    `bun:",notnull"`
-	DataSetID         string    `bun:",notnull"`
-	FirstSeenUploadID int64     `bun:",notnull"`
-	LastSeenUploadID  int64     `bun:",notnull"`
-	CreatedAt         time.Time `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt         time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	ID                  int64                `bun:",pk,autoincrement"`
+	BucketID            int64                `bun:",notnull"`
+	ProviderID          string               `bun:",notnull"`
+	CopyIndex           int                  `bun:",notnull"`
+	DataSetID           *string              `bun:",nullzero"`
+	ClientDataSetID     *string              `bun:",nullzero"`
+	Status              StorageDataSetStatus `bun:",notnull,default:'pending'"`
+	CreateTransactionID *string              `bun:",nullzero"`
+	CreateStatusURL     *string              `bun:",nullzero"`
+	CreatedByUploadID   *int64               `bun:",nullzero"`
+	LastUsedUploadID    *int64               `bun:",nullzero"`
+	LastError           *string              `bun:",nullzero"`
+	CreatedAt           time.Time            `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt           time.Time            `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Bucket          *Bucket        `bun:"rel:belongs-to,join:bucket_id=id"`
-	FirstSeenUpload *StorageUpload `bun:"rel:belongs-to,join:first_seen_upload_id=id"`
-	LastSeenUpload  *StorageUpload `bun:"rel:belongs-to,join:last_seen_upload_id=id"`
+	CreatedByUpload *StorageUpload `bun:"rel:belongs-to,join:created_by_upload_id=id"`
+	LastUsedUpload  *StorageUpload `bun:"rel:belongs-to,join:last_used_upload_id=id"`
 }
 
 // StorageUploadCopy stores one successful copy returned by the SDK.
 type StorageUploadCopy struct {
 	bun.BaseModel `bun:"table:storage_upload_copies"`
 
-	ID               int64     `bun:",pk,autoincrement"`
-	UploadID         int64     `bun:",notnull"`
-	CopyIndex        int       `bun:",notnull"`
-	ProviderID       *string   `bun:",nullzero"`
-	DataSetID        *string   `bun:",nullzero"`
-	PieceID          *string   `bun:",nullzero"`
-	Role             string    `bun:",notnull"`
-	RetrievalURL     *string   `bun:",nullzero"`
-	IsNewDataSet     bool      `bun:",notnull,default:false"`
-	StorageDataSetID *int64    `bun:",nullzero"`
-	CreatedAt        time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	ID                  int64                   `bun:",pk,autoincrement"`
+	UploadID            int64                   `bun:",notnull"`
+	CopyIndex           int                     `bun:",notnull"`
+	ProviderID          *string                 `bun:",nullzero"`
+	DataSetID           *string                 `bun:",scanonly"`
+	PieceID             *string                 `bun:",nullzero"`
+	Role                string                  `bun:",notnull"`
+	Status              StorageUploadCopyStatus `bun:",notnull,default:'pending'"`
+	RetrievalURL        *string                 `bun:",nullzero"`
+	StorageDataSetID    *int64                  `bun:",nullzero"`
+	CommitExtraDataHex  *string                 `bun:",nullzero"`
+	CommitTransactionID *string                 `bun:",nullzero"`
+	LastError           *string                 `bun:",nullzero"`
+	CreatedAt           time.Time               `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt           time.Time               `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Upload     *StorageUpload  `bun:"rel:belongs-to,join:upload_id=id"`
 	StorageSet *StorageDataSet `bun:"rel:belongs-to,join:storage_data_set_id=id"`

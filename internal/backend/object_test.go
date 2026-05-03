@@ -170,6 +170,87 @@ func acceptBackendVersionUpload(t *testing.T, repos *repository.Repositories, ve
 	return upload
 }
 
+func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageUpload {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for primary bind: version=%v err=%v", version, err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("mark committing: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start upload attempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          version.BucketID,
+		ProviderID:        "101",
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("ensure primary dataset binding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID:        primary.ID,
+		UploadID:  upload.ID,
+		DataSetID: "1001",
+	}); err != nil {
+		t.Fatalf("mark primary dataset ready: %v", err)
+	}
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          version.BucketID,
+		ProviderID:        "202",
+		CopyIndex:         1,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("ensure secondary dataset binding: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+	}); err != nil {
+		t.Fatalf("create upload copy rows: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("mark primary piece ready: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		PieceID:      "2001",
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("mark primary committed: %v", err)
+	}
+	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    version.BucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("bind primary committed upload: %v", err)
+	}
+	return upload
+}
+
 func stringPtr(value string) *string {
 	return &value
 }
@@ -410,7 +491,7 @@ func TestPutObjectIdenticalUploadingContentFollowsActiveUploadTask(t *testing.T)
 		t.Fatalf("mark first version uploading: %v", err)
 	}
 
-	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", 10, 0)
+	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("list tasks before second put: %v", err)
 	}
@@ -431,7 +512,7 @@ func TestPutObjectIdenticalUploadingContentFollowsActiveUploadTask(t *testing.T)
 		t.Fatalf("second version storage = piece:%v url:%v, want unset while upload runs", secondVersion.PieceCID, secondVersion.RetrievalURL)
 	}
 
-	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", 10, 0)
+	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("list tasks after second put: %v", err)
 	}
@@ -456,7 +537,7 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	}
 	acceptBackendVersionUpload(t, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
 
-	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", 10, 0)
+	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("list tasks before second put: %v", err)
 	}
@@ -476,7 +557,49 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 		t.Fatal("second version storage_upload_id is nil, want reused upload")
 	}
 
-	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", 10, 0)
+	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
+	if err != nil {
+		t.Fatalf("list tasks after second put: %v", err)
+	}
+	if len(tasksAfter) != len(tasksBefore) {
+		t.Fatalf("upload task count changed from %d to %d", len(tasksBefore), len(tasksAfter))
+	}
+}
+
+func TestPutObjectIdenticalReplicatingContentReusesPrimaryCommittedUpload(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "replicating-reuse-bucket")
+
+	firstOut := putTestObjectOutput(t, tb, "replicating-reuse-bucket", "file.txt", "same data")
+	bkt, _ := tb.repos.Buckets.GetByName(ctx, "replicating-reuse-bucket")
+	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
+	if err != nil || firstObj == nil {
+		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
+	}
+	upload := bindBackendPrimaryCommittedUpload(t, tb.repos, firstObj.VersionID, buildDummyCID(t), "https://provider.example/primary")
+
+	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
+	if err != nil {
+		t.Fatalf("list tasks before second put: %v", err)
+	}
+	secondOut := putTestObjectOutput(t, tb, "replicating-reuse-bucket", "file.txt", "same data")
+	if secondOut.VersionID == "" || secondOut.VersionID == firstOut.VersionID {
+		t.Fatalf("second VersionID = %q, first = %q", secondOut.VersionID, firstOut.VersionID)
+	}
+
+	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, secondOut.VersionID)
+	if err != nil || secondVersion == nil {
+		t.Fatalf("second version: version=%v err=%v", secondVersion, err)
+	}
+	if secondVersion.State != model.ObjectStateReplicating {
+		t.Fatalf("second version state = %s, want replicating", secondVersion.State)
+	}
+	if secondVersion.StorageUploadID == nil || *secondVersion.StorageUploadID != upload.ID || !secondVersion.InFilecoin {
+		t.Fatalf("second version storage = upload:%v in_filecoin:%v, want upload %d readable", secondVersion.StorageUploadID, secondVersion.InFilecoin, upload.ID)
+	}
+
+	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("list tasks after second put: %v", err)
 	}
@@ -1363,7 +1486,7 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
 
-	tasks, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), string(model.TaskStatusPending), 10, 0)
+	tasks, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", string(model.TaskStatusPending), 10, 0)
 	if err != nil {
 		t.Fatalf("List tasks: %v", err)
 	}
@@ -1371,6 +1494,9 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 		if task.RefType == "object" && task.RefID == dstObj.ObjectID {
 			if task.MaxRetries != 13 {
 				t.Fatalf("copy upload task MaxRetries = %d, want 13", task.MaxRetries)
+			}
+			if task.Stage == nil || *task.Stage != "prepare_upload" {
+				t.Fatalf("copy upload task Stage = %#v, want prepare_upload", task.Stage)
 			}
 			return
 		}

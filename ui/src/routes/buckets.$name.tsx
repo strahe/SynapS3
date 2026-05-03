@@ -16,7 +16,14 @@ import {
   UserRound,
 } from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
-import { api, type ObjectFolderItem, type ObjectItem, type ObjectStatus } from '@/api/client'
+import {
+  api,
+  type ObjectFolderItem,
+  type ObjectItem,
+  type ObjectState,
+  type ObjectStatus,
+  type ObjectUploadStatus,
+} from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
@@ -365,7 +372,9 @@ function ObjectVersionsDialog({
                         <ObjectStatusIcon
                           bucketName={bucketName}
                           versionID={version.version_id}
+                          state={version.state}
                           status={version.status}
+                          uploadStatus={version.upload_status}
                           compact
                         />
                         {version.is_current && (
@@ -453,20 +462,25 @@ function LocationBadges({ location }: { location: { cache: boolean; filecoin: bo
 function ObjectStatusIcon({
   bucketName,
   versionID,
+  state,
   status,
+  uploadStatus,
   compact = false,
 }: {
   bucketName: string
   versionID: string
+  state?: ObjectState
   status: ObjectStatus
+  uploadStatus?: ObjectUploadStatus
   compact?: boolean
 }) {
   const [detailEnabled, setDetailEnabled] = useState(false)
-  const detail = useObjectStatusDetail(bucketName, versionID, status === 'warning' && detailEnabled)
-  const label = objectStatusLabel(status)
+  const visualStatus = objectVisualStatus(status, uploadStatus)
+  const detail = useObjectStatusDetail(bucketName, versionID, visualStatus === 'warning' && detailEnabled)
+  const label = objectStateLabel(state, status, uploadStatus)
 
   const loadDetail = () => {
-    if (status === 'warning') setDetailEnabled(true)
+    if (visualStatus === 'warning') setDetailEnabled(true)
   }
 
   return (
@@ -484,13 +498,13 @@ function ObjectStatusIcon({
           onFocus={loadDetail}
           onClick={loadDetail}
         >
-          {objectStatusIcon(status, compact)}
+          {objectStatusIcon(visualStatus, compact)}
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-sm items-start whitespace-normal text-left">
         <div className="flex max-w-xs flex-col gap-1">
           <span className="font-medium">{label}</span>
-          {status === 'warning' && (
+          {visualStatus === 'warning' && (
             <span className="break-words opacity-90">
               {detail.isLoading
                 ? 'Loading issue details'
@@ -529,8 +543,64 @@ function objectStatusLabel(status: ObjectStatus) {
       return 'Warning'
     case 'unavailable':
       return 'Unavailable'
+    case 'syncing':
+      return 'Syncing'
     case 'uploading':
       return 'Uploading'
+  }
+}
+
+function objectVisualStatus(status: ObjectStatus, uploadStatus?: ObjectUploadStatus): ObjectStatus {
+  switch (uploadStatus) {
+    case 'partial':
+    case 'failed':
+    case 'rejected':
+      return 'warning'
+    default:
+      return status
+  }
+}
+
+function uploadStatusLabel(uploadStatus: ObjectUploadStatus) {
+  switch (uploadStatus) {
+    case 'running':
+      return 'Upload running'
+    case 'stored_on_primary':
+      return 'Stored on primary'
+    case 'primary_committed':
+      return 'Primary committed'
+    case 'partial':
+      return 'Partial replication'
+    case 'all_copies_committed':
+      return 'All copies committed'
+    case 'failed':
+      return 'Upload failed'
+    case 'rejected':
+      return 'Upload rejected'
+    case 'superseded':
+      return 'Upload superseded'
+  }
+}
+
+function objectStateLabel(state: ObjectState | undefined, status: ObjectStatus, uploadStatus?: ObjectUploadStatus) {
+  if (uploadStatus) return uploadStatusLabel(uploadStatus)
+  switch (state) {
+    case 'cached':
+      return 'Cached'
+    case 'uploading':
+      return 'Uploading'
+    case 'committing':
+      return 'Committing primary copy'
+    case 'replicating':
+      return 'Replicating'
+    case 'stored':
+      return 'Stored'
+    case 'cache_evicted':
+      return 'Cache evicted'
+    case 'failed':
+      return 'Warning'
+    default:
+      return objectStatusLabel(status)
   }
 }
 
@@ -538,6 +608,10 @@ function failureStageLabel(state?: string) {
   switch (state) {
     case 'uploading':
       return 'Failed while uploading'
+    case 'committing':
+      return 'Failed while committing primary copy'
+    case 'replicating':
+      return 'Failed while syncing copies'
     case 'stored':
       return 'Failed after storage'
     case 'cached':
@@ -764,7 +838,9 @@ function ObjectBrowserTable({
                         <ObjectStatusIcon
                           bucketName={bucketName}
                           versionID={object.current_version_id}
+                          state={object.state}
                           status={object.status}
+                          uploadStatus={object.upload_status}
                           compact
                         />
                       </div>

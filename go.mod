@@ -13,7 +13,7 @@ require (
 	github.com/knadh/koanf/v2 v2.3.4
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/prometheus/client_golang v1.23.2
-	github.com/strahe/synapse-go v0.1.0
+	github.com/strahe/synapse-go v0.1.1-0.20260501073158-7ee316ba8226
 	github.com/uptrace/bun v1.2.18
 	github.com/uptrace/bun/dialect/pgdialect v1.2.18
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18

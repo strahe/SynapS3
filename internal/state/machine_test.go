@@ -12,7 +12,9 @@ func TestObjectStateMachine_HappyPath(t *testing.T) {
 
 	transitions := []struct{ from, to model.ObjectState }{
 		{model.ObjectStateCached, model.ObjectStateUploading},
-		{model.ObjectStateUploading, model.ObjectStateStored},
+		{model.ObjectStateUploading, model.ObjectStateCommitting},
+		{model.ObjectStateCommitting, model.ObjectStateReplicating},
+		{model.ObjectStateReplicating, model.ObjectStateStored},
 		{model.ObjectStateStored, model.ObjectStateCacheEvicted},
 	}
 	for _, tt := range transitions {
@@ -28,6 +30,7 @@ func TestObjectStateMachine_FailureTransitions(t *testing.T) {
 	// States that can transition to failed.
 	canFail := []model.ObjectState{
 		model.ObjectStateUploading,
+		model.ObjectStateCommitting,
 	}
 	for _, from := range canFail {
 		if err := m.Validate(string(from), string(model.ObjectStateFailed)); err != nil {
@@ -38,6 +41,7 @@ func TestObjectStateMachine_FailureTransitions(t *testing.T) {
 	// States that cannot transition to failed.
 	cannotFail := []model.ObjectState{
 		model.ObjectStateCached,
+		model.ObjectStateReplicating,
 		model.ObjectStateStored,
 		model.ObjectStateFailed,
 		model.ObjectStateCacheEvicted,
@@ -80,6 +84,8 @@ func TestObjectStateMachine_InvalidTransitions(t *testing.T) {
 
 	invalid := []struct{ from, to model.ObjectState }{
 		{model.ObjectStateCached, model.ObjectStateStored},          // must go through uploading
+		{model.ObjectStateUploading, model.ObjectStateReplicating},  // primary Store is not enough
+		{model.ObjectStateCommitting, model.ObjectStateStored},      // secondary commits still pending
 		{model.ObjectStateCached, model.ObjectStateCacheEvicted},    // can't evict from cached
 		{model.ObjectStateCacheEvicted, model.ObjectStateCached},    // can't revive
 		{model.ObjectStateStored, model.ObjectStateUploading},       // backwards
@@ -100,6 +106,8 @@ func TestObjectStateMachine_SameStateSelfTransition(t *testing.T) {
 	allStates := []model.ObjectState{
 		model.ObjectStateCached,
 		model.ObjectStateUploading,
+		model.ObjectStateCommitting,
+		model.ObjectStateReplicating,
 		model.ObjectStateStored,
 		model.ObjectStateFailed,
 		model.ObjectStateCacheEvicted,
@@ -119,7 +127,9 @@ func TestObjectStateMachine_NextStates(t *testing.T) {
 		expected []string
 	}{
 		{model.ObjectStateCached, []string{"uploading"}},
-		{model.ObjectStateUploading, []string{"failed", "stored"}},
+		{model.ObjectStateUploading, []string{"committing", "failed"}},
+		{model.ObjectStateCommitting, []string{"failed", "replicating"}},
+		{model.ObjectStateReplicating, []string{"stored"}},
 		{model.ObjectStateStored, []string{"cache_evicted"}},
 		{model.ObjectStateFailed, []string{"uploading"}},
 		{model.ObjectStateCacheEvicted, nil},

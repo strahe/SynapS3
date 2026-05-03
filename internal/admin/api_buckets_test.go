@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 )
 
@@ -81,6 +83,20 @@ func (r *writeDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
 	r.deadlines = append(r.deadlines, deadline)
 	return nil
 }
+
+type storageUploadSelectCounter struct {
+	selects atomic.Int32
+}
+
+func (c *storageUploadSelectCounter) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	query := strings.ToLower(strings.TrimSpace(event.Query))
+	if strings.HasPrefix(query, "select") && (strings.Contains(query, `from "storage_uploads"`) || strings.Contains(query, "from storage_uploads")) {
+		c.selects.Add(1)
+	}
+	return ctx
+}
+
+func (c *storageUploadSelectCounter) AfterQuery(context.Context, *bun.QueryEvent) {}
 
 func seedAdminObjectVersion(t *testing.T, repos *repository.Repositories, bucket *model.Bucket, key string, size int64, etag, checksum, contentType, cacheKey string, state model.ObjectState) (int64, string) {
 	t.Helper()
@@ -159,6 +175,147 @@ func acceptAdminVersionUpload(t *testing.T, repos *repository.Repositories, vers
 		Checksum:    version.Checksum,
 	}); err != nil {
 		t.Fatalf("accept upload result: %v", err)
+	}
+	return upload
+}
+
+func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versionID string) *model.StorageUpload {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for partial upload: version=%v err=%v", version, err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("partial uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("partial committing: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start partial upload attempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("primary binding: %v", err)
+	}
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("secondary binding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+		t.Fatalf("primary dataset ready: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: "1002", ClientDataSetID: "9002"}); err != nil {
+		t.Fatalf("secondary dataset ready: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+	}); err != nil {
+		t.Fatalf("create upload copies: %v", err)
+	}
+	pieceCID := "piece-partial-" + versionID
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		PieceID:      "301",
+		RetrievalURL: "https://primary.example/piece/" + versionID,
+	}); err != nil {
+		t.Fatalf("primary committed: %v", err)
+	}
+	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    version.BucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("bind primary committed upload: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 1, "secondary pull: timeout"); err != nil {
+		t.Fatalf("mark secondary failed: %v", err)
+	}
+	return upload
+}
+
+func markAdminStoredOnPrimaryUpload(t *testing.T, repos *repository.Repositories, versionID string) *model.StorageUpload {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for stored-on-primary upload: version=%v err=%v", version, err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("stored-on-primary uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("stored-on-primary committing: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start stored-on-primary upload attempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("primary binding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+		t.Fatalf("primary dataset ready: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+	}); err != nil {
+		t.Fatalf("create upload copy: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "piece-primary-" + versionID,
+		RetrievalURL: "https://primary.example/piece/" + versionID,
+	}); err != nil {
+		t.Fatalf("mark primary piece ready: %v", err)
+	}
+	return upload
+}
+
+func markAdminFailedUpload(t *testing.T, repos *repository.Repositories, versionID string, message string) *model.StorageUpload {
+	t.Helper()
+	ctx := context.Background()
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version for failed upload: version=%v err=%v", version, err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("failed upload state: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        version.BucketID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("start failed upload attempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        false,
+		RequestedCopies: 2,
+		ErrorMessage:    &message,
+	}); err != nil {
+		t.Fatalf("record failed upload result: %v", err)
 	}
 	return upload
 }
@@ -814,6 +971,7 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 		Objects []struct {
 			Key              string         `json:"key"`
 			CurrentVersionID string         `json:"current_version_id"`
+			State            string         `json:"state"`
 			Status           string         `json:"status"`
 			Location         objectLocation `json:"location"`
 		} `json:"objects"`
@@ -833,6 +991,9 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	}
 	if body.Objects[0].Status != "success" {
 		t.Fatalf("status = %q, want success", body.Objects[0].Status)
+	}
+	if body.Objects[0].State != string(model.ObjectStateStored) {
+		t.Fatalf("state = %q, want stored", body.Objects[0].State)
 	}
 	if !body.Objects[0].Location.Cache || !body.Objects[0].Location.Filecoin {
 		t.Fatalf("location = %#v, want cache and filecoin", body.Objects[0].Location)
@@ -855,8 +1016,8 @@ func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		t.Fatalf("Decode raw: %v", err)
 	}
-	if _, ok := raw.Objects[0]["state"]; ok {
-		t.Fatal("object list exposed raw state")
+	if raw.Objects[0]["state"] != string(model.ObjectStateStored) {
+		t.Fatalf("object list state = %#v, want stored", raw.Objects[0]["state"])
 	}
 	if _, ok := raw.Objects[0]["storage"]; ok {
 		t.Fatal("object list exposed storage instead of location")
@@ -1140,6 +1301,7 @@ func TestAPIBucketObjectVersions(t *testing.T) {
 	var body struct {
 		Versions []struct {
 			VersionID string         `json:"version_id"`
+			State     string         `json:"state"`
 			Status    string         `json:"status"`
 			Location  objectLocation `json:"location"`
 			IsCurrent bool           `json:"is_current"`
@@ -1160,11 +1322,17 @@ func TestAPIBucketObjectVersions(t *testing.T) {
 	if body.Versions[0].Status != "uploading" {
 		t.Fatalf("current version status = %q, want uploading", body.Versions[0].Status)
 	}
+	if body.Versions[0].State != string(model.ObjectStateCached) {
+		t.Fatalf("current version state = %q, want cached", body.Versions[0].State)
+	}
 	if !body.Versions[0].Location.Cache || body.Versions[0].Location.Filecoin {
 		t.Fatalf("current version location = %#v, want cache only", body.Versions[0].Location)
 	}
 	if body.Versions[1].Status != "success" {
 		t.Fatalf("old version status = %q, want success", body.Versions[1].Status)
+	}
+	if body.Versions[1].State != string(model.ObjectStateStored) {
+		t.Fatalf("old version state = %q, want stored", body.Versions[1].State)
 	}
 	if !body.Versions[1].Location.Cache || !body.Versions[1].Location.Filecoin {
 		t.Fatalf("old version location = %#v, want cache and filecoin", body.Versions[1].Location)
@@ -1181,8 +1349,8 @@ func TestAPIBucketObjectVersions(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		t.Fatalf("Decode raw: %v", err)
 	}
-	if _, ok := raw.Versions[0]["state"]; ok {
-		t.Fatal("version list exposed raw state")
+	if raw.Versions[0]["state"] != string(model.ObjectStateCached) {
+		t.Fatalf("version list state = %#v, want cached", raw.Versions[0]["state"])
 	}
 	if _, ok := raw.Versions[0]["storage"]; ok {
 		t.Fatal("version list exposed storage instead of location")
@@ -1223,6 +1391,12 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	if err := repos.Objects.SetVersionCachePresence(ctx, unavailable.VersionID, false); err != nil {
 		t.Fatalf("unavailable cache presence: %v", err)
 	}
+	_, storedOnPrimaryVersionID := seedAdminObjectVersion(t, repos, bucket, "stored-primary.txt", 2, "etag-primary", "checksum-primary", "text/plain", "", model.ObjectStateCached)
+	markAdminStoredOnPrimaryUpload(t, repos, storedOnPrimaryVersionID)
+	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "partial.txt", 3, "etag-partial", "checksum-partial", "text/plain", "", model.ObjectStateCached)
+	bindAdminPartialUpload(t, repos, partialVersionID)
+	_, failedUploadVersionID := seedAdminObjectVersion(t, repos, bucket, "failed-upload.txt", 5, "etag-failed-upload", "checksum-failed-upload", "text/plain", "", model.ObjectStateCached)
+	markAdminFailedUpload(t, repos, failedUploadVersionID, "provider rejected piece")
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -1235,8 +1409,9 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 
 	var list struct {
 		Objects []struct {
-			Key    string `json:"key"`
-			Status string `json:"status"`
+			Key          string `json:"key"`
+			Status       string `json:"status"`
+			UploadStatus string `json:"upload_status"`
 		} `json:"objects"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
@@ -1244,14 +1419,25 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	}
 
 	statusByKey := map[string]string{}
+	uploadStatusByKey := map[string]string{}
 	for _, object := range list.Objects {
 		statusByKey[object.Key] = object.Status
+		uploadStatusByKey[object.Key] = object.UploadStatus
 	}
 	if statusByKey["warning.txt"] != "warning" {
 		t.Fatalf("warning status = %q, want warning", statusByKey["warning.txt"])
 	}
 	if statusByKey["unavailable.txt"] != "unavailable" {
 		t.Fatalf("unavailable status = %q, want unavailable", statusByKey["unavailable.txt"])
+	}
+	if uploadStatusByKey["stored-primary.txt"] != string(model.StorageUploadStatusStoredOnPrimary) {
+		t.Fatalf("stored-primary upload_status = %q, want stored_on_primary", uploadStatusByKey["stored-primary.txt"])
+	}
+	if statusByKey["partial.txt"] != "warning" || uploadStatusByKey["partial.txt"] != string(model.StorageUploadStatusPartial) {
+		t.Fatalf("partial status/upload_status = %q/%q, want warning/partial", statusByKey["partial.txt"], uploadStatusByKey["partial.txt"])
+	}
+	if statusByKey["failed-upload.txt"] != "warning" || uploadStatusByKey["failed-upload.txt"] != string(model.StorageUploadStatusFailed) {
+		t.Fatalf("failed upload status/upload_status = %q/%q, want warning/failed", statusByKey["failed-upload.txt"], uploadStatusByKey["failed-upload.txt"])
 	}
 
 	resp, err = http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(warningVersionID))
@@ -1269,11 +1455,51 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	if detail.VersionID != warningVersionID || detail.Status != "warning" {
 		t.Fatalf("detail = %#v, want version %s warning", detail, warningVersionID)
 	}
+	if detail.State != string(model.ObjectStateFailed) {
+		t.Fatalf("detail state = %q, want failed", detail.State)
+	}
 	if detail.FailedAtState == nil || *detail.FailedAtState != string(model.ObjectStateUploading) {
 		t.Fatalf("failed_at_state = %#v, want uploading", detail.FailedAtState)
 	}
 	if detail.Message == nil || *detail.Message != "provider rejected piece" {
 		t.Fatalf("message = %#v, want provider rejected piece", detail.Message)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(partialVersionID))
+	if err != nil {
+		t.Fatalf("GET partial status detail: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var partialDetail struct {
+		VersionID    string `json:"version_id"`
+		Status       string `json:"status"`
+		UploadStatus string `json:"upload_status"`
+		Message      string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&partialDetail); err != nil {
+		t.Fatalf("Decode partial detail: %v", err)
+	}
+	if partialDetail.VersionID != partialVersionID || partialDetail.Status != "warning" || partialDetail.UploadStatus != string(model.StorageUploadStatusPartial) {
+		t.Fatalf("partial detail = %#v, want partial warning", partialDetail)
+	}
+	if partialDetail.Message != "secondary pull: timeout" {
+		t.Fatalf("partial message = %q, want secondary pull: timeout", partialDetail.Message)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(failedUploadVersionID))
+	if err != nil {
+		t.Fatalf("GET failed upload status detail: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var failedUploadDetail struct {
+		UploadStatus string `json:"upload_status"`
+		Message      string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&failedUploadDetail); err != nil {
+		t.Fatalf("Decode failed upload detail: %v", err)
+	}
+	if failedUploadDetail.UploadStatus != string(model.StorageUploadStatusFailed) || failedUploadDetail.Message != "provider rejected piece" {
+		t.Fatalf("failed upload detail = %#v, want failed/provider rejected piece", failedUploadDetail)
 	}
 
 	otherBucket := &model.Bucket{Name: "other-status-bucket", Status: model.BucketStatusActive}
@@ -1287,6 +1513,84 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("wrong bucket status detail code = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	counter := &storageUploadSelectCounter{}
+	db.AddQueryHook(counter)
+	localCache, err := cache.NewFilesystem(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("creating test cache: %v", err)
+	}
+	repos := repository.NewRepositories(db)
+	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, testLogger())
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "batched-upload-status-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "stored.txt", 2, "etag-stored", "checksum-stored", "text/plain", "", model.ObjectStateStored)
+	_, primaryVersionID := seedAdminObjectVersion(t, repos, bucket, "primary.txt", 3, "etag-primary", "checksum-primary", "text/plain", "", model.ObjectStateCached)
+	markAdminStoredOnPrimaryUpload(t, repos, primaryVersionID)
+	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "partial.txt", 4, "etag-partial", "checksum-partial", "text/plain", "", model.ObjectStateCached)
+	bindAdminPartialUpload(t, repos, partialVersionID)
+	_, failedVersionID := seedAdminObjectVersion(t, repos, bucket, "failed.txt", 5, "etag-failed", "checksum-failed", "text/plain", "", model.ObjectStateCached)
+	markAdminFailedUpload(t, repos, failedVersionID, "provider rejected piece")
+
+	counter.selects.Store(0)
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/batched-upload-status-bucket/objects")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	if got := counter.selects.Load(); got > 2 {
+		t.Fatalf("storage upload selects = %d, want batched lookups no more than 2", got)
+	}
+}
+
+func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	counter := &storageUploadSelectCounter{}
+	db.AddQueryHook(counter)
+	localCache, err := cache.NewFilesystem(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("creating test cache: %v", err)
+	}
+	repos := repository.NewRepositories(db)
+	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, testLogger())
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "batched-version-status-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "file.txt", 2, "etag-stored", "checksum-stored", "text/plain", "", model.ObjectStateStored)
+	_, primaryVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 3, "etag-primary", "checksum-primary", "text/plain", "", model.ObjectStateCached)
+	markAdminStoredOnPrimaryUpload(t, repos, primaryVersionID)
+	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-partial", "checksum-partial", "text/plain", "", model.ObjectStateCached)
+	bindAdminPartialUpload(t, repos, partialVersionID)
+	_, failedVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 5, "etag-failed", "checksum-failed", "text/plain", "", model.ObjectStateCached)
+	markAdminFailedUpload(t, repos, failedVersionID, "provider rejected piece")
+
+	counter.selects.Store(0)
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/batched-version-status-bucket/objects/versions?key=" + url.QueryEscape("file.txt"))
+	if err != nil {
+		t.Fatalf("GET object versions: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	if got := counter.selects.Load(); got > 2 {
+		t.Fatalf("storage upload selects = %d, want batched lookups no more than 2", got)
 	}
 }
 

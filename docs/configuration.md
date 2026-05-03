@@ -20,6 +20,7 @@ SYNAPS3_FILECOIN_RPC_URL  -> filecoin.rpc_url
 SYNAPS3_S3_SECRET_KEY     -> s3.secret_key
 SYNAPS3_S3_IAM_DIR        -> s3.iam_dir
 SYNAPS3_FILECOIN_NETWORK  -> filecoin.network
+SYNAPS3_FILECOIN_DEFAULT_COPIES -> filecoin.default_copies
 SYNAPS3_WORKER_UPLOAD_CONCURRENCY -> worker.upload.concurrency
 ```
 
@@ -50,7 +51,7 @@ SynapS3 does not automatically migrate old local `./synaps3.db*` or `./cache` da
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local disk cache behavior |
 | `s3` | `access_key`, `secret_key`, `region`, `iam_dir` | S3 authentication and VersityGW users.json settings |
 | `server` | `port`, `tls.enabled`, `tls.cert_file`, `tls.key_file` | S3 server bind address and TLS |
-| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks` | synapse-go client settings |
+| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | synapse-go client settings and storage policy defaults; `default_copies` accepts 1-8 |
 | `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker tuning |
 | `worker.evictor` | `concurrency`, `poll_interval`, `max_retries` | Cache eviction worker tuning |
 | `logging` | `level`, `format` | Log output settings |

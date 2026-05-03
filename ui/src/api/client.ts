@@ -61,14 +61,26 @@ export interface ObjectLocation {
   filecoin: boolean
 }
 
-export type ObjectStatus = 'uploading' | 'success' | 'warning' | 'unavailable'
+export type ObjectStatus = 'uploading' | 'syncing' | 'success' | 'warning' | 'unavailable'
+export type ObjectState = 'cached' | 'uploading' | 'committing' | 'replicating' | 'stored' | 'cache_evicted' | 'failed'
+export type ObjectUploadStatus =
+  | 'running'
+  | 'stored_on_primary'
+  | 'primary_committed'
+  | 'partial'
+  | 'all_copies_committed'
+  | 'failed'
+  | 'rejected'
+  | 'superseded'
 
 export interface ObjectItem {
   id: number
   key: string
   current_version_id: string
   size: number
+  state: ObjectState
   status: ObjectStatus
+  upload_status?: ObjectUploadStatus
   location: ObjectLocation
   content_type: string
   etag: string
@@ -93,7 +105,9 @@ export interface ObjectVersionItem {
   version_id: string
   key: string
   size: number
+  state: ObjectState
   status: ObjectStatus
+  upload_status?: ObjectUploadStatus
   location: ObjectLocation
   content_type: string
   etag: string
@@ -111,7 +125,9 @@ export interface ObjectVersionListResponse {
 
 export interface ObjectStatusDetail {
   version_id: string
+  state: ObjectState
   status: ObjectStatus
+  upload_status?: ObjectUploadStatus
   failed_at_state?: string
   message?: string
   updated_at: string
@@ -120,6 +136,9 @@ export interface ObjectStatusDetail {
 export interface TaskItem {
   id: number
   type: string
+  stage?: string
+  upload_id?: number
+  copy_index?: number
   ref_type: string
   ref_id: number
   ref_version_id: string
@@ -143,6 +162,26 @@ export interface TaskStatusCount {
   type: string
   status: string
   count: number
+}
+
+export interface TaskRefObjectDetail {
+  bucket_name: string
+  key: string
+  version_id: string
+  size: number
+  state: ObjectState
+  status: ObjectStatus
+  upload_status?: ObjectUploadStatus
+  location: ObjectLocation
+  content_type: string
+  updated_at: string
+}
+
+export interface TaskRefDetail {
+  ref_type: string
+  ref_id: number
+  ref_version_id: string
+  object: TaskRefObjectDetail | null
 }
 
 export interface TokenAccountData {
@@ -248,6 +287,7 @@ export interface SettingsFilecoinConfig {
   source: string
   with_cdn: boolean
   allow_private_networks: boolean
+  default_copies: number
 }
 
 export interface SettingsCacheConfig {
@@ -385,9 +425,10 @@ export const api = {
     if (versionId) params.push(`version_id=${encodeURIComponent(versionId)}`)
     return `${BASE}/buckets/${encodeURIComponent(name)}/objects/download?${params.join('&')}`
   },
-  getTasks: (params: { type?: string; status?: string; limit?: number; offset?: number }) => {
+  getTasks: (params: { type?: string; stage?: string; status?: string; limit?: number; offset?: number }) => {
     const sp = new URLSearchParams()
     if (params.type) sp.set('type', params.type)
+    if (params.stage) sp.set('stage', params.stage)
     if (params.status) sp.set('status', params.status)
     if (params.limit) sp.set('limit', params.limit.toString())
     if (params.offset) sp.set('offset', params.offset.toString())
@@ -395,6 +436,7 @@ export const api = {
     return fetchJSON<TaskListResponse>(`/tasks${qs ? `?${qs}` : ''}`)
   },
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
+  getTaskRefDetail: (id: number) => fetchJSON<TaskRefDetail>(`/tasks/${id}/ref-detail`),
   retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
   getSystemInfo: () => fetchJSON<OverviewData['system']>('/system/info'),
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),

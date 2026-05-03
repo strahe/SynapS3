@@ -94,11 +94,20 @@ export function useDeleteBucket() {
   })
 }
 
-export function useTasks(taskType: string, status: string, limit: number, offset: number) {
+export function useTasks(taskType: string, stage: string, status: string, limit: number, offset: number) {
   return useQuery({
-    queryKey: ['tasks', taskType, status, limit, offset],
-    queryFn: () => api.getTasks({ type: taskType, status, limit, offset }),
+    queryKey: ['tasks', taskType, stage, status, limit, offset],
+    queryFn: () => api.getTasks({ type: taskType, stage, status, limit, offset }),
     refetchInterval: 10_000,
+  })
+}
+
+export function useTaskRefDetail(taskId: number, enabled = true) {
+  return useQuery({
+    queryKey: ['taskRefDetail', taskId],
+    queryFn: () => api.getTaskRefDetail(taskId),
+    enabled: Boolean(taskId && enabled),
+    staleTime: 60_000,
   })
 }
 

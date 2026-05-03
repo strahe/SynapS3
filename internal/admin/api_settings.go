@@ -122,6 +122,7 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 		setString("filecoin.source", &next.Filecoin.Source, req.Filecoin.Source)
 		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.Filecoin.WithCDN)
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.Filecoin.AllowPrivateNetworks)
+		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.Filecoin.DefaultCopies)
 	}
 	if req.Cache != nil {
 		if setString("cache.dir", &next.Cache.Dir, req.Cache.Dir) {
@@ -285,6 +286,7 @@ type settingsFilecoinConfig struct {
 	Source               string `json:"source"`
 	WithCDN              bool   `json:"with_cdn"`
 	AllowPrivateNetworks bool   `json:"allow_private_networks"`
+	DefaultCopies        int    `json:"default_copies"`
 }
 
 type settingsCacheConfig struct {
@@ -375,6 +377,7 @@ type settingsFilecoinUpdate struct {
 	Source               *string `json:"source,omitempty"`
 	WithCDN              *bool   `json:"with_cdn,omitempty"`
 	AllowPrivateNetworks *bool   `json:"allow_private_networks,omitempty"`
+	DefaultCopies        *int    `json:"default_copies,omitempty"`
 }
 
 type settingsCacheUpdate struct {
@@ -420,6 +423,7 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 			Source:               cfg.Filecoin.Source,
 			WithCDN:              cfg.Filecoin.WithCDN,
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+			DefaultCopies:        cfg.Filecoin.DefaultCopies,
 		},
 		Cache: settingsCacheConfig{
 			Dir:            cfg.Cache.Dir,
@@ -485,6 +489,7 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"filecoin.network":             {},
 		"filecoin.rpc_url":             {},
 		"filecoin.source":              {},
+		"filecoin.default_copies":      {},
 		"worker.upload.concurrency":    {},
 		"worker.upload.poll_interval":  {},
 		"worker.upload.max_retries":    {},

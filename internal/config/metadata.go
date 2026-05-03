@@ -94,6 +94,12 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS",
 		Editable:    true,
 	},
+	"filecoin.default_copies": {
+		Label:       "Default Copies",
+		Description: "Default target Filecoin copies for buckets without an explicit copy policy, from 1 to 8.",
+		Env:         "SYNAPS3_FILECOIN_DEFAULT_COPIES",
+		Editable:    true,
+	},
 	"database.driver": {
 		Label:       "Database Driver",
 		Description: "Database backend used for metadata persistence.",

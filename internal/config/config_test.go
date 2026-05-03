@@ -165,6 +165,32 @@ func TestValidate_WorkerPollInterval_Zero(t *testing.T) {
 	}
 }
 
+func TestValidate_FilecoinDefaultCopiesZero(t *testing.T) {
+	cfg := validConfig()
+	cfg.Filecoin.DefaultCopies = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for filecoin default_copies=0")
+	}
+	if !strings.Contains(err.Error(), "filecoin.default_copies") {
+		t.Fatalf("expected filecoin.default_copies error, got: %v", err)
+	}
+}
+
+func TestValidate_FilecoinDefaultCopiesTooHigh(t *testing.T) {
+	cfg := validConfig()
+	cfg.Filecoin.DefaultCopies = 9
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for filecoin default_copies=9")
+	}
+	if !strings.Contains(err.Error(), "filecoin.default_copies") {
+		t.Fatalf("expected filecoin.default_copies error, got: %v", err)
+	}
+}
+
 func TestValidate_EditableSettingsFields(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -204,6 +230,13 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			field: "worker.upload.max_retries",
 			mutate: func(cfg *Config) {
 				cfg.Worker.Upload.MaxRetries = -1
+			},
+		},
+		{
+			name:  "filecoin default copies",
+			field: "filecoin.default_copies",
+			mutate: func(cfg *Config) {
+				cfg.Filecoin.DefaultCopies = 0
 			},
 		},
 		{
@@ -282,6 +315,9 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Worker.Upload.PollInterval != def.Worker.Upload.PollInterval {
 		t.Errorf("Worker.Upload.PollInterval = %s, want %s", cfg.Worker.Upload.PollInterval, def.Worker.Upload.PollInterval)
 	}
+	if cfg.Filecoin.DefaultCopies != 2 {
+		t.Errorf("Filecoin.DefaultCopies = %d, want 2", cfg.Filecoin.DefaultCopies)
+	}
 
 	wantAppDir := filepath.Join(home, ".synaps3")
 	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
@@ -336,6 +372,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_PRIVATE_KEY", "env-private")
 	t.Setenv("SYNAPS3_FILECOIN_WITH_CDN", "true")
 	t.Setenv("SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS", "true")
+	t.Setenv("SYNAPS3_FILECOIN_DEFAULT_COPIES", "4")
 	t.Setenv("SYNAPS3_CACHE_MAX_SIZE_GB", "7")
 	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "manual")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
@@ -356,8 +393,8 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	if cfg.Filecoin.RPCURL != "https://rpc.env.example" || cfg.Filecoin.PrivateKey != "env-private" {
 		t.Fatalf("filecoin config = %#v, want env values", cfg.Filecoin)
 	}
-	if !cfg.Filecoin.WithCDN || !cfg.Filecoin.AllowPrivateNetworks {
-		t.Fatalf("filecoin booleans = %#v, want true values", cfg.Filecoin)
+	if !cfg.Filecoin.WithCDN || !cfg.Filecoin.AllowPrivateNetworks || cfg.Filecoin.DefaultCopies != 4 {
+		t.Fatalf("filecoin config = %#v, want env values", cfg.Filecoin)
 	}
 	if cfg.Cache.MaxSizeGB != 7 || cfg.Cache.EvictionPolicy != "manual" {
 		t.Fatalf("cache config = %#v, want env values", cfg.Cache)

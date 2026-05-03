@@ -671,6 +671,16 @@ func (b *SynapseBackend) resolveVersionReuse(ctx context.Context, objects reposi
 		return reuse, nil
 	}
 
+	replicating, err := objects.FindReusableReplicatingVersion(ctx, bucketID, size, checksum)
+	if err != nil {
+		return reuse, err
+	}
+	if replicating != nil {
+		reuse.State = model.ObjectStateReplicating
+		reuse.StorageUploadID = replicating.StorageUploadID
+		return reuse, nil
+	}
+
 	active, err := objects.FindReusableActiveUploadVersion(ctx, bucketID, size, checksum)
 	if err != nil {
 		return reuse, err
@@ -689,6 +699,10 @@ func (b *SynapseBackend) reusableStoredVersion(ctx context.Context, bucketID int
 }
 
 func (b *SynapseBackend) completeFollowerIfStoredReuseWonRace(ctx context.Context, bucketID int64, bucketName string, size int64, checksum string, objectID int64, versionID string, createdState model.ObjectState) {
+	if createdState == model.ObjectStateReplicating {
+		b.completeReplicatingFollowerIfUploadFinalized(ctx, bucketName, versionID)
+		return
+	}
 	if createdState != model.ObjectStateUploading || checksum == "" {
 		return
 	}
@@ -699,6 +713,25 @@ func (b *SynapseBackend) completeFollowerIfStoredReuseWonRace(ctx context.Contex
 		return
 	}
 	if reusable == nil || reusable.StorageUploadID == nil {
+		replicating, repErr := b.repos.Objects.FindReusableReplicatingVersion(ctx, bucketID, size, checksum)
+		if repErr != nil {
+			b.logger.Warn("checking replicating reuse after active upload follower write", "bucket", bucketName, "versionID", versionID, "error", repErr)
+			return
+		}
+		if replicating == nil || replicating.StorageUploadID == nil {
+			return
+		}
+		if refs, bindErr := b.repos.Uploads.BindPrimaryCommittedUploadForVersion(ctx, repository.BindPrimaryCommittedUploadForVersionInput{
+			UploadID:    *replicating.StorageUploadID,
+			BucketID:    bucketID,
+			ContentSize: size,
+			Checksum:    checksum,
+			VersionID:   versionID,
+		}); bindErr != nil {
+			b.logger.Debug("active upload follower was not ready for primary committed reuse", "bucket", bucketName, "versionID", versionID, "error", bindErr)
+		} else if len(refs) > 0 {
+			b.completeReplicatingFollowerIfUploadFinalized(ctx, bucketName, versionID)
+		}
 		return
 	}
 
@@ -711,11 +744,37 @@ func (b *SynapseBackend) completeFollowerIfStoredReuseWonRace(ctx context.Contex
 	}
 }
 
+func (b *SynapseBackend) completeReplicatingFollowerIfUploadFinalized(ctx context.Context, bucketName string, versionID string) {
+	version, err := b.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil {
+		b.logger.Warn("checking replicating reuse after follower write", "bucket", bucketName, "versionID", versionID, "error", err)
+		return
+	}
+	if version == nil || version.State != model.ObjectStateReplicating || version.StorageUploadID == nil {
+		return
+	}
+	finalized, refs, err := b.repos.Uploads.FinalizeUploadIfAllCopiesCommitted(ctx, repository.FinalizeUploadInput{UploadID: *version.StorageUploadID})
+	if err != nil {
+		b.logger.Warn("finalizing replicating reuse after follower write", "bucket", bucketName, "versionID", versionID, "uploadID", *version.StorageUploadID, "error", err)
+		return
+	}
+	if !finalized {
+		return
+	}
+	for _, ref := range refs {
+		if err := b.enqueuePostWriteTask(ctx, b.repos, ref.ObjectID, ref.VersionID, model.ObjectStateStored); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+			b.logger.Warn("enqueueing eviction after replicating reuse completion", "bucket", bucketName, "versionID", ref.VersionID, "error", err)
+		}
+	}
+}
+
 func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *repository.Repositories, objectID int64, versionID string, state model.ObjectState) error {
 	switch state {
 	case model.ObjectStateCached:
+		stage := "prepare_upload"
 		task := &model.Task{
 			Type:           model.TaskTypeUpload,
+			Stage:          &stage,
 			RefType:        "object",
 			RefID:          objectID,
 			RefVersionID:   versionID,

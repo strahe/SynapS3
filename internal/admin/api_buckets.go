@@ -20,7 +20,15 @@ import (
 	"github.com/versity/versitygw/auth"
 )
 
-const internalRootOwnerAccessKey = "__internal_root__"
+const (
+	internalRootOwnerAccessKey = "__internal_root__"
+
+	objectAdminStatusUnavailable = "unavailable"
+	objectAdminStatusUploading   = "uploading"
+	objectAdminStatusSyncing     = "syncing"
+	objectAdminStatusSuccess     = "success"
+	objectAdminStatusWarning     = "warning"
+)
 
 type bucketListItem struct {
 	ID             int64   `json:"id"`
@@ -372,7 +380,9 @@ type objectListItem struct {
 	Key              string         `json:"key"`
 	CurrentVersionID string         `json:"current_version_id"`
 	Size             int64          `json:"size"`
+	State            string         `json:"state"`
 	Status           string         `json:"status"`
+	UploadStatus     *string        `json:"upload_status,omitempty"`
 	Location         objectLocation `json:"location"`
 	ContentType      string         `json:"content_type"`
 	ETag             string         `json:"etag"`
@@ -388,27 +398,141 @@ type objectLocation struct {
 
 type objectStatusDetailResponse struct {
 	VersionID     string  `json:"version_id"`
+	State         string  `json:"state"`
 	Status        string  `json:"status"`
+	UploadStatus  *string `json:"upload_status,omitempty"`
 	FailedAtState *string `json:"failed_at_state,omitempty"`
 	Message       *string `json:"message,omitempty"`
 	UpdatedAt     string  `json:"updated_at"`
 }
 
-func objectAdminStatus(state model.ObjectState, inCache, inFilecoin bool) string {
+func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bool, uploadStatus *model.StorageUploadStatus) string {
 	if state == model.ObjectStateFailed {
-		return "warning"
+		return objectAdminStatusWarning
+	}
+	if uploadStatus != nil {
+		switch *uploadStatus {
+		case model.StorageUploadStatusPartial,
+			model.StorageUploadStatusFailed,
+			model.StorageUploadStatusRejected:
+			return objectAdminStatusWarning
+		case model.StorageUploadStatusStoredOnPrimary:
+			return objectAdminStatusUploading
+		case model.StorageUploadStatusPrimaryCommitted:
+			return objectAdminStatusSyncing
+		case model.StorageUploadStatusAllCopiesCommitted:
+			return objectAdminStatusSuccess
+		}
 	}
 	if !inCache && !inFilecoin {
-		return "unavailable"
+		return objectAdminStatusUnavailable
 	}
 	switch state {
 	case model.ObjectStateCached, model.ObjectStateUploading:
-		return "uploading"
+		return objectAdminStatusUploading
+	case model.ObjectStateCommitting, model.ObjectStateReplicating:
+		return objectAdminStatusSyncing
 	case model.ObjectStateStored, model.ObjectStateCacheEvicted:
-		return "success"
+		return objectAdminStatusSuccess
 	default:
-		return "unavailable"
+		return objectAdminStatusUnavailable
 	}
+}
+
+type objectAdminUploadInfo struct {
+	Status  *model.StorageUploadStatus
+	Message *string
+}
+
+func (s *Server) objectAdminUploadInfo(ctx context.Context, version model.ObjectVersion) (objectAdminUploadInfo, error) {
+	if s.repos.Uploads == nil {
+		return objectAdminUploadInfo{}, nil
+	}
+	var upload *model.StorageUpload
+	var err error
+	if version.StorageUploadID != nil {
+		upload, err = s.repos.Uploads.GetByID(ctx, *version.StorageUploadID)
+	} else {
+		upload, err = s.repos.Uploads.FindLatestUploadBySourceVersion(ctx, version.VersionID)
+	}
+	if err != nil || upload == nil {
+		return objectAdminUploadInfo{}, err
+	}
+	return objectAdminUploadInfo{
+		Status:  &upload.Status,
+		Message: uploadStatusMessage(upload),
+	}, nil
+}
+
+func (s *Server) objectAdminUploadInfos(ctx context.Context, versions []model.ObjectVersion) (map[string]objectAdminUploadInfo, error) {
+	infos := make(map[string]objectAdminUploadInfo, len(versions))
+	if s.repos.Uploads == nil || len(versions) == 0 {
+		return infos, nil
+	}
+	uploadIDSet := make(map[int64]struct{})
+	versionIDSet := make(map[string]struct{})
+	for _, version := range versions {
+		if version.StorageUploadID != nil {
+			uploadIDSet[*version.StorageUploadID] = struct{}{}
+		} else {
+			versionIDSet[version.VersionID] = struct{}{}
+		}
+	}
+	uploadIDs := make([]int64, 0, len(uploadIDSet))
+	for uploadID := range uploadIDSet {
+		uploadIDs = append(uploadIDs, uploadID)
+	}
+	uploadsByID, err := s.repos.Uploads.GetByIDs(ctx, uploadIDs)
+	if err != nil {
+		return nil, err
+	}
+	versionIDs := make([]string, 0, len(versionIDSet))
+	for versionID := range versionIDSet {
+		versionIDs = append(versionIDs, versionID)
+	}
+	uploadsByVersionID, err := s.repos.Uploads.FindLatestUploadsBySourceVersions(ctx, versionIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, version := range versions {
+		var upload model.StorageUpload
+		var ok bool
+		if version.StorageUploadID != nil {
+			upload, ok = uploadsByID[*version.StorageUploadID]
+		} else {
+			upload, ok = uploadsByVersionID[version.VersionID]
+		}
+		if !ok {
+			continue
+		}
+		status := upload.Status
+		infos[version.VersionID] = objectAdminUploadInfo{
+			Status:  &status,
+			Message: uploadStatusMessage(&upload),
+		}
+	}
+	return infos, nil
+}
+
+func uploadStatusString(status *model.StorageUploadStatus) *string {
+	if status == nil {
+		return nil
+	}
+	value := string(*status)
+	return &value
+}
+
+func uploadStatusMessage(upload *model.StorageUpload) *string {
+	if upload == nil {
+		return nil
+	}
+	if upload.ErrorMessage != nil && *upload.ErrorMessage != "" {
+		return upload.ErrorMessage
+	}
+	if upload.AcceptError != nil && *upload.AcceptError != "" {
+		return upload.AcceptError
+	}
+	return nil
 }
 
 type objectFolderItem struct {
@@ -485,14 +609,23 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	uploadInfos, err := s.objectAdminUploadInfos(ctx, objects)
+	if err != nil {
+		s.logger.Error("api: failed to load object upload statuses", "error", err, "bucket", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 	items := make([]objectListItem, 0, len(objects))
 	for _, o := range objects {
+		uploadInfo := uploadInfos[o.VersionID]
 		items = append(items, objectListItem{
 			ID:               o.ObjectID,
 			Key:              o.Key,
 			CurrentVersionID: o.VersionID,
 			Size:             o.Size,
-			Status:           objectAdminStatus(o.State, o.InCache, o.InFilecoin),
+			State:            string(o.State),
+			Status:           objectAdminStatusWithUpload(o.State, o.InCache, o.InFilecoin, uploadInfo.Status),
+			UploadStatus:     uploadStatusString(uploadInfo.Status),
 			Location:         objectLocation{Cache: o.InCache, Filecoin: o.InFilecoin},
 			ContentType:      o.ContentType,
 			ETag:             o.ETag,
@@ -646,17 +779,19 @@ func adminListingFolderName(commonPrefix, prefix, delimiter string) string {
 }
 
 type objectVersionListItem struct {
-	VersionID   string         `json:"version_id"`
-	Key         string         `json:"key"`
-	Size        int64          `json:"size"`
-	Status      string         `json:"status"`
-	Location    objectLocation `json:"location"`
-	ContentType string         `json:"content_type"`
-	ETag        string         `json:"etag"`
-	PieceCID    *string        `json:"piece_cid,omitempty"`
-	CreatedAt   string         `json:"created_at"`
-	UpdatedAt   string         `json:"updated_at"`
-	IsCurrent   bool           `json:"is_current"`
+	VersionID    string         `json:"version_id"`
+	Key          string         `json:"key"`
+	Size         int64          `json:"size"`
+	State        string         `json:"state"`
+	Status       string         `json:"status"`
+	UploadStatus *string        `json:"upload_status,omitempty"`
+	Location     objectLocation `json:"location"`
+	ContentType  string         `json:"content_type"`
+	ETag         string         `json:"etag"`
+	PieceCID     *string        `json:"piece_cid,omitempty"`
+	CreatedAt    string         `json:"created_at"`
+	UpdatedAt    string         `json:"updated_at"`
+	IsCurrent    bool           `json:"is_current"`
 }
 
 type objectVersionListResponse struct {
@@ -699,17 +834,29 @@ func (s *Server) handleAPIBucketObjectStatusDetail(w http.ResponseWriter, r *htt
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object version not found"})
 		return
 	}
+	uploadInfo, err := s.objectAdminUploadInfo(ctx, *version)
+	if err != nil {
+		s.logger.Error("api: failed to load object upload status detail", "error", err, "bucket", bucketName, "versionID", versionID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 
 	var failedAtState *string
 	if version.FailedAtState != nil {
 		state := string(*version.FailedAtState)
 		failedAtState = &state
 	}
+	message := version.LastError
+	if message == nil {
+		message = uploadInfo.Message
+	}
 	writeJSON(w, http.StatusOK, objectStatusDetailResponse{
 		VersionID:     version.VersionID,
-		Status:        objectAdminStatus(version.State, version.InCache, version.InFilecoin),
+		State:         string(version.State),
+		Status:        objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, uploadInfo.Status),
+		UploadStatus:  uploadStatusString(uploadInfo.Status),
 		FailedAtState: failedAtState,
-		Message:       version.LastError,
+		Message:       message,
 		UpdatedAt:     version.UpdatedAt.Format(time.RFC3339),
 	})
 }
@@ -757,20 +904,33 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 	if hasMore {
 		versions = versions[:limit]
 	}
+	versionRows := make([]model.ObjectVersion, 0, len(versions))
+	for _, v := range versions {
+		versionRows = append(versionRows, v.ObjectVersion)
+	}
+	uploadInfos, err := s.objectAdminUploadInfos(ctx, versionRows)
+	if err != nil {
+		s.logger.Error("api: failed to load object version upload statuses", "error", err, "bucket", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 	items := make([]objectVersionListItem, 0, len(versions))
 	for _, v := range versions {
+		uploadInfo := uploadInfos[v.VersionID]
 		items = append(items, objectVersionListItem{
-			VersionID:   v.VersionID,
-			Key:         v.Key,
-			Size:        v.Size,
-			Status:      objectAdminStatus(v.State, v.InCache, v.InFilecoin),
-			Location:    objectLocation{Cache: v.InCache, Filecoin: v.InFilecoin},
-			ContentType: v.ContentType,
-			ETag:        v.ETag,
-			PieceCID:    v.PieceCID,
-			CreatedAt:   v.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:   v.UpdatedAt.Format(time.RFC3339),
-			IsCurrent:   v.IsCurrent,
+			VersionID:    v.VersionID,
+			Key:          v.Key,
+			Size:         v.Size,
+			State:        string(v.State),
+			Status:       objectAdminStatusWithUpload(v.State, v.InCache, v.InFilecoin, uploadInfo.Status),
+			UploadStatus: uploadStatusString(uploadInfo.Status),
+			Location:     objectLocation{Cache: v.InCache, Filecoin: v.InFilecoin},
+			ContentType:  v.ContentType,
+			ETag:         v.ETag,
+			PieceCID:     v.PieceCID,
+			CreatedAt:    v.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:    v.UpdatedAt.Format(time.RFC3339),
+			IsCurrent:    v.IsCurrent,
 		})
 	}
 

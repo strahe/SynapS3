@@ -43,6 +43,7 @@ filecoin:
   source: synaps3
   with_cdn: false
   allow_private_networks: false  # set true only for trusted private SP retrieval URLs
+  default_copies: 2  # 1-8
 
 worker:
   upload:

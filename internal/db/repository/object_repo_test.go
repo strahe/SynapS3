@@ -435,6 +435,81 @@ func TestObjectRepo_FindReusableActiveUploadVersionRequiresActiveTask(t *testing
 	}
 }
 
+func TestObjectRepo_FindReusableActiveUploadVersionUsesDurableUploadLeader(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "durable-active-reuse-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000007B", 10)
+	version.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark uploading: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+
+	got, err := repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableActiveUploadVersion(uploading): %v", err)
+	}
+	if got == nil || got.VersionID != version.VersionID {
+		t.Fatalf("uploading durable leader = %#v, want %s", got, version.VersionID)
+	}
+
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("mark committing: %v", err)
+	}
+	got, err = repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableActiveUploadVersion(committing without primary): %v", err)
+	}
+	if got != nil {
+		t.Fatalf("committing leader without primary piece = %#v, want nil", got)
+	}
+
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        "101",
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacefake",
+		RetrievalURL: "https://provider.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+
+	got, err = repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableActiveUploadVersion(committing with primary): %v", err)
+	}
+	if got == nil || got.VersionID != version.VersionID {
+		t.Fatalf("committing durable leader = %#v, want %s", got, version.VersionID)
+	}
+}
+
 func TestObjectRepo_AcceptStorageUploadForContentUpdatesMatchingVersions(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -538,16 +613,37 @@ func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t 
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
 		t.Fatalf("follower version: %v", err)
 	}
+	committingFollower := newObjectVersion(bucket.ID, "commit.txt", "01J0000000000000000000007G", 10)
+	committingFollower.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, committingFollower); err != nil {
+		t.Fatalf("committing follower version: %v", err)
+	}
 	independent := newObjectVersion(bucket.ID, "other.txt", "01J0000000000000000000007F", 10)
 	independent.Checksum = "same-checksum"
 	independentObjID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, independent)
 	if err != nil {
 		t.Fatalf("independent version: %v", err)
 	}
-	for _, versionID := range []string{leader.VersionID, follower.VersionID, independent.VersionID} {
+	independentUpload := newObjectVersion(bucket.ID, "other-active.txt", "01J0000000000000000000007H", 10)
+	independentUpload.Checksum = "same-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, independentUpload); err != nil {
+		t.Fatalf("independent upload version: %v", err)
+	}
+	for _, versionID := range []string{leader.VersionID, follower.VersionID, committingFollower.VersionID, independent.VersionID, independentUpload.VersionID} {
 		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 			t.Fatalf("mark %s uploading: %v", versionID, err)
 		}
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, committingFollower.VersionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("mark committing follower committing: %v", err)
+	}
+	if _, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: independentUpload.VersionID,
+		ContentSize:     independentUpload.Size,
+		Checksum:        independentUpload.Checksum,
+	}); err != nil {
+		t.Fatalf("start independent active upload: %v", err)
 	}
 
 	for _, task := range []*model.Task{
@@ -581,11 +677,16 @@ func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t 
 	if err != nil {
 		t.Fatalf("FailUploadingContentFollowers: %v", err)
 	}
-	if len(refs) != 2 {
-		t.Fatalf("failed refs len = %d, want 2", len(refs))
+	if len(refs) != 3 {
+		t.Fatalf("failed refs len = %d, want 3", len(refs))
 	}
 
-	for _, versionID := range []string{leader.VersionID, follower.VersionID} {
+	wantFailedAtState := map[string]model.ObjectState{
+		leader.VersionID:             model.ObjectStateUploading,
+		follower.VersionID:           model.ObjectStateUploading,
+		committingFollower.VersionID: model.ObjectStateCommitting,
+	}
+	for versionID, failedAtState := range wantFailedAtState {
 		got, err := repos.Objects.GetVersionByID(ctx, versionID)
 		if err != nil || got == nil {
 			t.Fatalf("version %s: got=%v err=%v", versionID, got, err)
@@ -593,8 +694,8 @@ func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t 
 		if got.State != model.ObjectStateFailed {
 			t.Fatalf("version %s state = %s, want failed", versionID, got.State)
 		}
-		if got.FailedAtState == nil || *got.FailedAtState != model.ObjectStateUploading {
-			t.Fatalf("version %s failed_at_state = %#v, want uploading", versionID, got.FailedAtState)
+		if got.FailedAtState == nil || *got.FailedAtState != failedAtState {
+			t.Fatalf("version %s failed_at_state = %#v, want %s", versionID, got.FailedAtState, failedAtState)
 		}
 		if got.LastError == nil || *got.LastError != "upload failed" {
 			t.Fatalf("version %s last_error = %#v, want upload failed", versionID, got.LastError)
@@ -606,6 +707,13 @@ func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t 
 	}
 	if gotIndependent.State != model.ObjectStateUploading {
 		t.Fatalf("independent state = %s, want uploading", gotIndependent.State)
+	}
+	gotIndependentUpload, err := repos.Objects.GetVersionByID(ctx, independentUpload.VersionID)
+	if err != nil || gotIndependentUpload == nil {
+		t.Fatalf("independent upload version: got=%v err=%v", gotIndependentUpload, err)
+	}
+	if gotIndependentUpload.State != model.ObjectStateUploading {
+		t.Fatalf("independent upload state = %s, want uploading", gotIndependentUpload.State)
 	}
 }
 
@@ -728,6 +836,86 @@ func TestObjectRepo_UpdateVersionStateFromFailedClearsFailureDetails(t *testing.
 	}
 	if current.LastError != nil {
 		t.Fatalf("current last_error = %#v, want nil", current.LastError)
+	}
+}
+
+func TestObjectRepo_UpdateVersionStateToFailedClearsStorageUploadID(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "failed-upload-binding-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000000120", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        "101",
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID:              primary.ID,
+		UploadID:        upload.ID,
+		DataSetID:       "1001",
+		ClientDataSetID: "9001",
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacefailedbinding",
+		PieceID:      "2001",
+		RetrievalURL: "https://provider.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+	}
+
+	if err := repos.Objects.UpdateVersionStateToFailed(ctx, version.VersionID, model.ObjectStateReplicating, "replication failed"); err != nil {
+		t.Fatalf("UpdateVersionStateToFailed: %v", err)
+	}
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("GetVersionByID: got=%v err=%v", got, err)
+	}
+	if got.State != model.ObjectStateFailed || got.StorageUploadID != nil {
+		t.Fatalf("failed version = state:%s upload:%#v, want failed without upload binding", got.State, got.StorageUploadID)
+	}
+	if got.FailedAtState == nil || *got.FailedAtState != model.ObjectStateReplicating {
+		t.Fatalf("failed_at_state = %#v, want replicating", got.FailedAtState)
 	}
 }
 

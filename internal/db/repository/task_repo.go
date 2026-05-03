@@ -18,6 +18,7 @@ type BunTaskRepo struct {
 var _ TaskRepository = (*BunTaskRepo)(nil)
 
 func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
+	normalizeTaskStage(task)
 	_, err := r.db.NewInsert().Model(task).Exec(ctx)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -26,6 +27,17 @@ func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
 		return fmt.Errorf("inserting task: %w", err)
 	}
 	return nil
+}
+
+func normalizeTaskStage(task *model.Task) {
+	if task == nil || task.Stage != nil || task.Type != model.TaskTypeUpload {
+		return
+	}
+	stage, _ := task.Payload["stage"].(string)
+	if stage == "" {
+		stage = "prepare_upload"
+	}
+	task.Stage = &stage
 }
 
 func (r *BunTaskRepo) GetByID(ctx context.Context, id int64) (*model.Task, error) {
@@ -169,32 +181,119 @@ func (r *BunTaskRepo) ListDeadLetters(ctx context.Context, limit int) ([]model.T
 	return tasks, nil
 }
 
-// RetryDeadLetter resets a dead-letter task back to pending for manual retry.
-// TODO: This only resets the task status. If the worker also transitioned the
-// object/bucket to a failed state, the retried task will be rejected because
-// the entity is no longer in the expected source state. A full retry mechanism
-// should atomically reset both task and entity state.
 func (r *BunTaskRepo) RetryDeadLetter(ctx context.Context, taskID int64) error {
-	res, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusPending).
-		Set("retry_count = 0").
-		Set("scheduled_at = ?", time.Now()).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Set("completed_at = NULL").
-		Set("last_error = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusDeadLetter).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("retrying dead-letter task: %w", err)
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		task := new(model.Task)
+		err := db.NewSelect().
+			Model(task).
+			Where("id = ? AND status = ?", taskID, model.TaskStatusDeadLetter).
+			Scan(ctx)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("retrying dead-letter task %d: %w", taskID, ErrNotFound)
+			}
+			return fmt.Errorf("loading dead-letter task: %w", err)
+		}
+
+		now := time.Now()
+		if err := resetFailedObjectForTaskRetry(ctx, db, task, now); err != nil {
+			return err
+		}
+
+		res, err := db.NewUpdate().
+			Model((*model.Task)(nil)).
+			Set("status = ?", model.TaskStatusPending).
+			Set("retry_count = 0").
+			Set("scheduled_at = ?", now).
+			Set("claimed_at = NULL").
+			Set("lease_until = NULL").
+			Set("started_at = NULL").
+			Set("completed_at = NULL").
+			Set("last_error = NULL").
+			Where("id = ? AND status = ?", taskID, model.TaskStatusDeadLetter).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("retrying dead-letter task: %w", err)
+		}
+		rows, _ := res.RowsAffected()
+		if rows == 0 {
+			return fmt.Errorf("retrying dead-letter task %d: %w", taskID, ErrNotFound)
+		}
+		return nil
+	})
+}
+
+func resetFailedObjectForTaskRetry(ctx context.Context, db bun.IDB, task *model.Task, now time.Time) error {
+	if task.Type != model.TaskTypeUpload || task.RefType != "object" || task.RefVersionID == "" {
+		return nil
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("retrying dead-letter task %d: %w", taskID, ErrNotFound)
+
+	target := retryObjectState(task)
+	q := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("state = ?", target).
+		Set("failed_at_state = NULL").
+		Set("last_error = NULL").
+		Set("updated_at = ?", now).
+		Where("version_id = ? AND state = ?", task.RefVersionID, model.ObjectStateFailed)
+	if target == model.ObjectStateReplicating {
+		if uploadID := taskPayloadInt64(task.Payload, "upload_id"); uploadID > 0 {
+			q = q.Set("storage_upload_id = ?", uploadID)
+		}
+	}
+	if _, err := q.Exec(ctx); err != nil {
+		return fmt.Errorf("resetting failed object for task retry: %w", err)
 	}
 	return nil
+}
+
+func retryObjectState(task *model.Task) model.ObjectState {
+	stage := ""
+	if task.Stage != nil {
+		stage = *task.Stage
+	}
+	if stage == "" {
+		stage, _ = task.Payload["stage"].(string)
+	}
+	switch stage {
+	case "primary_commit":
+		return model.ObjectStateCommitting
+	case "secondary_pull", "secondary_commit":
+		return model.ObjectStateReplicating
+	case "ensure_dataset":
+		if taskPayloadInt64(task.Payload, "copy_index") > 0 {
+			return model.ObjectStateReplicating
+		}
+	}
+	return model.ObjectStateUploading
+}
+
+func taskPayloadInt64(payload map[string]interface{}, key string) int64 {
+	if payload == nil {
+		return 0
+	}
+	raw, ok := payload[key]
+	if !ok {
+		return 0
+	}
+	switch v := raw.(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	}
+	return 0
+}
+
+func (r *BunTaskRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {
+	if db, ok := r.db.(*bun.DB); ok {
+		return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+			return fn(tx)
+		})
+	}
+	return fn(r.db)
 }
 
 // Requeue resets a failed task back to pending with a scheduled backoff delay.
@@ -260,11 +359,14 @@ func (r *BunTaskRepo) CountActiveBucketTasksByBucketID(ctx context.Context, buck
 	return int64(count), nil
 }
 
-// List returns tasks with optional type/status filters, paginated by offset/limit.
-func (r *BunTaskRepo) List(ctx context.Context, taskType string, status string, limit, offset int) ([]model.Task, int, error) {
+// List returns tasks with optional type/stage/status filters, paginated by offset/limit.
+func (r *BunTaskRepo) List(ctx context.Context, taskType string, stage string, status string, limit, offset int) ([]model.Task, int, error) {
 	applyFilters := func(q *bun.SelectQuery) *bun.SelectQuery {
 		if taskType != "" {
 			q = q.Where("type = ?", taskType)
+		}
+		if stage != "" {
+			q = q.Where("stage = ?", stage)
 		}
 		if status != "" {
 			q = q.Where("status = ?", status)

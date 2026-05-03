@@ -14,6 +14,8 @@ export const Route = createFileRoute('/')({
 const STATE_COLORS: Record<string, string> = {
   cached: 'var(--chart-1)',
   uploading: 'var(--chart-2)',
+  committing: 'var(--chart-4)',
+  replicating: 'var(--chart-3)',
   stored: 'var(--chart-5)',
   failed: 'var(--destructive)',
   cache_evicted: 'var(--muted-foreground)',

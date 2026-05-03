@@ -89,6 +89,13 @@ export function collectSettingsRiskChanges(
       'Allows private-network retrieval URLs; enable only in trusted environments.'
     )
   }
+  addChanged(
+    'filecoin.default_copies',
+    initial.filecoin.default_copies,
+    next.filecoin.default_copies,
+    'medium',
+    'Changes the default Filecoin copy count for buckets without an explicit policy.'
+  )
 
   addChanged('cache.dir', initial.cache.dir, next.cache.dir, 'medium', 'Changes where cached object data is stored.')
   if (next.cache.max_size_gb < initial.cache.max_size_gb) {

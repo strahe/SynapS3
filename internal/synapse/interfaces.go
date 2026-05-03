@@ -7,13 +7,30 @@ import (
 
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synapse-go/storage"
+	"github.com/strahe/synapse-go/types"
 )
 
-// StorageClient abstracts the synapse-go storage.Manager for upload/download.
-// *storage.Manager satisfies this interface directly.
+// UploadContext abstracts one provider-scoped SDK storage context.
+type UploadContext interface {
+	ProviderID() types.ProviderID
+	DataSetID() *types.DataSetID
+	PieceURL(cid.Cid) string
+	ServiceURL() string
+	CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
+	WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
+	Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
+	PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error)
+	Pull(context.Context, storage.PullRequest) (*storage.PullResult, error)
+	Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error)
+}
+
+// StorageClient abstracts the synapse-go storage service for upload/download
+// plus staged provider operations.
 type StorageClient interface {
 	Upload(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
 	Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
+	CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]UploadContext, error)
+	CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (UploadContext, error)
 }
 
 // WalletQuerier provides on-chain wallet state for the admin dashboard.

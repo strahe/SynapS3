@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
@@ -57,6 +58,106 @@ func TestEvictor_HappyPath(t *testing.T) {
 	}
 	if obj.InCache {
 		t.Error("expected object cache location to be false after successful eviction")
+	}
+}
+
+func TestEvictor_ReplicatingVersionEvictsCacheAndKeepsState(t *testing.T) {
+	var deletedBucket, deletedKey string
+	mc := &testutil.MockCache{
+		DeleteFunc: func(_ context.Context, bucket, key string) error {
+			deletedBucket = bucket
+			deletedKey = key
+			return nil
+		},
+	}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	bucket, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
+	ctx := context.Background()
+
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := env.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	primary, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        "101",
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding primary: %v", err)
+	}
+	secondary, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        "202",
+		CopyIndex:         1,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding secondary: %v", err)
+	}
+	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+		t.Fatalf("MarkDataSetReady primary: %v", err)
+	}
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := env.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     testCID(t).String(),
+		PieceID:      "3001",
+		RetrievalURL: "https://primary.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted primary: %v", err)
+	}
+	if _, err := env.repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+	}
+
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
+
+	gotTask, _ := env.repos.Tasks.GetByID(ctx, task.ID)
+	if gotTask.Status != model.TaskStatusCompleted {
+		t.Fatalf("task status = %s, want completed", gotTask.Status)
+	}
+	gotVersion, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || gotVersion == nil {
+		t.Fatalf("GetVersionByID after evict: version=%v err=%v", gotVersion, err)
+	}
+	if gotVersion.State != model.ObjectStateReplicating {
+		t.Fatalf("version state = %s, want replicating", gotVersion.State)
+	}
+	if gotVersion.InCache {
+		t.Fatal("version in_cache = true, want false")
+	}
+	if deletedBucket != bucket.Name || deletedKey != version.CacheKey {
+		t.Fatalf("deleted cache = %s/%s, want %s/%s", deletedBucket, deletedKey, bucket.Name, version.CacheKey)
 	}
 }
 
