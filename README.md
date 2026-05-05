@@ -33,7 +33,11 @@ Default endpoints:
 - Dashboard and admin API: `http://localhost:9090`
 - Runtime data: `~/.synaps3/`
 
-Open the dashboard, create an S3 user, then configure your S3 client with the generated keys. Secrets are shown only when created or rotated.
+Create an S3 user from the dashboard or CLI, then configure your S3 client with the generated keys. Secrets are shown only when created or rotated.
+
+```bash
+synaps3 admin s3-user create
+```
 
 Example with AWS CLI:
 

@@ -62,6 +62,7 @@ func newRootCommand() *cli.Command {
 			serveCommand(),
 			migrateCommand(),
 			providerCommand(),
+			adminCommand(),
 			versionCommand(),
 		},
 	}

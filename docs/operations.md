@@ -71,6 +71,12 @@ Key metrics:
 
 `GET /healthz` checks database connectivity, cache directory availability, and worker liveness.
 
+The CLI wraps the same admin API:
+
+```bash
+synaps3 admin status
+```
+
 Healthy:
 
 ```json
@@ -99,11 +105,49 @@ Workers are unhealthy if they stop completing poll cycles for longer than `3 * p
 List dead-letter tasks:
 
 ```bash
-curl http://127.0.0.1:9090/admin/dead-letters?limit=100
+synaps3 admin task list --status dead_letter --limit 100
+```
+
+Show task queue counts:
+
+```bash
+synaps3 admin task stats
 ```
 
 Retry one task:
 
 ```bash
-curl -X POST http://127.0.0.1:9090/admin/dead-letters/42/retry
+synaps3 admin task retry 42
+```
+
+List S3 users:
+
+```bash
+synaps3 admin s3-user list
+```
+
+Update or delete an S3 user:
+
+```bash
+synaps3 admin s3-user update <access-key> --role userplus
+synaps3 admin s3-user delete <access-key> --yes
+```
+
+Show editable settings:
+
+```bash
+synaps3 admin settings get
+synaps3 admin settings get logging.level
+```
+
+Update settings:
+
+```bash
+synaps3 admin settings set logging.level=debug
+```
+
+High-risk settings, such as switching Filecoin networks or allowing private retrieval URLs, require `--yes`.
+
+```bash
+synaps3 admin settings set filecoin.network=mainnet --yes
 ```
