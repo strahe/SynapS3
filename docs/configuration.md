@@ -1,10 +1,10 @@
 # Configuration
 
-SynapS3 loads TOML configuration from a config file, then applies recognized `SYNAPS3_` environment overrides. Built-in defaults live in code; generated config files only store values that should be explicit for that installation.
+SynapS3 reads TOML config and applies `SYNAPS3_` environment overrides. Environment values win.
 
 ## Initialize
 
-Default local setup:
+Default setup:
 
 ```bash
 synaps3 init
@@ -18,56 +18,32 @@ synaps3 init --dir /var/lib/synaps3
 synaps3 serve --config /var/lib/synaps3/config.toml
 ```
 
-`synaps3 init` creates `config.toml`, `db/`, and `cache/`. It fails if `config.toml` already exists; back up or delete the file before running init again.
+`synaps3 init` creates `config.toml`, `db/`, and `cache/`. It fails if `config.toml` already exists.
 
-The generated config is a full reference file. Section headers stay active so fields can be uncommented in place. Commented values show built-in defaults and do not override runtime defaults until you uncomment them. Only installation-specific values are enabled by default:
+## Config Source
+
+- Without `--config`, SynapS3 uses `~/.synaps3/config.toml`
+- Pass `--config <path>` to use a different file
+- A `config.toml` in the current directory is ignored unless passed explicitly
+- `synaps3 init --dir <path>` creates files but does not change the default config source
+- Admin settings writes rewrite `config.toml`; custom comments and ordering are not preserved
+
+## Required Secret
+
+Edit `~/.synaps3/config.toml` before normal serving:
 
 ```toml
-[server]
-# Host and port where the S3-compatible API listens.
-# Env: SYNAPS3_SERVER_PORT
-# port = ":8080"
-
 [filecoin]
-# Required before serving unless SYNAPS3_FILECOIN_PRIVATE_KEY is set.
-private_key = ""
-
-[database]
-# Enabled with database.dsn so this installation uses SQLite at the initialized path.
-driver = "sqlite"
-dsn = "file:/path/to/synaps3/db/synaps3.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
-
-[cache]
-# Enabled so this installation uses the initialized cache directory.
-dir = "/path/to/synaps3/cache"
+private_key = "0x..."
 ```
 
-Set `filecoin.private_key` in the config file or use `SYNAPS3_FILECOIN_PRIVATE_KEY`. `database.driver`, `database.dsn`, and `cache.dir` are enabled so a custom `--dir` remains the active runtime data directory.
+Use an environment variable only when a deployment system manages secrets outside the config file:
 
-If settings are saved through the admin API, SynapS3 rewrites `config.toml` in its standard format with built-in comments. User-written comments, order, and spacing are not preserved.
-
-## Loading Rules
-
-- Without `--config`, SynapS3 reads and writes `~/.synaps3/config.toml`
-- Pass `--config <path>` to use a different config file
-- A `config.toml` in the current directory is ignored unless you pass `--config config.toml`
-- `synaps3 init --dir <path>` creates a config file but does not change the default config source
-- Environment variables use the `SYNAPS3_` prefix and override file values
-- Unknown `SYNAPS3_` names use a fallback mapping that lowercases the name and replaces `_` with `.`
-
-Examples:
-
-```text
-SYNAPS3_SERVER_PORT                  -> server.port
-SYNAPS3_S3_REGION                    -> s3.region
-SYNAPS3_FILECOIN_RPC_URL             -> filecoin.rpc_url
-SYNAPS3_FILECOIN_PRIVATE_KEY         -> filecoin.private_key
-SYNAPS3_FILECOIN_DEFAULT_COPIES      -> filecoin.default_copies
-SYNAPS3_DATABASE_DSN                 -> database.dsn
-SYNAPS3_CACHE_DIR                    -> cache.dir
-SYNAPS3_WORKER_UPLOAD_CONCURRENCY    -> worker.upload.concurrency
-SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL -> worker.evictor.poll_interval
+```bash
+export SYNAPS3_FILECOIN_PRIVATE_KEY='0x...'
 ```
+
+Keep secrets out of commits. In production, prefer environment variables or secret-managed config files.
 
 ## Runtime Data
 
@@ -83,23 +59,48 @@ Default local paths:
   cache/
 ```
 
-SQLite WAL and SHM files are expected and live beside the database file. Explicit `database.dsn` and `cache.dir` values take precedence.
+SQLite WAL and SHM files are expected. Explicit `database.dsn` and `cache.dir` values take precedence.
+
+## Environment Overrides
+
+Examples:
+
+```text
+SYNAPS3_SERVER_PORT                  -> server.port
+SYNAPS3_S3_REGION                    -> s3.region
+SYNAPS3_FILECOIN_RPC_URL             -> filecoin.rpc_url
+SYNAPS3_FILECOIN_PRIVATE_KEY         -> filecoin.private_key
+SYNAPS3_FILECOIN_DEFAULT_COPIES      -> filecoin.default_copies
+SYNAPS3_DATABASE_DSN                 -> database.dsn
+SYNAPS3_CACHE_DIR                    -> cache.dir
+SYNAPS3_WORKER_UPLOAD_CONCURRENCY    -> worker.upload.concurrency
+SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL -> worker.evictor.poll_interval
+SYNAPS3_ADMIN_ADDR                   -> admin.addr
+```
+
+Unknown `SYNAPS3_` names fall back to lowercase with `_` replaced by `.`.
 
 ## Main Sections
 
 | Section | Key Fields | Purpose |
 | --- | --- | --- |
-| `server` | `port`, `max_connections`, `max_requests`, `tls.enabled`, `tls.cert_file`, `tls.key_file` | S3 API listener and concurrency limits |
-| `s3` | `region` | Region reported by the S3-compatible gateway |
-| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | Filecoin client and upload defaults |
+| `server` | `port`, `max_connections`, `max_requests`, `tls.*` | S3 API listener |
+| `s3` | `region` | Region reported to S3 clients |
+| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | Filecoin upload behavior |
 | `database` | `driver`, `dsn`, `max_open_conns`, `max_idle_conns` | Metadata database |
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local object cache |
-| `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker tuning |
-| `worker.evictor` | `concurrency`, `poll_interval`, `max_retries` | Cache eviction worker tuning |
-| `logging` | `level`, `format` | Log output |
-| `admin` | `addr` | Admin dashboard and API address |
+| `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker |
+| `worker.evictor` | `concurrency`, `poll_interval`, `max_retries` | Cache eviction worker |
+| `logging` | `level`, `format` | Runtime logs |
+| `admin` | `addr` | Dashboard and admin API |
 
-`filecoin.network` supports `calibration` and `mainnet`. `filecoin.default_copies` accepts `1` through `8`. `cache.eviction_policy` supports `lru`, `manual`, and `none`.
+Allowed values:
+
+- `filecoin.network`: `calibration`, `mainnet`
+- `filecoin.default_copies`: `1` through `8`
+- `cache.eviction_policy`: `lru`, `manual`, `none`
+- `logging.level`: `debug`, `info`, `warn`, `error`
+- `logging.format`: `json`, `text`
 
 ## Production Example
 
@@ -124,8 +125,20 @@ with_cdn = false
 allow_private_networks = false
 default_copies = 2
 
+[worker.upload]
+concurrency = 4
+poll_interval = "5s"
+max_retries = 5
+
+[worker.evictor]
+concurrency = 2
+poll_interval = "1m"
+max_retries = 3
+
+[logging]
+level = "info"
+format = "json"
+
 [admin]
 addr = "127.0.0.1:9090"
 ```
-
-Keep secrets out of commits. For production, prefer environment variables or secret-managed config files.

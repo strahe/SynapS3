@@ -1,84 +1,80 @@
 # SynapS3
 
-SynapS3 exposes an S3-compatible endpoint backed by Filecoin. Clients use standard S3 APIs, while SynapS3 lands data in local cache first and moves it through provider upload and proof-related workflows in the background.
+SynapS3 lets S3 clients use Filecoin storage.
 
-## Architecture
+## Why SynapS3
 
-```text
-S3 Client
-   |
-   v
-SynapS3
-   |
-   +--> Local cache + metadata database
-   |
-   +--> Storage Provider + Filecoin proof flow
-```
-
-Writes land in the local cache and metadata database first, then background workers handle provider upload and the on-chain lifecycle.
+- Use existing S3 clients, SDKs, and tools.
+- Store object data through Filecoin providers.
+- Manage buckets, objects, settings, tasks, and health from one dashboard.
 
 ## Quick Start
 
-1. Initialize the app data directory.
-2. Set your Filecoin private key in the generated config or environment.
-3. Point your S3 client at the SynapS3 endpoint.
-
 ```bash
-go run ./cmd/synaps3 init
-go run ./cmd/synaps3 serve
+synaps3 init
 ```
 
-The default S3 endpoint is `http://localhost:8080`.
+Set `filecoin.private_key` in `~/.synaps3/config.toml`:
 
-The built-in dashboard is available at `http://localhost:9090` (admin port) and provides an overview of system health, bucket/object browsing, and task monitoring.
+```toml
+[filecoin]
+private_key = "0x..."
+```
 
-By default, local runtime data is stored under `~/.synaps3/`: SQLite files in `db/` and cached objects in `cache/`. Set `database.dsn` or `cache.dir` if you need explicit paths.
+Start SynapS3:
 
-If `--config` is omitted, SynapS3 uses `~/.synaps3/config.toml`. A `config.toml` in the current directory is only loaded when you pass it explicitly with `--config config.toml`.
+```bash
+synaps3 serve
+```
 
-See [`docs/configuration.md`](docs/configuration.md) for custom directories, environment overrides, and the main settings.
+Default endpoints:
 
-## S3 API Compatibility
+- S3 API: `http://localhost:8080`
+- Dashboard and admin API: `http://localhost:9090`
+- Runtime data: `~/.synaps3/`
 
-### Bucket Operations
+Open the dashboard, create an S3 user, then configure your S3 client with the generated keys. Secrets are shown only when created or rotated.
 
-| Operation | Status | Notes |
-| --- | --- | --- |
-| `CreateBucket` | Supported | Creates an active bucket and cache namespace |
-| `HeadBucket` | Supported | Returns bucket metadata |
-| `DeleteBucket` | Not supported | Bucket deletion is intentionally disabled in the current lifecycle |
-| `ListBuckets` | Supported | Lists active buckets |
+Example with AWS CLI:
 
-### Object Operations
+```bash
+export AWS_ACCESS_KEY_ID='replace-with-access-key'
+export AWS_SECRET_ACCESS_KEY='replace-with-secret-key'
+export AWS_DEFAULT_REGION=us-east-1
 
-| Operation | Status | Notes |
-| --- | --- | --- |
-| `PutObject` | Supported | Writes to local cache first, then enqueues provider upload |
-| `GetObject` | Supported | Serves from cache and can fall back on eligible cache misses when provider metadata is available and size limits allow |
-| `HeadObject` | Supported | Returns object metadata without body |
-| `DeleteObject` | Supported | Soft-deletes the object |
-| `DeleteObjects` | Supported | Batch soft-delete |
-| `CopyObject` | Supported | Copies within or across buckets while the source object is still available in local cache |
-| `ListObjects` | Supported | Marker-based pagination |
-| `ListObjectsV2` | Supported | Continuation-token pagination |
-
-### Multipart Upload Operations
-
-| Operation | Status | Notes |
-| --- | --- | --- |
-| `CreateMultipartUpload` | Supported | Starts a multipart upload |
-| `UploadPart` | Supported | Uploads a single part |
-| `UploadPartCopy` | Supported | Copies a full existing object from local cache into a part (`CopySourceRange` is not yet supported) |
-| `CompleteMultipartUpload` | Supported | Assembles parts into the final object and enqueues upload |
-| `AbortMultipartUpload` | Supported | Cancels the upload and cleans up staged parts |
-| `ListMultipartUploads` | Supported | Lists in-progress multipart uploads |
-| `ListParts` | Supported | Lists uploaded parts for an upload ID |
+aws --endpoint-url http://localhost:8080 s3api create-bucket --bucket demo
+aws --endpoint-url http://localhost:8080 s3api put-object --bucket demo --key hello.txt --body ./hello.txt
+aws --endpoint-url http://localhost:8080 s3api get-object --bucket demo --key hello.txt ./hello.out
+```
 
 ## Documentation
 
 - [Configuration](docs/configuration.md)
 - [Operations](docs/operations.md)
-- [Development](docs/development.md)
+
+## S3 Compatibility
+
+| Area | Operation | Status | Notes |
+| --- | --- | --- | --- |
+| Bucket | `CreateBucket` | ✅ | Creates a bucket |
+| Bucket | `HeadBucket` | ✅ | Checks bucket metadata |
+| Bucket | `ListBuckets` | ✅ | Lists active buckets |
+| Bucket | `DeleteBucket` | ❌ | Bucket deletion is not part of the current lifecycle |
+| Object | `PutObject` | ✅ | Stores an object |
+| Object | `GetObject` | ✅ | Reads an object |
+| Object | `HeadObject` | ✅ | Reads object metadata |
+| Object | `DeleteObject` | ✅ | Soft-deletes one object |
+| Object | `DeleteObjects` | ✅ | Soft-deletes multiple objects |
+| Object | `CopyObject` | ✅ | Source object must be in local cache |
+| Object | `ListObjects` | ✅ | Marker pagination |
+| Object | `ListObjectsV2` | ✅ | Continuation-token pagination |
+| Multipart | `CreateMultipartUpload` | ✅ | Starts an upload |
+| Multipart | `UploadPart` | ✅ | Uploads one part |
+| Multipart | `UploadPartCopy` | ⚠️ | Whole-object copy only; range copy is not supported |
+| Multipart | `CompleteMultipartUpload` | ✅ | Assembles parts |
+| Multipart | `AbortMultipartUpload` | ✅ | Cancels an upload |
+| Multipart | `ListMultipartUploads` | ✅ | Lists open uploads |
+| Multipart | `ListParts` | ✅ | Lists uploaded parts |
 
 ## License
 
