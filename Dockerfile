@@ -44,4 +44,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD wget -q --spider http://localhost:9090/healthz || exit 1
 
 ENTRYPOINT ["synaps3"]
-CMD ["serve", "--config", "/etc/synaps3/config.yaml"]
+CMD ["serve", "--config", "/etc/synaps3/config.toml"]

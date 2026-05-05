@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/knadh/koanf/parsers/yaml"
+	"github.com/knadh/koanf/parsers/toml/v2"
 	kfile "github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/strahe/synaps3/internal/config"
@@ -191,7 +191,7 @@ func configFileSetsRPCURL(path string) bool {
 	}
 
 	k := koanf.New(".")
-	if err := k.Load(kfile.Provider(path), yaml.Parser()); err != nil {
+	if err := k.Load(kfile.Provider(path), toml.Parser()); err != nil {
 		return false
 	}
 	return strings.TrimSpace(k.String("filecoin.rpc_url")) != ""

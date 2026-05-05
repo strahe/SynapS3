@@ -1,15 +1,15 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
-
-	"go.yaml.in/yaml/v3"
+	"strconv"
+	"strings"
 )
 
-const generatedConfigFileName = "config.yaml"
+const generatedConfigFileName = "config.toml"
 
 // Source describes the config file SynapS3 should read from and persist to.
 type Source struct {
@@ -17,6 +17,20 @@ type Source struct {
 	Explicit         bool
 	Exists           bool
 	GeneratedDefault bool
+}
+
+// InitOptions controls app data directory initialization.
+type InitOptions struct {
+	Dir string
+}
+
+// InitResult describes the paths created by app data directory initialization.
+type InitResult struct {
+	Dir         string
+	ConfigPath  string
+	DatabaseDir string
+	CacheDir    string
+	DefaultDir  bool
 }
 
 // FieldError is a validation error tied to a dotted config field path.
@@ -58,13 +72,60 @@ func ResolveSource(path string, explicit bool) (Source, error) {
 	return Source{Path: defaultPath, Exists: exists, GeneratedDefault: true}, nil
 }
 
+// InitAppDataDir creates a reference config file and runtime directories.
+func InitAppDataDir(opts InitOptions) (InitResult, error) {
+	appDir := strings.TrimSpace(opts.Dir)
+	defaultDir := appDir == ""
+	if defaultDir {
+		var err error
+		appDir, err = defaultAppDataDir()
+		if err != nil {
+			return InitResult{}, err
+		}
+	} else {
+		absDir, err := filepath.Abs(appDir)
+		if err != nil {
+			return InitResult{}, fmt.Errorf("resolving app data directory %s: %w", appDir, err)
+		}
+		appDir = absDir
+	}
+
+	result := InitResult{
+		Dir:         appDir,
+		ConfigPath:  filepath.Join(appDir, generatedConfigFileName),
+		DatabaseDir: filepath.Join(appDir, "db"),
+		CacheDir:    filepath.Join(appDir, "cache"),
+		DefaultDir:  defaultDir,
+	}
+
+	exists, err := fileExists(result.ConfigPath)
+	if err != nil {
+		return InitResult{}, err
+	}
+	if exists {
+		return InitResult{}, fmt.Errorf("config file %s already exists; back it up or delete it before running init again", result.ConfigPath)
+	}
+
+	for _, dir := range []string{result.Dir, result.DatabaseDir, result.CacheDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return InitResult{}, fmt.Errorf("creating directory %s: %w", dir, err)
+		}
+	}
+
+	if err := writeInitConfig(result.ConfigPath, result.Dir); err != nil {
+		return InitResult{}, err
+	}
+
+	return result, nil
+}
+
 // LoadSource reads configuration from a resolved source.
 func LoadSource(src Source) (*Config, error) {
 	return Load(src.Path)
 }
 
 // PersistedFieldPresence records manual/read-only fields that were explicitly
-// present in an existing YAML file. Settings writes use it to avoid
+// present in an existing TOML file. Settings writes use it to avoid
 // materializing defaults for fields the browser cannot edit.
 type PersistedFieldPresence struct {
 	FilecoinPrivateKey bool
@@ -76,21 +137,228 @@ type PersistedFieldPresence struct {
 	AdminAddr          bool
 }
 
-// Save writes a generated YAML config file. Existing comments and formatting are not preserved.
+// Save writes a generated TOML config file. Existing custom comments and formatting are not preserved.
 func Save(path string, cfg *Config) error {
 	return save(path, cfg, saveOptions{})
 }
 
-// SaveForSettings writes settings YAML while preserving absent manual/read-only fields.
+// SaveForSettings writes settings TOML while preserving absent manual/read-only fields.
 func SaveForSettings(path string, cfg *Config, presence PersistedFieldPresence) error {
 	return save(path, cfg, saveOptions{presence: &presence})
 }
 
-func save(path string, cfg *Config, opts saveOptions) error {
-	data, err := yaml.Marshal(toYAMLConfig(cfg, opts))
+func writeInitConfig(path, appDir string) error {
+	data := []byte(renderInitConfig(appDir))
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("marshalling config yaml: %w", err)
+		if os.IsExist(err) {
+			return fmt.Errorf("config file %s already exists; back it up or delete it before running init again", path)
+		}
+		return fmt.Errorf("creating config file %s: %w", path, err)
 	}
+	created := false
+	defer func() {
+		if !created {
+			_ = f.Close()
+			_ = os.Remove(path)
+		}
+	}()
+
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("writing config file %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing config file %s: %w", path, err)
+	}
+	created = true
+	return nil
+}
+
+type initSectionDescriptor struct {
+	Name   string
+	Fields []initFieldDescriptor
+}
+
+type initFieldDescriptor struct {
+	Field   string
+	Key     string
+	Value   string
+	Enabled bool
+	Notes   []string
+}
+
+func renderInitConfig(appDir string) string {
+	defaults := defaultConfig()
+	defaults.Database.DSN = defaultSQLiteDSN(appDir)
+	defaults.Cache.Dir = filepath.Join(appDir, "cache")
+	return renderTOMLConfig(defaults, PersistedFieldPresence{
+		FilecoinPrivateKey: true,
+		DatabaseDriver:     true,
+		DatabaseDSN:        true,
+		CacheDir:           true,
+	}, false)
+}
+
+func renderSavedConfig(cfg *Config, presence PersistedFieldPresence) string {
+	return renderTOMLConfig(cfg, presence, true)
+}
+
+func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode bool) string {
+	sections := []initSectionDescriptor{
+		{
+			Name: "server",
+			Fields: []initFieldDescriptor{
+				{Field: "server.port", Key: "port", Value: quoteTOMLString(cfg.Server.Port), Enabled: saveMode},
+				{Field: "server.max_connections", Key: "max_connections", Value: strconv.Itoa(cfg.Server.MaxConnections), Enabled: saveMode},
+				{Field: "server.max_requests", Key: "max_requests", Value: strconv.Itoa(cfg.Server.MaxRequests), Enabled: saveMode},
+			},
+		},
+		{
+			Name: "server.tls",
+			Fields: []initFieldDescriptor{
+				{Field: "server.tls.enabled", Key: "enabled", Value: strconv.FormatBool(cfg.Server.TLS.Enabled), Enabled: saveMode},
+				{Field: "server.tls.cert_file", Key: "cert_file", Value: quoteTOMLString(cfg.Server.TLS.CertFile), Enabled: saveMode, Notes: []string{"Required when server.tls.enabled is true."}},
+				{Field: "server.tls.key_file", Key: "key_file", Value: quoteTOMLString(cfg.Server.TLS.KeyFile), Enabled: saveMode, Notes: []string{"Required when server.tls.enabled is true."}},
+			},
+		},
+		{
+			Name: "s3",
+			Fields: []initFieldDescriptor{
+				{Field: "s3.region", Key: "region", Value: quoteTOMLString(cfg.S3.Region), Enabled: saveMode},
+			},
+		},
+		{
+			Name: "filecoin",
+			Fields: []initFieldDescriptor{
+				{Field: "filecoin.network", Key: "network", Value: quoteTOMLString(cfg.Filecoin.Network), Enabled: saveMode, Notes: []string{"Allowed: calibration, mainnet."}},
+				{Field: "filecoin.rpc_url", Key: "rpc_url", Value: quoteTOMLString(cfg.Filecoin.RPCURL), Enabled: saveMode},
+				{Field: "filecoin.private_key", Key: "private_key", Value: quoteTOMLString(cfg.Filecoin.PrivateKey), Enabled: !saveMode || presence.FilecoinPrivateKey, Notes: []string{"Required before serving unless SYNAPS3_FILECOIN_PRIVATE_KEY is set."}},
+				{Field: "filecoin.source", Key: "source", Value: quoteTOMLString(cfg.Filecoin.Source), Enabled: saveMode},
+				{Field: "filecoin.with_cdn", Key: "with_cdn", Value: strconv.FormatBool(cfg.Filecoin.WithCDN), Enabled: saveMode},
+				{Field: "filecoin.allow_private_networks", Key: "allow_private_networks", Value: strconv.FormatBool(cfg.Filecoin.AllowPrivateNetworks), Enabled: saveMode, Notes: []string{"Enable only for trusted private deployments."}},
+				{Field: "filecoin.default_copies", Key: "default_copies", Value: strconv.Itoa(cfg.Filecoin.DefaultCopies), Enabled: saveMode, Notes: []string{fmt.Sprintf("Allowed range: 1-%d.", MaxFilecoinDefaultCopies)}},
+			},
+		},
+		{
+			Name: "database",
+			Fields: []initFieldDescriptor{
+				{Field: "database.driver", Key: "driver", Value: quoteTOMLString(cfg.Database.Driver), Enabled: !saveMode || presence.DatabaseDriver, Notes: []string{"Enabled with database.dsn so this installation uses SQLite at the initialized path.", "Allowed: sqlite, postgres."}},
+				{Field: "database.dsn", Key: "dsn", Value: quoteTOMLString(cfg.Database.DSN), Enabled: !saveMode || presence.DatabaseDSN},
+				{Field: "database.max_open_conns", Key: "max_open_conns", Value: strconv.Itoa(cfg.Database.MaxOpenConns), Enabled: saveMode && presence.DatabaseMaxOpen},
+				{Field: "database.max_idle_conns", Key: "max_idle_conns", Value: strconv.Itoa(cfg.Database.MaxIdleConns), Enabled: saveMode && presence.DatabaseMaxIdle},
+			},
+		},
+		{
+			Name: "cache",
+			Fields: []initFieldDescriptor{
+				{Field: "cache.dir", Key: "dir", Value: quoteTOMLString(cfg.Cache.Dir), Enabled: !saveMode || presence.CacheDir, Notes: []string{"Enabled so this installation uses the initialized cache directory."}},
+				{Field: "cache.max_size_gb", Key: "max_size_gb", Value: strconv.Itoa(cfg.Cache.MaxSizeGB), Enabled: saveMode},
+				{Field: "cache.eviction_policy", Key: "eviction_policy", Value: quoteTOMLString(cfg.Cache.EvictionPolicy), Enabled: saveMode, Notes: []string{"Allowed: lru, manual, none."}},
+			},
+		},
+		{
+			Name: "worker.upload",
+			Fields: []initFieldDescriptor{
+				{Field: "worker.upload.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.Upload.Concurrency), Enabled: saveMode},
+				{Field: "worker.upload.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.Upload.PollInterval.String()), Enabled: saveMode},
+				{Field: "worker.upload.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.Upload.MaxRetries), Enabled: saveMode},
+			},
+		},
+		{
+			Name: "worker.evictor",
+			Fields: []initFieldDescriptor{
+				{Field: "worker.evictor.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.Evictor.Concurrency), Enabled: saveMode},
+				{Field: "worker.evictor.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.Evictor.PollInterval.String()), Enabled: saveMode},
+				{Field: "worker.evictor.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.Evictor.MaxRetries), Enabled: saveMode},
+			},
+		},
+		{
+			Name: "logging",
+			Fields: []initFieldDescriptor{
+				{Field: "logging.level", Key: "level", Value: quoteTOMLString(cfg.Logging.Level), Enabled: saveMode, Notes: []string{"Allowed: debug, info, warn, error."}},
+				{Field: "logging.format", Key: "format", Value: quoteTOMLString(cfg.Logging.Format), Enabled: saveMode, Notes: []string{"Allowed: json, text."}},
+			},
+		},
+		{
+			Name: "admin",
+			Fields: []initFieldDescriptor{
+				{Field: "admin.addr", Key: "addr", Value: quoteTOMLString(cfg.Admin.Addr), Enabled: saveMode && presence.AdminAddr},
+			},
+		},
+	}
+
+	var b bytes.Buffer
+	b.WriteString("# SynapS3 configuration\n")
+	if saveMode {
+		b.WriteString("# Generated by SynapS3 settings persistence.\n")
+	} else {
+		b.WriteString("# Generated by synaps3 init.\n")
+		b.WriteString("# Commented values show built-in defaults. Uncomment a value to override it.\n")
+	}
+	b.WriteString("# Environment variables listed below override config values and built-in defaults.\n\n")
+	for i, section := range sections {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		renderTOMLSection(&b, section)
+	}
+	return b.String()
+}
+
+func renderTOMLSection(b *bytes.Buffer, section initSectionDescriptor) {
+	writeTOMLValueLine(b, false, "["+section.Name+"]")
+	for i, field := range section.Fields {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		renderTOMLField(b, field)
+	}
+}
+
+func renderTOMLField(b *bytes.Buffer, field initFieldDescriptor) {
+	meta := fieldMetadataByPath[field.Field]
+	writeTOMLComment(b, meta.Description)
+	if meta.Env != "" {
+		writeTOMLComment(b, "Env: "+meta.Env)
+	}
+	for _, note := range field.Notes {
+		writeTOMLComment(b, note)
+	}
+	value := field.Value
+	if !field.Enabled && meta.Secret {
+		value = quoteTOMLString("")
+	}
+	writeTOMLValueLine(b, !field.Enabled, field.Key+" = "+value)
+}
+
+func writeTOMLComment(b *bytes.Buffer, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	b.WriteString("# ")
+	b.WriteString(text)
+	b.WriteByte('\n')
+}
+
+func writeTOMLValueLine(b *bytes.Buffer, commented bool, text string) {
+	if commented {
+		b.WriteString("# ")
+	}
+	b.WriteString(text)
+	b.WriteByte('\n')
+}
+
+func quoteTOMLString(s string) string {
+	return strconv.Quote(s)
+}
+
+func save(path string, cfg *Config, opts saveOptions) error {
+	presence := fullPersistedFieldPresence()
+	if opts.presence != nil {
+		presence = *opts.presence
+	}
+	data := []byte(renderSavedConfig(cfg, presence))
 
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
@@ -130,9 +398,9 @@ type saveOptions struct {
 	presence *PersistedFieldPresence
 }
 
-// LoadFileForSettings reads YAML for settings persistence without environment
+// LoadFileForSettings reads TOML for settings persistence without environment
 // overlays. Runtime defaults are applied for validation and UI display, while
-// field presence lets settings writes preserve omitted YAML fields.
+// field presence lets settings writes preserve omitted TOML fields.
 func LoadFileForSettings(path string) (*Config, PersistedFieldPresence, error) {
 	exists, err := fileExists(path)
 	if err != nil {
@@ -163,155 +431,6 @@ func fileExists(path string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("checking config path %s: %w", path, err)
-}
-
-type yamlConfig struct {
-	Server   yamlServerConfig   `yaml:"server"`
-	S3       yamlS3Config       `yaml:"s3"`
-	Filecoin yamlFilecoinConfig `yaml:"filecoin"`
-	Database yamlDatabaseConfig `yaml:"database"`
-	Cache    yamlCacheConfig    `yaml:"cache"`
-	Worker   yamlWorkerConfig   `yaml:"worker"`
-	Logging  yamlLoggingConfig  `yaml:"logging"`
-	Admin    yamlAdminConfig    `yaml:"admin"`
-}
-
-type yamlServerConfig struct {
-	Port           string        `yaml:"port"`
-	TLS            yamlTLSConfig `yaml:"tls"`
-	MaxConnections int           `yaml:"max_connections"`
-	MaxRequests    int           `yaml:"max_requests"`
-}
-
-type yamlTLSConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	CertFile string `yaml:"cert_file"`
-	KeyFile  string `yaml:"key_file"`
-}
-
-type yamlS3Config struct {
-	Region string `yaml:"region"`
-}
-
-type yamlFilecoinConfig struct {
-	Network              string  `yaml:"network"`
-	RPCURL               string  `yaml:"rpc_url"`
-	PrivateKey           *string `yaml:"private_key,omitempty"`
-	Source               string  `yaml:"source"`
-	WithCDN              bool    `yaml:"with_cdn"`
-	AllowPrivateNetworks bool    `yaml:"allow_private_networks"`
-	DefaultCopies        int     `yaml:"default_copies"`
-}
-
-type yamlDatabaseConfig struct {
-	Driver       *string `yaml:"driver,omitempty"`
-	DSN          *string `yaml:"dsn,omitempty"`
-	MaxOpenConns *int    `yaml:"max_open_conns,omitempty"`
-	MaxIdleConns *int    `yaml:"max_idle_conns,omitempty"`
-}
-
-type yamlCacheConfig struct {
-	Dir            *string `yaml:"dir,omitempty"`
-	MaxSizeGB      int     `yaml:"max_size_gb"`
-	EvictionPolicy string  `yaml:"eviction_policy"`
-}
-
-type yamlWorkerConfig struct {
-	Upload  yamlWorkerPoolConfig `yaml:"upload"`
-	Evictor yamlWorkerPoolConfig `yaml:"evictor"`
-}
-
-type yamlWorkerPoolConfig struct {
-	Concurrency  int    `yaml:"concurrency"`
-	PollInterval string `yaml:"poll_interval"`
-	MaxRetries   int    `yaml:"max_retries"`
-}
-
-type yamlLoggingConfig struct {
-	Level  string `yaml:"level"`
-	Format string `yaml:"format"`
-}
-
-type yamlAdminConfig struct {
-	Addr *string `yaml:"addr,omitempty"`
-}
-
-func toYAMLConfig(cfg *Config, opts saveOptions) yamlConfig {
-	presence := fullPersistedFieldPresence()
-	if opts.presence != nil {
-		presence = *opts.presence
-	}
-
-	return yamlConfig{
-		Server: yamlServerConfig{
-			Port: cfg.Server.Port,
-			TLS: yamlTLSConfig{
-				Enabled:  cfg.Server.TLS.Enabled,
-				CertFile: cfg.Server.TLS.CertFile,
-				KeyFile:  cfg.Server.TLS.KeyFile,
-			},
-			MaxConnections: cfg.Server.MaxConnections,
-			MaxRequests:    cfg.Server.MaxRequests,
-		},
-		S3: yamlS3Config{
-			Region: cfg.S3.Region,
-		},
-		Filecoin: yamlFilecoinConfig{
-			Network:              cfg.Filecoin.Network,
-			RPCURL:               cfg.Filecoin.RPCURL,
-			PrivateKey:           optionalString(cfg.Filecoin.PrivateKey, presence.FilecoinPrivateKey),
-			Source:               cfg.Filecoin.Source,
-			WithCDN:              cfg.Filecoin.WithCDN,
-			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-			DefaultCopies:        cfg.Filecoin.DefaultCopies,
-		},
-		Database: yamlDatabaseConfig{
-			Driver:       optionalString(cfg.Database.Driver, presence.DatabaseDriver),
-			DSN:          optionalString(cfg.Database.DSN, presence.DatabaseDSN),
-			MaxOpenConns: optionalInt(cfg.Database.MaxOpenConns, presence.DatabaseMaxOpen),
-			MaxIdleConns: optionalInt(cfg.Database.MaxIdleConns, presence.DatabaseMaxIdle),
-		},
-		Cache: yamlCacheConfig{
-			Dir:            optionalString(cfg.Cache.Dir, presence.CacheDir),
-			MaxSizeGB:      cfg.Cache.MaxSizeGB,
-			EvictionPolicy: cfg.Cache.EvictionPolicy,
-		},
-		Worker: yamlWorkerConfig{
-			Upload:  toYAMLWorkerPool(cfg.Worker.Upload),
-			Evictor: toYAMLWorkerPool(cfg.Worker.Evictor),
-		},
-		Logging: yamlLoggingConfig{
-			Level:  cfg.Logging.Level,
-			Format: cfg.Logging.Format,
-		},
-		Admin: yamlAdminConfig{Addr: optionalString(cfg.Admin.Addr, presence.AdminAddr)},
-	}
-}
-
-func toYAMLWorkerPool(cfg WorkerPoolConfig) yamlWorkerPoolConfig {
-	return yamlWorkerPoolConfig{
-		Concurrency:  cfg.Concurrency,
-		PollInterval: durationString(cfg.PollInterval),
-		MaxRetries:   cfg.MaxRetries,
-	}
-}
-
-func durationString(d time.Duration) string {
-	return d.String()
-}
-
-func optionalString(value string, include bool) *string {
-	if !include {
-		return nil
-	}
-	return &value
-}
-
-func optionalInt(value int, include bool) *int {
-	if !include {
-		return nil
-	}
-	return &value
 }
 
 func fullPersistedFieldPresence() PersistedFieldPresence {

@@ -32,9 +32,9 @@ func TestIsAutoEvictEnabled_CaseInsensitive(t *testing.T) {
 
 func TestResolveRPCAndNetwork_NormalizesConfigNetwork(t *testing.T) {
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
-	cfgYAML := "filecoin:\n  network: Mainnet\n"
-	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o644); err != nil {
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgTOML := "[filecoin]\nnetwork = \"Mainnet\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -66,9 +66,9 @@ func TestResolveRPCAndNetwork_NormalizesConfigNetwork(t *testing.T) {
 
 func TestResolveRPCAndNetwork_UsesExplicitConfigRPCURL(t *testing.T) {
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
-	cfgYAML := "filecoin:\n  network: Mainnet\n  rpc_url: https://rpc.example.test\n"
-	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o644); err != nil {
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgTOML := "[filecoin]\nnetwork = \"Mainnet\"\nrpc_url = \"https://rpc.example.test\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -101,9 +101,9 @@ func TestResolveRPCAndNetwork_UsesExplicitConfigRPCURL(t *testing.T) {
 func TestResolveRPCAndNetwork_UsesDefaultRPCWhenEnvOverridesConfigNetwork(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_NETWORK", "calibration")
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
-	cfgYAML := "filecoin:\n  network: mainnet\n  rpc_url: https://api.node.glif.io/rpc/v1\n"
-	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o644); err != nil {
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgTOML := "[filecoin]\nnetwork = \"mainnet\"\nrpc_url = \"https://api.node.glif.io/rpc/v1\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -142,9 +142,9 @@ func TestResolveRPCAndNetwork_UsesFallbackAppDataConfig(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	cfgPath := filepath.Join(cfgDir, "config.yaml")
-	cfgYAML := "filecoin:\n  network: mainnet\n  rpc_url: https://fallback.example.test/rpc\n"
-	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+	cfgPath := filepath.Join(cfgDir, "config.toml")
+	cfgTOML := "[filecoin]\nnetwork = \"mainnet\"\nrpc_url = \"https://fallback.example.test/rpc\"\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestResolveRPCAndNetwork_UsesFallbackAppDataConfig(t *testing.T) {
 	)
 	cmd := &cli.Command{
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "config", Value: "config.yaml"},
+			&cli.StringFlag{Name: "config", Value: "config.toml"},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			var err error
@@ -180,14 +180,14 @@ func TestConfigSourceFromCommand_DefaultIgnoresWorkingDirectoryConfig(t *testing
 	cwd := t.TempDir()
 	t.Chdir(cwd)
 
-	if err := os.WriteFile("config.yaml", []byte("filecoin:\n  network: mainnet\n"), 0o600); err != nil {
+	if err := os.WriteFile("config.toml", []byte("[filecoin]\nnetwork = \"mainnet\"\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile cwd config: %v", err)
 	}
 
 	var got config.Source
 	cmd := &cli.Command{
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "config", Value: "config.yaml"},
+			&cli.StringFlag{Name: "config", Value: "config.toml"},
 		},
 		Action: func(_ context.Context, cmd *cli.Command) error {
 			var err error
@@ -200,7 +200,7 @@ func TestConfigSourceFromCommand_DefaultIgnoresWorkingDirectoryConfig(t *testing
 		t.Fatalf("Run: %v", err)
 	}
 
-	want := filepath.Join(home, ".synaps3", "config.yaml")
+	want := filepath.Join(home, ".synaps3", "config.toml")
 	if got.Path != want {
 		t.Fatalf("source path = %q, want %q", got.Path, want)
 	}
@@ -219,7 +219,7 @@ func TestConfigSourceFromCommand_ExplicitRelativeConfigBecomesAbsolute(t *testin
 	var got config.Source
 	cmd := &cli.Command{
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "config", Value: "config.yaml"},
+			&cli.StringFlag{Name: "config", Value: "config.toml"},
 		},
 		Action: func(_ context.Context, cmd *cli.Command) error {
 			var err error
@@ -228,11 +228,11 @@ func TestConfigSourceFromCommand_ExplicitRelativeConfigBecomesAbsolute(t *testin
 		},
 	}
 
-	if err := cmd.Run(context.Background(), []string{"synaps3", "--config", "config.yaml"}); err != nil {
+	if err := cmd.Run(context.Background(), []string{"synaps3", "--config", "config.toml"}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	want := filepath.Join(cwd, "config.yaml")
+	want := filepath.Join(cwd, "config.toml")
 	if got.Path != want {
 		t.Fatalf("source path = %q, want %q", got.Path, want)
 	}

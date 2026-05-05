@@ -19,13 +19,13 @@ Writes land in the local cache and metadata database first, then background work
 
 ## Quick Start
 
-1. Copy the example config and fill in your S3 and Filecoin settings.
-2. Start SynapS3 with the config file.
+1. Initialize the app data directory.
+2. Set your Filecoin private key in the generated config or environment.
 3. Point your S3 client at the SynapS3 endpoint.
 
 ```bash
-cp config.example.yaml config.yaml
-go run ./cmd/synaps3 serve --config config.yaml
+go run ./cmd/synaps3 init
+go run ./cmd/synaps3 serve
 ```
 
 The default S3 endpoint is `http://localhost:8080`.
@@ -34,9 +34,9 @@ The built-in dashboard is available at `http://localhost:9090` (admin port) and 
 
 By default, local runtime data is stored under `~/.synaps3/`: SQLite files in `db/` and cached objects in `cache/`. Set `database.dsn` or `cache.dir` if you need explicit paths.
 
-If `--config` is omitted, SynapS3 uses `~/.synaps3/config.yaml`. A `config.yaml` in the current directory is only loaded when you pass it explicitly with `--config config.yaml`.
+If `--config` is omitted, SynapS3 uses `~/.synaps3/config.toml`. A `config.toml` in the current directory is only loaded when you pass it explicitly with `--config config.toml`.
 
-Start with [`config.example.yaml`](config.example.yaml) and see [`docs/configuration.md`](docs/configuration.md) for the main settings.
+See [`docs/configuration.md`](docs/configuration.md) for custom directories, environment overrides, and the main settings.
 
 ## S3 API Compatibility
 

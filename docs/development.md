@@ -15,12 +15,12 @@ make build    # Build binary to ./bin/synaps3
 make test     # Run the full test suite
 make lint     # Run golangci-lint
 make fmt      # Format code (requires goimports)
-make run      # Build and run with config.example.yaml
+make run      # Build and run with ~/.synaps3/config.toml
 make clean    # Remove build artifacts
-make migrate  # Build binary and run database migrations with config.example.yaml
+make migrate  # Build binary and run database migrations
 ```
 
-`config.example.yaml` leaves the default SQLite and cache paths unset, so `make run` and `make migrate` use `~/.synaps3/db/` and `~/.synaps3/cache/` unless you explicitly configure different paths.
+Run `go run ./cmd/synaps3 init` once before `make run` if `~/.synaps3/config.toml` does not exist. The default SQLite database and cache paths live under `~/.synaps3/` unless you explicitly configure different paths.
 
 ## Running Tests
 

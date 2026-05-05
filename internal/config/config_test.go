@@ -407,16 +407,16 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 }
 
-func TestLoad_PartialYAMLKeepsDefaultPaths(t *testing.T) {
+func TestLoad_PartialTOMLKeepsDefaultPaths(t *testing.T) {
 	home := t.TempDir()
 	withUserHomeDir(t, home)
 
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
-	cfgYAML := []byte(`server:
-  port: ":9999"
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgTOML := []byte(`[server]
+port = ":9999"
 `)
-	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, cfgTOML, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -434,32 +434,16 @@ func TestLoad_PartialYAMLKeepsDefaultPaths(t *testing.T) {
 	}
 }
 
-func TestLoad_ConfigExampleKeepsDefaultPaths(t *testing.T) {
-	home := t.TempDir()
-	withUserHomeDir(t, home)
-
-	cfg, err := Load("../../config.example.yaml")
-	if err != nil {
-		t.Fatalf("Load(config.example.yaml) failed: %v", err)
-	}
-
-	wantAppDir := filepath.Join(home, ".synaps3")
-	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
-	if cfg.Cache.Dir != filepath.Join(wantAppDir, "cache") {
-		t.Errorf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(wantAppDir, "cache"))
-	}
-}
-
-func TestLoad_YAMLOverridesDefaultPaths(t *testing.T) {
+func TestLoad_TOMLOverridesDefaultPaths(t *testing.T) {
 	home := t.TempDir()
 	withUserHomeDir(t, home)
 
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
+	cfgPath := filepath.Join(dir, "config.toml")
 	dbDSN := "file:" + filepath.ToSlash(filepath.Join(dir, "custom", "synaps3.db"))
 	cacheDir := filepath.Join(dir, "custom-cache")
-	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
-	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+	cfgTOML := []byte("[database]\ndsn = \"" + dbDSN + "\"\n[cache]\ndir = \"" + filepath.ToSlash(cacheDir) + "\"\n")
+	if err := os.WriteFile(cfgPath, cfgTOML, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -499,11 +483,11 @@ func TestLoad_ExplicitRuntimePathsDoNotRequireHome(t *testing.T) {
 	t.Cleanup(func() { userHomeDir = original })
 
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
+	cfgPath := filepath.Join(dir, "config.toml")
 	dbDSN := "file:" + filepath.ToSlash(filepath.Join(dir, "custom", "synaps3.db"))
 	cacheDir := filepath.Join(dir, "custom-cache")
-	cfgYAML := []byte("database:\n  dsn: \"" + dbDSN + "\"\ncache:\n  dir: \"" + filepath.ToSlash(cacheDir) + "\"\n")
-	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+	cfgTOML := []byte("[database]\ndsn = \"" + dbDSN + "\"\n[cache]\ndir = \"" + filepath.ToSlash(cacheDir) + "\"\n")
+	if err := os.WriteFile(cfgPath, cfgTOML, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -521,13 +505,13 @@ func TestLoad_ExplicitRuntimePathsDoNotRequireHome(t *testing.T) {
 
 func TestLoad_FilecoinSDKOptions(t *testing.T) {
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
-	cfgYAML := []byte(`filecoin:
-  source: "synaps3-test"
-  with_cdn: true
-  allow_private_networks: true
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgTOML := []byte(`[filecoin]
+source = "synaps3-test"
+with_cdn = true
+allow_private_networks = true
 `)
-	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, cfgTOML, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -543,6 +527,20 @@ func TestLoad_FilecoinSDKOptions(t *testing.T) {
 	}
 	if !cfg.Filecoin.AllowPrivateNetworks {
 		t.Fatal("filecoin.allow_private_networks = false, want true")
+	}
+}
+
+func TestLoad_YAMLConfigIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgYAML := []byte("server:\n  port: ':9999'\n")
+	if err := os.WriteFile(cfgPath, cfgYAML, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected YAML config to be rejected")
 	}
 }
 

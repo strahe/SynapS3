@@ -30,7 +30,7 @@ func TestSettingsGETRedactsSecretsAndReportsManualStatus(t *testing.T) {
 	cfg.Database.DSN = "postgres://synaps3:db-password@example.invalid:5432/synaps3?sslmode=disable"
 	cfg.Admin.Addr = "10.20.30.40:19090"
 
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
 	rr := httptest.NewRecorder()
 
@@ -66,7 +66,7 @@ func TestSettingsGETRedactsSecretsAndReportsManualStatus(t *testing.T) {
 
 func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
 	rr := httptest.NewRecorder()
 
@@ -109,7 +109,7 @@ func TestSettingsGETIncludesFieldMetadata(t *testing.T) {
 
 func TestSettingsGETReportsS3UsersUnavailableInSetupMode(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
 	rr := httptest.NewRecorder()
 
@@ -129,7 +129,7 @@ func TestSettingsGETReportsS3UsersUnavailableInSetupMode(t *testing.T) {
 
 func TestSettingsGETIncludesFilecoinRPCDefaults(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
 	rr := httptest.NewRecorder()
 
@@ -155,7 +155,7 @@ func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {
 	cfg := validSettingsConfig(t)
 	cfg.Filecoin.PrivateKey = "env-private"
 
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")})
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
 	rr := httptest.NewRecorder()
 
@@ -175,7 +175,7 @@ func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {
 
 func TestSettingsPUTRejectsSecretFieldsAndDoesNotPersistThem(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"s3":{"secret_key":"leak"}}`))
@@ -195,7 +195,7 @@ func TestSettingsPUTRejectsSecretFieldsAndDoesNotPersistThem(t *testing.T) {
 
 func TestSettingsPUTRequiresLoopbackAndWriteHeaders(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	srv := newSettingsAPITestServer(t, "0.0.0.0:9090", cfg, source)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":8}}`))
@@ -235,7 +235,7 @@ func TestSettingsPUTRequiresLoopbackAndWriteHeaders(t *testing.T) {
 
 func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	if err := config.Save(source.Path, cfg); err != nil {
 		t.Fatalf("Save initial config: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestSettingsPUTPreservesManualFieldsChangedOnDiskAfterServiceStart(t *testi
 	cfg := validSettingsConfig(t)
 	cfg.Filecoin.PrivateKey = "old-private-key"
 	cfg.Database.DSN = "postgres://synaps3:old-password@example.invalid:5432/synaps3"
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	if err := config.Save(source.Path, cfg); err != nil {
 		t.Fatalf("Save initial config: %v", err)
 	}
@@ -330,17 +330,20 @@ func TestSettingsPUTPreservesManualFieldsChangedOnDiskAfterServiceStart(t *testi
 func TestSettingsPUTDoesNotMaterializeMissingManualDatabaseDSN(t *testing.T) {
 	t.Setenv("SYNAPS3_DATABASE_DSN", "postgres://synaps3:env-password@example.invalid:5432/synaps3")
 
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml"), Exists: true}
 	initial := []byte(`
-s3:
-  region: us-east-1
-filecoin:
-  private_key: manual-filecoin-private-key
-database:
-  driver: sqlite
-cache:
-  dir: /tmp/synaps3-cache
-  max_size_gb: 7
+[s3]
+region = "us-east-1"
+
+[filecoin]
+private_key = "manual-filecoin-private-key"
+
+[database]
+driver = "sqlite"
+
+[cache]
+dir = "/tmp/synaps3-cache"
+max_size_gb = 7
 `)
 	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
 		t.Fatalf("WriteFile initial config: %v", err)
@@ -366,18 +369,19 @@ cache:
 		t.Fatalf("ReadFile saved config: %v", err)
 	}
 	text := string(data)
-	if strings.Contains(text, "dsn:") {
-		t.Fatalf("settings PUT materialized database.dsn in YAML:\n%s", text)
+	if containsEnabledTOMLKey(text, "dsn") {
+		t.Fatalf("settings PUT materialized database.dsn in TOML:\n%s", text)
 	}
 }
 
 func TestSettingsPUTUsesRuntimeDefaultForOmittedCacheDir(t *testing.T) {
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml"), Exists: true}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml"), Exists: true}
 	initial := []byte(`
-s3:
-  region: us-east-1
-filecoin:
-  private_key: manual-filecoin-private-key
+[s3]
+region = "us-east-1"
+
+[filecoin]
+private_key = "manual-filecoin-private-key"
 `)
 	if err := os.WriteFile(source.Path, initial, 0o600); err != nil {
 		t.Fatalf("WriteFile initial config: %v", err)
@@ -406,8 +410,8 @@ filecoin:
 		t.Fatalf("ReadFile saved config: %v", err)
 	}
 	text := string(data)
-	if strings.Contains(text, "  dir:") {
-		t.Fatalf("settings PUT materialized cache.dir in YAML:\n%s", text)
+	if containsEnabledTOMLKey(text, "dir") {
+		t.Fatalf("settings PUT materialized cache.dir in TOML:\n%s", text)
 	}
 	restarted, err := config.LoadSource(source)
 	if err != nil {
@@ -426,11 +430,11 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 	t.Setenv("HOME", home)
 	t.Chdir(t.TempDir())
 
-	source, err := config.ResolveSource("config.yaml", false)
+	source, err := config.ResolveSource("config.toml", false)
 	if err != nil {
 		t.Fatalf("ResolveSource: %v", err)
 	}
-	if source.Path != filepath.Join(home, ".synaps3", "config.yaml") {
+	if source.Path != filepath.Join(home, ".synaps3", "config.toml") {
 		t.Fatalf("source path = %q, want app data config", source.Path)
 	}
 	cfg, err := config.LoadSource(source)
@@ -546,7 +550,7 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 			t.Setenv(tt.envName, "managed")
 
 			cfg := validSettingsConfig(t)
-			source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+			source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 			srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
 
 			req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(tt.payload))
@@ -569,7 +573,7 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 
 func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
@@ -607,7 +611,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 
 func TestSettingsPUTRejectsTrailingJSON(t *testing.T) {
 	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.yaml")}
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":8}} {}`))
@@ -636,6 +640,16 @@ func validSettingsConfig(t *testing.T) *config.Config {
 func hasFieldError(errs []config.FieldError, field string) bool {
 	for _, err := range errs {
 		if err.Field == field {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEnabledTOMLKey(text, key string) bool {
+	prefix := key + " ="
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
 			return true
 		}
 	}

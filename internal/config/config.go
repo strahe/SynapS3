@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knadh/koanf/parsers/yaml"
+	"github.com/knadh/koanf/parsers/toml/v2"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
@@ -215,13 +215,13 @@ func applyDefaultRuntimePaths(cfg *Config, hasDatabaseDSN, hasCacheDir bool) err
 	return nil
 }
 
-// Load reads configuration from a YAML file (if it exists) and overlays
+// Load reads configuration from a TOML file (if it exists) and overlays
 // environment variables prefixed with SYNAPS3_.
 func Load(path string) (*Config, error) {
 	return load(path, true)
 }
 
-// LoadFile reads configuration from YAML only, without environment overlays.
+// LoadFile reads configuration from TOML only, without environment overlays.
 func LoadFile(path string) (*Config, error) {
 	return load(path, false)
 }
@@ -236,10 +236,10 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 	cfg := defaultConfig()
 	fileLoaded := false
 
-	// Load from YAML file if provided and exists.
+	// Load from TOML file if provided and exists.
 	if path != "" {
 		if _, err := os.Stat(path); err == nil {
-			if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
+			if err := k.Load(file.Provider(path), toml.Parser()); err != nil {
 				return nil, PersistedFieldPresence{}, fmt.Errorf("loading config file %s: %w", path, err)
 			}
 			fileLoaded = true

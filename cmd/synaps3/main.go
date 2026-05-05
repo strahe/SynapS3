@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -32,7 +33,14 @@ import (
 const defaultS3MultipartMaxParts = 10000
 
 func main() {
-	root := &cli.Command{
+	if err := newRootCommand().Run(context.Background(), os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func newRootCommand() *cli.Command {
+	return &cli.Command{
 		Name:        "synaps3",
 		Usage:       "S3-compatible gateway to Filecoin",
 		HideVersion: true,
@@ -40,31 +48,73 @@ func main() {
 			&cli.StringFlag{
 				Name:    "config",
 				Aliases: []string{"c"},
-				Usage:   "path to config file; defaults to ~/.synaps3/config.yaml",
+				Usage:   "path to TOML config file; defaults to ~/.synaps3/config.toml",
 			},
 		},
-		Action: func(ctx context.Context, cmd *cli.Command) error {
+		Action: func(_ context.Context, cmd *cli.Command) error {
 			if cmd.Args().Len() > 0 {
 				return fmt.Errorf("unknown command %q, run --help for available commands", cmd.Args().First())
 			}
-			src, err := configSourceFromCommand(cmd)
-			if err != nil {
-				return err
-			}
-			return runServe(ctx, src)
+			return cli.ShowRootCommandHelp(cmd)
 		},
 		Commands: []*cli.Command{
+			initCommand(),
 			serveCommand(),
 			migrateCommand(),
 			providerCommand(),
 			versionCommand(),
 		},
 	}
+}
 
-	if err := root.Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
-		os.Exit(1)
+func initCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "init",
+		Usage: "initialize config and runtime directories",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "dir",
+				Usage: "app data directory to initialize; defaults to ~/.synaps3",
+			},
+		},
+		Action: func(_ context.Context, cmd *cli.Command) error {
+			if cmd.Args().Len() > 0 {
+				return fmt.Errorf("unexpected argument %q, init takes no positional arguments", cmd.Args().First())
+			}
+			if cmd.Root().IsSet("config") {
+				return fmt.Errorf("init does not use --config; use --dir to choose the app data directory")
+			}
+
+			result, err := config.InitAppDataDir(config.InitOptions{Dir: cmd.String("dir")})
+			if err != nil {
+				return err
+			}
+
+			return writeInitResult(cmd, result)
+		},
 	}
+}
+
+func writeInitResult(cmd *cli.Command, result config.InitResult) error {
+	output := fmt.Sprintf(
+		"Initialized SynapS3 app data directory: %s\nConfig: %s\nSet filecoin.private_key in the config file or SYNAPS3_FILECOIN_PRIVATE_KEY before serving.\n",
+		result.Dir,
+		result.ConfigPath,
+	)
+	if result.DefaultDir {
+		output += "Next: synaps3 serve\n"
+	} else {
+		output += fmt.Sprintf("Next: synaps3 serve --config %s\n", result.ConfigPath)
+	}
+
+	n, err := cmd.Root().Writer.Write([]byte(output))
+	if err != nil {
+		return fmt.Errorf("writing init output: %w", err)
+	}
+	if n != len(output) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func serveCommand() *cli.Command {

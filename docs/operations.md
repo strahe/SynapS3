@@ -24,41 +24,41 @@ PutObject -> cache write + DB commit -> upload worker (synapse-go SP + on-chain 
 
 For production, prefer PostgreSQL and keep the admin server bound to localhost unless it is protected by an authenticated reverse proxy.
 
-```yaml
-database:
-  driver: postgres
-  dsn: "postgres://synaps3:password@db:5432/synaps3?sslmode=require"
-  max_open_conns: 25
-  max_idle_conns: 10
+```toml
+[database]
+driver = "postgres"
+dsn = "postgres://synaps3:password@db:5432/synaps3?sslmode=require"
+max_open_conns = 25
+max_idle_conns = 10
 
-cache:
-  dir: /var/lib/synaps3/cache
-  max_size_gb: 500
-  eviction_policy: lru
+[cache]
+dir = "/var/lib/synaps3/cache"
+max_size_gb = 500
+eviction_policy = "lru"
 
-filecoin:
-  network: calibration
-  rpc_url: "https://api.calibration.node.glif.io/rpc/v1"
-  private_key: "0x..."
-  source: synaps3
-  with_cdn: false
-  allow_private_networks: false  # set true only for trusted private SP retrieval URLs
-  default_copies: 2  # 1-8
+[filecoin]
+network = "calibration"
+rpc_url = "https://api.calibration.node.glif.io/rpc/v1"
+private_key = "0x..."
+source = "synaps3"
+with_cdn = false
+allow_private_networks = false # set true only for trusted private SP retrieval URLs
+default_copies = 2 # 1-8
 
-worker:
-  upload:
-    concurrency: 4
-    poll_interval: 5s
-  evictor:
-    concurrency: 2
-    poll_interval: 1m
+[worker.upload]
+concurrency = 4
+poll_interval = "5s"
 
-logging:
-  level: info
-  format: json
+[worker.evictor]
+concurrency = 2
+poll_interval = "1m"
 
-admin:
-  addr: "127.0.0.1:9090"
+[logging]
+level = "info"
+format = "json"
+
+[admin]
+addr = "127.0.0.1:9090"
 ```
 
 ## Docker
@@ -71,7 +71,7 @@ docker build -t synaps3 .
 docker run -d \
   --name synaps3 \
   -p 8080:8080 \
-  -v /etc/synaps3/config.yaml:/etc/synaps3/config.yaml:ro \
+  -v /etc/synaps3/config.toml:/etc/synaps3/config.toml:ro \
   -v /data/synaps3/cache:/var/lib/synaps3/cache \
   synaps3
 ```
@@ -109,7 +109,7 @@ scrape_configs:
 | --- | --- | --- |
 | Storage Provider unreachable | Upload tasks retry with backoff and can end in dead-letter after max retries; eligible cache-miss `GetObject` requests can also fail | Restore provider connectivity, then retry via admin API |
 | RPC node down | Upload tasks can fail while `synapse-go` waits for on-chain commit | Restore RPC connectivity, then retry via admin API |
-| Private retrieval URL blocked | URL-based provider downloads reject private-network addresses unless explicitly allowed | Set `filecoin.allow_private_networks: true` only for trusted private deployments |
+| Private retrieval URL blocked | URL-based provider downloads reject private-network addresses unless explicitly allowed | Set `filecoin.allow_private_networks = true` only for trusted private deployments |
 | Database full | Writes fail and worker claims stop progressing | Free space or scale the database |
 | Cache disk full | `PutObject` fails while cached reads continue | Increase disk, lower cache size, or evict more aggressively |
 | Process crash | Startup recovery reconciles stale states and orphaned tasks | Automatic on restart |
