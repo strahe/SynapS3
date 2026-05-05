@@ -78,6 +78,88 @@ func (r *BunStorageUploadRepo) GetByIDs(ctx context.Context, uploadIDs []int64) 
 	return uploadsByID, nil
 }
 
+func (r *BunStorageUploadRepo) GetUploadProvenance(ctx context.Context, uploadID int64) (*StorageUploadProvenance, error) {
+	upload, err := r.GetByID(ctx, uploadID)
+	if err != nil || upload == nil {
+		return nil, err
+	}
+	copies, err := r.ListCopies(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	failures, err := r.listFailures(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	return &StorageUploadProvenance{
+		Upload:   *upload,
+		Copies:   copies,
+		Failures: failures,
+	}, nil
+}
+
+func (r *BunStorageUploadRepo) AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error {
+	if input.UploadID == 0 {
+		return fmt.Errorf("uploadID is required: %w", ErrInvalidInput)
+	}
+	for {
+		err := r.appendUploadFailureOnce(ctx, input)
+		if err == nil {
+			return nil
+		}
+		if !shouldRetryUploadFailureAppend(err) {
+			return err
+		}
+		if err := waitUploadFailureAppendRetry(ctx); err != nil {
+			return fmt.Errorf("retrying storage upload failure append: %w", err)
+		}
+	}
+}
+
+func (r *BunStorageUploadRepo) appendUploadFailureOnce(ctx context.Context, input AppendUploadFailureInput) error {
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		providerID := input.ProviderID
+		role := input.Role
+		if providerID == nil || role == "" {
+			copyRow := new(model.StorageUploadCopy)
+			err := db.NewSelect().
+				Model(copyRow).
+				Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
+				Scan(ctx)
+			if err != nil && err != sql.ErrNoRows {
+				return fmt.Errorf("loading upload copy for failure: %w", err)
+			}
+			if err == nil {
+				if providerID == nil {
+					providerID = copyRow.ProviderID
+				}
+				if role == "" {
+					role = copyRow.Role
+				}
+			}
+		}
+		var next struct {
+			AttemptIndex int `bun:"attempt_index"`
+		}
+		if err := db.NewRaw(`SELECT COALESCE(MAX(attempt_index), -1) + 1 AS attempt_index FROM storage_upload_failures WHERE upload_id = ?`, input.UploadID).Scan(ctx, &next); err != nil {
+			return fmt.Errorf("selecting next upload failure index: %w", err)
+		}
+		failure := &model.StorageUploadFailure{
+			UploadID:     input.UploadID,
+			AttemptIndex: next.AttemptIndex,
+			ProviderID:   providerID,
+			Role:         role,
+			Stage:        nullableString(input.Stage),
+			ErrorMessage: nullableString(input.ErrorMessage),
+			Explicit:     input.Explicit,
+		}
+		if _, err := db.NewInsert().Model(failure).Exec(ctx); err != nil {
+			return fmt.Errorf("appending storage upload failure: %w", err)
+		}
+		return nil
+	})
+}
+
 func (r *BunStorageUploadRepo) ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error) {
 	var copies []model.StorageUploadCopy
 	query := `SELECT storage_copy.*, storage_data_set.data_set_id AS data_set_id
@@ -89,6 +171,34 @@ func (r *BunStorageUploadRepo) ListCopies(ctx context.Context, uploadID int64) (
 		return nil, fmt.Errorf("listing storage upload copies: %w", err)
 	}
 	return copies, nil
+}
+
+func shouldRetryUploadFailureAppend(err error) bool {
+	return isUniqueViolation(err) || isSQLiteBusy(err)
+}
+
+func waitUploadFailureAppendRetry(ctx context.Context) error {
+	const retryDelay = 5 * time.Millisecond
+	timer := time.NewTimer(retryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (r *BunStorageUploadRepo) listFailures(ctx context.Context, uploadID int64) ([]model.StorageUploadFailure, error) {
+	var failures []model.StorageUploadFailure
+	if err := r.db.NewSelect().
+		Model(&failures).
+		Where("upload_id = ?", uploadID).
+		OrderExpr("attempt_index ASC").
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing storage upload failures: %w", err)
+	}
+	return failures, nil
 }
 
 func (r *BunStorageUploadRepo) ListReadablePrimaryCopy(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error) {
@@ -148,6 +258,31 @@ func (r *BunStorageUploadRepo) ListDataSetBindings(ctx context.Context, bucketID
 		return nil, fmt.Errorf("listing storage data set bindings: %w", err)
 	}
 	return bindings, nil
+}
+
+func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error) {
+	var summaries []StorageDataSetSummary
+	query := `SELECT
+			storage_data_set.id,
+			storage_data_set.bucket_id,
+			bucket.name AS bucket_name,
+			storage_data_set.copy_index,
+			storage_data_set.provider_id,
+			storage_data_set.data_set_id,
+			storage_data_set.client_data_set_id,
+			storage_data_set.status,
+			storage_data_set.created_by_upload_id,
+			storage_data_set.last_used_upload_id,
+			storage_data_set.created_at,
+			storage_data_set.updated_at
+		FROM storage_data_sets AS storage_data_set
+		JOIN buckets AS bucket ON bucket.id = storage_data_set.bucket_id
+		WHERE (? = 0 OR storage_data_set.bucket_id = ?)
+		ORDER BY bucket.name ASC, storage_data_set.copy_index ASC`
+	if err := r.db.NewRaw(query, bucketID, bucketID).Scan(ctx, &summaries); err != nil {
+		return nil, fmt.Errorf("listing storage data set summaries: %w", err)
+	}
+	return summaries, nil
 }
 
 func (r *BunStorageUploadRepo) GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error) {
@@ -224,6 +359,10 @@ func (r *BunStorageUploadRepo) CreateUploadCopiesForBindings(ctx context.Context
 				return fmt.Errorf("providerID is required: %w", ErrInvalidInput)
 			}
 			providerID := input.ProviderID
+			isNewDataSet, err := storageDataSetCreatedByUpload(ctx, db, input.StorageDataSetID, uploadID)
+			if err != nil {
+				return err
+			}
 			copyRow := &model.StorageUploadCopy{
 				UploadID:         uploadID,
 				CopyIndex:        input.CopyIndex,
@@ -231,6 +370,7 @@ func (r *BunStorageUploadRepo) CreateUploadCopiesForBindings(ctx context.Context
 				Role:             input.Role,
 				Status:           model.StorageUploadCopyStatusPending,
 				StorageDataSetID: &input.StorageDataSetID,
+				IsNewDataSet:     isNewDataSet,
 			}
 			if _, err := db.NewInsert().
 				Model(copyRow).
@@ -315,11 +455,16 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, inp
 func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		now := time.Now()
-		_, err := db.NewUpdate().
+		isNewDataSet, err := uploadCopyDataSetCreatedByUpload(ctx, db, input.UploadID, input.CopyIndex)
+		if err != nil {
+			return err
+		}
+		_, err = db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusCommitted).
 			Set("piece_id = COALESCE(?, piece_id)", input.PieceID).
 			Set("retrieval_url = COALESCE(?, retrieval_url)", nullableString(input.RetrievalURL)).
+			Set("is_new_data_set = ?", isNewDataSet).
 			Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
 			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
 			Set("last_error = NULL").
@@ -678,6 +823,7 @@ func (r *BunStorageUploadRepo) RecordUploadResult(ctx context.Context, input Rec
 				PieceID:          copyInput.PieceID,
 				Role:             copyInput.Role,
 				RetrievalURL:     copyInput.RetrievalURL,
+				IsNewDataSet:     copyInput.IsNewDataSet,
 				Status:           status,
 				StorageDataSetID: storageDataSetID,
 			}
@@ -701,6 +847,7 @@ func (r *BunStorageUploadRepo) RecordUploadResult(ctx context.Context, input Rec
 					PieceID:      copyInput.PieceID,
 					Role:         copyInput.Role,
 					RetrievalURL: copyInput.RetrievalURL,
+					IsNewDataSet: copyInput.IsNewDataSet,
 					Status:       model.StorageUploadCopyStatusPending,
 				}
 				if _, err := db.NewInsert().Model(copyRow).Exec(ctx); err != nil {
@@ -1075,6 +1222,39 @@ func requireCommittedPrimaryCopy(ctx context.Context, db bun.IDB, uploadID int64
 		return fmt.Errorf("storage upload %d has no committed primary copy: %w", uploadID, ErrNotFound)
 	}
 	return nil
+}
+
+func uploadCopyDataSetCreatedByUpload(ctx context.Context, db bun.IDB, uploadID int64, copyIndex int) (bool, error) {
+	var row struct {
+		IsNewDataSet bool `bun:"is_new_data_set"`
+	}
+	err := db.NewRaw(`SELECT CASE
+			WHEN storage_data_set.created_by_upload_id = storage_copy.upload_id THEN TRUE
+			ELSE FALSE
+		END AS is_new_data_set
+		FROM storage_upload_copies AS storage_copy
+		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
+		WHERE storage_copy.upload_id = ? AND storage_copy.copy_index = ?`,
+		uploadID, copyIndex,
+	).Scan(ctx, &row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking storage upload copy data set origin: %w", err)
+	}
+	return row.IsNewDataSet, nil
+}
+
+func storageDataSetCreatedByUpload(ctx context.Context, db bun.IDB, storageDataSetID int64, uploadID int64) (bool, error) {
+	count, err := db.NewSelect().
+		Model((*model.StorageDataSet)(nil)).
+		Where("id = ? AND created_by_upload_id = ?", storageDataSetID, uploadID).
+		Count(ctx)
+	if err != nil {
+		return false, fmt.Errorf("checking storage data set origin: %w", err)
+	}
+	return count > 0, nil
 }
 
 func countUploadCopies(ctx context.Context, db bun.IDB, uploadID int64) (int, int, error) {

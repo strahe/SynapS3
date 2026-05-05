@@ -1207,6 +1207,15 @@ func (u *Uploader) markDataSetStageFailed(ctx context.Context, task *model.Task,
 }
 
 func (u *Uploader) markSecondaryFailed(ctx context.Context, task *model.Task, uploadID int64, copyIndex int, logger *slog.Logger, stage string, err error) {
+	if appendErr := u.repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
+		UploadID:     uploadID,
+		CopyIndex:    copyIndex,
+		Role:         string(storage.CopyRoleSecondary),
+		Stage:        stage,
+		ErrorMessage: err.Error(),
+	}); appendErr != nil {
+		logger.Warn("failed to append secondary upload failure", "uploadID", uploadID, "copyIndex", copyIndex, "error", appendErr)
+	}
 	_ = u.repos.Uploads.MarkUploadCopyFailed(ctx, uploadID, copyIndex, fmt.Sprintf("%s: %v", stage, err))
 	logger.Error(stage+" failed", "error", err)
 	if task.RetryCount+1 >= task.MaxRetries {
@@ -1708,6 +1717,17 @@ func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, version 
 }
 
 func (u *Uploader) handlePrimaryFailure(ctx context.Context, task *model.Task, version *model.ObjectVersion, uploadID int64, logger *slog.Logger, stage string, err error) {
+	if stage != "cache read" {
+		if appendErr := u.repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
+			UploadID:     uploadID,
+			CopyIndex:    0,
+			Role:         string(storage.CopyRolePrimary),
+			Stage:        stage,
+			ErrorMessage: err.Error(),
+		}); appendErr != nil {
+			logger.Warn("failed to append primary upload failure", "uploadID", uploadID, "error", appendErr)
+		}
+	}
 	if task.RetryCount+1 >= task.MaxRetries {
 		if markErr := u.repos.Uploads.MarkUploadCopyFailed(ctx, uploadID, 0, fmt.Sprintf("%s: %v", stage, err)); markErr != nil {
 			logger.Warn("failed to mark primary upload copy failed", "uploadID", uploadID, "error", markErr)

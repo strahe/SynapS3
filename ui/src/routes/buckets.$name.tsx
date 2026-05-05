@@ -6,8 +6,10 @@ import {
   Clock3,
   Download,
   FileIcon,
+  Fingerprint,
   Folder,
   History,
+  Info,
   Loader2,
   MoreHorizontal,
   RefreshCw,
@@ -15,20 +17,25 @@ import {
   TriangleAlert,
   UserRound,
 } from 'lucide-react'
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, type ReactNode, useEffect, useState } from 'react'
 import {
   api,
   type ObjectFolderItem,
   type ObjectItem,
+  type ObjectProvenance,
+  type ObjectProvenanceCopy,
+  type ObjectProvenanceFailure,
   type ObjectState,
   type ObjectStatus,
   type ObjectUploadStatus,
+  type ObjectVersionItem,
+  type StorageDataSetSummary,
 } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
-import { bucketStatusTone, StatusBadge } from '@/components/app/StatusBadge'
+import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -57,6 +64,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -65,6 +73,7 @@ import {
   useBucketObjects,
   useBucketObjectVersions,
   useDeleteBucket,
+  useObjectProvenance,
   useObjectStatusDetail,
   useS3Users,
   useUpdateBucketOwner,
@@ -98,13 +107,27 @@ function normalizePrefixSearch(value: unknown) {
   return prefix.endsWith('/') ? prefix : `${prefix}/`
 }
 
-function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: string; objectCount: number }) {
-  const [open, setOpen] = useState(false)
+function DeleteBucketDetailDialog({
+  bucketName,
+  objectCount,
+  open: controlledOpen,
+  onOpenChange,
+  showTrigger = true,
+}: {
+  bucketName: string
+  objectCount: number
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  showTrigger?: boolean
+}) {
+  const [internalOpen, setInternalOpen] = useState(false)
   const [confirmName, setConfirmName] = useState('')
   const [error, setError] = useState<string | null>(null)
   const deleteBucket = useDeleteBucket()
   const navigate = useNavigate()
 
+  const dialogOpen = controlledOpen ?? internalOpen
+  const setDialogOpen = onOpenChange ?? setInternalOpen
   const recursive = objectCount > 0
   const nameMatches = confirmName === bucketName
 
@@ -116,7 +139,7 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
 
   const handleOpenChange = (next: boolean) => {
     if (!next) reset()
-    setOpen(next)
+    setDialogOpen(next)
   }
 
   const handleDelete = () => {
@@ -126,7 +149,7 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
       { name: bucketName, recursive },
       {
         onSuccess: () => {
-          setOpen(false)
+          setDialogOpen(false)
           reset()
           navigate({ to: '/buckets' })
         },
@@ -138,13 +161,15 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
   }
 
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogTrigger asChild>
-        <Button variant="destructive" size="sm">
-          <Trash2 data-icon="inline-start" />
-          Delete
-        </Button>
-      </DialogTrigger>
+    <Dialog open={dialogOpen} onOpenChange={handleOpenChange}>
+      {showTrigger && (
+        <DialogTrigger asChild>
+          <Button variant="destructive" size="sm">
+            <Trash2 data-icon="inline-start" />
+            Delete
+          </Button>
+        </DialogTrigger>
+      )}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Delete bucket "{bucketName}"</DialogTitle>
@@ -190,22 +215,30 @@ function DeleteBucketDetailDialog({ bucketName, objectCount }: { bucketName: str
 function ChangeBucketOwnerDetailDialog({
   bucketName,
   ownerAccessKey,
+  open: controlledOpen,
+  onOpenChange,
+  showTrigger = true,
 }: {
   bucketName: string
   ownerAccessKey: string | null
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  showTrigger?: boolean
 }) {
-  const [open, setOpen] = useState(false)
+  const [internalOpen, setInternalOpen] = useState(false)
   const [selectedOwner, setSelectedOwner] = useState(ownerAccessKey ?? '')
   const [reviewing, setReviewing] = useState(false)
   const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
   const updateOwner = useUpdateBucketOwner()
+  const dialogOpen = controlledOpen ?? internalOpen
+  const setDialogOpen = onOpenChange ?? setInternalOpen
 
   useEffect(() => {
-    if (!open) {
+    if (!dialogOpen) {
       setSelectedOwner(ownerAccessKey ?? '')
       setReviewing(false)
     }
-  }, [ownerAccessKey, open])
+  }, [ownerAccessKey, dialogOpen])
 
   const reset = () => {
     setSelectedOwner(ownerAccessKey ?? '')
@@ -214,8 +247,8 @@ function ChangeBucketOwnerDetailDialog({
   }
 
   const handleOpenChange = (next: boolean) => {
-    reset()
-    setOpen(next)
+    if (!next) reset()
+    setDialogOpen(next)
   }
 
   const handleUpdate = () => {
@@ -229,7 +262,7 @@ function ChangeBucketOwnerDetailDialog({
       {
         onSuccess: () => {
           setReviewing(false)
-          setOpen(false)
+          setDialogOpen(false)
           reset()
         },
       }
@@ -237,13 +270,15 @@ function ChangeBucketOwnerDetailDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogTrigger asChild>
-        <Button variant="outline" size="sm">
-          <UserRound data-icon="inline-start" />
-          {ownerAccessKey ? 'Change owner' : 'Assign owner'}
-        </Button>
-      </DialogTrigger>
+    <Dialog open={dialogOpen} onOpenChange={handleOpenChange}>
+      {showTrigger && (
+        <DialogTrigger asChild>
+          <Button variant="outline" size="sm">
+            <UserRound data-icon="inline-start" />
+            {ownerAccessKey ? 'Change owner' : 'Assign owner'}
+          </Button>
+        </DialogTrigger>
+      )}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
@@ -360,7 +395,7 @@ function ObjectVersionsDialog({
                   <TableHead className="px-2">ETag</TableHead>
                   <TableHead className="px-2">Piece CID</TableHead>
                   <TableHead className="px-2">Created</TableHead>
-                  <TableHead className="px-2 text-right">Download</TableHead>
+                  <TableHead className="px-2 text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -407,15 +442,7 @@ function ObjectVersionsDialog({
                       {timeAgo(version.created_at)}
                     </TableCell>
                     <TableCell className="px-2 text-right">
-                      <Button variant="ghost" size="icon-sm" asChild>
-                        <a
-                          href={api.getObjectDownloadUrl(bucketName, object.key, version.version_id)}
-                          aria-label={`Download ${object.key} version ${version.version_id}`}
-                          title="Download"
-                        >
-                          <Download />
-                        </a>
-                      </Button>
+                      <VersionActions bucketName={bucketName} object={object} version={version} />
                     </TableCell>
                   </TableRow>
                 ))}
@@ -443,6 +470,258 @@ function ObjectVersionsDialog({
         )}
       </DialogContent>
     </Dialog>
+  )
+}
+
+function VersionActions({
+  bucketName,
+  object,
+  version,
+}: {
+  bucketName: string
+  object: ObjectItem
+  version: ObjectVersionItem
+}) {
+  const [provenanceOpen, setProvenanceOpen] = useState(false)
+
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${version.version_id}`} title="Actions">
+            <MoreHorizontal />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuGroup>
+            <DropdownMenuItem asChild>
+              <a
+                href={api.getObjectDownloadUrl(bucketName, object.key, version.version_id)}
+                aria-label={`Download ${object.key} version ${version.version_id}`}
+              >
+                <Download data-icon="inline-start" />
+                Download
+              </a>
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setProvenanceOpen(true)}>
+              <Fingerprint data-icon="inline-start" />
+              Provenance
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <ObjectProvenanceDialog
+        bucketName={bucketName}
+        objectKey={object.key}
+        versionID={version.version_id}
+        open={provenanceOpen}
+        onOpenChange={setProvenanceOpen}
+      />
+    </>
+  )
+}
+
+function ObjectProvenanceDialog({
+  bucketName,
+  objectKey,
+  versionID,
+  open,
+  onOpenChange,
+}: {
+  bucketName: string
+  objectKey: string
+  versionID: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const provenance = useObjectProvenance(bucketName, versionID, open)
+  const data = provenance.data
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-5xl lg:p-6">
+        <DialogHeader>
+          <DialogTitle>Storage provenance</DialogTitle>
+          <DialogDescription className="pr-8">
+            <span className="block max-w-full truncate font-mono text-xs" title={objectKey}>
+              {objectKey}
+            </span>
+            <span className="block max-w-full truncate font-mono text-xs" title={versionID}>
+              {versionID}
+            </span>
+          </DialogDescription>
+        </DialogHeader>
+
+        {provenance.isLoading ? (
+          <div className="flex h-40 items-center justify-center">
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+          </div>
+        ) : provenance.error ? (
+          <div className="text-sm text-destructive">Failed to load provenance</div>
+        ) : data ? (
+          <div className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1">
+            <ProvenanceSummary data={data} />
+            <ProvenanceCopies copies={data.copies} />
+            <ProvenanceFailures failures={data.failures} />
+          </div>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ProvenanceSummary({ data }: { data: ObjectProvenance }) {
+  const uploadLabel = data.upload_status ? uploadStatusLabel(data.upload_status) : 'No upload recorded'
+
+  return (
+    <dl className="grid gap-3 rounded-md border border-border p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+      <ProvenanceSummaryItem
+        label="Object status"
+        value={objectStateLabel(data.state, data.status, data.upload_status)}
+      />
+      <ProvenanceSummaryItem label="Upload" value={uploadLabel} />
+      <ProvenanceSummaryItem label="Copies" value={`${data.success_copies} / ${data.requested_copies}`} />
+      <ProvenanceSummaryItem label="Updated" value={timeAgo(data.updated_at)} title={data.updated_at} />
+      <ProvenanceSummaryItem
+        label="Piece CID"
+        value={data.piece_cid ?? '—'}
+        title={data.piece_cid}
+        className="sm:col-span-2 lg:col-span-4"
+        mono
+      />
+    </dl>
+  )
+}
+
+function ProvenanceSummaryItem({
+  label,
+  value,
+  title,
+  className,
+  mono = false,
+}: {
+  label: string
+  value: string
+  title?: string
+  className?: string
+  mono?: boolean
+}) {
+  return (
+    <div className={className}>
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd className={`mt-1 truncate ${mono ? 'font-mono text-xs' : 'font-medium'}`} title={title ?? value}>
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Copies</div>
+      <ScrollArea className="w-full">
+        <Table className="min-w-[960px]">
+          <TableHeader>
+            <TableRow>
+              <TableHead className="px-3">Copy</TableHead>
+              <TableHead className="px-3">Role</TableHead>
+              <TableHead className="px-3">Status</TableHead>
+              <TableHead className="px-3">Provider ID</TableHead>
+              <TableHead className="px-3">Data Set ID</TableHead>
+              <TableHead className="px-3">Piece ID</TableHead>
+              <TableHead className="px-3">New</TableHead>
+              <TableHead className="px-3">Retrieval URL</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {copies.map((copy) => (
+              <TableRow key={`${copy.copy_index}-${copy.role}`}>
+                <TableCell className="px-3 font-mono text-xs">{copy.copy_index}</TableCell>
+                <TableCell className="px-3">{copy.role || '—'}</TableCell>
+                <TableCell className="px-3">
+                  <StatusBadge tone={copyStatusTone(copy.status)}>{copy.status}</StatusBadge>
+                </TableCell>
+                <TableCell className="px-3 font-mono text-xs text-muted-foreground">
+                  {copy.provider_id ?? '—'}
+                </TableCell>
+                <TableCell className="px-3 font-mono text-xs text-muted-foreground">
+                  {copy.data_set_id ?? '—'}
+                </TableCell>
+                <TableCell className="px-3 font-mono text-xs text-muted-foreground">{copy.piece_id ?? '—'}</TableCell>
+                <TableCell className="px-3">
+                  <StatusBadge tone={copy.is_new_data_set ? 'info' : 'neutral'}>
+                    {copy.is_new_data_set ? 'Yes' : 'No'}
+                  </StatusBadge>
+                </TableCell>
+                <TableCell className="max-w-72 overflow-hidden truncate px-3 font-mono text-xs text-muted-foreground">
+                  {copy.retrieval_url ? (
+                    <a
+                      href={copy.retrieval_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="hover:text-foreground hover:underline"
+                      title={copy.retrieval_url}
+                    >
+                      {copy.retrieval_url}
+                    </a>
+                  ) : (
+                    '—'
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+            {copies.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={8} className="h-20 text-center text-muted-foreground">
+                  No storage copies recorded
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+        <ScrollBar orientation="horizontal" />
+      </ScrollArea>
+    </div>
+  )
+}
+
+function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] }) {
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Failed attempts</div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="px-3">Provider ID</TableHead>
+            <TableHead className="px-3">Role</TableHead>
+            <TableHead className="px-3">Stage</TableHead>
+            <TableHead className="px-3">Error</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {failures.map((failure) => (
+            <TableRow key={`${failure.attempt_index}-${failure.provider_id ?? 'unknown'}`}>
+              <TableCell className="px-3 font-mono text-xs text-muted-foreground">
+                {failure.provider_id ?? '—'}
+              </TableCell>
+              <TableCell className="px-3">{failure.role || '—'}</TableCell>
+              <TableCell className="px-3">{failure.stage ?? '—'}</TableCell>
+              <TableCell className="max-w-md overflow-hidden truncate px-3 text-muted-foreground" title={failure.error}>
+                {failure.error ?? '—'}
+              </TableCell>
+            </TableRow>
+          ))}
+          {failures.length === 0 && (
+            <TableRow>
+              <TableCell colSpan={4} className="h-20 text-center text-muted-foreground">
+                No failed attempts recorded
+              </TableCell>
+            </TableRow>
+          )}
+        </TableBody>
+      </Table>
+    </div>
   )
 }
 
@@ -561,6 +840,33 @@ function objectVisualStatus(status: ObjectStatus, uploadStatus?: ObjectUploadSta
   }
 }
 
+function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
+  switch (status) {
+    case 'committed':
+      return 'success'
+    case 'failed':
+      return 'danger'
+    case 'committing':
+    case 'piece_ready':
+      return 'info'
+    case 'pending':
+      return 'neutral'
+  }
+}
+
+function dataSetStatusTone(status: string): StatusTone {
+  switch (status) {
+    case 'ready':
+      return 'success'
+    case 'creating':
+      return 'info'
+    case 'failed':
+      return 'danger'
+    default:
+      return 'neutral'
+  }
+}
+
 function uploadStatusLabel(uploadStatus: ObjectUploadStatus) {
   switch (uploadStatus) {
     case 'running':
@@ -629,6 +935,9 @@ function ObjectBrowserPage() {
   const navigate = useNavigate()
   const prefix = search.prefix ?? ''
   const marker = search.marker ?? ''
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const [changeOwnerOpen, setChangeOwnerOpen] = useState(false)
+  const [deleteBucketOpen, setDeleteBucketOpen] = useState(false)
 
   const bucket = useBucket(name)
   const objects = useBucketObjects(name, prefix, marker)
@@ -664,6 +973,12 @@ function ObjectBrowserPage() {
   }
 
   const canDelete = bucket.data?.status === 'active'
+  const openChangeOwner = () => {
+    setChangeOwnerOpen(true)
+  }
+  const openDeleteBucket = () => {
+    setDeleteBucketOpen(true)
+  }
 
   return (
     <div className="flex flex-col gap-4 p-6">
@@ -671,26 +986,19 @@ function ObjectBrowserPage() {
 
       <PageHeader
         title={name}
-        description={bucket.data ? <BucketMetaLine bucket={bucket.data} /> : undefined}
         meta={
           bucket.data && <StatusBadge tone={bucketStatusTone(bucket.data.status)}>{bucket.data.status}</StatusBadge>
         }
         actions={
           <>
-            {bucket.data && (
-              <ChangeBucketOwnerDetailDialog bucketName={name} ownerAccessKey={bucket.data.owner_access_key} />
-            )}
-            {canDelete ? (
-              <DeleteBucketDetailDialog bucketName={name} objectCount={bucket.data?.object_count ?? 0} />
-            ) : (
-              <Button variant="destructive" size="sm" disabled>
-                <Trash2 data-icon="inline-start" />
-                Delete
-              </Button>
-            )}
             <Button variant="outline" size="sm" onClick={handleRefresh}>
               <RefreshCw data-icon="inline-start" /> Refresh
             </Button>
+            {bucket.data && (
+              <Button variant="outline" size="sm" onClick={() => setDetailsOpen(true)}>
+                <Info data-icon="inline-start" /> Details
+              </Button>
+            )}
           </>
         }
       />
@@ -714,29 +1022,207 @@ function ObjectBrowserPage() {
           navigateToMarker={navigateToMarker}
         />
       )}
+      {bucket.data && (
+        <>
+          <BucketDetailsSheet
+            bucket={bucket.data}
+            open={detailsOpen}
+            onOpenChange={setDetailsOpen}
+            canDelete={canDelete}
+            onChangeOwner={openChangeOwner}
+            onDeleteBucket={openDeleteBucket}
+          />
+          <ChangeBucketOwnerDetailDialog
+            bucketName={name}
+            ownerAccessKey={bucket.data.owner_access_key}
+            open={changeOwnerOpen}
+            onOpenChange={setChangeOwnerOpen}
+            showTrigger={false}
+          />
+          <DeleteBucketDetailDialog
+            bucketName={name}
+            objectCount={bucket.data.object_count}
+            open={deleteBucketOpen}
+            onOpenChange={setDeleteBucketOpen}
+            showTrigger={false}
+          />
+        </>
+      )}
     </div>
   )
 }
 
-function BucketMetaLine({ bucket }: { bucket: NonNullable<ReturnType<typeof useBucket>['data']> }) {
-  const details = [
-    formatObjectCount(bucket.object_count),
-    formatBytes(bucket.total_size_bytes),
-    `Versioning ${bucket.versioning_status.toLowerCase()}`,
-  ].filter(Boolean)
+function BucketDetailsSheet({
+  bucket,
+  open,
+  onOpenChange,
+  canDelete,
+  onChangeOwner,
+  onDeleteBucket,
+}: {
+  bucket: NonNullable<ReturnType<typeof useBucket>['data']>
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  canDelete: boolean
+  onChangeOwner: () => void
+  onDeleteBucket: () => void
+}) {
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent className="min-w-0 !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]">
+        <SheetHeader>
+          <SheetTitle>Bucket details</SheetTitle>
+          <SheetDescription>
+            <span className="block max-w-full truncate font-mono text-xs" title={bucket.name}>
+              {bucket.name}
+            </span>
+          </SheetDescription>
+        </SheetHeader>
+        <ScrollArea className="min-h-0 min-w-0 flex-1">
+          <div className="flex min-w-0 flex-col gap-6 px-4 pb-4">
+            <BucketDetailsSection title="Overview">
+              <BucketDetailsOverview bucket={bucket} />
+            </BucketDetailsSection>
+            <BucketDetailsSection title="Storage">
+              <BucketStorageDataSets dataSets={bucket.data_sets ?? []} />
+            </BucketDetailsSection>
+            <BucketDetailsSection title="Settings">
+              <BucketDetailsSettings
+                bucket={bucket}
+                canDelete={canDelete}
+                onChangeOwner={onChangeOwner}
+                onDeleteBucket={onDeleteBucket}
+              />
+            </BucketDetailsSection>
+          </div>
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
+function BucketDetailsSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="flex min-w-0 flex-col gap-3">
+      <h3 className="text-sm font-medium">{title}</h3>
+      {children}
+    </section>
+  )
+}
+
+function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<typeof useBucket>['data']> }) {
+  return (
+    <dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      <BucketDetailField label="Objects" value={formatObjectCount(bucket.object_count)} />
+      <BucketDetailField label="Total size" value={formatBytes(bucket.total_size_bytes)} />
+      <BucketDetailField label="Versioning" value={bucket.versioning_status} />
+      <BucketDetailField label="Owner" value={ownerLabel(bucket.owner_access_key)} />
+      <BucketDetailField label="Created" value={timeAgo(bucket.created_at)} title={bucket.created_at} />
+      <BucketDetailField label="Updated" value={timeAgo(bucket.updated_at)} title={bucket.updated_at} />
+      <div>
+        <dt className="text-xs text-muted-foreground">Status</dt>
+        <dd className="mt-1">
+          <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
+        </dd>
+      </div>
+    </dl>
+  )
+}
+
+function BucketDetailField({ label, value, title }: { label: string; value: string; title?: string }) {
+  return (
+    <div>
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd className="mt-1 truncate font-medium" title={title ?? value}>
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[] }) {
+  if (dataSets.length === 0) {
+    return (
+      <div className="rounded-md border border-border p-4">
+        <p className="text-sm font-medium">No data sets</p>
+        <p className="mt-1 text-sm text-muted-foreground">This bucket has no provider data sets yet.</p>
+      </div>
+    )
+  }
 
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
-      {details.map((detail, index) => (
-        <Fragment key={detail}>
-          {index > 0 && (
-            <span aria-hidden="true" className="text-border">
-              ·
-            </span>
-          )}
-          <span className="truncate">{detail}</span>
-        </Fragment>
-      ))}
+    <div className="min-w-0 overflow-hidden rounded-md border border-border">
+      <div className="border-b border-border bg-muted/50 px-4 py-2 text-sm font-medium">Data Sets</div>
+      <ScrollArea className="w-full">
+        <Table className="min-w-[720px]">
+          <TableHeader>
+            <TableRow>
+              <TableHead className="px-4">Copy</TableHead>
+              <TableHead className="px-4">Provider ID</TableHead>
+              <TableHead className="px-4">Data Set ID</TableHead>
+              <TableHead className="px-4">Status</TableHead>
+              <TableHead className="px-4">Last Used</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {dataSets.map((dataSet) => (
+              <TableRow key={dataSet.id}>
+                <TableCell className="px-4 font-mono text-xs">{dataSet.copy_index}</TableCell>
+                <TableCell className="px-4 font-mono text-xs text-muted-foreground">{dataSet.provider_id}</TableCell>
+                <TableCell className="px-4 font-mono text-xs text-muted-foreground">
+                  {dataSet.data_set_id ?? '—'}
+                </TableCell>
+                <TableCell className="px-4">
+                  <StatusBadge tone={dataSetStatusTone(dataSet.status)}>{dataSet.status}</StatusBadge>
+                </TableCell>
+                <TableCell className="px-4 text-muted-foreground" title={dataSet.updated_at}>
+                  {timeAgo(dataSet.updated_at)}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <ScrollBar orientation="horizontal" />
+      </ScrollArea>
+    </div>
+  )
+}
+
+function BucketDetailsSettings({
+  bucket,
+  canDelete,
+  onChangeOwner,
+  onDeleteBucket,
+}: {
+  bucket: NonNullable<ReturnType<typeof useBucket>['data']>
+  canDelete: boolean
+  onChangeOwner: () => void
+  onDeleteBucket: () => void
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-4">
+      <section className="rounded-md border border-border p-4">
+        <h3 className="text-sm font-medium">Owner</h3>
+        <p className="mt-1 truncate text-sm text-muted-foreground" title={ownerLabel(bucket.owner_access_key)}>
+          {ownerLabel(bucket.owner_access_key)}
+        </p>
+        <Button variant="outline" size="sm" className="mt-3" onClick={onChangeOwner}>
+          <UserRound data-icon="inline-start" />
+          {bucket.owner_access_key ? 'Change owner' : 'Assign owner'}
+        </Button>
+      </section>
+      <section className="rounded-md border border-destructive/30 p-4">
+        <h3 className="text-sm font-medium text-destructive">Delete bucket</h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {canDelete
+            ? 'Delete this bucket and its cached data after confirmation.'
+            : 'Deletion is unavailable while the bucket is not active.'}
+        </p>
+        <Button variant="destructive" size="sm" className="mt-3" onClick={onDeleteBucket} disabled={!canDelete}>
+          <Trash2 data-icon="inline-start" />
+          Delete bucket
+        </Button>
+      </section>
     </div>
   )
 }
@@ -909,6 +1395,7 @@ function FolderActions({ folder, onOpen }: { folder: ObjectFolderItem; onOpen: (
 
 function ObjectActions({ bucketName, object }: { bucketName: string; object: ObjectItem }) {
   const [versionsOpen, setVersionsOpen] = useState(false)
+  const [provenanceOpen, setProvenanceOpen] = useState(false)
 
   return (
     <>
@@ -930,6 +1417,10 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
               <History data-icon="inline-start" />
               Versions
             </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setProvenanceOpen(true)}>
+              <Fingerprint data-icon="inline-start" />
+              Provenance
+            </DropdownMenuItem>
           </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -938,6 +1429,13 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
         object={object}
         open={versionsOpen}
         onOpenChange={setVersionsOpen}
+      />
+      <ObjectProvenanceDialog
+        bucketName={bucketName}
+        objectKey={object.key}
+        versionID={object.current_version_id}
+        open={provenanceOpen}
+        onOpenChange={setProvenanceOpen}
       />
     </>
   )

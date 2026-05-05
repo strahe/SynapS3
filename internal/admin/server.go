@@ -122,6 +122,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/status-detail", s.handleAPIBucketObjectStatusDetail)
+		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/provenance", s.handleAPIBucketObjectProvenance)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", s.handleAPIBucketObjectVersions)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", s.handleAPIDownloadObject)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)

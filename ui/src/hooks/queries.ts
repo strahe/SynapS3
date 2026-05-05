@@ -53,6 +53,15 @@ export function useObjectStatusDetail(name: string, versionId: string, enabled =
   })
 }
 
+export function useObjectProvenance(name: string, versionId: string, enabled = true) {
+  return useQuery({
+    queryKey: ['objectProvenance', name, versionId],
+    queryFn: () => api.getObjectProvenance(name, versionId),
+    enabled: Boolean(name && versionId && enabled),
+    staleTime: 0,
+  })
+}
+
 export function useCreateBucket() {
   const qc = useQueryClient()
 

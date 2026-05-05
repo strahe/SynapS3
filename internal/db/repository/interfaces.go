@@ -148,6 +148,37 @@ type StorageUploadFailureInput struct {
 	Explicit     bool
 }
 
+type AppendUploadFailureInput struct {
+	UploadID     int64
+	CopyIndex    int
+	ProviderID   *types.OnChainID
+	Role         string
+	Stage        string
+	ErrorMessage string
+	Explicit     bool
+}
+
+type StorageUploadProvenance struct {
+	Upload   model.StorageUpload
+	Copies   []model.StorageUploadCopy
+	Failures []model.StorageUploadFailure
+}
+
+type StorageDataSetSummary struct {
+	ID                int64                      `bun:"id"`
+	BucketID          int64                      `bun:"bucket_id"`
+	BucketName        string                     `bun:"bucket_name"`
+	CopyIndex         int                        `bun:"copy_index"`
+	ProviderID        types.OnChainID            `bun:"provider_id"`
+	DataSetID         *types.OnChainID           `bun:"data_set_id"`
+	ClientDataSetID   *types.OnChainID           `bun:"client_data_set_id"`
+	Status            model.StorageDataSetStatus `bun:"status"`
+	CreatedByUploadID *int64                     `bun:"created_by_upload_id"`
+	LastUsedUploadID  *int64                     `bun:"last_used_upload_id"`
+	CreatedAt         time.Time                  `bun:"created_at"`
+	UpdatedAt         time.Time                  `bun:"updated_at"`
+}
+
 type ReadableStorageCopy struct {
 	UploadID     int64           `bun:"upload_id"`
 	PieceCID     string          `bun:"piece_cid"`
@@ -253,10 +284,13 @@ type StorageUploadRepository interface {
 	SetAcceptError(ctx context.Context, uploadID int64, message string) error
 	GetByID(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
 	GetByIDs(ctx context.Context, uploadIDs []int64) (map[int64]model.StorageUpload, error)
+	GetUploadProvenance(ctx context.Context, uploadID int64) (*StorageUploadProvenance, error)
+	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
 	ListReadableCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
 	ListReadablePrimaryCopy(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
+	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error

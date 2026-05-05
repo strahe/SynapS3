@@ -13,10 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
+	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
 )
 
@@ -53,16 +54,32 @@ type bucketMutationResponse struct {
 }
 
 type bucketDetailResponse struct {
-	ID                 int64   `json:"id"`
-	Name               string  `json:"name"`
-	OwnerAccessKey     *string `json:"owner_access_key"`
-	Status             string  `json:"status"`
-	ObjectCount        int64   `json:"object_count"`
-	TotalSizeBytes     int64   `json:"total_size_bytes"`
-	CreatedAt          string  `json:"created_at"`
-	UpdatedAt          string  `json:"updated_at"`
-	VersioningStatus   string  `json:"versioning_status"`
-	VersioningEnforced bool    `json:"versioning_enforced"`
+	ID                 int64                           `json:"id"`
+	Name               string                          `json:"name"`
+	OwnerAccessKey     *string                         `json:"owner_access_key"`
+	Status             string                          `json:"status"`
+	ObjectCount        int64                           `json:"object_count"`
+	TotalSizeBytes     int64                           `json:"total_size_bytes"`
+	CreatedAt          string                          `json:"created_at"`
+	UpdatedAt          string                          `json:"updated_at"`
+	VersioningStatus   string                          `json:"versioning_status"`
+	VersioningEnforced bool                            `json:"versioning_enforced"`
+	DataSets           []storageDataSetSummaryResponse `json:"data_sets"`
+}
+
+type storageDataSetSummaryResponse struct {
+	ID                int64   `json:"id"`
+	BucketID          int64   `json:"bucket_id"`
+	BucketName        string  `json:"bucket_name,omitempty"`
+	CopyIndex         int     `json:"copy_index"`
+	ProviderID        string  `json:"provider_id"`
+	DataSetID         *string `json:"data_set_id,omitempty"`
+	ClientDataSetID   *string `json:"client_data_set_id,omitempty"`
+	Status            string  `json:"status"`
+	CreatedByUploadID *int64  `json:"created_by_upload_id,omitempty"`
+	LastUsedUploadID  *int64  `json:"last_used_upload_id,omitempty"`
+	CreatedAt         string  `json:"created_at"`
+	UpdatedAt         string  `json:"updated_at"`
 }
 
 type bucketOwnerUpdateRequest struct {
@@ -211,6 +228,16 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	dataSets := make([]storageDataSetSummaryResponse, 0)
+	if s.repos.Uploads != nil {
+		summaries, err := s.repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+		if err != nil {
+			s.logger.Error("api: failed to list bucket storage data sets", "error", err, "name", bucketName)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			return
+		}
+		dataSets = storageDataSetSummaryResponses(summaries)
+	}
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
 		ID:                 bucket.ID,
@@ -223,6 +250,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:          bucket.UpdatedAt.Format(time.RFC3339),
 		VersioningStatus:   "Enabled",
 		VersioningEnforced: true,
+		DataSets:           dataSets,
 	})
 }
 
@@ -370,9 +398,38 @@ func bucketOwnerACL(owner string) ([]byte, error) {
 		Grantees: []auth.Grantee{{
 			Permission: auth.PermissionFullControl,
 			Access:     owner,
-			Type:       types.TypeCanonicalUser,
+			Type:       s3types.TypeCanonicalUser,
 		}},
 	})
+}
+
+func storageDataSetSummaryResponses(summaries []repository.StorageDataSetSummary) []storageDataSetSummaryResponse {
+	out := make([]storageDataSetSummaryResponse, 0, len(summaries))
+	for _, summary := range summaries {
+		out = append(out, storageDataSetSummaryResponse{
+			ID:                summary.ID,
+			BucketID:          summary.BucketID,
+			BucketName:        summary.BucketName,
+			CopyIndex:         summary.CopyIndex,
+			ProviderID:        summary.ProviderID.String(),
+			DataSetID:         onChainIDStringPtr(summary.DataSetID),
+			ClientDataSetID:   onChainIDStringPtr(summary.ClientDataSetID),
+			Status:            string(summary.Status),
+			CreatedByUploadID: summary.CreatedByUploadID,
+			LastUsedUploadID:  summary.LastUsedUploadID,
+			CreatedAt:         summary.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:         summary.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+func onChainIDStringPtr(id *idtypes.OnChainID) *string {
+	if id == nil {
+		return nil
+	}
+	value := id.String()
+	return &value
 }
 
 type objectListItem struct {
@@ -404,6 +461,38 @@ type objectStatusDetailResponse struct {
 	FailedAtState *string `json:"failed_at_state,omitempty"`
 	Message       *string `json:"message,omitempty"`
 	UpdatedAt     string  `json:"updated_at"`
+}
+
+type objectProvenanceResponse struct {
+	VersionID       string                            `json:"version_id"`
+	State           string                            `json:"state"`
+	Status          string                            `json:"status"`
+	UploadStatus    *string                           `json:"upload_status,omitempty"`
+	PieceCID        *string                           `json:"piece_cid,omitempty"`
+	RequestedCopies int                               `json:"requested_copies"`
+	SuccessCopies   int                               `json:"success_copies"`
+	Copies          []objectProvenanceCopyResponse    `json:"copies"`
+	Failures        []objectProvenanceFailureResponse `json:"failures"`
+	UpdatedAt       string                            `json:"updated_at"`
+}
+
+type objectProvenanceCopyResponse struct {
+	CopyIndex    int     `json:"copy_index"`
+	Status       string  `json:"status"`
+	ProviderID   *string `json:"provider_id,omitempty"`
+	DataSetID    *string `json:"data_set_id,omitempty"`
+	PieceID      *string `json:"piece_id,omitempty"`
+	Role         string  `json:"role"`
+	RetrievalURL *string `json:"retrieval_url,omitempty"`
+	IsNewDataSet bool    `json:"is_new_data_set"`
+}
+
+type objectProvenanceFailureResponse struct {
+	AttemptIndex int     `json:"attempt_index"`
+	ProviderID   *string `json:"provider_id,omitempty"`
+	Role         string  `json:"role"`
+	Stage        *string `json:"stage,omitempty"`
+	Error        *string `json:"error,omitempty"`
 }
 
 func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bool, uploadStatus *model.StorageUploadStatus) string {
@@ -444,17 +533,18 @@ type objectAdminUploadInfo struct {
 	Message *string
 }
 
-func (s *Server) objectAdminUploadInfo(ctx context.Context, version model.ObjectVersion) (objectAdminUploadInfo, error) {
+func (s *Server) objectAdminStorageUpload(ctx context.Context, version model.ObjectVersion) (*model.StorageUpload, error) {
 	if s.repos.Uploads == nil {
-		return objectAdminUploadInfo{}, nil
+		return nil, nil
 	}
-	var upload *model.StorageUpload
-	var err error
 	if version.StorageUploadID != nil {
-		upload, err = s.repos.Uploads.GetByID(ctx, *version.StorageUploadID)
-	} else {
-		upload, err = s.repos.Uploads.FindLatestUploadBySourceVersion(ctx, version.VersionID)
+		return s.repos.Uploads.GetByID(ctx, *version.StorageUploadID)
 	}
+	return s.repos.Uploads.FindLatestUploadBySourceVersion(ctx, version.VersionID)
+}
+
+func (s *Server) objectAdminUploadInfo(ctx context.Context, version model.ObjectVersion) (objectAdminUploadInfo, error) {
+	upload, err := s.objectAdminStorageUpload(ctx, version)
 	if err != nil || upload == nil {
 		return objectAdminUploadInfo{}, err
 	}
@@ -859,6 +949,104 @@ func (s *Server) handleAPIBucketObjectStatusDetail(w http.ResponseWriter, r *htt
 		Message:       message,
 		UpdatedAt:     version.UpdatedAt.Format(time.RFC3339),
 	})
+}
+
+func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	versionID := strings.TrimSpace(r.URL.Query().Get("version_id"))
+	if versionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "version_id is required"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	version, err := s.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil {
+		s.logger.Error("api: failed to get object version provenance", "error", err, "bucket", bucketName, "versionID", versionID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if version == nil || version.BucketID != bucket.ID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object version not found"})
+		return
+	}
+
+	resp := objectProvenanceResponse{
+		VersionID: version.VersionID,
+		State:     string(version.State),
+		Status:    objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, nil),
+		Copies:    make([]objectProvenanceCopyResponse, 0),
+		Failures:  make([]objectProvenanceFailureResponse, 0),
+		UpdatedAt: version.UpdatedAt.Format(time.RFC3339),
+	}
+
+	upload, err := s.objectAdminStorageUpload(ctx, *version)
+	if err != nil {
+		s.logger.Error("api: failed to load object provenance upload", "error", err, "bucket", bucketName, "versionID", versionID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if upload == nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	provenance, err := s.repos.Uploads.GetUploadProvenance(ctx, upload.ID)
+	if err != nil {
+		s.logger.Error("api: failed to load object provenance", "error", err, "bucket", bucketName, "versionID", versionID, "uploadID", upload.ID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if provenance == nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	resp.UploadStatus = uploadStatusString(&provenance.Upload.Status)
+	resp.Status = objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, &provenance.Upload.Status)
+	resp.PieceCID = provenance.Upload.PieceCID
+	resp.RequestedCopies = provenance.Upload.RequestedCopies
+	resp.UpdatedAt = provenance.Upload.UpdatedAt.Format(time.RFC3339)
+	for _, copyRow := range provenance.Copies {
+		if copyRow.Status == model.StorageUploadCopyStatusCommitted {
+			resp.SuccessCopies++
+		}
+		resp.Copies = append(resp.Copies, objectProvenanceCopyResponse{
+			CopyIndex:    copyRow.CopyIndex,
+			Status:       string(copyRow.Status),
+			ProviderID:   onChainIDStringPtr(copyRow.ProviderID),
+			DataSetID:    onChainIDStringPtr(copyRow.DataSetID),
+			PieceID:      onChainIDStringPtr(copyRow.PieceID),
+			Role:         copyRow.Role,
+			RetrievalURL: copyRow.RetrievalURL,
+			IsNewDataSet: copyRow.IsNewDataSet,
+		})
+	}
+	for _, failure := range provenance.Failures {
+		resp.Failures = append(resp.Failures, objectProvenanceFailureResponse{
+			AttemptIndex: failure.AttemptIndex,
+			ProviderID:   onChainIDStringPtr(failure.ProviderID),
+			Role:         failure.Role,
+			Stage:        failure.Stage,
+			Error:        failure.ErrorMessage,
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Request) {

@@ -129,6 +129,10 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 			t.Fatalf("%s table should exist", table)
 		}
 	}
+	copyColumns := sqliteColumns(t, db, "storage_upload_copies")
+	if !copyColumns["is_new_data_set"] {
+		t.Fatal("storage_upload_copies.is_new_data_set should exist")
+	}
 
 	indexes := sqliteIndexes(t, db, "objects")
 	if !indexes["idx_objects_bucket_key"] {

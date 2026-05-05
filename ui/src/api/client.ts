@@ -43,10 +43,26 @@ export interface BucketItem {
   created_at: string
 }
 
+export interface StorageDataSetSummary {
+  id: number
+  bucket_id: number
+  bucket_name?: string
+  copy_index: number
+  provider_id: string
+  data_set_id?: string
+  client_data_set_id?: string
+  status: string
+  created_by_upload_id?: number
+  last_used_upload_id?: number
+  created_at: string
+  updated_at: string
+}
+
 export interface BucketDetail extends BucketItem {
   updated_at: string
   versioning_status: string
   versioning_enforced: boolean
+  data_sets: StorageDataSetSummary[]
 }
 
 export interface BucketMutationResponse {
@@ -130,6 +146,40 @@ export interface ObjectStatusDetail {
   upload_status?: ObjectUploadStatus
   failed_at_state?: string
   message?: string
+  updated_at: string
+}
+
+export type ObjectUploadCopyStatus = 'pending' | 'piece_ready' | 'committing' | 'committed' | 'failed'
+
+export interface ObjectProvenanceCopy {
+  copy_index: number
+  status: ObjectUploadCopyStatus
+  provider_id?: string
+  data_set_id?: string
+  piece_id?: string
+  role: string
+  retrieval_url?: string
+  is_new_data_set: boolean
+}
+
+export interface ObjectProvenanceFailure {
+  attempt_index: number
+  provider_id?: string
+  role: string
+  stage?: string
+  error?: string
+}
+
+export interface ObjectProvenance {
+  version_id: string
+  state: ObjectState
+  status: ObjectStatus
+  upload_status?: ObjectUploadStatus
+  piece_cid?: string
+  requested_copies: number
+  success_copies: number
+  copies: ObjectProvenanceCopy[]
+  failures: ObjectProvenanceFailure[]
   updated_at: string
 }
 
@@ -419,6 +469,10 @@ export const api = {
   getObjectStatusDetail: (name: string, versionId: string) =>
     fetchJSON<ObjectStatusDetail>(
       `/buckets/${encodeURIComponent(name)}/objects/status-detail?version_id=${encodeURIComponent(versionId)}`
+    ),
+  getObjectProvenance: (name: string, versionId: string) =>
+    fetchJSON<ObjectProvenance>(
+      `/buckets/${encodeURIComponent(name)}/objects/provenance?version_id=${encodeURIComponent(versionId)}`
     ),
   getObjectDownloadUrl: (name: string, key: string, versionId?: string) => {
     const params = [`key=${encodeURIComponent(key)}`]

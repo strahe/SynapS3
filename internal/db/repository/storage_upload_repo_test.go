@@ -177,6 +177,185 @@ func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testi
 	}
 }
 
+func TestStorageUploadRepo_GetUploadProvenanceIncludesCopiesAndFailures(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "upload-provenance-detail-bucket")
+
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000PROV001",
+		ContentSize:     10,
+		Checksum:        "checksum-provenance-detail",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        strPtr("bafk2bzaceprovenancedetail"),
+		RequestedCopies: 2,
+		Copies: []repository.StorageUploadCopyInput{
+			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://primary.example/piece"), IsNewDataSet: true},
+			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: strPtr("https://secondary.example/piece"), IsNewDataSet: false},
+		},
+		Failures: []repository.StorageUploadFailureInput{{
+			ProviderID:   onChainIDPtr(t, "303"),
+			Role:         "secondary",
+			Stage:        strPtr("secondary_pull"),
+			ErrorMessage: strPtr("provider timed out"),
+			Explicit:     true,
+		}},
+	}); err != nil {
+		t.Fatalf("RecordUploadResult: %v", err)
+	}
+
+	got, err := repos.Uploads.GetUploadProvenance(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance: %v", err)
+	}
+	if got == nil || got.Upload.ID != upload.ID {
+		t.Fatalf("provenance upload = %#v, want upload %d", got, upload.ID)
+	}
+	if len(got.Copies) != 2 {
+		t.Fatalf("copies len = %d, want 2", len(got.Copies))
+	}
+	if !got.Copies[0].IsNewDataSet {
+		t.Fatalf("primary is_new_data_set = false, want true")
+	}
+	if got.Copies[1].IsNewDataSet {
+		t.Fatalf("secondary is_new_data_set = true, want false")
+	}
+	if got.Copies[1].DataSetID == nil || got.Copies[1].DataSetID.String() != "2002" {
+		t.Fatalf("secondary data_set_id = %#v, want 2002", got.Copies[1].DataSetID)
+	}
+	if len(got.Failures) != 1 {
+		t.Fatalf("failures len = %d, want 1", len(got.Failures))
+	}
+	if got.Failures[0].ProviderID == nil || got.Failures[0].ProviderID.String() != "303" || got.Failures[0].Stage == nil || *got.Failures[0].Stage != "secondary_pull" {
+		t.Fatalf("failure = %#v, want provider 303 stage secondary_pull", got.Failures[0])
+	}
+}
+
+func TestStorageUploadRepo_StagedProvenanceInfersNewDataSetAndAppendsFailures(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "staged-provenance-detail-bucket")
+
+	first, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000PROV101",
+		ContentSize:     10,
+		Checksum:        "checksum-staged-provenance-1",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt first: %v", err)
+	}
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        onChainID(t, "101"),
+		CopyIndex:         0,
+		CreatedByUploadID: first.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: first.ID, DataSetID: onChainID(t, "1001")}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, first.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		Role:             "primary",
+		ProviderID:       onChainID(t, "101"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings first: %v", err)
+	}
+	pendingFirstProvenance, err := repos.Uploads.GetUploadProvenance(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance pending first: %v", err)
+	}
+	if len(pendingFirstProvenance.Copies) != 1 || !pendingFirstProvenance.Copies[0].IsNewDataSet {
+		t.Fatalf("pending first copies = %#v, want inferred new data set before commit", pendingFirstProvenance.Copies)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     first.ID,
+		CopyIndex:    0,
+		PieceCID:     "piece-staged-first",
+		PieceID:      onChainIDPtr(t, "2001"),
+		RetrievalURL: "https://provider.example/first",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted first: %v", err)
+	}
+	if err := repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
+		UploadID:     first.ID,
+		CopyIndex:    0,
+		Stage:        "primary_commit",
+		ErrorMessage: "temporary commit failure",
+		ProviderID:   nil,
+		Role:         "",
+		Explicit:     false,
+	}); err != nil {
+		t.Fatalf("AppendUploadFailure: %v", err)
+	}
+
+	firstProvenance, err := repos.Uploads.GetUploadProvenance(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance first: %v", err)
+	}
+	if len(firstProvenance.Copies) != 1 || !firstProvenance.Copies[0].IsNewDataSet {
+		t.Fatalf("first copies = %#v, want inferred new data set", firstProvenance.Copies)
+	}
+	if len(firstProvenance.Failures) != 1 || firstProvenance.Failures[0].ProviderID == nil || firstProvenance.Failures[0].ProviderID.String() != "101" {
+		t.Fatalf("first failures = %#v, want provider inferred from copy", firstProvenance.Failures)
+	}
+
+	second, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000PROV102",
+		ContentSize:     10,
+		Checksum:        "checksum-staged-provenance-2",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt second: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, second.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		Role:             "primary",
+		ProviderID:       onChainID(t, "101"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings second: %v", err)
+	}
+	pendingSecondProvenance, err := repos.Uploads.GetUploadProvenance(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance pending second: %v", err)
+	}
+	if len(pendingSecondProvenance.Copies) != 1 || pendingSecondProvenance.Copies[0].IsNewDataSet {
+		t.Fatalf("pending second copies = %#v, want reused data set before commit", pendingSecondProvenance.Copies)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     second.ID,
+		CopyIndex:    0,
+		PieceCID:     "piece-staged-second",
+		PieceID:      onChainIDPtr(t, "2002"),
+		RetrievalURL: "https://provider.example/second",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted second: %v", err)
+	}
+
+	secondProvenance, err := repos.Uploads.GetUploadProvenance(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance second: %v", err)
+	}
+	if len(secondProvenance.Copies) != 1 || secondProvenance.Copies[0].IsNewDataSet {
+		t.Fatalf("second copies = %#v, want reused data set", secondProvenance.Copies)
+	}
+}
+
 func TestStorageUploadRepo_RequiredOnChainIDValidationUsesInvalidInput(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -991,6 +1170,71 @@ func TestStorageUploadRepo_DataSetCrossBucketConflictPreservesCopyButRejects(t *
 	}
 }
 
+func TestStorageUploadRepo_AppendUploadFailureRetriesRacedAttemptIndex(t *testing.T) {
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "storage-upload-failure-race.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("opening sqlite db: %v", err)
+	}
+	sqldb.SetMaxOpenConns(8)
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("running migrations: %v", err)
+	}
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "failure-race-bucket")
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:    bucket.ID,
+		ContentSize: 1,
+		Checksum:    "failure-race",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+
+	hook := &storageUploadFailureRaceHook{uploadID: upload.ID, collisionCount: 4}
+	db.AddQueryHook(hook)
+
+	if err := repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		ProviderID:   onChainIDPtr(t, "101"),
+		Role:         "primary",
+		Stage:        "primary_store",
+		ErrorMessage: "provider store failed",
+	}); err != nil {
+		t.Fatalf("AppendUploadFailure: %v", err)
+	}
+	if hookErr := hook.err.Load(); hookErr != nil {
+		t.Fatalf("race hook insert: %v", hookErr)
+	}
+	if !hook.triggered.Load() {
+		t.Fatal("race hook did not run")
+	}
+	provenance, err := repos.Uploads.GetUploadProvenance(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance: %v", err)
+	}
+	if len(provenance.Failures) != 5 {
+		t.Fatalf("failures len = %d, want four raced failures and retried append", len(provenance.Failures))
+	}
+	for index, failure := range provenance.Failures {
+		if failure.AttemptIndex != index {
+			t.Fatalf("attempt index at row %d = %d, want %d", index, failure.AttemptIndex, index)
+		}
+	}
+	lastFailure := provenance.Failures[len(provenance.Failures)-1]
+	if lastFailure.ErrorMessage == nil || *lastFailure.ErrorMessage != "provider store failed" {
+		t.Fatalf("retried failure = %#v, want original append data", lastFailure)
+	}
+}
+
 func TestStorageUploadRepo_RecordResultRejectsRacedCrossBucketDataSetConflict(t *testing.T) {
 	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "storage-upload-cross-bucket-race.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
@@ -1200,6 +1444,50 @@ type storageDataSetRaceHook struct {
 	uniqueViolationSeen atomic.Bool
 	err                 atomic.Value
 }
+
+type storageUploadFailureRaceHook struct {
+	uploadID         int64
+	collisionCount   int64
+	inserted         atomic.Int64
+	triggered        atomic.Bool
+	insertInProgress atomic.Bool
+	err              atomic.Value
+}
+
+func (h *storageUploadFailureRaceHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	if !strings.Contains(event.Query, "INSERT INTO") || !strings.Contains(event.Query, "storage_upload_failures") {
+		return ctx
+	}
+	if !h.insertInProgress.CompareAndSwap(false, true) {
+		return ctx
+	}
+	defer h.insertInProgress.Store(false)
+	attemptIndex := int(h.inserted.Load())
+	if int64(attemptIndex) >= h.collisionCount {
+		return ctx
+	}
+	h.inserted.Add(1)
+	h.triggered.Store(true)
+	providerID, err := types.ParseOnChainID("providerID", "101")
+	if err != nil {
+		h.err.Store(err)
+		return ctx
+	}
+	failure := &model.StorageUploadFailure{
+		UploadID:     h.uploadID,
+		AttemptIndex: attemptIndex,
+		ProviderID:   &providerID,
+		Role:         "primary",
+		Stage:        strPtr("raced_failure"),
+		ErrorMessage: strPtr("raced insert"),
+	}
+	if _, err := event.DB.NewInsert().Model(failure).Exec(ctx); err != nil {
+		h.err.Store(err)
+	}
+	return ctx
+}
+
+func (h *storageUploadFailureRaceHook) AfterQuery(context.Context, *bun.QueryEvent) {}
 
 func (h *storageDataSetRaceHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
 	if !strings.Contains(event.Query, "INSERT INTO") || !strings.Contains(event.Query, "storage_data_sets") {

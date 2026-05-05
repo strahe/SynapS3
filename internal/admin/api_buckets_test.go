@@ -65,6 +65,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}", srv.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", srv.handleAPIBucketObjects)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/status-detail", srv.handleAPIBucketObjectStatusDetail)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/provenance", srv.handleAPIBucketObjectProvenance)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", srv.handleAPIBucketObjectVersions)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
 	return mux
@@ -617,6 +618,67 @@ func TestAPIBucketDetail(t *testing.T) {
 	}
 	if body.TotalSizeBytes != 12 {
 		t.Fatalf("total_size_bytes = %d, want 12", body.TotalSizeBytes)
+	}
+}
+
+func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "detail-datasets-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000DATASET1",
+		ContentSize:     1,
+		Checksum:        "checksum-dataset-detail",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	pieceCID := "bafk2bzacedatasetdetail"
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        &pieceCID,
+		RequestedCopies: 2,
+		Copies: []repository.StorageUploadCopyInput{
+			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: testStringPtr("https://provider.example/1"), IsNewDataSet: true},
+			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: testStringPtr("https://provider.example/2"), IsNewDataSet: true},
+		},
+	}); err != nil {
+		t.Fatalf("RecordUploadResult: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/detail-datasets-bucket")
+	if err != nil {
+		t.Fatalf("GET bucket detail: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var body struct {
+		DataSets []struct {
+			CopyIndex  int    `json:"copy_index"`
+			ProviderID string `json:"provider_id"`
+			DataSetID  string `json:"data_set_id"`
+			Status     string `json:"status"`
+		} `json:"data_sets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.DataSets) != 2 {
+		t.Fatalf("data_sets len = %d, want 2", len(body.DataSets))
+	}
+	if body.DataSets[0].CopyIndex != 0 || body.DataSets[0].ProviderID != "101" || body.DataSets[0].DataSetID != "1001" || body.DataSets[0].Status != string(model.StorageDataSetStatusReady) {
+		t.Fatalf("first data set = %#v, want provider scoped data set", body.DataSets[0])
 	}
 }
 
@@ -1516,6 +1578,166 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	}
 }
 
+func TestAPIBucketObjectProvenance(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "provenance-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, oldVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 7, "etag-old-provenance", "checksum-old-provenance", "text/plain", "", model.ObjectStateStored)
+	_, versionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 8, "etag-provenance", "checksum-provenance", "text/plain", "", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark uploading: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     8,
+		Checksum:        "checksum-provenance",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	pieceCID := "bafk2bzaceadminprovenance"
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        &pieceCID,
+		RequestedCopies: 2,
+		Copies: []repository.StorageUploadCopyInput{
+			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: testStringPtr("https://primary.example/piece"), IsNewDataSet: true},
+			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: testStringPtr("https://secondary.example/piece"), IsNewDataSet: false},
+		},
+		Failures: []repository.StorageUploadFailureInput{{
+			ProviderID:   onChainIDPtr(t, "303"),
+			Role:         "secondary",
+			Stage:        testStringPtr("secondary_pull"),
+			ErrorMessage: testStringPtr("provider timed out"),
+		}},
+	}); err != nil {
+		t.Fatalf("RecordUploadResult: %v", err)
+	}
+	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: 8,
+		Checksum:    "checksum-provenance",
+	}); err != nil {
+		t.Fatalf("AcceptCompleteUploadForContent: %v", err)
+	}
+
+	_, noUploadVersionID := seedAdminObjectVersion(t, repos, bucket, "cached.txt", 3, "etag-cached", "checksum-cached", "text/plain", "", model.ObjectStateCached)
+	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "partial-provenance.txt", 4, "etag-partial-provenance", "checksum-partial-provenance", "text/plain", "", model.ObjectStateCached)
+	bindAdminPartialUpload(t, repos, partialVersionID)
+	_, failedVersionID := seedAdminObjectVersion(t, repos, bucket, "failed-provenance.txt", 5, "etag-failed-provenance", "checksum-failed-provenance", "text/plain", "", model.ObjectStateCached)
+	markAdminFailedUpload(t, repos, failedVersionID, "provider rejected piece")
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	type provenanceBody struct {
+		VersionID       string `json:"version_id"`
+		Status          string `json:"status"`
+		UploadStatus    string `json:"upload_status"`
+		PieceCID        string `json:"piece_cid"`
+		RequestedCopies int    `json:"requested_copies"`
+		SuccessCopies   int    `json:"success_copies"`
+		Copies          []struct {
+			CopyIndex    int    `json:"copy_index"`
+			Status       string `json:"status"`
+			ProviderID   string `json:"provider_id"`
+			DataSetID    string `json:"data_set_id"`
+			PieceID      string `json:"piece_id"`
+			Role         string `json:"role"`
+			RetrievalURL string `json:"retrieval_url"`
+			IsNewDataSet bool   `json:"is_new_data_set"`
+		} `json:"copies"`
+		Failures []struct {
+			AttemptIndex int    `json:"attempt_index"`
+			ProviderID   string `json:"provider_id"`
+			Role         string `json:"role"`
+			Stage        string `json:"stage"`
+			Error        string `json:"error"`
+		} `json:"failures"`
+	}
+	getProvenance := func(bucketName, targetVersionID string) (provenanceBody, int) {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucketName + "/objects/provenance?version_id=" + url.QueryEscape(targetVersionID))
+		if err != nil {
+			t.Fatalf("GET provenance: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return provenanceBody{}, resp.StatusCode
+		}
+		var body provenanceBody
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("Decode provenance: %v", err)
+		}
+		return body, resp.StatusCode
+	}
+
+	detail, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if detail.VersionID != versionID || detail.Status != "success" || detail.UploadStatus != string(model.StorageUploadStatusAllCopiesCommitted) {
+		t.Fatalf("detail status = %#v, want stored provenance", detail)
+	}
+	if detail.PieceCID != pieceCID || detail.RequestedCopies != 2 || detail.SuccessCopies != 2 {
+		t.Fatalf("detail counts = %#v, want piece and 2/2 copies", detail)
+	}
+	if len(detail.Copies) != 2 || detail.Copies[0].ProviderID != "101" || !detail.Copies[0].IsNewDataSet || detail.Copies[1].IsNewDataSet {
+		t.Fatalf("copies = %#v, want provider scoped copy provenance", detail.Copies)
+	}
+	if len(detail.Failures) != 1 || detail.Failures[0].ProviderID != "303" || detail.Failures[0].Stage != "secondary_pull" || detail.Failures[0].Error != "provider timed out" {
+		t.Fatalf("failures = %#v, want recorded provider attempt", detail.Failures)
+	}
+
+	oldDetail, statusCode := getProvenance("provenance-bucket", oldVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("old version status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if oldDetail.VersionID != oldVersionID || oldDetail.Status != "success" || oldDetail.SuccessCopies != 1 {
+		t.Fatalf("old version provenance = %#v, want historical stored version", oldDetail)
+	}
+
+	partialDetail, statusCode := getProvenance("provenance-bucket", partialVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("partial status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if partialDetail.Status != "warning" || partialDetail.UploadStatus != string(model.StorageUploadStatusPartial) || partialDetail.SuccessCopies != 1 {
+		t.Fatalf("partial provenance = %#v, want partial upload detail", partialDetail)
+	}
+
+	failedDetail, statusCode := getProvenance("provenance-bucket", failedVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("failed status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if failedDetail.Status != "warning" || failedDetail.UploadStatus != string(model.StorageUploadStatusFailed) || failedDetail.SuccessCopies != 0 {
+		t.Fatalf("failed provenance = %#v, want failed upload detail", failedDetail)
+	}
+
+	noUpload, statusCode := getProvenance("provenance-bucket", noUploadVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("no-upload status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if noUpload.VersionID != noUploadVersionID || len(noUpload.Copies) != 0 || len(noUpload.Failures) != 0 || noUpload.UploadStatus != "" {
+		t.Fatalf("no-upload provenance = %#v, want empty upload detail", noUpload)
+	}
+
+	otherBucket := &model.Bucket{Name: "other-provenance-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
+		t.Fatalf("other bucket: %v", err)
+	}
+	_, statusCode = getProvenance("other-provenance-bucket", versionID)
+	if statusCode != http.StatusNotFound {
+		t.Fatalf("wrong bucket provenance code = %d, want %d", statusCode, http.StatusNotFound)
+	}
+}
+
 func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	counter := &storageUploadSelectCounter{}
@@ -1799,6 +2021,10 @@ func readBody(t *testing.T, r io.Reader) string {
 		t.Fatalf("ReadAll: %v", err)
 	}
 	return string(data)
+}
+
+func testStringPtr(value string) *string {
+	return &value
 }
 
 func TestAPIBucket_DeleteReturnsNotImplemented(t *testing.T) {

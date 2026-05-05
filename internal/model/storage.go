@@ -102,6 +102,7 @@ type StorageUploadCopy struct {
 	Role                string                  `bun:",notnull"`
 	Status              StorageUploadCopyStatus `bun:",notnull,default:'pending'"`
 	RetrievalURL        *string                 `bun:",nullzero"`
+	IsNewDataSet        bool                    `bun:",notnull,default:false"`
 	StorageDataSetID    *int64                  `bun:",nullzero"`
 	CommitExtraDataHex  *string                 `bun:",nullzero"`
 	CommitTransactionID *string                 `bun:",nullzero"`

@@ -1391,6 +1391,17 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 	if copyRow.Status != model.StorageUploadCopyStatusFailed {
 		t.Fatalf("primary copy status = %s, want failed", copyRow.Status)
 	}
+	provenance, err := env.repos.Uploads.GetUploadProvenance(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance: %v", err)
+	}
+	if provenance == nil || len(provenance.Failures) != 1 {
+		t.Fatalf("provenance failures = %#v, want one primary failure", provenance)
+	}
+	failure := provenance.Failures[0]
+	if failure.ProviderID == nil || failure.ProviderID.String() != "101" || failure.Role != "primary" || failure.Stage == nil || *failure.Stage != "wait dataset" || failure.ErrorMessage == nil || *failure.ErrorMessage != "wait rejected: pdp: transaction rejected" {
+		t.Fatalf("failure = %#v, want provider 101 primary wait dataset failure", failure)
+	}
 }
 
 func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
@@ -2321,6 +2332,17 @@ func TestUploader_StagedPrimaryStoreTerminalFailureMarksUploadFailed(t *testing.
 	}
 	if copyRow.Status != model.StorageUploadCopyStatusFailed {
 		t.Fatalf("primary copy status = %s, want failed", copyRow.Status)
+	}
+	provenance, err := env.repos.Uploads.GetUploadProvenance(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance: %v", err)
+	}
+	if provenance == nil || len(provenance.Failures) != 1 {
+		t.Fatalf("provenance failures = %#v, want one primary failure", provenance)
+	}
+	failure := provenance.Failures[0]
+	if failure.ProviderID == nil || failure.ProviderID.String() != "101" || failure.Role != "primary" || failure.Stage == nil || *failure.Stage != "primary store" || failure.ErrorMessage == nil || *failure.ErrorMessage != "provider store failed" {
+		t.Fatalf("failure = %#v, want provider 101 primary store failure", failure)
 	}
 }
 
