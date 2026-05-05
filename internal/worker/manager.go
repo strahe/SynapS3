@@ -412,20 +412,3 @@ func (m *Manager) WorkerHealth() map[string]bool {
 	}
 	return health
 }
-
-// pollLoop is a helper that calls fn on a fixed interval until ctx is cancelled.
-func pollLoop(ctx context.Context, interval time.Duration, fn func(ctx context.Context) error) error {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := fn(ctx); err != nil {
-				slog.Error("poll iteration failed", "error", err)
-			}
-		}
-	}
-}

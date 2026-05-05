@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"log/slog"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/strahe/synaps3/internal/admin"
@@ -10,7 +12,6 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
-	"golang.org/x/sync/errgroup"
 )
 
 // Evictor claims evict_cache tasks and removes objects from local cache
@@ -25,6 +26,8 @@ type Evictor struct {
 	logger       *slog.Logger
 	*livenessTracker
 }
+
+const evictPollJitterDivisor = 5
 
 // NewEvictor creates a new cache evictor worker.
 func NewEvictor(repos *repository.Repositories, c cache.Cache, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Evictor {
@@ -43,32 +46,78 @@ func NewEvictor(repos *repository.Repositories, c cache.Cache, sm *state.Machine
 func (e *Evictor) Name() string { return "evictor" }
 
 func (e *Evictor) Run(ctx context.Context) error {
-	return pollLoop(ctx, e.pollInterval, e.tick)
-}
-
-func (e *Evictor) tick(ctx context.Context) error {
-	e.recordTick()
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(e.concurrency)
-
+	var wg sync.WaitGroup
 	for range e.concurrency {
-		task, err := e.repos.Tasks.ClaimPending(gctx, model.TaskTypeEvictCache, e.leaseTTL)
-		if err != nil {
-			e.logger.Error("claiming evict_cache task", "error", err)
-			break
-		}
-		if task == nil {
-			break
-		}
-
-		g.Go(func() error {
-			e.processTask(gctx, task)
-			return nil
-		})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.runSlot(ctx)
+		}()
 	}
 
-	err := g.Wait()
-	return err
+	wg.Wait()
+	return ctx.Err()
+}
+
+func (e *Evictor) runSlot(ctx context.Context) {
+	if !sleepUntilNextEvictPoll(ctx, e.pollInterval) {
+		return
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		e.recordTick()
+		task, err := e.repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, e.leaseTTL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			e.logger.Error("claiming evict_cache task", "error", err)
+			if !sleepUntilNextEvictPoll(ctx, e.pollInterval) {
+				return
+			}
+			continue
+		}
+		if task == nil {
+			if !sleepUntilNextEvictPoll(ctx, e.pollInterval) {
+				return
+			}
+			continue
+		}
+
+		e.recordWorkStarted()
+		func() {
+			defer e.recordWorkFinished()
+			e.processTask(ctx, task)
+		}()
+	}
+}
+
+func sleepUntilNextEvictPoll(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(evictPollSleepDuration(interval))
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func evictPollSleepDuration(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return interval
+	}
+
+	maxJitter := interval / evictPollJitterDivisor
+	if maxJitter <= 0 {
+		return interval
+	}
+	return interval + time.Duration(rand.Int63n(int64(maxJitter)+1))
 }
 
 // Healthy returns true if the worker has ticked recently.

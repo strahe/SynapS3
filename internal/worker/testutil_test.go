@@ -2,6 +2,7 @@ package worker_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/cache"
@@ -93,9 +94,9 @@ func acceptWorkerVersionUpload(t *testing.T, env *testWorkerEnv, versionID strin
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	providerID := onChainIDPtr(t, "101")
-	dataSetID := onChainIDPtr(t, "1001")
-	pieceID := onChainIDPtr(t, "1")
+	providerID := onChainIDPtr(t, strconv.FormatInt(100+upload.ID, 10))
+	dataSetID := onChainIDPtr(t, strconv.FormatInt(1000+upload.ID, 10))
+	pieceID := onChainIDPtr(t, strconv.FormatInt(2000+upload.ID, 10))
 	if err := env.repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
 		UploadID:        upload.ID,
 		Complete:        true,

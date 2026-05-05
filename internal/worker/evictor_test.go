@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +22,26 @@ func seedStoredObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, s
 	t.Helper()
 	ctx := context.Background()
 
-	bucket, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
+	versionID := model.NewVersionID()
+	bucket := &model.Bucket{Name: "b-" + strings.ToLower(versionID), Status: model.BucketStatusActive}
+	if err := env.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("creating bucket: %v", err)
+	}
+
+	version := &model.ObjectVersion{
+		VersionID:   versionID,
+		BucketID:    bucket.ID,
+		Key:         "hello-" + versionID + ".txt",
+		Size:        11,
+		ETag:        "etag-" + versionID,
+		Checksum:    "sha256-" + versionID,
+		ContentType: "text/plain",
+		CacheKey:    ".versions/" + versionID,
+	}
+	objID, err := env.repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("creating object version: %v", err)
+	}
 
 	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("transition to uploading: %v", err)
@@ -58,6 +78,102 @@ func TestEvictor_HappyPath(t *testing.T) {
 	}
 	if obj.InCache {
 		t.Error("expected object cache location to be false after successful eviction")
+	}
+}
+
+func TestEvictor_ClaimsLaterPendingTaskWhileAnotherEvictionRuns(t *testing.T) {
+	firstDeleteEntered := make(chan struct{})
+	releaseFirstDelete := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+
+	mc := &testutil.MockCache{}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	_, firstObjID, firstVersionID := seedStoredObject(t, env)
+	firstTask := seedTask(t, env, model.TaskTypeEvictCache, firstObjID, firstVersionID, 5, 0)
+	firstCacheKey := ".versions/" + firstVersionID
+	_, secondObjID, secondVersionID := seedStoredObject(t, env)
+
+	mc.DeleteFunc = func(ctx context.Context, _, key string) error {
+		if key == firstCacheKey {
+			enterOnce.Do(func() { close(firstDeleteEntered) })
+			select {
+			case <-releaseFirstDelete:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+
+	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 2, 20*time.Millisecond, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = evictor.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(releaseFirstDelete) })
+		cancel()
+		waitForSignal(t, done, time.Second, "evictor shutdown")
+	}()
+
+	waitForSignal(t, firstDeleteEntered, time.Second, "first eviction delete to start")
+
+	secondTask := seedTask(t, env, model.TaskTypeEvictCache, secondObjID, secondVersionID, 5, 0)
+
+	waitForTaskStatus(t, env, secondTask.ID, model.TaskStatusCompleted, 500*time.Millisecond)
+
+	got, err := env.repos.Tasks.GetByID(context.Background(), firstTask.ID)
+	if err != nil {
+		t.Fatalf("get first task: %v", err)
+	}
+	if got.Status != model.TaskStatusRunning {
+		t.Fatalf("first task status = %s, want running while second task completed", got.Status)
+	}
+}
+
+func TestEvictor_HealthyWhileEvictionTaskIsActive(t *testing.T) {
+	deleteEntered := make(chan struct{})
+	releaseDelete := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	pollInterval := 20 * time.Millisecond
+
+	mc := &testutil.MockCache{
+		DeleteFunc: func(ctx context.Context, _, _ string) error {
+			enterOnce.Do(func() { close(deleteEntered) })
+			select {
+			case <-releaseDelete:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	_, objID, versionID := seedStoredObject(t, env)
+	_ = seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+
+	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, pollInterval, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = evictor.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(releaseDelete) })
+		cancel()
+		waitForSignal(t, done, time.Second, "evictor shutdown")
+	}()
+
+	waitForSignal(t, deleteEntered, time.Second, "eviction delete to start")
+	time.Sleep(4 * pollInterval)
+
+	if !evictor.Healthy() {
+		t.Fatal("evictor should remain healthy while eviction task is active")
 	}
 }
 
