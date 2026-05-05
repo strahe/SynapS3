@@ -12,7 +12,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synapse-go/storage"
-	"github.com/strahe/synapse-go/types"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 func TestGetSubmittedCommitStatusTimesOutWhenProviderStalls(t *testing.T) {
@@ -43,7 +43,7 @@ func TestWaitForSubmittedCommitRejectsConfirmedWithoutPieces(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dataSetID := "1001"
+	dataSetID := onChainID(t, "1001")
 	u := &Uploader{}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -64,7 +64,7 @@ func TestWaitForSubmittedCommitHasGlobalTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dataSetID := "1001"
+	dataSetID := onChainID(t, "1001")
 	u := &Uploader{}
 	started := time.Now()
 	_, err := u.waitForSubmittedCommit(context.Background(), submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, "0xcommit", 1)
@@ -76,13 +76,35 @@ func TestWaitForSubmittedCommitHasGlobalTimeout(t *testing.T) {
 	}
 }
 
+func TestWaitForSubmittedCommitParsesBigIntStringIDsAndZeroPieceID(t *testing.T) {
+	dataSetID := "18446744073709551616"
+	pieceID := "18446744073709551617"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"txHash":"0xcommit","txStatus":"confirmed","dataSetId":"` + dataSetID + `","piecesAdded":true,"confirmedPieceIds":["0","` + pieceID + `"]}`))
+	}))
+	defer srv.Close()
+
+	bindingDataSetID := onChainID(t, dataSetID)
+	u := &Uploader{}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	result, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &bindingDataSetID}, "0xcommit", 2)
+	if err != nil {
+		t.Fatalf("waitForSubmittedCommit: %v", err)
+	}
+	if result.DataSetID.String() != dataSetID || len(result.PieceIDs) != 2 || result.PieceIDs[0].String() != "0" || result.PieceIDs[1].String() != pieceID {
+		t.Fatalf("commit result = %#v, want big data set and piece IDs", result)
+	}
+}
+
 type submittedCommitTestContext struct {
 	serviceURL string
 }
 
-func (c submittedCommitTestContext) ProviderID() types.ProviderID { return 0 }
+func (c submittedCommitTestContext) ProviderID() sdktypes.BigInt { return sdktypes.NewBigInt(0) }
 
-func (c submittedCommitTestContext) DataSetID() *types.DataSetID { return nil }
+func (c submittedCommitTestContext) DataSetID() *sdktypes.BigInt { return nil }
 
 func (c submittedCommitTestContext) PieceURL(cid.Cid) string { return "" }
 

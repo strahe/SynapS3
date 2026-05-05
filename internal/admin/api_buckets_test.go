@@ -150,18 +150,18 @@ func acceptAdminVersionUpload(t *testing.T, repos *repository.Repositories, vers
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	providerID := "101"
-	dataSetID := "dataset-" + versionID
-	pieceID := "1"
+	providerID := onChainIDPtr(t, "101")
+	dataSetID := onChainIDPtr(t, "1001")
+	pieceID := onChainIDPtr(t, "1")
 	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
 		UploadID:        upload.ID,
 		Complete:        true,
 		PieceCID:        &pieceCID,
 		RequestedCopies: 1,
 		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   &providerID,
-			DataSetID:    &dataSetID,
-			PieceID:      &pieceID,
+			ProviderID:   providerID,
+			DataSetID:    dataSetID,
+			PieceID:      pieceID,
 			Role:         "primary",
 			RetrievalURL: &retrievalURL,
 		}},
@@ -201,23 +201,23 @@ func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versio
 	if err != nil {
 		t.Fatalf("start partial upload attempt: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("primary dataset ready: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: "1002", ClientDataSetID: "9002"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
 		t.Fatalf("secondary dataset ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create upload copies: %v", err)
 	}
@@ -226,7 +226,7 @@ func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versio
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
-		PieceID:      "301",
+		PieceID:      onChainIDPtr(t, "301"),
 		RetrievalURL: "https://primary.example/piece/" + versionID,
 	}); err != nil {
 		t.Fatalf("primary committed: %v", err)
@@ -267,15 +267,15 @@ func markAdminStoredOnPrimaryUpload(t *testing.T, repos *repository.Repositories
 	if err != nil {
 		t.Fatalf("start stored-on-primary upload attempt: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("primary dataset ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("create upload copy: %v", err)
 	}

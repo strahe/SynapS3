@@ -93,18 +93,18 @@ func acceptWorkerVersionUpload(t *testing.T, env *testWorkerEnv, versionID strin
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	providerID := "101"
-	dataSetID := "dataset-" + versionID
-	pieceID := "1"
+	providerID := onChainIDPtr(t, "101")
+	dataSetID := onChainIDPtr(t, "1001")
+	pieceID := onChainIDPtr(t, "1")
 	if err := env.repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
 		UploadID:        upload.ID,
 		Complete:        true,
 		PieceCID:        &pieceCID,
 		RequestedCopies: 1,
 		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   &providerID,
-			DataSetID:    &dataSetID,
-			PieceID:      &pieceID,
+			ProviderID:   providerID,
+			DataSetID:    dataSetID,
+			PieceID:      pieceID,
 			Role:         "primary",
 			RetrievalURL: &retrievalURL,
 		}},

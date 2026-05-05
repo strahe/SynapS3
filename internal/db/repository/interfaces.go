@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
 )
 
@@ -131,16 +132,16 @@ type RecordUploadResultInput struct {
 }
 
 type StorageUploadCopyInput struct {
-	ProviderID   *string
-	DataSetID    *string
-	PieceID      *string
+	ProviderID   *types.OnChainID
+	DataSetID    *types.OnChainID
+	PieceID      *types.OnChainID
 	Role         string
 	RetrievalURL *string
 	IsNewDataSet bool
 }
 
 type StorageUploadFailureInput struct {
-	ProviderID   *string
+	ProviderID   *types.OnChainID
 	Role         string
 	Stage        *string
 	ErrorMessage *string
@@ -148,19 +149,19 @@ type StorageUploadFailureInput struct {
 }
 
 type ReadableStorageCopy struct {
-	UploadID     int64  `bun:"upload_id"`
-	PieceCID     string `bun:"piece_cid"`
-	CopyIndex    int    `bun:"copy_index"`
-	ProviderID   string `bun:"provider_id"`
-	DataSetID    string `bun:"data_set_id"`
-	PieceID      string `bun:"piece_id"`
-	Role         string `bun:"role"`
-	RetrievalURL string `bun:"retrieval_url"`
+	UploadID     int64           `bun:"upload_id"`
+	PieceCID     string          `bun:"piece_cid"`
+	CopyIndex    int             `bun:"copy_index"`
+	ProviderID   types.OnChainID `bun:"provider_id"`
+	DataSetID    types.OnChainID `bun:"data_set_id"`
+	PieceID      types.OnChainID `bun:"piece_id"`
+	Role         string          `bun:"role"`
+	RetrievalURL string          `bun:"retrieval_url"`
 }
 
 type EnsureDataSetBindingInput struct {
 	BucketID          int64
-	ProviderID        string
+	ProviderID        types.OnChainID
 	CopyIndex         int
 	CreatedByUploadID int64
 }
@@ -170,28 +171,28 @@ type MarkDataSetCreatingInput struct {
 	UploadID        int64
 	TransactionID   string
 	StatusURL       string
-	ClientDataSetID string
+	ClientDataSetID *types.OnChainID
 }
 
 type MarkDataSetReadyInput struct {
 	ID              int64
 	UploadID        int64
-	DataSetID       string
-	ClientDataSetID string
+	DataSetID       types.OnChainID
+	ClientDataSetID *types.OnChainID
 }
 
 type UploadCopyBindingInput struct {
 	StorageDataSetID int64
 	CopyIndex        int
 	Role             string
-	ProviderID       string
+	ProviderID       types.OnChainID
 }
 
 type MarkUploadCopyPieceReadyInput struct {
 	UploadID     int64
 	CopyIndex    int
 	PieceCID     string
-	PieceID      string
+	PieceID      *types.OnChainID
 	RetrievalURL string
 }
 
@@ -206,7 +207,7 @@ type MarkUploadCopyCommittedInput struct {
 	UploadID            int64
 	CopyIndex           int
 	PieceCID            string
-	PieceID             string
+	PieceID             *types.OnChainID
 	RetrievalURL        string
 	CommitExtraDataHex  string
 	CommitTransactionID string

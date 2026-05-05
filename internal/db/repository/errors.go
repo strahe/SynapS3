@@ -13,6 +13,9 @@ var ErrAlreadyExists = errors.New("already exists")
 // ErrNotFound is returned when a CAS update matches zero rows (entity missing or wrong state).
 var ErrNotFound = errors.New("not found")
 
+// ErrInvalidInput is returned when repository input fails validation.
+var ErrInvalidInput = errors.New("invalid input")
+
 var errConcurrentObjectCreate = errors.New("concurrent object create")
 
 // isUniqueViolation detects unique constraint violations for both PostgreSQL and SQLite.

@@ -41,9 +41,9 @@ func testCID(t *testing.T) cid.Cid {
 
 func validUploadCopy(retrievalURL string) storage.CopyResult {
 	return storage.CopyResult{
-		ProviderID:   sdktypes.ProviderID(101),
-		DataSetID:    sdktypes.DataSetID(123),
-		PieceID:      sdktypes.PieceID(2001),
+		ProviderID:   sdktypes.NewBigInt(101),
+		DataSetID:    sdktypes.NewBigInt(123),
+		PieceID:      sdktypes.NewBigInt(2001),
 		Role:         storage.CopyRolePrimary,
 		RetrievalURL: retrievalURL,
 	}
@@ -308,9 +308,9 @@ func uploadResultForCall(t *testing.T, call int32) *storage.UploadResult {
 		Size:     11,
 		Complete: true,
 		Copies: []storage.CopyResult{{
-			ProviderID:   sdktypes.ProviderID(id),
-			DataSetID:    sdktypes.DataSetID(id),
-			PieceID:      sdktypes.PieceID(id),
+			ProviderID:   sdktypes.NewBigInt(id),
+			DataSetID:    sdktypes.NewBigInt(id),
+			PieceID:      sdktypes.NewBigInt(id),
 			Role:         storage.CopyRolePrimary,
 			RetrievalURL: fmt.Sprintf("https://provider.example/pieces/%d", call),
 		}},
@@ -318,12 +318,12 @@ func uploadResultForCall(t *testing.T, call int32) *storage.UploadResult {
 }
 
 type fakeUploadContext struct {
-	providerID   sdktypes.ProviderID
-	dataSetID    sdktypes.DataSetID
-	boundDataSet *sdktypes.DataSetID
-	pieceID      sdktypes.PieceID
+	providerID   sdktypes.BigInt
+	dataSetID    sdktypes.BigInt
+	boundDataSet *sdktypes.BigInt
+	pieceID      sdktypes.BigInt
 	pieceCID     cid.Cid
-	clientDataID *big.Int
+	clientDataID sdktypes.BigInt
 	pullEntered  chan struct{}
 	releasePull  chan struct{}
 	pullOnce     sync.Once
@@ -341,35 +341,36 @@ type fakeUploadContext struct {
 	commitExtras [][]byte
 }
 
-func newFakeUploadContext(providerID sdktypes.ProviderID, dataSetID sdktypes.DataSetID, pieceID sdktypes.PieceID, pieceCID cid.Cid) *fakeUploadContext {
+func newFakeUploadContext(providerID sdktypes.BigInt, dataSetID sdktypes.BigInt, pieceID sdktypes.BigInt, pieceCID cid.Cid) *fakeUploadContext {
+	dataSetUint64, _ := dataSetID.Uint64()
 	return &fakeUploadContext{
 		providerID:   providerID,
 		dataSetID:    dataSetID,
 		pieceID:      pieceID,
 		pieceCID:     pieceCID,
-		clientDataID: big.NewInt(int64(dataSetID + 10000)),
+		clientDataID: sdktypes.NewBigInt(dataSetUint64 + 10000),
 	}
 }
 
-func (f *fakeUploadContext) ProviderID() sdktypes.ProviderID { return f.providerID }
+func (f *fakeUploadContext) ProviderID() sdktypes.BigInt { return f.providerID.Copy() }
 
-func (f *fakeUploadContext) DataSetID() *sdktypes.DataSetID {
+func (f *fakeUploadContext) DataSetID() *sdktypes.BigInt {
 	if f.boundDataSet == nil {
 		return nil
 	}
-	id := *f.boundDataSet
+	id := f.boundDataSet.Copy()
 	return &id
 }
 
 func (f *fakeUploadContext) PieceURL(piece cid.Cid) string {
-	return fmt.Sprintf("https://provider-%d.example/piece/%s", f.providerID, piece.String())
+	return fmt.Sprintf("https://provider-%s.example/piece/%s", f.providerID.String(), piece.String())
 }
 
 func (f *fakeUploadContext) ServiceURL() string {
 	if f.serviceURL != "" {
 		return f.serviceURL
 	}
-	return fmt.Sprintf("https://provider-%d.example", f.providerID)
+	return fmt.Sprintf("https://provider-%s.example", f.providerID.String())
 }
 
 func (f *fakeUploadContext) CreateDataSet(_ context.Context, opts *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
@@ -377,9 +378,9 @@ func (f *fakeUploadContext) CreateDataSet(_ context.Context, opts *storage.Creat
 		f.createCalls.Add(1)
 	}
 	submission := storage.CreateDataSetSubmission{
-		TransactionID:   fmt.Sprintf("0xcreate%x", uint64(f.dataSetID)),
-		StatusURL:       fmt.Sprintf("https://provider-%d.example/status/create", f.providerID),
-		ClientDataSetID: new(big.Int).Set(f.clientDataID),
+		TransactionID:   fmt.Sprintf("0xcreate%s", f.dataSetID.String()),
+		StatusURL:       fmt.Sprintf("https://provider-%s.example/status/create", f.providerID.String()),
+		ClientDataSetID: sdkBigIntTestPtr(f.clientDataID),
 	}
 	if opts != nil && opts.OnSubmitted != nil {
 		opts.OnSubmitted(submission)
@@ -389,8 +390,8 @@ func (f *fakeUploadContext) CreateDataSet(_ context.Context, opts *storage.Creat
 	}
 	return &storage.CreateDataSetResult{
 		TransactionID:   submission.TransactionID,
-		DataSetID:       f.dataSetID,
-		ClientDataSetID: new(big.Int).Set(f.clientDataID),
+		DataSetID:       f.dataSetID.Copy(),
+		ClientDataSetID: f.clientDataID.Copy(),
 	}, nil
 }
 
@@ -403,8 +404,8 @@ func (f *fakeUploadContext) WaitForDataSetCreated(_ context.Context, submission 
 	}
 	return &storage.CreateDataSetResult{
 		TransactionID:   submission.TransactionID,
-		DataSetID:       f.dataSetID,
-		ClientDataSetID: new(big.Int).Set(submission.ClientDataSetID),
+		DataSetID:       f.dataSetID.Copy(),
+		ClientDataSetID: submission.ClientDataSetID.Copy(),
 	}, nil
 }
 
@@ -420,7 +421,7 @@ func (f *fakeUploadContext) Store(_ context.Context, r io.Reader, _ *storage.Sto
 
 func (f *fakeUploadContext) PresignForCommit(_ context.Context, _ []storage.PieceInput) ([]byte, error) {
 	f.presignCalls.Add(1)
-	return []byte(fmt.Sprintf("extra-%d", f.providerID)), nil
+	return []byte(fmt.Sprintf("extra-%s", f.providerID.String())), nil
 }
 
 func (f *fakeUploadContext) Pull(ctx context.Context, _ storage.PullRequest) (*storage.PullResult, error) {
@@ -445,17 +446,23 @@ func (f *fakeUploadContext) Commit(_ context.Context, req storage.CommitRequest)
 	f.commitMu.Lock()
 	f.commitExtras = append(f.commitExtras, append([]byte(nil), req.ExtraData...))
 	f.commitMu.Unlock()
+	pieceID, _ := f.pieceID.Uint64()
 	if req.OnSubmitted != nil {
-		req.OnSubmitted(fmt.Sprintf("0xcommit%x", uint64(f.pieceID)))
+		req.OnSubmitted(fmt.Sprintf("0xcommit%x", pieceID))
 	}
 	if f.commitErr != nil {
 		return nil, f.commitErr
 	}
 	return &storage.CommitResult{
-		TransactionID: fmt.Sprintf("0xcommit%x", uint64(f.pieceID)),
-		DataSetID:     f.dataSetID,
-		PieceIDs:      []sdktypes.PieceID{f.pieceID},
+		TransactionID: fmt.Sprintf("0xcommit%x", pieceID),
+		DataSetID:     f.dataSetID.Copy(),
+		PieceIDs:      []sdktypes.BigInt{f.pieceID.Copy()},
 	}, nil
+}
+
+func sdkBigIntTestPtr(id sdktypes.BigInt) *sdktypes.BigInt {
+	cp := id.Copy()
+	return &cp
 }
 
 func TestUploader_WaitsPollIntervalBeforeInitialClaim(t *testing.T) {
@@ -604,20 +611,20 @@ func TestUploader_HappyPath(t *testing.T) {
 			Copies: []storage.CopyResult{
 				{
 					Role:       storage.CopyRoleSecondary,
-					ProviderID: sdktypes.ProviderID(202),
-					DataSetID:  sdktypes.DataSetID(777),
-					PieceID:    sdktypes.PieceID(3001),
+					ProviderID: sdktypes.NewBigInt(202),
+					DataSetID:  sdktypes.NewBigInt(777),
+					PieceID:    sdktypes.NewBigInt(3001),
 				},
 				{
-					ProviderID:   sdktypes.ProviderID(101),
+					ProviderID:   sdktypes.NewBigInt(101),
 					Role:         storage.CopyRolePrimary,
-					DataSetID:    sdktypes.DataSetID(123),
-					PieceID:      sdktypes.PieceID(2001),
+					DataSetID:    sdktypes.NewBigInt(123),
+					PieceID:      sdktypes.NewBigInt(2001),
 					RetrievalURL: "https://provider.example/pieces/1",
 				},
 			},
 			FailedAttempts: []storage.FailedAttempt{{
-				ProviderID: sdktypes.ProviderID(303),
+				ProviderID: sdktypes.NewBigInt(303),
 				Role:       storage.CopyRoleSecondary,
 				Stage:      storage.CopyStagePull,
 				Err:        errors.New("pull timeout"),
@@ -672,17 +679,17 @@ func TestUploader_HappyPath(t *testing.T) {
 			secondary = &copies[i]
 		}
 	}
-	if primary == nil || primary.ProviderID == nil || *primary.ProviderID != "101" || primary.DataSetID == nil || *primary.DataSetID != "123" || primary.PieceID == nil || *primary.PieceID != "2001" || primary.RetrievalURL == nil || *primary.RetrievalURL != "https://provider.example/pieces/1" {
+	if primary == nil || onChainIDPtrString(primary.ProviderID) != "101" || onChainIDPtrString(primary.DataSetID) != "123" || onChainIDPtrString(primary.PieceID) != "2001" || primary.RetrievalURL == nil || *primary.RetrievalURL != "https://provider.example/pieces/1" {
 		t.Fatalf("primary copy = %#v, want persisted provider/data set/piece/retrieval URL", primary)
 	}
-	if secondary == nil || secondary.ProviderID == nil || *secondary.ProviderID != "202" || secondary.DataSetID == nil || *secondary.DataSetID != "777" || secondary.PieceID == nil || *secondary.PieceID != "3001" {
+	if secondary == nil || onChainIDPtrString(secondary.ProviderID) != "202" || onChainIDPtrString(secondary.DataSetID) != "777" || onChainIDPtrString(secondary.PieceID) != "3001" {
 		t.Fatalf("secondary copy = %#v, want independent provider/data set/piece", secondary)
 	}
 	var failures []model.StorageUploadFailure
 	if err := env.db.NewSelect().Model(&failures).Where("upload_id = ?", *obj.StorageUploadID).Scan(ctx); err != nil {
 		t.Fatalf("list upload failures: %v", err)
 	}
-	if len(failures) != 1 || failures[0].ProviderID == nil || *failures[0].ProviderID != "303" || failures[0].Stage == nil || *failures[0].Stage != string(storage.CopyStagePull) || failures[0].ErrorMessage == nil || *failures[0].ErrorMessage != "pull timeout" || !failures[0].Explicit {
+	if len(failures) != 1 || onChainIDPtrString(failures[0].ProviderID) != "303" || failures[0].Stage == nil || *failures[0].Stage != string(storage.CopyStagePull) || failures[0].ErrorMessage == nil || *failures[0].ErrorMessage != "pull timeout" || !failures[0].Explicit {
 		t.Fatalf("upload failures = %#v, want persisted failed attempt", failures)
 	}
 	// With autoEvict=true, an evict_cache task should be created
@@ -711,17 +718,17 @@ func TestUploader_StagedPrimaryCommitMovesObjectToReplicatingAndEnqueuesEviction
 	secondaryPullEntered := make(chan struct{})
 	releaseSecondaryPull := make(chan struct{})
 
-	primary := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), pieceCID)
-	secondary := newFakeUploadContext(sdktypes.ProviderID(202), sdktypes.DataSetID(2002), sdktypes.PieceID(3001), pieceCID)
+	primary := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
+	secondary := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), pieceCID)
 	secondary.pullEntered = secondaryPullEntered
 	secondary.releasePull = releaseSecondaryPull
-	contextsByProvider := map[sdktypes.ProviderID]*fakeUploadContext{
-		primary.providerID:   primary,
-		secondary.providerID: secondary,
+	contextsByProvider := map[string]*fakeUploadContext{
+		primary.providerID.String():   primary,
+		secondary.providerID.String(): secondary,
 	}
-	contextsByDataSet := map[sdktypes.DataSetID]*fakeUploadContext{
-		primary.dataSetID:   primary,
-		secondary.dataSetID: secondary,
+	contextsByDataSet := map[string]*fakeUploadContext{
+		primary.dataSetID.String():   primary,
+		secondary.dataSetID.String(): secondary,
 	}
 
 	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
@@ -732,10 +739,10 @@ func TestUploader_StagedPrimaryCommitMovesObjectToReplicatingAndEnqueuesEviction
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
 		if len(opts.ProviderIDs) == 1 {
-			return contextsByProvider[opts.ProviderIDs[0]], nil
+			return contextsByProvider[opts.ProviderIDs[0].String()], nil
 		}
 		if len(opts.DataSetIDs) == 1 {
-			return contextsByDataSet[opts.DataSetIDs[0]], nil
+			return contextsByDataSet[opts.DataSetIDs[0].String()], nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
@@ -812,8 +819,8 @@ func TestUploader_EmptyPayloadStartsStagedPrepare(t *testing.T) {
 			t.Fatalf("CreateContexts copies = %d, want 2", opts.Copies)
 		}
 		return []synapse.UploadContext{
-			newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t)),
-			newFakeUploadContext(sdktypes.ProviderID(202), sdktypes.DataSetID(2002), sdktypes.PieceID(3001), testCID(t)),
+			newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t)),
+			newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), testCID(t)),
 		}, nil
 	}
 
@@ -868,9 +875,9 @@ func TestUploader_StagedPrepareUsesConfiguredCopyCount(t *testing.T) {
 			t.Fatalf("CreateContexts copies = %d, want 3", opts.Copies)
 		}
 		return []synapse.UploadContext{
-			newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t)),
-			newFakeUploadContext(sdktypes.ProviderID(202), sdktypes.DataSetID(2002), sdktypes.PieceID(3001), testCID(t)),
-			newFakeUploadContext(sdktypes.ProviderID(303), sdktypes.DataSetID(3003), sdktypes.PieceID(4001), testCID(t)),
+			newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t)),
+			newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), testCID(t)),
+			newFakeUploadContext(sdktypes.NewBigInt(303), sdktypes.NewBigInt(3003), sdktypes.NewBigInt(4001), testCID(t)),
 		}, nil
 	}
 
@@ -906,9 +913,9 @@ func TestUploader_StagedPrepareCapsConfiguredCopyCount(t *testing.T) {
 		contexts := make([]synapse.UploadContext, 0, opts.Copies)
 		for i := 0; i < opts.Copies; i++ {
 			contexts = append(contexts, newFakeUploadContext(
-				sdktypes.ProviderID(100+i),
-				sdktypes.DataSetID(1000+i),
-				sdktypes.PieceID(2000+i),
+				sdktypes.NewBigInt(uint64(100+i)),
+				sdktypes.NewBigInt(uint64(1000+i)),
+				sdktypes.NewBigInt(uint64(2000+i)),
 				testCID(t),
 			))
 		}
@@ -957,7 +964,7 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 	}
 	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -965,7 +972,7 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -989,12 +996,12 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 	}
 
 	var createCalls atomic.Int32
-	existingID := sdktypes.DataSetID(13236)
-	providerCtx := newFakeUploadContext(sdktypes.ProviderID(101), existingID, sdktypes.PieceID(2001), testCID(t))
+	existingID := sdktypes.NewBigInt(13236)
+	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), existingID, sdktypes.NewBigInt(2001), testCID(t))
 	providerCtx.boundDataSet = &existingID
 	providerCtx.createCalls = &createCalls
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0] == sdktypes.ProviderID(101) {
+		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1010,7 +1017,7 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 	if err != nil || gotBinding == nil {
 		t.Fatalf("GetDataSetBindingByCopyIndex: binding=%v err=%v", gotBinding, err)
 	}
-	if gotBinding.Status != model.StorageDataSetStatusReady || gotBinding.DataSetID == nil || *gotBinding.DataSetID != "13236" {
+	if gotBinding.Status != model.StorageDataSetStatusReady || onChainIDPtrString(gotBinding.DataSetID) != "13236" {
 		t.Fatalf("binding after ensure = status:%s dataSet:%v, want ready/13236", gotBinding.Status, gotBinding.DataSetID)
 	}
 }
@@ -1037,7 +1044,7 @@ func TestUploader_EnsureDatasetSubmittedCreateErrorResumesWait(t *testing.T) {
 	}
 	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -1045,7 +1052,7 @@ func TestUploader_EnsureDatasetSubmittedCreateErrorResumesWait(t *testing.T) {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -1068,12 +1075,12 @@ func TestUploader_EnsureDatasetSubmittedCreateErrorResumesWait(t *testing.T) {
 
 	var createCalls atomic.Int32
 	var waitCalls atomic.Int32
-	providerCtx := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t))
+	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	providerCtx.createCalls = &createCalls
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.createErr = errors.New("create status poll timeout")
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0] == sdktypes.ProviderID(101) {
+		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1106,7 +1113,7 @@ func TestUploader_EnsureDatasetSubmittedCreateErrorResumesWait(t *testing.T) {
 	if err != nil || gotBinding == nil {
 		t.Fatalf("GetDataSetBindingByCopyIndex after retry: binding=%v err=%v", gotBinding, err)
 	}
-	if gotBinding.Status != model.StorageDataSetStatusReady || gotBinding.DataSetID == nil || *gotBinding.DataSetID != "1001" {
+	if gotBinding.Status != model.StorageDataSetStatusReady || onChainIDPtrString(gotBinding.DataSetID) != "1001" {
 		t.Fatalf("binding after retry = %#v, want ready dataset 1001", gotBinding)
 	}
 }
@@ -1133,7 +1140,7 @@ func TestUploader_EnsureDatasetCreatingWaitErrorKeepsSubmission(t *testing.T) {
 	}
 	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -1145,12 +1152,12 @@ func TestUploader_EnsureDatasetCreatingWaitErrorKeepsSubmission(t *testing.T) {
 		UploadID:        upload.ID,
 		TransactionID:   "0xcreate3e9",
 		StatusURL:       "https://provider.example/status/create",
-		ClientDataSetID: "11001",
+		ClientDataSetID: onChainIDPtr(t, "11001"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetCreating: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -1173,12 +1180,12 @@ func TestUploader_EnsureDatasetCreatingWaitErrorKeepsSubmission(t *testing.T) {
 
 	var createCalls atomic.Int32
 	var waitCalls atomic.Int32
-	providerCtx := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t))
+	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	providerCtx.createCalls = &createCalls
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.waitErr = errors.New("create status poll timeout")
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0] == sdktypes.ProviderID(101) {
+		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1224,7 +1231,7 @@ func TestUploader_EnsureDatasetCreatingRejectedMarksBindingFailed(t *testing.T) 
 	}
 	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -1236,12 +1243,12 @@ func TestUploader_EnsureDatasetCreatingRejectedMarksBindingFailed(t *testing.T) 
 		UploadID:        upload.ID,
 		TransactionID:   "0xcreate3e9",
 		StatusURL:       "https://provider.example/status/create",
-		ClientDataSetID: "11001",
+		ClientDataSetID: onChainIDPtr(t, "11001"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetCreating: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -1264,12 +1271,12 @@ func TestUploader_EnsureDatasetCreatingRejectedMarksBindingFailed(t *testing.T) 
 
 	var createCalls atomic.Int32
 	var waitCalls atomic.Int32
-	providerCtx := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t))
+	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	providerCtx.createCalls = &createCalls
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0] == sdktypes.ProviderID(101) {
+		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1312,7 +1319,7 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 	}
 	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -1324,12 +1331,12 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 		UploadID:        upload.ID,
 		TransactionID:   "0xcreate3e9",
 		StatusURL:       "https://provider.example/status/create",
-		ClientDataSetID: "11001",
+		ClientDataSetID: onChainIDPtr(t, "11001"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetCreating: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -1350,10 +1357,10 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 		t.Fatalf("create ensure task: %v", err)
 	}
 
-	providerCtx := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t))
+	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	providerCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0] == sdktypes.ProviderID(101) {
+		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1411,7 +1418,7 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	}
 	primary, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -1421,13 +1428,13 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:              primary.ID,
 		UploadID:        upload.ID,
-		DataSetID:       "1001",
-		ClientDataSetID: "9001",
+		DataSetID:       onChainID(t, "1001"),
+		ClientDataSetID: onChainIDPtr(t, "9001"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -1456,10 +1463,10 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("create primary commit task: %v", err)
 	}
-	primaryCtx := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), pieceCID)
+	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
 	primaryCtx.commitErr = errors.New("commit status poll timeout")
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0] == sdktypes.DataSetID(1001) {
+		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1536,26 +1543,26 @@ func TestUploader_SecondaryFailureLeavesObjectReplicatingAndUploadPartial(t *tes
 	_ = seedStagedUploadTask(t, env, objID, versionID, 1)
 
 	pieceCID := testCID(t)
-	primary := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), pieceCID)
-	secondary := newFakeUploadContext(sdktypes.ProviderID(202), sdktypes.DataSetID(2002), sdktypes.PieceID(3001), pieceCID)
+	primary := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
+	secondary := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), pieceCID)
 	secondary.pullErr = errors.New("provider pull failed")
-	contextsByProvider := map[sdktypes.ProviderID]*fakeUploadContext{
-		primary.providerID:   primary,
-		secondary.providerID: secondary,
+	contextsByProvider := map[string]*fakeUploadContext{
+		primary.providerID.String():   primary,
+		secondary.providerID.String(): secondary,
 	}
-	contextsByDataSet := map[sdktypes.DataSetID]*fakeUploadContext{
-		primary.dataSetID:   primary,
-		secondary.dataSetID: secondary,
+	contextsByDataSet := map[string]*fakeUploadContext{
+		primary.dataSetID.String():   primary,
+		secondary.dataSetID.String(): secondary,
 	}
 	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
 		return []synapse.UploadContext{primary, secondary}, nil
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
 		if len(opts.ProviderIDs) == 1 {
-			return contextsByProvider[opts.ProviderIDs[0]], nil
+			return contextsByProvider[opts.ProviderIDs[0].String()], nil
 		}
 		if len(opts.DataSetIDs) == 1 {
-			return contextsByDataSet[opts.DataSetIDs[0]], nil
+			return contextsByDataSet[opts.DataSetIDs[0].String()], nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
@@ -1839,9 +1846,9 @@ func TestUploader_CompleteResultWithoutRetrievalURLDoesNotBindObject(t *testing.
 			RequestedCopies: 1,
 			Complete:        true,
 			Copies: []storage.CopyResult{{
-				ProviderID: sdktypes.ProviderID(101),
-				DataSetID:  sdktypes.DataSetID(123),
-				PieceID:    sdktypes.PieceID(2001),
+				ProviderID: sdktypes.NewBigInt(101),
+				DataSetID:  sdktypes.NewBigInt(123),
+				PieceID:    sdktypes.NewBigInt(2001),
 				Role:       storage.CopyRolePrimary,
 			}},
 		}, nil
@@ -1870,7 +1877,7 @@ func TestUploader_CompleteResultWithoutRetrievalURLDoesNotBindObject(t *testing.
 	}
 }
 
-func TestUploader_CompleteResultWithZeroCopyIdentifiersDoesNotBindObject(t *testing.T) {
+func TestUploader_CompleteResultWithZeroProviderAndDataSetStoresZeroPieceIDWithoutBindingObject(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 1, 0)
@@ -1907,8 +1914,8 @@ func TestUploader_CompleteResultWithZeroCopyIdentifiersDoesNotBindObject(t *test
 	if err := env.db.NewSelect().Model(&copies).Where("upload_id IN (SELECT id FROM storage_uploads WHERE source_version_id = ?)", versionID).Scan(ctx); err != nil {
 		t.Fatalf("list storage upload copies: %v", err)
 	}
-	if len(copies) != 1 || copies[0].ProviderID != nil || copies[0].DataSetID != nil || copies[0].PieceID != nil {
-		t.Fatalf("copy identifiers = %#v, want zero IDs stored as missing", copies)
+	if len(copies) != 1 || copies[0].ProviderID != nil || copies[0].DataSetID != nil || onChainIDPtrString(copies[0].PieceID) != "0" {
+		t.Fatalf("copy identifiers = %#v, want missing provider/data set and piece ID 0", copies)
 	}
 	var uploads []model.StorageUpload
 	if err := env.db.NewSelect().Model(&uploads).Where("source_version_id = ?", versionID).Scan(ctx); err != nil {
@@ -1938,9 +1945,9 @@ func TestUploader_AcceptFailureRetryDoesNotUploadAgain(t *testing.T) {
 			RequestedCopies: 1,
 			Complete:        true,
 			Copies: []storage.CopyResult{{
-				ProviderID:   sdktypes.ProviderID(101),
-				DataSetID:    sdktypes.DataSetID(123),
-				PieceID:      sdktypes.PieceID(2001),
+				ProviderID:   sdktypes.NewBigInt(101),
+				DataSetID:    sdktypes.NewBigInt(123),
+				PieceID:      sdktypes.NewBigInt(2001),
 				Role:         storage.CopyRolePrimary,
 				RetrievalURL: "https://provider.example/pieces/1",
 			}},
@@ -2155,7 +2162,7 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 	}
 	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -2165,13 +2172,13 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:              binding.ID,
 		UploadID:        upload.ID,
-		DataSetID:       "1001",
-		ClientDataSetID: "11001",
+		DataSetID:       onChainID(t, "1001"),
+		ClientDataSetID: onChainIDPtr(t, "11001"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -2191,11 +2198,11 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("create primary store task: %v", err)
 	}
-	primaryCtx := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t))
-	dataSetID := sdktypes.DataSetID(1001)
+	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
+	dataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &dataSetID
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0] == sdktypes.DataSetID(1001) {
+		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -2243,7 +2250,7 @@ func TestUploader_StagedPrimaryStoreTerminalFailureMarksUploadFailed(t *testing.
 	}
 	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -2253,13 +2260,13 @@ func TestUploader_StagedPrimaryStoreTerminalFailureMarksUploadFailed(t *testing.
 	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:              binding.ID,
 		UploadID:        upload.ID,
-		DataSetID:       "1001",
-		ClientDataSetID: "11001",
+		DataSetID:       onChainID(t, "1001"),
+		ClientDataSetID: onChainIDPtr(t, "11001"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -2279,12 +2286,12 @@ func TestUploader_StagedPrimaryStoreTerminalFailureMarksUploadFailed(t *testing.
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("create primary store task: %v", err)
 	}
-	primaryCtx := newFakeUploadContext(sdktypes.ProviderID(101), sdktypes.DataSetID(1001), sdktypes.PieceID(2001), testCID(t))
+	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	primaryCtx.storeErr = errors.New("provider store failed")
-	dataSetID := sdktypes.DataSetID(1001)
+	dataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &dataSetID
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0] == sdktypes.DataSetID(1001) {
+		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)

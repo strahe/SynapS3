@@ -7,6 +7,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/migrate"
@@ -37,6 +38,21 @@ func testDB(t *testing.T) *bun.DB {
 	}
 
 	return db
+}
+
+func onChainID(t *testing.T, value string) types.OnChainID {
+	t.Helper()
+	id, err := types.ParseOnChainID("test id", value)
+	if err != nil {
+		t.Fatalf("parse on-chain id %q: %v", value, err)
+	}
+	return id
+}
+
+func onChainIDPtr(t *testing.T, value string) *types.OnChainID {
+	t.Helper()
+	id := onChainID(t, value)
+	return &id
 }
 
 // seedBucket inserts a bucket and returns it.

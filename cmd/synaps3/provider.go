@@ -246,7 +246,7 @@ func outputTable(providers []provider.ProviderDetail) error {
 			health = p.HealthStatus
 		}
 
-		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			p.ID, p.Name, active, serviceURL, location, health, minPiece, maxPiece)
 	}
 

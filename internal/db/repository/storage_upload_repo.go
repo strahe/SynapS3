@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 )
 
@@ -184,7 +185,7 @@ func (r *BunStorageUploadRepo) MarkDataSetCreating(ctx context.Context, input Ma
 		Set("status = ?", model.StorageDataSetStatusCreating).
 		Set("create_transaction_id = ?", nullableString(input.TransactionID)).
 		Set("create_status_url = ?", nullableString(input.StatusURL)).
-		Set("client_data_set_id = ?", nullableString(input.ClientDataSetID)).
+		Set("client_data_set_id = ?", input.ClientDataSetID).
 		Set("last_used_upload_id = ?", nullableInt64(input.UploadID)).
 		Set("last_error = NULL").
 		Set("updated_at = ?", now).
@@ -219,11 +220,14 @@ func (r *BunStorageUploadRepo) MarkDataSetFailed(ctx context.Context, id int64, 
 func (r *BunStorageUploadRepo) CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		for _, input := range copies {
+			if input.ProviderID.IsZero() {
+				return fmt.Errorf("providerID is required: %w", ErrInvalidInput)
+			}
 			providerID := input.ProviderID
 			copyRow := &model.StorageUploadCopy{
 				UploadID:         uploadID,
 				CopyIndex:        input.CopyIndex,
-				ProviderID:       nullableString(providerID),
+				ProviderID:       &providerID,
 				Role:             input.Role,
 				Status:           model.StorageUploadCopyStatusPending,
 				StorageDataSetID: &input.StorageDataSetID,
@@ -269,7 +273,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 		res, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusPieceReady).
-			Set("piece_id = COALESCE(?, piece_id)", nullableString(input.PieceID)).
+			Set("piece_id = COALESCE(?, piece_id)", input.PieceID).
 			Set("retrieval_url = COALESCE(?, retrieval_url)", nullableString(input.RetrievalURL)).
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
@@ -314,7 +318,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 		_, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusCommitted).
-			Set("piece_id = COALESCE(?, piece_id)", nullableString(input.PieceID)).
+			Set("piece_id = COALESCE(?, piece_id)", input.PieceID).
 			Set("retrieval_url = COALESCE(?, retrieval_url)", nullableString(input.RetrievalURL)).
 			Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
 			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
@@ -645,14 +649,14 @@ func (r *BunStorageUploadRepo) RecordUploadResult(ctx context.Context, input Rec
 			if !conflicted && bindableCopy(copyInput) {
 				binding, err := ensureDataSetBinding(ctx, db, EnsureDataSetBindingInput{
 					BucketID:          upload.BucketID,
-					ProviderID:        derefString(copyInput.ProviderID),
+					ProviderID:        *copyInput.ProviderID,
 					CopyIndex:         i,
 					CreatedByUploadID: upload.ID,
 				})
 				if err != nil {
 					return err
 				}
-				if err := markDataSetReady(ctx, db, binding.ID, upload.ID, derefString(copyInput.DataSetID), ""); err != nil {
+				if err := markDataSetReady(ctx, db, binding.ID, upload.ID, *copyInput.DataSetID, nil); err != nil {
 					if errors.Is(err, ErrAlreadyExists) {
 						conflicted = true
 						break
@@ -660,7 +664,7 @@ func (r *BunStorageUploadRepo) RecordUploadResult(ctx context.Context, input Rec
 					return err
 				}
 				storageDataSetID = &binding.ID
-				if copyInput.PieceID != nil && *copyInput.PieceID != "" {
+				if copyInput.PieceID != nil {
 					status = model.StorageUploadCopyStatusCommitted
 				}
 				if usableCopy(copyInput) {
@@ -860,8 +864,8 @@ func (r *BunStorageUploadRepo) findActiveUploadBySourceVersion(ctx context.Conte
 }
 
 func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBindingInput) (*model.StorageDataSet, error) {
-	if input.BucketID == 0 || input.ProviderID == "" || input.CopyIndex < 0 {
-		return nil, fmt.Errorf("invalid storage data set binding input: %w", ErrNotFound)
+	if input.BucketID == 0 || input.ProviderID.IsZero() || input.CopyIndex < 0 {
+		return nil, fmt.Errorf("invalid storage data set binding input: %w", ErrInvalidInput)
 	}
 	existingByProvider := new(model.StorageDataSet)
 	err := db.NewSelect().
@@ -924,15 +928,15 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 	return binding, nil
 }
 
-func markDataSetReady(ctx context.Context, db bun.IDB, id int64, uploadID int64, dataSetID string, clientDataSetID string) error {
-	if dataSetID == "" {
-		return fmt.Errorf("dataSetID is required: %w", ErrNotFound)
+func markDataSetReady(ctx context.Context, db bun.IDB, id int64, uploadID int64, dataSetID types.OnChainID, clientDataSetID *types.OnChainID) error {
+	if dataSetID.IsZero() {
+		return fmt.Errorf("dataSetID is required: %w", ErrInvalidInput)
 	}
 	res, err := db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = ?", model.StorageDataSetStatusReady).
 		Set("data_set_id = ?", dataSetID).
-		Set("client_data_set_id = COALESCE(?, client_data_set_id)", nullableString(clientDataSetID)).
+		Set("client_data_set_id = COALESCE(?, client_data_set_id)", clientDataSetID).
 		Set("last_used_upload_id = ?", nullableInt64(uploadID)).
 		Set("last_error = NULL").
 		Set("updated_at = ?", time.Now()).
@@ -1004,7 +1008,7 @@ const uploadStageLegacyName = "legacy_upload"
 
 func hasStorageDataSetConflict(ctx context.Context, db bun.IDB, upload *model.StorageUpload, copies []StorageUploadCopyInput) (bool, error) {
 	for _, copyInput := range copies {
-		if copyInput.ProviderID == nil || *copyInput.ProviderID == "" || copyInput.DataSetID == nil || *copyInput.DataSetID == "" {
+		if !presentRequiredOnChainID(copyInput.ProviderID) || !presentRequiredOnChainID(copyInput.DataSetID) {
 			continue
 		}
 		existing := new(model.StorageDataSet)
@@ -1027,13 +1031,17 @@ func hasStorageDataSetConflict(ctx context.Context, db bun.IDB, upload *model.St
 
 func usableCopy(copyInput StorageUploadCopyInput) bool {
 	return bindableCopy(copyInput) &&
-		copyInput.PieceID != nil && *copyInput.PieceID != "" &&
+		copyInput.PieceID != nil &&
 		copyInput.RetrievalURL != nil && *copyInput.RetrievalURL != ""
 }
 
 func bindableCopy(copyInput StorageUploadCopyInput) bool {
-	return copyInput.ProviderID != nil && *copyInput.ProviderID != "" &&
-		copyInput.DataSetID != nil && *copyInput.DataSetID != ""
+	return presentRequiredOnChainID(copyInput.ProviderID) &&
+		presentRequiredOnChainID(copyInput.DataSetID)
+}
+
+func presentRequiredOnChainID(id *types.OnChainID) bool {
+	return id != nil && !id.IsZero()
 }
 
 func countReadableCommittedCopies(ctx context.Context, db bun.IDB, uploadID int64) (int, error) {

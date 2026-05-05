@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/strahe/synaps3/internal/types"
 )
 
 func TestCheckHealth_Reachable(t *testing.T) {
@@ -54,9 +56,9 @@ func TestCheckHealthBatch(t *testing.T) {
 	defer reachableSrv.Close()
 
 	providers := []ProviderDetail{
-		{ID: 1, ServiceURL: reachableSrv.URL, HealthStatus: "skipped"},
-		{ID: 2, ServiceURL: "http://127.0.0.1:1", HealthStatus: "skipped"},
-		{ID: 3, ServiceURL: "", HealthStatus: "skipped"},
+		{ID: types.NewOnChainID(1), ServiceURL: reachableSrv.URL, HealthStatus: "skipped"},
+		{ID: types.NewOnChainID(2), ServiceURL: "http://127.0.0.1:1", HealthStatus: "skipped"},
+		{ID: types.NewOnChainID(3), ServiceURL: "", HealthStatus: "skipped"},
 	}
 
 	CheckHealthBatch(context.Background(), providers, 2*time.Second)

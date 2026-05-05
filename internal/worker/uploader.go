@@ -25,6 +25,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
+	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -458,14 +459,10 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 	existing := make(map[int]struct{}, len(bindings))
 	targetCopies := boundedTargetCopies(u.targetCopies)
 	selected := make([]model.StorageDataSet, 0, targetCopies)
-	excluded := make([]sdktypes.ProviderID, 0, len(bindings))
+	excluded := make([]sdktypes.BigInt, 0, len(bindings))
 	for _, binding := range bindings {
 		existing[binding.CopyIndex] = struct{}{}
-		providerID, err := parseProviderID(binding.ProviderID)
-		if err != nil {
-			return nil, err
-		}
-		excluded = append(excluded, providerID)
+		excluded = append(excluded, binding.ProviderID.SDK())
 		if binding.CopyIndex < targetCopies {
 			selected = append(selected, binding)
 		}
@@ -496,7 +493,7 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 		}
 		binding, err := u.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 			BucketID:          bucket.ID,
-			ProviderID:        strconv.FormatUint(uint64(storageCtx.ProviderID()), 10),
+			ProviderID:        idtypes.OnChainIDFromSDK(storageCtx.ProviderID()),
 			CopyIndex:         nextCopyIndex,
 			CreatedByUploadID: uploadID,
 		})
@@ -507,7 +504,7 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 			if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 				ID:        binding.ID,
 				UploadID:  uploadID,
-				DataSetID: strconv.FormatUint(uint64(*dataSetID), 10),
+				DataSetID: idtypes.OnChainIDFromSDK(*dataSetID),
 			}); err != nil {
 				return nil, err
 			}
@@ -539,7 +536,7 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 			if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 				ID:        binding.ID,
 				UploadID:  uploadID,
-				DataSetID: strconv.FormatUint(uint64(*dataSetID), 10),
+				DataSetID: idtypes.OnChainIDFromSDK(*dataSetID),
 			}); err != nil {
 				u.handleTaskFailure(ctx, task, logger, "mark existing dataset ready", err)
 				return
@@ -557,7 +554,7 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 							UploadID:        uploadID,
 							TransactionID:   sub.TransactionID,
 							StatusURL:       sub.StatusURL,
-							ClientDataSetID: bigIntDecimalString(sub.ClientDataSetID),
+							ClientDataSetID: onChainIDPtrFromSDKPtr(sub.ClientDataSetID),
 						})
 					},
 				})
@@ -579,8 +576,8 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 				if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 					ID:              binding.ID,
 					UploadID:        uploadID,
-					DataSetID:       strconv.FormatUint(uint64(result.DataSetID), 10),
-					ClientDataSetID: bigIntDecimalString(result.ClientDataSetID),
+					DataSetID:       idtypes.OnChainIDFromSDK(result.DataSetID),
+					ClientDataSetID: onChainIDPtrFromSDK(result.ClientDataSetID),
 				}); err != nil {
 					u.handleTaskFailure(ctx, task, logger, "mark dataset ready", err)
 					return
@@ -590,11 +587,7 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 					u.markDataSetStageFailed(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "wait dataset", errors.New("dataset creation submission is incomplete"))
 					return
 				}
-				clientDataSetID, err := parseClientDataSetID(*binding.ClientDataSetID)
-				if err != nil {
-					u.markDataSetStageFailed(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "parse client dataset id", err)
-					return
-				}
+				clientDataSetID := sdkBigIntPtr(binding.ClientDataSetID)
 				result, err := storageCtx.WaitForDataSetCreated(ctx, storage.CreateDataSetSubmission{
 					TransactionID:   *binding.CreateTransactionID,
 					StatusURL:       *binding.CreateStatusURL,
@@ -611,8 +604,8 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 				if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 					ID:              binding.ID,
 					UploadID:        uploadID,
-					DataSetID:       strconv.FormatUint(uint64(result.DataSetID), 10),
-					ClientDataSetID: bigIntDecimalString(result.ClientDataSetID),
+					DataSetID:       idtypes.OnChainIDFromSDK(result.DataSetID),
+					ClientDataSetID: onChainIDPtrFromSDK(result.ClientDataSetID),
 				}); err != nil {
 					u.handleTaskFailure(ctx, task, logger, "mark dataset ready", err)
 					return
@@ -744,9 +737,9 @@ func (u *Uploader) primaryCommit(ctx context.Context, task *model.Task, version 
 			u.handleTaskFailure(ctx, task, logger, "wait primary commit", err)
 			return
 		}
-		pieceID := ""
+		var pieceID *idtypes.OnChainID
 		if len(result.PieceIDs) > 0 {
-			pieceID = strconv.FormatUint(uint64(result.PieceIDs[0]), 10)
+			pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 		}
 		if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
 			UploadID:            uploadID,
@@ -795,9 +788,9 @@ func (u *Uploader) primaryCommit(ctx context.Context, task *model.Task, version 
 		u.handlePrimaryFailure(ctx, task, version, uploadID, logger, "primary commit", err)
 		return
 	}
-	pieceID := ""
+	var pieceID *idtypes.OnChainID
 	if len(result.PieceIDs) > 0 {
-		pieceID = strconv.FormatUint(uint64(result.PieceIDs[0]), 10)
+		pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 	}
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
 		UploadID:            uploadID,
@@ -1010,9 +1003,9 @@ func (u *Uploader) secondaryCommit(ctx context.Context, task *model.Task, versio
 			u.handleTaskFailure(ctx, task, logger, "wait secondary commit", err)
 			return
 		}
-		pieceID := ""
+		var pieceID *idtypes.OnChainID
 		if len(result.PieceIDs) > 0 {
-			pieceID = strconv.FormatUint(uint64(result.PieceIDs[0]), 10)
+			pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 		}
 		if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
 			UploadID:            uploadID,
@@ -1070,9 +1063,9 @@ func (u *Uploader) secondaryCommit(ctx context.Context, task *model.Task, versio
 		u.markSecondaryFailed(ctx, task, uploadID, copyIndex, logger, "secondary commit", err)
 		return
 	}
-	pieceID := ""
+	var pieceID *idtypes.OnChainID
 	if len(result.PieceIDs) > 0 {
-		pieceID = strconv.FormatUint(uint64(result.PieceIDs[0]), 10)
+		pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 	}
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
 		UploadID:            uploadID,
@@ -1237,7 +1230,7 @@ func (u *Uploader) readyContextForCopy(ctx context.Context, bucket *model.Bucket
 	if binding == nil {
 		return nil, nil, nil
 	}
-	if binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || *binding.DataSetID == "" {
+	if binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.DataSetID.IsZero() {
 		return nil, nil, fmt.Errorf("dataset binding %d is not ready", binding.ID)
 	}
 	storageCtx, err := u.contextForReadyBinding(ctx, binding, bucket.Name)
@@ -1248,23 +1241,15 @@ func (u *Uploader) readyContextForCopy(ctx context.Context, bucket *model.Bucket
 }
 
 func (u *Uploader) contextForBindingProvider(ctx context.Context, binding *model.StorageDataSet, bucketName string) (synapse.UploadContext, error) {
-	providerID, err := parseProviderID(binding.ProviderID)
-	if err != nil {
-		return nil, err
-	}
 	return u.storage.CreateContext(ctx, &storage.CreateContextOptions{
-		ProviderIDs:     []sdktypes.ProviderID{providerID},
+		ProviderIDs:     []sdktypes.BigInt{binding.ProviderID.SDK()},
 		DataSetMetadata: map[string]string{"bucket": bucketName},
 	})
 }
 
 func (u *Uploader) contextForReadyBinding(ctx context.Context, binding *model.StorageDataSet, bucketName string) (synapse.UploadContext, error) {
-	dataSetID, err := parseDataSetID(derefString(binding.DataSetID))
-	if err != nil {
-		return nil, err
-	}
 	return u.storage.CreateContext(ctx, &storage.CreateContextOptions{
-		DataSetIDs:      []sdktypes.DataSetID{dataSetID},
+		DataSetIDs:      []sdktypes.BigInt{binding.DataSetID.SDK()},
 		DataSetMetadata: map[string]string{"bucket": bucketName},
 	})
 }
@@ -1286,15 +1271,15 @@ func (u *Uploader) extraDataForCopy(ctx context.Context, storageCtx synapse.Uplo
 }
 
 type submittedCommitStatus struct {
-	TxHash            string        `json:"txHash"`
-	TxStatus          string        `json:"txStatus"`
-	DataSetID         json.Number   `json:"dataSetId"`
-	PiecesAdded       bool          `json:"piecesAdded"`
-	ConfirmedPieceIDs []json.Number `json:"confirmedPieceIds,omitempty"`
+	TxHash            string            `json:"txHash"`
+	TxStatus          string            `json:"txStatus"`
+	DataSetID         json.RawMessage   `json:"dataSetId"`
+	PiecesAdded       bool              `json:"piecesAdded"`
+	ConfirmedPieceIDs []json.RawMessage `json:"confirmedPieceIds,omitempty"`
 }
 
 func (u *Uploader) waitForSubmittedCommit(ctx context.Context, storageCtx synapse.UploadContext, binding *model.StorageDataSet, txHash string, pieceCount int) (*storage.CommitResult, error) {
-	if binding == nil || binding.DataSetID == nil || *binding.DataSetID == "" {
+	if binding == nil || binding.DataSetID == nil || binding.DataSetID.IsZero() {
 		return nil, errors.New("commit dataset binding is not ready")
 	}
 	if submittedCommitMaxWait > 0 {
@@ -1302,11 +1287,7 @@ func (u *Uploader) waitForSubmittedCommit(ctx context.Context, storageCtx synaps
 		ctx, cancel = context.WithTimeout(ctx, submittedCommitMaxWait)
 		defer cancel()
 	}
-	dataSetID, err := parseDataSetID(*binding.DataSetID)
-	if err != nil {
-		return nil, err
-	}
-	statusURL, err := submittedCommitStatusURL(storageCtx, *binding.DataSetID, txHash)
+	statusURL, err := submittedCommitStatusURL(storageCtx, binding.DataSetID.String(), txHash)
 	if err != nil {
 		return nil, err
 	}
@@ -1318,7 +1299,7 @@ func (u *Uploader) waitForSubmittedCommit(ctx context.Context, storageCtx synaps
 		switch status.TxStatus {
 		case "confirmed":
 			if status.PiecesAdded {
-				return status.commitResult(dataSetID, txHash, pieceCount)
+				return status.commitResult(*binding.DataSetID, txHash, pieceCount)
 			}
 			return nil, fmt.Errorf("%w: commit %s confirmed without adding pieces", errCommitRejected, txHash)
 		case "rejected":
@@ -1375,76 +1356,72 @@ func getSubmittedCommitStatus(ctx context.Context, statusURL string) (*submitted
 	return &status, nil
 }
 
-func (s *submittedCommitStatus) commitResult(dataSetID sdktypes.DataSetID, txHash string, pieceCount int) (*storage.CommitResult, error) {
-	if s.DataSetID == "" {
+func (s *submittedCommitStatus) commitResult(dataSetID idtypes.OnChainID, txHash string, pieceCount int) (*storage.CommitResult, error) {
+	if len(s.DataSetID) == 0 {
 		return nil, errors.New("commit status missing dataSetId")
 	}
-	gotDataSetID, err := uint64FromJSONNumber("dataSetId", s.DataSetID)
+	gotDataSetID, err := parseJSONOnChainID("dataSetId", s.DataSetID)
 	if err != nil {
 		return nil, err
 	}
-	if sdktypes.DataSetID(gotDataSetID) != dataSetID {
-		return nil, fmt.Errorf("commit status dataSetId = %d, want %d", gotDataSetID, dataSetID)
+	if !gotDataSetID.Equal(dataSetID) {
+		return nil, fmt.Errorf("commit status dataSetId = %s, want %s", gotDataSetID.String(), dataSetID.String())
 	}
 	if len(s.ConfirmedPieceIDs) != pieceCount {
 		return nil, fmt.Errorf("commit status confirmedPieceIds = %d, want %d", len(s.ConfirmedPieceIDs), pieceCount)
 	}
-	pieceIDs := make([]sdktypes.PieceID, 0, len(s.ConfirmedPieceIDs))
+	pieceIDs := make([]sdktypes.BigInt, 0, len(s.ConfirmedPieceIDs))
 	for _, raw := range s.ConfirmedPieceIDs {
-		pieceID, err := uint64FromJSONNumber("confirmedPieceId", raw)
+		pieceID, err := parseJSONOnChainID("confirmedPieceId", raw)
 		if err != nil {
 			return nil, err
 		}
-		pieceIDs = append(pieceIDs, sdktypes.PieceID(pieceID))
+		pieceIDs = append(pieceIDs, pieceID.SDK())
 	}
 	if s.TxHash != "" {
 		txHash = s.TxHash
 	}
 	return &storage.CommitResult{
 		TransactionID: txHash,
-		DataSetID:     dataSetID,
+		DataSetID:     dataSetID.SDK(),
 		PieceIDs:      pieceIDs,
 		IsNewDataSet:  false,
 	}, nil
 }
 
-func uint64FromJSONNumber(name string, value json.Number) (uint64, error) {
-	parsed, ok := new(big.Int).SetString(value.String(), 10)
-	if !ok || !parsed.IsUint64() {
-		return 0, fmt.Errorf("bad %s %q", name, value.String())
-	}
-	return parsed.Uint64(), nil
-}
-
-func parseProviderID(value string) (sdktypes.ProviderID, error) {
-	id, err := strconv.ParseUint(value, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parsing providerID %q: %w", value, err)
-	}
-	return sdktypes.ProviderID(id), nil
-}
-
-func parseDataSetID(value string) (sdktypes.DataSetID, error) {
-	id, err := strconv.ParseUint(value, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parsing dataSetID %q: %w", value, err)
-	}
-	return sdktypes.DataSetID(id), nil
-}
-
-func parseClientDataSetID(value string) (sdktypes.ClientDataSetID, error) {
-	id, ok := new(big.Int).SetString(value, 10)
-	if !ok {
-		return nil, fmt.Errorf("parsing clientDataSetID %q", value)
+func parseJSONOnChainID(name string, raw json.RawMessage) (idtypes.OnChainID, error) {
+	var id idtypes.OnChainID
+	if err := json.Unmarshal(raw, &id); err != nil {
+		return idtypes.OnChainID{}, fmt.Errorf("bad %s: %w", name, err)
 	}
 	return id, nil
 }
 
-func bigIntDecimalString(value *big.Int) string {
-	if value == nil {
-		return ""
+func onChainIDPtrFromSDK(value sdktypes.BigInt) *idtypes.OnChainID {
+	id := idtypes.OnChainIDFromSDK(value)
+	return &id
+}
+
+func requiredOnChainIDPtrFromSDK(value sdktypes.BigInt) *idtypes.OnChainID {
+	if value.IsZero() {
+		return nil
 	}
-	return value.String()
+	return onChainIDPtrFromSDK(value)
+}
+
+func onChainIDPtrFromSDKPtr(value *sdktypes.BigInt) *idtypes.OnChainID {
+	if value == nil {
+		return nil
+	}
+	return onChainIDPtrFromSDK(*value)
+}
+
+func sdkBigIntPtr(value *idtypes.OnChainID) *sdktypes.BigInt {
+	if value == nil {
+		return nil
+	}
+	id := value.SDK()
+	return &id
 }
 
 func derefString(value *string) string {
@@ -1509,9 +1486,9 @@ func recordUploadResultInput(uploadID int64, result *storage.UploadResult) repos
 	input.Copies = make([]repository.StorageUploadCopyInput, 0, len(result.Copies))
 	for _, copy := range result.Copies {
 		input.Copies = append(input.Copies, repository.StorageUploadCopyInput{
-			ProviderID:   uintIDString(uint64(copy.ProviderID)),
-			DataSetID:    uintIDString(uint64(copy.DataSetID)),
-			PieceID:      uintIDString(uint64(copy.PieceID)),
+			ProviderID:   requiredOnChainIDPtrFromSDK(copy.ProviderID),
+			DataSetID:    requiredOnChainIDPtrFromSDK(copy.DataSetID),
+			PieceID:      onChainIDPtrFromSDK(copy.PieceID),
 			Role:         string(copy.Role),
 			RetrievalURL: nonEmptyStringPtr(copy.RetrievalURL),
 			IsNewDataSet: copy.IsNewDataSet,
@@ -1520,7 +1497,7 @@ func recordUploadResultInput(uploadID int64, result *storage.UploadResult) repos
 	input.Failures = make([]repository.StorageUploadFailureInput, 0, len(result.FailedAttempts))
 	for _, failure := range result.FailedAttempts {
 		input.Failures = append(input.Failures, repository.StorageUploadFailureInput{
-			ProviderID:   uintIDString(uint64(failure.ProviderID)),
+			ProviderID:   requiredOnChainIDPtrFromSDK(failure.ProviderID),
 			Role:         string(failure.Role),
 			Stage:        nonEmptyStringPtr(string(failure.Stage)),
 			ErrorMessage: errorStringPtr(failure.Err),
@@ -1567,9 +1544,9 @@ func rawUploadResultJSON(result *storage.UploadResult) []byte {
 	}
 	for _, copy := range result.Copies {
 		dto.Copies = append(dto.Copies, uploadCopyJSON{
-			ProviderID:   strconv.FormatUint(uint64(copy.ProviderID), 10),
-			DataSetID:    strconv.FormatUint(uint64(copy.DataSetID), 10),
-			PieceID:      strconv.FormatUint(uint64(copy.PieceID), 10),
+			ProviderID:   copy.ProviderID.String(),
+			DataSetID:    copy.DataSetID.String(),
+			PieceID:      copy.PieceID.String(),
 			Role:         string(copy.Role),
 			RetrievalURL: copy.RetrievalURL,
 			IsNewDataSet: copy.IsNewDataSet,
@@ -1577,7 +1554,7 @@ func rawUploadResultJSON(result *storage.UploadResult) []byte {
 	}
 	for _, failure := range result.FailedAttempts {
 		dto.FailedAttempts = append(dto.FailedAttempts, uploadFailureJSON{
-			ProviderID: strconv.FormatUint(uint64(failure.ProviderID), 10),
+			ProviderID: failure.ProviderID.String(),
 			Role:       string(failure.Role),
 			Stage:      string(failure.Stage),
 			Error:      errorString(failure.Err),
@@ -1597,14 +1574,6 @@ func rawUploadErrorJSON(message string) []byte {
 		return nil
 	}
 	return raw
-}
-
-func uintIDString(id uint64) *string {
-	if id == 0 {
-		return nil
-	}
-	value := strconv.FormatUint(id, 10)
-	return &value
 }
 
 func nonEmptyStringPtr(value string) *string {

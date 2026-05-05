@@ -150,9 +150,9 @@ func acceptBackendVersionUpload(t *testing.T, repos *repository.Repositories, ve
 		PieceCID:        &pieceCID,
 		RequestedCopies: 1,
 		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   stringPtr("101"),
-			DataSetID:    stringPtr("dataset-" + versionID),
-			PieceID:      stringPtr("1"),
+			ProviderID:   onChainIDPtr(t, "101"),
+			DataSetID:    onChainIDPtr(t, "1001"),
+			PieceID:      onChainIDPtr(t, "1"),
 			Role:         "primary",
 			RetrievalURL: &retrievalURL,
 		}},
@@ -194,7 +194,7 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositor
 	}
 	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          version.BucketID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -204,13 +204,13 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositor
 	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:        primary.ID,
 		UploadID:  upload.ID,
-		DataSetID: "1001",
+		DataSetID: onChainID(t, "1001"),
 	}); err != nil {
 		t.Fatalf("mark primary dataset ready: %v", err)
 	}
 	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          version.BucketID,
-		ProviderID:        "202",
+		ProviderID:        onChainID(t, "202"),
 		CopyIndex:         1,
 		CreatedByUploadID: upload.ID,
 	})
@@ -218,8 +218,8 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositor
 		t.Fatalf("ensure secondary dataset binding: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create upload copy rows: %v", err)
 	}
@@ -235,7 +235,7 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositor
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
-		PieceID:      "2001",
+		PieceID:      onChainIDPtr(t, "2001"),
 		RetrievalURL: retrievalURL,
 	}); err != nil {
 		t.Fatalf("mark primary committed: %v", err)
@@ -249,10 +249,6 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositor
 		t.Fatalf("bind primary committed upload: %v", err)
 	}
 	return upload
-}
-
-func stringPtr(value string) *string {
-	return &value
 }
 
 func counterValue(t *testing.T, name string) float64 {

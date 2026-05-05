@@ -49,27 +49,27 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesReplicatingFollower(t *tes
 	if err != nil {
 		t.Fatalf("start upload: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
 		t.Fatalf("primary ready: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: "2002"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002")}); err != nil {
 		t.Fatalf("secondary ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create copy rows: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacedummy", PieceID: "1", RetrievalURL: "https://provider.example/primary"}); err != nil {
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacedummy", PieceID: onChainIDPtr(t, "1"), RetrievalURL: "https://provider.example/primary"}); err != nil {
 		t.Fatalf("primary committed: %v", err)
 	}
 	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
@@ -80,7 +80,7 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesReplicatingFollower(t *tes
 	}); err != nil {
 		t.Fatalf("bind primary committed: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 1, PieceCID: "bafk2bzacedummy", PieceID: "2", RetrievalURL: "https://provider.example/secondary"}); err != nil {
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 1, PieceCID: "bafk2bzacedummy", PieceID: onChainIDPtr(t, "2"), RetrievalURL: "https://provider.example/secondary"}); err != nil {
 		t.Fatalf("secondary committed: %v", err)
 	}
 
@@ -154,27 +154,27 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesAfterBindingFollower(t *te
 	if err != nil {
 		t.Fatalf("start upload: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
 		t.Fatalf("primary ready: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: "2002"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002")}); err != nil {
 		t.Fatalf("secondary ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create copy rows: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacedummy", PieceID: "1", RetrievalURL: "https://provider.example/primary"}); err != nil {
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacedummy", PieceID: onChainIDPtr(t, "1"), RetrievalURL: "https://provider.example/primary"}); err != nil {
 		t.Fatalf("primary committed: %v", err)
 	}
 	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
@@ -185,7 +185,7 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesAfterBindingFollower(t *te
 	}); err != nil {
 		t.Fatalf("bind primary committed: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 1, PieceCID: "bafk2bzacedummy", PieceID: "2", RetrievalURL: "https://provider.example/secondary"}); err != nil {
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 1, PieceCID: "bafk2bzacedummy", PieceID: onChainIDPtr(t, "2"), RetrievalURL: "https://provider.example/secondary"}); err != nil {
 		t.Fatalf("secondary committed: %v", err)
 	}
 

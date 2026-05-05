@@ -6,6 +6,7 @@ linters:
     paths:
       - ^versitygw/
       - ^synapse-sdk/
+      - ^synapse-go/
       - ^tmp/
       - ^cache/
       - ^ui/dist/
@@ -20,6 +21,7 @@ formatters:
     paths:
       - ^versitygw/
       - ^synapse-sdk/
+      - ^synapse-go/
       - ^tmp/
       - ^cache/
       - ^ui/dist/

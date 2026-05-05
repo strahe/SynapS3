@@ -174,15 +174,15 @@ func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -236,20 +236,20 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     "bafk2bzacesecondaryrecover",
-		PieceID:      "301",
+		PieceID:      onChainIDPtr(t, "301"),
 		RetrievalURL: "https://primary.example/piece",
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
@@ -549,20 +549,20 @@ func TestManager_ReconcileTasks_AutoEvictIncludesReplicating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding primary: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding secondary: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("MarkDataSetReady primary: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -570,7 +570,7 @@ func TestManager_ReconcileTasks_AutoEvictIncludesReplicating(t *testing.T) {
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     "piece-replicating-evict-reconcile",
-		PieceID:      "301",
+		PieceID:      onChainIDPtr(t, "301"),
 		RetrievalURL: "https://primary.example/piece",
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
@@ -640,9 +640,9 @@ func acceptManagerVersionUpload(t *testing.T, repos *repository.Repositories, ve
 		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
 	}
 	pieceCID := "piece-" + versionID
-	providerID := "101"
-	dataSetID := "dataset-" + versionID
-	pieceID := "1"
+	providerID := onChainIDPtr(t, "101")
+	dataSetID := onChainIDPtr(t, "1001")
+	pieceID := onChainIDPtr(t, "1")
 	retrievalURL := "https://provider.example/piece/" + versionID
 	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
 		BucketID:        version.BucketID,
@@ -659,9 +659,9 @@ func acceptManagerVersionUpload(t *testing.T, repos *repository.Repositories, ve
 		PieceCID:        &pieceCID,
 		RequestedCopies: 1,
 		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   &providerID,
-			DataSetID:    &dataSetID,
-			PieceID:      &pieceID,
+			ProviderID:   providerID,
+			DataSetID:    dataSetID,
+			PieceID:      pieceID,
 			Role:         "primary",
 			RetrievalURL: &retrievalURL,
 		}},

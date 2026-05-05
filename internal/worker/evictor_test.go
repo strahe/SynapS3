@@ -95,7 +95,7 @@ func TestEvictor_ReplicatingVersionEvictsCacheAndKeepsState(t *testing.T) {
 	}
 	primary, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "101",
+		ProviderID:        onChainID(t, "101"),
 		CopyIndex:         0,
 		CreatedByUploadID: upload.ID,
 	})
@@ -104,19 +104,19 @@ func TestEvictor_ReplicatingVersionEvictsCacheAndKeepsState(t *testing.T) {
 	}
 	secondary, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:          bucket.ID,
-		ProviderID:        "202",
+		ProviderID:        onChainID(t, "202"),
 		CopyIndex:         1,
 		CreatedByUploadID: upload.ID,
 	})
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding secondary: %v", err)
 	}
-	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("MarkDataSetReady primary: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestEvictor_ReplicatingVersionEvictsCacheAndKeepsState(t *testing.T) {
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     testCID(t).String(),
-		PieceID:      "3001",
+		PieceID:      onChainIDPtr(t, "3001"),
 		RetrievalURL: "https://primary.example/piece",
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted primary: %v", err)

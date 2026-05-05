@@ -7,13 +7,13 @@ import (
 
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synapse-go/storage"
-	"github.com/strahe/synapse-go/types"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 // UploadContext abstracts one provider-scoped SDK storage context.
 type UploadContext interface {
-	ProviderID() types.ProviderID
-	DataSetID() *types.DataSetID
+	ProviderID() sdktypes.BigInt
+	DataSetID() *sdktypes.BigInt
 	PieceURL(cid.Cid) string
 	ServiceURL() string
 	CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)

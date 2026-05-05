@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 )
 
@@ -70,10 +71,10 @@ type StorageDataSet struct {
 
 	ID                  int64                `bun:",pk,autoincrement"`
 	BucketID            int64                `bun:",notnull"`
-	ProviderID          string               `bun:",notnull"`
+	ProviderID          types.OnChainID      `bun:"type:text,notnull"`
 	CopyIndex           int                  `bun:",notnull"`
-	DataSetID           *string              `bun:",nullzero"`
-	ClientDataSetID     *string              `bun:",nullzero"`
+	DataSetID           *types.OnChainID     `bun:"type:text"`
+	ClientDataSetID     *types.OnChainID     `bun:"type:text"`
 	Status              StorageDataSetStatus `bun:",notnull,default:'pending'"`
 	CreateTransactionID *string              `bun:",nullzero"`
 	CreateStatusURL     *string              `bun:",nullzero"`
@@ -95,9 +96,9 @@ type StorageUploadCopy struct {
 	ID                  int64                   `bun:",pk,autoincrement"`
 	UploadID            int64                   `bun:",notnull"`
 	CopyIndex           int                     `bun:",notnull"`
-	ProviderID          *string                 `bun:",nullzero"`
-	DataSetID           *string                 `bun:",scanonly"`
-	PieceID             *string                 `bun:",nullzero"`
+	ProviderID          *types.OnChainID        `bun:"type:text"`
+	DataSetID           *types.OnChainID        `bun:"type:text,scanonly"`
+	PieceID             *types.OnChainID        `bun:"type:text"`
 	Role                string                  `bun:",notnull"`
 	Status              StorageUploadCopyStatus `bun:",notnull,default:'pending'"`
 	RetrievalURL        *string                 `bun:",nullzero"`
@@ -116,15 +117,15 @@ type StorageUploadCopy struct {
 type StorageUploadFailure struct {
 	bun.BaseModel `bun:"table:storage_upload_failures"`
 
-	ID           int64     `bun:",pk,autoincrement"`
-	UploadID     int64     `bun:",notnull"`
-	AttemptIndex int       `bun:",notnull"`
-	ProviderID   *string   `bun:",nullzero"`
-	Role         string    `bun:",notnull"`
-	Stage        *string   `bun:",nullzero"`
-	ErrorMessage *string   `bun:",nullzero"`
-	Explicit     bool      `bun:",notnull,default:false"`
-	CreatedAt    time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	ID           int64            `bun:",pk,autoincrement"`
+	UploadID     int64            `bun:",notnull"`
+	AttemptIndex int              `bun:",notnull"`
+	ProviderID   *types.OnChainID `bun:"type:text"`
+	Role         string           `bun:",notnull"`
+	Stage        *string          `bun:",nullzero"`
+	ErrorMessage *string          `bun:",nullzero"`
+	Explicit     bool             `bun:",notnull,default:false"`
+	CreatedAt    time.Time        `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Upload *StorageUpload `bun:"rel:belongs-to,join:upload_id=id"`
 }

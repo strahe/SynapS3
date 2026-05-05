@@ -13,7 +13,7 @@ require (
 	github.com/knadh/koanf/v2 v2.3.4
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/prometheus/client_golang v1.23.2
-	github.com/strahe/synapse-go v0.1.1-0.20260501073158-7ee316ba8226
+	github.com/strahe/synapse-go v0.2.0
 	github.com/uptrace/bun v1.2.18
 	github.com/uptrace/bun/dialect/pgdialect v1.2.18
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
@@ -133,7 +133,7 @@ require (
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/oklog/ulid/v2 v2.1.1 // indirect
+	github.com/oklog/ulid/v2 v2.1.1
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/rabbitmq/amqp091-go v1.10.0 // indirect

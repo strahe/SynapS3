@@ -44,9 +44,9 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 		t.Fatalf("start upload attempt: %v", err)
 	}
 	pieceCID := "piece-wallet"
-	providerID := "101"
-	dataSetID := "proofset-1"
-	pieceID := "1"
+	providerID := onChainIDPtr(t, "101")
+	dataSetID := onChainIDPtr(t, "1001")
+	pieceID := onChainIDPtr(t, "1")
 	retrievalURL := "https://provider.example/wallet"
 	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
 		UploadID:        upload.ID,
@@ -54,9 +54,9 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 		PieceCID:        &pieceCID,
 		RequestedCopies: 1,
 		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   &providerID,
-			DataSetID:    &dataSetID,
-			PieceID:      &pieceID,
+			ProviderID:   providerID,
+			DataSetID:    dataSetID,
+			PieceID:      pieceID,
 			Role:         "primary",
 			RetrievalURL: &retrievalURL,
 		}},

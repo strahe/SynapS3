@@ -13,8 +13,8 @@ import (
 
 type fakeRegistryProviderSource struct {
 	count     *big.Int
-	pdp       map[sdktypes.ProviderID]spregistry.PDPProvider
-	providers map[sdktypes.ProviderID]spregistry.ProviderInfo
+	pdp       map[string]spregistry.PDPProvider
+	providers map[string]spregistry.ProviderInfo
 }
 
 func (f *fakeRegistryProviderSource) GetPDPProviders(context.Context, bool, sdktypes.ListOptions) (*spregistry.PaginatedPDPProviders, error) {
@@ -25,16 +25,16 @@ func (f *fakeRegistryProviderSource) GetProviderCount(context.Context) (*big.Int
 	return new(big.Int).Set(f.count), nil
 }
 
-func (f *fakeRegistryProviderSource) GetPDPProvider(_ context.Context, providerID sdktypes.ProviderID) (*spregistry.PDPProvider, error) {
-	p, ok := f.pdp[providerID]
+func (f *fakeRegistryProviderSource) GetPDPProvider(_ context.Context, providerID sdktypes.BigInt) (*spregistry.PDPProvider, error) {
+	p, ok := f.pdp[providerID.String()]
 	if !ok {
 		return nil, fmt.Errorf("missing PDP product: %w", spregistry.ErrNotFound)
 	}
 	return &p, nil
 }
 
-func (f *fakeRegistryProviderSource) GetProvider(_ context.Context, providerID sdktypes.ProviderID) (*spregistry.ProviderInfo, error) {
-	p, ok := f.providers[providerID]
+func (f *fakeRegistryProviderSource) GetProvider(_ context.Context, providerID sdktypes.BigInt) (*spregistry.ProviderInfo, error) {
+	p, ok := f.providers[providerID.String()]
 	if !ok {
 		return nil, fmt.Errorf("missing provider: %w", spregistry.ErrNotFound)
 	}
@@ -44,7 +44,7 @@ func (f *fakeRegistryProviderSource) GetProvider(_ context.Context, providerID s
 func newTestPDPProvider(id int, name string, active bool, pdpURL string) spregistry.PDPProvider {
 	p := spregistry.PDPProvider{
 		Info: spregistry.ProviderInfo{
-			ID:              sdktypes.ProviderID(id),
+			ID:              sdktypes.NewBigInt(uint64(id)),
 			Name:            name,
 			IsActive:        active,
 			ServiceProvider: common.HexToAddress("0x1234567890abcdef1234567890abcdef12345678"),
@@ -72,8 +72,8 @@ func TestPDPProviderToDetail_WithPDP(t *testing.T) {
 		t.Fatalf("pdpProviderToDetail: %v", err)
 	}
 
-	if d.ID != 1 {
-		t.Errorf("expected ID 1, got %d", d.ID)
+	if d.ID.String() != "1" {
+		t.Errorf("expected ID 1, got %s", d.ID.String())
 	}
 	if d.Name != "Alpha" {
 		t.Errorf("expected name Alpha, got %s", d.Name)
@@ -108,7 +108,7 @@ func TestPDPProviderToDetail_NoPDP(t *testing.T) {
 
 func TestProviderInfoToDetail(t *testing.T) {
 	info := &spregistry.ProviderInfo{
-		ID:              sdktypes.ProviderID(42),
+		ID:              sdktypes.NewBigInt(42),
 		Name:            "Basic",
 		Description:     "A basic provider",
 		IsActive:        false,
@@ -119,8 +119,8 @@ func TestProviderInfoToDetail(t *testing.T) {
 		t.Fatalf("providerInfoToDetail: %v", err)
 	}
 
-	if d.ID != 42 {
-		t.Errorf("expected ID 42, got %d", d.ID)
+	if d.ID.String() != "42" {
+		t.Errorf("expected ID 42, got %s", d.ID.String())
 	}
 	if d.Name != "Basic" {
 		t.Errorf("expected name Basic, got %s", d.Name)
@@ -142,12 +142,12 @@ func TestProviderInfoToDetail(t *testing.T) {
 func TestListAllProviders_FallsBackWhenPDPProductMissing(t *testing.T) {
 	reg := &RegistryService{svc: &fakeRegistryProviderSource{
 		count: big.NewInt(2),
-		pdp: map[sdktypes.ProviderID]spregistry.PDPProvider{
-			1: newTestPDPProvider(1, "Alpha", true, "https://alpha.example.com"),
+		pdp: map[string]spregistry.PDPProvider{
+			"1": newTestPDPProvider(1, "Alpha", true, "https://alpha.example.com"),
 		},
-		providers: map[sdktypes.ProviderID]spregistry.ProviderInfo{
-			2: {
-				ID:              sdktypes.ProviderID(2),
+		providers: map[string]spregistry.ProviderInfo{
+			"2": {
+				ID:              sdktypes.NewBigInt(2),
 				Name:            "Basic",
 				Description:     "No PDP product",
 				IsActive:        true,
@@ -163,32 +163,40 @@ func TestListAllProviders_FallsBackWhenPDPProductMissing(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len(listAllProviders) = %d, want 2", len(got))
 	}
-	if !got[0].HasPDP || got[0].ID != 1 {
+	if !got[0].HasPDP || got[0].ID.String() != "1" {
 		t.Fatalf("first provider = %+v, want PDP provider ID 1", got[0])
 	}
 	if got[1].HasPDP {
 		t.Fatalf("second provider HasPDP = true, want false")
 	}
-	if got[1].ID != 2 || got[1].Name != "Basic" {
+	if got[1].ID.String() != "2" || got[1].Name != "Basic" {
 		t.Fatalf("second provider = %+v, want basic provider ID 2", got[1])
 	}
 }
 
 func TestPDPProviderToDetail_InvalidID(t *testing.T) {
 	p := newTestPDPProvider(1, "Alpha", true, "https://alpha.example.com")
-	p.Info.ID = 0
+	p.Info.ID = sdktypes.NewBigInt(0)
 
 	if _, err := pdpProviderToDetail(p); err == nil {
 		t.Fatal("expected invalid provider ID error")
 	}
 }
 
-func TestPDPProviderToDetail_ProviderIDOverflow(t *testing.T) {
+func TestPDPProviderToDetail_LargeProviderID(t *testing.T) {
 	p := newTestPDPProvider(1, "Alpha", true, "https://alpha.example.com")
-	p.Info.ID = sdktypes.ProviderID(^uint64(0))
+	id, err := sdktypes.ParseBigInt("18446744073709551616")
+	if err != nil {
+		t.Fatalf("ParseBigInt: %v", err)
+	}
+	p.Info.ID = id
 
-	if _, err := pdpProviderToDetail(p); err == nil {
-		t.Fatal("expected invalid provider ID error")
+	d, err := pdpProviderToDetail(p)
+	if err != nil {
+		t.Fatalf("pdpProviderToDetail: %v", err)
+	}
+	if d.ID.String() != "18446744073709551616" {
+		t.Fatalf("ID = %s, want 18446744073709551616", d.ID.String())
 	}
 }
 

@@ -143,7 +143,7 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 		UploadID:     uploadID,
 		CopyIndex:    1,
 		PieceCID:     pieceCID,
-		PieceID:      "2",
+		PieceID:      onChainIDPtr(t, "2"),
 		RetrievalURL: "https://secondary.example/piece",
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted secondary: %v", err)
@@ -503,9 +503,9 @@ func acceptReaderVersionUpload(t *testing.T, repos *repository.Repositories, ver
 	if err != nil || version == nil {
 		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
 	}
-	providerID := "101"
-	dataSetID := "dataset-" + versionID
-	pieceID := "1"
+	providerID := onChainIDPtr(t, "101")
+	dataSetID := onChainIDPtr(t, "1001")
+	pieceID := onChainIDPtr(t, "1")
 	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
 		BucketID:        version.BucketID,
 		SourceVersionID: version.VersionID,
@@ -521,9 +521,9 @@ func acceptReaderVersionUpload(t *testing.T, repos *repository.Repositories, ver
 		PieceCID:        &pieceCID,
 		RequestedCopies: 1,
 		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   &providerID,
-			DataSetID:    &dataSetID,
-			PieceID:      &pieceID,
+			ProviderID:   providerID,
+			DataSetID:    dataSetID,
+			PieceID:      pieceID,
 			Role:         "primary",
 			RetrievalURL: &retrievalURL,
 		}},
@@ -562,23 +562,23 @@ func bindReaderPrimaryCommittedUpload(t *testing.T, repos *repository.Repositori
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "101", CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: "202", CopyIndex: 1, CreatedByUploadID: upload.ID})
+	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: "1001", ClientDataSetID: "9001"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("primary ready: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: "2002", ClientDataSetID: "9002"}); err != nil {
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
 		t.Fatalf("secondary ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: "101"},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: "202"},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create copy rows: %v", err)
 	}
@@ -586,7 +586,7 @@ func bindReaderPrimaryCommittedUpload(t *testing.T, repos *repository.Repositori
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
-		PieceID:      "1",
+		PieceID:      onChainIDPtr(t, "1"),
 		RetrievalURL: retrievalURL,
 	}); err != nil {
 		t.Fatalf("primary committed: %v", err)
