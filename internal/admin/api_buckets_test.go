@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/testutil"
+	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 )
@@ -98,6 +100,25 @@ func (c *storageUploadSelectCounter) BeforeQuery(ctx context.Context, event *bun
 }
 
 func (c *storageUploadSelectCounter) AfterQuery(context.Context, *bun.QueryEvent) {}
+
+type fakeAPIProviderIdentityResolver struct {
+	identities map[string]*providerIdentityResponse
+	requests   [][]string
+}
+
+func (f *fakeAPIProviderIdentityResolver) ProviderIdentities(providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {
+	ids := make([]string, 0, len(providerIDs))
+	out := make(map[string]*providerIdentityResponse)
+	for _, providerID := range providerIDs {
+		key := providerID.String()
+		ids = append(ids, key)
+		if identity := f.identities[key]; identity != nil {
+			out[key] = identity
+		}
+	}
+	f.requests = append(f.requests, ids)
+	return out
+}
 
 func seedAdminObjectVersion(t *testing.T, repos *repository.Repositories, bucket *model.Bucket, key string, size int64, etag, checksum, contentType, cacheKey string, state model.ObjectState) (int64, string) {
 	t.Helper()
@@ -623,6 +644,20 @@ func TestAPIBucketDetail(t *testing.T) {
 
 func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
+	identityResolver := &fakeAPIProviderIdentityResolver{
+		identities: map[string]*providerIdentityResponse{
+			"101": {
+				RegistryProviderID:     "101",
+				Name:                   "alpha-pdp",
+				ServiceProviderAddress: "0x1111111111111111111111111111111111111111",
+				FilecoinActorID:        "f01234",
+				ServiceURL:             "https://alpha.example",
+				Location:               "C=US;ST=California;L=San Francisco",
+				ExtraCapabilities:      map[string]string{"serviceStatus": "prod"},
+			},
+		},
+	}
+	srv.WithProviderIdentityResolver(identityResolver)
 	ctx := context.Background()
 
 	bucket := &model.Bucket{Name: "detail-datasets-bucket", Status: model.BucketStatusActive}
@@ -665,10 +700,11 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	}
 	var body struct {
 		DataSets []struct {
-			CopyIndex  int    `json:"copy_index"`
-			ProviderID string `json:"provider_id"`
-			DataSetID  string `json:"data_set_id"`
-			Status     string `json:"status"`
+			CopyIndex        int                       `json:"copy_index"`
+			ProviderID       string                    `json:"provider_id"`
+			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
+			DataSetID        string                    `json:"data_set_id"`
+			Status           string                    `json:"status"`
 		} `json:"data_sets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -679,6 +715,15 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	}
 	if body.DataSets[0].CopyIndex != 0 || body.DataSets[0].ProviderID != "101" || body.DataSets[0].DataSetID != "1001" || body.DataSets[0].Status != string(model.StorageDataSetStatusReady) {
 		t.Fatalf("first data set = %#v, want provider scoped data set", body.DataSets[0])
+	}
+	if body.DataSets[0].ProviderIdentity == nil || body.DataSets[0].ProviderIdentity.Name != "alpha-pdp" || body.DataSets[0].ProviderIdentity.FilecoinActorID != "f01234" {
+		t.Fatalf("provider_identity = %#v, want enriched provider identity", body.DataSets[0].ProviderIdentity)
+	}
+	if body.DataSets[1].ProviderID != "202" || body.DataSets[1].ProviderIdentity != nil {
+		t.Fatalf("second data set = %#v, want provider_id compatibility without identity when lookup fails", body.DataSets[1])
+	}
+	if !reflect.DeepEqual(identityResolver.requests, [][]string{{"101", "202"}}) {
+		t.Fatalf("provider identity requests = %#v, want one batched snapshot request", identityResolver.requests)
 	}
 }
 
@@ -1580,6 +1625,23 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 
 func TestAPIBucketObjectProvenance(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
+	identityResolver := &fakeAPIProviderIdentityResolver{
+		identities: map[string]*providerIdentityResponse{
+			"101": {
+				RegistryProviderID:     "101",
+				Name:                   "alpha-pdp",
+				ServiceProviderAddress: "0x1111111111111111111111111111111111111111",
+				FilecoinActorID:        "f01234",
+				ServiceURL:             "https://alpha.example",
+			},
+			"303": {
+				RegistryProviderID: "303",
+				Name:               "gamma-pdp",
+				FilecoinActorID:    "f05678",
+			},
+		},
+	}
+	srv.WithProviderIdentityResolver(identityResolver)
 	ctx := context.Background()
 
 	bucket := &model.Bucket{Name: "provenance-bucket", Status: model.BucketStatusActive}
@@ -1645,21 +1707,23 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 		RequestedCopies int    `json:"requested_copies"`
 		SuccessCopies   int    `json:"success_copies"`
 		Copies          []struct {
-			CopyIndex    int    `json:"copy_index"`
-			Status       string `json:"status"`
-			ProviderID   string `json:"provider_id"`
-			DataSetID    string `json:"data_set_id"`
-			PieceID      string `json:"piece_id"`
-			Role         string `json:"role"`
-			RetrievalURL string `json:"retrieval_url"`
-			IsNewDataSet bool   `json:"is_new_data_set"`
+			CopyIndex        int                       `json:"copy_index"`
+			Status           string                    `json:"status"`
+			ProviderID       string                    `json:"provider_id"`
+			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
+			DataSetID        string                    `json:"data_set_id"`
+			PieceID          string                    `json:"piece_id"`
+			Role             string                    `json:"role"`
+			RetrievalURL     string                    `json:"retrieval_url"`
+			IsNewDataSet     bool                      `json:"is_new_data_set"`
 		} `json:"copies"`
 		Failures []struct {
-			AttemptIndex int    `json:"attempt_index"`
-			ProviderID   string `json:"provider_id"`
-			Role         string `json:"role"`
-			Stage        string `json:"stage"`
-			Error        string `json:"error"`
+			AttemptIndex     int                       `json:"attempt_index"`
+			ProviderID       string                    `json:"provider_id"`
+			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
+			Role             string                    `json:"role"`
+			Stage            string                    `json:"stage"`
+			Error            string                    `json:"error"`
 		} `json:"failures"`
 	}
 	getProvenance := func(bucketName, targetVersionID string) (provenanceBody, int) {
@@ -1692,8 +1756,20 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	if len(detail.Copies) != 2 || detail.Copies[0].ProviderID != "101" || !detail.Copies[0].IsNewDataSet || detail.Copies[1].IsNewDataSet {
 		t.Fatalf("copies = %#v, want provider scoped copy provenance", detail.Copies)
 	}
+	if detail.Copies[0].ProviderIdentity == nil || detail.Copies[0].ProviderIdentity.Name != "alpha-pdp" || detail.Copies[0].ProviderIdentity.FilecoinActorID != "f01234" {
+		t.Fatalf("copy provider_identity = %#v, want enriched copy identity", detail.Copies[0].ProviderIdentity)
+	}
+	if detail.Copies[1].ProviderID != "202" || detail.Copies[1].ProviderIdentity != nil {
+		t.Fatalf("secondary copy = %#v, want provider_id compatibility without identity when lookup fails", detail.Copies[1])
+	}
 	if len(detail.Failures) != 1 || detail.Failures[0].ProviderID != "303" || detail.Failures[0].Stage != "secondary_pull" || detail.Failures[0].Error != "provider timed out" {
 		t.Fatalf("failures = %#v, want recorded provider attempt", detail.Failures)
+	}
+	if detail.Failures[0].ProviderIdentity == nil || detail.Failures[0].ProviderIdentity.Name != "gamma-pdp" || detail.Failures[0].ProviderIdentity.FilecoinActorID != "f05678" {
+		t.Fatalf("failure provider_identity = %#v, want enriched failure identity", detail.Failures[0].ProviderIdentity)
+	}
+	if !reflect.DeepEqual(identityResolver.requests[0], []string{"101", "202", "303"}) {
+		t.Fatalf("provider identity request = %#v, want one provenance snapshot request", identityResolver.requests)
 	}
 
 	oldDetail, statusCode := getProvenance("provenance-bucket", oldVersionID)

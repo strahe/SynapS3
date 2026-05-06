@@ -49,6 +49,7 @@ export interface StorageDataSetSummary {
   bucket_name?: string
   copy_index: number
   provider_id: string
+  provider_identity?: ProviderIdentity
   data_set_id?: string
   client_data_set_id?: string
   status: string
@@ -151,10 +152,24 @@ export interface ObjectStatusDetail {
 
 export type ObjectUploadCopyStatus = 'pending' | 'piece_ready' | 'committing' | 'committed' | 'failed'
 
+export interface ProviderIdentity {
+  registry_provider_id: string
+  name?: string
+  description?: string
+  service_provider_address?: string
+  payee_address?: string
+  filecoin_address?: string
+  filecoin_actor_id?: string
+  service_url?: string
+  location?: string
+  extra_capabilities?: Record<string, string>
+}
+
 export interface ObjectProvenanceCopy {
   copy_index: number
   status: ObjectUploadCopyStatus
   provider_id?: string
+  provider_identity?: ProviderIdentity
   data_set_id?: string
   piece_id?: string
   role: string
@@ -165,6 +180,7 @@ export interface ObjectProvenanceCopy {
 export interface ObjectProvenanceFailure {
   attempt_index: number
   provider_id?: string
+  provider_identity?: ProviderIdentity
   role: string
   stage?: string
   error?: string

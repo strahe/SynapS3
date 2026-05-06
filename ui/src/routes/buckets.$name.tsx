@@ -29,6 +29,7 @@ import {
   type ObjectStatus,
   type ObjectUploadStatus,
   type ObjectVersionItem,
+  type ProviderIdentity,
   type StorageDataSetSummary,
 } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
@@ -63,6 +64,7 @@ import {
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -616,6 +618,84 @@ function ProvenanceSummaryItem({
   )
 }
 
+function ProviderIdentityCell({ providerID, identity }: { providerID?: string; identity?: ProviderIdentity }) {
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const registryID = identity?.registry_provider_id ?? providerID
+  const label = identity?.name?.trim() || (registryID ? `Registry #${registryID}` : '—')
+
+  if (!identity) {
+    return (
+      <span className="block max-w-44 truncate font-mono text-xs text-muted-foreground" title={registryID}>
+        {label}
+      </span>
+    )
+  }
+
+  return (
+    <div className="flex min-w-0 items-center gap-1.5">
+      <span className="min-w-0 max-w-44 truncate font-medium" title={label}>
+        {label}
+      </span>
+      <Popover open={detailsOpen} onOpenChange={setDetailsOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`Provider details for ${label}`}
+            aria-expanded={detailsOpen}
+          >
+            <Info />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent
+          side="top"
+          className="max-h-[min(calc(100vh-2rem),32rem)] w-max max-w-[min(calc(100vw-2rem),36rem)] overflow-y-auto whitespace-normal p-3.5 text-left"
+        >
+          <ProviderIdentityDetails providerID={registryID} identity={identity} />
+        </PopoverContent>
+      </Popover>
+    </div>
+  )
+}
+
+function ProviderIdentityDetails({ providerID, identity }: { providerID?: string; identity: ProviderIdentity }) {
+  const allFields: Array<[string, string | undefined]> = [
+    ['Registry Provider ID', identity.registry_provider_id || providerID],
+    ['Actor ID', identity.filecoin_actor_id],
+    ['Filecoin address', identity.filecoin_address],
+    ['EVM service provider', identity.service_provider_address],
+    ['Payee address', identity.payee_address],
+    ['Service URL', identity.service_url],
+    ['Location', identity.location],
+    ['Description', identity.description],
+  ]
+  const fields = allFields.filter((field): field is [string, string] => Boolean(field[1]))
+  const extras = Object.entries(identity.extra_capabilities ?? {}).sort(([a], [b]) => a.localeCompare(b))
+
+  return (
+    <div className="flex w-full select-text flex-col gap-3">
+      <div className="font-medium">
+        {identity.name?.trim() || `Registry #${identity.registry_provider_id || providerID}`}
+      </div>
+      <div className="grid grid-cols-1 gap-x-3 gap-y-2 text-xs sm:grid-cols-[9rem_minmax(0,1fr)]">
+        {fields.map(([label, value]) => (
+          <Fragment key={label}>
+            <span className="text-muted-foreground">{label}</span>
+            <span className="min-w-0 break-words font-mono leading-relaxed">{value}</span>
+          </Fragment>
+        ))}
+        {extras.map(([label, value]) => (
+          <Fragment key={label}>
+            <span className="text-muted-foreground">{label}</span>
+            <span className="min-w-0 break-words font-mono leading-relaxed">{value}</span>
+          </Fragment>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
   return (
     <div className="overflow-hidden rounded-md border border-border">
@@ -627,7 +707,7 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
               <TableHead className="px-3">Copy</TableHead>
               <TableHead className="px-3">Role</TableHead>
               <TableHead className="px-3">Status</TableHead>
-              <TableHead className="px-3">Provider ID</TableHead>
+              <TableHead className="px-3">Provider</TableHead>
               <TableHead className="px-3">Data Set ID</TableHead>
               <TableHead className="px-3">Piece ID</TableHead>
               <TableHead className="px-3">New</TableHead>
@@ -642,8 +722,8 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 <TableCell className="px-3">
                   <StatusBadge tone={copyStatusTone(copy.status)}>{copy.status}</StatusBadge>
                 </TableCell>
-                <TableCell className="px-3 font-mono text-xs text-muted-foreground">
-                  {copy.provider_id ?? '—'}
+                <TableCell className="px-3">
+                  <ProviderIdentityCell providerID={copy.provider_id} identity={copy.provider_identity} />
                 </TableCell>
                 <TableCell className="px-3 font-mono text-xs text-muted-foreground">
                   {copy.data_set_id ?? '—'}
@@ -693,7 +773,7 @@ function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] 
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead className="px-3">Provider ID</TableHead>
+            <TableHead className="px-3">Provider</TableHead>
             <TableHead className="px-3">Role</TableHead>
             <TableHead className="px-3">Stage</TableHead>
             <TableHead className="px-3">Error</TableHead>
@@ -702,8 +782,8 @@ function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] 
         <TableBody>
           {failures.map((failure) => (
             <TableRow key={`${failure.attempt_index}-${failure.provider_id ?? 'unknown'}`}>
-              <TableCell className="px-3 font-mono text-xs text-muted-foreground">
-                {failure.provider_id ?? '—'}
+              <TableCell className="px-3">
+                <ProviderIdentityCell providerID={failure.provider_id} identity={failure.provider_identity} />
               </TableCell>
               <TableCell className="px-3">{failure.role || '—'}</TableCell>
               <TableCell className="px-3">{failure.stage ?? '—'}</TableCell>
@@ -1158,7 +1238,7 @@ function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[]
           <TableHeader>
             <TableRow>
               <TableHead className="px-4">Copy</TableHead>
-              <TableHead className="px-4">Provider ID</TableHead>
+              <TableHead className="px-4">Provider</TableHead>
               <TableHead className="px-4">Data Set ID</TableHead>
               <TableHead className="px-4">Status</TableHead>
               <TableHead className="px-4">Last Used</TableHead>
@@ -1168,7 +1248,9 @@ function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[]
             {dataSets.map((dataSet) => (
               <TableRow key={dataSet.id}>
                 <TableCell className="px-4 font-mono text-xs">{dataSet.copy_index}</TableCell>
-                <TableCell className="px-4 font-mono text-xs text-muted-foreground">{dataSet.provider_id}</TableCell>
+                <TableCell className="px-4">
+                  <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
+                </TableCell>
                 <TableCell className="px-4 font-mono text-xs text-muted-foreground">
                   {dataSet.data_set_id ?? '—'}
                 </TableCell>

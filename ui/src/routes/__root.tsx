@@ -1,4 +1,4 @@
-import type { QueryClient } from '@tanstack/react-query'
+import { type QueryClient, useQueryClient } from '@tanstack/react-query'
 import { createRootRouteWithContext, Link, Outlet, useLocation } from '@tanstack/react-router'
 import { AlertTriangle, Database, HardDrive, LayoutDashboard, ListTodo, Settings, Wallet } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -18,6 +18,7 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar'
 import { useSettings } from '@/hooks/queries'
+import { applyProviderIdentityEventData } from '@/lib/provider-identity-events'
 import { rootContentKind } from './-root-content'
 
 interface RouterContext {
@@ -82,6 +83,7 @@ function RootLayout() {
 
   return (
     <SidebarProvider defaultOpen={readSidebarDefaultOpen()}>
+      <AdminEventsBridge enabled={!settingsLoading && !setupMode} />
       <AppSidebar activeNavItems={activeNavItems} pathname={location.pathname} />
 
       <SidebarInset className="overflow-auto">
@@ -93,6 +95,22 @@ function RootLayout() {
       </SidebarInset>
     </SidebarProvider>
   )
+}
+
+function AdminEventsBridge({ enabled }: { enabled: boolean }) {
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    if (!enabled) return
+
+    const events = new EventSource('/api/v1/events')
+    events.addEventListener('provider_identity_updated', (event) => {
+      applyProviderIdentityEventData(queryClient, event.data)
+    })
+    return () => events.close()
+  }, [enabled, queryClient])
+
+  return null
 }
 
 function AppSidebar({ activeNavItems, pathname }: { activeNavItems: NavItem[]; pathname: string }) {

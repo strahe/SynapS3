@@ -86,7 +86,7 @@ Unknown `SYNAPS3_` names fall back to lowercase with `_` replaced by `.`.
 | --- | --- | --- |
 | `server` | `port`, `max_connections`, `max_requests`, `tls.*` | S3 API listener |
 | `s3` | `region` | Region reported to S3 clients |
-| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | Filecoin upload behavior |
+| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | Filecoin uploads and admin provider identity resolution |
 | `database` | `driver`, `dsn`, `max_open_conns`, `max_idle_conns` | Metadata database |
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local object cache |
 | `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker |

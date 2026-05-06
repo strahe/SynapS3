@@ -68,18 +68,19 @@ type bucketDetailResponse struct {
 }
 
 type storageDataSetSummaryResponse struct {
-	ID                int64   `json:"id"`
-	BucketID          int64   `json:"bucket_id"`
-	BucketName        string  `json:"bucket_name,omitempty"`
-	CopyIndex         int     `json:"copy_index"`
-	ProviderID        string  `json:"provider_id"`
-	DataSetID         *string `json:"data_set_id,omitempty"`
-	ClientDataSetID   *string `json:"client_data_set_id,omitempty"`
-	Status            string  `json:"status"`
-	CreatedByUploadID *int64  `json:"created_by_upload_id,omitempty"`
-	LastUsedUploadID  *int64  `json:"last_used_upload_id,omitempty"`
-	CreatedAt         string  `json:"created_at"`
-	UpdatedAt         string  `json:"updated_at"`
+	ID                int64                     `json:"id"`
+	BucketID          int64                     `json:"bucket_id"`
+	BucketName        string                    `json:"bucket_name,omitempty"`
+	CopyIndex         int                       `json:"copy_index"`
+	ProviderID        string                    `json:"provider_id"`
+	ProviderIdentity  *providerIdentityResponse `json:"provider_identity,omitempty"`
+	DataSetID         *string                   `json:"data_set_id,omitempty"`
+	ClientDataSetID   *string                   `json:"client_data_set_id,omitempty"`
+	Status            string                    `json:"status"`
+	CreatedByUploadID *int64                    `json:"created_by_upload_id,omitempty"`
+	LastUsedUploadID  *int64                    `json:"last_used_upload_id,omitempty"`
+	CreatedAt         string                    `json:"created_at"`
+	UpdatedAt         string                    `json:"updated_at"`
 }
 
 type bucketOwnerUpdateRequest struct {
@@ -236,7 +237,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 			return
 		}
-		dataSets = storageDataSetSummaryResponses(summaries)
+		dataSets = s.storageDataSetSummaryResponses(summaries)
 	}
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
@@ -403,8 +404,13 @@ func bucketOwnerACL(owner string) ([]byte, error) {
 	})
 }
 
-func storageDataSetSummaryResponses(summaries []repository.StorageDataSetSummary) []storageDataSetSummaryResponse {
+func (s *Server) storageDataSetSummaryResponses(summaries []repository.StorageDataSetSummary) []storageDataSetSummaryResponse {
 	out := make([]storageDataSetSummaryResponse, 0, len(summaries))
+	providerIDs := make([]idtypes.OnChainID, 0, len(summaries))
+	for _, summary := range summaries {
+		providerIDs = append(providerIDs, summary.ProviderID)
+	}
+	identities := s.providerIdentities(providerIDs)
 	for _, summary := range summaries {
 		out = append(out, storageDataSetSummaryResponse{
 			ID:                summary.ID,
@@ -412,6 +418,7 @@ func storageDataSetSummaryResponses(summaries []repository.StorageDataSetSummary
 			BucketName:        summary.BucketName,
 			CopyIndex:         summary.CopyIndex,
 			ProviderID:        summary.ProviderID.String(),
+			ProviderIdentity:  providerIdentityFromSnapshot(identities, summary.ProviderID),
 			DataSetID:         onChainIDStringPtr(summary.DataSetID),
 			ClientDataSetID:   onChainIDStringPtr(summary.ClientDataSetID),
 			Status:            string(summary.Status),
@@ -422,6 +429,27 @@ func storageDataSetSummaryResponses(summaries []repository.StorageDataSetSummary
 		})
 	}
 	return out
+}
+
+func (s *Server) providerIdentities(providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {
+	if s.providerIdentity == nil {
+		return nil
+	}
+	return s.providerIdentity.ProviderIdentities(providerIDs)
+}
+
+func providerIdentityFromSnapshot(identities map[string]*providerIdentityResponse, providerID idtypes.OnChainID) *providerIdentityResponse {
+	if identities == nil || providerID.IsZero() {
+		return nil
+	}
+	return identities[providerID.String()]
+}
+
+func providerIdentityFromSnapshotPtr(identities map[string]*providerIdentityResponse, providerID *idtypes.OnChainID) *providerIdentityResponse {
+	if providerID == nil {
+		return nil
+	}
+	return providerIdentityFromSnapshot(identities, *providerID)
 }
 
 func onChainIDStringPtr(id *idtypes.OnChainID) *string {
@@ -477,22 +505,24 @@ type objectProvenanceResponse struct {
 }
 
 type objectProvenanceCopyResponse struct {
-	CopyIndex    int     `json:"copy_index"`
-	Status       string  `json:"status"`
-	ProviderID   *string `json:"provider_id,omitempty"`
-	DataSetID    *string `json:"data_set_id,omitempty"`
-	PieceID      *string `json:"piece_id,omitempty"`
-	Role         string  `json:"role"`
-	RetrievalURL *string `json:"retrieval_url,omitempty"`
-	IsNewDataSet bool    `json:"is_new_data_set"`
+	CopyIndex        int                       `json:"copy_index"`
+	Status           string                    `json:"status"`
+	ProviderID       *string                   `json:"provider_id,omitempty"`
+	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
+	DataSetID        *string                   `json:"data_set_id,omitempty"`
+	PieceID          *string                   `json:"piece_id,omitempty"`
+	Role             string                    `json:"role"`
+	RetrievalURL     *string                   `json:"retrieval_url,omitempty"`
+	IsNewDataSet     bool                      `json:"is_new_data_set"`
 }
 
 type objectProvenanceFailureResponse struct {
-	AttemptIndex int     `json:"attempt_index"`
-	ProviderID   *string `json:"provider_id,omitempty"`
-	Role         string  `json:"role"`
-	Stage        *string `json:"stage,omitempty"`
-	Error        *string `json:"error,omitempty"`
+	AttemptIndex     int                       `json:"attempt_index"`
+	ProviderID       *string                   `json:"provider_id,omitempty"`
+	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
+	Role             string                    `json:"role"`
+	Stage            *string                   `json:"stage,omitempty"`
+	Error            *string                   `json:"error,omitempty"`
 }
 
 func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bool, uploadStatus *model.StorageUploadStatus) string {
@@ -1022,28 +1052,42 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 	resp.PieceCID = provenance.Upload.PieceCID
 	resp.RequestedCopies = provenance.Upload.RequestedCopies
 	resp.UpdatedAt = provenance.Upload.UpdatedAt.Format(time.RFC3339)
+	providerIDs := make([]idtypes.OnChainID, 0, len(provenance.Copies)+len(provenance.Failures))
+	for _, copyRow := range provenance.Copies {
+		if copyRow.ProviderID != nil {
+			providerIDs = append(providerIDs, *copyRow.ProviderID)
+		}
+	}
+	for _, failure := range provenance.Failures {
+		if failure.ProviderID != nil {
+			providerIDs = append(providerIDs, *failure.ProviderID)
+		}
+	}
+	providerIdentities := s.providerIdentities(providerIDs)
 	for _, copyRow := range provenance.Copies {
 		if copyRow.Status == model.StorageUploadCopyStatusCommitted {
 			resp.SuccessCopies++
 		}
 		resp.Copies = append(resp.Copies, objectProvenanceCopyResponse{
-			CopyIndex:    copyRow.CopyIndex,
-			Status:       string(copyRow.Status),
-			ProviderID:   onChainIDStringPtr(copyRow.ProviderID),
-			DataSetID:    onChainIDStringPtr(copyRow.DataSetID),
-			PieceID:      onChainIDStringPtr(copyRow.PieceID),
-			Role:         copyRow.Role,
-			RetrievalURL: copyRow.RetrievalURL,
-			IsNewDataSet: copyRow.IsNewDataSet,
+			CopyIndex:        copyRow.CopyIndex,
+			Status:           string(copyRow.Status),
+			ProviderID:       onChainIDStringPtr(copyRow.ProviderID),
+			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, copyRow.ProviderID),
+			DataSetID:        onChainIDStringPtr(copyRow.DataSetID),
+			PieceID:          onChainIDStringPtr(copyRow.PieceID),
+			Role:             copyRow.Role,
+			RetrievalURL:     copyRow.RetrievalURL,
+			IsNewDataSet:     copyRow.IsNewDataSet,
 		})
 	}
 	for _, failure := range provenance.Failures {
 		resp.Failures = append(resp.Failures, objectProvenanceFailureResponse{
-			AttemptIndex: failure.AttemptIndex,
-			ProviderID:   onChainIDStringPtr(failure.ProviderID),
-			Role:         failure.Role,
-			Stage:        failure.Stage,
-			Error:        failure.ErrorMessage,
+			AttemptIndex:     failure.AttemptIndex,
+			ProviderID:       onChainIDStringPtr(failure.ProviderID),
+			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, failure.ProviderID),
+			Role:             failure.Role,
+			Stage:            failure.Stage,
+			Error:            failure.ErrorMessage,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)

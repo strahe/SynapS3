@@ -30,21 +30,23 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr            string
-	db              *bun.DB
-	cache           cache.Cache
-	objectReader    *objectreader.Reader
-	cacheMaxBytes   int64
-	repos           *repository.Repositories
-	bucketLifecycle *bucketlifecycle.Service
-	workerHealth    WorkerHealthChecker
-	wallet          synapse.WalletQuerier
-	settings        *SettingsService
-	s3IAM           auth.IAMService
-	s3RootAccess    string
-	setupOnly       bool
-	logger          *slog.Logger
-	startedAt       time.Time
+	addr             string
+	db               *bun.DB
+	cache            cache.Cache
+	objectReader     *objectreader.Reader
+	cacheMaxBytes    int64
+	repos            *repository.Repositories
+	bucketLifecycle  *bucketlifecycle.Service
+	workerHealth     WorkerHealthChecker
+	wallet           synapse.WalletQuerier
+	providerIdentity providerIdentityLookup
+	events           *adminEventHub
+	settings         *SettingsService
+	s3IAM            auth.IAMService
+	s3RootAccess     string
+	setupOnly        bool
+	logger           *slog.Logger
+	startedAt        time.Time
 
 	// Track previously seen label sets to zero stale entries on refresh.
 	prevTaskLabels   map[[2]string]struct{}
@@ -63,6 +65,7 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		bucketLifecycle: bucketlifecycle.New(repos, c, logger),
 		workerHealth:    wh,
 		wallet:          newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
+		events:          newAdminEventHub(),
 		logger:          logger,
 		startedAt:       time.Now(),
 	}
@@ -71,6 +74,15 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 // WithObjectStorage enables provider-backed object reads for admin downloads.
 func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
 	s.objectReader = objectreader.New(s.repos, s.cache, storage, s.logger)
+	return s
+}
+
+// WithProviderIdentityResolver enables provider identity enrichment for admin APIs.
+func (s *Server) WithProviderIdentityResolver(resolver providerIdentityLookup) *Server {
+	s.providerIdentity = resolver
+	if setter, ok := resolver.(providerIdentityPublisherSetter); ok {
+		setter.SetProviderIdentityPublisher(s.publishProviderIdentity)
+	}
 	return s
 }
 
@@ -102,6 +114,9 @@ func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 func (s *Server) Run(ctx context.Context) error {
 	if !s.setupOnly {
 		go s.refreshMetricsLoop(ctx)
+		if runner, ok := s.providerIdentity.(providerIdentityRunner); ok {
+			go runner.Run(ctx)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -115,6 +130,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 		// Dashboard API
 		mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
+		mux.HandleFunc("GET /api/v1/events", s.handleAPIEvents)
 		mux.HandleFunc("GET /api/v1/buckets", s.handleAPIListBuckets)
 		mux.HandleFunc("POST /api/v1/buckets", s.handleAPICreateBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}", s.handleAPIGetBucket)
