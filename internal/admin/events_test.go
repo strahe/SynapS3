@@ -168,6 +168,72 @@ func TestAdminEventsHandlerStreamsProviderIdentityEvent(t *testing.T) {
 	}
 }
 
+func TestAdminEventsHandlerStreamsUploadProgressEvent(t *testing.T) {
+	events := NewEventHub()
+	srv := &Server{events: events, logger: testLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/events", srv.handleAPIEvents)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/events")
+	if err != nil {
+		t.Fatalf("GET events: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	reader := bufio.NewReader(resp.Body)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read connected comment: %v", err)
+	}
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read connected separator: %v", err)
+	}
+
+	events.Publish("upload_progress_updated", map[string]any{
+		"upload_id":   int64(11),
+		"version_id":  "01J000000000000000PROG01",
+		"bucket_name": "photos",
+		"object_key":  "image.jpg",
+		"progress": map[string]any{
+			"scope":          "primary_store",
+			"attempt":        1,
+			"uploaded_bytes": int64(4),
+			"total_bytes":    int64(10),
+			"percent":        40,
+			"done":           false,
+			"updated_at":     "2026-05-06T00:00:00Z",
+		},
+	})
+	lines := readSSEEventLines(t, reader)
+	if !containsLine(lines, "event: upload_progress_updated\n") {
+		t.Fatalf("SSE lines = %#v, want upload_progress_updated event", lines)
+	}
+	dataLine := findDataLine(lines)
+	if dataLine == "" {
+		t.Fatalf("SSE lines = %#v, want data line", lines)
+	}
+	var payload struct {
+		Seq       uint64 `json:"seq"`
+		Topic     string `json:"topic"`
+		UploadID  int64  `json:"upload_id"`
+		VersionID string `json:"version_id"`
+		Progress  struct {
+			Scope         string `json:"scope"`
+			Attempt       int    `json:"attempt"`
+			UploadedBytes int64  `json:"uploaded_bytes"`
+			TotalBytes    int64  `json:"total_bytes"`
+			Percent       *int   `json:"percent"`
+			Done          bool   `json:"done"`
+		} `json:"progress"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(dataLine), "data: ")), &payload); err != nil {
+		t.Fatalf("Unmarshal SSE data: %v", err)
+	}
+	if payload.Seq != 1 || payload.Topic != "upload_progress_updated" || payload.UploadID != 11 || payload.VersionID != "01J000000000000000PROG01" || payload.Progress.Percent == nil || *payload.Progress.Percent != 40 {
+		t.Fatalf("payload = %#v, want upload progress event payload", payload)
+	}
+}
+
 func TestAdminEventsHandlerReturnsUnavailableWithoutHub(t *testing.T) {
 	srv := &Server{logger: testLogger()}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)

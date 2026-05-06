@@ -64,6 +64,47 @@ func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 	}
 }
 
+func TestManager_RecoverOnStartup_PreservesActiveLeases(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-active-lease-bucket")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "mgr-active-lease-key", model.ObjectStateCached)
+	now := time.Now()
+	leaseUntil := now.Add(10 * time.Minute)
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		RefType:        "object",
+		RefID:          objID,
+		RefVersionID:   versionID,
+		IdempotencyKey: "upload:" + versionID,
+		Status:         model.TaskStatusRunning,
+		MaxRetries:     5,
+		ScheduledAt:    now,
+		ClaimedAt:      &now,
+		LeaseUntil:     &leaseUntil,
+		StartedAt:      &now,
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create running task: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr.Start(ctx)
+
+	got, err := repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != model.TaskStatusRunning {
+		t.Fatalf("task status = %s, want running", got.Status)
+	}
+	if got.LeaseUntil == nil || !got.LeaseUntil.After(now) {
+		t.Fatalf("lease_until = %v, want active lease after %s", got.LeaseUntil, now)
+	}
+}
+
 func TestManager_RecoverOnStartup_DoesNotResetStagedUploadingState(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -207,6 +248,89 @@ func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
 	}
 	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || tasks[0].Payload["upload_id"] == nil {
 		t.Fatalf("primary_commit task = %#v, want recovered task for source version", tasks[0])
+	}
+}
+
+func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-primary-commit-interrupted")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "interrupted-primary-commit", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzaceprimaryinterrupted",
+		RetrievalURL: "https://primary.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	stage := "primary_commit"
+	now := time.Now()
+	leaseUntil := now.Add(-time.Minute)
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objID,
+		RefVersionID:   versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:primary_commit:%d", versionID, upload.ID),
+		Payload:        map[string]interface{}{"upload_id": upload.ID},
+		Status:         model.TaskStatusRunning,
+		MaxRetries:     9,
+		ScheduledAt:    now,
+		ClaimedAt:      &now,
+		LeaseUntil:     &leaseUntil,
+		StartedAt:      &now,
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create running task: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	claimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expired primary_commit task was not claimable after startup recovery")
+	}
+	if claimed.ID != task.ID {
+		t.Fatalf("claimed task ID = %d, want expired task %d", claimed.ID, task.ID)
 	}
 }
 
@@ -523,7 +647,7 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	}
 }
 
-func TestManager_ReconcileTasks_AutoEvictIncludesReplicating(t *testing.T) {
+func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -591,11 +715,8 @@ func TestManager_ReconcileTasks_AutoEvictIncludesReplicating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claiming evict task: %v", err)
 	}
-	if task == nil {
-		t.Fatal("expected evict_cache task for replicating version")
-	}
-	if task.RefID != objID || task.RefVersionID != versionID {
-		t.Fatalf("evict task refs = (%d,%s), want (%d,%s)", task.RefID, task.RefVersionID, objID, versionID)
+	if task != nil {
+		t.Fatalf("unexpected evict_cache task for replicating version %d/%s: %#v", objID, versionID, task)
 	}
 }
 

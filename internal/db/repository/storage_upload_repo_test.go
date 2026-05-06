@@ -177,6 +177,85 @@ func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testi
 	}
 }
 
+func TestStorageUploadRepo_PrimaryStoreProgressTracksAttemptsAndClamps(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "primary-store-progress-bucket")
+
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000000PRG01",
+		ContentSize:     10,
+		Checksum:        "checksum-primary-progress",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	if upload.PrimaryBytesUploaded != 0 || upload.PrimaryStoreAttempt != 0 || upload.ProgressUpdatedAt != nil {
+		t.Fatalf("new upload progress = bytes:%d attempt:%d updated:%v, want zero values", upload.PrimaryBytesUploaded, upload.PrimaryStoreAttempt, upload.ProgressUpdatedAt)
+	}
+
+	attemptOne, err := repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("BeginPrimaryStoreProgress first: %v", err)
+	}
+	if attemptOne.PrimaryStoreAttempt != 1 || attemptOne.PrimaryBytesUploaded != 0 || attemptOne.ProgressUpdatedAt == nil {
+		t.Fatalf("first attempt progress = bytes:%d attempt:%d updated:%v, want reset attempt 1", attemptOne.PrimaryBytesUploaded, attemptOne.PrimaryStoreAttempt, attemptOne.ProgressUpdatedAt)
+	}
+
+	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+		UploadID:      upload.ID,
+		Attempt:       attemptOne.PrimaryStoreAttempt,
+		BytesUploaded: 7,
+	}); err != nil {
+		t.Fatalf("RecordPrimaryStoreProgress 7: %v", err)
+	}
+	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+		UploadID:      upload.ID,
+		Attempt:       attemptOne.PrimaryStoreAttempt,
+		BytesUploaded: 4,
+	}); err != nil {
+		t.Fatalf("RecordPrimaryStoreProgress stale bytes: %v", err)
+	}
+	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+		UploadID:      upload.ID,
+		Attempt:       attemptOne.PrimaryStoreAttempt,
+		BytesUploaded: 99,
+	}); err != nil {
+		t.Fatalf("RecordPrimaryStoreProgress clamp: %v", err)
+	}
+	got, err := repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID after progress: got=%v err=%v", got, err)
+	}
+	if got.PrimaryBytesUploaded != 10 {
+		t.Fatalf("primary bytes after attempt one = %d, want clamped content size", got.PrimaryBytesUploaded)
+	}
+
+	attemptTwo, err := repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("BeginPrimaryStoreProgress second: %v", err)
+	}
+	if attemptTwo.PrimaryStoreAttempt != 2 || attemptTwo.PrimaryBytesUploaded != 0 {
+		t.Fatalf("second attempt progress = bytes:%d attempt:%d, want reset attempt 2", attemptTwo.PrimaryBytesUploaded, attemptTwo.PrimaryStoreAttempt)
+	}
+	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+		UploadID:      upload.ID,
+		Attempt:       attemptOne.PrimaryStoreAttempt,
+		BytesUploaded: 8,
+	}); err != nil {
+		t.Fatalf("RecordPrimaryStoreProgress old attempt: %v", err)
+	}
+	got, err = repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID after old attempt: got=%v err=%v", got, err)
+	}
+	if got.PrimaryStoreAttempt != 2 || got.PrimaryBytesUploaded != 0 {
+		t.Fatalf("old attempt progress changed current attempt = bytes:%d attempt:%d, want reset attempt 2", got.PrimaryBytesUploaded, got.PrimaryStoreAttempt)
+	}
+}
+
 func TestStorageUploadRepo_GetUploadProvenanceIncludesCopiesAndFailures(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

@@ -1623,6 +1623,65 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	}
 }
 
+func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	bucket := &model.Bucket{Name: "object-progress-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(context.Background(), bucket); err != nil {
+		t.Fatalf("Create bucket: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, repos, bucket, "uploading.txt", 10, "etag-progress", "checksum-progress", "text/plain", "", model.ObjectStateUploading)
+	upload, err := repos.Uploads.StartObjectUploadAttempt(context.Background(), repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     10,
+		Checksum:        "checksum-progress",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	progressUpload, err := repos.Uploads.BeginPrimaryStoreProgress(context.Background(), upload.ID)
+	if err != nil {
+		t.Fatalf("BeginPrimaryStoreProgress: %v", err)
+	}
+	if _, err := repos.Uploads.RecordPrimaryStoreProgress(context.Background(), repository.RecordPrimaryStoreProgressInput{
+		UploadID:      upload.ID,
+		Attempt:       progressUpload.PrimaryStoreAttempt,
+		BytesUploaded: 4,
+	}); err != nil {
+		t.Fatalf("RecordPrimaryStoreProgress: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/object-progress-bucket/objects")
+	if err != nil {
+		t.Fatalf("GET objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		Objects []struct {
+			Key      string                  `json:"key"`
+			Progress *uploadProgressResponse `json:"progress"`
+		} `json:"objects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Objects) != 1 || body.Objects[0].Key != "uploading.txt" {
+		t.Fatalf("objects = %#v, want uploading object", body.Objects)
+	}
+	progress := body.Objects[0].Progress
+	if progress == nil {
+		t.Fatal("progress is nil, want primary transfer progress")
+	}
+	if progress.Scope != "primary_store" || progress.Attempt != progressUpload.PrimaryStoreAttempt || progress.UploadedBytes != 4 || progress.TotalBytes != 10 || progress.Percent == nil || *progress.Percent != 40 || progress.Done {
+		t.Fatalf("progress = %#v, want 4/10 primary transfer progress", progress)
+	}
+}
+
 func TestAPIBucketObjectProvenance(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	identityResolver := &fakeAPIProviderIdentityResolver{

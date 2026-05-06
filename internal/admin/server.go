@@ -40,7 +40,7 @@ type Server struct {
 	workerHealth     WorkerHealthChecker
 	wallet           synapse.WalletQuerier
 	providerIdentity providerIdentityLookup
-	events           *adminEventHub
+	events           *EventHub
 	settings         *SettingsService
 	s3IAM            auth.IAMService
 	s3RootAccess     string
@@ -74,6 +74,11 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 // WithObjectStorage enables provider-backed object reads for admin downloads.
 func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
 	s.objectReader = objectreader.New(s.repos, s.cache, storage, s.logger)
+	return s
+}
+
+func (s *Server) WithEventHub(events *EventHub) *Server {
+	s.events = events
 	return s
 }
 

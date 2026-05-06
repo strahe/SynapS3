@@ -88,6 +88,25 @@ func (r *BunTaskRepo) ClaimPending(ctx context.Context, taskType model.TaskType,
 	return task, nil
 }
 
+func (r *BunTaskRepo) RenewLease(ctx context.Context, taskID int64, leaseDuration time.Duration) error {
+	if leaseDuration < 0 {
+		leaseDuration = 0
+	}
+	res, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("lease_until = ?", time.Now().Add(leaseDuration)).
+		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("renewing task lease: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("renewing task %d lease: not in running state", taskID)
+	}
+	return nil
+}
+
 // Complete marks a running task as completed.
 func (r *BunTaskRepo) Complete(ctx context.Context, taskID int64) error {
 	now := time.Now()
@@ -126,6 +145,30 @@ func (r *BunTaskRepo) Fail(ctx context.Context, taskID int64, lastError string) 
 	return nil
 }
 
+func (r *BunTaskRepo) DeferRunning(ctx context.Context, taskID int64, delay time.Duration, reason string) error {
+	if delay < 0 {
+		delay = 0
+	}
+	res, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusPending).
+		Set("last_error = ?", reason).
+		Set("scheduled_at = ?", time.Now().Add(delay)).
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
+		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("deferring running task: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("deferring task %d: not in running state", taskID)
+	}
+	return nil
+}
+
 // ReleaseExpiredLeases resets running tasks whose lease has expired back to pending.
 func (r *BunTaskRepo) ReleaseExpiredLeases(ctx context.Context) (int, error) {
 	now := time.Now()
@@ -135,7 +178,7 @@ func (r *BunTaskRepo) ReleaseExpiredLeases(ctx context.Context) (int, error) {
 		Set("claimed_at = NULL").
 		Set("lease_until = NULL").
 		Set("started_at = NULL").
-		Where("status = ? AND lease_until < ?", model.TaskStatusRunning, now).
+		Where("status = ? AND (lease_until IS NULL OR lease_until < ?)", model.TaskStatusRunning, now).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("releasing expired leases: %w", err)

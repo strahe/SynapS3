@@ -90,6 +90,16 @@ export type ObjectUploadStatus =
   | 'rejected'
   | 'superseded'
 
+export interface UploadTransferProgress {
+  scope: 'primary_store'
+  attempt: number
+  uploaded_bytes: number
+  total_bytes: number
+  percent?: number
+  done: boolean
+  updated_at: string
+}
+
 export interface ObjectItem {
   id: number
   key: string
@@ -98,6 +108,7 @@ export interface ObjectItem {
   state: ObjectState
   status: ObjectStatus
   upload_status?: ObjectUploadStatus
+  progress?: UploadTransferProgress
   location: ObjectLocation
   content_type: string
   etag: string
@@ -125,6 +136,7 @@ export interface ObjectVersionItem {
   state: ObjectState
   status: ObjectStatus
   upload_status?: ObjectUploadStatus
+  progress?: UploadTransferProgress
   location: ObjectLocation
   content_type: string
   etag: string
@@ -145,6 +157,7 @@ export interface ObjectStatusDetail {
   state: ObjectState
   status: ObjectStatus
   upload_status?: ObjectUploadStatus
+  progress?: UploadTransferProgress
   failed_at_state?: string
   message?: string
   updated_at: string
@@ -191,6 +204,7 @@ export interface ObjectProvenance {
   state: ObjectState
   status: ObjectStatus
   upload_status?: ObjectUploadStatus
+  progress?: UploadTransferProgress
   piece_cid?: string
   requested_copies: number
   success_copies: number
@@ -209,6 +223,7 @@ export interface TaskItem {
   ref_id: number
   ref_version_id: string
   status: string
+  progress?: UploadTransferProgress
   retry_count: number
   max_retries: number
   last_error?: string
@@ -238,6 +253,7 @@ export interface TaskRefObjectDetail {
   state: ObjectState
   status: ObjectStatus
   upload_status?: ObjectUploadStatus
+  progress?: UploadTransferProgress
   location: ObjectLocation
   content_type: string
   updated_at: string

@@ -177,12 +177,11 @@ func TestEvictor_HealthyWhileEvictionTaskIsActive(t *testing.T) {
 	}
 }
 
-func TestEvictor_ReplicatingVersionEvictsCacheAndKeepsState(t *testing.T) {
-	var deletedBucket, deletedKey string
+func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
+	deleteCalled := false
 	mc := &testutil.MockCache{
-		DeleteFunc: func(_ context.Context, bucket, key string) error {
-			deletedBucket = bucket
-			deletedKey = key
+		DeleteFunc: func(_ context.Context, _, _ string) error {
+			deleteCalled = true
 			return nil
 		},
 	}
@@ -255,12 +254,58 @@ func TestEvictor_ReplicatingVersionEvictsCacheAndKeepsState(t *testing.T) {
 	}
 
 	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+	originalScheduledAt := task.ScheduledAt
 	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
 
-	gotTask, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if gotTask.Status != model.TaskStatusCompleted {
-		t.Fatalf("task status = %s, want completed", gotTask.Status)
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = evictor.Run(runCtx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		waitForSignal(t, done, time.Second, "evictor shutdown")
+	}()
+
+	deadline := time.After(3 * time.Second)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	var gotTask *model.Task
+	for gotTask == nil {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for replicating evict task to be deferred")
+		case <-ticker.C:
+			current, err := env.repos.Tasks.GetByID(ctx, task.ID)
+			if err != nil || current == nil {
+				continue
+			}
+			if current.Status != model.TaskStatusPending {
+				if current.Status != model.TaskStatusRunning {
+					gotTask = current
+				}
+				continue
+			}
+			if current.LastError != nil && strings.Contains(*current.LastError, "waiting for all copies") {
+				gotTask = current
+			}
+		}
+	}
+	if gotTask.Status != model.TaskStatusPending {
+		t.Fatalf("task status = %s, want pending deferred task", gotTask.Status)
+	}
+	if gotTask.RetryCount != 0 {
+		t.Fatalf("task retry_count = %d, want 0", gotTask.RetryCount)
+	}
+	if gotTask.LastError == nil || !strings.Contains(*gotTask.LastError, "waiting for all copies") {
+		t.Fatalf("task last_error = %v, want waiting-for-copies reason", gotTask.LastError)
+	}
+	if !gotTask.ScheduledAt.After(originalScheduledAt) {
+		t.Fatalf("task scheduled_at = %s, want after %s", gotTask.ScheduledAt, originalScheduledAt)
+	}
+	if gotTask.ScheduledAt.Before(originalScheduledAt.Add(20 * time.Second)) {
+		t.Fatalf("task scheduled_at = %s, want a longer defer while replication is still running", gotTask.ScheduledAt)
 	}
 	gotVersion, err := env.repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || gotVersion == nil {
@@ -269,11 +314,11 @@ func TestEvictor_ReplicatingVersionEvictsCacheAndKeepsState(t *testing.T) {
 	if gotVersion.State != model.ObjectStateReplicating {
 		t.Fatalf("version state = %s, want replicating", gotVersion.State)
 	}
-	if gotVersion.InCache {
-		t.Fatal("version in_cache = true, want false")
+	if !gotVersion.InCache {
+		t.Fatal("version in_cache = false, want cache retained while replicating")
 	}
-	if deletedBucket != bucket.Name || deletedKey != version.CacheKey {
-		t.Fatalf("deleted cache = %s/%s, want %s/%s", deletedBucket, deletedKey, bucket.Name, version.CacheKey)
+	if deleteCalled {
+		t.Fatalf("cache delete was called for replicating version %s in bucket %s", version.CacheKey, bucket.Name)
 	}
 }
 

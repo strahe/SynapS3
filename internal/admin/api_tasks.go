@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,21 +12,22 @@ import (
 )
 
 type taskListItem struct {
-	ID           int64   `json:"id"`
-	Type         string  `json:"type"`
-	Stage        *string `json:"stage,omitempty"`
-	UploadID     *int64  `json:"upload_id,omitempty"`
-	CopyIndex    *int    `json:"copy_index,omitempty"`
-	RefType      string  `json:"ref_type"`
-	RefID        int64   `json:"ref_id"`
-	RefVersionID string  `json:"ref_version_id"`
-	Status       string  `json:"status"`
-	RetryCount   int     `json:"retry_count"`
-	MaxRetries   int     `json:"max_retries"`
-	LastError    *string `json:"last_error,omitempty"`
-	ScheduledAt  string  `json:"scheduled_at"`
-	ClaimedAt    *string `json:"claimed_at,omitempty"`
-	CompletedAt  *string `json:"completed_at,omitempty"`
+	ID           int64                   `json:"id"`
+	Type         string                  `json:"type"`
+	Stage        *string                 `json:"stage,omitempty"`
+	UploadID     *int64                  `json:"upload_id,omitempty"`
+	CopyIndex    *int                    `json:"copy_index,omitempty"`
+	RefType      string                  `json:"ref_type"`
+	RefID        int64                   `json:"ref_id"`
+	RefVersionID string                  `json:"ref_version_id"`
+	Status       string                  `json:"status"`
+	Progress     *uploadProgressResponse `json:"progress,omitempty"`
+	RetryCount   int                     `json:"retry_count"`
+	MaxRetries   int                     `json:"max_retries"`
+	LastError    *string                 `json:"last_error,omitempty"`
+	ScheduledAt  string                  `json:"scheduled_at"`
+	ClaimedAt    *string                 `json:"claimed_at,omitempty"`
+	CompletedAt  *string                 `json:"completed_at,omitempty"`
 }
 
 type taskListResponse struct {
@@ -43,16 +45,17 @@ type taskRefDetailResponse struct {
 }
 
 type taskRefObjectDetail struct {
-	BucketName   string         `json:"bucket_name"`
-	Key          string         `json:"key"`
-	VersionID    string         `json:"version_id"`
-	Size         int64          `json:"size"`
-	State        string         `json:"state"`
-	Status       string         `json:"status"`
-	UploadStatus *string        `json:"upload_status,omitempty"`
-	Location     objectLocation `json:"location"`
-	ContentType  string         `json:"content_type"`
-	UpdatedAt    string         `json:"updated_at"`
+	BucketName   string                  `json:"bucket_name"`
+	Key          string                  `json:"key"`
+	VersionID    string                  `json:"version_id"`
+	Size         int64                   `json:"size"`
+	State        string                  `json:"state"`
+	Status       string                  `json:"status"`
+	UploadStatus *string                 `json:"upload_status,omitempty"`
+	Progress     *uploadProgressResponse `json:"progress,omitempty"`
+	Location     objectLocation          `json:"location"`
+	ContentType  string                  `json:"content_type"`
+	UpdatedAt    string                  `json:"updated_at"`
 }
 
 func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +90,7 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	progressByTaskID := s.taskUploadProgresses(ctx, tasks)
 
 	items := make([]taskListItem, 0, len(tasks))
 	for _, t := range tasks {
@@ -113,6 +117,7 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 			v := t.CompletedAt.Format(time.RFC3339)
 			item.CompletedAt = &v
 		}
+		item.Progress = progressByTaskID[t.ID]
 		items = append(items, item)
 	}
 
@@ -174,6 +179,87 @@ func taskPayloadInt64(payload map[string]interface{}, key string) *int64 {
 		}
 	}
 	return nil
+}
+
+func (s *Server) taskUploadProgresses(ctx context.Context, tasks []model.Task) map[int64]*uploadProgressResponse {
+	progressByTaskID := make(map[int64]*uploadProgressResponse)
+	if s == nil || s.repos == nil || s.repos.Uploads == nil || len(tasks) == 0 {
+		return progressByTaskID
+	}
+
+	taskUploadIDs := make(map[int64]int64)
+	taskVersionIDs := make(map[int64]string)
+	uploadIDSet := make(map[int64]struct{})
+	versionIDSet := make(map[string]struct{})
+	for i := range tasks {
+		task := &tasks[i]
+		if !taskWantsUploadProgress(task) {
+			continue
+		}
+		if uploadID := taskPayloadInt64(task.Payload, "upload_id"); uploadID != nil {
+			taskUploadIDs[task.ID] = *uploadID
+			uploadIDSet[*uploadID] = struct{}{}
+			continue
+		}
+		versionID := strings.TrimSpace(task.RefVersionID)
+		if versionID == "" {
+			continue
+		}
+		taskVersionIDs[task.ID] = versionID
+		versionIDSet[versionID] = struct{}{}
+	}
+
+	uploadsByID := make(map[int64]model.StorageUpload)
+	if len(uploadIDSet) > 0 {
+		uploadIDs := make([]int64, 0, len(uploadIDSet))
+		for uploadID := range uploadIDSet {
+			uploadIDs = append(uploadIDs, uploadID)
+		}
+		var err error
+		uploadsByID, err = s.repos.Uploads.GetByIDs(ctx, uploadIDs)
+		if err != nil {
+			s.logger.Warn("api: failed to load task upload progress by upload id", "error", err)
+			uploadsByID = nil
+		}
+	}
+
+	uploadsByVersionID := make(map[string]model.StorageUpload)
+	if len(versionIDSet) > 0 {
+		versionIDs := make([]string, 0, len(versionIDSet))
+		for versionID := range versionIDSet {
+			versionIDs = append(versionIDs, versionID)
+		}
+		var err error
+		uploadsByVersionID, err = s.repos.Uploads.FindLatestUploadsBySourceVersions(ctx, versionIDs)
+		if err != nil {
+			s.logger.Warn("api: failed to load task upload progress by version id", "error", err)
+			uploadsByVersionID = nil
+		}
+	}
+
+	for taskID, uploadID := range taskUploadIDs {
+		upload, ok := uploadsByID[uploadID]
+		if !ok {
+			continue
+		}
+		progressByTaskID[taskID] = uploadProgressResponseFromUpload(&upload)
+	}
+	for taskID, versionID := range taskVersionIDs {
+		upload, ok := uploadsByVersionID[versionID]
+		if !ok {
+			continue
+		}
+		progressByTaskID[taskID] = uploadProgressResponseFromUpload(&upload)
+	}
+	return progressByTaskID
+}
+
+func taskWantsUploadProgress(task *model.Task) bool {
+	if task == nil || task.Type != model.TaskTypeUpload {
+		return false
+	}
+	stage := taskStage(task)
+	return stage != nil && (*stage == "primary_store" || *stage == "legacy_upload")
 }
 
 func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) {
@@ -250,6 +336,7 @@ func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) 
 		State:        string(version.State),
 		Status:       objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, uploadInfo.Status),
 		UploadStatus: uploadStatusString(uploadInfo.Status),
+		Progress:     uploadInfo.Progress,
 		Location:     objectLocation{Cache: version.InCache, Filecoin: version.InFilecoin},
 		ContentType:  version.ContentType,
 		UpdatedAt:    version.UpdatedAt.Format(time.RFC3339),

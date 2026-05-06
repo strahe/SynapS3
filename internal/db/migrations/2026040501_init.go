@@ -303,6 +303,8 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		ColumnExpr("CONSTRAINT chk_storage_uploads_status CHECK (status IN ('running', 'stored_on_primary', 'primary_committed', 'partial', 'all_copies_committed', 'failed', 'rejected', 'superseded'))").
 		ColumnExpr("CONSTRAINT chk_storage_uploads_content_size CHECK (content_size >= 0)").
 		ColumnExpr("CONSTRAINT chk_storage_uploads_requested_copies CHECK (requested_copies >= 0)").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_primary_bytes CHECK (primary_bytes_uploaded >= 0 AND primary_bytes_uploaded <= content_size)").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_primary_attempt CHECK (primary_store_attempt >= 0)").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating storage_uploads table: %w", err)
 	}

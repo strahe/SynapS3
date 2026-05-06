@@ -300,6 +300,45 @@ func waitForTaskStatus(t *testing.T, env *testWorkerEnv, taskID int64, status mo
 	}
 }
 
+type publishedAdminEvent struct {
+	topic   string
+	payload map[string]any
+}
+
+type fakeAdminEventPublisher struct {
+	mu     sync.Mutex
+	events []publishedAdminEvent
+}
+
+func (p *fakeAdminEventPublisher) Publish(topic string, payload map[string]any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events = append(p.events, publishedAdminEvent{topic: topic, payload: payload})
+}
+
+func (p *fakeAdminEventPublisher) hasTopic(topic string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, event := range p.events {
+		if event.topic == topic {
+			return true
+		}
+	}
+	return false
+}
+
+type failingProgressUploadRepo struct {
+	repository.StorageUploadRepository
+}
+
+func (r failingProgressUploadRepo) BeginPrimaryStoreProgress(_ context.Context, _ int64) (*model.StorageUpload, error) {
+	return nil, errors.New("progress begin failed")
+}
+
+func (r failingProgressUploadRepo) RecordPrimaryStoreProgress(_ context.Context, _ repository.RecordPrimaryStoreProgressInput) (*model.StorageUpload, error) {
+	return nil, errors.New("progress record failed")
+}
+
 func uploadResultForCall(t *testing.T, call int32) *storage.UploadResult {
 	t.Helper()
 	id := uint64(1000 + call)
@@ -318,27 +357,28 @@ func uploadResultForCall(t *testing.T, call int32) *storage.UploadResult {
 }
 
 type fakeUploadContext struct {
-	providerID   sdktypes.BigInt
-	dataSetID    sdktypes.BigInt
-	boundDataSet *sdktypes.BigInt
-	pieceID      sdktypes.BigInt
-	pieceCID     cid.Cid
-	clientDataID sdktypes.BigInt
-	pullEntered  chan struct{}
-	releasePull  chan struct{}
-	pullOnce     sync.Once
-	pullErr      error
-	createCalls  *atomic.Int32
-	waitCalls    *atomic.Int32
-	createErr    error
-	waitErr      error
-	storeErr     error
-	commitErr    error
-	serviceURL   string
-	presignCalls atomic.Int32
-	commitCalls  atomic.Int32
-	commitMu     sync.Mutex
-	commitExtras [][]byte
+	providerID    sdktypes.BigInt
+	dataSetID     sdktypes.BigInt
+	boundDataSet  *sdktypes.BigInt
+	pieceID       sdktypes.BigInt
+	pieceCID      cid.Cid
+	clientDataID  sdktypes.BigInt
+	pullEntered   chan struct{}
+	releasePull   chan struct{}
+	pullOnce      sync.Once
+	pullErr       error
+	createCalls   *atomic.Int32
+	waitCalls     *atomic.Int32
+	createErr     error
+	waitErr       error
+	storeErr      error
+	storeProgress []int64
+	commitErr     error
+	serviceURL    string
+	presignCalls  atomic.Int32
+	commitCalls   atomic.Int32
+	commitMu      sync.Mutex
+	commitExtras  [][]byte
 }
 
 func newFakeUploadContext(providerID sdktypes.BigInt, dataSetID sdktypes.BigInt, pieceID sdktypes.BigInt, pieceCID cid.Cid) *fakeUploadContext {
@@ -409,9 +449,14 @@ func (f *fakeUploadContext) WaitForDataSetCreated(_ context.Context, submission 
 	}, nil
 }
 
-func (f *fakeUploadContext) Store(_ context.Context, r io.Reader, _ *storage.StoreOptions) (*storage.StoreResult, error) {
+func (f *fakeUploadContext) Store(_ context.Context, r io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
 	if _, err := io.ReadAll(r); err != nil {
 		return nil, err
+	}
+	if opts != nil && opts.OnProgress != nil {
+		for _, n := range f.storeProgress {
+			opts.OnProgress(n)
+		}
 	}
 	if f.storeErr != nil {
 		return nil, f.storeErr
@@ -463,6 +508,76 @@ func (f *fakeUploadContext) Commit(_ context.Context, req storage.CommitRequest)
 func sdkBigIntTestPtr(id sdktypes.BigInt) *sdktypes.BigInt {
 	cp := id.Copy()
 	return &cp
+}
+
+func seedReadyPrimaryStoreTask(t *testing.T, env *testWorkerEnv) (*model.StorageUpload, *model.Task, *fakeUploadContext) {
+	t.Helper()
+	bucket, objID, versionID := seedCachedObject(t, env)
+	ctx := context.Background()
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark uploading: %v", err)
+	}
+	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := env.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        onChainID(t, "101"),
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID:              binding.ID,
+		UploadID:        upload.ID,
+		DataSetID:       onChainID(t, "1001"),
+		ClientDataSetID: onChainIDPtr(t, "11001"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	stage := "primary_store"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objID,
+		RefVersionID:   versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:primary_store:%d", versionID, upload.ID),
+		Payload:        map[string]interface{}{"upload_id": upload.ID},
+		Status:         model.TaskStatusPending,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("create primary store task: %v", err)
+	}
+	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
+	dataSetID := sdktypes.NewBigInt(1001)
+	primaryCtx.boundDataSet = &dataSetID
+	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
+			return primaryCtx, nil
+		}
+		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+	}
+	return upload, task, primaryCtx
 }
 
 func TestUploader_WaitsPollIntervalBeforeInitialClaim(t *testing.T) {
@@ -709,7 +824,115 @@ func TestUploader_HappyPath(t *testing.T) {
 	}
 }
 
-func TestUploader_StagedPrimaryCommitMovesObjectToReplicatingAndEnqueuesEvictionBeforeSecondary(t *testing.T) {
+func TestUploader_LegacyUploadRecordsPrimaryTransferProgress(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
+	publisher := &fakeAdminEventPublisher{}
+
+	env.storage.UploadFunc = func(_ context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
+		if _, err := io.ReadAll(r); err != nil {
+			return nil, err
+		}
+		if opts == nil || opts.OnProgress == nil {
+			t.Fatal("UploadOptions.OnProgress is nil")
+		}
+		opts.OnProgress(5)
+		opts.OnProgress(11)
+		return &storage.UploadResult{
+			PieceCID: testCID(t),
+			Size:     11,
+			Complete: true,
+			Copies: []storage.CopyResult{{
+				ProviderID:   sdktypes.NewBigInt(101),
+				DataSetID:    sdktypes.NewBigInt(1001),
+				PieceID:      sdktypes.NewBigInt(2001),
+				Role:         storage.CopyRolePrimary,
+				RetrievalURL: "https://provider.example/piece",
+			}},
+		}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default(), worker.WithEventPublisher(publisher))
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	got, err := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
+	if err != nil || got == nil || got.StorageUploadID == nil {
+		t.Fatalf("GetCurrentVersionByObjectID: object=%v err=%v", got, err)
+	}
+	upload, err := env.repos.Uploads.GetByID(context.Background(), *got.StorageUploadID)
+	if err != nil || upload == nil {
+		t.Fatalf("GetByID(upload): upload=%v err=%v", upload, err)
+	}
+	if upload.PrimaryStoreAttempt != 1 || upload.PrimaryBytesUploaded != 11 || upload.ProgressUpdatedAt == nil {
+		t.Fatalf("legacy progress = bytes:%d attempt:%d updated:%v, want completed primary transfer", upload.PrimaryBytesUploaded, upload.PrimaryStoreAttempt, upload.ProgressUpdatedAt)
+	}
+	if !publisher.hasTopic("upload_progress_updated") {
+		t.Fatal("expected upload_progress_updated event")
+	}
+}
+
+func TestUploader_ProgressFailureDoesNotFailLegacyUpload(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	_, objID, versionID := seedCachedObject(t, env)
+	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
+	env.repos.Uploads = failingProgressUploadRepo{StorageUploadRepository: env.repos.Uploads}
+
+	env.storage.UploadFunc = func(_ context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
+		if _, err := io.ReadAll(r); err != nil {
+			return nil, err
+		}
+		if opts != nil && opts.OnProgress != nil {
+			opts.OnProgress(11)
+		}
+		return &storage.UploadResult{
+			PieceCID: testCID(t),
+			Size:     11,
+			Complete: true,
+			Copies: []storage.CopyResult{{
+				ProviderID:   sdktypes.NewBigInt(101),
+				DataSetID:    sdktypes.NewBigInt(1001),
+				PieceID:      sdktypes.NewBigInt(2001),
+				Role:         storage.CopyRolePrimary,
+				RetrievalURL: "https://provider.example/piece",
+			}},
+		}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	got, err := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID(task): task=%v err=%v", got, err)
+	}
+	if got.Status != model.TaskStatusCompleted {
+		t.Fatalf("task status = %s, want completed despite progress failure", got.Status)
+	}
+}
+
+func TestUploader_StagedPrimaryStoreRecordsTransferProgress(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	upload, task, primaryCtx := seedReadyPrimaryStoreTask(t, env)
+	primaryCtx.storeProgress = []int64{5, 11}
+	publisher := &fakeAdminEventPublisher{}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default(), worker.WithEventPublisher(publisher))
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	got, err := env.repos.Uploads.GetByID(context.Background(), upload.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID(upload): upload=%v err=%v", got, err)
+	}
+	if got.PrimaryStoreAttempt != 1 || got.PrimaryBytesUploaded != 11 || got.ProgressUpdatedAt == nil {
+		t.Fatalf("staged progress = bytes:%d attempt:%d updated:%v, want completed primary transfer", got.PrimaryBytesUploaded, got.PrimaryStoreAttempt, got.ProgressUpdatedAt)
+	}
+	if !publisher.hasTopic("upload_progress_updated") {
+		t.Fatal("expected upload_progress_updated event")
+	}
+}
+
+func TestUploader_StagedPrimaryCommitKeepsCacheUntilAllCopiesCommitted(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	bucket, objID, versionID := seedCachedObject(t, env)
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
@@ -717,6 +940,7 @@ func TestUploader_StagedPrimaryCommitMovesObjectToReplicatingAndEnqueuesEviction
 	pieceCID := testCID(t)
 	secondaryPullEntered := make(chan struct{})
 	releaseSecondaryPull := make(chan struct{})
+	var releaseSecondaryPullOnce sync.Once
 
 	primary := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
 	secondary := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), pieceCID)
@@ -756,7 +980,7 @@ func TestUploader_StagedPrimaryCommitMovesObjectToReplicatingAndEnqueuesEviction
 	}()
 	defer func() {
 		cancel()
-		close(releaseSecondaryPull)
+		releaseSecondaryPullOnce.Do(func() { close(releaseSecondaryPull) })
 		waitForSignal(t, done, time.Second, "uploader shutdown")
 	}()
 
@@ -770,6 +994,9 @@ func TestUploader_StagedPrimaryCommitMovesObjectToReplicatingAndEnqueuesEviction
 	if obj.StorageUploadID == nil || !obj.InFilecoin {
 		t.Fatalf("replicating object storage = upload:%v in_filecoin:%v, want primary readable upload", obj.StorageUploadID, obj.InFilecoin)
 	}
+	if !obj.InCache {
+		t.Fatal("replicating object in_cache = false, want cache retained before all copies are committed")
+	}
 	upload, err := env.repos.Uploads.GetByID(context.Background(), *obj.StorageUploadID)
 	if err != nil || upload == nil {
 		t.Fatalf("GetByID(upload): upload=%v err=%v", upload, err)
@@ -781,11 +1008,22 @@ func TestUploader_StagedPrimaryCommitMovesObjectToReplicatingAndEnqueuesEviction
 	if err != nil {
 		t.Fatalf("ClaimPending(evict): %v", err)
 	}
+	if evict != nil {
+		t.Fatalf("unexpected evict task before all copies are committed: %#v", evict)
+	}
+
+	releaseSecondaryPullOnce.Do(func() { close(releaseSecondaryPull) })
+	waitForObjectState(t, env, versionID, model.ObjectStateStored, 3*time.Second)
+
+	evict, err = env.repos.Tasks.ClaimPending(context.Background(), model.TaskTypeEvictCache, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending(evict after stored): %v", err)
+	}
 	if evict == nil {
-		t.Fatal("expected evict task after primary copy is readable")
+		t.Fatal("expected evict task after all copies are committed")
 	}
 	if evict.RefID != objID || evict.RefVersionID != versionID {
-		t.Fatalf("evict task refs = (%d,%s), want (%d,%s)", evict.RefID, evict.RefVersionID, objID, versionID)
+		t.Fatalf("evict task refs after stored = (%d,%s), want (%d,%s)", evict.RefID, evict.RefVersionID, objID, versionID)
 	}
 	if task.ID == 0 || bucket.ID == 0 {
 		t.Fatal("seeded task and bucket should be persisted")
@@ -1636,11 +1874,8 @@ doneWaiting:
 	if err != nil {
 		t.Fatalf("ClaimPending(evict): %v", err)
 	}
-	if evict == nil {
-		t.Fatal("expected evict task for partial upload with readable primary")
-	}
-	if evict.RefID != obj.ObjectID || evict.RefVersionID != obj.VersionID {
-		t.Fatalf("evict task refs = (%d,%s), want (%d,%s)", evict.RefID, evict.RefVersionID, obj.ObjectID, obj.VersionID)
+	if evict != nil {
+		t.Fatalf("unexpected evict task for partial upload: %#v", evict)
 	}
 }
 

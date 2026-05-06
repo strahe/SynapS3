@@ -281,6 +281,7 @@ func runServe(ctx context.Context, src config.Source) error {
 
 	// Build state machine.
 	sm := state.NewObjectStateMachine()
+	adminEvents := admin.NewEventHub()
 
 	// Initialize Filecoin SDK clients.
 	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
@@ -348,7 +349,8 @@ func runServe(ctx context.Context, src config.Source) error {
 		worker.NewUploader(repos, localCache, storageClient, walletQuerier, sm, autoEvict,
 			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
 			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
-			worker.WithTargetCopies(cfg.Filecoin.DefaultCopies)),
+			worker.WithTargetCopies(cfg.Filecoin.DefaultCopies),
+			worker.WithEventPublisher(adminEvents)),
 		worker.NewEvictor(repos, localCache, sm,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
@@ -356,6 +358,7 @@ func runServe(ctx context.Context, src config.Source) error {
 
 	// Start admin server (healthz + metrics).
 	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, logger).
+		WithEventHub(adminEvents).
 		WithObjectStorage(storageClient).
 		WithProviderIdentityResolver(admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger)).
 		WithSettings(settingsSvc).

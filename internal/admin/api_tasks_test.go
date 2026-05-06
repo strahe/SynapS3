@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -14,6 +15,14 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
+
+type failingTaskProgressUploadRepo struct {
+	repository.StorageUploadRepository
+}
+
+func (r failingTaskProgressUploadRepo) GetByIDs(_ context.Context, _ []int64) (map[int64]model.StorageUpload, error) {
+	return nil, errors.New("progress lookup failed")
+}
 
 func TestAPITasksStageFilter(t *testing.T) {
 	db := testutil.NewTestDB(t)
@@ -127,6 +136,122 @@ func TestAPITasksShowsLegacyPayloadStage(t *testing.T) {
 	}
 	if body.Tasks[0].Stage == nil || *body.Tasks[0].Stage != "secondary_pull" {
 		t.Fatalf("stage = %#v, want secondary_pull", body.Tasks[0].Stage)
+	}
+}
+
+func TestAPITasksIncludesPrimaryTransferProgress(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := testutil.SeedBucket(t, db, "task-progress-bucket")
+	objectID, versionID := seedAdminObjectVersion(t, repos, bucket, "uploading.txt", 20, "etag-progress", "checksum-progress", "text/plain", "", model.ObjectStateUploading)
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     20,
+		Checksum:        "checksum-progress",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	progressUpload, err := repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("BeginPrimaryStoreProgress: %v", err)
+	}
+	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+		UploadID:      upload.ID,
+		Attempt:       progressUpload.PrimaryStoreAttempt,
+		BytesUploaded: 5,
+	}); err != nil {
+		t.Fatalf("RecordPrimaryStoreProgress: %v", err)
+	}
+	stage := "primary_store"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   versionID,
+		IdempotencyKey: "task-primary-progress",
+		Payload:        map[string]interface{}{"upload_id": upload.ID},
+		Status:         model.TaskStatusRunning,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+
+	srv := New(":0", db, nil, 0, repos, nil, nil, testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&status=running")
+	if err != nil {
+		t.Fatalf("GET tasks: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body taskListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Tasks) != 1 || body.Tasks[0].Progress == nil {
+		t.Fatalf("tasks = %#v, want primary transfer progress", body.Tasks)
+	}
+	progress := body.Tasks[0].Progress
+	if progress.Scope != "primary_store" || progress.Attempt != progressUpload.PrimaryStoreAttempt || progress.UploadedBytes != 5 || progress.TotalBytes != 20 || progress.Percent == nil || *progress.Percent != 25 || progress.Done {
+		t.Fatalf("progress = %#v, want 5/20 primary transfer progress", progress)
+	}
+}
+
+func TestAPITasksSkipsProgressWhenLookupFails(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	stage := "primary_store"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          1,
+		RefVersionID:   "01J000000000000000TASKP01",
+		IdempotencyKey: "task-progress-lookup-fails",
+		Payload:        map[string]interface{}{"upload_id": int64(42)},
+		Status:         model.TaskStatusRunning,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	repos.Uploads = failingTaskProgressUploadRepo{StorageUploadRepository: repos.Uploads}
+
+	srv := New(":0", db, nil, 0, repos, nil, nil, testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&status=running")
+	if err != nil {
+		t.Fatalf("GET tasks: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body taskListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Tasks) != 1 {
+		t.Fatalf("tasks = %#v, want one task", body.Tasks)
+	}
+	if body.Tasks[0].Progress != nil {
+		t.Fatalf("progress = %#v, want omitted progress after lookup failure", body.Tasks[0].Progress)
 	}
 }
 

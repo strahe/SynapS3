@@ -27,7 +27,10 @@ type Evictor struct {
 	*livenessTracker
 }
 
-const evictPollJitterDivisor = 5
+const (
+	evictPollJitterDivisor     = 5
+	replicatingEvictDeferDelay = 30 * time.Second
+)
 
 // NewEvictor creates a new cache evictor worker.
 func NewEvictor(repos *repository.Repositories, c cache.Cache, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Evictor {
@@ -91,8 +94,11 @@ func (e *Evictor) runSlot(ctx context.Context) {
 		e.recordWorkStarted()
 		func() {
 			defer e.recordWorkFinished()
+			stopLeaseRenewal := startTaskLeaseRenewal(e.logger, e.repos, task.ID, e.leaseTTL)
+			defer stopLeaseRenewal()
 			e.processTask(ctx, task)
 		}()
+		releaseTaskOnWorkerShutdown(ctx, e.logger, e.repos, task.ID)
 	}
 }
 
@@ -139,7 +145,18 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		return
 	}
 
-	if version.State != model.ObjectStateStored && version.State != model.ObjectStateReplicating {
+	if version.State == model.ObjectStateReplicating {
+		if err := e.repos.Tasks.DeferRunning(ctx, task.ID, replicatingEvictDeferDelay, "waiting for all copies to commit"); err != nil {
+			logger.Error("failed to defer replicating cache eviction", "error", err)
+			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
+			return
+		}
+		admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
+		logger.Info("cache eviction deferred until replication completes")
+		return
+	}
+	if version.State != model.ObjectStateStored {
 		logger.Warn("object version not in stored state", "state", version.State)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, "not stored")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
@@ -151,12 +168,7 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
-	var copies []repository.ReadableStorageCopy
-	if version.State == model.ObjectStateReplicating {
-		copies, err = e.repos.Uploads.ListReadablePrimaryCopy(ctx, *version.StorageUploadID)
-	} else {
-		copies, err = e.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
-	}
+	copies, err := e.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
 	if err != nil {
 		logger.Error("storage upload copy lookup failed", "error", err)
 		_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
@@ -191,28 +203,6 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 			_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
 		}
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
-		return
-	}
-
-	if version.State == model.ObjectStateReplicating {
-		if err := e.repos.Objects.SetVersionCachePresence(ctx, task.RefVersionID, false); err != nil {
-			logger.Error("cache presence update after replicating eviction failed", "error", err)
-			if task.RetryCount+1 >= task.MaxRetries {
-				if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
-					logger.Error("failed to mark task as dead-letter", "error", ftErr)
-				} else {
-					admin.DeadLetterTotal.WithLabelValues("evictor", string(model.TaskTypeEvictCache)).Inc()
-				}
-			} else {
-				_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
-				_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
-			}
-			admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
-			return
-		}
-		_ = e.repos.Tasks.Complete(ctx, task.ID)
-		admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
-		logger.Info("replicating cache evicted")
 		return
 	}
 

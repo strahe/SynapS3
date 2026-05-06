@@ -31,12 +31,14 @@ import {
   type ObjectVersionItem,
   type ProviderIdentity,
   type StorageDataSetSummary,
+  type UploadTransferProgress,
 } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
+import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -412,6 +414,7 @@ function ObjectVersionsDialog({
                           state={version.state}
                           status={version.status}
                           uploadStatus={version.upload_status}
+                          progress={version.progress}
                           compact
                         />
                         {version.is_current && (
@@ -824,6 +827,7 @@ function ObjectStatusIcon({
   state,
   status,
   uploadStatus,
+  progress,
   compact = false,
 }: {
   bucketName: string
@@ -831,12 +835,19 @@ function ObjectStatusIcon({
   state?: ObjectState
   status: ObjectStatus
   uploadStatus?: ObjectUploadStatus
+  progress?: UploadTransferProgress
   compact?: boolean
 }) {
   const [detailEnabled, setDetailEnabled] = useState(false)
   const visualStatus = objectVisualStatus(status, uploadStatus)
   const detail = useObjectStatusDetail(bucketName, versionID, visualStatus === 'warning' && detailEnabled)
+  const progressPercent = uploadStatus === 'running' ? uploadProgressPercent(progress) : null
   const label = objectStateLabel(state, status, uploadStatus)
+  const displayLabel = progressPercent === null ? label : `${label} ${progressPercent}%`
+  const progressDetail =
+    progressPercent === null || !progress
+      ? null
+      : `${formatBytes(progress.uploaded_bytes)} of ${formatBytes(progress.total_bytes)} uploaded`
 
   const loadDetail = () => {
     if (visualStatus === 'warning') setDetailEnabled(true)
@@ -849,20 +860,21 @@ function ObjectStatusIcon({
           type="button"
           className={
             compact
-              ? 'inline-flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
-              : 'inline-flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+              ? 'inline-flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground leading-none hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+              : 'inline-flex size-8 items-center justify-center rounded-md text-muted-foreground leading-none hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
           }
-          aria-label={`${label} status`}
+          aria-label={`${displayLabel} status`}
           onMouseEnter={loadDetail}
           onFocus={loadDetail}
           onClick={loadDetail}
         >
-          {objectStatusIcon(visualStatus, compact)}
+          {objectStatusIcon(visualStatus, compact, progressPercent)}
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-sm items-start whitespace-normal text-left">
         <div className="flex max-w-xs flex-col gap-1">
-          <span className="font-medium">{label}</span>
+          <span className="font-medium">{displayLabel}</span>
+          {progressDetail && <span className="break-words opacity-90">{progressDetail}</span>}
           {visualStatus === 'warning' && (
             <span className="break-words opacity-90">
               {detail.isLoading
@@ -880,8 +892,16 @@ function ObjectStatusIcon({
   )
 }
 
-function objectStatusIcon(status: ObjectStatus, compact = false) {
+function objectStatusIcon(status: ObjectStatus, compact = false, progressPercent: number | null = null) {
   const sizeClass = compact ? 'size-3.5' : 'size-4'
+  if (progressPercent !== null) {
+    const progressIconSizeClass = compact ? 'size-3' : 'size-3.5'
+    return (
+      <UploadProgressRing percent={progressPercent} compact={compact}>
+        <Clock3 className={`${progressIconSizeClass} animate-spin text-status-info`} />
+      </UploadProgressRing>
+    )
+  }
   switch (status) {
     case 'success':
       return <CheckCircle2 className={`${sizeClass} text-status-success`} />
@@ -950,21 +970,21 @@ function dataSetStatusTone(status: string): StatusTone {
 function uploadStatusLabel(uploadStatus: ObjectUploadStatus) {
   switch (uploadStatus) {
     case 'running':
-      return 'Upload running'
+      return 'Uploading primary copy'
     case 'stored_on_primary':
-      return 'Stored on primary'
+      return 'Primary copy uploaded'
     case 'primary_committed':
-      return 'Primary committed'
+      return 'Primary copy confirmed, syncing replicas'
     case 'partial':
-      return 'Partial replication'
+      return 'Stored with replica issues'
     case 'all_copies_committed':
-      return 'All copies committed'
+      return 'Stored on all copies'
     case 'failed':
       return 'Upload failed'
     case 'rejected':
       return 'Upload rejected'
     case 'superseded':
-      return 'Upload superseded'
+      return 'Superseded by newer version'
   }
 }
 
@@ -972,19 +992,19 @@ function objectStateLabel(state: ObjectState | undefined, status: ObjectStatus, 
   if (uploadStatus) return uploadStatusLabel(uploadStatus)
   switch (state) {
     case 'cached':
-      return 'Cached'
+      return 'Stored in cache'
     case 'uploading':
       return 'Uploading'
     case 'committing':
-      return 'Committing primary copy'
+      return 'Confirming primary copy'
     case 'replicating':
-      return 'Replicating'
+      return 'Syncing replicas'
     case 'stored':
       return 'Stored'
     case 'cache_evicted':
-      return 'Cache evicted'
+      return 'Stored remotely'
     case 'failed':
-      return 'Warning'
+      return 'Needs attention'
     default:
       return objectStatusLabel(status)
   }
@@ -995,15 +1015,15 @@ function failureStageLabel(state?: string) {
     case 'uploading':
       return 'Failed while uploading'
     case 'committing':
-      return 'Failed while committing primary copy'
+      return 'Failed while confirming primary copy'
     case 'replicating':
-      return 'Failed while syncing copies'
+      return 'Failed while syncing replicas'
     case 'stored':
       return 'Failed after storage'
     case 'cached':
       return 'Failed while cached'
     case 'cache_evicted':
-      return 'Failed after cache eviction'
+      return 'Failed after cache removal'
     default:
       return 'Failure'
   }
@@ -1409,6 +1429,7 @@ function ObjectBrowserTable({
                           state={object.state}
                           status={object.status}
                           uploadStatus={object.upload_status}
+                          progress={object.progress}
                           compact
                         />
                       </div>

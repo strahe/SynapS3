@@ -50,6 +50,7 @@ type Uploader struct {
 	autoEvict       bool
 	evictMaxRetries int
 	targetCopies    int
+	eventPublisher  admin.EventPublisher
 	concurrency     int
 	pollInterval    time.Duration
 	leaseTTL        time.Duration
@@ -62,6 +63,7 @@ const (
 	uploadPollJitterDivisor = 5
 	defaultTargetCopies     = 2
 	maxTargetCopies         = 8
+	uploadProgressTimeout   = 2 * time.Second
 
 	uploadStagePrepare         = "prepare_upload"
 	uploadStageEnsureDataSet   = "ensure_dataset"
@@ -88,6 +90,12 @@ func WithTargetCopies(copies int) UploaderOption {
 		if copies > 0 {
 			u.targetCopies = boundedTargetCopies(copies)
 		}
+	}
+}
+
+func WithEventPublisher(publisher admin.EventPublisher) UploaderOption {
+	return func(u *Uploader) {
+		u.eventPublisher = publisher
 	}
 }
 
@@ -122,6 +130,195 @@ func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.Stora
 		opt(u)
 	}
 	return u
+}
+
+type uploadProgressReporter struct {
+	ctx           context.Context
+	repos         *repository.Repositories
+	publisher     admin.EventPublisher
+	logger        *slog.Logger
+	uploadID      int64
+	taskID        int64
+	versionID     string
+	bucketName    string
+	objectKey     string
+	attempt       int
+	totalBytes    int64
+	flushInterval time.Duration
+
+	mu           sync.Mutex
+	lastFlush    time.Time
+	pendingBytes int64
+	pending      bool
+	pendingTimer *time.Timer
+}
+
+func (u *Uploader) beginPrimaryProgressReporter(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, logger *slog.Logger) *uploadProgressReporter {
+	if u == nil || u.repos == nil || u.repos.Uploads == nil || uploadID == 0 {
+		return nil
+	}
+	upload, err := u.repos.Uploads.BeginPrimaryStoreProgress(ctx, uploadID)
+	if err != nil {
+		logger.Warn("failed to begin primary upload progress", "uploadID", uploadID, "error", err)
+		return nil
+	}
+	reporter := &uploadProgressReporter{
+		ctx:           ctx,
+		repos:         u.repos,
+		publisher:     u.eventPublisher,
+		logger:        logger,
+		uploadID:      uploadID,
+		versionID:     upload.SourceVersionID,
+		attempt:       upload.PrimaryStoreAttempt,
+		totalBytes:    upload.ContentSize,
+		flushInterval: time.Second,
+	}
+	if task != nil {
+		reporter.taskID = task.ID
+		if reporter.versionID == "" {
+			reporter.versionID = task.RefVersionID
+		}
+	}
+	if version != nil {
+		if reporter.versionID == "" {
+			reporter.versionID = version.VersionID
+		}
+		reporter.objectKey = version.Key
+		if reporter.totalBytes == 0 {
+			reporter.totalBytes = version.Size
+		}
+	}
+	if bucket != nil {
+		reporter.bucketName = bucket.Name
+	}
+	reporter.record(0, false)
+	return reporter
+}
+
+func (r *uploadProgressReporter) OnProgress(bytesUploaded int64) {
+	if r == nil || r.attempt <= 0 {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	if r.flushInterval <= 0 || r.lastFlush.IsZero() || now.Sub(r.lastFlush) >= r.flushInterval {
+		r.cancelPendingLocked()
+		r.lastFlush = now
+		r.mu.Unlock()
+		go r.record(bytesUploaded, false)
+		return
+	}
+	r.pendingBytes = bytesUploaded
+	r.pending = true
+	if r.pendingTimer == nil {
+		delay := r.flushInterval - now.Sub(r.lastFlush)
+		r.pendingTimer = time.AfterFunc(delay, r.flushPendingProgress)
+	}
+	r.mu.Unlock()
+}
+
+func (r *uploadProgressReporter) Flush(bytesUploaded int64, done bool) {
+	if r == nil || r.attempt <= 0 {
+		return
+	}
+	r.mu.Lock()
+	r.cancelPendingLocked()
+	r.mu.Unlock()
+	r.record(bytesUploaded, done)
+}
+
+func (r *uploadProgressReporter) flushPendingProgress() {
+	r.mu.Lock()
+	if !r.pending {
+		r.pendingTimer = nil
+		r.mu.Unlock()
+		return
+	}
+	bytesUploaded := r.pendingBytes
+	r.pending = false
+	r.pendingTimer = nil
+	r.lastFlush = time.Now()
+	r.mu.Unlock()
+	r.record(bytesUploaded, false)
+}
+
+func (r *uploadProgressReporter) cancelPendingLocked() {
+	r.pending = false
+	if r.pendingTimer != nil {
+		r.pendingTimer.Stop()
+		r.pendingTimer = nil
+	}
+}
+
+func (r *uploadProgressReporter) record(bytesUploaded int64, done bool) {
+	if r == nil || r.repos == nil || r.repos.Uploads == nil {
+		return
+	}
+	ctx, cancel := r.recordContext()
+	defer cancel()
+	upload, err := r.repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+		UploadID:      r.uploadID,
+		Attempt:       r.attempt,
+		BytesUploaded: bytesUploaded,
+	})
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("failed to record primary upload progress", "uploadID", r.uploadID, "attempt", r.attempt, "error", err)
+		}
+		return
+	}
+	if r.publisher == nil || upload == nil || upload.ProgressUpdatedAt == nil {
+		return
+	}
+	r.publisher.Publish("upload_progress_updated", map[string]any{
+		"upload_id":   r.uploadID,
+		"task_id":     nullableTaskID(r.taskID),
+		"version_id":  r.versionID,
+		"bucket_name": r.bucketName,
+		"object_key":  r.objectKey,
+		"progress":    uploadProgressEventPayload(upload, done),
+	})
+}
+
+func (r *uploadProgressReporter) recordContext() (context.Context, context.CancelFunc) {
+	baseCtx := context.Background()
+	if r != nil && r.ctx != nil {
+		baseCtx = r.ctx
+	}
+	return context.WithTimeout(baseCtx, uploadProgressTimeout)
+}
+
+func nullableTaskID(taskID int64) any {
+	if taskID == 0 {
+		return nil
+	}
+	return taskID
+}
+
+func uploadProgressEventPayload(upload *model.StorageUpload, done bool) map[string]any {
+	uploaded := upload.PrimaryBytesUploaded
+	if uploaded < 0 {
+		uploaded = 0
+	}
+	total := upload.ContentSize
+	if total < 0 {
+		total = 0
+	}
+	if uploaded > total {
+		uploaded = total
+	}
+	progress := map[string]any{
+		"scope":          "primary_store",
+		"attempt":        upload.PrimaryStoreAttempt,
+		"uploaded_bytes": uploaded,
+		"total_bytes":    total,
+		"done":           done || (total > 0 && uploaded >= total),
+		"updated_at":     upload.ProgressUpdatedAt.Format(time.RFC3339),
+	}
+	if percent := model.UploadProgressPercent(uploaded, total); percent != nil {
+		progress["percent"] = *percent
+	}
+	return progress
 }
 
 func (u *Uploader) Name() string { return "uploader" }
@@ -172,8 +369,11 @@ func (u *Uploader) runSlot(ctx context.Context) {
 		u.recordWorkStarted()
 		func() {
 			defer u.recordWorkFinished()
+			stopLeaseRenewal := startTaskLeaseRenewal(u.logger, u.repos, task.ID, u.leaseTTL)
+			defer stopLeaseRenewal()
 			u.processTask(ctx, task)
 		}()
+		releaseTaskOnWorkerShutdown(ctx, u.logger, u.repos, task.ID)
 	}
 }
 
@@ -234,6 +434,7 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
+	defer u.publishUploadStateChanged(task, version, bucket)
 
 	if version.State == model.ObjectStateStored || version.State == model.ObjectStateCacheEvicted {
 		if version.State == model.ObjectStateStored {
@@ -246,6 +447,27 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	}
 
 	u.processStagedTask(ctx, task, version, bucket, uploadTaskStage(task), logger)
+}
+
+func (u *Uploader) publishUploadStateChanged(task *model.Task, version *model.ObjectVersion, bucket *model.Bucket) {
+	if u == nil || u.eventPublisher == nil || task == nil {
+		return
+	}
+	payload := map[string]any{
+		"task_id":    task.ID,
+		"version_id": task.RefVersionID,
+	}
+	if uploadID, err := payloadInt64(task.Payload, "upload_id"); err == nil && uploadID != 0 {
+		payload["upload_id"] = uploadID
+	}
+	if version != nil {
+		payload["version_id"] = version.VersionID
+		payload["object_key"] = version.Key
+	}
+	if bucket != nil {
+		payload["bucket_name"] = bucket.Name
+	}
+	u.eventPublisher.Publish("upload_state_changed", payload)
 }
 
 func (u *Uploader) processLegacyUploadTask(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, logger *slog.Logger) {
@@ -299,10 +521,14 @@ func (u *Uploader) processLegacyUploadTask(ctx context.Context, task *model.Task
 		u.handleTaskFailure(ctx, task, logger, "start upload attempt", err)
 		return
 	}
+	progress := u.beginPrimaryProgressReporter(ctx, task, version, bucket, attempt.ID, logger)
 
 	// Upload to provider (SDK handles store + on-chain commit)
 	uploadOpts := &storage.UploadOptions{
 		DataSetMetadata: map[string]string{"bucket": bucket.Name},
+		OnProgress: func(bytesUploaded int64) {
+			progress.OnProgress(bytesUploaded)
+		},
 	}
 	result, err := u.storage.Upload(ctx, rc, uploadOpts)
 	if err != nil {
@@ -317,6 +543,7 @@ func (u *Uploader) processLegacyUploadTask(ctx context.Context, task *model.Task
 		u.handleFailure(ctx, task, version, logger, "upload", errors.New("upload returned nil result"))
 		return
 	}
+	progress.Flush(version.Size, true)
 
 	recordInput := recordUploadResultInput(attempt.ID, result)
 	if !result.Complete {
@@ -669,11 +896,17 @@ func (u *Uploader) primaryStore(ctx context.Context, task *model.Task, version *
 		return
 	}
 	defer func() { _ = rc.Close() }()
-	result, err := storageCtx.Store(ctx, rc, nil)
+	progress := u.beginPrimaryProgressReporter(ctx, task, version, bucket, uploadID, logger)
+	result, err := storageCtx.Store(ctx, rc, &storage.StoreOptions{
+		OnProgress: func(bytesUploaded int64) {
+			progress.OnProgress(bytesUploaded)
+		},
+	})
 	if err != nil {
 		u.handlePrimaryFailure(ctx, task, version, uploadID, logger, "primary store", err)
 		return
 	}
+	progress.Flush(version.Size, true)
 	pieceCID := result.PieceCID.String()
 	if err := u.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
 		UploadID:     uploadID,
@@ -818,7 +1051,6 @@ func (u *Uploader) finishPrimaryCommitted(ctx context.Context, task *model.Task,
 		u.handleTaskFailure(ctx, task, logger, "bind primary committed", err)
 		return
 	}
-	u.enqueueEvictTasksForRefs(ctx, logger, refs)
 	copies, err := u.repos.Uploads.ListCopies(ctx, uploadID)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "list upload copies", err)

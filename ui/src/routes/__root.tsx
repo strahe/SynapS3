@@ -19,6 +19,7 @@ import {
 } from '@/components/ui/sidebar'
 import { useSettings } from '@/hooks/queries'
 import { applyProviderIdentityEventData } from '@/lib/provider-identity-events'
+import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '@/lib/upload-progress-events'
 import { rootContentKind } from './-root-content'
 
 interface RouterContext {
@@ -106,6 +107,12 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
     const events = new EventSource('/api/v1/events')
     events.addEventListener('provider_identity_updated', (event) => {
       applyProviderIdentityEventData(queryClient, event.data)
+    })
+    events.addEventListener('upload_progress_updated', (event) => {
+      applyUploadProgressEventData(queryClient, event.data)
+    })
+    events.addEventListener('upload_state_changed', (event) => {
+      applyUploadStateChangedEventData(queryClient, event.data)
     })
     return () => events.close()
   }, [enabled, queryClient])

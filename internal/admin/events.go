@@ -19,20 +19,28 @@ type adminEvent struct {
 	data  []byte
 }
 
-type adminEventHub struct {
+type EventPublisher interface {
+	Publish(topic string, payload map[string]any)
+}
+
+type EventHub struct {
 	publishMu   sync.Mutex
 	mu          sync.Mutex
 	nextSeq     uint64
 	subscribers map[chan adminEvent]struct{}
 }
 
-func newAdminEventHub() *adminEventHub {
-	return &adminEventHub{
+func NewEventHub() *EventHub {
+	return newAdminEventHub()
+}
+
+func newAdminEventHub() *EventHub {
+	return &EventHub{
 		subscribers: make(map[chan adminEvent]struct{}),
 	}
 }
 
-func (h *adminEventHub) subscribe() (<-chan adminEvent, func()) {
+func (h *EventHub) subscribe() (<-chan adminEvent, func()) {
 	ch := make(chan adminEvent, adminEventSubscriberBuffer)
 	h.mu.Lock()
 	h.subscribers[ch] = struct{}{}
@@ -46,7 +54,7 @@ func (h *adminEventHub) subscribe() (<-chan adminEvent, func()) {
 	return ch, unsubscribe
 }
 
-func (h *adminEventHub) publish(topic string, payload map[string]any) {
+func (h *EventHub) Publish(topic string, payload map[string]any) {
 	if h == nil {
 		return
 	}
@@ -84,6 +92,10 @@ func (h *adminEventHub) publish(topic string, payload map[string]any) {
 		default:
 		}
 	}
+}
+
+func (h *EventHub) publish(topic string, payload map[string]any) {
+	h.Publish(topic, payload)
 }
 
 func (s *Server) publishProviderIdentity(identity *providerIdentityResponse) {

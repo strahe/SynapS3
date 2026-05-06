@@ -158,6 +158,12 @@ type AppendUploadFailureInput struct {
 	Explicit     bool
 }
 
+type RecordPrimaryStoreProgressInput struct {
+	UploadID      int64
+	Attempt       int
+	BytesUploaded int64
+}
+
 type StorageUploadProvenance struct {
 	Upload   model.StorageUpload
 	Copies   []model.StorageUploadCopy
@@ -284,6 +290,8 @@ type StorageUploadRepository interface {
 	SetAcceptError(ctx context.Context, uploadID int64, message string) error
 	GetByID(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
 	GetByIDs(ctx context.Context, uploadIDs []int64) (map[int64]model.StorageUpload, error)
+	BeginPrimaryStoreProgress(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
+	RecordPrimaryStoreProgress(ctx context.Context, input RecordPrimaryStoreProgressInput) (*model.StorageUpload, error)
 	GetUploadProvenance(ctx context.Context, uploadID int64) (*StorageUploadProvenance, error)
 	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
@@ -328,10 +336,14 @@ type TaskRepository interface {
 	// ClaimPending atomically claims one pending task of the given type by
 	// transitioning it to running and setting a lease. Returns nil if no task is available.
 	ClaimPending(ctx context.Context, taskType model.TaskType, leaseDuration time.Duration) (*model.Task, error)
+	// RenewLease extends a running task lease.
+	RenewLease(ctx context.Context, taskID int64, leaseDuration time.Duration) error
 	// Complete marks a running task as completed.
 	Complete(ctx context.Context, taskID int64) error
 	// Fail marks a running task as failed, recording the error and incrementing retry count.
 	Fail(ctx context.Context, taskID int64, lastError string) error
+	// DeferRunning returns a running task to pending without incrementing retry count.
+	DeferRunning(ctx context.Context, taskID int64, delay time.Duration, reason string) error
 	// Requeue resets a failed task back to pending with a scheduled backoff delay.
 	Requeue(ctx context.Context, taskID int64, backoff time.Duration) error
 	// ReleaseExpiredLeases resets running tasks whose lease has expired back to pending.

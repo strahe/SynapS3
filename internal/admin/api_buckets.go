@@ -461,19 +461,20 @@ func onChainIDStringPtr(id *idtypes.OnChainID) *string {
 }
 
 type objectListItem struct {
-	ID               int64          `json:"id"`
-	Key              string         `json:"key"`
-	CurrentVersionID string         `json:"current_version_id"`
-	Size             int64          `json:"size"`
-	State            string         `json:"state"`
-	Status           string         `json:"status"`
-	UploadStatus     *string        `json:"upload_status,omitempty"`
-	Location         objectLocation `json:"location"`
-	ContentType      string         `json:"content_type"`
-	ETag             string         `json:"etag"`
-	PieceCID         *string        `json:"piece_cid,omitempty"`
-	CreatedAt        string         `json:"created_at"`
-	UpdatedAt        string         `json:"updated_at"`
+	ID               int64                   `json:"id"`
+	Key              string                  `json:"key"`
+	CurrentVersionID string                  `json:"current_version_id"`
+	Size             int64                   `json:"size"`
+	State            string                  `json:"state"`
+	Status           string                  `json:"status"`
+	UploadStatus     *string                 `json:"upload_status,omitempty"`
+	Progress         *uploadProgressResponse `json:"progress,omitempty"`
+	Location         objectLocation          `json:"location"`
+	ContentType      string                  `json:"content_type"`
+	ETag             string                  `json:"etag"`
+	PieceCID         *string                 `json:"piece_cid,omitempty"`
+	CreatedAt        string                  `json:"created_at"`
+	UpdatedAt        string                  `json:"updated_at"`
 }
 
 type objectLocation struct {
@@ -482,13 +483,14 @@ type objectLocation struct {
 }
 
 type objectStatusDetailResponse struct {
-	VersionID     string  `json:"version_id"`
-	State         string  `json:"state"`
-	Status        string  `json:"status"`
-	UploadStatus  *string `json:"upload_status,omitempty"`
-	FailedAtState *string `json:"failed_at_state,omitempty"`
-	Message       *string `json:"message,omitempty"`
-	UpdatedAt     string  `json:"updated_at"`
+	VersionID     string                  `json:"version_id"`
+	State         string                  `json:"state"`
+	Status        string                  `json:"status"`
+	UploadStatus  *string                 `json:"upload_status,omitempty"`
+	Progress      *uploadProgressResponse `json:"progress,omitempty"`
+	FailedAtState *string                 `json:"failed_at_state,omitempty"`
+	Message       *string                 `json:"message,omitempty"`
+	UpdatedAt     string                  `json:"updated_at"`
 }
 
 type objectProvenanceResponse struct {
@@ -496,6 +498,7 @@ type objectProvenanceResponse struct {
 	State           string                            `json:"state"`
 	Status          string                            `json:"status"`
 	UploadStatus    *string                           `json:"upload_status,omitempty"`
+	Progress        *uploadProgressResponse           `json:"progress,omitempty"`
 	PieceCID        *string                           `json:"piece_cid,omitempty"`
 	RequestedCopies int                               `json:"requested_copies"`
 	SuccessCopies   int                               `json:"success_copies"`
@@ -523,6 +526,16 @@ type objectProvenanceFailureResponse struct {
 	Role             string                    `json:"role"`
 	Stage            *string                   `json:"stage,omitempty"`
 	Error            *string                   `json:"error,omitempty"`
+}
+
+type uploadProgressResponse struct {
+	Scope         string `json:"scope"`
+	Attempt       int    `json:"attempt"`
+	UploadedBytes int64  `json:"uploaded_bytes"`
+	TotalBytes    int64  `json:"total_bytes"`
+	Percent       *int   `json:"percent,omitempty"`
+	Done          bool   `json:"done"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bool, uploadStatus *model.StorageUploadStatus) string {
@@ -559,8 +572,9 @@ func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bo
 }
 
 type objectAdminUploadInfo struct {
-	Status  *model.StorageUploadStatus
-	Message *string
+	Status   *model.StorageUploadStatus
+	Message  *string
+	Progress *uploadProgressResponse
 }
 
 func (s *Server) objectAdminStorageUpload(ctx context.Context, version model.ObjectVersion) (*model.StorageUpload, error) {
@@ -579,8 +593,9 @@ func (s *Server) objectAdminUploadInfo(ctx context.Context, version model.Object
 		return objectAdminUploadInfo{}, err
 	}
 	return objectAdminUploadInfo{
-		Status:  &upload.Status,
-		Message: uploadStatusMessage(upload),
+		Status:   &upload.Status,
+		Message:  uploadStatusMessage(upload),
+		Progress: uploadProgressResponseFromUpload(upload),
 	}, nil
 }
 
@@ -627,8 +642,9 @@ func (s *Server) objectAdminUploadInfos(ctx context.Context, versions []model.Ob
 		}
 		status := upload.Status
 		infos[version.VersionID] = objectAdminUploadInfo{
-			Status:  &status,
-			Message: uploadStatusMessage(&upload),
+			Status:   &status,
+			Message:  uploadStatusMessage(&upload),
+			Progress: uploadProgressResponseFromUpload(&upload),
 		}
 	}
 	return infos, nil
@@ -653,6 +669,33 @@ func uploadStatusMessage(upload *model.StorageUpload) *string {
 		return upload.AcceptError
 	}
 	return nil
+}
+
+func uploadProgressResponseFromUpload(upload *model.StorageUpload) *uploadProgressResponse {
+	if upload == nil || upload.ProgressUpdatedAt == nil || upload.PrimaryStoreAttempt <= 0 {
+		return nil
+	}
+	uploaded := upload.PrimaryBytesUploaded
+	if uploaded < 0 {
+		uploaded = 0
+	}
+	total := upload.ContentSize
+	if total < 0 {
+		total = 0
+	}
+	if uploaded > total {
+		uploaded = total
+	}
+	percent := model.UploadProgressPercent(uploaded, total)
+	return &uploadProgressResponse{
+		Scope:         "primary_store",
+		Attempt:       upload.PrimaryStoreAttempt,
+		UploadedBytes: uploaded,
+		TotalBytes:    total,
+		Percent:       percent,
+		Done:          uploaded >= total,
+		UpdatedAt:     upload.ProgressUpdatedAt.Format(time.RFC3339),
+	}
 }
 
 type objectFolderItem struct {
@@ -746,6 +789,7 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 			State:            string(o.State),
 			Status:           objectAdminStatusWithUpload(o.State, o.InCache, o.InFilecoin, uploadInfo.Status),
 			UploadStatus:     uploadStatusString(uploadInfo.Status),
+			Progress:         uploadInfo.Progress,
 			Location:         objectLocation{Cache: o.InCache, Filecoin: o.InFilecoin},
 			ContentType:      o.ContentType,
 			ETag:             o.ETag,
@@ -899,19 +943,20 @@ func adminListingFolderName(commonPrefix, prefix, delimiter string) string {
 }
 
 type objectVersionListItem struct {
-	VersionID    string         `json:"version_id"`
-	Key          string         `json:"key"`
-	Size         int64          `json:"size"`
-	State        string         `json:"state"`
-	Status       string         `json:"status"`
-	UploadStatus *string        `json:"upload_status,omitempty"`
-	Location     objectLocation `json:"location"`
-	ContentType  string         `json:"content_type"`
-	ETag         string         `json:"etag"`
-	PieceCID     *string        `json:"piece_cid,omitempty"`
-	CreatedAt    string         `json:"created_at"`
-	UpdatedAt    string         `json:"updated_at"`
-	IsCurrent    bool           `json:"is_current"`
+	VersionID    string                  `json:"version_id"`
+	Key          string                  `json:"key"`
+	Size         int64                   `json:"size"`
+	State        string                  `json:"state"`
+	Status       string                  `json:"status"`
+	UploadStatus *string                 `json:"upload_status,omitempty"`
+	Progress     *uploadProgressResponse `json:"progress,omitempty"`
+	Location     objectLocation          `json:"location"`
+	ContentType  string                  `json:"content_type"`
+	ETag         string                  `json:"etag"`
+	PieceCID     *string                 `json:"piece_cid,omitempty"`
+	CreatedAt    string                  `json:"created_at"`
+	UpdatedAt    string                  `json:"updated_at"`
+	IsCurrent    bool                    `json:"is_current"`
 }
 
 type objectVersionListResponse struct {
@@ -975,6 +1020,7 @@ func (s *Server) handleAPIBucketObjectStatusDetail(w http.ResponseWriter, r *htt
 		State:         string(version.State),
 		Status:        objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, uploadInfo.Status),
 		UploadStatus:  uploadStatusString(uploadInfo.Status),
+		Progress:      uploadInfo.Progress,
 		FailedAtState: failedAtState,
 		Message:       message,
 		UpdatedAt:     version.UpdatedAt.Format(time.RFC3339),
@@ -1048,6 +1094,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 	}
 
 	resp.UploadStatus = uploadStatusString(&provenance.Upload.Status)
+	resp.Progress = uploadProgressResponseFromUpload(&provenance.Upload)
 	resp.Status = objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, &provenance.Upload.Status)
 	resp.PieceCID = provenance.Upload.PieceCID
 	resp.RequestedCopies = provenance.Upload.RequestedCopies
@@ -1156,6 +1203,7 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 			State:        string(v.State),
 			Status:       objectAdminStatusWithUpload(v.State, v.InCache, v.InFilecoin, uploadInfo.Status),
 			UploadStatus: uploadStatusString(uploadInfo.Status),
+			Progress:     uploadInfo.Progress,
 			Location:     objectLocation{Cache: v.InCache, Filecoin: v.InFilecoin},
 			ContentType:  v.ContentType,
 			ETag:         v.ETag,

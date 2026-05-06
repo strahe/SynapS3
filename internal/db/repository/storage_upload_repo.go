@@ -78,6 +78,59 @@ func (r *BunStorageUploadRepo) GetByIDs(ctx context.Context, uploadIDs []int64) 
 	return uploadsByID, nil
 }
 
+func (r *BunStorageUploadRepo) BeginPrimaryStoreProgress(ctx context.Context, uploadID int64) (*model.StorageUpload, error) {
+	if uploadID == 0 {
+		return nil, fmt.Errorf("uploadID is required: %w", ErrInvalidInput)
+	}
+	now := time.Now()
+	_, err := r.db.NewUpdate().
+		Model((*model.StorageUpload)(nil)).
+		Set("primary_store_attempt = primary_store_attempt + 1").
+		Set("primary_bytes_uploaded = 0").
+		Set("progress_updated_at = ?", now).
+		Where("id = ?", uploadID).
+		Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning primary store progress: %w", err)
+	}
+	upload, err := r.GetByID(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	if upload == nil {
+		return nil, fmt.Errorf("beginning primary store progress: %w", ErrNotFound)
+	}
+	return upload, nil
+}
+
+func (r *BunStorageUploadRepo) RecordPrimaryStoreProgress(ctx context.Context, input RecordPrimaryStoreProgressInput) (*model.StorageUpload, error) {
+	if input.UploadID == 0 {
+		return nil, fmt.Errorf("uploadID is required: %w", ErrInvalidInput)
+	}
+	if input.Attempt <= 0 {
+		return nil, fmt.Errorf("attempt is required: %w", ErrInvalidInput)
+	}
+	now := time.Now()
+	_, err := r.db.NewUpdate().
+		Model((*model.StorageUpload)(nil)).
+		Set("progress_updated_at = CASE WHEN primary_bytes_uploaded < content_size AND ? > primary_bytes_uploaded THEN ? ELSE progress_updated_at END", input.BytesUploaded, now).
+		Set("primary_bytes_uploaded = CASE WHEN ? > content_size THEN content_size WHEN ? > primary_bytes_uploaded THEN ? ELSE primary_bytes_uploaded END", input.BytesUploaded, input.BytesUploaded, input.BytesUploaded).
+		Where("id = ?", input.UploadID).
+		Where("primary_store_attempt = ?", input.Attempt).
+		Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("recording primary store progress: %w", err)
+	}
+	upload, err := r.GetByID(ctx, input.UploadID)
+	if err != nil {
+		return nil, err
+	}
+	if upload == nil {
+		return nil, fmt.Errorf("recording primary store progress: %w", ErrNotFound)
+	}
+	return upload, nil
+}
+
 func (r *BunStorageUploadRepo) GetUploadProvenance(ctx context.Context, uploadID int64) (*StorageUploadProvenance, error) {
 	upload, err := r.GetByID(ctx, uploadID)
 	if err != nil || upload == nil {
@@ -1286,6 +1339,8 @@ func updateUploadPrimaryStored(ctx context.Context, db bun.IDB, uploadID int64, 
 		Model((*model.StorageUpload)(nil)).
 		Set("status = ?", model.StorageUploadStatusStoredOnPrimary).
 		Set("piece_cid = COALESCE(?, piece_cid)", nullableString(pieceCID)).
+		Set("primary_bytes_uploaded = content_size").
+		Set("progress_updated_at = ?", now).
 		Set("updated_at = ?", now).
 		Where("id = ?", uploadID).
 		Where("status IN (?)", bun.List([]model.StorageUploadStatus{

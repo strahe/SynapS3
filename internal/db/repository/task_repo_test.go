@@ -69,6 +69,40 @@ func TestTaskRepo_ClaimPending(t *testing.T) {
 	}
 }
 
+func TestTaskRepo_RenewLease(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUpload)
+	claimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if claimed == nil || claimed.LeaseUntil == nil {
+		t.Fatal("expected claimed task with lease")
+	}
+	oldLeaseUntil := *claimed.LeaseUntil
+
+	if err := repos.Tasks.RenewLease(ctx, claimed.ID, 10*time.Minute); err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+
+	task, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if task.Status != model.TaskStatusRunning {
+		t.Fatalf("task status = %s, want running", task.Status)
+	}
+	if task.LeaseUntil == nil || !task.LeaseUntil.After(oldLeaseUntil) {
+		t.Fatalf("lease_until = %v, want after %s", task.LeaseUntil, oldLeaseUntil)
+	}
+	if task.ClaimedAt == nil || task.StartedAt == nil {
+		t.Fatalf("claimed_at/start_at = %v/%v, want preserved", task.ClaimedAt, task.StartedAt)
+	}
+}
+
 func TestTaskRepo_Complete(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -163,6 +197,37 @@ func TestTaskRepo_ReleaseExpiredLeases(t *testing.T) {
 	}
 }
 
+func TestTaskRepo_ReleaseExpiredLeasesPreservesActiveLease(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUpload)
+	claimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	released, err := repos.Tasks.ReleaseExpiredLeases(ctx)
+	if err != nil {
+		t.Fatalf("ReleaseExpiredLeases: %v", err)
+	}
+	if released != 0 {
+		t.Fatalf("released = %d, want 0", released)
+	}
+
+	task, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if task.Status != model.TaskStatusRunning {
+		t.Fatalf("task status = %s, want running", task.Status)
+	}
+}
+
 func TestTaskRepo_Requeue(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -196,6 +261,51 @@ func TestTaskRepo_Requeue(t *testing.T) {
 	err := repos.Tasks.Requeue(ctx, seeded.ID, time.Second)
 	if err == nil {
 		t.Fatal("expected error requeuing non-failed task")
+	}
+}
+
+func TestTaskRepo_DeferRunning(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeEvictCache)
+	claimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected claimed task")
+	}
+
+	before := time.Now()
+	if err := repos.Tasks.DeferRunning(ctx, claimed.ID, 2*time.Minute, "waiting for all copies"); err != nil {
+		t.Fatalf("DeferRunning: %v", err)
+	}
+
+	task, _ := repos.Tasks.GetByID(ctx, claimed.ID)
+	if task.Status != model.TaskStatusPending {
+		t.Fatalf("task status = %s, want pending", task.Status)
+	}
+	if task.RetryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0", task.RetryCount)
+	}
+	if task.LastError == nil || *task.LastError != "waiting for all copies" {
+		t.Fatalf("last_error = %v, want waiting reason", task.LastError)
+	}
+	if task.ClaimedAt != nil || task.LeaseUntil != nil || task.StartedAt != nil {
+		t.Fatalf("task lease fields = claimed:%v lease:%v started:%v, want cleared", task.ClaimedAt, task.LeaseUntil, task.StartedAt)
+	}
+	if !task.ScheduledAt.After(before) {
+		t.Fatalf("scheduled_at = %s, want after %s", task.ScheduledAt, before)
+	}
+
+	next, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending deferred: %v", err)
+	}
+	if next != nil {
+		t.Fatalf("deferred task was claimable before scheduled_at: %#v", next)
 	}
 }
 

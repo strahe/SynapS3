@@ -7,6 +7,7 @@ import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialo
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
+import { UploadProgressBar } from '@/components/app/UploadProgress'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
@@ -54,13 +55,13 @@ const stageOptions = [
 const PAGE_SIZE = 20
 
 const taskStageLabels: Record<string, string> = {
-  prepare_upload: 'prepare',
-  ensure_dataset: 'dataset',
-  primary_store: 'primary store',
-  primary_commit: 'primary commit',
-  secondary_pull: 'secondary pull',
-  secondary_commit: 'secondary commit',
-  legacy_upload: 'legacy upload',
+  prepare_upload: 'Prepare upload',
+  ensure_dataset: 'Prepare storage',
+  primary_store: 'Transfer primary copy',
+  primary_commit: 'Confirm primary copy',
+  secondary_pull: 'Transfer replica',
+  secondary_commit: 'Confirm replica',
+  legacy_upload: 'Upload',
 }
 
 function taskStageLabel(task: TaskItem) {
@@ -68,6 +69,10 @@ function taskStageLabel(task: TaskItem) {
   const base = taskStageLabels[stage] ?? stage
   if (typeof task.copy_index === 'number') return `${base} · copy ${task.copy_index}`
   return base
+}
+
+function isPrimaryTransferTask(task: TaskItem) {
+  return task.stage === 'primary_store' || task.stage === 'legacy_upload'
 }
 
 function TaskRefCell({ task }: { task: TaskItem }) {
@@ -272,6 +277,7 @@ function TasksPage() {
                   <TableHead className="whitespace-nowrap px-3 py-2">ID</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2">Type</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2">Stage</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Progress</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2">Ref</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2">Status</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2 text-right">Retries</TableHead>
@@ -289,6 +295,13 @@ function TasksPage() {
                       <TableCell className="whitespace-nowrap px-3 py-2">
                         {t.stage ? (
                           <span className="font-mono text-xs">{taskStageLabel(t)}</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap px-3 py-2">
+                        {isPrimaryTransferTask(t) ? (
+                          <UploadProgressBar progress={t.progress} />
                         ) : (
                           <span className="text-muted-foreground">—</span>
                         )}
@@ -340,7 +353,7 @@ function TasksPage() {
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
+                    <TableCell colSpan={10} className="h-24 text-center text-muted-foreground">
                       No tasks found
                     </TableCell>
                   </TableRow>

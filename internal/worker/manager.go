@@ -91,10 +91,9 @@ func (m *Manager) Start(ctx context.Context) {
 // recoverOnStartup releases expired task leases and resets objects stuck
 // in intermediate states from a previous crash.
 func (m *Manager) recoverOnStartup(ctx context.Context) {
-	// Release expired task leases
 	released, err := m.repos.Tasks.ReleaseExpiredLeases(ctx)
 	if err != nil {
-		m.logger.Error("failed to release expired leases", "error", err)
+		m.logger.Error("failed to release expired task leases", "error", err)
 	} else if released > 0 {
 		m.logger.Info("released expired task leases", "count", released)
 	}
@@ -104,7 +103,6 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 	m.reconcileStagedUploads(ctx)
 	if m.autoEvict {
 		m.reconcileTasks(ctx, model.ObjectStateStored, model.TaskTypeEvictCache, "evict_cache")
-		m.reconcileTasks(ctx, model.ObjectStateReplicating, model.TaskTypeEvictCache, "evict_cache")
 	}
 
 	// Log dead-letter task count for operator awareness
