@@ -27,10 +27,27 @@ export function useBucket(name: string) {
   })
 }
 
-export function useBucketObjects(name: string, prefix: string, after: string, limit = 50, delimiter = '/') {
+export function useBucketObjects(
+  name: string,
+  prefix: string,
+  after: string,
+  limit = 50,
+  delimiter = '/',
+  enabled = true
+) {
   return useQuery({
     queryKey: ['objects', name, prefix, delimiter, after, limit],
     queryFn: () => api.getBucketObjects(name, { prefix, delimiter, after, limit }),
+    enabled: Boolean(name && enabled),
+    refetchInterval: 15_000,
+  })
+}
+
+export function useDeletedBucketObjects(name: string, prefix: string, after: string, limit = 50, enabled = true) {
+  return useQuery({
+    queryKey: ['deletedObjects', name, prefix, after, limit],
+    queryFn: () => api.getBucketDeletedObjects(name, { prefix, after, limit }),
+    enabled: Boolean(name && enabled),
     refetchInterval: 15_000,
   })
 }
@@ -99,6 +116,35 @@ export function useDeleteBucket() {
       qc.invalidateQueries({ queryKey: ['buckets'] })
       qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
       qc.invalidateQueries({ queryKey: ['objects', variables.name] })
+    },
+  })
+}
+
+export function useDeleteBucketObject() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ name, key }: { name: string; key: string }) => api.deleteBucketObject(name, key),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['deletedObjects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objectVersions', variables.name, variables.key] })
+    },
+  })
+}
+
+export function useRestoreBucketObject() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ name, key, deleteMarkerVersionID }: { name: string; key: string; deleteMarkerVersionID: string }) =>
+      api.restoreBucketObject(name, { key, delete_marker_version_id: deleteMarkerVersionID }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['deletedObjects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objectVersions', variables.name, variables.key] })
     },
   })
 }

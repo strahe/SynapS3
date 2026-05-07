@@ -66,6 +66,9 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", srv.handleAPIUpdateBucketOwner)
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}", srv.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", srv.handleAPIBucketObjects)
+	mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", srv.handleAPIDeleteBucketObject)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/deleted", srv.handleAPIBucketDeletedObjects)
+	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/restore", srv.handleAPIRestoreBucketObject)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/status-detail", srv.handleAPIBucketObjectStatusDetail)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/provenance", srv.handleAPIBucketObjectProvenance)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", srv.handleAPIBucketObjectVersions)
@@ -1377,6 +1380,244 @@ func TestListBucketObjectEntriesSkipsDuplicateRowsBeforeSiblingFolders(t *testin
 	}
 }
 
+func TestAPIBucketObjects_DeleteListAndRestore(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", "", model.ObjectStateCached)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	deleteReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/buckets/trash-bucket/objects?key="+url.QueryEscape("folder/file.txt"), nil)
+	if err != nil {
+		t.Fatalf("NewRequest delete: %v", err)
+	}
+	setBucketWriteHeaders(deleteReq)
+	deleteResp, err := ts.Client().Do(deleteReq)
+	if err != nil {
+		t.Fatalf("DELETE bucket object: %v", err)
+	}
+	defer func() { _ = deleteResp.Body.Close() }()
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want %d, body=%s", deleteResp.StatusCode, http.StatusOK, readBody(t, deleteResp.Body))
+	}
+	var deleteBody struct {
+		Key                   string `json:"key"`
+		DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+		DeletedAt             string `json:"deleted_at"`
+	}
+	if err := json.NewDecoder(deleteResp.Body).Decode(&deleteBody); err != nil {
+		t.Fatalf("Decode delete: %v", err)
+	}
+	if deleteBody.Key != "folder/file.txt" || deleteBody.DeleteMarkerVersionID == "" || deleteBody.DeletedAt == "" {
+		t.Fatalf("delete response = %#v, want marker metadata", deleteBody)
+	}
+
+	listResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET live objects: %v", err)
+	}
+	defer func() { _ = listResp.Body.Close() }()
+	var live objectListResponse
+	if err := json.NewDecoder(listResp.Body).Decode(&live); err != nil {
+		t.Fatalf("Decode live objects: %v", err)
+	}
+	if len(live.Objects) != 0 {
+		t.Fatalf("live objects = %#v, want deleted object hidden", live.Objects)
+	}
+
+	versionsResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/versions?key=" + url.QueryEscape("folder/file.txt"))
+	if err != nil {
+		t.Fatalf("GET object versions: %v", err)
+	}
+	defer func() { _ = versionsResp.Body.Close() }()
+	var versionsBody struct {
+		Versions []struct {
+			VersionID       string `json:"version_id"`
+			IsCurrent       bool   `json:"is_current"`
+			IsDeleteMarker  bool   `json:"is_delete_marker"`
+			UploadStatus    string `json:"upload_status"`
+			DownloadVisible bool   `json:"download_visible"`
+		} `json:"versions"`
+	}
+	if err := json.NewDecoder(versionsResp.Body).Decode(&versionsBody); err != nil {
+		t.Fatalf("Decode versions: %v", err)
+	}
+	if len(versionsBody.Versions) != 2 {
+		t.Fatalf("versions len = %d, want 2", len(versionsBody.Versions))
+	}
+	if versionsBody.Versions[0].VersionID != deleteBody.DeleteMarkerVersionID || !versionsBody.Versions[0].IsCurrent || !versionsBody.Versions[0].IsDeleteMarker {
+		t.Fatalf("first version = %#v, want current delete marker", versionsBody.Versions[0])
+	}
+	if versionsBody.Versions[1].VersionID != versionID || versionsBody.Versions[1].IsDeleteMarker {
+		t.Fatalf("second version = %#v, want data version %s", versionsBody.Versions[1], versionID)
+	}
+
+	deletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET deleted objects: %v", err)
+	}
+	defer func() { _ = deletedResp.Body.Close() }()
+	var deletedBody struct {
+		Objects []struct {
+			Key                   string `json:"key"`
+			DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+			DeletedAt             string `json:"deleted_at"`
+			RestoreVersionID      string `json:"restore_version_id"`
+			RestoreSize           int64  `json:"restore_size"`
+			RestoreContentType    string `json:"restore_content_type"`
+			RestoreETag           string `json:"restore_etag"`
+		} `json:"objects"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := json.NewDecoder(deletedResp.Body).Decode(&deletedBody); err != nil {
+		t.Fatalf("Decode deleted objects: %v", err)
+	}
+	if len(deletedBody.Objects) != 1 {
+		t.Fatalf("deleted objects len = %d, want 1", len(deletedBody.Objects))
+	}
+	deleted := deletedBody.Objects[0]
+	if deleted.Key != "folder/file.txt" || deleted.DeleteMarkerVersionID != deleteBody.DeleteMarkerVersionID || deleted.RestoreVersionID != versionID || deleted.RestoreSize != 7 || deleted.RestoreContentType != "text/plain" || deleted.RestoreETag != "etag-file" || deleted.DeletedAt == "" {
+		t.Fatalf("deleted object = %#v, want recoverable file", deleted)
+	}
+
+	restoreReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/trash-bucket/objects/restore", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", deleteBody.DeleteMarkerVersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest restore: %v", err)
+	}
+	setBucketWriteHeaders(restoreReq)
+	restoreResp, err := ts.Client().Do(restoreReq)
+	if err != nil {
+		t.Fatalf("POST restore object: %v", err)
+	}
+	defer func() { _ = restoreResp.Body.Close() }()
+	if restoreResp.StatusCode != http.StatusOK {
+		t.Fatalf("restore status = %d, want %d, body=%s", restoreResp.StatusCode, http.StatusOK, readBody(t, restoreResp.Body))
+	}
+	var restoreBody struct {
+		Key               string `json:"key"`
+		RestoredVersionID string `json:"restored_version_id"`
+	}
+	if err := json.NewDecoder(restoreResp.Body).Decode(&restoreBody); err != nil {
+		t.Fatalf("Decode restore: %v", err)
+	}
+	if restoreBody.Key != "folder/file.txt" || restoreBody.RestoredVersionID != versionID {
+		t.Fatalf("restore response = %#v, want data version restored", restoreBody)
+	}
+
+	restoredListResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET restored objects: %v", err)
+	}
+	defer func() { _ = restoredListResp.Body.Close() }()
+	var restoredLive objectListResponse
+	if err := json.NewDecoder(restoredListResp.Body).Decode(&restoredLive); err != nil {
+		t.Fatalf("Decode restored objects: %v", err)
+	}
+	if len(restoredLive.Objects) != 1 || restoredLive.Objects[0].Key != "folder/file.txt" || restoredLive.Objects[0].CurrentVersionID != versionID {
+		t.Fatalf("restored live objects = %#v, want restored file", restoredLive.Objects)
+	}
+
+	emptyDeletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET deleted objects after restore: %v", err)
+	}
+	defer func() { _ = emptyDeletedResp.Body.Close() }()
+	var emptyDeleted struct {
+		Objects []struct{} `json:"objects"`
+	}
+	if err := json.NewDecoder(emptyDeletedResp.Body).Decode(&emptyDeleted); err != nil {
+		t.Fatalf("Decode empty deleted: %v", err)
+	}
+	if len(emptyDeleted.Objects) != 0 {
+		t.Fatalf("deleted objects after restore len = %d, want 0", len(emptyDeleted.Objects))
+	}
+}
+
+func TestAPIBucketObjects_RestoreRejectsStaleMarker(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "stale-restore-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", "", model.ObjectStateCached)
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J0000000000000000000ADM1")
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "file.txt", 6, "etag-new", "checksum-new", "text/plain", "", model.ObjectStateCached)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/stale-restore-bucket/objects/restore", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "file.txt", marker.VersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest restore: %v", err)
+	}
+	setBucketWriteHeaders(req)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST stale restore: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusConflict, readBody(t, resp.Body))
+	}
+}
+
+func TestAPIBucketDeletedObjects_ExcludesMarkerWithoutDataVersion(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "empty-trash-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "missing.txt", "01J0000000000000000000ADM2")
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/empty-trash-bucket/objects/deleted")
+	if err != nil {
+		t.Fatalf("GET deleted objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body struct {
+		Objects []struct{} `json:"objects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode deleted objects: %v", err)
+	}
+	if len(body.Objects) != 0 {
+		t.Fatalf("deleted objects len = %d, want marker without data hidden", len(body.Objects))
+	}
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/empty-trash-bucket/objects/restore", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "missing.txt", marker.VersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest restore: %v", err)
+	}
+	setBucketWriteHeaders(req)
+	restoreResp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST restore without data: %v", err)
+	}
+	defer func() { _ = restoreResp.Body.Close() }()
+	if restoreResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("restore status = %d, want %d, body=%s", restoreResp.StatusCode, http.StatusNotFound, readBody(t, restoreResp.Body))
+	}
+}
+
 func TestAPIBucketObjectVersions(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
@@ -2047,6 +2288,29 @@ func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
 	}
 	if body := readBody(t, resp.Body); body != "old admin" {
 		t.Fatalf("body = %q, want old admin", body)
+	}
+}
+
+func TestAPIBucketObjectDownload_DeleteMarkerVersionIsMethodNotAllowed(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "download-marker-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/report.txt", "01J0000000000000000000DL01")
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/download-marker-bucket/objects/download?key="+url.QueryEscape("folder/report.txt")+"&version_id="+url.QueryEscape(marker.VersionID), nil)
+	req.SetPathValue("name", bucket.Name)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIDownloadObject(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusMethodNotAllowed, rr.Body.String())
 	}
 }
 

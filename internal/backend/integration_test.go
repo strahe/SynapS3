@@ -332,20 +332,62 @@ func TestIntegration_CopyObjectPath(t *testing.T) {
 	}
 }
 
-func TestIntegration_DeletePath_NotSupported(t *testing.T) {
+func TestIntegration_DeletePath_CreatesDeleteMarker(t *testing.T) {
 	ib := newIntegrationBackend(t)
 	ctx := context.Background()
 
-	testutil.SeedBucket(t, ib.db, "bucket")
-	putObject(t, ib.backend, "bucket", "key", "data")
+	bucket := testutil.SeedBucket(t, ib.db, "bucket")
+	putOut := putObject(t, ib.backend, "bucket", "key", "data")
 
-	// DeleteObject should return an error (501 Not Implemented)
-	_, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+	deleteOut, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: strPtr("bucket"),
 		Key:    strPtr("key"),
 	})
-	if err == nil {
-		t.Fatal("expected DeleteObject to return error (not supported)")
+	if err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if deleteOut.DeleteMarker == nil || !*deleteOut.DeleteMarker || deleteOut.VersionId == nil || *deleteOut.VersionId == "" {
+		t.Fatalf("DeleteObject output = %#v, want delete marker version", deleteOut)
+	}
+
+	current, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if current == nil || !current.IsDeleteMarker {
+		t.Fatalf("current version = %#v, want delete marker", current)
+	}
+
+	if _, err := ib.backend.GetObject(ctx, &s3.GetObjectInput{Bucket: strPtr("bucket"), Key: strPtr("key")}); err == nil {
+		t.Fatal("GetObject after delete returned nil error")
+	}
+	listOut, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: strPtr("bucket")})
+	if err != nil {
+		t.Fatalf("ListObjectsV2: %v", err)
+	}
+	if len(listOut.Contents) != 0 {
+		t.Fatalf("ListObjectsV2 contents = %#v, want deleted object hidden", listOut.Contents)
+	}
+	versionsOut, err := ib.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: strPtr("bucket")})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.DeleteMarkers) != 1 || versionsOut.DeleteMarkers[0].VersionId == nil || *versionsOut.DeleteMarkers[0].VersionId != *deleteOut.VersionId {
+		t.Fatalf("delete markers = %#v, want created marker", versionsOut.DeleteMarkers)
+	}
+	if len(versionsOut.Versions) != 1 || versionsOut.Versions[0].VersionId == nil || *versionsOut.Versions[0].VersionId != putOut.VersionID {
+		t.Fatalf("versions = %#v, want original data version", versionsOut.Versions)
+	}
+
+	if _, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    strPtr("bucket"),
+		Key:       strPtr("key"),
+		VersionId: deleteOut.VersionId,
+	}); err != nil {
+		t.Fatalf("DeleteObject marker version: %v", err)
+	}
+	if body := getObjectBody(t, ib.backend, "bucket", "key"); body != "data" {
+		t.Fatalf("restored body = %q, want data", body)
 	}
 }
 

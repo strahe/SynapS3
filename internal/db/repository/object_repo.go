@@ -77,6 +77,74 @@ func (r *BunObjectRepo) CreateVersionAndSetCurrentIfChanged(ctx context.Context,
 	}
 }
 
+func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error) {
+	if bucketID == 0 || key == "" || versionID == "" {
+		return nil, fmt.Errorf("creating delete marker: %w", ErrInvalidInput)
+	}
+	marker := &model.ObjectVersion{
+		VersionID:      versionID,
+		BucketID:       bucketID,
+		Key:            key,
+		Size:           0,
+		ETag:           "",
+		Checksum:       "",
+		ContentType:    "",
+		CacheKey:       "",
+		InCache:        false,
+		IsDeleteMarker: true,
+		State:          model.ObjectStateCached,
+	}
+
+	_, canRestartTx := r.db.(*bun.DB)
+	for attempt := 0; ; attempt++ {
+		err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+			return createDeleteMarkerAndSetCurrent(ctx, db, marker)
+		})
+		if err == nil {
+			return marker, nil
+		}
+		if !shouldRetryObjectWrite(err, canRestartTx) || attempt >= 19 {
+			return nil, err
+		}
+		delay := time.Duration(attempt+1) * 25 * time.Millisecond
+		if delay > 200*time.Millisecond {
+			delay = 200 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *BunObjectRepo) DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string) error {
+	if bucketID == 0 || key == "" || versionID == "" {
+		return fmt.Errorf("deleting marker version: %w", ErrInvalidInput)
+	}
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		return deleteMarkerVersion(ctx, db, bucketID, key, versionID)
+	})
+}
+
+func (r *BunObjectRepo) RestoreCurrentDeleteMarkerStack(ctx context.Context, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error) {
+	if bucketID == 0 || key == "" || currentMarkerVersionID == "" {
+		return nil, fmt.Errorf("restoring delete marker stack: %w", ErrInvalidInput)
+	}
+	var restored *model.ObjectVersion
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		version, err := restoreCurrentDeleteMarkerStack(ctx, db, bucketID, key, currentMarkerVersionID)
+		restored = version
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return restored, nil
+}
+
 func (r *BunObjectRepo) GetObjectByID(ctx context.Context, id int64) (*model.Object, error) {
 	obj := new(model.Object)
 	err := r.db.NewSelect().
@@ -178,6 +246,7 @@ func (r *BunObjectRepo) FindReusableStoredVersion(ctx context.Context, bucketID 
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version")
 	err := q.Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
+		Where("object_version.is_delete_marker = ?", false).
 		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
 		Where("storage_upload.status = ?", model.StorageUploadStatusComplete).
 		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
@@ -201,6 +270,7 @@ func (r *BunObjectRepo) FindReusableReplicatingVersion(ctx context.Context, buck
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version")
 	err := q.Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
+		Where("object_version.is_delete_marker = ?", false).
 		Where("object_version.state = ?", model.ObjectStateReplicating).
 		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
 		OrderExpr("object_version.created_at DESC").
@@ -223,6 +293,7 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 		ModelTableExpr("object_versions AS object_version").
 		ColumnExpr("object_version.*").
 		Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
+		Where("object_version.is_delete_marker = ?", false).
 		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateCached, model.ObjectStateUploading, model.ObjectStateCommitting})).
 		Where("object_version.in_cache = ?", true).
 		Where(`(
@@ -289,6 +360,7 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version").
 		Where("object_version.bucket_id = ? AND object_version.is_current = ?", bucketID, true).
+		Where("object_version.is_delete_marker = ?", false).
 		OrderExpr("object_version.key ASC")
 
 	if prefix != "" {
@@ -380,6 +452,54 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 		return nil, fmt.Errorf("listing object versions by key: %w", err)
 	}
 	return rows, nil
+}
+
+func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error) {
+	var markers []model.ObjectVersion
+	q := r.db.NewSelect().
+		Model(&markers).
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version").
+		Where("object_version.bucket_id = ?", bucketID).
+		Where("object_version.is_current = ?", true).
+		Where("object_version.is_delete_marker = ?", true).
+		Where("EXISTS (SELECT 1 FROM object_versions AS data_version WHERE data_version.object_id = object_version.object_id AND data_version.is_delete_marker = ?)", false).
+		OrderExpr("object_version.key ASC")
+
+	if prefix != "" {
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+		q = q.Where("object_version.key LIKE ? ESCAPE '\\'", escaped+"%")
+	}
+	if afterKey != "" {
+		q = q.Where("object_version.key > ?", afterKey)
+	}
+	if maxKeys > 0 {
+		q = q.Limit(maxKeys)
+	}
+	if err := q.Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing recoverable delete markers: %w", err)
+	}
+
+	items := make([]RecoverableDeleteMarker, 0, len(markers))
+	objectIDs := make([]int64, 0, len(markers))
+	for _, marker := range markers {
+		objectIDs = append(objectIDs, marker.ObjectID)
+	}
+	restoreVersions, err := selectLatestDataVersionsByObjectIDs(ctx, r.db, objectIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, marker := range markers {
+		restoreVersion, ok := restoreVersions[marker.ObjectID]
+		if !ok {
+			continue
+		}
+		items = append(items, RecoverableDeleteMarker{
+			Marker:         marker,
+			RestoreVersion: restoreVersion,
+		})
+	}
+	return items, nil
 }
 
 func (r *BunObjectRepo) UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error {
@@ -507,6 +627,7 @@ func (r *BunObjectRepo) ListVersionsByStateAfter(ctx context.Context, state mode
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version").
 		Where("object_version.state = ?", state).
+		Where("object_version.is_delete_marker = ?", false).
 		OrderExpr("object_version.updated_at ASC, object_version.version_id ASC")
 	if !afterUpdatedAt.IsZero() || afterVersionID != "" {
 		q = q.Where("(object_version.updated_at > ? OR (object_version.updated_at = ? AND object_version.version_id > ?))", afterUpdatedAt, afterUpdatedAt, afterVersionID)
@@ -543,6 +664,7 @@ func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, e
 		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("state, COUNT(*) AS count").
 		Where("is_current = ?", true).
+		Where("is_delete_marker = ?", false).
 		GroupExpr("state").
 		Scan(ctx, &counts)
 	if err != nil {
@@ -558,6 +680,7 @@ func (r *BunObjectRepo) TotalSize(ctx context.Context) (int64, error) {
 		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("COALESCE(SUM(size), 0)").
 		Where("is_current = ?", true).
+		Where("is_delete_marker = ?", false).
 		Scan(ctx, &total)
 	if err != nil {
 		return 0, fmt.Errorf("computing total current object size: %w", err)
@@ -570,6 +693,7 @@ func (r *BunObjectRepo) CountByBucket(ctx context.Context, bucketID int64) (int6
 	count, err := r.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
 		Where("bucket_id = ? AND is_current = ?", bucketID, true).
+		Where("is_delete_marker = ?", false).
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("counting current objects in bucket %d: %w", bucketID, err)
@@ -584,6 +708,7 @@ func (r *BunObjectRepo) TotalSizeByBucket(ctx context.Context, bucketID int64) (
 		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("COALESCE(SUM(size), 0)").
 		Where("bucket_id = ? AND is_current = ?", bucketID, true).
+		Where("is_delete_marker = ?", false).
 		Scan(ctx, &total)
 	if err != nil {
 		return 0, fmt.Errorf("computing total current size for bucket %d: %w", bucketID, err)
@@ -604,6 +729,7 @@ func (r *BunObjectRepo) AggregateByBucket(ctx context.Context) (map[int64]Bucket
 		ColumnExpr("COUNT(*) AS count").
 		ColumnExpr("COALESCE(SUM(size), 0) AS total_size").
 		Where("is_current = ?", true).
+		Where("is_delete_marker = ?", false).
 		GroupExpr("bucket_id").
 		Scan(ctx, &rows)
 	if err != nil {
@@ -752,6 +878,180 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 	}, nil
 }
 
+func createDeleteMarkerAndSetCurrent(ctx context.Context, db bun.IDB, marker *model.ObjectVersion) error {
+	now := time.Now()
+	if err := lockCurrentObjectIfExists(ctx, db, marker.BucketID, marker.Key); err != nil {
+		return err
+	}
+	existing, err := selectObjectByBucketAndKey(ctx, db, marker.BucketID, marker.Key)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("checking existing object: %w", err)
+	}
+	if err == sql.ErrNoRows {
+		obj := objectIdentityFromVersion(marker)
+		obj.CreatedAt = now
+		obj.UpdatedAt = now
+		if _, insertErr := db.NewInsert().Model(obj).Exec(ctx); insertErr != nil {
+			if !isUniqueViolation(insertErr) {
+				return fmt.Errorf("inserting new object for delete marker: %w", insertErr)
+			}
+			return fmt.Errorf("%w: inserting new object for delete marker: %w", errConcurrentObjectCreate, insertErr)
+		}
+		marker.ObjectID = obj.ID
+	} else {
+		marker.ObjectID = existing.ID
+		if _, updateErr := db.NewUpdate().
+			Model((*model.Object)(nil)).
+			Set("updated_at = ?", now).
+			Where("id = ?", existing.ID).
+			Exec(ctx); updateErr != nil {
+			return fmt.Errorf("updating object identity timestamp: %w", updateErr)
+		}
+	}
+
+	marker.IsCurrent = true
+	marker.IsDeleteMarker = true
+	marker.Size = 0
+	marker.ETag = ""
+	marker.Checksum = ""
+	marker.ContentType = ""
+	marker.CacheKey = ""
+	marker.StorageUploadID = nil
+	marker.InCache = false
+	marker.State = model.ObjectStateCached
+	marker.FailedAtState = nil
+	marker.LastError = nil
+	if marker.CreatedAt.IsZero() {
+		marker.CreatedAt = now
+	}
+	if marker.UpdatedAt.IsZero() {
+		marker.UpdatedAt = now
+	}
+
+	if _, err := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("is_current = ?", false).
+		Where("object_id = ? AND is_current = ?", marker.ObjectID, true).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("clearing previous current version: %w", err)
+	}
+	if _, err := db.NewInsert().
+		Model(marker).
+		Column("version_id", "object_id", "bucket_id", "key", "size", "e_tag", "checksum", "content_type", "metadata", "cache_key", "storage_upload_id", "in_cache", "is_current", "is_delete_marker", "state", "failed_at_state", "last_error", "created_at", "updated_at").
+		Value("content_type", "?", "").
+		Value("in_cache", "?", false).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("inserting delete marker: %w", err)
+	}
+	return nil
+}
+
+func deleteMarkerVersion(ctx context.Context, db bun.IDB, bucketID int64, key string, versionID string) error {
+	if err := lockCurrentObjectIfExists(ctx, db, bucketID, key); err != nil {
+		return err
+	}
+	version, err := selectVersionByBucketKeyAndID(ctx, db, bucketID, key, versionID)
+	if err != nil {
+		return err
+	}
+	if version == nil {
+		return fmt.Errorf("deleting marker version: %w", ErrNotFound)
+	}
+	if !version.IsDeleteMarker {
+		return fmt.Errorf("deleting marker version: %w", ErrInvalidInput)
+	}
+
+	if _, err := db.NewDelete().
+		Model((*model.ObjectVersion)(nil)).
+		Where("bucket_id = ? AND key = ? AND version_id = ?", bucketID, key, versionID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("deleting marker version: %w", err)
+	}
+	if !version.IsCurrent {
+		return nil
+	}
+	return promoteLatestVersion(ctx, db, version.ObjectID)
+}
+
+func restoreCurrentDeleteMarkerStack(ctx context.Context, db bun.IDB, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error) {
+	if err := lockCurrentObjectIfExists(ctx, db, bucketID, key); err != nil {
+		return nil, err
+	}
+	current, err := selectCurrentVersionByBucketAndKey(ctx, db, bucketID, key)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil {
+		return nil, fmt.Errorf("restoring delete marker stack: %w", ErrNotFound)
+	}
+	if !current.IsDeleteMarker || current.VersionID != currentMarkerVersionID {
+		return nil, fmt.Errorf("restoring delete marker stack: %w", ErrConflict)
+	}
+
+	versions, err := selectVersionsByObjectNewestFirst(ctx, db, current.ObjectID)
+	if err != nil {
+		return nil, err
+	}
+	markerIDs := make([]string, 0)
+	var restoreTarget *model.ObjectVersion
+	for i := range versions {
+		version := versions[i]
+		if version.IsDeleteMarker {
+			markerIDs = append(markerIDs, version.VersionID)
+			continue
+		}
+		restoreTarget = &version
+		break
+	}
+	if restoreTarget == nil {
+		return nil, fmt.Errorf("restoring delete marker stack: %w", ErrNotFound)
+	}
+	if len(markerIDs) == 0 {
+		return nil, fmt.Errorf("restoring delete marker stack: %w", ErrConflict)
+	}
+
+	if _, err := db.NewDelete().
+		Model((*model.ObjectVersion)(nil)).
+		Where("object_id = ? AND version_id IN (?)", current.ObjectID, bun.List(markerIDs)).
+		Exec(ctx); err != nil {
+		return nil, fmt.Errorf("deleting marker stack: %w", err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("is_current = ?", true).
+		Where("version_id = ?", restoreTarget.VersionID).
+		Exec(ctx); err != nil {
+		return nil, fmt.Errorf("restoring data version current flag: %w", err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", current.ObjectID).
+		Exec(ctx); err != nil {
+		return nil, fmt.Errorf("updating object identity timestamp: %w", err)
+	}
+	restoreTarget.IsCurrent = true
+	return restoreTarget, nil
+}
+
+func promoteLatestVersion(ctx context.Context, db bun.IDB, objectID int64) error {
+	latest, err := selectLatestVersionByObjectID(ctx, db, objectID)
+	if err != nil {
+		return err
+	}
+	if latest == nil {
+		return nil
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("is_current = ?", true).
+		Where("version_id = ?", latest.VersionID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("promoting latest version: %w", err)
+	}
+	return nil
+}
+
 func normalizeObjectVersion(version *model.ObjectVersion) {
 	version.FailedAtState = nil
 	version.LastError = nil
@@ -791,6 +1091,107 @@ func selectCurrentVersionByObjectID(ctx context.Context, db bun.IDB, objectID in
 	return version, nil
 }
 
+func selectCurrentVersionByBucketAndKey(ctx context.Context, db bun.IDB, bucketID int64, key string) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	q := db.NewSelect().
+		Model(version).
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.bucket_id = ? AND object_version.key = ? AND object_version.is_current = ?", bucketID, key, true).Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting current object version by bucket+key: %w", err)
+	}
+	return version, nil
+}
+
+func selectVersionByBucketKeyAndID(ctx context.Context, db bun.IDB, bucketID int64, key string, versionID string) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	q := db.NewSelect().
+		Model(version).
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.bucket_id = ? AND object_version.key = ? AND object_version.version_id = ?", bucketID, key, versionID).Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting object version by bucket+key+ID: %w", err)
+	}
+	return version, nil
+}
+
+func selectLatestVersionByObjectID(ctx context.Context, db bun.IDB, objectID int64) (*model.ObjectVersion, error) {
+	version := new(model.ObjectVersion)
+	q := db.NewSelect().
+		Model(version).
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.object_id = ?", objectID).
+		OrderExpr("object_version.created_at DESC").
+		OrderExpr("object_version.version_id DESC").
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting latest object version: %w", err)
+	}
+	return version, nil
+}
+
+func selectLatestDataVersionsByObjectIDs(ctx context.Context, db bun.IDB, objectIDs []int64) (map[int64]model.ObjectVersion, error) {
+	if len(objectIDs) == 0 {
+		return map[int64]model.ObjectVersion{}, nil
+	}
+
+	var versions []model.ObjectVersion
+	q := db.NewSelect().
+		Model(&versions).
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.object_id IN (?)", bun.List(objectIDs)).
+		Where("object_version.is_delete_marker = ?", false).
+		Where(`NOT EXISTS (
+			SELECT 1 FROM object_versions AS newer_data_version
+			WHERE newer_data_version.object_id = object_version.object_id
+			  AND newer_data_version.is_delete_marker = ?
+			  AND (
+			    newer_data_version.created_at > object_version.created_at
+			    OR (newer_data_version.created_at = object_version.created_at AND newer_data_version.version_id > object_version.version_id)
+			  )
+		)`, false).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("selecting latest data versions: %w", err)
+	}
+
+	byObjectID := make(map[int64]model.ObjectVersion, len(versions))
+	for _, version := range versions {
+		byObjectID[version.ObjectID] = version
+	}
+	return byObjectID, nil
+}
+
+func selectVersionsByObjectNewestFirst(ctx context.Context, db bun.IDB, objectID int64) ([]model.ObjectVersion, error) {
+	var versions []model.ObjectVersion
+	q := db.NewSelect().
+		Model(&versions).
+		ModelTableExpr("object_versions AS object_version")
+	q = withObjectVersionStorageColumns(q, "object_version")
+	err := q.Where("object_version.object_id = ?", objectID).
+		OrderExpr("object_version.created_at DESC").
+		OrderExpr("object_version.version_id DESC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("selecting object versions by object ID: %w", err)
+	}
+	return versions, nil
+}
+
 func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, key string) error {
 	if _, err := db.NewUpdate().
 		Model((*model.Object)(nil)).
@@ -803,7 +1204,7 @@ func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, 
 }
 
 func objectVersionMatchesVersion(current *model.ObjectVersion, version *model.ObjectVersion) bool {
-	if current == nil || current.State == model.ObjectStateFailed {
+	if current == nil || current.State == model.ObjectStateFailed || current.IsDeleteMarker {
 		return false
 	}
 	return current.Size == version.Size &&

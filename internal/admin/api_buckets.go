@@ -607,6 +607,9 @@ func (s *Server) objectAdminUploadInfos(ctx context.Context, versions []model.Ob
 	uploadIDSet := make(map[int64]struct{})
 	versionIDSet := make(map[string]struct{})
 	for _, version := range versions {
+		if version.IsDeleteMarker {
+			continue
+		}
 		if version.StorageUploadID != nil {
 			uploadIDSet[*version.StorageUploadID] = struct{}{}
 		} else {
@@ -710,6 +713,38 @@ type objectListResponse struct {
 	NextMarker string             `json:"next_marker,omitempty"`
 }
 
+type objectDeleteMarkerResponse struct {
+	Key                   string `json:"key"`
+	DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+	DeletedAt             string `json:"deleted_at"`
+}
+
+type deletedObjectListItem struct {
+	Key                   string `json:"key"`
+	DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+	DeletedAt             string `json:"deleted_at"`
+	RestoreVersionID      string `json:"restore_version_id"`
+	RestoreSize           int64  `json:"restore_size"`
+	RestoreContentType    string `json:"restore_content_type"`
+	RestoreETag           string `json:"restore_etag"`
+}
+
+type deletedObjectListResponse struct {
+	Objects    []deletedObjectListItem `json:"objects"`
+	HasMore    bool                    `json:"has_more"`
+	NextMarker string                  `json:"next_marker,omitempty"`
+}
+
+type restoreObjectRequest struct {
+	Key                   string `json:"key"`
+	DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+}
+
+type restoreObjectResponse struct {
+	Key               string `json:"key"`
+	RestoredVersionID string `json:"restored_version_id"`
+}
+
 func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucketName := r.PathValue("name")
@@ -809,6 +844,162 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAPIDeleteBucketObject(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	if !s.requireBucketWrite(w, r) {
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "object key is required"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for object delete", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	marker, err := s.repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, key, model.NewVersionID())
+	if err != nil {
+		s.logger.Error("api: failed to delete bucket object", "error", err, "bucket", bucketName, "key", key)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, objectDeleteMarkerResponse{
+		Key:                   marker.Key,
+		DeleteMarkerVersionID: marker.VersionID,
+		DeletedAt:             marker.CreatedAt.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) handleAPIBucketDeletedObjects(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for deleted object list", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	prefix := r.URL.Query().Get("prefix")
+	after := r.URL.Query().Get("after")
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+
+	markers, err := s.repos.Objects.ListRecoverableDeleteMarkers(ctx, bucket.ID, prefix, after, limit+1)
+	if err != nil {
+		s.logger.Error("api: failed to list deleted bucket objects", "error", err, "bucket", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	hasMore := len(markers) > limit
+	if hasMore {
+		markers = markers[:limit]
+	}
+	items := make([]deletedObjectListItem, 0, len(markers))
+	for _, marker := range markers {
+		items = append(items, deletedObjectListItem{
+			Key:                   marker.Marker.Key,
+			DeleteMarkerVersionID: marker.Marker.VersionID,
+			DeletedAt:             marker.Marker.CreatedAt.Format(time.RFC3339),
+			RestoreVersionID:      marker.RestoreVersion.VersionID,
+			RestoreSize:           marker.RestoreVersion.Size,
+			RestoreContentType:    marker.RestoreVersion.ContentType,
+			RestoreETag:           marker.RestoreVersion.ETag,
+		})
+	}
+	resp := deletedObjectListResponse{
+		Objects: items,
+		HasMore: hasMore,
+	}
+	if hasMore && len(items) > 0 {
+		resp.NextMarker = items[len(items)-1].Key
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAPIRestoreBucketObject(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	if !s.requireBucketWrite(w, r) {
+		return
+	}
+
+	var req restoreObjectRequest
+	if !decodeBucketStrictJSON(w, r, &req) {
+		return
+	}
+	key := req.Key
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "object key is required"})
+		return
+	}
+	deleteMarkerVersionID := strings.TrimSpace(req.DeleteMarkerVersionID)
+	if deleteMarkerVersionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "delete_marker_version_id is required"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for object restore", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	restored, err := s.repos.Objects.RestoreCurrentDeleteMarkerStack(ctx, bucket.ID, key, deleteMarkerVersionID)
+	if err != nil {
+		switch {
+		case errors.Is(err, repository.ErrConflict):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "delete marker is no longer current"})
+		case errors.Is(err, repository.ErrNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "restorable object not found"})
+		default:
+			s.logger.Error("api: failed to restore bucket object", "error", err, "bucket", bucketName, "key", key, "marker", deleteMarkerVersionID)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, restoreObjectResponse{
+		Key:               restored.Key,
+		RestoredVersionID: restored.VersionID,
+	})
 }
 
 const adminObjectListingBatchSize = 1000
@@ -943,20 +1134,21 @@ func adminListingFolderName(commonPrefix, prefix, delimiter string) string {
 }
 
 type objectVersionListItem struct {
-	VersionID    string                  `json:"version_id"`
-	Key          string                  `json:"key"`
-	Size         int64                   `json:"size"`
-	State        string                  `json:"state"`
-	Status       string                  `json:"status"`
-	UploadStatus *string                 `json:"upload_status,omitempty"`
-	Progress     *uploadProgressResponse `json:"progress,omitempty"`
-	Location     objectLocation          `json:"location"`
-	ContentType  string                  `json:"content_type"`
-	ETag         string                  `json:"etag"`
-	PieceCID     *string                 `json:"piece_cid,omitempty"`
-	CreatedAt    string                  `json:"created_at"`
-	UpdatedAt    string                  `json:"updated_at"`
-	IsCurrent    bool                    `json:"is_current"`
+	VersionID      string                  `json:"version_id"`
+	Key            string                  `json:"key"`
+	Size           int64                   `json:"size"`
+	State          string                  `json:"state"`
+	Status         string                  `json:"status"`
+	IsDeleteMarker bool                    `json:"is_delete_marker"`
+	UploadStatus   *string                 `json:"upload_status,omitempty"`
+	Progress       *uploadProgressResponse `json:"progress,omitempty"`
+	Location       objectLocation          `json:"location"`
+	ContentType    string                  `json:"content_type"`
+	ETag           string                  `json:"etag"`
+	PieceCID       *string                 `json:"piece_cid,omitempty"`
+	CreatedAt      string                  `json:"created_at"`
+	UpdatedAt      string                  `json:"updated_at"`
+	IsCurrent      bool                    `json:"is_current"`
 }
 
 type objectVersionListResponse struct {
@@ -1197,20 +1389,21 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 	for _, v := range versions {
 		uploadInfo := uploadInfos[v.VersionID]
 		items = append(items, objectVersionListItem{
-			VersionID:    v.VersionID,
-			Key:          v.Key,
-			Size:         v.Size,
-			State:        string(v.State),
-			Status:       objectAdminStatusWithUpload(v.State, v.InCache, v.InFilecoin, uploadInfo.Status),
-			UploadStatus: uploadStatusString(uploadInfo.Status),
-			Progress:     uploadInfo.Progress,
-			Location:     objectLocation{Cache: v.InCache, Filecoin: v.InFilecoin},
-			ContentType:  v.ContentType,
-			ETag:         v.ETag,
-			PieceCID:     v.PieceCID,
-			CreatedAt:    v.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:    v.UpdatedAt.Format(time.RFC3339),
-			IsCurrent:    v.IsCurrent,
+			VersionID:      v.VersionID,
+			Key:            v.Key,
+			Size:           v.Size,
+			State:          string(v.State),
+			Status:         objectAdminStatusWithUpload(v.State, v.InCache, v.InFilecoin, uploadInfo.Status),
+			IsDeleteMarker: v.IsDeleteMarker,
+			UploadStatus:   uploadStatusString(uploadInfo.Status),
+			Progress:       uploadInfo.Progress,
+			Location:       objectLocation{Cache: v.InCache, Filecoin: v.InFilecoin},
+			ContentType:    v.ContentType,
+			ETag:           v.ETag,
+			PieceCID:       v.PieceCID,
+			CreatedAt:      v.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:      v.UpdatedAt.Format(time.RFC3339),
+			IsCurrent:      v.IsCurrent,
 		})
 	}
 
@@ -1262,6 +1455,8 @@ func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request)
 		switch {
 		case errors.Is(err, objectreader.ErrInvalidArgument):
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		case errors.Is(err, objectreader.ErrMethodNotAllowed):
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		case errors.Is(err, objectreader.ErrNoSuchBucket), errors.Is(err, objectreader.ErrNoSuchKey), errors.Is(err, objectreader.ErrNoSuchVersion):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "object not found"})
 		default:

@@ -53,6 +53,7 @@ type ObjectVersion struct {
 	InCache         bool              `bun:",notnull,default:true"`
 	InFilecoin      bool              `bun:",scanonly"`
 	IsCurrent       bool              `bun:",notnull,default:false"`
+	IsDeleteMarker  bool              `bun:",notnull,default:false"`
 	State           ObjectState       `bun:",notnull,default:'cached'"`
 	FailedAtState   *ObjectState      `bun:",nullzero"`
 	LastError       *string           `bun:",nullzero"`

@@ -69,6 +69,13 @@ type ObjectVersionListItem struct {
 	model.ObjectVersion `bun:",extend"`
 }
 
+// RecoverableDeleteMarker pairs a current delete marker with the data version
+// that would become current if the marker stack is restored.
+type RecoverableDeleteMarker struct {
+	Marker         model.ObjectVersion
+	RestoreVersion model.ObjectVersion
+}
+
 // ObjectVersionRef identifies a version and its current object row.
 type ObjectVersionRef struct {
 	ObjectID  int64  `bun:"object_id"`
@@ -79,6 +86,12 @@ type ObjectVersionRef struct {
 type ObjectRepository interface {
 	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (objectID int64, err error)
 	CreateVersionAndSetCurrentIfChanged(ctx context.Context, version *model.ObjectVersion) (ObjectVersionWriteResult, error)
+	CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
+	DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string) error
+	// RestoreCurrentDeleteMarkerStack is the admin trash restore path: it removes
+	// the current delete marker stack until the latest data version becomes current,
+	// unlike S3 versioned delete which removes only one specified delete marker.
+	RestoreCurrentDeleteMarkerStack(ctx context.Context, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error)
 	GetObjectByID(ctx context.Context, id int64) (*model.Object, error)
 	GetObjectByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.Object, error)
 	GetCurrentVersionByObjectID(ctx context.Context, objectID int64) (*model.ObjectVersion, error)
@@ -92,6 +105,7 @@ type ObjectRepository interface {
 	ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.ObjectVersion, error)
 	ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error)
 	ListVersionsByKey(ctx context.Context, bucketID int64, key string, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
+	ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error)
 	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
 	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
 	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error

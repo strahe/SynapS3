@@ -129,12 +129,40 @@ export interface ObjectListResponse {
   next_marker?: string
 }
 
+export interface ObjectDeleteMarkerResponse {
+  key: string
+  delete_marker_version_id: string
+  deleted_at: string
+}
+
+export interface DeletedObjectItem {
+  key: string
+  delete_marker_version_id: string
+  deleted_at: string
+  restore_version_id: string
+  restore_size: number
+  restore_content_type: string
+  restore_etag: string
+}
+
+export interface DeletedObjectListResponse {
+  objects: DeletedObjectItem[]
+  has_more: boolean
+  next_marker?: string
+}
+
+export interface RestoreObjectResponse {
+  key: string
+  restored_version_id: string
+}
+
 export interface ObjectVersionItem {
   version_id: string
   key: string
   size: number
   state: ObjectState
   status: ObjectStatus
+  is_delete_marker: boolean
   upload_status?: ObjectUploadStatus
   progress?: UploadTransferProgress
   location: ObjectLocation
@@ -538,6 +566,34 @@ export const api = {
     const qs = sp.toString()
     return fetchJSON<ObjectListResponse>(`/buckets/${encodeURIComponent(name)}/objects${qs ? `?${qs}` : ''}`)
   },
+  deleteBucketObject: (name: string, key: string) => {
+    const sp = new URLSearchParams()
+    sp.set('key', key)
+    return fetchJSON<ObjectDeleteMarkerResponse>(`/buckets/${encodeURIComponent(name)}/objects?${sp.toString()}`, {
+      method: 'DELETE',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+    })
+  },
+  getBucketDeletedObjects: (name: string, params: { prefix?: string; after?: string; limit?: number }) => {
+    const sp = new URLSearchParams()
+    if (params.prefix) sp.set('prefix', params.prefix)
+    if (params.after) sp.set('after', params.after)
+    if (params.limit) sp.set('limit', params.limit.toString())
+    const qs = sp.toString()
+    return fetchJSON<DeletedObjectListResponse>(
+      `/buckets/${encodeURIComponent(name)}/objects/deleted${qs ? `?${qs}` : ''}`
+    )
+  },
+  restoreBucketObject: (name: string, payload: { key: string; delete_marker_version_id: string }) =>
+    fetchJSON<RestoreObjectResponse>(`/buckets/${encodeURIComponent(name)}/objects/restore`, {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
   getBucketObjectVersions: (name: string, params: { key: string; limit?: number; version_marker?: string }) => {
     const sp = new URLSearchParams()
     sp.set('key', params.key)

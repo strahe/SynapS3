@@ -23,6 +23,7 @@ var (
 	ErrNoSuchBucket     = errors.New("object reader: bucket not found")
 	ErrNoSuchKey        = errors.New("object reader: object not found")
 	ErrNoSuchVersion    = errors.New("object reader: object version not found")
+	ErrMethodNotAllowed = errors.New("object reader: method not allowed")
 	ErrCacheRead        = errors.New("object reader: cache read failed")
 	ErrCacheMiss        = errors.New("object reader: cache miss")
 	ErrProviderDownload = errors.New("object reader: provider download failed")
@@ -103,6 +104,9 @@ func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID str
 	if version == nil {
 		return nil, ErrNoSuchVersion
 	}
+	if version.IsDeleteMarker {
+		return nil, ErrMethodNotAllowed
+	}
 
 	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
 	if cacheErr == nil {
@@ -148,6 +152,9 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 		return nil, fmt.Errorf("querying object: %w", err)
 	}
 	if version == nil {
+		return nil, ErrNoSuchKey
+	}
+	if version.IsDeleteMarker {
 		return nil, ErrNoSuchKey
 	}
 

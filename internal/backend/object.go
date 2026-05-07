@@ -127,6 +127,8 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		case errors.Is(err, objectreader.ErrNoSuchVersion):
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
+		case errors.Is(err, objectreader.ErrMethodNotAllowed):
+			return nil, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 		case errors.Is(err, objectreader.ErrProviderDownload):
 			return nil, s3err.GetAPIError(s3err.ErrInternalError)
 		default:
@@ -274,7 +276,7 @@ func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsI
 	return result, nil
 }
 
-// ListObjectVersions lists non-delete object versions with S3 markers and delimiter grouping.
+// ListObjectVersions lists object versions and delete markers with S3 markers and delimiter grouping.
 func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
 	if input.Bucket == nil {
 		return s3response.ListVersionsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -322,10 +324,20 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 	for _, row := range rows {
 		key := row.Key
 		versionID := row.VersionID
-		etag := fmt.Sprintf(`"%s"`, row.ETag)
-		size := row.Size
 		lastModified := row.CreatedAt
 		isLatest := row.IsCurrent
+		if row.IsDeleteMarker {
+			result.DeleteMarkers = append(result.DeleteMarkers, types.DeleteMarkerEntry{
+				Key:          &key,
+				VersionId:    &versionID,
+				IsLatest:     &isLatest,
+				LastModified: &lastModified,
+			})
+			continue
+		}
+
+		etag := fmt.Sprintf(`"%s"`, row.ETag)
+		size := row.Size
 		result.Versions = append(result.Versions, s3response.ObjectVersion{
 			Key:          &key,
 			VersionId:    &versionID,
@@ -338,6 +350,50 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 	}
 
 	return result, nil
+}
+
+func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+	if input == nil || input.Bucket == nil || input.Key == nil {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+
+	bucket, err := b.requireActiveBucket(ctx, *input.Bucket)
+	if err != nil {
+		return nil, err
+	}
+	key := *input.Key
+
+	if input.VersionId == nil || *input.VersionId == "" {
+		marker, err := b.repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, key, model.NewVersionID())
+		if err != nil {
+			return nil, fmt.Errorf("creating delete marker: %w", err)
+		}
+		deleteMarker := true
+		return &s3.DeleteObjectOutput{
+			DeleteMarker: &deleteMarker,
+			VersionId:    &marker.VersionID,
+		}, nil
+	}
+
+	versionID := *input.VersionId
+	version, err := b.repos.Objects.GetVersionByBucketKeyAndID(ctx, bucket.ID, key, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying object version for delete: %w", err)
+	}
+	if version == nil {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
+	}
+	if !version.IsDeleteMarker {
+		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+	if err := b.repos.Objects.DeleteMarkerVersion(ctx, bucket.ID, key, versionID); err != nil {
+		return nil, fmt.Errorf("deleting marker version: %w", err)
+	}
+	deleteMarker := true
+	return &s3.DeleteObjectOutput{
+		DeleteMarker: &deleteMarker,
+		VersionId:    &versionID,
+	}, nil
 }
 
 func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
@@ -637,6 +693,9 @@ func (b *SynapseBackend) versionForRead(ctx context.Context, bucketID int64, key
 		if version == nil {
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
 		}
+		if version.IsDeleteMarker {
+			return nil, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
+		}
 		return version, nil
 	}
 
@@ -645,6 +704,9 @@ func (b *SynapseBackend) versionForRead(ctx context.Context, bucketID int64, key
 		return nil, fmt.Errorf("querying object: %w", err)
 	}
 	if version == nil {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+	if version.IsDeleteMarker {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	return version, nil
@@ -817,6 +879,8 @@ func (b *SynapseBackend) objectReaderError(err error) error {
 		return s3err.GetAPIError(s3err.ErrNoSuchKey)
 	case errors.Is(err, objectreader.ErrNoSuchVersion):
 		return s3err.GetAPIError(s3err.ErrNoSuchVersion)
+	case errors.Is(err, objectreader.ErrMethodNotAllowed):
+		return s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 	case errors.Is(err, objectreader.ErrProviderDownload):
 		return s3err.GetAPIError(s3err.ErrInternalError)
 	default:

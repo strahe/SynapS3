@@ -13,6 +13,7 @@ import {
   Loader2,
   MoreHorizontal,
   RefreshCw,
+  RotateCcw,
   Trash2,
   TriangleAlert,
   UserRound,
@@ -20,6 +21,7 @@ import {
 import { Fragment, type ReactNode, useEffect, useState } from 'react'
 import {
   api,
+  type DeletedObjectItem,
   type ObjectFolderItem,
   type ObjectItem,
   type ObjectProvenance,
@@ -35,6 +37,7 @@ import {
 } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
+import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
@@ -71,14 +74,18 @@ import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   useBucket,
   useBucketObjects,
   useBucketObjectVersions,
   useDeleteBucket,
+  useDeleteBucketObject,
+  useDeletedBucketObjects,
   useObjectProvenance,
   useObjectStatusDetail,
+  useRestoreBucketObject,
   useS3Users,
   useUpdateBucketOwner,
 } from '@/hooks/queries'
@@ -89,6 +96,7 @@ import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 type ObjectBrowserSearch = {
   prefix?: string
   marker?: string
+  view?: 'objects' | 'deleted'
 }
 
 const objectBrowserSkeletonRows = ['row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8']
@@ -97,6 +105,7 @@ export const Route = createFileRoute('/buckets/$name')({
   validateSearch: (search: Record<string, unknown>): ObjectBrowserSearch => ({
     prefix: normalizePrefixSearch(search.prefix),
     marker: normalizeSearchString(search.marker),
+    view: search.view === 'deleted' ? 'deleted' : undefined,
   }),
   component: ObjectBrowserPage,
 })
@@ -408,15 +417,21 @@ function ObjectVersionsDialog({
                     <TableCell className="overflow-hidden px-2" title={version.version_id}>
                       <div className="flex min-w-0 items-center gap-2">
                         <span className="min-w-0 truncate font-mono text-xs">{version.version_id}</span>
-                        <ObjectStatusIcon
-                          bucketName={bucketName}
-                          versionID={version.version_id}
-                          state={version.state}
-                          status={version.status}
-                          uploadStatus={version.upload_status}
-                          progress={version.progress}
-                          compact
-                        />
+                        {version.is_delete_marker ? (
+                          <StatusBadge tone="neutral" className="shrink-0">
+                            Delete marker
+                          </StatusBadge>
+                        ) : (
+                          <ObjectStatusIcon
+                            bucketName={bucketName}
+                            versionID={version.version_id}
+                            state={version.state}
+                            status={version.status}
+                            uploadStatus={version.upload_status}
+                            progress={version.progress}
+                            compact
+                          />
+                        )}
                         {version.is_current && (
                           <StatusBadge tone="success" className="shrink-0">
                             Current
@@ -488,6 +503,10 @@ function VersionActions({
   version: ObjectVersionItem
 }) {
   const [provenanceOpen, setProvenanceOpen] = useState(false)
+
+  if (version.is_delete_marker) {
+    return <span className="text-xs text-muted-foreground">-</span>
+  }
 
   return (
     <>
@@ -1035,12 +1054,14 @@ function ObjectBrowserPage() {
   const navigate = useNavigate()
   const prefix = search.prefix ?? ''
   const marker = search.marker ?? ''
+  const view = search.view ?? 'objects'
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [changeOwnerOpen, setChangeOwnerOpen] = useState(false)
   const [deleteBucketOpen, setDeleteBucketOpen] = useState(false)
 
   const bucket = useBucket(name)
-  const objects = useBucketObjects(name, prefix, marker)
+  const objects = useBucketObjects(name, prefix, marker, 50, '/', view === 'objects')
+  const deletedObjects = useDeletedBucketObjects(name, prefix, marker, 50, view === 'deleted')
   const qc = useQueryClient()
 
   const pathCrumbs = bucketPrefixCrumbs(prefix)
@@ -1052,6 +1073,7 @@ function ObjectBrowserPage() {
       search: {
         prefix: newPrefix || undefined,
         marker: undefined,
+        view: view === 'deleted' ? 'deleted' : undefined,
       },
     })
   }
@@ -1063,6 +1085,19 @@ function ObjectBrowserPage() {
       search: {
         prefix: prefix || undefined,
         marker: newMarker || undefined,
+        view: view === 'deleted' ? 'deleted' : undefined,
+      },
+    })
+  }
+
+  const navigateToView = (nextView: 'objects' | 'deleted') => {
+    navigate({
+      to: '/buckets/$name',
+      params: { name },
+      search: {
+        prefix: prefix || undefined,
+        marker: undefined,
+        view: nextView === 'deleted' ? 'deleted' : undefined,
       },
     })
   }
@@ -1070,6 +1105,7 @@ function ObjectBrowserPage() {
   const handleRefresh = () => {
     qc.invalidateQueries({ queryKey: ['bucket', name] })
     qc.invalidateQueries({ queryKey: ['objects', name] })
+    qc.invalidateQueries({ queryKey: ['deletedObjects', name] })
   }
 
   const canDelete = bucket.data?.status === 'active'
@@ -1105,11 +1141,18 @@ function ObjectBrowserPage() {
 
       {bucket.error && <div className="text-sm text-destructive">Failed to load bucket details</div>}
 
-      {objects.isLoading ? (
+      <Tabs value={view} onValueChange={(value) => navigateToView(value === 'deleted' ? 'deleted' : 'objects')}>
+        <TabsList className="max-w-full justify-start overflow-x-auto">
+          <TabsTrigger value="objects">Objects</TabsTrigger>
+          <TabsTrigger value="deleted">Deleted</TabsTrigger>
+        </TabsList>
+      </Tabs>
+
+      {view === 'objects' && objects.isLoading ? (
         <ObjectBrowserSkeleton />
-      ) : objects.error ? (
+      ) : view === 'objects' && objects.error ? (
         <div className="text-destructive">Failed to load objects</div>
-      ) : (
+      ) : view === 'objects' ? (
         <ObjectBrowserTable
           bucketName={name}
           prefix={prefix}
@@ -1117,6 +1160,21 @@ function ObjectBrowserPage() {
           files={objects.data?.objects ?? []}
           hasMore={objects.data?.has_more ?? false}
           nextMarker={objects.data?.next_marker}
+          marker={marker}
+          navigateToPrefix={navigateToPrefix}
+          navigateToMarker={navigateToMarker}
+        />
+      ) : deletedObjects.isLoading ? (
+        <ObjectBrowserSkeleton />
+      ) : deletedObjects.error ? (
+        <div className="text-destructive">Failed to load deleted objects</div>
+      ) : (
+        <DeletedObjectsTable
+          bucketName={name}
+          prefix={prefix}
+          objects={deletedObjects.data?.objects ?? []}
+          hasMore={deletedObjects.data?.has_more ?? false}
+          nextMarker={deletedObjects.data?.next_marker}
           marker={marker}
           navigateToPrefix={navigateToPrefix}
           navigateToMarker={navigateToMarker}
@@ -1476,6 +1534,214 @@ function ObjectBrowserTable({
   )
 }
 
+function DeletedObjectsTable({
+  bucketName,
+  prefix,
+  objects,
+  hasMore,
+  nextMarker,
+  marker,
+  navigateToPrefix,
+  navigateToMarker,
+}: {
+  bucketName: string
+  prefix: string
+  objects: DeletedObjectItem[]
+  hasMore: boolean
+  nextMarker?: string
+  marker: string
+  navigateToPrefix: (prefix: string) => void
+  navigateToMarker: (marker: string) => void
+}) {
+  const empty = objects.length === 0
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <ObjectPathBreadcrumb prefix={prefix} navigateToPrefix={navigateToPrefix} />
+        <p className="text-sm text-muted-foreground">{formatCountLabel(objects.length, 'deleted file')}</p>
+      </div>
+
+      {empty ? (
+        <div className="rounded-md border border-border">
+          <Empty className="h-64 border-0">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <Trash2 />
+              </EmptyMedia>
+              <EmptyTitle>No deleted objects found</EmptyTitle>
+              <EmptyDescription>This path has no recoverable deleted files.</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </div>
+      ) : (
+        <div className="rounded-md border border-border">
+          <ScrollArea className="w-full">
+            <Table className="min-w-[860px]">
+              <TableHeader>
+                <TableRow className="bg-muted/50">
+                  <TableHead className="w-[35%] px-4">Name</TableHead>
+                  <TableHead className="w-[22%] px-4">Restore target</TableHead>
+                  <TableHead className="w-[10%] px-4 text-right">Size</TableHead>
+                  <TableHead className="w-[18%] px-4">Type</TableHead>
+                  <TableHead className="w-[10%] px-4">Deleted</TableHead>
+                  <TableHead className="w-[5%] px-4 text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {objects.map((object) => (
+                  <TableRow key={object.delete_marker_version_id}>
+                    <TableCell className="px-4">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 truncate" title={object.key}>
+                          {objectDisplayName(object.key, prefix)}
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell className="overflow-hidden px-4">
+                      <span
+                        className="block truncate font-mono text-xs text-muted-foreground"
+                        title={object.restore_version_id}
+                      >
+                        {object.restore_version_id}
+                      </span>
+                    </TableCell>
+                    <TableCell className="px-4 text-right">{formatBytes(object.restore_size)}</TableCell>
+                    <TableCell className="px-4 text-muted-foreground">
+                      <span className="block max-w-48 truncate" title={object.restore_content_type}>
+                        {object.restore_content_type}
+                      </span>
+                    </TableCell>
+                    <TableCell className="px-4 text-muted-foreground" title={object.deleted_at}>
+                      {timeAgo(object.deleted_at)}
+                    </TableCell>
+                    <TableCell className="px-4 text-right">
+                      <DeletedObjectActions bucketName={bucketName} object={object} />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <ScrollBar orientation="horizontal" />
+          </ScrollArea>
+        </div>
+      )}
+
+      <div className="flex justify-between">
+        {marker ? (
+          <Button variant="outline" size="sm" onClick={() => navigateToMarker('')}>
+            First page
+          </Button>
+        ) : (
+          <span />
+        )}
+        {hasMore && nextMarker && (
+          <Button variant="outline" size="sm" onClick={() => navigateToMarker(nextMarker)}>
+            Next page
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function DeletedObjectActions({ bucketName, object }: { bucketName: string; object: DeletedObjectItem }) {
+  const [restoreOpen, setRestoreOpen] = useState(false)
+
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${object.key}`} title="Actions">
+            <MoreHorizontal />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-36">
+          <DropdownMenuGroup>
+            <DropdownMenuItem onSelect={() => setRestoreOpen(true)}>
+              <RotateCcw data-icon="inline-start" />
+              Restore
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <RestoreDeletedObjectDialog
+        bucketName={bucketName}
+        object={object}
+        open={restoreOpen}
+        onOpenChange={setRestoreOpen}
+      />
+    </>
+  )
+}
+
+function RestoreDeletedObjectDialog({
+  bucketName,
+  object,
+  open,
+  onOpenChange,
+}: {
+  bucketName: string
+  object: DeletedObjectItem
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const restoreObject = useRestoreBucketObject()
+
+  const handleOpenChange = (next: boolean) => {
+    onOpenChange(next)
+    if (!next) restoreObject.reset()
+  }
+
+  const handleRestore = () => {
+    restoreObject.mutate(
+      { name: bucketName, key: object.key, deleteMarkerVersionID: object.delete_marker_version_id },
+      {
+        onSuccess: () => {
+          handleOpenChange(false)
+        },
+      }
+    )
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Restore object</DialogTitle>
+          <DialogDescription>
+            Restore the latest data version and make the object visible in normal listings.
+          </DialogDescription>
+        </DialogHeader>
+        <ReviewDetails
+          rows={[
+            { id: 'key', label: 'Object', value: object.key },
+            { id: 'marker', label: 'Delete marker', value: object.delete_marker_version_id },
+            { id: 'target', label: 'Restore version', value: object.restore_version_id },
+            { id: 'size', label: 'Size', value: formatBytes(object.restore_size) },
+          ]}
+        />
+        {restoreObject.error && <p className="text-sm text-destructive">{restoreObject.error.message}</p>}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            disabled={restoreObject.isPending}
+          >
+            Cancel
+          </Button>
+          <Button type="button" onClick={handleRestore} disabled={restoreObject.isPending}>
+            {restoreObject.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
+            Restore
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function FolderActions({ folder, onOpen }: { folder: ObjectFolderItem; onOpen: () => void }) {
   return (
     <DropdownMenu>
@@ -1499,6 +1765,20 @@ function FolderActions({ folder, onOpen }: { folder: ObjectFolderItem; onOpen: (
 function ObjectActions({ bucketName, object }: { bucketName: string; object: ObjectItem }) {
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [provenanceOpen, setProvenanceOpen] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const deleteObject = useDeleteBucketObject()
+
+  const handleDelete = () => {
+    deleteObject.mutate(
+      { name: bucketName, key: object.key },
+      {
+        onSuccess: () => {
+          setDeleteOpen(false)
+          deleteObject.reset()
+        },
+      }
+    )
+  }
 
   return (
     <>
@@ -1524,6 +1804,10 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
               <Fingerprint data-icon="inline-start" />
               Provenance
             </DropdownMenuItem>
+            <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
+              <Trash2 data-icon="inline-start" />
+              Delete
+            </DropdownMenuItem>
           </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -1539,6 +1823,19 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
         versionID={object.current_version_id}
         open={provenanceOpen}
         onOpenChange={setProvenanceOpen}
+      />
+      <DangerActionAlertDialog
+        open={deleteOpen}
+        onOpenChange={(next) => {
+          setDeleteOpen(next)
+          if (!next) deleteObject.reset()
+        }}
+        title="Delete object"
+        description="This creates a delete marker and hides the current object from normal listings."
+        confirmLabel="Delete object"
+        pending={deleteObject.isPending}
+        error={deleteObject.error?.message}
+        onConfirm={handleDelete}
       />
     </>
   )

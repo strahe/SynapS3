@@ -758,6 +758,204 @@ func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
 	}
 }
 
+func TestObjectRepo_CreateDeleteMarkerHidesCurrentObjectButKeepsVersionHistory(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "delete-marker-bucket")
+
+	data := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000001001", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, data); err != nil {
+		t.Fatalf("create data version: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J00000000000000000001002")
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+	if !marker.IsDeleteMarker || marker.Size != 0 || marker.CacheKey != "" || marker.InCache {
+		t.Fatalf("marker = %#v, want metadata-only delete marker", marker)
+	}
+
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if current == nil || !current.IsDeleteMarker || current.VersionID != marker.VersionID {
+		t.Fatalf("current = %#v, want delete marker %s", current, marker.VersionID)
+	}
+
+	currentList, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "", "", 10)
+	if err != nil {
+		t.Fatalf("ListCurrentVersionsByBucket: %v", err)
+	}
+	if len(currentList) != 0 {
+		t.Fatalf("current list len = %d, want object hidden", len(currentList))
+	}
+
+	versions, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "", "", 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByBucket: %v", err)
+	}
+	if len(versions) != 2 {
+		t.Fatalf("versions len = %d, want marker plus data version", len(versions))
+	}
+	if !versions[0].IsDeleteMarker || !versions[0].IsCurrent {
+		t.Fatalf("first version = %#v, want current delete marker", versions[0].ObjectVersion)
+	}
+	if versions[1].VersionID != data.VersionID || versions[1].IsDeleteMarker {
+		t.Fatalf("second version = %#v, want data version %s", versions[1].ObjectVersion, data.VersionID)
+	}
+
+	cached, err := repos.Objects.ListVersionsByState(ctx, model.ObjectStateCached, 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByState: %v", err)
+	}
+	if len(cached) != 1 || cached[0].VersionID != data.VersionID {
+		t.Fatalf("cached versions = %#v, want only data version", cached)
+	}
+}
+
+func TestObjectRepo_DeleteMarkerVersionRestoresPreviousCurrentVersion(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "delete-marker-restore-bucket")
+
+	first := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000001011", 10)
+	second := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000001012", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, first); err != nil {
+		t.Fatalf("create first version: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, second); err != nil {
+		t.Fatalf("create second version: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J00000000000000000001013")
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	if err := repos.Objects.DeleteMarkerVersion(ctx, bucket.ID, "file.txt", marker.VersionID); err != nil {
+		t.Fatalf("DeleteMarkerVersion: %v", err)
+	}
+
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if current == nil || current.VersionID != second.VersionID || current.IsDeleteMarker {
+		t.Fatalf("current = %#v, want restored data version %s", current, second.VersionID)
+	}
+	deletedMarker, err := repos.Objects.GetVersionByID(ctx, marker.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(marker): %v", err)
+	}
+	if deletedMarker != nil {
+		t.Fatalf("deleted marker still exists: %#v", deletedMarker)
+	}
+}
+
+func TestObjectRepo_RestoreCurrentDeleteMarkerStackRemovesMarkersUntilDataVersion(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "delete-marker-stack-bucket")
+
+	data := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000001021", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, data); err != nil {
+		t.Fatalf("create data version: %v", err)
+	}
+	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J00000000000000000001022"); err != nil {
+		t.Fatalf("create first marker: %v", err)
+	}
+	currentMarker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J00000000000000000001023")
+	if err != nil {
+		t.Fatalf("create second marker: %v", err)
+	}
+
+	restored, err := repos.Objects.RestoreCurrentDeleteMarkerStack(ctx, bucket.ID, "file.txt", currentMarker.VersionID)
+	if err != nil {
+		t.Fatalf("RestoreCurrentDeleteMarkerStack: %v", err)
+	}
+	if restored.VersionID != data.VersionID || restored.IsDeleteMarker {
+		t.Fatalf("restored = %#v, want data version %s", restored, data.VersionID)
+	}
+
+	versions, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "", "", "", 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByBucket: %v", err)
+	}
+	if len(versions) != 1 || versions[0].VersionID != data.VersionID || !versions[0].IsCurrent {
+		t.Fatalf("versions after restore = %#v, want only current data version", versions)
+	}
+}
+
+func TestObjectRepo_DeleteMarkerStatsAndRecoverableListIgnoreUnrestorableMarkers(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "delete-marker-stats-bucket")
+
+	data := newObjectVersion(bucket.ID, "restorable.txt", "01J00000000000000000001031", 25)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, data); err != nil {
+		t.Fatalf("create data version: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "restorable.txt", "01J00000000000000000001032")
+	if err != nil {
+		t.Fatalf("create restorable marker: %v", err)
+	}
+	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "missing.txt", "01J00000000000000000001033"); err != nil {
+		t.Fatalf("create unrestorable marker: %v", err)
+	}
+
+	count, err := repos.Objects.CountByBucket(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("CountByBucket: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("current count = %d, want delete markers ignored", count)
+	}
+	total, err := repos.Objects.TotalSizeByBucket(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("TotalSizeByBucket: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("current size = %d, want delete markers ignored", total)
+	}
+
+	deleted, err := repos.Objects.ListRecoverableDeleteMarkers(ctx, bucket.ID, "", "", 10)
+	if err != nil {
+		t.Fatalf("ListRecoverableDeleteMarkers: %v", err)
+	}
+	if len(deleted) != 1 {
+		t.Fatalf("recoverable markers len = %d, want 1", len(deleted))
+	}
+	if deleted[0].Marker.VersionID != marker.VersionID || deleted[0].RestoreVersion.VersionID != data.VersionID {
+		t.Fatalf("recoverable marker = %#v, want marker %s restoring %s", deleted[0], marker.VersionID, data.VersionID)
+	}
+}
+
+func TestObjectRepo_RestoreCurrentDeleteMarkerStackRejectsStaleMarker(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "delete-marker-stale-bucket")
+
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000001041", 10)); err != nil {
+		t.Fatalf("create data version: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J00000000000000000001042")
+	if err != nil {
+		t.Fatalf("create marker: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000001043", 20)); err != nil {
+		t.Fatalf("create newer data version: %v", err)
+	}
+
+	if _, err := repos.Objects.RestoreCurrentDeleteMarkerStack(ctx, bucket.ID, "file.txt", marker.VersionID); err == nil {
+		t.Fatal("RestoreCurrentDeleteMarkerStack returned nil error for stale marker")
+	}
+}
+
 func TestObjectRepo_VersionStateUpdatesOnlyMirrorCurrentVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

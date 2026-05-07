@@ -16,6 +16,9 @@ var ErrNotFound = errors.New("not found")
 // ErrInvalidInput is returned when repository input fails validation.
 var ErrInvalidInput = errors.New("invalid input")
 
+// ErrConflict is returned when a compare-and-restore operation sees stale state.
+var ErrConflict = errors.New("conflict")
+
 var errConcurrentObjectCreate = errors.New("concurrent object create")
 
 // isUniqueViolation detects unique constraint violations for both PostgreSQL and SQLite.

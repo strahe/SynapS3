@@ -431,11 +431,16 @@ func TestEvictor_CacheDeleteFailureLeavesObjectUnchangedAndKeepsTaskRecoverable(
 			task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, tc.retryCount)
 
 			evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			defer cancel()
-			_ = evictor.Run(ctx)
+			if tc.wantStatus == model.TaskStatusPending {
+				runWorkerUntilTaskRetryCount(t, env, evictor, task.ID, tc.wantRetries, 5*time.Second)
+			} else {
+				runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
+			}
 
-			got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+			got, err := env.repos.Tasks.GetByID(context.Background(), task.ID)
+			if err != nil || got == nil {
+				t.Fatalf("get task after cache delete failure: task=%v err=%v", got, err)
+			}
 			if got.Status != tc.wantStatus {
 				t.Errorf("expected task %s after cache delete failure, got %s", tc.wantStatus, got.Status)
 			}
@@ -443,7 +448,10 @@ func TestEvictor_CacheDeleteFailureLeavesObjectUnchangedAndKeepsTaskRecoverable(
 				t.Errorf("expected retry_count=%d, got %d", tc.wantRetries, got.RetryCount)
 			}
 
-			obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
+			obj, err := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
+			if err != nil || obj == nil {
+				t.Fatalf("get object after cache delete failure: object=%v err=%v", obj, err)
+			}
 			if obj.State != model.ObjectStateStored {
 				t.Errorf("expected object state stored after cache delete failure, got %s", obj.State)
 			}

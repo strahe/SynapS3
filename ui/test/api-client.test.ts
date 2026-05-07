@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { api } from '../src/api/client.ts'
 
-test('bucket write mutations send settings write header', async () => {
+test('admin write mutations send settings write header', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ headers: Headers; method?: string }> = []
   globalThis.fetch = (async (_input, init) => {
@@ -17,15 +17,24 @@ test('bucket write mutations send settings write header', async () => {
   try {
     await api.createBucket({ name: 'bucket-a', owner_access_key: 'owner-a' })
     await api.updateBucketOwner('bucket-a', 'owner-b')
+    await api.deleteBucketObject('bucket-a', 'folder/file.txt')
+    await api.restoreBucketObject('bucket-a', {
+      key: 'folder/file.txt',
+      delete_marker_version_id: 'marker-1',
+    })
   } finally {
     globalThis.fetch = originalFetch
   }
 
-  assert.equal(calls.length, 2)
+  assert.equal(calls.length, 4)
   assert.equal(calls[0]?.method, 'POST')
   assert.equal(calls[0]?.headers.get('X-SynapS3-Settings-Write'), '1')
   assert.equal(calls[1]?.method, 'PUT')
   assert.equal(calls[1]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[2]?.method, 'DELETE')
+  assert.equal(calls[2]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[3]?.method, 'POST')
+  assert.equal(calls[3]?.headers.get('X-SynapS3-Settings-Write'), '1')
 })
 
 test('object download URL encodes bucket name and object key', () => {

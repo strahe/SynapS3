@@ -1004,6 +1004,55 @@ func TestHeadObject_NotFound(t *testing.T) {
 	}
 }
 
+func TestHeadObject_DeleteMarkerCurrentAndVersionID(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "head-delete-marker-bucket")
+
+	putTestObject(t, tb, "head-delete-marker-bucket", "file.txt", "data")
+	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("head-delete-marker-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if marker.VersionId == nil || *marker.VersionId == "" {
+		t.Fatalf("DeleteObject marker = %#v, want version id", marker)
+	}
+
+	_, err = tb.backend.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String("head-delete-marker-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err == nil {
+		t.Fatal("HeadObject current delete marker returned nil error")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("HeadObject current delete marker error = %T %v, want APIError", err, err)
+	}
+	if want := s3err.GetAPIError(s3err.ErrNoSuchKey); apiErr.Code != want.Code {
+		t.Fatalf("HeadObject current delete marker code = %q, want %q", apiErr.Code, want.Code)
+	}
+
+	_, err = tb.backend.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:    aws.String("head-delete-marker-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: marker.VersionId,
+	})
+	if err == nil {
+		t.Fatal("HeadObject delete marker version returned nil error")
+	}
+	apiErr, ok = err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("HeadObject delete marker version error = %T %v, want APIError", err, err)
+	}
+	if want := s3err.GetAPIError(s3err.ErrMethodNotAllowed); apiErr.Code != want.Code {
+		t.Fatalf("HeadObject delete marker version code = %q, want %q", apiErr.Code, want.Code)
+	}
+}
+
 func TestGetObjectAttributes_WithVersionID(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
@@ -1362,6 +1411,190 @@ func TestListObjectVersions_DelimiterPaginationSkipsDuplicateCommonPrefix(t *tes
 	}
 	if len(page2.CommonPrefixes) != 1 || page2.CommonPrefixes[0].Prefix == nil || *page2.CommonPrefixes[0].Prefix != "b/" {
 		t.Fatalf("page2 common prefixes = %#v, want b/", page2.CommonPrefixes)
+	}
+}
+
+// ---------- DeleteObject ----------
+
+func TestDeleteObject_CreatesDeleteMarkerAndHidesCurrentObject(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-marker-bucket")
+
+	putOut := putTestObjectOutput(t, tb, "delete-marker-bucket", "file.txt", "old")
+	delOut, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("delete-marker-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if delOut.DeleteMarker == nil || !*delOut.DeleteMarker || delOut.VersionId == nil || *delOut.VersionId == "" {
+		t.Fatalf("delete output = %#v, want delete marker and version id", delOut)
+	}
+	if *delOut.VersionId == putOut.VersionID {
+		t.Fatalf("delete marker version id reused data version id %s", putOut.VersionID)
+	}
+
+	_, err = tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("delete-marker-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err == nil {
+		t.Fatal("GetObject returned nil error for delete-marker current object")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("GetObject error = %T %v, want APIError", err, err)
+	}
+	if want := s3err.GetAPIError(s3err.ErrNoSuchKey); apiErr.Code != want.Code {
+		t.Fatalf("GetObject code = %q, want %q", apiErr.Code, want.Code)
+	}
+
+	listOut, err := tb.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String("delete-marker-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2: %v", err)
+	}
+	if len(listOut.Contents) != 0 {
+		t.Fatalf("ListObjectsV2 contents = %#v, want hidden object", listOut.Contents)
+	}
+
+	versionsOut, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String("delete-marker-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.Versions) != 1 || *versionsOut.Versions[0].VersionId != putOut.VersionID {
+		t.Fatalf("versions = %#v, want data version %s", versionsOut.Versions, putOut.VersionID)
+	}
+	if len(versionsOut.DeleteMarkers) != 1 || versionsOut.DeleteMarkers[0].VersionId == nil || *versionsOut.DeleteMarkers[0].VersionId != *delOut.VersionId {
+		t.Fatalf("delete markers = %#v, want marker %s", versionsOut.DeleteMarkers, *delOut.VersionId)
+	}
+	if versionsOut.DeleteMarkers[0].IsLatest == nil || !*versionsOut.DeleteMarkers[0].IsLatest {
+		t.Fatalf("delete marker IsLatest = %v, want true", versionsOut.DeleteMarkers[0].IsLatest)
+	}
+
+	versioned, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:    aws.String("delete-marker-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: aws.String(putOut.VersionID),
+	})
+	if err != nil {
+		t.Fatalf("GetObject(data version): %v", err)
+	}
+	defer func() { _ = versioned.Body.Close() }()
+	body, _ := io.ReadAll(versioned.Body)
+	if string(body) != "old" {
+		t.Fatalf("versioned body = %q, want old", string(body))
+	}
+
+	_, err = tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:    aws.String("delete-marker-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: delOut.VersionId,
+	})
+	if err == nil {
+		t.Fatal("GetObject(delete marker version) returned nil error")
+	}
+	apiErr, ok = err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("GetObject(delete marker) error = %T %v, want APIError", err, err)
+	}
+	if want := s3err.GetAPIError(s3err.ErrMethodNotAllowed); apiErr.Code != want.Code {
+		t.Fatalf("GetObject(delete marker) code = %q, want %q", apiErr.Code, want.Code)
+	}
+}
+
+func TestDeleteObject_DeleteMarkerVersionRestoresObject(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-marker-restore-bucket")
+
+	putTestObject(t, tb, "delete-marker-restore-bucket", "file.txt", "restored")
+	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("delete-marker-restore-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject marker: %v", err)
+	}
+
+	out, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    aws.String("delete-marker-restore-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: marker.VersionId,
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject(marker version): %v", err)
+	}
+	if out.DeleteMarker == nil || !*out.DeleteMarker || out.VersionId == nil || *out.VersionId != *marker.VersionId {
+		t.Fatalf("delete marker version output = %#v, want marker version %s", out, *marker.VersionId)
+	}
+
+	got, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("delete-marker-restore-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject restored: %v", err)
+	}
+	defer func() { _ = got.Body.Close() }()
+	body, _ := io.ReadAll(got.Body)
+	if string(body) != "restored" {
+		t.Fatalf("restored body = %q, want restored", string(body))
+	}
+}
+
+func TestDeleteObject_MissingKeyCreatesDeleteMarker(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-missing-bucket")
+
+	out, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("delete-missing-bucket"),
+		Key:    aws.String("missing.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject missing key: %v", err)
+	}
+	if out.DeleteMarker == nil || !*out.DeleteMarker || out.VersionId == nil || *out.VersionId == "" {
+		t.Fatalf("delete missing output = %#v, want delete marker", out)
+	}
+
+	versionsOut, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String("delete-missing-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.Versions) != 0 || len(versionsOut.DeleteMarkers) != 1 {
+		t.Fatalf("versions=%#v markers=%#v, want one marker and no data versions", versionsOut.Versions, versionsOut.DeleteMarkers)
+	}
+}
+
+func TestDeleteObject_DataVersionPermanentDeleteNotImplemented(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-data-version-bucket")
+
+	putOut := putTestObjectOutput(t, tb, "delete-data-version-bucket", "file.txt", "data")
+	_, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    aws.String("delete-data-version-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: aws.String(putOut.VersionID),
+	})
+	if err == nil {
+		t.Fatal("DeleteObject(data version) returned nil error")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("DeleteObject(data version) error = %T %v, want APIError", err, err)
+	}
+	if want := s3err.GetAPIError(s3err.ErrNotImplemented); apiErr.Code != want.Code {
+		t.Fatalf("DeleteObject(data version) code = %q, want %q", apiErr.Code, want.Code)
 	}
 }
 
