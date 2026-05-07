@@ -188,6 +188,9 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating task ref version index: %w", err)
 	}
+	if err := createWalletOperationTables(ctx, db); err != nil {
+		return err
+	}
 
 	// Secondary IAM and bucket indexes are grouped here to keep table creation order clear.
 	if err := createS3AccountIndexes(ctx, db); err != nil {
@@ -243,6 +246,7 @@ func down2026040501Init(ctx context.Context, db *bun.DB) error {
 	for _, m := range []interface{}{
 		(*model.MultipartPart)(nil),
 		(*model.MultipartUpload)(nil),
+		(*model.WalletOperation)(nil),
 		(*model.Task)(nil),
 		(*model.StorageUploadFailure)(nil),
 		(*model.StorageUploadCopy)(nil),
@@ -258,6 +262,43 @@ func down2026040501Init(ctx context.Context, db *bun.DB) error {
 		}
 	}
 	return nil
+}
+
+func createWalletOperationTables(ctx context.Context, db *bun.DB) error {
+	if _, err := db.NewCreateTable().
+		Model((*model.WalletOperation)(nil)).
+		IfNotExists().
+		ColumnExpr(`CONSTRAINT chk_wallet_operations_type CHECK ("type" IN ('fund', 'withdraw'))`).
+		ColumnExpr("CONSTRAINT chk_wallet_operations_status CHECK (status IN ('pending', 'running', 'submitted', 'confirmed', 'failed', 'unknown'))").
+		ColumnExpr("CONSTRAINT chk_wallet_operations_amount CHECK (" + walletOperationAmountCheck(db) + ")").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating wallet_operations table: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.WalletOperation)(nil)).
+		Index("idx_wallet_operations_request").
+		Column("type", "client_request_id").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating wallet operation request index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.WalletOperation)(nil)).
+		Index("idx_wallet_operations_status_created").
+		Column("status", "created_at", "id").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating wallet operation status index: %w", err)
+	}
+	return nil
+}
+
+func walletOperationAmountCheck(db *bun.DB) string {
+	if db.Dialect().Name() == dialect.PG {
+		return `amount ~ '^[1-9][0-9]*$'`
+	}
+	return `amount GLOB '[1-9]*' AND amount NOT GLOB '*[^0-9]*'`
 }
 
 func createS3AccountIndexes(ctx context.Context, db *bun.DB) error {

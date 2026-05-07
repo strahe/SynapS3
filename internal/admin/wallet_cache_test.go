@@ -50,6 +50,118 @@ func TestCachedWalletQuerier_UsesCachedValueUntilTTLExpires(t *testing.T) {
 	}
 }
 
+func TestCachedWalletQuerier_InvalidateClearsCachedValue(t *testing.T) {
+	var calls atomic.Int32
+	q := newCachedWalletQuerier(&testWalletQuerier{
+		fn: func(context.Context) (*synapse.WalletInfo, error) {
+			call := calls.Add(1)
+			return &synapse.WalletInfo{Address: "wallet-call-" + string(rune('0'+call))}, nil
+		},
+	}, time.Minute, time.Now)
+
+	first, err := q.GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("first GetWalletInfo: %v", err)
+	}
+	q.(walletCacheInvalidator).Invalidate()
+	second, err := q.GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("second GetWalletInfo: %v", err)
+	}
+	if first.Address != "wallet-call-1" || second.Address != "wallet-call-2" {
+		t.Fatalf("addresses = %q/%q, want wallet-call-1/wallet-call-2", first.Address, second.Address)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestCachedWalletQuerier_InvalidatePreventsStaleFetchFromRecaching(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	q := newCachedWalletQuerier(&testWalletQuerier{
+		fn: func(context.Context) (*synapse.WalletInfo, error) {
+			switch calls.Add(1) {
+			case 1:
+				close(firstStarted)
+				<-releaseFirst
+				return &synapse.WalletInfo{Address: "stale"}, nil
+			default:
+				return &synapse.WalletInfo{Address: "fresh"}, nil
+			}
+		},
+	}, time.Minute, time.Now)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		info, err := q.GetWalletInfo(context.Background())
+		if err == nil && info.Address != "stale" {
+			err = errors.New("first fetch did not receive stale value")
+		}
+		firstDone <- err
+	}()
+	<-firstStarted
+
+	q.(walletCacheInvalidator).Invalidate()
+	second, err := q.GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("second GetWalletInfo: %v", err)
+	}
+	if second.Address != "fresh" {
+		t.Fatalf("second address = %q, want fresh", second.Address)
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	third, err := q.GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("third GetWalletInfo: %v", err)
+	}
+	if third.Address != "fresh" {
+		t.Fatalf("third address = %q, want fresh", third.Address)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestServer_WalletOperationEventInvalidatesWalletCache(t *testing.T) {
+	var calls atomic.Int32
+	wallet := newCachedWalletQuerier(&testWalletQuerier{
+		fn: func(context.Context) (*synapse.WalletInfo, error) {
+			call := calls.Add(1)
+			return &synapse.WalletInfo{Address: "wallet-call-" + string(rune('0'+call))}, nil
+		},
+	}, time.Minute, time.Now)
+	events := NewEventHub()
+	srv := &Server{wallet: wallet, events: events}
+	srv.watchWalletOperationEvents()
+
+	first, err := srv.wallet.GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("first GetWalletInfo: %v", err)
+	}
+	second, err := srv.wallet.GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("second GetWalletInfo: %v", err)
+	}
+	if first.Address != "wallet-call-1" || second.Address != "wallet-call-1" {
+		t.Fatalf("cached addresses = %q/%q, want wallet-call-1", first.Address, second.Address)
+	}
+
+	events.Publish("wallet_operation_updated", map[string]any{"operation": map[string]any{"id": 1}})
+	third, err := srv.wallet.GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("third GetWalletInfo: %v", err)
+	}
+	if third.Address != "wallet-call-2" {
+		t.Fatalf("address after wallet event = %q, want wallet-call-2", third.Address)
+	}
+}
+
 func TestCachedWalletQuerier_CoalescesConcurrentMisses(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -136,9 +248,9 @@ func TestCachedWalletQuerier_ReturnsClonedWalletInfo(t *testing.T) {
 	q := newCachedWalletQuerier(&testWalletQuerier{
 		fn: func(context.Context) (*synapse.WalletInfo, error) {
 			return &synapse.WalletInfo{
-				Nonce:      &nonce,
-				FILBalance: big.NewInt(123),
-				FILAccount: &synapse.TokenAccountInfo{
+				Nonce:         &nonce,
+				FILGasBalance: big.NewInt(123),
+				PaymentAccount: &synapse.PaymentAccountInfo{
 					Funds: big.NewInt(456),
 				},
 				Errors: map[string]string{"chain": "RPC call failed"},
@@ -151,8 +263,8 @@ func TestCachedWalletQuerier_ReturnsClonedWalletInfo(t *testing.T) {
 		t.Fatalf("first GetWalletInfo: %v", err)
 	}
 	first.Errors["mutated"] = "yes"
-	first.FILBalance.SetInt64(999)
-	first.FILAccount.Funds.SetInt64(888)
+	first.FILGasBalance.SetInt64(999)
+	first.PaymentAccount.Funds.SetInt64(888)
 	*first.Nonce = 99
 
 	second, err := q.GetWalletInfo(context.Background())
@@ -162,11 +274,11 @@ func TestCachedWalletQuerier_ReturnsClonedWalletInfo(t *testing.T) {
 	if _, ok := second.Errors["mutated"]; ok {
 		t.Fatal("cached Errors map was shared with caller")
 	}
-	if got := second.FILBalance.String(); got != "123" {
-		t.Fatalf("FILBalance = %s, want 123", got)
+	if got := second.FILGasBalance.String(); got != "123" {
+		t.Fatalf("FILGasBalance = %s, want 123", got)
 	}
-	if got := second.FILAccount.Funds.String(); got != "456" {
-		t.Fatalf("FILAccount funds = %s, want 456", got)
+	if got := second.PaymentAccount.Funds.String(); got != "456" {
+		t.Fatalf("PaymentAccount funds = %s, want 456", got)
 	}
 	if second.Nonce == nil || *second.Nonce != 7 {
 		t.Fatalf("Nonce = %v, want 7", second.Nonce)

@@ -266,13 +266,18 @@ export interface TaskRefDetail {
   object: TaskRefObjectDetail | null
 }
 
-export interface TokenAccountData {
+export interface PaymentAccountData {
   funds: string | null
   available_funds: string | null
   lockup_current: string | null
   lockup_rate: string | null
   lockup_last_settled_at: string | null
   funded_until_epoch: string | null
+  funded_until_time?: string
+  runway_seconds?: number
+  lockup_rate_per_day: string | null
+  lockup_rate_per_month: string | null
+  no_active_spend: boolean
 }
 
 export interface WalletBusiness {
@@ -283,19 +288,55 @@ export interface WalletBusiness {
 
 export interface WalletData {
   configured: boolean
-  address?: string
-  network?: string
-  chain_id?: number
-  nonce: number | null
-  payments_address?: string
-  usdfc_address?: string
-  usdfc_decimals: number
-  fil_balance: string | null
-  usdfc_balance: string | null
-  fil_account: TokenAccountData | null
-  usdfc_account: TokenAccountData | null
+  identity?: {
+    address: string
+    nonce: number | null
+  }
+  chain?: {
+    network: string
+    chain_id: number
+    current_epoch: string | null
+    epoch_duration_seconds: number
+  }
+  wallet_balances?: {
+    fil_gas: string | null
+    usdfc: string | null
+  }
+  payment_account?: PaymentAccountData | null
+  contracts?: {
+    payments_address: string
+    usdfc_address: string
+    usdfc_decimals: number
+  }
   business?: WalletBusiness
   partial_errors?: Record<string, string>
+}
+
+export type WalletOperationType = 'fund' | 'withdraw'
+export type WalletOperationStatus = 'pending' | 'running' | 'submitted' | 'confirmed' | 'failed' | 'unknown'
+
+export interface WalletOperation {
+  id: number
+  type: WalletOperationType
+  client_request_id: string
+  amount: string
+  status: WalletOperationStatus
+  tx_hash?: string
+  last_error?: string
+  lease_until?: string
+  started_at?: string
+  submitted_at?: string
+  completed_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface WalletOperationResponse {
+  operation: WalletOperation
+}
+
+export interface WalletOperationsResponse {
+  operations: WalletOperation[]
 }
 
 export interface SettingsFieldError {
@@ -528,6 +569,23 @@ export const api = {
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
   getWallet: () => fetchJSON<WalletData>('/wallet'),
+  getWalletOperations: (limit = 20) => fetchJSON<WalletOperationsResponse>(`/wallet/operations?limit=${limit}`),
+  fundWallet: (payload: { client_request_id: string; amount: string }) =>
+    fetchJSON<WalletOperationResponse>('/wallet/fund', {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
+  withdrawWallet: (payload: { client_request_id: string; amount: string }) =>
+    fetchJSON<WalletOperationResponse>('/wallet/withdraw', {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
   getSettings: () => fetchJSON<SettingsData>('/settings'),
   updateSettings: (payload: SettingsUpdatePayload) =>
     fetchJSON<SettingsData>('/settings', {

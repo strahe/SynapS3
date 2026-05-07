@@ -369,6 +369,24 @@ type TaskRepository interface {
 	List(ctx context.Context, taskType string, stage string, status string, limit, offset int) ([]model.Task, int, error)
 }
 
+type WalletOperationRepository interface {
+	CreateOrGet(ctx context.Context, input CreateWalletOperationInput) (*model.WalletOperation, bool, error)
+	GetByID(ctx context.Context, id int64) (*model.WalletOperation, error)
+	ClaimPending(ctx context.Context, leaseDuration time.Duration) (*model.WalletOperation, error)
+	MarkSubmitted(ctx context.Context, id int64, txHash string) error
+	MarkConfirmed(ctx context.Context, id int64) error
+	MarkFailed(ctx context.Context, id int64, lastError string) error
+	MarkExpiredRunningUnknown(ctx context.Context) ([]model.WalletOperation, error)
+	ListSubmitted(ctx context.Context, limit int) ([]model.WalletOperation, error)
+	ListRecent(ctx context.Context, limit int) ([]model.WalletOperation, error)
+}
+
+type CreateWalletOperationInput struct {
+	Type            model.WalletOperationType
+	ClientRequestID string
+	Amount          string
+}
+
 // TaskStatusCount holds a task count grouped by type and status.
 type TaskStatusCount struct {
 	Type   string `bun:"type"`

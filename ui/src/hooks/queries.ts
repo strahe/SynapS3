@@ -137,6 +137,38 @@ export function useWallet() {
   })
 }
 
+export function useWalletOperations(limit = 20) {
+  return useQuery({
+    queryKey: ['walletOperations', limit],
+    queryFn: () => api.getWalletOperations(limit),
+    refetchInterval: 15_000,
+  })
+}
+
+export function useWalletFund() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: api.fundWallet,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['wallet'] })
+      qc.invalidateQueries({ queryKey: ['walletOperations'] })
+    },
+  })
+}
+
+export function useWalletWithdraw() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: api.withdrawWallet,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['wallet'] })
+      qc.invalidateQueries({ queryKey: ['walletOperations'] })
+    },
+  })
+}
+
 export function useSettings() {
   return useQuery({
     queryKey: ['settings'],

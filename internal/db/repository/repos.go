@@ -12,12 +12,13 @@ import (
 // dependency for service/backend layers.  The WithTx helper executes a callback
 // inside a database transaction with a clone of Repositories backed by the tx.
 type Repositories struct {
-	Buckets    BucketRepository
-	S3Accounts S3AccountRepository
-	Objects    ObjectRepository
-	Uploads    StorageUploadRepository
-	Tasks      TaskRepository
-	Multiparts MultipartUploadRepository
+	Buckets          BucketRepository
+	S3Accounts       S3AccountRepository
+	Objects          ObjectRepository
+	Uploads          StorageUploadRepository
+	Tasks            TaskRepository
+	Multiparts       MultipartUploadRepository
+	WalletOperations WalletOperationRepository
 
 	db bun.IDB
 }
@@ -25,13 +26,14 @@ type Repositories struct {
 // NewRepositories constructs a Repositories with concrete Bun-backed implementations.
 func NewRepositories(db bun.IDB) *Repositories {
 	return &Repositories{
-		Buckets:    &BunBucketRepo{db: db},
-		S3Accounts: &BunS3AccountRepo{db: db},
-		Objects:    &BunObjectRepo{db: db},
-		Uploads:    &BunStorageUploadRepo{db: db},
-		Tasks:      &BunTaskRepo{db: db},
-		Multiparts: &BunMultipartRepo{db: db},
-		db:         db,
+		Buckets:          &BunBucketRepo{db: db},
+		S3Accounts:       &BunS3AccountRepo{db: db},
+		Objects:          &BunObjectRepo{db: db},
+		Uploads:          &BunStorageUploadRepo{db: db},
+		Tasks:            &BunTaskRepo{db: db},
+		Multiparts:       &BunMultipartRepo{db: db},
+		WalletOperations: &BunWalletOperationRepo{db: db},
+		db:               db,
 	}
 }
 

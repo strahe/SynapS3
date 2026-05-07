@@ -59,16 +59,14 @@ func (m *mockWalletPayments) accountInfoCalls(token common.Address) int {
 	return m.accountInfoCall[token]
 }
 
-func TestWalletQuerier_ReusesFILAccountInfoForBalance(t *testing.T) {
+func TestWalletQuerier_ReturnsGasBalanceAndUSDFCPaymentAccount(t *testing.T) {
 	addrs := chain.Calibration.Addresses()
 	owner := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	pay := newMockWalletPayments()
 	pay.accountInfoFunc = func(_ context.Context, token, _ common.Address) (*payments.AccountState, error) {
 		switch token {
-		case payments.ZeroAddress:
-			return accountState(123), nil
 		case addrs.USDFC:
-			return accountState(456), nil
+			return accountStateWithRate(456, 100, 2), nil
 		default:
 			t.Fatalf("unexpected AccountInfo token %s", token.Hex())
 			return nil, nil
@@ -76,7 +74,7 @@ func TestWalletQuerier_ReusesFILAccountInfoForBalance(t *testing.T) {
 	}
 	pay.walletBalanceFunc = func(_ context.Context, token, _ common.Address) (*big.Int, error) {
 		if token == payments.ZeroAddress {
-			t.Fatal("FIL WalletBalance should not be called")
+			return big.NewInt(123), nil
 		}
 		return big.NewInt(789), nil
 	}
@@ -85,31 +83,35 @@ func TestWalletQuerier_ReusesFILAccountInfoForBalance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWalletInfo: %v", err)
 	}
-	if got := pay.walletBalanceCalls(payments.ZeroAddress); got != 0 {
-		t.Fatalf("FIL WalletBalance calls = %d, want 0", got)
+	if got := pay.walletBalanceCalls(payments.ZeroAddress); got != 1 {
+		t.Fatalf("FIL WalletBalance calls = %d, want 1", got)
 	}
-	if got := pay.accountInfoCalls(payments.ZeroAddress); got != 1 {
-		t.Fatalf("FIL AccountInfo calls = %d, want 1", got)
+	if got := pay.accountInfoCalls(payments.ZeroAddress); got != 0 {
+		t.Fatalf("FIL AccountInfo calls = %d, want 0", got)
 	}
-	if got := info.FILBalance.String(); got != "123" {
-		t.Fatalf("FILBalance = %s, want 123", got)
+	if got := info.FILGasBalance.String(); got != "123" {
+		t.Fatalf("FILGasBalance = %s, want 123", got)
 	}
-	if got := info.FILAccount.Funds.String(); got != "123" {
-		t.Fatalf("FILAccount funds = %s, want 123", got)
+	if info.PaymentAccount == nil {
+		t.Fatal("PaymentAccount = nil, want USDFC account")
 	}
-	if got := info.USDFCBalance.String(); got != "789" {
-		t.Fatalf("USDFCBalance = %s, want 789", got)
+	if got := info.USDFCWalletBalance.String(); got != "789" {
+		t.Fatalf("USDFCWalletBalance = %s, want 789", got)
+	}
+	if got := info.PaymentAccount.LockupRatePerDay.String(); got != "5760" {
+		t.Fatalf("LockupRatePerDay = %s, want 5760", got)
+	}
+	if got := info.PaymentAccount.LockupRatePerMonth.String(); got != "172800" {
+		t.Fatalf("LockupRatePerMonth = %s, want 172800", got)
 	}
 }
 
-func TestWalletQuerier_FILAccountErrorMarksBalanceUnavailable(t *testing.T) {
+func TestWalletQuerier_FILGasBalanceErrorDoesNotHidePaymentAccount(t *testing.T) {
 	addrs := chain.Calibration.Addresses()
 	owner := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	pay := newMockWalletPayments()
 	pay.accountInfoFunc = func(_ context.Context, token, _ common.Address) (*payments.AccountState, error) {
 		switch token {
-		case payments.ZeroAddress:
-			return nil, errors.New("fil rpc down")
 		case addrs.USDFC:
 			return accountState(456), nil
 		default:
@@ -119,7 +121,7 @@ func TestWalletQuerier_FILAccountErrorMarksBalanceUnavailable(t *testing.T) {
 	}
 	pay.walletBalanceFunc = func(_ context.Context, token, _ common.Address) (*big.Int, error) {
 		if token == payments.ZeroAddress {
-			t.Fatal("FIL WalletBalance should not be called")
+			return nil, errors.New("fil rpc down")
 		}
 		return big.NewInt(789), nil
 	}
@@ -128,25 +130,80 @@ func TestWalletQuerier_FILAccountErrorMarksBalanceUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWalletInfo: %v", err)
 	}
-	if info.FILBalance != nil {
-		t.Fatalf("FILBalance = %s, want nil", info.FILBalance)
+	if info.FILGasBalance != nil {
+		t.Fatalf("FILGasBalance = %s, want nil", info.FILGasBalance)
 	}
-	if info.FILAccount != nil {
-		t.Fatalf("FILAccount = %#v, want nil", info.FILAccount)
+	if info.PaymentAccount == nil {
+		t.Fatal("PaymentAccount = nil, want USDFC account")
 	}
-	if got := info.Errors["fil_account"]; got != "RPC call failed" {
-		t.Fatalf("fil_account error = %q, want RPC call failed", got)
-	}
-	if got := info.Errors["fil_balance"]; got != "RPC call failed" {
+	if got := info.Errors["fil_gas_balance"]; got != "RPC call failed" {
 		t.Fatalf("fil_balance error = %q, want RPC call failed", got)
 	}
 }
 
+func TestWalletQuerier_ZeroLockupRateHasNoActiveSpend(t *testing.T) {
+	addrs := chain.Calibration.Addresses()
+	owner := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	pay := newMockWalletPayments()
+	pay.accountInfoFunc = func(_ context.Context, token, _ common.Address) (*payments.AccountState, error) {
+		if token != addrs.USDFC {
+			t.Fatalf("unexpected AccountInfo token %s", token.Hex())
+		}
+		return accountStateWithRate(456, 0, 0), nil
+	}
+
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetWalletInfo: %v", err)
+	}
+	if info.PaymentAccount == nil {
+		t.Fatal("PaymentAccount = nil")
+	}
+	if !info.PaymentAccount.NoActiveSpend {
+		t.Fatal("NoActiveSpend = false, want true")
+	}
+	if info.PaymentAccount.RunwaySeconds != nil {
+		t.Fatalf("RunwaySeconds = %v, want nil", info.PaymentAccount.RunwaySeconds)
+	}
+}
+
+func TestWalletQuerier_Uint256MaxFundedUntilHasNoActiveSpend(t *testing.T) {
+	addrs := chain.Calibration.Addresses()
+	owner := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	pay := newMockWalletPayments()
+	pay.accountInfoFunc = func(_ context.Context, token, _ common.Address) (*payments.AccountState, error) {
+		if token != addrs.USDFC {
+			t.Fatalf("unexpected AccountInfo token %s", token.Hex())
+		}
+		acct := accountStateWithRate(456, 0, 1)
+		acct.FundedUntilEpoch = uint256Max()
+		return acct, nil
+	}
+
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetWalletInfo: %v", err)
+	}
+	if info.PaymentAccount == nil {
+		t.Fatal("PaymentAccount = nil")
+	}
+	if !info.PaymentAccount.NoActiveSpend {
+		t.Fatal("NoActiveSpend = false, want true")
+	}
+	if info.PaymentAccount.RunwaySeconds != nil {
+		t.Fatalf("RunwaySeconds = %v, want nil", info.PaymentAccount.RunwaySeconds)
+	}
+}
+
 func accountState(funds int64) *payments.AccountState {
+	return accountStateWithRate(funds, 0, 0)
+}
+
+func accountStateWithRate(funds, lockupCurrent, lockupRate int64) *payments.AccountState {
 	return &payments.AccountState{
 		Funds:               big.NewInt(funds),
-		LockupCurrent:       big.NewInt(0),
-		LockupRate:          big.NewInt(0),
+		LockupCurrent:       big.NewInt(lockupCurrent),
+		LockupRate:          big.NewInt(lockupRate),
 		LockupLastSettledAt: big.NewInt(0),
 		FundedUntilEpoch:    big.NewInt(0),
 	}

@@ -1862,7 +1862,7 @@ func copyCommitted(copyRow *model.StorageUploadCopy) bool {
 	return copyRow != nil && copyRow.Status == model.StorageUploadCopyStatusCommitted
 }
 
-func availableUSDFCFunds(acct *synapse.TokenAccountInfo) *big.Int {
+func availableUSDFCFunds(acct *synapse.PaymentAccountInfo) *big.Int {
 	if acct == nil {
 		return nil
 	}
@@ -1895,7 +1895,7 @@ func (u *Uploader) checkPaymentBalancePreflight(ctx context.Context, logger *slo
 	if info == nil {
 		return nil
 	}
-	available := availableUSDFCFunds(info.USDFCAccount)
+	available := availableUSDFCFunds(info.PaymentAccount)
 	if available == nil || available.Sign() != 0 {
 		return nil
 	}

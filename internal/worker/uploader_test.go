@@ -2684,7 +2684,7 @@ func TestUploader_ZeroAvailableFunds_RequeuesTask(t *testing.T) {
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
 			return &synapse.WalletInfo{
-				USDFCAccount: &synapse.TokenAccountInfo{
+				PaymentAccount: &synapse.PaymentAccountInfo{
 					Funds:          big.NewInt(0),
 					AvailableFunds: big.NewInt(0),
 					LockupCurrent:  big.NewInt(0),
@@ -2735,7 +2735,7 @@ func TestUploader_StagedUploadZeroAvailableFundsRequeuesTask(t *testing.T) {
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
 			return &synapse.WalletInfo{
-				USDFCAccount: &synapse.TokenAccountInfo{
+				PaymentAccount: &synapse.PaymentAccountInfo{
 					Funds:          big.NewInt(0),
 					AvailableFunds: big.NewInt(0),
 					LockupCurrent:  big.NewInt(0),
@@ -2789,7 +2789,7 @@ func TestUploader_LockedAvailableFunds_RequeuesTask(t *testing.T) {
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
 			return &synapse.WalletInfo{
-				USDFCAccount: &synapse.TokenAccountInfo{
+				PaymentAccount: &synapse.PaymentAccountInfo{
 					Funds:          big.NewInt(100),
 					AvailableFunds: big.NewInt(0),
 					LockupCurrent:  big.NewInt(100),
@@ -2828,7 +2828,7 @@ func TestUploader_AvailableFundsFallback_RequeuesTask(t *testing.T) {
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
 			return &synapse.WalletInfo{
-				USDFCAccount: &synapse.TokenAccountInfo{
+				PaymentAccount: &synapse.PaymentAccountInfo{
 					Funds:         big.NewInt(100),
 					LockupCurrent: big.NewInt(100),
 				},
@@ -2866,7 +2866,7 @@ func TestUploader_NegativeAvailableFunds_RequeuesTask(t *testing.T) {
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
 			return &synapse.WalletInfo{
-				USDFCAccount: &synapse.TokenAccountInfo{
+				PaymentAccount: &synapse.PaymentAccountInfo{
 					Funds:          big.NewInt(100),
 					AvailableFunds: big.NewInt(-1),
 					LockupCurrent:  big.NewInt(101),
@@ -2904,7 +2904,7 @@ func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testin
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
 			if walletCalls.Add(1) == 1 {
 				return &synapse.WalletInfo{
-					USDFCAccount: &synapse.TokenAccountInfo{
+					PaymentAccount: &synapse.PaymentAccountInfo{
 						Funds:          big.NewInt(0),
 						AvailableFunds: big.NewInt(0),
 						LockupCurrent:  big.NewInt(0),
@@ -2912,7 +2912,7 @@ func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testin
 				}, nil
 			}
 			return &synapse.WalletInfo{
-				USDFCAccount: &synapse.TokenAccountInfo{
+				PaymentAccount: &synapse.PaymentAccountInfo{
 					Funds:          big.NewInt(100),
 					AvailableFunds: big.NewInt(100),
 					LockupCurrent:  big.NewInt(0),

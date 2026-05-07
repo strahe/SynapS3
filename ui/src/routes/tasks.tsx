@@ -1,15 +1,15 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
-import { Check, Copy, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Loader2, RefreshCw, RotateCcw } from 'lucide-react'
+import { useState } from 'react'
 import { api, type TaskItem } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
+import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressBar } from '@/components/app/UploadProgress'
 import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
 import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -423,7 +423,7 @@ function TasksPage() {
         )}
       </DangerActionAlertDialog>
 
-      <ErrorDetailDialog errorText={errorDialogText} onClose={() => setErrorDialogText(null)} />
+      <DetailTextDialog title="Error Details" text={errorDialogText} onClose={() => setErrorDialogText(null)} />
     </div>
   )
 }
@@ -437,57 +437,4 @@ function retryTaskDescription(task: TaskItem) {
     default:
       return 'This will requeue the dead-letter task for background processing.'
   }
-}
-
-function ErrorDetailDialog({ errorText, onClose }: { errorText: string | null; onClose: () => void }) {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  useEffect(() => {
-    if (errorText !== null) {
-      setCopied(false)
-    }
-  }, [errorText])
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [])
-
-  const handleCopy = useCallback(async () => {
-    if (!errorText) return
-    try {
-      await navigator.clipboard.writeText(errorText)
-      setCopied(true)
-      if (timerRef.current) clearTimeout(timerRef.current)
-      timerRef.current = setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Clipboard API may fail on non-HTTPS
-    }
-  }, [errorText])
-
-  return (
-    <Dialog
-      open={errorText !== null}
-      onOpenChange={(open) => {
-        if (!open) onClose()
-      }}
-    >
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>Error Details</DialogTitle>
-        </DialogHeader>
-        <div className="max-h-80 overflow-auto rounded-md border border-border bg-muted/50 p-3">
-          <pre className="whitespace-pre-wrap break-all font-mono text-xs">{errorText}</pre>
-        </div>
-        <DialogFooter>
-          <Button type="button" variant="outline" onClick={handleCopy}>
-            {copied ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
-            {copied ? 'Copied' : 'Copy'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
 }

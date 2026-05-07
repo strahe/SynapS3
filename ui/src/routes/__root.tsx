@@ -20,6 +20,7 @@ import {
 import { useSettings } from '@/hooks/queries'
 import { applyProviderIdentityEventData } from '@/lib/provider-identity-events'
 import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '@/lib/upload-progress-events'
+import { applyWalletOperationEventData } from '@/lib/wallet-operation-events'
 import { rootContentKind } from './-root-content'
 
 interface RouterContext {
@@ -113,6 +114,9 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
     })
     events.addEventListener('upload_state_changed', (event) => {
       applyUploadStateChangedEventData(queryClient, event.data)
+    })
+    events.addEventListener('wallet_operation_updated', (event) => {
+      applyWalletOperationEventData(queryClient, event.data)
     })
     return () => events.close()
   }, [enabled, queryClient])

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"math/big"
+	"time"
 
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synapse-go/storage"
@@ -38,29 +39,41 @@ type WalletQuerier interface {
 	GetWalletInfo(ctx context.Context) (*WalletInfo, error)
 }
 
+// WalletOperator broadcasts wallet payment transactions.
+type WalletOperator interface {
+	FundUSDFC(ctx context.Context, amount *big.Int) (string, error)
+	WithdrawUSDFC(ctx context.Context, amount *big.Int) (string, error)
+}
+
 // WalletInfo holds a snapshot of the wallet's on-chain state.
 // Fields are nil when the corresponding RPC call failed; see Errors for details.
 type WalletInfo struct {
-	Address         string
-	Network         string
-	ChainID         int64
-	Nonce           *uint64
-	PaymentsAddress string
-	USDFCAddress    string
-	USDFCDecimals   uint8
-	FILBalance      *big.Int
-	USDFCBalance    *big.Int
-	FILAccount      *TokenAccountInfo
-	USDFCAccount    *TokenAccountInfo
-	Errors          map[string]string
+	Address              string
+	Network              string
+	ChainID              int64
+	Nonce                *uint64
+	CurrentEpoch         *big.Int
+	EpochDurationSeconds int64
+	PaymentsAddress      string
+	USDFCAddress         string
+	USDFCDecimals        uint8
+	FILGasBalance        *big.Int
+	USDFCWalletBalance   *big.Int
+	PaymentAccount       *PaymentAccountInfo
+	Errors               map[string]string
 }
 
-// TokenAccountInfo holds the PDP payments contract account state for a single token.
-type TokenAccountInfo struct {
+// PaymentAccountInfo holds USDFC payment contract account state.
+type PaymentAccountInfo struct {
 	Funds               *big.Int
 	AvailableFunds      *big.Int
 	LockupCurrent       *big.Int
 	LockupRate          *big.Int
 	LockupLastSettledAt *big.Int
 	FundedUntilEpoch    *big.Int
+	FundedUntilTime     *time.Time
+	RunwaySeconds       *int64
+	LockupRatePerDay    *big.Int
+	LockupRatePerMonth  *big.Int
+	NoActiveSpend       bool
 }

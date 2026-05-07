@@ -19,6 +19,8 @@ type adminEvent struct {
 	data  []byte
 }
 
+type adminEventListener func(topic string)
+
 type EventPublisher interface {
 	Publish(topic string, payload map[string]any)
 }
@@ -28,6 +30,7 @@ type EventHub struct {
 	mu          sync.Mutex
 	nextSeq     uint64
 	subscribers map[chan adminEvent]struct{}
+	listeners   []adminEventListener
 }
 
 func NewEventHub() *EventHub {
@@ -52,6 +55,15 @@ func (h *EventHub) subscribe() (<-chan adminEvent, func()) {
 		h.mu.Unlock()
 	}
 	return ch, unsubscribe
+}
+
+func (h *EventHub) onPublish(listener adminEventListener) {
+	if h == nil || listener == nil {
+		return
+	}
+	h.mu.Lock()
+	h.listeners = append(h.listeners, listener)
+	h.mu.Unlock()
 }
 
 func (h *EventHub) Publish(topic string, payload map[string]any) {
@@ -80,12 +92,16 @@ func (h *EventHub) Publish(topic string, payload map[string]any) {
 	event := adminEvent{seq: seq, topic: topic, data: data}
 
 	h.mu.Lock()
+	listeners := append([]adminEventListener(nil), h.listeners...)
 	subscribers := make([]chan adminEvent, 0, len(h.subscribers))
 	for ch := range h.subscribers {
 		subscribers = append(subscribers, ch)
 	}
 	h.mu.Unlock()
 
+	for _, listener := range listeners {
+		listener(topic)
+	}
 	for _, ch := range subscribers {
 		select {
 		case ch <- event:

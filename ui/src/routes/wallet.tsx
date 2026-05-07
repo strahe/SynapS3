@@ -1,25 +1,91 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, Wallet } from 'lucide-react'
+import { AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Clock, Wallet } from 'lucide-react'
+import { type ReactNode, useMemo, useState } from 'react'
+import type { PaymentAccountData, WalletOperation, WalletOperationStatus } from '@/api/client'
 import { CopyButton } from '@/components/app/CopyButton'
+import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageHeader } from '@/components/app/PageHeader'
-import { StatusBadge } from '@/components/app/StatusBadge'
+import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useWallet } from '@/hooks/queries'
-import { formatAttoFIL, formatTokenAmount } from '@/lib/utils'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { useWallet, useWalletFund, useWalletOperations, useWalletWithdraw } from '@/hooks/queries'
+import { cn, formatAttoFIL, formatDuration, formatTokenAmount, timeAgo } from '@/lib/utils'
+import {
+  baseUnitsToDecimal,
+  createWalletOperationDraft,
+  decimalToBaseUnits,
+  fundedUntilCaption,
+  fundedUntilTone,
+  topUpNeeded,
+  type WalletOperationDialogCloseReason,
+  type WalletOperationDraft,
+  type WalletRunwayTone,
+  walletOperationDetail,
+  walletOperationDialogShouldClearDraft,
+  walletOperationMutationError,
+  walletOperationPayload,
+} from '@/lib/wallet-operations'
 
 export const Route = createFileRoute('/wallet')({
   component: WalletPage,
 })
 
+const usdfcDecimals = 18
+const topUpTargets = [
+  { label: '30 days', epochs: 86_400 },
+  { label: '3 months', epochs: 259_200 },
+  { label: '6 months', epochs: 518_400 },
+] as const
+const walletOperationsDefaultLimit = 10
+const walletOperationsLimitOptions = [10, 20, 50, 100] as const
+
+interface PendingWalletOperation extends WalletOperationDraft {
+  clearInput?: () => void
+}
+
 function WalletPage() {
   const { data, isLoading, error } = useWallet()
+  const [operationsLimit, setOperationsLimit] = useState(walletOperationsDefaultLimit)
+  const { data: operationsData } = useWalletOperations(operationsLimit)
+  const fundMutation = useWalletFund()
+  const withdrawMutation = useWalletWithdraw()
+  const [fundAmount, setFundAmount] = useState('')
+  const [withdrawAmount, setWithdrawAmount] = useState('')
+  const [formError, setFormError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [pendingOperation, setPendingOperation] = useState<PendingWalletOperation | null>(null)
+  const [operationDetailText, setOperationDetailText] = useState<string | null>(null)
 
-  if (isLoading) {
-    return <WalletSkeleton />
-  }
+  const paymentAccount = data?.payment_account ?? null
+  const decimals = data?.contracts?.usdfc_decimals ?? usdfcDecimals
+  const operations = operationsData?.operations ?? []
+  const mutationError = walletOperationMutationError(pendingOperation?.type, fundMutation.error, withdrawMutation.error)
+  const isMutating = fundMutation.isPending || withdrawMutation.isPending
+
+  const topUpAmounts = useMemo(() => {
+    return topUpTargets.map((target) => ({
+      ...target,
+      amount: paymentAccount ? topUpNeeded(paymentAccount, target.epochs) : 0n,
+    }))
+  }, [paymentAccount])
+
+  if (isLoading) return <WalletSkeleton />
 
   if (error || !data) {
     return <div className="flex h-full items-center justify-center text-destructive">Failed to load wallet data</div>
@@ -39,6 +105,86 @@ function WalletPage() {
         </EmptyHeader>
       </Empty>
     )
+  }
+
+  const submitFund = () => {
+    const parsed = decimalToBaseUnits(fundAmount, decimals)
+    if (!parsed.ok) {
+      setFormError(parsed.error)
+      return
+    }
+    setFormError(null)
+    setNotice(null)
+    queueWalletOperation('fund', parsed.value.toString(), () => setFundAmount(''))
+  }
+
+  const submitWithdraw = () => {
+    const parsed = decimalToBaseUnits(withdrawAmount, decimals)
+    if (!parsed.ok) {
+      setFormError(parsed.error)
+      return
+    }
+    setFormError(null)
+    setNotice(null)
+    queueWalletOperation('withdraw', parsed.value.toString(), () => setWithdrawAmount(''))
+  }
+
+  const withdrawMax = () => {
+    if (!paymentAccount?.available_funds) return
+    setWithdrawAmount(baseUnitsToDecimal(paymentAccount.available_funds, decimals))
+    setFormError(null)
+  }
+
+  const topUpRunway = (amount: bigint, label: string) => {
+    if (amount <= 0n) {
+      setNotice(`Runway already meets ${label}`)
+      setFormError(null)
+      return
+    }
+    setNotice(null)
+    setFormError(null)
+    queueWalletOperation('fund', amount.toString(), undefined, `runway-${label.replace(/\s+/g, '-')}`)
+  }
+
+  const queueWalletOperation = (
+    type: PendingWalletOperation['type'],
+    amount: string,
+    clearInput?: () => void,
+    requestPrefix: string = type
+  ) => {
+    fundMutation.reset()
+    withdrawMutation.reset()
+    const draft = createWalletOperationDraft({ type, amountBaseUnits: amount, decimals, requestPrefix })
+    setPendingOperation({ ...draft, clearInput })
+    setNotice(null)
+    setFormError(null)
+  }
+
+  const clearPendingOperation = (reason: WalletOperationDialogCloseReason) => {
+    if (walletOperationDialogShouldClearDraft(reason, isMutating)) {
+      fundMutation.reset()
+      withdrawMutation.reset()
+      setPendingOperation(null)
+    }
+  }
+
+  const handlePendingOperationOpenChange = (open: boolean) => {
+    if (!open) clearPendingOperation('dismiss')
+  }
+
+  const confirmPendingOperation = () => {
+    if (!pendingOperation) return
+    const payload = walletOperationPayload(pendingOperation)
+    const clearInput = pendingOperation.clearInput
+    const onSuccess = () => {
+      clearInput?.()
+      clearPendingOperation('success')
+    }
+    if (pendingOperation.type === 'withdraw') {
+      withdrawMutation.mutate(payload, { onSuccess })
+    } else {
+      fundMutation.mutate(payload, { onSuccess })
+    }
   }
 
   return (
@@ -63,73 +209,145 @@ function WalletPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Identity</CardTitle>
+          <CardTitle>Wallet</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-5">
           <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
             <IdentityField
               label="Address"
-              value={data.address ?? '—'}
+              value={data.identity?.address ?? '—'}
               copyable
               className="sm:col-span-2 lg:col-span-3"
             />
-            <IdentityField label="Network" value={data.network ?? '—'} badge />
-            <IdentityField label="Chain ID" value={data.chain_id?.toString() ?? '—'} />
-            <IdentityField label="Nonce" value={data.nonce?.toString() ?? '—'} />
+            <IdentityField label="Network" value={data.chain?.network ?? '—'} badge />
+            <IdentityField label="Chain ID" value={data.chain?.chain_id?.toString() ?? '—'} />
+            <IdentityField label="Nonce" value={data.identity?.nonce?.toString() ?? '—'} />
+            <IdentityField label="Current Epoch" value={data.chain?.current_epoch ?? '—'} />
           </dl>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <BalanceCard
+              title="FIL Balance"
+              amount={formatAttoFIL(data.wallet_balances?.fil_gas)}
+              raw={data.wallet_balances?.fil_gas}
+            />
+            <BalanceCard
+              title="USDFC Balance"
+              amount={formatTokenAmount(data.wallet_balances?.usdfc, decimals, 'USDFC')}
+              raw={data.wallet_balances?.usdfc}
+            />
+          </div>
         </CardContent>
       </Card>
 
-      <div className="grid gap-4 sm:grid-cols-2">
-        <BalanceCard title="FIL Balance" amount={formatAttoFIL(data.fil_balance)} raw={data.fil_balance} />
-        <BalanceCard
-          title="USDFC Balance"
-          amount={formatTokenAmount(data.usdfc_balance, data.usdfc_decimals ?? 18, 'USDFC')}
-          raw={data.usdfc_balance}
-        />
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        {data.fil_account && (
-          <AccountCard title="PDP Account — FIL" account={data.fil_account} decimals={18} symbol="FIL" />
-        )}
-        {data.usdfc_account && (
-          <AccountCard
-            title="PDP Account — USDFC"
-            account={data.usdfc_account}
-            decimals={data.usdfc_decimals ?? 18}
-            symbol="USDFC"
-          />
-        )}
-        {!data.fil_account && !data.usdfc_account && (
-          <Card className="col-span-2">
-            <CardContent>
-              <p className="text-sm text-muted-foreground">PDP account data unavailable</p>
-            </CardContent>
-          </Card>
-        )}
-      </div>
-
-      {(data.payments_address || data.usdfc_address) && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Contract Addresses</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <dl className="grid gap-4 sm:grid-cols-2">
-              {data.payments_address && (
-                <IdentityField label="Payments Contract" value={data.payments_address} copyable />
+      <Card>
+        <CardHeader>
+          <CardTitle>USDFC Payment Account</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-5">
+          {paymentAccount ? (
+            <>
+              <PaymentAccountStats account={paymentAccount} decimals={decimals} />
+              <div className="grid gap-4 lg:grid-cols-2">
+                <OperationBox
+                  label="Fund"
+                  value={fundAmount}
+                  onValueChange={setFundAmount}
+                  onSubmit={submitFund}
+                  disabled={isMutating}
+                  icon={<ArrowDownToLine />}
+                />
+                <OperationBox
+                  label="Withdraw"
+                  value={withdrawAmount}
+                  onValueChange={setWithdrawAmount}
+                  onSubmit={submitWithdraw}
+                  disabled={isMutating}
+                  icon={<ArrowUpFromLine />}
+                  secondaryAction={
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={withdrawMax}
+                      disabled={!paymentAccount.available_funds || isMutating}
+                    >
+                      Max withdraw
+                    </Button>
+                  }
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <span className="text-sm text-muted-foreground">Top up to target runway</span>
+                <div className="grid gap-2 sm:grid-cols-3">
+                  {topUpAmounts.map((target) => (
+                    <Button
+                      key={target.label}
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-auto min-h-12 justify-start whitespace-normal px-3 py-2 text-left"
+                      disabled={isMutating}
+                      onClick={() => topUpRunway(target.amount, target.label)}
+                      title={`Additional needed: ${formatTokenAmount(target.amount.toString(), decimals, 'USDFC')}`}
+                    >
+                      <Clock data-icon="inline-start" />
+                      <span className="flex min-w-0 flex-col items-start gap-0.5">
+                        <span className="leading-none">To {target.label}</span>
+                        <span className="max-w-full truncate text-[11px] font-normal text-muted-foreground group-hover/button:text-foreground">
+                          {target.amount > 0n
+                            ? formatTokenAmount(target.amount.toString(), decimals, 'USDFC')
+                            : 'Already funded'}
+                        </span>
+                      </span>
+                    </Button>
+                  ))}
+                </div>
+              </div>
+              {(formError || mutationError || notice) && (
+                <p className={cn('text-sm', formError || mutationError ? 'text-destructive' : 'text-muted-foreground')}>
+                  {formError ?? mutationError ?? notice}
+                </p>
               )}
-              {data.usdfc_address && <IdentityField label="USDFC Token" value={data.usdfc_address} copyable />}
-            </dl>
-          </CardContent>
-        </Card>
-      )}
+            </>
+          ) : (
+            <p className="text-sm text-muted-foreground">USDFC payment account data unavailable</p>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Operations</CardTitle>
+          <CardAction className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">Latest</span>
+            <Label htmlFor="wallet-operations-limit" className="sr-only">
+              Operation count
+            </Label>
+            <Select value={operationsLimit.toString()} onValueChange={(value) => setOperationsLimit(Number(value))}>
+              <SelectTrigger id="wallet-operations-limit" className="h-7 w-20 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {walletOperationsLimitOptions.map((limit) => (
+                    <SelectItem key={limit} value={limit.toString()}>
+                      {limit}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          <OperationsTable operations={operations} decimals={decimals} onOpenDetails={setOperationDetailText} />
+        </CardContent>
+      </Card>
 
       {data.business && (
         <Card>
           <CardHeader>
-            <CardTitle>Business Stats</CardTitle>
+            <CardTitle>Business</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="grid gap-4 sm:grid-cols-3">
@@ -140,50 +358,80 @@ function WalletPage() {
           </CardContent>
         </Card>
       )}
+
+      {data.contracts && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Advanced</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <dl className="grid gap-4 sm:grid-cols-2">
+              <IdentityField label="Payments Contract" value={data.contracts.payments_address} copyable />
+              <IdentityField label="USDFC Token" value={data.contracts.usdfc_address} copyable />
+            </dl>
+          </CardContent>
+        </Card>
+      )}
+      <AlertDialog open={pendingOperation != null} onOpenChange={handlePendingOperationOpenChange}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{pendingOperation?.confirmation.title ?? 'Confirm operation'}</AlertDialogTitle>
+            <AlertDialogDescription>{pendingOperation?.confirmation.description}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="rounded-md border border-border p-3">
+            <div className="text-xs text-muted-foreground">Amount</div>
+            <div className="mt-1 font-mono text-sm">{pendingOperation?.confirmation.amount ?? '—'}</div>
+          </div>
+          {mutationError && <p className="text-sm text-destructive">{mutationError}</p>}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isMutating}>Cancel</AlertDialogCancel>
+            <Button type="button" disabled={isMutating} onClick={confirmPendingOperation}>
+              {pendingOperation?.confirmation.actionLabel ?? 'Confirm'}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <DetailTextDialog
+        title="Operation Details"
+        text={operationDetailText}
+        onClose={() => setOperationDetailText(null)}
+      />
     </div>
   )
 }
-
-// --- Sub-components ---
 
 function WalletSkeleton() {
   return (
     <div className="flex flex-col gap-6 p-6">
       <PageHeader title="Wallet" />
-
       <Card>
         <CardHeader>
-          <CardTitle>Identity</CardTitle>
+          <CardTitle>Wallet</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-5">
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
             <SkeletonField className="sm:col-span-2 lg:col-span-3" />
             <SkeletonField />
             <SkeletonField />
             <SkeletonField />
+            <SkeletonField />
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Skeleton className="h-20" />
+            <Skeleton className="h-20" />
           </div>
         </CardContent>
       </Card>
-
-      <div className="grid gap-4 sm:grid-cols-2">
-        <SkeletonBalanceCard />
-        <SkeletonBalanceCard />
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        <SkeletonAccountCard />
-        <SkeletonAccountCard />
-      </div>
-
       <Card>
         <CardHeader>
-          <CardTitle>Business Stats</CardTitle>
+          <CardTitle>USDFC Payment Account</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Skeleton className="mx-auto h-12 w-24" />
-            <Skeleton className="mx-auto h-12 w-24" />
-            <Skeleton className="mx-auto h-12 w-24" />
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Skeleton className="h-16" />
+            <Skeleton className="h-16" />
+            <Skeleton className="h-16" />
+            <Skeleton className="h-16" />
           </div>
         </CardContent>
       </Card>
@@ -197,36 +445,6 @@ function SkeletonField({ className }: { className?: string }) {
       <Skeleton className="h-3 w-20" />
       <Skeleton className="mt-2 h-5 w-full max-w-72" />
     </div>
-  )
-}
-
-function SkeletonBalanceCard() {
-  return (
-    <Card>
-      <CardContent>
-        <Skeleton className="h-4 w-28" />
-        <Skeleton className="mt-3 h-8 w-40" />
-      </CardContent>
-    </Card>
-  )
-}
-
-function SkeletonAccountCard() {
-  return (
-    <Card>
-      <CardHeader>
-        <Skeleton className="h-5 w-40" />
-      </CardHeader>
-      <CardContent>
-        <div className="flex flex-col gap-3">
-          <Skeleton className="h-5 w-full" />
-          <Skeleton className="h-5 w-full" />
-          <Skeleton className="h-5 w-full" />
-          <Skeleton className="h-5 w-full" />
-          <Skeleton className="h-5 w-full" />
-        </div>
-      </CardContent>
-    </Card>
   )
 }
 
@@ -262,72 +480,205 @@ function IdentityField({
   )
 }
 
-function BalanceCard({ title, amount, raw }: { title: string; amount: string; raw: string | null }) {
+function BalanceCard({ title, amount, raw }: { title: string; amount: string; raw: string | null | undefined }) {
   return (
-    <Card>
-      <CardContent>
-        <div className="flex items-center gap-2 text-muted-foreground">
-          <Wallet className="size-4" />
-          <span className="text-sm">{title}</span>
-        </div>
-        <div className={raw == null ? 'mt-2 text-2xl font-bold text-muted-foreground' : 'mt-2 text-2xl font-bold'}>
-          {amount}
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-// uint256.max sentinel — Solidity uses this to mean "unlimited/∞"
-const UINT256_MAX = '115792089237316195423570985008687907853269984665640564039457584007913129639935'
-
-function AccountCard({
-  title,
-  account,
-  decimals,
-  symbol,
-}: {
-  title: string
-  account: {
-    funds: string | null
-    available_funds: string | null
-    lockup_current: string | null
-    lockup_rate: string | null
-    funded_until_epoch: string | null
-  }
-  decimals: number
-  symbol: string
-}) {
-  const fundedDisplay = account.funded_until_epoch === UINT256_MAX ? '∞' : (account.funded_until_epoch ?? '—')
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <dl className="flex flex-col gap-3 text-sm">
-          <AccountRow label="Total Deposited" value={formatTokenAmount(account.funds, decimals, symbol)} />
-          <AccountRow
-            label="Available"
-            value={formatTokenAmount(account.available_funds, decimals, symbol)}
-            highlight
-          />
-          <AccountRow label="Locked" value={formatTokenAmount(account.lockup_current, decimals, symbol)} />
-          <AccountRow label="Lock Rate" value={formatTokenAmount(account.lockup_rate, decimals, `${symbol}/epoch`)} />
-          <AccountRow label="Funded Until Epoch" value={fundedDisplay} />
-        </dl>
-      </CardContent>
-    </Card>
-  )
-}
-
-function AccountRow({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
-  return (
-    <div className="flex items-center justify-between">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className={highlight ? 'font-mono font-semibold text-primary' : 'font-mono'}>{value}</dd>
+    <div className="rounded-md border border-border p-4">
+      <div className="flex items-center gap-2 text-muted-foreground">
+        <Wallet className="size-4" />
+        <span className="text-sm">{title}</span>
+      </div>
+      <div className={raw == null ? 'mt-2 text-2xl font-bold text-muted-foreground' : 'mt-2 text-2xl font-bold'}>
+        {amount}
+      </div>
     </div>
+  )
+}
+
+function PaymentAccountStats({ account, decimals }: { account: PaymentAccountData; decimals: number }) {
+  const riskTone = fundedUntilTone(account)
+  const riskCaption = fundedUntilCaption(account)
+  const fundedDisplay = account.no_active_spend
+    ? 'No active spend'
+    : [
+        account.funded_until_epoch ?? '—',
+        account.funded_until_time ? new Date(account.funded_until_time).toLocaleString() : null,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+  const runwayDisplay =
+    account.no_active_spend || account.runway_seconds == null
+      ? '—'
+      : formatDuration(Math.max(0, account.runway_seconds))
+
+  return (
+    <dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <AccountMetric label="Total Deposited" value={formatTokenAmount(account.funds, decimals, 'USDFC')} />
+      <AccountMetric
+        label="Available"
+        value={formatTokenAmount(account.available_funds, decimals, 'USDFC')}
+        highlight
+      />
+      <AccountMetric label="Locked" value={formatTokenAmount(account.lockup_current, decimals, 'USDFC')} />
+      <AccountMetric label="Runway" value={runwayDisplay} tone={riskTone} caption={riskCaption} />
+      <AccountMetric label="Lock Rate" value={formatTokenAmount(account.lockup_rate, decimals, 'USDFC/epoch')} />
+      <AccountMetric
+        label="Daily Spend"
+        value={formatTokenAmount(account.lockup_rate_per_day, decimals, 'USDFC/day')}
+      />
+      <AccountMetric
+        label="Monthly Spend"
+        value={formatTokenAmount(account.lockup_rate_per_month, decimals, 'USDFC/month')}
+      />
+      <AccountMetric label="Funded Until Epoch" value={fundedDisplay} tone={riskTone} caption={riskCaption} />
+    </dl>
+  )
+}
+
+const accountMetricTextClasses: Record<WalletRunwayTone, string> = {
+  danger: 'text-[color:var(--status-danger)]',
+  warning: 'text-[color:var(--status-warning)]',
+  neutral: '',
+}
+
+function AccountMetric({
+  label,
+  value,
+  highlight,
+  tone = 'neutral',
+  caption,
+}: {
+  label: string
+  value: string
+  highlight?: boolean
+  tone?: WalletRunwayTone
+  caption?: string
+}) {
+  return (
+    <div className="min-w-0 rounded-md border border-border p-3">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd
+        className={cn(
+          'mt-1 truncate font-mono text-sm',
+          highlight && 'font-semibold text-primary',
+          accountMetricTextClasses[tone]
+        )}
+        title={value}
+      >
+        {value}
+      </dd>
+      {caption && <div className={cn('mt-1 text-xs font-medium', accountMetricTextClasses[tone])}>{caption}</div>}
+    </div>
+  )
+}
+
+function OperationBox({
+  label,
+  value,
+  onValueChange,
+  onSubmit,
+  disabled,
+  icon,
+  secondaryAction,
+}: {
+  label: string
+  value: string
+  onValueChange: (value: string) => void
+  onSubmit: () => void
+  disabled: boolean
+  icon: ReactNode
+  secondaryAction?: ReactNode
+}) {
+  return (
+    <div className="rounded-md border border-border p-4">
+      <Label htmlFor={`wallet-${label.toLowerCase()}`}>{label} USDFC</Label>
+      <div className="mt-2 flex gap-2">
+        <Input
+          id={`wallet-${label.toLowerCase()}`}
+          inputMode="decimal"
+          value={value}
+          onChange={(event) => onValueChange(event.target.value)}
+          placeholder="0.0"
+          disabled={disabled}
+        />
+        <Button type="button" onClick={onSubmit} disabled={disabled}>
+          {icon}
+          {label}
+        </Button>
+      </div>
+      {secondaryAction && <div className="mt-2 flex justify-end">{secondaryAction}</div>}
+    </div>
+  )
+}
+
+function OperationsTable({
+  operations,
+  decimals,
+  onOpenDetails,
+}: {
+  operations: WalletOperation[]
+  decimals: number
+  onOpenDetails: (detail: string) => void
+}) {
+  if (operations.length === 0) {
+    return <p className="text-sm text-muted-foreground">No wallet operations yet</p>
+  }
+
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Type</TableHead>
+          <TableHead>Status</TableHead>
+          <TableHead>Amount</TableHead>
+          <TableHead>Tx Hash</TableHead>
+          <TableHead>Details</TableHead>
+          <TableHead>Updated</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {operations.map((operation) => {
+          const detail = walletOperationDetail(operation)
+          return (
+            <TableRow key={operation.id}>
+              <TableCell className="capitalize">{operation.type}</TableCell>
+              <TableCell>
+                <StatusBadge tone={walletOperationStatusTone(operation.status)} className="capitalize">
+                  {operation.status}
+                </StatusBadge>
+              </TableCell>
+              <TableCell className="font-mono">{formatTokenAmount(operation.amount, decimals, 'USDFC')}</TableCell>
+              <TableCell>
+                {operation.tx_hash ? (
+                  <span className="inline-flex max-w-48 items-center gap-1">
+                    <span className="truncate font-mono text-xs" title={operation.tx_hash}>
+                      {operation.tx_hash}
+                    </span>
+                    <CopyButton value={operation.tx_hash} label="Transaction hash" size="icon-xs" />
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground">—</span>
+                )}
+              </TableCell>
+              <TableCell>
+                {detail ? (
+                  <Button
+                    type="button"
+                    variant="link"
+                    onClick={() => onOpenDetails(detail)}
+                    className="h-auto max-w-80 justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
+                  >
+                    <span className="truncate">{detail}</span>
+                  </Button>
+                ) : (
+                  <span className="text-muted-foreground">—</span>
+                )}
+              </TableCell>
+              <TableCell className="text-muted-foreground">{timeAgo(operation.updated_at)}</TableCell>
+            </TableRow>
+          )
+        })}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -338,4 +689,21 @@ function StatItem({ label, value }: { label: string; value: number }) {
       <div className="mt-1 text-xs text-muted-foreground">{label}</div>
     </div>
   )
+}
+
+function walletOperationStatusTone(status: WalletOperationStatus): StatusTone {
+  switch (status) {
+    case 'confirmed':
+      return 'success'
+    case 'pending':
+    case 'running':
+    case 'submitted':
+      return 'warning'
+    case 'failed':
+      return 'danger'
+    case 'unknown':
+      return 'info'
+    default:
+      return 'neutral'
+  }
 }

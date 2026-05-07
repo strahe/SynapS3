@@ -21,10 +21,11 @@ type cachedWalletQuerier struct {
 	ttl   time.Duration
 	now   func() time.Time
 
-	mu        sync.Mutex
-	info      *synapse.WalletInfo
-	expiresAt time.Time
-	group     singleflight.Group
+	mu         sync.Mutex
+	info       *synapse.WalletInfo
+	expiresAt  time.Time
+	generation uint64
+	group      singleflight.Group
 }
 
 func newCachedWalletQuerier(inner synapse.WalletQuerier, ttl time.Duration, now func() time.Time) synapse.WalletQuerier {
@@ -41,6 +42,15 @@ func newCachedWalletQuerier(inner synapse.WalletQuerier, ttl time.Duration, now 
 	}
 }
 
+func (c *cachedWalletQuerier) Invalidate() {
+	c.mu.Lock()
+	c.info = nil
+	c.expiresAt = time.Time{}
+	c.generation++
+	c.mu.Unlock()
+	c.group.Forget("wallet")
+}
+
 func (c *cachedWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.WalletInfo, error) {
 	if info := c.cached(); info != nil {
 		return info, nil
@@ -50,6 +60,7 @@ func (c *cachedWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.Walle
 		if info := c.cached(); info != nil {
 			return info, nil
 		}
+		generation := c.currentGeneration()
 
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), walletCacheFetchTimeout)
 		defer cancel()
@@ -61,8 +72,10 @@ func (c *cachedWalletQuerier) GetWalletInfo(ctx context.Context) (*synapse.Walle
 
 		cached := cloneWalletInfo(info)
 		c.mu.Lock()
-		c.info = cached
-		c.expiresAt = c.now().Add(c.ttl)
+		if generation == c.generation {
+			c.info = cached
+			c.expiresAt = c.now().Add(c.ttl)
+		}
 		c.mu.Unlock()
 
 		return cached, nil
@@ -94,32 +107,44 @@ func (c *cachedWalletQuerier) cached() *synapse.WalletInfo {
 	return cloneWalletInfo(info)
 }
 
+func (c *cachedWalletQuerier) currentGeneration() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
+}
+
 func cloneWalletInfo(info *synapse.WalletInfo) *synapse.WalletInfo {
 	if info == nil {
 		return nil
 	}
 	out := *info
 	out.Nonce = cloneUint64(info.Nonce)
-	out.FILBalance = cloneBigInt(info.FILBalance)
-	out.USDFCBalance = cloneBigInt(info.USDFCBalance)
-	out.FILAccount = cloneTokenAccountInfo(info.FILAccount)
-	out.USDFCAccount = cloneTokenAccountInfo(info.USDFCAccount)
+	out.CurrentEpoch = cloneBigInt(info.CurrentEpoch)
+	out.FILGasBalance = cloneBigInt(info.FILGasBalance)
+	out.USDFCWalletBalance = cloneBigInt(info.USDFCWalletBalance)
+	out.PaymentAccount = clonePaymentAccountInfo(info.PaymentAccount)
 	out.Errors = cloneStringMap(info.Errors)
 	return &out
 }
 
-func cloneTokenAccountInfo(info *synapse.TokenAccountInfo) *synapse.TokenAccountInfo {
+func clonePaymentAccountInfo(info *synapse.PaymentAccountInfo) *synapse.PaymentAccountInfo {
 	if info == nil {
 		return nil
 	}
-	return &synapse.TokenAccountInfo{
+	out := &synapse.PaymentAccountInfo{
 		Funds:               cloneBigInt(info.Funds),
 		AvailableFunds:      cloneBigInt(info.AvailableFunds),
 		LockupCurrent:       cloneBigInt(info.LockupCurrent),
 		LockupRate:          cloneBigInt(info.LockupRate),
 		LockupLastSettledAt: cloneBigInt(info.LockupLastSettledAt),
 		FundedUntilEpoch:    cloneBigInt(info.FundedUntilEpoch),
+		FundedUntilTime:     cloneTime(info.FundedUntilTime),
+		RunwaySeconds:       cloneInt64(info.RunwaySeconds),
+		LockupRatePerDay:    cloneBigInt(info.LockupRatePerDay),
+		LockupRatePerMonth:  cloneBigInt(info.LockupRatePerMonth),
+		NoActiveSpend:       info.NoActiveSpend,
 	}
+	return out
 }
 
 func cloneBigInt(v *big.Int) *big.Int {
@@ -130,6 +155,22 @@ func cloneBigInt(v *big.Int) *big.Int {
 }
 
 func cloneUint64(v *uint64) *uint64 {
+	if v == nil {
+		return nil
+	}
+	out := *v
+	return &out
+}
+
+func cloneInt64(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	out := *v
+	return &out
+}
+
+func cloneTime(v *time.Time) *time.Time {
 	if v == nil {
 		return nil
 	}

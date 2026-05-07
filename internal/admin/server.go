@@ -55,7 +55,7 @@ type Server struct {
 
 // New creates a new admin HTTP server.
 func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, logger *slog.Logger) *Server {
-	return &Server{
+	s := &Server{
 		addr:            addr,
 		db:              db,
 		cache:           c,
@@ -69,6 +69,8 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		logger:          logger,
 		startedAt:       time.Now(),
 	}
+	s.watchWalletOperationEvents()
+	return s
 }
 
 // WithObjectStorage enables provider-backed object reads for admin downloads.
@@ -79,7 +81,31 @@ func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
 
 func (s *Server) WithEventHub(events *EventHub) *Server {
 	s.events = events
+	s.watchWalletOperationEvents()
 	return s
+}
+
+func (s *Server) watchWalletOperationEvents() {
+	if s == nil || s.events == nil {
+		return
+	}
+	s.events.onPublish(func(topic string) {
+		if topic == "wallet_operation_updated" {
+			s.invalidateWalletCache()
+		}
+	})
+}
+
+type walletCacheInvalidator interface {
+	Invalidate()
+}
+
+func (s *Server) invalidateWalletCache() {
+	cache, ok := s.wallet.(walletCacheInvalidator)
+	if !ok {
+		return
+	}
+	cache.Invalidate()
 }
 
 // WithProviderIdentityResolver enables provider identity enrichment for admin APIs.
@@ -154,6 +180,9 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
 		mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
 		mux.HandleFunc("GET /api/v1/wallet", s.handleAPIWallet)
+		mux.HandleFunc("POST /api/v1/wallet/fund", s.handleAPIWalletFund)
+		mux.HandleFunc("POST /api/v1/wallet/withdraw", s.handleAPIWalletWithdraw)
+		mux.HandleFunc("GET /api/v1/wallet/operations", s.handleAPIWalletOperations)
 		if s.s3IAM != nil {
 			mux.HandleFunc("GET /api/v1/s3-users", s.handleAPIListS3Users)
 			mux.HandleFunc("POST /api/v1/s3-users", s.handleAPICreateS3User)

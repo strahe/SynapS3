@@ -10,7 +10,9 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/buildinfo"
@@ -298,6 +300,12 @@ func runServe(ctx context.Context, src config.Source) error {
 	defer func() { _ = client.Close() }()
 	storageClient := synapse.AdaptStorageService(client.Storage())
 	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain())
+	walletOperator := synapse.NewWalletOperator(client.Payments(), client.Chain())
+	walletReceiptClient, err := ethclient.DialContext(ctx, cfg.Filecoin.RPCURL)
+	if err != nil {
+		return fmt.Errorf("creating wallet receipt client: %w", err)
+	}
+	defer walletReceiptClient.Close()
 
 	autoEvict := isAutoEvictEnabled(cfg.Cache.EvictionPolicy)
 
@@ -353,6 +361,8 @@ func runServe(ctx context.Context, src config.Source) error {
 			worker.WithEventPublisher(adminEvents)),
 		worker.NewEvictor(repos, localCache, sm,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
+		worker.NewWalletOperationRunner(repos, walletOperator, walletReceiptClient, 5*time.Second, logger,
+			worker.WithWalletOperationEventPublisher(adminEvents)),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
 	go wm.Start(ctx)
 

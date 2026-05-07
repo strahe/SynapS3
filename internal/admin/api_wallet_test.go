@@ -1,10 +1,13 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,7 +26,7 @@ func (s *stubWalletQuerier) GetWalletInfo(_ context.Context) (*synapse.WalletInf
 	return s.info, s.err
 }
 
-func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
+func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -105,13 +108,27 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 	nonce := uint64(7)
 	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
 		info: &synapse.WalletInfo{
-			Address:         "0xabc",
-			Network:         "mainnet",
-			ChainID:         314,
-			Nonce:           &nonce,
-			PaymentsAddress: "0xpay",
-			USDFCAddress:    "0xusdfc",
-			USDFCDecimals:   18,
+			Address:              "0xabc",
+			Network:              "mainnet",
+			ChainID:              314,
+			Nonce:                &nonce,
+			CurrentEpoch:         big.NewInt(3727006),
+			EpochDurationSeconds: 30,
+			PaymentsAddress:      "0xpay",
+			USDFCAddress:         "0xusdfc",
+			USDFCDecimals:        18,
+			FILGasBalance:        big.NewInt(11),
+			USDFCWalletBalance:   big.NewInt(22),
+			PaymentAccount: &synapse.PaymentAccountInfo{
+				Funds:               big.NewInt(100),
+				AvailableFunds:      big.NewInt(80),
+				LockupCurrent:       big.NewInt(20),
+				LockupRate:          big.NewInt(2),
+				LockupLastSettledAt: big.NewInt(3727000),
+				FundedUntilEpoch:    big.NewInt(3727100),
+				LockupRatePerDay:    big.NewInt(5760),
+				LockupRatePerMonth:  big.NewInt(172800),
+			},
 		},
 	}, testLogger())
 
@@ -123,21 +140,38 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
 
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("Unmarshal raw: %v", err)
+	}
+	if _, ok := raw["fil_account"]; ok {
+		t.Fatal("response contains fil_account, want new wallet schema without FIL payment account")
+	}
+
 	var resp walletResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-	if resp.Nonce == nil || *resp.Nonce != nonce {
-		t.Fatalf("nonce = %v, want %d", resp.Nonce, nonce)
+	if resp.Identity == nil || resp.Identity.Nonce == nil || *resp.Identity.Nonce != nonce {
+		t.Fatalf("identity.nonce = %v, want %d", resp.Identity, nonce)
 	}
-	if resp.PaymentsAddress != "0xpay" {
-		t.Fatalf("payments_address = %q, want 0xpay", resp.PaymentsAddress)
+	if resp.Chain == nil || resp.Chain.CurrentEpoch == nil || *resp.Chain.CurrentEpoch != "3727006" {
+		t.Fatalf("chain.current_epoch = %#v, want 3727006", resp.Chain)
 	}
-	if resp.USDFCAddress != "0xusdfc" {
-		t.Fatalf("usdfc_address = %q, want 0xusdfc", resp.USDFCAddress)
+	if resp.Contracts == nil || resp.Contracts.PaymentsAddress != "0xpay" {
+		t.Fatalf("contracts.payments = %#v, want 0xpay", resp.Contracts)
 	}
-	if resp.USDFCDecimals != 18 {
-		t.Fatalf("usdfc_decimals = %d, want 18", resp.USDFCDecimals)
+	if resp.Contracts.USDFCAddress != "0xusdfc" {
+		t.Fatalf("contracts.usdfc = %q, want 0xusdfc", resp.Contracts.USDFCAddress)
+	}
+	if resp.Contracts.USDFCDecimals != 18 {
+		t.Fatalf("contracts.usdfc_decimals = %d, want 18", resp.Contracts.USDFCDecimals)
+	}
+	if resp.WalletBalances == nil || resp.WalletBalances.FILGas == nil || *resp.WalletBalances.FILGas != "11" {
+		t.Fatalf("wallet_balances.fil_gas = %#v, want 11", resp.WalletBalances)
+	}
+	if resp.PaymentAccount == nil || resp.PaymentAccount.LockupRatePerMonth == nil || *resp.PaymentAccount.LockupRatePerMonth != "172800" {
+		t.Fatalf("payment_account.lockup_rate_per_month = %#v, want 172800", resp.PaymentAccount)
 	}
 	if resp.Business == nil {
 		t.Fatal("business = nil, want populated")
@@ -150,5 +184,91 @@ func TestHandleAPIWallet_CompatibilityFields(t *testing.T) {
 	}
 	if resp.Business.OnchainTasksCompleted != 1 {
 		t.Fatalf("onchain_tasks_completed = %d, want 1", resp.Business.OnchainTasksCompleted)
+	}
+}
+
+func TestHandleAPIWalletFund_RejectsUnsafeOrInvalidRequests(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	srv := New("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
+		info: &synapse.WalletInfo{Address: "0xabc"},
+	}, testLogger())
+
+	tests := []struct {
+		name        string
+		body        string
+		contentType string
+		writeHeader bool
+		wantStatus  int
+	}{
+		{name: "missing write header", body: `{"client_request_id":"a","amount":"1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
+		{name: "non json", body: `{"client_request_id":"a","amount":"1"}`, contentType: "text/plain", writeHeader: true, wantStatus: http.StatusBadRequest},
+		{name: "empty amount", body: `{"client_request_id":"a","amount":""}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
+		{name: "zero amount", body: `{"client_request_id":"a","amount":"0"}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
+		{name: "negative amount", body: `{"client_request_id":"a","amount":"-1"}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
+		{name: "decimal amount", body: `{"client_request_id":"a","amount":"1.1"}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/fund", strings.NewReader(tt.body))
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+			if tt.writeHeader {
+				req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+			}
+			rr := httptest.NewRecorder()
+			srv.handleAPIWalletFund(rr, req)
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleAPIWalletFund_IsIdempotentByClientRequestID(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	srv := New("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
+		info: &synapse.WalletInfo{Address: "0xabc"},
+	}, testLogger())
+
+	create := func(amount string) (walletOperationDTO, int) {
+		body := []byte(`{"client_request_id":"same-request","amount":"` + amount + `"}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/fund", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+		rr := httptest.NewRecorder()
+		srv.handleAPIWalletFund(rr, req)
+		var resp walletOperationResponse
+		if rr.Code == http.StatusAccepted {
+			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("Unmarshal operation response: %v", err)
+			}
+		}
+		return resp.Operation, rr.Code
+	}
+
+	first, status := create("100")
+	if status != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202", status)
+	}
+	second, status := create("100")
+	if status != http.StatusAccepted {
+		t.Fatalf("second status = %d, want 202", status)
+	}
+	if first.ID == 0 || second.ID != first.ID {
+		t.Fatalf("idempotent ID = %d then %d, want same non-zero ID", first.ID, second.ID)
+	}
+	if _, status := create("101"); status != http.StatusConflict {
+		t.Fatalf("conflict status = %d, want 409", status)
+	}
+
+	ops, err := repos.WalletOperations.ListRecent(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("ListRecent: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("operation count = %d, want 1", len(ops))
 	}
 }

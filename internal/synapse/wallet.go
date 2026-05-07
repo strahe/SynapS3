@@ -36,15 +36,18 @@ func NewWalletQuerier(paySvc *payments.Service, address common.Address, c chain.
 // produce nil fields and entries in the Errors map instead of aborting.
 func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) {
 	addrs := w.chain.Addresses()
+	currentEpoch := chain.CurrentEpoch(w.chain)
 
 	info := &WalletInfo{
-		Address:         w.address.Hex(),
-		Network:         w.chain.String(),
-		ChainID:         w.chain.ChainID(),
-		PaymentsAddress: addrs.Payments.Hex(),
-		USDFCAddress:    addrs.USDFC.Hex(),
-		USDFCDecimals:   18,
-		Errors:          make(map[string]string),
+		Address:              w.address.Hex(),
+		Network:              w.chain.String(),
+		ChainID:              w.chain.ChainID(),
+		CurrentEpoch:         currentEpoch,
+		EpochDurationSeconds: chain.EpochDurationSeconds,
+		PaymentsAddress:      addrs.Payments.Hex(),
+		USDFCAddress:         addrs.USDFC.Hex(),
+		USDFCDecimals:        18,
+		Errors:               make(map[string]string),
 	}
 
 	var mu sync.Mutex
@@ -65,28 +68,23 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 		defer wg.Done()
 		bal, err := w.payments.WalletBalance(ctx, addrs.USDFC, w.address)
 		if err != nil {
-			setErr("usdfc_balance", err)
+			setErr("usdfc_wallet_balance", err)
 			return
 		}
 		mu.Lock()
-		info.USDFCBalance = bal
+		info.USDFCWalletBalance = cloneBigInt(bal)
 		mu.Unlock()
 	}()
 
 	go func() {
 		defer wg.Done()
-		acct, err := w.payments.AccountInfo(ctx, payments.ZeroAddress, w.address)
+		bal, err := w.payments.WalletBalance(ctx, payments.ZeroAddress, w.address)
 		if err != nil {
-			setErr("fil_account", err)
-			setErr("fil_balance", err)
+			setErr("fil_gas_balance", err)
 			return
 		}
-		filAccount := convertAccountState(acct)
 		mu.Lock()
-		info.FILAccount = filAccount
-		if filAccount != nil {
-			info.FILBalance = filAccount.Funds
-		}
+		info.FILGasBalance = cloneBigInt(bal)
 		mu.Unlock()
 	}()
 
@@ -98,26 +96,85 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 			return
 		}
 		mu.Lock()
-		info.USDFCAccount = convertAccountState(acct)
+		info.PaymentAccount = convertAccountState(acct, w.chain, currentEpoch)
 		mu.Unlock()
 	}()
 
 	wg.Wait()
+	info.CurrentEpoch = cloneBigInt(info.CurrentEpoch)
 	return info, nil
 }
 
-func convertAccountState(acct *payments.AccountState) *TokenAccountInfo {
+func convertAccountState(acct *payments.AccountState, c chain.Chain, currentEpoch *big.Int) *PaymentAccountInfo {
 	if acct == nil {
 		return nil
 	}
-	return &TokenAccountInfo{
-		Funds:               acct.Funds,
+	out := &PaymentAccountInfo{
+		Funds:               cloneBigInt(acct.Funds),
 		AvailableFunds:      acct.AvailableFunds(),
-		LockupCurrent:       acct.LockupCurrent,
-		LockupRate:          acct.LockupRate,
-		LockupLastSettledAt: acct.LockupLastSettledAt,
-		FundedUntilEpoch:    acct.FundedUntilEpoch,
+		LockupCurrent:       cloneBigInt(acct.LockupCurrent),
+		LockupRate:          cloneBigInt(acct.LockupRate),
+		LockupLastSettledAt: cloneBigInt(acct.LockupLastSettledAt),
+		FundedUntilEpoch:    cloneBigInt(acct.FundedUntilEpoch),
 	}
+	out.LockupRatePerDay = multiplyBigInt(out.LockupRate, chain.EpochsPerDay)
+	out.LockupRatePerMonth = multiplyBigInt(out.LockupRate, chain.EpochsPerMonth)
+
+	out.NoActiveSpend = noActivePaymentSpend(out.LockupRate, out.FundedUntilEpoch)
+	if out.NoActiveSpend {
+		return out
+	}
+
+	if fundedUntil := chain.EpochToTime(c, out.FundedUntilEpoch); !fundedUntil.IsZero() {
+		out.FundedUntilTime = &fundedUntil
+	}
+	if seconds, ok := runwaySeconds(currentEpoch, out.FundedUntilEpoch); ok {
+		out.RunwaySeconds = &seconds
+	}
+	return out
+}
+
+func multiplyBigInt(v *big.Int, n int64) *big.Int {
+	if v == nil {
+		return nil
+	}
+	return new(big.Int).Mul(new(big.Int).Set(v), big.NewInt(n))
+}
+
+func noActivePaymentSpend(lockupRate, fundedUntilEpoch *big.Int) bool {
+	if lockupRate == nil || lockupRate.Sign() <= 0 {
+		return true
+	}
+	if fundedUntilEpoch == nil {
+		return true
+	}
+	return fundedUntilEpoch.Cmp(uint256Max()) == 0
+}
+
+func runwaySeconds(currentEpoch, fundedUntilEpoch *big.Int) (int64, bool) {
+	if currentEpoch == nil || fundedUntilEpoch == nil {
+		return 0, false
+	}
+	delta := new(big.Int).Sub(new(big.Int).Set(fundedUntilEpoch), currentEpoch)
+	if delta.Sign() < 0 {
+		return 0, true
+	}
+	seconds := delta.Mul(delta, big.NewInt(chain.EpochDurationSeconds))
+	if !seconds.IsInt64() {
+		return 0, false
+	}
+	return seconds.Int64(), true
+}
+
+func uint256Max() *big.Int {
+	return new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+}
+
+func cloneBigInt(v *big.Int) *big.Int {
+	if v == nil {
+		return nil
+	}
+	return new(big.Int).Set(v)
 }
 
 // sanitizeRPCError returns a user-safe error description, stripping
