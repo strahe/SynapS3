@@ -138,6 +138,10 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 	if req.Logging != nil {
 		setString("logging.level", &next.Logging.Level, req.Logging.Level)
 		setString("logging.format", &next.Logging.Format, req.Logging.Format)
+		if req.Logging.S3Access != nil {
+			setBool("logging.s3_access.enabled", &next.Logging.S3Access.Enabled, req.Logging.S3Access.Enabled)
+			setString("logging.s3_access.level", &next.Logging.S3Access.Level, req.Logging.S3Access.Level)
+		}
 	}
 
 	if len(fieldErrs) == 0 {
@@ -307,8 +311,14 @@ type settingsWorkerPoolConfig struct {
 }
 
 type settingsLoggingConfig struct {
-	Level  string `json:"level"`
-	Format string `json:"format"`
+	Level    string                        `json:"level"`
+	Format   string                        `json:"format"`
+	S3Access settingsLoggingS3AccessConfig `json:"s3_access"`
+}
+
+type settingsLoggingS3AccessConfig struct {
+	Enabled bool   `json:"enabled"`
+	Level   string `json:"level"`
 }
 
 type settingsManualConfig struct {
@@ -398,8 +408,14 @@ type settingsWorkerPoolUpdate struct {
 }
 
 type settingsLoggingUpdate struct {
-	Level  *string `json:"level,omitempty"`
-	Format *string `json:"format,omitempty"`
+	Level    *string                        `json:"level,omitempty"`
+	Format   *string                        `json:"format,omitempty"`
+	S3Access *settingsLoggingS3AccessUpdate `json:"s3_access,omitempty"`
+}
+
+type settingsLoggingS3AccessUpdate struct {
+	Enabled *bool   `json:"enabled,omitempty"`
+	Level   *string `json:"level,omitempty"`
 }
 
 func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
@@ -437,6 +453,10 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 		Logging: settingsLoggingConfig{
 			Level:  cfg.Logging.Level,
 			Format: cfg.Logging.Format,
+			S3Access: settingsLoggingS3AccessConfig{
+				Enabled: cfg.Logging.S3Access.Enabled,
+				Level:   cfg.Logging.S3Access.Level,
+			},
 		},
 	}
 }
@@ -498,6 +518,8 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"worker.evictor.max_retries":   {},
 		"logging.level":                {},
 		"logging.format":               {},
+		"logging.s3_access.enabled":    {},
+		"logging.s3_access.level":      {},
 	}
 
 	var out []config.FieldError

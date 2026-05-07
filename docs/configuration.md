@@ -91,7 +91,7 @@ Unknown `SYNAPS3_` names fall back to lowercase with `_` replaced by `.`.
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local object cache |
 | `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker |
 | `worker.evictor` | `concurrency`, `poll_interval`, `max_retries` | Cache eviction worker |
-| `logging` | `level`, `format` | Runtime logs |
+| `logging` | `level`, `format`, `s3_access.*` | Runtime logs |
 | `admin` | `addr` | Dashboard and admin API |
 
 Allowed values:
@@ -101,6 +101,9 @@ Allowed values:
 - `cache.eviction_policy`: `lru`, `manual`, `none`
 - `logging.level`: `debug`, `info`, `warn`, `error`
 - `logging.format`: `json`, `text`
+- `logging.s3_access.level`: `debug`, `info`, `warn`, `error`
+
+S3 access logs are emitted through the SynapS3 runtime logger. Set `logging.s3_access.enabled = false` to disable them.
 
 ## Production Example
 
@@ -137,7 +140,11 @@ max_retries = 3
 
 [logging]
 level = "info"
-format = "json"
+format = "text"
+
+[logging.s3_access]
+enabled = true
+level = "info"
 
 [admin]
 addr = "127.0.0.1:9090"

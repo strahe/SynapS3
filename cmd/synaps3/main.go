@@ -20,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/s3access"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -30,6 +31,7 @@ import (
 	"github.com/versity/versitygw/s3api"
 	"github.com/versity/versitygw/s3api/middlewares"
 	"github.com/versity/versitygw/s3api/utils"
+	"github.com/versity/versitygw/s3log"
 )
 
 const defaultS3MultipartMaxParts = 10000
@@ -212,6 +214,7 @@ func s3ServerOptions(cfg config.ServerConfig) ([]s3api.Option, error) {
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
 		s3api.WithMpMaxParts(defaultS3MultipartMaxParts),
+		s3api.WithQuiet(),
 	}
 	if cfg.TLS.Enabled {
 		cs := utils.NewCertStorage()
@@ -342,7 +345,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		rootCfg,
 		cfg.S3.Region,
 		iamSvc,
-		nil, // audit logger
+		s3AccessLogger(logger, cfg.Logging.S3Access),
 		nil, // admin logger
 		nil, // event sender
 		nil, // metrics manager
@@ -459,7 +462,9 @@ func setupModeAllowedField(field string) bool {
 		"worker.evictor.poll_interval",
 		"worker.evictor.max_retries",
 		"logging.level",
-		"logging.format":
+		"logging.format",
+		"logging.s3_access.enabled",
+		"logging.s3_access.level":
 		return true
 	default:
 		return false
@@ -476,6 +481,13 @@ func joinFieldErrors(fieldErrs []config.FieldError) error {
 
 func isAutoEvictEnabled(policy string) bool {
 	return strings.EqualFold(strings.TrimSpace(policy), "lru")
+}
+
+func s3AccessLogger(logger *slog.Logger, cfg config.LoggingS3AccessConfig) s3log.AuditLogger {
+	if !cfg.Enabled {
+		return nil
+	}
+	return s3access.NewLogger(logger, cfg.Level)
 }
 
 func setupLogger(cfg config.LoggingConfig) *slog.Logger {

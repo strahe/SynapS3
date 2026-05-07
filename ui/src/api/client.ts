@@ -433,6 +433,12 @@ export interface SettingsWorkerPoolConfig {
 export interface SettingsLoggingConfig {
   level: string
   format: string
+  s3_access: SettingsS3AccessLoggingConfig
+}
+
+export interface SettingsS3AccessLoggingConfig {
+  enabled: boolean
+  level: string
 }
 
 export interface SettingsManualField {
@@ -490,7 +496,9 @@ export type SettingsUpdatePayload = Partial<{
     upload: Partial<SettingsWorkerPoolConfig>
     evictor: Partial<SettingsWorkerPoolConfig>
   }>
-  logging: Partial<SettingsLoggingConfig>
+  logging: Partial<Pick<SettingsLoggingConfig, 'level' | 'format'>> & {
+    s3_access?: Partial<SettingsS3AccessLoggingConfig>
+  }
 }>
 
 export const api = {

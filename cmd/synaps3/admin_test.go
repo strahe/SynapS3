@@ -377,6 +377,13 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 				if logging["level"] != "debug" {
 					t.Fatalf("logging.level = %#v, want debug", logging["level"])
 				}
+				s3Access := logging["s3_access"].(map[string]any)
+				if s3Access["enabled"] != false {
+					t.Fatalf("logging.s3_access.enabled = %#v, want false", s3Access["enabled"])
+				}
+				if s3Access["level"] != "debug" {
+					t.Fatalf("logging.s3_access.level = %#v, want debug", s3Access["level"])
+				}
 				writeAdminTestJSON(t, w, http.StatusOK, adminTestSettings("calibration", false))
 			default:
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
@@ -387,6 +394,7 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 		out, err := runAdminCommand(t, []string{
 			"synaps3", "admin", "--admin-url", ts.URL,
 			"settings", "set", "cache.max_size_gb=8", "filecoin.with_cdn=true", "logging.level=debug",
+			"logging.s3_access.enabled=false", "logging.s3_access.level=debug",
 		})
 		if err != nil {
 			t.Fatalf("settings set: %v\n%s", err, out)
@@ -589,7 +597,11 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 				"upload":  map[string]any{"concurrency": 4, "poll_interval": "5s", "max_retries": 5},
 				"evictor": map[string]any{"concurrency": 2, "poll_interval": "1m0s", "max_retries": 3},
 			},
-			"logging": map[string]any{"level": "info", "format": "json"},
+			"logging": map[string]any{
+				"level":     "info",
+				"format":    "text",
+				"s3_access": map[string]any{"enabled": true, "level": "info"},
+			},
 		},
 	}
 }

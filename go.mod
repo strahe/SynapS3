@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.98.0
 	github.com/ethereum/go-ethereum v1.17.2
+	github.com/gofiber/fiber/v2 v2.52.12
 	github.com/ipfs/go-cid v0.5.0
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/knadh/koanf/parsers/toml/v2 v2.2.0
@@ -111,7 +112,6 @@ require (
 	github.com/go-asn1-ber/asn1-ber v1.5.8-0.20250403174932-29230038a667 // indirect
 	github.com/go-ldap/ldap/v3 v3.4.13 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
-	github.com/gofiber/fiber/v2 v2.52.12 // indirect
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -259,5 +261,18 @@ func TestS3ServerOptions_TLS(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "TLS certificate") {
 		t.Fatalf("error = %v, want TLS certificate context", err)
+	}
+}
+
+func TestS3AccessLoggerFromConfig(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.LoggingS3AccessConfig{Enabled: true, Level: "debug"}
+	if got := s3AccessLogger(logger, cfg); got == nil {
+		t.Fatal("s3AccessLogger(enabled) = nil, want logger")
+	}
+
+	cfg.Enabled = false
+	if got := s3AccessLogger(logger, cfg); got != nil {
+		t.Fatalf("s3AccessLogger(disabled) = %#v, want nil", got)
 	}
 }

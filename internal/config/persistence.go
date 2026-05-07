@@ -281,6 +281,13 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			},
 		},
 		{
+			Name: "logging.s3_access",
+			Fields: []initFieldDescriptor{
+				{Field: "logging.s3_access.enabled", Key: "enabled", Value: strconv.FormatBool(cfg.Logging.S3Access.Enabled), Enabled: saveMode},
+				{Field: "logging.s3_access.level", Key: "level", Value: quoteTOMLString(cfg.Logging.S3Access.Level), Enabled: saveMode, Notes: []string{"Allowed: debug, info, warn, error."}},
+			},
+		},
+		{
 			Name: "admin",
 			Fields: []initFieldDescriptor{
 				{Field: "admin.addr", Key: "addr", Value: quoteTOMLString(cfg.Admin.Addr), Enabled: saveMode && presence.AdminAddr},

@@ -33,6 +33,7 @@ func TestShouldStartSetupModeAllowsEditableConfigErrors(t *testing.T) {
 	cfg.Worker.Upload.PollInterval = 0
 	cfg.Worker.Upload.MaxRetries = -1
 	cfg.Logging.Level = "verbose"
+	cfg.Logging.S3Access.Level = "verbose"
 
 	if !shouldStartSetupMode(cfg.FieldValidationErrors()) {
 		t.Fatal("editable config validation errors should allow setup mode")

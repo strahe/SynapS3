@@ -76,7 +76,11 @@ function baseConfig(): SettingsEditableConfig {
     },
     logging: {
       level: 'info',
-      format: 'json',
+      format: 'text',
+      s3_access: {
+        enabled: true,
+        level: 'info',
+      },
     },
   }
 }

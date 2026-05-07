@@ -187,6 +187,18 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_LOGGING_FORMAT",
 		Editable:    true,
 	},
+	"logging.s3_access.enabled": {
+		Label:       "S3 Access Log Enabled",
+		Description: "Whether S3 request access logs are emitted.",
+		Env:         "SYNAPS3_LOGGING_S3_ACCESS_ENABLED",
+		Editable:    true,
+	},
+	"logging.s3_access.level": {
+		Label:       "S3 Access Log Level",
+		Description: "Log level used for S3 request access logs.",
+		Env:         "SYNAPS3_LOGGING_S3_ACCESS_LEVEL",
+		Editable:    true,
+	},
 	"admin.addr": {
 		Label:       "Admin Address",
 		Description: "Address where the admin dashboard and API listen.",

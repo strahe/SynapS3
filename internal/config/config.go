@@ -82,8 +82,14 @@ type WorkerPoolConfig struct {
 }
 
 type LoggingConfig struct {
-	Level  string `koanf:"level"`  // debug | info | warn | error
-	Format string `koanf:"format"` // json | text
+	Level    string                `koanf:"level"`  // debug | info | warn | error
+	Format   string                `koanf:"format"` // json | text
+	S3Access LoggingS3AccessConfig `koanf:"s3_access"`
+}
+
+type LoggingS3AccessConfig struct {
+	Enabled bool   `koanf:"enabled"`
+	Level   string `koanf:"level"` // debug | info | warn | error
 }
 
 type AdminConfig struct {
@@ -161,7 +167,11 @@ func defaultConfig() *Config {
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
-			Format: "json",
+			Format: "text",
+			S3Access: LoggingS3AccessConfig{
+				Enabled: true,
+				Level:   "info",
+			},
 		},
 		Admin: AdminConfig{
 			Addr: "127.0.0.1:9090",
@@ -409,6 +419,11 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	case "json", "text":
 	default:
 		add("logging.format", fmt.Sprintf("must be json or text, got %q", c.Logging.Format))
+	}
+	switch c.Logging.S3Access.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		add("logging.s3_access.level", fmt.Sprintf("must be one of [debug, info, warn, error], got %q", c.Logging.S3Access.Level))
 	}
 
 	// Admin.

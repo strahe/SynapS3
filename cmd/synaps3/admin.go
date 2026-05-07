@@ -757,8 +757,14 @@ type adminSettingsWorkerPoolConfig struct {
 }
 
 type adminSettingsLoggingConfig struct {
-	Level  string `json:"level"`
-	Format string `json:"format"`
+	Level    string                             `json:"level"`
+	Format   string                             `json:"format"`
+	S3Access adminSettingsLoggingS3AccessConfig `json:"s3_access"`
+}
+
+type adminSettingsLoggingS3AccessConfig struct {
+	Enabled bool   `json:"enabled"`
+	Level   string `json:"level"`
 }
 
 type adminTaskListResponse struct {
@@ -826,6 +832,8 @@ var adminEditableSettings = map[string]adminSettingSpec{
 	"worker.evictor.max_retries":      {path: []string{"worker", "evictor", "max_retries"}, kind: adminSettingInt},
 	"logging.level":                   {path: []string{"logging", "level"}, kind: adminSettingString},
 	"logging.format":                  {path: []string{"logging", "format"}, kind: adminSettingString},
+	"logging.s3_access.enabled":       {path: []string{"logging", "s3_access", "enabled"}, kind: adminSettingBool},
+	"logging.s3_access.level":         {path: []string{"logging", "s3_access", "level"}, kind: adminSettingString},
 }
 
 type adminSettingsUpdates struct {
@@ -1174,6 +1182,8 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 			rows: []adminOutputRow{
 				{Name: "logging.level", Value: settings.Config.Logging.Level},
 				{Name: "logging.format", Value: settings.Config.Logging.Format},
+				{Name: "logging.s3_access.enabled", Value: formatAdminYesNo(settings.Config.Logging.S3Access.Enabled)},
+				{Name: "logging.s3_access.level", Value: settings.Config.Logging.S3Access.Level},
 			},
 		},
 	}

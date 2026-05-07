@@ -216,6 +216,7 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"[server.tls]",
 		"[worker.upload]",
 		"[logging]",
+		"[logging.s3_access]",
 		"[filecoin]",
 		"private_key = \"\"",
 		"# network = \"calibration\"",
@@ -239,6 +240,8 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"port = \":8080\"",
 		"network = \"calibration\"",
 		"level = \"info\"",
+		"format = \"text\"",
+		"enabled = true",
 		"max_open_conns = 25",
 		"max_size_gb = 100",
 		"eviction_policy = \"lru\"",
@@ -289,6 +292,8 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	cfg.Cache.MaxSizeGB = 42
 	cfg.Worker.Upload.PollInterval = 7 * time.Second
 	cfg.Worker.Evictor.PollInterval = 2 * time.Minute
+	cfg.Logging.S3Access.Enabled = false
+	cfg.Logging.S3Access.Level = "debug"
 
 	path := filepath.Join(t.TempDir(), "nested", "config.toml")
 	if err := Save(path, cfg); err != nil {
@@ -320,6 +325,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		"poll_interval = \"7s\"",
 		"[worker.evictor]",
 		"poll_interval = \"2m0s\"",
+		"[logging.s3_access]",
+		"enabled = false",
+		"level = \"debug\"",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated TOML missing %q:\n%s", want, text)
@@ -417,9 +425,10 @@ func TestEnvManagedFieldPaths_ReturnsRecognizedOverrides(t *testing.T) {
 	t.Setenv("SYNAPS3_CACHE_DIR", "/tmp/synaps3-cache")
 	t.Setenv("SYNAPS3_FILECOIN_NETWORK", "mainnet")
 	t.Setenv("SYNAPS3_FILECOIN_RPC_URL", "https://rpc.example.invalid")
+	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
 
 	managed := EnvManagedFieldPaths()
-	for _, want := range []string{"server.port", "cache.dir", "filecoin.network", "filecoin.rpc_url"} {
+	for _, want := range []string{"server.port", "cache.dir", "filecoin.network", "filecoin.rpc_url", "logging.s3_access.enabled"} {
 		if managed[want] == "" {
 			t.Fatalf("EnvManagedFieldPaths() missing %q in %#v", want, managed)
 		}
@@ -436,6 +445,8 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 		{env: "SYNAPS3_S3_REGION", field: "s3.region"},
 		{env: "SYNAPS3_FILECOIN_PRIVATE_KEY", field: "filecoin.private_key"},
 		{env: "SYNAPS3_CACHE_MAX_SIZE_GB", field: "cache.max_size_gb"},
+		{env: "SYNAPS3_LOGGING_S3_ACCESS_ENABLED", field: "logging.s3_access.enabled"},
+		{env: "SYNAPS3_LOGGING_S3_ACCESS_LEVEL", field: "logging.s3_access.level"},
 		{env: "SYNAPS3_ADMIN_ADDR", field: "admin.addr"},
 	}
 

@@ -253,6 +253,13 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 				cfg.Logging.Format = "xml"
 			},
 		},
+		{
+			name:  "s3 access logging level",
+			field: "logging.s3_access.level",
+			mutate: func(cfg *Config) {
+				cfg.Logging.S3Access.Level = "verbose"
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -318,6 +325,15 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Filecoin.DefaultCopies != 2 {
 		t.Errorf("Filecoin.DefaultCopies = %d, want 2", cfg.Filecoin.DefaultCopies)
 	}
+	if cfg.Logging.Format != "text" {
+		t.Errorf("Logging.Format = %q, want text", cfg.Logging.Format)
+	}
+	if !cfg.Logging.S3Access.Enabled {
+		t.Error("Logging.S3Access.Enabled = false, want true")
+	}
+	if cfg.Logging.S3Access.Level != "info" {
+		t.Errorf("Logging.S3Access.Level = %q, want info", cfg.Logging.S3Access.Level)
+	}
 
 	wantAppDir := filepath.Join(home, ".synaps3")
 	assertSQLiteDSNPath(t, cfg.Database.DSN, filepath.Join(wantAppDir, "db", "synaps3.db"))
@@ -379,6 +395,8 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_MAX_RETRIES", "8")
 	t.Setenv("SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL", "2m")
 	t.Setenv("SYNAPS3_WORKER_EVICTOR_MAX_RETRIES", "6")
+	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
+	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_LEVEL", "debug")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -404,6 +422,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 	if cfg.Worker.Evictor.PollInterval != 2*time.Minute || cfg.Worker.Evictor.MaxRetries != 6 {
 		t.Fatalf("evictor worker = %#v, want env values", cfg.Worker.Evictor)
+	}
+	if cfg.Logging.S3Access.Enabled || cfg.Logging.S3Access.Level != "debug" {
+		t.Fatalf("s3 access logging = %#v, want disabled debug", cfg.Logging.S3Access)
 	}
 }
 

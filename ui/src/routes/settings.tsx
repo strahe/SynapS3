@@ -42,6 +42,7 @@ import {
   type SettingsRiskChange,
   settingsRiskNeedsStrongConfirmation,
 } from '@/lib/risk-confirmation'
+import { buildSettingsPayload } from '@/lib/settings-payload'
 
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
@@ -75,7 +76,7 @@ const tabFields = {
     'worker.evictor.poll_interval',
     'worker.evictor.max_retries',
   ],
-  logging: ['logging.level', 'logging.format'],
+  logging: ['logging.level', 'logging.format', 'logging.s3_access.enabled', 'logging.s3_access.level'],
   runtime: ['database.driver', 'database.dsn', 'database.max_open_conns', 'database.max_idle_conns', 'admin.addr'],
 } as const
 
@@ -406,6 +407,39 @@ function SettingsPage() {
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => setForm({ ...form, logging: { ...form.logging, format: value } })}
+              />
+              <CheckboxField
+                data={data}
+                field="logging.s3_access.enabled"
+                label="S3 Access Log"
+                checked={form.logging.s3_access.enabled}
+                errors={fieldErrors}
+                onChange={(checked) =>
+                  setForm({
+                    ...form,
+                    logging: {
+                      ...form.logging,
+                      s3_access: { ...form.logging.s3_access, enabled: checked },
+                    },
+                  })
+                }
+              />
+              <SelectField
+                label="S3 Access Level"
+                field="logging.s3_access.level"
+                value={form.logging.s3_access.level}
+                options={['debug', 'info', 'warn', 'error']}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) =>
+                  setForm({
+                    ...form,
+                    logging: {
+                      ...form.logging,
+                      s3_access: { ...form.logging.s3_access, level: value },
+                    },
+                  })
+                }
               />
             </div>
           </Section>
@@ -833,55 +867,4 @@ function fieldDisabled(data: SettingsData, field: string) {
 
 function normalizeNetworkName(network: string) {
   return network.trim().toLowerCase()
-}
-
-function buildSettingsPayload(
-  form: SettingsEditableConfig,
-  initial: SettingsEditableConfig,
-  envManaged: Record<string, string>
-): SettingsUpdatePayload {
-  const include = (field: string) => !envManaged[field]
-  const payload: SettingsUpdatePayload = {}
-
-  payload.server = {}
-  if (include('server.port')) payload.server.port = form.server.port
-  if (include('server.max_connections')) payload.server.max_connections = form.server.max_connections
-  if (include('server.max_requests')) payload.server.max_requests = form.server.max_requests
-  payload.server.tls = {}
-  if (include('server.tls.enabled')) payload.server.tls.enabled = form.server.tls.enabled
-  if (include('server.tls.cert_file')) payload.server.tls.cert_file = form.server.tls.cert_file
-  if (include('server.tls.key_file')) payload.server.tls.key_file = form.server.tls.key_file
-
-  payload.s3 = {}
-  if (include('s3.region')) payload.s3.region = form.s3.region
-
-  payload.filecoin = {}
-  if (include('filecoin.network')) payload.filecoin.network = form.filecoin.network
-  if (include('filecoin.rpc_url')) payload.filecoin.rpc_url = form.filecoin.rpc_url
-  if (include('filecoin.source')) payload.filecoin.source = form.filecoin.source
-  if (include('filecoin.default_copies')) payload.filecoin.default_copies = form.filecoin.default_copies
-  if (include('filecoin.with_cdn')) payload.filecoin.with_cdn = form.filecoin.with_cdn
-  if (include('filecoin.allow_private_networks'))
-    payload.filecoin.allow_private_networks = form.filecoin.allow_private_networks
-
-  payload.cache = {}
-  if (include('cache.dir') && form.cache.dir !== initial.cache.dir) payload.cache.dir = form.cache.dir
-  if (include('cache.max_size_gb')) payload.cache.max_size_gb = form.cache.max_size_gb
-  if (include('cache.eviction_policy')) payload.cache.eviction_policy = form.cache.eviction_policy
-
-  const upload: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['upload']> = {}
-  const evictor: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['evictor']> = {}
-  if (include('worker.upload.concurrency')) upload.concurrency = form.worker.upload.concurrency
-  if (include('worker.upload.poll_interval')) upload.poll_interval = form.worker.upload.poll_interval
-  if (include('worker.upload.max_retries')) upload.max_retries = form.worker.upload.max_retries
-  if (include('worker.evictor.concurrency')) evictor.concurrency = form.worker.evictor.concurrency
-  if (include('worker.evictor.poll_interval')) evictor.poll_interval = form.worker.evictor.poll_interval
-  if (include('worker.evictor.max_retries')) evictor.max_retries = form.worker.evictor.max_retries
-  payload.worker = { upload, evictor }
-
-  payload.logging = {}
-  if (include('logging.level')) payload.logging.level = form.logging.level
-  if (include('logging.format')) payload.logging.format = form.logging.format
-
-  return payload
 }

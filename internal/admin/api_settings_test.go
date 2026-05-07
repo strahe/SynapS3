@@ -247,7 +247,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 		"filecoin":{"network":"mainnet","with_cdn":true,"default_copies":3},
 		"cache":{"max_size_gb":8},
 		"worker":{"upload":{"poll_interval":"9s"}},
-		"logging":{"format":"text"}
+		"logging":{"format":"text","s3_access":{"enabled":false,"level":"debug"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
@@ -281,6 +281,9 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	}
 	if loaded.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("saved filecoin.default_copies = %d, want 3", loaded.Filecoin.DefaultCopies)
+	}
+	if loaded.Logging.S3Access.Enabled || loaded.Logging.S3Access.Level != "debug" {
+		t.Fatalf("saved logging.s3_access = %#v, want disabled debug", loaded.Logging.S3Access)
 	}
 }
 
@@ -514,10 +517,11 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 
 func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 	tests := []struct {
-		name    string
-		envName string
-		payload string
-		field   string
+		name     string
+		envName  string
+		payload  string
+		field    string
+		envValue string
 	}{
 		{name: "server port", envName: "SYNAPS3_SERVER_PORT", payload: `{"server":{"port":":8088"}}`, field: "server.port"},
 		{name: "server max connections", envName: "SYNAPS3_SERVER_MAX_CONNECTIONS", payload: `{"server":{"max_connections":10}}`, field: "server.max_connections"},
@@ -543,11 +547,17 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "evictor max retries", envName: "SYNAPS3_WORKER_EVICTOR_MAX_RETRIES", payload: `{"worker":{"evictor":{"max_retries":4}}}`, field: "worker.evictor.max_retries"},
 		{name: "logging level", envName: "SYNAPS3_LOGGING_LEVEL", payload: `{"logging":{"level":"debug"}}`, field: "logging.level"},
 		{name: "logging format", envName: "SYNAPS3_LOGGING_FORMAT", payload: `{"logging":{"format":"text"}}`, field: "logging.format"},
+		{name: "s3 access logging enabled", envName: "SYNAPS3_LOGGING_S3_ACCESS_ENABLED", payload: `{"logging":{"s3_access":{"enabled":false}}}`, field: "logging.s3_access.enabled", envValue: "true"},
+		{name: "s3 access logging level", envName: "SYNAPS3_LOGGING_S3_ACCESS_LEVEL", payload: `{"logging":{"s3_access":{"level":"debug"}}}`, field: "logging.s3_access.level", envValue: "info"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(tt.envName, "managed")
+			envValue := tt.envValue
+			if envValue == "" {
+				envValue = "managed"
+			}
+			t.Setenv(tt.envName, envValue)
 
 			cfg := validSettingsConfig(t)
 			source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
@@ -581,7 +591,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"s3":{"region":""},
 		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","source":"","default_copies":0},
 		"worker":{"upload":{"max_retries":-1}},
-		"logging":{"level":"verbose","format":"xml"}
+		"logging":{"level":"verbose","format":"xml","s3_access":{"level":"verbose"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
@@ -602,6 +612,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"worker.upload.max_retries",
 		"logging.level",
 		"logging.format",
+		"logging.s3_access.level",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body missing %q: %s", want, body)
