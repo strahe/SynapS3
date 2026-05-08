@@ -30,15 +30,27 @@ const taskTypeLabels: Record<string, string> = {
   evict_cache: 'Evict Cache',
 }
 
-const statusOptions = ['all', 'pending', 'running', 'completed', 'failed', 'cancelled', 'dead_letter'] as const
+const statusOptions = [
+  'all',
+  'queued',
+  'scheduled',
+  'waiting',
+  'running',
+  'completed',
+  'failed',
+  'exhausted',
+  'cancelled',
+] as const
 const statusLabels: Record<string, string> = {
   all: 'All',
-  pending: 'Pending',
+  queued: 'Queued',
+  scheduled: 'Scheduled',
+  waiting: 'Waiting',
   running: 'Running',
   completed: 'Completed',
   failed: 'Failed',
   cancelled: 'Cancelled',
-  dead_letter: 'Dead Letter',
+  exhausted: 'Exhausted',
 }
 
 const stageOptions = [
@@ -73,6 +85,14 @@ function taskStageLabel(task: TaskItem) {
 
 function isPrimaryTransferTask(task: TaskItem) {
   return task.stage === 'primary_store' || task.stage === 'legacy_upload'
+}
+
+function taskDetailText(task: TaskItem) {
+  return task.status_message || task.last_error || ''
+}
+
+function taskDetailTitle(task: TaskItem) {
+  return task.last_error ? 'Error Details' : 'Status Details'
 }
 
 function TaskRefCell({ task }: { task: TaskItem }) {
@@ -157,7 +177,7 @@ function TasksPage() {
   const qc = useQueryClient()
 
   const [retryTarget, setRetryTarget] = useState<TaskItem | null>(null)
-  const [errorDialogText, setErrorDialogText] = useState<string | null>(null)
+  const [detailDialog, setDetailDialog] = useState<{ title: string; text: string } | null>(null)
   const retryMutation = useMutation({
     mutationFn: (taskId: number) => api.retryTask(taskId),
     onSuccess: () => setRetryTarget(null),
@@ -281,7 +301,7 @@ function TasksPage() {
                   <TableHead className="whitespace-nowrap px-3 py-2">Ref</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2">Status</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2 text-right">Retries</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Error</TableHead>
+                  <TableHead className="whitespace-nowrap px-3 py-2">Details</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2">Scheduled</TableHead>
                   <TableHead className="whitespace-nowrap px-3 py-2">Actions</TableHead>
                 </TableRow>
@@ -316,18 +336,16 @@ function TasksPage() {
                         {t.retry_count}/{t.max_retries}
                       </TableCell>
                       <TableCell className="max-w-xs whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
-                        {t.last_error ? (
+                        {taskDetailText(t) ? (
                           <Button
                             type="button"
                             variant="link"
                             onClick={() => {
-                              if (t.last_error) {
-                                setErrorDialogText(t.last_error)
-                              }
+                              setDetailDialog({ title: taskDetailTitle(t), text: taskDetailText(t) })
                             }}
                             className="h-auto max-w-full justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
                           >
-                            <span className="truncate">{t.last_error}</span>
+                            <span className="truncate">{taskDetailText(t)}</span>
                           </Button>
                         ) : (
                           '—'
@@ -337,7 +355,7 @@ function TasksPage() {
                         {timeAgo(t.scheduled_at)}
                       </TableCell>
                       <TableCell className="whitespace-nowrap px-3 py-2">
-                        {t.status === 'dead_letter' && (
+                        {t.status === 'exhausted' && (
                           <Button
                             type="button"
                             variant="outline"
@@ -401,7 +419,7 @@ function TasksPage() {
       <DangerActionAlertDialog
         open={Boolean(retryTarget)}
         onOpenChange={(open) => !open && setRetryTarget(null)}
-        title="Retry dead-letter task?"
+        title="Retry exhausted task?"
         description={retryTarget ? retryTaskDescription(retryTarget) : ''}
         confirmLabel="Retry task"
         pending={Boolean(retryTarget && retryMutation.isPending && retryMutation.variables === retryTarget.id)}
@@ -418,12 +436,17 @@ function TasksPage() {
               { id: 'ref', label: 'Ref', value: `${retryTarget.ref_type}:${retryTarget.ref_id}` },
               { id: 'retries', label: 'Retries', value: `${retryTarget.retry_count}/${retryTarget.max_retries}` },
               { id: 'last-error', label: 'Last error', value: retryTarget.last_error ?? 'None' },
+              { id: 'status-message', label: 'Status message', value: retryTarget.status_message ?? 'None' },
             ]}
           />
         )}
       </DangerActionAlertDialog>
 
-      <DetailTextDialog title="Error Details" text={errorDialogText} onClose={() => setErrorDialogText(null)} />
+      <DetailTextDialog
+        title={detailDialog?.title ?? 'Task Details'}
+        text={detailDialog?.text ?? null}
+        onClose={() => setDetailDialog(null)}
+      />
     </div>
   )
 }
@@ -435,6 +458,6 @@ function retryTaskDescription(task: TaskItem) {
     case 'evict_cache':
       return 'This will requeue cache eviction work and may remove local cached data.'
     default:
-      return 'This will requeue the dead-letter task for background processing.'
+      return 'This will requeue the exhausted task for background processing.'
   }
 }

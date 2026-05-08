@@ -62,7 +62,7 @@ func TestStorageUploadRepo_RecordCompleteResultAndAcceptsUploadingContent(t *tes
 
 	refs, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
 		UploadID:        upload.ID,
-		TaskID:          task.ID,
+		Task:            task,
 		BucketID:        bucket.ID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
@@ -99,6 +99,89 @@ func TestStorageUploadRepo_RecordCompleteResultAndAcceptsUploadingContent(t *tes
 	}
 	if completed.Status != model.TaskStatusCompleted {
 		t.Fatalf("task status = %s, want completed", completed.Status)
+	}
+}
+
+func TestStorageUploadRepo_AcceptCompleteUploadRejectsExpiredTaskClaim(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "expired-accept-claim-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000001000X", 10)
+	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: "upload-expired:" + version.VersionID,
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     3,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	expiredClaim, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, -time.Second)
+	if err != nil {
+		t.Fatalf("ClaimReady expired: %v", err)
+	}
+	if expiredClaim == nil {
+		t.Fatal("ClaimReady expired returned nil")
+	}
+
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceTaskID:    expiredClaim.ID,
+		SourceVersionID: version.VersionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
+		UploadID:        upload.ID,
+		Complete:        true,
+		PieceCID:        strPtr("bafk2bzaceexpiredclaim"),
+		RequestedCopies: 1,
+		RawResultJSON:   []byte(`{"complete":true}`),
+		Copies: []repository.StorageUploadCopyInput{
+			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://primary.example/piece"), IsNewDataSet: true},
+		},
+	}); err != nil {
+		t.Fatalf("RecordUploadResult: %v", err)
+	}
+
+	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+		UploadID:    upload.ID,
+		Task:        expiredClaim,
+		BucketID:    bucket.ID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err == nil {
+		t.Fatal("AcceptCompleteUploadForContent should reject an expired task claim")
+	}
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || gotVersion == nil {
+		t.Fatalf("GetVersionByID: got=%v err=%v", gotVersion, err)
+	}
+	if gotVersion.State != model.ObjectStateUploading || gotVersion.StorageUploadID != nil || gotVersion.PieceCID != nil {
+		t.Fatalf("version after stale accept = state:%s upload:%v piece:%v, want uploading without upload binding", gotVersion.State, gotVersion.StorageUploadID, gotVersion.PieceCID)
+	}
+	gotUpload, err := repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || gotUpload == nil {
+		t.Fatalf("GetByID upload: got=%v err=%v", gotUpload, err)
+	}
+	if gotUpload.AcceptedAt != nil {
+		t.Fatalf("accepted_at after stale accept = %v, want nil", gotUpload.AcceptedAt)
 	}
 }
 
@@ -636,7 +719,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForContentMovesFollowersToR
 		RefID:          independentObjectID,
 		RefVersionID:   independent.VersionID,
 		IdempotencyKey: "upload:" + independent.VersionID,
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     3,
 		ScheduledAt:    time.Now(),
 	}); err != nil {
@@ -736,7 +819,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForVersionCompletesFollower
 		RefID:          followerObjectID,
 		RefVersionID:   follower.VersionID,
 		IdempotencyKey: "upload:" + follower.VersionID,
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     3,
 		ScheduledAt:    time.Now(),
 	}
@@ -929,7 +1012,7 @@ func TestStorageUploadRepo_PartialResultDoesNotBindObjectVersion(t *testing.T) {
 	}
 	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
 		UploadID:    upload.ID,
-		TaskID:      task.ID,
+		Task:        task,
 		BucketID:    bucket.ID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
@@ -1614,14 +1697,21 @@ func seedRunningUploadTask(t *testing.T, repos *repository.Repositories, objectI
 		RefID:          objectID,
 		RefVersionID:   versionID,
 		IdempotencyKey: "upload:" + versionID,
-		Status:         model.TaskStatusRunning,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     3,
 		ScheduledAt:    time.Now(),
 	}
 	if err := repos.Tasks.Create(context.Background(), task); err != nil {
 		t.Fatalf("Create task: %v", err)
 	}
-	return task
+	claimed, err := repos.Tasks.ClaimReady(context.Background(), model.TaskTypeUpload, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimReady: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("ClaimReady returned nil")
+	}
+	return claimed
 }
 
 func acceptTestStorageUploadForVersion(t *testing.T, repos *repository.Repositories, bucketID int64, version *model.ObjectVersion, pieceCID string) int64 {

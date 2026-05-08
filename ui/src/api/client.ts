@@ -255,6 +255,8 @@ export interface TaskItem {
   retry_count: number
   max_retries: number
   last_error?: string
+  status_message?: string
+  wait_reason?: string
   scheduled_at: string
   claimed_at?: string
   completed_at?: string

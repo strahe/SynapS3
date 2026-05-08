@@ -46,15 +46,15 @@ var (
 		Help:      "Total tasks processed by worker type and result",
 	}, []string{"worker", "result"})
 
-	// DeadLetterTotal counts tasks that entered dead-letter status by worker type and task type.
-	DeadLetterTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// TasksExhaustedTotal counts tasks that entered exhausted status by worker type and task type.
+	TasksExhaustedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "synaps3",
 		Subsystem: "worker",
-		Name:      "dead_letter_total",
-		Help:      "Total tasks that entered dead-letter status",
+		Name:      "tasks_exhausted_total",
+		Help:      "Total tasks that entered exhausted status",
 	}, []string{"worker", "task_type"})
 
-	// TaskQueueDepth tracks pending task count by type and status.
+	// TaskQueueDepth tracks active task count by type and status.
 	TaskQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "synaps3",
 		Subsystem: "task",

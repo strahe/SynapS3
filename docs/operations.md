@@ -9,7 +9,7 @@ PutObject -> cache + DB -> worker -> storage provider + Filecoin
 ```
 
 - Writes commit to local cache and metadata before provider upload
-- Upload tasks retry with backoff and move to dead-letter after max retries
+- Upload tasks retry with backoff and move to exhausted after max retries
 - `GetObject` reads from cache first and can retrieve from the provider when metadata is available
 - `DeleteBucket` is disabled; object deletes are soft deletes
 
@@ -22,7 +22,7 @@ Minimum production posture:
 - Store cache data on durable local disk
 - Keep `filecoin.private_key` out of committed config files
 - Keep `filecoin.allow_private_networks = false` unless provider retrieval URLs are trusted
-- Monitor cache usage, task queue depth, worker health, and dead-letter tasks
+- Monitor cache usage, task queue depth, worker health, and exhausted tasks
 
 See [Configuration](configuration.md) for the full production config example.
 
@@ -63,8 +63,8 @@ Key metrics:
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | Cache read behavior |
 | `synaps3_worker_tasks_processed_total` | Worker throughput by result |
 | `synaps3_worker_task_duration_seconds` | Worker task latency |
-| `synaps3_worker_dead_letter_total` | Tasks that exhausted retries |
-| `synaps3_task_queue_depth` | Pending tasks by type and status |
+| `synaps3_worker_tasks_exhausted_total` | Tasks that exhausted retries |
+| `synaps3_task_queue_depth` | Active tasks by type and status |
 | `synaps3_object_state_distribution` | Object counts by lifecycle state |
 
 ## Health
@@ -95,17 +95,17 @@ Workers are unhealthy if they stop completing poll cycles for longer than `3 * p
 
 | Scenario | Recovery |
 | --- | --- |
-| Storage provider unreachable | Restore connectivity, then retry dead-letter tasks |
-| RPC node down | Restore RPC connectivity, then retry dead-letter tasks |
+| Storage provider unreachable | Restore connectivity, then retry exhausted tasks |
+| RPC node down | Restore RPC connectivity, then retry exhausted tasks |
 | Private retrieval URL blocked | Keep blocked by default; enable `filecoin.allow_private_networks` only for trusted private deployments |
 | Database full | Free space or scale the database |
 | Cache disk full | Increase disk, lower `cache.max_size_gb`, or evict data |
 | Process crash | Restart; startup recovery reconciles stale states and orphaned tasks |
 
-List dead-letter tasks:
+List exhausted tasks:
 
 ```bash
-synaps3 admin task list --status dead_letter --limit 100
+synaps3 admin task list --status exhausted --limit 100
 ```
 
 Show task queue counts:

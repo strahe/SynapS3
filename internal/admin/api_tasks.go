@@ -12,22 +12,24 @@ import (
 )
 
 type taskListItem struct {
-	ID           int64                   `json:"id"`
-	Type         string                  `json:"type"`
-	Stage        *string                 `json:"stage,omitempty"`
-	UploadID     *int64                  `json:"upload_id,omitempty"`
-	CopyIndex    *int                    `json:"copy_index,omitempty"`
-	RefType      string                  `json:"ref_type"`
-	RefID        int64                   `json:"ref_id"`
-	RefVersionID string                  `json:"ref_version_id"`
-	Status       string                  `json:"status"`
-	Progress     *uploadProgressResponse `json:"progress,omitempty"`
-	RetryCount   int                     `json:"retry_count"`
-	MaxRetries   int                     `json:"max_retries"`
-	LastError    *string                 `json:"last_error,omitempty"`
-	ScheduledAt  string                  `json:"scheduled_at"`
-	ClaimedAt    *string                 `json:"claimed_at,omitempty"`
-	CompletedAt  *string                 `json:"completed_at,omitempty"`
+	ID            int64                   `json:"id"`
+	Type          string                  `json:"type"`
+	Stage         *string                 `json:"stage,omitempty"`
+	UploadID      *int64                  `json:"upload_id,omitempty"`
+	CopyIndex     *int                    `json:"copy_index,omitempty"`
+	RefType       string                  `json:"ref_type"`
+	RefID         int64                   `json:"ref_id"`
+	RefVersionID  string                  `json:"ref_version_id"`
+	Status        string                  `json:"status"`
+	Progress      *uploadProgressResponse `json:"progress,omitempty"`
+	RetryCount    int                     `json:"retry_count"`
+	MaxRetries    int                     `json:"max_retries"`
+	LastError     *string                 `json:"last_error,omitempty"`
+	StatusMessage *string                 `json:"status_message,omitempty"`
+	WaitReason    *string                 `json:"wait_reason,omitempty"`
+	ScheduledAt   string                  `json:"scheduled_at"`
+	ClaimedAt     *string                 `json:"claimed_at,omitempty"`
+	CompletedAt   *string                 `json:"completed_at,omitempty"`
 }
 
 type taskListResponse struct {
@@ -93,32 +95,8 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 	progressByTaskID := s.taskUploadProgresses(ctx, tasks)
 
 	items := make([]taskListItem, 0, len(tasks))
-	for _, t := range tasks {
-		item := taskListItem{
-			ID:           t.ID,
-			Type:         string(t.Type),
-			Stage:        taskStage(&t),
-			UploadID:     taskPayloadInt64(t.Payload, "upload_id"),
-			CopyIndex:    taskPayloadInt(t.Payload, "copy_index"),
-			RefType:      t.RefType,
-			RefID:        t.RefID,
-			RefVersionID: t.RefVersionID,
-			Status:       string(t.Status),
-			RetryCount:   t.RetryCount,
-			MaxRetries:   t.MaxRetries,
-			LastError:    t.LastError,
-			ScheduledAt:  t.ScheduledAt.Format(time.RFC3339),
-		}
-		if t.ClaimedAt != nil {
-			v := t.ClaimedAt.Format(time.RFC3339)
-			item.ClaimedAt = &v
-		}
-		if t.CompletedAt != nil {
-			v := t.CompletedAt.Format(time.RFC3339)
-			item.CompletedAt = &v
-		}
-		item.Progress = progressByTaskID[t.ID]
-		items = append(items, item)
+	for i := range tasks {
+		items = append(items, taskListItemFromModel(&tasks[i], progressByTaskID[tasks[i].ID]))
 	}
 
 	writeJSON(w, http.StatusOK, taskListResponse{
@@ -127,6 +105,39 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 		Limit:  limit,
 		Offset: offset,
 	})
+}
+
+func taskListItemFromModel(t *model.Task, progress *uploadProgressResponse) taskListItem {
+	item := taskListItem{
+		ID:            t.ID,
+		Type:          string(t.Type),
+		Stage:         taskStage(t),
+		UploadID:      taskPayloadInt64(t.Payload, "upload_id"),
+		CopyIndex:     taskPayloadInt(t.Payload, "copy_index"),
+		RefType:       t.RefType,
+		RefID:         t.RefID,
+		RefVersionID:  t.RefVersionID,
+		Status:        string(t.Status),
+		Progress:      progress,
+		RetryCount:    t.RetryCount,
+		MaxRetries:    t.MaxRetries,
+		LastError:     t.LastError,
+		StatusMessage: t.StatusMessage,
+		ScheduledAt:   t.ScheduledAt.Format(time.RFC3339),
+	}
+	if t.WaitReason != nil {
+		v := string(*t.WaitReason)
+		item.WaitReason = &v
+	}
+	if t.ClaimedAt != nil {
+		v := t.ClaimedAt.Format(time.RFC3339)
+		item.ClaimedAt = &v
+	}
+	if t.CompletedAt != nil {
+		v := t.CompletedAt.Format(time.RFC3339)
+		item.CompletedAt = &v
+	}
+	return item
 }
 
 func taskStage(task *model.Task) *string {

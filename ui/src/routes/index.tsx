@@ -25,11 +25,13 @@ const STATE_COLORS: Record<string, string> = {
 }
 
 const STATUS_COLORS: Record<string, string> = {
-  pending: 'var(--chart-4)',
+  queued: 'var(--chart-4)',
+  scheduled: 'var(--chart-3)',
+  waiting: 'var(--chart-2)',
   running: 'var(--chart-2)',
   completed: 'var(--chart-5)',
   failed: 'var(--destructive)',
-  dead_letter: 'var(--destructive)',
+  exhausted: 'var(--destructive)',
   cancelled: 'var(--muted-foreground)',
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/ui"
@@ -156,8 +157,8 @@ func (s *Server) Run(ctx context.Context) error {
 	} else {
 		mux.HandleFunc("GET /healthz", s.handleHealthz)
 		mux.Handle("GET /metrics", promhttp.Handler())
-		mux.HandleFunc("GET /admin/dead-letters", s.handleListDeadLetters)
-		mux.HandleFunc("POST /admin/dead-letters/{id}/retry", s.handleRetryDeadLetter)
+		mux.HandleFunc("GET /admin/exhausted-tasks", s.handleListExhausted)
+		mux.HandleFunc("POST /admin/exhausted-tasks/{id}/retry", s.handleRetryExhausted)
 
 		// Dashboard API
 		mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
@@ -178,7 +179,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
 		mux.HandleFunc("GET /api/v1/tasks/{id}/ref-detail", s.handleAPITaskRefDetail)
-		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryDeadLetter) // only retries dead_letter tasks
+		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryExhausted) // only retries exhausted tasks
 		mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
 		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
 		mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
@@ -302,55 +303,35 @@ func (s *Server) cacheRootDir() string {
 	return ""
 }
 
-func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
-	const maxDeadLetterLimit = 1000
+func (s *Server) handleListExhausted(w http.ResponseWriter, r *http.Request) {
+	const maxExhaustedLimit = 1000
 	limit := 100
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
 	}
-	if limit > maxDeadLetterLimit {
-		limit = maxDeadLetterLimit
+	if limit > maxExhaustedLimit {
+		limit = maxExhaustedLimit
 	}
 
-	tasks, err := s.repos.Tasks.ListDeadLetters(r.Context(), limit)
+	tasks, err := s.repos.Tasks.ListExhausted(r.Context(), limit)
 	if err != nil {
-		s.logger.Error("failed to list dead-letter tasks", "error", err)
+		s.logger.Error("failed to list exhausted tasks", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
 
 	// Map to DTO to ensure consistent snake_case JSON and avoid exposing internal fields.
 	items := make([]taskListItem, 0, len(tasks))
-	for _, t := range tasks {
-		item := taskListItem{
-			ID:           t.ID,
-			Type:         string(t.Type),
-			RefType:      t.RefType,
-			RefID:        t.RefID,
-			RefVersionID: t.RefVersionID,
-			Status:       string(t.Status),
-			RetryCount:   t.RetryCount,
-			MaxRetries:   t.MaxRetries,
-			LastError:    t.LastError,
-			ScheduledAt:  t.ScheduledAt.Format(time.RFC3339),
-		}
-		if t.ClaimedAt != nil {
-			v := t.ClaimedAt.Format(time.RFC3339)
-			item.ClaimedAt = &v
-		}
-		if t.CompletedAt != nil {
-			v := t.CompletedAt.Format(time.RFC3339)
-			item.CompletedAt = &v
-		}
-		items = append(items, item)
+	for i := range tasks {
+		items = append(items, taskListItemFromModel(&tasks[i], nil))
 	}
 
 	writeJSON(w, http.StatusOK, items)
 }
 
-func (s *Server) handleRetryDeadLetter(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRetryExhausted(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -358,10 +339,10 @@ func (s *Server) handleRetryDeadLetter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repos.Tasks.RetryDeadLetter(r.Context(), id); err != nil {
-		s.logger.Error("failed to retry dead-letter task", "taskID", id, "error", err)
+	if err := s.repos.Tasks.RetryExhausted(r.Context(), id); err != nil {
+		s.logger.Error("failed to retry exhausted task", "taskID", id, "error", err)
 		if errors.Is(err, repository.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found or not in dead_letter state"})
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found or not in exhausted state"})
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		}
@@ -395,6 +376,9 @@ func (s *Server) refreshMetrics(ctx context.Context) {
 	} else {
 		currentTaskLabels := make(map[[2]string]struct{}, len(taskCounts))
 		for _, tc := range taskCounts {
+			if !isActiveTaskStatus(tc.Status) {
+				continue
+			}
 			key := [2]string{tc.Type, tc.Status}
 			currentTaskLabels[key] = struct{}{}
 			TaskQueueDepth.WithLabelValues(tc.Type, tc.Status).Set(float64(tc.Count))
@@ -423,5 +407,17 @@ func (s *Server) refreshMetrics(ctx context.Context) {
 			}
 		}
 		s.prevObjectLabels = currentObjLabels
+	}
+}
+
+func isActiveTaskStatus(status string) bool {
+	switch status {
+	case string(model.TaskStatusQueued),
+		string(model.TaskStatusScheduled),
+		string(model.TaskStatusWaiting),
+		string(model.TaskStatusRunning):
+		return true
+	default:
+		return false
 	}
 }

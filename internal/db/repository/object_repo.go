@@ -321,7 +321,7 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 					WHERE active_task.ref_type = ?
 					  AND active_task.ref_version_id = object_version.version_id
 					  AND active_task.type = ?
-					  AND active_task.status IN (?, ?)
+					  AND active_task.status IN (?)
 				)
 			)
 		)`,
@@ -330,7 +330,7 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 			model.ObjectStateCommitting,
 			model.StorageUploadCopyStatusPieceReady, model.StorageUploadCopyStatusCommitting, model.StorageUploadCopyStatusCommitted,
 			model.ObjectStateCached, model.ObjectStateUploading,
-			"object", model.TaskTypeUpload, model.TaskStatusPending, model.TaskStatusRunning,
+			"object", model.TaskTypeUpload, bun.List(activeTaskStatuses()),
 		).
 		OrderExpr("object_version.created_at DESC").
 		OrderExpr("object_version.version_id DESC").
@@ -574,7 +574,7 @@ func (r *BunObjectRepo) FailUploadingContentFollowers(ctx context.Context, bucke
 					WHERE tasks.ref_type = ?
 					  AND tasks.ref_version_id = object_versions.version_id
 					  AND tasks.type = ?
-					  AND tasks.status IN (?, ?)
+					  AND tasks.status IN (?)
 				)
 				AND NOT EXISTS (
 					SELECT 1 FROM storage_uploads AS active_upload
@@ -595,8 +595,7 @@ func (r *BunObjectRepo) FailUploadingContentFollowers(ctx context.Context, bucke
 			leaderVersionID,
 			"object",
 			model.TaskTypeUpload,
-			model.TaskStatusPending,
-			model.TaskStatusRunning,
+			bun.List(activeTaskStatuses()),
 			bun.List(activeUploadStatuses()),
 		).Scan(ctx, &refs)
 		if err != nil {

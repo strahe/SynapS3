@@ -294,14 +294,14 @@ func TestRefreshMetrics(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Seed a pending task.
+	// Seed a queued task.
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
 		RefType:        "object",
 		RefID:          1,
 		RefVersionID:   "01J000000000000000TASK001",
 		IdempotencyKey: "test-refresh-task",
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		ScheduledAt:    time.Now(),
 	}
 	if err := repos.Tasks.Create(ctx, task); err != nil {

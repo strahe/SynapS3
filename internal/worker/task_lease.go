@@ -6,17 +6,18 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 )
 
 const (
 	taskLeaseOperationTimeout = 2 * time.Second
-	interruptedTaskReason     = "worker interrupted"
 )
 
-func startTaskLeaseRenewal(logger *slog.Logger, repos *repository.Repositories, taskID int64, leaseTTL time.Duration) func() {
-	if repos == nil || repos.Tasks == nil || taskID == 0 || leaseTTL <= 0 {
+func startTaskLeaseRenewal(logger *slog.Logger, repos *repository.Repositories, task *model.Task, leaseTTL time.Duration) func() {
+	if repos == nil || repos.Tasks == nil || task == nil || task.ID == 0 || leaseTTL <= 0 {
 		return func() {}
 	}
+	taskID := task.ID
 	renewCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -29,7 +30,7 @@ func startTaskLeaseRenewal(logger *slog.Logger, repos *repository.Repositories, 
 				return
 			case <-ticker.C:
 				opCtx, opCancel := context.WithTimeout(context.Background(), taskLeaseOperationTimeout)
-				err := repos.Tasks.RenewLease(opCtx, taskID, leaseTTL)
+				err := repos.Tasks.RenewLease(opCtx, task, leaseTTL)
 				opCancel()
 				if err != nil && logger != nil {
 					logger.Warn("failed to renew task lease", "taskID", taskID, "error", err)
@@ -54,13 +55,14 @@ func taskLeaseRenewInterval(leaseTTL time.Duration) time.Duration {
 	return interval
 }
 
-func releaseTaskOnWorkerShutdown(ctx context.Context, logger *slog.Logger, repos *repository.Repositories, taskID int64) {
-	if ctx.Err() == nil || repos == nil || repos.Tasks == nil || taskID == 0 {
+func releaseTaskOnWorkerShutdown(ctx context.Context, logger *slog.Logger, repos *repository.Repositories, task *model.Task) {
+	if ctx.Err() == nil || repos == nil || repos.Tasks == nil || task == nil || task.ID == 0 {
 		return
 	}
+	taskID := task.ID
 	opCtx, cancel := context.WithTimeout(context.Background(), taskLeaseOperationTimeout)
 	defer cancel()
-	if err := repos.Tasks.DeferRunning(opCtx, taskID, 0, interruptedTaskReason); err != nil && logger != nil {
+	if err := repos.Tasks.ReleaseRunning(opCtx, task); err != nil && logger != nil {
 		logger.Debug("skipped task release on worker shutdown", "taskID", taskID, "error", err)
 	}
 }

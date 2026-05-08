@@ -73,7 +73,7 @@ func (e *Evictor) runSlot(ctx context.Context) {
 		}
 
 		e.recordTick()
-		task, err := e.repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, e.leaseTTL)
+		task, err := e.repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, e.leaseTTL)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -94,11 +94,11 @@ func (e *Evictor) runSlot(ctx context.Context) {
 		e.recordWorkStarted()
 		func() {
 			defer e.recordWorkFinished()
-			stopLeaseRenewal := startTaskLeaseRenewal(e.logger, e.repos, task.ID, e.leaseTTL)
+			stopLeaseRenewal := startTaskLeaseRenewal(e.logger, e.repos, task, e.leaseTTL)
 			defer stopLeaseRenewal()
 			e.processTask(ctx, task)
 		}()
-		releaseTaskOnWorkerShutdown(ctx, e.logger, e.repos, task.ID)
+		releaseTaskOnWorkerShutdown(ctx, e.logger, e.repos, task)
 	}
 }
 
@@ -140,15 +140,15 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	version, err := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
 	if err != nil || version == nil {
 		logger.Warn("object version not found for evict task", "error", err)
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "object not found")
+		_ = e.repos.Tasks.FailRunning(ctx, task, "object not found")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
 	if version.State == model.ObjectStateReplicating {
-		if err := e.repos.Tasks.DeferRunning(ctx, task.ID, replicatingEvictDeferDelay, "waiting for all copies to commit"); err != nil {
+		if err := e.repos.Tasks.WaitRunning(ctx, task, model.TaskWaitReasonDependency, "waiting for all copies to commit", replicatingEvictDeferDelay); err != nil {
 			logger.Error("failed to defer replicating cache eviction", "error", err)
-			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
+			_ = e.repos.Tasks.FailRunning(ctx, task, err.Error())
 			admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 			return
 		}
@@ -158,26 +158,26 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	}
 	if version.State != model.ObjectStateStored {
 		logger.Warn("object version not in stored state", "state", version.State)
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "not stored")
+		_ = e.repos.Tasks.FailRunning(ctx, task, "not stored")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 	if version.StorageUploadID == nil {
 		logger.Error("object version has no accepted upload, refusing to evict")
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "no accepted upload")
+		_ = e.repos.Tasks.FailRunning(ctx, task, "no accepted upload")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 	copies, err := e.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
 	if err != nil {
 		logger.Error("storage upload copy lookup failed", "error", err)
-		_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
+		_ = e.repos.Tasks.FailRunning(ctx, task, err.Error())
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 	if len(copies) == 0 {
 		logger.Error("object version has no readable upload copies, refusing to evict")
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "no readable upload copies")
+		_ = e.repos.Tasks.FailRunning(ctx, task, "no readable upload copies")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
@@ -185,23 +185,14 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	bucket, err := e.repos.Buckets.GetByID(ctx, version.BucketID)
 	if err != nil || bucket == nil {
 		logger.Error("bucket not found", "bucketID", version.BucketID, "error", err)
-		_ = e.repos.Tasks.Fail(ctx, task.ID, "bucket not found")
+		_ = e.repos.Tasks.FailRunning(ctx, task, "bucket not found")
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
 	if err := e.cache.Delete(ctx, bucket.Name, version.CacheKey); err != nil {
 		logger.Warn("cache delete failed", "error", err)
-		if task.RetryCount+1 >= task.MaxRetries {
-			if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
-				logger.Error("failed to mark task as dead-letter", "error", ftErr)
-			} else {
-				admin.DeadLetterTotal.WithLabelValues("evictor", string(model.TaskTypeEvictCache)).Inc()
-			}
-		} else {
-			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
-			_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
-		}
+		scheduleTaskRetry(ctx, e.repos, task, "evictor", logger, err)
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
@@ -211,26 +202,19 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
 		logger.Error("state transition stored→cache_evicted failed", "error", err)
 		if latest, latestErr := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID); latestErr == nil && latest != nil && latest.State == model.ObjectStateCacheEvicted {
-			_ = e.repos.Tasks.Complete(ctx, task.ID)
-			admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
+			if !completeWorkerTask(ctx, e.repos, task, "evictor", logger) {
+				return
+			}
 			logger.Info("cache eviction already recorded")
 			return
 		}
-		if task.RetryCount+1 >= task.MaxRetries {
-			if ftErr := e.repos.Tasks.FailTerminal(ctx, task.ID, err.Error()); ftErr != nil {
-				logger.Error("failed to mark task as dead-letter", "error", ftErr)
-			} else {
-				admin.DeadLetterTotal.WithLabelValues("evictor", string(model.TaskTypeEvictCache)).Inc()
-			}
-		} else {
-			_ = e.repos.Tasks.Fail(ctx, task.ID, err.Error())
-			_ = e.repos.Tasks.Requeue(ctx, task.ID, retryDelay(task.RetryCount))
-		}
+		scheduleTaskRetry(ctx, e.repos, task, "evictor", logger, err)
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
 
-	_ = e.repos.Tasks.Complete(ctx, task.ID)
-	admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
+	if !completeWorkerTask(ctx, e.repos, task, "evictor", logger) {
+		return
+	}
 	logger.Info("cache eviction completed")
 }

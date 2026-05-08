@@ -50,12 +50,14 @@ export function taskStatusTone(status: string): StatusTone {
   switch (status) {
     case 'completed':
       return 'success'
-    case 'pending':
+    case 'queued':
+    case 'scheduled':
       return 'warning'
     case 'running':
+    case 'waiting':
       return 'info'
     case 'failed':
-    case 'dead_letter':
+    case 'exhausted':
       return 'danger'
     default:
       return 'neutral'

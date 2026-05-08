@@ -407,7 +407,7 @@ func TestObjectRepo_FindReusableActiveUploadVersionRequiresActiveTask(t *testing
 		RefID:          version.ObjectID,
 		RefVersionID:   version.VersionID,
 		IdempotencyKey: "upload:" + version.VersionID,
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -663,7 +663,7 @@ func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t 
 			RefID:          independentObjID,
 			RefVersionID:   independent.VersionID,
 			IdempotencyKey: "upload:" + independent.VersionID,
-			Status:         model.TaskStatusPending,
+			Status:         model.TaskStatusQueued,
 			MaxRetries:     1,
 			ScheduledAt:    time.Now(),
 		},

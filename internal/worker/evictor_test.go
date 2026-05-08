@@ -281,25 +281,31 @@ func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
 			if err != nil || current == nil {
 				continue
 			}
-			if current.Status != model.TaskStatusPending {
+			if current.Status != model.TaskStatusQueued && current.Status != model.TaskStatusWaiting {
 				if current.Status != model.TaskStatusRunning {
 					gotTask = current
 				}
 				continue
 			}
-			if current.LastError != nil && strings.Contains(*current.LastError, "waiting for all copies") {
+			if current.StatusMessage != nil && strings.Contains(*current.StatusMessage, "waiting for all copies") {
 				gotTask = current
 			}
 		}
 	}
-	if gotTask.Status != model.TaskStatusPending {
-		t.Fatalf("task status = %s, want pending deferred task", gotTask.Status)
+	if gotTask.Status != model.TaskStatusWaiting {
+		t.Fatalf("task status = %s, want waiting deferred task", gotTask.Status)
 	}
 	if gotTask.RetryCount != 0 {
 		t.Fatalf("task retry_count = %d, want 0", gotTask.RetryCount)
 	}
-	if gotTask.LastError == nil || !strings.Contains(*gotTask.LastError, "waiting for all copies") {
-		t.Fatalf("task last_error = %v, want waiting-for-copies reason", gotTask.LastError)
+	if gotTask.LastError != nil {
+		t.Fatalf("task last_error = %v, want nil", gotTask.LastError)
+	}
+	if gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonDependency {
+		t.Fatalf("task wait_reason = %v, want dependency", gotTask.WaitReason)
+	}
+	if gotTask.StatusMessage == nil || !strings.Contains(*gotTask.StatusMessage, "waiting for all copies") {
+		t.Fatalf("task status_message = %v, want waiting-for-copies reason", gotTask.StatusMessage)
 	}
 	if !gotTask.ScheduledAt.After(originalScheduledAt) {
 		t.Fatalf("task scheduled_at = %s, want after %s", gotTask.ScheduledAt, originalScheduledAt)
@@ -333,7 +339,7 @@ func TestEvictor_MissingVersion(t *testing.T) {
 		RefID:          objID,
 		RefVersionID:   "01J000000000000000MISSING1",
 		IdempotencyKey: "evict_cache:missing",
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -413,8 +419,8 @@ func TestEvictor_CacheDeleteFailureLeavesObjectUnchangedAndKeepsTaskRecoverable(
 		wantStatus  model.TaskStatus
 		wantRetries int
 	}{
-		{name: "requeue", retryCount: 0, wantStatus: model.TaskStatusPending, wantRetries: 1},
-		{name: "dead letter", retryCount: 4, wantStatus: model.TaskStatusDeadLetter, wantRetries: 5},
+		{name: "requeue", retryCount: 0, wantStatus: model.TaskStatusScheduled, wantRetries: 1},
+		{name: "exhausted", retryCount: 4, wantStatus: model.TaskStatusExhausted, wantRetries: 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mc := &testutil.MockCache{
@@ -431,7 +437,7 @@ func TestEvictor_CacheDeleteFailureLeavesObjectUnchangedAndKeepsTaskRecoverable(
 			task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, tc.retryCount)
 
 			evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
-			if tc.wantStatus == model.TaskStatusPending {
+			if tc.wantStatus == model.TaskStatusScheduled {
 				runWorkerUntilTaskRetryCount(t, env, evictor, task.ID, tc.wantRetries, 5*time.Second)
 			} else {
 				runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)

@@ -139,7 +139,8 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		Model((*model.Task)(nil)).
 		IfNotExists().
 		ColumnExpr(`CONSTRAINT chk_tasks_type CHECK ("type" IN ('upload', 'evict_cache'))`).
-		ColumnExpr("CONSTRAINT chk_tasks_status CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'dead_letter'))").
+		ColumnExpr("CONSTRAINT chk_tasks_status CHECK (status IN ('queued', 'scheduled', 'running', 'waiting', 'completed', 'failed', 'exhausted', 'cancelled'))").
+		ColumnExpr("CONSTRAINT chk_tasks_wait_reason CHECK (wait_reason IS NULL OR (status = 'waiting' AND wait_reason IN ('dependency', 'external_confirmation')))").
 		ColumnExpr("CONSTRAINT chk_tasks_ref_type CHECK (ref_type IN ('object', 'bucket'))").
 		ColumnExpr("CONSTRAINT chk_tasks_object_ref_version CHECK (ref_type <> 'object' OR ref_version_id <> '')").
 		ColumnExpr("CONSTRAINT chk_tasks_retry_count CHECK (retry_count >= 0)").

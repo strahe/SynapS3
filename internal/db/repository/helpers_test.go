@@ -40,6 +40,13 @@ func testDB(t *testing.T) *bun.DB {
 	return db
 }
 
+func mustExec(t *testing.T, db *bun.DB, query string, args ...interface{}) {
+	t.Helper()
+	if _, err := db.NewRaw(query, args...).Exec(context.Background()); err != nil {
+		t.Fatalf("exec %q: %v", query, err)
+	}
+}
+
 func onChainID(t *testing.T, value string) types.OnChainID {
 	t.Helper()
 	id, err := types.ParseOnChainID("test id", value)

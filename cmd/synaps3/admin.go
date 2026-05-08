@@ -421,7 +421,7 @@ func adminTaskCommand() *cli.Command {
 			},
 			{
 				Name:      "retry",
-				Usage:     "retry a dead-letter task",
+				Usage:     "retry an exhausted task",
 				ArgsUsage: "<id>",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					taskID, err := requireSingleArg(cmd, "task id")
@@ -775,17 +775,19 @@ type adminTaskListResponse struct {
 }
 
 type adminTaskItem struct {
-	ID           int64   `json:"id"`
-	Type         string  `json:"type"`
-	Stage        *string `json:"stage,omitempty"`
-	RefType      string  `json:"ref_type"`
-	RefID        int64   `json:"ref_id"`
-	RefVersionID string  `json:"ref_version_id"`
-	Status       string  `json:"status"`
-	RetryCount   int     `json:"retry_count"`
-	MaxRetries   int     `json:"max_retries"`
-	LastError    *string `json:"last_error,omitempty"`
-	ScheduledAt  string  `json:"scheduled_at"`
+	ID            int64   `json:"id"`
+	Type          string  `json:"type"`
+	Stage         *string `json:"stage,omitempty"`
+	RefType       string  `json:"ref_type"`
+	RefID         int64   `json:"ref_id"`
+	RefVersionID  string  `json:"ref_version_id"`
+	Status        string  `json:"status"`
+	RetryCount    int     `json:"retry_count"`
+	MaxRetries    int     `json:"max_retries"`
+	LastError     *string `json:"last_error,omitempty"`
+	StatusMessage *string `json:"status_message,omitempty"`
+	WaitReason    *string `json:"wait_reason,omitempty"`
+	ScheduledAt   string  `json:"scheduled_at"`
 }
 
 type adminTaskStatusCount struct {
@@ -1207,24 +1209,35 @@ func writeAdminTasksTable(w io.Writer, tasks []adminTaskItem) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "ID\tTYPE\tSTAGE\tSTATUS\tRETRIES\tREF\tSCHEDULED\tLAST_ERROR")
+	_, _ = fmt.Fprintln(tw, "ID\tTYPE\tSTAGE\tSTATUS\tRETRIES\tREF\tSCHEDULED\tDETAILS")
 	for _, task := range tasks {
 		stage := ""
 		if task.Stage != nil {
 			stage = *task.Stage
 		}
-		lastErr := ""
-		if task.LastError != nil {
-			lastErr = *task.LastError
-		}
+		details := adminTaskDetails(task)
 		ref := task.RefType + ":" + strconv.FormatInt(task.RefID, 10)
 		if task.RefVersionID != "" {
 			ref += ":" + task.RefVersionID
 		}
 		retries := fmt.Sprintf("%d/%d", task.RetryCount, task.MaxRetries)
-		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", task.ID, task.Type, stage, task.Status, retries, ref, task.ScheduledAt, lastErr)
+		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", task.ID, task.Type, stage, task.Status, retries, ref, task.ScheduledAt, details)
 	}
 	return tw.Flush()
+}
+
+func adminTaskDetails(task adminTaskItem) string {
+	switch {
+	case task.StatusMessage != nil && *task.StatusMessage != "":
+		if task.WaitReason != nil && *task.WaitReason != "" {
+			return *task.WaitReason + ": " + *task.StatusMessage
+		}
+		return *task.StatusMessage
+	case task.LastError != nil:
+		return *task.LastError
+	default:
+		return ""
+	}
 }
 
 func writeAdminTaskStatsTable(w io.Writer, stats []adminTaskStatusCount) error {

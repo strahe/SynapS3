@@ -21,21 +21,21 @@ func TestTaskLeaseRenewalExtendsLeaseUntilStopped(t *testing.T) {
 		RefID:          1,
 		RefVersionID:   "01J0000000000000000000LEASE",
 		IdempotencyKey: "upload:lease-renewal",
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 	}
 	if err := repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	claimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, 30*time.Millisecond)
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 30*time.Millisecond)
 	if err != nil {
-		t.Fatalf("ClaimPending: %v", err)
+		t.Fatalf("ClaimReady: %v", err)
 	}
 	if claimed == nil || claimed.LeaseUntil == nil {
 		t.Fatal("expected claimed task with lease")
 	}
 	oldLeaseUntil := *claimed.LeaseUntil
 
-	stop := startTaskLeaseRenewal(nil, repos, claimed.ID, 30*time.Millisecond)
+	stop := startTaskLeaseRenewal(nil, repos, claimed, 30*time.Millisecond)
 	defer stop()
 
 	deadline := time.Now().Add(300 * time.Millisecond)

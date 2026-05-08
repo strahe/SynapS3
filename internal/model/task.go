@@ -18,12 +18,23 @@ const (
 type TaskStatus string
 
 const (
-	TaskStatusPending    TaskStatus = "pending"
-	TaskStatusRunning    TaskStatus = "running"
-	TaskStatusCompleted  TaskStatus = "completed"
-	TaskStatusFailed     TaskStatus = "failed"
-	TaskStatusCancelled  TaskStatus = "cancelled"
-	TaskStatusDeadLetter TaskStatus = "dead_letter"
+	TaskStatusQueued    TaskStatus = "queued"
+	TaskStatusScheduled TaskStatus = "scheduled"
+	TaskStatusRunning   TaskStatus = "running"
+	TaskStatusWaiting   TaskStatus = "waiting"
+	TaskStatusCompleted TaskStatus = "completed"
+	TaskStatusFailed    TaskStatus = "failed"
+	TaskStatusExhausted TaskStatus = "exhausted"
+	TaskStatusCancelled TaskStatus = "cancelled"
+)
+
+// TaskWaitReason identifies why a task is waiting without treating the wait as
+// an error.
+type TaskWaitReason string
+
+const (
+	TaskWaitReasonDependency           TaskWaitReason = "dependency"
+	TaskWaitReasonExternalConfirmation TaskWaitReason = "external_confirmation"
 )
 
 // Task represents an async job in the DB-backed queue with lease semantics.
@@ -38,10 +49,12 @@ type Task struct {
 	RefVersionID   string                 `bun:",notnull"`
 	IdempotencyKey string                 `bun:",unique,notnull"`
 	Payload        map[string]interface{} `bun:"type:jsonb"`
-	Status         TaskStatus             `bun:",notnull,default:'pending'"`
+	Status         TaskStatus             `bun:",notnull,default:'queued'"`
 	RetryCount     int                    `bun:",notnull,default:0"`
 	MaxRetries     int                    `bun:",notnull,default:5"`
 	LastError      *string                `bun:",nullzero"`
+	StatusMessage  *string                `bun:",nullzero"`
+	WaitReason     *TaskWaitReason        `bun:",nullzero"`
 	ScheduledAt    time.Time              `bun:",nullzero,notnull,default:current_timestamp"`
 	ClaimedAt      *time.Time             `bun:",nullzero"`
 	LeaseUntil     *time.Time             `bun:",nullzero"`

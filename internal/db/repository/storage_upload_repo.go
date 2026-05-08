@@ -623,7 +623,7 @@ func (r *BunStorageUploadRepo) BindPrimaryCommittedUploadForContent(ctx context.
 						WHERE active_task.ref_type = 'object'
 						  AND active_task.ref_version_id = object_versions.version_id
 						  AND active_task.type = ?
-						  AND active_task.status IN (?, ?)
+						  AND active_task.status IN (?)
 					)
 				)
 			  )
@@ -634,7 +634,7 @@ func (r *BunStorageUploadRepo) BindPrimaryCommittedUploadForContent(ctx context.
 			upload.SourceVersionID, model.ObjectStateCommitting, model.ObjectStateFailed,
 			model.ObjectStateUploading,
 			input.UploadID,
-			model.TaskTypeUpload, model.TaskStatusPending, model.TaskStatusRunning,
+			model.TaskTypeUpload, bun.List(activeTaskStatuses()),
 		).Scan(ctx, &refs)
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("binding primary committed upload for content: %w", err)
@@ -1009,7 +1009,7 @@ func (r *BunStorageUploadRepo) AcceptCompleteUploadForContent(ctx context.Contex
 					RefID:          ref.ObjectID,
 					RefVersionID:   ref.VersionID,
 					IdempotencyKey: "evict_cache:" + ref.VersionID,
-					Status:         model.TaskStatusPending,
+					Status:         model.TaskStatusQueued,
 					MaxRetries:     input.EvictMaxRetries,
 					ScheduledAt:    now,
 				}
@@ -1018,7 +1018,7 @@ func (r *BunStorageUploadRepo) AcceptCompleteUploadForContent(ctx context.Contex
 				}
 			}
 		}
-		if err := completeTaskIfRunning(ctx, db, input.TaskID, now); err != nil {
+		if err := completeTaskIfRunning(ctx, db, input.Task, now); err != nil {
 			return err
 		}
 		_, err = db.NewUpdate().
@@ -1392,7 +1392,7 @@ func handleNoAcceptedVersions(ctx context.Context, db bun.IDB, upload *model.Sto
 	}
 	if version.StorageUploadID != nil && *version.StorageUploadID == upload.ID &&
 		(version.State == model.ObjectStateStored || version.State == model.ObjectStateCacheEvicted) {
-		if err := completeTaskIfRunning(ctx, db, input.TaskID, now); err != nil {
+		if err := completeTaskIfRunning(ctx, db, input.Task, now); err != nil {
 			return err
 		}
 		_, err := db.NewUpdate().
@@ -1408,7 +1408,7 @@ func handleNoAcceptedVersions(ctx context.Context, db bun.IDB, upload *model.Sto
 		return nil
 	}
 	if version.StorageUploadID != nil && (version.State == model.ObjectStateStored || version.State == model.ObjectStateCacheEvicted) {
-		if err := completeTaskIfRunning(ctx, db, input.TaskID, now); err != nil {
+		if err := completeTaskIfRunning(ctx, db, input.Task, now); err != nil {
 			return err
 		}
 		_, err := db.NewUpdate().
@@ -1426,7 +1426,14 @@ func handleNoAcceptedVersions(ctx context.Context, db bun.IDB, upload *model.Sto
 	return fmt.Errorf("no object versions matched content: %w", ErrNotFound)
 }
 
-func completeTaskIfRunning(ctx context.Context, db bun.IDB, taskID int64, now time.Time) error {
+func completeTaskIfRunning(ctx context.Context, db bun.IDB, task *model.Task, now time.Time) error {
+	taskID, claimedAt, err := runningTaskClaim(task)
+	if err != nil {
+		if task == nil || task.ID == 0 {
+			return nil
+		}
+		return err
+	}
 	if taskID == 0 {
 		return nil
 	}
@@ -1434,7 +1441,15 @@ func completeTaskIfRunning(ctx context.Context, db bun.IDB, taskID int64, now ti
 		Model((*model.Task)(nil)).
 		Set("status = ?", model.TaskStatusCompleted).
 		Set("completed_at = ?", now).
+		Set("last_error = NULL").
+		Set("wait_reason = NULL").
+		Set("status_message = NULL").
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
 		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
+		Where("claimed_at = ?", claimedAt).
+		Where("lease_until IS NOT NULL AND lease_until > ?", now).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("completing upload task: %w", err)
@@ -1464,8 +1479,14 @@ func completeUploadTasksForVersion(ctx context.Context, db bun.IDB, versionID st
 		Model((*model.Task)(nil)).
 		Set("status = ?", model.TaskStatusCompleted).
 		Set("completed_at = ?", now).
+		Set("last_error = NULL").
+		Set("wait_reason = NULL").
+		Set("status_message = NULL").
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
 		Where("ref_type = ? AND ref_version_id = ? AND type = ?", "object", versionID, model.TaskTypeUpload).
-		Where("status IN (?, ?)", model.TaskStatusPending, model.TaskStatusRunning).
+		Where("status IN (?)", bun.List(activeTaskStatuses())).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("completing upload tasks for bound version: %w", err)

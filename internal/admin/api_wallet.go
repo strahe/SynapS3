@@ -169,7 +169,7 @@ func (s *Server) handleAPIWallet(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		switch tc.Status {
-		case string(model.TaskStatusPending), string(model.TaskStatusRunning):
+		case string(model.TaskStatusQueued), string(model.TaskStatusScheduled), string(model.TaskStatusWaiting), string(model.TaskStatusRunning):
 			biz.OnchainTasksPending += int(tc.Count)
 		case string(model.TaskStatusCompleted):
 			biz.OnchainTasksCompleted += int(tc.Count)

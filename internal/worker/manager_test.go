@@ -54,13 +54,13 @@ func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), false)
 	mgr.Start(ctx)
 
-	// Task should be back to pending
+	// Task should be back to queued.
 	got, err := repos.Tasks.GetByID(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("getting task: %v", err)
 	}
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task status pending after lease release, got %s", got.Status)
+	if got.Status != model.TaskStatusQueued {
+		t.Errorf("expected task status queued after lease release, got %s", got.Status)
 	}
 }
 
@@ -141,7 +141,7 @@ func TestManager_RecoverOnStartup_DoesNotResetStagedUploadingState(t *testing.T)
 	if got.State != model.ObjectStateUploading {
 		t.Errorf("expected object to remain uploading, got %s", got.State)
 	}
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusPending), 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
 		t.Fatalf("List prepare_upload tasks: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestManager_RecoverOnStartup_RequeuesOrphanCommittingState(t *testing.T) {
 	if got.State != model.ObjectStateUploading {
 		t.Fatalf("object state = %s, want uploading", got.State)
 	}
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusPending), 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
 		t.Fatalf("List prepare_upload tasks: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "primary_commit", string(model.TaskStatusPending), 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "primary_commit", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
 		t.Fatalf("List primary_commit tasks: %v", err)
 	}
@@ -322,9 +322,9 @@ func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *test
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	claimed, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimPending: %v", err)
+		t.Fatalf("ClaimReady: %v", err)
 	}
 	if claimed == nil {
 		t.Fatal("expired primary_commit task was not claimable after startup recovery")
@@ -398,7 +398,7 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ensure_dataset", string(model.TaskStatusPending), 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ensure_dataset", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
 		t.Fatalf("List ensure_dataset tasks: %v", err)
 	}
@@ -438,7 +438,7 @@ func TestManager_RecoverOnStartup_ReconcilesAllStagedUploads(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusPending), 200, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusQueued), 200, 0)
 	if err != nil {
 		t.Fatalf("List prepare_upload tasks: %v", err)
 	}
@@ -475,7 +475,7 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	mgr.Start(ctx)
 
 	// Claim the task created by reconciliation
-	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming task: %v", err)
 	}
@@ -570,7 +570,7 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 		RefID:          objID,
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -583,7 +583,7 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 	mgr.Start(ctx)
 
 	// Claim the task — should be exactly one (the pre-existing one)
-	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming task: %v", err)
 	}
@@ -595,7 +595,7 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 	}
 
 	// No second task should be claimable
-	dup, _ := repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	dup, _ := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if dup != nil {
 		t.Error("expected no duplicate task after idempotency dedup")
 	}
@@ -612,7 +612,7 @@ func TestManager_ReconcileTasks_AutoEvictGuard(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), false)
 	mgr.Start(ctx)
 
-	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming evict task: %v", err)
 	}
@@ -632,7 +632,7 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming evict task: %v", err)
 	}
@@ -711,7 +711,7 @@ func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	task, err := repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming evict task: %v", err)
 	}

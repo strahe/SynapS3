@@ -425,8 +425,8 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 			switch {
 			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/tasks":
 				sawList = true
-				if got := r.URL.Query().Get("status"); got != "dead_letter" {
-					t.Fatalf("status query = %q, want dead_letter", got)
+				if got := r.URL.Query().Get("status"); got != "exhausted" {
+					t.Fatalf("status query = %q, want exhausted", got)
 				}
 				if got := r.URL.Query().Get("limit"); got != "50" {
 					t.Fatalf("limit query = %q, want 50", got)
@@ -444,7 +444,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "list", "--status", "dead_letter", "--limit", "50"}); err != nil {
+		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "list", "--status", "exhausted", "--limit", "50"}); err != nil {
 			t.Fatalf("task list: %v\n%s", err, out)
 		}
 		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "retry", "42"}); err != nil {
@@ -520,7 +520,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 					"ref_type":       "object",
 					"ref_id":         11,
 					"ref_version_id": "version-1",
-					"status":         "dead_letter",
+					"status":         "exhausted",
 					"retry_count":    5,
 					"max_retries":    5,
 					"scheduled_at":   "2026-05-05T10:00:00Z",
@@ -538,6 +538,44 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		}
 		if !strings.Contains(out, "object:11:version-1") {
 			t.Fatalf("task output missing version id:\n%s", out)
+		}
+	})
+
+	t.Run("task list shows waiting status details", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/api/v1/tasks" {
+				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+			}
+			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{
+				"tasks": []map[string]any{{
+					"id":             8,
+					"type":           "evict_cache",
+					"ref_type":       "object",
+					"ref_id":         12,
+					"ref_version_id": "version-2",
+					"status":         "waiting",
+					"retry_count":    0,
+					"max_retries":    5,
+					"wait_reason":    "dependency",
+					"status_message": "waiting for all copies to commit",
+					"scheduled_at":   "2026-05-05T10:00:00Z",
+				}},
+				"total":  1,
+				"limit":  20,
+				"offset": 0,
+			})
+		}))
+		defer ts.Close()
+
+		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "list"})
+		if err != nil {
+			t.Fatalf("task list: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "DETAILS") || strings.Contains(out, "LAST_ERROR") {
+			t.Fatalf("task output did not use details column:\n%s", out)
+		}
+		if !strings.Contains(out, "dependency: waiting for all copies to commit") {
+			t.Fatalf("task output missing waiting details:\n%s", out)
 		}
 	})
 }

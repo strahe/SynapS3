@@ -285,7 +285,7 @@ type FinalizeUploadInput struct {
 
 type AcceptCompleteUploadInput struct {
 	UploadID        int64
-	TaskID          int64
+	Task            *model.Task
 	BucketID        int64
 	ContentSize     int64
 	Checksum        string
@@ -347,36 +347,39 @@ type TaskRepository interface {
 	Create(ctx context.Context, task *model.Task) error
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
 
-	// ClaimPending atomically claims one pending task of the given type by
+	// ClaimReady atomically claims one ready task of the given type by
 	// transitioning it to running and setting a lease. Returns nil if no task is available.
-	ClaimPending(ctx context.Context, taskType model.TaskType, leaseDuration time.Duration) (*model.Task, error)
-	// RenewLease extends a running task lease.
-	RenewLease(ctx context.Context, taskID int64, leaseDuration time.Duration) error
-	// Complete marks a running task as completed.
-	Complete(ctx context.Context, taskID int64) error
-	// Fail marks a running task as failed, recording the error and incrementing retry count.
-	Fail(ctx context.Context, taskID int64, lastError string) error
-	// DeferRunning returns a running task to pending without incrementing retry count.
-	DeferRunning(ctx context.Context, taskID int64, delay time.Duration, reason string) error
-	// Requeue resets a failed task back to pending with a scheduled backoff delay.
-	Requeue(ctx context.Context, taskID int64, backoff time.Duration) error
-	// ReleaseExpiredLeases resets running tasks whose lease has expired back to pending.
+	ClaimReady(ctx context.Context, taskType model.TaskType, leaseDuration time.Duration) (*model.Task, error)
+	// RenewLease extends the same running task claim.
+	RenewLease(ctx context.Context, task *model.Task, leaseDuration time.Duration) error
+	// Complete marks the same running task claim as completed.
+	Complete(ctx context.Context, task *model.Task) error
+	// FailRunning marks the same running task claim as non-retryably failed.
+	FailRunning(ctx context.Context, task *model.Task, lastError string) error
+	// ScheduleRetryRunning records a retryable failure for the same running claim
+	// and returns the resulting task status.
+	ScheduleRetryRunning(ctx context.Context, task *model.Task, lastError string, backoff time.Duration) (model.TaskStatus, error)
+	// WaitRunning records a non-error wait and releases the running task until scheduled_at.
+	WaitRunning(ctx context.Context, task *model.Task, reason model.TaskWaitReason, message string, delay time.Duration) error
+	// ReleaseRunning releases the same running task claim back to queued without recording an error.
+	ReleaseRunning(ctx context.Context, task *model.Task) error
+	// ReleaseExpiredLeases resets running tasks whose lease has expired back to queued.
 	ReleaseExpiredLeases(ctx context.Context) (int, error)
-	// FailTerminal marks a running task as dead-letter (permanently failed after max retries).
-	FailTerminal(ctx context.Context, taskID int64, lastError string) error
-	// ListDeadLetters returns dead-letter tasks, ordered by most recent first.
-	ListDeadLetters(ctx context.Context, limit int) ([]model.Task, error)
-	// RetryDeadLetter resets a dead-letter task back to pending for manual retry.
-	RetryDeadLetter(ctx context.Context, taskID int64) error
+	// MarkRunningExhausted marks the same running task claim as exhausted.
+	MarkRunningExhausted(ctx context.Context, task *model.Task, lastError string) error
+	// ListExhausted returns exhausted tasks, ordered by most recent first.
+	ListExhausted(ctx context.Context, limit int) ([]model.Task, error)
+	// RetryExhausted resets an exhausted task back to queued for manual retry.
+	RetryExhausted(ctx context.Context, taskID int64) error
 	// CountByStatus returns task counts grouped by type and status.
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
-	// CountActiveObjectTasksByBucket returns pending/running object tasks
+	// CountActiveObjectTasksByBucket returns active object tasks
 	// whose referenced current object belongs to the given bucket.
 	CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error)
-	// CountActiveBucketTasksByBucketID returns the number of pending/running tasks
+	// CountActiveBucketTasksByBucketID returns the number of active tasks
 	// that directly reference the given bucket (ref_type=bucket, ref_id=bucketID).
 	CountActiveBucketTasksByBucketID(ctx context.Context, bucketID int64) (int64, error)
-	// CompleteByRef marks all pending/running tasks matching the given ref as completed.
+	// CompleteByRef marks all active tasks matching the given ref as completed.
 	CompleteByRef(ctx context.Context, refType string, refID int64, taskType model.TaskType) error
 	// List returns tasks with optional filters, paginated by offset/limit.
 	// Returns the matching tasks and the total count (for pagination).

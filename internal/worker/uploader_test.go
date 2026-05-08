@@ -115,7 +115,7 @@ func seedObjectInDB(t *testing.T, env *testWorkerEnv, bucketStatus model.BucketS
 	return bucket, objID, versionID
 }
 
-// seedTask creates a pending task of the given type.
+// seedTask creates a queued task of the given type.
 func seedTask(t *testing.T, env *testWorkerEnv, taskType model.TaskType, refID int64, versionID string, maxRetries, retryCount int) *model.Task {
 	t.Helper()
 	ctx := context.Background()
@@ -125,7 +125,7 @@ func seedTask(t *testing.T, env *testWorkerEnv, taskType model.TaskType, refID i
 		RefID:          refID,
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("%s:%s", taskType, versionID),
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		RetryCount:     retryCount,
 		MaxRetries:     maxRetries,
 		ScheduledAt:    time.Now(),
@@ -149,7 +149,7 @@ func seedStagedUploadTask(t *testing.T, env *testWorkerEnv, refID int64, version
 		RefID:          refID,
 		RefVersionID:   versionID,
 		IdempotencyKey: "upload:" + versionID,
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     maxRetries,
 		ScheduledAt:    time.Now(),
 	}
@@ -189,7 +189,7 @@ func waitForObjectState(t *testing.T, env *testWorkerEnv, versionID string, stat
 }
 
 // runWorkerUntilTask runs a worker and waits until the given task
-// leaves pending/running status, or times out.
+// leaves active queue states, or times out.
 func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskID int64, timeout time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -216,7 +216,7 @@ func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskI
 			if err != nil {
 				continue
 			}
-			if task != nil && task.Status != model.TaskStatusPending && task.Status != model.TaskStatusRunning {
+			if task != nil && task.Status != model.TaskStatusQueued && task.Status != model.TaskStatusScheduled && task.Status != model.TaskStatusWaiting && task.Status != model.TaskStatusRunning {
 				cancel()
 				<-done
 				return
@@ -561,7 +561,7 @@ func seedReadyPrimaryStoreTask(t *testing.T, env *testWorkerEnv) (*model.Storage
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:primary_store:%d", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -808,7 +808,7 @@ func TestUploader_HappyPath(t *testing.T) {
 		t.Fatalf("upload failures = %#v, want persisted failed attempt", failures)
 	}
 	// With autoEvict=true, an evict_cache task should be created
-	evictTask, err := env.repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	evictTask, err := env.repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming evict_cache: %v", err)
 	}
@@ -1004,9 +1004,9 @@ func TestUploader_StagedPrimaryCommitKeepsCacheUntilAllCopiesCommitted(t *testin
 	if upload.Status != model.StorageUploadStatusPrimaryCommitted {
 		t.Fatalf("upload status = %s, want primary_committed while secondary is blocked", upload.Status)
 	}
-	evict, err := env.repos.Tasks.ClaimPending(context.Background(), model.TaskTypeEvictCache, time.Minute)
+	evict, err := env.repos.Tasks.ClaimReady(context.Background(), model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimPending(evict): %v", err)
+		t.Fatalf("ClaimReady(evict): %v", err)
 	}
 	if evict != nil {
 		t.Fatalf("unexpected evict task before all copies are committed: %#v", evict)
@@ -1015,9 +1015,9 @@ func TestUploader_StagedPrimaryCommitKeepsCacheUntilAllCopiesCommitted(t *testin
 	releaseSecondaryPullOnce.Do(func() { close(releaseSecondaryPull) })
 	waitForObjectState(t, env, versionID, model.ObjectStateStored, 3*time.Second)
 
-	evict, err = env.repos.Tasks.ClaimPending(context.Background(), model.TaskTypeEvictCache, time.Minute)
+	evict, err = env.repos.Tasks.ClaimReady(context.Background(), model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimPending(evict after stored): %v", err)
+		t.Fatalf("ClaimReady(evict after stored): %v", err)
 	}
 	if evict == nil {
 		t.Fatal("expected evict task after all copies are committed")
@@ -1039,7 +1039,7 @@ func TestUploader_EmptyPayloadStartsStagedPrepare(t *testing.T) {
 		RefID:          objID,
 		RefVersionID:   versionID,
 		IdempotencyKey: "upload:" + versionID,
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -1087,19 +1087,19 @@ func TestUploader_EmptyPayloadStartsStagedPrepare(t *testing.T) {
 		t.Fatalf("list upload tasks: %v", err)
 	}
 	foundEnsurePrimary := false
-	for _, pending := range tasks {
-		if pending.RefVersionID == versionID && strings.Contains(pending.IdempotencyKey, "ensure_dataset") && strings.HasSuffix(pending.IdempotencyKey, ":0") {
-			if pending.Stage == nil || *pending.Stage != "ensure_dataset" {
-				t.Fatalf("ensure dataset task stage = %#v, want ensure_dataset", pending.Stage)
+	for _, task := range tasks {
+		if task.RefVersionID == versionID && strings.Contains(task.IdempotencyKey, "ensure_dataset") && strings.HasSuffix(task.IdempotencyKey, ":0") {
+			if task.Stage == nil || *task.Stage != "ensure_dataset" {
+				t.Fatalf("ensure dataset task stage = %#v, want ensure_dataset", task.Stage)
 			}
-			if _, ok := pending.Payload["stage"]; ok {
-				t.Fatalf("ensure dataset task payload kept stage: %#v", pending.Payload)
+			if _, ok := task.Payload["stage"]; ok {
+				t.Fatalf("ensure dataset task payload kept stage: %#v", task.Payload)
 			}
 			foundEnsurePrimary = true
 		}
 	}
 	if !foundEnsurePrimary {
-		t.Fatalf("pending tasks = %#v, want primary ensure_dataset task", tasks)
+		t.Fatalf("upload tasks = %#v, want primary ensure_dataset task", tasks)
 	}
 }
 
@@ -1225,7 +1225,7 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 			"upload_id":  upload.ID,
 			"copy_index": 0,
 		},
-		Status:      model.TaskStatusPending,
+		Status:      model.TaskStatusQueued,
 		MaxRetries:  5,
 		ScheduledAt: time.Now(),
 	}
@@ -1303,7 +1303,7 @@ func TestUploader_EnsureDatasetSubmittedCreateErrorResumesWait(t *testing.T) {
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:ensure_dataset:%d:0", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 0},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -1408,7 +1408,7 @@ func TestUploader_EnsureDatasetCreatingWaitErrorKeepsSubmission(t *testing.T) {
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:ensure_dataset:%d:0", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 0},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -1499,7 +1499,7 @@ func TestUploader_EnsureDatasetCreatingRejectedMarksBindingFailed(t *testing.T) 
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:ensure_dataset:%d:0", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 0},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -1587,7 +1587,7 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:ensure_dataset:%d:0", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 0},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     1,
 		ScheduledAt:    time.Now(),
 	}
@@ -1608,8 +1608,8 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	gotTask, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if gotTask.Status != model.TaskStatusDeadLetter {
-		t.Fatalf("task status = %s, want dead_letter", gotTask.Status)
+	if gotTask.Status != model.TaskStatusExhausted {
+		t.Fatalf("task status = %s, want exhausted", gotTask.Status)
 	}
 	gotVersion, _ := env.repos.Objects.GetVersionByID(ctx, versionID)
 	if gotVersion.State != model.ObjectStateFailed || gotVersion.StorageUploadID != nil {
@@ -1705,7 +1705,7 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:primary_commit:%d", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     2,
 		ScheduledAt:    time.Now(),
 	}
@@ -1863,16 +1863,16 @@ doneWaiting:
 	if len(copies) != 2 || copies[0].Status != model.StorageUploadCopyStatusCommitted || copies[1].Status != model.StorageUploadCopyStatusFailed {
 		t.Fatalf("copies after secondary failure = %#v, want primary committed and secondary failed", copies)
 	}
-	deadLetters, err := env.repos.Tasks.ListDeadLetters(context.Background(), 10)
+	exhaustedTasks, err := env.repos.Tasks.ListExhausted(context.Background(), 10)
 	if err != nil {
-		t.Fatalf("ListDeadLetters: %v", err)
+		t.Fatalf("ListExhausted: %v", err)
 	}
-	if len(deadLetters) == 0 {
-		t.Fatal("expected secondary stage task to be dead-lettered")
+	if len(exhaustedTasks) == 0 {
+		t.Fatal("expected secondary stage task to be exhausted")
 	}
-	evict, err := env.repos.Tasks.ClaimPending(context.Background(), model.TaskTypeEvictCache, time.Minute)
+	evict, err := env.repos.Tasks.ClaimReady(context.Background(), model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimPending(evict): %v", err)
+		t.Fatalf("ClaimReady(evict): %v", err)
 	}
 	if evict != nil {
 		t.Fatalf("unexpected evict task for partial upload: %#v", evict)
@@ -2006,8 +2006,8 @@ func TestUploader_TerminalUploadFailureFailsVersionsFollowingActiveUpload(t *tes
 	if err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if gotTask.Status != model.TaskStatusDeadLetter {
-		t.Fatalf("task status = %s, want dead_letter", gotTask.Status)
+	if gotTask.Status != model.TaskStatusExhausted {
+		t.Fatalf("task status = %s, want exhausted", gotTask.Status)
 	}
 
 	for _, versionID := range []string{leaderVersionID, followerVersionID} {
@@ -2058,8 +2058,8 @@ func TestUploader_PartialSuccessDoesNotMarkObjectStored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if gotTask.Status != model.TaskStatusDeadLetter {
-		t.Fatalf("expected task dead-lettered, got %s", gotTask.Status)
+	if gotTask.Status != model.TaskStatusExhausted {
+		t.Fatalf("expected task exhausted, got %s", gotTask.Status)
 	}
 
 	obj, err := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
@@ -2070,7 +2070,7 @@ func TestUploader_PartialSuccessDoesNotMarkObjectStored(t *testing.T) {
 		t.Fatalf("expected object failed, got %s", obj.State)
 	}
 
-	evictTask, err := env.repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	evictTask, err := env.repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
 		t.Fatalf("claiming evict_cache: %v", err)
 	}
@@ -2210,8 +2210,8 @@ func TestUploader_AcceptFailureRetryDoesNotUploadAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get task after accept failure: %v", err)
 	}
-	if gotTask.Status != model.TaskStatusPending {
-		t.Fatalf("task status after accept failure = %s, want pending", gotTask.Status)
+	if gotTask.Status != model.TaskStatusScheduled {
+		t.Fatalf("task status after accept failure = %s, want scheduled", gotTask.Status)
 	}
 	attempt, err := env.repos.Uploads.FindAcceptableUploadAttempt(context.Background(), task.ID, versionID)
 	if err != nil || attempt == nil {
@@ -2272,7 +2272,7 @@ func TestUploader_MissingVersion(t *testing.T) {
 		RefID:          objID,
 		RefVersionID:   "01J000000000000000MISSING1",
 		IdempotencyKey: fmt.Sprintf("upload:%d:missing", objID),
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -2322,7 +2322,7 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
-	// RetryCount at max-1 so this attempt triggers dead-letter terminal path.
+	// RetryCount at max-1 so this attempt triggers exhausted terminal path.
 	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 4)
 
 	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
@@ -2335,8 +2335,8 @@ func TestUploader_CacheReadFailure(t *testing.T) {
 
 	ctx := context.Background()
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusDeadLetter {
-		t.Errorf("expected task dead_letter, got %s", got.Status)
+	if got.Status != model.TaskStatusExhausted {
+		t.Errorf("expected task exhausted, got %s", got.Status)
 	}
 
 	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
@@ -2364,8 +2364,8 @@ func TestUploader_CacheMissMarksCacheLocationAbsent(t *testing.T) {
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 
 	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
@@ -2437,7 +2437,7 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:primary_store:%d", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     5,
 		ScheduledAt:    time.Now(),
 	}
@@ -2458,8 +2458,8 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
 	if obj.State != model.ObjectStateUploading {
@@ -2525,7 +2525,7 @@ func TestUploader_StagedPrimaryStoreTerminalFailureMarksUploadFailed(t *testing.
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("upload:%s:primary_store:%d", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID},
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     1,
 		ScheduledAt:    time.Now(),
 	}
@@ -2547,8 +2547,8 @@ func TestUploader_StagedPrimaryStoreTerminalFailureMarksUploadFailed(t *testing.
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	gotTask, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if gotTask.Status != model.TaskStatusDeadLetter {
-		t.Fatalf("task status = %s, want dead_letter", gotTask.Status)
+	if gotTask.Status != model.TaskStatusExhausted {
+		t.Fatalf("task status = %s, want exhausted", gotTask.Status)
 	}
 	gotVersion, _ := env.repos.Objects.GetVersionByID(ctx, versionID)
 	if gotVersion.State != model.ObjectStateFailed || gotVersion.StorageUploadID != nil {
@@ -2591,15 +2591,14 @@ func TestUploader_SPUploadFailure_Retry(t *testing.T) {
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 50*time.Millisecond, slog.Default())
-	// After Fail+Requeue, task goes back to pending with future ScheduledAt.
-	// Use a short Run since runWorkerUntilTask won't see it leave pending.
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	_ = uploader.Run(ctx)
+	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got == nil {
+		t.Fatal("expected task after retry")
+	}
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 	if got.RetryCount != 1 {
 		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
@@ -2621,8 +2620,8 @@ func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 
 	ctx := context.Background()
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusDeadLetter {
-		t.Errorf("expected task dead_letter, got %s", got.Status)
+	if got.Status != model.TaskStatusExhausted {
+		t.Errorf("expected task exhausted, got %s", got.Status)
 	}
 
 	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
@@ -2653,7 +2652,7 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 		RefID:          objID,
 		RefVersionID:   versionID,
 		IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     3,
 		ScheduledAt:    time.Now(),
 	}
@@ -2707,8 +2706,8 @@ func TestUploader_ZeroAvailableFunds_RequeuesTask(t *testing.T) {
 	}
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 	if got.RetryCount != 1 {
 		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
@@ -2766,8 +2765,8 @@ func TestUploader_StagedUploadZeroAvailableFundsRequeuesTask(t *testing.T) {
 	}
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 	if got.RetryCount != 1 {
 		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
@@ -2812,8 +2811,8 @@ func TestUploader_LockedAvailableFunds_RequeuesTask(t *testing.T) {
 	}
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 	if got.RetryCount != 1 {
 		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
@@ -2850,8 +2849,8 @@ func TestUploader_AvailableFundsFallback_RequeuesTask(t *testing.T) {
 	}
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 	if got.RetryCount != 1 {
 		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
@@ -2889,12 +2888,12 @@ func TestUploader_NegativeAvailableFunds_RequeuesTask(t *testing.T) {
 	}
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Errorf("expected task requeued to pending, got %s", got.Status)
+	if got.Status != model.TaskStatusScheduled {
+		t.Errorf("expected task scheduled for retry, got %s", got.Status)
 	}
 }
 
-func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testing.T) {
+func TestUploader_ZeroAvailableFunds_ExhaustedRetryRemainsRecoverable(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 1, 0)
@@ -2937,16 +2936,16 @@ func TestUploader_ZeroAvailableFunds_DeadLetterRetryRemainsRecoverable(t *testin
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusDeadLetter {
-		t.Fatalf("expected task dead_letter, got %s", got.Status)
+	if got.Status != model.TaskStatusExhausted {
+		t.Fatalf("expected task exhausted, got %s", got.Status)
 	}
 	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
 	if obj.State != model.ObjectStateUploading {
 		t.Fatalf("expected object to remain uploading for manual retry, got %s", obj.State)
 	}
 
-	if err := env.repos.Tasks.RetryDeadLetter(context.Background(), task.ID); err != nil {
-		t.Fatalf("retrying dead-letter task: %v", err)
+	if err := env.repos.Tasks.RetryExhausted(context.Background(), task.ID); err != nil {
+		t.Fatalf("retrying exhausted task: %v", err)
 	}
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 

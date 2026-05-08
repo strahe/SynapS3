@@ -335,9 +335,9 @@ func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 		t.Fatalf("PutObject: %v", err)
 	}
 
-	task, err := tb.repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimPending: %v", err)
+		t.Fatalf("ClaimReady: %v", err)
 	}
 	if task == nil {
 		t.Fatal("expected upload task")
@@ -476,7 +476,7 @@ func TestPutObjectIdenticalUploadingContentFollowsActiveUploadTask(t *testing.T)
 		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
 	}
 
-	claimed, err := tb.repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	claimed, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
 		t.Fatalf("claim upload task: %v", err)
 	}
@@ -621,7 +621,7 @@ func TestPutObjectIdenticalStoredContentQueuesEvictWhenAutoEvictEnabled(t *testi
 	acceptBackendVersionUpload(t, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
 
 	secondOut := putTestObjectOutput(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
-	task, err := tb.repos.Tasks.ClaimPending(ctx, model.TaskTypeEvictCache, time.Minute)
+	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
 		t.Fatalf("claim evict task: %v", err)
 	}
@@ -1715,7 +1715,7 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
 
-	tasks, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", string(model.TaskStatusPending), 10, 0)
+	tasks, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
 		t.Fatalf("List tasks: %v", err)
 	}

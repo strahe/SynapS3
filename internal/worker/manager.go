@@ -105,17 +105,17 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.reconcileTasks(ctx, model.ObjectStateStored, model.TaskTypeEvictCache, "evict_cache")
 	}
 
-	// Log dead-letter task count for operator awareness
-	deadLetters, err := m.repos.Tasks.ListDeadLetters(ctx, 100)
+	// Log exhausted task count for operator awareness
+	exhaustedTasks, err := m.repos.Tasks.ListExhausted(ctx, 100)
 	if err != nil {
-		m.logger.Error("failed to check dead-letter tasks", "error", err)
-	} else if len(deadLetters) > 0 {
-		m.logger.Warn("dead-letter tasks found on startup, review via GET /admin/dead-letters", "count", len(deadLetters))
+		m.logger.Error("failed to check exhausted tasks", "error", err)
+	} else if len(exhaustedTasks) > 0 {
+		m.logger.Warn("exhausted tasks found on startup, review via GET /admin/exhausted-tasks", "count", len(exhaustedTasks))
 	}
 }
 
 // reconcileTasks finds object versions in the given state and ensures each has a corresponding
-// pending task. Uses idempotency keys to safely skip objects that already have tasks.
+// queued task. Uses idempotency keys to safely skip objects that already have tasks.
 // keyPrefix must match the prefix used by the normal task creation path for deduplication.
 func (m *Manager) reconcileTasks(ctx context.Context, objState model.ObjectState, taskType model.TaskType, keyPrefix string) {
 	created := 0
@@ -137,7 +137,7 @@ func (m *Manager) reconcileTasks(ctx context.Context, objState model.ObjectState
 				RefID:          version.ObjectID,
 				RefVersionID:   version.VersionID,
 				IdempotencyKey: fmt.Sprintf("%s:%s", keyPrefix, version.VersionID),
-				Status:         model.TaskStatusPending,
+				Status:         model.TaskStatusQueued,
 				MaxRetries:     m.maxRetriesForTaskType(taskType),
 				ScheduledAt:    time.Now(),
 			}
@@ -365,7 +365,7 @@ func (m *Manager) enqueueRecoveredUploadStage(ctx context.Context, version model
 		RefVersionID:   version.VersionID,
 		IdempotencyKey: key,
 		Payload:        payload,
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		MaxRetries:     m.uploadMaxRetries,
 		ScheduledAt:    time.Now(),
 	}
@@ -385,7 +385,7 @@ func (m *Manager) enqueueRecoveredEvictTasks(ctx context.Context, refs []reposit
 			RefID:          ref.ObjectID,
 			RefVersionID:   ref.VersionID,
 			IdempotencyKey: fmt.Sprintf("evict_cache:%s", ref.VersionID),
-			Status:         model.TaskStatusPending,
+			Status:         model.TaskStatusQueued,
 			MaxRetries:     m.evictMaxRetries,
 			ScheduledAt:    time.Now(),
 		}

@@ -220,9 +220,9 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	if obj.State != model.ObjectStateCached {
 		t.Errorf("object state = %q, want %q", obj.State, model.ObjectStateCached)
 	}
-	task, err := tb.repos.Tasks.ClaimPending(ctx, model.TaskTypeUpload, time.Minute)
+	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimPending: %v", err)
+		t.Fatalf("ClaimReady: %v", err)
 	}
 	if task == nil {
 		t.Fatal("expected upload task")

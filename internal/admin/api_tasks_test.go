@@ -39,7 +39,7 @@ func TestAPITasksStageFilter(t *testing.T) {
 			RefID:          1,
 			RefVersionID:   "01J000000000000000TASKA01",
 			IdempotencyKey: "api-stage-primary",
-			Status:         model.TaskStatusPending,
+			Status:         model.TaskStatusQueued,
 			ScheduledAt:    time.Now(),
 		},
 		{
@@ -49,7 +49,7 @@ func TestAPITasksStageFilter(t *testing.T) {
 			RefID:          2,
 			RefVersionID:   "01J000000000000000TASKA02",
 			IdempotencyKey: "api-stage-secondary",
-			Status:         model.TaskStatusPending,
+			Status:         model.TaskStatusQueued,
 			ScheduledAt:    time.Now(),
 		},
 		{
@@ -58,7 +58,7 @@ func TestAPITasksStageFilter(t *testing.T) {
 			RefID:          3,
 			RefVersionID:   "01J000000000000000TASKA03",
 			IdempotencyKey: "api-stage-evict",
-			Status:         model.TaskStatusPending,
+			Status:         model.TaskStatusQueued,
 			ScheduledAt:    time.Now(),
 		},
 	} {
@@ -73,7 +73,7 @@ func TestAPITasksStageFilter(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&stage=primary_commit&status=pending")
+	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&stage=primary_commit&status=queued")
 	if err != nil {
 		t.Fatalf("GET tasks: %v", err)
 	}
@@ -102,12 +102,70 @@ func TestAPITasksStageFilter(t *testing.T) {
 	}
 }
 
+func TestAPITasksReturnsWaitingDetails(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	waitReason := model.TaskWaitReasonDependency
+	statusMessage := "waiting for all copies to commit"
+
+	task := &model.Task{
+		Type:           model.TaskTypeEvictCache,
+		RefType:        "object",
+		RefID:          1,
+		RefVersionID:   "01J000000000000000TASKW01",
+		IdempotencyKey: "api-task-waiting",
+		Status:         model.TaskStatusWaiting,
+		WaitReason:     &waitReason,
+		StatusMessage:  &statusMessage,
+		ScheduledAt:    time.Now().Add(time.Minute),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+
+	srv := New(":0", db, nil, 0, repos, nil, nil, testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/tasks?status=waiting")
+	if err != nil {
+		t.Fatalf("GET tasks: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body taskListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.Total != 1 || len(body.Tasks) != 1 {
+		t.Fatalf("tasks = total:%d items:%#v, want one", body.Total, body.Tasks)
+	}
+	got := body.Tasks[0]
+	if got.Status != string(model.TaskStatusWaiting) {
+		t.Fatalf("task status = %s, want waiting", got.Status)
+	}
+	if got.WaitReason == nil || *got.WaitReason != string(waitReason) {
+		t.Fatalf("wait_reason = %v, want %s", got.WaitReason, waitReason)
+	}
+	if got.StatusMessage == nil || *got.StatusMessage != statusMessage {
+		t.Fatalf("status_message = %v, want %s", got.StatusMessage, statusMessage)
+	}
+	if got.LastError != nil {
+		t.Fatalf("last_error = %v, want nil", got.LastError)
+	}
+}
+
 func TestAPITasksShowsLegacyPayloadStage(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	_, err := db.ExecContext(context.Background(), `
 		INSERT INTO tasks (type, ref_type, ref_id, ref_version_id, idempotency_key, payload, status, scheduled_at)
-		VALUES ('upload', 'object', 1, '01J000000000000000TASKB01', 'legacy-payload-stage', '{"stage":"secondary_pull","upload_id":9,"copy_index":1}', 'pending', CURRENT_TIMESTAMP)
+		VALUES ('upload', 'object', 1, '01J000000000000000TASKB01', 'legacy-payload-stage', '{"stage":"secondary_pull","upload_id":9,"copy_index":1}', 'queued', CURRENT_TIMESTAMP)
 	`)
 	if err != nil {
 		t.Fatalf("insert legacy task: %v", err)
@@ -119,7 +177,7 @@ func TestAPITasksShowsLegacyPayloadStage(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&status=pending")
+	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&status=queued")
 	if err != nil {
 		t.Fatalf("GET tasks: %v", err)
 	}
@@ -315,7 +373,7 @@ func TestAPITaskRefDetailNotFound(t *testing.T) {
 		RefID:          123,
 		RefVersionID:   "01J000000000000000MISSING",
 		IdempotencyKey: "task-ref-missing-object",
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		ScheduledAt:    time.Now(),
 	}
 	if err := repos.Tasks.Create(context.Background(), task); err != nil {
@@ -336,7 +394,7 @@ func TestAPITaskRefDetailNonObject(t *testing.T) {
 		RefID:          bucket.ID,
 		RefVersionID:   "",
 		IdempotencyKey: "task-ref-bucket",
-		Status:         model.TaskStatusPending,
+		Status:         model.TaskStatusQueued,
 		ScheduledAt:    time.Now(),
 	}
 	if err := repos.Tasks.Create(context.Background(), task); err != nil {

@@ -841,7 +841,7 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 			RefID:          objectID,
 			RefVersionID:   versionID,
 			IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
-			Status:         model.TaskStatusPending,
+			Status:         model.TaskStatusQueued,
 			MaxRetries:     b.uploadMaxRetries,
 			ScheduledAt:    time.Now(),
 		}
@@ -856,7 +856,7 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 			RefID:          objectID,
 			RefVersionID:   versionID,
 			IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
-			Status:         model.TaskStatusPending,
+			Status:         model.TaskStatusQueued,
 			MaxRetries:     b.evictMaxRetries,
 			ScheduledAt:    time.Now(),
 		}
