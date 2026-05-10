@@ -783,14 +783,14 @@ func (b *SynapseBackend) completeFollowerIfStoredReuseWonRace(ctx context.Contex
 		if replicating == nil || replicating.StorageUploadID == nil {
 			return
 		}
-		if refs, bindErr := b.repos.Uploads.BindPrimaryCommittedUploadForVersion(ctx, repository.BindPrimaryCommittedUploadForVersionInput{
+		if refs, bindErr := b.repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
 			UploadID:    *replicating.StorageUploadID,
 			BucketID:    bucketID,
 			ContentSize: size,
 			Checksum:    checksum,
 			VersionID:   versionID,
 		}); bindErr != nil {
-			b.logger.Debug("active upload follower was not ready for primary committed reuse", "bucket", bucketName, "versionID", versionID, "error", bindErr)
+			b.logger.Debug("active upload follower was not ready for readable copy reuse", "bucket", bucketName, "versionID", versionID, "error", bindErr)
 		} else if len(refs) > 0 {
 			b.completeReplicatingFollowerIfUploadFinalized(ctx, bucketName, versionID)
 		}
@@ -815,7 +815,7 @@ func (b *SynapseBackend) completeReplicatingFollowerIfUploadFinalized(ctx contex
 	if version == nil || version.State != model.ObjectStateReplicating || version.StorageUploadID == nil {
 		return
 	}
-	finalized, refs, err := b.repos.Uploads.FinalizeUploadIfAllCopiesCommitted(ctx, repository.FinalizeUploadInput{UploadID: *version.StorageUploadID})
+	finalized, refs, err := b.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: *version.StorageUploadID})
 	if err != nil {
 		b.logger.Warn("finalizing replicating reuse after follower write", "bucket", bucketName, "versionID", versionID, "uploadID", *version.StorageUploadID, "error", err)
 		return

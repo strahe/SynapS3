@@ -39,33 +39,22 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 		t.Fatalf("creating bucket: %v", err)
 	}
 	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:    bucket.ID,
-		ContentSize: 1,
-		Checksum:    "wallet-checksum",
+		BucketID:        bucket.ID,
+		ContentSize:     1,
+		Checksum:        "wallet-checksum",
+		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
 	pieceCID := "piece-wallet"
-	providerID := onChainIDPtr(t, "101")
-	dataSetID := onChainIDPtr(t, "1001")
-	pieceID := onChainIDPtr(t, "1")
-	retrievalURL := "https://provider.example/wallet"
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        &pieceCID,
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   providerID,
-			DataSetID:    dataSetID,
-			PieceID:      pieceID,
-			Role:         "primary",
-			RetrievalURL: &retrievalURL,
-		}},
-	}); err != nil {
-		t.Fatalf("record upload result: %v", err)
-	}
+	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{{
+		ProviderID:     onChainID(t, "101"),
+		DataSetID:      onChainID(t, "1001"),
+		PieceID:        onChainIDPtr(t, "1"),
+		TransferMethod: model.StorageCopyTransferMethodIngress,
+		RetrievalURL:   "https://provider.example/wallet",
+	}})
 
 	tasks := []*model.Task{
 		{

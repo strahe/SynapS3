@@ -195,7 +195,7 @@ func TestAdminEventsHandlerStreamsUploadProgressEvent(t *testing.T) {
 		"bucket_name": "photos",
 		"object_key":  "image.jpg",
 		"progress": map[string]any{
-			"scope":          "primary_store",
+			"scope":          "ingress_store",
 			"attempt":        1,
 			"uploaded_bytes": int64(4),
 			"total_bytes":    int64(10),

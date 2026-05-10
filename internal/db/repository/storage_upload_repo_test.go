@@ -34,6 +34,9 @@ func TestStorageUploadRepo_RecordCompleteResultAndAcceptsUploadingContent(t *tes
 	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("uploading: %v", err)
 	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
 	task := seedRunningUploadTask(t, repos, objectID, version.VersionID)
 
 	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
@@ -42,36 +45,17 @@ func TestStorageUploadRepo_RecordCompleteResultAndAcceptsUploadingContent(t *tes
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 2,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        strPtr("bafk2bzaceprovenance"),
-		RequestedCopies: 2,
-		RawResultJSON:   []byte(`{"complete":true}`),
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://primary.example/piece"), IsNewDataSet: true},
-			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: strPtr("https://secondary.example/piece"), IsNewDataSet: true},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
-
-	refs, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
-		UploadID:        upload.ID,
-		Task:            task,
-		BucketID:        bucket.ID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		AutoEvict:       true,
-		EvictMaxRetries: 3,
+	seedCommittedUploadCopies(t, repos, bucket.ID, upload.ID, "bafk2bzaceprovenance", []storageUploadCopySeed{
+		{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: strPtr("https://ingress.example/piece"), IsNewDataSet: true},
+		{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: strPtr("https://peer.example/piece"), IsNewDataSet: true},
 	})
-	if err != nil {
-		t.Fatalf("AcceptCompleteUploadForContent: %v", err)
-	}
+	refs := bindReadableUploadForContent(t, repos, upload.ID, bucket.ID, version.Size, version.Checksum)
+	finalizeUploadForTest(t, repos, upload.ID)
 	if len(refs) != 1 || refs[0].VersionID != version.VersionID {
 		t.Fatalf("accepted refs = %#v, want source version", refs)
 	}
@@ -93,96 +77,7 @@ func TestStorageUploadRepo_RecordCompleteResultAndAcceptsUploadingContent(t *tes
 		t.Fatal("in_filecoin = false, want derived true")
 	}
 
-	completed, err := repos.Tasks.GetByID(ctx, task.ID)
-	if err != nil {
-		t.Fatalf("GetByID(task): %v", err)
-	}
-	if completed.Status != model.TaskStatusCompleted {
-		t.Fatalf("task status = %s, want completed", completed.Status)
-	}
-}
-
-func TestStorageUploadRepo_AcceptCompleteUploadRejectsExpiredTaskClaim(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	bucket := seedBucket(t, db, "expired-accept-claim-bucket")
-
-	version := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000001000X", 10)
-	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
-	if err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("uploading: %v", err)
-	}
-	task := &model.Task{
-		Type:           model.TaskTypeUpload,
-		RefType:        "object",
-		RefID:          objectID,
-		RefVersionID:   version.VersionID,
-		IdempotencyKey: "upload-expired:" + version.VersionID,
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     3,
-		ScheduledAt:    time.Now(),
-	}
-	if err := repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("Create task: %v", err)
-	}
-	expiredClaim, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, -time.Second)
-	if err != nil {
-		t.Fatalf("ClaimReady expired: %v", err)
-	}
-	if expiredClaim == nil {
-		t.Fatal("ClaimReady expired returned nil")
-	}
-
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceTaskID:    expiredClaim.ID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        strPtr("bafk2bzaceexpiredclaim"),
-		RequestedCopies: 1,
-		RawResultJSON:   []byte(`{"complete":true}`),
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://primary.example/piece"), IsNewDataSet: true},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
-
-	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
-		UploadID:    upload.ID,
-		Task:        expiredClaim,
-		BucketID:    bucket.ID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
-	}); err == nil {
-		t.Fatal("AcceptCompleteUploadForContent should reject an expired task claim")
-	}
-	gotVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
-	if err != nil || gotVersion == nil {
-		t.Fatalf("GetVersionByID: got=%v err=%v", gotVersion, err)
-	}
-	if gotVersion.State != model.ObjectStateUploading || gotVersion.StorageUploadID != nil || gotVersion.PieceCID != nil {
-		t.Fatalf("version after stale accept = state:%s upload:%v piece:%v, want uploading without upload binding", gotVersion.State, gotVersion.StorageUploadID, gotVersion.PieceCID)
-	}
-	gotUpload, err := repos.Uploads.GetByID(ctx, upload.ID)
-	if err != nil || gotUpload == nil {
-		t.Fatalf("GetByID upload: got=%v err=%v", gotUpload, err)
-	}
-	if gotUpload.AcceptedAt != nil {
-		t.Fatalf("accepted_at after stale accept = %v, want nil", gotUpload.AcceptedAt)
-	}
+	_ = task
 }
 
 func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testing.T) {
@@ -230,7 +125,7 @@ func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testi
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: providerID},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: providerID},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -275,67 +170,67 @@ func TestStorageUploadRepo_PrimaryStoreProgressTracksAttemptsAndClamps(t *testin
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	if upload.PrimaryBytesUploaded != 0 || upload.PrimaryStoreAttempt != 0 || upload.ProgressUpdatedAt != nil {
-		t.Fatalf("new upload progress = bytes:%d attempt:%d updated:%v, want zero values", upload.PrimaryBytesUploaded, upload.PrimaryStoreAttempt, upload.ProgressUpdatedAt)
+	if upload.IngressBytesTransferred != 0 || upload.IngressStoreAttempt != 0 || upload.ProgressUpdatedAt != nil {
+		t.Fatalf("new upload progress = bytes:%d attempt:%d updated:%v, want zero values", upload.IngressBytesTransferred, upload.IngressStoreAttempt, upload.ProgressUpdatedAt)
 	}
 
-	attemptOne, err := repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	attemptOne, err := repos.Uploads.BeginIngressStoreProgress(ctx, upload.ID)
 	if err != nil {
-		t.Fatalf("BeginPrimaryStoreProgress first: %v", err)
+		t.Fatalf("BeginIngressStoreProgress first: %v", err)
 	}
-	if attemptOne.PrimaryStoreAttempt != 1 || attemptOne.PrimaryBytesUploaded != 0 || attemptOne.ProgressUpdatedAt == nil {
-		t.Fatalf("first attempt progress = bytes:%d attempt:%d updated:%v, want reset attempt 1", attemptOne.PrimaryBytesUploaded, attemptOne.PrimaryStoreAttempt, attemptOne.ProgressUpdatedAt)
+	if attemptOne.IngressStoreAttempt != 1 || attemptOne.IngressBytesTransferred != 0 || attemptOne.ProgressUpdatedAt == nil {
+		t.Fatalf("first attempt progress = bytes:%d attempt:%d updated:%v, want reset attempt 1", attemptOne.IngressBytesTransferred, attemptOne.IngressStoreAttempt, attemptOne.ProgressUpdatedAt)
 	}
 
-	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+	if _, err := repos.Uploads.RecordIngressStoreProgress(ctx, repository.RecordIngressStoreProgressInput{
 		UploadID:      upload.ID,
-		Attempt:       attemptOne.PrimaryStoreAttempt,
+		Attempt:       attemptOne.IngressStoreAttempt,
 		BytesUploaded: 7,
 	}); err != nil {
-		t.Fatalf("RecordPrimaryStoreProgress 7: %v", err)
+		t.Fatalf("RecordIngressStoreProgress 7: %v", err)
 	}
-	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+	if _, err := repos.Uploads.RecordIngressStoreProgress(ctx, repository.RecordIngressStoreProgressInput{
 		UploadID:      upload.ID,
-		Attempt:       attemptOne.PrimaryStoreAttempt,
+		Attempt:       attemptOne.IngressStoreAttempt,
 		BytesUploaded: 4,
 	}); err != nil {
-		t.Fatalf("RecordPrimaryStoreProgress stale bytes: %v", err)
+		t.Fatalf("RecordIngressStoreProgress stale bytes: %v", err)
 	}
-	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+	if _, err := repos.Uploads.RecordIngressStoreProgress(ctx, repository.RecordIngressStoreProgressInput{
 		UploadID:      upload.ID,
-		Attempt:       attemptOne.PrimaryStoreAttempt,
+		Attempt:       attemptOne.IngressStoreAttempt,
 		BytesUploaded: 99,
 	}); err != nil {
-		t.Fatalf("RecordPrimaryStoreProgress clamp: %v", err)
+		t.Fatalf("RecordIngressStoreProgress clamp: %v", err)
 	}
 	got, err := repos.Uploads.GetByID(ctx, upload.ID)
 	if err != nil || got == nil {
 		t.Fatalf("GetByID after progress: got=%v err=%v", got, err)
 	}
-	if got.PrimaryBytesUploaded != 10 {
-		t.Fatalf("primary bytes after attempt one = %d, want clamped content size", got.PrimaryBytesUploaded)
+	if got.IngressBytesTransferred != 10 {
+		t.Fatalf("primary bytes after attempt one = %d, want clamped content size", got.IngressBytesTransferred)
 	}
 
-	attemptTwo, err := repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	attemptTwo, err := repos.Uploads.BeginIngressStoreProgress(ctx, upload.ID)
 	if err != nil {
-		t.Fatalf("BeginPrimaryStoreProgress second: %v", err)
+		t.Fatalf("BeginIngressStoreProgress second: %v", err)
 	}
-	if attemptTwo.PrimaryStoreAttempt != 2 || attemptTwo.PrimaryBytesUploaded != 0 {
-		t.Fatalf("second attempt progress = bytes:%d attempt:%d, want reset attempt 2", attemptTwo.PrimaryBytesUploaded, attemptTwo.PrimaryStoreAttempt)
+	if attemptTwo.IngressStoreAttempt != 2 || attemptTwo.IngressBytesTransferred != 0 {
+		t.Fatalf("second attempt progress = bytes:%d attempt:%d, want reset attempt 2", attemptTwo.IngressBytesTransferred, attemptTwo.IngressStoreAttempt)
 	}
-	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+	if _, err := repos.Uploads.RecordIngressStoreProgress(ctx, repository.RecordIngressStoreProgressInput{
 		UploadID:      upload.ID,
-		Attempt:       attemptOne.PrimaryStoreAttempt,
+		Attempt:       attemptOne.IngressStoreAttempt,
 		BytesUploaded: 8,
 	}); err != nil {
-		t.Fatalf("RecordPrimaryStoreProgress old attempt: %v", err)
+		t.Fatalf("RecordIngressStoreProgress old attempt: %v", err)
 	}
 	got, err = repos.Uploads.GetByID(ctx, upload.ID)
 	if err != nil || got == nil {
 		t.Fatalf("GetByID after old attempt: got=%v err=%v", got, err)
 	}
-	if got.PrimaryStoreAttempt != 2 || got.PrimaryBytesUploaded != 0 {
-		t.Fatalf("old attempt progress changed current attempt = bytes:%d attempt:%d, want reset attempt 2", got.PrimaryBytesUploaded, got.PrimaryStoreAttempt)
+	if got.IngressStoreAttempt != 2 || got.IngressBytesTransferred != 0 {
+		t.Fatalf("old attempt progress changed current attempt = bytes:%d attempt:%d, want reset attempt 2", got.IngressBytesTransferred, got.IngressStoreAttempt)
 	}
 }
 
@@ -354,24 +249,19 @@ func TestStorageUploadRepo_GetUploadProvenanceIncludesCopiesAndFailures(t *testi
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        strPtr("bafk2bzaceprovenancedetail"),
-		RequestedCopies: 2,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://primary.example/piece"), IsNewDataSet: true},
-			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: strPtr("https://secondary.example/piece"), IsNewDataSet: false},
-		},
-		Failures: []repository.StorageUploadFailureInput{{
-			ProviderID:   onChainIDPtr(t, "303"),
-			Role:         "secondary",
-			Stage:        strPtr("secondary_pull"),
-			ErrorMessage: strPtr("provider timed out"),
-			Explicit:     true,
-		}},
+	seedCommittedUploadCopies(t, repos, bucket.ID, upload.ID, "bafk2bzaceprovenancedetail", []storageUploadCopySeed{
+		{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: strPtr("https://ingress.example/piece"), IsNewDataSet: true},
+		{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: strPtr("https://peer.example/piece")},
+	})
+	if err := repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
+		UploadID:       upload.ID,
+		ProviderID:     onChainIDPtr(t, "303"),
+		TransferMethod: string(model.StorageCopyTransferMethodPeerPull),
+		Stage:          "peer_pull",
+		ErrorMessage:   "provider timed out",
+		Explicit:       true,
 	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
+		t.Fatalf("AppendUploadFailure: %v", err)
 	}
 
 	got, err := repos.Uploads.GetUploadProvenance(ctx, upload.ID)
@@ -396,8 +286,8 @@ func TestStorageUploadRepo_GetUploadProvenanceIncludesCopiesAndFailures(t *testi
 	if len(got.Failures) != 1 {
 		t.Fatalf("failures len = %d, want 1", len(got.Failures))
 	}
-	if got.Failures[0].ProviderID == nil || got.Failures[0].ProviderID.String() != "303" || got.Failures[0].Stage == nil || *got.Failures[0].Stage != "secondary_pull" {
-		t.Fatalf("failure = %#v, want provider 303 stage secondary_pull", got.Failures[0])
+	if got.Failures[0].ProviderID == nil || got.Failures[0].ProviderID.String() != "303" || got.Failures[0].Stage == nil || *got.Failures[0].Stage != "peer_pull" {
+		t.Fatalf("failure = %#v, want provider 303 stage peer_pull", got.Failures[0])
 	}
 }
 
@@ -431,7 +321,7 @@ func TestStorageUploadRepo_StagedProvenanceInfersNewDataSetAndAppendsFailures(t 
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, first.ID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
 		CopyIndex:        0,
-		Role:             "primary",
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
 		ProviderID:       onChainID(t, "101"),
 	}}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings first: %v", err)
@@ -453,13 +343,13 @@ func TestStorageUploadRepo_StagedProvenanceInfersNewDataSetAndAppendsFailures(t 
 		t.Fatalf("MarkUploadCopyCommitted first: %v", err)
 	}
 	if err := repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
-		UploadID:     first.ID,
-		CopyIndex:    0,
-		Stage:        "primary_commit",
-		ErrorMessage: "temporary commit failure",
-		ProviderID:   nil,
-		Role:         "",
-		Explicit:     false,
+		UploadID:       first.ID,
+		CopyIndex:      0,
+		Stage:          "ingress_commit",
+		ErrorMessage:   "temporary commit failure",
+		ProviderID:     nil,
+		TransferMethod: "",
+		Explicit:       false,
 	}); err != nil {
 		t.Fatalf("AppendUploadFailure: %v", err)
 	}
@@ -487,7 +377,7 @@ func TestStorageUploadRepo_StagedProvenanceInfersNewDataSetAndAppendsFailures(t 
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, second.ID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
 		CopyIndex:        0,
-		Role:             "primary",
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
 		ProviderID:       onChainID(t, "101"),
 	}}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings second: %v", err)
@@ -554,7 +444,7 @@ func TestStorageUploadRepo_RequiredOnChainIDValidationUsesInvalidInput(t *testin
 	}
 
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: types.OnChainID{}},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: types.OnChainID{}},
 	}); !errors.Is(err, repository.ErrInvalidInput) || errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("CreateUploadCopiesForBindings zero provider error = %v, want ErrInvalidInput only", err)
 	}
@@ -627,59 +517,7 @@ func TestStorageUploadRepo_DataSetBindingIsBucketProviderCopySlot(t *testing.T) 
 	}
 }
 
-func TestStorageUploadRepo_RecordResultDoesNotOverwriteStagedCopies(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	bucket := seedBucket(t, db, "staged-result-guard")
-
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: "01J00000000000000000020006",
-		ContentSize:     10,
-		Checksum:        "checksum-staged-result",
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
-	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          bucket.ID,
-		ProviderID:        onChainID(t, "101"),
-		CopyIndex:         0,
-		CreatedByUploadID: upload.ID,
-	})
-	if err != nil {
-		t.Fatalf("EnsureDataSetBinding: %v", err)
-	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-	}); err != nil {
-		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
-	}
-
-	err = repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        strPtr("bafk2bzacestagedguard"),
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://provider.example/piece")},
-		},
-	})
-	if err == nil {
-		t.Fatal("RecordUploadResult should reject uploads that already have staged copy rows")
-	}
-
-	copies, err := repos.Uploads.ListCopies(ctx, upload.ID)
-	if err != nil {
-		t.Fatalf("ListCopies: %v", err)
-	}
-	if len(copies) != 1 || copies[0].Status != model.StorageUploadCopyStatusPending || copies[0].StorageDataSetID == nil || *copies[0].StorageDataSetID != binding.ID {
-		t.Fatalf("copies after rejected legacy result = %#v, want original staged pending copy", copies)
-	}
-}
-
-func TestStorageUploadRepo_BindPrimaryCommittedUploadForContentMovesFollowersToReplicating(t *testing.T) {
+func TestStorageUploadRepo_BindReadableUploadForContentMovesFollowersToReplicating(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -743,7 +581,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForContentMovesFollowersToR
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -756,13 +594,13 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForContentMovesFollowersToR
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: leader.Size,
 		Checksum:    leader.Checksum,
 	}); err != nil {
-		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
 	for _, versionID := range []string{leader.VersionID, follower.VersionID} {
@@ -789,7 +627,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForContentMovesFollowersToR
 	}
 }
 
-func TestStorageUploadRepo_BindPrimaryCommittedUploadForVersionCompletesFollowerTask(t *testing.T) {
+func TestStorageUploadRepo_BindReadableUploadForVersionCompletesFollowerTask(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -844,7 +682,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForVersionCompletesFollower
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -858,7 +696,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForVersionCompletesFollower
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
 	}
 
-	refs, err := repos.Uploads.BindPrimaryCommittedUploadForVersion(ctx, repository.BindPrimaryCommittedUploadForVersionInput{
+	refs, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: follower.Size,
@@ -866,7 +704,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForVersionCompletesFollower
 		VersionID:   follower.VersionID,
 	})
 	if err != nil {
-		t.Fatalf("BindPrimaryCommittedUploadForVersion: %v", err)
+		t.Fatalf("BindReadableUploadForVersion: %v", err)
 	}
 	if len(refs) != 1 || refs[0].VersionID != follower.VersionID {
 		t.Fatalf("bound refs = %#v, want follower version", refs)
@@ -887,7 +725,7 @@ func TestStorageUploadRepo_BindPrimaryCommittedUploadForVersionCompletesFollower
 	}
 }
 
-func TestStorageUploadRepo_FinalizeUploadIfAllCopiesCommittedMovesReplicatingToStored(t *testing.T) {
+func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStored(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -921,27 +759,33 @@ func TestStorageUploadRepo_FinalizeUploadIfAllCopiesCommittedMovesReplicatingToS
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+		t.Fatalf("primary ready: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
+		t.Fatalf("secondary ready: %v", err)
+	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacefinalize", PieceID: onChainIDPtr(t, "301"), RetrievalURL: "https://primary.example/piece"}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted primary: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
-	done, refs, err := repos.Uploads.FinalizeUploadIfAllCopiesCommitted(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	done, refs, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
 	if err != nil {
-		t.Fatalf("FinalizeUploadIfAllCopiesCommitted partial: %v", err)
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet partial: %v", err)
 	}
 	if done || len(refs) != 0 {
 		t.Fatalf("partial finalize = done:%v refs:%v, want no-op", done, refs)
@@ -954,12 +798,42 @@ func TestStorageUploadRepo_FinalizeUploadIfAllCopiesCommittedMovesReplicatingToS
 		t.Fatalf("partial state = %s, want replicating", got.State)
 	}
 
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 1, PieceCID: "bafk2bzacefinalize", PieceID: onChainIDPtr(t, "302"), RetrievalURL: "https://secondary.example/piece"}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitted secondary: %v", err)
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 1, "peer pull: dataset unavailable"); err != nil {
+		t.Fatalf("MarkUploadCopyFailed peer: %v", err)
 	}
-	done, refs, err = repos.Uploads.FinalizeUploadIfAllCopiesCommitted(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	replacement, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "303"), CopyIndex: 2, CreatedByUploadID: upload.ID})
 	if err != nil {
-		t.Fatalf("FinalizeUploadIfAllCopiesCommitted complete: %v", err)
+		t.Fatalf("replacement binding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: replacement.ID, UploadID: upload.ID, DataSetID: onChainID(t, "3003"), ClientDataSetID: onChainIDPtr(t, "9003")}); err != nil {
+		t.Fatalf("replacement ready: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: replacement.ID, CopyIndex: 2, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "303")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings replacement: %v", err)
+	}
+	upload, err = repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("GetByID after replacement: %v", err)
+	}
+	if upload.RequestedCopies != 2 {
+		t.Fatalf("requested copies after replacement append = %d, want 2", upload.RequestedCopies)
+	}
+	done, refs, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet after replacement append: %v", err)
+	}
+	if done || len(refs) != 0 {
+		t.Fatalf("replacement append finalize = done:%v refs:%v, want no-op until target copies are met", done, refs)
+	}
+
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 2, PieceCID: "bafk2bzacefinalize", PieceID: onChainIDPtr(t, "302"), RetrievalURL: "https://replacement.example/piece"}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted replacement: %v", err)
+	}
+	done, refs, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet complete: %v", err)
 	}
 	if !done || len(refs) != 1 || refs[0].VersionID != version.VersionID {
 		t.Fatalf("complete finalize = done:%v refs:%v, want stored source version", done, refs)
@@ -970,62 +844,6 @@ func TestStorageUploadRepo_FinalizeUploadIfAllCopiesCommittedMovesReplicatingToS
 	}
 	if got.State != model.ObjectStateStored {
 		t.Fatalf("complete state = %s, want stored", got.State)
-	}
-}
-
-func TestStorageUploadRepo_PartialResultDoesNotBindObjectVersion(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	bucket := seedBucket(t, db, "partial-upload-bucket")
-
-	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000010002", 10)
-	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
-	if err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("uploading: %v", err)
-	}
-	task := seedRunningUploadTask(t, repos, objectID, version.VersionID)
-
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceTaskID:    task.ID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        false,
-		PieceCID:        strPtr("bafk2bzacepartial"),
-		RequestedCopies: 2,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://primary.example/piece"), IsNewDataSet: true},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
-	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
-		UploadID:    upload.ID,
-		Task:        task,
-		BucketID:    bucket.ID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
-	}); err == nil {
-		t.Fatal("AcceptCompleteUploadForContent should reject partial upload")
-	}
-
-	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
-	if err != nil || got == nil {
-		t.Fatalf("GetVersionByID: got=%v err=%v", got, err)
-	}
-	if got.State != model.ObjectStateUploading || got.StorageUploadID != nil || got.InFilecoin {
-		t.Fatalf("version after partial = state:%s upload:%#v filecoin:%v", got.State, got.StorageUploadID, got.InFilecoin)
 	}
 }
 
@@ -1054,12 +872,12 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
 
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, "primary store: provider rejected piece"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, "ingress store: provider rejected piece"); err != nil {
 		t.Fatalf("MarkUploadCopyFailed: %v", err)
 	}
 	got, err := repos.Uploads.GetByID(ctx, upload.ID)
@@ -1069,8 +887,8 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 	if got.Status != model.StorageUploadStatusFailed {
 		t.Fatalf("upload status = %s, want failed", got.Status)
 	}
-	if got.ErrorMessage == nil || *got.ErrorMessage != "primary store: provider rejected piece" {
-		t.Fatalf("upload error_message = %#v, want primary failure reason", got.ErrorMessage)
+	if got.ErrorMessage == nil || *got.ErrorMessage != "ingress store: provider rejected piece" {
+		t.Fatalf("upload error_message = %#v, want ingress failure reason", got.ErrorMessage)
 	}
 
 	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
@@ -1085,11 +903,11 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("GetByID after store retry: got=%v err=%v", got, err)
 	}
-	if got.Status != model.StorageUploadStatusStoredOnPrimary {
-		t.Fatalf("upload status after store retry = %s, want stored_on_primary", got.Status)
+	if got.Status != model.StorageUploadStatusIngressReady {
+		t.Fatalf("upload status after store retry = %s, want ingress_ready", got.Status)
 	}
 
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, "primary commit: provider rejected piece"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, "ingress commit: provider rejected piece"); err != nil {
 		t.Fatalf("MarkUploadCopyFailed after store retry: %v", err)
 	}
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
@@ -1105,8 +923,8 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("GetByID after commit retry: got=%v err=%v", got, err)
 	}
-	if got.Status != model.StorageUploadStatusPrimaryCommitted {
-		t.Fatalf("upload status after commit retry = %s, want primary_committed", got.Status)
+	if got.Status != model.StorageUploadStatusReadable {
+		t.Fatalf("upload status after commit retry = %s, want readable", got.Status)
 	}
 }
 
@@ -1150,8 +968,8 @@ func TestStorageUploadRepo_CommittedCopyIgnoresStaleStatusUpdates(t *testing.T) 
 		t.Fatalf("MarkDataSetReady secondary: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -1195,143 +1013,6 @@ func TestStorageUploadRepo_CommittedCopyIgnoresStaleStatusUpdates(t *testing.T) 
 	}
 }
 
-func TestStorageUploadRepo_AcceptSupersededUploadPreservesAcceptError(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	bucket := seedBucket(t, db, "superseded-accept-error-bucket")
-
-	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000010020", 10)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("uploading: %v", err)
-	}
-	_ = acceptTestStorageUploadForVersion(t, repos, bucket.ID, version, "bafk2bzacesupersededfirst")
-
-	second, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-	})
-	if err != nil {
-		t.Fatalf("second StartObjectUploadAttempt: %v", err)
-	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        second.ID,
-		Complete:        true,
-		PieceCID:        strPtr("bafk2bzacesupersededsecond"),
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001002"), PieceID: onChainIDPtr(t, "2002"), Role: "primary", RetrievalURL: strPtr("https://provider.example/second")},
-		},
-	}); err != nil {
-		t.Fatalf("second RecordUploadResult: %v", err)
-	}
-	refs, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
-		UploadID:    second.ID,
-		BucketID:    bucket.ID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
-	})
-	if err != nil {
-		t.Fatalf("second AcceptCompleteUploadForContent: %v", err)
-	}
-	if len(refs) != 0 {
-		t.Fatalf("second accepted refs = %#v, want none", refs)
-	}
-	got, err := repos.Uploads.GetByID(ctx, second.ID)
-	if err != nil || got == nil {
-		t.Fatalf("GetByID(second): got=%v err=%v", got, err)
-	}
-	if got.Status != model.StorageUploadStatusSuperseded {
-		t.Fatalf("second status = %s, want superseded", got.Status)
-	}
-	if got.AcceptError == nil || !strings.Contains(*got.AcceptError, "source version already stored by another upload") {
-		t.Fatalf("second accept_error = %#v, want superseded reason", got.AcceptError)
-	}
-}
-
-func TestStorageUploadRepo_DataSetCrossBucketConflictPreservesCopyButRejects(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	bucketA := seedBucket(t, db, "dataset-owner-a")
-	bucketB := seedBucket(t, db, "dataset-owner-b")
-
-	first, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucketA.ID,
-		SourceVersionID: "first",
-		ContentSize:     1,
-		Checksum:        "sum-a",
-	})
-	if err != nil {
-		t.Fatalf("first StartObjectUploadAttempt: %v", err)
-	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        first.ID,
-		Complete:        true,
-		PieceCID:        strPtr("bafk2bzacefirst"),
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://provider.example/first")},
-		},
-	}); err != nil {
-		t.Fatalf("first RecordUploadResult: %v", err)
-	}
-
-	second, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucketB.ID,
-		SourceVersionID: "second",
-		ContentSize:     1,
-		Checksum:        "sum-b",
-	})
-	if err != nil {
-		t.Fatalf("second StartObjectUploadAttempt: %v", err)
-	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        second.ID,
-		Complete:        true,
-		PieceCID:        strPtr("bafk2bzacesecond"),
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "9999"), Role: "primary", RetrievalURL: strPtr("https://provider.example/second")},
-			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: strPtr("https://provider.example/second-copy")},
-		},
-	}); err != nil {
-		t.Fatalf("second RecordUploadResult: %v", err)
-	}
-
-	got, err := repos.Uploads.GetByID(ctx, second.ID)
-	if err != nil || got == nil {
-		t.Fatalf("GetByID(second): got=%v err=%v", got, err)
-	}
-	if got.Status != model.StorageUploadStatusRejected {
-		t.Fatalf("second status = %s, want rejected", got.Status)
-	}
-	copies, err := repos.Uploads.ListCopies(ctx, second.ID)
-	if err != nil {
-		t.Fatalf("ListCopies: %v", err)
-	}
-	if len(copies) != 2 {
-		t.Fatalf("copies len = %d, want 2", len(copies))
-	}
-	for _, copy := range copies {
-		if copy.StorageDataSetID != nil {
-			t.Fatalf("rejected copy storage_data_set_id = %#v, want nil", copy.StorageDataSetID)
-		}
-	}
-	count, err := db.NewSelect().Model((*model.StorageDataSet)(nil)).Count(ctx)
-	if err != nil {
-		t.Fatalf("count storage data sets: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("storage data set count = %d, want only original owner row", count)
-	}
-}
-
 func TestStorageUploadRepo_AppendUploadFailureRetriesRacedAttemptIndex(t *testing.T) {
 	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "storage-upload-failure-race.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
@@ -1364,12 +1045,12 @@ func TestStorageUploadRepo_AppendUploadFailureRetriesRacedAttemptIndex(t *testin
 	db.AddQueryHook(hook)
 
 	if err := repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
-		UploadID:     upload.ID,
-		CopyIndex:    0,
-		ProviderID:   onChainIDPtr(t, "101"),
-		Role:         "primary",
-		Stage:        "primary_store",
-		ErrorMessage: "provider store failed",
+		UploadID:       upload.ID,
+		CopyIndex:      0,
+		ProviderID:     onChainIDPtr(t, "101"),
+		TransferMethod: string(model.StorageCopyTransferMethodIngress),
+		Stage:          "ingress_store",
+		ErrorMessage:   "provider store failed",
 	}); err != nil {
 		t.Fatalf("AppendUploadFailure: %v", err)
 	}
@@ -1395,216 +1076,6 @@ func TestStorageUploadRepo_AppendUploadFailureRetriesRacedAttemptIndex(t *testin
 	if lastFailure.ErrorMessage == nil || *lastFailure.ErrorMessage != "provider store failed" {
 		t.Fatalf("retried failure = %#v, want original append data", lastFailure)
 	}
-}
-
-func TestStorageUploadRepo_RecordResultRejectsRacedCrossBucketDataSetConflict(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "storage-upload-cross-bucket-race.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
-	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
-	repos := repository.NewRepositories(db)
-	ownerBucket := seedBucket(t, db, "cross-bucket-race-owner")
-	racingBucket := seedBucket(t, db, "cross-bucket-race-loser")
-
-	ownerUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:    ownerBucket.ID,
-		ContentSize: 1,
-		Checksum:    "race-owner",
-	})
-	if err != nil {
-		t.Fatalf("owner StartObjectUploadAttempt: %v", err)
-	}
-	racingUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:    racingBucket.ID,
-		ContentSize: 1,
-		Checksum:    "race-loser",
-	})
-	if err != nil {
-		t.Fatalf("racing StartObjectUploadAttempt: %v", err)
-	}
-
-	hook := &storageDataSetRaceHook{
-		bucketID:   ownerBucket.ID,
-		uploadID:   ownerUpload.ID,
-		providerID: "404",
-		dataSetID:  "1404",
-	}
-	db.AddQueryHook(hook)
-
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("opening bun conn: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	connRepos := repository.NewRepositories(conn)
-
-	if err := connRepos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        racingUpload.ID,
-		Complete:        true,
-		PieceCID:        strPtr("piece-cross-race"),
-		RequestedCopies: 2,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "303"), DataSetID: onChainIDPtr(t, "1303"), PieceID: onChainIDPtr(t, "1"), Role: "primary", RetrievalURL: strPtr("https://provider.example/safe")},
-			{ProviderID: onChainIDPtr(t, hook.providerID), DataSetID: onChainIDPtr(t, hook.dataSetID), PieceID: onChainIDPtr(t, "2"), Role: "primary", RetrievalURL: strPtr("https://provider.example/cross-race")},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
-	if hookErr := hook.err.Load(); hookErr != nil {
-		t.Fatalf("race hook insert: %v", hookErr)
-	}
-	if !hook.triggered.Load() {
-		t.Fatal("race hook did not run")
-	}
-	if hook.uniqueViolationSeen.Load() {
-		t.Fatal("RecordUploadResult recovered from a unique violation, which aborts PostgreSQL transactions")
-	}
-
-	got, err := repos.Uploads.GetByID(ctx, racingUpload.ID)
-	if err != nil || got == nil {
-		t.Fatalf("GetByID(racing upload): got=%v err=%v", got, err)
-	}
-	if got.Status != model.StorageUploadStatusRejected {
-		t.Fatalf("racing upload status = %s, want rejected", got.Status)
-	}
-	copies, err := repos.Uploads.ListCopies(ctx, racingUpload.ID)
-	if err != nil {
-		t.Fatalf("ListCopies: %v", err)
-	}
-	if len(copies) != 2 {
-		t.Fatalf("copies len = %d, want 2", len(copies))
-	}
-	for _, copy := range copies {
-		if copy.StorageDataSetID != nil {
-			t.Fatalf("raced rejected copy storage_data_set_id = %#v, want nil", copy.StorageDataSetID)
-		}
-	}
-	count, err := db.NewSelect().
-		Model((*model.StorageDataSet)(nil)).
-		Where("bucket_id = ?", racingBucket.ID).
-		Count(ctx)
-	if err != nil {
-		t.Fatalf("count racing bucket storage data sets: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("racing bucket storage data set count = %d, want 0", count)
-	}
-}
-
-func TestStorageUploadRepo_RecordResultReusesSameBucketDataSetAfterUniqueRace(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "storage-upload-race.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
-	if err != nil {
-		t.Fatalf("opening sqlite db: %v", err)
-	}
-	sqldb.SetMaxOpenConns(8)
-	db := bun.NewDB(sqldb, sqlitedialect.New())
-	t.Cleanup(func() { _ = db.Close() })
-
-	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("init migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("running migrations: %v", err)
-	}
-	repos := repository.NewRepositories(db)
-	bucket := seedBucket(t, db, "same-bucket-race")
-
-	first, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:    bucket.ID,
-		ContentSize: 1,
-		Checksum:    "race-first",
-	})
-	if err != nil {
-		t.Fatalf("first StartObjectUploadAttempt: %v", err)
-	}
-	second, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:    bucket.ID,
-		ContentSize: 1,
-		Checksum:    "race-second",
-	})
-	if err != nil {
-		t.Fatalf("second StartObjectUploadAttempt: %v", err)
-	}
-
-	hook := &storageDataSetRaceHook{
-		bucketID:   bucket.ID,
-		uploadID:   first.ID,
-		providerID: "505",
-		dataSetID:  "1505",
-	}
-	db.AddQueryHook(hook)
-
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("opening bun conn: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	connRepos := repository.NewRepositories(conn)
-
-	retrievalURL := "https://provider.example/race"
-	if err := connRepos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        second.ID,
-		Complete:        true,
-		PieceCID:        strPtr("piece-race"),
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, hook.providerID), DataSetID: onChainIDPtr(t, hook.dataSetID), PieceID: onChainIDPtr(t, "2"), Role: "primary", RetrievalURL: &retrievalURL},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
-	if hookErr := hook.err.Load(); hookErr != nil {
-		t.Fatalf("race hook insert: %v", hookErr)
-	}
-	if !hook.triggered.Load() {
-		t.Fatal("race hook did not run")
-	}
-	if hook.uniqueViolationSeen.Load() {
-		t.Fatal("RecordUploadResult recovered from a unique violation, which aborts PostgreSQL transactions")
-	}
-
-	copies, err := repos.Uploads.ListCopies(ctx, second.ID)
-	if err != nil {
-		t.Fatalf("ListCopies: %v", err)
-	}
-	if len(copies) != 1 || copies[0].StorageDataSetID == nil {
-		t.Fatalf("copies = %#v, want one copy linked to existing data set", copies)
-	}
-	dataSet := new(model.StorageDataSet)
-	if err := db.NewSelect().
-		Model(dataSet).
-		Where("provider_id = ? AND data_set_id = ?", hook.providerID, hook.dataSetID).
-		Scan(ctx); err != nil {
-		t.Fatalf("selecting data set: %v", err)
-	}
-	if dataSet.CreatedByUploadID == nil || *dataSet.CreatedByUploadID != first.ID ||
-		dataSet.LastUsedUploadID == nil || *dataSet.LastUsedUploadID != second.ID {
-		t.Fatalf("data set seen uploads = created:%v last:%v, want created:%d last:%d", dataSet.CreatedByUploadID, dataSet.LastUsedUploadID, first.ID, second.ID)
-	}
-}
-
-type storageDataSetRaceHook struct {
-	bucketID            int64
-	uploadID            int64
-	providerID          string
-	dataSetID           string
-	triggered           atomic.Bool
-	uniqueViolationSeen atomic.Bool
-	err                 atomic.Value
 }
 
 type storageUploadFailureRaceHook struct {
@@ -1636,12 +1107,12 @@ func (h *storageUploadFailureRaceHook) BeforeQuery(ctx context.Context, event *b
 		return ctx
 	}
 	failure := &model.StorageUploadFailure{
-		UploadID:     h.uploadID,
-		AttemptIndex: attemptIndex,
-		ProviderID:   &providerID,
-		Role:         "primary",
-		Stage:        strPtr("raced_failure"),
-		ErrorMessage: strPtr("raced insert"),
+		UploadID:       h.uploadID,
+		AttemptIndex:   attemptIndex,
+		ProviderID:     &providerID,
+		TransferMethod: string(model.StorageCopyTransferMethodIngress),
+		Stage:          strPtr("raced_failure"),
+		ErrorMessage:   strPtr("raced insert"),
 	}
 	if _, err := event.DB.NewInsert().Model(failure).Exec(ctx); err != nil {
 		h.err.Store(err)
@@ -1650,44 +1121,6 @@ func (h *storageUploadFailureRaceHook) BeforeQuery(ctx context.Context, event *b
 }
 
 func (h *storageUploadFailureRaceHook) AfterQuery(context.Context, *bun.QueryEvent) {}
-
-func (h *storageDataSetRaceHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
-	if !strings.Contains(event.Query, "INSERT INTO") || !strings.Contains(event.Query, "storage_data_sets") {
-		return ctx
-	}
-	if !h.triggered.CompareAndSwap(false, true) {
-		return ctx
-	}
-	providerID, err := types.ParseOnChainID("providerID", h.providerID)
-	if err != nil {
-		h.err.Store(err)
-		return ctx
-	}
-	dataSetID, err := types.ParseOnChainID("dataSetID", h.dataSetID)
-	if err != nil {
-		h.err.Store(err)
-		return ctx
-	}
-	dataSet := &model.StorageDataSet{
-		BucketID:          h.bucketID,
-		ProviderID:        providerID,
-		CopyIndex:         0,
-		DataSetID:         &dataSetID,
-		Status:            model.StorageDataSetStatusReady,
-		CreatedByUploadID: &h.uploadID,
-		LastUsedUploadID:  &h.uploadID,
-	}
-	if _, err := event.DB.NewInsert().Model(dataSet).Exec(ctx); err != nil {
-		h.err.Store(err)
-	}
-	return ctx
-}
-
-func (h *storageDataSetRaceHook) AfterQuery(_ context.Context, event *bun.QueryEvent) {
-	if event.Err != nil && strings.Contains(event.Err.Error(), "UNIQUE constraint") {
-		h.uniqueViolationSeen.Store(true)
-	}
-}
 
 func seedRunningUploadTask(t *testing.T, repos *repository.Repositories, objectID int64, versionID string) *model.Task {
 	t.Helper()
@@ -1721,30 +1154,17 @@ func acceptTestStorageUploadForVersion(t *testing.T, repos *repository.Repositor
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
 	dataSetID := "1001" + strconv.FormatInt(upload.ID, 10)
-	if err := repos.Uploads.RecordUploadResult(context.Background(), repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        strPtr(pieceCID),
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, dataSetID), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://provider.example/" + version.VersionID)},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
-	if _, err := repos.Uploads.AcceptCompleteUploadForContent(context.Background(), repository.AcceptCompleteUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    bucketID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
-	}); err != nil {
-		t.Fatalf("AcceptCompleteUploadForContent: %v", err)
-	}
+	seedCommittedUploadCopies(t, repos, bucketID, upload.ID, pieceCID, []storageUploadCopySeed{
+		{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, dataSetID), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: strPtr("https://provider.example/" + version.VersionID), IsNewDataSet: true},
+	})
+	bindReadableUploadForContent(t, repos, upload.ID, bucketID, version.Size, version.Checksum)
+	finalizeUploadForTest(t, repos, upload.ID)
 	return upload.ID
 }
 

@@ -305,12 +305,7 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 					(object_version.state = ? AND active_upload.status IN (?, ?))
 					OR (
 						object_version.state = ?
-						AND EXISTS (
-							SELECT 1 FROM storage_upload_copies AS primary_copy
-							WHERE primary_copy.upload_id = active_upload.id
-							  AND primary_copy.copy_index = 0
-							  AND primary_copy.status IN (?, ?, ?)
-						)
+						AND `+usableCopyExistsSQL("active_upload.id")+`
 					)
 				  )
 			)
@@ -326,9 +321,8 @@ func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, buc
 			)
 		)`,
 			bun.List(activeUploadStatuses()),
-			model.ObjectStateUploading, model.StorageUploadStatusRunning, model.StorageUploadStatusStoredOnPrimary,
+			model.ObjectStateUploading, model.StorageUploadStatusRunning, model.StorageUploadStatusIngressReady,
 			model.ObjectStateCommitting,
-			model.StorageUploadCopyStatusPieceReady, model.StorageUploadCopyStatusCommitting, model.StorageUploadCopyStatusCommitted,
 			model.ObjectStateCached, model.ObjectStateUploading,
 			"object", model.TaskTypeUpload, bun.List(activeTaskStatuses()),
 		).
@@ -759,7 +753,7 @@ func withObjectVersionStorageColumns(q *bun.SelectQuery, alias string) *bun.Sele
 }
 
 func usableCopyExistsSQL(uploadIDExpr string) string {
-	return "EXISTS (SELECT 1 FROM storage_upload_copies AS storage_copy JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id WHERE storage_copy.upload_id = " + uploadIDExpr + " AND storage_copy.status = 'committed' AND storage_copy.storage_data_set_id IS NOT NULL AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> '' AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> '' AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> '' AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> '')"
+	return "EXISTS (SELECT 1 FROM storage_upload_copies AS storage_copy JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id WHERE storage_copy.upload_id = " + uploadIDExpr + " AND storage_copy.status = 'committed' AND storage_copy.storage_data_set_id IS NOT NULL AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> '' AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> '' AND storage_data_set.status IN ('ready', 'draining') AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> '' AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> '')"
 }
 
 func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (ObjectVersionWriteResult, error) {

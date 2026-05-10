@@ -218,13 +218,7 @@ func (r *Reader) downloadVersionFromProvider(ctx context.Context, key string, ve
 	if version.StorageUploadID == nil || r.storage == nil {
 		return nil, ErrCacheMiss
 	}
-	var copies []repository.ReadableStorageCopy
-	var err error
-	if version.State == model.ObjectStateReplicating {
-		copies, err = r.repos.Uploads.ListReadablePrimaryCopy(ctx, *version.StorageUploadID)
-	} else {
-		copies, err = r.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
-	}
+	copies, err := r.repos.Uploads.ListReadableCommittedCopies(ctx, *version.StorageUploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +238,7 @@ func (r *Reader) downloadVersionFromProvider(ctx context.Context, key string, ve
 		if err == nil {
 			return rc, nil
 		}
-		r.logger.Warn("provider download failed", "key", key, "versionID", version.VersionID, "copyIndex", copy.CopyIndex, "role", copy.Role, "err", err)
+		r.logger.Warn("provider download failed", "key", key, "versionID", version.VersionID, "copyIndex", copy.CopyIndex, "transferMethod", copy.TransferMethod, "err", err)
 		lastErr = err
 	}
 	if lastErr != nil {

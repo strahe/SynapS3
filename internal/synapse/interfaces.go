@@ -25,10 +25,9 @@ type UploadContext interface {
 	Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error)
 }
 
-// StorageClient abstracts the synapse-go storage service for upload/download
-// plus staged provider operations.
+// StorageClient abstracts the synapse-go storage service for download plus
+// staged provider operations.
 type StorageClient interface {
-	Upload(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
 	Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
 	CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]UploadContext, error)
 	CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (UploadContext, error)

@@ -38,12 +38,12 @@ const (
 )
 
 const (
-	recoveryStagePrepare         = "prepare_upload"
-	recoveryStageEnsureDataSet   = "ensure_dataset"
-	recoveryStagePrimaryStore    = "primary_store"
-	recoveryStagePrimaryCommit   = "primary_commit"
-	recoveryStageSecondaryPull   = "secondary_pull"
-	recoveryStageSecondaryCommit = "secondary_commit"
+	recoveryStagePrepare       = "prepare_upload"
+	recoveryStageEnsureDataSet = "ensure_dataset"
+	recoveryStageIngressStore  = "ingress_store"
+	recoveryStageIngressCommit = "ingress_commit"
+	recoveryStagePeerPull      = "peer_pull"
+	recoveryStagePeerCommit    = "peer_commit"
 )
 
 // NewManager creates a new worker manager.
@@ -212,7 +212,7 @@ func (m *Manager) reconcileStagedUploads(ctx context.Context) {
 					m.reconcileReplicatingUpload(ctx, version, upload)
 					continue
 				}
-				m.reconcilePrimaryUpload(ctx, version, upload)
+				m.reconcileIngressUpload(ctx, version, upload)
 			}
 			if len(versions) < reconcileBatchSize {
 				break
@@ -225,14 +225,14 @@ func (m *Manager) reconcileStagedUploads(ctx context.Context) {
 func (m *Manager) reconcileOrphanStagedVersion(ctx context.Context, version model.ObjectVersion) {
 	switch version.State {
 	case model.ObjectStateUploading:
-		m.enqueueRecoveredUploadStage(ctx, version, 0, recoveryStagePrepare, 0, false)
+		m.enqueueRecoveredUploadStage(ctx, version, 0, recoveryStagePrepare, 0, "")
 	case model.ObjectStateCommitting:
 		if err := m.repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCommitting, model.ObjectStateUploading); err != nil {
 			m.logger.Error("failed to reset orphan committing version", "versionID", version.VersionID, "error", err)
 			return
 		}
 		version.State = model.ObjectStateUploading
-		m.enqueueRecoveredUploadStage(ctx, version, 0, recoveryStagePrepare, 0, false)
+		m.enqueueRecoveredUploadStage(ctx, version, 0, recoveryStagePrepare, 0, "")
 	case model.ObjectStateReplicating:
 		m.logger.Warn("replicating version has no recoverable storage upload", "versionID", version.VersionID)
 	}
@@ -255,106 +255,132 @@ func (m *Manager) recoverableUploadForVersion(ctx context.Context, version model
 func isRecoverableUploadStatus(status model.StorageUploadStatus) bool {
 	switch status {
 	case model.StorageUploadStatusRunning,
-		model.StorageUploadStatusStoredOnPrimary,
-		model.StorageUploadStatusPrimaryCommitted,
-		model.StorageUploadStatusPartial,
-		model.StorageUploadStatusAllCopiesCommitted:
+		model.StorageUploadStatusIngressReady,
+		model.StorageUploadStatusReadable,
+		model.StorageUploadStatusComplete:
 		return true
 	default:
 		return false
 	}
 }
 
-func (m *Manager) reconcilePrimaryUpload(ctx context.Context, version model.ObjectVersion, upload *model.StorageUpload) {
+func (m *Manager) reconcileIngressUpload(ctx context.Context, version model.ObjectVersion, upload *model.StorageUpload) {
 	copies, err := m.repos.Uploads.ListCopies(ctx, upload.ID)
 	if err != nil {
-		m.logger.Error("failed to list primary upload copies for reconciliation", "uploadID", upload.ID, "error", err)
+		m.logger.Error("failed to list ingress upload copies for reconciliation", "uploadID", upload.ID, "error", err)
 		return
 	}
 	if len(copies) == 0 {
-		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStagePrepare, 0, false)
+		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStagePrepare, 0, "")
 		return
 	}
-	var primary *model.StorageUploadCopy
+	var ingress *model.StorageUploadCopy
 	for i := range copies {
-		if copies[i].CopyIndex == 0 {
-			primary = &copies[i]
+		if copies[i].TransferMethod == model.StorageCopyTransferMethodIngress && !copyCommitted(&copies[i]) {
+			ingress = &copies[i]
 			break
 		}
 	}
-	binding, err := m.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, version.BucketID, 0)
+	if ingress == nil {
+		m.reconcileReplicatingUpload(ctx, version, upload)
+		return
+	}
+	binding, err := m.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, version.BucketID, ingress.CopyIndex)
 	if err != nil {
-		m.logger.Error("failed to load primary dataset binding for reconciliation", "uploadID", upload.ID, "error", err)
+		m.logger.Error("failed to load ingress dataset binding for reconciliation", "uploadID", upload.ID, "copyIndex", ingress.CopyIndex, "error", err)
 		return
 	}
-	if primary == nil || binding == nil || binding.Status != model.StorageDataSetStatusReady {
-		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageEnsureDataSet, 0, true)
+	if binding == nil || binding.Status != model.StorageDataSetStatusReady {
+		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageEnsureDataSet, ingress.CopyIndex, ingress.TransferMethod)
 		return
 	}
-	if version.State == model.ObjectStateCommitting && copyHasPiece(primary) {
-		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStagePrimaryCommit, 0, false)
+	if version.State == model.ObjectStateCommitting && copyHasPiece(ingress) {
+		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageIngressCommit, ingress.CopyIndex, ingress.TransferMethod)
 		return
 	}
-	m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStagePrimaryStore, 0, false)
+	m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageIngressStore, ingress.CopyIndex, ingress.TransferMethod)
 }
 
 func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.ObjectVersion, upload *model.StorageUpload) {
 	copies, err := m.repos.Uploads.ListCopies(ctx, upload.ID)
 	if err != nil {
-		m.logger.Error("failed to list secondary upload copies for reconciliation", "uploadID", upload.ID, "error", err)
+		m.logger.Error("failed to list peer upload copies for reconciliation", "uploadID", upload.ID, "error", err)
 		return
 	}
 	if len(copies) == 0 {
 		return
 	}
-	allCommitted := true
-	for i := range copies {
-		if !copyCommitted(&copies[i]) {
-			allCommitted = false
-			break
-		}
-	}
-	if allCommitted {
-		finalized, refs, err := m.repos.Uploads.FinalizeUploadIfAllCopiesCommitted(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
-		if err != nil {
-			m.logger.Error("failed to finalize recovered upload", "uploadID", upload.ID, "error", err)
-			return
-		}
-		if finalized {
-			m.enqueueRecoveredEvictTasks(ctx, refs)
-		}
+	readableCopies, err := m.repos.Uploads.ListReadableCommittedCopies(ctx, upload.ID)
+	if err != nil {
+		m.logger.Error("failed to list readable upload copies for reconciliation", "uploadID", upload.ID, "error", err)
 		return
 	}
+	if len(readableCopies) > 0 && !versionBoundToUpload(version, upload.ID) {
+		_, err := m.repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+			UploadID:    upload.ID,
+			BucketID:    version.BucketID,
+			ContentSize: version.Size,
+			Checksum:    version.Checksum,
+		})
+		if err != nil {
+			m.logger.Error("failed to bind recovered readable upload", "uploadID", upload.ID, "versionID", version.VersionID, "error", err)
+			return
+		}
+		version.State = model.ObjectStateReplicating
+		version.StorageUploadID = &upload.ID
+	}
+	finalized, refs, err := m.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	if err != nil {
+		m.logger.Error("failed to finalize recovered upload", "uploadID", upload.ID, "error", err)
+		return
+	}
+	if finalized {
+		m.enqueueRecoveredEvictTasks(ctx, refs)
+		return
+	}
+	recoverablePeerCount := 0
 	for i := range copies {
 		copyRow := &copies[i]
-		if copyRow.CopyIndex == 0 || copyCommitted(copyRow) {
+		if copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull || copyCommitted(copyRow) || copyRow.Status == model.StorageUploadCopyStatusFailed {
 			continue
 		}
 		stage := recoveryStageEnsureDataSet
 		binding, err := m.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, version.BucketID, copyRow.CopyIndex)
 		if err != nil {
-			m.logger.Error("failed to load secondary dataset binding for reconciliation", "uploadID", upload.ID, "copyIndex", copyRow.CopyIndex, "error", err)
+			m.logger.Error("failed to load peer dataset binding for reconciliation", "uploadID", upload.ID, "copyIndex", copyRow.CopyIndex, "error", err)
 			continue
 		}
+		if !dataSetBindingCanEnsureWrite(binding) {
+			continue
+		}
+		recoverablePeerCount++
 		if binding != nil && binding.Status == model.StorageDataSetStatusReady {
-			stage = recoveryStageSecondaryPull
+			stage = recoveryStagePeerPull
 			if copyHasPiece(copyRow) {
-				stage = recoveryStageSecondaryCommit
+				stage = recoveryStagePeerCommit
 			}
 		}
-		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, stage, copyRow.CopyIndex, true)
+		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, stage, copyRow.CopyIndex, copyRow.TransferMethod)
+	}
+	if upload.RequestedCopies > len(readableCopies)+recoverablePeerCount && len(readableCopies) > 0 {
+		m.enqueueRecoveredUploadRepair(ctx, version, upload.ID)
 	}
 }
 
-func (m *Manager) enqueueRecoveredUploadStage(ctx context.Context, version model.ObjectVersion, uploadID int64, stage string, copyIndex int, includeCopyIndex bool) {
+func versionBoundToUpload(version model.ObjectVersion, uploadID int64) bool {
+	return version.State == model.ObjectStateReplicating && version.StorageUploadID != nil && *version.StorageUploadID == uploadID
+}
+
+func (m *Manager) enqueueRecoveredUploadStage(ctx context.Context, version model.ObjectVersion, uploadID int64, stage string, copyIndex int, transferMethod model.StorageCopyTransferMethod) {
 	payload := map[string]interface{}{"upload_id": uploadID}
 	key := fmt.Sprintf("upload:%s:%s:%d", version.VersionID, stage, uploadID)
 	if stage == recoveryStagePrepare {
 		payload = nil
 		key = fmt.Sprintf("upload:%s", version.VersionID)
 	}
-	if includeCopyIndex {
+	if transferMethod != "" {
 		payload["copy_index"] = copyIndex
+		payload["transfer_method"] = string(transferMethod)
 		key = fmt.Sprintf("%s:%d", key, copyIndex)
 	}
 	task := &model.Task{
@@ -371,6 +397,25 @@ func (m *Manager) enqueueRecoveredUploadStage(ctx context.Context, version model
 	}
 	if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
 		m.logger.Error("failed to enqueue recovered upload stage", "stage", stage, "uploadID", uploadID, "versionID", version.VersionID, "error", err)
+	}
+}
+
+func (m *Manager) enqueueRecoveredUploadRepair(ctx context.Context, version model.ObjectVersion, uploadID int64) {
+	stage := recoveryStagePrepare
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          version.ObjectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:%s:%d:repair", version.VersionID, stage, uploadID),
+		Payload:        map[string]interface{}{"upload_id": uploadID},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     m.uploadMaxRetries,
+		ScheduledAt:    time.Now(),
+	}
+	if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+		m.logger.Error("failed to enqueue recovered upload repair", "uploadID", uploadID, "versionID", version.VersionID, "error", err)
 	}
 }
 

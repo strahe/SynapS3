@@ -483,12 +483,12 @@ func retryObjectState(task *model.Task) model.ObjectState {
 		stage, _ = task.Payload["stage"].(string)
 	}
 	switch stage {
-	case "primary_commit":
+	case "ingress_commit":
 		return model.ObjectStateCommitting
-	case "secondary_pull", "secondary_commit":
+	case "peer_pull", "peer_commit":
 		return model.ObjectStateReplicating
 	case "ensure_dataset":
-		if taskPayloadInt64(task.Payload, "copy_index") > 0 {
+		if taskPayloadString(task.Payload, "transfer_method") == string(model.StorageCopyTransferMethodPeerPull) {
 			return model.ObjectStateReplicating
 		}
 	}
@@ -512,6 +512,18 @@ func taskPayloadInt64(payload map[string]interface{}, key string) int64 {
 		return int64(v)
 	}
 	return 0
+}
+
+func taskPayloadString(payload map[string]interface{}, key string) string {
+	if payload == nil {
+		return ""
+	}
+	raw, ok := payload[key]
+	if !ok {
+		return ""
+	}
+	value, _ := raw.(string)
+	return value
 }
 
 func (r *BunTaskRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {

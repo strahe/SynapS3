@@ -68,6 +68,23 @@ func (s *stubWorker) Name() string                { return s.name }
 func (s *stubWorker) Run(_ context.Context) error { return nil }
 func (s *stubWorker) Healthy() bool               { return s.isHealthy }
 
+func taskPayloadInt64ForTest(payload map[string]interface{}, key string) int64 {
+	raw, ok := payload[key]
+	if !ok {
+		return 0
+	}
+	switch v := raw.(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
 func newWorkerTestCache(t *testing.T, maxBytes int64) cache.Cache {
 	t.Helper()
 	dir := t.TempDir()
@@ -90,35 +107,55 @@ func acceptWorkerVersionUpload(t *testing.T, env *testWorkerEnv, versionID strin
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	providerID := onChainIDPtr(t, strconv.FormatInt(100+upload.ID, 10))
-	dataSetID := onChainIDPtr(t, strconv.FormatInt(1000+upload.ID, 10))
+	providerID := onChainID(t, strconv.FormatInt(100+upload.ID, 10))
+	dataSetID := onChainID(t, strconv.FormatInt(1000+upload.ID, 10))
 	pieceID := onChainIDPtr(t, strconv.FormatInt(2000+upload.ID, 10))
-	if err := env.repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        &pieceCID,
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   providerID,
-			DataSetID:    dataSetID,
-			PieceID:      pieceID,
-			Role:         "primary",
-			RetrievalURL: &retrievalURL,
-		}},
-	}); err != nil {
-		t.Fatalf("record upload result: %v", err)
+	binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          version.BucketID,
+		ProviderID:        providerID,
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if _, err := env.repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: dataSetID}); err != nil {
+		t.Fatalf("mark dataset ready: %v", err)
+	}
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       providerID,
+	}}); err != nil {
+		t.Fatalf("create upload copy: %v", err)
+	}
+	if err := env.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		PieceID:      pieceID,
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("mark copy committed: %v", err)
+	}
+	if _, err := env.repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    version.BucketID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("accept upload result: %v", err)
+		t.Fatalf("bind readable upload: %v", err)
+	}
+	if finalized, _, err := env.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+		t.Fatalf("finalize upload: %v", err)
+	} else if !finalized {
+		t.Fatal("finalize upload = false, want true")
 	}
 	return upload
 }

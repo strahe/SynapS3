@@ -223,7 +223,7 @@ func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -239,15 +239,83 @@ func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "primary_commit", string(model.TaskStatusQueued), 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ingress_commit", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
-		t.Fatalf("List primary_commit tasks: %v", err)
+		t.Fatalf("List ingress_commit tasks: %v", err)
 	}
 	if total != 1 || len(tasks) != 1 {
-		t.Fatalf("primary_commit tasks total=%d tasks=%#v, want one", total, tasks)
+		t.Fatalf("ingress_commit tasks total=%d tasks=%#v, want one", total, tasks)
 	}
 	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || tasks[0].Payload["upload_id"] == nil {
-		t.Fatalf("primary_commit task = %#v, want recovered task for source version", tasks[0])
+		t.Fatalf("ingress_commit task = %#v, want recovered task for source version", tasks[0])
+	}
+}
+
+func TestManager_RecoverOnStartup_BindsCommittedIngressBeforeSingleCopyFinalize(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-single-copy-commit-recover")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-single-copy", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacesinglecopyrecover",
+		PieceID:      onChainIDPtr(t, "301"),
+		RetrievalURL: "https://ingress.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	got, err := repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
+	if err != nil || got == nil {
+		t.Fatalf("GetCurrentVersionByObjectID: got=%v err=%v", got, err)
+	}
+	if got.State != model.ObjectStateStored || got.StorageUploadID == nil || *got.StorageUploadID != upload.ID {
+		t.Fatalf("object after recovery = state:%s upload:%v, want stored on recovered upload %d", got.State, got.StorageUploadID, upload.ID)
+	}
+	gotUpload, err := repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || gotUpload == nil {
+		t.Fatalf("GetByID(upload): upload=%v err=%v", gotUpload, err)
+	}
+	if gotUpload.Status != model.StorageUploadStatusComplete {
+		t.Fatalf("upload status = %s, want complete", gotUpload.Status)
 	}
 }
 
@@ -285,7 +353,7 @@ func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *test
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -297,7 +365,7 @@ func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *test
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	stage := "primary_commit"
+	stage := "ingress_commit"
 	now := time.Now()
 	leaseUntil := now.Add(-time.Minute)
 	task := &model.Task{
@@ -306,8 +374,8 @@ func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *test
 		RefType:        "object",
 		RefID:          objID,
 		RefVersionID:   versionID,
-		IdempotencyKey: fmt.Sprintf("upload:%s:primary_commit:%d", versionID, upload.ID),
-		Payload:        map[string]interface{}{"upload_id": upload.ID},
+		IdempotencyKey: fmt.Sprintf("upload:%s:ingress_commit:%d", versionID, upload.ID),
+		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 0, "transfer_method": string(model.StorageCopyTransferMethodIngress)},
 		Status:         model.TaskStatusRunning,
 		MaxRetries:     9,
 		ScheduledAt:    now,
@@ -327,7 +395,7 @@ func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *test
 		t.Fatalf("ClaimReady: %v", err)
 	}
 	if claimed == nil {
-		t.Fatal("expired primary_commit task was not claimable after startup recovery")
+		t.Fatal("expired ingress_commit task was not claimable after startup recovery")
 	}
 	if claimed.ID != task.ID {
 		t.Fatalf("claimed task ID = %d, want expired task %d", claimed.ID, task.ID)
@@ -372,8 +440,8 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -386,13 +454,13 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
 	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
@@ -407,6 +475,194 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 	}
 	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || tasks[0].Payload["copy_index"] == nil {
 		t.Fatalf("ensure_dataset task = %#v, want recovered secondary task", tasks[0])
+	}
+}
+
+func TestManager_RecoverOnStartup_QueuesRepairForUnavailablePeerDeficit(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-peer-unavailable-recover")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-peer-unavailable", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+		RequestedCopies: 2,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	ingress, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("ingress binding: %v", err)
+	}
+	peer, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("peer binding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: ingress.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+		t.Fatalf("MarkDataSetReady ingress: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: peer.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
+		t.Fatalf("MarkDataSetReady peer: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: ingress.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: peer.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacepeerdeficit",
+		PieceID:      onChainIDPtr(t, "301"),
+		RetrievalURL: "https://ingress.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForContent: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetUnavailable(ctx, peer.ID, "provider dataset retired"); err != nil {
+		t.Fatalf("MarkDataSetUnavailable peer: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	ensureTasks, ensureTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ensure_dataset", string(model.TaskStatusQueued), 10, 0)
+	if err != nil {
+		t.Fatalf("List ensure_dataset tasks: %v", err)
+	}
+	if ensureTotal != 0 || len(ensureTasks) != 0 {
+		t.Fatalf("ensure_dataset tasks total=%d tasks=%#v, want no recovery for unavailable peer", ensureTotal, ensureTasks)
+	}
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusQueued), 10, 0)
+	if err != nil {
+		t.Fatalf("List repair prepare tasks: %v", err)
+	}
+	if total != 1 || len(tasks) != 1 {
+		t.Fatalf("prepare_upload tasks total=%d tasks=%#v, want one repair task", total, tasks)
+	}
+	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || taskPayloadInt64ForTest(tasks[0].Payload, "upload_id") != upload.ID {
+		t.Fatalf("repair task = %#v, want upload repair task for upload %d", tasks[0], upload.ID)
+	}
+}
+
+func TestManager_RecoverOnStartup_QueuesRepairForFailedPeerDeficitWithRecoverablePeer(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-peer-deficit-with-pending-recover")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-peer-deficit-pending", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+		RequestedCopies: 3,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	ingress, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("ingress binding: %v", err)
+	}
+	pendingPeer, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("pending peer binding: %v", err)
+	}
+	failedPeer, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "303"), CopyIndex: 2, CreatedByUploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("failed peer binding: %v", err)
+	}
+	for _, input := range []repository.MarkDataSetReadyInput{
+		{ID: ingress.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")},
+		{ID: pendingPeer.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")},
+		{ID: failedPeer.ID, UploadID: upload.ID, DataSetID: onChainID(t, "3003"), ClientDataSetID: onChainIDPtr(t, "9003")},
+	} {
+		if err := repos.Uploads.MarkDataSetReady(ctx, input); err != nil {
+			t.Fatalf("MarkDataSetReady: %v", err)
+		}
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: ingress.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: pendingPeer.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: failedPeer.ID, CopyIndex: 2, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "303")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacepeerdeficitpending",
+		PieceID:      onChainIDPtr(t, "301"),
+		RetrievalURL: "https://ingress.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		UploadID:    upload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForContent: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 2, "peer pull: provider failed"); err != nil {
+		t.Fatalf("MarkUploadCopyFailed: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	ensureTasks, ensureTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "peer_pull", string(model.TaskStatusQueued), 10, 0)
+	if err != nil {
+		t.Fatalf("List peer_pull tasks: %v", err)
+	}
+	if ensureTotal != 1 || len(ensureTasks) != 1 || taskPayloadInt64ForTest(ensureTasks[0].Payload, "copy_index") != 1 {
+		t.Fatalf("peer_pull tasks total=%d tasks=%#v, want pending peer recovery", ensureTotal, ensureTasks)
+	}
+	repairTasks, repairTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusQueued), 10, 0)
+	if err != nil {
+		t.Fatalf("List repair prepare tasks: %v", err)
+	}
+	if repairTotal != 1 || len(repairTasks) != 1 {
+		t.Fatalf("prepare_upload tasks total=%d tasks=%#v, want repair for remaining deficit", repairTotal, repairTasks)
+	}
+	if repairTasks[0].RefID != objID || repairTasks[0].RefVersionID != versionID || taskPayloadInt64ForTest(repairTasks[0].Payload, "upload_id") != upload.ID {
+		t.Fatalf("repair task = %#v, want upload repair task for upload %d", repairTasks[0], upload.ID)
 	}
 }
 
@@ -685,8 +941,8 @@ func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
 		t.Fatalf("MarkDataSetReady primary: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -699,13 +955,13 @@ func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
 	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
@@ -761,8 +1017,8 @@ func acceptManagerVersionUpload(t *testing.T, repos *repository.Repositories, ve
 		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
 	}
 	pieceCID := "piece-" + versionID
-	providerID := onChainIDPtr(t, "101")
-	dataSetID := onChainIDPtr(t, "1001")
+	providerID := onChainID(t, "101")
+	dataSetID := onChainID(t, "1001")
 	pieceID := onChainIDPtr(t, "1")
 	retrievalURL := "https://provider.example/piece/" + versionID
 	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
@@ -770,32 +1026,52 @@ func acceptManagerVersionUpload(t *testing.T, repos *repository.Repositories, ve
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        &pieceCID,
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   providerID,
-			DataSetID:    dataSetID,
-			PieceID:      pieceID,
-			Role:         "primary",
-			RetrievalURL: &retrievalURL,
-		}},
-	}); err != nil {
-		t.Fatalf("record upload result: %v", err)
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          version.BucketID,
+		ProviderID:        providerID,
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: dataSetID}); err != nil {
+		t.Fatalf("mark dataset ready: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       providerID,
+	}}); err != nil {
+		t.Fatalf("create upload copy: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		PieceID:      pieceID,
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("mark copy committed: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    version.BucketID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("accept upload result: %v", err)
+		t.Fatalf("bind readable upload: %v", err)
+	}
+	if finalized, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+		t.Fatalf("finalize upload: %v", err)
+	} else if !finalized {
+		t.Fatal("finalize upload = false, want true")
 	}
 }
 

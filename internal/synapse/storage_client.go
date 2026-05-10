@@ -19,10 +19,6 @@ func AdaptStorageService(service *storage.Service) *StorageServiceAdapter {
 	return &StorageServiceAdapter{service: service}
 }
 
-func (s *StorageServiceAdapter) Upload(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
-	return s.service.Upload(ctx, r, opts)
-}
-
 func (s *StorageServiceAdapter) Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
 	return s.service.Download(ctx, pieceCID, opts)
 }

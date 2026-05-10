@@ -270,7 +270,7 @@ func taskWantsUploadProgress(task *model.Task) bool {
 		return false
 	}
 	stage := taskStage(task)
-	return stage != nil && (*stage == "primary_store" || *stage == "legacy_upload")
+	return stage != nil && (*stage == "ingress_store" || *stage == "")
 }
 
 func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) {

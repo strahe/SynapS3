@@ -75,7 +75,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		ColumnExpr("CONSTRAINT chk_object_versions_state CHECK (state IN ('cached', 'uploading', 'committing', 'replicating', 'stored', 'failed', 'cache_evicted'))").
 		ColumnExpr("CONSTRAINT chk_object_versions_size CHECK (size >= 0)").
 		// Committing tracks the active upload through storage_uploads.source_version_id.
-		// storage_upload_id is set only after primary commit makes the version readable.
+		// storage_upload_id is set only after a committed copy makes the version readable.
 		ColumnExpr("CONSTRAINT chk_object_versions_storage_upload_state CHECK ((state IN ('replicating', 'stored', 'cache_evicted') AND storage_upload_id IS NOT NULL) OR (state IN ('cached', 'uploading', 'committing', 'failed') AND storage_upload_id IS NULL))").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating object_versions table: %w", err)
@@ -342,11 +342,11 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		Model((*model.StorageUpload)(nil)).
 		IfNotExists().
 		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
-		ColumnExpr("CONSTRAINT chk_storage_uploads_status CHECK (status IN ('running', 'stored_on_primary', 'primary_committed', 'partial', 'all_copies_committed', 'failed', 'rejected', 'superseded'))").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_status CHECK (status IN ('running', 'ingress_ready', 'readable', 'complete', 'failed', 'rejected', 'superseded'))").
 		ColumnExpr("CONSTRAINT chk_storage_uploads_content_size CHECK (content_size >= 0)").
 		ColumnExpr("CONSTRAINT chk_storage_uploads_requested_copies CHECK (requested_copies >= 0)").
-		ColumnExpr("CONSTRAINT chk_storage_uploads_primary_bytes CHECK (primary_bytes_uploaded >= 0 AND primary_bytes_uploaded <= content_size)").
-		ColumnExpr("CONSTRAINT chk_storage_uploads_primary_attempt CHECK (primary_store_attempt >= 0)").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_ingress_bytes CHECK (ingress_bytes_transferred >= 0 AND ingress_bytes_transferred <= content_size)").
+		ColumnExpr("CONSTRAINT chk_storage_uploads_ingress_attempt CHECK (ingress_store_attempt >= 0)").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating storage_uploads table: %w", err)
 	}
@@ -370,7 +370,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		Model((*model.StorageUpload)(nil)).
 		Index("idx_storage_uploads_active_source_version").
 		Column("source_version_id").
-		Where("source_version_id <> '' AND status IN ('running', 'stored_on_primary', 'primary_committed', 'partial')").
+		Where("source_version_id <> '' AND status IN ('running', 'ingress_ready', 'readable')").
 		Unique().
 		IfNotExists().
 		Exec(ctx); err != nil {
@@ -384,7 +384,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		ForeignKey("(created_by_upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE SET NULL").
 		ForeignKey("(last_used_upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE SET NULL").
 		ColumnExpr("CONSTRAINT chk_storage_data_sets_copy_index CHECK (copy_index >= 0)").
-		ColumnExpr("CONSTRAINT chk_storage_data_sets_status CHECK (status IN ('pending', 'creating', 'ready', 'failed'))").
+		ColumnExpr("CONSTRAINT chk_storage_data_sets_status CHECK (status IN ('pending', 'creating', 'ready', 'failed', 'unavailable', 'draining', 'retired'))").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating storage_data_sets table: %w", err)
 	}
@@ -424,6 +424,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		ForeignKey("(storage_data_set_id) REFERENCES storage_data_sets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
 		ColumnExpr("CONSTRAINT chk_storage_upload_copies_copy_index CHECK (copy_index >= 0)").
 		ColumnExpr("CONSTRAINT chk_storage_upload_copies_status CHECK (status IN ('pending', 'piece_ready', 'committing', 'committed', 'failed'))").
+		ColumnExpr("CONSTRAINT chk_storage_upload_copies_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull'))").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating storage_upload_copies table: %w", err)
 	}
@@ -438,17 +439,26 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 	}
 	if _, err := db.NewCreateIndex().
 		Model((*model.StorageUploadCopy)(nil)).
-		Index("idx_storage_upload_copies_upload_role_index").
-		Column("upload_id", "role", "copy_index").
+		Index("idx_storage_upload_copies_upload_transfer_method_index").
+		Column("upload_id", "transfer_method", "copy_index").
 		IfNotExists().
 		Exec(ctx); err != nil {
-		return fmt.Errorf("creating storage upload copy role index: %w", err)
+		return fmt.Errorf("creating storage upload copy transfer method index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUploadCopy)(nil)).
+		Index("idx_storage_upload_copies_status_data_set_upload").
+		Column("status", "storage_data_set_id", "upload_id").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload copy dataset summary index: %w", err)
 	}
 
 	if _, err := db.NewCreateTable().
 		Model((*model.StorageUploadFailure)(nil)).
 		IfNotExists().
 		ForeignKey("(upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE CASCADE").
+		ColumnExpr("CONSTRAINT chk_storage_upload_failures_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull'))").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating storage_upload_failures table: %w", err)
 	}

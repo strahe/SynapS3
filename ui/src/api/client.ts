@@ -55,6 +55,11 @@ export interface StorageDataSetSummary {
   status: string
   created_by_upload_id?: number
   last_used_upload_id?: number
+  committed_copies: number
+  readable_copies: number
+  physical_bytes: number
+  referenced_version_count: number
+  current_version_count: number
   created_at: string
   updated_at: string
 }
@@ -82,16 +87,15 @@ export type ObjectStatus = 'uploading' | 'syncing' | 'success' | 'warning' | 'un
 export type ObjectState = 'cached' | 'uploading' | 'committing' | 'replicating' | 'stored' | 'cache_evicted' | 'failed'
 export type ObjectUploadStatus =
   | 'running'
-  | 'stored_on_primary'
-  | 'primary_committed'
-  | 'partial'
-  | 'all_copies_committed'
+  | 'ingress_ready'
+  | 'readable'
+  | 'complete'
   | 'failed'
   | 'rejected'
   | 'superseded'
 
 export interface UploadTransferProgress {
-  scope: 'primary_store'
+  scope: 'ingress_store'
   attempt: number
   uploaded_bytes: number
   total_bytes: number
@@ -213,7 +217,7 @@ export interface ObjectProvenanceCopy {
   provider_identity?: ProviderIdentity
   data_set_id?: string
   piece_id?: string
-  role: string
+  transfer_method: string
   retrieval_url?: string
   is_new_data_set: boolean
 }
@@ -222,7 +226,7 @@ export interface ObjectProvenanceFailure {
   attempt_index: number
   provider_id?: string
   provider_identity?: ProviderIdentity
-  role: string
+  transfer_method: string
   stage?: string
   error?: string
 }

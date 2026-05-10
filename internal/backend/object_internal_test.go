@@ -64,15 +64,15 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesReplicatingFollower(t *tes
 		t.Fatalf("secondary ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create copy rows: %v", err)
 	}
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacedummy", PieceID: onChainIDPtr(t, "1"), RetrievalURL: "https://provider.example/primary"}); err != nil {
 		t.Fatalf("primary committed: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: source.Size,
@@ -169,15 +169,15 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesAfterBindingFollower(t *te
 		t.Fatalf("secondary ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create copy rows: %v", err)
 	}
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacedummy", PieceID: onChainIDPtr(t, "1"), RetrievalURL: "https://provider.example/primary"}); err != nil {
 		t.Fatalf("primary committed: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: source.Size,

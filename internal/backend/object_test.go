@@ -135,37 +135,63 @@ func acceptBackendVersionUpload(t *testing.T, repos *repository.Repositories, ve
 	if err != nil || version == nil {
 		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
 	}
+	if version.State == model.ObjectStateUploading {
+		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+			t.Fatalf("mark committing: %v", err)
+		}
+	}
 	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
 		BucketID:        version.BucketID,
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        &pieceCID,
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   onChainIDPtr(t, "101"),
-			DataSetID:    onChainIDPtr(t, "1001"),
-			PieceID:      onChainIDPtr(t, "1"),
-			Role:         "primary",
-			RetrievalURL: &retrievalURL,
-		}},
-	}); err != nil {
-		t.Fatalf("record upload result: %v", err)
+	providerID := onChainID(t, "101")
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          version.BucketID,
+		ProviderID:        providerID,
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
+		t.Fatalf("mark dataset ready: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       providerID,
+	}}); err != nil {
+		t.Fatalf("create upload copy: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		PieceID:      onChainIDPtr(t, "1"),
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("mark copy committed: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    version.BucketID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("accept upload result: %v", err)
+		t.Fatalf("bind readable upload: %v", err)
+	}
+	if finalized, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+		t.Fatalf("finalize upload: %v", err)
+	} else if !finalized {
+		t.Fatal("finalize upload = false, want true")
 	}
 	return upload
 }
@@ -218,8 +244,8 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositor
 		t.Fatalf("ensure secondary dataset binding: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create upload copy rows: %v", err)
 	}
@@ -240,7 +266,7 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositor
 	}); err != nil {
 		t.Fatalf("mark primary committed: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    version.BucketID,
 		ContentSize: version.Size,

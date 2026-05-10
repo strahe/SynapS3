@@ -104,10 +104,10 @@ func TestUploadProgressEventPayloadUsesOverflowSafePercent(t *testing.T) {
 	updatedAt := time.Now()
 	const huge = int64(1 << 62)
 	payload := uploadProgressEventPayload(&model.StorageUpload{
-		PrimaryStoreAttempt:  1,
-		PrimaryBytesUploaded: huge,
-		ContentSize:          huge,
-		ProgressUpdatedAt:    &updatedAt,
+		IngressStoreAttempt:     1,
+		IngressBytesTransferred: huge,
+		ContentSize:             huge,
+		ProgressUpdatedAt:       &updatedAt,
 	}, true)
 
 	percent, ok := payload["percent"].(int)
@@ -122,10 +122,10 @@ func TestUploadProgressEventPayloadUsesOverflowSafePercent(t *testing.T) {
 func TestUploadProgressEventPayloadMarksDoneWhenBytesReachTotal(t *testing.T) {
 	updatedAt := time.Now()
 	payload := uploadProgressEventPayload(&model.StorageUpload{
-		PrimaryStoreAttempt:  1,
-		PrimaryBytesUploaded: 100,
-		ContentSize:          100,
-		ProgressUpdatedAt:    &updatedAt,
+		IngressStoreAttempt:     1,
+		IngressBytesTransferred: 100,
+		ContentSize:             100,
+		ProgressUpdatedAt:       &updatedAt,
 	}, false)
 
 	done, ok := payload["done"].(bool)
@@ -152,9 +152,9 @@ func TestUploadProgressReporterRecordRespectsCanceledContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	upload, err = repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	upload, err = repos.Uploads.BeginIngressStoreProgress(ctx, upload.ID)
 	if err != nil {
-		t.Fatalf("BeginPrimaryStoreProgress: %v", err)
+		t.Fatalf("BeginIngressStoreProgress: %v", err)
 	}
 
 	canceledCtx, cancel := context.WithCancel(context.Background())
@@ -163,7 +163,7 @@ func TestUploadProgressReporterRecordRespectsCanceledContext(t *testing.T) {
 		ctx:      canceledCtx,
 		repos:    repos,
 		uploadID: upload.ID,
-		attempt:  upload.PrimaryStoreAttempt,
+		attempt:  upload.IngressStoreAttempt,
 	}
 	reporter.record(50, false)
 
@@ -171,8 +171,8 @@ func TestUploadProgressReporterRecordRespectsCanceledContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
-	if got.PrimaryBytesUploaded != 0 {
-		t.Fatalf("primary_bytes_uploaded = %d, want 0 after canceled reporter context", got.PrimaryBytesUploaded)
+	if got.IngressBytesTransferred != 0 {
+		t.Fatalf("ingress_bytes_transferred = %d, want 0 after canceled reporter context", got.IngressBytesTransferred)
 	}
 }
 
@@ -191,16 +191,16 @@ func TestUploadProgressReporterCoalescesThrottledProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	upload, err = repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	upload, err = repos.Uploads.BeginIngressStoreProgress(ctx, upload.ID)
 	if err != nil {
-		t.Fatalf("BeginPrimaryStoreProgress: %v", err)
+		t.Fatalf("BeginIngressStoreProgress: %v", err)
 	}
 
 	reporter := &uploadProgressReporter{
 		ctx:           context.Background(),
 		repos:         repos,
 		uploadID:      upload.ID,
-		attempt:       upload.PrimaryStoreAttempt,
+		attempt:       upload.IngressStoreAttempt,
 		flushInterval: 50 * time.Millisecond,
 	}
 	reporter.OnProgress(10)
@@ -213,7 +213,7 @@ func TestUploadProgressReporterCoalescesThrottledProgress(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetByID: %v", err)
 		}
-		if got.PrimaryBytesUploaded == 70 {
+		if got.IngressBytesTransferred == 70 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -223,7 +223,7 @@ func TestUploadProgressReporterCoalescesThrottledProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByID final: %v", err)
 	}
-	t.Fatalf("primary_bytes_uploaded = %d, want coalesced latest progress 70", got.PrimaryBytesUploaded)
+	t.Fatalf("ingress_bytes_transferred = %d, want coalesced latest progress 70", got.IngressBytesTransferred)
 }
 
 type submittedCommitTestContext struct {

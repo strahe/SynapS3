@@ -12,15 +12,13 @@ import (
 type StorageUploadStatus string
 
 const (
-	StorageUploadStatusRunning            StorageUploadStatus = "running"
-	StorageUploadStatusStoredOnPrimary    StorageUploadStatus = "stored_on_primary"
-	StorageUploadStatusPrimaryCommitted   StorageUploadStatus = "primary_committed"
-	StorageUploadStatusPartial            StorageUploadStatus = "partial"
-	StorageUploadStatusAllCopiesCommitted StorageUploadStatus = "all_copies_committed"
-	StorageUploadStatusComplete           StorageUploadStatus = StorageUploadStatusAllCopiesCommitted
-	StorageUploadStatusFailed             StorageUploadStatus = "failed"
-	StorageUploadStatusRejected           StorageUploadStatus = "rejected"
-	StorageUploadStatusSuperseded         StorageUploadStatus = "superseded"
+	StorageUploadStatusRunning      StorageUploadStatus = "running"
+	StorageUploadStatusIngressReady StorageUploadStatus = "ingress_ready"
+	StorageUploadStatusReadable     StorageUploadStatus = "readable"
+	StorageUploadStatusComplete     StorageUploadStatus = "complete"
+	StorageUploadStatusFailed       StorageUploadStatus = "failed"
+	StorageUploadStatusRejected     StorageUploadStatus = "rejected"
+	StorageUploadStatusSuperseded   StorageUploadStatus = "superseded"
 )
 
 // UploadProgressPercent returns a byte-based integer percent when the total is known.
@@ -43,10 +41,20 @@ func UploadProgressPercent(uploaded, total int64) *int {
 type StorageDataSetStatus string
 
 const (
-	StorageDataSetStatusPending  StorageDataSetStatus = "pending"
-	StorageDataSetStatusCreating StorageDataSetStatus = "creating"
-	StorageDataSetStatusReady    StorageDataSetStatus = "ready"
-	StorageDataSetStatusFailed   StorageDataSetStatus = "failed"
+	StorageDataSetStatusPending     StorageDataSetStatus = "pending"
+	StorageDataSetStatusCreating    StorageDataSetStatus = "creating"
+	StorageDataSetStatusReady       StorageDataSetStatus = "ready"
+	StorageDataSetStatusFailed      StorageDataSetStatus = "failed"
+	StorageDataSetStatusUnavailable StorageDataSetStatus = "unavailable"
+	StorageDataSetStatusDraining    StorageDataSetStatus = "draining"
+	StorageDataSetStatusRetired     StorageDataSetStatus = "retired"
+)
+
+type StorageCopyTransferMethod string
+
+const (
+	StorageCopyTransferMethodIngress  StorageCopyTransferMethod = "ingress"
+	StorageCopyTransferMethodPeerPull StorageCopyTransferMethod = "peer_pull"
 )
 
 type StorageUploadCopyStatus string
@@ -63,24 +71,24 @@ const (
 type StorageUpload struct {
 	bun.BaseModel `bun:"table:storage_uploads"`
 
-	ID                   int64               `bun:",pk,autoincrement"`
-	BucketID             int64               `bun:",notnull"`
-	SourceTaskID         *int64              `bun:",nullzero"`
-	SourceVersionID      string              `bun:",nullzero"`
-	ContentSize          int64               `bun:",notnull"`
-	Checksum             string              `bun:",notnull"`
-	Status               StorageUploadStatus `bun:",notnull,default:'running'"`
-	PieceCID             *string             `bun:",nullzero"`
-	RequestedCopies      int                 `bun:",notnull,default:0"`
-	PrimaryBytesUploaded int64               `bun:",notnull,default:0"`
-	PrimaryStoreAttempt  int                 `bun:",notnull,default:0"`
-	ProgressUpdatedAt    *time.Time          `bun:",nullzero"`
-	RawResultJSON        json.RawMessage     `bun:"type:jsonb,nullzero"`
-	ErrorMessage         *string             `bun:",nullzero"`
-	AcceptError          *string             `bun:",nullzero"`
-	AcceptedAt           *time.Time          `bun:",nullzero"`
-	CreatedAt            time.Time           `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt            time.Time           `bun:",nullzero,notnull,default:current_timestamp"`
+	ID                      int64               `bun:",pk,autoincrement"`
+	BucketID                int64               `bun:",notnull"`
+	SourceTaskID            *int64              `bun:",nullzero"`
+	SourceVersionID         string              `bun:",nullzero"`
+	ContentSize             int64               `bun:",notnull"`
+	Checksum                string              `bun:",notnull"`
+	Status                  StorageUploadStatus `bun:",notnull,default:'running'"`
+	PieceCID                *string             `bun:",nullzero"`
+	RequestedCopies         int                 `bun:",notnull,default:2"`
+	IngressBytesTransferred int64               `bun:",notnull,default:0"`
+	IngressStoreAttempt     int                 `bun:",notnull,default:0"`
+	ProgressUpdatedAt       *time.Time          `bun:",nullzero"`
+	RawResultJSON           json.RawMessage     `bun:"type:jsonb,nullzero"`
+	ErrorMessage            *string             `bun:",nullzero"`
+	AcceptError             *string             `bun:",nullzero"`
+	AcceptedAt              *time.Time          `bun:",nullzero"`
+	CreatedAt               time.Time           `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt               time.Time           `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Bucket *Bucket `bun:"rel:belongs-to,join:bucket_id=id"`
 	Task   *Task   `bun:"rel:belongs-to,join:source_task_id=id"`
@@ -114,22 +122,22 @@ type StorageDataSet struct {
 type StorageUploadCopy struct {
 	bun.BaseModel `bun:"table:storage_upload_copies"`
 
-	ID                  int64                   `bun:",pk,autoincrement"`
-	UploadID            int64                   `bun:",notnull"`
-	CopyIndex           int                     `bun:",notnull"`
-	ProviderID          *types.OnChainID        `bun:"type:text"`
-	DataSetID           *types.OnChainID        `bun:"type:text,scanonly"`
-	PieceID             *types.OnChainID        `bun:"type:text"`
-	Role                string                  `bun:",notnull"`
-	Status              StorageUploadCopyStatus `bun:",notnull,default:'pending'"`
-	RetrievalURL        *string                 `bun:",nullzero"`
-	IsNewDataSet        bool                    `bun:",notnull,default:false"`
-	StorageDataSetID    *int64                  `bun:",nullzero"`
-	CommitExtraDataHex  *string                 `bun:",nullzero"`
-	CommitTransactionID *string                 `bun:",nullzero"`
-	LastError           *string                 `bun:",nullzero"`
-	CreatedAt           time.Time               `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt           time.Time               `bun:",nullzero,notnull,default:current_timestamp"`
+	ID                  int64                     `bun:",pk,autoincrement"`
+	UploadID            int64                     `bun:",notnull"`
+	CopyIndex           int                       `bun:",notnull"`
+	ProviderID          *types.OnChainID          `bun:"type:text"`
+	DataSetID           *types.OnChainID          `bun:"type:text,scanonly"`
+	PieceID             *types.OnChainID          `bun:"type:text"`
+	TransferMethod      StorageCopyTransferMethod `bun:",notnull"`
+	Status              StorageUploadCopyStatus   `bun:",notnull,default:'pending'"`
+	RetrievalURL        *string                   `bun:",nullzero"`
+	IsNewDataSet        bool                      `bun:",notnull,default:false"`
+	StorageDataSetID    *int64                    `bun:",nullzero"`
+	CommitExtraDataHex  *string                   `bun:",nullzero"`
+	CommitTransactionID *string                   `bun:",nullzero"`
+	LastError           *string                   `bun:",nullzero"`
+	CreatedAt           time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt           time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Upload     *StorageUpload  `bun:"rel:belongs-to,join:upload_id=id"`
 	StorageSet *StorageDataSet `bun:"rel:belongs-to,join:storage_data_set_id=id"`
@@ -139,15 +147,15 @@ type StorageUploadCopy struct {
 type StorageUploadFailure struct {
 	bun.BaseModel `bun:"table:storage_upload_failures"`
 
-	ID           int64            `bun:",pk,autoincrement"`
-	UploadID     int64            `bun:",notnull"`
-	AttemptIndex int              `bun:",notnull"`
-	ProviderID   *types.OnChainID `bun:"type:text"`
-	Role         string           `bun:",notnull"`
-	Stage        *string          `bun:",nullzero"`
-	ErrorMessage *string          `bun:",nullzero"`
-	Explicit     bool             `bun:",notnull,default:false"`
-	CreatedAt    time.Time        `bun:",nullzero,notnull,default:current_timestamp"`
+	ID             int64            `bun:",pk,autoincrement"`
+	UploadID       int64            `bun:",notnull"`
+	AttemptIndex   int              `bun:",notnull"`
+	ProviderID     *types.OnChainID `bun:"type:text"`
+	TransferMethod string           `bun:",notnull"`
+	Stage          *string          `bun:",nullzero"`
+	ErrorMessage   *string          `bun:",nullzero"`
+	Explicit       bool             `bun:",notnull,default:false"`
+	CreatedAt      time.Time        `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Upload *StorageUpload `bun:"rel:belongs-to,join:upload_id=id"`
 }

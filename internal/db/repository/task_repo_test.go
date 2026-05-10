@@ -738,7 +738,7 @@ func TestTaskRepo_RetryPrimaryCommitExhaustedRestoresCommittingState(t *testing.
 		t.Fatalf("failed state: %v", err)
 	}
 
-	stage := "primary_commit"
+	stage := "ingress_commit"
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
 		Stage:          &stage,
@@ -880,12 +880,12 @@ func TestTaskRepo_ListFiltersByStage(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	primaryCommit := "primary_commit"
+	ingressCommit := "ingress_commit"
 	prepare := "prepare_upload"
 	for _, task := range []*model.Task{
 		{
 			Type:           model.TaskTypeUpload,
-			Stage:          &primaryCommit,
+			Stage:          &ingressCommit,
 			RefType:        "object",
 			RefID:          1,
 			RefVersionID:   "01J000000000000000STAGE01",
@@ -918,12 +918,12 @@ func TestTaskRepo_ListFiltersByStage(t *testing.T) {
 		}
 	}
 
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), primaryCommit, string(model.TaskStatusQueued), 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), ingressCommit, string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
 		t.Fatalf("List by stage: %v", err)
 	}
 	if total != 1 || len(tasks) != 1 || tasks[0].IdempotencyKey != "stage-primary-commit" {
-		t.Fatalf("stage filtered tasks = total:%d tasks:%#v, want primary_commit only", total, tasks)
+		t.Fatalf("stage filtered tasks = total:%d tasks:%#v, want ingress_commit only", total, tasks)
 	}
 
 	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 5*time.Minute)

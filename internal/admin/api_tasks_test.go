@@ -28,13 +28,13 @@ func TestAPITasksStageFilter(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	primaryCommit := "primary_commit"
-	secondaryCommit := "secondary_commit"
+	ingressCommit := "ingress_commit"
+	peerCommit := "peer_commit"
 
 	for _, task := range []*model.Task{
 		{
 			Type:           model.TaskTypeUpload,
-			Stage:          &primaryCommit,
+			Stage:          &ingressCommit,
 			RefType:        "object",
 			RefID:          1,
 			RefVersionID:   "01J000000000000000TASKA01",
@@ -44,7 +44,7 @@ func TestAPITasksStageFilter(t *testing.T) {
 		},
 		{
 			Type:           model.TaskTypeUpload,
-			Stage:          &secondaryCommit,
+			Stage:          &peerCommit,
 			RefType:        "object",
 			RefID:          2,
 			RefVersionID:   "01J000000000000000TASKA02",
@@ -73,7 +73,7 @@ func TestAPITasksStageFilter(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&stage=primary_commit&status=queued")
+	resp, err := http.Get(ts.URL + "/api/v1/tasks?type=upload&stage=ingress_commit&status=queued")
 	if err != nil {
 		t.Fatalf("GET tasks: %v", err)
 	}
@@ -88,11 +88,11 @@ func TestAPITasksStageFilter(t *testing.T) {
 	if body.Total != 1 || len(body.Tasks) != 1 {
 		t.Fatalf("tasks = total:%d items:%#v, want one", body.Total, body.Tasks)
 	}
-	if body.Tasks[0].Stage == nil || *body.Tasks[0].Stage != primaryCommit {
-		t.Fatalf("stage = %#v, want primary_commit", body.Tasks[0].Stage)
+	if body.Tasks[0].Stage == nil || *body.Tasks[0].Stage != ingressCommit {
+		t.Fatalf("stage = %#v, want ingress_commit", body.Tasks[0].Stage)
 	}
 
-	resp, err = http.Get(ts.URL + "/api/v1/tasks?stage=primary_commit")
+	resp, err = http.Get(ts.URL + "/api/v1/tasks?stage=ingress_commit")
 	if err != nil {
 		t.Fatalf("GET tasks without type: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestAPITasksShowsLegacyPayloadStage(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	_, err := db.ExecContext(context.Background(), `
 		INSERT INTO tasks (type, ref_type, ref_id, ref_version_id, idempotency_key, payload, status, scheduled_at)
-		VALUES ('upload', 'object', 1, '01J000000000000000TASKB01', 'legacy-payload-stage', '{"stage":"secondary_pull","upload_id":9,"copy_index":1}', 'queued', CURRENT_TIMESTAMP)
+		VALUES ('upload', 'object', 1, '01J000000000000000TASKB01', 'legacy-payload-stage', '{"stage":"peer_pull","upload_id":9,"copy_index":1}', 'queued', CURRENT_TIMESTAMP)
 	`)
 	if err != nil {
 		t.Fatalf("insert legacy task: %v", err)
@@ -192,8 +192,8 @@ func TestAPITasksShowsLegacyPayloadStage(t *testing.T) {
 	if body.Total != 1 || len(body.Tasks) != 1 {
 		t.Fatalf("tasks = total:%d items:%#v, want one", body.Total, body.Tasks)
 	}
-	if body.Tasks[0].Stage == nil || *body.Tasks[0].Stage != "secondary_pull" {
-		t.Fatalf("stage = %#v, want secondary_pull", body.Tasks[0].Stage)
+	if body.Tasks[0].Stage == nil || *body.Tasks[0].Stage != "peer_pull" {
+		t.Fatalf("stage = %#v, want peer_pull", body.Tasks[0].Stage)
 	}
 }
 
@@ -212,18 +212,18 @@ func TestAPITasksIncludesPrimaryTransferProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	progressUpload, err := repos.Uploads.BeginPrimaryStoreProgress(ctx, upload.ID)
+	progressUpload, err := repos.Uploads.BeginIngressStoreProgress(ctx, upload.ID)
 	if err != nil {
-		t.Fatalf("BeginPrimaryStoreProgress: %v", err)
+		t.Fatalf("BeginIngressStoreProgress: %v", err)
 	}
-	if _, err := repos.Uploads.RecordPrimaryStoreProgress(ctx, repository.RecordPrimaryStoreProgressInput{
+	if _, err := repos.Uploads.RecordIngressStoreProgress(ctx, repository.RecordIngressStoreProgressInput{
 		UploadID:      upload.ID,
-		Attempt:       progressUpload.PrimaryStoreAttempt,
+		Attempt:       progressUpload.IngressStoreAttempt,
 		BytesUploaded: 5,
 	}); err != nil {
-		t.Fatalf("RecordPrimaryStoreProgress: %v", err)
+		t.Fatalf("RecordIngressStoreProgress: %v", err)
 	}
-	stage := "primary_store"
+	stage := "ingress_store"
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
 		Stage:          &stage,
@@ -261,7 +261,7 @@ func TestAPITasksIncludesPrimaryTransferProgress(t *testing.T) {
 		t.Fatalf("tasks = %#v, want primary transfer progress", body.Tasks)
 	}
 	progress := body.Tasks[0].Progress
-	if progress.Scope != "primary_store" || progress.Attempt != progressUpload.PrimaryStoreAttempt || progress.UploadedBytes != 5 || progress.TotalBytes != 20 || progress.Percent == nil || *progress.Percent != 25 || progress.Done {
+	if progress.Scope != "ingress_store" || progress.Attempt != progressUpload.IngressStoreAttempt || progress.UploadedBytes != 5 || progress.TotalBytes != 20 || progress.Percent == nil || *progress.Percent != 25 || progress.Done {
 		t.Fatalf("progress = %#v, want 5/20 primary transfer progress", progress)
 	}
 }
@@ -270,7 +270,7 @@ func TestAPITasksSkipsProgressWhenLookupFails(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	stage := "primary_store"
+	stage := "ingress_store"
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
 		Stage:          &stage,
@@ -355,8 +355,8 @@ func TestAPITaskRefDetailObject(t *testing.T) {
 	if rawStatus != http.StatusOK {
 		t.Fatalf("raw status = %d, want 200", rawStatus)
 	}
-	if rawBody.Object == nil || rawBody.Object.UploadStatus != string(model.StorageUploadStatusAllCopiesCommitted) {
-		t.Fatalf("task object upload_status = %#v, want all_copies_committed", rawBody.Object)
+	if rawBody.Object == nil || rawBody.Object.UploadStatus != string(model.StorageUploadStatusComplete) {
+		t.Fatalf("task object upload_status = %#v, want complete", rawBody.Object)
 	}
 }
 

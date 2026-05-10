@@ -230,8 +230,8 @@ func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
 		t.Fatalf("MarkDataSetReady primary: %v", err)
 	}
 	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -244,13 +244,13 @@ func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted primary: %v", err)
 	}
-	if _, err := env.repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := env.repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
 	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)

@@ -168,7 +168,7 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
 		return
 	}
-	copies, err := e.repos.Uploads.ListReadableCopies(ctx, *version.StorageUploadID)
+	copies, err := e.repos.Uploads.ListReadableCommittedCopies(ctx, *version.StorageUploadID)
 	if err != nil {
 		logger.Error("storage upload copy lookup failed", "error", err)
 		_ = e.repos.Tasks.FailRunning(ctx, task, err.Error())

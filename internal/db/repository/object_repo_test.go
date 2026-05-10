@@ -472,10 +472,10 @@ func TestObjectRepo_FindReusableActiveUploadVersionUsesDurableUploadLeader(t *te
 	}
 	got, err = repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
 	if err != nil {
-		t.Fatalf("FindReusableActiveUploadVersion(committing without primary): %v", err)
+		t.Fatalf("FindReusableActiveUploadVersion(committing without readable copy): %v", err)
 	}
 	if got != nil {
-		t.Fatalf("committing leader without primary piece = %#v, want nil", got)
+		t.Fatalf("committing leader without readable copy = %#v, want nil", got)
 	}
 
 	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
@@ -488,9 +488,12 @@ func TestObjectRepo_FindReusableActiveUploadVersionUsesDurableUploadLeader(t *te
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: binding.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
 		UploadID:     upload.ID,
@@ -500,10 +503,26 @@ func TestObjectRepo_FindReusableActiveUploadVersionUsesDurableUploadLeader(t *te
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
+	got, err = repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
+	if err != nil {
+		t.Fatalf("FindReusableActiveUploadVersion(committing with uncommitted copy): %v", err)
+	}
+	if got != nil {
+		t.Fatalf("committing leader with uncommitted copy = %#v, want nil", got)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacefake",
+		PieceID:      onChainIDPtr(t, "2001"),
+		RetrievalURL: "https://provider.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
 
 	got, err = repos.Objects.FindReusableActiveUploadVersion(ctx, bucket.ID, 10, "same-checksum")
 	if err != nil {
-		t.Fatalf("FindReusableActiveUploadVersion(committing with primary): %v", err)
+		t.Fatalf("FindReusableActiveUploadVersion(committing with readable copy): %v", err)
 	}
 	if got == nil || got.VersionID != version.VersionID {
 		t.Fatalf("committing durable leader = %#v, want %s", got, version.VersionID)
@@ -537,30 +556,16 @@ func TestObjectRepo_AcceptStorageUploadForContentUpdatesMatchingVersions(t *test
 		SourceVersionID: currentVersion.VersionID,
 		ContentSize:     currentVersion.Size,
 		Checksum:        currentVersion.Checksum,
+		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        strPtr("piece-shared"),
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strPtr("https://provider.example/shared")},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
-	refs, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    bucket.ID,
-		ContentSize: currentVersion.Size,
-		Checksum:    currentVersion.Checksum,
+	seedCommittedUploadCopies(t, repos, bucket.ID, upload.ID, "piece-shared", []storageUploadCopySeed{
+		{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: strPtr("https://provider.example/shared")},
 	})
-	if err != nil {
-		t.Fatalf("AcceptCompleteUploadForContent: %v", err)
-	}
+	refs := bindReadableUploadForContent(t, repos, upload.ID, bucket.ID, currentVersion.Size, currentVersion.Checksum)
+	finalizeUploadForTest(t, repos, upload.ID)
 	if len(refs) != 2 {
 		t.Fatalf("updated refs len = %d, want 2", len(refs))
 	}
@@ -1080,7 +1085,7 @@ func TestObjectRepo_UpdateVersionStateToFailedClearsStorageUploadID(t *testing.T
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
@@ -1093,13 +1098,13 @@ func TestObjectRepo_UpdateVersionStateToFailedClearsStorageUploadID(t *testing.T
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("BindPrimaryCommittedUploadForContent: %v", err)
+		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
 	if err := repos.Objects.UpdateVersionStateToFailed(ctx, version.VersionID, model.ObjectStateReplicating, "replication failed"); err != nil {

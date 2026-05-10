@@ -159,6 +159,67 @@ func seedAdminObjectVersion(t *testing.T, repos *repository.Repositories, bucket
 	return objID, versionID
 }
 
+type adminStorageCopySeed struct {
+	CopyIndex      int
+	ProviderID     idtypes.OnChainID
+	DataSetID      idtypes.OnChainID
+	PieceID        *idtypes.OnChainID
+	TransferMethod model.StorageCopyTransferMethod
+	RetrievalURL   string
+}
+
+func seedAdminCommittedCopies(t *testing.T, repos *repository.Repositories, bucketID int64, uploadID int64, pieceCID string, copies []adminStorageCopySeed) {
+	t.Helper()
+	ctx := context.Background()
+	inputs := make([]repository.UploadCopyBindingInput, 0, len(copies))
+	for i, copySeed := range copies {
+		copyIndex := copySeed.CopyIndex
+		if i > 0 && copyIndex == 0 {
+			copyIndex = i
+		}
+		binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+			BucketID:          bucketID,
+			ProviderID:        copySeed.ProviderID,
+			CopyIndex:         copyIndex,
+			CreatedByUploadID: uploadID,
+		})
+		if err != nil {
+			t.Fatalf("ensure dataset binding: %v", err)
+		}
+		if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: uploadID, DataSetID: copySeed.DataSetID}); err != nil {
+			t.Fatalf("mark dataset ready: %v", err)
+		}
+		transferMethod := copySeed.TransferMethod
+		if transferMethod == "" {
+			transferMethod = model.StorageCopyTransferMethodPeerPull
+			if i == 0 {
+				transferMethod = model.StorageCopyTransferMethodIngress
+			}
+		}
+		inputs = append(inputs, repository.UploadCopyBindingInput{
+			StorageDataSetID: binding.ID,
+			CopyIndex:        copyIndex,
+			TransferMethod:   transferMethod,
+			ProviderID:       copySeed.ProviderID,
+		})
+		copies[i].CopyIndex = copyIndex
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, uploadID, inputs); err != nil {
+		t.Fatalf("create upload copies: %v", err)
+	}
+	for _, copySeed := range copies {
+		if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+			UploadID:     uploadID,
+			CopyIndex:    copySeed.CopyIndex,
+			PieceCID:     pieceCID,
+			PieceID:      copySeed.PieceID,
+			RetrievalURL: copySeed.RetrievalURL,
+		}); err != nil {
+			t.Fatalf("mark copy committed: %v", err)
+		}
+	}
+}
+
 func acceptAdminVersionUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageUpload {
 	t.Helper()
 	ctx := context.Background()
@@ -171,35 +232,55 @@ func acceptAdminVersionUpload(t *testing.T, repos *repository.Repositories, vers
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)
 	}
-	providerID := onChainIDPtr(t, "101")
-	dataSetID := onChainIDPtr(t, "1001")
+	providerID := onChainID(t, "101")
+	dataSetID := onChainID(t, fmt.Sprintf("1001%d", upload.ID))
 	pieceID := onChainIDPtr(t, "1")
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        &pieceCID,
-		RequestedCopies: 1,
-		Copies: []repository.StorageUploadCopyInput{{
-			ProviderID:   providerID,
-			DataSetID:    dataSetID,
-			PieceID:      pieceID,
-			Role:         "primary",
-			RetrievalURL: &retrievalURL,
-		}},
-	}); err != nil {
-		t.Fatalf("record upload result: %v", err)
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          version.BucketID,
+		ProviderID:        providerID,
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: dataSetID}); err != nil {
+		t.Fatalf("mark dataset ready: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       providerID,
+	}}); err != nil {
+		t.Fatalf("create upload copy: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     pieceCID,
+		PieceID:      pieceID,
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("mark upload copy committed: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    version.BucketID,
 		ContentSize: version.Size,
 		Checksum:    version.Checksum,
 	}); err != nil {
-		t.Fatalf("accept upload result: %v", err)
+		t.Fatalf("bind readable upload: %v", err)
+	}
+	if finalized, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+		t.Fatalf("finalize upload: %v", err)
+	} else if !finalized {
+		t.Fatal("finalize upload = false, want true")
 	}
 	return upload
 }
@@ -222,6 +303,7 @@ func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versio
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 2,
 	})
 	if err != nil {
 		t.Fatalf("start partial upload attempt: %v", err)
@@ -241,8 +323,8 @@ func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versio
 		t.Fatalf("secondary dataset ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, Role: "secondary", ProviderID: onChainID(t, "202")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create upload copies: %v", err)
 	}
@@ -256,7 +338,7 @@ func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versio
 	}); err != nil {
 		t.Fatalf("primary committed: %v", err)
 	}
-	if _, err := repos.Uploads.BindPrimaryCommittedUploadForContent(ctx, repository.BindPrimaryCommittedUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    version.BucketID,
 		ContentSize: version.Size,
@@ -300,7 +382,7 @@ func markAdminStoredOnPrimaryUpload(t *testing.T, repos *repository.Repositories
 		t.Fatalf("primary dataset ready: %v", err)
 	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, Role: "primary", ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("create upload copy: %v", err)
 	}
@@ -334,13 +416,25 @@ func markAdminFailedUpload(t *testing.T, repos *repository.Repositories, version
 	if err != nil {
 		t.Fatalf("start failed upload attempt: %v", err)
 	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        false,
-		RequestedCopies: 2,
-		ErrorMessage:    &message,
-	}); err != nil {
-		t.Fatalf("record failed upload result: %v", err)
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          version.BucketID,
+		ProviderID:        onChainID(t, "101"),
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("ensure failed upload dataset: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       onChainID(t, "101"),
+	}}); err != nil {
+		t.Fatalf("create failed upload copy: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, message); err != nil {
+		t.Fatalf("mark failed upload copy: %v", err)
 	}
 	return upload
 }
@@ -677,18 +771,10 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
 	pieceCID := "bafk2bzacedatasetdetail"
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        &pieceCID,
-		RequestedCopies: 2,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: testStringPtr("https://provider.example/1"), IsNewDataSet: true},
-			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: testStringPtr("https://provider.example/2"), IsNewDataSet: true},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
+	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{
+		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
+		{ProviderID: onChainID(t, "202"), DataSetID: onChainID(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://provider.example/2"},
+	})
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -1778,11 +1864,11 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	if statusByKey["unavailable.txt"] != "unavailable" {
 		t.Fatalf("unavailable status = %q, want unavailable", statusByKey["unavailable.txt"])
 	}
-	if uploadStatusByKey["stored-primary.txt"] != string(model.StorageUploadStatusStoredOnPrimary) {
-		t.Fatalf("stored-primary upload_status = %q, want stored_on_primary", uploadStatusByKey["stored-primary.txt"])
+	if uploadStatusByKey["stored-primary.txt"] != string(model.StorageUploadStatusIngressReady) {
+		t.Fatalf("stored-primary upload_status = %q, want ingress_ready", uploadStatusByKey["stored-primary.txt"])
 	}
-	if statusByKey["partial.txt"] != "warning" || uploadStatusByKey["partial.txt"] != string(model.StorageUploadStatusPartial) {
-		t.Fatalf("partial status/upload_status = %q/%q, want warning/partial", statusByKey["partial.txt"], uploadStatusByKey["partial.txt"])
+	if statusByKey["partial.txt"] != "syncing" || uploadStatusByKey["partial.txt"] != string(model.StorageUploadStatusReadable) {
+		t.Fatalf("partial status/upload_status = %q/%q, want syncing/readable", statusByKey["partial.txt"], uploadStatusByKey["partial.txt"])
 	}
 	if statusByKey["failed-upload.txt"] != "warning" || uploadStatusByKey["failed-upload.txt"] != string(model.StorageUploadStatusFailed) {
 		t.Fatalf("failed upload status/upload_status = %q/%q, want warning/failed", statusByKey["failed-upload.txt"], uploadStatusByKey["failed-upload.txt"])
@@ -1827,8 +1913,8 @@ func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&partialDetail); err != nil {
 		t.Fatalf("Decode partial detail: %v", err)
 	}
-	if partialDetail.VersionID != partialVersionID || partialDetail.Status != "warning" || partialDetail.UploadStatus != string(model.StorageUploadStatusPartial) {
-		t.Fatalf("partial detail = %#v, want partial warning", partialDetail)
+	if partialDetail.VersionID != partialVersionID || partialDetail.Status != "syncing" || partialDetail.UploadStatus != string(model.StorageUploadStatusReadable) {
+		t.Fatalf("partial detail = %#v, want readable syncing detail", partialDetail)
 	}
 	if partialDetail.Message != "secondary pull: timeout" {
 		t.Fatalf("partial message = %q, want secondary pull: timeout", partialDetail.Message)
@@ -1880,16 +1966,16 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	progressUpload, err := repos.Uploads.BeginPrimaryStoreProgress(context.Background(), upload.ID)
+	progressUpload, err := repos.Uploads.BeginIngressStoreProgress(context.Background(), upload.ID)
 	if err != nil {
-		t.Fatalf("BeginPrimaryStoreProgress: %v", err)
+		t.Fatalf("BeginIngressStoreProgress: %v", err)
 	}
-	if _, err := repos.Uploads.RecordPrimaryStoreProgress(context.Background(), repository.RecordPrimaryStoreProgressInput{
+	if _, err := repos.Uploads.RecordIngressStoreProgress(context.Background(), repository.RecordIngressStoreProgressInput{
 		UploadID:      upload.ID,
-		Attempt:       progressUpload.PrimaryStoreAttempt,
+		Attempt:       progressUpload.IngressStoreAttempt,
 		BytesUploaded: 4,
 	}); err != nil {
-		t.Fatalf("RecordPrimaryStoreProgress: %v", err)
+		t.Fatalf("RecordIngressStoreProgress: %v", err)
 	}
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -1918,7 +2004,7 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 	if progress == nil {
 		t.Fatal("progress is nil, want primary transfer progress")
 	}
-	if progress.Scope != "primary_store" || progress.Attempt != progressUpload.PrimaryStoreAttempt || progress.UploadedBytes != 4 || progress.TotalBytes != 10 || progress.Percent == nil || *progress.Percent != 40 || progress.Done {
+	if progress.Scope != "ingress_store" || progress.Attempt != progressUpload.IngressStoreAttempt || progress.UploadedBytes != 4 || progress.TotalBytes != 10 || progress.Percent == nil || *progress.Percent != 40 || progress.Done {
 		t.Fatalf("progress = %#v, want 4/10 primary transfer progress", progress)
 	}
 }
@@ -1963,31 +2049,29 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
 	pieceCID := "bafk2bzaceadminprovenance"
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        &pieceCID,
-		RequestedCopies: 2,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: testStringPtr("https://primary.example/piece"), IsNewDataSet: true},
-			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: testStringPtr("https://secondary.example/piece"), IsNewDataSet: false},
-		},
-		Failures: []repository.StorageUploadFailureInput{{
-			ProviderID:   onChainIDPtr(t, "303"),
-			Role:         "secondary",
-			Stage:        testStringPtr("secondary_pull"),
-			ErrorMessage: testStringPtr("provider timed out"),
-		}},
+	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{
+		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://ingress.example/piece"},
+		{ProviderID: onChainID(t, "202"), DataSetID: onChainID(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://peer.example/piece"},
+	})
+	if err := repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
+		UploadID:       upload.ID,
+		ProviderID:     onChainIDPtr(t, "303"),
+		TransferMethod: string(model.StorageCopyTransferMethodPeerPull),
+		Stage:          "peer_pull",
+		ErrorMessage:   "provider timed out",
 	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
+		t.Fatalf("AppendUploadFailure: %v", err)
 	}
-	if _, err := repos.Uploads.AcceptCompleteUploadForContent(ctx, repository.AcceptCompleteUploadInput{
+	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 		UploadID:    upload.ID,
 		BucketID:    bucket.ID,
 		ContentSize: 8,
 		Checksum:    "checksum-provenance",
 	}); err != nil {
-		t.Fatalf("AcceptCompleteUploadForContent: %v", err)
+		t.Fatalf("BindReadableUploadForContent: %v", err)
+	}
+	if _, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet: %v", err)
 	}
 
 	_, noUploadVersionID := seedAdminObjectVersion(t, repos, bucket, "cached.txt", 3, "etag-cached", "checksum-cached", "text/plain", "", model.ObjectStateCached)
@@ -2013,7 +2097,7 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
 			DataSetID        string                    `json:"data_set_id"`
 			PieceID          string                    `json:"piece_id"`
-			Role             string                    `json:"role"`
+			TransferMethod   string                    `json:"transfer_method"`
 			RetrievalURL     string                    `json:"retrieval_url"`
 			IsNewDataSet     bool                      `json:"is_new_data_set"`
 		} `json:"copies"`
@@ -2021,7 +2105,7 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 			AttemptIndex     int                       `json:"attempt_index"`
 			ProviderID       string                    `json:"provider_id"`
 			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
-			Role             string                    `json:"role"`
+			TransferMethod   string                    `json:"transfer_method"`
 			Stage            string                    `json:"stage"`
 			Error            string                    `json:"error"`
 		} `json:"failures"`
@@ -2047,13 +2131,13 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	if statusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", statusCode, http.StatusOK)
 	}
-	if detail.VersionID != versionID || detail.Status != "success" || detail.UploadStatus != string(model.StorageUploadStatusAllCopiesCommitted) {
+	if detail.VersionID != versionID || detail.Status != "success" || detail.UploadStatus != string(model.StorageUploadStatusComplete) {
 		t.Fatalf("detail status = %#v, want stored provenance", detail)
 	}
 	if detail.PieceCID != pieceCID || detail.RequestedCopies != 2 || detail.SuccessCopies != 2 {
 		t.Fatalf("detail counts = %#v, want piece and 2/2 copies", detail)
 	}
-	if len(detail.Copies) != 2 || detail.Copies[0].ProviderID != "101" || !detail.Copies[0].IsNewDataSet || detail.Copies[1].IsNewDataSet {
+	if len(detail.Copies) != 2 || detail.Copies[0].ProviderID != "101" || detail.Copies[0].TransferMethod != string(model.StorageCopyTransferMethodIngress) || detail.Copies[1].TransferMethod != string(model.StorageCopyTransferMethodPeerPull) {
 		t.Fatalf("copies = %#v, want provider scoped copy provenance", detail.Copies)
 	}
 	if detail.Copies[0].ProviderIdentity == nil || detail.Copies[0].ProviderIdentity.Name != "alpha-pdp" || detail.Copies[0].ProviderIdentity.FilecoinActorID != "f01234" {
@@ -2062,11 +2146,40 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	if detail.Copies[1].ProviderID != "202" || detail.Copies[1].ProviderIdentity != nil {
 		t.Fatalf("secondary copy = %#v, want provider_id compatibility without identity when lookup fails", detail.Copies[1])
 	}
-	if len(detail.Failures) != 1 || detail.Failures[0].ProviderID != "303" || detail.Failures[0].Stage != "secondary_pull" || detail.Failures[0].Error != "provider timed out" {
+	if len(detail.Failures) != 1 || detail.Failures[0].ProviderID != "303" || detail.Failures[0].Stage != "peer_pull" || detail.Failures[0].Error != "provider timed out" {
 		t.Fatalf("failures = %#v, want recorded provider attempt", detail.Failures)
 	}
 	if detail.Failures[0].ProviderIdentity == nil || detail.Failures[0].ProviderIdentity.Name != "gamma-pdp" || detail.Failures[0].ProviderIdentity.FilecoinActorID != "f05678" {
 		t.Fatalf("failure provider_identity = %#v, want enriched failure identity", detail.Failures[0].ProviderIdentity)
+	}
+	peerBinding, err := repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 1)
+	if err != nil || peerBinding == nil {
+		t.Fatalf("GetDataSetBindingByCopyIndex peer: binding=%v err=%v", peerBinding, err)
+	}
+	if _, err := srv.db.NewUpdate().
+		Model((*model.StorageDataSet)(nil)).
+		Set("status = ?", model.StorageDataSetStatusDraining).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", peerBinding.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("mark peer dataset draining: %v", err)
+	}
+	drainingDetail, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("draining status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if drainingDetail.SuccessCopies != 2 {
+		t.Fatalf("draining provenance = %#v, want draining dataset counted as readable", drainingDetail)
+	}
+	if err := repos.Uploads.MarkDataSetUnavailable(ctx, peerBinding.ID, "provider dataset retired"); err != nil {
+		t.Fatalf("MarkDataSetUnavailable peer: %v", err)
+	}
+	unavailableDetail, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("unavailable status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if unavailableDetail.SuccessCopies != 1 {
+		t.Fatalf("unavailable provenance = %#v, want unavailable dataset excluded from readable copies", unavailableDetail)
 	}
 	if !reflect.DeepEqual(identityResolver.requests[0], []string{"101", "202", "303"}) {
 		t.Fatalf("provider identity request = %#v, want one provenance snapshot request", identityResolver.requests)
@@ -2084,8 +2197,8 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	if statusCode != http.StatusOK {
 		t.Fatalf("partial status = %d, want %d", statusCode, http.StatusOK)
 	}
-	if partialDetail.Status != "warning" || partialDetail.UploadStatus != string(model.StorageUploadStatusPartial) || partialDetail.SuccessCopies != 1 {
-		t.Fatalf("partial provenance = %#v, want partial upload detail", partialDetail)
+	if partialDetail.Status != "syncing" || partialDetail.UploadStatus != string(model.StorageUploadStatusReadable) || partialDetail.SuccessCopies != 1 {
+		t.Fatalf("partial provenance = %#v, want readable upload detail", partialDetail)
 	}
 
 	failedDetail, statusCode := getProvenance("provenance-bucket", failedVersionID)
@@ -2420,10 +2533,6 @@ func readBody(t *testing.T, r io.Reader) string {
 		t.Fatalf("ReadAll: %v", err)
 	}
 	return string(data)
-}
-
-func testStringPtr(value string) *string {
-	return &value
 }
 
 func TestAPIBucket_DeleteReturnsNotImplemented(t *testing.T) {

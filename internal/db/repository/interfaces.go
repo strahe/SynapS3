@@ -132,47 +132,20 @@ type StartObjectUploadAttemptInput struct {
 	SourceVersionID string
 	ContentSize     int64
 	Checksum        string
-}
-
-type RecordUploadResultInput struct {
-	UploadID        int64
-	Complete        bool
-	PieceCID        *string
 	RequestedCopies int
-	RawResultJSON   []byte
-	ErrorMessage    *string
-	Copies          []StorageUploadCopyInput
-	Failures        []StorageUploadFailureInput
-}
-
-type StorageUploadCopyInput struct {
-	ProviderID   *types.OnChainID
-	DataSetID    *types.OnChainID
-	PieceID      *types.OnChainID
-	Role         string
-	RetrievalURL *string
-	IsNewDataSet bool
-}
-
-type StorageUploadFailureInput struct {
-	ProviderID   *types.OnChainID
-	Role         string
-	Stage        *string
-	ErrorMessage *string
-	Explicit     bool
 }
 
 type AppendUploadFailureInput struct {
-	UploadID     int64
-	CopyIndex    int
-	ProviderID   *types.OnChainID
-	Role         string
-	Stage        string
-	ErrorMessage string
-	Explicit     bool
+	UploadID       int64
+	CopyIndex      int
+	ProviderID     *types.OnChainID
+	TransferMethod string
+	Stage          string
+	ErrorMessage   string
+	Explicit       bool
 }
 
-type RecordPrimaryStoreProgressInput struct {
+type RecordIngressStoreProgressInput struct {
 	UploadID      int64
 	Attempt       int
 	BytesUploaded int64
@@ -185,29 +158,34 @@ type StorageUploadProvenance struct {
 }
 
 type StorageDataSetSummary struct {
-	ID                int64                      `bun:"id"`
-	BucketID          int64                      `bun:"bucket_id"`
-	BucketName        string                     `bun:"bucket_name"`
-	CopyIndex         int                        `bun:"copy_index"`
-	ProviderID        types.OnChainID            `bun:"provider_id"`
-	DataSetID         *types.OnChainID           `bun:"data_set_id"`
-	ClientDataSetID   *types.OnChainID           `bun:"client_data_set_id"`
-	Status            model.StorageDataSetStatus `bun:"status"`
-	CreatedByUploadID *int64                     `bun:"created_by_upload_id"`
-	LastUsedUploadID  *int64                     `bun:"last_used_upload_id"`
-	CreatedAt         time.Time                  `bun:"created_at"`
-	UpdatedAt         time.Time                  `bun:"updated_at"`
+	ID                 int64                      `bun:"id"`
+	BucketID           int64                      `bun:"bucket_id"`
+	BucketName         string                     `bun:"bucket_name"`
+	CopyIndex          int                        `bun:"copy_index"`
+	ProviderID         types.OnChainID            `bun:"provider_id"`
+	DataSetID          *types.OnChainID           `bun:"data_set_id"`
+	ClientDataSetID    *types.OnChainID           `bun:"client_data_set_id"`
+	Status             model.StorageDataSetStatus `bun:"status"`
+	CreatedByUploadID  *int64                     `bun:"created_by_upload_id"`
+	LastUsedUploadID   *int64                     `bun:"last_used_upload_id"`
+	CommittedCopies    int64                      `bun:"committed_copies"`
+	ReadableCopies     int64                      `bun:"readable_copies"`
+	PhysicalBytes      int64                      `bun:"physical_bytes"`
+	ReferencedVersions int64                      `bun:"referenced_versions"`
+	CurrentVersions    int64                      `bun:"current_versions"`
+	CreatedAt          time.Time                  `bun:"created_at"`
+	UpdatedAt          time.Time                  `bun:"updated_at"`
 }
 
 type ReadableStorageCopy struct {
-	UploadID     int64           `bun:"upload_id"`
-	PieceCID     string          `bun:"piece_cid"`
-	CopyIndex    int             `bun:"copy_index"`
-	ProviderID   types.OnChainID `bun:"provider_id"`
-	DataSetID    types.OnChainID `bun:"data_set_id"`
-	PieceID      types.OnChainID `bun:"piece_id"`
-	Role         string          `bun:"role"`
-	RetrievalURL string          `bun:"retrieval_url"`
+	UploadID       int64           `bun:"upload_id"`
+	PieceCID       string          `bun:"piece_cid"`
+	CopyIndex      int             `bun:"copy_index"`
+	ProviderID     types.OnChainID `bun:"provider_id"`
+	DataSetID      types.OnChainID `bun:"data_set_id"`
+	PieceID        types.OnChainID `bun:"piece_id"`
+	TransferMethod string          `bun:"transfer_method"`
+	RetrievalURL   string          `bun:"retrieval_url"`
 }
 
 type EnsureDataSetBindingInput struct {
@@ -235,7 +213,7 @@ type MarkDataSetReadyInput struct {
 type UploadCopyBindingInput struct {
 	StorageDataSetID int64
 	CopyIndex        int
-	Role             string
+	TransferMethod   model.StorageCopyTransferMethod
 	ProviderID       types.OnChainID
 }
 
@@ -264,14 +242,14 @@ type MarkUploadCopyCommittedInput struct {
 	CommitTransactionID string
 }
 
-type BindPrimaryCommittedUploadInput struct {
+type BindReadableUploadInput struct {
 	UploadID    int64
 	BucketID    int64
 	ContentSize int64
 	Checksum    string
 }
 
-type BindPrimaryCommittedUploadForVersionInput struct {
+type BindReadableUploadForVersionInput struct {
 	UploadID    int64
 	BucketID    int64
 	ContentSize int64
@@ -283,50 +261,38 @@ type FinalizeUploadInput struct {
 	UploadID int64
 }
 
-type AcceptCompleteUploadInput struct {
-	UploadID        int64
-	Task            *model.Task
-	BucketID        int64
-	ContentSize     int64
-	Checksum        string
-	AutoEvict       bool
-	EvictMaxRetries int
-}
-
 type StorageUploadRepository interface {
 	StartObjectUploadAttempt(ctx context.Context, input StartObjectUploadAttemptInput) (*model.StorageUpload, error)
-	RecordUploadResult(ctx context.Context, input RecordUploadResultInput) error
-	AcceptCompleteUploadForContent(ctx context.Context, input AcceptCompleteUploadInput) ([]ObjectVersionRef, error)
-	FindAcceptableUploadAttempt(ctx context.Context, taskID int64, versionID string) (*model.StorageUpload, error)
 	FindActiveUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error)
 	FindLatestUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error)
 	FindLatestUploadsBySourceVersions(ctx context.Context, versionIDs []string) (map[string]model.StorageUpload, error)
 	SetAcceptError(ctx context.Context, uploadID int64, message string) error
 	GetByID(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
 	GetByIDs(ctx context.Context, uploadIDs []int64) (map[int64]model.StorageUpload, error)
-	BeginPrimaryStoreProgress(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
-	RecordPrimaryStoreProgress(ctx context.Context, input RecordPrimaryStoreProgressInput) (*model.StorageUpload, error)
+	BeginIngressStoreProgress(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
+	RecordIngressStoreProgress(ctx context.Context, input RecordIngressStoreProgressInput) (*model.StorageUpload, error)
 	GetUploadProvenance(ctx context.Context, uploadID int64) (*StorageUploadProvenance, error)
 	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
-	ListReadableCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
-	ListReadablePrimaryCopy(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
+	ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
 	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
+	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
 	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error
+	MarkDataSetUnavailable(ctx context.Context, id int64, lastError string) error
 	CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
 	MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error
 	MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error
 	MarkUploadCopyFailed(ctx context.Context, uploadID int64, copyIndex int, lastError string) error
-	BindPrimaryCommittedUploadForContent(ctx context.Context, input BindPrimaryCommittedUploadInput) ([]ObjectVersionRef, error)
-	BindPrimaryCommittedUploadForVersion(ctx context.Context, input BindPrimaryCommittedUploadForVersionInput) ([]ObjectVersionRef, error)
-	FinalizeUploadIfAllCopiesCommitted(ctx context.Context, input FinalizeUploadInput) (bool, []ObjectVersionRef, error)
+	BindReadableUploadForContent(ctx context.Context, input BindReadableUploadInput) ([]ObjectVersionRef, error)
+	BindReadableUploadForVersion(ctx context.Context, input BindReadableUploadForVersionInput) ([]ObjectVersionRef, error)
+	FinalizeUploadIfTargetCopiesMet(ctx context.Context, input FinalizeUploadInput) (bool, []ObjectVersionRef, error)
 }
 
 // BucketObjectStats holds aggregate object metrics for a single bucket.

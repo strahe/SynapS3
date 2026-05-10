@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { Loader2, RefreshCw, RotateCcw } from 'lucide-react'
-import { useState } from 'react'
+import { type ReactNode, useState } from 'react'
 import { api, type TaskItem } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
@@ -17,19 +17,21 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTaskRefDetail, useTasks } from '@/hooks/queries'
+import {
+  taskHasByteTransfer,
+  taskOperationLabel,
+  taskOperationOptionLabel,
+  taskReplicaLabel,
+  taskStageOptions,
+  taskTypeLabel,
+} from '@/lib/storage-status-labels'
 import { formatBytes, timeAgo } from '@/lib/utils'
 
 export const Route = createFileRoute('/tasks')({
   component: TasksPage,
 })
 
-const taskTypeTabs = ['all', 'upload', 'evict_cache'] as const
-const taskTypeLabels: Record<string, string> = {
-  all: 'All',
-  upload: 'Upload',
-  evict_cache: 'Evict Cache',
-}
-
+const taskTypeTabs = ['upload', 'evict_cache'] as const
 const statusOptions = [
   'all',
   'queued',
@@ -53,38 +55,15 @@ const statusLabels: Record<string, string> = {
   exhausted: 'Exhausted',
 }
 
-const stageOptions = [
-  'all',
-  'prepare_upload',
-  'ensure_dataset',
-  'primary_store',
-  'primary_commit',
-  'secondary_pull',
-  'secondary_commit',
-  'legacy_upload',
-] as const
-
 const PAGE_SIZE = 20
 
-const taskStageLabels: Record<string, string> = {
-  prepare_upload: 'Prepare upload',
-  ensure_dataset: 'Prepare storage',
-  primary_store: 'Transfer primary copy',
-  primary_commit: 'Confirm primary copy',
-  secondary_pull: 'Transfer replica',
-  secondary_commit: 'Confirm replica',
-  legacy_upload: 'Upload',
-}
-
-function taskStageLabel(task: TaskItem) {
-  const stage = task.stage ?? ''
-  const base = taskStageLabels[stage] ?? stage
-  if (typeof task.copy_index === 'number') return `${base} · copy ${task.copy_index}`
-  return base
-}
-
-function isPrimaryTransferTask(task: TaskItem) {
-  return task.stage === 'primary_store' || task.stage === 'legacy_upload'
+type TaskTypeTab = (typeof taskTypeTabs)[number]
+type TaskDetailDialogState = { title: string; text: string }
+type TaskTableProps = {
+  tasks: TaskItem[]
+  retryPending: boolean
+  onRetry: (task: TaskItem) => void
+  onOpenDetail: (dialog: TaskDetailDialogState) => void
 }
 
 function taskDetailText(task: TaskItem) {
@@ -168,9 +147,183 @@ function taskObjectLocationLabel(location: { cache: boolean; filecoin: boolean }
   return 'None'
 }
 
+function TaskDetailsCell({
+  task,
+  onOpenDetail,
+}: {
+  task: TaskItem
+  onOpenDetail: (dialog: TaskDetailDialogState) => void
+}) {
+  const detailText = taskDetailText(task)
+  if (!detailText) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  return (
+    <Button
+      type="button"
+      variant="link"
+      onClick={() => {
+        onOpenDetail({ title: taskDetailTitle(task), text: detailText })
+      }}
+      className="h-auto max-w-full justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
+    >
+      <span className="truncate">{detailText}</span>
+    </Button>
+  )
+}
+
+function TaskActionsCell({
+  task,
+  retryPending,
+  onRetry,
+}: {
+  task: TaskItem
+  retryPending: boolean
+  onRetry: (task: TaskItem) => void
+}) {
+  if (task.status !== 'exhausted') return <span className="text-muted-foreground">—</span>
+  return (
+    <Button type="button" variant="outline" size="xs" onClick={() => onRetry(task)} disabled={retryPending}>
+      <RotateCcw data-icon="inline-start" /> Retry
+    </Button>
+  )
+}
+
+function TaskCommonCells({
+  task,
+  retryPending,
+  onRetry,
+  onOpenDetail,
+}: {
+  task: TaskItem
+  retryPending: boolean
+  onRetry: (task: TaskItem) => void
+  onOpenDetail: (dialog: TaskDetailDialogState) => void
+}) {
+  return (
+    <>
+      <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+        <TaskRefCell task={task} />
+      </TableCell>
+      <TableCell className="whitespace-nowrap px-3 py-2">
+        <StatusBadge tone={taskStatusTone(task.status)}>{task.status}</StatusBadge>
+      </TableCell>
+      <TableCell className="whitespace-nowrap px-3 py-2 text-right">
+        {task.retry_count}/{task.max_retries}
+      </TableCell>
+      <TableCell className="max-w-xs whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
+        <TaskDetailsCell task={task} onOpenDetail={onOpenDetail} />
+      </TableCell>
+      <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">{timeAgo(task.scheduled_at)}</TableCell>
+      <TableCell className="whitespace-nowrap px-3 py-2">
+        <TaskActionsCell task={task} retryPending={retryPending} onRetry={onRetry} />
+      </TableCell>
+    </>
+  )
+}
+
+function UploadTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTableProps) {
+  return (
+    <TaskTableFrame>
+      <Table>
+        <TableHeader>
+          <TableRow className="bg-muted/50">
+            <TableHead className="whitespace-nowrap px-3 py-2">ID</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Operation</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Replica</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Object</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Status</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2 text-right">Retries</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Details</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Scheduled</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {tasks.length > 0 ? (
+            tasks.map((task) => (
+              <TableRow key={task.id}>
+                <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">{task.id}</TableCell>
+                <TableCell className="whitespace-nowrap px-3 py-2">
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm">{taskOperationLabel(task)}</span>
+                    {taskHasByteTransfer(task) && task.progress && <UploadProgressBar progress={task.progress} />}
+                  </div>
+                </TableCell>
+                <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                  {taskReplicaLabel(task)}
+                </TableCell>
+                <TaskCommonCells
+                  task={task}
+                  retryPending={retryPending}
+                  onRetry={onRetry}
+                  onOpenDetail={onOpenDetail}
+                />
+              </TableRow>
+            ))
+          ) : (
+            <TaskEmptyRow colSpan={9} />
+          )}
+        </TableBody>
+      </Table>
+    </TaskTableFrame>
+  )
+}
+
+function EvictCacheTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTableProps) {
+  return (
+    <TaskTableFrame>
+      <Table>
+        <TableHeader>
+          <TableRow className="bg-muted/50">
+            <TableHead className="whitespace-nowrap px-3 py-2">ID</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Object</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Status</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2 text-right">Retries</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Details</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Scheduled</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {tasks.length > 0 ? (
+            tasks.map((task) => (
+              <TableRow key={task.id}>
+                <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">{task.id}</TableCell>
+                <TaskCommonCells
+                  task={task}
+                  retryPending={retryPending}
+                  onRetry={onRetry}
+                  onOpenDetail={onOpenDetail}
+                />
+              </TableRow>
+            ))
+          ) : (
+            <TaskEmptyRow colSpan={7} />
+          )}
+        </TableBody>
+      </Table>
+    </TaskTableFrame>
+  )
+}
+
+function TaskTableFrame({ children }: { children: ReactNode }) {
+  return <div className="overflow-hidden rounded-lg border border-border">{children}</div>
+}
+
+function TaskEmptyRow({ colSpan }: { colSpan: number }) {
+  return (
+    <TableRow>
+      <TableCell colSpan={colSpan} className="h-24 text-center text-muted-foreground">
+        No tasks found
+      </TableCell>
+    </TableRow>
+  )
+}
+
 function TasksPage() {
   const [status, setStatus] = useState('')
-  const [taskType, setTaskType] = useState('')
+  const [taskType, setTaskType] = useState<TaskTypeTab>('upload')
   const [stage, setStage] = useState('')
   const [offset, setOffset] = useState(0)
   const { data, isLoading, error } = useTasks(taskType, stage, status, PAGE_SIZE, offset)
@@ -209,10 +362,10 @@ function TasksPage() {
 
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <Tabs
-          value={taskType || 'all'}
+          value={taskType}
           onValueChange={(value) => {
-            setTaskType(value === 'all' ? '' : value)
-            if (value !== 'upload') setStage('')
+            setTaskType(value as TaskTypeTab)
+            setStage('')
             setOffset(0)
           }}
           className="min-w-0"
@@ -220,42 +373,40 @@ function TasksPage() {
           <TabsList className="max-w-full justify-start overflow-x-auto">
             {taskTypeTabs.map((tab) => (
               <TabsTrigger key={tab} value={tab}>
-                {taskTypeLabels[tab]}
+                {taskTypeLabel(tab)}
               </TabsTrigger>
             ))}
           </TabsList>
         </Tabs>
 
         <div className="flex flex-wrap items-center gap-2">
-          <Label htmlFor="task-stage-filter" className="text-sm text-muted-foreground">
-            Stage:
-          </Label>
-          <Select
-            value={stage || 'all'}
-            disabled={taskType !== '' && taskType !== 'upload'}
-            onValueChange={(value) => {
-              if (value === 'all') {
-                setStage('')
-              } else {
-                setTaskType('upload')
-                setStage(value)
-              }
-              setOffset(0)
-            }}
-          >
-            <SelectTrigger id="task-stage-filter" className="w-48">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {stageOptions.map((option) => (
-                  <SelectItem key={option} value={option}>
-                    {option === 'all' ? 'All' : (taskStageLabels[option] ?? option)}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
+          {taskType === 'upload' && (
+            <>
+              <Label htmlFor="task-stage-filter" className="text-sm text-muted-foreground">
+                Operation:
+              </Label>
+              <Select
+                value={stage || 'all'}
+                onValueChange={(value) => {
+                  setStage(value === 'all' ? '' : value)
+                  setOffset(0)
+                }}
+              >
+                <SelectTrigger id="task-stage-filter" className="w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {taskStageOptions.map((option) => (
+                      <SelectItem key={option} value={option}>
+                        {taskOperationOptionLabel(option)}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </>
+          )}
           <Label htmlFor="task-status-filter" className="text-sm text-muted-foreground">
             Status:
           </Label>
@@ -290,95 +441,21 @@ function TasksPage() {
         <div className="text-destructive">Failed to load tasks</div>
       ) : (
         <>
-          <div className="overflow-hidden rounded-lg border border-border">
-            <Table>
-              <TableHeader>
-                <TableRow className="bg-muted/50">
-                  <TableHead className="whitespace-nowrap px-3 py-2">ID</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Type</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Stage</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Progress</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Ref</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Status</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2 text-right">Retries</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Details</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Scheduled</TableHead>
-                  <TableHead className="whitespace-nowrap px-3 py-2">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data && data.tasks.length > 0 ? (
-                  data.tasks.map((t) => (
-                    <TableRow key={t.id}>
-                      <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">{t.id}</TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2">{t.type}</TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2">
-                        {t.stage ? (
-                          <span className="font-mono text-xs">{taskStageLabel(t)}</span>
-                        ) : (
-                          <span className="text-muted-foreground">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2">
-                        {isPrimaryTransferTask(t) ? (
-                          <UploadProgressBar progress={t.progress} />
-                        ) : (
-                          <span className="text-muted-foreground">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
-                        <TaskRefCell task={t} />
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2">
-                        <StatusBadge tone={taskStatusTone(t.status)}>{t.status}</StatusBadge>
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2 text-right">
-                        {t.retry_count}/{t.max_retries}
-                      </TableCell>
-                      <TableCell className="max-w-xs whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
-                        {taskDetailText(t) ? (
-                          <Button
-                            type="button"
-                            variant="link"
-                            onClick={() => {
-                              setDetailDialog({ title: taskDetailTitle(t), text: taskDetailText(t) })
-                            }}
-                            className="h-auto max-w-full justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
-                          >
-                            <span className="truncate">{taskDetailText(t)}</span>
-                          </Button>
-                        ) : (
-                          '—'
-                        )}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
-                        {timeAgo(t.scheduled_at)}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap px-3 py-2">
-                        {t.status === 'exhausted' && (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="xs"
-                            onClick={() => openRetryDialog(t)}
-                            disabled={retryPending}
-                          >
-                            <RotateCcw data-icon="inline-start" /> Retry
-                          </Button>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  ))
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={10} className="h-24 text-center text-muted-foreground">
-                      No tasks found
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
+          {taskType === 'upload' ? (
+            <UploadTasksTable
+              tasks={data?.tasks ?? []}
+              retryPending={retryPending}
+              onRetry={openRetryDialog}
+              onOpenDetail={setDetailDialog}
+            />
+          ) : (
+            <EvictCacheTasksTable
+              tasks={data?.tasks ?? []}
+              retryPending={retryPending}
+              onRetry={openRetryDialog}
+              onOpenDetail={setDetailDialog}
+            />
+          )}
 
           {totalPages > 1 && (
             <div className="flex items-center justify-between">
@@ -432,7 +509,7 @@ function TasksPage() {
           <ReviewDetails
             rows={[
               { id: 'task-id', label: 'Task ID', value: retryTarget.id.toString() },
-              { id: 'type', label: 'Type', value: retryTarget.type },
+              { id: 'type', label: 'Type', value: taskTypeLabel(retryTarget.type) },
               { id: 'ref', label: 'Ref', value: `${retryTarget.ref_type}:${retryTarget.ref_id}` },
               { id: 'retries', label: 'Retries', value: `${retryTarget.retry_count}/${retryTarget.max_retries}` },
               { id: 'last-error', label: 'Last error', value: retryTarget.last_error ?? 'None' },

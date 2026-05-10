@@ -68,19 +68,24 @@ type bucketDetailResponse struct {
 }
 
 type storageDataSetSummaryResponse struct {
-	ID                int64                     `json:"id"`
-	BucketID          int64                     `json:"bucket_id"`
-	BucketName        string                    `json:"bucket_name,omitempty"`
-	CopyIndex         int                       `json:"copy_index"`
-	ProviderID        string                    `json:"provider_id"`
-	ProviderIdentity  *providerIdentityResponse `json:"provider_identity,omitempty"`
-	DataSetID         *string                   `json:"data_set_id,omitempty"`
-	ClientDataSetID   *string                   `json:"client_data_set_id,omitempty"`
-	Status            string                    `json:"status"`
-	CreatedByUploadID *int64                    `json:"created_by_upload_id,omitempty"`
-	LastUsedUploadID  *int64                    `json:"last_used_upload_id,omitempty"`
-	CreatedAt         string                    `json:"created_at"`
-	UpdatedAt         string                    `json:"updated_at"`
+	ID                 int64                     `json:"id"`
+	BucketID           int64                     `json:"bucket_id"`
+	BucketName         string                    `json:"bucket_name,omitempty"`
+	CopyIndex          int                       `json:"copy_index"`
+	ProviderID         string                    `json:"provider_id"`
+	ProviderIdentity   *providerIdentityResponse `json:"provider_identity,omitempty"`
+	DataSetID          *string                   `json:"data_set_id,omitempty"`
+	ClientDataSetID    *string                   `json:"client_data_set_id,omitempty"`
+	Status             string                    `json:"status"`
+	CreatedByUploadID  *int64                    `json:"created_by_upload_id,omitempty"`
+	LastUsedUploadID   *int64                    `json:"last_used_upload_id,omitempty"`
+	CommittedCopies    int64                     `json:"committed_copies"`
+	ReadableCopies     int64                     `json:"readable_copies"`
+	PhysicalBytes      int64                     `json:"physical_bytes"`
+	ReferencedVersions int64                     `json:"referenced_version_count"`
+	CurrentVersions    int64                     `json:"current_version_count"`
+	CreatedAt          string                    `json:"created_at"`
+	UpdatedAt          string                    `json:"updated_at"`
 }
 
 type bucketOwnerUpdateRequest struct {
@@ -413,19 +418,24 @@ func (s *Server) storageDataSetSummaryResponses(summaries []repository.StorageDa
 	identities := s.providerIdentities(providerIDs)
 	for _, summary := range summaries {
 		out = append(out, storageDataSetSummaryResponse{
-			ID:                summary.ID,
-			BucketID:          summary.BucketID,
-			BucketName:        summary.BucketName,
-			CopyIndex:         summary.CopyIndex,
-			ProviderID:        summary.ProviderID.String(),
-			ProviderIdentity:  providerIdentityFromSnapshot(identities, summary.ProviderID),
-			DataSetID:         onChainIDStringPtr(summary.DataSetID),
-			ClientDataSetID:   onChainIDStringPtr(summary.ClientDataSetID),
-			Status:            string(summary.Status),
-			CreatedByUploadID: summary.CreatedByUploadID,
-			LastUsedUploadID:  summary.LastUsedUploadID,
-			CreatedAt:         summary.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:         summary.UpdatedAt.Format(time.RFC3339),
+			ID:                 summary.ID,
+			BucketID:           summary.BucketID,
+			BucketName:         summary.BucketName,
+			CopyIndex:          summary.CopyIndex,
+			ProviderID:         summary.ProviderID.String(),
+			ProviderIdentity:   providerIdentityFromSnapshot(identities, summary.ProviderID),
+			DataSetID:          onChainIDStringPtr(summary.DataSetID),
+			ClientDataSetID:    onChainIDStringPtr(summary.ClientDataSetID),
+			Status:             string(summary.Status),
+			CreatedByUploadID:  summary.CreatedByUploadID,
+			LastUsedUploadID:   summary.LastUsedUploadID,
+			CommittedCopies:    summary.CommittedCopies,
+			ReadableCopies:     summary.ReadableCopies,
+			PhysicalBytes:      summary.PhysicalBytes,
+			ReferencedVersions: summary.ReferencedVersions,
+			CurrentVersions:    summary.CurrentVersions,
+			CreatedAt:          summary.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:          summary.UpdatedAt.Format(time.RFC3339),
 		})
 	}
 	return out
@@ -514,7 +524,7 @@ type objectProvenanceCopyResponse struct {
 	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
 	DataSetID        *string                   `json:"data_set_id,omitempty"`
 	PieceID          *string                   `json:"piece_id,omitempty"`
-	Role             string                    `json:"role"`
+	TransferMethod   string                    `json:"transfer_method"`
 	RetrievalURL     *string                   `json:"retrieval_url,omitempty"`
 	IsNewDataSet     bool                      `json:"is_new_data_set"`
 }
@@ -523,7 +533,7 @@ type objectProvenanceFailureResponse struct {
 	AttemptIndex     int                       `json:"attempt_index"`
 	ProviderID       *string                   `json:"provider_id,omitempty"`
 	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
-	Role             string                    `json:"role"`
+	TransferMethod   string                    `json:"transfer_method"`
 	Stage            *string                   `json:"stage,omitempty"`
 	Error            *string                   `json:"error,omitempty"`
 }
@@ -544,15 +554,14 @@ func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bo
 	}
 	if uploadStatus != nil {
 		switch *uploadStatus {
-		case model.StorageUploadStatusPartial,
-			model.StorageUploadStatusFailed,
+		case model.StorageUploadStatusFailed,
 			model.StorageUploadStatusRejected:
 			return objectAdminStatusWarning
-		case model.StorageUploadStatusStoredOnPrimary:
+		case model.StorageUploadStatusIngressReady:
 			return objectAdminStatusUploading
-		case model.StorageUploadStatusPrimaryCommitted:
+		case model.StorageUploadStatusReadable:
 			return objectAdminStatusSyncing
-		case model.StorageUploadStatusAllCopiesCommitted:
+		case model.StorageUploadStatusComplete:
 			return objectAdminStatusSuccess
 		}
 	}
@@ -675,10 +684,10 @@ func uploadStatusMessage(upload *model.StorageUpload) *string {
 }
 
 func uploadProgressResponseFromUpload(upload *model.StorageUpload) *uploadProgressResponse {
-	if upload == nil || upload.ProgressUpdatedAt == nil || upload.PrimaryStoreAttempt <= 0 {
+	if upload == nil || upload.ProgressUpdatedAt == nil || upload.IngressStoreAttempt <= 0 {
 		return nil
 	}
-	uploaded := upload.PrimaryBytesUploaded
+	uploaded := upload.IngressBytesTransferred
 	if uploaded < 0 {
 		uploaded = 0
 	}
@@ -691,8 +700,8 @@ func uploadProgressResponseFromUpload(upload *model.StorageUpload) *uploadProgre
 	}
 	percent := model.UploadProgressPercent(uploaded, total)
 	return &uploadProgressResponse{
-		Scope:         "primary_store",
-		Attempt:       upload.PrimaryStoreAttempt,
+		Scope:         "ingress_store",
+		Attempt:       upload.IngressStoreAttempt,
 		UploadedBytes: uploaded,
 		TotalBytes:    total,
 		Percent:       percent,
@@ -1284,12 +1293,19 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
+	readableCopies, err := s.repos.Uploads.ListReadableCommittedCopies(ctx, upload.ID)
+	if err != nil {
+		s.logger.Error("api: failed to count readable provenance copies", "error", err, "bucket", bucketName, "versionID", versionID, "uploadID", upload.ID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 
 	resp.UploadStatus = uploadStatusString(&provenance.Upload.Status)
 	resp.Progress = uploadProgressResponseFromUpload(&provenance.Upload)
 	resp.Status = objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, &provenance.Upload.Status)
 	resp.PieceCID = provenance.Upload.PieceCID
 	resp.RequestedCopies = provenance.Upload.RequestedCopies
+	resp.SuccessCopies = len(readableCopies)
 	resp.UpdatedAt = provenance.Upload.UpdatedAt.Format(time.RFC3339)
 	providerIDs := make([]idtypes.OnChainID, 0, len(provenance.Copies)+len(provenance.Failures))
 	for _, copyRow := range provenance.Copies {
@@ -1304,9 +1320,6 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 	}
 	providerIdentities := s.providerIdentities(providerIDs)
 	for _, copyRow := range provenance.Copies {
-		if copyRow.Status == model.StorageUploadCopyStatusCommitted {
-			resp.SuccessCopies++
-		}
 		resp.Copies = append(resp.Copies, objectProvenanceCopyResponse{
 			CopyIndex:        copyRow.CopyIndex,
 			Status:           string(copyRow.Status),
@@ -1314,7 +1327,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, copyRow.ProviderID),
 			DataSetID:        onChainIDStringPtr(copyRow.DataSetID),
 			PieceID:          onChainIDStringPtr(copyRow.PieceID),
-			Role:             copyRow.Role,
+			TransferMethod:   string(copyRow.TransferMethod),
 			RetrievalURL:     copyRow.RetrievalURL,
 			IsNewDataSet:     copyRow.IsNewDataSet,
 		})
@@ -1324,7 +1337,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			AttemptIndex:     failure.AttemptIndex,
 			ProviderID:       onChainIDStringPtr(failure.ProviderID),
 			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, failure.ProviderID),
-			Role:             failure.Role,
+			TransferMethod:   failure.TransferMethod,
 			Stage:            failure.Stage,
 			Error:            failure.ErrorMessage,
 		})

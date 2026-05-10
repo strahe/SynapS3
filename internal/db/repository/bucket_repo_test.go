@@ -338,18 +338,10 @@ func TestBucketRepo_CountStorageDataSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	if err := repos.Uploads.RecordUploadResult(ctx, repository.RecordUploadResultInput{
-		UploadID:        upload.ID,
-		Complete:        true,
-		PieceCID:        strptr("bafk2bzacedatasetcount"),
-		RequestedCopies: 2,
-		Copies: []repository.StorageUploadCopyInput{
-			{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), Role: "primary", RetrievalURL: strptr("https://provider.example/1")},
-			{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), Role: "secondary", RetrievalURL: strptr("https://provider.example/2")},
-		},
-	}); err != nil {
-		t.Fatalf("RecordUploadResult: %v", err)
-	}
+	seedCommittedUploadCopies(t, repos, bucket.ID, upload.ID, "bafk2bzacedatasetcount", []storageUploadCopySeed{
+		{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: strptr("https://provider.example/1")},
+		{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: strptr("https://provider.example/2")},
+	})
 
 	count, err := repos.Buckets.CountStorageDataSets(ctx)
 	if err != nil {

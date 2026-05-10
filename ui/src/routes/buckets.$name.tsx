@@ -91,6 +91,7 @@ import {
 } from '@/hooks/queries'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs } from '@/lib/s3-prefix'
+import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 type ObjectBrowserSearch = {
@@ -595,16 +596,17 @@ function ObjectProvenanceDialog({
 }
 
 function ProvenanceSummary({ data }: { data: ObjectProvenance }) {
-  const uploadLabel = data.upload_status ? uploadStatusLabel(data.upload_status) : 'No upload recorded'
+  const progressPercent = data.upload_status === 'running' ? uploadProgressPercent(data.progress) : null
+  const uploadLabel = data.upload_status ? uploadStatusLabel(data.upload_status, progressPercent) : 'No upload recorded'
 
   return (
     <dl className="grid gap-3 rounded-md border border-border p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
       <ProvenanceSummaryItem
         label="Object status"
-        value={objectStateLabel(data.state, data.status, data.upload_status)}
+        value={objectStateLabel(data.state, data.status, data.upload_status, progressPercent)}
       />
       <ProvenanceSummaryItem label="Upload" value={uploadLabel} />
-      <ProvenanceSummaryItem label="Copies" value={`${data.success_copies} / ${data.requested_copies}`} />
+      <ProvenanceSummaryItem label="Replicas" value={`${data.success_copies} / ${data.requested_copies}`} />
       <ProvenanceSummaryItem label="Updated" value={timeAgo(data.updated_at)} title={data.updated_at} />
       <ProvenanceSummaryItem
         label="Piece CID"
@@ -721,13 +723,13 @@ function ProviderIdentityDetails({ providerID, identity }: { providerID?: string
 function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
   return (
     <div className="overflow-hidden rounded-md border border-border">
-      <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Copies</div>
+      <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Replicas</div>
       <ScrollArea className="w-full">
         <Table className="min-w-[960px]">
           <TableHeader>
             <TableRow>
-              <TableHead className="px-3">Copy</TableHead>
-              <TableHead className="px-3">Role</TableHead>
+              <TableHead className="px-3">Replica</TableHead>
+              <TableHead className="px-3">Transfer</TableHead>
               <TableHead className="px-3">Status</TableHead>
               <TableHead className="px-3">Provider</TableHead>
               <TableHead className="px-3">Data Set ID</TableHead>
@@ -738,9 +740,9 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
           </TableHeader>
           <TableBody>
             {copies.map((copy) => (
-              <TableRow key={`${copy.copy_index}-${copy.role}`}>
-                <TableCell className="px-3 font-mono text-xs">{copy.copy_index}</TableCell>
-                <TableCell className="px-3">{copy.role || '—'}</TableCell>
+              <TableRow key={`${copy.copy_index}-${copy.transfer_method}`}>
+                <TableCell className="px-3 font-mono text-xs">{replicaLabel(copy.copy_index)}</TableCell>
+                <TableCell className="px-3">{transferMethodLabel(copy.transfer_method)}</TableCell>
                 <TableCell className="px-3">
                   <StatusBadge tone={copyStatusTone(copy.status)}>{copy.status}</StatusBadge>
                 </TableCell>
@@ -776,7 +778,7 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
             {copies.length === 0 && (
               <TableRow>
                 <TableCell colSpan={8} className="h-20 text-center text-muted-foreground">
-                  No storage copies recorded
+                  No replicas recorded
                 </TableCell>
               </TableRow>
             )}
@@ -796,7 +798,7 @@ function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] 
         <TableHeader>
           <TableRow>
             <TableHead className="px-3">Provider</TableHead>
-            <TableHead className="px-3">Role</TableHead>
+            <TableHead className="px-3">Transfer</TableHead>
             <TableHead className="px-3">Stage</TableHead>
             <TableHead className="px-3">Error</TableHead>
           </TableRow>
@@ -807,7 +809,7 @@ function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] 
               <TableCell className="px-3">
                 <ProviderIdentityCell providerID={failure.provider_id} identity={failure.provider_identity} />
               </TableCell>
-              <TableCell className="px-3">{failure.role || '—'}</TableCell>
+              <TableCell className="px-3">{transferMethodLabel(failure.transfer_method)}</TableCell>
               <TableCell className="px-3">{failure.stage ?? '—'}</TableCell>
               <TableCell className="max-w-md overflow-hidden truncate px-3 text-muted-foreground" title={failure.error}>
                 {failure.error ?? '—'}
@@ -861,8 +863,7 @@ function ObjectStatusIcon({
   const visualStatus = objectVisualStatus(status, uploadStatus)
   const detail = useObjectStatusDetail(bucketName, versionID, visualStatus === 'warning' && detailEnabled)
   const progressPercent = uploadStatus === 'running' ? uploadProgressPercent(progress) : null
-  const label = objectStateLabel(state, status, uploadStatus)
-  const displayLabel = progressPercent === null ? label : `${label} ${progressPercent}%`
+  const displayLabel = objectStateLabel(state, status, uploadStatus, progressPercent)
   const progressDetail =
     progressPercent === null || !progress
       ? null
@@ -933,24 +934,8 @@ function objectStatusIcon(status: ObjectStatus, compact = false, progressPercent
   }
 }
 
-function objectStatusLabel(status: ObjectStatus) {
-  switch (status) {
-    case 'success':
-      return 'Success'
-    case 'warning':
-      return 'Warning'
-    case 'unavailable':
-      return 'Unavailable'
-    case 'syncing':
-      return 'Syncing'
-    case 'uploading':
-      return 'Uploading'
-  }
-}
-
 function objectVisualStatus(status: ObjectStatus, uploadStatus?: ObjectUploadStatus): ObjectStatus {
   switch (uploadStatus) {
-    case 'partial':
     case 'failed':
     case 'rejected':
       return 'warning'
@@ -976,56 +961,17 @@ function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
 function dataSetStatusTone(status: string): StatusTone {
   switch (status) {
     case 'ready':
+    case 'draining':
       return 'success'
     case 'creating':
+    case 'pending':
       return 'info'
     case 'failed':
+    case 'unavailable':
+    case 'retired':
       return 'danger'
     default:
       return 'neutral'
-  }
-}
-
-function uploadStatusLabel(uploadStatus: ObjectUploadStatus) {
-  switch (uploadStatus) {
-    case 'running':
-      return 'Uploading primary copy'
-    case 'stored_on_primary':
-      return 'Primary copy uploaded'
-    case 'primary_committed':
-      return 'Primary copy confirmed, syncing replicas'
-    case 'partial':
-      return 'Stored with replica issues'
-    case 'all_copies_committed':
-      return 'Stored on all copies'
-    case 'failed':
-      return 'Upload failed'
-    case 'rejected':
-      return 'Upload rejected'
-    case 'superseded':
-      return 'Superseded by newer version'
-  }
-}
-
-function objectStateLabel(state: ObjectState | undefined, status: ObjectStatus, uploadStatus?: ObjectUploadStatus) {
-  if (uploadStatus) return uploadStatusLabel(uploadStatus)
-  switch (state) {
-    case 'cached':
-      return 'Stored in cache'
-    case 'uploading':
-      return 'Uploading'
-    case 'committing':
-      return 'Confirming primary copy'
-    case 'replicating':
-      return 'Syncing replicas'
-    case 'stored':
-      return 'Stored'
-    case 'cache_evicted':
-      return 'Stored remotely'
-    case 'failed':
-      return 'Needs attention'
-    default:
-      return objectStatusLabel(status)
   }
 }
 
@@ -1034,7 +980,7 @@ function failureStageLabel(state?: string) {
     case 'uploading':
       return 'Failed while uploading'
     case 'committing':
-      return 'Failed while confirming primary copy'
+      return 'Failed while registering storage record'
     case 'replicating':
       return 'Failed while syncing replicas'
     case 'stored':
@@ -1315,7 +1261,7 @@ function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[]
         <Table className="min-w-[720px]">
           <TableHeader>
             <TableRow>
-              <TableHead className="px-4">Copy</TableHead>
+              <TableHead className="px-4">Replica Slot</TableHead>
               <TableHead className="px-4">Provider</TableHead>
               <TableHead className="px-4">Data Set ID</TableHead>
               <TableHead className="px-4">Status</TableHead>
@@ -1325,7 +1271,7 @@ function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[]
           <TableBody>
             {dataSets.map((dataSet) => (
               <TableRow key={dataSet.id}>
-                <TableCell className="px-4 font-mono text-xs">{dataSet.copy_index}</TableCell>
+                <TableCell className="px-4 font-mono text-xs">{replicaLabel(dataSet.copy_index)}</TableCell>
                 <TableCell className="px-4">
                   <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
                 </TableCell>

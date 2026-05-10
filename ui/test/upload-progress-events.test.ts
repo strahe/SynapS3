@@ -6,7 +6,7 @@ import type { ObjectListResponse, TaskListResponse, UploadTransferProgress } fro
 import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '../src/lib/upload-progress-events.ts'
 
 const progress: UploadTransferProgress = {
-  scope: 'primary_store',
+  scope: 'ingress_store',
   attempt: 1,
   uploaded_bytes: 4,
   total_bytes: 10,
@@ -55,12 +55,12 @@ test('upload progress events patch object list cache by version id', () => {
 
 test('upload progress events patch task list cache and ignore stale attempts', () => {
   const qc = new QueryClient()
-  qc.setQueryData<TaskListResponse>(['tasks', 'upload', 'primary_store', 'running', 20, 0], {
+  qc.setQueryData<TaskListResponse>(['tasks', 'upload', 'ingress_store', 'running', 20, 0], {
     tasks: [
       {
         id: 7,
         type: 'upload',
-        stage: 'primary_store',
+        stage: 'ingress_store',
         upload_id: 11,
         ref_type: 'object',
         ref_id: 1,
@@ -88,7 +88,7 @@ test('upload progress events patch task list cache and ignore stale attempts', (
     })
   )
 
-  let data = qc.getQueryData<TaskListResponse>(['tasks', 'upload', 'primary_store', 'running', 20, 0])
+  let data = qc.getQueryData<TaskListResponse>(['tasks', 'upload', 'ingress_store', 'running', 20, 0])
   assert.equal(data?.tasks[0]?.progress?.attempt, 2)
   assert.equal(data?.tasks[0]?.progress?.uploaded_bytes, 8)
 
@@ -103,19 +103,19 @@ test('upload progress events patch task list cache and ignore stale attempts', (
     })
   )
 
-  data = qc.getQueryData<TaskListResponse>(['tasks', 'upload', 'primary_store', 'running', 20, 0])
+  data = qc.getQueryData<TaskListResponse>(['tasks', 'upload', 'ingress_store', 'running', 20, 0])
   assert.equal(data?.tasks[0]?.progress?.attempt, 3)
   assert.equal(data?.tasks[0]?.progress?.uploaded_bytes, 0)
 })
 
 test('upload progress events keep completed progress when late running events arrive', () => {
   const qc = new QueryClient()
-  qc.setQueryData<TaskListResponse>(['tasks', 'upload', 'primary_store', 'running', 20, 0], {
+  qc.setQueryData<TaskListResponse>(['tasks', 'upload', 'ingress_store', 'running', 20, 0], {
     tasks: [
       {
         id: 7,
         type: 'upload',
-        stage: 'primary_store',
+        stage: 'ingress_store',
         upload_id: 11,
         ref_type: 'object',
         ref_id: 1,
@@ -155,7 +155,7 @@ test('upload progress events keep completed progress when late running events ar
     })
   )
 
-  const data = qc.getQueryData<TaskListResponse>(['tasks', 'upload', 'primary_store', 'running', 20, 0])
+  const data = qc.getQueryData<TaskListResponse>(['tasks', 'upload', 'ingress_store', 'running', 20, 0])
   assert.equal(data?.tasks[0]?.progress?.done, true)
 })
 
