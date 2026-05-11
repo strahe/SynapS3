@@ -160,6 +160,8 @@ type ObjectRepository interface {
 	CountByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// TotalSizeByBucket returns the sum of current object sizes in a bucket.
 	TotalSizeByBucket(ctx context.Context, bucketID int64) (int64, error)
+	// BucketStats returns object count and total size for a single bucket in a single query.
+	BucketStats(ctx context.Context, bucketID int64) (BucketObjectStats, error)
 	// AggregateByBucket returns object count and total size for all buckets in a single query.
 	AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error)
 }

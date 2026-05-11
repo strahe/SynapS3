@@ -31,6 +31,9 @@ func TestS3AccountRepo_CRUDAndRootFiltering(t *testing.T) {
 	if gotRoot == nil || !gotRoot.IsRoot || gotRoot.Role != auth.RoleAdmin {
 		t.Fatalf("root account = %#v, want root admin", gotRoot)
 	}
+	if err := repos.S3Accounts.Create(ctx, root); !errors.Is(err, repository.ErrAlreadyExists) {
+		t.Fatalf("Create duplicate root error = %v, want ErrAlreadyExists", err)
+	}
 
 	users, err := repos.S3Accounts.ListNonRoot(ctx)
 	if err != nil {
@@ -38,6 +41,43 @@ func TestS3AccountRepo_CRUDAndRootFiltering(t *testing.T) {
 	}
 	if len(users) != 1 || users[0].AccessKey != "user-access" {
 		t.Fatalf("users = %#v, want only non-root user", users)
+	}
+
+	gotRootAccount, err := repos.S3Accounts.GetRoot(ctx)
+	if err != nil {
+		t.Fatalf("GetRoot: %v", err)
+	}
+	if gotRootAccount == nil || gotRootAccount.AccessKey != "root-access" {
+		t.Fatalf("GetRoot = %#v, want root-access", gotRootAccount)
+	}
+
+	if err := repos.S3Accounts.Delete(ctx, "root-access"); err != nil {
+		t.Fatalf("Delete root: %v", err)
+	}
+	missingRoot, err := repos.S3Accounts.GetRoot(ctx)
+	if err != nil {
+		t.Fatalf("GetRoot after delete: %v", err)
+	}
+	if missingRoot != nil {
+		t.Fatalf("GetRoot after delete = %#v, want nil", missingRoot)
+	}
+	if err := repos.S3Accounts.Create(ctx, root); err != nil {
+		t.Fatalf("Create root again: %v", err)
+	}
+
+	locked, err := repos.S3Accounts.LockByAccessKey(ctx, "root-access")
+	if err != nil {
+		t.Fatalf("LockByAccessKey: %v", err)
+	}
+	if locked == nil || locked.AccessKey != "root-access" {
+		t.Fatalf("LockByAccessKey = %#v, want root-access", locked)
+	}
+	missingLock, err := repos.S3Accounts.LockByAccessKey(ctx, "not-found")
+	if err != nil {
+		t.Fatalf("LockByAccessKey missing: %v", err)
+	}
+	if missingLock != nil {
+		t.Fatalf("LockByAccessKey missing = %#v, want nil", missingLock)
 	}
 
 	if err := repos.S3Accounts.Update(ctx, "user-access", repository.S3AccountUpdate{Role: auth.RoleAdmin}); err != nil {
@@ -49,6 +89,9 @@ func TestS3AccountRepo_CRUDAndRootFiltering(t *testing.T) {
 	}
 	if updated.Role != auth.RoleAdmin {
 		t.Fatalf("role = %q, want admin", updated.Role)
+	}
+	if err := repos.S3Accounts.Update(ctx, "missing", repository.S3AccountUpdate{Role: auth.RoleAdmin}); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("Update missing error = %v, want ErrNotFound", err)
 	}
 
 	if err := repos.S3Accounts.Delete(ctx, "user-access"); err != nil {

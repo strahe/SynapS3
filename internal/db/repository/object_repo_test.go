@@ -960,6 +960,13 @@ func TestObjectRepo_DeleteMarkerStatsAndRecoverableListIgnoreUnrestorableMarkers
 	if total != 0 {
 		t.Fatalf("current size = %d, want delete markers ignored", total)
 	}
+	bucketStats, err := repos.Objects.BucketStats(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("BucketStats: %v", err)
+	}
+	if bucketStats.Count != 0 || bucketStats.TotalSize != 0 {
+		t.Fatalf("bucket stats = count:%d size:%d, want delete markers ignored", bucketStats.Count, bucketStats.TotalSize)
+	}
 
 	deleted, err := repos.Objects.ListRecoverableDeleteMarkers(ctx, bucket.ID, "", "", 10)
 	if err != nil {
@@ -1456,6 +1463,15 @@ func TestObjectRepo_CurrentStatsUseCurrentVersions(t *testing.T) {
 	ctx := context.Background()
 	bucketA := seedBucket(t, db, "stats-a")
 	bucketB := seedBucket(t, db, "stats-b")
+	emptyBucket := seedBucket(t, db, "stats-empty")
+
+	emptyStats, err := repos.Objects.BucketStats(ctx, emptyBucket.ID)
+	if err != nil {
+		t.Fatalf("BucketStats empty: %v", err)
+	}
+	if emptyStats.Count != 0 || emptyStats.TotalSize != 0 {
+		t.Fatalf("empty bucket stats = count:%d size:%d, want 0/0", emptyStats.Count, emptyStats.TotalSize)
+	}
 
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucketA.ID, "a.txt", "01J00000000000000000000041", 100)); err != nil {
 		t.Fatalf("create a v1: %v", err)
@@ -1481,6 +1497,13 @@ func TestObjectRepo_CurrentStatsUseCurrentVersions(t *testing.T) {
 	}
 	if totalA != 250 {
 		t.Fatalf("bucket A current size = %d, want 250", totalA)
+	}
+	statsA, err := repos.Objects.BucketStats(ctx, bucketA.ID)
+	if err != nil {
+		t.Fatalf("BucketStats: %v", err)
+	}
+	if statsA.Count != 1 || statsA.TotalSize != 250 {
+		t.Fatalf("bucket A stats = count:%d size:%d, want count:1 size:250", statsA.Count, statsA.TotalSize)
 	}
 
 	stats, err := repos.Objects.AggregateByBucket(ctx)

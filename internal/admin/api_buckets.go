@@ -223,15 +223,9 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	objectCount, err := s.repos.Objects.CountByBucket(ctx, bucket.ID)
+	stats, err := s.repos.Objects.BucketStats(ctx, bucket.ID)
 	if err != nil {
-		s.logger.Error("api: failed to count bucket objects", "error", err, "name", bucketName)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-	totalSize, err := s.repos.Objects.TotalSizeByBucket(ctx, bucket.ID)
-	if err != nil {
-		s.logger.Error("api: failed to sum bucket object size", "error", err, "name", bucketName)
+		s.logger.Error("api: failed to get bucket object stats", "error", err, "name", bucketName)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
@@ -251,8 +245,8 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		Name:               bucket.Name,
 		OwnerAccessKey:     s.adminOwnerAccessKey(bucket.OwnerAccessKey),
 		Status:             string(bucket.Status),
-		ObjectCount:        objectCount,
-		TotalSizeBytes:     totalSize,
+		ObjectCount:        stats.Count,
+		TotalSizeBytes:     stats.TotalSize,
 		CreatedAt:          bucket.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:          bucket.UpdatedAt.Format(time.RFC3339),
 		VersioningStatus:   "Enabled",

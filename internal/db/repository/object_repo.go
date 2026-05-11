@@ -927,6 +927,22 @@ func (r *BunObjectRepo) TotalSizeByBucket(ctx context.Context, bucketID int64) (
 	return total, nil
 }
 
+// BucketStats returns current object count and total size for a single bucket.
+func (r *BunObjectRepo) BucketStats(ctx context.Context, bucketID int64) (BucketObjectStats, error) {
+	var stats BucketObjectStats
+	err := r.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		ColumnExpr("COUNT(*) AS count").
+		ColumnExpr("COALESCE(SUM(size), 0) AS total_size").
+		Where("bucket_id = ? AND is_current = ?", bucketID, true).
+		Where("is_delete_marker = ?", false).
+		Scan(ctx, &stats)
+	if err != nil {
+		return BucketObjectStats{}, fmt.Errorf("getting stats for bucket %d: %w", bucketID, err)
+	}
+	return stats, nil
+}
+
 // AggregateByBucket returns current object count and total size for all buckets in a single query.
 func (r *BunObjectRepo) AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error) {
 	var rows []struct {
@@ -1527,24 +1543,6 @@ func restoreCurrentDeleteMarkerStack(ctx context.Context, db bun.IDB, bucketID i
 	}
 	restoreTarget.IsCurrent = true
 	return restoreTarget, nil
-}
-
-func promoteLatestVersion(ctx context.Context, db bun.IDB, objectID int64) error {
-	latest, err := selectLatestVersionByObjectID(ctx, db, objectID)
-	if err != nil {
-		return err
-	}
-	if latest == nil {
-		return nil
-	}
-	if _, err := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("is_current = ?", true).
-		Where("version_id = ?", latest.VersionID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("promoting latest version: %w", err)
-	}
-	return nil
 }
 
 func promoteLatestVersionOrDeleteObject(ctx context.Context, db bun.IDB, objectID int64) error {
