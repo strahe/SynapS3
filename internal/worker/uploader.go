@@ -1785,14 +1785,14 @@ func (u *Uploader) readyContextForCopy(ctx context.Context, bucket *model.Bucket
 
 func (u *Uploader) contextForBindingProvider(ctx context.Context, binding *model.StorageDataSet, bucketName string) (synapse.UploadContext, error) {
 	return u.storage.CreateContext(ctx, &storage.CreateContextOptions{
-		ProviderIDs:     []sdktypes.BigInt{binding.ProviderID.SDK()},
+		ProviderID:      sdkBigIntPtr(&binding.ProviderID),
 		DataSetMetadata: map[string]string{"bucket": bucketName},
 	})
 }
 
 func (u *Uploader) contextForReadyBinding(ctx context.Context, binding *model.StorageDataSet, bucketName string) (synapse.UploadContext, error) {
 	return u.storage.CreateContext(ctx, &storage.CreateContextOptions{
-		DataSetIDs:      []sdktypes.BigInt{binding.DataSetID.SDK()},
+		DataSetID:       sdkBigIntPtr(binding.DataSetID),
 		DataSetMetadata: map[string]string{"bucket": bucketName},
 	})
 }

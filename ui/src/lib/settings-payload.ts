@@ -36,13 +36,20 @@ export function buildSettingsPayload(
 
   const upload: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['upload']> = {}
   const evictor: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['evictor']> = {}
+  const storageCleanup: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['storage_cleanup']> = {}
   if (include('worker.upload.concurrency')) upload.concurrency = form.worker.upload.concurrency
   if (include('worker.upload.poll_interval')) upload.poll_interval = form.worker.upload.poll_interval
   if (include('worker.upload.max_retries')) upload.max_retries = form.worker.upload.max_retries
   if (include('worker.evictor.concurrency')) evictor.concurrency = form.worker.evictor.concurrency
   if (include('worker.evictor.poll_interval')) evictor.poll_interval = form.worker.evictor.poll_interval
   if (include('worker.evictor.max_retries')) evictor.max_retries = form.worker.evictor.max_retries
-  payload.worker = { upload, evictor }
+  if (include('worker.storage_cleanup.concurrency'))
+    storageCleanup.concurrency = form.worker.storage_cleanup.concurrency
+  if (include('worker.storage_cleanup.poll_interval'))
+    storageCleanup.poll_interval = form.worker.storage_cleanup.poll_interval
+  if (include('worker.storage_cleanup.max_retries'))
+    storageCleanup.max_retries = form.worker.storage_cleanup.max_retries
+  payload.worker = { upload, evictor, storage_cleanup: storageCleanup }
 
   payload.logging = {}
   if (include('logging.level')) payload.logging.level = form.logging.level

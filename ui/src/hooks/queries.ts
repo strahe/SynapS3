@@ -134,6 +134,43 @@ export function useDeleteBucketObject() {
   })
 }
 
+export function usePermanentDeleteBucketObjectVersion() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ name, key, versionID }: { name: string; key: string; versionID: string }) =>
+      api.permanentlyDeleteBucketObjectVersion(name, { key, version_id: versionID }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['deletedObjects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objectVersions', variables.name, variables.key] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+      qc.invalidateQueries({ queryKey: ['taskStats'] })
+    },
+  })
+}
+
+export function usePermanentDeleteDeletedBucketObject() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ name, key, deleteMarkerVersionID }: { name: string; key: string; deleteMarkerVersionID: string }) =>
+      api.permanentlyDeleteDeletedBucketObject(name, {
+        key,
+        delete_marker_version_id: deleteMarkerVersionID,
+      }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['deletedObjects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objectVersions', variables.name, variables.key] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+      qc.invalidateQueries({ queryKey: ['taskStats'] })
+    },
+  })
+}
+
 export function useRestoreBucketObject() {
   const qc = useQueryClient()
 

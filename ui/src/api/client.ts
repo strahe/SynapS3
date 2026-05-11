@@ -160,6 +160,22 @@ export interface RestoreObjectResponse {
   restored_version_id: string
 }
 
+export interface PermanentDeleteObjectResponse {
+  key: string
+  version_id: string
+  cache_cleanup_status: string
+  storage_cleanup_task_id?: number
+}
+
+export interface PermanentDeleteDeletedObjectResponse {
+  key: string
+  delete_marker_version_id: string
+  data_versions_deleted: number
+  delete_markers_deleted: number
+  cache_cleanup_failed_count: number
+  storage_cleanup_task_ids: number[]
+}
+
 export interface ObjectVersionItem {
   version_id: string
   key: string
@@ -293,11 +309,38 @@ export interface TaskRefObjectDetail {
   updated_at: string
 }
 
+export interface TaskStorageCleanupCopyDetail {
+  copy_index: number
+  provider_id?: string
+  data_set_id?: string
+  client_data_set_id?: string
+  piece_id?: string
+  piece_cid: string
+  status: string
+  delete_tx_hash?: string
+  last_error?: string
+}
+
+export interface TaskStorageCleanupDeletedVersionDetail {
+  bucket_name: string
+  key: string
+  version_id: string
+  size: number
+  deleted_at: string
+}
+
+export interface TaskStorageCleanupDetail {
+  upload_id: number
+  deleted_versions: TaskStorageCleanupDeletedVersionDetail[]
+  copies: TaskStorageCleanupCopyDetail[]
+}
+
 export interface TaskRefDetail {
   ref_type: string
   ref_id: number
   ref_version_id: string
   object: TaskRefObjectDetail | null
+  storage_cleanup?: TaskStorageCleanupDetail
 }
 
 export interface PaymentAccountData {
@@ -456,6 +499,7 @@ export interface SettingsCacheConfig {
 export interface SettingsWorkerConfig {
   upload: SettingsWorkerPoolConfig
   evictor: SettingsWorkerPoolConfig
+  storage_cleanup: SettingsWorkerPoolConfig
 }
 
 export interface SettingsWorkerPoolConfig {
@@ -529,6 +573,7 @@ export type SettingsUpdatePayload = Partial<{
   worker: Partial<{
     upload: Partial<SettingsWorkerPoolConfig>
     evictor: Partial<SettingsWorkerPoolConfig>
+    storage_cleanup: Partial<SettingsWorkerPoolConfig>
   }>
   logging: Partial<Pick<SettingsLoggingConfig, 'level' | 'format'>> & {
     s3_access?: Partial<SettingsS3AccessLoggingConfig>
@@ -600,6 +645,25 @@ export const api = {
       },
       body: JSON.stringify(payload),
     }),
+  permanentlyDeleteBucketObjectVersion: (name: string, payload: { key: string; version_id: string }) =>
+    fetchJSON<PermanentDeleteObjectResponse>(`/buckets/${encodeURIComponent(name)}/objects/permanent-delete`, {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
+  permanentlyDeleteDeletedBucketObject: (name: string, payload: { key: string; delete_marker_version_id: string }) =>
+    fetchJSON<PermanentDeleteDeletedObjectResponse>(
+      `/buckets/${encodeURIComponent(name)}/objects/deleted/permanent-delete`,
+      {
+        method: 'POST',
+        headers: {
+          'X-SynapS3-Settings-Write': '1',
+        },
+        body: JSON.stringify(payload),
+      }
+    ),
   getBucketObjectVersions: (name: string, params: { key: string; limit?: number; version_marker?: string }) => {
     const sp = new URLSearchParams()
     sp.set('key', params.key)

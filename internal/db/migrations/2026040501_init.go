@@ -134,14 +134,47 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating version storage upload index: %w", err)
 	}
 
+	if _, err := db.NewCreateTable().
+		Model((*model.ObjectDeletion)(nil)).
+		IfNotExists().
+		ColumnExpr("CONSTRAINT chk_object_deletions_size CHECK (size >= 0)").
+		ColumnExpr("CONSTRAINT chk_object_deletions_cache_status CHECK (cache_cleanup_status IN ('pending', 'deleted', 'skipped', 'failed'))").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating object_deletions table: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectDeletion)(nil)).
+		Index("idx_object_deletions_bucket_key_created").
+		Column("bucket_id", "key", "created_at").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating object deletion bucket key index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectDeletion)(nil)).
+		Index("idx_object_deletions_storage_upload").
+		Column("storage_upload_id").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating object deletion storage upload index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectDeletion)(nil)).
+		Index("idx_object_deletions_bucket_created").
+		ColumnExpr("bucket_id, created_at DESC, id DESC").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating object deletion bucket created index: %w", err)
+	}
+
 	// Tasks are queue/audit records with polymorphic references, so no FK is declared here.
 	if _, err := db.NewCreateTable().
 		Model((*model.Task)(nil)).
 		IfNotExists().
-		ColumnExpr(`CONSTRAINT chk_tasks_type CHECK ("type" IN ('upload', 'evict_cache'))`).
+		ColumnExpr(`CONSTRAINT chk_tasks_type CHECK ("type" IN ('upload', 'evict_cache', 'storage_cleanup'))`).
 		ColumnExpr("CONSTRAINT chk_tasks_status CHECK (status IN ('queued', 'scheduled', 'running', 'waiting', 'completed', 'failed', 'exhausted', 'cancelled'))").
 		ColumnExpr("CONSTRAINT chk_tasks_wait_reason CHECK (wait_reason IS NULL OR (status = 'waiting' AND wait_reason IN ('dependency', 'external_confirmation')))").
-		ColumnExpr("CONSTRAINT chk_tasks_ref_type CHECK (ref_type IN ('object', 'bucket'))").
+		ColumnExpr("CONSTRAINT chk_tasks_ref_type CHECK (ref_type IN ('object', 'bucket', 'storage_upload'))").
 		ColumnExpr("CONSTRAINT chk_tasks_object_ref_version CHECK (ref_type <> 'object' OR ref_version_id <> '')").
 		ColumnExpr("CONSTRAINT chk_tasks_retry_count CHECK (retry_count >= 0)").
 		ColumnExpr("CONSTRAINT chk_tasks_max_retries CHECK (max_retries >= 0)").
@@ -188,6 +221,32 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating task ref version index: %w", err)
+	}
+	if _, err := db.NewCreateTable().
+		Model((*model.StorageCleanupCopy)(nil)).
+		IfNotExists().
+		ForeignKey("(task_id) REFERENCES tasks(id) ON UPDATE CASCADE ON DELETE CASCADE").
+		ColumnExpr("CONSTRAINT chk_storage_cleanup_copies_copy_index CHECK (copy_index >= 0)").
+		ColumnExpr("CONSTRAINT chk_storage_cleanup_copies_status CHECK (status IN ('pending', 'delete_scheduled', 'removed', 'failed', 'unsupported'))").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage_cleanup_copies table: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageCleanupCopy)(nil)).
+		Index("idx_storage_cleanup_copies_task_copy").
+		Column("task_id", "copy_index").
+		Unique().
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage cleanup copy task index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageCleanupCopy)(nil)).
+		Index("idx_storage_cleanup_copies_upload_status").
+		Column("upload_id", "status").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage cleanup copy upload index: %w", err)
 	}
 	if err := createWalletOperationTables(ctx, db); err != nil {
 		return err
@@ -248,7 +307,9 @@ func down2026040501Init(ctx context.Context, db *bun.DB) error {
 		(*model.MultipartPart)(nil),
 		(*model.MultipartUpload)(nil),
 		(*model.WalletOperation)(nil),
+		(*model.StorageCleanupCopy)(nil),
 		(*model.Task)(nil),
+		(*model.ObjectDeletion)(nil),
 		(*model.StorageUploadFailure)(nil),
 		(*model.StorageUploadCopy)(nil),
 		(*model.ObjectVersion)(nil),
@@ -452,6 +513,14 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating storage upload copy dataset summary index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUploadCopy)(nil)).
+		Index("idx_storage_upload_copies_status_piece_identity_upload").
+		Column("status", "provider_id", "piece_id", "upload_id").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload copy piece identity index: %w", err)
 	}
 
 	if _, err := db.NewCreateTable().

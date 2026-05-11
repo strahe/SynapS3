@@ -17,21 +17,23 @@ import (
 type SynapseBackend struct {
 	backend.BackendUnsupported // provides ErrNotImplemented for unimplemented methods
 
-	repos            *repository.Repositories
-	cache            cache.Cache
-	objectReader     *objectreader.Reader
-	bucketLifecycle  *bucketlifecycle.Service
-	stateMachine     *state.Machine
-	storage          synapse.StorageClient
-	uploadMaxRetries int
-	evictMaxRetries  int
-	autoEvict        bool
-	logger           *slog.Logger
+	repos                    *repository.Repositories
+	cache                    cache.Cache
+	objectReader             *objectreader.Reader
+	bucketLifecycle          *bucketlifecycle.Service
+	stateMachine             *state.Machine
+	storage                  synapse.StorageClient
+	uploadMaxRetries         int
+	evictMaxRetries          int
+	storageCleanupMaxRetries int
+	autoEvict                bool
+	logger                   *slog.Logger
 }
 
 const (
-	defaultUploadMaxRetries = 5
-	defaultEvictMaxRetries  = 3
+	defaultUploadMaxRetries         = 5
+	defaultEvictMaxRetries          = 3
+	defaultStorageCleanupMaxRetries = 5
 )
 
 // Option configures SynapseBackend runtime behavior.
@@ -51,6 +53,13 @@ func WithEvictMaxRetries(maxRetries int) Option {
 	}
 }
 
+// WithStorageCleanupMaxRetries configures max retries for newly-created storage cleanup tasks.
+func WithStorageCleanupMaxRetries(maxRetries int) Option {
+	return func(b *SynapseBackend) {
+		b.storageCleanupMaxRetries = maxRetries
+	}
+}
+
 // WithAutoEvict configures whether stored objects enqueue cache eviction tasks.
 func WithAutoEvict(autoEvict bool) Option {
 	return func(b *SynapseBackend) {
@@ -61,15 +70,16 @@ func WithAutoEvict(autoEvict bool) Option {
 // New creates a new SynapseBackend.
 func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc synapse.StorageClient, logger *slog.Logger, opts ...Option) *SynapseBackend {
 	b := &SynapseBackend{
-		repos:            repos,
-		cache:            c,
-		objectReader:     objectreader.New(repos, c, sc, logger),
-		bucketLifecycle:  bucketlifecycle.New(repos, c, logger),
-		stateMachine:     sm,
-		storage:          sc,
-		uploadMaxRetries: defaultUploadMaxRetries,
-		evictMaxRetries:  defaultEvictMaxRetries,
-		logger:           logger,
+		repos:                    repos,
+		cache:                    c,
+		objectReader:             objectreader.New(repos, c, sc, logger),
+		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
+		stateMachine:             sm,
+		storage:                  sc,
+		uploadMaxRetries:         defaultUploadMaxRetries,
+		evictMaxRetries:          defaultEvictMaxRetries,
+		storageCleanupMaxRetries: defaultStorageCleanupMaxRetries,
+		logger:                   logger,
 	}
 	for _, opt := range opts {
 		opt(b)

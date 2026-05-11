@@ -31,23 +31,24 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr             string
-	db               *bun.DB
-	cache            cache.Cache
-	objectReader     *objectreader.Reader
-	cacheMaxBytes    int64
-	repos            *repository.Repositories
-	bucketLifecycle  *bucketlifecycle.Service
-	workerHealth     WorkerHealthChecker
-	wallet           synapse.WalletQuerier
-	providerIdentity providerIdentityLookup
-	events           *EventHub
-	settings         *SettingsService
-	s3IAM            auth.IAMService
-	s3RootAccess     string
-	setupOnly        bool
-	logger           *slog.Logger
-	startedAt        time.Time
+	addr                     string
+	db                       *bun.DB
+	cache                    cache.Cache
+	objectReader             *objectreader.Reader
+	cacheMaxBytes            int64
+	repos                    *repository.Repositories
+	bucketLifecycle          *bucketlifecycle.Service
+	workerHealth             WorkerHealthChecker
+	wallet                   synapse.WalletQuerier
+	providerIdentity         providerIdentityLookup
+	events                   *EventHub
+	settings                 *SettingsService
+	s3IAM                    auth.IAMService
+	s3RootAccess             string
+	storageCleanupMaxRetries int
+	setupOnly                bool
+	logger                   *slog.Logger
+	startedAt                time.Time
 
 	// Track previously seen label sets to zero stale entries on refresh.
 	prevTaskLabels   map[[2]string]struct{}
@@ -57,18 +58,19 @@ type Server struct {
 // New creates a new admin HTTP server.
 func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, logger *slog.Logger) *Server {
 	s := &Server{
-		addr:            addr,
-		db:              db,
-		cache:           c,
-		objectReader:    objectreader.New(repos, c, nil, logger),
-		cacheMaxBytes:   cacheMaxBytes,
-		repos:           repos,
-		bucketLifecycle: bucketlifecycle.New(repos, c, logger),
-		workerHealth:    wh,
-		wallet:          newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
-		events:          newAdminEventHub(),
-		logger:          logger,
-		startedAt:       time.Now(),
+		addr:                     addr,
+		db:                       db,
+		cache:                    c,
+		objectReader:             objectreader.New(repos, c, nil, logger),
+		cacheMaxBytes:            cacheMaxBytes,
+		repos:                    repos,
+		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
+		workerHealth:             wh,
+		wallet:                   newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
+		events:                   newAdminEventHub(),
+		storageCleanupMaxRetries: 5,
+		logger:                   logger,
+		startedAt:                time.Now(),
 	}
 	s.watchWalletOperationEvents()
 	return s
@@ -142,6 +144,12 @@ func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	return s
 }
 
+// WithStorageCleanupMaxRetries configures max retries for storage cleanup tasks created by admin actions.
+func (s *Server) WithStorageCleanupMaxRetries(maxRetries int) *Server {
+	s.storageCleanupMaxRetries = maxRetries
+	return s
+}
+
 // Run starts the admin HTTP server. Blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	if !s.setupOnly {
@@ -171,6 +179,9 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", s.handleAPIDeleteBucketObject)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/deleted", s.handleAPIBucketDeletedObjects)
+		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/deleted/permanent-delete", s.handleAPIPermanentDeleteDeletedBucketObject)
+		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/deletions", s.handleAPIBucketObjectDeletions)
+		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/permanent-delete", s.handleAPIPermanentDeleteBucketObject)
 		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/restore", s.handleAPIRestoreBucketObject)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/status-detail", s.handleAPIBucketObjectStatusDetail)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/provenance", s.handleAPIBucketObjectProvenance)

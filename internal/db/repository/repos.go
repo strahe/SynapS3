@@ -16,6 +16,7 @@ type Repositories struct {
 	S3Accounts       S3AccountRepository
 	Objects          ObjectRepository
 	Uploads          StorageUploadRepository
+	StorageCleanup   StorageCleanupRepository
 	Tasks            TaskRepository
 	Multiparts       MultipartUploadRepository
 	WalletOperations WalletOperationRepository
@@ -30,6 +31,7 @@ func NewRepositories(db bun.IDB) *Repositories {
 		S3Accounts:       &BunS3AccountRepo{db: db},
 		Objects:          &BunObjectRepo{db: db},
 		Uploads:          &BunStorageUploadRepo{db: db},
+		StorageCleanup:   &BunStorageCleanupRepo{db: db},
 		Tasks:            &BunTaskRepo{db: db},
 		Multiparts:       &BunMultipartRepo{db: db},
 		WalletOperations: &BunWalletOperationRepo{db: db},

@@ -125,25 +125,37 @@ func (r *BunTaskRepo) RenewLease(ctx context.Context, claimedTask *model.Task, l
 
 // Complete marks a running task as completed.
 func (r *BunTaskRepo) Complete(ctx context.Context, claimedTask *model.Task) error {
+	return r.complete(ctx, claimedTask, "")
+}
+
+func (r *BunTaskRepo) CompleteWithMessage(ctx context.Context, claimedTask *model.Task, message string) error {
+	return r.complete(ctx, claimedTask, message)
+}
+
+func (r *BunTaskRepo) complete(ctx context.Context, claimedTask *model.Task, message string) error {
 	taskID, claimedAt, err := runningTaskClaim(claimedTask)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
 		Set("status = ?", model.TaskStatusCompleted).
 		Set("completed_at = ?", now).
 		Set("last_error = NULL").
 		Set("wait_reason = NULL").
-		Set("status_message = NULL").
 		Set("claimed_at = NULL").
 		Set("lease_until = NULL").
 		Set("started_at = NULL").
 		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
 		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
-		Exec(ctx)
+		Where("lease_until IS NOT NULL AND lease_until > ?", now)
+	if message == "" {
+		q = q.Set("status_message = NULL")
+	} else {
+		q = q.Set("status_message = ?", message)
+	}
+	res, err := q.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("completing task: %w", err)
 	}

@@ -274,6 +274,14 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			},
 		},
 		{
+			Name: "worker.storage_cleanup",
+			Fields: []initFieldDescriptor{
+				{Field: "worker.storage_cleanup.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.StorageCleanup.Concurrency), Enabled: saveMode},
+				{Field: "worker.storage_cleanup.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.StorageCleanup.PollInterval.String()), Enabled: saveMode},
+				{Field: "worker.storage_cleanup.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.StorageCleanup.MaxRetries), Enabled: saveMode},
+			},
+		},
+		{
 			Name: "logging",
 			Fields: []initFieldDescriptor{
 				{Field: "logging.level", Key: "level", Value: quoteTOMLString(cfg.Logging.Level), Enabled: saveMode, Notes: []string{"Allowed: debug, info, warn, error."}},

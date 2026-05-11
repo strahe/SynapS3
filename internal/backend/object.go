@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"path"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -384,7 +386,30 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
 	}
 	if !version.IsDeleteMarker {
-		return nil, s3err.GetAPIError(s3err.ErrNotImplemented)
+		result, err := b.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+			BucketID:                 bucket.ID,
+			Key:                      key,
+			VersionID:                versionID,
+			StorageCleanupMaxRetries: &b.storageCleanupMaxRetries,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, repository.ErrNotFound):
+				return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
+			case errors.Is(err, repository.ErrConflict):
+				return nil, s3err.APIError{
+					Code:           "InvalidRequest",
+					Description:    "Permanent delete is only supported for stable data versions with no active work.",
+					HTTPStatusCode: http.StatusBadRequest,
+				}
+			default:
+				return nil, fmt.Errorf("permanently deleting object version: %w", err)
+			}
+		}
+		b.recordPermanentDeleteCacheCleanup(ctx, bucket.Name, versionID, result.CacheKey)
+		return &s3.DeleteObjectOutput{
+			VersionId: &versionID,
+		}, nil
 	}
 	if err := b.repos.Objects.DeleteMarkerVersion(ctx, bucket.ID, key, versionID); err != nil {
 		return nil, fmt.Errorf("deleting marker version: %w", err)
@@ -394,6 +419,10 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 		DeleteMarker: &deleteMarker,
 		VersionId:    &versionID,
 	}, nil
+}
+
+func (b *SynapseBackend) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) {
+	objectdeletion.RecordCacheCleanup(ctx, b.cache, b.repos.Objects, b.logger, bucketName, versionID, cacheKey)
 }
 
 func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {

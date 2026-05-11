@@ -175,6 +175,24 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_WORKER_EVICTOR_MAX_RETRIES",
 		Editable:    true,
 	},
+	"worker.storage_cleanup.concurrency": {
+		Label:       "Replica Cleanup Concurrency",
+		Description: "Number of remote replica cleanup jobs that may run concurrently.",
+		Env:         "SYNAPS3_WORKER_STORAGE_CLEANUP_CONCURRENCY",
+		Editable:    true,
+	},
+	"worker.storage_cleanup.poll_interval": {
+		Label:       "Replica Cleanup Poll Interval",
+		Description: "Interval between remote replica cleanup polling cycles.",
+		Env:         "SYNAPS3_WORKER_STORAGE_CLEANUP_POLL_INTERVAL",
+		Editable:    true,
+	},
+	"worker.storage_cleanup.max_retries": {
+		Label:       "Replica Cleanup Max Retries",
+		Description: "Maximum retry attempts for failed remote replica cleanup work.",
+		Env:         "SYNAPS3_WORKER_STORAGE_CLEANUP_MAX_RETRIES",
+		Editable:    true,
+	},
 	"logging.level": {
 		Label:       "Level",
 		Description: "Minimum log level emitted by SynapS3.",

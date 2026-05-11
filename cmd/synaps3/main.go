@@ -316,6 +316,7 @@ func runServe(ctx context.Context, src config.Source) error {
 	be := backend.New(repos, localCache, sm, storageClient, logger,
 		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
 		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
+		backend.WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries),
 		backend.WithAutoEvict(autoEvict),
 	)
 
@@ -364,6 +365,8 @@ func runServe(ctx context.Context, src config.Source) error {
 			worker.WithEventPublisher(adminEvents)),
 		worker.NewEvictor(repos, localCache, sm,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
+		worker.NewStorageCleanupWorker(repos, storageClient,
+			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger),
 		worker.NewWalletOperationRunner(repos, walletOperator, walletReceiptClient, 5*time.Second, logger,
 			worker.WithWalletOperationEventPublisher(adminEvents)),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
@@ -375,6 +378,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		WithObjectStorage(storageClient).
 		WithProviderIdentityResolver(admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger)).
 		WithSettings(settingsSvc).
+		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithS3IAM(iamSvc, rootAccount.Access)
 	errCh := make(chan error, 2)
 	go func() {
@@ -461,6 +465,9 @@ func setupModeAllowedField(field string) bool {
 		"worker.evictor.concurrency",
 		"worker.evictor.poll_interval",
 		"worker.evictor.max_retries",
+		"worker.storage_cleanup.concurrency",
+		"worker.storage_cleanup.poll_interval",
+		"worker.storage_cleanup.max_retries",
 		"logging.level",
 		"logging.format",
 		"logging.s3_access.enabled",

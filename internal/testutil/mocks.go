@@ -20,10 +20,11 @@ var (
 
 // MockStorageClient is a configurable test double for synapse.StorageClient.
 type MockStorageClient struct {
-	UploadFunc         func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
-	DownloadFunc       func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
-	CreateContextsFunc func(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error)
-	CreateContextFunc  func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error)
+	UploadFunc               func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
+	DownloadFunc             func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
+	CreateContextsFunc       func(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error)
+	CreateContextFunc        func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error)
+	CreateCleanupContextFunc func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error)
 }
 
 func (m *MockStorageClient) Upload(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
@@ -52,6 +53,24 @@ func (m *MockStorageClient) CreateContext(ctx context.Context, opts *storage.Cre
 		return m.CreateContextFunc(ctx, opts)
 	}
 	return nil, errors.New("MockStorageClient.CreateContext not configured")
+}
+
+func (m *MockStorageClient) CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error) {
+	if m.CreateCleanupContextFunc != nil {
+		return m.CreateCleanupContextFunc(ctx, opts)
+	}
+	if m.CreateContextFunc != nil {
+		ctx, err := m.CreateContextFunc(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		cleanupCtx, ok := ctx.(synapse.CleanupContext)
+		if !ok {
+			return nil, errors.New("MockStorageClient.CreateContext did not return CleanupContext")
+		}
+		return cleanupCtx, nil
+	}
+	return nil, errors.New("MockStorageClient.CreateCleanupContext not configured")
 }
 
 // MockWalletQuerier is a configurable test double for synapse.WalletQuerier.

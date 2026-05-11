@@ -1601,26 +1601,123 @@ func TestDeleteObject_MissingKeyCreatesDeleteMarker(t *testing.T) {
 	}
 }
 
-func TestDeleteObject_DataVersionPermanentDeleteNotImplemented(t *testing.T) {
+func TestDeleteObject_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "delete-data-version-bucket")
 
 	putOut := putTestObjectOutput(t, tb, "delete-data-version-bucket", "file.txt", "data")
-	_, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+	if _, err := tb.db.NewRaw(`UPDATE tasks SET status = ? WHERE ref_type = ? AND ref_version_id = ?`, model.TaskStatusCompleted, "object", putOut.VersionID).Exec(ctx); err != nil {
+		t.Fatalf("complete upload task: %v", err)
+	}
+	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("delete-data-version-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject(marker): %v", err)
+	}
+	if marker.DeleteMarker == nil || !*marker.DeleteMarker {
+		t.Fatalf("marker output = %#v, want delete marker", marker)
+	}
+
+	versionBeforeDelete, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil || versionBeforeDelete == nil {
+		t.Fatalf("GetVersionByID(before delete): version=%v err=%v", versionBeforeDelete, err)
+	}
+	if !tb.cache.Exists(ctx, "delete-data-version-bucket", versionBeforeDelete.CacheKey) {
+		t.Fatal("expected cache file before permanent delete")
+	}
+
+	out, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket:    aws.String("delete-data-version-bucket"),
 		Key:       aws.String("file.txt"),
 		VersionId: aws.String(putOut.VersionID),
 	})
+	if err != nil {
+		t.Fatalf("DeleteObject(data version): %v", err)
+	}
+	if out.VersionId == nil || *out.VersionId != putOut.VersionID {
+		t.Fatalf("DeleteObject(data version) VersionId = %v, want %s", out.VersionId, putOut.VersionID)
+	}
+	if out.DeleteMarker != nil && *out.DeleteMarker {
+		t.Fatalf("DeleteObject(data version) DeleteMarker = true, want false/nil")
+	}
+
+	deleted, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(after delete): %v", err)
+	}
+	if deleted != nil {
+		t.Fatalf("deleted data version still exists: %#v", deleted)
+	}
+	if tb.cache.Exists(ctx, "delete-data-version-bucket", versionBeforeDelete.CacheKey) {
+		t.Fatal("cache file still exists after permanent delete")
+	}
+
+	var cacheStatus string
+	if err := tb.db.NewRaw(`SELECT cache_cleanup_status FROM object_deletions WHERE version_id = ?`, putOut.VersionID).Scan(ctx, &cacheStatus); err != nil {
+		t.Fatalf("object deletion cache status: %v", err)
+	}
+	if cacheStatus != string(model.CacheCleanupStatusDeleted) {
+		t.Fatalf("cache cleanup status = %q, want %q", cacheStatus, model.CacheCleanupStatusDeleted)
+	}
+
+	versionsOut, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String("delete-data-version-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.Versions) != 0 || len(versionsOut.DeleteMarkers) != 1 {
+		t.Fatalf("versions=%#v markers=%#v, want only delete marker", versionsOut.Versions, versionsOut.DeleteMarkers)
+	}
+}
+
+func TestDeleteObject_DataVersionPermanentDeleteRemovesCurrentVisibleVersion(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-current-data-version-bucket")
+
+	putOut := putTestObjectOutput(t, tb, "delete-current-data-version-bucket", "file.txt", "data")
+	if _, err := tb.db.NewRaw(`UPDATE tasks SET status = ? WHERE ref_type = ? AND ref_version_id = ?`, model.TaskStatusCompleted, "object", putOut.VersionID).Exec(ctx); err != nil {
+		t.Fatalf("complete upload task: %v", err)
+	}
+	out, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    aws.String("delete-current-data-version-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: aws.String(putOut.VersionID),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject(current data version): %v", err)
+	}
+	if out.VersionId == nil || *out.VersionId != putOut.VersionID {
+		t.Fatalf("DeleteObject(current data version) VersionId = %v, want %s", out.VersionId, putOut.VersionID)
+	}
+	if out.DeleteMarker != nil && *out.DeleteMarker {
+		t.Fatalf("DeleteObject(current data version) DeleteMarker = true, want false/nil")
+	}
+
+	deleted, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(after delete): %v", err)
+	}
+	if deleted != nil {
+		t.Fatalf("deleted current data version still exists: %#v", deleted)
+	}
+	_, err = tb.backend.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String("delete-current-data-version-bucket"),
+		Key:    aws.String("file.txt"),
+	})
 	if err == nil {
-		t.Fatal("DeleteObject(data version) returned nil error")
+		t.Fatal("HeadObject after deleting only current version returned nil error")
 	}
 	apiErr, ok := err.(s3err.APIError)
 	if !ok {
-		t.Fatalf("DeleteObject(data version) error = %T %v, want APIError", err, err)
+		t.Fatalf("HeadObject after deleting only current version error = %T %v, want APIError", err, err)
 	}
-	if want := s3err.GetAPIError(s3err.ErrNotImplemented); apiErr.Code != want.Code {
-		t.Fatalf("DeleteObject(data version) code = %q, want %q", apiErr.Code, want.Code)
+	if want := s3err.GetAPIError(s3err.ErrNoSuchKey); apiErr.Code != want.Code {
+		t.Fatalf("HeadObject after deleting only current version code = %q, want %q", apiErr.Code, want.Code)
 	}
 }
 

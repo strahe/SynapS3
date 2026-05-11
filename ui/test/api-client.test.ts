@@ -22,11 +22,15 @@ test('admin write mutations send settings write header', async () => {
       key: 'folder/file.txt',
       delete_marker_version_id: 'marker-1',
     })
+    await api.permanentlyDeleteDeletedBucketObject('bucket-a', {
+      key: 'folder/file.txt',
+      delete_marker_version_id: 'marker-1',
+    })
   } finally {
     globalThis.fetch = originalFetch
   }
 
-  assert.equal(calls.length, 4)
+  assert.equal(calls.length, 5)
   assert.equal(calls[0]?.method, 'POST')
   assert.equal(calls[0]?.headers.get('X-SynapS3-Settings-Write'), '1')
   assert.equal(calls[1]?.method, 'PUT')
@@ -35,6 +39,8 @@ test('admin write mutations send settings write header', async () => {
   assert.equal(calls[2]?.headers.get('X-SynapS3-Settings-Write'), '1')
   assert.equal(calls[3]?.method, 'POST')
   assert.equal(calls[3]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[4]?.method, 'POST')
+  assert.equal(calls[4]?.headers.get('X-SynapS3-Settings-Write'), '1')
 })
 
 test('object download URL encodes bucket name and object key', () => {

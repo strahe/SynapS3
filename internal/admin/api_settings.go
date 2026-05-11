@@ -134,6 +134,7 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 	if req.Worker != nil {
 		applyWorkerPoolUpdate(req.Worker.Upload, &next.Worker.Upload, "worker.upload", setInt, setDuration)
 		applyWorkerPoolUpdate(req.Worker.Evictor, &next.Worker.Evictor, "worker.evictor", setInt, setDuration)
+		applyWorkerPoolUpdate(req.Worker.StorageCleanup, &next.Worker.StorageCleanup, "worker.storage_cleanup", setInt, setDuration)
 	}
 	if req.Logging != nil {
 		setString("logging.level", &next.Logging.Level, req.Logging.Level)
@@ -300,8 +301,9 @@ type settingsCacheConfig struct {
 }
 
 type settingsWorkerConfig struct {
-	Upload  settingsWorkerPoolConfig `json:"upload"`
-	Evictor settingsWorkerPoolConfig `json:"evictor"`
+	Upload         settingsWorkerPoolConfig `json:"upload"`
+	Evictor        settingsWorkerPoolConfig `json:"evictor"`
+	StorageCleanup settingsWorkerPoolConfig `json:"storage_cleanup"`
 }
 
 type settingsWorkerPoolConfig struct {
@@ -397,8 +399,9 @@ type settingsCacheUpdate struct {
 }
 
 type settingsWorkerUpdate struct {
-	Upload  *settingsWorkerPoolUpdate `json:"upload,omitempty"`
-	Evictor *settingsWorkerPoolUpdate `json:"evictor,omitempty"`
+	Upload         *settingsWorkerPoolUpdate `json:"upload,omitempty"`
+	Evictor        *settingsWorkerPoolUpdate `json:"evictor,omitempty"`
+	StorageCleanup *settingsWorkerPoolUpdate `json:"storage_cleanup,omitempty"`
 }
 
 type settingsWorkerPoolUpdate struct {
@@ -447,8 +450,9 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 			EvictionPolicy: cfg.Cache.EvictionPolicy,
 		},
 		Worker: settingsWorkerConfig{
-			Upload:  toSettingsWorkerPoolConfig(cfg.Worker.Upload),
-			Evictor: toSettingsWorkerPoolConfig(cfg.Worker.Evictor),
+			Upload:         toSettingsWorkerPoolConfig(cfg.Worker.Upload),
+			Evictor:        toSettingsWorkerPoolConfig(cfg.Worker.Evictor),
+			StorageCleanup: toSettingsWorkerPoolConfig(cfg.Worker.StorageCleanup),
 		},
 		Logging: settingsLoggingConfig{
 			Level:  cfg.Logging.Level,
@@ -497,29 +501,32 @@ func toSettingsSecretStatus(cfg *config.Config) settingsSecretStatus {
 
 func editableValidationErrors(cfg *config.Config) []config.FieldError {
 	editable := map[string]struct{}{
-		"server.port":                  {},
-		"server.max_connections":       {},
-		"server.max_requests":          {},
-		"server.tls.cert_file":         {},
-		"server.tls.key_file":          {},
-		"s3.region":                    {},
-		"cache.dir":                    {},
-		"cache.max_size_gb":            {},
-		"cache.eviction_policy":        {},
-		"filecoin.network":             {},
-		"filecoin.rpc_url":             {},
-		"filecoin.source":              {},
-		"filecoin.default_copies":      {},
-		"worker.upload.concurrency":    {},
-		"worker.upload.poll_interval":  {},
-		"worker.upload.max_retries":    {},
-		"worker.evictor.concurrency":   {},
-		"worker.evictor.poll_interval": {},
-		"worker.evictor.max_retries":   {},
-		"logging.level":                {},
-		"logging.format":               {},
-		"logging.s3_access.enabled":    {},
-		"logging.s3_access.level":      {},
+		"server.port":                          {},
+		"server.max_connections":               {},
+		"server.max_requests":                  {},
+		"server.tls.cert_file":                 {},
+		"server.tls.key_file":                  {},
+		"s3.region":                            {},
+		"cache.dir":                            {},
+		"cache.max_size_gb":                    {},
+		"cache.eviction_policy":                {},
+		"filecoin.network":                     {},
+		"filecoin.rpc_url":                     {},
+		"filecoin.source":                      {},
+		"filecoin.default_copies":              {},
+		"worker.upload.concurrency":            {},
+		"worker.upload.poll_interval":          {},
+		"worker.upload.max_retries":            {},
+		"worker.evictor.concurrency":           {},
+		"worker.evictor.poll_interval":         {},
+		"worker.evictor.max_retries":           {},
+		"worker.storage_cleanup.concurrency":   {},
+		"worker.storage_cleanup.poll_interval": {},
+		"worker.storage_cleanup.max_retries":   {},
+		"logging.level":                        {},
+		"logging.format":                       {},
+		"logging.s3_access.enabled":            {},
+		"logging.s3_access.level":              {},
 	}
 
 	var out []config.FieldError

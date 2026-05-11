@@ -25,12 +25,19 @@ type UploadContext interface {
 	Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error)
 }
 
+// CleanupContext abstracts the SDK operations needed to remove PDP pieces.
+type CleanupContext interface {
+	DeletePieceByID(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error)
+	PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error)
+}
+
 // StorageClient abstracts the synapse-go storage service for download plus
 // staged provider operations.
 type StorageClient interface {
 	Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
 	CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]UploadContext, error)
 	CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (UploadContext, error)
+	CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (CleanupContext, error)
 }
 
 // WalletQuerier provides on-chain wallet state for the admin dashboard.

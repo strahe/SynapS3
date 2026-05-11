@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   objectStateLabel,
   replicaLabel,
+  storageCleanupStatusLabel,
   taskHasByteTransfer,
   taskOperationLabel,
   taskOperationOptionLabel,
@@ -32,9 +33,11 @@ test('object state labels prefer active upload lifecycle when present', () => {
 test('task labels use product-facing task and operation names', () => {
   assert.equal(taskTypeLabel('upload'), 'Upload')
   assert.equal(taskTypeLabel('evict_cache'), 'Evict Cache')
+  assert.equal(taskTypeLabel('storage_cleanup'), 'Replica Cleanup')
   assert.equal(taskOperationOptionLabel('ensure_dataset'), 'Prepare replica target')
   assert.equal(taskOperationOptionLabel('peer_pull'), 'Sync peer replica')
   assert.equal(taskOperationLabel({ type: 'evict_cache' }), 'Evict local cache')
+  assert.equal(taskOperationLabel({ type: 'storage_cleanup' }), 'Delete remote replicas')
   assert.equal(taskOperationLabel({ type: 'upload', stage: '' }), 'Upload object')
   assert.equal(
     taskOperationLabel({ type: 'upload', stage: 'peer_commit', copy_index: 1 }),
@@ -53,4 +56,13 @@ test('replica and transfer labels hide zero-based storage internals', () => {
   assert.equal(taskHasByteTransfer({ type: 'upload', stage: '' }), true)
   assert.equal(taskHasByteTransfer({ type: 'upload', stage: 'peer_pull' }), false)
   assert.equal(taskHasByteTransfer({ type: 'evict_cache' }), false)
+  assert.equal(taskHasByteTransfer({ type: 'storage_cleanup' }), false)
+})
+
+test('replica cleanup status labels describe user-visible cleanup state', () => {
+  assert.equal(storageCleanupStatusLabel([{ status: 'pending' }]), 'Waiting to delete replicas')
+  assert.equal(storageCleanupStatusLabel([{ status: 'delete_scheduled' }]), 'Replica deletion scheduled')
+  assert.equal(storageCleanupStatusLabel([{ status: 'removed' }]), 'Remote replicas deleted')
+  assert.equal(storageCleanupStatusLabel([{ status: 'unsupported' }, { status: 'failed' }]), 'Needs attention')
+  assert.equal(storageCleanupStatusLabel([]), 'No remote replicas to delete')
 })

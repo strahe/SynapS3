@@ -129,6 +129,224 @@ func (r *BunObjectRepo) DeleteMarkerVersion(ctx context.Context, bucketID int64,
 	})
 }
 
+func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, input DeleteObjectVersionInput) (DeleteObjectVersionResult, error) {
+	var result DeleteObjectVersionResult
+	if input.BucketID == 0 || input.Key == "" || input.VersionID == "" {
+		return result, fmt.Errorf("permanently deleting object version: %w", ErrInvalidInput)
+	}
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if err := lockCurrentObjectIfExists(ctx, db, input.BucketID, input.Key); err != nil {
+			return err
+		}
+		version, err := selectVersionByBucketKeyAndID(ctx, db, input.BucketID, input.Key, input.VersionID)
+		if err != nil {
+			return err
+		}
+		if version == nil {
+			return ErrNotFound
+		}
+		if version.IsDeleteMarker || !objectVersionPermanentDeleteStateAllowed(version.State) {
+			return ErrConflict
+		}
+		if err := ensureObjectVersionHasNoActiveWork(ctx, db, version.VersionID); err != nil {
+			return err
+		}
+		wasCurrent := version.IsCurrent
+		objectID := version.ObjectID
+
+		now := time.Now()
+		deletion := &model.ObjectDeletion{
+			BucketID:           version.BucketID,
+			ObjectID:           version.ObjectID,
+			Key:                version.Key,
+			VersionID:          version.VersionID,
+			CacheKey:           version.CacheKey,
+			StorageUploadID:    version.StorageUploadID,
+			Size:               version.Size,
+			Checksum:           version.Checksum,
+			CacheCleanupStatus: model.CacheCleanupStatusPending,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+			DeletedAt:          now,
+		}
+		if _, err := db.NewInsert().Model(deletion).Exec(ctx); err != nil {
+			if isUniqueViolation(err) {
+				return ErrAlreadyExists
+			}
+			return fmt.Errorf("recording object deletion: %w", err)
+		}
+		result.DeletionID = deletion.ID
+		result.CacheKey = version.CacheKey
+		result.StorageUploadID = version.StorageUploadID
+
+		if version.StorageUploadID != nil {
+			cleanupTaskID, err := createStorageCleanupTaskForDeletedVersion(ctx, db, *version.StorageUploadID, version.VersionID, input.StorageCleanupMaxRetries)
+			if err != nil {
+				return err
+			}
+			result.StorageCleanupTaskID = cleanupTaskID
+		}
+
+		res, err := db.NewDelete().
+			Model((*model.ObjectVersion)(nil)).
+			Where("version_id = ?", version.VersionID).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("deleting object version row: %w", err)
+		}
+		rows, _ := res.RowsAffected()
+		if rows == 0 {
+			return ErrNotFound
+		}
+		if wasCurrent {
+			if err := promoteLatestVersionOrDeleteObject(ctx, db, objectID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return DeleteObjectVersionResult{}, fmt.Errorf("permanently deleting object version: %w", err)
+	}
+	return result, nil
+}
+
+func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, input DeleteDeletedObjectInput) (DeleteDeletedObjectResult, error) {
+	var result DeleteDeletedObjectResult
+	if input.BucketID == 0 || input.Key == "" || input.DeleteMarkerVersionID == "" {
+		return result, fmt.Errorf("permanently deleting deleted object: %w", ErrInvalidInput)
+	}
+	result.Key = input.Key
+	result.DeleteMarkerVersionID = input.DeleteMarkerVersionID
+
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if err := lockCurrentObjectIfExists(ctx, db, input.BucketID, input.Key); err != nil {
+			return err
+		}
+		current, err := selectCurrentVersionByBucketAndKey(ctx, db, input.BucketID, input.Key)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return ErrNotFound
+		}
+		if !current.IsDeleteMarker || current.VersionID != input.DeleteMarkerVersionID {
+			return ErrConflict
+		}
+
+		versions, err := selectVersionsByObjectNewestFirst(ctx, db, current.ObjectID)
+		if err != nil {
+			return err
+		}
+		if len(versions) == 0 {
+			return ErrNotFound
+		}
+
+		now := time.Now()
+		deletions := make([]model.ObjectDeletion, 0, len(versions))
+		deletedVersionIDsByUpload := make(map[int64][]string)
+		for i := range versions {
+			version := versions[i]
+			if version.IsDeleteMarker {
+				result.DeleteMarkersDeleted++
+				continue
+			}
+			if !objectVersionPermanentDeleteStateAllowed(version.State) {
+				return ErrConflict
+			}
+			if err := ensureObjectVersionHasNoActiveWork(ctx, db, version.VersionID); err != nil {
+				return err
+			}
+			deletions = append(deletions, model.ObjectDeletion{
+				BucketID:           version.BucketID,
+				ObjectID:           version.ObjectID,
+				Key:                version.Key,
+				VersionID:          version.VersionID,
+				CacheKey:           version.CacheKey,
+				StorageUploadID:    version.StorageUploadID,
+				Size:               version.Size,
+				Checksum:           version.Checksum,
+				CacheCleanupStatus: model.CacheCleanupStatusPending,
+				CreatedAt:          now,
+				UpdatedAt:          now,
+				DeletedAt:          now,
+			})
+			result.DeletedVersions = append(result.DeletedVersions, DeletedObjectVersionSnapshot{
+				VersionID: version.VersionID,
+				CacheKey:  version.CacheKey,
+			})
+			result.DataVersionsDeleted++
+			if version.StorageUploadID != nil {
+				uploadID := *version.StorageUploadID
+				deletedVersionIDsByUpload[uploadID] = append(deletedVersionIDsByUpload[uploadID], version.VersionID)
+			}
+		}
+
+		if len(deletions) > 0 {
+			if _, err := db.NewInsert().Model(&deletions).Exec(ctx); err != nil {
+				if isUniqueViolation(err) {
+					return ErrAlreadyExists
+				}
+				return fmt.Errorf("recording object deletions: %w", err)
+			}
+		}
+
+		for uploadID, deletedVersionIDs := range deletedVersionIDsByUpload {
+			cleanupTaskID, err := createStorageCleanupTaskForDeletedVersions(ctx, db, uploadID, deletedVersionIDs, input.StorageCleanupMaxRetries)
+			if err != nil {
+				return err
+			}
+			if cleanupTaskID != nil {
+				result.StorageCleanupTaskIDs = append(result.StorageCleanupTaskIDs, *cleanupTaskID)
+			}
+		}
+
+		if _, err := db.NewDelete().
+			Model((*model.ObjectVersion)(nil)).
+			Where("object_id = ?", current.ObjectID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("deleting deleted object versions: %w", err)
+		}
+		if _, err := db.NewDelete().
+			Model((*model.Object)(nil)).
+			Where("id = ?", current.ObjectID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("deleting object identity: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return DeleteDeletedObjectResult{}, fmt.Errorf("permanently deleting deleted object: %w", err)
+	}
+	return result, nil
+}
+
+func (r *BunObjectRepo) UpdateObjectDeletionCacheCleanup(ctx context.Context, versionID string, status model.CacheCleanupStatus, cacheError string) error {
+	if versionID == "" || status == "" {
+		return fmt.Errorf("updating object deletion cache cleanup: %w", ErrInvalidInput)
+	}
+	now := time.Now()
+	q := r.db.NewUpdate().
+		Model((*model.ObjectDeletion)(nil)).
+		Set("cache_cleanup_status = ?", status).
+		Set("cache_cleaned_at = ?", now).
+		Set("updated_at = ?", now)
+	if cacheError == "" {
+		q = q.Set("cache_error = NULL")
+	} else {
+		q = q.Set("cache_error = ?", cacheError)
+	}
+	res, err := q.Where("version_id = ?", versionID).Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("updating object deletion cache cleanup: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("updating object deletion cache cleanup: %w", ErrNotFound)
+	}
+	return nil
+}
+
 func (r *BunObjectRepo) RestoreCurrentDeleteMarkerStack(ctx context.Context, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error) {
 	if bucketID == 0 || key == "" || currentMarkerVersionID == "" {
 		return nil, fmt.Errorf("restoring delete marker stack: %w", ErrInvalidInput)
@@ -756,6 +974,290 @@ func usableCopyExistsSQL(uploadIDExpr string) string {
 	return "EXISTS (SELECT 1 FROM storage_upload_copies AS storage_copy JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id WHERE storage_copy.upload_id = " + uploadIDExpr + " AND storage_copy.status = 'committed' AND storage_copy.storage_data_set_id IS NOT NULL AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> '' AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> '' AND storage_data_set.status IN ('ready', 'draining') AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> '' AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> '')"
 }
 
+func objectVersionPermanentDeleteStateAllowed(state model.ObjectState) bool {
+	switch state {
+	case model.ObjectStateCached, model.ObjectStateStored, model.ObjectStateCacheEvicted, model.ObjectStateFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func ensureObjectVersionHasNoActiveWork(ctx context.Context, db bun.IDB, versionID string) error {
+	uploadCount, err := db.NewSelect().
+		Model((*model.StorageUpload)(nil)).
+		Where("source_version_id = ? AND status IN (?)", versionID, bun.List(activeUploadStatuses())).
+		Count(ctx)
+	if err != nil {
+		return fmt.Errorf("checking active upload for permanent delete: %w", err)
+	}
+	if uploadCount > 0 {
+		return ErrConflict
+	}
+	taskCount, err := db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("ref_type = ? AND ref_version_id = ? AND status IN (?)", "object", versionID, bun.List(activeTaskStatuses())).
+		Count(ctx)
+	if err != nil {
+		return fmt.Errorf("checking active task for permanent delete: %w", err)
+	}
+	if taskCount > 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+const defaultStorageCleanupMaxRetries = 5
+
+func createStorageCleanupTaskForDeletedVersion(ctx context.Context, db bun.IDB, uploadID int64, deletedVersionID string, maxRetries *int) (*int64, error) {
+	return createStorageCleanupTaskForDeletedVersions(ctx, db, uploadID, []string{deletedVersionID}, maxRetries)
+}
+
+func createStorageCleanupTaskForDeletedVersions(ctx context.Context, db bun.IDB, uploadID int64, deletedVersionIDs []string, maxRetries *int) (*int64, error) {
+	if uploadID == 0 || len(deletedVersionIDs) == 0 {
+		return nil, fmt.Errorf("creating storage cleanup task: %w", ErrInvalidInput)
+	}
+	copies, err := storageCleanupCopySnapshots(ctx, db, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	if len(copies) == 0 {
+		return nil, nil
+	}
+
+	idempotencyKey := fmt.Sprintf("storage_cleanup:%d", uploadID)
+	task := new(model.Task)
+	err = db.NewSelect().
+		Model(task).
+		Where("idempotency_key = ?", idempotencyKey).
+		Scan(ctx)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("selecting storage cleanup task: %w", err)
+	}
+	if err == nil {
+		return reuseStorageCleanupTask(ctx, db, task, uploadID, deletedVersionIDs, maxRetries)
+	}
+
+	now := time.Now()
+	maxRetriesValue := storageCleanupMaxRetries(maxRetries)
+	task = &model.Task{
+		Type:           model.TaskTypeStorageCleanup,
+		RefType:        "storage_upload",
+		RefID:          uploadID,
+		RefVersionID:   "",
+		IdempotencyKey: idempotencyKey,
+		Payload:        storageCleanupTaskPayload(uploadID, deletedVersionIDs),
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     maxRetriesValue,
+		ScheduledAt:    now,
+	}
+	res, err := db.NewInsert().
+		Model(task).
+		On("CONFLICT (idempotency_key) DO NOTHING").
+		Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating storage cleanup task: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		task = new(model.Task)
+		if err := db.NewSelect().
+			Model(task).
+			Where("idempotency_key = ?", idempotencyKey).
+			Scan(ctx); err != nil {
+			return nil, fmt.Errorf("selecting concurrent storage cleanup task: %w", err)
+		}
+		return reuseStorageCleanupTask(ctx, db, task, uploadID, deletedVersionIDs, maxRetries)
+	}
+	if maxRetriesValue == 0 {
+		if _, err := db.NewUpdate().
+			Model((*model.Task)(nil)).
+			Set("max_retries = 0").
+			Where("id = ?", task.ID).
+			Exec(ctx); err != nil {
+			return nil, fmt.Errorf("setting storage cleanup task max retries: %w", err)
+		}
+	}
+	for i := range copies {
+		copies[i].TaskID = task.ID
+		copies[i].CreatedAt = now
+		copies[i].UpdatedAt = now
+	}
+	if _, err := db.NewInsert().Model(&copies).Exec(ctx); err != nil {
+		return nil, fmt.Errorf("creating storage cleanup copy snapshots: %w", err)
+	}
+	return &task.ID, nil
+}
+
+func reuseStorageCleanupTask(ctx context.Context, db bun.IDB, task *model.Task, uploadID int64, deletedVersionIDs []string, maxRetries *int) (*int64, error) {
+	if task == nil {
+		return nil, fmt.Errorf("reusing storage cleanup task: %w", ErrInvalidInput)
+	}
+	if task.Status != model.TaskStatusCompleted {
+		if taskStatusIsActive(task.Status) {
+			if err := updateStorageCleanupTaskPayload(ctx, db, task, uploadID, deletedVersionIDs); err != nil {
+				return nil, err
+			}
+		}
+		return &task.ID, nil
+	}
+
+	remainingCopies, err := db.NewSelect().
+		Model((*model.StorageCleanupCopy)(nil)).
+		Where("task_id = ? AND status <> ?", task.ID, model.StorageCleanupCopyStatusRemoved).
+		Count(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("checking retained storage cleanup copies: %w", err)
+	}
+	if remainingCopies == 0 {
+		return &task.ID, nil
+	}
+
+	now := time.Now()
+	res, err := db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusQueued).
+		Set("retry_count = 0").
+		Set("max_retries = ?", storageCleanupMaxRetries(maxRetries)).
+		Set("payload = ?", mergeStorageCleanupTaskPayload(task.Payload, uploadID, deletedVersionIDs)).
+		Set("scheduled_at = ?", now).
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
+		Set("completed_at = NULL").
+		Set("last_error = NULL").
+		Set("wait_reason = NULL").
+		Set("status_message = NULL").
+		Where("id = ? AND status = ?", task.ID, model.TaskStatusCompleted).
+		Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("requeueing retained storage cleanup task: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return nil, fmt.Errorf("requeueing retained storage cleanup task %d: %w", task.ID, ErrConflict)
+	}
+	return &task.ID, nil
+}
+
+func updateStorageCleanupTaskPayload(ctx context.Context, db bun.IDB, task *model.Task, uploadID int64, deletedVersionIDs []string) error {
+	payload := mergeStorageCleanupTaskPayload(task.Payload, uploadID, deletedVersionIDs)
+	res, err := db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("payload = ?", payload).
+		Where("id = ?", task.ID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("updating storage cleanup task payload: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("updating storage cleanup task payload %d: %w", task.ID, ErrNotFound)
+	}
+	return nil
+}
+
+func taskStatusIsActive(status model.TaskStatus) bool {
+	for _, active := range activeTaskStatuses() {
+		if status == active {
+			return true
+		}
+	}
+	return false
+}
+
+func storageCleanupMaxRetries(maxRetries *int) int {
+	if maxRetries == nil {
+		return defaultStorageCleanupMaxRetries
+	}
+	return *maxRetries
+}
+
+func storageCleanupTaskPayload(uploadID int64, deletedVersionIDs []string) map[string]interface{} {
+	payload := map[string]interface{}{
+		"storage_upload_id": uploadID,
+	}
+	if len(deletedVersionIDs) > 0 {
+		payload["deleted_source_version"] = deletedVersionIDs[0]
+	}
+	payload["deleted_source_versions"] = deletedVersionIDs
+	return payload
+}
+
+func mergeStorageCleanupTaskPayload(existing map[string]interface{}, uploadID int64, deletedVersionIDs []string) map[string]interface{} {
+	merged := storageCleanupPayloadVersionIDs(existing)
+	for _, versionID := range deletedVersionIDs {
+		merged = appendUniqueString(merged, versionID)
+	}
+	return storageCleanupTaskPayload(uploadID, merged)
+}
+
+func storageCleanupPayloadVersionIDs(payload map[string]interface{}) []string {
+	var out []string
+	if payload == nil {
+		return out
+	}
+
+	switch values := payload["deleted_source_versions"].(type) {
+	case []string:
+		for _, value := range values {
+			out = appendUniqueString(out, value)
+		}
+	case []interface{}:
+		for _, value := range values {
+			text, ok := value.(string)
+			if ok {
+				out = appendUniqueString(out, text)
+			}
+		}
+	}
+	legacy, ok := payload["deleted_source_version"].(string)
+	if ok {
+		out = appendUniqueString(out, legacy)
+	}
+	return out
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func storageCleanupCopySnapshots(ctx context.Context, db bun.IDB, uploadID int64) ([]model.StorageCleanupCopy, error) {
+	var copies []model.StorageCleanupCopy
+	err := db.NewRaw(`SELECT
+			storage_copy.upload_id,
+			storage_copy.copy_index,
+			storage_copy.provider_id,
+			storage_copy.storage_data_set_id,
+			storage_data_set.data_set_id,
+			storage_data_set.client_data_set_id,
+			storage_copy.piece_id,
+			storage_upload.piece_cid,
+			storage_copy.retrieval_url,
+			? AS status
+		FROM storage_upload_copies AS storage_copy
+		JOIN storage_uploads AS storage_upload ON storage_upload.id = storage_copy.upload_id
+		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
+		WHERE storage_copy.upload_id = ? AND storage_copy.status = ?
+		ORDER BY storage_copy.copy_index ASC`,
+		model.StorageCleanupCopyStatusPending,
+		uploadID,
+		model.StorageUploadCopyStatusCommitted,
+	).Scan(ctx, &copies)
+	if err != nil {
+		return nil, fmt.Errorf("loading storage cleanup copy snapshots: %w", err)
+	}
+	return copies, nil
+}
+
 func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (ObjectVersionWriteResult, error) {
 	normalizeObjectVersion(version)
 	if err := lockCurrentObjectIfExists(ctx, db, version.BucketID, version.Key); err != nil {
@@ -963,7 +1465,7 @@ func deleteMarkerVersion(ctx context.Context, db bun.IDB, bucketID int64, key st
 	if !version.IsCurrent {
 		return nil
 	}
-	return promoteLatestVersion(ctx, db, version.ObjectID)
+	return promoteLatestVersionOrDeleteObject(ctx, db, version.ObjectID)
 }
 
 func restoreCurrentDeleteMarkerStack(ctx context.Context, db bun.IDB, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error) {
@@ -1041,6 +1543,37 @@ func promoteLatestVersion(ctx context.Context, db bun.IDB, objectID int64) error
 		Where("version_id = ?", latest.VersionID).
 		Exec(ctx); err != nil {
 		return fmt.Errorf("promoting latest version: %w", err)
+	}
+	return nil
+}
+
+func promoteLatestVersionOrDeleteObject(ctx context.Context, db bun.IDB, objectID int64) error {
+	latest, err := selectLatestVersionByObjectID(ctx, db, objectID)
+	if err != nil {
+		return err
+	}
+	if latest == nil {
+		if _, err := db.NewDelete().
+			Model((*model.Object)(nil)).
+			Where("id = ?", objectID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("deleting empty object identity: %w", err)
+		}
+		return nil
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("is_current = (version_id = ?)", latest.VersionID).
+		Where("object_id = ?", objectID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("promoting latest version: %w", err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", objectID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("updating object identity timestamp: %w", err)
 	}
 	return nil
 }
@@ -1186,6 +1719,7 @@ func selectVersionsByObjectNewestFirst(ctx context.Context, db bun.IDB, objectID
 }
 
 func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, key string) error {
+	// Use an UPDATE as a cross-dialect row lock; SELECT FOR UPDATE is not supported by SQLite.
 	if _, err := db.NewUpdate().
 		Model((*model.Object)(nil)).
 		Set("updated_at = updated_at").

@@ -71,8 +71,9 @@ type CacheConfig struct {
 }
 
 type WorkerConfig struct {
-	Upload  WorkerPoolConfig `koanf:"upload"`
-	Evictor WorkerPoolConfig `koanf:"evictor"`
+	Upload         WorkerPoolConfig `koanf:"upload"`
+	Evictor        WorkerPoolConfig `koanf:"evictor"`
+	StorageCleanup WorkerPoolConfig `koanf:"storage_cleanup"`
 }
 
 type WorkerPoolConfig struct {
@@ -163,6 +164,11 @@ func defaultConfig() *Config {
 				Concurrency:  2,
 				PollInterval: time.Minute,
 				MaxRetries:   3,
+			},
+			StorageCleanup: WorkerPoolConfig{
+				Concurrency:  2,
+				PollInterval: time.Minute,
+				MaxRetries:   5,
 			},
 		},
 		Logging: LoggingConfig{
@@ -408,6 +414,7 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	validatePool("upload", c.Worker.Upload)
 	validatePool("evictor", c.Worker.Evictor)
+	validatePool("storage_cleanup", c.Worker.StorageCleanup)
 
 	// Logging.
 	switch c.Logging.Level {

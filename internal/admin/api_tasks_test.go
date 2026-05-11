@@ -384,6 +384,86 @@ func TestAPITaskRefDetailNotFound(t *testing.T) {
 	}
 }
 
+func TestAPITaskRefDetailStorageCleanupIncludesDeletedVersionSnapshot(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := testutil.SeedBucket(t, db, "task-ref-storage-cleanup-bucket")
+	uploadID := int64(98)
+	versionID := "01J000000000000000DELETE1"
+	now := time.Now().UTC()
+
+	task := &model.Task{
+		Type:           model.TaskTypeStorageCleanup,
+		RefType:        "storage_upload",
+		RefID:          uploadID,
+		RefVersionID:   "",
+		IdempotencyKey: "task-ref-storage-cleanup",
+		Payload: map[string]interface{}{
+			"storage_upload_id":       uploadID,
+			"deleted_source_version":  versionID,
+			"deleted_source_versions": []string{versionID},
+		},
+		Status:      model.TaskStatusQueued,
+		MaxRetries:  5,
+		ScheduledAt: now,
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	deletion := &model.ObjectDeletion{
+		BucketID:           bucket.ID,
+		ObjectID:           55,
+		Key:                "folder/deleted.txt",
+		VersionID:          versionID,
+		CacheKey:           "cache/deleted",
+		StorageUploadID:    &uploadID,
+		Size:               456,
+		Checksum:           "checksum-deleted",
+		CacheCleanupStatus: model.CacheCleanupStatusSkipped,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		DeletedAt:          now,
+	}
+	if _, err := db.NewInsert().Model(deletion).Exec(ctx); err != nil {
+		t.Fatalf("Insert object deletion: %v", err)
+	}
+	copy := &model.StorageCleanupCopy{
+		TaskID:      task.ID,
+		UploadID:    uploadID,
+		CopyIndex:   0,
+		PieceCID:    "bafkzcibedeleted",
+		Status:      model.StorageCleanupCopyStatusPending,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		ScheduledAt: &now,
+	}
+	if _, err := db.NewInsert().Model(copy).Exec(ctx); err != nil {
+		t.Fatalf("Insert storage cleanup copy: %v", err)
+	}
+
+	body, status := getTaskRefDetail(t, db, repos, task.ID)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if body.StorageCleanup == nil {
+		t.Fatal("storage cleanup detail is nil")
+	}
+	if body.StorageCleanup.UploadID != uploadID || len(body.StorageCleanup.Copies) != 1 {
+		t.Fatalf("storage cleanup detail = %#v, want upload and copy snapshot", body.StorageCleanup)
+	}
+	if len(body.StorageCleanup.DeletedVersions) != 1 {
+		t.Fatalf("deleted versions = %#v, want one deleted version snapshot", body.StorageCleanup.DeletedVersions)
+	}
+	deleted := body.StorageCleanup.DeletedVersions[0]
+	if deleted.BucketName != bucket.Name || deleted.Key != "folder/deleted.txt" || deleted.VersionID != versionID {
+		t.Fatalf("deleted version = %#v, want bucket/key/version snapshot", deleted)
+	}
+	if deleted.Size != 456 || deleted.DeletedAt == "" {
+		t.Fatalf("deleted version = %#v, want size and deletion timestamp", deleted)
+	}
+}
+
 func TestAPITaskRefDetailNonObject(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)

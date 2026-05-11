@@ -10,8 +10,9 @@ import (
 type TaskType string
 
 const (
-	TaskTypeUpload     TaskType = "upload"
-	TaskTypeEvictCache TaskType = "evict_cache"
+	TaskTypeUpload         TaskType = "upload"
+	TaskTypeEvictCache     TaskType = "evict_cache"
+	TaskTypeStorageCleanup TaskType = "storage_cleanup"
 )
 
 // TaskStatus represents the processing state of a task.

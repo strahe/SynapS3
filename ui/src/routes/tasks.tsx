@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { Loader2, RefreshCw, RotateCcw } from 'lucide-react'
 import { type ReactNode, useState } from 'react'
-import { api, type TaskItem } from '@/api/client'
+import { api, type TaskItem, type TaskStorageCleanupDetail } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageHeader } from '@/components/app/PageHeader'
@@ -18,6 +18,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTaskRefDetail, useTasks } from '@/hooks/queries'
 import {
+  storageCleanupStatusLabel,
   taskHasByteTransfer,
   taskOperationLabel,
   taskOperationOptionLabel,
@@ -31,7 +32,7 @@ export const Route = createFileRoute('/tasks')({
   component: TasksPage,
 })
 
-const taskTypeTabs = ['upload', 'evict_cache'] as const
+const taskTypeTabs = ['upload', 'evict_cache', 'storage_cleanup'] as const
 const statusOptions = [
   'all',
   'queued',
@@ -77,7 +78,7 @@ function taskDetailTitle(task: TaskItem) {
 function TaskRefCell({ task }: { task: TaskItem }) {
   const [detailEnabled, setDetailEnabled] = useState(false)
   const detail = useTaskRefDetail(task.id, detailEnabled)
-  const refLabel = `${task.ref_type}:${task.ref_id}`
+  const refLabel = task.type === 'storage_cleanup' ? 'Deleted object' : `${task.ref_type}:${task.ref_id}`
 
   const enableDetail = () => setDetailEnabled(true)
 
@@ -93,7 +94,7 @@ function TaskRefCell({ task }: { task: TaskItem }) {
           type="button"
           className="inline-flex max-w-48 truncate font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onClick={enableDetail}
-          aria-label={`${refLabel} reference`}
+          aria-label={`${refLabel} details`}
         >
           {refLabel}
         </button>
@@ -107,13 +108,68 @@ function TaskRefCell({ task }: { task: TaskItem }) {
 
 function TaskRefTooltipContent({ detail, enabled }: { detail: ReturnType<typeof useTaskRefDetail>; enabled: boolean }) {
   if (!enabled || detail.isLoading || (detail.isFetching && !detail.data)) {
-    return <span>Loading reference</span>
+    return <span>Loading details</span>
   }
-  if (detail.error || !detail.data?.object) {
-    return <span>Reference unavailable</span>
+  if (detail.error || (!detail.data?.object && !detail.data?.storage_cleanup)) {
+    return <span>Details unavailable</span>
   }
 
-  const object = detail.data.object
+  if (detail.data.storage_cleanup) {
+    return <TaskStorageCleanupTooltip cleanup={detail.data.storage_cleanup} />
+  }
+
+  if (!detail.data.object) {
+    return <span>Details unavailable</span>
+  }
+
+  return <TaskObjectRefTooltip object={detail.data.object} />
+}
+
+function TaskStorageCleanupTooltip({ cleanup }: { cleanup: TaskStorageCleanupDetail }) {
+  const versions = cleanup.deleted_versions ?? []
+  if (versions.length === 0) {
+    return <span>Details unavailable</span>
+  }
+
+  const totalSize = versions.reduce((sum, version) => sum + version.size, 0)
+  const firstDeletedAt = versions.find((version) => version.deleted_at)?.deleted_at
+  return (
+    <div className="grid max-w-xs grid-cols-[auto_1fr] gap-x-2 gap-y-1 text-xs">
+      <span className="text-muted-foreground">Bucket</span>
+      <span className="truncate font-medium">
+        {storageCleanupValueLabel(
+          versions.map((version) => version.bucket_name),
+          'buckets'
+        )}
+      </span>
+      <span className="text-muted-foreground">Key</span>
+      <span className="truncate font-medium">
+        {storageCleanupValueLabel(
+          versions.map((version) => version.key),
+          'objects'
+        )}
+      </span>
+      <span className="text-muted-foreground">Version</span>
+      <span className="truncate font-mono">{storageCleanupVersionLabel(versions)}</span>
+      <span className="text-muted-foreground">Status</span>
+      <span>{storageCleanupStatusLabel(cleanup.copies)}</span>
+      <span className="text-muted-foreground">Size</span>
+      <span>{formatBytes(totalSize)}</span>
+      <span className="text-muted-foreground">Deleted</span>
+      <span>{firstDeletedAt ? timeAgo(firstDeletedAt) : '—'}</span>
+    </div>
+  )
+}
+
+function TaskObjectRefTooltip({
+  object,
+}: {
+  object: NonNullable<ReturnType<typeof useTaskRefDetail>['data']>['object']
+}) {
+  if (!object) {
+    return <span>Details unavailable</span>
+  }
+
   return (
     <div className="grid max-w-xs grid-cols-[auto_1fr] gap-x-2 gap-y-1 text-xs">
       <span className="text-muted-foreground">Bucket</span>
@@ -138,6 +194,24 @@ function TaskRefTooltipContent({ detail, enabled }: { detail: ReturnType<typeof 
       <span>{timeAgo(object.updated_at)}</span>
     </div>
   )
+}
+
+function storageCleanupValueLabel(values: string[], pluralName: string) {
+  const uniqueValues = uniqueNonEmpty(values)
+  if (uniqueValues.length === 0) return '—'
+  if (uniqueValues.length === 1) return uniqueValues[0]
+  return `${uniqueValues[0]} +${uniqueValues.length - 1} ${pluralName}`
+}
+
+function storageCleanupVersionLabel(versions: TaskStorageCleanupDetail['deleted_versions']) {
+  const first = versions[0]
+  if (!first) return '—'
+  if (versions.length === 1) return first.version_id
+  return `${first.version_id} +${versions.length - 1} versions`
+}
+
+function uniqueNonEmpty(values: Array<string | undefined>) {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value))))
 }
 
 function taskObjectLocationLabel(location: { cache: boolean; filecoin: boolean }) {
@@ -534,6 +608,8 @@ function retryTaskDescription(task: TaskItem) {
       return 'This will requeue upload work and may trigger provider and on-chain operations again.'
     case 'evict_cache':
       return 'This will requeue cache eviction work and may remove local cached data.'
+    case 'storage_cleanup':
+      return 'This will retry deleting remote replicas for deleted object versions.'
     default:
       return 'This will requeue the exhausted task for background processing.'
   }

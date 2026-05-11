@@ -16,6 +16,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/objectreader"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
@@ -754,6 +755,45 @@ type restoreObjectResponse struct {
 	RestoredVersionID string `json:"restored_version_id"`
 }
 
+type permanentDeleteObjectRequest struct {
+	Key       string `json:"key"`
+	VersionID string `json:"version_id"`
+}
+
+type permanentDeleteObjectResponse struct {
+	Key                  string `json:"key"`
+	VersionID            string `json:"version_id"`
+	CacheCleanupStatus   string `json:"cache_cleanup_status"`
+	StorageCleanupTaskID *int64 `json:"storage_cleanup_task_id,omitempty"`
+}
+
+type permanentDeleteDeletedObjectRequest struct {
+	Key                   string `json:"key"`
+	DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+}
+
+type permanentDeleteDeletedObjectResponse struct {
+	Key                     string  `json:"key"`
+	DeleteMarkerVersionID   string  `json:"delete_marker_version_id"`
+	DataVersionsDeleted     int     `json:"data_versions_deleted"`
+	DeleteMarkersDeleted    int     `json:"delete_markers_deleted"`
+	CacheCleanupFailedCount int     `json:"cache_cleanup_failed_count"`
+	StorageCleanupTaskIDs   []int64 `json:"storage_cleanup_task_ids"`
+}
+
+type objectDeletionListItem struct {
+	Key                string  `json:"key"`
+	VersionID          string  `json:"version_id"`
+	CacheCleanupStatus string  `json:"cache_cleanup_status"`
+	CacheError         *string `json:"cache_error,omitempty"`
+	CreatedAt          string  `json:"created_at"`
+	DeletedAt          string  `json:"deleted_at"`
+}
+
+type objectDeletionListResponse struct {
+	Deletions []objectDeletionListItem `json:"deletions"`
+}
+
 func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucketName := r.PathValue("name")
@@ -953,6 +993,206 @@ func (s *Server) handleAPIBucketDeletedObjects(w http.ResponseWriter, r *http.Re
 		resp.NextMarker = items[len(items)-1].Key
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAPIPermanentDeleteBucketObject(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	if !s.requireBucketWrite(w, r) {
+		return
+	}
+
+	var req permanentDeleteObjectRequest
+	if !decodeBucketStrictJSON(w, r, &req) {
+		return
+	}
+	key := req.Key
+	versionID := strings.TrimSpace(req.VersionID)
+	if key == "" || versionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key and version_id are required"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for permanent delete", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	result, err := s.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID:                 bucket.ID,
+		Key:                      key,
+		VersionID:                versionID,
+		StorageCleanupMaxRetries: &s.storageCleanupMaxRetries,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, repository.ErrNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "object version not found"})
+		case errors.Is(err, repository.ErrConflict):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "object version cannot be permanently deleted"})
+		default:
+			s.logger.Error("api: failed to permanently delete object version", "error", err, "bucket", bucketName, "key", key, "versionID", versionID)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		}
+		return
+	}
+
+	status := s.recordPermanentDeleteCacheCleanup(ctx, bucket.Name, versionID, result.CacheKey)
+	writeJSON(w, http.StatusOK, permanentDeleteObjectResponse{
+		Key:                  key,
+		VersionID:            versionID,
+		CacheCleanupStatus:   string(status),
+		StorageCleanupTaskID: result.StorageCleanupTaskID,
+	})
+}
+
+func (s *Server) handleAPIPermanentDeleteDeletedBucketObject(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	if !s.requireBucketWrite(w, r) {
+		return
+	}
+
+	var req permanentDeleteDeletedObjectRequest
+	if !decodeBucketStrictJSON(w, r, &req) {
+		return
+	}
+	key := req.Key
+	deleteMarkerVersionID := strings.TrimSpace(req.DeleteMarkerVersionID)
+	if key == "" || deleteMarkerVersionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key and delete_marker_version_id are required"})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for deleted object permanent delete", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	result, err := s.repos.Objects.DeleteDeletedObjectPermanently(ctx, repository.DeleteDeletedObjectInput{
+		BucketID:                 bucket.ID,
+		Key:                      key,
+		DeleteMarkerVersionID:    deleteMarkerVersionID,
+		StorageCleanupMaxRetries: &s.storageCleanupMaxRetries,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, repository.ErrNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "deleted object not found"})
+		case errors.Is(err, repository.ErrConflict):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "deleted object cannot be permanently deleted"})
+		default:
+			s.logger.Error("api: failed to permanently delete deleted object", "error", err, "bucket", bucketName, "key", key, "marker", deleteMarkerVersionID)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		}
+		return
+	}
+
+	cacheCleanupFailedCount := 0
+	for _, version := range result.DeletedVersions {
+		if err := ctx.Err(); err != nil {
+			s.logger.Warn("permanent delete cache cleanup stopped because request context ended", "bucket", bucketName, "key", key, "error", err)
+			return
+		}
+		if s.recordPermanentDeleteCacheCleanup(ctx, bucket.Name, version.VersionID, version.CacheKey) == model.CacheCleanupStatusFailed {
+			cacheCleanupFailedCount++
+		}
+	}
+	storageCleanupTaskIDs := result.StorageCleanupTaskIDs
+	if storageCleanupTaskIDs == nil {
+		storageCleanupTaskIDs = []int64{}
+	}
+	writeJSON(w, http.StatusOK, permanentDeleteDeletedObjectResponse{
+		Key:                     result.Key,
+		DeleteMarkerVersionID:   result.DeleteMarkerVersionID,
+		DataVersionsDeleted:     result.DataVersionsDeleted,
+		DeleteMarkersDeleted:    result.DeleteMarkersDeleted,
+		CacheCleanupFailedCount: cacheCleanupFailedCount,
+		StorageCleanupTaskIDs:   storageCleanupTaskIDs,
+	})
+}
+
+func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for object deletions", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	var deletions []model.ObjectDeletion
+	q := s.db.NewSelect().
+		Model(&deletions).
+		Where("bucket_id = ?", bucket.ID).
+		OrderExpr("created_at DESC, id DESC").
+		Limit(limit).
+		Offset(offset)
+	if key := r.URL.Query().Get("key"); key != "" {
+		q = q.Where("key = ?", key)
+	}
+	if err := q.Scan(ctx); err != nil {
+		s.logger.Error("api: failed to list object deletions", "error", err, "bucket", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	items := make([]objectDeletionListItem, 0, len(deletions))
+	for _, deletion := range deletions {
+		items = append(items, objectDeletionListItem{
+			Key:                deletion.Key,
+			VersionID:          deletion.VersionID,
+			CacheCleanupStatus: string(deletion.CacheCleanupStatus),
+			CacheError:         deletion.CacheError,
+			CreatedAt:          deletion.CreatedAt.Format(time.RFC3339),
+			DeletedAt:          deletion.DeletedAt.Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, objectDeletionListResponse{Deletions: items})
+}
+
+func (s *Server) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) model.CacheCleanupStatus {
+	return objectdeletion.RecordCacheCleanup(ctx, s.cache, s.repos.Objects, s.logger, bucketName, versionID, cacheKey)
 }
 
 func (s *Server) handleAPIRestoreBucketObject(w http.ResponseWriter, r *http.Request) {

@@ -75,6 +75,7 @@ SYNAPS3_DATABASE_DSN                 -> database.dsn
 SYNAPS3_CACHE_DIR                    -> cache.dir
 SYNAPS3_WORKER_UPLOAD_CONCURRENCY    -> worker.upload.concurrency
 SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL -> worker.evictor.poll_interval
+SYNAPS3_WORKER_STORAGE_CLEANUP_POLL_INTERVAL -> worker.storage_cleanup.poll_interval
 SYNAPS3_ADMIN_ADDR                   -> admin.addr
 ```
 
@@ -91,6 +92,7 @@ Unknown `SYNAPS3_` names fall back to lowercase with `_` replaced by `.`.
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local object cache |
 | `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker |
 | `worker.evictor` | `concurrency`, `poll_interval`, `max_retries` | Cache eviction worker |
+| `worker.storage_cleanup` | `concurrency`, `poll_interval`, `max_retries` | Remote replica cleanup worker |
 | `logging` | `level`, `format`, `s3_access.*` | Runtime logs |
 | `admin` | `addr` | Dashboard and admin API |
 
@@ -137,6 +139,11 @@ max_retries = 5
 concurrency = 2
 poll_interval = "1m"
 max_retries = 3
+
+[worker.storage_cleanup]
+concurrency = 2
+poll_interval = "1m"
+max_retries = 5
 
 [logging]
 level = "info"

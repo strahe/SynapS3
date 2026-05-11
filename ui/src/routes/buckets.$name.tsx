@@ -18,7 +18,7 @@ import {
   TriangleAlert,
   UserRound,
 } from 'lucide-react'
-import { Fragment, type ReactNode, useEffect, useState } from 'react'
+import { Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   api,
   type DeletedObjectItem,
@@ -85,6 +85,8 @@ import {
   useDeletedBucketObjects,
   useObjectProvenance,
   useObjectStatusDetail,
+  usePermanentDeleteBucketObjectVersion,
+  usePermanentDeleteDeletedBucketObject,
   useRestoreBucketObject,
   useS3Users,
   useUpdateBucketOwner,
@@ -106,7 +108,7 @@ export const Route = createFileRoute('/buckets/$name')({
   validateSearch: (search: Record<string, unknown>): ObjectBrowserSearch => ({
     prefix: normalizePrefixSearch(search.prefix),
     marker: normalizeSearchString(search.marker),
-    view: search.view === 'deleted' ? 'deleted' : undefined,
+    view: search.view === 'deleted' ? search.view : undefined,
   }),
   component: ObjectBrowserPage,
 })
@@ -356,17 +358,18 @@ function ChangeBucketOwnerDetailDialog({
 
 function ObjectVersionsDialog({
   bucketName,
-  object,
+  objectKey,
   open,
   onOpenChange,
 }: {
   bucketName: string
-  object: ObjectItem
+  objectKey: string
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
   const [versionMarker, setVersionMarker] = useState('')
-  const versions = useBucketObjectVersions(bucketName, object.key, versionMarker, 50, open)
+  const titleRef = useRef<HTMLHeadingElement>(null)
+  const versions = useBucketObjectVersions(bucketName, objectKey, versionMarker, 50, open)
 
   useEffect(() => {
     if (open) setVersionMarker('')
@@ -374,12 +377,20 @@ function ObjectVersionsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-6xl lg:p-6">
+      <DialogContent
+        className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-6xl lg:p-6"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault()
+          titleRef.current?.focus({ preventScroll: true })
+        }}
+      >
         <DialogHeader>
-          <DialogTitle>Object versions</DialogTitle>
+          <DialogTitle ref={titleRef} tabIndex={-1} className="outline-none">
+            Object versions
+          </DialogTitle>
           <DialogDescription className="pr-8">
-            <span className="block max-w-full truncate font-mono text-xs" title={object.key}>
-              {object.key}
+            <span className="block max-w-full truncate font-mono text-xs" title={objectKey}>
+              {objectKey}
             </span>
           </DialogDescription>
         </DialogHeader>
@@ -420,7 +431,7 @@ function ObjectVersionsDialog({
                         <span className="min-w-0 truncate font-mono text-xs">{version.version_id}</span>
                         {version.is_delete_marker ? (
                           <StatusBadge tone="neutral" className="shrink-0">
-                            Delete marker
+                            Deleted
                           </StatusBadge>
                         ) : (
                           <ObjectStatusIcon
@@ -463,7 +474,7 @@ function ObjectVersionsDialog({
                       {timeAgo(version.created_at)}
                     </TableCell>
                     <TableCell className="px-2 text-right">
-                      <VersionActions bucketName={bucketName} object={object} version={version} />
+                      <VersionActions bucketName={bucketName} objectKey={objectKey} version={version} />
                     </TableCell>
                   </TableRow>
                 ))}
@@ -496,17 +507,31 @@ function ObjectVersionsDialog({
 
 function VersionActions({
   bucketName,
-  object,
+  objectKey,
   version,
 }: {
   bucketName: string
-  object: ObjectItem
+  objectKey: string
   version: ObjectVersionItem
 }) {
   const [provenanceOpen, setProvenanceOpen] = useState(false)
+  const [permanentDeleteOpen, setPermanentDeleteOpen] = useState(false)
+  const permanentDelete = usePermanentDeleteBucketObjectVersion()
 
   if (version.is_delete_marker) {
     return <span className="text-xs text-muted-foreground">-</span>
+  }
+
+  const handlePermanentDelete = () => {
+    permanentDelete.mutate(
+      { name: bucketName, key: objectKey, versionID: version.version_id },
+      {
+        onSuccess: () => {
+          setPermanentDeleteOpen(false)
+          permanentDelete.reset()
+        },
+      }
+    )
   }
 
   return (
@@ -521,8 +546,8 @@ function VersionActions({
           <DropdownMenuGroup>
             <DropdownMenuItem asChild>
               <a
-                href={api.getObjectDownloadUrl(bucketName, object.key, version.version_id)}
-                aria-label={`Download ${object.key} version ${version.version_id}`}
+                href={api.getObjectDownloadUrl(bucketName, objectKey, version.version_id)}
+                aria-label={`Download ${objectKey} version ${version.version_id}`}
               >
                 <Download data-icon="inline-start" />
                 Download
@@ -532,16 +557,43 @@ function VersionActions({
               <Fingerprint data-icon="inline-start" />
               Provenance
             </DropdownMenuItem>
+            {!version.is_delete_marker && (
+              <DropdownMenuItem variant="destructive" onSelect={() => setPermanentDeleteOpen(true)}>
+                <Trash2 data-icon="inline-start" />
+                Permanently delete
+              </DropdownMenuItem>
+            )}
           </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
       <ObjectProvenanceDialog
         bucketName={bucketName}
-        objectKey={object.key}
+        objectKey={objectKey}
         versionID={version.version_id}
         open={provenanceOpen}
         onOpenChange={setProvenanceOpen}
       />
+      <DangerActionAlertDialog
+        open={permanentDeleteOpen}
+        onOpenChange={(next) => {
+          setPermanentDeleteOpen(next)
+          if (!next) permanentDelete.reset()
+        }}
+        title="Permanently delete version"
+        description="This permanently deletes this version. Storage used only by this version will be released in the background."
+        confirmLabel="Permanently delete"
+        pending={permanentDelete.isPending}
+        error={permanentDelete.error?.message}
+        onConfirm={handlePermanentDelete}
+      >
+        <ReviewDetails
+          rows={[
+            { id: 'key', label: 'Object', value: objectKey },
+            { id: 'version', label: 'Version', value: version.version_id },
+            { id: 'size', label: 'Size', value: formatBytes(version.size) },
+          ]}
+        />
+      </DangerActionAlertDialog>
     </>
   )
 }
@@ -1019,7 +1071,7 @@ function ObjectBrowserPage() {
       search: {
         prefix: newPrefix || undefined,
         marker: undefined,
-        view: view === 'deleted' ? 'deleted' : undefined,
+        view: view === 'deleted' ? view : undefined,
       },
     })
   }
@@ -1031,7 +1083,7 @@ function ObjectBrowserPage() {
       search: {
         prefix: prefix || undefined,
         marker: newMarker || undefined,
-        view: view === 'deleted' ? 'deleted' : undefined,
+        view: view === 'deleted' ? view : undefined,
       },
     })
   }
@@ -1043,7 +1095,7 @@ function ObjectBrowserPage() {
       search: {
         prefix: prefix || undefined,
         marker: undefined,
-        view: nextView === 'deleted' ? 'deleted' : undefined,
+        view: nextView === 'objects' ? undefined : nextView,
       },
     })
   }
@@ -1090,7 +1142,7 @@ function ObjectBrowserPage() {
       <Tabs value={view} onValueChange={(value) => navigateToView(value === 'deleted' ? 'deleted' : 'objects')}>
         <TabsList className="max-w-full justify-start overflow-x-auto">
           <TabsTrigger value="objects">Objects</TabsTrigger>
-          <TabsTrigger value="deleted">Deleted</TabsTrigger>
+          <TabsTrigger value="deleted">Trash</TabsTrigger>
         </TabsList>
       </Tabs>
 
@@ -1110,11 +1162,11 @@ function ObjectBrowserPage() {
           navigateToPrefix={navigateToPrefix}
           navigateToMarker={navigateToMarker}
         />
-      ) : deletedObjects.isLoading ? (
+      ) : view === 'deleted' && deletedObjects.isLoading ? (
         <ObjectBrowserSkeleton />
-      ) : deletedObjects.error ? (
-        <div className="text-destructive">Failed to load deleted objects</div>
-      ) : (
+      ) : view === 'deleted' && deletedObjects.error ? (
+        <div className="text-destructive">Failed to load trash</div>
+      ) : view === 'deleted' ? (
         <DeletedObjectsTable
           bucketName={name}
           prefix={prefix}
@@ -1125,6 +1177,8 @@ function ObjectBrowserPage() {
           navigateToPrefix={navigateToPrefix}
           navigateToMarker={navigateToMarker}
         />
+      ) : (
+        <ObjectBrowserSkeleton />
       )}
       {bucket.data && (
         <>
@@ -1505,7 +1559,7 @@ function DeletedObjectsTable({
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <ObjectPathBreadcrumb prefix={prefix} navigateToPrefix={navigateToPrefix} />
-        <p className="text-sm text-muted-foreground">{formatCountLabel(objects.length, 'deleted file')}</p>
+        <p className="text-sm text-muted-foreground">{formatCountLabel(objects.length, 'trash item')}</p>
       </div>
 
       {empty ? (
@@ -1515,8 +1569,8 @@ function DeletedObjectsTable({
               <EmptyMedia variant="icon">
                 <Trash2 />
               </EmptyMedia>
-              <EmptyTitle>No deleted objects found</EmptyTitle>
-              <EmptyDescription>This path has no recoverable deleted files.</EmptyDescription>
+              <EmptyTitle>Trash is empty</EmptyTitle>
+              <EmptyDescription>This path has no objects that can be restored.</EmptyDescription>
             </EmptyHeader>
           </Empty>
         </div>
@@ -1530,7 +1584,7 @@ function DeletedObjectsTable({
                   <TableHead className="w-[22%] px-4">Restore target</TableHead>
                   <TableHead className="w-[10%] px-4 text-right">Size</TableHead>
                   <TableHead className="w-[18%] px-4">Type</TableHead>
-                  <TableHead className="w-[10%] px-4">Deleted</TableHead>
+                  <TableHead className="w-[10%] px-4">Moved to Trash</TableHead>
                   <TableHead className="w-[5%] px-4 text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
@@ -1594,6 +1648,8 @@ function DeletedObjectsTable({
 
 function DeletedObjectActions({ bucketName, object }: { bucketName: string; object: DeletedObjectItem }) {
   const [restoreOpen, setRestoreOpen] = useState(false)
+  const [versionsOpen, setVersionsOpen] = useState(false)
+  const [permanentDeleteOpen, setPermanentDeleteOpen] = useState(false)
 
   return (
     <>
@@ -1603,11 +1659,19 @@ function DeletedObjectActions({ bucketName, object }: { bucketName: string; obje
             <MoreHorizontal />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-36">
+        <DropdownMenuContent align="end" className="w-52">
           <DropdownMenuGroup>
             <DropdownMenuItem onSelect={() => setRestoreOpen(true)}>
               <RotateCcw data-icon="inline-start" />
               Restore
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setVersionsOpen(true)}>
+              <History data-icon="inline-start" />
+              Versions
+            </DropdownMenuItem>
+            <DropdownMenuItem variant="destructive" onSelect={() => setPermanentDeleteOpen(true)}>
+              <Trash2 data-icon="inline-start" />
+              Permanently delete object
             </DropdownMenuItem>
           </DropdownMenuGroup>
         </DropdownMenuContent>
@@ -1618,7 +1682,69 @@ function DeletedObjectActions({ bucketName, object }: { bucketName: string; obje
         open={restoreOpen}
         onOpenChange={setRestoreOpen}
       />
+      <ObjectVersionsDialog
+        bucketName={bucketName}
+        objectKey={object.key}
+        open={versionsOpen}
+        onOpenChange={setVersionsOpen}
+      />
+      <PermanentDeleteDeletedObjectDialog
+        bucketName={bucketName}
+        object={object}
+        open={permanentDeleteOpen}
+        onOpenChange={setPermanentDeleteOpen}
+      />
     </>
+  )
+}
+
+function PermanentDeleteDeletedObjectDialog({
+  bucketName,
+  object,
+  open,
+  onOpenChange,
+}: {
+  bucketName: string
+  object: DeletedObjectItem
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const permanentDelete = usePermanentDeleteDeletedBucketObject()
+
+  const handleOpenChange = (next: boolean) => {
+    onOpenChange(next)
+    if (!next) permanentDelete.reset()
+  }
+
+  const handlePermanentDelete = () => {
+    permanentDelete.mutate(
+      { name: bucketName, key: object.key, deleteMarkerVersionID: object.delete_marker_version_id },
+      {
+        onSuccess: () => {
+          handleOpenChange(false)
+        },
+      }
+    )
+  }
+
+  return (
+    <DangerActionAlertDialog
+      open={open}
+      onOpenChange={handleOpenChange}
+      title="Permanently delete object"
+      description="This permanently deletes this object from Trash and every version kept for restore. You cannot restore it afterward."
+      confirmLabel="Permanently delete"
+      pending={permanentDelete.isPending}
+      error={permanentDelete.error?.message}
+      onConfirm={handlePermanentDelete}
+    >
+      <ReviewDetails
+        rows={[
+          { id: 'key', label: 'Object', value: object.key },
+          { id: 'size', label: 'Latest size', value: formatBytes(object.restore_size) },
+        ]}
+      />
+    </DangerActionAlertDialog>
   )
 }
 
@@ -1656,14 +1782,12 @@ function RestoreDeletedObjectDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Restore object</DialogTitle>
-          <DialogDescription>
-            Restore the latest data version and make the object visible in normal listings.
-          </DialogDescription>
+          <DialogDescription>Restore the latest data version and show the object again.</DialogDescription>
         </DialogHeader>
         <ReviewDetails
           rows={[
             { id: 'key', label: 'Object', value: object.key },
-            { id: 'marker', label: 'Delete marker', value: object.delete_marker_version_id },
+            { id: 'marker', label: 'Deletion record', value: object.delete_marker_version_id },
             { id: 'target', label: 'Restore version', value: object.restore_version_id },
             { id: 'size', label: 'Size', value: formatBytes(object.restore_size) },
           ]}
@@ -1759,7 +1883,7 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
       </DropdownMenu>
       <ObjectVersionsDialog
         bucketName={bucketName}
-        object={object}
+        objectKey={object.key}
         open={versionsOpen}
         onOpenChange={setVersionsOpen}
       />
@@ -1777,7 +1901,7 @@ function ObjectActions({ bucketName, object }: { bucketName: string; object: Obj
           if (!next) deleteObject.reset()
         }}
         title="Delete object"
-        description="This creates a delete marker and hides the current object from normal listings."
+        description="This moves the object to Trash. Its data is kept so you can restore it later."
         confirmLabel="Delete object"
         pending={deleteObject.isPending}
         error={deleteObject.error?.message}

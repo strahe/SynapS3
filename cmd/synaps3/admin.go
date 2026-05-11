@@ -746,8 +746,9 @@ type adminSettingsCacheConfig struct {
 }
 
 type adminSettingsWorkerConfig struct {
-	Upload  adminSettingsWorkerPoolConfig `json:"upload"`
-	Evictor adminSettingsWorkerPoolConfig `json:"evictor"`
+	Upload         adminSettingsWorkerPoolConfig `json:"upload"`
+	Evictor        adminSettingsWorkerPoolConfig `json:"evictor"`
+	StorageCleanup adminSettingsWorkerPoolConfig `json:"storage_cleanup"`
 }
 
 type adminSettingsWorkerPoolConfig struct {
@@ -810,32 +811,35 @@ type adminSettingSpec struct {
 }
 
 var adminEditableSettings = map[string]adminSettingSpec{
-	"server.port":                     {path: []string{"server", "port"}, kind: adminSettingString},
-	"server.max_connections":          {path: []string{"server", "max_connections"}, kind: adminSettingInt},
-	"server.max_requests":             {path: []string{"server", "max_requests"}, kind: adminSettingInt},
-	"server.tls.enabled":              {path: []string{"server", "tls", "enabled"}, kind: adminSettingBool},
-	"server.tls.cert_file":            {path: []string{"server", "tls", "cert_file"}, kind: adminSettingString},
-	"server.tls.key_file":             {path: []string{"server", "tls", "key_file"}, kind: adminSettingString},
-	"s3.region":                       {path: []string{"s3", "region"}, kind: adminSettingString},
-	"filecoin.network":                {path: []string{"filecoin", "network"}, kind: adminSettingString},
-	"filecoin.rpc_url":                {path: []string{"filecoin", "rpc_url"}, kind: adminSettingString},
-	"filecoin.source":                 {path: []string{"filecoin", "source"}, kind: adminSettingString},
-	"filecoin.with_cdn":               {path: []string{"filecoin", "with_cdn"}, kind: adminSettingBool},
-	"filecoin.allow_private_networks": {path: []string{"filecoin", "allow_private_networks"}, kind: adminSettingBool},
-	"filecoin.default_copies":         {path: []string{"filecoin", "default_copies"}, kind: adminSettingInt},
-	"cache.dir":                       {path: []string{"cache", "dir"}, kind: adminSettingString},
-	"cache.max_size_gb":               {path: []string{"cache", "max_size_gb"}, kind: adminSettingInt},
-	"cache.eviction_policy":           {path: []string{"cache", "eviction_policy"}, kind: adminSettingString},
-	"worker.upload.concurrency":       {path: []string{"worker", "upload", "concurrency"}, kind: adminSettingInt},
-	"worker.upload.poll_interval":     {path: []string{"worker", "upload", "poll_interval"}, kind: adminSettingString},
-	"worker.upload.max_retries":       {path: []string{"worker", "upload", "max_retries"}, kind: adminSettingInt},
-	"worker.evictor.concurrency":      {path: []string{"worker", "evictor", "concurrency"}, kind: adminSettingInt},
-	"worker.evictor.poll_interval":    {path: []string{"worker", "evictor", "poll_interval"}, kind: adminSettingString},
-	"worker.evictor.max_retries":      {path: []string{"worker", "evictor", "max_retries"}, kind: adminSettingInt},
-	"logging.level":                   {path: []string{"logging", "level"}, kind: adminSettingString},
-	"logging.format":                  {path: []string{"logging", "format"}, kind: adminSettingString},
-	"logging.s3_access.enabled":       {path: []string{"logging", "s3_access", "enabled"}, kind: adminSettingBool},
-	"logging.s3_access.level":         {path: []string{"logging", "s3_access", "level"}, kind: adminSettingString},
+	"server.port":                          {path: []string{"server", "port"}, kind: adminSettingString},
+	"server.max_connections":               {path: []string{"server", "max_connections"}, kind: adminSettingInt},
+	"server.max_requests":                  {path: []string{"server", "max_requests"}, kind: adminSettingInt},
+	"server.tls.enabled":                   {path: []string{"server", "tls", "enabled"}, kind: adminSettingBool},
+	"server.tls.cert_file":                 {path: []string{"server", "tls", "cert_file"}, kind: adminSettingString},
+	"server.tls.key_file":                  {path: []string{"server", "tls", "key_file"}, kind: adminSettingString},
+	"s3.region":                            {path: []string{"s3", "region"}, kind: adminSettingString},
+	"filecoin.network":                     {path: []string{"filecoin", "network"}, kind: adminSettingString},
+	"filecoin.rpc_url":                     {path: []string{"filecoin", "rpc_url"}, kind: adminSettingString},
+	"filecoin.source":                      {path: []string{"filecoin", "source"}, kind: adminSettingString},
+	"filecoin.with_cdn":                    {path: []string{"filecoin", "with_cdn"}, kind: adminSettingBool},
+	"filecoin.allow_private_networks":      {path: []string{"filecoin", "allow_private_networks"}, kind: adminSettingBool},
+	"filecoin.default_copies":              {path: []string{"filecoin", "default_copies"}, kind: adminSettingInt},
+	"cache.dir":                            {path: []string{"cache", "dir"}, kind: adminSettingString},
+	"cache.max_size_gb":                    {path: []string{"cache", "max_size_gb"}, kind: adminSettingInt},
+	"cache.eviction_policy":                {path: []string{"cache", "eviction_policy"}, kind: adminSettingString},
+	"worker.upload.concurrency":            {path: []string{"worker", "upload", "concurrency"}, kind: adminSettingInt},
+	"worker.upload.poll_interval":          {path: []string{"worker", "upload", "poll_interval"}, kind: adminSettingString},
+	"worker.upload.max_retries":            {path: []string{"worker", "upload", "max_retries"}, kind: adminSettingInt},
+	"worker.evictor.concurrency":           {path: []string{"worker", "evictor", "concurrency"}, kind: adminSettingInt},
+	"worker.evictor.poll_interval":         {path: []string{"worker", "evictor", "poll_interval"}, kind: adminSettingString},
+	"worker.evictor.max_retries":           {path: []string{"worker", "evictor", "max_retries"}, kind: adminSettingInt},
+	"worker.storage_cleanup.concurrency":   {path: []string{"worker", "storage_cleanup", "concurrency"}, kind: adminSettingInt},
+	"worker.storage_cleanup.poll_interval": {path: []string{"worker", "storage_cleanup", "poll_interval"}, kind: adminSettingString},
+	"worker.storage_cleanup.max_retries":   {path: []string{"worker", "storage_cleanup", "max_retries"}, kind: adminSettingInt},
+	"logging.level":                        {path: []string{"logging", "level"}, kind: adminSettingString},
+	"logging.format":                       {path: []string{"logging", "format"}, kind: adminSettingString},
+	"logging.s3_access.enabled":            {path: []string{"logging", "s3_access", "enabled"}, kind: adminSettingBool},
+	"logging.s3_access.level":              {path: []string{"logging", "s3_access", "level"}, kind: adminSettingString},
 }
 
 type adminSettingsUpdates struct {
@@ -1177,6 +1181,9 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 				{Name: "worker.evictor.concurrency", Value: strconv.Itoa(settings.Config.Worker.Evictor.Concurrency)},
 				{Name: "worker.evictor.poll_interval", Value: settings.Config.Worker.Evictor.PollInterval},
 				{Name: "worker.evictor.max_retries", Value: strconv.Itoa(settings.Config.Worker.Evictor.MaxRetries)},
+				{Name: "worker.storage_cleanup.concurrency", Value: strconv.Itoa(settings.Config.Worker.StorageCleanup.Concurrency)},
+				{Name: "worker.storage_cleanup.poll_interval", Value: settings.Config.Worker.StorageCleanup.PollInterval},
+				{Name: "worker.storage_cleanup.max_retries", Value: strconv.Itoa(settings.Config.Worker.StorageCleanup.MaxRetries)},
 			},
 		},
 		{

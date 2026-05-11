@@ -75,6 +75,9 @@ const tabFields = {
     'worker.evictor.concurrency',
     'worker.evictor.poll_interval',
     'worker.evictor.max_retries',
+    'worker.storage_cleanup.concurrency',
+    'worker.storage_cleanup.poll_interval',
+    'worker.storage_cleanup.max_retries',
   ],
   logging: ['logging.level', 'logging.format', 'logging.s3_access.enabled', 'logging.s3_access.level'],
   runtime: ['database.driver', 'database.dsn', 'database.max_open_conns', 'database.max_idle_conns', 'admin.addr'],
@@ -384,6 +387,14 @@ function SettingsPage() {
               errors={fieldErrors}
               onChange={(value) => setForm({ ...form, worker: { ...form.worker, evictor: value } })}
             />
+            <WorkerSection
+              title="Replica Cleanup Worker"
+              prefix="worker.storage_cleanup"
+              value={form.worker.storage_cleanup}
+              data={data}
+              errors={fieldErrors}
+              onChange={(value) => setForm({ ...form, worker: { ...form.worker, storage_cleanup: value } })}
+            />
           </div>
         </TabsContent>
 
@@ -677,7 +688,7 @@ function WorkerSection({
   onChange,
 }: {
   title: string
-  prefix: 'worker.upload' | 'worker.evictor'
+  prefix: 'worker.upload' | 'worker.evictor' | 'worker.storage_cleanup'
   value: SettingsEditableConfig['worker']['upload']
   data: SettingsData
   errors: Record<string, string>

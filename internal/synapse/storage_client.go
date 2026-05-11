@@ -38,3 +38,7 @@ func (s *StorageServiceAdapter) CreateContexts(ctx context.Context, opts *storag
 func (s *StorageServiceAdapter) CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (UploadContext, error) {
 	return s.service.CreateContext(ctx, opts)
 }
+
+func (s *StorageServiceAdapter) CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (CleanupContext, error) {
+	return s.service.CreateContext(ctx, opts)
+}

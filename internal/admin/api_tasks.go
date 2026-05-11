@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
 )
 
 type taskListItem struct {
@@ -40,10 +41,11 @@ type taskListResponse struct {
 }
 
 type taskRefDetailResponse struct {
-	RefType      string               `json:"ref_type"`
-	RefID        int64                `json:"ref_id"`
-	RefVersionID string               `json:"ref_version_id"`
-	Object       *taskRefObjectDetail `json:"object"`
+	RefType        string                       `json:"ref_type"`
+	RefID          int64                        `json:"ref_id"`
+	RefVersionID   string                       `json:"ref_version_id"`
+	Object         *taskRefObjectDetail         `json:"object"`
+	StorageCleanup *taskRefStorageCleanupDetail `json:"storage_cleanup,omitempty"`
 }
 
 type taskRefObjectDetail struct {
@@ -58,6 +60,32 @@ type taskRefObjectDetail struct {
 	Location     objectLocation          `json:"location"`
 	ContentType  string                  `json:"content_type"`
 	UpdatedAt    string                  `json:"updated_at"`
+}
+
+type taskRefStorageCleanupDetail struct {
+	UploadID        int64                                 `json:"upload_id"`
+	DeletedVersions []taskRefStorageCleanupDeletedVersion `json:"deleted_versions"`
+	Copies          []taskRefStorageCleanupCopy           `json:"copies"`
+}
+
+type taskRefStorageCleanupDeletedVersion struct {
+	BucketName string `json:"bucket_name"`
+	Key        string `json:"key"`
+	VersionID  string `json:"version_id"`
+	Size       int64  `json:"size"`
+	DeletedAt  string `json:"deleted_at"`
+}
+
+type taskRefStorageCleanupCopy struct {
+	CopyIndex       int     `json:"copy_index"`
+	ProviderID      *string `json:"provider_id,omitempty"`
+	DataSetID       *string `json:"data_set_id,omitempty"`
+	ClientDataSetID *string `json:"client_data_set_id,omitempty"`
+	PieceID         *string `json:"piece_id,omitempty"`
+	PieceCID        string  `json:"piece_cid"`
+	Status          string  `json:"status"`
+	DeleteTxHash    *string `json:"delete_tx_hash,omitempty"`
+	LastError       *string `json:"last_error,omitempty"`
 }
 
 func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +325,40 @@ func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) 
 		RefID:        task.RefID,
 		RefVersionID: task.RefVersionID,
 	}
+	if task.RefType == "storage_upload" && task.Type == model.TaskTypeStorageCleanup {
+		copies, err := s.repos.StorageCleanup.ListCopiesForTask(ctx, task.ID)
+		if err != nil {
+			s.logger.Error("api: failed to list storage cleanup copies", "error", err, "taskID", id)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			return
+		}
+		deletedVersions, err := s.taskStorageCleanupDeletedVersions(ctx, task)
+		if err != nil {
+			s.logger.Error("api: failed to list storage cleanup deleted versions", "error", err, "taskID", id)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			return
+		}
+		resp.StorageCleanup = &taskRefStorageCleanupDetail{
+			UploadID:        task.RefID,
+			DeletedVersions: deletedVersions,
+			Copies:          make([]taskRefStorageCleanupCopy, 0, len(copies)),
+		}
+		for _, copy := range copies {
+			resp.StorageCleanup.Copies = append(resp.StorageCleanup.Copies, taskRefStorageCleanupCopy{
+				CopyIndex:       copy.CopyIndex,
+				ProviderID:      onChainIDStringPtr(copy.ProviderID),
+				DataSetID:       onChainIDStringPtr(copy.DataSetID),
+				ClientDataSetID: onChainIDStringPtr(copy.ClientDataSetID),
+				PieceID:         onChainIDStringPtr(copy.PieceID),
+				PieceCID:        copy.PieceCID,
+				Status:          string(copy.Status),
+				DeleteTxHash:    copy.DeleteTxHash,
+				LastError:       copy.LastError,
+			})
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	if task.RefType != "object" {
 		writeJSON(w, http.StatusOK, resp)
 		return
@@ -314,11 +376,11 @@ func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if version == nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object reference not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object details not found"})
 		return
 	}
 	if version.ObjectID != task.RefID {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object reference not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object details not found"})
 		return
 	}
 
@@ -329,7 +391,7 @@ func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if bucket == nil || !bucket.Status.IsAdminVisible() {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object reference not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "object details not found"})
 		return
 	}
 	uploadInfo, err := s.objectAdminUploadInfo(ctx, *version)
@@ -353,6 +415,97 @@ func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) 
 		UpdatedAt:    version.UpdatedAt.Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) taskStorageCleanupDeletedVersions(ctx context.Context, task *model.Task) ([]taskRefStorageCleanupDeletedVersion, error) {
+	if task == nil {
+		return nil, nil
+	}
+	versionIDs := taskPayloadStringSlice(task.Payload, "deleted_source_versions")
+	if len(versionIDs) == 0 {
+		if versionID, ok := task.Payload["deleted_source_version"].(string); ok && strings.TrimSpace(versionID) != "" {
+			versionIDs = append(versionIDs, strings.TrimSpace(versionID))
+		}
+	}
+
+	type deletedVersionRow struct {
+		BucketName string    `bun:"bucket_name"`
+		Key        string    `bun:"key"`
+		VersionID  string    `bun:"version_id"`
+		Size       int64     `bun:"size"`
+		DeletedAt  time.Time `bun:"deleted_at"`
+	}
+	var rows []deletedVersionRow
+	q := s.db.NewSelect().
+		TableExpr("object_deletions AS deletion").
+		ColumnExpr("bucket.name AS bucket_name").
+		ColumnExpr("deletion.key AS key").
+		ColumnExpr("deletion.version_id AS version_id").
+		ColumnExpr("deletion.size AS size").
+		ColumnExpr("deletion.deleted_at AS deleted_at").
+		Join("JOIN buckets AS bucket ON bucket.id = deletion.bucket_id")
+	if len(versionIDs) > 0 {
+		q = q.Where("deletion.version_id IN (?)", bun.List(versionIDs))
+	} else {
+		q = q.Where("deletion.storage_upload_id = ?", task.RefID)
+	}
+	if err := q.OrderExpr("deletion.deleted_at DESC, deletion.id DESC").Scan(ctx, &rows); err != nil {
+		return nil, err
+	}
+
+	deletedVersions := make([]taskRefStorageCleanupDeletedVersion, 0, len(rows))
+	for _, row := range rows {
+		deletedVersions = append(deletedVersions, taskRefStorageCleanupDeletedVersion{
+			BucketName: row.BucketName,
+			Key:        row.Key,
+			VersionID:  row.VersionID,
+			Size:       row.Size,
+			DeletedAt:  row.DeletedAt.Format(time.RFC3339),
+		})
+	}
+	return deletedVersions, nil
+}
+
+func taskPayloadStringSlice(payload map[string]interface{}, key string) []string {
+	if payload == nil {
+		return nil
+	}
+	raw, ok := payload[key]
+	if !ok {
+		return nil
+	}
+
+	var values []string
+	switch v := raw.(type) {
+	case []string:
+		values = v
+	case []interface{}:
+		for _, item := range v {
+			value, ok := item.(string)
+			if !ok {
+				continue
+			}
+			values = append(values, value)
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+
+	clean := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		clean = append(clean, value)
+	}
+	return clean
 }
 
 func (s *Server) handleAPITaskStats(w http.ResponseWriter, r *http.Request) {

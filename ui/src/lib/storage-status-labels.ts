@@ -30,6 +30,8 @@ export function taskTypeLabel(type?: string) {
       return 'Upload'
     case 'evict_cache':
       return 'Evict Cache'
+    case 'storage_cleanup':
+      return 'Replica Cleanup'
     default:
       return titleCaseEnum(type)
   }
@@ -56,12 +58,22 @@ export function taskHasByteTransfer(task: { type?: string; stage?: string }) {
   return task.stage === 'ingress_store' || task.stage === ''
 }
 
+export function storageCleanupStatusLabel(copies: Array<{ status?: string }>) {
+  if (copies.length === 0) return 'No remote replicas to delete'
+  if (copies.some((copy) => copy.status === 'failed' || copy.status === 'unsupported')) return 'Needs attention'
+  if (copies.every((copy) => copy.status === 'removed')) return 'Remote replicas deleted'
+  if (copies.some((copy) => copy.status === 'delete_scheduled')) return 'Replica deletion scheduled'
+  return 'Waiting to delete replicas'
+}
+
 function taskOperationBaseLabel(type: string | undefined, stage: string) {
   const stageLabel = taskStageLabels[stage as keyof typeof taskStageLabels]
   if (stageLabel && stage !== '') return stageLabel
   switch (type) {
     case 'evict_cache':
       return 'Evict local cache'
+    case 'storage_cleanup':
+      return 'Delete remote replicas'
     case 'upload':
       return 'Upload object'
     default:

@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"log/slog"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -27,10 +26,7 @@ type Evictor struct {
 	*livenessTracker
 }
 
-const (
-	evictPollJitterDivisor     = 5
-	replicatingEvictDeferDelay = 30 * time.Second
-)
+const replicatingEvictDeferDelay = 30 * time.Second
 
 // NewEvictor creates a new cache evictor worker.
 func NewEvictor(repos *repository.Repositories, c cache.Cache, sm *state.Machine, concurrency int, pollInterval time.Duration, logger *slog.Logger) *Evictor {
@@ -63,7 +59,7 @@ func (e *Evictor) Run(ctx context.Context) error {
 }
 
 func (e *Evictor) runSlot(ctx context.Context) {
-	if !sleepUntilNextEvictPoll(ctx, e.pollInterval) {
+	if !sleepUntilNextWorkerPoll(ctx, e.pollInterval) {
 		return
 	}
 
@@ -79,13 +75,13 @@ func (e *Evictor) runSlot(ctx context.Context) {
 				return
 			}
 			e.logger.Error("claiming evict_cache task", "error", err)
-			if !sleepUntilNextEvictPoll(ctx, e.pollInterval) {
+			if !sleepUntilNextWorkerPoll(ctx, e.pollInterval) {
 				return
 			}
 			continue
 		}
 		if task == nil {
-			if !sleepUntilNextEvictPoll(ctx, e.pollInterval) {
+			if !sleepUntilNextWorkerPoll(ctx, e.pollInterval) {
 				return
 			}
 			continue
@@ -100,30 +96,6 @@ func (e *Evictor) runSlot(ctx context.Context) {
 		}()
 		releaseTaskOnWorkerShutdown(ctx, e.logger, e.repos, task)
 	}
-}
-
-func sleepUntilNextEvictPoll(ctx context.Context, interval time.Duration) bool {
-	timer := time.NewTimer(evictPollSleepDuration(interval))
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-func evictPollSleepDuration(interval time.Duration) time.Duration {
-	if interval <= 0 {
-		return interval
-	}
-
-	maxJitter := interval / evictPollJitterDivisor
-	if maxJitter <= 0 {
-		return interval
-	}
-	return interval + time.Duration(rand.Int63n(int64(maxJitter)+1))
 }
 
 // Healthy returns true if the worker has ticked recently.

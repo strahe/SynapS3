@@ -859,6 +859,40 @@ func TestObjectRepo_DeleteMarkerVersionRestoresPreviousCurrentVersion(t *testing
 	}
 }
 
+func TestObjectRepo_DeleteOnlyMarkerVersionDeletesObjectIdentity(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "delete-only-marker-bucket")
+
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "deleted.txt", "01J00000000000000000001014")
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	if err := repos.Objects.DeleteMarkerVersion(ctx, bucket.ID, "deleted.txt", marker.VersionID); err != nil {
+		t.Fatalf("DeleteMarkerVersion: %v", err)
+	}
+
+	current, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "deleted.txt")
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if current != nil {
+		t.Fatalf("current = %#v, want none after deleting only marker", current)
+	}
+	objectCount, err := db.NewSelect().
+		Model((*model.Object)(nil)).
+		Where("bucket_id = ? AND key = ?", bucket.ID, "deleted.txt").
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("count object identities: %v", err)
+	}
+	if objectCount != 0 {
+		t.Fatalf("object identity count = %d, want 0", objectCount)
+	}
+}
+
 func TestObjectRepo_RestoreCurrentDeleteMarkerStackRemovesMarkersUntilDataVersion(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

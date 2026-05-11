@@ -28,6 +28,9 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'worker.evictor.concurrency': meta('Evictor Concurrency'),
   'worker.evictor.max_retries': meta('Evictor Max Retries'),
   'worker.evictor.poll_interval': meta('Evictor Poll Interval'),
+  'worker.storage_cleanup.concurrency': meta('Replica Cleanup Concurrency'),
+  'worker.storage_cleanup.max_retries': meta('Replica Cleanup Max Retries'),
+  'worker.storage_cleanup.poll_interval': meta('Replica Cleanup Poll Interval'),
 }
 
 function meta(label: string): SettingsFieldMetadata {
@@ -72,6 +75,11 @@ function baseConfig(): SettingsEditableConfig {
         concurrency: 2,
         poll_interval: '1m',
         max_retries: 3,
+      },
+      storage_cleanup: {
+        concurrency: 2,
+        poll_interval: '1m',
+        max_retries: 5,
       },
     },
     logging: {

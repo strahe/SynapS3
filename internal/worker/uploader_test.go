@@ -39,6 +39,14 @@ func testCID(t *testing.T) cid.Cid {
 	return cid.NewCidV1(cid.Raw, mh)
 }
 
+func createContextProviderIDEqual(opts *storage.CreateContextOptions, want sdktypes.BigInt) bool {
+	return opts.ProviderID != nil && opts.ProviderID.Equal(want)
+}
+
+func createContextDataSetIDEqual(opts *storage.CreateContextOptions, want sdktypes.BigInt) bool {
+	return opts.DataSetID != nil && opts.DataSetID.Equal(want)
+}
+
 // seedCachedObject creates a bucket, writes a file into the filesystem cache,
 // and inserts an object in "cached" state.
 func seedCachedObject(t *testing.T, env *testWorkerEnv) (*model.Bucket, int64, string) {
@@ -548,7 +556,7 @@ func seedReadyPrimaryStoreTask(t *testing.T, env *testWorkerEnv) (*model.Storage
 	dataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &dataSetID
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
+		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -763,11 +771,11 @@ func TestUploader_StagedPrimaryCommitKeepsCacheUntilAllCopiesCommitted(t *testin
 		return []synapse.UploadContext{primary, secondary}, nil
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 {
-			return contextsByProvider[opts.ProviderIDs[0].String()], nil
+		if opts.ProviderID != nil {
+			return contextsByProvider[opts.ProviderID.String()], nil
 		}
-		if len(opts.DataSetIDs) == 1 {
-			return contextsByDataSet[opts.DataSetIDs[0].String()], nil
+		if opts.DataSetID != nil {
+			return contextsByDataSet[opts.DataSetID.String()], nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
@@ -1040,10 +1048,10 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 	providerCtx.boundDataSet = &existingID
 	providerCtx.createCalls = &createCalls
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
+		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(existingID) {
+		if createContextDataSetIDEqual(opts, existingID) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1115,7 +1123,7 @@ func TestUploader_EnsureDatasetContextTimeoutKeepsBindingPendingForRetry(t *test
 		t.Fatalf("create ensure task: %v", err)
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
+		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return nil, context.DeadlineExceeded
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1198,10 +1206,10 @@ func TestUploader_EnsureDatasetSubmittedCreateErrorResumesWait(t *testing.T) {
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.createErr = errors.New("create status poll timeout")
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
+		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
+		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1306,7 +1314,7 @@ func TestUploader_EnsureDatasetCreatingWaitErrorKeepsSubmission(t *testing.T) {
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.waitErr = errors.New("create status poll timeout")
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
+		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1397,7 +1405,7 @@ func TestUploader_EnsureDatasetCreatingRejectedMarksBindingFailed(t *testing.T) 
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
+		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1481,7 +1489,7 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	providerCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(sdktypes.NewBigInt(101)) {
+		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1598,7 +1606,7 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
 	primaryCtx.commitErr = errors.New("commit status poll timeout")
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
+		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -1693,11 +1701,11 @@ func TestUploader_PeerFailureKeepsObjectReadableAndQueuesRepair(t *testing.T) {
 		return nil, fmt.Errorf("replacement selection unavailable")
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 {
-			return contextsByProvider[opts.ProviderIDs[0].String()], nil
+		if opts.ProviderID != nil {
+			return contextsByProvider[opts.ProviderID.String()], nil
 		}
-		if len(opts.DataSetIDs) == 1 {
-			return contextsByDataSet[opts.DataSetIDs[0].String()], nil
+		if opts.DataSetID != nil {
+			return contextsByDataSet[opts.DataSetID.String()], nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
@@ -1846,7 +1854,7 @@ func TestUploader_PeerTransientFailureKeepsCopyRetryable(t *testing.T) {
 	peerCtx := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), testCID(t))
 	peerCtx.pullErr = errors.New("temporary provider pull failed")
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(2002)) {
+		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(2002)) {
 			return peerCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -2061,10 +2069,10 @@ func TestUploader_RepairPrepareCreatesReplacementForPeerDeficit(t *testing.T) {
 				return []synapse.UploadContext{replacement}, nil
 			}
 			env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-				if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(replacement.providerID) {
+				if createContextProviderIDEqual(opts, replacement.providerID) {
 					return replacement, nil
 				}
-				if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(replacement.dataSetID) {
+				if createContextDataSetIDEqual(opts, replacement.dataSetID) {
 					return replacement, nil
 				}
 				return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -2227,7 +2235,7 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 	dataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &dataSetID
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
+		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -2338,7 +2346,7 @@ func TestUploader_StagedIngressStoreDataSetFailureReplans(t *testing.T) {
 			dataSetID := sdktypes.NewBigInt(1001)
 			primaryCtx.boundDataSet = &dataSetID
 			env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-				if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(sdktypes.NewBigInt(1001)) {
+				if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 					return primaryCtx, nil
 				}
 				return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -2472,10 +2480,10 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 		return []synapse.UploadContext{ingress}, nil
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(ingress.providerID) {
+		if createContextProviderIDEqual(opts, ingress.providerID) {
 			return ingress, nil
 		}
-		if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(ingress.dataSetID) {
+		if createContextDataSetIDEqual(opts, ingress.dataSetID) {
 			return ingress, nil
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
@@ -2772,10 +2780,10 @@ func TestUploader_ZeroAvailableFunds_ExhaustedRetryRemainsRecoverable(t *testing
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
 		for _, uploadCtx := range uploadContexts {
 			fakeCtx := uploadCtx.(*fakeUploadContext)
-			if len(opts.ProviderIDs) == 1 && opts.ProviderIDs[0].Equal(fakeCtx.providerID) {
+			if createContextProviderIDEqual(opts, fakeCtx.providerID) {
 				return fakeCtx, nil
 			}
-			if len(opts.DataSetIDs) == 1 && opts.DataSetIDs[0].Equal(fakeCtx.dataSetID) {
+			if createContextDataSetIDEqual(opts, fakeCtx.dataSetID) {
 				return fakeCtx, nil
 			}
 		}

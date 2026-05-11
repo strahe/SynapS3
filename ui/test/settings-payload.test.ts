@@ -29,6 +29,7 @@ function baseConfig(): SettingsEditableConfig {
     worker: {
       upload: { concurrency: 4, poll_interval: '5s', max_retries: 5 },
       evictor: { concurrency: 2, poll_interval: '1m0s', max_retries: 3 },
+      storage_cleanup: { concurrency: 2, poll_interval: '1m0s', max_retries: 5 },
     },
     logging: {
       level: 'info',

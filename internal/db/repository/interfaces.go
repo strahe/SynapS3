@@ -82,12 +82,50 @@ type ObjectVersionRef struct {
 	VersionID string `bun:"version_id"`
 }
 
+type DeleteObjectVersionInput struct {
+	BucketID                 int64
+	Key                      string
+	VersionID                string
+	StorageCleanupMaxRetries *int
+}
+
+type DeleteObjectVersionResult struct {
+	DeletionID           int64
+	CacheKey             string
+	StorageUploadID      *int64
+	StorageCleanupTaskID *int64
+}
+
+type DeleteDeletedObjectInput struct {
+	BucketID                 int64
+	Key                      string
+	DeleteMarkerVersionID    string
+	StorageCleanupMaxRetries *int
+}
+
+type DeletedObjectVersionSnapshot struct {
+	VersionID string
+	CacheKey  string
+}
+
+type DeleteDeletedObjectResult struct {
+	Key                   string
+	DeleteMarkerVersionID string
+	DataVersionsDeleted   int
+	DeleteMarkersDeleted  int
+	DeletedVersions       []DeletedObjectVersionSnapshot
+	StorageCleanupTaskIDs []int64
+}
+
 // ObjectRepository defines persistence operations for object identities and versions.
 type ObjectRepository interface {
 	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (objectID int64, err error)
 	CreateVersionAndSetCurrentIfChanged(ctx context.Context, version *model.ObjectVersion) (ObjectVersionWriteResult, error)
 	CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
 	DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string) error
+	DeleteObjectVersionPermanently(ctx context.Context, input DeleteObjectVersionInput) (DeleteObjectVersionResult, error)
+	DeleteDeletedObjectPermanently(ctx context.Context, input DeleteDeletedObjectInput) (DeleteDeletedObjectResult, error)
+	UpdateObjectDeletionCacheCleanup(ctx context.Context, versionID string, status model.CacheCleanupStatus, cacheError string) error
 	// RestoreCurrentDeleteMarkerStack is the admin trash restore path: it removes
 	// the current delete marker stack until the latest data version becomes current,
 	// unlike S3 versioned delete which removes only one specified delete marker.
@@ -186,6 +224,16 @@ type ReadableStorageCopy struct {
 	PieceID        types.OnChainID `bun:"piece_id"`
 	TransferMethod string          `bun:"transfer_method"`
 	RetrievalURL   string          `bun:"retrieval_url"`
+}
+
+type StorageCleanupRepository interface {
+	ListCopiesForTask(ctx context.Context, taskID int64) ([]model.StorageCleanupCopy, error)
+	MarkCopyRemoved(ctx context.Context, id int64) error
+	MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error
+	MarkCopyUnsupported(ctx context.Context, id int64, message string) error
+	UploadHasObjectReferences(ctx context.Context, uploadID int64) (bool, error)
+	TaskHasObjectReferences(ctx context.Context, taskID int64, uploadID int64) (bool, error)
+	DeleteUploadProvenanceIfUnreferenced(ctx context.Context, uploadID int64) error
 }
 
 type EnsureDataSetBindingInput struct {
@@ -320,6 +368,8 @@ type TaskRepository interface {
 	RenewLease(ctx context.Context, task *model.Task, leaseDuration time.Duration) error
 	// Complete marks the same running task claim as completed.
 	Complete(ctx context.Context, task *model.Task) error
+	// CompleteWithMessage marks the same running task claim as completed with a retained status message.
+	CompleteWithMessage(ctx context.Context, task *model.Task, message string) error
 	// FailRunning marks the same running task claim as non-retryably failed.
 	FailRunning(ctx context.Context, task *model.Task, lastError string) error
 	// ScheduleRetryRunning records a retryable failure for the same running claim
