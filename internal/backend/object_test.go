@@ -23,6 +23,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -41,7 +42,7 @@ func seedActiveBucket(t *testing.T, tb *testBackend, name string) *model.Bucket 
 	return bkt
 }
 
-// putTestObject is a shorthand that creates a bucket, puts an object, and returns the etag.
+// putTestObject seeds an exact cached object and returns the ETag.
 func putTestObject(t *testing.T, tb *testBackend, bucket, key, body string) string {
 	t.Helper()
 	return putTestObjectOutput(t, tb, bucket, key, body).ETag
@@ -50,17 +51,72 @@ func putTestObject(t *testing.T, tb *testBackend, bucket, key, body string) stri
 func putTestObjectOutput(t *testing.T, tb *testBackend, bucket, key, body string) s3response.PutObjectOutput {
 	t.Helper()
 	ctx := context.Background()
+	bkt, err := tb.repos.Buckets.GetByName(ctx, bucket)
+	if err != nil || bkt == nil {
+		t.Fatalf("getting seeded bucket %q: bucket=%v err=%v", bucket, bkt, err)
+	}
+	versionID := model.NewVersionID()
+	cacheKey := path.Join(".versions", versionID)
+	info, err := tb.cache.Put(ctx, bucket, cacheKey, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("seeding cache object %s/%s: %v", bucket, key, err)
+	}
+	if _, err := tb.repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+		VersionID:   versionID,
+		BucketID:    bkt.ID,
+		Key:         key,
+		Size:        info.Size,
+		ETag:        info.ETag,
+		Checksum:    info.Checksum,
+		ContentType: "text/plain",
+		CacheKey:    cacheKey,
+		State:       model.ObjectStateCached,
+	}); err != nil {
+		t.Fatalf("seeding object version %s/%s: %v", bucket, key, err)
+	}
+	etag := fmt.Sprintf(`"%s"`, info.ETag)
+	return s3response.PutObjectOutput{ETag: etag, VersionID: versionID, Size: &info.Size}
+}
+
+func putValidTestObject(t *testing.T, tb *testBackend, bucket, key, body string) string {
+	t.Helper()
+	return putValidTestObjectOutput(t, tb, bucket, key, body).ETag
+}
+
+// putValidTestObjectOutput uses the production PutObject path with FOC-valid content.
+func putValidTestObjectOutput(t *testing.T, tb *testBackend, bucket, key, body string) s3response.PutObjectOutput {
+	t.Helper()
+	ctx := context.Background()
 	ct := "text/plain"
+	validBody := validTestObjectBody(body)
 	out, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
 		Bucket:      &bucket,
 		Key:         &key,
-		Body:        strings.NewReader(body),
+		Body:        strings.NewReader(validBody),
 		ContentType: &ct,
 	})
 	if err != nil {
 		t.Fatalf("PutObject(%s/%s): %v", bucket, key, err)
 	}
 	return out
+}
+
+func ptrInt64(v int64) *int64 {
+	return &v
+}
+
+func assertS3ErrorCode(t *testing.T, err error, wantCode s3err.ErrorCode) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected APIError")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	if want := s3err.GetAPIError(wantCode); apiErr.Code != want.Code {
+		t.Fatalf("error code = %s, want %s", apiErr.Code, want.Code)
+	}
 }
 
 func touchVersionLifecycle(t *testing.T, tb *testBackend, ctx context.Context, versionID string) *model.ObjectVersion {
@@ -304,7 +360,7 @@ func TestPutObject_HappyPath(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "put-bucket")
 
-	body := "hello world"
+	body := validTestObjectBody("hello world")
 	ct := "text/plain"
 	out, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
 		Bucket:      aws.String("put-bucket"),
@@ -347,6 +403,52 @@ func TestPutObject_HappyPath(t *testing.T) {
 	}
 }
 
+func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength *int64
+		wantCode      s3err.ErrorCode
+	}{
+		{
+			name:     "below minimum",
+			body:     strings.Repeat("a", chain.MinUploadSize-1),
+			wantCode: s3err.ErrEntityTooSmall,
+		},
+		{
+			name:          "known length above maximum",
+			body:          "short body",
+			contentLength: ptrInt64(chain.MaxUploadSize + 1),
+			wantCode:      s3err.ErrEntityTooLarge,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tb := newTestBackend(t)
+			ctx := context.Background()
+			seedActiveBucket(t, tb, "put-size-limit-bucket")
+
+			_, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
+				Bucket:        aws.String("put-size-limit-bucket"),
+				Key:           aws.String("file.txt"),
+				Body:          strings.NewReader(tt.body),
+				ContentLength: tt.contentLength,
+			})
+			if err == nil {
+				t.Fatal("expected size limit error")
+			}
+			apiErr, ok := err.(s3err.APIError)
+			if !ok {
+				t.Fatalf("expected APIError, got %T: %v", err, err)
+			}
+			if want := s3err.GetAPIError(tt.wantCode); apiErr.Code != want.Code {
+				t.Fatalf("error code = %s, want %s", apiErr.Code, want.Code)
+			}
+		})
+	}
+}
+
 func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(11))
 	ctx := context.Background()
@@ -355,7 +457,7 @@ func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 	_, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
 		Bucket: aws.String("put-retries-bucket"),
 		Key:    aws.String("file.txt"),
-		Body:   strings.NewReader("data"),
+		Body:   strings.NewReader(validTestObjectBody("data")),
 	})
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
@@ -387,7 +489,7 @@ func TestPutObject_CacheFull(t *testing.T) {
 	_, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
 		Bucket: aws.String("full-bucket"),
 		Key:    aws.String("file.txt"),
-		Body:   strings.NewReader("data"),
+		Body:   strings.NewReader(validTestObjectBody("data")),
 	})
 	if err == nil {
 		t.Fatal("expected error when cache is full")
@@ -402,7 +504,7 @@ func TestPutObject_Overwrite(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "ow-bucket")
 
-	putTestObject(t, tb, "ow-bucket", "file.txt", "version-1")
+	putValidTestObject(t, tb, "ow-bucket", "file.txt", "version-1")
 
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "ow-bucket")
 	obj1, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
@@ -411,7 +513,7 @@ func TestPutObject_Overwrite(t *testing.T) {
 	}
 	firstVersionID := obj1.VersionID
 
-	putTestObject(t, tb, "ow-bucket", "file.txt", "version-2")
+	putValidTestObject(t, tb, "ow-bucket", "file.txt", "version-2")
 
 	obj2, _ := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if obj2.VersionID == "" || obj2.VersionID == firstVersionID {
@@ -435,7 +537,7 @@ func TestPutObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "dedupe-bucket")
 
-	firstOut := putTestObjectOutput(t, tb, "dedupe-bucket", "file.txt", "same data")
+	firstOut := putValidTestObjectOutput(t, tb, "dedupe-bucket", "file.txt", "same data")
 
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "dedupe-bucket")
 	obj1, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
@@ -443,7 +545,7 @@ func TestPutObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 		t.Fatalf("current object after first put: obj=%v err=%v", obj1, err)
 	}
 
-	secondOut := putTestObjectOutput(t, tb, "dedupe-bucket", "file.txt", "same data")
+	secondOut := putValidTestObjectOutput(t, tb, "dedupe-bucket", "file.txt", "same data")
 
 	obj2, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || obj2 == nil {
@@ -495,7 +597,7 @@ func TestPutObjectIdenticalUploadingContentFollowsActiveUploadTask(t *testing.T)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "uploading-reuse-bucket")
 
-	firstOut := putTestObjectOutput(t, tb, "uploading-reuse-bucket", "file.txt", "same data")
+	firstOut := putValidTestObjectOutput(t, tb, "uploading-reuse-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "uploading-reuse-bucket")
 	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
@@ -518,7 +620,7 @@ func TestPutObjectIdenticalUploadingContentFollowsActiveUploadTask(t *testing.T)
 		t.Fatalf("list tasks before second put: %v", err)
 	}
 
-	secondOut := putTestObjectOutput(t, tb, "uploading-reuse-bucket", "file.txt", "same data")
+	secondOut := putValidTestObjectOutput(t, tb, "uploading-reuse-bucket", "file.txt", "same data")
 	if secondOut.VersionID == "" || secondOut.VersionID == firstOut.VersionID {
 		t.Fatalf("second VersionID = %q, first = %q", secondOut.VersionID, firstOut.VersionID)
 	}
@@ -548,7 +650,7 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "stored-reuse-bucket")
 
-	firstOut := putTestObjectOutput(t, tb, "stored-reuse-bucket", "file.txt", "same data")
+	firstOut := putValidTestObjectOutput(t, tb, "stored-reuse-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "stored-reuse-bucket")
 	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
@@ -563,7 +665,7 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list tasks before second put: %v", err)
 	}
-	secondOut := putTestObjectOutput(t, tb, "stored-reuse-bucket", "file.txt", "same data")
+	secondOut := putValidTestObjectOutput(t, tb, "stored-reuse-bucket", "file.txt", "same data")
 	if secondOut.VersionID == "" || secondOut.VersionID == firstOut.VersionID {
 		t.Fatalf("second VersionID = %q, first = %q", secondOut.VersionID, firstOut.VersionID)
 	}
@@ -593,7 +695,7 @@ func TestPutObjectIdenticalReplicatingContentReusesPrimaryCommittedUpload(t *tes
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "replicating-reuse-bucket")
 
-	firstOut := putTestObjectOutput(t, tb, "replicating-reuse-bucket", "file.txt", "same data")
+	firstOut := putValidTestObjectOutput(t, tb, "replicating-reuse-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "replicating-reuse-bucket")
 	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
@@ -605,7 +707,7 @@ func TestPutObjectIdenticalReplicatingContentReusesPrimaryCommittedUpload(t *tes
 	if err != nil {
 		t.Fatalf("list tasks before second put: %v", err)
 	}
-	secondOut := putTestObjectOutput(t, tb, "replicating-reuse-bucket", "file.txt", "same data")
+	secondOut := putValidTestObjectOutput(t, tb, "replicating-reuse-bucket", "file.txt", "same data")
 	if secondOut.VersionID == "" || secondOut.VersionID == firstOut.VersionID {
 		t.Fatalf("second VersionID = %q, first = %q", secondOut.VersionID, firstOut.VersionID)
 	}
@@ -635,7 +737,7 @@ func TestPutObjectIdenticalStoredContentQueuesEvictWhenAutoEvictEnabled(t *testi
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "stored-reuse-evict-bucket")
 
-	putTestObject(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
+	putValidTestObject(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "stored-reuse-evict-bucket")
 	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
@@ -646,7 +748,7 @@ func TestPutObjectIdenticalStoredContentQueuesEvictWhenAutoEvictEnabled(t *testi
 	}
 	acceptBackendVersionUpload(t, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
 
-	secondOut := putTestObjectOutput(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
+	secondOut := putValidTestObjectOutput(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
 	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
 	if err != nil {
 		t.Fatalf("claim evict task: %v", err)
@@ -1961,7 +2063,7 @@ func TestCopyObject_HappyPath(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "src-bucket")
 	seedActiveBucket(t, tb, "dst-bucket")
-	putTestObject(t, tb, "src-bucket", "original.txt", "copy me")
+	putValidTestObject(t, tb, "src-bucket", "original.txt", "copy me")
 
 	out, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket:     aws.String("dst-bucket"),
@@ -1994,7 +2096,7 @@ func TestCopyObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "copy-dedupe-src")
 	seedActiveBucket(t, tb, "copy-dedupe-dst")
-	putTestObject(t, tb, "copy-dedupe-src", "original.txt", "copy me")
+	putValidTestObject(t, tb, "copy-dedupe-src", "original.txt", "copy me")
 
 	copyInput := s3response.CopyObjectInput{
 		Bucket:     aws.String("copy-dedupe-dst"),
@@ -2051,7 +2153,7 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "copy-retry-src")
 	seedActiveBucket(t, tb, "copy-retry-dst")
-	putTestObject(t, tb, "copy-retry-src", "original.txt", "copy me")
+	putValidTestObject(t, tb, "copy-retry-src", "original.txt", "copy me")
 
 	_, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket:     aws.String("copy-retry-dst"),
@@ -2094,7 +2196,7 @@ func TestCopyObject_MetadataReplace(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "mr-src")
 	seedActiveBucket(t, tb, "mr-dst")
-	putTestObject(t, tb, "mr-src", "file.txt", "data")
+	putValidTestObject(t, tb, "mr-src", "file.txt", "data")
 
 	newCT := "application/json"
 	out, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
@@ -2129,7 +2231,7 @@ func TestCopyObject_SameBucket(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "same-bucket")
-	putTestObject(t, tb, "same-bucket", "src.txt", "data")
+	putValidTestObject(t, tb, "same-bucket", "src.txt", "data")
 
 	_, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket:     aws.String("same-bucket"),
@@ -2155,8 +2257,8 @@ func TestCopyObject_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) {
 	seedActiveBucket(t, tb, "copy-version-src")
 	seedActiveBucket(t, tb, "copy-version-dst")
 
-	firstOut := putTestObjectOutput(t, tb, "copy-version-src", "original.txt", "old")
-	putTestObject(t, tb, "copy-version-src", "original.txt", "new")
+	firstOut := putValidTestObjectOutput(t, tb, "copy-version-src", "original.txt", "old")
+	putValidTestObject(t, tb, "copy-version-src", "original.txt", "new")
 
 	out, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket:     aws.String("copy-version-dst"),
@@ -2179,8 +2281,8 @@ func TestCopyObject_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) {
 	}
 	defer func() { _ = got.Body.Close() }()
 	data, _ := io.ReadAll(got.Body)
-	if string(data) != "old" {
-		t.Fatalf("copied body = %q, want old source version", string(data))
+	if want := validTestObjectBody("old"); string(data) != want {
+		t.Fatalf("copied body = %q, want %q", string(data), want)
 	}
 }
 
@@ -2190,7 +2292,7 @@ func TestCopyObjectBindsImplicitCurrentReadToResolvedVersion(t *testing.T) {
 	srcBkt := seedActiveBucket(t, tb, "copy-implicit-race-src")
 	seedActiveBucket(t, tb, "copy-implicit-race-dst")
 
-	firstOut := putTestObjectOutput(t, tb, "copy-implicit-race-src", "original.txt", "old")
+	firstOut := putValidTestObjectOutput(t, tb, "copy-implicit-race-src", "original.txt", "old")
 	baseObjects := tb.repos.Objects
 	var hookErr error
 	tb.repos.Objects = &getCurrentVersionByBucketAndKeyAfterReadRepo{
@@ -2244,7 +2346,7 @@ func TestCopyObjectBindsImplicitCurrentReadToResolvedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read copied body: %v", err)
 	}
-	if string(data) != "old" {
+	if want := validTestObjectBody("old"); string(data) != want {
 		t.Fatalf("copied body = %q, want resolved source version body", string(data))
 	}
 }
@@ -2255,7 +2357,7 @@ func TestParseCopySource_Formats(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "fmt-bucket")
-	putTestObject(t, tb, "fmt-bucket", "key with spaces.txt", "data")
+	putValidTestObject(t, tb, "fmt-bucket", "key with spaces.txt", "data")
 
 	tests := []struct {
 		name   string

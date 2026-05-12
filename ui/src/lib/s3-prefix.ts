@@ -27,3 +27,24 @@ export function bucketPrefixCrumbs(prefix: string): BucketPrefixCrumb[] {
 
   return crumbs
 }
+
+export function objectUploadKey(prefix: string, fileName: string) {
+  if (prefix === '' || prefix.endsWith('/')) return `${prefix}${fileName}`
+  return `${prefix}/${fileName}`
+}
+
+export function duplicateObjectUploadKeys(keys: string[]) {
+  const seen = new Set<string>()
+  const duplicates = new Set<string>()
+  const result: string[] = []
+
+  for (const key of keys) {
+    if (seen.has(key) && !duplicates.has(key)) {
+      duplicates.add(key)
+      result.push(key)
+    }
+    seen.add(key)
+  }
+
+  return result
+}

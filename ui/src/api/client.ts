@@ -1,6 +1,18 @@
 const BASE = '/api/v1'
 
 export const internalRootOwnerAccessKey = '__internal_root__'
+export const minFOCUploadSize = 127
+export const maxFOCUploadSize = 1_065_353_216
+
+export function validateFOCUploadSize(size: number) {
+  if (size < minFOCUploadSize) {
+    return `EntityTooSmall: object size must be at least ${minFOCUploadSize} B`
+  }
+  if (size > maxFOCUploadSize) {
+    return `EntityTooLarge: object size must be no more than ${maxFOCUploadSize} bytes`
+  }
+  return null
+}
 
 async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
@@ -137,6 +149,20 @@ export interface ObjectDeleteMarkerResponse {
   key: string
   delete_marker_version_id: string
   deleted_at: string
+}
+
+export interface ObjectUploadResponse {
+  key: string
+  version_id: string
+  etag: string
+  size: number
+  content_type: string
+}
+
+export interface ObjectUploadClientProgress {
+  loaded: number
+  total: number
+  percent: number
 }
 
 export interface DeletedObjectItem {
@@ -627,6 +653,51 @@ export const api = {
       },
     })
   },
+  uploadBucketObject: (
+    name: string,
+    params: { key: string; file: File; onProgress?: (progress: ObjectUploadClientProgress) => void }
+  ) =>
+    new Promise<ObjectUploadResponse>((resolve, reject) => {
+      const sizeError = validateFOCUploadSize(params.file.size)
+      if (sizeError) {
+        reject(new Error(sizeError))
+        return
+      }
+      const xhr = new XMLHttpRequest()
+      xhr.open(
+        'POST',
+        `${BASE}/buckets/${encodeURIComponent(name)}/objects/upload?key=${encodeURIComponent(params.key)}`
+      )
+      xhr.setRequestHeader('X-SynapS3-Settings-Write', '1')
+      xhr.setRequestHeader('Content-Type', params.file.type || 'application/octet-stream')
+      xhr.timeout = 60 * 60 * 1000
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable || event.total <= 0) return
+        params.onProgress?.({
+          loaded: event.loaded,
+          total: event.total,
+          percent: Math.round((event.loaded / event.total) * 100),
+        })
+      }
+      xhr.onload = () => {
+        let body: unknown
+        try {
+          body = xhr.responseText ? JSON.parse(xhr.responseText) : undefined
+        } catch {
+          reject(new Error(`API error: ${xhr.status}`))
+          return
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(body as ObjectUploadResponse)
+          return
+        }
+        const errorBody = body as { error?: string } | undefined
+        reject(new Error(errorBody?.error || `API error: ${xhr.status}`))
+      }
+      xhr.onerror = () => reject(new Error('Network error'))
+      xhr.ontimeout = () => reject(new Error('Upload timed out'))
+      xhr.send(params.file)
+    }),
   getBucketDeletedObjects: (name: string, params: { prefix?: string; after?: string; limit?: number }) => {
     const sp = new URLSearchParams()
     if (params.prefix) sp.set('prefix', params.prefix)

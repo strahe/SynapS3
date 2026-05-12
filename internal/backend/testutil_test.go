@@ -2,6 +2,7 @@ package backend_test
 
 import (
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/backend"
@@ -11,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
 )
@@ -96,6 +98,13 @@ func newTestCache(t *testing.T, maxBytes int64) cache.Cache {
 		t.Fatalf("creating test cache: %v", err)
 	}
 	return c
+}
+
+func validTestObjectBody(seed string) string {
+	if len(seed) >= chain.MinUploadSize {
+		return seed
+	}
+	return seed + strings.Repeat(".", chain.MinUploadSize-len(seed))
 }
 
 func seedS3Account(t *testing.T, tb *testBackend, accessKey string) {

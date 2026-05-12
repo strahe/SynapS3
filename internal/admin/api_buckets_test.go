@@ -21,8 +21,11 @@ import (
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
+	"github.com/versity/versitygw/s3err"
+	"github.com/versity/versitygw/s3response"
 )
 
 func newBucketAPITestServer(t *testing.T) (*Server, *repository.Repositories) {
@@ -76,6 +79,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/provenance", srv.handleAPIBucketObjectProvenance)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", srv.handleAPIBucketObjectVersions)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
+	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", srv.handleAPIUploadObject)
 	return mux
 }
 
@@ -91,6 +95,85 @@ type writeDeadlineRecorder struct {
 func (r *writeDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
 	r.deadlines = append(r.deadlines, deadline)
 	return nil
+}
+
+type recordingObjectUploader struct {
+	calls            int
+	bucket           string
+	key              string
+	contentType      string
+	contentLength    int64
+	hasContentLength bool
+	body             string
+	output           s3response.PutObjectOutput
+	err              error
+}
+
+func (u *recordingObjectUploader) PutObject(_ context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
+	u.calls++
+	if input.Bucket != nil {
+		u.bucket = *input.Bucket
+	}
+	if input.Key != nil {
+		u.key = *input.Key
+	}
+	if input.ContentType != nil {
+		u.contentType = *input.ContentType
+	}
+	if input.ContentLength != nil {
+		u.contentLength = *input.ContentLength
+		u.hasContentLength = true
+	}
+	if input.Body != nil {
+		data, err := io.ReadAll(input.Body)
+		if err != nil {
+			return s3response.PutObjectOutput{}, err
+		}
+		u.body = string(data)
+	}
+	return u.output, u.err
+}
+
+type cacheBackedObjectUploader struct {
+	t     *testing.T
+	cache cache.Cache
+	repos *repository.Repositories
+}
+
+func (u *cacheBackedObjectUploader) PutObject(ctx context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
+	u.t.Helper()
+	if input.Bucket == nil || input.Key == nil {
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+	bucket, err := u.repos.Buckets.GetByName(ctx, *input.Bucket)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	versionID := model.NewVersionID()
+	cacheKey := ".versions/" + versionID
+	info, err := u.cache.Put(ctx, *input.Bucket, cacheKey, input.Body)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	contentType := "application/octet-stream"
+	if input.ContentType != nil && *input.ContentType != "" {
+		contentType = *input.ContentType
+	}
+	if _, err := u.repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+		VersionID:   versionID,
+		BucketID:    bucket.ID,
+		Key:         *input.Key,
+		Size:        info.Size,
+		ETag:        info.ETag,
+		Checksum:    info.Checksum,
+		ContentType: contentType,
+		CacheKey:    cacheKey,
+		State:       model.ObjectStateCached,
+	}); err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	etag := `"` + info.ETag + `"`
+	return s3response.PutObjectOutput{ETag: etag, VersionID: versionID, Size: &info.Size}, nil
 }
 
 type cancelingDeleteCache struct {
@@ -2559,6 +2642,347 @@ func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
 	}
 	if got := counter.selects.Load(); got > 2 {
 		t.Fatalf("storage upload selects = %d, want batched lookups no more than 2", got)
+	}
+}
+
+func TestAPIBucketObjectUpload_PassesRequestToUploader(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "upload-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	uploadBody := validAdminUploadBody("hello upload")
+	size := int64(len(uploadBody))
+	uploader := &recordingObjectUploader{
+		output: s3response.PutObjectOutput{ETag: `"etag-upload"`, VersionID: model.NewVersionID(), Size: &size},
+	}
+	srv.WithObjectUploader(uploader)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-bucket/objects/upload?key="+url.QueryEscape("folder/report.txt"), strings.NewReader(uploadBody))
+	req.SetPathValue("name", bucket.Name)
+	req.Header.Set("Content-Type", "text/plain")
+	setBucketWriteHeaders(req)
+	rr := &writeDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	start := time.Now()
+
+	srv.handleAPIUploadObject(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if uploader.calls != 1 {
+		t.Fatalf("uploader calls = %d, want 1", uploader.calls)
+	}
+	if uploader.bucket != bucket.Name {
+		t.Fatalf("bucket = %q, want %q", uploader.bucket, bucket.Name)
+	}
+	if uploader.key != "folder/report.txt" {
+		t.Fatalf("key = %q, want folder/report.txt", uploader.key)
+	}
+	if uploader.contentType != "text/plain" {
+		t.Fatalf("content type = %q, want text/plain", uploader.contentType)
+	}
+	if !uploader.hasContentLength || uploader.contentLength != size {
+		t.Fatalf("content length = %d set=%v, want %d", uploader.contentLength, uploader.hasContentLength, size)
+	}
+	if uploader.body != uploadBody {
+		t.Fatalf("body = %q, want %q", uploader.body, uploadBody)
+	}
+	if len(rr.deadlines) != 1 {
+		t.Fatalf("write deadlines = %#v, want single upload deadline", rr.deadlines)
+	}
+	deadline := rr.deadlines[0]
+	if deadline.IsZero() {
+		t.Fatalf("write deadline = %v, want finite upload deadline", deadline)
+	}
+	minDeadline := start.Add(time.Hour)
+	maxDeadline := time.Now().Add(time.Hour + time.Second)
+	if deadline.Before(minDeadline) || deadline.After(maxDeadline) {
+		t.Fatalf("write deadline = %v, want between %v and %v", deadline, minDeadline, maxDeadline)
+	}
+	var body struct {
+		Key         string `json:"key"`
+		VersionID   string `json:"version_id"`
+		ETag        string `json:"etag"`
+		Size        int64  `json:"size"`
+		ContentType string `json:"content_type"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.Key != "folder/report.txt" || body.VersionID == "" || body.ETag != `"etag-upload"` || body.Size != size || body.ContentType != "text/plain" {
+		t.Fatalf("response = %#v, want uploaded object metadata", body)
+	}
+}
+
+func TestAPIBucketObjectUpload_RejectsMissingUploaderSize(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "upload-missing-size-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	uploader := &recordingObjectUploader{
+		output: s3response.PutObjectOutput{ETag: `"etag-upload"`, VersionID: model.NewVersionID()},
+	}
+	srv.WithObjectUploader(uploader)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-missing-size-bucket/objects/upload?key=file.txt", strings.NewReader(validAdminUploadBody("body")))
+	req.SetPathValue("name", bucket.Name)
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUploadObject(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusInternalServerError, rr.Body.String())
+	}
+	if uploader.calls != 1 {
+		t.Fatalf("uploader calls = %d, want 1", uploader.calls)
+	}
+	if !strings.Contains(rr.Body.String(), "uploader did not return object size") {
+		t.Fatalf("body = %s, want missing size error", rr.Body.String())
+	}
+}
+
+func TestAPIBucketObjectUpload_RejectsEmptyObject(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "upload-empty-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	uploader := &recordingObjectUploader{}
+	srv.WithObjectUploader(uploader)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-empty-bucket/objects/upload?key=empty.txt", strings.NewReader(""))
+	req.SetPathValue("name", bucket.Name)
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUploadObject(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+	if uploader.calls != 0 {
+		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
+	}
+	if !strings.Contains(rr.Body.String(), "EntityTooSmall") {
+		t.Fatalf("body = %s, want EntityTooSmall", rr.Body.String())
+	}
+}
+
+func TestAPIBucketObjectUpload_RejectsFOCSizeLimits(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		wantStatus    int
+		wantError     string
+	}{
+		{
+			name:          "below minimum",
+			body:          strings.Repeat("a", chain.MinUploadSize-1),
+			contentLength: chain.MinUploadSize - 1,
+			wantStatus:    http.StatusBadRequest,
+			wantError:     "EntityTooSmall",
+		},
+		{
+			name:          "above maximum",
+			body:          "short body",
+			contentLength: chain.MaxUploadSize + 1,
+			wantStatus:    http.StatusRequestEntityTooLarge,
+			wantError:     "EntityTooLarge",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, repos := newBucketAPITestServer(t)
+			ctx := context.Background()
+			bucket := &model.Bucket{Name: "upload-size-limit-bucket", Status: model.BucketStatusActive}
+			if err := repos.Buckets.Create(ctx, bucket); err != nil {
+				t.Fatalf("Buckets.Create: %v", err)
+			}
+			uploader := &recordingObjectUploader{}
+			srv.WithObjectUploader(uploader)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-size-limit-bucket/objects/upload?key=file.txt", strings.NewReader(tt.body))
+			req.ContentLength = tt.contentLength
+			req.SetPathValue("name", bucket.Name)
+			setBucketWriteHeaders(req)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIUploadObject(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
+			}
+			if uploader.calls != 0 {
+				t.Fatalf("uploader calls = %d, want 0", uploader.calls)
+			}
+			if !strings.Contains(rr.Body.String(), tt.wantError) {
+				t.Fatalf("body = %s, want %s", rr.Body.String(), tt.wantError)
+			}
+		})
+	}
+}
+
+func TestAPIBucketObjectUpload_RequiresWriteAccess(t *testing.T) {
+	srv, _ := newBucketAPITestServer(t)
+	uploader := &recordingObjectUploader{}
+	srv.WithObjectUploader(uploader)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-bucket/objects/upload?key=file.txt", strings.NewReader("body"))
+	req.SetPathValue("name", "upload-bucket")
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUploadObject(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("missing header status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+	if uploader.calls != 0 {
+		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
+	}
+
+	srv.addr = "0.0.0.0:9090"
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-bucket/objects/upload?key=file.txt", strings.NewReader("body"))
+	req.SetPathValue("name", "upload-bucket")
+	setBucketWriteHeaders(req)
+	rr = httptest.NewRecorder()
+
+	srv.handleAPIUploadObject(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback status = %d, want %d, body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
+	}
+	if uploader.calls != 0 {
+		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
+	}
+}
+
+func validAdminUploadBody(seed string) string {
+	if len(seed) >= chain.MinUploadSize {
+		return seed
+	}
+	return seed + strings.Repeat(".", chain.MinUploadSize-len(seed))
+}
+
+func TestAPIBucketObjectUpload_RejectsEmptyKey(t *testing.T) {
+	srv, _ := newBucketAPITestServer(t)
+	uploader := &recordingObjectUploader{}
+	srv.WithObjectUploader(uploader)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-bucket/objects/upload", strings.NewReader("body"))
+	req.SetPathValue("name", "upload-bucket")
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUploadObject(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+	if uploader.calls != 0 {
+		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
+	}
+}
+
+func TestAPIBucketObjectUpload_MapsUploaderErrors(t *testing.T) {
+	srv, _ := newBucketAPITestServer(t)
+
+	tests := []struct {
+		name      string
+		err       error
+		status    int
+		wantError string
+	}{
+		{name: "s3 api error", err: s3err.GetAPIError(s3err.ErrNoSuchBucket), status: http.StatusNotFound},
+		{name: "cache full", err: fmt.Errorf("staging object: %w", cache.ErrCacheFull), status: http.StatusInsufficientStorage},
+		{
+			name:      "http max bytes",
+			err:       fmt.Errorf("staging object: %w", &http.MaxBytesError{Limit: int64(chain.MaxUploadSize)}),
+			status:    http.StatusRequestEntityTooLarge,
+			wantError: "EntityTooLarge",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv.WithObjectUploader(&recordingObjectUploader{err: tt.err})
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/missing-bucket/objects/upload?key=file.txt", strings.NewReader(validAdminUploadBody("body")))
+			req.SetPathValue("name", "missing-bucket")
+			setBucketWriteHeaders(req)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIUploadObject(rr, req)
+
+			if rr.Code != tt.status {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.status, rr.Body.String())
+			}
+			var body map[string]string
+			if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if body["error"] == "" {
+				t.Fatal("expected error message")
+			}
+			if tt.wantError != "" && !strings.Contains(body["error"], tt.wantError) {
+				t.Fatalf("error = %q, want %q", body["error"], tt.wantError)
+			}
+		})
+	}
+}
+
+func TestAPIBucketObjectUpload_AppearsInObjectList(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "upload-list-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	srv.WithObjectUploader(&cacheBackedObjectUploader{t: t, cache: srv.cache, repos: repos})
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/upload-list-bucket/objects/upload?key="+url.QueryEscape("folder/new.txt"), strings.NewReader(validAdminUploadBody("visible upload")))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	setBucketWriteHeaders(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST object upload: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/upload-list-bucket/objects?prefix=" + url.QueryEscape("folder/") + "&delimiter=%2F&limit=50")
+	if err != nil {
+		t.Fatalf("GET object list: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	var list objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("Decode list: %v", err)
+	}
+	if len(list.Objects) != 1 {
+		t.Fatalf("objects = %#v, want one uploaded object", list.Objects)
+	}
+	got := list.Objects[0]
+	if got.Key != "folder/new.txt" || got.Size != int64(len(validAdminUploadBody("visible upload"))) || got.ContentType != "text/plain" {
+		t.Fatalf("object = %#v, want uploaded object metadata", got)
 	}
 }
 

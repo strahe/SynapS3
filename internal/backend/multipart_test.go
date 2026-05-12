@@ -12,7 +12,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	synaps3backend "github.com/strahe/synaps3/internal/backend"
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
+	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synapse-go/chain"
+	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
 
@@ -93,8 +97,8 @@ func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) 
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "up-copy-version-bucket")
 
-	firstOut := putTestObjectOutput(t, tb, "up-copy-version-bucket", "source.txt", "old")
-	putTestObject(t, tb, "up-copy-version-bucket", "source.txt", "new")
+	firstOut := putValidTestObjectOutput(t, tb, "up-copy-version-bucket", "source.txt", "old")
+	putValidTestObject(t, tb, "up-copy-version-bucket", "source.txt", "new")
 
 	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
 		Bucket: aws.String("up-copy-version-bucket"),
@@ -146,8 +150,8 @@ func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) 
 	if err != nil {
 		t.Fatalf("read copied body: %v", err)
 	}
-	if string(body) != "old" {
-		t.Fatalf("copied body = %q, want old", string(body))
+	if want := validTestObjectBody("old"); string(body) != want {
+		t.Fatalf("copied body = %q, want %q", string(body), want)
 	}
 }
 
@@ -172,12 +176,16 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	// Upload 2 parts.
 	var partETags [2]string
 	for i := int32(1); i <= 2; i++ {
+		partBody := fmt.Sprintf("part-%d-data", i)
+		if i == 1 {
+			partBody = validTestObjectBody(partBody)
+		}
 		partOut, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket:     aws.String("cmp-bucket"),
 			Key:        aws.String("assembled.bin"),
 			UploadId:   aws.String(uploadID),
 			PartNumber: &i,
-			Body:       strings.NewReader(fmt.Sprintf("part-%d-data", i)),
+			Body:       strings.NewReader(partBody),
 		})
 		if err != nil {
 			t.Fatalf("UploadPart %d: %v", i, err)
@@ -232,6 +240,84 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCompleteMultipartUploadRejectsFOCSizeBelowMinimum(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "cmp-small-bucket")
+
+	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String("cmp-small-bucket"),
+		Key:    aws.String("small.bin"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	partNum := int32(1)
+	partOut, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String("cmp-small-bucket"),
+		Key:        aws.String("small.bin"),
+		UploadId:   aws.String(initResult.UploadId),
+		PartNumber: &partNum,
+		Body:       strings.NewReader(strings.Repeat("a", chain.MinUploadSize-1)),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+
+	_, _, err = tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String("cmp-small-bucket"),
+		Key:      aws.String("small.bin"),
+		UploadId: aws.String(initResult.UploadId),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{PartNumber: &partNum, ETag: partOut.ETag}},
+		},
+	})
+	assertS3ErrorCode(t, err, s3err.ErrEntityTooSmall)
+}
+
+func TestCompleteMultipartUploadRejectsFOCSizeAboveMaximum(t *testing.T) {
+	assembleCalled := false
+	mc := &synaps3testutil.MockCache{
+		AssemblePartsFunc: func(_ context.Context, _, _, _ string, _ []int) (*cache.ObjectInfo, []string, error) {
+			assembleCalled = true
+			return &cache.ObjectInfo{Size: chain.MaxUploadSize + 1, ETag: strings.Repeat("a", 32), Checksum: "checksum"}, nil, nil
+		},
+	}
+	tb := newTestBackendWithMockCache(t, mc)
+	ctx := context.Background()
+	bucket := seedActiveBucket(t, tb, "cmp-large-bucket")
+	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket.Name),
+		Key:    aws.String("large.bin"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	partNum := int32(1)
+	etag := strings.Repeat("b", 32)
+	if err := tb.repos.Multiparts.CreatePart(ctx, &model.MultipartPart{
+		UploadID:   initResult.UploadId,
+		PartNumber: 1,
+		Size:       chain.MaxUploadSize + 1,
+		ETag:       etag,
+	}); err != nil {
+		t.Fatalf("CreatePart: %v", err)
+	}
+
+	_, _, err = tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(bucket.Name),
+		Key:      aws.String("large.bin"),
+		UploadId: aws.String(initResult.UploadId),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{PartNumber: &partNum, ETag: &etag}},
+		},
+	})
+	assertS3ErrorCode(t, err, s3err.ErrEntityTooLarge)
+	if assembleCalled {
+		t.Fatal("AssembleParts was called for object above FOC maximum")
+	}
+}
+
 func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
@@ -253,7 +339,7 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testi
 			Key:        aws.String("assembled.bin"),
 			UploadId:   aws.String(initResult.UploadId),
 			PartNumber: &partNum,
-			Body:       strings.NewReader("same multipart data"),
+			Body:       strings.NewReader(validTestObjectBody("same multipart data")),
 		})
 		if err != nil {
 			t.Fatalf("UploadPart: %v", err)

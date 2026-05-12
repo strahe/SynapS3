@@ -17,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -34,15 +35,29 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 	versionID := model.NewVersionID()
 	cacheKey := versionCacheKey(versionID)
 
+	if input.ContentLength != nil {
+		if err := objectlimits.ValidateFOCUploadSize(*input.ContentLength); err != nil {
+			admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+			return s3response.PutObjectOutput{}, objectSizeAPIError(err)
+		}
+	}
+
 	// Write to a version-specific cache key so overwrites cannot affect older tasks.
-	staged, err := b.cache.PutStaged(ctx, bucketName, cacheKey, input.Body)
+	staged, err := b.cache.PutStaged(ctx, bucketName, cacheKey, objectlimits.LimitFOCUploadReader(input.Body))
 	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		if errors.Is(err, objectlimits.ErrTooLarge) {
+			return s3response.PutObjectOutput{}, objectSizeAPIError(err)
+		}
 		return s3response.PutObjectOutput{}, fmt.Errorf("staging object: %w", err)
 	}
 	defer func() { _ = staged.Rollback() }()
 
 	cacheInfo := staged.Info
+	if err := objectlimits.ValidateFOCUploadSize(cacheInfo.Size); err != nil {
+		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		return s3response.PutObjectOutput{}, objectSizeAPIError(err)
+	}
 
 	// Build metadata map from input.
 	meta := make(map[string]string)
@@ -100,7 +115,23 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 	return s3response.PutObjectOutput{
 		ETag:      etag,
 		VersionID: versionID,
+		Size:      &cacheInfo.Size,
 	}, nil
+}
+
+func objectSizeAPIError(err error) s3err.APIError {
+	switch {
+	case errors.Is(err, objectlimits.ErrTooSmall):
+		apiErr := s3err.GetAPIError(s3err.ErrEntityTooSmall)
+		apiErr.Description = err.Error()
+		return apiErr
+	case errors.Is(err, objectlimits.ErrTooLarge):
+		apiErr := s3err.GetAPIError(s3err.ErrEntityTooLarge)
+		apiErr.Description = err.Error()
+		return apiErr
+	default:
+		return s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
 }
 
 func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
@@ -541,12 +572,18 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 	// Write to a version-specific destination cache key.
 	versionID := model.NewVersionID()
 	cacheKey := versionCacheKey(versionID)
-	staged, err := b.cache.PutStaged(ctx, dstBucketName, cacheKey, srcResult.Body)
+	staged, err := b.cache.PutStaged(ctx, dstBucketName, cacheKey, objectlimits.LimitFOCUploadReader(srcResult.Body))
 	if err != nil {
+		if errors.Is(err, objectlimits.ErrTooLarge) {
+			return s3response.CopyObjectOutput{}, objectSizeAPIError(err)
+		}
 		return s3response.CopyObjectOutput{}, fmt.Errorf("staging copy destination: %w", err)
 	}
 	defer func() { _ = staged.Rollback() }()
 	cacheInfo := staged.Info
+	if err := objectlimits.ValidateFOCUploadSize(cacheInfo.Size); err != nil {
+		return s3response.CopyObjectOutput{}, objectSizeAPIError(err)
+	}
 
 	// Determine metadata: COPY (default) preserves source, REPLACE uses request metadata
 	meta := make(map[string]string)

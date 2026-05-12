@@ -77,7 +77,7 @@ func putObject(t *testing.T, b *backend.SynapseBackend, bucket, key, body string
 	out, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
-		Body:   strings.NewReader(body),
+		Body:   strings.NewReader(validTestObjectBody(body)),
 	})
 	if err != nil {
 		t.Fatalf("PutObject(%s/%s): %v", bucket, key, err)
@@ -208,10 +208,10 @@ func TestIntegration_OverwritePath(t *testing.T) {
 		t.Fatalf("expected first task version=%s, got %s", firstVersionID, tasks[0].RefVersionID)
 	}
 
-	// GetObject should return v2
+	// GetObject should return the current version.
 	body := getObjectBody(t, ib.backend, "bucket", "key")
-	if body != "v2" {
-		t.Fatalf("expected body=v2, got %q", body)
+	if want := validTestObjectBody("v2"); body != want {
+		t.Fatalf("expected body=%q, got %q", want, body)
 	}
 }
 
@@ -327,8 +327,8 @@ func TestIntegration_CopyObjectPath(t *testing.T) {
 
 	// GetObject on dest should return the same data
 	body := getObjectBody(t, ib.backend, "bucket", "dst-key")
-	if body != "data" {
-		t.Fatalf("expected body=data, got %q", body)
+	if want := validTestObjectBody("data"); body != want {
+		t.Fatalf("expected body=%q, got %q", want, body)
 	}
 }
 
@@ -386,7 +386,7 @@ func TestIntegration_DeletePath_CreatesDeleteMarker(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("DeleteObject marker version: %v", err)
 	}
-	if body := getObjectBody(t, ib.backend, "bucket", "key"); body != "data" {
+	if body := getObjectBody(t, ib.backend, "bucket", "key"); body != validTestObjectBody("data") {
 		t.Fatalf("restored body = %q, want data", body)
 	}
 }
@@ -464,12 +464,13 @@ func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
 
 	// 2. UploadPart 1
 	part1Num := int32(1)
+	part1Body := validTestObjectBody("part1-data")
 	part1Out, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:     strPtr("bucket"),
 		Key:        strPtr("big-file"),
 		UploadId:   &uploadID,
 		PartNumber: &part1Num,
-		Body:       strings.NewReader("part1-data"),
+		Body:       strings.NewReader(part1Body),
 	})
 	if err != nil {
 		t.Fatalf("UploadPart 1: %v", err)
@@ -477,12 +478,13 @@ func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
 
 	// 3. UploadPart 2
 	part2Num := int32(2)
+	part2Body := "part2-data"
 	part2Out, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:     strPtr("bucket"),
 		Key:        strPtr("big-file"),
 		UploadId:   &uploadID,
 		PartNumber: &part2Num,
-		Body:       strings.NewReader("part2-data"),
+		Body:       strings.NewReader(part2Body),
 	})
 	if err != nil {
 		t.Fatalf("UploadPart 2: %v", err)
@@ -509,7 +511,8 @@ func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
 	if err != nil || obj == nil {
 		t.Fatalf("expected object after complete, err=%v", err)
 	}
-	expectedSize := int64(len("part1-data") + len("part2-data"))
+	expectedBody := part1Body + part2Body
+	expectedSize := int64(len(expectedBody))
 	if obj.Size != expectedSize {
 		t.Fatalf("expected size=%d, got %d", expectedSize, obj.Size)
 	}
@@ -520,10 +523,10 @@ func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
 		t.Fatal("expected upload task for completed multipart object")
 	}
 
-	// 6. GetObject → verify body = "part1-datapart2-data"
+	// 6. GetObject → verify assembled body
 	body := getObjectBody(t, ib.backend, "bucket", "big-file")
-	if body != "part1-datapart2-data" {
-		t.Fatalf("expected body=part1-datapart2-data, got %q", body)
+	if body != expectedBody {
+		t.Fatalf("expected body=%q, got %q", expectedBody, body)
 	}
 }
 
@@ -789,8 +792,8 @@ func TestIntegration_UploadPartCopy(t *testing.T) {
 
 	// Verify the assembled object has the same data as the source
 	body := getObjectBody(t, ib.backend, "bucket", "copy-dst")
-	if body != "source-data-for-part-copy" {
-		t.Fatalf("expected body=source-data-for-part-copy, got %q", body)
+	if want := validTestObjectBody("source-data-for-part-copy"); body != want {
+		t.Fatalf("expected body=%q, got %q", want, body)
 	}
 }
 
@@ -806,7 +809,7 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 	_, err := ib.backend.PutObject(ctx, s3response.PutObjectInput{
 		Bucket:      &srcBucket,
 		Key:         &srcKey,
-		Body:        strings.NewReader("copy-me"),
+		Body:        strings.NewReader(validTestObjectBody("copy-me")),
 		ContentType: strPtr("text/plain"),
 	})
 	if err != nil {
@@ -863,8 +866,8 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 
 	// Verify body matches
 	body := getObjectBody(t, ib.backend, "bucket", "copy.txt")
-	if body != "copy-me" {
-		t.Fatalf("expected body=copy-me, got %q", body)
+	if want := validTestObjectBody("copy-me"); body != want {
+		t.Fatalf("expected body=%q, got %q", want, body)
 	}
 }
 
@@ -1015,7 +1018,7 @@ func TestIntegration_HeadObject(t *testing.T) {
 
 	testutil.SeedBucket(t, ib.db, "bucket")
 
-	content := "hello-head-object"
+	content := validTestObjectBody("hello-head-object")
 	bucketName := "bucket"
 	keyName := "head-key"
 	_, err := ib.backend.PutObject(ctx, s3response.PutObjectInput{

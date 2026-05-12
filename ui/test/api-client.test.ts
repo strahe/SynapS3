@@ -1,7 +1,52 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { api } from '../src/api/client.ts'
+import { api, maxFOCUploadSize, minFOCUploadSize, validateFOCUploadSize } from '../src/api/client.ts'
+
+class FakeXMLHttpRequest {
+  static instances: FakeXMLHttpRequest[] = []
+
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null }
+  method = ''
+  url = ''
+  headers = new Headers()
+  body: XMLHttpRequestBodyInit | null = null
+  status = 0
+  responseText = ''
+  timeout = 0
+  onload: (() => void) | null = null
+  onerror: (() => void) | null = null
+  ontimeout: (() => void) | null = null
+
+  open(method: string, url: string) {
+    this.method = method
+    this.url = url
+  }
+
+  setRequestHeader(name: string, value: string) {
+    this.headers.set(name, value)
+  }
+
+  send(body?: XMLHttpRequestBodyInit | null) {
+    this.body = body ?? null
+    FakeXMLHttpRequest.instances.push(this)
+  }
+
+  load(status: number, responseText: string) {
+    this.status = status
+    this.responseText = responseText
+    this.onload?.()
+  }
+}
+
+function installFakeXMLHttpRequest() {
+  const original = globalThis.XMLHttpRequest
+  FakeXMLHttpRequest.instances = []
+  globalThis.XMLHttpRequest = FakeXMLHttpRequest as unknown as typeof XMLHttpRequest
+  return () => {
+    globalThis.XMLHttpRequest = original
+  }
+}
 
 test('admin write mutations send settings write header', async () => {
   const originalFetch = globalThis.fetch
@@ -76,4 +121,121 @@ test('bucket object listing sends folder browser query parameters', async () => 
     requestedURL,
     '/api/v1/buckets/bucket-a/objects?prefix=reports%2F&delimiter=%2F&after=reports%2F2026%2Fa.txt&limit=50'
   )
+})
+
+test('object upload uses XHR with write header and upload progress', async () => {
+  const restore = installFakeXMLHttpRequest()
+  const file = new File(['x'.repeat(minFOCUploadSize)], 'report summary.txt', { type: 'text/plain' })
+  const progress: Array<{ loaded: number; total: number; percent: number }> = []
+
+  try {
+    const promise = api.uploadBucketObject('bucket a', {
+      key: 'reports/report summary.txt',
+      file,
+      onProgress: (next) => progress.push(next),
+    })
+
+    const xhr = FakeXMLHttpRequest.instances[0]
+    assert.ok(xhr)
+    assert.equal(xhr.method, 'POST')
+    assert.equal(xhr.url, '/api/v1/buckets/bucket%20a/objects/upload?key=reports%2Freport%20summary.txt')
+    assert.equal(xhr.headers.get('X-SynapS3-Settings-Write'), '1')
+    assert.equal(xhr.headers.get('Content-Type'), 'text/plain')
+    assert.equal(xhr.timeout, 60 * 60 * 1000)
+    assert.equal(xhr.body, file)
+
+    xhr.upload.onprogress?.({ lengthComputable: true, loaded: 6, total: 12 } as ProgressEvent)
+    xhr.load(
+      200,
+      JSON.stringify({
+        key: 'reports/report summary.txt',
+        version_id: 'version-1',
+        etag: '"etag-1"',
+        size: 12,
+        content_type: 'text/plain',
+      })
+    )
+
+    assert.deepEqual(await promise, {
+      key: 'reports/report summary.txt',
+      version_id: 'version-1',
+      etag: '"etag-1"',
+      size: 12,
+      content_type: 'text/plain',
+    })
+    assert.deepEqual(progress, [{ loaded: 6, total: 12, percent: 50 }])
+  } finally {
+    restore()
+  }
+})
+
+test('object upload surfaces timeout errors', async () => {
+  const restore = installFakeXMLHttpRequest()
+  const file = new File(['x'.repeat(minFOCUploadSize)], 'slow.bin')
+
+  try {
+    const promise = api.uploadBucketObject('bucket-a', {
+      key: 'slow.bin',
+      file,
+    })
+
+    const xhr = FakeXMLHttpRequest.instances[0]
+    assert.ok(xhr)
+    assert.equal(typeof xhr.ontimeout, 'function')
+    xhr.ontimeout?.()
+
+    await assert.rejects(promise, /Upload timed out/)
+  } finally {
+    restore()
+  }
+})
+
+test('object upload surfaces JSON error responses', async () => {
+  const restore = installFakeXMLHttpRequest()
+  const file = new File(['x'.repeat(minFOCUploadSize)], 'large.bin')
+
+  try {
+    const promise = api.uploadBucketObject('bucket-a', {
+      key: 'large.bin',
+      file,
+      onProgress: () => {},
+    })
+
+    const xhr = FakeXMLHttpRequest.instances[0]
+    assert.ok(xhr)
+    xhr.load(507, JSON.stringify({ error: 'cache capacity exceeded' }))
+
+    await assert.rejects(promise, /cache capacity exceeded/)
+  } finally {
+    restore()
+  }
+})
+
+test('object upload rejects files outside FOC size limits before XHR', async () => {
+  const restore = installFakeXMLHttpRequest()
+
+  try {
+    await assert.rejects(
+      api.uploadBucketObject('bucket-a', {
+        key: 'empty.bin',
+        file: new File([], 'empty.bin'),
+      }),
+      /EntityTooSmall/
+    )
+
+    const hugeFile = new File(['x'], 'huge.bin')
+    Object.defineProperty(hugeFile, 'size', { value: maxFOCUploadSize + 1 })
+    await assert.rejects(
+      api.uploadBucketObject('bucket-a', {
+        key: 'huge.bin',
+        file: hugeFile,
+      }),
+      /EntityTooLarge/
+    )
+
+    assert.equal(validateFOCUploadSize(minFOCUploadSize), null)
+    assert.equal(FakeXMLHttpRequest.instances.length, 0)
+  } finally {
+    restore()
+  }
 })

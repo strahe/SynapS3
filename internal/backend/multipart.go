@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -71,8 +73,11 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 		return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumber)
 	}
 
-	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, input.Body)
+	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(input.Body))
 	if err != nil {
+		if errors.Is(err, objectlimits.ErrTooLarge) {
+			return nil, objectSizeAPIError(err)
+		}
 		return nil, fmt.Errorf("caching part: %w", err)
 	}
 
@@ -129,8 +134,11 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 	defer func() { _ = srcResult.Body.Close() }()
 
 	// NOTE: CopySourceRange for partial copies is not yet supported (future enhancement).
-	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, srcResult.Body)
+	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(srcResult.Body))
 	if err != nil {
+		if errors.Is(err, objectlimits.ErrTooLarge) {
+			return s3response.CopyPartResult{}, objectSizeAPIError(err)
+		}
 		return s3response.CopyPartResult{}, fmt.Errorf("caching copied part: %w", err)
 	}
 
@@ -219,6 +227,20 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 			}
 		}
+	}
+	totalSize := int64(0)
+	for _, pn := range partNumbers {
+		size := dbPartMap[pn].Size
+		if size > objectlimits.MaxFOCUploadSize || totalSize > objectlimits.MaxFOCUploadSize-size {
+			return s3response.CompleteMultipartUploadResult{}, "", objectSizeAPIError(&objectlimits.SizeError{
+				Size: objectlimits.MaxFOCUploadSize + 1,
+				Err:  objectlimits.ErrTooLarge,
+			})
+		}
+		totalSize += size
+	}
+	if err := objectlimits.ValidateFOCUploadSize(totalSize); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", objectSizeAPIError(err)
 	}
 
 	versionID := model.NewVersionID()

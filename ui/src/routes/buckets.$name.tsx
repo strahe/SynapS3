@@ -16,12 +16,15 @@ import {
   RotateCcw,
   Trash2,
   TriangleAlert,
+  Upload,
   UserRound,
 } from 'lucide-react'
-import { Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
+import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   api,
   type DeletedObjectItem,
+  maxFOCUploadSize,
+  minFOCUploadSize,
   type ObjectFolderItem,
   type ObjectItem,
   type ObjectProvenance,
@@ -29,11 +32,13 @@ import {
   type ObjectProvenanceFailure,
   type ObjectState,
   type ObjectStatus,
+  type ObjectUploadClientProgress,
   type ObjectUploadStatus,
   type ObjectVersionItem,
   type ProviderIdentity,
   type StorageDataSetSummary,
   type UploadTransferProgress,
+  validateFOCUploadSize,
 } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
@@ -67,9 +72,11 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Progress } from '@/components/ui/progress'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -92,7 +99,7 @@ import {
   useUpdateBucketOwner,
 } from '@/hooks/queries'
 import { ownerLabel } from '@/lib/s3-owner'
-import { type BucketPrefixCrumb, bucketPrefixCrumbs } from '@/lib/s3-prefix'
+import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
@@ -1056,6 +1063,7 @@ function ObjectBrowserPage() {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [changeOwnerOpen, setChangeOwnerOpen] = useState(false)
   const [deleteBucketOpen, setDeleteBucketOpen] = useState(false)
+  const [uploadOpen, setUploadOpen] = useState(false)
 
   const bucket = useBucket(name)
   const objects = useBucketObjects(name, prefix, marker, 50, '/', view === 'objects')
@@ -1106,6 +1114,24 @@ function ObjectBrowserPage() {
     qc.invalidateQueries({ queryKey: ['deletedObjects', name] })
   }
 
+  const handleUploadCompleted = () => {
+    qc.invalidateQueries({ queryKey: ['bucket', name] })
+    qc.invalidateQueries({ queryKey: ['objects', name] })
+    qc.invalidateQueries({ queryKey: ['tasks'] })
+    qc.invalidateQueries({ queryKey: ['taskStats'] })
+    if (marker) {
+      navigate({
+        to: '/buckets/$name',
+        params: { name },
+        search: {
+          prefix: prefix || undefined,
+          marker: undefined,
+          view: undefined,
+        },
+      })
+    }
+  }
+
   const canDelete = bucket.data?.status === 'active'
   const openChangeOwner = () => {
     setChangeOwnerOpen(true)
@@ -1125,6 +1151,16 @@ function ObjectBrowserPage() {
         }
         actions={
           <>
+            {view === 'objects' && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setUploadOpen(true)}
+                disabled={bucket.data?.status !== 'active'}
+              >
+                <Upload data-icon="inline-start" /> Upload
+              </Button>
+            )}
             <Button variant="outline" size="sm" onClick={handleRefresh}>
               <RefreshCw data-icon="inline-start" /> Refresh
             </Button>
@@ -1180,6 +1216,13 @@ function ObjectBrowserPage() {
       ) : (
         <ObjectBrowserSkeleton />
       )}
+      <UploadObjectsDialog
+        bucketName={name}
+        prefix={prefix}
+        open={uploadOpen}
+        onOpenChange={setUploadOpen}
+        onUploaded={handleUploadCompleted}
+      />
       {bucket.data && (
         <>
           <BucketDetailsSheet
@@ -1208,6 +1251,304 @@ function ObjectBrowserPage() {
       )}
     </div>
   )
+}
+
+type UploadDialogStatus = 'queued' | 'uploading' | 'success' | 'failed'
+
+type UploadDialogItem = {
+  id: string
+  file: File
+  key: string
+  status: UploadDialogStatus
+  loaded: number
+  total: number
+  percent: number
+  retryable: boolean
+  error?: string
+}
+
+function UploadObjectsDialog({
+  bucketName,
+  prefix,
+  open,
+  onOpenChange,
+  onUploaded,
+}: {
+  bucketName: string
+  prefix: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onUploaded: () => void
+}) {
+  const [items, setItems] = useState<UploadDialogItem[]>([])
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const queuedCount = items.filter((item) => item.status === 'queued').length
+  const retryableFailedCount = items.filter((item) => item.status === 'failed' && item.retryable).length
+
+  useEffect(() => {
+    if (!open && !uploading) {
+      setItems([])
+    }
+  }, [open, uploading])
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (uploading) return
+    onOpenChange(nextOpen)
+  }
+
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? [])
+    const keys = files.map((file) => objectUploadKey(prefix, file.name))
+    const duplicateKeys = new Set(duplicateObjectUploadKeys(keys))
+    setItems(files.map((file, index) => createUploadDialogItem(file, keys[index] ?? file.name, index, duplicateKeys)))
+    event.currentTarget.value = ''
+  }
+
+  const uploadItems = async (status: UploadDialogStatus) => {
+    const targets = items.filter(
+      (item) =>
+        item.status === status &&
+        (status === 'queued' || item.retryable) &&
+        validateFOCUploadSize(item.file.size) === null
+    )
+    if (targets.length === 0) return
+    setUploading(true)
+    let uploaded = false
+    for (const item of targets) {
+      setItems(itemsSetUploading(item.id, item.file.size))
+      try {
+        await api.uploadBucketObject(bucketName, {
+          key: item.key,
+          file: item.file,
+          onProgress: (progress) => setItems(itemsSetProgress(item.id, progress)),
+        })
+        uploaded = true
+        setItems(itemsSetSuccess(item.id, item.file.size))
+      } catch (error) {
+        setItems(itemsSetFailed(item.id, errorMessage(error)))
+      }
+    }
+    setUploading(false)
+    if (uploaded) {
+      onUploaded()
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Upload objects</DialogTitle>
+          <DialogDescription>Target: {prefix || '/'}</DialogDescription>
+        </DialogHeader>
+
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="object-upload-files">Files</FieldLabel>
+            <Input
+              ref={fileInputRef}
+              id="object-upload-files"
+              type="file"
+              multiple
+              disabled={uploading}
+              onChange={handleFileChange}
+              className="sr-only"
+            />
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+              >
+                <Upload data-icon="inline-start" /> Select files
+              </Button>
+              <span className="text-sm text-muted-foreground">{formatCountLabel(items.length, 'selected file')}</span>
+            </div>
+            <FieldDescription>
+              Allowed size: {formatBytes(minFOCUploadSize)} to {formatBytes(maxFOCUploadSize)}
+            </FieldDescription>
+          </Field>
+        </FieldGroup>
+
+        {items.length === 0 ? (
+          <div className="rounded-md border border-border">
+            <Empty className="h-44 border-0">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <Upload />
+                </EmptyMedia>
+                <EmptyTitle>No files selected</EmptyTitle>
+              </EmptyHeader>
+            </Empty>
+          </div>
+        ) : (
+          <div className="rounded-md border border-border">
+            <ScrollArea className="max-h-80 w-full">
+              <Table className="min-w-[680px]">
+                <TableHeader>
+                  <TableRow className="bg-muted/50">
+                    <TableHead className="w-[36%] px-4">Name</TableHead>
+                    <TableHead className="w-[16%] px-4 text-right">Size</TableHead>
+                    <TableHead className="w-[14%] px-4">Status</TableHead>
+                    <TableHead className="w-[20%] px-4">Progress</TableHead>
+                    <TableHead className="w-[14%] px-4">Message</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {items.map((item) => (
+                    <TableRow key={item.id}>
+                      <TableCell className="px-4">
+                        <span className="block max-w-72 truncate" title={item.key}>
+                          {item.file.name}
+                        </span>
+                      </TableCell>
+                      <TableCell className="px-4 text-right">{formatBytes(item.file.size)}</TableCell>
+                      <TableCell className="px-4">
+                        <StatusBadge tone={uploadDialogStatusTone(item.status)}>
+                          {uploadDialogStatusLabel(item.status)}
+                        </StatusBadge>
+                      </TableCell>
+                      <TableCell className="px-4">
+                        <UploadDialogProgress item={item} />
+                      </TableCell>
+                      <TableCell className="px-4">
+                        <span className="block max-w-44 truncate text-muted-foreground" title={item.error}>
+                          {item.error ?? '-'}
+                        </span>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+              <ScrollBar orientation="horizontal" />
+            </ScrollArea>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={uploading}>
+            Close
+          </Button>
+          {retryableFailedCount > 0 && (
+            <Button variant="outline" onClick={() => uploadItems('failed')} disabled={uploading}>
+              <RotateCcw data-icon="inline-start" /> Retry failed
+            </Button>
+          )}
+          <Button onClick={() => uploadItems('queued')} disabled={uploading || queuedCount === 0}>
+            {uploading ? (
+              <Loader2 data-icon="inline-start" className="animate-spin" />
+            ) : (
+              <Upload data-icon="inline-start" />
+            )}
+            Upload
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function createUploadDialogItem(
+  file: File,
+  key: string,
+  index: number,
+  duplicateKeys: ReadonlySet<string>
+): UploadDialogItem {
+  const sizeError = validateFOCUploadSize(file.size)
+  const duplicateError = duplicateKeys.has(key) ? 'Duplicate object key in selected files' : null
+  const error = sizeError ?? duplicateError ?? undefined
+  return {
+    id: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+    file,
+    key,
+    status: error ? 'failed' : 'queued',
+    loaded: 0,
+    total: file.size,
+    percent: 0,
+    retryable: false,
+    error,
+  }
+}
+
+function updateUploadDialogItems(updater: (item: UploadDialogItem) => UploadDialogItem) {
+  return (items: UploadDialogItem[]) => items.map((item) => updater(item))
+}
+
+function itemsSetUploading(id: string, total: number) {
+  return updateUploadDialogItems((item) =>
+    item.id === id
+      ? { ...item, status: 'uploading', loaded: 0, total, percent: 0, retryable: false, error: undefined }
+      : item
+  )
+}
+
+function itemsSetProgress(id: string, progress: ObjectUploadClientProgress) {
+  return updateUploadDialogItems((item) =>
+    item.id === id
+      ? {
+          ...item,
+          loaded: progress.loaded,
+          total: progress.total,
+          percent: Math.max(0, Math.min(100, progress.percent)),
+        }
+      : item
+  )
+}
+
+function itemsSetSuccess(id: string, total: number) {
+  return updateUploadDialogItems((item) =>
+    item.id === id
+      ? { ...item, status: 'success', loaded: total, total, percent: 100, retryable: false, error: undefined }
+      : item
+  )
+}
+
+function itemsSetFailed(id: string, message: string, retryable = true) {
+  return updateUploadDialogItems((item) =>
+    item.id === id ? { ...item, status: 'failed', retryable, error: message } : item
+  )
+}
+
+function UploadDialogProgress({ item }: { item: UploadDialogItem }) {
+  const percent = item.status === 'success' ? 100 : item.percent
+  return (
+    <div className="inline-flex w-36 shrink-0 items-center gap-2" title={`${percent}% uploaded`}>
+      <Progress value={percent} className="min-w-0 flex-1" />
+      <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted-foreground">{percent}%</span>
+    </div>
+  )
+}
+
+function uploadDialogStatusLabel(status: UploadDialogStatus) {
+  switch (status) {
+    case 'queued':
+      return 'Queued'
+    case 'uploading':
+      return 'Uploading'
+    case 'success':
+      return 'Uploaded'
+    case 'failed':
+      return 'Failed'
+  }
+}
+
+function uploadDialogStatusTone(status: UploadDialogStatus): StatusTone {
+  switch (status) {
+    case 'success':
+      return 'success'
+    case 'uploading':
+      return 'info'
+    case 'failed':
+      return 'danger'
+    case 'queued':
+      return 'neutral'
+  }
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : 'Upload failed'
 }
 
 function BucketDetailsSheet({
