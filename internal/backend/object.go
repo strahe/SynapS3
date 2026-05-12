@@ -354,6 +354,8 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 	return result, nil
 }
 
+const deleteObjectsMaxObjects = 1000
+
 func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
 	if input == nil || input.Bucket == nil || input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
@@ -363,9 +365,43 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 	if err != nil {
 		return nil, err
 	}
-	key := *input.Key
+	return b.deleteObjectInBucket(ctx, bucket, *input.Key, derefStr(input.VersionId))
+}
 
-	if input.VersionId == nil || *input.VersionId == "" {
+func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
+	if input == nil || input.Bucket == nil || input.Delete == nil {
+		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+
+	bucket, err := b.requireActiveBucket(ctx, *input.Bucket)
+	if err != nil {
+		return s3response.DeleteResult{}, err
+	}
+	if len(input.Delete.Objects) > deleteObjectsMaxObjects {
+		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrMalformedXML)
+	}
+
+	// TODO: Support Quiet after upstream issue is resolved: https://github.com/versity/versitygw/issues/2124
+	result := s3response.DeleteResult{}
+	for _, obj := range input.Delete.Objects {
+		if obj.Key == nil || *obj.Key == "" {
+			result.Error = append(result.Error, deleteObjectsEntryError(obj.Key, obj.VersionId, s3err.GetAPIError(s3err.ErrInvalidArgument)))
+			continue
+		}
+
+		out, err := b.deleteObjectInBucket(ctx, bucket, *obj.Key, derefStr(obj.VersionId))
+		if err != nil {
+			result.Error = append(result.Error, deleteObjectsEntryError(obj.Key, obj.VersionId, err))
+			continue
+		}
+		result.Deleted = append(result.Deleted, deleteObjectsDeletedObject(obj, out))
+	}
+
+	return result, nil
+}
+
+func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model.Bucket, key string, versionID string) (*s3.DeleteObjectOutput, error) {
+	if versionID == "" {
 		marker, err := b.repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, key, model.NewVersionID())
 		if err != nil {
 			return nil, fmt.Errorf("creating delete marker: %w", err)
@@ -377,7 +413,6 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 		}, nil
 	}
 
-	versionID := *input.VersionId
 	version, err := b.repos.Objects.GetVersionByBucketKeyAndID(ctx, bucket.ID, key, versionID)
 	if err != nil {
 		return nil, fmt.Errorf("querying object version for delete: %w", err)
@@ -419,6 +454,46 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 		DeleteMarker: &deleteMarker,
 		VersionId:    &versionID,
 	}, nil
+}
+
+func deleteObjectsDeletedObject(obj types.ObjectIdentifier, out *s3.DeleteObjectOutput) types.DeletedObject {
+	deleted := types.DeletedObject{
+		Key: obj.Key,
+	}
+	if derefStr(obj.VersionId) != "" {
+		deleted.VersionId = obj.VersionId
+	}
+	if out.DeleteMarker != nil && *out.DeleteMarker {
+		deleted.DeleteMarker = out.DeleteMarker
+		deleted.DeleteMarkerVersionId = out.VersionId
+		return deleted
+	}
+	if derefStr(obj.VersionId) != "" {
+		deleteMarker := false
+		deleted.DeleteMarker = &deleteMarker
+	}
+	return deleted
+}
+
+func deleteObjectsEntryError(key *string, versionID *string, err error) types.Error {
+	if apiErr, ok := errors.AsType[s3err.APIError](err); ok {
+		code := apiErr.Code
+		message := apiErr.Description
+		return types.Error{
+			Key:       key,
+			VersionId: versionID,
+			Code:      &code,
+			Message:   &message,
+		}
+	}
+	code := "InternalError"
+	message := err.Error()
+	return types.Error{
+		Key:       key,
+		VersionId: versionID,
+		Code:      &code,
+		Message:   &message,
+	}
 }
 
 func (b *SynapseBackend) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) {

@@ -1721,6 +1721,239 @@ func TestDeleteObject_DataVersionPermanentDeleteRemovesCurrentVisibleVersion(t *
 	}
 }
 
+func TestDeleteObjects_EmptyListReturnsEmptyResult(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-empty-bucket")
+
+	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-empty-bucket"),
+		Delete: &types.Delete{},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects(empty): %v", err)
+	}
+	if len(out.Deleted) != 0 || len(out.Error) != 0 {
+		t.Fatalf("DeleteObjects(empty) = %#v, want empty result", out)
+	}
+}
+
+func TestDeleteObjects_TooManyObjectsReturnsRequestError(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-too-many-bucket")
+	putTestObject(t, tb, "delete-objects-too-many-bucket", "file-0000", "data")
+
+	objects := make([]types.ObjectIdentifier, 1001)
+	for i := range objects {
+		objects[i] = types.ObjectIdentifier{Key: aws.String(fmt.Sprintf("file-%04d", i))}
+	}
+
+	_, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-too-many-bucket"),
+		Delete: &types.Delete{
+			Objects: objects,
+		},
+	})
+	if err == nil {
+		t.Fatal("DeleteObjects returned nil error for more than 1000 objects")
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("DeleteObjects error = %T %v, want APIError", err, err)
+	}
+	if want := s3err.GetAPIError(s3err.ErrMalformedXML); apiErr.Code != want.Code {
+		t.Fatalf("DeleteObjects code = %q, want %q", apiErr.Code, want.Code)
+	}
+
+	got, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("delete-objects-too-many-bucket"),
+		Key:    aws.String("file-0000"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject(file-0000): %v", err)
+	}
+	defer func() { _ = got.Body.Close() }()
+}
+
+func TestDeleteObjects_MixedSuccessAndMissingVersionReturnsEntryResults(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-mixed-bucket")
+	putTestObject(t, tb, "delete-objects-mixed-bucket", "file.txt", "data")
+
+	missingVersionID := "missing-version"
+	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-mixed-bucket"),
+		Delete: &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String("file.txt")},
+				{Key: aws.String("file.txt"), VersionId: aws.String(missingVersionID)},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects(mixed): %v", err)
+	}
+	if len(out.Deleted) != 1 {
+		t.Fatalf("Deleted = %#v, want one entry", out.Deleted)
+	}
+	deleted := out.Deleted[0]
+	if deleted.Key == nil || *deleted.Key != "file.txt" {
+		t.Fatalf("deleted key = %v, want file.txt", deleted.Key)
+	}
+	if deleted.DeleteMarker == nil || !*deleted.DeleteMarker {
+		t.Fatalf("deleted DeleteMarker = %v, want true", deleted.DeleteMarker)
+	}
+	if deleted.DeleteMarkerVersionId == nil || *deleted.DeleteMarkerVersionId == "" {
+		t.Fatalf("deleted DeleteMarkerVersionId = %v, want marker version", deleted.DeleteMarkerVersionId)
+	}
+	if len(out.Error) != 1 {
+		t.Fatalf("Error = %#v, want one entry", out.Error)
+	}
+	entryErr := out.Error[0]
+	wantErr := s3err.GetAPIError(s3err.ErrNoSuchVersion)
+	if entryErr.Code == nil || *entryErr.Code != wantErr.Code {
+		t.Fatalf("error code = %v, want %q", entryErr.Code, wantErr.Code)
+	}
+	if entryErr.VersionId == nil || *entryErr.VersionId != missingVersionID {
+		t.Fatalf("error version id = %v, want %s", entryErr.VersionId, missingVersionID)
+	}
+}
+
+func TestDeleteObjects_DeleteMarkerVersionRestoresObject(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-marker-bucket")
+	putTestObject(t, tb, "delete-objects-marker-bucket", "file.txt", "restored")
+	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("delete-objects-marker-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject(marker): %v", err)
+	}
+
+	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-marker-bucket"),
+		Delete: &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String("file.txt"), VersionId: marker.VersionId},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects(marker version): %v", err)
+	}
+	if len(out.Error) != 0 {
+		t.Fatalf("Error = %#v, want none", out.Error)
+	}
+	if len(out.Deleted) != 1 {
+		t.Fatalf("Deleted = %#v, want one entry", out.Deleted)
+	}
+	deleted := out.Deleted[0]
+	if deleted.DeleteMarker == nil || !*deleted.DeleteMarker {
+		t.Fatalf("deleted DeleteMarker = %v, want true", deleted.DeleteMarker)
+	}
+	if deleted.VersionId == nil || *deleted.VersionId != *marker.VersionId {
+		t.Fatalf("deleted VersionId = %v, want %s", deleted.VersionId, *marker.VersionId)
+	}
+	if deleted.DeleteMarkerVersionId == nil || *deleted.DeleteMarkerVersionId != *marker.VersionId {
+		t.Fatalf("deleted DeleteMarkerVersionId = %v, want %s", deleted.DeleteMarkerVersionId, *marker.VersionId)
+	}
+
+	got, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("delete-objects-marker-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject(restored): %v", err)
+	}
+	defer func() { _ = got.Body.Close() }()
+	body, _ := io.ReadAll(got.Body)
+	if string(body) != "restored" {
+		t.Fatalf("restored body = %q, want restored", string(body))
+	}
+}
+
+func TestDeleteObjects_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-data-version-bucket")
+
+	putOut := putTestObjectOutput(t, tb, "delete-objects-data-version-bucket", "file.txt", "data")
+	if _, err := tb.db.NewRaw(`UPDATE tasks SET status = ? WHERE ref_type = ? AND ref_version_id = ?`, model.TaskStatusCompleted, "object", putOut.VersionID).Exec(ctx); err != nil {
+		t.Fatalf("complete upload task: %v", err)
+	}
+	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("delete-objects-data-version-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject(marker): %v", err)
+	}
+	versionBeforeDelete, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil || versionBeforeDelete == nil {
+		t.Fatalf("GetVersionByID(before delete): version=%v err=%v", versionBeforeDelete, err)
+	}
+	if !tb.cache.Exists(ctx, "delete-objects-data-version-bucket", versionBeforeDelete.CacheKey) {
+		t.Fatal("expected cache file before permanent delete")
+	}
+
+	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-data-version-bucket"),
+		Delete: &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String("file.txt"), VersionId: aws.String(putOut.VersionID)},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects(data version): %v", err)
+	}
+	if len(out.Error) != 0 {
+		t.Fatalf("Error = %#v, want none", out.Error)
+	}
+	if len(out.Deleted) != 1 {
+		t.Fatalf("Deleted = %#v, want one entry", out.Deleted)
+	}
+	deleted := out.Deleted[0]
+	if deleted.VersionId == nil || *deleted.VersionId != putOut.VersionID {
+		t.Fatalf("deleted VersionId = %v, want %s", deleted.VersionId, putOut.VersionID)
+	}
+	if deleted.DeleteMarker == nil || *deleted.DeleteMarker {
+		t.Fatalf("deleted DeleteMarker = %v, want false", deleted.DeleteMarker)
+	}
+
+	removed, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(after delete): %v", err)
+	}
+	if removed != nil {
+		t.Fatalf("deleted data version still exists: %#v", removed)
+	}
+	if tb.cache.Exists(ctx, "delete-objects-data-version-bucket", versionBeforeDelete.CacheKey) {
+		t.Fatal("cache file still exists after permanent delete")
+	}
+	var cacheStatus string
+	if err := tb.db.NewRaw(`SELECT cache_cleanup_status FROM object_deletions WHERE version_id = ?`, putOut.VersionID).Scan(ctx, &cacheStatus); err != nil {
+		t.Fatalf("object deletion cache status: %v", err)
+	}
+	if cacheStatus != string(model.CacheCleanupStatusDeleted) {
+		t.Fatalf("cache cleanup status = %q, want %q", cacheStatus, model.CacheCleanupStatusDeleted)
+	}
+
+	versionsOut, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String("delete-objects-data-version-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.Versions) != 0 || len(versionsOut.DeleteMarkers) != 1 || *versionsOut.DeleteMarkers[0].VersionId != *marker.VersionId {
+		t.Fatalf("versions=%#v markers=%#v, want only marker %s", versionsOut.Versions, versionsOut.DeleteMarkers, *marker.VersionId)
+	}
+}
+
 // ---------- CopyObject ----------
 
 func TestCopyObject_HappyPath(t *testing.T) {

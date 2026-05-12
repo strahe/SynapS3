@@ -868,24 +868,58 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 	}
 }
 
-func TestIntegration_DeleteObjects_Batch_NotSupported(t *testing.T) {
+func TestIntegration_DeleteObjects_BatchCreatesDeleteMarkers(t *testing.T) {
 	ib := newIntegrationBackend(t)
 	ctx := context.Background()
 
 	testutil.SeedBucket(t, ib.db, "bucket")
 	putObject(t, ib.backend, "bucket", "file-a", "aaa")
+	putObject(t, ib.backend, "bucket", "file-b", "bbb")
 
-	// DeleteObjects should return an error (501 Not Implemented)
-	_, err := ib.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+	out, err := ib.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 		Bucket: strPtr("bucket"),
 		Delete: &types.Delete{
 			Objects: []types.ObjectIdentifier{
 				{Key: strPtr("file-a")},
+				{Key: strPtr("file-b")},
 			},
 		},
 	})
-	if err == nil {
-		t.Fatal("expected DeleteObjects to return error (not supported)")
+	if err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+	if len(out.Error) != 0 {
+		t.Fatalf("DeleteObjects errors = %#v, want none", out.Error)
+	}
+	if len(out.Deleted) != 2 {
+		t.Fatalf("DeleteObjects deleted = %#v, want two entries", out.Deleted)
+	}
+	for _, deleted := range out.Deleted {
+		if deleted.Key == nil || *deleted.Key == "" {
+			t.Fatalf("deleted entry missing key: %#v", deleted)
+		}
+		if deleted.DeleteMarker == nil || !*deleted.DeleteMarker {
+			t.Fatalf("deleted entry DeleteMarker = %v, want true", deleted.DeleteMarker)
+		}
+		if deleted.DeleteMarkerVersionId == nil || *deleted.DeleteMarkerVersionId == "" {
+			t.Fatalf("deleted entry missing DeleteMarkerVersionId: %#v", deleted)
+		}
+	}
+
+	listOut, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: strPtr("bucket")})
+	if err != nil {
+		t.Fatalf("ListObjectsV2: %v", err)
+	}
+	if len(listOut.Contents) != 0 {
+		t.Fatalf("ListObjectsV2 contents = %#v, want hidden objects", listOut.Contents)
+	}
+
+	versionsOut, err := ib.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: strPtr("bucket")})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.Versions) != 2 || len(versionsOut.DeleteMarkers) != 2 {
+		t.Fatalf("versions=%#v deleteMarkers=%#v, want two data versions and two delete markers", versionsOut.Versions, versionsOut.DeleteMarkers)
 	}
 }
 
