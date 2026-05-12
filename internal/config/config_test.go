@@ -670,11 +670,24 @@ func TestDefaultConfig_ServerConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() failed: %v", err)
 	}
-	if cfg.Server.MaxConnections != 250000 {
-		t.Errorf("Server.MaxConnections = %d, want 250000", cfg.Server.MaxConnections)
+	if cfg.Server.MaxConnections != 4096 {
+		t.Errorf("Server.MaxConnections = %d, want 4096", cfg.Server.MaxConnections)
 	}
-	if cfg.Server.MaxRequests != 100000 {
-		t.Errorf("Server.MaxRequests = %d, want 100000", cfg.Server.MaxRequests)
+	if cfg.Server.MaxRequests != 512 {
+		t.Errorf("Server.MaxRequests = %d, want 512", cfg.Server.MaxRequests)
+	}
+}
+
+func TestDefaultConfig_DatabasePool(t *testing.T) {
+	cfg, err := DefaultConfig()
+	if err != nil {
+		t.Fatalf("DefaultConfig() failed: %v", err)
+	}
+	if cfg.Database.MaxOpenConns != 4 {
+		t.Errorf("Database.MaxOpenConns = %d, want 4", cfg.Database.MaxOpenConns)
+	}
+	if cfg.Database.MaxIdleConns != 2 {
+		t.Errorf("Database.MaxIdleConns = %d, want 2", cfg.Database.MaxIdleConns)
 	}
 }
 
@@ -730,9 +743,8 @@ func assertSQLiteDSNPath(t *testing.T, dsn, wantPath string) {
 	if filepath.Clean(filepath.FromSlash(parsedPath)) != filepath.Clean(wantPath) {
 		t.Fatalf("DSN path = %q, want %q", filepath.FromSlash(parsedPath), wantPath)
 	}
-	pragmas := u.Query()["_pragma"]
-	if len(pragmas) != 2 || pragmas[0] != "journal_mode(WAL)" || pragmas[1] != "busy_timeout(5000)" {
-		t.Fatalf("DSN _pragma values = %#v, want journal_mode(WAL), busy_timeout(5000)", pragmas)
+	if u.RawQuery != "" {
+		t.Fatalf("DSN query = %q, want empty", u.RawQuery)
 	}
 }
 

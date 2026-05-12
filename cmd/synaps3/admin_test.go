@@ -352,6 +352,76 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 		}
 	})
 
+	t.Run("network casing does not require yes", func(t *testing.T) {
+		var putCalled bool
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/settings":
+				writeAdminTestJSON(t, w, http.StatusOK, adminTestSettings("calibration", false))
+			case r.Method == http.MethodPut && r.URL.Path == "/api/v1/settings":
+				putCalled = true
+				writeAdminTestJSON(t, w, http.StatusOK, adminTestSettings("CALIBRATION", false))
+			default:
+				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer ts.Close()
+
+		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "settings", "set", "filecoin.network=CALIBRATION"}); err != nil {
+			t.Fatalf("settings set failed: %v\n%s", err, out)
+		}
+		if !putCalled {
+			t.Fatal("PUT was not sent")
+		}
+	})
+
+	t.Run("increased server limits require yes before put", func(t *testing.T) {
+		var putCalled bool
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/settings":
+				writeAdminTestJSON(t, w, http.StatusOK, adminTestSettings("calibration", false))
+			case r.Method == http.MethodPut:
+				putCalled = true
+				t.Fatalf("PUT should not be sent")
+			default:
+				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer ts.Close()
+
+		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "settings", "set", "server.max_connections=8192"})
+		if err == nil {
+			t.Fatalf("expected error, output:\n%s", out)
+		}
+		if putCalled {
+			t.Fatal("PUT was sent")
+		}
+	})
+
+	t.Run("lowered server limits do not require yes", func(t *testing.T) {
+		var putCalled bool
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/settings":
+				writeAdminTestJSON(t, w, http.StatusOK, adminTestSettings("calibration", false))
+			case r.Method == http.MethodPut && r.URL.Path == "/api/v1/settings":
+				putCalled = true
+				writeAdminTestJSON(t, w, http.StatusOK, adminTestSettings("calibration", false))
+			default:
+				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer ts.Close()
+
+		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "settings", "set", "server.max_requests=256"}); err != nil {
+			t.Fatalf("settings set failed: %v\n%s", err, out)
+		}
+		if !putCalled {
+			t.Fatal("PUT was not sent")
+		}
+	})
+
 	t.Run("payload is nested and typed", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
@@ -609,8 +679,8 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 		"config": map[string]any{
 			"server": map[string]any{
 				"port":            ":8080",
-				"max_connections": 250000,
-				"max_requests":    100000,
+				"max_connections": 4096,
+				"max_requests":    512,
 				"tls": map[string]any{
 					"enabled":   false,
 					"cert_file": "",

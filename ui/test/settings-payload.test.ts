@@ -8,8 +8,8 @@ function baseConfig(): SettingsEditableConfig {
   return {
     server: {
       port: ':8080',
-      max_connections: 250000,
-      max_requests: 100000,
+      max_connections: 4096,
+      max_requests: 512,
       tls: { enabled: false, cert_file: '', key_file: '' },
     },
     s3: { region: 'us-east-1' },

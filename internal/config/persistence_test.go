@@ -223,7 +223,7 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"[database]",
 		"driver = \"sqlite\"",
 		"dsn = ",
-		"# max_open_conns = 25",
+		"# max_open_conns = 4",
 		"[cache]",
 		"dir = ",
 		"# max_size_gb = 100",
@@ -234,6 +234,9 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 	} {
 		assertConfigContains(t, text, want)
 	}
+	if strings.Contains(text, "_pragma") {
+		t.Fatalf("generated config contains SQLite pragmas:\n%s", text)
+	}
 	assertGeneratedTOMLOnlyEnablesInitFields(t, text)
 
 	for _, disabled := range []string{
@@ -242,7 +245,7 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"level = \"info\"",
 		"format = \"text\"",
 		"enabled = true",
-		"max_open_conns = 25",
+		"max_open_conns = 4",
 		"max_size_gb = 100",
 		"eviction_policy = \"lru\"",
 	} {
@@ -371,7 +374,7 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 	for _, want := range []string{
 		"# Database connection string.",
 		"# dsn = \"\"",
-		"# max_open_conns = 25",
+		"# max_open_conns = 4",
 		"driver = \"sqlite\"",
 		"dir = \"/var/lib/synaps3/cache\"",
 	} {
@@ -382,8 +385,8 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 	}
 	for _, disabled := range []string{
 		"dsn = \"postgres://synaps3:password@example.invalid:5432/synaps3\"",
-		"max_open_conns = 25",
-		"max_idle_conns = 5",
+		"max_open_conns = 4",
+		"max_idle_conns = 2",
 	} {
 		assertConfigLacksEnabledLine(t, text, disabled)
 	}

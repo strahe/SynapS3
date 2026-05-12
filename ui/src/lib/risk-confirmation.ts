@@ -64,6 +64,24 @@ export function collectSettingsRiskChanges(
     'medium',
     'Changes the TLS private key used by the S3 API listener.'
   )
+  if (next.server.max_connections > initial.server.max_connections) {
+    addChanged(
+      'server.max_connections',
+      initial.server.max_connections,
+      next.server.max_connections,
+      'medium',
+      'Increases the maximum concurrent TCP connections accepted by the S3 server.'
+    )
+  }
+  if (next.server.max_requests > initial.server.max_requests) {
+    addChanged(
+      'server.max_requests',
+      initial.server.max_requests,
+      next.server.max_requests,
+      'medium',
+      'Increases the maximum in-flight S3 requests before SlowDown responses.'
+    )
+  }
   addChanged('s3.region', initial.s3.region, next.s3.region, 'medium', 'Changes the S3 region reported to clients.')
 
   addChanged(

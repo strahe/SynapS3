@@ -133,8 +133,8 @@ func defaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Port:           ":8080",
-			MaxConnections: 250000,
-			MaxRequests:    100000,
+			MaxConnections: 4096,
+			MaxRequests:    512,
 		},
 		S3: S3Config{
 			Region: "us-east-1",
@@ -147,8 +147,8 @@ func defaultConfig() *Config {
 		},
 		Database: DatabaseConfig{
 			Driver:       "sqlite",
-			MaxOpenConns: 25,
-			MaxIdleConns: 5,
+			MaxOpenConns: 4,
+			MaxIdleConns: 2,
 		},
 		Cache: CacheConfig{
 			MaxSizeGB:      100,
@@ -207,7 +207,6 @@ func defaultSQLiteDSN(appDataDir string) string {
 		Scheme: "file",
 		Path:   urlPath,
 	}
-	u.RawQuery = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 	return u.String()
 }
 

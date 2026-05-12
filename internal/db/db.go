@@ -156,18 +156,57 @@ func normalizeFileURLPath(path string) string {
 }
 
 func ensureSQLitePragmas(dsn string) string {
-	dsn = ensureSQLitePragma(dsn, "foreign_keys(1)", "foreign_keys=")
-	return ensureSQLitePragma(dsn, "busy_timeout(5000)", "busy_timeout=")
+	if _, ok, _ := sqliteFilePath(dsn); ok {
+		dsn = ensureSQLitePragma(dsn, "journal_mode", "journal_mode(WAL)")
+	}
+	dsn = ensureSQLitePragma(dsn, "foreign_keys", "foreign_keys(1)")
+	return ensureSQLitePragma(dsn, "busy_timeout", "busy_timeout(5000)")
 }
 
-func ensureSQLitePragma(dsn, pragma, assignment string) string {
-	lower := strings.ToLower(dsn)
-	name := strings.TrimSuffix(strings.SplitN(pragma, "(", 2)[0], "(")
-	if strings.Contains(lower, name+"(") || strings.Contains(lower, assignment) {
+func ensureSQLitePragma(dsn, name, pragma string) string {
+	if sqliteDSNHasPragma(dsn, name) {
 		return dsn
 	}
 	if strings.Contains(dsn, "?") {
 		return dsn + "&_pragma=" + pragma
 	}
 	return dsn + "?_pragma=" + pragma
+}
+
+func sqliteDSNHasPragma(dsn, name string) bool {
+	_, rawQuery, ok := strings.Cut(dsn, "?")
+	if !ok {
+		return false
+	}
+
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+	for key, entries := range values {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+		if !strings.EqualFold(key, "_pragma") {
+			continue
+		}
+		for _, entry := range entries {
+			if strings.EqualFold(sqlitePragmaName(entry), name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sqlitePragmaName(entry string) string {
+	entry = strings.TrimSpace(entry)
+	entry = strings.TrimPrefix(strings.ToLower(entry), "pragma ")
+	if before, _, ok := strings.Cut(entry, "("); ok {
+		return strings.TrimSpace(before)
+	}
+	if before, _, ok := strings.Cut(entry, "="); ok {
+		return strings.TrimSpace(before)
+	}
+	return strings.ToLower(entry)
 }

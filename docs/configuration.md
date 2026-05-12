@@ -60,6 +60,7 @@ Default local paths:
 ```
 
 SQLite WAL and SHM files are expected. Explicit `database.dsn` and `cache.dir` values take precedence.
+For SQLite, `database.dsn` only needs the database file URL. SynapS3 manages SQLite runtime pragmas.
 
 ## Environment Overrides
 
@@ -106,6 +107,32 @@ Allowed values:
 - `logging.s3_access.level`: `debug`, `info`, `warn`, `error`
 
 S3 access logs are emitted through the SynapS3 runtime logger. Set `logging.s3_access.enabled = false` to disable them.
+
+Default capacity settings are conservative for a single-node installation:
+
+```toml
+[server]
+max_connections = 4096
+max_requests = 512
+
+[database]
+max_open_conns = 4
+max_idle_conns = 2
+```
+
+`server.max_connections` limits concurrent TCP connections. `server.max_requests` limits in-flight S3 requests before SlowDown responses. Increase them only with matching file descriptor, memory, database, disk, and backend capacity.
+
+SQLite DSNs should stay simple:
+
+```toml
+[database]
+driver = "sqlite"
+dsn = "file:///var/lib/synaps3/db/synaps3.db"
+```
+
+SynapS3 adds SQLite runtime pragmas. File-backed SQLite gets `journal_mode(WAL)`, `busy_timeout(5000)`, and `foreign_keys(1)`. In-memory SQLite skips WAL and still gets `busy_timeout(5000)` and `foreign_keys(1)`. Postgres DSNs are passed through unchanged.
+
+`cache.eviction_policy = "lru"` queues local cache eviction after remote storage succeeds. It is not a general least-recently-used cache scanner.
 
 ## Production Example
 

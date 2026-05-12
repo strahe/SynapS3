@@ -244,7 +244,7 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			Name: "database",
 			Fields: []initFieldDescriptor{
 				{Field: "database.driver", Key: "driver", Value: quoteTOMLString(cfg.Database.Driver), Enabled: !saveMode || presence.DatabaseDriver, Notes: []string{"Enabled with database.dsn so this installation uses SQLite at the initialized path.", "Allowed: sqlite, postgres."}},
-				{Field: "database.dsn", Key: "dsn", Value: quoteTOMLString(cfg.Database.DSN), Enabled: !saveMode || presence.DatabaseDSN},
+				{Field: "database.dsn", Key: "dsn", Value: quoteTOMLString(cfg.Database.DSN), Enabled: !saveMode || presence.DatabaseDSN, Notes: []string{"For SQLite, provide only the database file URL; SynapS3 manages SQLite pragmas."}},
 				{Field: "database.max_open_conns", Key: "max_open_conns", Value: strconv.Itoa(cfg.Database.MaxOpenConns), Enabled: saveMode && presence.DatabaseMaxOpen},
 				{Field: "database.max_idle_conns", Key: "max_idle_conns", Value: strconv.Itoa(cfg.Database.MaxIdleConns), Enabled: saveMode && presence.DatabaseMaxIdle},
 			},
@@ -254,7 +254,7 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			Fields: []initFieldDescriptor{
 				{Field: "cache.dir", Key: "dir", Value: quoteTOMLString(cfg.Cache.Dir), Enabled: !saveMode || presence.CacheDir, Notes: []string{"Enabled so this installation uses the initialized cache directory."}},
 				{Field: "cache.max_size_gb", Key: "max_size_gb", Value: strconv.Itoa(cfg.Cache.MaxSizeGB), Enabled: saveMode},
-				{Field: "cache.eviction_policy", Key: "eviction_policy", Value: quoteTOMLString(cfg.Cache.EvictionPolicy), Enabled: saveMode, Notes: []string{"Allowed: lru, manual, none."}},
+				{Field: "cache.eviction_policy", Key: "eviction_policy", Value: quoteTOMLString(cfg.Cache.EvictionPolicy), Enabled: saveMode, Notes: []string{"Allowed: lru, manual, none.", "lru queues local cache eviction after remote storage succeeds."}},
 			},
 		},
 		{

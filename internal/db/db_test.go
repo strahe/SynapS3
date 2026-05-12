@@ -270,6 +270,49 @@ func TestNew_SQLiteCreatesParentDirectory(t *testing.T) {
 	}
 }
 
+func TestNew_SQLiteFileDSNAppliesManagedPragmas(t *testing.T) {
+	t.Parallel()
+
+	dbDir := filepath.Join(t.TempDir(), "db")
+	cfg := config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.ToSlash(filepath.Join(dbDir, "synaps3.db")),
+		MaxOpenConns: 1,
+		MaxIdleConns: 1,
+	}
+
+	db, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	var journalMode string
+	if err := db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("PRAGMA journal_mode: %v", err)
+	}
+	if strings.ToLower(journalMode) != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", journalMode)
+	}
+
+	var busyTimeout int
+	if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("PRAGMA busy_timeout: %v", err)
+	}
+	if busyTimeout != 5000 {
+		t.Fatalf("busy_timeout = %d, want 5000", busyTimeout)
+	}
+
+	var foreignKeys int
+	if err := db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+		t.Fatalf("PRAGMA foreign_keys: %v", err)
+	}
+	if foreignKeys != 1 {
+		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
+	}
+}
+
 func TestNew_SQLiteMemoryDSNDoesNotCreateDirectories(t *testing.T) {
 	cwd := t.TempDir()
 	oldCWD, err := os.Getwd()
@@ -300,6 +343,106 @@ func TestNew_SQLiteMemoryDSNDoesNotCreateDirectories(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(cwd, "memory-dir")); !os.IsNotExist(err) {
 		t.Fatalf("memory DSN created directory unexpectedly, stat error = %v", err)
+	}
+}
+
+func TestNew_SQLiteMemoryDSNAppliesManagedConnectionPragmas(t *testing.T) {
+	t.Parallel()
+
+	for name, dsn := range map[string]string{
+		"colon": ":memory:",
+		"uri":   "file:managed-memory?mode=memory&cache=shared",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := config.DatabaseConfig{
+				Driver:       "sqlite",
+				DSN:          dsn,
+				MaxOpenConns: 1,
+				MaxIdleConns: 1,
+			}
+
+			db, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+
+			ctx := context.Background()
+			var journalMode string
+			if err := db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
+				t.Fatalf("PRAGMA journal_mode: %v", err)
+			}
+			if strings.EqualFold(journalMode, "wal") {
+				t.Fatalf("journal_mode = %q, want non-WAL memory journal", journalMode)
+			}
+
+			var busyTimeout int
+			if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+				t.Fatalf("PRAGMA busy_timeout: %v", err)
+			}
+			if busyTimeout != 5000 {
+				t.Fatalf("busy_timeout = %d, want 5000", busyTimeout)
+			}
+
+			var foreignKeys int
+			if err := db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+				t.Fatalf("PRAGMA foreign_keys: %v", err)
+			}
+			if foreignKeys != 1 {
+				t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
+			}
+		})
+	}
+}
+
+func TestEnsureSQLitePragmasDoesNotDuplicateExistingSettings(t *testing.T) {
+	for name, query := range map[string]string{
+		"pragma":     "_pragma=journal_mode(WAL)&_pragma=busy_timeout(7000)&_pragma=foreign_keys(1)",
+		"assignment": "journal_mode=WAL&busy_timeout=7000&foreign_keys=1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3.db")) + "?" + query
+
+			got := ensureSQLitePragmas(dsn)
+
+			for _, want := range []string{"journal_mode", "busy_timeout", "foreign_keys"} {
+				if count := strings.Count(strings.ToLower(got), want); count != 1 {
+					t.Fatalf("%s count = %d in %q, want 1", want, count, got)
+				}
+			}
+			if !strings.Contains(got, "busy_timeout=7000") && !strings.Contains(got, "busy_timeout(7000)") {
+				t.Fatalf("managed pragmas overwrote existing busy_timeout: %q", got)
+			}
+		})
+	}
+}
+
+func TestEnsureSQLitePragmasIgnoresSimilarQueryParameters(t *testing.T) {
+	dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3.db")) +
+		"?journal_mode_override=WAL&note=foreign_keys(1)&busy_timeout_ms=7000"
+
+	got := ensureSQLitePragmas(dsn)
+
+	for _, want := range []string{"journal_mode(WAL)", "foreign_keys(1)", "busy_timeout(5000)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("ensureSQLitePragmas() = %q, want %s", got, want)
+		}
+	}
+}
+
+func TestEnsureSQLitePragmasDoesNotAddWALForMemoryDSN(t *testing.T) {
+	for _, dsn := range []string{":memory:", "file:memory-dir/named?mode=memory&cache=shared"} {
+		got := ensureSQLitePragmas(dsn)
+		if strings.Contains(strings.ToLower(got), "journal_mode") {
+			t.Fatalf("ensureSQLitePragmas(%q) = %q, want no journal_mode", dsn, got)
+		}
+		for _, want := range []string{"foreign_keys(1)", "busy_timeout(5000)"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("ensureSQLitePragmas(%q) = %q, want %s", dsn, got, want)
+			}
+		}
 	}
 }
 

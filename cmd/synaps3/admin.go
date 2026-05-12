@@ -306,7 +306,7 @@ func adminSettingsCommand() *cli.Command {
 				Usage:     "update settings with field=value pairs",
 				ArgsUsage: "<field=value>...",
 				Flags: []cli.Flag{
-					&cli.BoolFlag{Name: "yes", Usage: "confirm high-risk settings changes"},
+					&cli.BoolFlag{Name: "yes", Usage: "confirm settings changes that require review"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Len() == 0 {
@@ -327,9 +327,9 @@ func adminSettingsCommand() *cli.Command {
 					if err := rejectEnvManagedSettings(current, updates.fields); err != nil {
 						return err
 					}
-					risks := highRiskSettingsChanges(current, updates.values)
-					if len(risks) > 0 && !cmd.Bool("yes") {
-						return fmt.Errorf("high-risk settings change requires --yes: %s", strings.Join(risks, ", "))
+					reviewRequired := reviewRequiredSettingsChanges(current, updates.values)
+					if len(reviewRequired) > 0 && !cmd.Bool("yes") {
+						return fmt.Errorf("settings change requires --yes: %s", strings.Join(reviewRequired, ", "))
 					}
 					var saved adminSettingsResponse
 					if err := client.putJSON(ctx, "/api/v1/settings", updates.payload, &saved, true); err != nil {
@@ -916,15 +916,22 @@ func rejectEnvManagedSettings(settings adminSettingsResponse, fields []string) e
 	return nil
 }
 
-func highRiskSettingsChanges(current adminSettingsResponse, values map[string]any) []string {
-	var risks []string
-	if value, ok := values["filecoin.network"].(string); ok && value != current.Config.Filecoin.Network {
-		risks = append(risks, "filecoin.network")
+func reviewRequiredSettingsChanges(current adminSettingsResponse, values map[string]any) []string {
+	var fields []string
+	if value, ok := values["server.max_connections"].(int); ok && value > current.Config.Server.MaxConnections {
+		fields = append(fields, "server.max_connections")
+	}
+	if value, ok := values["server.max_requests"].(int); ok && value > current.Config.Server.MaxRequests {
+		fields = append(fields, "server.max_requests")
+	}
+	if value, ok := values["filecoin.network"].(string); ok &&
+		!strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(current.Config.Filecoin.Network)) {
+		fields = append(fields, "filecoin.network")
 	}
 	if value, ok := values["filecoin.allow_private_networks"].(bool); ok && value && !current.Config.Filecoin.AllowPrivateNetworks {
-		risks = append(risks, "filecoin.allow_private_networks")
+		fields = append(fields, "filecoin.allow_private_networks")
 	}
-	return risks
+	return fields
 }
 
 func adminSettingsFieldValue(settings adminSettingsResponse, field string) (any, error) {

@@ -23,13 +23,13 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"server.max_connections": {
 		Label:       "Max Connections",
-		Description: "Maximum concurrent TCP connections accepted by the S3 server.",
+		Description: "Maximum concurrent TCP connections accepted by the S3 server. Increase only with matching file descriptor and memory capacity.",
 		Env:         "SYNAPS3_SERVER_MAX_CONNECTIONS",
 		Editable:    true,
 	},
 	"server.max_requests": {
 		Label:       "Max Requests",
-		Description: "Maximum in-flight S3 requests before excess requests receive SlowDown responses.",
+		Description: "Maximum in-flight S3 requests before excess requests receive SlowDown responses. Increase only with matching backend capacity.",
 		Env:         "SYNAPS3_SERVER_MAX_REQUESTS",
 		Editable:    true,
 	},
@@ -107,7 +107,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"database.dsn": {
 		Label:       "Database DSN",
-		Description: "Database connection string. Omit for the default SQLite database under the app data directory.",
+		Description: "Database connection string. SQLite only needs a file URL; SynapS3 manages SQLite runtime parameters.",
 		Env:         "SYNAPS3_DATABASE_DSN",
 		Secret:      true,
 	},
@@ -135,7 +135,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"cache.eviction_policy": {
 		Label:       "Eviction Policy",
-		Description: "Cache eviction mode: lru, manual, or none.",
+		Description: "Cache eviction mode: lru automatically evicts local cache after remote storage; manual and none do not.",
 		Env:         "SYNAPS3_CACHE_EVICTION_POLICY",
 		Editable:    true,
 	},

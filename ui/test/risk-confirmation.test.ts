@@ -14,6 +14,8 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'server.tls.cert_file': meta('TLS Cert File'),
   'server.tls.key_file': meta('TLS Key File'),
   'server.port': meta('S3 Port'),
+  'server.max_connections': meta('Max Connections'),
+  'server.max_requests': meta('Max Requests'),
   's3.region': meta('Region'),
   'filecoin.network': meta('Filecoin Network'),
   'filecoin.rpc_url': meta('Filecoin RPC URL'),
@@ -41,8 +43,8 @@ function baseConfig(): SettingsEditableConfig {
   return {
     server: {
       port: ':8080',
-      max_connections: 250000,
-      max_requests: 100000,
+      max_connections: 4096,
+      max_requests: 512,
       tls: {
         enabled: true,
         cert_file: '/certs/current.pem',
@@ -141,6 +143,8 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.server.tls.enabled = false
   next.server.tls.cert_file = '/certs/next.pem'
   next.server.tls.key_file = '/certs/next.key'
+  next.server.max_connections = 8192
+  next.server.max_requests = 1024
   next.s3.region = 'us-west-2'
   next.filecoin.rpc_url = 'https://rpc.example.invalid'
   next.filecoin.default_copies = 3
@@ -163,6 +167,8 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['server.tls.enabled', 'TLS Enabled', 'true', 'false', 'medium'],
       ['server.tls.cert_file', 'TLS Cert File', '/certs/current.pem', '/certs/next.pem', 'medium'],
       ['server.tls.key_file', 'TLS Key File', '/certs/current.key', '/certs/next.key', 'medium'],
+      ['server.max_connections', 'Max Connections', '4096', '8192', 'medium'],
+      ['server.max_requests', 'Max Requests', '512', '1024', 'medium'],
       ['s3.region', 'Region', 'us-east-1', 'us-west-2', 'medium'],
       [
         'filecoin.rpc_url',
@@ -185,4 +191,15 @@ test('settings risk collection reports review-level infrastructure changes', () 
   )
   assert.deepEqual([...new Set(changes.map(classifySettingsRisk))], ['review'])
   assert.equal(settingsRiskNeedsStrongConfirmation(changes), false)
+})
+
+test('settings risk collection ignores lowered server capacity limits', () => {
+  const initial = baseConfig()
+  const next = baseConfig()
+  next.server.max_connections = 2048
+  next.server.max_requests = 256
+
+  const changes = collectSettingsRiskChanges(initial, next, {}, metadata)
+
+  assert.deepEqual(changes, [])
 })
