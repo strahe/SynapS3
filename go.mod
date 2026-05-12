@@ -2,8 +2,6 @@ module github.com/strahe/synaps3
 
 go 1.26.3
 
-replace github.com/strahe/synapse-go => ../synapse-go
-
 require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.98.0
 	github.com/ethereum/go-ethereum v1.17.2
@@ -16,7 +14,7 @@ require (
 	github.com/knadh/koanf/v2 v2.3.4
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/prometheus/client_golang v1.23.2
-	github.com/strahe/synapse-go v0.2.1
+	github.com/strahe/synapse-go v0.3.0
 	github.com/uptrace/bun v1.2.18
 	github.com/uptrace/bun/dialect/pgdialect v1.2.18
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
