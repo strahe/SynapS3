@@ -64,6 +64,28 @@ func TestS3AccountsMigrationCreatesAccountAndOwnerSchema(t *testing.T) {
 	}
 }
 
+func TestMigrationCreatesStorageUploadSourceVersionIndex(t *testing.T) {
+	sqldb, err := sql.Open("sqlite", "file::memory:?cache=shared&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	migrator := migrate.NewMigrator(db, Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if !sqliteIndexExists(t, db, "idx_storage_uploads_source_version_id") {
+		t.Fatal("idx_storage_uploads_source_version_id index missing")
+	}
+}
+
 func sqliteTableExists(t *testing.T, db *bun.DB, table string) bool {
 	t.Helper()
 	var count int

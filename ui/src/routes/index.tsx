@@ -1,41 +1,16 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { Database, FileBox, HardDrive, Loader2 } from 'lucide-react'
-import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { createFileRoute, Link } from '@tanstack/react-router'
+import { CheckCircle2, ChevronRight, Database, FileBox, HardDrive, Loader2 } from 'lucide-react'
+import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useOverview } from '@/hooks/queries'
+import { attentionDisplayRows, overviewPipelineRows, type PipelineDisplayRow, workerHealthRows } from '@/lib/overview'
 import { formatBytes, formatDuration, formatNumber } from '@/lib/utils'
 
 export const Route = createFileRoute('/')({
   component: OverviewPage,
 })
-
-const STATE_COLORS: Record<string, string> = {
-  cached: 'var(--chart-1)',
-  uploading: 'var(--chart-2)',
-  committing: 'var(--chart-4)',
-  replicating: 'var(--chart-3)',
-  stored: 'var(--chart-5)',
-  failed: 'var(--destructive)',
-  cache_evicted: 'var(--muted-foreground)',
-  uploaded: 'var(--chart-3)',
-  onchaining: 'var(--chart-4)',
-  onchained: 'var(--chart-5)',
-}
-
-const STATUS_COLORS: Record<string, string> = {
-  queued: 'var(--chart-4)',
-  scheduled: 'var(--chart-3)',
-  waiting: 'var(--chart-2)',
-  running: 'var(--chart-2)',
-  completed: 'var(--chart-5)',
-  failed: 'var(--destructive)',
-  exhausted: 'var(--destructive)',
-  cancelled: 'var(--muted-foreground)',
-}
-
-const DEFAULT_CHART_COLOR = 'var(--muted-foreground)'
 
 function OverviewPage() {
   const { data, isLoading, error } = useOverview()
@@ -52,8 +27,13 @@ function OverviewPage() {
     return <div className="flex h-full items-center justify-center text-destructive">Failed to load overview data</div>
   }
 
-  const objStateData = Object.entries(data.objects.by_state).map(([name, value]) => ({ name, value }))
-  const taskStatusData = Object.entries(data.tasks.by_status).map(([name, value]) => ({ name, value }))
+  const attentionRows = attentionDisplayRows({
+    objects: data.objects.attention ?? { needs_attention: 0, unavailable: 0 },
+    tasks: data.tasks.attention ?? { failed: 0, exhausted: 0 },
+  })
+  const pipelineRows = overviewPipelineRows(data.tasks.active_pipeline ?? [])
+  const hasActiveTasks = pipelineRows.some((row) => row.total > 0)
+  const workers = workerHealthRows(data.workers)
   const cachePercent = data.cache.max_bytes > 0 ? (data.cache.used_bytes / data.cache.max_bytes) * 100 : 0
 
   return (
@@ -75,54 +55,43 @@ function OverviewPage() {
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Current Object Versions by State</CardTitle>
+            <CardTitle>Attention Needed</CardTitle>
           </CardHeader>
           <CardContent>
-            {objStateData.length > 0 ? (
-              <ResponsiveContainer width="100%" height={240}>
-                <PieChart>
-                  <Pie
-                    data={objStateData}
-                    dataKey="value"
-                    nameKey="name"
-                    cx="50%"
-                    cy="50%"
-                    outerRadius={80}
-                    label={({ name, value }) => `${name}: ${value}`}
-                  >
-                    {objStateData.map((entry) => (
-                      <Cell key={entry.name} fill={STATE_COLORS[entry.name] ?? DEFAULT_CHART_COLOR} />
-                    ))}
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
+            {attentionRows.length > 0 ? (
+              <div className="flex h-60 flex-col justify-center gap-3">
+                {attentionRows.map((row) => (
+                  <AttentionLinkRow key={row.key} row={row} />
+                ))}
+              </div>
             ) : (
-              <div className="flex h-60 items-center justify-center text-muted-foreground">No objects yet</div>
+              <div className="flex h-60 flex-col items-center justify-center gap-2 text-muted-foreground">
+                <CheckCircle2 className="size-5 text-status-success" />
+                <div className="text-sm text-foreground">No attention needed</div>
+                <div className="max-w-full text-center text-xs">
+                  Object failures 0 · Unavailable 0 · Failed tasks 0 · Retry limit reached 0
+                </div>
+              </div>
             )}
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle>Tasks by Status</CardTitle>
+            <CardTitle>Active Task Pipeline</CardTitle>
           </CardHeader>
           <CardContent>
-            {taskStatusData.length > 0 ? (
+            {hasActiveTasks ? (
               <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={taskStatusData}>
-                  <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                  <YAxis tick={{ fontSize: 12 }} />
-                  <Tooltip />
-                  <Bar dataKey="value">
-                    {taskStatusData.map((entry) => (
-                      <Cell key={entry.name} fill={STATUS_COLORS[entry.name] ?? DEFAULT_CHART_COLOR} />
-                    ))}
-                  </Bar>
+                <BarChart data={pipelineRows} layout="vertical" margin={{ top: 8, right: 24, bottom: 8, left: 8 }}>
+                  <XAxis type="number" tick={{ fontSize: 12 }} allowDecimals={false} />
+                  <YAxis type="category" dataKey="label" tick={{ fontSize: 12 }} width={72} />
+                  <Tooltip content={<PipelineTooltip />} />
+                  <Bar dataKey="total" fill="var(--chart-1)" radius={[0, 4, 4, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             ) : (
-              <div className="flex h-60 items-center justify-center text-muted-foreground">No tasks yet</div>
+              <div className="flex h-60 items-center justify-center text-muted-foreground">No active tasks</div>
             )}
           </CardContent>
         </Card>
@@ -135,15 +104,15 @@ function OverviewPage() {
           </CardHeader>
           <CardContent>
             <div className="flex flex-col gap-2">
-              {Object.entries(data.workers).map(([name, healthy]) => (
-                <div key={name} className="flex items-center justify-between">
-                  <span className="text-sm capitalize">{name}</span>
-                  <StatusBadge tone={healthy ? 'success' : 'danger'}>{healthy ? 'Healthy' : 'Unhealthy'}</StatusBadge>
+              {workers.map((worker) => (
+                <div key={worker.key} className="flex items-center justify-between">
+                  <span className="text-sm">{worker.label}</span>
+                  <StatusBadge tone={worker.healthy ? 'success' : 'danger'}>
+                    {worker.healthy ? 'Healthy' : 'Unhealthy'}
+                  </StatusBadge>
                 </div>
               ))}
-              {Object.keys(data.workers).length === 0 && (
-                <div className="text-sm text-muted-foreground">No workers registered</div>
-              )}
+              {workers.length === 0 && <div className="text-sm text-muted-foreground">No workers registered</div>}
             </div>
           </CardContent>
         </Card>
@@ -169,6 +138,66 @@ function OverviewPage() {
             </dl>
           </CardContent>
         </Card>
+      </div>
+    </div>
+  )
+}
+
+function AttentionLinkRow({ row }: { row: ReturnType<typeof attentionDisplayRows>[number] }) {
+  const content = (
+    <>
+      <span className="min-w-0 truncate text-sm text-foreground">{row.label}</span>
+      <span className="flex shrink-0 items-center gap-2">
+        <StatusBadge tone={row.tone}>{formatNumber(row.value)}</StatusBadge>
+        <ChevronRight className="size-4 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+      </span>
+    </>
+  )
+  const className =
+    'group flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+
+  if (row.target === 'tasks') {
+    return (
+      <Link
+        to="/tasks"
+        search={{ type: 'all', status: row.taskStatus }}
+        className={className}
+        aria-label={`${row.label}: ${formatNumber(row.value)}`}
+      >
+        {content}
+      </Link>
+    )
+  }
+
+  return (
+    <Link to="/buckets" className={className} aria-label={`${row.label}: ${formatNumber(row.value)}`}>
+      {content}
+    </Link>
+  )
+}
+
+interface PipelineTooltipProps {
+  active?: boolean
+  label?: string
+  payload?: Array<{ payload?: PipelineDisplayRow }>
+}
+
+function PipelineTooltip({ active, payload, label }: PipelineTooltipProps) {
+  if (!active) return null
+  const row = payload?.[0]?.payload
+  if (!row) return null
+  return (
+    <div className="rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
+      <div className="mb-1 font-medium">{label}</div>
+      <div className="grid grid-cols-[auto_auto] gap-x-3 gap-y-1">
+        <span className="text-muted-foreground">Queued</span>
+        <span className="text-right">{formatNumber(row.queued)}</span>
+        <span className="text-muted-foreground">Scheduled</span>
+        <span className="text-right">{formatNumber(row.scheduled)}</span>
+        <span className="text-muted-foreground">Waiting</span>
+        <span className="text-right">{formatNumber(row.waiting)}</span>
+        <span className="text-muted-foreground">Running</span>
+        <span className="text-right">{formatNumber(row.running)}</span>
       </div>
     </div>
   )

@@ -421,6 +421,15 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 	}
 	if _, err := db.NewCreateIndex().
 		Model((*model.StorageUpload)(nil)).
+		Index("idx_storage_uploads_source_version_id").
+		Column("source_version_id", "id").
+		Where("source_version_id <> ''").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating storage upload source version index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.StorageUpload)(nil)).
 		Index("idx_storage_uploads_content_status").
 		Column("bucket_id", "content_size", "checksum", "status", "accepted_at").
 		IfNotExists().

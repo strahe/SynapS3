@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { Loader2, RefreshCw, RotateCcw } from 'lucide-react'
-import { type ReactNode, useState } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import { api, type TaskItem, type TaskStorageCleanupDetail } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
@@ -28,11 +28,7 @@ import {
 } from '@/lib/storage-status-labels'
 import { formatBytes, timeAgo } from '@/lib/utils'
 
-export const Route = createFileRoute('/tasks')({
-  component: TasksPage,
-})
-
-const taskTypeTabs = ['upload', 'evict_cache', 'storage_cleanup'] as const
+const taskTypeTabs = ['all', 'upload', 'evict_cache', 'storage_cleanup'] as const
 const statusOptions = [
   'all',
   'queued',
@@ -59,6 +55,11 @@ const statusLabels: Record<string, string> = {
 const PAGE_SIZE = 20
 
 type TaskTypeTab = (typeof taskTypeTabs)[number]
+type TaskStatusFilter = Exclude<(typeof statusOptions)[number], 'all'>
+type TasksSearch = {
+  type?: TaskTypeTab
+  status?: TaskStatusFilter
+}
 type TaskDetailDialogState = { title: string; text: string }
 type TaskTableProps = {
   tasks: TaskItem[]
@@ -66,6 +67,22 @@ type TaskTableProps = {
   onRetry: (task: TaskItem) => void
   onOpenDetail: (dialog: TaskDetailDialogState) => void
 }
+
+const taskTypeSearchValues = new Set<string>(taskTypeTabs)
+const taskStatusSearchValues = new Set<string>(statusOptions.filter((option) => option !== 'all'))
+
+export const Route = createFileRoute('/tasks')({
+  validateSearch: (search: Record<string, unknown>): TasksSearch => {
+    const type = typeof search.type === 'string' && taskTypeSearchValues.has(search.type) ? search.type : undefined
+    const status =
+      typeof search.status === 'string' && taskStatusSearchValues.has(search.status) ? search.status : undefined
+    return {
+      type: type as TaskTypeTab | undefined,
+      status: status as TaskStatusFilter | undefined,
+    }
+  },
+  component: TasksPage,
+})
 
 function taskDetailText(task: TaskItem) {
   return task.status_message || task.last_error || ''
@@ -296,6 +313,49 @@ function TaskCommonCells({
   )
 }
 
+function AllTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTableProps) {
+  return (
+    <TaskTableFrame>
+      <Table>
+        <TableHeader>
+          <TableRow className="bg-muted/50">
+            <TableHead className="whitespace-nowrap px-3 py-2">ID</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Type</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Operation</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Object</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Status</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2 text-right">Retries</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Details</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Scheduled</TableHead>
+            <TableHead className="whitespace-nowrap px-3 py-2">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {tasks.length > 0 ? (
+            tasks.map((task) => (
+              <TableRow key={task.id}>
+                <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">{task.id}</TableCell>
+                <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                  {taskTypeLabel(task.type)}
+                </TableCell>
+                <TableCell className="whitespace-nowrap px-3 py-2">{taskOperationLabel(task)}</TableCell>
+                <TaskCommonCells
+                  task={task}
+                  retryPending={retryPending}
+                  onRetry={onRetry}
+                  onOpenDetail={onOpenDetail}
+                />
+              </TableRow>
+            ))
+          ) : (
+            <TaskEmptyRow colSpan={9} />
+          )}
+        </TableBody>
+      </Table>
+    </TaskTableFrame>
+  )
+}
+
 function UploadTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTableProps) {
   return (
     <TaskTableFrame>
@@ -396,11 +456,13 @@ function TaskEmptyRow({ colSpan }: { colSpan: number }) {
 }
 
 function TasksPage() {
-  const [status, setStatus] = useState('')
-  const [taskType, setTaskType] = useState<TaskTypeTab>('upload')
+  const search = Route.useSearch()
+  const [status, setStatus] = useState(search.status ?? '')
+  const [taskType, setTaskType] = useState<TaskTypeTab>(search.type ?? 'all')
   const [stage, setStage] = useState('')
   const [offset, setOffset] = useState(0)
-  const { data, isLoading, error } = useTasks(taskType, stage, status, PAGE_SIZE, offset)
+  const queryTaskType = taskType === 'all' ? '' : taskType
+  const { data, isLoading, error } = useTasks(queryTaskType, stage, status, PAGE_SIZE, offset)
   const qc = useQueryClient()
 
   const [retryTarget, setRetryTarget] = useState<TaskItem | null>(null)
@@ -416,6 +478,13 @@ function TasksPage() {
 
   const totalPages = data ? Math.ceil(data.total / PAGE_SIZE) : 0
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1
+
+  useEffect(() => {
+    setTaskType(search.type ?? 'all')
+    setStatus(search.status ?? '')
+    setStage('')
+    setOffset(0)
+  }, [search.type, search.status])
 
   function openRetryDialog(task: TaskItem) {
     if (retryPending) return
@@ -515,7 +584,14 @@ function TasksPage() {
         <div className="text-destructive">Failed to load tasks</div>
       ) : (
         <>
-          {taskType === 'upload' ? (
+          {taskType === 'all' ? (
+            <AllTasksTable
+              tasks={data?.tasks ?? []}
+              retryPending={retryPending}
+              onRetry={openRetryDialog}
+              onOpenDetail={setDetailDialog}
+            />
+          ) : taskType === 'upload' ? (
             <UploadTasksTable
               tasks={data?.tasks ?? []}
               retryPending={retryPending}

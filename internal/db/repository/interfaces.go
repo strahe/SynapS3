@@ -154,6 +154,7 @@ type ObjectRepository interface {
 	ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
 	// CountByState returns object counts grouped by state.
 	CountByState(ctx context.Context) ([]ObjectStateCount, error)
+	CountOverviewAttention(ctx context.Context) (ObjectAttentionCount, error)
 	// TotalSize returns the sum of current object sizes in bytes.
 	TotalSize(ctx context.Context) (int64, error)
 	// CountByBucket returns the number of current objects in a bucket.
@@ -391,6 +392,8 @@ type TaskRepository interface {
 	RetryExhausted(ctx context.Context, taskID int64) error
 	// CountByStatus returns task counts grouped by type and status.
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+	CountOverviewAttention(ctx context.Context) (TaskAttentionCount, error)
+	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
 	// CountActiveObjectTasksByBucket returns active object tasks
 	// whose referenced current object belongs to the given bucket.
 	CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error)
@@ -429,10 +432,26 @@ type TaskStatusCount struct {
 	Count  int64  `bun:"count"`
 }
 
+type TaskAttentionCount struct {
+	Failed    int64 `bun:"failed"`
+	Exhausted int64 `bun:"exhausted"`
+}
+
+type TaskPipelineCount struct {
+	Pipeline string `bun:"pipeline"`
+	Status   string `bun:"status"`
+	Count    int64  `bun:"count"`
+}
+
 // ObjectStateCount holds an object count grouped by state.
 type ObjectStateCount struct {
 	State string `bun:"state"`
 	Count int64  `bun:"count"`
+}
+
+type ObjectAttentionCount struct {
+	NeedsAttention int64 `bun:"needs_attention"`
+	Unavailable    int64 `bun:"unavailable"`
 }
 
 // BucketStatusCount holds a bucket count grouped by status.

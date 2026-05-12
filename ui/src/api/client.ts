@@ -38,8 +38,17 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
 
 export interface OverviewData {
   buckets: { total: number; by_status: Record<string, number> }
-  objects: { total: number; total_size_bytes: number; by_state: Record<string, number> }
-  tasks: { by_status: Record<string, number> }
+  objects: {
+    total: number
+    total_size_bytes: number
+    by_state: Record<string, number>
+    attention: { needs_attention: number; unavailable: number }
+  }
+  tasks: {
+    by_status: Record<string, number>
+    attention: { failed: number; exhausted: number }
+    active_pipeline: Array<{ pipeline: string; by_status: Record<string, number>; total: number }>
+  }
   cache: { used_bytes: number; max_bytes: number }
   workers: Record<string, boolean>
   system: { version: string; commit: string; build_date: string; uptime_seconds: number }

@@ -985,6 +985,94 @@ func TestTaskRepo_CountByStatus(t *testing.T) {
 	}
 }
 
+func TestTaskRepo_OverviewActivePipeline(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	prepare := seedTask(t, repos, model.TaskTypeUpload)
+	ensure := seedTask(t, repos, model.TaskTypeUpload)
+	upload := seedTask(t, repos, model.TaskTypeUpload)
+	commit := seedTask(t, repos, model.TaskTypeUpload)
+	syncPull := seedTask(t, repos, model.TaskTypeUpload)
+	syncCommit := seedTask(t, repos, model.TaskTypeUpload)
+	evict := seedTask(t, repos, model.TaskTypeEvictCache)
+	cleanup := seedTask(t, repos, model.TaskTypeStorageCleanup)
+	completed := seedTask(t, repos, model.TaskTypeUpload)
+	failed := seedTask(t, repos, model.TaskTypeUpload)
+	exhausted := seedTask(t, repos, model.TaskTypeEvictCache)
+
+	mustExec(t, db, `UPDATE tasks SET stage = NULL, status = ? WHERE id = ?`, model.TaskStatusQueued, prepare.ID)
+	mustExec(t, db, `UPDATE tasks SET stage = ?, status = ? WHERE id = ?`, "ensure_dataset", model.TaskStatusScheduled, ensure.ID)
+	mustExec(t, db, `UPDATE tasks SET stage = ?, status = ? WHERE id = ?`, "ingress_store", model.TaskStatusRunning, upload.ID)
+	mustExec(t, db, `UPDATE tasks SET stage = ?, status = ? WHERE id = ?`, "ingress_commit", model.TaskStatusWaiting, commit.ID)
+	mustExec(t, db, `UPDATE tasks SET stage = ?, status = ? WHERE id = ?`, "peer_pull", model.TaskStatusQueued, syncPull.ID)
+	mustExec(t, db, `UPDATE tasks SET stage = ?, status = ? WHERE id = ?`, "peer_commit", model.TaskStatusScheduled, syncCommit.ID)
+	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusRunning, evict.ID)
+	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusWaiting, cleanup.ID)
+	mustExec(t, db, `UPDATE tasks SET stage = ?, status = ? WHERE id = ?`, "ingress_store", model.TaskStatusCompleted, completed.ID)
+	mustExec(t, db, `UPDATE tasks SET stage = ?, status = ? WHERE id = ?`, "ingress_store", model.TaskStatusFailed, failed.ID)
+	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusExhausted, exhausted.ID)
+
+	counts, err := repos.Tasks.CountOverviewActivePipeline(ctx)
+	if err != nil {
+		t.Fatalf("CountOverviewActivePipeline: %v", err)
+	}
+	lookup := make(map[string]int64)
+	for _, count := range counts {
+		lookup[count.Pipeline+"/"+count.Status] = count.Count
+	}
+	assertPipelineCount := func(pipeline string, status model.TaskStatus, want int64) {
+		t.Helper()
+		if got := lookup[pipeline+"/"+string(status)]; got != want {
+			t.Fatalf("%s/%s = %d, want %d", pipeline, status, got, want)
+		}
+	}
+	assertPipelineCount("prepare", model.TaskStatusQueued, 1)
+	assertPipelineCount("prepare", model.TaskStatusScheduled, 1)
+	assertPipelineCount("upload", model.TaskStatusRunning, 1)
+	assertPipelineCount("commit", model.TaskStatusWaiting, 1)
+	assertPipelineCount("sync", model.TaskStatusQueued, 1)
+	assertPipelineCount("sync", model.TaskStatusScheduled, 1)
+	assertPipelineCount("evict", model.TaskStatusRunning, 1)
+	assertPipelineCount("cleanup", model.TaskStatusWaiting, 1)
+	if _, ok := lookup["upload/"+string(model.TaskStatusCompleted)]; ok {
+		t.Fatal("completed upload should not appear in active pipeline")
+	}
+	if _, ok := lookup["upload/"+string(model.TaskStatusFailed)]; ok {
+		t.Fatal("failed upload should not appear in active pipeline")
+	}
+	if _, ok := lookup["evict/"+string(model.TaskStatusExhausted)]; ok {
+		t.Fatal("exhausted evict task should not appear in active pipeline")
+	}
+}
+
+func TestTaskRepo_CountOverviewAttention(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUpload)
+	failed := seedTask(t, repos, model.TaskTypeUpload)
+	exhausted := seedTask(t, repos, model.TaskTypeEvictCache)
+	cancelled := seedTask(t, repos, model.TaskTypeStorageCleanup)
+
+	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusFailed, failed.ID)
+	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusExhausted, exhausted.ID)
+	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusCancelled, cancelled.ID)
+
+	counts, err := repos.Tasks.CountOverviewAttention(ctx)
+	if err != nil {
+		t.Fatalf("CountOverviewAttention: %v", err)
+	}
+	if counts.Failed != 1 {
+		t.Fatalf("Failed = %d, want 1", counts.Failed)
+	}
+	if counts.Exhausted != 1 {
+		t.Fatalf("Exhausted = %d, want 1", counts.Exhausted)
+	}
+}
+
 func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

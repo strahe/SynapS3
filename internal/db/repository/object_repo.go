@@ -884,6 +884,48 @@ func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, e
 	return counts, nil
 }
 
+func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAttentionCount, error) {
+	var count ObjectAttentionCount
+	query := `WITH current_versions AS (
+			SELECT version_id, storage_upload_id, state, in_cache
+			FROM object_versions
+			WHERE is_current = ?
+			  AND is_delete_marker = ?
+		),
+		latest_upload_refs AS (
+			SELECT source_upload.source_version_id, MAX(source_upload.id) AS latest_upload_id
+			FROM storage_uploads AS source_upload
+			JOIN current_versions AS current_version
+			  ON current_version.version_id = source_upload.source_version_id
+			 AND current_version.storage_upload_id IS NULL
+			WHERE source_upload.source_version_id <> ''
+			GROUP BY source_upload.source_version_id
+		)
+		SELECT
+			COALESCE(SUM(CASE WHEN current_version.state = ? OR latest_upload.status IN (?, ?) THEN 1 ELSE 0 END), 0) AS needs_attention,
+			COALESCE(SUM(CASE WHEN current_version.in_cache = ? AND NOT (current_version.state IN (?, ?, ?) AND ` + usableCopyExistsSQL("current_version.storage_upload_id") + `) THEN 1 ELSE 0 END), 0) AS unavailable
+		FROM current_versions AS current_version
+		LEFT JOIN latest_upload_refs AS latest_upload_ref
+		  ON latest_upload_ref.source_version_id = current_version.version_id
+		LEFT JOIN storage_uploads AS latest_upload
+		  ON latest_upload.id = COALESCE(current_version.storage_upload_id, latest_upload_ref.latest_upload_id)`
+	err := r.db.NewRaw(query,
+		true,
+		false,
+		model.ObjectStateFailed,
+		model.StorageUploadStatusFailed,
+		model.StorageUploadStatusRejected,
+		false,
+		model.ObjectStateReplicating,
+		model.ObjectStateStored,
+		model.ObjectStateCacheEvicted,
+	).Scan(ctx, &count)
+	if err != nil {
+		return ObjectAttentionCount{}, fmt.Errorf("counting overview object attention: %w", err)
+	}
+	return count, nil
+}
+
 // TotalSize returns the sum of all current object sizes in bytes.
 func (r *BunObjectRepo) TotalSize(ctx context.Context) (int64, error) {
 	var total int64

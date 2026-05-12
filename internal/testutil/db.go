@@ -5,6 +5,8 @@ package testutil
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/db/migrations"
@@ -17,16 +19,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+var testDBCounter atomic.Uint64
+
 // NewTestDB creates a fresh in-memory SQLite DB with all migrations applied.
 // The database is closed automatically when the test completes.
 func NewTestDB(t *testing.T) *bun.DB {
 	t.Helper()
 
-	sqldb, err := sql.Open("sqlite", "file::memory:?cache=shared&_pragma=foreign_keys(1)")
+	dsn := fmt.Sprintf("file:synaps3-test-%d?mode=memory&cache=shared&_pragma=foreign_keys(1)", testDBCounter.Add(1))
+	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatalf("opening test db: %v", err)
 	}
 	sqldb.SetMaxOpenConns(1)
+	sqldb.SetMaxIdleConns(1)
 
 	db := bun.NewDB(sqldb, sqlitedialect.New())
 	t.Cleanup(func() { _ = db.Close() })

@@ -1,7 +1,16 @@
 import { type QueryClient, useQueryClient } from '@tanstack/react-query'
 import { createRootRouteWithContext, Link, Outlet, useLocation } from '@tanstack/react-router'
-import { AlertTriangle, Database, HardDrive, LayoutDashboard, ListTodo, Settings, Wallet } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import {
+  AlertTriangle,
+  Database,
+  HardDrive,
+  LayoutDashboard,
+  ListTodo,
+  PanelLeftOpen,
+  Settings,
+  Wallet,
+} from 'lucide-react'
+import { type MouseEvent, useEffect, useState } from 'react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -125,28 +134,46 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
 }
 
 function AppSidebar({ activeNavItems, pathname }: { activeNavItems: NavItem[]; pathname: string }) {
-  const { isMobile, setOpenMobile } = useSidebar()
+  const { isMobile, setOpenMobile, state, toggleSidebar } = useSidebar()
   const closeMobileSidebar = () => {
     if (isMobile) setOpenMobile(false)
+  }
+  const handleLogoClick = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (!isMobile && state === 'collapsed') {
+      event.preventDefault()
+      toggleSidebar()
+      return
+    }
+    closeMobileSidebar()
   }
 
   return (
     <Sidebar collapsible="icon">
-      <SidebarHeader>
-        <div className="flex items-center gap-2 group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:gap-1">
-          <SidebarMenu className="min-w-0 flex-1 group-data-[collapsible=icon]:flex-none">
+      <SidebarHeader className="h-16 justify-center">
+        <div className="flex h-10 items-center gap-2">
+          <SidebarMenu className="min-w-0 flex-1">
             <SidebarMenuItem>
-              <SidebarMenuButton asChild size="lg" tooltip="SynapS3">
-                <Link to="/" onClick={closeMobileSidebar}>
-                  <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-sidebar-primary text-sidebar-primary-foreground">
-                    <HardDrive />
+              <SidebarMenuButton
+                asChild
+                size="lg"
+                tooltip={state === 'collapsed' && !isMobile ? 'Expand sidebar' : 'SynapS3'}
+              >
+                <Link
+                  to="/"
+                  onClick={handleLogoClick}
+                  className="group/logo"
+                  aria-label={state === 'collapsed' && !isMobile ? 'Expand sidebar' : 'SynapS3'}
+                >
+                  <span className="relative flex size-8 shrink-0 items-center justify-center rounded-md bg-sidebar-primary text-sidebar-primary-foreground">
+                    <HardDrive className="size-4 transition-opacity group-data-[collapsible=icon]:group-hover/logo:opacity-0" />
+                    <PanelLeftOpen className="absolute size-4 opacity-0 transition-opacity group-data-[collapsible=icon]:group-hover/logo:opacity-100" />
                   </span>
                   <span className="truncate font-semibold group-data-[collapsible=icon]:hidden">SynapS3</span>
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
-          <SidebarTrigger className="shrink-0" />
+          <SidebarTrigger className="shrink-0 group-data-[collapsible=icon]:hidden" />
         </div>
       </SidebarHeader>
       <SidebarContent>

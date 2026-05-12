@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/buildinfo"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 )
 
@@ -25,13 +26,32 @@ type bucketOverview struct {
 }
 
 type objectOverview struct {
-	Total          int64            `json:"total"`
-	TotalSizeBytes int64            `json:"total_size_bytes"`
-	ByState        map[string]int64 `json:"by_state"`
+	Total          int64                   `json:"total"`
+	TotalSizeBytes int64                   `json:"total_size_bytes"`
+	ByState        map[string]int64        `json:"by_state"`
+	Attention      objectAttentionOverview `json:"attention"`
 }
 
 type taskOverview struct {
+	ByStatus       map[string]int64       `json:"by_status"`
+	Attention      taskAttentionOverview  `json:"attention"`
+	ActivePipeline []taskPipelineOverview `json:"active_pipeline"`
+}
+
+type objectAttentionOverview struct {
+	NeedsAttention int64 `json:"needs_attention"`
+	Unavailable    int64 `json:"unavailable"`
+}
+
+type taskAttentionOverview struct {
+	Failed    int64 `json:"failed"`
+	Exhausted int64 `json:"exhausted"`
+}
+
+type taskPipelineOverview struct {
+	Pipeline string           `json:"pipeline"`
 	ByStatus map[string]int64 `json:"by_status"`
+	Total    int64            `json:"total"`
 }
 
 type cacheOverview struct {
@@ -84,6 +104,15 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	} else {
 		resp.Objects.TotalSizeBytes = totalSize
 	}
+	objectAttention, err := s.repos.Objects.CountOverviewAttention(ctx)
+	if err != nil {
+		s.logger.Warn("overview: failed to count object attention", "error", err)
+	} else {
+		resp.Objects.Attention = objectAttentionOverview{
+			NeedsAttention: objectAttention.NeedsAttention,
+			Unavailable:    objectAttention.Unavailable,
+		}
+	}
 
 	// Tasks
 	taskCounts, err := s.repos.Tasks.CountByStatus(ctx)
@@ -93,6 +122,21 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 		for _, tc := range taskCounts {
 			resp.Tasks.ByStatus[tc.Status] += tc.Count
 		}
+	}
+	taskAttention, err := s.repos.Tasks.CountOverviewAttention(ctx)
+	if err != nil {
+		s.logger.Warn("overview: failed to count task attention", "error", err)
+	} else {
+		resp.Tasks.Attention = taskAttentionOverview{
+			Failed:    taskAttention.Failed,
+			Exhausted: taskAttention.Exhausted,
+		}
+	}
+	taskPipelineCounts, err := s.repos.Tasks.CountOverviewActivePipeline(ctx)
+	if err != nil {
+		s.logger.Warn("overview: failed to count active task pipeline", "error", err)
+	} else {
+		resp.Tasks.ActivePipeline = taskPipelineOverviewRows(taskPipelineCounts)
 	}
 
 	// Cache
@@ -117,6 +161,33 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func taskPipelineOverviewRows(counts []repository.TaskPipelineCount) []taskPipelineOverview {
+	pipelines := []string{"prepare", "upload", "commit", "sync", "evict", "cleanup"}
+	rows := make([]taskPipelineOverview, 0, len(pipelines))
+	index := make(map[string]int, len(pipelines))
+	for _, pipeline := range pipelines {
+		index[pipeline] = len(rows)
+		rows = append(rows, taskPipelineOverview{
+			Pipeline: pipeline,
+			ByStatus: map[string]int64{
+				string(model.TaskStatusQueued):    0,
+				string(model.TaskStatusScheduled): 0,
+				string(model.TaskStatusWaiting):   0,
+				string(model.TaskStatusRunning):   0,
+			},
+		})
+	}
+	for _, count := range counts {
+		i, ok := index[count.Pipeline]
+		if !ok {
+			continue
+		}
+		rows[i].ByStatus[count.Status] += count.Count
+		rows[i].Total += count.Count
+	}
+	return rows
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
