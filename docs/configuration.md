@@ -1,6 +1,6 @@
 # Configuration
 
-SynapS3 reads TOML config and applies `SYNAPS3_` environment overrides. Environment values win.
+SynapS3 reads TOML config. `SYNAPS3_` environment overrides win.
 
 ## Initialize
 
@@ -26,24 +26,24 @@ synaps3 serve --config /var/lib/synaps3/config.toml
 - Pass `--config <path>` to use a different file
 - A `config.toml` in the current directory is ignored unless passed explicitly
 - `synaps3 init --dir <path>` creates files but does not change the default config source
-- Admin settings writes rewrite `config.toml`; custom comments and ordering are not preserved
+- Admin settings writes rewrite `config.toml`; comments and ordering are not preserved
 
 ## Required Secret
 
-Edit `~/.synaps3/config.toml` before normal serving:
+Set the Filecoin wallet private key before normal serving:
 
 ```toml
 [filecoin]
 private_key = "0x..."
 ```
 
-Use an environment variable only when a deployment system manages secrets outside the config file:
+Or use an environment variable:
 
 ```bash
 export SYNAPS3_FILECOIN_PRIVATE_KEY='0x...'
 ```
 
-Keep secrets out of commits. In production, prefer environment variables or secret-managed config files.
+Keep private keys out of commits.
 
 ## Runtime Data
 
@@ -60,40 +60,37 @@ Default local paths:
 ```
 
 SQLite WAL and SHM files are expected. Explicit `database.dsn` and `cache.dir` values take precedence.
-For SQLite, `database.dsn` only needs the database file URL. SynapS3 manages SQLite runtime pragmas.
 
-## Environment Overrides
-
-Examples:
+## Common Environment Overrides
 
 ```text
 SYNAPS3_SERVER_PORT                  -> server.port
 SYNAPS3_S3_REGION                    -> s3.region
+SYNAPS3_FILECOIN_NETWORK             -> filecoin.network
 SYNAPS3_FILECOIN_RPC_URL             -> filecoin.rpc_url
 SYNAPS3_FILECOIN_PRIVATE_KEY         -> filecoin.private_key
 SYNAPS3_FILECOIN_DEFAULT_COPIES      -> filecoin.default_copies
+SYNAPS3_DATABASE_DRIVER              -> database.driver
 SYNAPS3_DATABASE_DSN                 -> database.dsn
 SYNAPS3_CACHE_DIR                    -> cache.dir
+SYNAPS3_CACHE_MAX_SIZE_GB            -> cache.max_size_gb
+SYNAPS3_CACHE_EVICTION_POLICY        -> cache.eviction_policy
 SYNAPS3_WORKER_UPLOAD_CONCURRENCY    -> worker.upload.concurrency
-SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL -> worker.evictor.poll_interval
-SYNAPS3_WORKER_STORAGE_CLEANUP_POLL_INTERVAL -> worker.storage_cleanup.poll_interval
+SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL  -> worker.upload.poll_interval
+SYNAPS3_WORKER_UPLOAD_MAX_RETRIES    -> worker.upload.max_retries
 SYNAPS3_ADMIN_ADDR                   -> admin.addr
 ```
 
-Unknown `SYNAPS3_` names fall back to lowercase with `_` replaced by `.`.
-
 ## Main Sections
 
-| Section | Key Fields | Purpose |
+| Section | Key fields | Purpose |
 | --- | --- | --- |
 | `server` | `port`, `max_connections`, `max_requests`, `tls.*` | S3 API listener |
 | `s3` | `region` | Region reported to S3 clients |
-| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | Filecoin uploads and admin provider identity resolution |
+| `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | Filecoin uploads |
 | `database` | `driver`, `dsn`, `max_open_conns`, `max_idle_conns` | Metadata database |
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local object cache |
-| `worker.upload` | `concurrency`, `poll_interval`, `max_retries` | Upload worker |
-| `worker.evictor` | `concurrency`, `poll_interval`, `max_retries` | Cache eviction worker |
-| `worker.storage_cleanup` | `concurrency`, `poll_interval`, `max_retries` | Remote replica cleanup worker |
+| `worker.*` | `concurrency`, `poll_interval`, `max_retries` | Background work |
 | `logging` | `level`, `format`, `s3_access.*` | Runtime logs |
 | `admin` | `addr` | Dashboard and admin API |
 
@@ -101,26 +98,12 @@ Allowed values:
 
 - `filecoin.network`: `calibration`, `mainnet`
 - `filecoin.default_copies`: `1` through `8`
+- `database.driver`: `sqlite`, `postgres`
 - `cache.eviction_policy`: `lru`, `manual`, `none`
 - `logging.level`: `debug`, `info`, `warn`, `error`
 - `logging.format`: `json`, `text`
-- `logging.s3_access.level`: `debug`, `info`, `warn`, `error`
 
-S3 access logs are emitted through the SynapS3 runtime logger. Set `logging.s3_access.enabled = false` to disable them.
-
-Default capacity settings are conservative for a single-node installation:
-
-```toml
-[server]
-max_connections = 4096
-max_requests = 512
-
-[database]
-max_open_conns = 4
-max_idle_conns = 2
-```
-
-`server.max_connections` limits concurrent TCP connections. `server.max_requests` limits in-flight S3 requests before SlowDown responses. Increase them only with matching file descriptor, memory, database, disk, and backend capacity.
+## Notes
 
 SQLite DSNs should stay simple:
 
@@ -130,56 +113,18 @@ driver = "sqlite"
 dsn = "file:///var/lib/synaps3/db/synaps3.db"
 ```
 
-SynapS3 adds SQLite runtime pragmas. File-backed SQLite gets `journal_mode(WAL)`, `busy_timeout(5000)`, and `foreign_keys(1)`. In-memory SQLite skips WAL and still gets `busy_timeout(5000)` and `foreign_keys(1)`. Postgres DSNs are passed through unchanged.
+SynapS3 manages SQLite runtime pragmas. Postgres DSNs are passed through unchanged.
 
-`cache.eviction_policy = "lru"` queues local cache eviction after remote storage succeeds. It is not a general least-recently-used cache scanner.
+`cache.eviction_policy = "lru"` queues local cache eviction after remote storage succeeds. It is not a general LRU scanner.
 
-## Production Example
+Default capacity settings are conservative for one node:
 
 ```toml
+[server]
+max_connections = 4096
+max_requests = 512
+
 [database]
-driver = "postgres"
-dsn = "postgres://synaps3:password@db:5432/synaps3?sslmode=require"
-max_open_conns = 25
-max_idle_conns = 10
-
-[cache]
-dir = "/var/lib/synaps3/cache"
-max_size_gb = 500
-eviction_policy = "lru"
-
-[filecoin]
-network = "calibration"
-rpc_url = "https://api.calibration.node.glif.io/rpc/v1"
-private_key = "0x..."
-source = "synaps3"
-with_cdn = false
-allow_private_networks = false
-default_copies = 2
-
-[worker.upload]
-concurrency = 4
-poll_interval = "5s"
-max_retries = 5
-
-[worker.evictor]
-concurrency = 2
-poll_interval = "1m"
-max_retries = 3
-
-[worker.storage_cleanup]
-concurrency = 2
-poll_interval = "1m"
-max_retries = 5
-
-[logging]
-level = "info"
-format = "text"
-
-[logging.s3_access]
-enabled = true
-level = "info"
-
-[admin]
-addr = "127.0.0.1:9090"
+max_open_conns = 4
+max_idle_conns = 2
 ```
