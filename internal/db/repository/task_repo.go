@@ -17,6 +17,20 @@ type BunTaskRepo struct {
 
 var _ TaskRepository = (*BunTaskRepo)(nil)
 
+const claimReadySQL = `UPDATE tasks
+		 SET status = ?, claimed_at = ?, lease_until = ?, started_at = ?,
+		     last_error = NULL, wait_reason = NULL, status_message = NULL
+		 WHERE id = (
+		     SELECT id FROM tasks
+		     WHERE type = ?
+		       AND status IN ('queued', 'scheduled', 'waiting')
+		       AND scheduled_at <= ?
+		     ORDER BY scheduled_at ASC, id ASC
+		     LIMIT 1
+		 )
+		 AND status IN ('queued', 'scheduled', 'waiting')
+		 RETURNING *`
+
 func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
 	if task != nil && task.Status == "" {
 		task.Status = model.TaskStatusQueued
@@ -69,24 +83,10 @@ func (r *BunTaskRepo) ClaimReady(ctx context.Context, taskType model.TaskType, l
 	// Atomic claim: UPDATE ... WHERE id = (subquery) RETURNING *
 	// The scheduled_at filter ensures future retry/wait tasks are not claimed prematurely.
 	err := r.db.NewRaw(
-		`UPDATE tasks
-		 SET status = ?, claimed_at = ?, lease_until = ?, started_at = ?,
-		     last_error = NULL, wait_reason = NULL, status_message = NULL
-		 WHERE id = (
-		     SELECT id FROM tasks
-		     WHERE type = ?
-		       AND status IN (?, ?, ?)
-		       AND scheduled_at <= ?
-		     ORDER BY scheduled_at ASC
-		     LIMIT 1
-		 )
-		 AND status IN (?, ?, ?)
-		 RETURNING *`,
+		claimReadySQL,
 		model.TaskStatusRunning, now, leaseUntil, now,
 		taskType,
-		model.TaskStatusQueued, model.TaskStatusScheduled, model.TaskStatusWaiting,
 		now,
-		model.TaskStatusQueued, model.TaskStatusScheduled, model.TaskStatusWaiting,
 	).Scan(ctx, task)
 	if err != nil {
 		if err == sql.ErrNoRows {

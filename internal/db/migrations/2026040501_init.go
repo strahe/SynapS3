@@ -77,6 +77,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		// Committing tracks the active upload through storage_uploads.source_version_id.
 		// storage_upload_id is set only after a committed copy makes the version readable.
 		ColumnExpr("CONSTRAINT chk_object_versions_storage_upload_state CHECK ((state IN ('replicating', 'stored', 'cache_evicted') AND storage_upload_id IS NOT NULL) OR (state IN ('cached', 'uploading', 'committing', 'failed') AND storage_upload_id IS NULL))").
+		ColumnExpr("CONSTRAINT chk_object_versions_delete_marker_shape CHECK ((is_delete_marker = TRUE AND size = 0 AND e_tag = '' AND checksum = '' AND content_type = '' AND cache_key = '' AND storage_upload_id IS NULL AND in_cache = FALSE AND state = 'cached' AND failed_at_state IS NULL AND last_error IS NULL) OR (is_delete_marker = FALSE AND e_tag <> '' AND checksum <> '' AND cache_key <> ''))").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating object_versions table: %w", err)
 	}
@@ -108,6 +109,14 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating version history index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.ObjectVersion)(nil)).
+		Index("idx_object_versions_object_created").
+		ColumnExpr("object_id, created_at DESC, version_id DESC").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating object version history index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
 		Model((*model.ObjectVersion)(nil)).
@@ -189,6 +198,15 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating task polling index: %w", err)
+	}
+	if _, err := db.NewCreateIndex().
+		Model((*model.Task)(nil)).
+		Index("idx_tasks_type_ready_scheduled").
+		Column("type", "scheduled_at", "id").
+		Where("status IN ('queued', 'scheduled', 'waiting')").
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating ready task polling index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
 		Model((*model.Task)(nil)).
@@ -495,6 +513,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		ColumnExpr("CONSTRAINT chk_storage_upload_copies_copy_index CHECK (copy_index >= 0)").
 		ColumnExpr("CONSTRAINT chk_storage_upload_copies_status CHECK (status IN ('pending', 'piece_ready', 'committing', 'committed', 'failed'))").
 		ColumnExpr("CONSTRAINT chk_storage_upload_copies_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull'))").
+		ColumnExpr("CONSTRAINT chk_storage_upload_copies_committed_shape CHECK (status <> 'committed' OR (storage_data_set_id IS NOT NULL AND provider_id IS NOT NULL AND provider_id <> '' AND piece_id IS NOT NULL AND piece_id <> '' AND retrieval_url IS NOT NULL AND retrieval_url <> ''))").
 		Exec(ctx); err != nil {
 		return fmt.Errorf("creating storage_upload_copies table: %w", err)
 	}

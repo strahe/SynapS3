@@ -144,12 +144,9 @@ func TestObjectRepo_CountOverviewAttention(t *testing.T) {
 	mustExec(t, db, `UPDATE object_versions SET state = ?, storage_upload_id = (SELECT MAX(id) FROM storage_uploads), in_cache = FALSE WHERE version_id = ?`,
 		model.ObjectStateStored, unavailable.VersionID)
 
-	deleted := newObjectVersion(bucket.ID, "deleted.txt", "01J00000000000000000000A05", 10)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, deleted); err != nil {
-		t.Fatalf("seed deleted version: %v", err)
+	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "deleted.txt", "01J00000000000000000000A05"); err != nil {
+		t.Fatalf("seed deleted marker: %v", err)
 	}
-	mustExec(t, db, `UPDATE object_versions SET state = ?, is_delete_marker = TRUE WHERE version_id = ?`,
-		model.ObjectStateFailed, deleted.VersionID)
 
 	counts, err := repos.Objects.CountOverviewAttention(ctx)
 	if err != nil {

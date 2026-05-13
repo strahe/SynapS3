@@ -113,6 +113,28 @@ func TestTaskRepo_ClaimReadyHandlesQueuedScheduledAndWaiting(t *testing.T) {
 	}
 }
 
+func TestTaskRepo_ClaimReadyBreaksScheduledTiesByID(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	scheduledAt := time.Now().Add(-time.Minute)
+
+	first := seedTask(t, repos, model.TaskTypeUpload)
+	second := seedTask(t, repos, model.TaskTypeUpload)
+	mustExec(t, db, `UPDATE tasks SET scheduled_at = ? WHERE id IN (?, ?)`, scheduledAt, first.ID, second.ID)
+
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimReady: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("ClaimReady returned nil, want task")
+	}
+	if claimed.ID != first.ID {
+		t.Fatalf("ClaimReady ID = %d, want lowest ID %d", claimed.ID, first.ID)
+	}
+}
+
 func TestTaskRepo_RunningFailureTransitions(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

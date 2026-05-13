@@ -148,6 +148,13 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	if !versionIndexes["idx_object_versions_storage_upload"] {
 		t.Fatal("idx_object_versions_storage_upload should exist")
 	}
+	if !versionIndexes["idx_object_versions_object_created"] {
+		t.Fatal("idx_object_versions_object_created should exist")
+	}
+	taskIndexes := sqliteIndexes(t, db, "tasks")
+	if !taskIndexes["idx_tasks_type_ready_scheduled"] {
+		t.Fatal("idx_tasks_type_ready_scheduled should exist")
+	}
 	uploadCopyIndexes := sqliteIndexes(t, db, "storage_upload_copies")
 	if !uploadCopyIndexes["idx_storage_upload_copies_status_data_set_upload"] {
 		t.Fatal("idx_storage_upload_copies_status_data_set_upload should exist")
@@ -174,6 +181,16 @@ func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T
 	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, state) VALUES ('stored-without-upload', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/stored-without-upload', 'stored')`); err == nil {
 		t.Fatal("expected stored object version without storage_upload_id to fail")
 	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, content_type, cache_key, is_delete_marker, in_cache, state) VALUES ('bad-marker', 1, 1, 'file.txt', 0, 'etag-marker', '', '', '', TRUE, FALSE, 'cached')`); err == nil {
+		t.Fatal("expected malformed delete marker insert to fail")
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE object_versions SET is_delete_marker = TRUE WHERE version_id = 'v3'`); err == nil {
+		t.Fatal("expected malformed delete marker update to fail")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key) VALUES ('empty-cache-key', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '')`); err == nil {
+		t.Fatal("expected data version without cache_key to fail")
+	}
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, content_type, cache_key, is_delete_marker, in_cache, state) VALUES ('marker-ok', 1, 1, 'file.txt', 0, '', '', '', '', TRUE, FALSE, 'cached')`)
 
 	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, piece_cid, requested_copies) VALUES (1, 1, 'v-upload', 1, 'sum-1', 'complete', 'bafk2bzacefake', 1)`)
 	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, state, storage_upload_id) VALUES ('cached-with-upload', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/cached-with-upload', 'cached', 1)`); err == nil {
@@ -203,6 +220,14 @@ func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
 		t.Fatal("expected duplicate copy_index for upload to fail")
 	}
 	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, transfer_method, storage_data_set_id) VALUES (1, 1, '202', 'peer_pull', 2)`)
+	if _, err := db.ExecContext(ctx, `UPDATE storage_upload_copies SET status = 'committed' WHERE upload_id = 1 AND copy_index = 1`); err == nil {
+		t.Fatal("expected committed copy without piece identity to fail")
+	}
+	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, transfer_method) VALUES (1, 2, 'peer_pull')`)
+	if _, err := db.ExecContext(ctx, `UPDATE storage_upload_copies SET status = 'committed', piece_id = '2002', retrieval_url = 'https://provider.example/missing-binding' WHERE upload_id = 1 AND copy_index = 2`); err == nil {
+		t.Fatal("expected committed copy without provider and data set binding to fail")
+	}
+	mustExec(t, db, `UPDATE storage_upload_copies SET status = 'committed', piece_id = '0', retrieval_url = 'https://provider.example/zero-piece' WHERE upload_id = 1 AND copy_index = 1`)
 	mustExec(t, db, `INSERT INTO storage_upload_failures (upload_id, attempt_index, provider_id, transfer_method, stage, error_message, explicit) VALUES (1, 0, '202', 'peer_pull', 'pull', 'pull failed', FALSE)`)
 	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_failures (upload_id, attempt_index, transfer_method) VALUES (1, 0, 'peer_pull')`); err == nil {
 		t.Fatal("expected duplicate failure attempt_index for upload to fail")

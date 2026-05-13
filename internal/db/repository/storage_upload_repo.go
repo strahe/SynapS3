@@ -553,13 +553,16 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, inp
 }
 
 func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error {
+	if input.UploadID <= 0 || input.CopyIndex < 0 || input.PieceCID == "" || input.PieceID == nil || input.RetrievalURL == "" {
+		return fmt.Errorf("marking storage upload copy committed: %w", ErrInvalidInput)
+	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		now := time.Now()
 		isNewDataSet, err := uploadCopyDataSetCreatedByUpload(ctx, db, input.UploadID, input.CopyIndex)
 		if err != nil {
 			return err
 		}
-		_, err = db.NewUpdate().
+		res, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusCommitted).
 			Set("piece_id = COALESCE(?, piece_id)", input.PieceID).
@@ -573,6 +576,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("marking storage upload copy committed: %w", err)
+		}
+		rows, _ := res.RowsAffected()
+		if rows == 0 {
+			return fmt.Errorf("marking storage upload copy committed: %w", ErrNotFound)
 		}
 		if err := updateUploadReadable(ctx, db, input.UploadID, input.PieceCID, now); err != nil {
 			return err

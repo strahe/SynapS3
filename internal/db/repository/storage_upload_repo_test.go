@@ -458,6 +458,103 @@ func TestStorageUploadRepo_RequiredOnChainIDValidationUsesInvalidInput(t *testin
 	}
 }
 
+func TestStorageUploadRepo_MarkUploadCopyCommittedValidatesReadableIdentity(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "committed-copy-validation-bucket")
+
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000000BAD02",
+		ContentSize:     10,
+		Checksum:        "checksum-committed-validation",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        onChainID(t, "101"),
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+
+	valid := repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "piece-committed-validation",
+		PieceID:      onChainIDPtr(t, "2001"),
+		RetrievalURL: "https://provider.example/piece",
+	}
+	tests := []struct {
+		name  string
+		input repository.MarkUploadCopyCommittedInput
+	}{
+		{name: "missing upload", input: repository.MarkUploadCopyCommittedInput{UploadID: 0, CopyIndex: valid.CopyIndex, PieceCID: valid.PieceCID, PieceID: valid.PieceID, RetrievalURL: valid.RetrievalURL}},
+		{name: "negative copy index", input: repository.MarkUploadCopyCommittedInput{UploadID: valid.UploadID, CopyIndex: -1, PieceCID: valid.PieceCID, PieceID: valid.PieceID, RetrievalURL: valid.RetrievalURL}},
+		{name: "missing piece cid", input: repository.MarkUploadCopyCommittedInput{UploadID: valid.UploadID, CopyIndex: valid.CopyIndex, PieceID: valid.PieceID, RetrievalURL: valid.RetrievalURL}},
+		{name: "missing piece id", input: repository.MarkUploadCopyCommittedInput{UploadID: valid.UploadID, CopyIndex: valid.CopyIndex, PieceCID: valid.PieceCID, RetrievalURL: valid.RetrievalURL}},
+		{name: "missing retrieval url", input: repository.MarkUploadCopyCommittedInput{UploadID: valid.UploadID, CopyIndex: valid.CopyIndex, PieceCID: valid.PieceCID, PieceID: valid.PieceID}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := repos.Uploads.MarkUploadCopyCommitted(ctx, tt.input)
+			if !errors.Is(err, repository.ErrInvalidInput) || errors.Is(err, repository.ErrNotFound) {
+				t.Fatalf("MarkUploadCopyCommitted error = %v, want ErrInvalidInput only", err)
+			}
+		})
+	}
+}
+
+func TestStorageUploadRepo_MarkUploadCopyCommittedMissingCopyDoesNotMarkReadable(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "missing-committed-copy-bucket")
+
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000000BAD03",
+		ContentSize:     10,
+		Checksum:        "checksum-missing-committed-copy",
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+
+	err = repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "piece-missing-copy",
+		PieceID:      onChainIDPtr(t, "2001"),
+		RetrievalURL: "https://provider.example/missing-copy",
+	})
+	if !errors.Is(err, repository.ErrNotFound) || errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("MarkUploadCopyCommitted missing copy error = %v, want ErrNotFound only", err)
+	}
+
+	got, err := repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID: upload=%v err=%v", got, err)
+	}
+	if got.Status != model.StorageUploadStatusRunning {
+		t.Fatalf("upload status = %s, want running", got.Status)
+	}
+	if got.PieceCID != nil {
+		t.Fatalf("upload piece cid = %q, want nil", *got.PieceCID)
+	}
+}
+
 func TestStorageUploadRepo_DataSetBindingIsBucketProviderCopySlot(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
