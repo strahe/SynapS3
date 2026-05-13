@@ -10,6 +10,27 @@ SynapS3 lets S3 clients use Filecoin storage.
 - Store object data through Filecoin providers.
 - Manage buckets, objects, settings, tasks, and health from one dashboard.
 
+## Core Features
+
+| Feature | Status | Note |
+| --- | --- | --- |
+| S3-compatible API | ✅ | Standard S3 clients and tools |
+| Bucket and object operations | ✅ | Create, upload, list, read, delete |
+| Multipart uploads | ✅ | Large object upload flow |
+| Object versioning | ✅ | Versions and delete markers |
+| Web dashboard | ✅ | Buckets, objects, tasks, settings |
+| S3 user management | ✅ | Access keys for S3 clients |
+| Filecoin storage backend | ✅ | Storage through Synapse |
+| Automatic provider selection | ✅ | Provider contexts from Synapse |
+| Configurable storage copies | ✅ | Copy count is configurable |
+| Provider-backed reads | ✅ | Reads can fall back to providers |
+| Wallet and payment tools | ✅ | Wallet, testnet funding, USDFC |
+| Background task management | ✅ | Monitor and retry tasks |
+| Managed provider policy | 📝 | Future provider controls |
+| Automatic repair | 📝 | Future replica repair loop |
+| One-click deployment | 📝 | Future deployment flow |
+| Production readiness | 📝 | Future hardening work |
+
 ## Quick Start
 
 Prerequisites:
