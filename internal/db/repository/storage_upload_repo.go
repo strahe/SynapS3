@@ -457,6 +457,56 @@ func (r *BunStorageUploadRepo) MarkDataSetUnavailable(ctx context.Context, id in
 	return nil
 }
 
+func (r *BunStorageUploadRepo) DiscardFailedDataSetCandidate(ctx context.Context, uploadID int64, copyIndex int, storageDataSetID int64) error {
+	if uploadID <= 0 || copyIndex < 0 || storageDataSetID <= 0 {
+		return fmt.Errorf("invalid failed storage data set candidate: %w", ErrInvalidInput)
+	}
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		candidates, err := db.NewSelect().
+			Model((*model.StorageDataSet)(nil)).
+			Where("id = ?", storageDataSetID).
+			Where("created_by_upload_id = ?", uploadID).
+			Where("status = ?", model.StorageDataSetStatusFailed).
+			Where("(data_set_id IS NULL OR data_set_id = '')").
+			Count(ctx)
+		if err != nil {
+			return fmt.Errorf("checking failed storage data set candidate: %w", err)
+		}
+		if candidates == 0 {
+			return nil
+		}
+		if _, err := db.NewDelete().
+			Model((*model.StorageUploadCopy)(nil)).
+			Where("upload_id = ?", uploadID).
+			Where("copy_index = ?", copyIndex).
+			Where("storage_data_set_id = ?", storageDataSetID).
+			Where("status = ?", model.StorageUploadCopyStatusFailed).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("deleting failed storage upload copy candidate: %w", err)
+		}
+		refs, err := db.NewSelect().
+			Model((*model.StorageUploadCopy)(nil)).
+			Where("storage_data_set_id = ?", storageDataSetID).
+			Count(ctx)
+		if err != nil {
+			return fmt.Errorf("checking failed storage data set candidate references: %w", err)
+		}
+		if refs > 0 {
+			return nil
+		}
+		if _, err := db.NewDelete().
+			Model((*model.StorageDataSet)(nil)).
+			Where("id = ?", storageDataSetID).
+			Where("created_by_upload_id = ?", uploadID).
+			Where("status = ?", model.StorageDataSetStatusFailed).
+			Where("(data_set_id IS NULL OR data_set_id = '')").
+			Exec(ctx); err != nil {
+			return fmt.Errorf("deleting failed storage data set candidate: %w", err)
+		}
+		return nil
+	})
+}
+
 func (r *BunStorageUploadRepo) CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		for _, input := range copies {

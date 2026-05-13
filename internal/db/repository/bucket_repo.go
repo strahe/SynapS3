@@ -133,6 +133,23 @@ func (r *BunBucketRepo) SetOwnerAndACL(ctx context.Context, name string, ownerAc
 	return nil
 }
 
+func (r *BunBucketRepo) SetDefaultCopies(ctx context.Context, name string, copies *int) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("default_copies = ?", copies).
+		Set("updated_at = ?", time.Now().UTC()).
+		Where("name = ?", name).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("setting bucket default copies: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("setting bucket default copies: bucket %q not found", name)
+	}
+	return nil
+}
+
 func (r *BunBucketRepo) CountByOwner(ctx context.Context, ownerAccessKey string) (int, error) {
 	count, err := r.db.NewSelect().
 		Model((*model.Bucket)(nil)).

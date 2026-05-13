@@ -83,8 +83,12 @@ export function useCreateBucket() {
   const qc = useQueryClient()
 
   return useMutation({
-    mutationFn: (payload: { name: string; ownerAccessKey: string }) =>
-      api.createBucket({ name: payload.name, owner_access_key: payload.ownerAccessKey }),
+    mutationFn: (payload: { name: string; ownerAccessKey: string; defaultCopies: number | null }) =>
+      api.createBucket({
+        name: payload.name,
+        owner_access_key: payload.ownerAccessKey,
+        default_copies: payload.defaultCopies,
+      }),
     onSuccess: (bucket) => {
       qc.invalidateQueries({ queryKey: ['buckets'] })
       qc.invalidateQueries({ queryKey: ['bucket', bucket.name] })
@@ -103,6 +107,19 @@ export function useUpdateBucketOwner() {
       qc.invalidateQueries({ queryKey: ['buckets'] })
       qc.invalidateQueries({ queryKey: ['bucket', bucket.name] })
       qc.invalidateQueries({ queryKey: ['s3Users'] })
+    },
+  })
+}
+
+export function useUpdateBucketCopyPolicy() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ name, defaultCopies }: { name: string; defaultCopies: number | null }) =>
+      api.updateBucketCopyPolicy(name, defaultCopies),
+    onSuccess: (bucket) => {
+      qc.invalidateQueries({ queryKey: ['buckets'] })
+      qc.invalidateQueries({ queryKey: ['bucket', bucket.name] })
     },
   })
 }

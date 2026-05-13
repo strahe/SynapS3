@@ -65,7 +65,6 @@ const (
 	defaultEvictMaxRetries  = 3
 	uploadPollJitterDivisor = 5
 	defaultTargetCopies     = 2
-	maxTargetCopies         = 8
 	uploadProgressTimeout   = 2 * time.Second
 
 	uploadStagePrepare       = "prepare_upload"
@@ -105,10 +104,7 @@ func boundedTargetCopies(copies int) int {
 	if copies <= 0 {
 		return defaultTargetCopies
 	}
-	if copies > maxTargetCopies {
-		return maxTargetCopies
-	}
-	return copies
+	return model.ClampStorageCopies(copies)
 }
 
 // NewUploader creates a new upload worker.
@@ -537,19 +533,21 @@ func (u *Uploader) prepareStagedUpload(ctx context.Context, task *model.Task, ve
 		return
 	}
 
+	targetCopies := u.targetCopiesForBucket(bucket)
 	upload, err := u.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
 		BucketID:        version.BucketID,
 		SourceTaskID:    task.ID,
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
-		RequestedCopies: boundedTargetCopies(u.targetCopies),
+		RequestedCopies: targetCopies,
 	})
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "start upload attempt", err)
 		return
 	}
-	bindings, err := u.ensureBucketProviderBindings(ctx, bucket, upload.ID)
+	targetCopies = boundedTargetCopies(upload.RequestedCopies)
+	bindings, err := u.ensureBucketProviderBindings(ctx, bucket, upload.ID, targetCopies)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "ensure provider bindings", err)
 		return
@@ -661,13 +659,20 @@ func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.
 	completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 }
 
-func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *model.Bucket, uploadID int64) ([]model.StorageDataSet, error) {
+func (u *Uploader) targetCopiesForBucket(bucket *model.Bucket) int {
+	if bucket != nil && bucket.DefaultCopies != nil {
+		return boundedTargetCopies(*bucket.DefaultCopies)
+	}
+	return boundedTargetCopies(u.targetCopies)
+}
+
+func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *model.Bucket, uploadID int64, targetCopies int) ([]model.StorageDataSet, error) {
 	bindings, err := u.repos.Uploads.ListDataSetBindings(ctx, bucket.ID)
 	if err != nil {
 		return nil, err
 	}
 	existing := make(map[int]struct{}, len(bindings))
-	targetCopies := boundedTargetCopies(u.targetCopies)
+	targetCopies = boundedTargetCopies(targetCopies)
 	selected := make([]model.StorageDataSet, 0, targetCopies)
 	excluded := make([]sdktypes.BigInt, 0, len(bindings))
 	for _, binding := range bindings {
@@ -1237,7 +1242,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 				return
 			}
 			if errors.Is(err, errCommitRejected) {
-				u.markPeerFailed(ctx, task, uploadID, copyIndex, logger, "peer commit", err)
+				u.markPeerFailed(ctx, task, uploadID, copyIndex, 0, logger, "peer commit", err)
 				return
 			}
 			u.handleTaskFailure(ctx, task, logger, "wait peer commit", err)
@@ -1466,7 +1471,11 @@ func (u *Uploader) markDataSetStageFailed(ctx context.Context, task *model.Task,
 			u.replacePeerCopy(ctx, task, bucket, uploadID, copyIndex, logger, stage, err)
 			return
 		}
-		u.markPeerFailed(ctx, task, uploadID, copyIndex, logger, stage, err)
+		discardDataSetID := int64(0)
+		if dataSetID > 0 && dataSetCreationRejected(err) {
+			discardDataSetID = dataSetID
+		}
+		u.markPeerFailed(ctx, task, uploadID, copyIndex, discardDataSetID, logger, stage, err)
 		return
 	}
 	if writeBlocked || unavailable {
@@ -1476,7 +1485,7 @@ func (u *Uploader) markDataSetStageFailed(ctx context.Context, task *model.Task,
 	u.handleIngressFailure(ctx, task, version, uploadID, copyIndex, logger, stage, err)
 }
 
-func (u *Uploader) markPeerFailed(ctx context.Context, task *model.Task, uploadID int64, copyIndex int, logger *slog.Logger, stage string, err error) {
+func (u *Uploader) markPeerFailed(ctx context.Context, task *model.Task, uploadID int64, copyIndex int, discardDataSetID int64, logger *slog.Logger, stage string, err error) {
 	if appendErr := u.repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
 		UploadID:       uploadID,
 		CopyIndex:      copyIndex,
@@ -1493,6 +1502,11 @@ func (u *Uploader) markPeerFailed(ctx context.Context, task *model.Task, uploadI
 		defer cancel()
 		if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, uploadID, copyIndex, fmt.Sprintf("%s: %v", stage, err)); markErr != nil {
 			logger.Warn("failed to mark peer upload copy failed", "uploadID", uploadID, "copyIndex", copyIndex, "error", markErr)
+		}
+		if discardDataSetID > 0 {
+			if discardErr := u.repos.Uploads.DiscardFailedDataSetCandidate(cleanupCtx, uploadID, copyIndex, discardDataSetID); discardErr != nil {
+				logger.Warn("failed to discard failed dataset candidate", "uploadID", uploadID, "copyIndex", copyIndex, "dataSetID", discardDataSetID, "error", discardErr)
+			}
 		}
 		if repairErr := u.enqueueRepairUpload(cleanupCtx, task, uploadID); repairErr != nil {
 			logger.Warn("failed to enqueue peer repair task", "uploadID", uploadID, "copyIndex", copyIndex, "error", repairErr)
@@ -1518,7 +1532,7 @@ func (u *Uploader) handlePeerDataSetFailure(ctx context.Context, task *model.Tas
 			return
 		}
 	}
-	u.markPeerFailed(ctx, task, uploadID, copyIndex, logger, stage, err)
+	u.markPeerFailed(ctx, task, uploadID, copyIndex, 0, logger, stage, err)
 }
 
 func (u *Uploader) enqueueRepairUpload(ctx context.Context, parent *model.Task, uploadID int64) error {

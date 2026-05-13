@@ -3,6 +3,7 @@ package migrations
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
@@ -13,8 +14,20 @@ func init() {
 	Migrations.MustRegister(up2026040501Init, down2026040501Init)
 }
 
-// up2026040501Init is the squashed development baseline schema.
-// Follow-up migrations should only be added after the first business release.
+type bucket2026040501 struct {
+	bun.BaseModel `bun:"table:buckets"`
+
+	ID             int64     `bun:",pk,autoincrement"`
+	Name           string    `bun:",unique,notnull"`
+	ACL            []byte    `bun:",nullzero"`
+	OwnerAccessKey *string   `bun:",nullzero"`
+	Status         string    `bun:",notnull,default:'active'"`
+	CreatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+// up2026040501Init is the frozen development-preview baseline schema.
+// Follow-up schema changes must be added as separate migrations.
 func up2026040501Init(ctx context.Context, db *bun.DB) error {
 	// IAM and bucket ownership tables come first because buckets reference S3 accounts.
 	if _, err := db.NewCreateTable().
@@ -26,7 +39,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateTable().
-		Model((*model.Bucket)(nil)).
+		Model((*bucket2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(owner_access_key) REFERENCES s3_accounts(access_key) ON UPDATE CASCADE ON DELETE RESTRICT").
 		ColumnExpr("CONSTRAINT chk_buckets_status CHECK (status IN ('active'))").
@@ -406,7 +419,7 @@ func createS3AccountIndexes(ctx context.Context, db *bun.DB) error {
 
 func createBucketIndexes(ctx context.Context, db *bun.DB) error {
 	if _, err := db.NewCreateIndex().
-		Model((*model.Bucket)(nil)).
+		Model((*bucket2026040501)(nil)).
 		Index("idx_buckets_owner_access_key").
 		Column("owner_access_key").
 		IfNotExists().

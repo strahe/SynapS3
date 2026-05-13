@@ -380,6 +380,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		WithObjectStorage(storageClient).
 		WithProviderIdentityResolver(admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger)).
 		WithSettings(settingsSvc).
+		WithFilecoinDefaultCopies(cfg.Filecoin.DefaultCopies).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithS3IAM(iamSvc, rootAccount.Access)
 	errCh := make(chan error, 2)

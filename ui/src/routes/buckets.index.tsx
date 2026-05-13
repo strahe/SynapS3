@@ -19,8 +19,10 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBuckets, useCreateBucket, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
+import { bucketCopyPolicyLabel, copyPolicyOptions, inheritedCopyPolicyValue } from '@/lib/bucket-copy-policy'
 import { ownerLabel } from '@/lib/s3-owner'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
@@ -34,6 +36,7 @@ function CreateBucketDialog() {
   const [open, setOpen] = useState(false)
   const [bucketName, setBucketName] = useState('')
   const [ownerAccessKey, setOwnerAccessKey] = useState('')
+  const [copyPolicy, setCopyPolicy] = useState(inheritedCopyPolicyValue)
   const [error, setError] = useState<string | null>(null)
   const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
   const createBucket = useCreateBucket()
@@ -42,6 +45,7 @@ function CreateBucketDialog() {
   const reset = () => {
     setBucketName('')
     setOwnerAccessKey('')
+    setCopyPolicy(inheritedCopyPolicyValue)
     setError(null)
     createBucket.reset()
   }
@@ -64,8 +68,9 @@ function CreateBucketDialog() {
     }
 
     setError(null)
+    const defaultCopies = copyPolicy === inheritedCopyPolicyValue ? null : Number(copyPolicy)
     createBucket.mutate(
-      { name, ownerAccessKey },
+      { name, ownerAccessKey, defaultCopies },
       {
         onSuccess: (bucket) => {
           setOpen(false)
@@ -119,6 +124,24 @@ function CreateBucketDialog() {
               </p>
             )}
             {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="bucket-copies">Replicas</Label>
+            <Select value={copyPolicy} onValueChange={setCopyPolicy} disabled={createBucket.isPending}>
+              <SelectTrigger id="bucket-copies" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value={inheritedCopyPolicyValue}>Inherit global default</SelectItem>
+                  {copyPolicyOptions.map((copies) => (
+                    <SelectItem key={copies} value={copies.toString()}>
+                      {copies} {copies === 1 ? 'copy' : 'copies'}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
           <DialogFooter>
@@ -375,6 +398,7 @@ function BucketsPage() {
               <TableRow className="bg-muted/50">
                 <TableHead className="px-4">Name</TableHead>
                 <TableHead className="px-4">Owner</TableHead>
+                <TableHead className="px-4">Replicas</TableHead>
                 <TableHead className="px-4">Status</TableHead>
                 <TableHead className="px-4 text-right">Objects</TableHead>
                 <TableHead className="px-4 text-right">Size</TableHead>
@@ -401,6 +425,7 @@ function BucketsPage() {
                       <TableCell className="px-4">
                         <OwnerCell ownerAccessKey={bucket.owner_access_key} />
                       </TableCell>
+                      <TableCell className="px-4">{bucketCopyPolicyLabel(bucket)}</TableCell>
                       <TableCell className="px-4">
                         <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
                       </TableCell>
@@ -432,7 +457,7 @@ function BucketsPage() {
                 })
               ) : (
                 <TableRow>
-                  <TableCell colSpan={7} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
                     No buckets found
                   </TableCell>
                 </TableRow>

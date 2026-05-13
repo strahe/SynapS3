@@ -1,9 +1,11 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -33,31 +35,38 @@ const (
 )
 
 type bucketListItem struct {
-	ID             int64   `json:"id"`
-	Name           string  `json:"name"`
-	OwnerAccessKey *string `json:"owner_access_key"`
-	Status         string  `json:"status"`
-	ObjectCount    int64   `json:"object_count"`
-	TotalSizeBytes int64   `json:"total_size_bytes"`
-	CreatedAt      string  `json:"created_at"`
+	ID              int64   `json:"id"`
+	Name            string  `json:"name"`
+	OwnerAccessKey  *string `json:"owner_access_key"`
+	DefaultCopies   *int    `json:"default_copies"`
+	EffectiveCopies int     `json:"effective_copies"`
+	Status          string  `json:"status"`
+	ObjectCount     int64   `json:"object_count"`
+	TotalSizeBytes  int64   `json:"total_size_bytes"`
+	CreatedAt       string  `json:"created_at"`
 }
 
 type bucketCreateRequest struct {
 	Name           string `json:"name"`
 	OwnerAccessKey string `json:"owner_access_key"`
+	DefaultCopies  *int   `json:"default_copies"`
 }
 
 type bucketMutationResponse struct {
-	ID             int64   `json:"id"`
-	Name           string  `json:"name"`
-	OwnerAccessKey *string `json:"owner_access_key"`
-	Status         string  `json:"status"`
+	ID              int64   `json:"id"`
+	Name            string  `json:"name"`
+	OwnerAccessKey  *string `json:"owner_access_key"`
+	DefaultCopies   *int    `json:"default_copies"`
+	EffectiveCopies int     `json:"effective_copies"`
+	Status          string  `json:"status"`
 }
 
 type bucketDetailResponse struct {
 	ID                 int64                           `json:"id"`
 	Name               string                          `json:"name"`
 	OwnerAccessKey     *string                         `json:"owner_access_key"`
+	DefaultCopies      *int                            `json:"default_copies"`
+	EffectiveCopies    int                             `json:"effective_copies"`
 	Status             string                          `json:"status"`
 	ObjectCount        int64                           `json:"object_count"`
 	TotalSizeBytes     int64                           `json:"total_size_bytes"`
@@ -93,6 +102,48 @@ type bucketOwnerUpdateRequest struct {
 	OwnerAccessKey string `json:"owner_access_key"`
 }
 
+type bucketCopyPolicyUpdateRequest struct {
+	DefaultCopies json.RawMessage `json:"default_copies"`
+}
+
+func (s *Server) effectiveBucketCopies(bucket *model.Bucket) int {
+	if bucket != nil && bucket.DefaultCopies != nil {
+		return boundedBucketCopies(*bucket.DefaultCopies)
+	}
+	return boundedBucketCopies(s.filecoinDefaultCopies)
+}
+
+func boundedBucketCopies(copies int) int {
+	return model.ClampStorageCopies(copies)
+}
+
+func validateBucketDefaultCopies(copies *int) error {
+	if copies == nil {
+		return nil
+	}
+	if !model.ValidStorageCopies(*copies) {
+		return fmt.Errorf("default_copies must be between %d and %d", model.StorageCopiesMin, model.StorageCopiesMax)
+	}
+	return nil
+}
+
+func parseBucketDefaultCopies(raw json.RawMessage) (*int, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("default_copies is required")
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil
+	}
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, fmt.Errorf("default_copies must be an integer or null")
+	}
+	if err := validateBucketDefaultCopies(&value); err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
 func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -117,13 +168,15 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 		}
 		stats := statsMap[b.ID]
 		items = append(items, bucketListItem{
-			ID:             b.ID,
-			Name:           b.Name,
-			OwnerAccessKey: s.adminOwnerAccessKey(b.OwnerAccessKey),
-			Status:         string(b.Status),
-			ObjectCount:    stats.Count,
-			TotalSizeBytes: stats.TotalSize,
-			CreatedAt:      b.CreatedAt.Format(time.RFC3339),
+			ID:              b.ID,
+			Name:            b.Name,
+			OwnerAccessKey:  s.adminOwnerAccessKey(b.OwnerAccessKey),
+			DefaultCopies:   b.DefaultCopies,
+			EffectiveCopies: s.effectiveBucketCopies(&b),
+			Status:          string(b.Status),
+			ObjectCount:     stats.Count,
+			TotalSizeBytes:  stats.TotalSize,
+			CreatedAt:       b.CreatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -152,6 +205,10 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name: must be 3-63 lowercase alphanumeric characters or hyphens, cannot start or end with a hyphen"})
 		return
 	}
+	if err := validateBucketDefaultCopies(req.DefaultCopies); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	ownerAccessKey := strings.TrimSpace(req.OwnerAccessKey)
 	actualOwnerAccessKey, ok := s.resolveS3BucketOwner(w, ownerAccessKey, http.StatusBadRequest)
 	if !ok {
@@ -177,6 +234,7 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 			Name:           name,
 			ACL:            acl,
 			OwnerAccessKey: &actualOwnerAccessKey,
+			DefaultCopies:  req.DefaultCopies,
 			Status:         model.BucketStatusActive,
 		}
 		return txRepos.Buckets.Create(r.Context(), bucket)
@@ -197,10 +255,12 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 	s.bucketLifecycle.EnsureCacheBucketDir(r.Context(), name)
 
 	writeJSON(w, http.StatusCreated, bucketMutationResponse{
-		ID:             bucket.ID,
-		Name:           bucket.Name,
-		OwnerAccessKey: s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		Status:         string(bucket.Status),
+		ID:              bucket.ID,
+		Name:            bucket.Name,
+		OwnerAccessKey:  s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:   bucket.DefaultCopies,
+		EffectiveCopies: s.effectiveBucketCopies(bucket),
+		Status:          string(bucket.Status),
 	})
 }
 
@@ -244,6 +304,8 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		ID:                 bucket.ID,
 		Name:               bucket.Name,
 		OwnerAccessKey:     s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:      bucket.DefaultCopies,
+		EffectiveCopies:    s.effectiveBucketCopies(bucket),
 		Status:             string(bucket.Status),
 		ObjectCount:        stats.Count,
 		TotalSizeBytes:     stats.TotalSize,
@@ -314,10 +376,60 @@ func (s *Server) handleAPIUpdateBucketOwner(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, bucketMutationResponse{
-		ID:             bucket.ID,
-		Name:           bucket.Name,
-		OwnerAccessKey: s.adminOwnerAccessKey(&actualOwnerAccessKey),
-		Status:         string(bucket.Status),
+		ID:              bucket.ID,
+		Name:            bucket.Name,
+		OwnerAccessKey:  s.adminOwnerAccessKey(&actualOwnerAccessKey),
+		DefaultCopies:   bucket.DefaultCopies,
+		EffectiveCopies: s.effectiveBucketCopies(bucket),
+		Status:          string(bucket.Status),
+	})
+}
+
+func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	if !s.requireBucketWrite(w, r) {
+		return
+	}
+
+	var req bucketCopyPolicyUpdateRequest
+	if !decodeBucketStrictJSON(w, r, &req) {
+		return
+	}
+	copies, err := parseBucketDefaultCopies(req.DefaultCopies)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket for copy policy update", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+	if err := s.repos.Buckets.SetDefaultCopies(ctx, bucketName, copies); err != nil {
+		s.logger.Error("api: failed to update bucket copy policy", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	bucket.DefaultCopies = copies
+
+	writeJSON(w, http.StatusOK, bucketMutationResponse{
+		ID:              bucket.ID,
+		Name:            bucket.Name,
+		OwnerAccessKey:  s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:   bucket.DefaultCopies,
+		EffectiveCopies: s.effectiveBucketCopies(bucket),
+		Status:          string(bucket.Status),
 	})
 }
 

@@ -86,6 +86,52 @@ func TestMigrationCreatesStorageUploadSourceVersionIndex(t *testing.T) {
 	}
 }
 
+func TestBucketDefaultCopiesMigrationAddsNullableBoundedColumn(t *testing.T) {
+	sqldb, err := sql.Open("sqlite", "file::memory:?cache=shared&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	migrator := migrate.NewMigrator(db, Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if !sqliteColumnExists(t, db, "buckets", "default_copies") {
+		t.Fatal("buckets.default_copies column missing")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO buckets (name, status, default_copies) VALUES ('inherit-bucket', 'active', NULL)`); err != nil {
+		t.Fatalf("insert inherited bucket: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO buckets (name, status, default_copies) VALUES ('one-copy-bucket', 'active', 1)`); err != nil {
+		t.Fatalf("insert one-copy bucket: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO buckets (name, status, default_copies) VALUES ('eight-copy-bucket', 'active', 8)`); err != nil {
+		t.Fatalf("insert eight-copy bucket: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		copies int
+	}{
+		{name: "zero-copy-bucket", copies: 0},
+		{name: "nine-copy-bucket", copies: 9},
+	} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO buckets (name, status, default_copies) VALUES (?, 'active', ?)`, tc.name, tc.copies); err == nil {
+			t.Fatalf("insert %s with default_copies=%d succeeded, want constraint failure", tc.name, tc.copies)
+		}
+	}
+
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+}
+
 func sqliteTableExists(t *testing.T, db *bun.DB, table string) bool {
 	t.Helper()
 	var count int

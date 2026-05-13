@@ -67,6 +67,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/buckets", srv.handleAPICreateBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}", srv.handleAPIGetBucket)
 	mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", srv.handleAPIUpdateBucketOwner)
+	mux.HandleFunc("PUT /api/v1/buckets/{name}/copy-policy", srv.handleAPIUpdateBucketCopyPolicy)
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}", srv.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", srv.handleAPIBucketObjects)
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", srv.handleAPIDeleteBucketObject)
@@ -613,8 +614,9 @@ func (r *recordingObjectListRepo) list(prefix string, include func(string) bool,
 
 func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
+	srv.WithFilecoinDefaultCopies(2)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"admin-create-bucket","owner_access_key":"owner-access"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"admin-create-bucket","owner_access_key":"owner-access","default_copies":4}`))
 	req.Header.Set("Content-Type", "application/json")
 	setBucketWriteHeaders(req)
 	rr := httptest.NewRecorder()
@@ -643,16 +645,24 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if acl.Owner != "owner-access" {
 		t.Fatalf("owner = %q, want owner-access", acl.Owner)
 	}
+	if bucket.DefaultCopies == nil || *bucket.DefaultCopies != 4 {
+		t.Fatalf("bucket default_copies = %v, want 4", bucket.DefaultCopies)
+	}
 
 	var body struct {
-		Name           string  `json:"name"`
-		OwnerAccessKey *string `json:"owner_access_key"`
+		Name            string  `json:"name"`
+		OwnerAccessKey  *string `json:"owner_access_key"`
+		DefaultCopies   *int    `json:"default_copies"`
+		EffectiveCopies int     `json:"effective_copies"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode response: %v", err)
 	}
 	if body.OwnerAccessKey == nil || *body.OwnerAccessKey != "owner-access" {
 		t.Fatalf("owner_access_key = %v, want owner-access", body.OwnerAccessKey)
+	}
+	if body.DefaultCopies == nil || *body.DefaultCopies != 4 || body.EffectiveCopies != 4 {
+		t.Fatalf("copy policy response = default:%v effective:%d, want 4/4", body.DefaultCopies, body.EffectiveCopies)
 	}
 }
 
@@ -965,6 +975,7 @@ func TestAPIBuckets_ListAllBuckets(t *testing.T) {
 
 func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
+	srv.WithFilecoinDefaultCopies(5)
 	ctx := context.Background()
 
 	ownedACL, err := json.Marshal(auth.ACL{Owner: "owner-access"})
@@ -975,8 +986,9 @@ func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
 	if err := repos.S3Accounts.Create(ctx, &model.S3Account{AccessKey: ownerAccess, SecretKey: "owner-secret", Role: auth.RoleUserPlus}); err != nil {
 		t.Fatalf("S3Accounts.Create: %v", err)
 	}
+	overrideCopies := 3
 	for _, bucket := range []*model.Bucket{
-		{Name: "owned-bucket", Status: model.BucketStatusActive, ACL: ownedACL, OwnerAccessKey: &ownerAccess},
+		{Name: "owned-bucket", Status: model.BucketStatusActive, ACL: ownedACL, OwnerAccessKey: &ownerAccess, DefaultCopies: &overrideCopies},
 		{Name: "unassigned-bucket", Status: model.BucketStatusActive},
 	} {
 		if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -996,21 +1008,37 @@ func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
 		t.Fatalf("list status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 	var listBody []struct {
-		Name           string  `json:"name"`
-		OwnerAccessKey *string `json:"owner_access_key"`
+		Name            string  `json:"name"`
+		OwnerAccessKey  *string `json:"owner_access_key"`
+		DefaultCopies   *int    `json:"default_copies"`
+		EffectiveCopies int     `json:"effective_copies"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&listBody); err != nil {
 		t.Fatalf("Decode list: %v", err)
 	}
 	owners := make(map[string]*string, len(listBody))
+	copyPolicies := make(map[string]struct {
+		defaultCopies   *int
+		effectiveCopies int
+	}, len(listBody))
 	for _, item := range listBody {
 		owners[item.Name] = item.OwnerAccessKey
+		copyPolicies[item.Name] = struct {
+			defaultCopies   *int
+			effectiveCopies int
+		}{defaultCopies: item.DefaultCopies, effectiveCopies: item.EffectiveCopies}
 	}
 	if owners["owned-bucket"] == nil || *owners["owned-bucket"] != "owner-access" {
 		t.Fatalf("owned-bucket owner = %v, want owner-access", owners["owned-bucket"])
 	}
 	if owners["unassigned-bucket"] != nil {
 		t.Fatalf("unassigned-bucket owner = %v, want nil", *owners["unassigned-bucket"])
+	}
+	if copyPolicies["owned-bucket"].defaultCopies == nil || *copyPolicies["owned-bucket"].defaultCopies != 3 || copyPolicies["owned-bucket"].effectiveCopies != 3 {
+		t.Fatalf("owned bucket copy policy = %#v, want override 3", copyPolicies["owned-bucket"])
+	}
+	if copyPolicies["unassigned-bucket"].defaultCopies != nil || copyPolicies["unassigned-bucket"].effectiveCopies != 5 {
+		t.Fatalf("unassigned bucket copy policy = %#v, want inherited 5", copyPolicies["unassigned-bucket"])
 	}
 
 	detailResp, err := http.Get(ts.URL + "/api/v1/buckets/owned-bucket")
@@ -1022,7 +1050,9 @@ func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
 		t.Fatalf("detail status = %d, want %d", detailResp.StatusCode, http.StatusOK)
 	}
 	var detailBody struct {
-		OwnerAccessKey *string `json:"owner_access_key"`
+		OwnerAccessKey  *string `json:"owner_access_key"`
+		DefaultCopies   *int    `json:"default_copies"`
+		EffectiveCopies int     `json:"effective_copies"`
 	}
 	if err := json.NewDecoder(detailResp.Body).Decode(&detailBody); err != nil {
 		t.Fatalf("Decode detail: %v", err)
@@ -1030,10 +1060,115 @@ func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
 	if detailBody.OwnerAccessKey == nil || *detailBody.OwnerAccessKey != "owner-access" {
 		t.Fatalf("detail owner = %v, want owner-access", detailBody.OwnerAccessKey)
 	}
+	if detailBody.DefaultCopies == nil || *detailBody.DefaultCopies != 3 || detailBody.EffectiveCopies != 3 {
+		t.Fatalf("detail copy policy = default:%v effective:%d, want 3/3", detailBody.DefaultCopies, detailBody.EffectiveCopies)
+	}
+}
+
+func TestAPIBucketCopyPolicy_UpdateAndClear(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	srv.WithFilecoinDefaultCopies(5)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "copy-policy-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	setReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader(`{"default_copies":6}`))
+	if err != nil {
+		t.Fatalf("NewRequest set: %v", err)
+	}
+	setReq.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(setReq)
+	setResp, err := http.DefaultClient.Do(setReq)
+	if err != nil {
+		t.Fatalf("PUT copy policy set: %v", err)
+	}
+	defer func() { _ = setResp.Body.Close() }()
+	if setResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(setResp.Body)
+		t.Fatalf("set status = %d, want %d body=%s", setResp.StatusCode, http.StatusOK, body)
+	}
+	var setBody struct {
+		Name            string `json:"name"`
+		DefaultCopies   *int   `json:"default_copies"`
+		EffectiveCopies int    `json:"effective_copies"`
+	}
+	if err := json.NewDecoder(setResp.Body).Decode(&setBody); err != nil {
+		t.Fatalf("Decode set response: %v", err)
+	}
+	if setBody.Name != bucket.Name || setBody.DefaultCopies == nil || *setBody.DefaultCopies != 6 || setBody.EffectiveCopies != 6 {
+		t.Fatalf("set copy policy response = %#v, want override 6", setBody)
+	}
+
+	clearReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader("{\"default_copies\": \n null \t}"))
+	if err != nil {
+		t.Fatalf("NewRequest clear: %v", err)
+	}
+	clearReq.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(clearReq)
+	clearResp, err := http.DefaultClient.Do(clearReq)
+	if err != nil {
+		t.Fatalf("PUT copy policy clear: %v", err)
+	}
+	defer func() { _ = clearResp.Body.Close() }()
+	if clearResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(clearResp.Body)
+		t.Fatalf("clear status = %d, want %d body=%s", clearResp.StatusCode, http.StatusOK, body)
+	}
+	var clearBody struct {
+		DefaultCopies   *int `json:"default_copies"`
+		EffectiveCopies int  `json:"effective_copies"`
+	}
+	if err := json.NewDecoder(clearResp.Body).Decode(&clearBody); err != nil {
+		t.Fatalf("Decode clear response: %v", err)
+	}
+	if clearBody.DefaultCopies != nil || clearBody.EffectiveCopies != 5 {
+		t.Fatalf("clear copy policy response = %#v, want inherited 5", clearBody)
+	}
+}
+
+func TestAPIBucketCopyPolicy_RejectsInvalidPayloads(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "invalid-copy-policy-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing field", body: `{}`},
+		{name: "unknown field", body: `{"default_copies":3,"extra":true}`},
+		{name: "string copies", body: `{"default_copies":"3"}`},
+		{name: "fractional copies", body: `{"default_copies":3.5}`},
+		{name: "zero copies", body: `{"default_copies":0}`},
+		{name: "too many copies", body: `{"default_copies":9}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/invalid-copy-policy-bucket/copy-policy", strings.NewReader(tc.body))
+			req.SetPathValue("name", bucket.Name)
+			req.Header.Set("Content-Type", "application/json")
+			setBucketWriteHeaders(req)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIUpdateBucketCopyPolicy(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+			}
+		})
+	}
 }
 
 func TestAPIBucketOwner_UpdateAssignsExistingS3User(t *testing.T) {
 	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
+	srv.WithFilecoinDefaultCopies(4)
 	ctx := context.Background()
 	bucket := &model.Bucket{Name: "assign-owner-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -1063,13 +1198,18 @@ func TestAPIBucketOwner_UpdateAssignsExistingS3User(t *testing.T) {
 		t.Fatalf("owner = %q, want owner-access", acl.Owner)
 	}
 	var body struct {
-		OwnerAccessKey *string `json:"owner_access_key"`
+		OwnerAccessKey  *string `json:"owner_access_key"`
+		DefaultCopies   *int    `json:"default_copies"`
+		EffectiveCopies int     `json:"effective_copies"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode response: %v", err)
 	}
 	if body.OwnerAccessKey == nil || *body.OwnerAccessKey != "owner-access" {
 		t.Fatalf("response owner = %v, want owner-access", body.OwnerAccessKey)
+	}
+	if body.DefaultCopies != nil || body.EffectiveCopies != 4 {
+		t.Fatalf("owner update copy policy = default:%v effective:%d, want inherited 4", body.DefaultCopies, body.EffectiveCopies)
 	}
 }
 

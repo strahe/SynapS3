@@ -15,9 +15,10 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	"github.com/strahe/synaps3/internal/model"
 )
 
-const MaxFilecoinDefaultCopies = 8
+const MaxFilecoinDefaultCopies = model.StorageCopiesMax
 
 type Config struct {
 	Server   ServerConfig   `koanf:"server"`
@@ -387,11 +388,12 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	if strings.TrimSpace(c.Filecoin.PrivateKey) == "" {
 		add("filecoin.private_key", "must be non-empty")
 	}
-	if c.Filecoin.DefaultCopies < 1 {
-		add("filecoin.default_copies", fmt.Sprintf("must be >= 1, got %d", c.Filecoin.DefaultCopies))
-	}
-	if c.Filecoin.DefaultCopies > MaxFilecoinDefaultCopies {
-		add("filecoin.default_copies", fmt.Sprintf("must be <= %d, got %d", MaxFilecoinDefaultCopies, c.Filecoin.DefaultCopies))
+	if !model.ValidStorageCopies(c.Filecoin.DefaultCopies) {
+		if c.Filecoin.DefaultCopies < model.StorageCopiesMin {
+			add("filecoin.default_copies", fmt.Sprintf("must be >= %d, got %d", model.StorageCopiesMin, c.Filecoin.DefaultCopies))
+		} else {
+			add("filecoin.default_copies", fmt.Sprintf("must be <= %d, got %d", model.StorageCopiesMax, c.Filecoin.DefaultCopies))
+		}
 	}
 
 	// S3 credentials.

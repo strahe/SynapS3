@@ -948,6 +948,141 @@ func TestUploader_StagedPrepareUsesConfiguredCopyCount(t *testing.T) {
 	}
 }
 
+func TestUploader_StagedPrepareUsesBucketCopyOverride(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	bucket, objID, versionID := seedCachedObject(t, env)
+	task := seedStagedUploadTask(t, env, objID, versionID, 5)
+	ctx := context.Background()
+	bucketCopies := 4
+	if err := env.repos.Buckets.SetDefaultCopies(ctx, bucket.Name, &bucketCopies); err != nil {
+		t.Fatalf("SetDefaultCopies: %v", err)
+	}
+
+	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		if opts.Copies != 4 {
+			t.Fatalf("CreateContexts copies = %d, want 4", opts.Copies)
+		}
+		contexts := make([]synapse.UploadContext, 0, opts.Copies)
+		for i := 0; i < opts.Copies; i++ {
+			contexts = append(contexts, newFakeUploadContext(
+				sdktypes.NewBigInt(uint64(100+i)),
+				sdktypes.NewBigInt(uint64(1000+i)),
+				sdktypes.NewBigInt(uint64(2000+i)),
+				testCID(t),
+			))
+		}
+		return contexts, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 100*time.Millisecond, slog.Default(), worker.WithTargetCopies(2))
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	var uploads []model.StorageUpload
+	if err := env.db.NewSelect().Model(&uploads).Where("source_version_id = ?", versionID).Scan(ctx); err != nil {
+		t.Fatalf("list uploads: %v", err)
+	}
+	if len(uploads) != 1 || uploads[0].RequestedCopies != 4 {
+		t.Fatalf("uploads after prepare = %#v, want one upload with four requested copies", uploads)
+	}
+}
+
+func TestUploader_StagedPrepareReusesExistingUploadRequestedCopies(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	bucket, objID, versionID := seedCachedObject(t, env)
+	ctx := context.Background()
+	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark uploading: %v", err)
+	}
+	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := env.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: versionID,
+		ContentSize:     version.Size,
+		Checksum:        version.Checksum,
+		RequestedCopies: 4,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	for copyIndex := 0; copyIndex < 4; copyIndex++ {
+		providerID := onChainID(t, fmt.Sprintf("%d", 100+copyIndex))
+		binding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+			BucketID:          bucket.ID,
+			ProviderID:        providerID,
+			CopyIndex:         copyIndex,
+			CreatedByUploadID: upload.ID,
+		})
+		if err != nil {
+			t.Fatalf("EnsureDataSetBinding(%d): %v", copyIndex, err)
+		}
+		if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+			ID:        binding.ID,
+			UploadID:  upload.ID,
+			DataSetID: onChainID(t, fmt.Sprintf("%d", 1000+copyIndex)),
+		}); err != nil {
+			t.Fatalf("MarkDataSetReady(%d): %v", copyIndex, err)
+		}
+		transferMethod := model.StorageCopyTransferMethodPeerPull
+		if copyIndex == 0 {
+			transferMethod = model.StorageCopyTransferMethodIngress
+		}
+		if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+			StorageDataSetID: binding.ID,
+			CopyIndex:        copyIndex,
+			TransferMethod:   transferMethod,
+			ProviderID:       providerID,
+		}}); err != nil {
+			t.Fatalf("CreateUploadCopiesForBindings(%d): %v", copyIndex, err)
+		}
+	}
+
+	newBucketCopies := 7
+	if err := env.repos.Buckets.SetDefaultCopies(ctx, bucket.Name, &newBucketCopies); err != nil {
+		t.Fatalf("SetDefaultCopies after upload: %v", err)
+	}
+	var createContextsCopies []int
+	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		createContextsCopies = append(createContextsCopies, opts.Copies)
+		return newFakeUploadContexts(t, opts.Copies, 10000), nil
+	}
+	env.storage.CreateContextFunc = func(ctx context.Context, _ *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	stage := "prepare_upload"
+	retryTask := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objID,
+		RefVersionID:   versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:retry", versionID),
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, retryTask); err != nil {
+		t.Fatalf("create retry prepare task: %v", err)
+	}
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 100*time.Millisecond, slog.Default(), worker.WithTargetCopies(2))
+	runWorkerUntilTask(t, env, uploader, retryTask.ID, 5*time.Second)
+
+	if len(createContextsCopies) != 0 {
+		t.Fatalf("CreateContexts copies after retry = %v, want none", createContextsCopies)
+	}
+	copies, err := env.repos.Uploads.ListCopies(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("ListCopies after retry: %v", err)
+	}
+	if len(copies) != 4 {
+		t.Fatalf("copy rows after retry = %d, want historical 4", len(copies))
+	}
+}
+
 func TestUploader_StagedPrepareCapsConfiguredCopyCount(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, versionID := seedCachedObject(t, env)
@@ -2114,6 +2249,224 @@ func TestUploader_RepairPrepareCreatesReplacementForPeerDeficit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUploader_FailedNewPeerDataSetDoesNotRemainInBucketPool(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadableUploadWithPendingPeer(t, env)
+	if _, err := env.db.NewUpdate().
+		Model((*model.StorageUpload)(nil)).
+		Set("requested_copies = ?", 3).
+		Where("id = ?", fixture.upload.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("set requested copies: %v", err)
+	}
+	failedProviderID := onChainID(t, "303")
+	failedBinding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          fixture.upload.BucketID,
+		ProviderID:        failedProviderID,
+		CopyIndex:         2,
+		CreatedByUploadID: fixture.upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding failed candidate: %v", err)
+	}
+	if err := env.repos.Uploads.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+		ID:              failedBinding.ID,
+		UploadID:        fixture.upload.ID,
+		TransactionID:   "0xcreate303",
+		StatusURL:       "https://provider-303.example/status/create",
+		ClientDataSetID: onChainIDPtr(t, "10303"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetCreating failed candidate: %v", err)
+	}
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, fixture.upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: failedBinding.ID,
+		CopyIndex:        2,
+		TransferMethod:   model.StorageCopyTransferMethodPeerPull,
+		ProviderID:       failedProviderID,
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings failed candidate: %v", err)
+	}
+
+	failedCtx := newFakeUploadContext(sdktypes.NewBigInt(303), sdktypes.NewBigInt(3003), sdktypes.NewBigInt(4001), testCID(t))
+	failedCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
+	replacement := newFakeUploadContext(sdktypes.NewBigInt(404), sdktypes.NewBigInt(4004), sdktypes.NewBigInt(5001), testCID(t))
+	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		if createContextProviderIDEqual(opts, failedCtx.providerID) {
+			return failedCtx, nil
+		}
+		if createContextProviderIDEqual(opts, replacement.providerID) {
+			return replacement, nil
+		}
+		if createContextDataSetIDEqual(opts, replacement.dataSetID) {
+			return replacement, nil
+		}
+		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+	}
+	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		if opts.Copies != 1 {
+			t.Fatalf("CreateContexts copies = %d, want 1", opts.Copies)
+		}
+		return []synapse.UploadContext{replacement}, nil
+	}
+
+	stage := "ensure_dataset"
+	ensureTask := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          fixture.objID,
+		RefVersionID:   fixture.versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:ensure_dataset:%d:2", fixture.versionID, fixture.upload.ID),
+		Payload:        map[string]interface{}{"upload_id": fixture.upload.ID, "copy_index": 2, "transfer_method": string(model.StorageCopyTransferMethodPeerPull)},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     1,
+		ScheduledAt:    time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, ensureTask); err != nil {
+		t.Fatalf("Create ensure task: %v", err)
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 10*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, ensureTask.ID, 5*time.Second)
+
+	repairTasks, _, err := env.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", "", 10, 0)
+	if err != nil {
+		t.Fatalf("list repair tasks: %v", err)
+	}
+	var repairTask *model.Task
+	for i := range repairTasks {
+		if repairTasks[i].RefVersionID == fixture.versionID && strings.Contains(repairTasks[i].IdempotencyKey, ":repair") {
+			repairTask = &repairTasks[i]
+			break
+		}
+	}
+	if repairTask == nil {
+		t.Fatalf("repair tasks = %#v, want one repair prepare task", repairTasks)
+	}
+	runWorkerUntilTask(t, env, uploader, repairTask.ID, 5*time.Second)
+
+	bindings, err := env.repos.Uploads.ListDataSetBindings(ctx, fixture.upload.BucketID)
+	if err != nil {
+		t.Fatalf("ListDataSetBindings: %v", err)
+	}
+	if len(bindings) != 3 {
+		t.Fatalf("dataset bindings = %#v, want three reusable bindings", bindings)
+	}
+	for _, binding := range bindings {
+		if binding.ProviderID.String() == failedProviderID.String() || binding.Status == model.StorageDataSetStatusFailed {
+			t.Fatalf("dataset bindings = %#v, want failed candidate removed from bucket pool", bindings)
+		}
+	}
+	replacementBinding, err := env.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, fixture.upload.BucketID, 2)
+	if err != nil || replacementBinding == nil {
+		t.Fatalf("GetDataSetBindingByCopyIndex replacement: binding=%v err=%v", replacementBinding, err)
+	}
+	if replacementBinding.ProviderID.String() != "404" {
+		t.Fatalf("replacement provider = %s, want 404", replacementBinding.ProviderID.String())
+	}
+
+	copies, err := env.repos.Uploads.ListCopies(ctx, fixture.upload.ID)
+	if err != nil {
+		t.Fatalf("ListCopies: %v", err)
+	}
+	if len(copies) != 3 || copies[2].CopyIndex != 2 || copies[2].ProviderID == nil || copies[2].ProviderID.String() != "404" {
+		t.Fatalf("copies after repair = %#v, want replacement copy index 2 from provider 404", copies)
+	}
+	provenance, err := env.repos.Uploads.GetUploadProvenance(ctx, fixture.upload.ID)
+	if err != nil {
+		t.Fatalf("GetUploadProvenance: %v", err)
+	}
+	if len(provenance.Failures) != 1 || provenance.Failures[0].ProviderID == nil || provenance.Failures[0].ProviderID.String() != failedProviderID.String() {
+		t.Fatalf("provenance failures = %#v, want failed provider attempt retained", provenance.Failures)
+	}
+}
+
+func TestUploader_FailedNewPeerDataSetDiscardDoesNotDependOnFailureLog(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadableUploadWithPendingPeer(t, env)
+	failedProviderID := onChainID(t, "303")
+	failedBinding, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          fixture.upload.BucketID,
+		ProviderID:        failedProviderID,
+		CopyIndex:         2,
+		CreatedByUploadID: fixture.upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding failed candidate: %v", err)
+	}
+	if err := env.repos.Uploads.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+		ID:              failedBinding.ID,
+		UploadID:        fixture.upload.ID,
+		TransactionID:   "0xcreate303",
+		StatusURL:       "https://provider-303.example/status/create",
+		ClientDataSetID: onChainIDPtr(t, "10303"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetCreating failed candidate: %v", err)
+	}
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, fixture.upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: failedBinding.ID,
+		CopyIndex:        2,
+		TransferMethod:   model.StorageCopyTransferMethodPeerPull,
+		ProviderID:       failedProviderID,
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings failed candidate: %v", err)
+	}
+
+	baseUploads := env.repos.Uploads
+	env.repos.Uploads = &appendFailureUploadRepo{
+		StorageUploadRepository: baseUploads,
+		err:                     errors.New("append failure unavailable"),
+	}
+
+	failedCtx := newFakeUploadContext(sdktypes.NewBigInt(303), sdktypes.NewBigInt(3003), sdktypes.NewBigInt(4001), testCID(t))
+	failedCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
+	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		if createContextProviderIDEqual(opts, failedCtx.providerID) {
+			return failedCtx, nil
+		}
+		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+	}
+
+	stage := "ensure_dataset"
+	ensureTask := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          fixture.objID,
+		RefVersionID:   fixture.versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:ensure_dataset:%d:2", fixture.versionID, fixture.upload.ID),
+		Payload:        map[string]interface{}{"upload_id": fixture.upload.ID, "copy_index": 2, "transfer_method": string(model.StorageCopyTransferMethodPeerPull)},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     1,
+		ScheduledAt:    time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, ensureTask); err != nil {
+		t.Fatalf("Create ensure task: %v", err)
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 10*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, ensureTask.ID, 5*time.Second)
+
+	binding, err := baseUploads.GetDataSetBindingByCopyIndex(ctx, fixture.upload.BucketID, 2)
+	if err != nil {
+		t.Fatalf("GetDataSetBindingByCopyIndex: %v", err)
+	}
+	if binding != nil {
+		t.Fatalf("failed dataset candidate binding = %#v, want discarded even when AppendUploadFailure fails", binding)
+	}
+}
+
+type appendFailureUploadRepo struct {
+	repository.StorageUploadRepository
+	err error
+}
+
+func (r *appendFailureUploadRepo) AppendUploadFailure(context.Context, repository.AppendUploadFailureInput) error {
+	return r.err
 }
 
 func TestUploader_MissingVersion(t *testing.T) {

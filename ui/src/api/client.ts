@@ -58,6 +58,8 @@ export interface BucketItem {
   id: number
   name: string
   owner_access_key: string | null
+  default_copies: number | null
+  effective_copies: number
   status: string
   object_count: number
   total_size_bytes: number
@@ -96,6 +98,8 @@ export interface BucketMutationResponse {
   id: number
   name: string
   owner_access_key: string | null
+  default_copies: number | null
+  effective_copies: number
   status: string
 }
 
@@ -619,7 +623,7 @@ export const api = {
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
   getBucket: (name: string) => fetchJSON<BucketDetail>(`/buckets/${encodeURIComponent(name)}`),
-  createBucket: (payload: { name: string; owner_access_key: string }) =>
+  createBucket: (payload: { name: string; owner_access_key: string; default_copies?: number | null }) =>
     fetchJSON<BucketMutationResponse>('/buckets', {
       method: 'POST',
       headers: {
@@ -634,6 +638,14 @@ export const api = {
         'X-SynapS3-Settings-Write': '1',
       },
       body: JSON.stringify({ owner_access_key: ownerAccessKey }),
+    }),
+  updateBucketCopyPolicy: (name: string, defaultCopies: number | null) =>
+    fetchJSON<BucketMutationResponse>(`/buckets/${encodeURIComponent(name)}/copy-policy`, {
+      method: 'PUT',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify({ default_copies: defaultCopies }),
     }),
   deleteBucket: (name: string, params: { recursive?: boolean } = {}) => {
     const sp = new URLSearchParams()

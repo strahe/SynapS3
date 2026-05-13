@@ -43,6 +43,7 @@ import {
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
+import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
@@ -78,6 +79,7 @@ import { Label } from '@/components/ui/label'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Progress } from '@/components/ui/progress'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -96,8 +98,18 @@ import {
   usePermanentDeleteDeletedBucketObject,
   useRestoreBucketObject,
   useS3Users,
+  useUpdateBucketCopyPolicy,
   useUpdateBucketOwner,
 } from '@/hooks/queries'
+import {
+  bucketCopyPolicyEffectNote,
+  bucketCopyPolicyInheritOptionLabel,
+  bucketCopyPolicyLabel,
+  bucketCopyPolicySavedMessage,
+  bucketCopyPolicyValue,
+  copyPolicyOptions,
+  inheritedCopyPolicyValue,
+} from '@/lib/bucket-copy-policy'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
@@ -108,6 +120,7 @@ type ObjectBrowserSearch = {
   marker?: string
   view?: 'objects' | 'deleted'
 }
+type ProvenanceFailureDialogState = { title: string; text: string }
 
 const objectBrowserSkeletonRows = ['row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8']
 
@@ -620,37 +633,56 @@ function ObjectProvenanceDialog({
 }) {
   const provenance = useObjectProvenance(bucketName, versionID, open)
   const data = provenance.data
+  const [failureDialog, setFailureDialog] = useState<ProvenanceFailureDialogState | null>(null)
+
+  const handleOpenChange = (next: boolean) => {
+    if (!next) setFailureDialog(null)
+    onOpenChange(next)
+  }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-5xl lg:p-6">
-        <DialogHeader>
-          <DialogTitle>Storage provenance</DialogTitle>
-          <DialogDescription className="pr-8">
-            <span className="block max-w-full truncate font-mono text-xs" title={objectKey}>
-              {objectKey}
-            </span>
-            <span className="block max-w-full truncate font-mono text-xs" title={versionID}>
-              {versionID}
-            </span>
-          </DialogDescription>
-        </DialogHeader>
+    <>
+      <Dialog open={open} onOpenChange={handleOpenChange}>
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-5xl lg:p-6">
+          <DialogHeader>
+            <DialogTitle>Storage provenance</DialogTitle>
+            <DialogDescription className="pr-8">
+              <span className="block max-w-full truncate font-mono text-xs" title={objectKey}>
+                {objectKey}
+              </span>
+              <span className="block max-w-full truncate font-mono text-xs" title={versionID}>
+                {versionID}
+              </span>
+            </DialogDescription>
+          </DialogHeader>
 
-        {provenance.isLoading ? (
-          <div className="flex h-40 items-center justify-center">
-            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-          </div>
-        ) : provenance.error ? (
-          <div className="text-sm text-destructive">Failed to load provenance</div>
-        ) : data ? (
-          <div className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1">
-            <ProvenanceSummary data={data} />
-            <ProvenanceCopies copies={data.copies} />
-            <ProvenanceFailures failures={data.failures} />
-          </div>
-        ) : null}
-      </DialogContent>
-    </Dialog>
+          {provenance.isLoading ? (
+            <div className="flex h-40 items-center justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : provenance.error ? (
+            <div className="text-sm text-destructive">Failed to load provenance</div>
+          ) : data ? (
+            <div className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1">
+              <ProvenanceSummary data={data} />
+              <ProvenanceCopies copies={data.copies} />
+              <ProvenanceFailures
+                failures={data.failures}
+                onOpenError={(failure) => {
+                  if (!failure.error) return
+                  setFailureDialog({ title: 'Failed Attempt Error', text: failure.error })
+                }}
+              />
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+      <DetailTextDialog
+        title={failureDialog?.title ?? 'Failed Attempt Error'}
+        text={failureDialog?.text ?? null}
+        onClose={() => setFailureDialog(null)}
+      />
+    </>
   )
 }
 
@@ -849,7 +881,13 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
   )
 }
 
-function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] }) {
+function ProvenanceFailures({
+  failures,
+  onOpenError,
+}: {
+  failures: ObjectProvenanceFailure[]
+  onOpenError: (failure: ObjectProvenanceFailure) => void
+}) {
   return (
     <div className="overflow-hidden rounded-md border border-border">
       <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Failed attempts</div>
@@ -870,8 +908,8 @@ function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] 
               </TableCell>
               <TableCell className="px-3">{transferMethodLabel(failure.transfer_method)}</TableCell>
               <TableCell className="px-3">{failure.stage ?? '—'}</TableCell>
-              <TableCell className="max-w-md overflow-hidden truncate px-3 text-muted-foreground" title={failure.error}>
-                {failure.error ?? '—'}
+              <TableCell className="max-w-md px-3">
+                <ProvenanceFailureErrorCell failure={failure} onOpenError={onOpenError} />
               </TableCell>
             </TableRow>
           ))}
@@ -885,6 +923,28 @@ function ProvenanceFailures({ failures }: { failures: ObjectProvenanceFailure[] 
         </TableBody>
       </Table>
     </div>
+  )
+}
+
+function ProvenanceFailureErrorCell({
+  failure,
+  onOpenError,
+}: {
+  failure: ObjectProvenanceFailure
+  onOpenError: (failure: ObjectProvenanceFailure) => void
+}) {
+  if (!failure.error) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  return (
+    <Button
+      type="button"
+      variant="link"
+      onClick={() => onOpenError(failure)}
+      className="h-auto max-w-full justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
+    >
+      <span className="truncate">{failure.error}</span>
+    </Button>
   )
 }
 
@@ -1614,6 +1674,7 @@ function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<type
     <dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
       <BucketDetailField label="Objects" value={formatObjectCount(bucket.object_count)} />
       <BucketDetailField label="Total size" value={formatBytes(bucket.total_size_bytes)} />
+      <BucketDetailField label="Replicas" value={bucketCopyPolicyLabel(bucket)} />
       <BucketDetailField label="Versioning" value={bucket.versioning_status} />
       <BucketDetailField label="Owner" value={ownerLabel(bucket.owner_access_key)} />
       <BucketDetailField label="Created" value={timeAgo(bucket.created_at)} title={bucket.created_at} />
@@ -1700,6 +1761,47 @@ function BucketDetailsSettings({
   onChangeOwner: () => void
   onDeleteBucket: () => void
 }) {
+  const updateCopyPolicy = useUpdateBucketCopyPolicy()
+  const currentCopyPolicy = bucketCopyPolicyValue(bucket)
+  const [copyPolicy, setCopyPolicy] = useState(currentCopyPolicy)
+  const [copyPolicyError, setCopyPolicyError] = useState<string | null>(null)
+  const [copyPolicyNotice, setCopyPolicyNotice] = useState<string | null>(null)
+
+  useEffect(() => {
+    setCopyPolicy(currentCopyPolicy)
+    setCopyPolicyError(null)
+  }, [currentCopyPolicy])
+
+  useEffect(() => {
+    if (bucket.name) setCopyPolicyNotice(null)
+  }, [bucket.name])
+
+  const copyPolicyChanged = copyPolicy !== currentCopyPolicy && copyPolicyNotice == null
+  const handleCopyPolicyChange = (next: string) => {
+    setCopyPolicy(next)
+    setCopyPolicyError(null)
+    setCopyPolicyNotice(null)
+  }
+  const saveCopyPolicy = () => {
+    setCopyPolicyError(null)
+    setCopyPolicyNotice(null)
+    updateCopyPolicy.mutate(
+      {
+        name: bucket.name,
+        defaultCopies: copyPolicy === inheritedCopyPolicyValue ? null : Number(copyPolicy),
+      },
+      {
+        onSuccess: (savedBucket) => {
+          setCopyPolicy(bucketCopyPolicyValue(savedBucket))
+          setCopyPolicyNotice(bucketCopyPolicySavedMessage())
+        },
+        onError: (mutationError) => {
+          setCopyPolicyError(mutationError instanceof Error ? mutationError.message : 'Failed to update copy policy')
+        },
+      }
+    )
+  }
+
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <section className="rounded-md border border-border p-4">
@@ -1711,6 +1813,48 @@ function BucketDetailsSettings({
           <UserRound data-icon="inline-start" />
           {bucket.owner_access_key ? 'Change owner' : 'Assign owner'}
         </Button>
+      </section>
+      <section className="rounded-md border border-border p-4">
+        <h3 className="text-sm font-medium">Replicas</h3>
+        <p className="mt-1 text-sm text-muted-foreground">{bucketCopyPolicyLabel(bucket)}</p>
+        <p className="mt-1 text-xs text-muted-foreground">{bucketCopyPolicyEffectNote()}</p>
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Select value={copyPolicy} onValueChange={handleCopyPolicyChange} disabled={updateCopyPolicy.isPending}>
+            <SelectTrigger className="w-full sm:w-56">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value={inheritedCopyPolicyValue}>{bucketCopyPolicyInheritOptionLabel(bucket)}</SelectItem>
+                {copyPolicyOptions.map((copies) => (
+                  <SelectItem key={copies} value={copies.toString()}>
+                    {copies} {copies === 1 ? 'copy' : 'copies'}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={saveCopyPolicy}
+            disabled={!copyPolicyChanged || updateCopyPolicy.isPending}
+          >
+            {updateCopyPolicy.isPending ? (
+              <Loader2 data-icon="inline-start" className="animate-spin" />
+            ) : (
+              <CheckCircle2 data-icon="inline-start" />
+            )}
+            Save
+          </Button>
+        </div>
+        {copyPolicyNotice && (
+          <p className="mt-2 inline-flex items-center gap-1.5 text-sm text-emerald-500" role="status">
+            <CheckCircle2 className="size-4" />
+            {copyPolicyNotice}
+          </p>
+        )}
+        {copyPolicyError && <p className="mt-2 text-sm text-destructive">{copyPolicyError}</p>}
       </section>
       <section className="rounded-md border border-destructive/30 p-4">
         <h3 className="text-sm font-medium text-destructive">Delete bucket</h3>

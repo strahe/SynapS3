@@ -46,6 +46,7 @@ type Server struct {
 	settings                 *SettingsService
 	s3IAM                    auth.IAMService
 	s3RootAccess             string
+	filecoinDefaultCopies    int
 	storageCleanupMaxRetries int
 	setupOnly                bool
 	logger                   *slog.Logger
@@ -69,6 +70,7 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		workerHealth:             wh,
 		wallet:                   newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
 		events:                   newAdminEventHub(),
+		filecoinDefaultCopies:    2,
 		storageCleanupMaxRetries: 5,
 		logger:                   logger,
 		startedAt:                time.Now(),
@@ -145,6 +147,11 @@ func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	return s
 }
 
+func (s *Server) WithFilecoinDefaultCopies(copies int) *Server {
+	s.filecoinDefaultCopies = boundedBucketCopies(copies)
+	return s
+}
+
 // WithStorageCleanupMaxRetries configures max retries for storage cleanup tasks created by admin actions.
 func (s *Server) WithStorageCleanupMaxRetries(maxRetries int) *Server {
 	s.storageCleanupMaxRetries = maxRetries
@@ -176,6 +183,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("POST /api/v1/buckets", s.handleAPICreateBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}", s.handleAPIGetBucket)
 		mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", s.handleAPIUpdateBucketOwner)
+		mux.HandleFunc("PUT /api/v1/buckets/{name}/copy-policy", s.handleAPIUpdateBucketCopyPolicy)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", s.handleAPIDeleteBucketObject)

@@ -69,6 +69,51 @@ func TestBucketRepo_GetByID(t *testing.T) {
 	}
 }
 
+func TestBucketRepo_SetDefaultCopies(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "copies-policy", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	copies := 4
+	if err := repos.Buckets.SetDefaultCopies(ctx, bucket.Name, &copies); err != nil {
+		t.Fatalf("SetDefaultCopies set: %v", err)
+	}
+	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetByName after set: %v", err)
+	}
+	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies {
+		t.Fatalf("DefaultCopies after set = %#v, want %d", got, copies)
+	}
+
+	if err := repos.Buckets.SetDefaultCopies(ctx, bucket.Name, nil); err != nil {
+		t.Fatalf("SetDefaultCopies clear: %v", err)
+	}
+	got, err = repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetByName after clear: %v", err)
+	}
+	if got == nil || got.DefaultCopies != nil {
+		t.Fatalf("DefaultCopies after clear = %#v, want nil", got)
+	}
+}
+
+func TestBucketRepo_SetDefaultCopiesMissingBucket(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	copies := 3
+	if err := repos.Buckets.SetDefaultCopies(ctx, "missing-copies-policy", &copies); err == nil {
+		t.Fatal("SetDefaultCopies missing bucket succeeded, want error")
+	}
+}
+
 func TestBucketRepo_ListActive(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

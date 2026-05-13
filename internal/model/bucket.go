@@ -30,6 +30,7 @@ type Bucket struct {
 	Name           string       `bun:",unique,notnull"`
 	ACL            []byte       `bun:",nullzero"`
 	OwnerAccessKey *string      `bun:",nullzero"`
+	DefaultCopies  *int         `bun:",nullzero"`
 	Status         BucketStatus `bun:",notnull,default:'active'"`
 	CreatedAt      time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt      time.Time    `bun:",nullzero,notnull,default:current_timestamp"`

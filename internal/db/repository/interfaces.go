@@ -28,6 +28,8 @@ type BucketRepository interface {
 	SetACL(ctx context.Context, name string, acl []byte) error
 	// SetOwnerAndACL stores both the authoritative owner and compatible ACL.
 	SetOwnerAndACL(ctx context.Context, name string, ownerAccessKey *string, acl []byte) error
+	// SetDefaultCopies stores the bucket copy policy override. Nil means inherit.
+	SetDefaultCopies(ctx context.Context, name string, copies *int) error
 	// CountByOwner returns bucket count for the authoritative owner access key.
 	CountByOwner(ctx context.Context, ownerAccessKey string) (int, error)
 	// AggregateCountsByOwner returns bucket counts grouped by authoritative owner access key.
@@ -335,6 +337,7 @@ type StorageUploadRepository interface {
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
 	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error
 	MarkDataSetUnavailable(ctx context.Context, id int64, lastError string) error
+	DiscardFailedDataSetCandidate(ctx context.Context, uploadID int64, copyIndex int, storageDataSetID int64) error
 	CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
