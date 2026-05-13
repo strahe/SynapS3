@@ -15,9 +15,18 @@ SynapS3 lets S3 clients use Filecoin storage.
 Prerequisites:
 
 - Go 1.26.3 or later
+- C toolchain for cgo, such as gcc or clang
 - Node.js 22.12 or later
-- pnpm 10
-- [rc](https://github.com/rustfs/cli) for S3 testing
+- pnpm 11, installed directly or managed by [Corepack](https://github.com/nodejs/corepack)
+- [rc](https://github.com/rustfs/cli) or [mc](https://github.com/minio/mc) for S3 testing
+
+If pnpm 11 is not already installed, enable [Corepack](https://github.com/nodejs/corepack) before building:
+
+```bash
+corepack enable
+```
+
+If `corepack` is missing, install it first with `npm install --global corepack@latest`.
 
 Clone and build SynapS3 with the embedded dashboard:
 
@@ -33,6 +42,12 @@ Initialize the local app data directory:
 ./bin/synaps3 init
 ```
 
+Generate a wallet if you do not already have one:
+
+```bash
+./bin/synaps3 wallet generate
+```
+
 Set `filecoin.private_key` in `~/.synaps3/config.toml`:
 
 ```toml
@@ -40,7 +55,12 @@ Set `filecoin.private_key` in `~/.synaps3/config.toml`:
 private_key = "0x..."
 ```
 
-For Calibration testing, get testnet tFIL and USDFC from the [Plumbline faucet](https://faucet.reiers.io/).
+For Calibration testing, fund the wallet with testnet tFIL and USDFC:
+
+```bash
+# Use the generated wallet address, not the private key.
+./bin/synaps3 wallet fund-testnet 0x...
+```
 
 Start SynapS3:
 
@@ -56,7 +76,11 @@ Default endpoints:
 
 Do not expose the dashboard and admin API directly to an untrusted network.
 
-Open the Dashboard Wallet page and fund the USDFC payment account before uploading.
+Deposit USDFC into the payment account before uploading. This command signs with the Filecoin private key from your SynapS3 config:
+
+```bash
+./bin/synaps3 wallet deposit 2
+```
 
 In another terminal, create an S3 user from the dashboard or CLI, then configure your S3 client with the generated keys. Secrets are shown only when created or rotated.
 

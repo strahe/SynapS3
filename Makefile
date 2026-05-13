@@ -2,6 +2,8 @@ BINARY   := synaps3
 MODULE   := github.com/strahe/synaps3
 PKG      := ./cmd/synaps3
 GOFLAGS  := -trimpath
+CGO_ENABLED := 1
+CGO      := CGO_ENABLED=$(CGO_ENABLED)
 
 VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT   := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -24,19 +26,19 @@ build: ui-build build-go
 
 build-go:
 	@test -f ui/dist/index.html || { echo "ui/dist/index.html not found; run make ui-build first"; exit 1; }
-	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) $(PKG)
+	$(CGO) go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) $(PKG)
 
 test: test-race
 
 test-fast:
-	go test -count=1 ./cmd/... ./internal/...
+	$(CGO) go test -count=1 ./cmd/... ./internal/...
 
 test-race:
-	go test -race -count=1 ./cmd/... ./internal/...
+	$(CGO) go test -race -count=1 ./cmd/... ./internal/...
 
 lint:
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
-	golangci-lint run
+	$(CGO) golangci-lint run
 	cd ui && pnpm run check
 
 fmt:
@@ -48,7 +50,7 @@ check: ui-build
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
 	golangci-lint config verify
 	golangci-lint fmt --diff
-	golangci-lint run
+	$(CGO) golangci-lint run
 	cd ui && pnpm run check
 	cd ui && pnpm run test
 	$(MAKE) test-race
@@ -57,14 +59,14 @@ verify-fast: ui-build
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
 	golangci-lint config verify
 	golangci-lint fmt --diff
-	golangci-lint run
+	$(CGO) golangci-lint run
 	cd ui && pnpm run check
 	cd ui && pnpm run test
 	$(MAKE) test-fast
 	$(MAKE) build-go
 
 verify-race:
-	go test -race -tags dev -count=1 ./cmd/... ./internal/...
+	$(CGO) go test -race -tags dev -count=1 ./cmd/... ./internal/...
 
 clean:
 	rm -rf bin/
