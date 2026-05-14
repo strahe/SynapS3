@@ -51,6 +51,8 @@ For Calibration testing, fund the wallet with testnet tFIL and USDFC:
 ./bin/synaps3 wallet fund-testnet 0x...
 ```
 
+The command claims tFIL and USDFC. It may wait up to 120 seconds per faucet and automatically tries a fallback faucet when the primary faucet is unavailable or missing a token.
+
 Start SynapS3:
 
 ```bash

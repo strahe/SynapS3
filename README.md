@@ -53,6 +53,8 @@ Copy the generated private key into `.env`, then fund the generated address on C
 docker run --rm --env-file .env ghcr.io/strahe/synaps3:edge synaps3 wallet fund-testnet 0x...
 ```
 
+If it fails, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/).
+
 Start a temporary service:
 
 ```bash

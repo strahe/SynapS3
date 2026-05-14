@@ -64,9 +64,7 @@ func TestWalletFundTestnetClaimsBothFaucetTokens(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	origEndpoint := walletFaucetEndpoint
-	walletFaucetEndpoint = ts.URL
-	t.Cleanup(func() { walletFaucetEndpoint = origEndpoint })
+	replaceWalletFaucetEndpoints(t, walletFaucetEndpoint{Name: "test", URL: ts.URL})
 
 	out, err := runWalletCommand(t, []string{
 		"synaps3", "wallet", "fund-testnet", "--json", "0x1111111111111111111111111111111111111111",
@@ -95,6 +93,155 @@ func TestWalletFundTestnetClaimsBothFaucetTokens(t *testing.T) {
 	}
 }
 
+func TestWalletFundTestnetUsesFallbackForFailedToken(t *testing.T) {
+	var primaryRequests int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryRequests++
+		writeAdminTestJSON(t, w, http.StatusOK, map[string]any{
+			"result": []map[string]any{
+				{
+					"faucetInfo": "CalibnetUSDFC",
+					"error":      map[string]string{"ServerError": "Faucet is empty, Request top-up"},
+				},
+				{"faucetInfo": "CalibnetFIL", "tx_hash": "0x" + strings.Repeat("b", 64)},
+			},
+		})
+	}))
+	defer primary.Close()
+
+	var fallbackRequests int
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackRequests++
+		if got := r.URL.Query().Get("assets"); got != "usdfc" {
+			t.Fatalf("assets query = %q, want usdfc", got)
+		}
+		writeAdminTestJSON(t, w, http.StatusOK, []map[string]string{
+			{"faucetInfo": "CalibnetUSDFC", "tx_hash": "0x" + strings.Repeat("a", 64)},
+		})
+	}))
+	defer fallback.Close()
+
+	replaceWalletFaucetEndpoints(t,
+		walletFaucetEndpoint{Name: "primary", URL: primary.URL},
+		walletFaucetEndpoint{Name: "fallback", URL: fallback.URL, SupportsAssets: true},
+	)
+
+	out, err := runWalletCommand(t, []string{
+		"synaps3", "wallet", "fund-testnet", "--json", "0x1111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatalf("wallet fund-testnet: %v\n%s", err, out)
+	}
+	if primaryRequests != 1 {
+		t.Fatalf("primary requests = %d, want 1", primaryRequests)
+	}
+	if fallbackRequests != 1 {
+		t.Fatalf("fallback requests = %d, want 1", fallbackRequests)
+	}
+	var body struct {
+		Results []walletFaucetResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &body); err != nil {
+		t.Fatalf("json output: %v\n%s", err, out)
+	}
+	if len(body.Results) != 2 {
+		t.Fatalf("results = %#v, want two token results", body.Results)
+	}
+	if body.Results[0].FaucetInfo != "CalibnetUSDFC" || body.Results[0].TxHash != "0x"+strings.Repeat("a", 64) {
+		t.Fatalf("first result = %#v, want fallback USDFC hash", body.Results[0])
+	}
+	if body.Results[1].FaucetInfo != "CalibnetFIL" || body.Results[1].TxHash != "0x"+strings.Repeat("b", 64) {
+		t.Fatalf("second result = %#v, want primary FIL hash", body.Results[1])
+	}
+}
+
+func TestWalletFundTestnetUsesFallbackAfterPrimaryRequestFailure(t *testing.T) {
+	var primaryRequests int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryRequests++
+		http.Error(w, "dry", http.StatusServiceUnavailable)
+	}))
+	defer primary.Close()
+
+	var fallbackRequests int
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackRequests++
+		if got := r.URL.Query().Get("assets"); got != "" {
+			t.Fatalf("assets query = %q, want empty dual-token request", got)
+		}
+		writeAdminTestJSON(t, w, http.StatusOK, []map[string]string{
+			{"faucetInfo": "CalibnetFIL", "tx_hash": "0x" + strings.Repeat("b", 64)},
+			{"faucetInfo": "CalibnetUSDFC", "tx_hash": "0x" + strings.Repeat("a", 64)},
+		})
+	}))
+	defer fallback.Close()
+
+	replaceWalletFaucetEndpoints(t,
+		walletFaucetEndpoint{Name: "primary", URL: primary.URL},
+		walletFaucetEndpoint{Name: "fallback", URL: fallback.URL, SupportsAssets: true},
+	)
+
+	out, err := runWalletCommand(t, []string{
+		"synaps3", "wallet", "fund-testnet", "--json", "0x1111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatalf("wallet fund-testnet: %v\n%s", err, out)
+	}
+	if primaryRequests != 1 {
+		t.Fatalf("primary requests = %d, want 1", primaryRequests)
+	}
+	if fallbackRequests != 1 {
+		t.Fatalf("fallback requests = %d, want 1", fallbackRequests)
+	}
+	if !strings.Contains(out, `"faucet_info": "CalibnetUSDFC"`) || !strings.Contains(out, `"faucet_info": "CalibnetFIL"`) {
+		t.Fatalf("output = %s, want both token results", out)
+	}
+}
+
+func TestWalletFundTestnetDoesNotOverwritePrimarySuccessWithFallbackResult(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAdminTestJSON(t, w, http.StatusOK, map[string]any{
+			"result": []map[string]any{
+				{
+					"faucetInfo": "CalibnetUSDFC",
+					"error":      map[string]string{"ServerError": "Faucet is empty, Request top-up"},
+				},
+				{"faucetInfo": "CalibnetFIL", "tx_hash": "0x" + strings.Repeat("b", 64)},
+			},
+		})
+	}))
+	defer primary.Close()
+
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAdminTestJSON(t, w, http.StatusOK, []map[string]string{
+			{"faucetInfo": "CalibnetFIL", "tx_hash": "0x" + strings.Repeat("c", 64)},
+			{"faucetInfo": "CalibnetUSDFC", "tx_hash": "0x" + strings.Repeat("a", 64)},
+		})
+	}))
+	defer fallback.Close()
+
+	replaceWalletFaucetEndpoints(t,
+		walletFaucetEndpoint{Name: "primary", URL: primary.URL},
+		walletFaucetEndpoint{Name: "fallback", URL: fallback.URL, SupportsAssets: true},
+	)
+
+	out, err := runWalletCommand(t, []string{
+		"synaps3", "wallet", "fund-testnet", "--json", "0x1111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatalf("wallet fund-testnet: %v\n%s", err, out)
+	}
+	var body struct {
+		Results []walletFaucetResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &body); err != nil {
+		t.Fatalf("json output: %v\n%s", err, out)
+	}
+	if body.Results[1].TxHash != "0x"+strings.Repeat("b", 64) {
+		t.Fatalf("FIL tx_hash = %s, want primary hash", body.Results[1].TxHash)
+	}
+}
+
 func TestWalletFundTestnetRejectsInvalidAddress(t *testing.T) {
 	out, err := runWalletCommand(t, []string{"synaps3", "wallet", "fund-testnet", "not-an-address"})
 	if err == nil {
@@ -119,9 +266,7 @@ func TestWalletFundTestnetReportsTokenFailure(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	origEndpoint := walletFaucetEndpoint
-	walletFaucetEndpoint = ts.URL
-	t.Cleanup(func() { walletFaucetEndpoint = origEndpoint })
+	replaceWalletFaucetEndpoints(t, walletFaucetEndpoint{Name: "test", URL: ts.URL})
 
 	out, err := runWalletCommand(t, []string{
 		"synaps3", "wallet", "fund-testnet", "0x1111111111111111111111111111111111111111",
@@ -134,6 +279,43 @@ func TestWalletFundTestnetReportsTokenFailure(t *testing.T) {
 	}
 	if !strings.Contains(out, "CalibnetFIL: 0x"+strings.Repeat("b", 64)) {
 		t.Fatalf("output = %s, want successful token hash", out)
+	}
+}
+
+func TestWalletFundTestnetReportsFallbackMessageError(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAdminTestJSON(t, w, http.StatusOK, map[string]any{
+			"result": []map[string]any{
+				{"faucetInfo": "CalibnetUSDFC", "error": map[string]string{"ServerError": "primary dry"}},
+				{"faucetInfo": "CalibnetFIL", "tx_hash": "0x" + strings.Repeat("b", 64)},
+			},
+		})
+	}))
+	defer primary.Close()
+
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAdminTestJSON(t, w, http.StatusTooManyRequests, []map[string]any{
+			{"faucetInfo": "CalibnetUSDFC", "error": map[string]string{"message": "address rate limited"}},
+		})
+	}))
+	defer fallback.Close()
+
+	replaceWalletFaucetEndpoints(t,
+		walletFaucetEndpoint{Name: "primary", URL: primary.URL},
+		walletFaucetEndpoint{Name: "fallback", URL: fallback.URL, SupportsAssets: true},
+	)
+
+	out, err := runWalletCommand(t, []string{
+		"synaps3", "wallet", "fund-testnet", "0x1111111111111111111111111111111111111111",
+	})
+	if err == nil {
+		t.Fatalf("wallet fund-testnet succeeded, output:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "address rate limited") {
+		t.Fatalf("error = %v, want fallback message", err)
+	}
+	if !strings.Contains(out, "CalibnetFIL: 0x"+strings.Repeat("b", 64)) {
+		t.Fatalf("output = %s, want successful FIL hash", out)
 	}
 }
 
@@ -250,6 +432,13 @@ func runWalletCommand(t *testing.T, args []string) (string, error) {
 	cmd.ErrWriter = &out
 	err := cmd.Run(context.Background(), args)
 	return out.String(), err
+}
+
+func replaceWalletFaucetEndpoints(t *testing.T, endpoints ...walletFaucetEndpoint) {
+	t.Helper()
+	origEndpoints := walletFaucetEndpoints
+	walletFaucetEndpoints = endpoints
+	t.Cleanup(func() { walletFaucetEndpoints = origEndpoints })
 }
 
 func writeWalletTestConfig(t *testing.T, privateKey string) string {

@@ -36,6 +36,8 @@ Fund the generated address on Calibration:
 docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
+The command claims tFIL and USDFC. It may wait up to 120 seconds per faucet and automatically tries a fallback faucet when the primary faucet is unavailable or missing a token.
+
 Start SynapS3:
 
 ```bash

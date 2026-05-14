@@ -27,9 +27,18 @@ const usdfcDecimals = 18
 var walletFaucetTokenOrder = []string{"CalibnetUSDFC", "CalibnetFIL"}
 
 var (
-	walletFaucetEndpoint = "https://forest-explorer.chainsafe.dev/api/claim_token_all"
-	walletDeposit        = runWalletDeposit
+	walletFaucetEndpoints = []walletFaucetEndpoint{
+		{Name: "ChainSafe", URL: "https://forest-explorer.chainsafe.dev/api/claim_token_all"},
+		{Name: "Reiers", URL: "https://faucet.reiers.io/api/claim_token_all", SupportsAssets: true},
+	}
+	walletDeposit = runWalletDeposit
 )
+
+type walletFaucetEndpoint struct {
+	Name           string
+	URL            string
+	SupportsAssets bool
+}
 
 type walletDepositResult struct {
 	TxHash    string `json:"tx_hash"`
@@ -119,8 +128,8 @@ func walletFundTestnetCommand() *cli.Command {
 			},
 			&cli.DurationFlag{
 				Name:  "timeout",
-				Value: 20 * time.Second,
-				Usage: "faucet request timeout",
+				Value: 120 * time.Second,
+				Usage: "faucet request timeout per endpoint",
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -135,7 +144,7 @@ func walletFundTestnetCommand() *cli.Command {
 			if timeout <= 0 {
 				return fmt.Errorf("timeout must be positive")
 			}
-			results, err := claimWalletTestnetFunds(ctx, walletFaucetEndpoint, address, timeout)
+			results, err := claimWalletTestnetFunds(ctx, walletFaucetEndpoints, address, timeout)
 			if writeErr := writeWalletFaucetResults(cmd, address, results); writeErr != nil {
 				return writeErr
 			}
@@ -201,14 +210,46 @@ func isHexAddress(address string) bool {
 	return common.IsHexAddress(strings.TrimSpace(address))
 }
 
-func claimWalletTestnetFunds(ctx context.Context, endpoint, address string, timeout time.Duration) ([]walletFaucetResult, error) {
+func claimWalletTestnetFunds(ctx context.Context, endpoints []walletFaucetEndpoint, address string, timeout time.Duration) ([]walletFaucetResult, error) {
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no faucet endpoints configured")
+	}
+	resultsByToken := make(map[string]walletFaucetResult, len(walletFaucetTokenOrder))
+	var requestErrs []error
+	for _, endpoint := range endpoints {
+		pending := walletFaucetPendingTokens(resultsByToken)
+		if len(pending) == 0 {
+			break
+		}
+		assets := ""
+		if endpoint.SupportsAssets && len(pending) == 1 {
+			assets = walletFaucetTokenAsset(pending[0])
+		}
+		results, err := claimWalletTestnetFundsFromEndpoint(ctx, endpoint, address, timeout, assets)
+		if err != nil {
+			requestErrs = append(requestErrs, fmt.Errorf("%s faucet: %w", endpoint.Name, err))
+		}
+		mergeWalletFaucetResults(resultsByToken, results)
+	}
+	results := orderedWalletFaucetResults(resultsByToken)
+	if err := walletFaucetResultsError(results); err != nil {
+		errs := append([]error{err}, requestErrs...)
+		return results, errors.Join(errs...)
+	}
+	return results, nil
+}
+
+func claimWalletTestnetFundsFromEndpoint(ctx context.Context, endpoint walletFaucetEndpoint, address string, timeout time.Duration, assets string) ([]walletFaucetResult, error) {
 	client := &http.Client{Timeout: timeout}
-	u, err := url.Parse(endpoint)
+	u, err := url.Parse(endpoint.URL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing faucet endpoint: %w", err)
 	}
 	q := u.Query()
 	q.Set("address", address)
+	if assets != "" {
+		q.Set("assets", assets)
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -236,6 +277,80 @@ func claimWalletTestnetFunds(ctx context.Context, endpoint, address string, time
 		return nil, fmt.Errorf("faucet returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	return parseWalletFaucetClaims(body)
+}
+
+func walletFaucetPendingTokens(results map[string]walletFaucetResult) []string {
+	pending := make([]string, 0, len(walletFaucetTokenOrder))
+	for _, token := range walletFaucetTokenOrder {
+		result, ok := results[token]
+		if !ok || result.TxHash == "" {
+			pending = append(pending, token)
+		}
+	}
+	return pending
+}
+
+func walletFaucetTokenAsset(token string) string {
+	switch token {
+	case "CalibnetFIL":
+		return "fil"
+	case "CalibnetUSDFC":
+		return "usdfc"
+	default:
+		return ""
+	}
+}
+
+func mergeWalletFaucetResults(resultsByToken map[string]walletFaucetResult, results []walletFaucetResult) {
+	for _, result := range results {
+		token, ok := canonicalWalletFaucetToken(result.FaucetInfo)
+		if !ok {
+			continue
+		}
+		existing, exists := resultsByToken[token]
+		if exists && existing.TxHash != "" {
+			continue
+		}
+		result.FaucetInfo = token
+		resultsByToken[token] = result
+	}
+}
+
+func orderedWalletFaucetResults(resultsByToken map[string]walletFaucetResult) []walletFaucetResult {
+	results := make([]walletFaucetResult, 0, len(walletFaucetTokenOrder))
+	for _, token := range walletFaucetTokenOrder {
+		result, ok := resultsByToken[token]
+		if !ok {
+			result = walletFaucetResult{FaucetInfo: token, Error: "missing transaction hash"}
+		}
+		result.FaucetInfo = token
+		results = append(results, result)
+	}
+	return results
+}
+
+func walletFaucetResultsError(results []walletFaucetResult) error {
+	var errs []error
+	for _, result := range results {
+		if result.Error != "" {
+			errs = append(errs, fmt.Errorf("%s: %s", result.FaucetInfo, result.Error))
+		} else if strings.TrimSpace(result.TxHash) == "" {
+			errs = append(errs, fmt.Errorf("%s: missing transaction hash", result.FaucetInfo))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func canonicalWalletFaucetToken(token string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(token))
+	switch normalized {
+	case "calibnetfil", "fil", "tfil":
+		return "CalibnetFIL", true
+	case "calibnetusdfc", "usdfc":
+		return "CalibnetUSDFC", true
+	default:
+		return "", false
+	}
 }
 
 func parseWalletFaucetClaims(body []byte) ([]walletFaucetResult, error) {
@@ -296,6 +411,9 @@ func walletFaucetClaimsToResults(claims []walletFaucetClaim) ([]walletFaucetResu
 func walletFaucetClaimError(errs map[string]string) string {
 	if len(errs) == 0 {
 		return ""
+	}
+	if msg := strings.TrimSpace(errs["message"]); msg != "" {
+		return msg
 	}
 	if msg := strings.TrimSpace(errs["ServerError"]); msg != "" {
 		return msg
