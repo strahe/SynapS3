@@ -58,7 +58,7 @@ type Server struct {
 }
 
 // New creates a new admin HTTP server.
-func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, logger *slog.Logger) *Server {
+func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, filecoinDefaultCopies int, logger *slog.Logger) *Server {
 	s := &Server{
 		addr:                     addr,
 		db:                       db,
@@ -70,7 +70,7 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		workerHealth:             wh,
 		wallet:                   newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
 		events:                   newAdminEventHub(),
-		filecoinDefaultCopies:    2,
+		filecoinDefaultCopies:    boundedBucketCopies(filecoinDefaultCopies),
 		storageCleanupMaxRetries: 5,
 		logger:                   logger,
 		startedAt:                time.Now(),
@@ -144,11 +144,6 @@ func (s *Server) WithSettings(settings *SettingsService) *Server {
 func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	s.s3IAM = iam
 	s.s3RootAccess = rootAccess
-	return s
-}
-
-func (s *Server) WithFilecoinDefaultCopies(copies int) *Server {
-	s.filecoinDefaultCopies = boundedBucketCopies(copies)
 	return s
 }
 

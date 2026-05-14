@@ -578,6 +578,7 @@ func bindReaderPrimaryCommittedUpload(t *testing.T, repos *repository.Repositori
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("start upload attempt: %v", err)

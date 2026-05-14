@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
@@ -211,6 +212,7 @@ func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
 		SourceVersionID: versionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -341,6 +343,7 @@ func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *test
 		SourceVersionID: versionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -424,6 +427,7 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 		SourceVersionID: versionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -686,6 +690,7 @@ func TestManager_RecoverOnStartup_ReconcilesAllStagedUploads(t *testing.T) {
 			SourceVersionID: versionID,
 			ContentSize:     version.Size,
 			Checksum:        version.Checksum,
+			RequestedCopies: 3,
 		}); err != nil {
 			t.Fatalf("StartObjectUploadAttempt %d: %v", i, err)
 		}
@@ -788,7 +793,7 @@ func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
 	logger := slog.Default()
 	poll := 50 * time.Millisecond
 
-	up := worker.NewUploader(repos, mc, nil, nil, sm, true, 1, poll, logger)
+	up := worker.NewUploader(repos, mc, nil, nil, sm, true, config.DefaultFilecoinCopies, 1, poll, logger)
 	ev := worker.NewEvictor(repos, mc, sm, 1, poll, logger)
 
 	mgr := worker.NewManager(repos, logger, true, up, ev)
@@ -925,6 +930,7 @@ func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
 		SourceVersionID: versionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)

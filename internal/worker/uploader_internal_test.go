@@ -148,6 +148,7 @@ func TestUploadProgressReporterRecordRespectsCanceledContext(t *testing.T) {
 		SourceVersionID: "01J0000000000000000CTXPRG",
 		ContentSize:     100,
 		Checksum:        "sha256:progress-context",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -187,6 +188,7 @@ func TestUploadProgressReporterCoalescesThrottledProgress(t *testing.T) {
 		SourceVersionID: "01J0000000000000000COALES",
 		ContentSize:     100,
 		Checksum:        "sha256:progress-coalesce",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)

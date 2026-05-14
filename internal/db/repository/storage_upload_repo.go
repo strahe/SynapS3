@@ -19,8 +19,8 @@ var _ StorageUploadRepository = (*BunStorageUploadRepo)(nil)
 
 func (r *BunStorageUploadRepo) StartObjectUploadAttempt(ctx context.Context, input StartObjectUploadAttemptInput) (*model.StorageUpload, error) {
 	requestedCopies := input.RequestedCopies
-	if requestedCopies <= 0 {
-		requestedCopies = 2
+	if !model.ValidStorageCopies(requestedCopies) {
+		return nil, fmt.Errorf("requested copies must be between %d and %d, got %d", model.StorageCopiesMin, model.StorageCopiesMax, requestedCopies)
 	}
 	upload := &model.StorageUpload{
 		BucketID:        input.BucketID,

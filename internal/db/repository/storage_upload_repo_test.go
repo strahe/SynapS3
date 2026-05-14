@@ -80,6 +80,37 @@ func TestStorageUploadRepo_RecordCompleteResultAndAcceptsUploadingContent(t *tes
 	_ = task
 }
 
+func TestStorageUploadRepo_StartObjectUploadAttemptRequiresRequestedCopies(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	tests := []struct {
+		name            string
+		requestedCopies int
+	}{
+		{name: "zero", requestedCopies: 0},
+		{name: "negative", requestedCopies: -1},
+		{name: "too-high", requestedCopies: 9},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bucket := seedBucket(t, db, "upload-invalid-copies-"+tt.name)
+
+			if _, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+				BucketID:        bucket.ID,
+				SourceVersionID: "01J000000000000000DEF" + strings.ToUpper(tt.name),
+				ContentSize:     10,
+				Checksum:        "checksum-invalid-copies-" + tt.name,
+				RequestedCopies: tt.requestedCopies,
+			}); err == nil {
+				t.Fatal("StartObjectUploadAttempt succeeded, want error")
+			}
+		})
+	}
+}
+
 func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -91,6 +122,7 @@ func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testi
 		SourceVersionID: "01J000000000000000000BIG01",
 		ContentSize:     10,
 		Checksum:        "checksum-onchain-id",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -166,6 +198,7 @@ func TestStorageUploadRepo_PrimaryStoreProgressTracksAttemptsAndClamps(t *testin
 		SourceVersionID: "01J000000000000000000PRG01",
 		ContentSize:     10,
 		Checksum:        "checksum-primary-progress",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -245,6 +278,7 @@ func TestStorageUploadRepo_GetUploadProvenanceIncludesCopiesAndFailures(t *testi
 		SourceVersionID: "01J000000000000000PROV001",
 		ContentSize:     10,
 		Checksum:        "checksum-provenance-detail",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -302,6 +336,7 @@ func TestStorageUploadRepo_StagedProvenanceInfersNewDataSetAndAppendsFailures(t 
 		SourceVersionID: "01J000000000000000PROV101",
 		ContentSize:     10,
 		Checksum:        "checksum-staged-provenance-1",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt first: %v", err)
@@ -370,6 +405,7 @@ func TestStorageUploadRepo_StagedProvenanceInfersNewDataSetAndAppendsFailures(t 
 		SourceVersionID: "01J000000000000000PROV102",
 		ContentSize:     10,
 		Checksum:        "checksum-staged-provenance-2",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt second: %v", err)
@@ -419,6 +455,7 @@ func TestStorageUploadRepo_RequiredOnChainIDValidationUsesInvalidInput(t *testin
 		SourceVersionID: "01J000000000000000000BAD01",
 		ContentSize:     10,
 		Checksum:        "checksum-onchain-validation",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -469,6 +506,7 @@ func TestStorageUploadRepo_MarkUploadCopyCommittedValidatesReadableIdentity(t *t
 		SourceVersionID: "01J000000000000000000BAD02",
 		ContentSize:     10,
 		Checksum:        "checksum-committed-validation",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -527,6 +565,7 @@ func TestStorageUploadRepo_MarkUploadCopyCommittedMissingCopyDoesNotMarkReadable
 		SourceVersionID: "01J000000000000000000BAD03",
 		ContentSize:     10,
 		Checksum:        "checksum-missing-committed-copy",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -566,6 +605,7 @@ func TestStorageUploadRepo_DataSetBindingIsBucketProviderCopySlot(t *testing.T) 
 		SourceVersionID: "01J00000000000000000020001",
 		ContentSize:     10,
 		Checksum:        "checksum-binding",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -666,6 +706,7 @@ func TestStorageUploadRepo_BindReadableUploadForContentMovesFollowersToReplicati
 		SourceVersionID: leader.VersionID,
 		ContentSize:     leader.Size,
 		Checksum:        leader.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -767,6 +808,7 @@ func TestStorageUploadRepo_BindReadableUploadForVersionCompletesFollowerTask(t *
 		SourceVersionID: leader.VersionID,
 		ContentSize:     leader.Size,
 		Checksum:        leader.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -844,6 +886,7 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 2,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -955,6 +998,7 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 		SourceVersionID: "01J00000000000000000010030",
 		ContentSize:     10,
 		Checksum:        "checksum-primary-failure",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -1036,6 +1080,7 @@ func TestStorageUploadRepo_CommittedCopyIgnoresStaleStatusUpdates(t *testing.T) 
 		SourceVersionID: "01J00000000000000000010031",
 		ContentSize:     10,
 		Checksum:        "checksum-committed-stale-status",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -1130,9 +1175,10 @@ func TestStorageUploadRepo_AppendUploadFailureRetriesRacedAttemptIndex(t *testin
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "failure-race-bucket")
 	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:    bucket.ID,
-		ContentSize: 1,
-		Checksum:    "failure-race",
+		BucketID:        bucket.ID,
+		ContentSize:     1,
+		Checksum:        "failure-race",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)

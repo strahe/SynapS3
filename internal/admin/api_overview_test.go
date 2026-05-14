@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -34,8 +35,8 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unavailable); err != nil {
 		t.Fatalf("seed unavailable object: %v", err)
 	}
-	overviewMustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status) VALUES (?, ?, ?, ?, ?)`,
-		bucket.ID, unavailable.VersionID, unavailable.Size, unavailable.Checksum, model.StorageUploadStatusComplete)
+	overviewMustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?, ?)`,
+		bucket.ID, unavailable.VersionID, unavailable.Size, unavailable.Checksum, model.StorageUploadStatusComplete, 3)
 	overviewMustExec(t, db, `UPDATE object_versions SET state = ?, storage_upload_id = (SELECT MAX(id) FROM storage_uploads), in_cache = FALSE WHERE version_id = ?`,
 		model.ObjectStateStored, unavailable.VersionID)
 
@@ -48,7 +49,7 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	overviewSeedTask(t, repos, model.TaskTypeUpload, "ingress_store", model.TaskStatusFailed)
 	overviewSeedTask(t, repos, model.TaskTypeEvictCache, "", model.TaskStatusExhausted)
 
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir(), usedByte: 42}, 100, repos, &stubWorkerHealth{health: map[string]bool{"uploader": true}}, nil, testLogger())
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir(), usedByte: 42}, 100, repos, &stubWorkerHealth{health: map[string]bool{"uploader": true}}, nil, config.DefaultFilecoinCopies, testLogger())
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/overview", nil)
 	srv.handleAPIOverview(rr, req)

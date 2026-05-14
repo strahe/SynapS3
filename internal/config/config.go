@@ -18,7 +18,10 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 )
 
-const MaxFilecoinDefaultCopies = model.StorageCopiesMax
+const (
+	DefaultFilecoinCopies    = 3
+	MaxFilecoinDefaultCopies = model.StorageCopiesMax
+)
 
 type Config struct {
 	Server   ServerConfig   `koanf:"server"`
@@ -144,7 +147,7 @@ func defaultConfig() *Config {
 			Network:       "calibration",
 			RPCURL:        defaultFilecoinRPCURLs["calibration"],
 			Source:        "synaps3",
-			DefaultCopies: 2,
+			DefaultCopies: DefaultFilecoinCopies,
 		},
 		Database: DatabaseConfig{
 			Driver:       "sqlite",

@@ -379,6 +379,7 @@ func TestBucketRepo_CountStorageDataSets(t *testing.T) {
 		SourceVersionID: "dataset-count",
 		ContentSize:     1,
 		Checksum:        "sum",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)

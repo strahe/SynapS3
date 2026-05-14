@@ -103,44 +103,44 @@ func TestObjectRepo_CountOverviewAttention(t *testing.T) {
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, failedUpload); err != nil {
 		t.Fatalf("seed failed-upload version: %v", err)
 	}
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, error_message) VALUES (?, ?, ?, ?, ?, ?)`,
-		bucket.ID, failedUpload.VersionID, failedUpload.Size, failedUpload.Checksum, model.StorageUploadStatusFailed, "provider failed")
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, error_message, requested_copies) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		bucket.ID, failedUpload.VersionID, failedUpload.Size, failedUpload.Checksum, model.StorageUploadStatusFailed, "provider failed", 3)
 
 	resolvedUpload := newObjectVersion(bucket.ID, "resolved-upload.txt", "01J00000000000000000000A06", 10)
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, resolvedUpload); err != nil {
 		t.Fatalf("seed resolved-upload version: %v", err)
 	}
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status) VALUES (?, ?, ?, ?, ?)`,
-		bucket.ID, resolvedUpload.VersionID, resolvedUpload.Size, resolvedUpload.Checksum, model.StorageUploadStatusFailed)
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status) VALUES (?, ?, ?, ?, ?)`,
-		bucket.ID, resolvedUpload.VersionID, resolvedUpload.Size, resolvedUpload.Checksum, model.StorageUploadStatusComplete)
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?, ?)`,
+		bucket.ID, resolvedUpload.VersionID, resolvedUpload.Size, resolvedUpload.Checksum, model.StorageUploadStatusFailed, 3)
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?, ?)`,
+		bucket.ID, resolvedUpload.VersionID, resolvedUpload.Size, resolvedUpload.Checksum, model.StorageUploadStatusComplete, 3)
 
 	rejectedLatestUpload := newObjectVersion(bucket.ID, "rejected-latest-upload.txt", "01J00000000000000000000A07", 10)
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, rejectedLatestUpload); err != nil {
 		t.Fatalf("seed rejected-latest-upload version: %v", err)
 	}
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status) VALUES (?, ?, ?, ?, ?)`,
-		bucket.ID, rejectedLatestUpload.VersionID, rejectedLatestUpload.Size, rejectedLatestUpload.Checksum, model.StorageUploadStatusComplete)
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status) VALUES (?, ?, ?, ?, ?)`,
-		bucket.ID, rejectedLatestUpload.VersionID, rejectedLatestUpload.Size, rejectedLatestUpload.Checksum, model.StorageUploadStatusRejected)
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?, ?)`,
+		bucket.ID, rejectedLatestUpload.VersionID, rejectedLatestUpload.Size, rejectedLatestUpload.Checksum, model.StorageUploadStatusComplete, 3)
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?, ?)`,
+		bucket.ID, rejectedLatestUpload.VersionID, rejectedLatestUpload.Size, rejectedLatestUpload.Checksum, model.StorageUploadStatusRejected, 3)
 
 	boundUpload := newObjectVersion(bucket.ID, "bound-upload.txt", "01J00000000000000000000A08", 10)
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, boundUpload); err != nil {
 		t.Fatalf("seed bound-upload version: %v", err)
 	}
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, content_size, checksum, status) VALUES (?, ?, ?, ?)`,
-		bucket.ID, boundUpload.Size, boundUpload.Checksum, model.StorageUploadStatusComplete)
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?)`,
+		bucket.ID, boundUpload.Size, boundUpload.Checksum, model.StorageUploadStatusComplete, 3)
 	mustExec(t, db, `UPDATE object_versions SET state = ?, storage_upload_id = (SELECT MAX(id) FROM storage_uploads) WHERE version_id = ?`,
 		model.ObjectStateStored, boundUpload.VersionID)
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status) VALUES (?, ?, ?, ?, ?)`,
-		bucket.ID, boundUpload.VersionID, boundUpload.Size, boundUpload.Checksum, model.StorageUploadStatusFailed)
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?, ?)`,
+		bucket.ID, boundUpload.VersionID, boundUpload.Size, boundUpload.Checksum, model.StorageUploadStatusFailed, 3)
 
 	unavailable := newObjectVersion(bucket.ID, "unavailable.txt", "01J00000000000000000000A04", 10)
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unavailable); err != nil {
 		t.Fatalf("seed unavailable version: %v", err)
 	}
-	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status) VALUES (?, ?, ?, ?, ?)`,
-		bucket.ID, unavailable.VersionID, unavailable.Size, unavailable.Checksum, model.StorageUploadStatusComplete)
+	mustExec(t, db, `INSERT INTO storage_uploads (bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (?, ?, ?, ?, ?, ?)`,
+		bucket.ID, unavailable.VersionID, unavailable.Size, unavailable.Checksum, model.StorageUploadStatusComplete, 3)
 	mustExec(t, db, `UPDATE object_versions SET state = ?, storage_upload_id = (SELECT MAX(id) FROM storage_uploads), in_cache = FALSE WHERE version_id = ?`,
 		model.ObjectStateStored, unavailable.VersionID)
 
@@ -534,6 +534,7 @@ func TestObjectRepo_FindReusableActiveUploadVersionUsesDurableUploadLeader(t *te
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -727,6 +728,7 @@ func TestObjectRepo_FailUploadingContentFollowersKeepsIndependentActiveUpload(t 
 		SourceVersionID: independentUpload.VersionID,
 		ContentSize:     independentUpload.Size,
 		Checksum:        independentUpload.Checksum,
+		RequestedCopies: 3,
 	}); err != nil {
 		t.Fatalf("start independent active upload: %v", err)
 	}
@@ -1184,6 +1186,7 @@ func TestObjectRepo_UpdateVersionStateToFailedClearsStorageUploadID(t *testing.T
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)

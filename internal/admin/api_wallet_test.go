@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -119,7 +120,7 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 				LockupRatePerMonth:  big.NewInt(172800),
 			},
 		},
-	}, testLogger())
+	}, config.DefaultFilecoinCopies, testLogger())
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/wallet", nil)
 	rr := httptest.NewRecorder()
@@ -181,7 +182,7 @@ func TestHandleAPIWalletFund_RejectsUnsafeOrInvalidRequests(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	srv := New("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
 		info: &synapse.WalletInfo{Address: "0xabc"},
-	}, testLogger())
+	}, config.DefaultFilecoinCopies, testLogger())
 
 	tests := []struct {
 		name        string
@@ -220,7 +221,7 @@ func TestHandleAPIWalletFund_IsIdempotentByClientRequestID(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	srv := New("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
 		info: &synapse.WalletInfo{Address: "0xabc"},
-	}, testLogger())
+	}, config.DefaultFilecoinCopies, testLogger())
 
 	create := func(amount string) (walletOperationDTO, int) {
 		body := []byte(`{"client_request_id":"same-request","amount":"` + amount + `"}`)

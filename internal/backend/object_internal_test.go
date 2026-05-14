@@ -45,6 +45,7 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesReplicatingFollower(t *tes
 		SourceVersionID: sourceID,
 		ContentSize:     source.Size,
 		Checksum:        source.Checksum,
+		RequestedCopies: 2,
 	})
 	if err != nil {
 		t.Fatalf("start upload: %v", err)
@@ -150,6 +151,7 @@ func TestCompleteFollowerIfStoredReuseWonRaceFinalizesAfterBindingFollower(t *te
 		SourceVersionID: sourceID,
 		ContentSize:     source.Size,
 		Checksum:        source.Checksum,
+		RequestedCopies: 2,
 	})
 	if err != nil {
 		t.Fatalf("start upload: %v", err)

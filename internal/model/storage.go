@@ -79,7 +79,7 @@ type StorageUpload struct {
 	Checksum                string              `bun:",notnull"`
 	Status                  StorageUploadStatus `bun:",notnull,default:'running'"`
 	PieceCID                *string             `bun:",nullzero"`
-	RequestedCopies         int                 `bun:",notnull,default:2"`
+	RequestedCopies         int                 `bun:",notnull"`
 	IngressBytesTransferred int64               `bun:",notnull,default:0"`
 	IngressStoreAttempt     int                 `bun:",notnull,default:0"`
 	ProgressUpdatedAt       *time.Time          `bun:",nullzero"`

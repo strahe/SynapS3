@@ -205,7 +205,7 @@ func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
 	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (1, 'bucket-a')`)
 	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (2, 'bucket-b')`)
 	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, piece_cid, requested_copies) VALUES (1, 1, 'v1', 10, 'sum-1', 'complete', 'bafk2bzacefake', 2)`)
-	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status) VALUES (2, 2, 'v2', 10, 'sum-2', 'running')`)
+	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (2, 2, 'v2', 10, 'sum-2', 'running', 3)`)
 	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (1, 1, '101', 0, '1001', 'ready', 1, 1)`)
 	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (2, '101', 0, '1001', 'ready', 2, 2)`); err == nil {
 		t.Fatal("expected provider/data_set reuse across buckets to fail")

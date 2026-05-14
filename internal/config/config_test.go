@@ -322,8 +322,8 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Worker.Upload.PollInterval != def.Worker.Upload.PollInterval {
 		t.Errorf("Worker.Upload.PollInterval = %s, want %s", cfg.Worker.Upload.PollInterval, def.Worker.Upload.PollInterval)
 	}
-	if cfg.Filecoin.DefaultCopies != 2 {
-		t.Errorf("Filecoin.DefaultCopies = %d, want 2", cfg.Filecoin.DefaultCopies)
+	if cfg.Filecoin.DefaultCopies != 3 {
+		t.Errorf("Filecoin.DefaultCopies = %d, want 3", cfg.Filecoin.DefaultCopies)
 	}
 	if cfg.Logging.Format != "text" {
 		t.Errorf("Logging.Format = %q, want text", cfg.Logging.Format)

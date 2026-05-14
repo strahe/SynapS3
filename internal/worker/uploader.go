@@ -64,7 +64,6 @@ type Uploader struct {
 const (
 	defaultEvictMaxRetries  = 3
 	uploadPollJitterDivisor = 5
-	defaultTargetCopies     = 2
 	uploadProgressTimeout   = 2 * time.Second
 
 	uploadStagePrepare       = "prepare_upload"
@@ -85,15 +84,6 @@ func WithEvictMaxRetries(maxRetries int) UploaderOption {
 	}
 }
 
-// WithTargetCopies configures the target number of storage copies for staged uploads.
-func WithTargetCopies(copies int) UploaderOption {
-	return func(u *Uploader) {
-		if copies > 0 {
-			u.targetCopies = boundedTargetCopies(copies)
-		}
-	}
-}
-
 func WithEventPublisher(publisher admin.EventPublisher) UploaderOption {
 	return func(u *Uploader) {
 		u.eventPublisher = publisher
@@ -101,14 +91,11 @@ func WithEventPublisher(publisher admin.EventPublisher) UploaderOption {
 }
 
 func boundedTargetCopies(copies int) int {
-	if copies <= 0 {
-		return defaultTargetCopies
-	}
 	return model.ClampStorageCopies(copies)
 }
 
 // NewUploader creates a new upload worker.
-func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, autoEvict bool, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
+func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, autoEvict bool, targetCopies int, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
 	u := &Uploader{
 		repos:           repos,
 		cache:           c,
@@ -117,7 +104,7 @@ func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.Stora
 		stateMachine:    sm,
 		autoEvict:       autoEvict,
 		evictMaxRetries: defaultEvictMaxRetries,
-		targetCopies:    defaultTargetCopies,
+		targetCopies:    boundedTargetCopies(targetCopies),
 		concurrency:     concurrency,
 		pollInterval:    pollInterval,
 		leaseTTL:        10 * time.Minute,

@@ -97,7 +97,7 @@ SYNAPS3_ADMIN_ADDR                   -> admin.addr
 Allowed values:
 
 - `filecoin.network`: `calibration`, `mainnet`
-- `filecoin.default_copies`: `1` through `8`; used for buckets without an Admin API copy policy override.
+- `filecoin.default_copies`: `1` through `8`, defaults to `3`; used for buckets without an Admin API copy policy override.
 - `database.driver`: `sqlite`, `postgres`
 - `cache.eviction_policy`: `lru`, `manual`, `none`
 - `logging.level`: `debug`, `info`, `warn`, `error`

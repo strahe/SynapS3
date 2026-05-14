@@ -360,9 +360,8 @@ func runServe(ctx context.Context, src config.Source) error {
 	// Start background workers.
 	wm := worker.NewManager(repos, logger, autoEvict,
 		worker.NewUploader(repos, localCache, storageClient, walletQuerier, sm, autoEvict,
-			cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
+			cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
 			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
-			worker.WithTargetCopies(cfg.Filecoin.DefaultCopies),
 			worker.WithEventPublisher(adminEvents)),
 		worker.NewEvictor(repos, localCache, sm,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
@@ -374,13 +373,12 @@ func runServe(ctx context.Context, src config.Source) error {
 	go wm.Start(ctx)
 
 	// Start admin server (healthz + metrics).
-	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, logger).
+	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, cfg.Filecoin.DefaultCopies, logger).
 		WithEventHub(adminEvents).
 		WithObjectUploader(be).
 		WithObjectStorage(storageClient).
 		WithProviderIdentityResolver(admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger)).
 		WithSettings(settingsSvc).
-		WithFilecoinDefaultCopies(cfg.Filecoin.DefaultCopies).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithS3IAM(iamSvc, rootAccount.Access)
 	errCh := make(chan error, 2)

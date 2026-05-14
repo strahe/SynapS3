@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
@@ -29,6 +30,10 @@ import (
 )
 
 func newBucketAPITestServer(t *testing.T) (*Server, *repository.Repositories) {
+	return newBucketAPITestServerWithRuntimeCopies(t, config.DefaultFilecoinCopies)
+}
+
+func newBucketAPITestServerWithRuntimeCopies(t *testing.T, filecoinDefaultCopies int) (*Server, *repository.Repositories) {
 	t.Helper()
 
 	db := testutil.NewTestDB(t)
@@ -38,14 +43,18 @@ func newBucketAPITestServer(t *testing.T) (*Server, *repository.Repositories) {
 	}
 
 	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, testLogger())
+	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, filecoinDefaultCopies, testLogger())
 	return srv, repos
 }
 
 func newBucketAPITestServerWithS3Users(t *testing.T, accessKeys ...string) (*Server, *repository.Repositories) {
+	return newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, config.DefaultFilecoinCopies, accessKeys...)
+}
+
+func newBucketAPITestServerWithS3UsersAndRuntimeCopies(t *testing.T, filecoinDefaultCopies int, accessKeys ...string) (*Server, *repository.Repositories) {
 	t.Helper()
 
-	srv, repos := newBucketAPITestServer(t)
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, filecoinDefaultCopies)
 	iamSvc := s3iam.NewService(repos)
 	root, err := iamSvc.EnsureRootAccount(t.Context())
 	if err != nil {
@@ -471,6 +480,7 @@ func markAdminStoredOnPrimaryUpload(t *testing.T, repos *repository.Repositories
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("start stored-on-primary upload attempt: %v", err)
@@ -513,6 +523,7 @@ func markAdminFailedUpload(t *testing.T, repos *repository.Repositories, version
 		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("start failed upload attempt: %v", err)
@@ -613,8 +624,7 @@ func (r *recordingObjectListRepo) list(prefix string, include func(string) bool,
 }
 
 func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
-	srv.WithFilecoinDefaultCopies(2)
+	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 2, "owner-access")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"admin-create-bucket","owner_access_key":"owner-access","default_copies":4}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -876,6 +886,7 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 		SourceVersionID: "01J000000000000000DATASET1",
 		ContentSize:     1,
 		Checksum:        "checksum-dataset-detail",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -974,8 +985,7 @@ func TestAPIBuckets_ListAllBuckets(t *testing.T) {
 }
 
 func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	srv.WithFilecoinDefaultCopies(5)
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
 	ctx := context.Background()
 
 	ownedACL, err := json.Marshal(auth.ACL{Owner: "owner-access"})
@@ -1066,8 +1076,7 @@ func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
 }
 
 func TestAPIBucketCopyPolicy_UpdateAndClear(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	srv.WithFilecoinDefaultCopies(5)
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
 	ctx := context.Background()
 	bucket := &model.Bucket{Name: "copy-policy-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -1167,8 +1176,7 @@ func TestAPIBucketCopyPolicy_RejectsInvalidPayloads(t *testing.T) {
 }
 
 func TestAPIBucketOwner_UpdateAssignsExistingS3User(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
-	srv.WithFilecoinDefaultCopies(4)
+	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 4, "owner-access")
 	ctx := context.Background()
 	bucket := &model.Bucket{Name: "assign-owner-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -2442,6 +2450,7 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 		SourceVersionID: versionID,
 		ContentSize:     10,
 		Checksum:        "checksum-progress",
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -2524,6 +2533,7 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 		SourceVersionID: versionID,
 		ContentSize:     8,
 		Checksum:        "checksum-provenance",
+		RequestedCopies: 2,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -2716,7 +2726,7 @@ func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 		t.Fatalf("creating test cache: %v", err)
 	}
 	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, testLogger())
+	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	ctx := context.Background()
 	bucket := &model.Bucket{Name: "batched-upload-status-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -2755,7 +2765,7 @@ func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
 		t.Fatalf("creating test cache: %v", err)
 	}
 	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, testLogger())
+	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	ctx := context.Background()
 	bucket := &model.Bucket{Name: "batched-version-status-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {

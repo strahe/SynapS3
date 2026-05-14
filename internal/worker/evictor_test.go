@@ -204,6 +204,7 @@ func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
 		SourceVersionID: versionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
+		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)

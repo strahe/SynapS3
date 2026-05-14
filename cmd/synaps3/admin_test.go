@@ -694,7 +694,7 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 				"source":                 "synaps3",
 				"with_cdn":               false,
 				"allow_private_networks": allowPrivate,
-				"default_copies":         2,
+				"default_copies":         3,
 			},
 			"cache": map[string]any{
 				"dir":             "/tmp/cache",
