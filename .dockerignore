@@ -5,3 +5,7 @@ cache/
 *.db-shm
 *.db-wal
 synaps3
+ui/dist/
+ui/node_modules/
+.pnpm-store/
+.env

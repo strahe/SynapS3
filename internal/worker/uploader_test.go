@@ -189,7 +189,7 @@ func waitForObjectState(t *testing.T, env *testWorkerEnv, versionID string, stat
 
 // runWorkerUntilTask runs a worker and waits until the given task
 // leaves active queue states, or times out.
-func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskID int64, timeout time.Duration) {
+func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskID int64, timeout time.Duration) *model.Task {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -218,7 +218,7 @@ func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskI
 			if task != nil && task.Status != model.TaskStatusQueued && task.Status != model.TaskStatusScheduled && task.Status != model.TaskStatusWaiting && task.Status != model.TaskStatusRunning {
 				cancel()
 				<-done
-				return
+				return task
 			}
 		}
 	}
@@ -3199,9 +3199,8 @@ func TestUploader_WalletError_ProceedsWithUpload(t *testing.T) {
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+	got := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
 	if got.Status != model.TaskStatusCompleted {
 		t.Errorf("expected task completed (wallet error should not block upload), got %s", got.Status)
 	}
@@ -3226,9 +3225,8 @@ func TestUploader_WalletNilInfo_NoPanic(t *testing.T) {
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+	got := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
 	if got.Status != model.TaskStatusCompleted {
 		t.Errorf("expected task completed (nil info should not panic), got %s", got.Status)
 	}

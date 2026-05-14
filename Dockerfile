@@ -1,13 +1,23 @@
-# Build stage — frontend
-FROM node:22-alpine AS frontend
+# Build stage - frontend
+FROM node:26-alpine AS frontend
+
+ENV PNPM_HOME=/pnpm
+ENV PATH="$PNPM_HOME:$PATH"
 
 WORKDIR /ui
-COPY ui/package.json ui/package-lock.json ./
-RUN npm ci
-COPY ui/ .
-RUN npm run build
 
-# Build stage — Go binary
+RUN npm install -g pnpm@11
+
+COPY ui/pnpm-lock.yaml ui/pnpm-workspace.yaml ./
+RUN pnpm fetch --frozen-lockfile --config.store-dir=/pnpm/store --config.confirmModulesPurge=false
+
+COPY ui/package.json ./
+RUN pnpm install --frozen-lockfile --offline --config.store-dir=/pnpm/store --config.confirmModulesPurge=false
+
+COPY ui/ .
+RUN pnpm run build
+
+# Build stage - Go binary
 FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache gcc musl-dev git
@@ -30,18 +40,21 @@ RUN CGO_ENABLED=1 go build -trimpath \
     -o /synaps3 ./cmd/synaps3
 
 # Runtime stage
-FROM alpine:3.21
+FROM alpine:3
 
 RUN apk add --no-cache ca-certificates tzdata wget
 
 COPY --from=builder /synaps3 /usr/local/bin/synaps3
+COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN mkdir -p /var/lib/synaps3/cache
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /var/lib/synaps3/cache
+
+VOLUME ["/var/lib/synaps3"]
 
 EXPOSE 8080 9090
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD wget -q --spider http://localhost:9090/healthz || exit 1
 
-ENTRYPOINT ["synaps3"]
-CMD ["serve", "--config", "/etc/synaps3/config.toml"]
+ENTRYPOINT ["docker-entrypoint.sh"]

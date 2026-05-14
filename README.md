@@ -33,106 +33,61 @@ SynapS3 lets S3 clients use Filecoin storage.
 
 ## Quick Start
 
+This Quick Start uses `docker run` for quick evaluation. For Docker Compose deployment, use the [Docker deployment guide](docs/deployment/docker.md). To compile locally, use the [source build guide](docs/deployment/source.md).
+
 Prerequisites:
 
-- Go 1.26.3 or later
-- C toolchain for cgo, such as gcc or clang
-- Node.js 22.12 or later
-- pnpm 11, installed directly or managed by [Corepack](https://github.com/nodejs/corepack)
-- [rc](https://github.com/rustfs/cli) or [mc](https://github.com/minio/mc) for S3 testing
+- [Docker Engine](https://docs.docker.com/engine/install/) or [Docker Desktop](https://docs.docker.com/get-started/get-docker/)
+- [Host networking](https://docs.docker.com/engine/network/tutorials/host/) enabled for Docker Desktop
 
-If pnpm 11 is not already installed, enable [Corepack](https://github.com/nodejs/corepack) before building:
+The commands use Docker host networking so the admin server can stay bound to `127.0.0.1`.
 
 ```bash
-corepack enable
+cp .env.example .env
+docker run --rm ghcr.io/strahe/synaps3:edge synaps3 wallet generate
 ```
 
-If `corepack` is missing, install it first with `npm install --global corepack@latest`.
-
-Clone and build SynapS3 with the embedded dashboard:
+Copy the generated private key into `.env`, then fund the generated address on Calibration:
 
 ```bash
-git clone https://github.com/strahe/SynapS3.git
-cd SynapS3
-make build
+docker run --rm --env-file .env ghcr.io/strahe/synaps3:edge synaps3 wallet fund-testnet 0x...
 ```
 
-Initialize the local app data directory:
+Start a temporary service:
 
 ```bash
-./bin/synaps3 init
+docker volume create synaps3-test-data
+docker run -d --name synaps3-test \
+  --network host \
+  --env-file .env \
+  -v synaps3-test-data:/var/lib/synaps3 \
+  ghcr.io/strahe/synaps3:edge
 ```
 
-Generate a wallet if you do not already have one:
+Check health and deposit USDFC:
 
 ```bash
-./bin/synaps3 wallet generate
+curl http://127.0.0.1:9090/healthz
+docker exec synaps3-test synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2
 ```
 
-Set `filecoin.private_key` in `~/.synaps3/config.toml`:
-
-```toml
-[filecoin]
-private_key = "0x..."
-```
-
-For Calibration testing, fund the wallet with testnet tFIL and USDFC:
+Open the dashboard at `http://127.0.0.1:9090` and upload a file. If the host is remote, use an SSH tunnel:
 
 ```bash
-# Use the generated wallet address, not the private key.
-./bin/synaps3 wallet fund-testnet 0x...
+ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-Start SynapS3:
+Clean up the testing container when done:
 
 ```bash
-./bin/synaps3 serve
-```
-
-Default endpoints:
-
-- S3 API: `http://localhost:8080`
-- Dashboard and admin API: `http://localhost:9090`
-- Runtime data: `~/.synaps3/`
-
-Do not expose the dashboard and admin API directly to an untrusted network.
-
-Deposit USDFC into the payment account before uploading. This command signs with the Filecoin private key from your SynapS3 config:
-
-```bash
-./bin/synaps3 wallet deposit 2
-```
-
-In another terminal, create an S3 user from the dashboard or CLI, then configure your S3 client with the generated keys. Secrets are shown only when created or rotated.
-
-```bash
-./bin/synaps3 admin s3-user create
-```
-
-Example with rc:
-
-```bash
-printf '%*s\n' 128 'hello synaps3' > hello.txt
-rc alias set synaps3 http://localhost:8080 'replace-with-access-key' 'replace-with-secret-key'
-rc mb synaps3/demo
-rc cp ./hello.txt synaps3/demo/hello.txt
-rc cat synaps3/demo/hello.txt
-```
-
-The sample file is padded because FOC uploads require at least 127 bytes. Any path-style S3 client can be used.
-
-You can also upload files from the dashboard.
-
-Check health and task recovery:
-
-```bash
-./bin/synaps3 admin status
-curl http://localhost:9090/healthz
-./bin/synaps3 admin task list --status exhausted --limit 100
+docker rm -f synaps3-test
+docker volume rm synaps3-test-data
 ```
 
 ## Documentation
 
+- [Docker deployment](docs/deployment/docker.md)
+- [Build from source](docs/deployment/source.md)
 - [Configuration](docs/configuration.md)
 - [Operations](docs/operations.md)
 

@@ -15,8 +15,8 @@ PutObject -> cache + DB -> worker -> storage provider + Filecoin
 
 ## Deployment Notes
 
-- Use the local build flow in the [README](../README.md) for the current developer preview
-- Docker deployment guidance is coming soon
+- Use the [Docker deployment guide](deployment/docker.md) for Linux single-host deployments
+- Use the [source build guide](deployment/source.md) for local development or custom binaries
 - Keep the admin server bound to `127.0.0.1` unless it is behind an authenticated reverse proxy
 - Keep `filecoin.private_key` out of committed config files
 - Store cache data on durable local disk for long-running nodes

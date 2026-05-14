@@ -1,0 +1,18 @@
+services:
+  synaps3:
+    image: ghcr.io/strahe/synaps3:edge
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SYNAPS3_DATA_DIR: /var/lib/synaps3
+      SYNAPS3_ADMIN_ADDR: 127.0.0.1:9090
+      SYNAPS3_LOGGING_FORMAT: json
+    volumes:
+      - synaps3-data:/var/lib/synaps3
+
+volumes:
+  synaps3-data:
+    name: synaps3-data

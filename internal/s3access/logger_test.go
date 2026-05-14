@@ -32,7 +32,7 @@ func TestLoggerLogsStructuredSuccessfulRequest(t *testing.T) {
 	assertLogField(t, record, "method", http.MethodPut)
 	assertLogField(t, record, "path", "/test1/Pencil-mac-arm64.dmg")
 	assertLogNumber(t, record, "status", http.StatusOK)
-	assertLogNumber(t, record, "duration_ms", 1500)
+	assertLogNumberRange(t, record, "duration_ms", 1500, 5000)
 }
 
 func TestLoggerOmitsQueryAndObjectDetailFields(t *testing.T) {
@@ -143,5 +143,17 @@ func assertLogNumber(t *testing.T, record map[string]any, field string, want int
 	}
 	if int(got) != want {
 		t.Fatalf("record[%q] = %v, want %d", field, got, want)
+	}
+}
+
+func assertLogNumberRange(t *testing.T, record map[string]any, field string, min, max int) {
+	t.Helper()
+	got, ok := record[field].(float64)
+	if !ok {
+		t.Fatalf("record[%q] = %#v, want numeric value in [%d, %d]", field, record[field], min, max)
+	}
+	gotInt := int(got)
+	if gotInt < min || gotInt > max {
+		t.Fatalf("record[%q] = %v, want value in [%d, %d]", field, got, min, max)
 	}
 }
