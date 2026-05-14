@@ -6,16 +6,27 @@ import {
   HardDrive,
   LayoutDashboard,
   ListTodo,
+  Monitor,
+  Moon,
   PanelLeftOpen,
   Settings,
+  Sun,
   Wallet,
 } from 'lucide-react'
 import { type MouseEvent, useEffect, useState } from 'react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
   Sidebar,
   SidebarContent,
+  SidebarFooter,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
@@ -28,6 +39,15 @@ import {
 } from '@/components/ui/sidebar'
 import { useSettings } from '@/hooks/queries'
 import { applyProviderIdentityEventData } from '@/lib/provider-identity-events'
+import {
+  getSystemThemeMediaQuery,
+  normalizeThemePreference,
+  readSystemPrefersDark,
+  readThemePreference,
+  resolveThemeDark,
+  type ThemePreference,
+  writeThemePreference,
+} from '@/lib/theme'
 import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '@/lib/upload-progress-events'
 import { applyWalletOperationEventData } from '@/lib/wallet-operation-events'
 import { rootContentKind } from './-root-content'
@@ -51,6 +71,12 @@ type NavItem = (typeof navItems)[number]
 
 const setupNavItems: NavItem[] = [{ to: '/settings', label: 'Settings', icon: Settings }]
 const sidebarCookieName = 'sidebar_state'
+const systemThemeOption = { value: 'system', label: 'System', icon: Monitor } as const
+const themeOptions = [
+  systemThemeOption,
+  { value: 'dark', label: 'Dark', icon: Moon },
+  { value: 'light', label: 'Light', icon: Sun },
+] as const
 
 function readSidebarDefaultOpen() {
   if (typeof document === 'undefined') return true
@@ -60,17 +86,20 @@ function readSidebarDefaultOpen() {
 }
 
 function RootLayout() {
-  const [dark, setDark] = useState(false)
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => readThemePreference())
+  const [systemPrefersDark, setSystemPrefersDark] = useState(readSystemPrefersDark)
   const location = useLocation()
   const { data: settings, isLoading: settingsLoading } = useSettings()
   const setupMode = settings?.mode === 'setup'
   const activeNavItems = settingsLoading || setupMode ? setupNavItems : navItems
   const contentKind = rootContentKind(settings, location.pathname)
+  const dark = resolveThemeDark(themePreference, systemPrefersDark)
 
   useEffect(() => {
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    setDark(mq.matches)
-    const handler = (e: MediaQueryListEvent) => setDark(e.matches)
+    const mq = getSystemThemeMediaQuery()
+    if (!mq) return
+    setSystemPrefersDark(mq.matches)
+    const handler = (e: MediaQueryListEvent) => setSystemPrefersDark(e.matches)
     mq.addEventListener('change', handler)
     return () => mq.removeEventListener('change', handler)
   }, [])
@@ -92,10 +121,20 @@ function RootLayout() {
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [])
 
+  function handleThemePreferenceChange(preference: ThemePreference) {
+    setThemePreference(preference)
+    writeThemePreference(preference)
+  }
+
   return (
     <SidebarProvider defaultOpen={readSidebarDefaultOpen()}>
       <AdminEventsBridge enabled={!settingsLoading && !setupMode} />
-      <AppSidebar activeNavItems={activeNavItems} pathname={location.pathname} />
+      <AppSidebar
+        activeNavItems={activeNavItems}
+        pathname={location.pathname}
+        themePreference={themePreference}
+        onThemePreferenceChange={handleThemePreferenceChange}
+      />
 
       <SidebarInset className="overflow-auto">
         <div className="flex h-14 items-center gap-2 border-b border-border px-4 md:hidden">
@@ -133,7 +172,17 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
   return null
 }
 
-function AppSidebar({ activeNavItems, pathname }: { activeNavItems: NavItem[]; pathname: string }) {
+function AppSidebar({
+  activeNavItems,
+  pathname,
+  themePreference,
+  onThemePreferenceChange,
+}: {
+  activeNavItems: NavItem[]
+  pathname: string
+  themePreference: ThemePreference
+  onThemePreferenceChange: (preference: ThemePreference) => void
+}) {
   const { isMobile, setOpenMobile, state, toggleSidebar } = useSidebar()
   const closeMobileSidebar = () => {
     if (isMobile) setOpenMobile(false)
@@ -194,8 +243,59 @@ function AppSidebar({ activeNavItems, pathname }: { activeNavItems: NavItem[]; p
           ))}
         </SidebarMenu>
       </SidebarContent>
+      <SidebarFooter>
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <ThemeMenu
+              value={themePreference}
+              isMobile={isMobile}
+              onChange={(preference) => {
+                onThemePreferenceChange(preference)
+                closeMobileSidebar()
+              }}
+            />
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarFooter>
       <SidebarRail />
     </Sidebar>
+  )
+}
+
+function ThemeMenu({
+  value,
+  isMobile,
+  onChange,
+}: {
+  value: ThemePreference
+  isMobile: boolean
+  onChange: (preference: ThemePreference) => void
+}) {
+  const activeOption = themeOptions.find((option) => option.value === value) ?? systemThemeOption
+  const ActiveIcon = activeOption.icon
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <SidebarMenuButton tooltip={`Theme: ${activeOption.label}`} aria-label={`Theme: ${activeOption.label}`}>
+          <ActiveIcon />
+          <span className="group-data-[collapsible=icon]:hidden">Theme: {activeOption.label}</span>
+        </SidebarMenuButton>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent side={isMobile ? 'top' : 'right'} align="end" className="w-40">
+        <DropdownMenuRadioGroup value={value} onValueChange={(next) => onChange(normalizeThemePreference(next))}>
+          {themeOptions.map((option) => {
+            const Icon = option.icon
+            return (
+              <DropdownMenuRadioItem key={option.value} value={option.value}>
+                <Icon />
+                {option.label}
+              </DropdownMenuRadioItem>
+            )
+          })}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
