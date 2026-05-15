@@ -1069,32 +1069,6 @@ func TestTaskRepo_OverviewActivePipeline(t *testing.T) {
 	}
 }
 
-func TestTaskRepo_CountOverviewAttention(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	seedTask(t, repos, model.TaskTypeUpload)
-	failed := seedTask(t, repos, model.TaskTypeUpload)
-	exhausted := seedTask(t, repos, model.TaskTypeEvictCache)
-	cancelled := seedTask(t, repos, model.TaskTypeStorageCleanup)
-
-	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusFailed, failed.ID)
-	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusExhausted, exhausted.ID)
-	mustExec(t, db, `UPDATE tasks SET status = ? WHERE id = ?`, model.TaskStatusCancelled, cancelled.ID)
-
-	counts, err := repos.Tasks.CountOverviewAttention(ctx)
-	if err != nil {
-		t.Fatalf("CountOverviewAttention: %v", err)
-	}
-	if counts.Failed != 1 {
-		t.Fatalf("Failed = %d, want 1", counts.Failed)
-	}
-	if counts.Exhausted != 1 {
-		t.Fatalf("Exhausted = %d, want 1", counts.Exhausted)
-	}
-}
-
 func TestTaskRepo_CountActiveObjectTasksByBucket(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

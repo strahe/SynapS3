@@ -395,7 +395,6 @@ type TaskRepository interface {
 	RetryExhausted(ctx context.Context, taskID int64) error
 	// CountByStatus returns task counts grouped by type and status.
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
-	CountOverviewAttention(ctx context.Context) (TaskAttentionCount, error)
 	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
 	// CountActiveObjectTasksByBucket returns active object tasks
 	// whose referenced current object belongs to the given bucket.
@@ -433,11 +432,6 @@ type TaskStatusCount struct {
 	Type   string `bun:"type"`
 	Status string `bun:"status"`
 	Count  int64  `bun:"count"`
-}
-
-type TaskAttentionCount struct {
-	Failed    int64 `bun:"failed"`
-	Exhausted int64 `bun:"exhausted"`
 }
 
 type TaskPipelineCount struct {

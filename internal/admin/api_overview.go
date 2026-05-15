@@ -122,14 +122,9 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 		for _, tc := range taskCounts {
 			resp.Tasks.ByStatus[tc.Status] += tc.Count
 		}
-	}
-	taskAttention, err := s.repos.Tasks.CountOverviewAttention(ctx)
-	if err != nil {
-		s.logger.Warn("overview: failed to count task attention", "error", err)
-	} else {
 		resp.Tasks.Attention = taskAttentionOverview{
-			Failed:    taskAttention.Failed,
-			Exhausted: taskAttention.Exhausted,
+			Failed:    resp.Tasks.ByStatus[string(model.TaskStatusFailed)],
+			Exhausted: resp.Tasks.ByStatus[string(model.TaskStatusExhausted)],
 		}
 	}
 	taskPipelineCounts, err := s.repos.Tasks.CountOverviewActivePipeline(ctx)

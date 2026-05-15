@@ -150,6 +150,24 @@ func (f *Filesystem) safePath(parts ...string) (string, error) {
 	if !strings.HasPrefix(abs, rootPrefix) {
 		return "", ErrInvalidPath
 	}
+	if len(parts) > 0 {
+		namespace := filepath.Clean(parts[0])
+		if namespace != parts[0] ||
+			namespace == "." ||
+			namespace == ".." ||
+			filepath.IsAbs(namespace) ||
+			strings.ContainsAny(namespace, `/\`) {
+			return "", ErrInvalidPath
+		}
+		base, err := filepath.Abs(filepath.Join(f.root, namespace))
+		if err != nil {
+			return "", ErrInvalidPath
+		}
+		basePrefix := base + string(filepath.Separator)
+		if abs != base && !strings.HasPrefix(abs, basePrefix) {
+			return "", ErrInvalidPath
+		}
+	}
 	return abs, nil
 }
 

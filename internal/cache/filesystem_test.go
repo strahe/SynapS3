@@ -279,6 +279,9 @@ func TestPathTraversal(t *testing.T) {
 	}{
 		{"../escape", "key"},
 		{"bkt", "../../etc/passwd"},
+		{"bucket-a", "../bucket-b/secret"},
+		{"bucket-a/../bucket-b", "secret"},
+		{"bucket-a/..", "root-secret"},
 		{"..", ".."},
 		{"bkt/../..", "key"},
 	}
@@ -325,6 +328,16 @@ func TestPathTraversal(t *testing.T) {
 	err = fs.DeleteBucketDir(ctx, ".")
 	if err != ErrInvalidPath {
 		t.Errorf("DeleteBucketDir dot bucket: err = %v, want ErrInvalidPath", err)
+	}
+
+	_, err = fs.PutPart(ctx, "../upload-escape", 1, strings.NewReader("bad"))
+	if err != ErrInvalidPath {
+		t.Errorf("PutPart traversal upload: err = %v, want ErrInvalidPath", err)
+	}
+
+	err = fs.DeleteUpload(ctx, "../upload-escape")
+	if err != ErrInvalidPath {
+		t.Errorf("DeleteUpload traversal upload: err = %v, want ErrInvalidPath", err)
 	}
 }
 

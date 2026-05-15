@@ -561,21 +561,6 @@ func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, err
 	return counts, nil
 }
 
-func (r *BunTaskRepo) CountOverviewAttention(ctx context.Context) (TaskAttentionCount, error) {
-	var count TaskAttentionCount
-	err := r.db.NewRaw(`SELECT
-			COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS failed,
-			COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS exhausted
-		FROM tasks`,
-		model.TaskStatusFailed,
-		model.TaskStatusExhausted,
-	).Scan(ctx, &count)
-	if err != nil {
-		return TaskAttentionCount{}, fmt.Errorf("counting overview task attention: %w", err)
-	}
-	return count, nil
-}
-
 func (r *BunTaskRepo) CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error) {
 	var counts []TaskPipelineCount
 	err := r.db.NewRaw(`SELECT pipeline, status, COUNT(*) AS count
