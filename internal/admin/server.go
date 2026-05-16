@@ -41,6 +41,7 @@ type Server struct {
 	bucketLifecycle          *bucketlifecycle.Service
 	workerHealth             WorkerHealthChecker
 	wallet                   synapse.WalletQuerier
+	filecoinReadiness        filecoinReadinessProbe
 	providerIdentity         providerIdentityLookup
 	events                   *EventHub
 	settings                 *SettingsService
@@ -140,6 +141,12 @@ func (s *Server) WithSettings(settings *SettingsService) *Server {
 	return s
 }
 
+// WithFilecoinReadiness enables Filecoin readiness API routes.
+func (s *Server) WithFilecoinReadiness(probe filecoinReadinessProbe) *Server {
+	s.filecoinReadiness = probe
+	return s
+}
+
 // WithS3IAM enables S3 user management API routes.
 func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	s.s3IAM = iam
@@ -203,6 +210,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("POST /api/v1/wallet/fund", s.handleAPIWalletFund)
 		mux.HandleFunc("POST /api/v1/wallet/withdraw", s.handleAPIWalletWithdraw)
 		mux.HandleFunc("GET /api/v1/wallet/operations", s.handleAPIWalletOperations)
+		mux.HandleFunc("GET /api/v1/filecoin/readiness", s.handleAPIFilecoinReadiness)
 		if s.s3IAM != nil {
 			mux.HandleFunc("GET /api/v1/s3-users", s.handleAPIListS3Users)
 			mux.HandleFunc("POST /api/v1/s3-users", s.handleAPICreateS3User)
@@ -214,6 +222,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.settings != nil {
 		mux.HandleFunc("GET /api/v1/settings", s.handleAPIGetSettings)
 		mux.HandleFunc("PUT /api/v1/settings", s.handleAPIUpdateSettings)
+		mux.HandleFunc("POST /api/v1/filecoin/readiness/preflight", s.handleAPIFilecoinReadinessPreflight)
 	}
 
 	// Serve embedded SPA frontend (fallback for non-API routes)

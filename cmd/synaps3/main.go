@@ -305,6 +305,11 @@ func runServe(ctx context.Context, src config.Source) error {
 	storageClient := synapse.AdaptStorageService(client.Storage())
 	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain())
 	walletOperator := synapse.NewWalletOperator(client.Payments(), client.Chain())
+	filecoinReadiness := synapse.NewReadinessChecker(
+		synapse.ReadinessConfigFromFilecoinConfig(cfg.Filecoin),
+		synapse.AdaptReadinessClient(client),
+		synapse.WithReadinessLogger(logger),
+	)
 	walletReceiptClient, err := ethclient.DialContext(ctx, cfg.Filecoin.RPCURL)
 	if err != nil {
 		return fmt.Errorf("creating wallet receipt client: %w", err)
@@ -379,6 +384,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		WithObjectStorage(storageClient).
 		WithProviderIdentityResolver(admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger)).
 		WithSettings(settingsSvc).
+		WithFilecoinReadiness(filecoinReadiness).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithS3IAM(iamSvc, rootAccount.Access)
 	errCh := make(chan error, 2)
@@ -424,7 +430,13 @@ func runSetupMode(ctx context.Context, cfg *config.Config, settingsSvc *admin.Se
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	adminSrv := admin.NewSetup(cfg.Admin.Addr, settingsSvc, logger)
+	filecoinReadiness := synapse.NewReadinessChecker(
+		synapse.ReadinessConfigFromFilecoinConfig(cfg.Filecoin),
+		nil,
+		synapse.WithReadinessLogger(logger),
+	)
+	adminSrv := admin.NewSetup(cfg.Admin.Addr, settingsSvc, logger).
+		WithFilecoinReadiness(filecoinReadiness)
 	if err := adminSrv.Run(ctx); err != nil {
 		return fmt.Errorf("admin setup server error: %w", err)
 	}

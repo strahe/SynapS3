@@ -127,6 +127,25 @@ func TestSettingsGETReportsS3UsersUnavailableInSetupMode(t *testing.T) {
 	}
 }
 
+func TestSettingsGETReportsRuntimeAvailability(t *testing.T) {
+	cfg := validSettingsConfig(t)
+	setupSrv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
+	setupResp := getSettingsResponse(t, setupSrv)
+	if setupResp.RuntimeAvailable {
+		t.Fatalf("setup runtime_available = true, want false")
+	}
+
+	runtimeSrv := &Server{
+		addr:     "127.0.0.1:9090",
+		settings: setupSrv.settings,
+		logger:   testLogger(),
+	}
+	runtimeResp := getSettingsResponse(t, runtimeSrv)
+	if !runtimeResp.RuntimeAvailable {
+		t.Fatalf("runtime runtime_available = false, want true")
+	}
+}
+
 func TestSettingsGETIncludesFilecoinRPCDefaults(t *testing.T) {
 	cfg := validSettingsConfig(t)
 	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
@@ -147,6 +166,23 @@ func TestSettingsGETIncludesFilecoinRPCDefaults(t *testing.T) {
 			t.Fatalf("default rpc for %s = %q, want %q", network, got, want)
 		}
 	}
+}
+
+func getSettingsResponse(t *testing.T, srv *Server) settingsResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIGetSettings(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp settingsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	return resp
 }
 
 func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {

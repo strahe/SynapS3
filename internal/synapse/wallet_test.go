@@ -195,6 +195,34 @@ func TestWalletQuerier_Uint256MaxFundedUntilHasNoActiveSpend(t *testing.T) {
 	}
 }
 
+func TestWalletQuerier_MissingFundedUntilWithLockupRateHasUnknownRunway(t *testing.T) {
+	addrs := chain.Calibration.Addresses()
+	owner := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	pay := newMockWalletPayments()
+	pay.accountInfoFunc = func(_ context.Context, token, _ common.Address) (*payments.AccountState, error) {
+		if token != addrs.USDFC {
+			t.Fatalf("unexpected AccountInfo token %s", token.Hex())
+		}
+		acct := accountStateWithRate(456, 0, 1)
+		acct.FundedUntilEpoch = nil
+		return acct, nil
+	}
+
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetWalletInfo: %v", err)
+	}
+	if info.PaymentAccount == nil {
+		t.Fatal("PaymentAccount = nil")
+	}
+	if info.PaymentAccount.NoActiveSpend {
+		t.Fatal("NoActiveSpend = true, want false")
+	}
+	if info.PaymentAccount.RunwaySeconds != nil {
+		t.Fatalf("RunwaySeconds = %v, want nil", info.PaymentAccount.RunwaySeconds)
+	}
+}
+
 func accountState(funds int64) *payments.AccountState {
 	return accountStateWithRate(funds, 0, 0)
 }

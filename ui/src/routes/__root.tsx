@@ -2,6 +2,7 @@ import { type QueryClient, useQueryClient } from '@tanstack/react-query'
 import { createRootRouteWithContext, Link, Outlet, useLocation } from '@tanstack/react-router'
 import {
   AlertTriangle,
+  BellOff,
   Database,
   HardDrive,
   LayoutDashboard,
@@ -9,11 +10,14 @@ import {
   Monitor,
   Moon,
   PanelLeftOpen,
+  RefreshCw,
   Settings,
   Sun,
   Wallet,
 } from 'lucide-react'
 import { type MouseEvent, useEffect, useState } from 'react'
+import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
+import { StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -37,7 +41,16 @@ import {
   SidebarTrigger,
   useSidebar,
 } from '@/components/ui/sidebar'
-import { useSettings } from '@/hooks/queries'
+import { useFilecoinReadiness, useSettings } from '@/hooks/queries'
+import {
+  filecoinReadinessStatusLabel,
+  filecoinReadinessStatusTone,
+  filecoinReadinessSummary,
+  importantFilecoinReadinessChecks,
+  isDismissibleFilecoinReadinessCheck,
+  readDismissedFilecoinReadinessChecks,
+  writeDismissedFilecoinReadinessCheck,
+} from '@/lib/filecoin-readiness'
 import { applyProviderIdentityEventData } from '@/lib/provider-identity-events'
 import {
   getSystemThemeMediaQuery,
@@ -50,7 +63,7 @@ import {
 } from '@/lib/theme'
 import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '@/lib/upload-progress-events'
 import { applyWalletOperationEventData } from '@/lib/wallet-operation-events'
-import { rootContentKind } from './-root-content'
+import { filecoinRuntimeReadinessEnabled, rootContentKind } from './-root-content'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -141,9 +154,112 @@ function RootLayout() {
           <SidebarTrigger />
           <span className="font-semibold">SynapS3</span>
         </div>
-        {contentKind === 'setup-required' ? <SetupRequired configPath={settings?.config_path ?? ''} /> : <Outlet />}
+        {contentKind === 'setup-required' ? (
+          <SetupRequired configPath={settings?.config_path ?? ''} />
+        ) : (
+          <>
+            <GlobalFilecoinReadinessAlert enabled={filecoinRuntimeReadinessEnabled(settings, settingsLoading)} />
+            <Outlet />
+          </>
+        )}
       </SidebarInset>
     </SidebarProvider>
+  )
+}
+
+function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
+  const readiness = useFilecoinReadiness(enabled)
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const [dismissedCheckIds, setDismissedCheckIds] = useState(() => readDismissedFilecoinReadinessChecks())
+  const data = readiness.data
+  const status = data?.status ?? 'unknown'
+  const failed = readiness.error instanceof Error
+  const visibleChecks = data ? importantFilecoinReadinessChecks(data.checks, dismissedCheckIds) : []
+  const primaryCheck = visibleChecks[0]
+  const showDataAlert =
+    data != null && data.status !== 'ready' && (visibleChecks.length > 0 || data.checks.length === 0)
+  const show = enabled && (failed || showDataAlert)
+
+  if (!show) return null
+
+  const title = failed ? 'Filecoin readiness could not be checked' : 'Filecoin uploads need attention'
+  const summary = failed ? readiness.error?.message : filecoinReadinessSummary(data, dismissedCheckIds)
+  const danger = failed || status === 'blocked'
+  const attention = !danger
+  const canDismissPrimaryCheck = Boolean(primaryCheck && isDismissibleFilecoinReadinessCheck(primaryCheck.id))
+
+  function dismissCheck(id: string) {
+    writeDismissedFilecoinReadinessCheck(id, true)
+    setDismissedCheckIds((current) => {
+      const next = new Set(current)
+      next.add(id)
+      return next
+    })
+  }
+
+  return (
+    <>
+      <div className="w-full min-w-0 px-6 pt-6">
+        <Alert
+          variant={danger ? 'destructive' : 'default'}
+          className={
+            attention
+              ? 'max-w-full border-[color:var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[color:var(--status-warning)]'
+              : 'max-w-full'
+          }
+        >
+          <AlertTriangle />
+          <AlertTitle className="flex flex-wrap items-center gap-2">
+            {title}
+            {!failed && (
+              <StatusBadge tone={filecoinReadinessStatusTone(status)}>
+                {filecoinReadinessStatusLabel(status)}
+              </StatusBadge>
+            )}
+          </AlertTitle>
+          <AlertDescription className={attention ? 'text-[color:var(--status-warning)]' : undefined}>
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+              <span className="min-w-0 flex-1 break-words">{summary}</span>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                {canDismissPrimaryCheck && primaryCheck && (
+                  <Button type="button" variant="outline" size="sm" onClick={() => dismissCheck(primaryCheck.id)}>
+                    <BellOff data-icon="inline-start" />
+                    Dismiss
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => readiness.refetch()}
+                  disabled={readiness.isFetching}
+                >
+                  <RefreshCw data-icon="inline-start" className={readiness.isFetching ? 'animate-spin' : undefined} />
+                  Refresh
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={!data}
+                  onClick={() => data && setDetailsOpen(true)}
+                >
+                  Details
+                </Button>
+              </div>
+            </div>
+          </AlertDescription>
+        </Alert>
+      </div>
+      <FilecoinReadinessDialog
+        title="Filecoin Readiness"
+        data={data}
+        open={detailsOpen}
+        onOpenChange={setDetailsOpen}
+        dismissedCheckIds={dismissedCheckIds}
+        onDismissCheck={dismissCheck}
+      />
+    </>
   )
 }
 

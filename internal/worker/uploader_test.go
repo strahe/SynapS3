@@ -194,6 +194,10 @@ func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskI
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	baseTasks := env.repos.Tasks
+	env.repos.Tasks = stopAfterTaskRepo{TaskRepository: baseTasks, stopTaskID: taskID}
+	defer func() { env.repos.Tasks = baseTasks }()
+
 	done := make(chan struct{})
 	go func() {
 		_ = w.Run(ctx)
@@ -221,6 +225,31 @@ func runWorkerUntilTask(t *testing.T, env *testWorkerEnv, w worker.Worker, taskI
 				return task
 			}
 		}
+	}
+}
+
+type stopAfterTaskRepo struct {
+	repository.TaskRepository
+	stopTaskID int64
+}
+
+func (r stopAfterTaskRepo) ClaimReady(ctx context.Context, taskType model.TaskType, leaseDuration time.Duration) (*model.Task, error) {
+	task, err := r.GetByID(ctx, r.stopTaskID)
+	if err != nil {
+		return nil, err
+	}
+	if task != nil && !taskStatusActive(task.Status) {
+		return nil, nil
+	}
+	return r.TaskRepository.ClaimReady(ctx, taskType, leaseDuration)
+}
+
+func taskStatusActive(status model.TaskStatus) bool {
+	switch status {
+	case model.TaskStatusQueued, model.TaskStatusScheduled, model.TaskStatusWaiting, model.TaskStatusRunning:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2392,6 +2421,76 @@ func TestUploader_FailedNewPeerDataSetDoesNotRemainInBucketPool(t *testing.T) {
 	}
 	if len(provenance.Failures) != 1 || provenance.Failures[0].ProviderID == nil || provenance.Failures[0].ProviderID.String() != failedProviderID.String() {
 		t.Fatalf("provenance failures = %#v, want failed provider attempt retained", provenance.Failures)
+	}
+}
+
+func TestUploader_RepairReusesReplacementBindingWithoutUploadCopy(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadableUploadWithPendingPeer(t, env)
+	if _, err := env.db.NewUpdate().
+		Model((*model.StorageUpload)(nil)).
+		Set("requested_copies = ?", 3).
+		Where("id = ?", fixture.upload.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("set requested copies: %v", err)
+	}
+
+	replacementProviderID := onChainID(t, "404")
+	if _, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          fixture.upload.BucketID,
+		ProviderID:        replacementProviderID,
+		CopyIndex:         2,
+		CreatedByUploadID: fixture.upload.ID,
+	}); err != nil {
+		t.Fatalf("EnsureDataSetBinding replacement: %v", err)
+	}
+
+	replacement := newFakeUploadContext(sdktypes.NewBigInt(404), sdktypes.NewBigInt(4004), sdktypes.NewBigInt(5001), testCID(t))
+	var createContextsCalls atomic.Int32
+	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		createContextsCalls.Add(1)
+		return []synapse.UploadContext{replacement}, nil
+	}
+	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		if createContextProviderIDEqual(opts, replacement.providerID) {
+			return replacement, nil
+		}
+		if createContextDataSetIDEqual(opts, replacement.dataSetID) {
+			return replacement, nil
+		}
+		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+	}
+
+	stage := "prepare_upload"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          fixture.objID,
+		RefVersionID:   fixture.versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:prepare_upload:%d:repair", fixture.versionID, fixture.upload.ID),
+		Payload:        map[string]interface{}{"upload_id": fixture.upload.ID},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create repair task: %v", err)
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+
+	if got := createContextsCalls.Load(); got != 0 {
+		t.Fatalf("CreateContexts calls = %d, want 0 when reusable replacement binding exists", got)
+	}
+	copies, err := env.repos.Uploads.ListCopies(ctx, fixture.upload.ID)
+	if err != nil {
+		t.Fatalf("ListCopies: %v", err)
+	}
+	if len(copies) != 3 || copies[2].CopyIndex != 2 || copies[2].ProviderID == nil || copies[2].ProviderID.String() != "404" {
+		t.Fatalf("copies after repair = %#v, want reused replacement copy index 2 from provider 404", copies)
 	}
 }
 

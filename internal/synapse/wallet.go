@@ -146,7 +146,7 @@ func noActivePaymentSpend(lockupRate, fundedUntilEpoch *big.Int) bool {
 		return true
 	}
 	if fundedUntilEpoch == nil {
-		return true
+		return false
 	}
 	return fundedUntilEpoch.Cmp(uint256Max()) == 0
 }

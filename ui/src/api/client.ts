@@ -428,6 +428,23 @@ export interface WalletData {
   partial_errors?: Record<string, string>
 }
 
+export type FilecoinReadinessStatus = 'ready' | 'warning' | 'blocked' | 'unknown'
+
+export interface FilecoinReadinessCheck {
+  id: string
+  status: FilecoinReadinessStatus
+  message: string
+  action?: string
+}
+
+export interface FilecoinReadinessData {
+  status: FilecoinReadinessStatus
+  mode: 'runtime' | 'draft'
+  checked_at: string
+  checks: FilecoinReadinessCheck[]
+  partial_errors?: Record<string, string>
+}
+
 export type WalletOperationType = 'fund' | 'withdraw'
 export type WalletOperationStatus = 'pending' | 'running' | 'submitted' | 'confirmed' | 'failed' | 'unknown'
 
@@ -464,6 +481,7 @@ export interface SettingsData {
   mode: 'ready' | 'setup'
   config_path: string
   writable: boolean
+  runtime_available: boolean
   restart_required: boolean
   s3_users: SettingsS3UsersStatus
   config: SettingsEditableConfig
@@ -618,6 +636,10 @@ export type SettingsUpdatePayload = Partial<{
     s3_access?: Partial<SettingsS3AccessLoggingConfig>
   }
 }>
+
+export interface FilecoinReadinessPreflightPayload {
+  filecoin: Partial<SettingsFilecoinConfig>
+}
 
 export const api = {
   getOverview: () => fetchJSON<OverviewData>('/overview'),
@@ -795,6 +817,15 @@ export const api = {
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
   getWallet: () => fetchJSON<WalletData>('/wallet'),
+  getFilecoinReadiness: () => fetchJSON<FilecoinReadinessData>('/filecoin/readiness'),
+  preflightFilecoin: (payload: FilecoinReadinessPreflightPayload) =>
+    fetchJSON<FilecoinReadinessData>('/filecoin/readiness/preflight', {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
   getWalletOperations: (limit = 20) => fetchJSON<WalletOperationsResponse>(`/wallet/operations?limit=${limit}`),
   fundWallet: (payload: { client_request_id: string; amount: string }) =>
     fetchJSON<WalletOperationResponse>('/wallet/fund', {

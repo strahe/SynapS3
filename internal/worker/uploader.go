@@ -1571,9 +1571,15 @@ func (u *Uploader) createReplacementPeerCopy(ctx context.Context, task *model.Ta
 	if bucket == nil {
 		return errors.New("bucket is required for replacement peer copy")
 	}
-	binding, err := u.createNewBucketProviderBinding(ctx, bucket, uploadID)
+	binding, err := u.reusableReplacementPeerBinding(ctx, bucket, uploadID)
 	if err != nil {
 		return err
+	}
+	if binding == nil {
+		binding, err = u.createNewBucketProviderBinding(ctx, bucket, uploadID)
+		if err != nil {
+			return err
+		}
 	}
 	if err := u.repos.Uploads.CreateUploadCopiesForBindings(ctx, uploadID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
@@ -1590,6 +1596,29 @@ func (u *Uploader) createReplacementPeerCopy(ctx context.Context, task *model.Ta
 		logger.Info("queued replacement peer copy", "uploadID", uploadID, "copyIndex", binding.CopyIndex)
 	}
 	return nil
+}
+
+func (u *Uploader) reusableReplacementPeerBinding(ctx context.Context, bucket *model.Bucket, uploadID int64) (*model.StorageDataSet, error) {
+	copies, err := u.repos.Uploads.ListCopies(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	usedCopyIndexes := make(map[int]struct{}, len(copies))
+	for _, copyRow := range copies {
+		usedCopyIndexes[copyRow.CopyIndex] = struct{}{}
+	}
+	bindings, err := u.repos.Uploads.ListDataSetBindings(ctx, bucket.ID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range bindings {
+		binding := &bindings[i]
+		if _, used := usedCopyIndexes[binding.CopyIndex]; used || !dataSetBindingCanEnsureWrite(binding) {
+			continue
+		}
+		return binding, nil
+	}
+	return nil, nil
 }
 
 func (u *Uploader) createNewBucketProviderBinding(ctx context.Context, bucket *model.Bucket, uploadID int64) (*model.StorageDataSet, error) {

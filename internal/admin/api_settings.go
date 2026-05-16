@@ -175,6 +175,63 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 	return s.snapshotLocked(writable), nil, nil
 }
 
+func (s *SettingsService) FilecoinDraftConfig(req *settingsFilecoinUpdate) (*config.Config, []config.FieldError) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := cloneConfig(s.effective)
+	if next == nil {
+		return nil, []config.FieldError{{Field: "filecoin", Message: "settings are unavailable"}}
+	}
+
+	var fieldErrs []config.FieldError
+	managed := config.EnvManagedFieldPaths()
+	checkField := func(field string) bool {
+		if envName, ok := managed[field]; ok {
+			fieldErrs = append(fieldErrs, config.FieldError{
+				Field:   field,
+				Message: "is managed by " + envName,
+			})
+			return false
+		}
+		return true
+	}
+	setString := func(field string, target *string, value *string) {
+		if value == nil || !checkField(field) {
+			return
+		}
+		*target = *value
+	}
+	setInt := func(field string, target *int, value *int) {
+		if value == nil || !checkField(field) {
+			return
+		}
+		*target = *value
+	}
+	setBool := func(field string, target *bool, value *bool) {
+		if value == nil || !checkField(field) {
+			return
+		}
+		*target = *value
+	}
+
+	if req != nil {
+		setString("filecoin.network", &next.Filecoin.Network, req.Network)
+		setString("filecoin.rpc_url", &next.Filecoin.RPCURL, req.RPCURL)
+		setString("filecoin.source", &next.Filecoin.Source, req.Source)
+		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.WithCDN)
+		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.AllowPrivateNetworks)
+		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.DefaultCopies)
+	}
+	if len(fieldErrs) == 0 {
+		fieldErrs = filecoinEditableValidationErrors(next)
+	}
+	if len(fieldErrs) > 0 {
+		return next, fieldErrs
+	}
+	return next, nil
+}
+
 func applyWorkerPoolUpdate(
 	req *settingsWorkerPoolUpdate,
 	target *config.WorkerPoolConfig,
@@ -212,6 +269,7 @@ func (s *SettingsService) snapshotFromConfigLocked(cfg *config.Config, writable 
 		Mode:              mode,
 		ConfigPath:        s.source.Path,
 		Writable:          writable,
+		RuntimeAvailable:  false,
 		RestartRequired:   s.restartRequired,
 		Config:            toSettingsEditableConfig(cfg),
 		Manual:            toSettingsManualConfig(cfg),
@@ -237,6 +295,7 @@ type settingsResponse struct {
 	Mode              string                          `json:"mode"`
 	ConfigPath        string                          `json:"config_path"`
 	Writable          bool                            `json:"writable"`
+	RuntimeAvailable  bool                            `json:"runtime_available"`
 	RestartRequired   bool                            `json:"restart_required"`
 	S3Users           settingsS3UsersStatus           `json:"s3_users"`
 	Config            settingsEditableConfig          `json:"config"`
@@ -538,6 +597,23 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 	return out
 }
 
+func filecoinEditableValidationErrors(cfg *config.Config) []config.FieldError {
+	editable := map[string]struct{}{
+		"filecoin.network":        {},
+		"filecoin.rpc_url":        {},
+		"filecoin.source":         {},
+		"filecoin.default_copies": {},
+	}
+
+	var out []config.FieldError
+	for _, fieldErr := range cfg.FieldValidationErrors() {
+		if _, ok := editable[fieldErr.Field]; ok {
+			out = append(out, fieldErr)
+		}
+	}
+	return out
+}
+
 func configuredLabel(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return "missing"
@@ -617,6 +693,7 @@ func (s *Server) handleAPIUpdateSettings(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) decorateSettingsResponse(resp settingsResponse) settingsResponse {
 	resp.S3Users = s.s3UsersStatus()
+	resp.RuntimeAvailable = !s.setupOnly
 	return resp
 }
 

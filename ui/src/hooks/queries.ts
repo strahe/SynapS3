@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { S3UserRole } from '@/api/client'
+import type { FilecoinReadinessPreflightPayload, S3UserRole } from '@/api/client'
 import { api } from '@/api/client'
 
 export function useOverview() {
@@ -234,6 +234,21 @@ export function useWallet() {
     queryFn: api.getWallet,
     staleTime: 10_000,
     refetchInterval: 30_000,
+  })
+}
+
+export function useFilecoinReadiness(enabled = true) {
+  return useQuery({
+    queryKey: ['filecoinReadiness'],
+    queryFn: api.getFilecoinReadiness,
+    enabled,
+    staleTime: 60_000,
+  })
+}
+
+export function useFilecoinPreflight() {
+  return useMutation({
+    mutationFn: (payload: FilecoinReadinessPreflightPayload) => api.preflightFilecoin(payload),
   })
 }
 

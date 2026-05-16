@@ -88,6 +88,53 @@ test('admin write mutations send settings write header', async () => {
   assert.equal(calls[4]?.headers.get('X-SynapS3-Settings-Write'), '1')
 })
 
+test('filecoin preflight sends settings write header and payload', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedURL = ''
+  let requestedMethod = ''
+  let requestedHeaders = new Headers()
+  let requestedBody: unknown
+  globalThis.fetch = (async (input, init) => {
+    requestedURL = input.toString()
+    requestedMethod = init?.method ?? ''
+    requestedHeaders = new Headers(init?.headers)
+    requestedBody = JSON.parse(init?.body?.toString() ?? '{}') as unknown
+    return new Response(
+      JSON.stringify({
+        status: 'ready',
+        mode: 'draft',
+        checked_at: '2026-05-16T12:00:00Z',
+        checks: [],
+      }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    )
+  }) as typeof fetch
+
+  try {
+    await api.preflightFilecoin({
+      filecoin: {
+        network: 'calibration',
+        default_copies: 2,
+      },
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(requestedURL, '/api/v1/filecoin/readiness/preflight')
+  assert.equal(requestedMethod, 'POST')
+  assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), '1')
+  assert.deepEqual(requestedBody, {
+    filecoin: {
+      network: 'calibration',
+      default_copies: 2,
+    },
+  })
+})
+
 test('object download URL encodes bucket name and object key', () => {
   assert.equal(
     api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),

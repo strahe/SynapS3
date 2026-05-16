@@ -1,7 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, CheckCircle2, Loader2, Save } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Loader2, RefreshCw, Save } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import type {
+  FilecoinReadinessData,
   SettingsData,
   SettingsEditableConfig,
   SettingsFieldError,
@@ -10,6 +11,7 @@ import type {
   SettingsUpdatePayload,
 } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
+import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { S3SettingsPanel } from '@/components/settings/S3SettingsPanel'
@@ -35,7 +37,14 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useSettings, useUpdateSettings } from '@/hooks/queries'
+import { useFilecoinPreflight, useSettings, useUpdateSettings } from '@/hooks/queries'
+import {
+  buildFilecoinPreflightPayload,
+  filecoinPreflightPayloadKey,
+  filecoinReadinessStatusLabel,
+  filecoinReadinessStatusTone,
+  filecoinReadinessSummary,
+} from '@/lib/filecoin-readiness'
 import {
   classifySettingsRisk,
   collectSettingsRiskChanges,
@@ -86,8 +95,11 @@ const tabFields = {
 function SettingsPage() {
   const { data, isLoading, error } = useSettings()
   const updateSettings = useUpdateSettings()
+  const filecoinPreflight = useFilecoinPreflight()
   const [form, setForm] = useState<SettingsEditableConfig | null>(null)
+  const [checkedPreflightKey, setCheckedPreflightKey] = useState<string | null>(null)
   const [generatedCredentials, setGeneratedCredentials] = useState<SettingsS3Credentials | null>(null)
+  const [preflightDetailData, setPreflightDetailData] = useState<FilecoinReadinessData | null>(null)
   const [pendingSettingsPayload, setPendingSettingsPayload] = useState<SettingsUpdatePayload | null>(null)
   const [pendingRiskChanges, setPendingRiskChanges] = useState<SettingsRiskChange[]>([])
   const formDirty = Boolean(form && data && JSON.stringify(form) !== JSON.stringify(data.config))
@@ -98,6 +110,18 @@ function SettingsPage() {
   }, [data, form, formDirty])
 
   const fieldErrors = useMemo(() => toFieldErrorMap(data?.validation_errors ?? []), [data?.validation_errors])
+  const currentFilecoinPreflightPayload =
+    form && data ? buildFilecoinPreflightPayload(form.filecoin, data.env_managed) : null
+  const currentFilecoinPreflightKey = currentFilecoinPreflightPayload
+    ? filecoinPreflightPayloadKey(currentFilecoinPreflightPayload)
+    : null
+  const preflightMatchesCurrentDraft = Boolean(
+    checkedPreflightKey && currentFilecoinPreflightKey && checkedPreflightKey === currentFilecoinPreflightKey
+  )
+
+  useEffect(() => {
+    if (preflightDetailData && !preflightMatchesCurrentDraft) setPreflightDetailData(null)
+  }, [preflightDetailData, preflightMatchesCurrentDraft])
 
   if (error) {
     return <div className="flex h-full items-center justify-center text-destructive">Failed to load settings</div>
@@ -169,6 +193,19 @@ function SettingsPage() {
         },
       }
     })
+  }
+
+  function runFilecoinPreflight() {
+    if (
+      !currentFilecoinPreflightPayload ||
+      !currentFilecoinPreflightKey ||
+      !data?.writable ||
+      filecoinPreflight.isPending
+    ) {
+      return
+    }
+    setCheckedPreflightKey(currentFilecoinPreflightKey)
+    filecoinPreflight.mutate(currentFilecoinPreflightPayload)
   }
 
   return (
@@ -279,7 +316,30 @@ function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="filecoin">
-          <Section title="Filecoin">
+          <Section
+            title="Filecoin"
+            action={
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!data.writable || filecoinPreflight.isPending}
+                onClick={runFilecoinPreflight}
+              >
+                <RefreshCw
+                  data-icon="inline-start"
+                  className={filecoinPreflight.isPending ? 'animate-spin' : undefined}
+                />
+                Check
+              </Button>
+            }
+          >
+            <FilecoinPreflightSummary
+              data={preflightMatchesCurrentDraft ? filecoinPreflight.data : undefined}
+              pending={preflightMatchesCurrentDraft && filecoinPreflight.isPending}
+              error={preflightMatchesCurrentDraft ? filecoinPreflight.error : null}
+              onDetails={setPreflightDetailData}
+            />
             <div className="grid gap-4 md:grid-cols-2">
               <CredentialStatusCard data={data} label="Filecoin Private Key" field={data.manual.filecoin_private_key} />
               <SelectField
@@ -484,6 +544,12 @@ function SettingsPage() {
         credentials={generatedCredentials}
         onOpenChange={(open) => !open && setGeneratedCredentials(null)}
       />
+      <FilecoinReadinessDialog
+        title="Filecoin Preflight"
+        data={preflightDetailData}
+        open={Boolean(preflightDetailData)}
+        onOpenChange={(open) => !open && setPreflightDetailData(null)}
+      />
 
       <DangerActionAlertDialog
         open={Boolean(pendingSettingsPayload)}
@@ -510,6 +576,36 @@ function SettingsPage() {
         <SettingsRiskChangeList changes={pendingRiskChanges} metadata={data.metadata} />
       </DangerActionAlertDialog>
     </form>
+  )
+}
+
+function FilecoinPreflightSummary({
+  data,
+  pending,
+  error,
+  onDetails,
+}: {
+  data?: FilecoinReadinessData
+  pending: boolean
+  error: Error | null
+  onDetails: (data: FilecoinReadinessData) => void
+}) {
+  if (!pending && !data && !error) return null
+
+  const status = data?.status ?? 'unknown'
+  const label = pending ? 'Checking' : filecoinReadinessStatusLabel(status)
+  const summary = pending ? 'Checking draft Filecoin settings...' : error?.message || filecoinReadinessSummary(data)
+
+  return (
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        <StatusBadge tone={filecoinReadinessStatusTone(status)}>{label}</StatusBadge>
+        <span className="min-w-0 break-words text-sm text-muted-foreground">{summary}</span>
+      </div>
+      <Button type="button" variant="outline" size="sm" disabled={!data} onClick={() => data && onDetails(data)}>
+        Details
+      </Button>
+    </div>
   )
 }
 
