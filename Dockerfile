@@ -26,7 +26,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY ui/embed.go ui/embed_dev.go ./ui/
 COPY --from=frontend /ui/dist /src/ui/dist
 
 ARG VERSION=dev

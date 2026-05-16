@@ -7,67 +7,204 @@ on:
     tags:
       - 'v*'
   pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Manual run mode
+        type: choice
+        required: true
+        default: build-only
+        options:
+          - build-only
+          - publish-test
 
 permissions:
   contents: read
-  packages: write
+
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  image:
-    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+  image_pr:
+    name: image-pr
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - &checkout
+        name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
+      - &setup-buildx
+        name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Log in to GHCR
-        if: github.event_name == 'push'
+      - &resolve-build-date
+        name: Resolve build date
+        id: build-date
+        run: echo "build_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - &resolve-image-name
+        name: Resolve image name
+        id: image
+        shell: bash
+        run: printf 'name=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - &docker-metadata
+        name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=ci-manual-test,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'publish-test' }}
+            type=ref,event=tag,enable=${{ github.event_name == 'push' }}
+            type=ref,event=pr,enable=${{ github.event_name == 'pull_request' }}
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=synaps3-image-amd64
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'edge' }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.build-date.outputs.build_date }}
+
+  image_amd64:
+    name: image-amd64
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - *checkout
+
+      - *setup-buildx
+
+      - &login-ghcr
+        name: Log in to GHCR
+        if: github.event_name == 'push' || github.event.inputs.mode == 'publish-test'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve build date
-        id: build-date
-        run: echo "build_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+      - *resolve-build-date
 
-      - name: Resolve image name
-        id: image
-        shell: bash
-        run: printf 'name=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - *resolve-image-name
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ steps.image.outputs.name }}
-          tags: |
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=ref,event=tag
-            type=ref,event=pr
+      - *docker-metadata
 
       - name: Build image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=synaps3-image
-          cache-to: type=gha,scope=synaps3-image,mode=max,ignore-error=true
+          outputs: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
+          cache-from: type=gha,scope=synaps3-image-amd64
+          cache-to: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && 'type=gha,scope=synaps3-image-amd64,mode=max,ignore-error=true' || '' }}
           build-args: |
-            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'edge' }}
+            VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.build_date }}
+
+  image_arm64:
+    name: image-arm64
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.RUNS_ON_ARM64 || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - *checkout
+
+      - *setup-buildx
+
+      - *login-ghcr
+
+      - *resolve-build-date
+
+      - *resolve-image-name
+
+      - *docker-metadata
+
+      - name: Build image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) || '' }}
+          cache-from: type=gha,scope=synaps3-image-arm64
+          cache-to: ${{ (github.event_name == 'push' || github.event.inputs.mode == 'publish-test') && 'type=gha,scope=synaps3-image-arm64,mode=max,ignore-error=true' || '' }}
+          build-args: |
+            VERSION=${{ github.event_name == 'workflow_dispatch' && 'ci-manual-test' || github.ref_type == 'tag' && github.ref_name || 'edge' }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.build-date.outputs.build_date }}
+
+  image_manifest:
+    name: image-manifest
+    if: github.event_name == 'push' || github.event.inputs.mode == 'publish-test'
+    needs:
+      - image_amd64
+      - image_arm64
+    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - *setup-buildx
+
+      - *login-ghcr
+
+      - *resolve-image-name
+
+      - *docker-metadata
+
+      - name: Create manifest
+        shell: bash
+        env:
+          DOCKER_METADATA_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          tag_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && tag_args+=("-t" "$tag")
+          done <<< "$DOCKER_METADATA_TAGS"
+
+          if [ "${#tag_args[@]}" -eq 0 ]; then
+            echo "No Docker tags resolved"
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" \
+            "${{ steps.image.outputs.name }}@${{ needs.image_amd64.outputs.digest }}" \
+            "${{ steps.image.outputs.name }}@${{ needs.image_arm64.outputs.digest }}"
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect ${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}

@@ -16,6 +16,7 @@ concurrency:
 jobs:
   check:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
