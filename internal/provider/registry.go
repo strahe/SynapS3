@@ -59,6 +59,20 @@ func ListProviders(ctx context.Context, reg *RegistryService, opts ListOptions) 
 	return listAllProviders(ctx, reg)
 }
 
+func LookupProvider(ctx context.Context, reg *RegistryService, providerID sdktypes.BigInt) (ProviderDetail, error) {
+	p, err := reg.svc.GetPDPProvider(ctx, providerID)
+	if err != nil {
+		if errors.Is(err, spregistry.ErrNotFound) {
+			return providerInfoDetail(ctx, reg, providerID, providerID)
+		}
+		return ProviderDetail{}, err
+	}
+	if p == nil {
+		return providerInfoDetail(ctx, reg, providerID, providerID)
+	}
+	return pdpProviderToDetail(*p)
+}
+
 func listActiveProviders(ctx context.Context, reg *RegistryService) ([]ProviderDetail, error) {
 	var all []ProviderDetail
 	var offset uint64
@@ -113,7 +127,7 @@ func listAllProviders(ctx context.Context, reg *RegistryService) ([]ProviderDeta
 				return nil, ctx.Err()
 			}
 			if errors.Is(err, spregistry.ErrNotFound) {
-				detail, detailErr := providerInfoDetail(ctx, reg, providerID, id)
+				detail, detailErr := providerInfoDetailWithFallback(ctx, reg, providerID, id)
 				if detailErr != nil {
 					skipped++
 					continue
@@ -125,7 +139,7 @@ func listAllProviders(ctx context.Context, reg *RegistryService) ([]ProviderDeta
 			continue
 		}
 		if p == nil {
-			detail, detailErr := providerInfoDetail(ctx, reg, providerID, id)
+			detail, detailErr := providerInfoDetailWithFallback(ctx, reg, providerID, id)
 			if detailErr != nil {
 				skipped++
 				continue
@@ -152,7 +166,7 @@ func pdpProviderToDetail(p spregistry.PDPProvider) (ProviderDetail, error) {
 }
 
 func pdpProviderToDetailWithFallback(p spregistry.PDPProvider, fallbackID uint64) (ProviderDetail, error) {
-	id, err := providerID(p.Info.ID, fallbackID)
+	id, err := providerID(p.Info.ID, sdktypes.NewBigInt(fallbackID))
 	if err != nil {
 		return ProviderDetail{}, err
 	}
@@ -177,7 +191,7 @@ func providerInfoToDetail(info *spregistry.ProviderInfo) (ProviderDetail, error)
 	return providerInfoToDetailWithFallback(info, 0)
 }
 
-func providerInfoDetail(ctx context.Context, reg *RegistryService, providerID sdktypes.BigInt, fallbackID uint64) (ProviderDetail, error) {
+func providerInfoDetail(ctx context.Context, reg *RegistryService, providerID sdktypes.BigInt, fallbackID sdktypes.BigInt) (ProviderDetail, error) {
 	info, err := reg.svc.GetProvider(ctx, providerID)
 	if err != nil {
 		return ProviderDetail{}, err
@@ -185,10 +199,18 @@ func providerInfoDetail(ctx context.Context, reg *RegistryService, providerID sd
 	if info == nil {
 		return ProviderDetail{}, fmt.Errorf("provider info missing")
 	}
-	return providerInfoToDetailWithFallback(info, fallbackID)
+	return providerInfoToDetailWithFallbackID(info, fallbackID)
+}
+
+func providerInfoDetailWithFallback(ctx context.Context, reg *RegistryService, providerID sdktypes.BigInt, fallbackID uint64) (ProviderDetail, error) {
+	return providerInfoDetail(ctx, reg, providerID, sdktypes.NewBigInt(fallbackID))
 }
 
 func providerInfoToDetailWithFallback(info *spregistry.ProviderInfo, fallbackID uint64) (ProviderDetail, error) {
+	return providerInfoToDetailWithFallbackID(info, sdktypes.NewBigInt(fallbackID))
+}
+
+func providerInfoToDetailWithFallbackID(info *spregistry.ProviderInfo, fallbackID sdktypes.BigInt) (ProviderDetail, error) {
 	id, err := providerID(info.ID, fallbackID)
 	if err != nil {
 		return ProviderDetail{}, err
@@ -203,10 +225,10 @@ func providerInfoToDetailWithFallback(info *spregistry.ProviderInfo, fallbackID 
 	}, nil
 }
 
-func providerID(v sdktypes.BigInt, fallback uint64) (types.OnChainID, error) {
+func providerID(v sdktypes.BigInt, fallback sdktypes.BigInt) (types.OnChainID, error) {
 	if v.IsZero() {
-		if fallback > 0 {
-			return types.NewOnChainID(fallback), nil
+		if !fallback.IsZero() {
+			return types.OnChainIDFromSDK(fallback), nil
 		}
 		return types.OnChainID{}, fmt.Errorf("invalid provider ID")
 	}

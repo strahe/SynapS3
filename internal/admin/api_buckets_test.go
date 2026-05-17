@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -896,6 +898,30 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
 		{ProviderID: onChainID(t, "202"), DataSetID: onChainID(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://provider.example/2"},
 	})
+	summaries, err := repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("ListDataSetSummaries: %v", err)
+	}
+	if err := repos.Availability.ReplaceDataSetSnapshots(ctx, []availability.DataSetSnapshot{
+		{
+			LocalDataSetID: summaries[0].ID,
+			BucketID:       bucket.ID,
+			BucketName:     bucket.Name,
+			ProviderID:     summaries[0].ProviderID,
+			ChainDataSetID: summaries[0].DataSetID,
+			LocalStatus:    summaries[0].Status,
+			Status:         availability.StatusDegraded,
+			ReasonCodes:    []availability.ReasonCode{availability.ReasonChainDataSetUnmanaged},
+			LastCheckedAt:  time.Now().UTC(),
+			Evidence:       map[string]any{},
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDataSetSnapshots: %v", err)
+	}
+	srv.WithAvailability(availability.NewService(availability.ServiceOptions{
+		Store:           repos.Availability,
+		RefreshInterval: time.Hour,
+	}))
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -915,6 +941,11 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
 			DataSetID        string                    `json:"data_set_id"`
 			Status           string                    `json:"status"`
+			Availability     *struct {
+				Status      string                    `json:"status"`
+				ReasonCodes []availability.ReasonCode `json:"reason_codes"`
+				Stale       bool                      `json:"stale"`
+			} `json:"availability"`
 		} `json:"data_sets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -929,12 +960,124 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if body.DataSets[0].ProviderIdentity == nil || body.DataSets[0].ProviderIdentity.Name != "alpha-pdp" || body.DataSets[0].ProviderIdentity.FilecoinActorID != "f01234" {
 		t.Fatalf("provider_identity = %#v, want enriched provider identity", body.DataSets[0].ProviderIdentity)
 	}
+	if body.DataSets[0].Availability == nil ||
+		body.DataSets[0].Availability.Status != string(availability.StatusDegraded) ||
+		!reflect.DeepEqual(body.DataSets[0].Availability.ReasonCodes, []availability.ReasonCode{availability.ReasonChainDataSetUnmanaged}) ||
+		body.DataSets[0].Availability.Stale {
+		t.Fatalf("availability = %#v, want fresh degraded data set availability", body.DataSets[0].Availability)
+	}
 	if body.DataSets[1].ProviderID != "202" || body.DataSets[1].ProviderIdentity != nil {
 		t.Fatalf("second data set = %#v, want provider_id compatibility without identity when lookup fails", body.DataSets[1])
 	}
 	if !reflect.DeepEqual(identityResolver.requests, [][]string{{"101", "202"}}) {
 		t.Fatalf("provider identity requests = %#v, want one batched snapshot request", identityResolver.requests)
 	}
+}
+
+func TestAPIBucketDetail_DataSetAvailabilityQueryFailureReturnsUnknownPlaceholder(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "detail-datasets-availability-error", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000AVAILERR",
+		ContentSize:     1,
+		Checksum:        "checksum-dataset-availability-error",
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, "bafk2bzaceavailabilityerror", []adminStorageCopySeed{
+		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
+	})
+	srv.WithAvailability(availability.NewService(availability.ServiceOptions{
+		Store: &bucketAvailabilityErrorStore{err: errors.New("database password leaked detail")},
+	}))
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/detail-datasets-availability-error")
+	if err != nil {
+		t.Fatalf("GET bucket detail: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var body struct {
+		DataSets []struct {
+			Availability *struct {
+				Status      string                    `json:"status"`
+				ReasonCodes []availability.ReasonCode `json:"reason_codes"`
+				LastError   string                    `json:"last_error"`
+			} `json:"availability"`
+		} `json:"data_sets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.DataSets) != 1 {
+		t.Fatalf("data_sets len = %d, want 1", len(body.DataSets))
+	}
+	info := body.DataSets[0].Availability
+	if info == nil || info.Status != string(availability.StatusUnknown) || len(info.ReasonCodes) != 0 || info.LastError != "availability query failed" {
+		t.Fatalf("availability = %#v, want sanitized unknown placeholder", info)
+	}
+	if strings.Contains(info.LastError, "password") {
+		t.Fatalf("availability last_error leaked detail: %q", info.LastError)
+	}
+}
+
+func TestDataSetAvailabilityInfoEncodesEmptyReasonCodesArray(t *testing.T) {
+	checkedAt := time.Now().UTC()
+	srv := (&Server{logger: testLogger()}).
+		WithAvailability(availability.NewService(availability.ServiceOptions{RefreshInterval: time.Hour}))
+
+	info := srv.dataSetAvailabilityInfo(availability.DataSetSnapshot{
+		LocalDataSetID: 1,
+		Status:         availability.StatusAvailable,
+		LastCheckedAt:  checkedAt,
+	})
+	body, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(body), `"reason_codes":null`) {
+		t.Fatalf("availability reason_codes encoded as null: %s", body)
+	}
+	if !strings.Contains(string(body), `"reason_codes":[]`) {
+		t.Fatalf("availability reason_codes should be an empty array: %s", body)
+	}
+}
+
+type bucketAvailabilityErrorStore struct {
+	err error
+}
+
+func (s *bucketAvailabilityErrorStore) ReplaceProviderSnapshots(context.Context, []availability.ProviderSnapshot) error {
+	return nil
+}
+
+func (s *bucketAvailabilityErrorStore) ListProviderSnapshots(context.Context, availability.ListOptions) (availability.ProviderSnapshotPage, error) {
+	return availability.ProviderSnapshotPage{}, nil
+}
+
+func (s *bucketAvailabilityErrorStore) ReplaceDataSetSnapshots(context.Context, []availability.DataSetSnapshot) error {
+	return nil
+}
+
+func (s *bucketAvailabilityErrorStore) ListDataSetSnapshots(context.Context, availability.ListOptions) (availability.DataSetSnapshotPage, error) {
+	return availability.DataSetSnapshotPage{}, nil
+}
+
+func (s *bucketAvailabilityErrorStore) GetDataSetSnapshotsByLocalIDs(context.Context, []int64) (map[int64]availability.DataSetSnapshot, error) {
+	return nil, s.err
 }
 
 func TestAPIBuckets_ListAllBuckets(t *testing.T) {

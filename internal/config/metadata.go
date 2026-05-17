@@ -100,6 +100,24 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_FILECOIN_DEFAULT_COPIES",
 		Editable:    true,
 	},
+	"filecoin.availability.interval": {
+		Label:       "Availability Interval",
+		Description: "Interval between background provider and local data set availability checks. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL",
+		Editable:    true,
+	},
+	"filecoin.availability.timeout": {
+		Label:       "Availability Timeout",
+		Description: "Base timeout used to derive bounded registry, wallet scan, provider lookup, and health check deadlines. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT",
+		Editable:    true,
+	},
+	"filecoin.availability.concurrency": {
+		Label:       "Availability Concurrency",
+		Description: "Maximum concurrent provider availability checks. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY",
+		Editable:    true,
+	},
 	"database.driver": {
 		Label:       "Database Driver",
 		Description: "Database backend used for metadata persistence.",

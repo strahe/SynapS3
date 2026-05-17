@@ -241,6 +241,14 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			},
 		},
 		{
+			Name: "filecoin.availability",
+			Fields: []initFieldDescriptor{
+				{Field: "filecoin.availability.interval", Key: "interval", Value: quoteTOMLString(cfg.Filecoin.Availability.Interval.String()), Enabled: saveMode},
+				{Field: "filecoin.availability.timeout", Key: "timeout", Value: quoteTOMLString(cfg.Filecoin.Availability.Timeout.String()), Enabled: saveMode},
+				{Field: "filecoin.availability.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Filecoin.Availability.Concurrency), Enabled: saveMode},
+			},
+		},
+		{
 			Name: "database",
 			Fields: []initFieldDescriptor{
 				{Field: "database.driver", Key: "driver", Value: quoteTOMLString(cfg.Database.Driver), Enabled: !saveMode || presence.DatabaseDriver, Notes: []string{"Enabled with database.dsn so this installation uses SQLite at the initialized path.", "Allowed: sqlite, postgres."}},

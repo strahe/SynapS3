@@ -20,6 +20,7 @@ type Repositories struct {
 	Tasks            TaskRepository
 	Multiparts       MultipartUploadRepository
 	WalletOperations WalletOperationRepository
+	Availability     AvailabilityRepository
 
 	db bun.IDB
 }
@@ -35,6 +36,7 @@ func NewRepositories(db bun.IDB) *Repositories {
 		Tasks:            &BunTaskRepo{db: db},
 		Multiparts:       &BunMultipartRepo{db: db},
 		WalletOperations: &BunWalletOperationRepo{db: db},
+		Availability:     &BunAvailabilityRepo{db: db},
 		db:               db,
 	}
 }

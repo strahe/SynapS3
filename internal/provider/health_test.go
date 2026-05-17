@@ -49,6 +49,21 @@ func TestCheckHealth_Timeout(t *testing.T) {
 	}
 }
 
+func TestHealthCheckerUsesProvidedClient(t *testing.T) {
+	transport := &recordingRoundTripper{}
+	checker := NewHealthChecker(&http.Client{Transport: transport})
+
+	if status := checker.Check(context.Background(), "https://provider.example", time.Second); status != "reachable" {
+		t.Fatalf("status = %q, want reachable", status)
+	}
+	if transport.calls != 1 {
+		t.Fatalf("round trip calls = %d, want 1", transport.calls)
+	}
+	if transport.method != http.MethodHead {
+		t.Fatalf("method = %q, want HEAD", transport.method)
+	}
+}
+
 func TestCheckHealthBatch(t *testing.T) {
 	reachableSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -78,4 +93,19 @@ func TestCheckHealthBatch_Empty(t *testing.T) {
 	// Should not panic on empty slice.
 	CheckHealthBatch(context.Background(), nil, time.Second)
 	CheckHealthBatch(context.Background(), []ProviderDetail{}, time.Second)
+}
+
+type recordingRoundTripper struct {
+	calls  int
+	method string
+}
+
+func (r *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.calls++
+	r.method = req.Method
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       http.NoBody,
+		Request:    req,
+	}, nil
 }

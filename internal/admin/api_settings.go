@@ -166,6 +166,11 @@ func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Conf
 		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.Filecoin.WithCDN)
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.Filecoin.AllowPrivateNetworks)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.Filecoin.DefaultCopies)
+		if req.Filecoin.Availability != nil {
+			setDuration("filecoin.availability.interval", &next.Filecoin.Availability.Interval, req.Filecoin.Availability.Interval)
+			setDuration("filecoin.availability.timeout", &next.Filecoin.Availability.Timeout, req.Filecoin.Availability.Timeout)
+			setInt("filecoin.availability.concurrency", &next.Filecoin.Availability.Concurrency, req.Filecoin.Availability.Concurrency)
+		}
 	}
 	if req.Cache != nil {
 		if setString("cache.dir", &next.Cache.Dir, req.Cache.Dir) {
@@ -233,6 +238,17 @@ func (s *SettingsService) FilecoinDraftConfig(req *settingsFilecoinUpdate) (*con
 		}
 		*target = *value
 	}
+	setDuration := func(field string, target *time.Duration, value *string) {
+		if value == nil || !checkField(field) {
+			return
+		}
+		parsed, err := time.ParseDuration(*value)
+		if err != nil {
+			fieldErrs = append(fieldErrs, config.FieldError{Field: field, Message: "must be a valid duration"})
+			return
+		}
+		*target = parsed
+	}
 
 	if req != nil {
 		setString("filecoin.network", &next.Filecoin.Network, req.Network)
@@ -241,6 +257,11 @@ func (s *SettingsService) FilecoinDraftConfig(req *settingsFilecoinUpdate) (*con
 		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.WithCDN)
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.AllowPrivateNetworks)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.DefaultCopies)
+		if req.Availability != nil {
+			setDuration("filecoin.availability.interval", &next.Filecoin.Availability.Interval, req.Availability.Interval)
+			setDuration("filecoin.availability.timeout", &next.Filecoin.Availability.Timeout, req.Availability.Timeout)
+			setInt("filecoin.availability.concurrency", &next.Filecoin.Availability.Concurrency, req.Availability.Concurrency)
+		}
 	}
 	if len(fieldErrs) == 0 {
 		fieldErrs = filecoinEditableValidationErrors(next)
@@ -364,12 +385,19 @@ type settingsS3Config struct {
 }
 
 type settingsFilecoinConfig struct {
-	Network              string `json:"network"`
-	RPCURL               string `json:"rpc_url"`
-	Source               string `json:"source"`
-	WithCDN              bool   `json:"with_cdn"`
-	AllowPrivateNetworks bool   `json:"allow_private_networks"`
-	DefaultCopies        int    `json:"default_copies"`
+	Network              string                     `json:"network"`
+	RPCURL               string                     `json:"rpc_url"`
+	Source               string                     `json:"source"`
+	WithCDN              bool                       `json:"with_cdn"`
+	AllowPrivateNetworks bool                       `json:"allow_private_networks"`
+	DefaultCopies        int                        `json:"default_copies"`
+	Availability         settingsAvailabilityConfig `json:"availability"`
+}
+
+type settingsAvailabilityConfig struct {
+	Interval    string `json:"interval"`
+	Timeout     string `json:"timeout"`
+	Concurrency int    `json:"concurrency"`
 }
 
 type settingsCacheConfig struct {
@@ -462,12 +490,19 @@ type settingsS3Update struct {
 }
 
 type settingsFilecoinUpdate struct {
-	Network              *string `json:"network,omitempty"`
-	RPCURL               *string `json:"rpc_url,omitempty"`
-	Source               *string `json:"source,omitempty"`
-	WithCDN              *bool   `json:"with_cdn,omitempty"`
-	AllowPrivateNetworks *bool   `json:"allow_private_networks,omitempty"`
-	DefaultCopies        *int    `json:"default_copies,omitempty"`
+	Network              *string                     `json:"network,omitempty"`
+	RPCURL               *string                     `json:"rpc_url,omitempty"`
+	Source               *string                     `json:"source,omitempty"`
+	WithCDN              *bool                       `json:"with_cdn,omitempty"`
+	AllowPrivateNetworks *bool                       `json:"allow_private_networks,omitempty"`
+	DefaultCopies        *int                        `json:"default_copies,omitempty"`
+	Availability         *settingsAvailabilityUpdate `json:"availability,omitempty"`
+}
+
+type settingsAvailabilityUpdate struct {
+	Interval    *string `json:"interval,omitempty"`
+	Timeout     *string `json:"timeout,omitempty"`
+	Concurrency *int    `json:"concurrency,omitempty"`
 }
 
 type settingsCacheUpdate struct {
@@ -521,6 +556,11 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 			WithCDN:              cfg.Filecoin.WithCDN,
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 			DefaultCopies:        cfg.Filecoin.DefaultCopies,
+			Availability: settingsAvailabilityConfig{
+				Interval:    cfg.Filecoin.Availability.Interval.String(),
+				Timeout:     cfg.Filecoin.Availability.Timeout.String(),
+				Concurrency: cfg.Filecoin.Availability.Concurrency,
+			},
 		},
 		Cache: settingsCacheConfig{
 			Dir:            cfg.Cache.Dir,
@@ -592,6 +632,9 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"filecoin.rpc_url":                     {},
 		"filecoin.source":                      {},
 		"filecoin.default_copies":              {},
+		"filecoin.availability.interval":       {},
+		"filecoin.availability.timeout":        {},
+		"filecoin.availability.concurrency":    {},
 		"worker.upload.concurrency":            {},
 		"worker.upload.poll_interval":          {},
 		"worker.upload.max_retries":            {},
@@ -618,10 +661,13 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 
 func filecoinEditableValidationErrors(cfg *config.Config) []config.FieldError {
 	editable := map[string]struct{}{
-		"filecoin.network":        {},
-		"filecoin.rpc_url":        {},
-		"filecoin.source":         {},
-		"filecoin.default_copies": {},
+		"filecoin.network":                  {},
+		"filecoin.rpc_url":                  {},
+		"filecoin.source":                   {},
+		"filecoin.default_copies":           {},
+		"filecoin.availability.interval":    {},
+		"filecoin.availability.timeout":     {},
+		"filecoin.availability.concurrency": {},
 	}
 
 	var out []config.FieldError

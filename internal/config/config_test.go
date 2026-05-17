@@ -240,6 +240,27 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			},
 		},
 		{
+			name:  "filecoin availability interval",
+			field: "filecoin.availability.interval",
+			mutate: func(cfg *Config) {
+				cfg.Filecoin.Availability.Interval = 0
+			},
+		},
+		{
+			name:  "filecoin availability timeout",
+			field: "filecoin.availability.timeout",
+			mutate: func(cfg *Config) {
+				cfg.Filecoin.Availability.Timeout = 0
+			},
+		},
+		{
+			name:  "filecoin availability concurrency",
+			field: "filecoin.availability.concurrency",
+			mutate: func(cfg *Config) {
+				cfg.Filecoin.Availability.Concurrency = 0
+			},
+		},
+		{
 			name:  "logging level",
 			field: "logging.level",
 			mutate: func(cfg *Config) {
@@ -325,6 +346,15 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Filecoin.DefaultCopies != 3 {
 		t.Errorf("Filecoin.DefaultCopies = %d, want 3", cfg.Filecoin.DefaultCopies)
 	}
+	if cfg.Filecoin.Availability.Interval != 5*time.Minute {
+		t.Errorf("Filecoin.Availability.Interval = %s, want 5m", cfg.Filecoin.Availability.Interval)
+	}
+	if cfg.Filecoin.Availability.Timeout != 5*time.Second {
+		t.Errorf("Filecoin.Availability.Timeout = %s, want 5s", cfg.Filecoin.Availability.Timeout)
+	}
+	if cfg.Filecoin.Availability.Concurrency != 8 {
+		t.Errorf("Filecoin.Availability.Concurrency = %d, want 8", cfg.Filecoin.Availability.Concurrency)
+	}
 	if cfg.Logging.Format != "text" {
 		t.Errorf("Logging.Format = %q, want text", cfg.Logging.Format)
 	}
@@ -389,6 +419,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_WITH_CDN", "true")
 	t.Setenv("SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS", "true")
 	t.Setenv("SYNAPS3_FILECOIN_DEFAULT_COPIES", "4")
+	t.Setenv("SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL", "3m")
+	t.Setenv("SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT", "4s")
+	t.Setenv("SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY", "6")
 	t.Setenv("SYNAPS3_CACHE_MAX_SIZE_GB", "7")
 	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "manual")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
@@ -413,6 +446,11 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 	if !cfg.Filecoin.WithCDN || !cfg.Filecoin.AllowPrivateNetworks || cfg.Filecoin.DefaultCopies != 4 {
 		t.Fatalf("filecoin config = %#v, want env values", cfg.Filecoin)
+	}
+	if cfg.Filecoin.Availability.Interval != 3*time.Minute ||
+		cfg.Filecoin.Availability.Timeout != 4*time.Second ||
+		cfg.Filecoin.Availability.Concurrency != 6 {
+		t.Fatalf("filecoin availability = %#v, want env values", cfg.Filecoin.Availability)
 	}
 	if cfg.Cache.MaxSizeGB != 7 || cfg.Cache.EvictionPolicy != "manual" {
 		t.Fatalf("cache config = %#v, want env values", cfg.Cache)

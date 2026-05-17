@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
+  type AvailabilityStatus,
   api,
   type DeletedObjectItem,
   maxFOCUploadSize,
@@ -96,6 +97,7 @@ import {
   useObjectStatusDetail,
   usePermanentDeleteBucketObjectVersion,
   usePermanentDeleteDeletedBucketObject,
+  useRefreshDataSetAvailability,
   useRestoreBucketObject,
   useS3Users,
   useUpdateBucketCopyPolicy,
@@ -110,6 +112,7 @@ import {
   copyPolicyOptions,
   inheritedCopyPolicyValue,
 } from '@/lib/bucket-copy-policy'
+import { dataSetAvailabilityDetailParts, dataSetAvailabilityRefreshErrorMessage } from '@/lib/data-set-availability'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
@@ -1077,23 +1080,6 @@ function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
   }
 }
 
-function dataSetStatusTone(status: string): StatusTone {
-  switch (status) {
-    case 'ready':
-    case 'draining':
-      return 'success'
-    case 'creating':
-    case 'pending':
-      return 'info'
-    case 'failed':
-    case 'unavailable':
-    case 'retired':
-      return 'danger'
-    default:
-      return 'neutral'
-  }
-}
-
 function failureStageLabel(state?: string) {
   switch (state) {
     case 'uploading':
@@ -1643,7 +1629,7 @@ function BucketDetailsSheet({
               <BucketDetailsOverview bucket={bucket} />
             </BucketDetailsSection>
             <BucketDetailsSection title="Storage">
-              <BucketStorageDataSets dataSets={bucket.data_sets ?? []} />
+              <BucketStorageDataSets bucketName={bucket.name} dataSets={bucket.data_sets ?? []} />
             </BucketDetailsSection>
             <BucketDetailsSection title="Settings">
               <BucketDetailsSettings
@@ -1700,7 +1686,10 @@ function BucketDetailField({ label, value, title }: { label: string; value: stri
   )
 }
 
-function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[] }) {
+function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; dataSets: StorageDataSetSummary[] }) {
+  const refreshAvailability = useRefreshDataSetAvailability()
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+
   if (dataSets.length === 0) {
     return (
       <div className="rounded-md border border-border p-4">
@@ -1712,15 +1701,42 @@ function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[]
 
   return (
     <div className="min-w-0 overflow-hidden rounded-md border border-border">
-      <div className="border-b border-border bg-muted/50 px-4 py-2 text-sm font-medium">Data Sets</div>
+      <div className="flex items-center justify-between gap-2 border-b border-border bg-muted/50 px-4 py-2">
+        <div className="text-sm font-medium">Data Sets</div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={refreshAvailability.isPending}
+          onClick={() => {
+            setRefreshError(null)
+            refreshAvailability.mutate(
+              { bucket: bucketName },
+              {
+                onSuccess: () => setRefreshError(null),
+                onError: (error) => setRefreshError(dataSetAvailabilityRefreshErrorMessage(error)),
+              }
+            )
+          }}
+        >
+          <RefreshCw data-icon="inline-start" className={refreshAvailability.isPending ? 'animate-spin' : undefined} />
+          Refresh
+        </Button>
+      </div>
+      {refreshError && (
+        <div className="flex items-start gap-2 border-b border-border px-4 py-2 text-sm text-destructive">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          <span>{refreshError}</span>
+        </div>
+      )}
       <ScrollArea className="w-full">
-        <Table className="min-w-[720px]">
+        <Table className="min-w-[760px]">
           <TableHeader>
             <TableRow>
               <TableHead className="px-4">Replica Slot</TableHead>
               <TableHead className="px-4">Provider</TableHead>
               <TableHead className="px-4">Data Set ID</TableHead>
-              <TableHead className="px-4">Status</TableHead>
+              <TableHead className="px-4">Availability</TableHead>
               <TableHead className="px-4">Last Used</TableHead>
             </TableRow>
           </TableHeader>
@@ -1735,7 +1751,7 @@ function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[]
                   {dataSet.data_set_id ?? '—'}
                 </TableCell>
                 <TableCell className="px-4">
-                  <StatusBadge tone={dataSetStatusTone(dataSet.status)}>{dataSet.status}</StatusBadge>
+                  <DataSetAvailabilityCell dataSet={dataSet} />
                 </TableCell>
                 <TableCell className="px-4 text-muted-foreground" title={dataSet.updated_at}>
                   {timeAgo(dataSet.updated_at)}
@@ -1748,6 +1764,51 @@ function BucketStorageDataSets({ dataSets }: { dataSets: StorageDataSetSummary[]
       </ScrollArea>
     </div>
   )
+}
+
+function DataSetAvailabilityCell({ dataSet }: { dataSet: StorageDataSetSummary }) {
+  const availability = dataSet.availability
+  const detailParts = dataSetAvailabilityDetailParts(dataSet)
+  const details = detailParts.join(' · ')
+  if (!availability) {
+    return (
+      <div className="flex min-w-0 flex-col gap-1">
+        <StatusBadge tone="neutral">unknown</StatusBadge>
+        <span className="text-xs text-muted-foreground" title={details}>
+          {details}
+        </span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <StatusBadge tone={availabilityStatusTone(availability.status)}>{availability.status}</StatusBadge>
+        {availability.stale && (
+          <StatusBadge tone="warning" className="shrink-0">
+            stale
+          </StatusBadge>
+        )}
+      </div>
+      <div className="min-w-0 truncate text-xs text-muted-foreground" title={details}>
+        {details}
+      </div>
+    </div>
+  )
+}
+
+function availabilityStatusTone(status: AvailabilityStatus): StatusTone {
+  switch (status) {
+    case 'available':
+      return 'success'
+    case 'degraded':
+      return 'warning'
+    case 'unavailable':
+      return 'danger'
+    case 'unknown':
+      return 'neutral'
+  }
 }
 
 function BucketDetailsSettings({

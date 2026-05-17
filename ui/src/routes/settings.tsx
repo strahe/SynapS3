@@ -86,6 +86,9 @@ const tabFields = {
     'filecoin.with_cdn',
     'filecoin.allow_private_networks',
     'filecoin.default_copies',
+    'filecoin.availability.interval',
+    'filecoin.availability.timeout',
+    'filecoin.availability.concurrency',
   ],
   cache: ['cache.dir', 'cache.max_size_gb', 'cache.eviction_policy'],
   workers: [
@@ -457,6 +460,54 @@ function SettingsPage() {
                 errors={fieldErrors}
                 onChange={(checked) =>
                   setForm({ ...form, filecoin: { ...form.filecoin, allow_private_networks: checked } })
+                }
+              />
+              <TextField
+                label="Availability Interval"
+                field="filecoin.availability.interval"
+                value={form.filecoin.availability.interval}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) =>
+                  setForm({
+                    ...form,
+                    filecoin: {
+                      ...form.filecoin,
+                      availability: { ...form.filecoin.availability, interval: value },
+                    },
+                  })
+                }
+              />
+              <TextField
+                label="Availability Timeout"
+                field="filecoin.availability.timeout"
+                value={form.filecoin.availability.timeout}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) =>
+                  setForm({
+                    ...form,
+                    filecoin: {
+                      ...form.filecoin,
+                      availability: { ...form.filecoin.availability, timeout: value },
+                    },
+                  })
+                }
+              />
+              <NumberField
+                label="Availability Concurrency"
+                field="filecoin.availability.concurrency"
+                value={form.filecoin.availability.concurrency}
+                data={data}
+                errors={fieldErrors}
+                onChange={(value) =>
+                  setForm({
+                    ...form,
+                    filecoin: {
+                      ...form.filecoin,
+                      availability: { ...form.filecoin.availability, concurrency: value },
+                    },
+                  })
                 }
               />
             </div>

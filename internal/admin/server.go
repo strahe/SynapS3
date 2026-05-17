@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -42,6 +43,7 @@ type Server struct {
 	workerHealth             WorkerHealthChecker
 	wallet                   synapse.WalletQuerier
 	filecoinReadiness        filecoinReadinessProbe
+	availability             *availability.Service
 	providerIdentity         providerIdentityLookup
 	events                   *EventHub
 	settings                 *SettingsService
@@ -147,6 +149,11 @@ func (s *Server) WithFilecoinReadiness(probe filecoinReadinessProbe) *Server {
 	return s
 }
 
+func (s *Server) WithAvailability(service *availability.Service) *Server {
+	s.availability = service
+	return s
+}
+
 // WithS3IAM enables S3 user management API routes.
 func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	s.s3IAM = iam
@@ -211,6 +218,10 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("POST /api/v1/wallet/withdraw", s.handleAPIWalletWithdraw)
 		mux.HandleFunc("GET /api/v1/wallet/operations", s.handleAPIWalletOperations)
 		mux.HandleFunc("GET /api/v1/filecoin/readiness", s.handleAPIFilecoinReadiness)
+		mux.HandleFunc("GET /api/v1/availability/providers", s.handleAPIAvailabilityProviders)
+		mux.HandleFunc("POST /api/v1/availability/providers/refresh", s.handleAPIRefreshAvailabilityProviders)
+		mux.HandleFunc("GET /api/v1/availability/data-sets", s.handleAPIAvailabilityDataSets)
+		mux.HandleFunc("POST /api/v1/availability/data-sets/refresh", s.handleAPIRefreshAvailabilityDataSets)
 		if s.s3IAM != nil {
 			mux.HandleFunc("GET /api/v1/s3-users", s.handleAPIListS3Users)
 			mux.HandleFunc("POST /api/v1/s3-users", s.handleAPICreateS3User)

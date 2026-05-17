@@ -85,6 +85,35 @@ export interface StorageDataSetSummary {
   current_version_count: number
   created_at: string
   updated_at: string
+  availability?: DataSetAvailabilityInfo
+}
+
+export type AvailabilityStatus = 'available' | 'degraded' | 'unavailable' | 'unknown'
+
+export interface DataSetAvailabilityInfo {
+  status: AvailabilityStatus
+  reason_codes: string[] | null
+  active_piece_count?: number
+  last_checked_at?: string
+  last_error?: string
+  stale: boolean
+}
+
+export interface AvailabilityListResponse<T> {
+  items: T[]
+  summary: {
+    total: number
+    available: number
+    degraded: number
+    unavailable: number
+    unknown: number
+  }
+  last_checked_at?: string
+  stale: boolean
+  warnings: string[]
+  total: number
+  limit: number
+  offset: number
 }
 
 export interface BucketDetail extends BucketItem {
@@ -549,6 +578,13 @@ export interface SettingsFilecoinConfig {
   with_cdn: boolean
   allow_private_networks: boolean
   default_copies: number
+  availability: SettingsAvailabilityConfig
+}
+
+export interface SettingsAvailabilityConfig {
+  interval: string
+  timeout: string
+  concurrency: number
 }
 
 export interface SettingsCacheConfig {
@@ -629,7 +665,9 @@ export type SettingsUpdatePayload = Partial<{
     max_requests: number
   }>
   s3: Partial<SettingsS3Config>
-  filecoin: Partial<SettingsFilecoinConfig>
+  filecoin: Partial<Omit<SettingsFilecoinConfig, 'availability'>> & {
+    availability?: Partial<SettingsAvailabilityConfig>
+  }
   cache: Partial<SettingsCacheConfig>
   worker: Partial<{
     upload: Partial<SettingsWorkerPoolConfig>
@@ -642,7 +680,9 @@ export type SettingsUpdatePayload = Partial<{
 }>
 
 export interface FilecoinReadinessPreflightPayload {
-  filecoin: Partial<SettingsFilecoinConfig>
+  filecoin: Partial<Omit<SettingsFilecoinConfig, 'availability'>> & {
+    availability?: Partial<SettingsAvailabilityConfig>
+  }
 }
 
 export const api = {
@@ -822,6 +862,18 @@ export const api = {
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
   getWallet: () => fetchJSON<WalletData>('/wallet'),
   getFilecoinReadiness: () => fetchJSON<FilecoinReadinessData>('/filecoin/readiness'),
+  refreshDataSetAvailability: (params: { bucket?: string; bucket_id?: number } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.bucket) sp.set('bucket', params.bucket)
+    if (params.bucket_id !== undefined) sp.set('bucket_id', params.bucket_id.toString())
+    const qs = sp.toString()
+    return fetchJSON<AvailabilityListResponse<unknown>>(`/availability/data-sets/refresh${qs ? `?${qs}` : ''}`, {
+      method: 'POST',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+    })
+  },
   preflightFilecoin: (payload: FilecoinReadinessPreflightPayload) =>
     fetchJSON<FilecoinReadinessData>('/filecoin/readiness/preflight', {
       method: 'POST',

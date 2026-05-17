@@ -174,6 +174,29 @@ func TestListAllProviders_FallsBackWhenPDPProductMissing(t *testing.T) {
 	}
 }
 
+func TestLookupProviderFallsBackWhenPDPProductMissing(t *testing.T) {
+	reg := &RegistryService{svc: &fakeRegistryProviderSource{
+		count: big.NewInt(1),
+		pdp:   map[string]spregistry.PDPProvider{},
+		providers: map[string]spregistry.ProviderInfo{
+			"7": {
+				ID:              sdktypes.NewBigInt(0),
+				Name:            "Fallback",
+				IsActive:        false,
+				ServiceProvider: common.HexToAddress("0xabcdef1234567890abcdef1234567890abcdef12"),
+			},
+		},
+	}}
+
+	got, err := LookupProvider(context.Background(), reg, sdktypes.NewBigInt(7))
+	if err != nil {
+		t.Fatalf("LookupProvider: %v", err)
+	}
+	if got.ID.String() != "7" || got.Name != "Fallback" || got.Active || got.HasPDP {
+		t.Fatalf("LookupProvider = %+v, want inactive provider 7", got)
+	}
+}
+
 func TestPDPProviderToDetail_InvalidID(t *testing.T) {
 	p := newTestPDPProvider(1, "Alpha", true, "https://alpha.example.com")
 	p.Info.ID = sdktypes.NewBigInt(0)

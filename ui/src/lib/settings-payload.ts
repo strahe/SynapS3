@@ -28,6 +28,13 @@ export function buildSettingsPayload(
   if (include('filecoin.with_cdn')) payload.filecoin.with_cdn = form.filecoin.with_cdn
   if (include('filecoin.allow_private_networks'))
     payload.filecoin.allow_private_networks = form.filecoin.allow_private_networks
+  payload.filecoin.availability = {}
+  if (include('filecoin.availability.interval'))
+    payload.filecoin.availability.interval = form.filecoin.availability.interval
+  if (include('filecoin.availability.timeout'))
+    payload.filecoin.availability.timeout = form.filecoin.availability.timeout
+  if (include('filecoin.availability.concurrency'))
+    payload.filecoin.availability.concurrency = form.filecoin.availability.concurrency
 
   payload.cache = {}
   if (include('cache.dir') && form.cache.dir !== initial.cache.dir) payload.cache.dir = form.cache.dir

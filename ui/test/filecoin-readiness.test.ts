@@ -110,6 +110,7 @@ test('preflight payload includes editable filecoin fields and excludes private k
     with_cdn: true,
     allow_private_networks: false,
     default_copies: 2,
+    availability: { interval: '10m0s', timeout: '10s', concurrency: 4 },
     private_key: 'raw-private-key',
     ignored: 'value',
   } as Record<string, unknown>)
@@ -122,6 +123,7 @@ test('preflight payload includes editable filecoin fields and excludes private k
       with_cdn: true,
       allow_private_networks: false,
       default_copies: 2,
+      availability: { interval: '10m0s', timeout: '10s', concurrency: 4 },
     },
   })
   assert.equal('private_key' in payload.filecoin, false)
@@ -134,10 +136,13 @@ test('preflight payload includes editable filecoin fields and excludes private k
       with_cdn: true,
       allow_private_networks: false,
       default_copies: 2,
+      availability: { interval: '10m0s', timeout: '10s', concurrency: 4 },
     },
     {
       'filecoin.rpc_url': 'SYNAPS3_FILECOIN_RPC_URL',
       'filecoin.default_copies': '',
+      'filecoin.availability.timeout': 'SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT',
+      'filecoin.availability.concurrency': 'SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY',
     }
   )
   assert.deepEqual(envManagedPayload, {
@@ -146,8 +151,21 @@ test('preflight payload includes editable filecoin fields and excludes private k
       source: 'synaps3',
       with_cdn: true,
       allow_private_networks: false,
+      availability: { interval: '10m0s' },
     },
   })
+
+  const fullyManagedAvailabilityPayload = buildFilecoinPreflightPayload(
+    {
+      availability: { interval: '10m0s', timeout: '10s', concurrency: 4 },
+    },
+    {
+      'filecoin.availability.interval': 'SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL',
+      'filecoin.availability.timeout': 'SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT',
+      'filecoin.availability.concurrency': 'SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY',
+    }
+  )
+  assert.equal('availability' in fullyManagedAvailabilityPayload.filecoin, false)
 })
 
 class MemoryStorage {

@@ -9,16 +9,37 @@ import (
 
 const defaultHealthConcurrency = 10
 
+// HealthChecker performs provider health probes with a reusable HTTP client.
+type HealthChecker struct {
+	client *http.Client
+}
+
+// NewHealthChecker creates a provider health checker.
+func NewHealthChecker(client *http.Client) *HealthChecker {
+	if client == nil {
+		client = &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+	}
+	return &HealthChecker{client: client}
+}
+
 // CheckHealth performs an HTTP HEAD request to the given service URL and returns
 // "reachable", "unreachable", or "n/a" (for empty URLs).
 func CheckHealth(ctx context.Context, serviceURL string, timeout time.Duration) string {
+	return NewHealthChecker(nil).Check(ctx, serviceURL, timeout)
+}
+
+// Check performs a single provider health probe.
+func (h *HealthChecker) Check(ctx context.Context, serviceURL string, timeout time.Duration) string {
 	if serviceURL == "" {
 		return "n/a"
 	}
 
-	client := &http.Client{
-		Timeout:       timeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, serviceURL, nil)
@@ -26,7 +47,7 @@ func CheckHealth(ctx context.Context, serviceURL string, timeout time.Duration) 
 		return "unreachable"
 	}
 
-	resp, err := client.Do(req)
+	resp, err := h.client.Do(req)
 	if err != nil {
 		return "unreachable"
 	}
@@ -42,6 +63,7 @@ func CheckHealthBatch(ctx context.Context, providers []ProviderDetail, timeout t
 		return
 	}
 
+	checker := NewHealthChecker(nil)
 	sem := make(chan struct{}, defaultHealthConcurrency)
 	var wg sync.WaitGroup
 
@@ -56,7 +78,7 @@ func CheckHealthBatch(ctx context.Context, providers []ProviderDetail, timeout t
 		go func(idx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			providers[idx].HealthStatus = CheckHealth(ctx, providers[idx].ServiceURL, timeout)
+			providers[idx].HealthStatus = checker.Check(ctx, providers[idx].ServiceURL, timeout)
 		}(i)
 	}
 

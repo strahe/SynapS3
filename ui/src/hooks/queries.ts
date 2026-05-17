@@ -252,6 +252,18 @@ export function useFilecoinPreflight() {
   })
 }
 
+export function useRefreshDataSetAvailability() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ bucket }: { bucket?: string } = {}) => api.refreshDataSetAvailability({ bucket }),
+    onSuccess: (_, variables) => {
+      if (variables?.bucket) qc.invalidateQueries({ queryKey: ['bucket', variables.bucket] })
+      qc.invalidateQueries({ queryKey: ['filecoinReadiness'] })
+    },
+  })
+}
+
 export function useWalletOperations(limit = 20) {
   return useQuery({
     queryKey: ['walletOperations', limit],

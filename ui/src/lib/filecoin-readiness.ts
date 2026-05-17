@@ -63,6 +63,16 @@ const filecoinPayloadFieldPaths: Record<(typeof filecoinPayloadKeys)[number], st
   default_copies: 'filecoin.default_copies',
 }
 
+const filecoinAvailabilityPayloadKeys = ['interval', 'timeout', 'concurrency'] as const satisfies Array<
+  keyof SettingsFilecoinConfig['availability']
+>
+
+const filecoinAvailabilityPayloadFieldPaths: Record<(typeof filecoinAvailabilityPayloadKeys)[number], string> = {
+  interval: 'filecoin.availability.interval',
+  timeout: 'filecoin.availability.timeout',
+  concurrency: 'filecoin.availability.concurrency',
+}
+
 const checkTitles: Record<string, string> = {
   config_private_key: 'Private key',
   config_rpc_url: 'RPC URL',
@@ -157,13 +167,28 @@ export function buildFilecoinPreflightPayload(
   filecoin: Partial<SettingsFilecoinConfig> | Record<string, unknown>,
   envManaged: Readonly<Record<string, string>> = {}
 ): FilecoinReadinessPreflightPayload {
-  const out: Partial<SettingsFilecoinConfig> = {}
+  const out: FilecoinReadinessPreflightPayload['filecoin'] = {}
   const source = filecoin as Record<string, unknown>
   for (const key of filecoinPayloadKeys) {
     if (Object.keys(envManaged).includes(filecoinPayloadFieldPaths[key])) continue
     const value = source[key]
     if (value !== undefined) {
       Object.assign(out, { [key]: value })
+    }
+  }
+  const availabilitySource = source.availability
+  if (availabilitySource && typeof availabilitySource === 'object' && !Array.isArray(availabilitySource)) {
+    const availability: NonNullable<FilecoinReadinessPreflightPayload['filecoin']['availability']> = {}
+    const availabilityRecord = availabilitySource as Record<string, unknown>
+    for (const key of filecoinAvailabilityPayloadKeys) {
+      if (Object.keys(envManaged).includes(filecoinAvailabilityPayloadFieldPaths[key])) continue
+      const value = availabilityRecord[key]
+      if (value !== undefined) {
+        Object.assign(availability, { [key]: value })
+      }
+    }
+    if (Object.keys(availability).length > 0) {
+      out.availability = availability
     }
   }
   return { filecoin: out }

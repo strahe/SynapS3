@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
@@ -419,6 +420,14 @@ type WalletOperationRepository interface {
 	MarkExpiredRunningUnknown(ctx context.Context) ([]model.WalletOperation, error)
 	ListSubmitted(ctx context.Context, limit int) ([]model.WalletOperation, error)
 	ListRecent(ctx context.Context, limit int) ([]model.WalletOperation, error)
+}
+
+type AvailabilityRepository interface {
+	ReplaceProviderSnapshots(ctx context.Context, snapshots []availability.ProviderSnapshot) error
+	ListProviderSnapshots(ctx context.Context, opts availability.ListOptions) (availability.ProviderSnapshotPage, error)
+	ReplaceDataSetSnapshots(ctx context.Context, snapshots []availability.DataSetSnapshot) error
+	ListDataSetSnapshots(ctx context.Context, opts availability.ListOptions) (availability.DataSetSnapshotPage, error)
+	GetDataSetSnapshotsByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]availability.DataSetSnapshot, error)
 }
 
 type CreateWalletOperationInput struct {

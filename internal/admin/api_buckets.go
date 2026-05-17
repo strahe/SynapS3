@@ -16,6 +16,7 @@ import (
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
@@ -96,6 +97,16 @@ type storageDataSetSummaryResponse struct {
 	CurrentVersions    int64                     `json:"current_version_count"`
 	CreatedAt          string                    `json:"created_at"`
 	UpdatedAt          string                    `json:"updated_at"`
+	Availability       *dataSetAvailabilityInfo  `json:"availability,omitempty"`
+}
+
+type dataSetAvailabilityInfo struct {
+	Status           string                    `json:"status"`
+	ReasonCodes      []availability.ReasonCode `json:"reason_codes"`
+	ActivePieceCount *int64                    `json:"active_piece_count,omitempty"`
+	LastCheckedAt    string                    `json:"last_checked_at,omitempty"`
+	LastError        *string                   `json:"last_error,omitempty"`
+	Stale            bool                      `json:"stale"`
 }
 
 type bucketOwnerUpdateRequest struct {
@@ -297,7 +308,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 			return
 		}
-		dataSets = s.storageDataSetSummaryResponses(summaries)
+		dataSets = s.storageDataSetSummaryResponses(ctx, summaries)
 	}
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
@@ -516,14 +527,21 @@ func bucketOwnerACL(owner string) ([]byte, error) {
 	})
 }
 
-func (s *Server) storageDataSetSummaryResponses(summaries []repository.StorageDataSetSummary) []storageDataSetSummaryResponse {
+func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries []repository.StorageDataSetSummary) []storageDataSetSummaryResponse {
 	out := make([]storageDataSetSummaryResponse, 0, len(summaries))
 	providerIDs := make([]idtypes.OnChainID, 0, len(summaries))
+	localIDs := make([]int64, 0, len(summaries))
 	for _, summary := range summaries {
 		providerIDs = append(providerIDs, summary.ProviderID)
+		localIDs = append(localIDs, summary.ID)
 	}
 	identities := s.providerIdentities(providerIDs)
+	availabilityByLocalID, availabilityFailed := s.dataSetAvailabilitySnapshots(ctx, localIDs)
 	for _, summary := range summaries {
+		availabilityInfo := s.dataSetAvailabilityInfo(availabilityByLocalID[summary.ID])
+		if availabilityFailed {
+			availabilityInfo = dataSetAvailabilityQueryFailureInfo()
+		}
 		out = append(out, storageDataSetSummaryResponse{
 			ID:                 summary.ID,
 			BucketID:           summary.BucketID,
@@ -543,9 +561,62 @@ func (s *Server) storageDataSetSummaryResponses(summaries []repository.StorageDa
 			CurrentVersions:    summary.CurrentVersions,
 			CreatedAt:          summary.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:          summary.UpdatedAt.Format(time.RFC3339),
+			Availability:       availabilityInfo,
 		})
 	}
 	return out
+}
+
+func (s *Server) dataSetAvailabilitySnapshots(ctx context.Context, localIDs []int64) (map[int64]availability.DataSetSnapshot, bool) {
+	if s.availability == nil || len(localIDs) == 0 {
+		return nil, false
+	}
+	snapshots, err := s.availability.DataSetSnapshotsByLocalIDs(ctx, localIDs)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("api: failed to enrich bucket data set availability", "error", err)
+		}
+		return nil, true
+	}
+	return snapshots, false
+}
+
+func (s *Server) dataSetAvailabilityInfo(snapshot availability.DataSetSnapshot) *dataSetAvailabilityInfo {
+	if snapshot.LocalDataSetID == 0 {
+		return nil
+	}
+	reasonCodes := make([]availability.ReasonCode, 0, len(snapshot.ReasonCodes))
+	reasonCodes = append(reasonCodes, snapshot.ReasonCodes...)
+	stale, _ := availabilityFreshness(&snapshot.LastCheckedAt, s.availability.RefreshInterval())
+	if stale && !reasonCodeContains(reasonCodes, availability.ReasonStaleSnapshot) {
+		reasonCodes = append(reasonCodes, availability.ReasonStaleSnapshot)
+	}
+	return &dataSetAvailabilityInfo{
+		Status:           string(snapshot.Status),
+		ReasonCodes:      reasonCodes,
+		ActivePieceCount: snapshot.ActivePieceCount,
+		LastCheckedAt:    snapshot.LastCheckedAt.Format(time.RFC3339),
+		LastError:        snapshot.LastError,
+		Stale:            stale,
+	}
+}
+
+func dataSetAvailabilityQueryFailureInfo() *dataSetAvailabilityInfo {
+	errText := "availability query failed"
+	return &dataSetAvailabilityInfo{
+		Status:      string(availability.StatusUnknown),
+		ReasonCodes: []availability.ReasonCode{},
+		LastError:   &errText,
+	}
+}
+
+func reasonCodeContains(codes []availability.ReasonCode, want availability.ReasonCode) bool {
+	for _, code := range codes {
+		if code == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) providerIdentities(providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {

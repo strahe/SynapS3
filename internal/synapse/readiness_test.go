@@ -1,9 +1,11 @@
 package synapse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"strings"
 	"testing"
@@ -145,7 +147,12 @@ func TestReadinessCheckerStorageErrorsAreUnknownAndSanitized(t *testing.T) {
 	client := readyReadinessClient(1)
 	client.storage.info = nil
 	client.storage.infoErr = errors.New("dial https://secret-token@example.invalid/rpc: boom")
-	checker := NewReadinessChecker(cfg, client)
+	var logs bytes.Buffer
+	checker := NewReadinessChecker(
+		cfg,
+		client,
+		WithReadinessLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
 
 	got := checker.CheckRuntime(context.Background())
 
@@ -159,6 +166,31 @@ func TestReadinessCheckerStorageErrorsAreUnknownAndSanitized(t *testing.T) {
 	}
 	if got.PartialErrors["storage_info"] != "RPC call failed" {
 		t.Fatalf("partial storage error = %#v, want sanitized RPC failure", got.PartialErrors)
+	}
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("readiness partial error should not log warning: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "level=DEBUG") {
+		t.Fatalf("readiness partial error should be debug logged: %s", logs.String())
+	}
+}
+
+func TestReadinessCheckerDoesNotWarnForCancelledRequests(t *testing.T) {
+	cfg := readyReadinessConfig()
+	client := readyReadinessClient(1)
+	client.storage.info = nil
+	client.storage.infoErr = context.Canceled
+	var logs bytes.Buffer
+	checker := NewReadinessChecker(
+		cfg,
+		client,
+		WithReadinessLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+
+	_ = checker.CheckRuntime(context.Background())
+
+	if strings.Contains(logs.String(), "filecoin readiness probe failed") {
+		t.Fatalf("cancelled readiness request should not log warning: %s", logs.String())
 	}
 }
 
@@ -215,8 +247,8 @@ func TestReadinessStatusRollupPrioritizesBlockedUnknownWarning(t *testing.T) {
 	result.addCheck("warning", ReadinessStatusWarning, "warning", "")
 	result.addCheck("unknown", ReadinessStatusUnknown, "unknown", "")
 	result.finish()
-	if result.Status != ReadinessStatusUnknown {
-		t.Fatalf("Status = %q, want unknown", result.Status)
+	if result.Status != ReadinessStatusWarning {
+		t.Fatalf("Status = %q, want warning", result.Status)
 	}
 	result.addCheck("blocked", ReadinessStatusBlocked, "blocked", "")
 	result.finish()

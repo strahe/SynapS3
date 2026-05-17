@@ -2,6 +2,7 @@ package synapse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -533,8 +534,8 @@ func (r *ReadinessResult) addPartialError(field string, err error) {
 }
 
 func (c *ReadinessChecker) addPartialError(result *ReadinessResult, field string, err error) {
-	if c != nil && c.logger != nil && err != nil {
-		c.logger.Warn(
+	if c != nil && c.logger != nil && err != nil && !errors.Is(err, context.Canceled) {
+		c.logger.Debug(
 			"filecoin readiness probe failed",
 			"check", field,
 			"error", sanitizeRPCError(err),
@@ -545,6 +546,11 @@ func (c *ReadinessChecker) addPartialError(result *ReadinessResult, field string
 }
 
 func (r *ReadinessResult) finish() {
+	r.Finish()
+}
+
+// Finish updates the aggregate readiness status from the contained checks.
+func (r *ReadinessResult) Finish() {
 	if r == nil {
 		return
 	}
@@ -555,11 +561,11 @@ func (r *ReadinessResult) finish() {
 			r.Status = ReadinessStatusBlocked
 			return
 		case ReadinessStatusUnknown:
-			if status != ReadinessStatusBlocked {
+			if status == ReadinessStatusReady {
 				status = ReadinessStatusUnknown
 			}
 		case ReadinessStatusWarning:
-			if status == ReadinessStatusReady {
+			if status == ReadinessStatusReady || status == ReadinessStatusUnknown {
 				status = ReadinessStatusWarning
 			}
 		}

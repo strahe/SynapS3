@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -10,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
 )
 
@@ -46,6 +50,181 @@ func TestFilecoinReadinessRuntime(t *testing.T) {
 				assertRuntimeReadinessResponse(t, rr.Body.Bytes())
 			}
 		})
+	}
+}
+
+func TestFilecoinReadinessAvailabilityNoSnapshotWarns(t *testing.T) {
+	srv := (&Server{logger: testLogger()}).
+		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
+		WithAvailability(availability.NewService(availability.ServiceOptions{
+			Store:           &availabilityAPIStore{},
+			RefreshInterval: time.Minute,
+		}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIFilecoinReadiness(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body synapse.ReadinessResult
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.Status != synapse.ReadinessStatusWarning {
+		t.Fatalf("readiness status = %s, want warning", body.Status)
+	}
+	assertReadinessCheckStatus(t, body.Checks, "availability_providers", synapse.ReadinessStatusWarning)
+	assertReadinessCheckStatus(t, body.Checks, "availability_data_sets", synapse.ReadinessStatusWarning)
+}
+
+func TestFilecoinReadinessEmptyDataSetInventoryIsReady(t *testing.T) {
+	checkedAt := time.Now().UTC()
+	srv, _ := newBucketAPITestServer(t)
+	srv.WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
+		WithAvailability(availability.NewService(availability.ServiceOptions{
+			Store: &availabilityReadinessStore{
+				providers: availability.ProviderSnapshotPage{
+					Summary:       availability.Summary{Total: 1, Available: 1},
+					LastCheckedAt: &checkedAt,
+				},
+				dataSets: availability.DataSetSnapshotPage{},
+			},
+			RefreshInterval: time.Minute,
+		}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIFilecoinReadiness(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body synapse.ReadinessResult
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	assertReadinessCheckStatus(t, body.Checks, "availability_data_sets", synapse.ReadinessStatusReady)
+	if body.Status != synapse.ReadinessStatusReady {
+		t.Fatalf("readiness status = %s, want ready", body.Status)
+	}
+}
+
+func TestFilecoinReadinessLocalDataSetWithoutSnapshotWarns(t *testing.T) {
+	checkedAt := time.Now().UTC()
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "readiness-local-dataset", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000READYDS",
+		ContentSize:     1,
+		Checksum:        "checksum-readiness-local-dataset",
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, "bafk2bzacereadinessdataset", []adminStorageCopySeed{
+		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
+	})
+	srv.WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
+		WithAvailability(availability.NewService(availability.ServiceOptions{
+			Store: &availabilityReadinessStore{
+				providers: availability.ProviderSnapshotPage{
+					Summary:       availability.Summary{Total: 1, Available: 1},
+					LastCheckedAt: &checkedAt,
+				},
+				dataSets: availability.DataSetSnapshotPage{},
+			},
+			RefreshInterval: time.Minute,
+		}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIFilecoinReadiness(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body synapse.ReadinessResult
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	assertReadinessCheckStatus(t, body.Checks, "availability_data_sets", synapse.ReadinessStatusWarning)
+}
+
+func TestFilecoinReadinessProviderHTTPDegradedDoesNotWarn(t *testing.T) {
+	checkedAt := time.Now().UTC()
+	srv := (&Server{logger: testLogger()}).
+		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
+		WithAvailability(availability.NewService(availability.ServiceOptions{
+			Store: &availabilityReadinessStore{
+				providers: availability.ProviderSnapshotPage{
+					Summary:       availability.Summary{Total: 11, Degraded: 11},
+					LastCheckedAt: &checkedAt,
+				},
+				dataSets: availability.DataSetSnapshotPage{
+					Summary:       availability.Summary{Total: 1, Available: 1},
+					LastCheckedAt: &checkedAt,
+				},
+			},
+			RefreshInterval: time.Minute,
+		}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIFilecoinReadiness(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body synapse.ReadinessResult
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	assertReadinessCheckStatus(t, body.Checks, "availability_providers", synapse.ReadinessStatusReady)
+}
+
+func TestFilecoinReadinessAvailabilityPartialErrorsAreSanitized(t *testing.T) {
+	srv := (&Server{logger: testLogger()}).
+		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
+		WithAvailability(availability.NewService(availability.ServiceOptions{
+			Store: &availabilityReadinessStore{
+				providerErr: errors.New("rpc failed with sensitive detail"),
+			},
+			RefreshInterval: time.Minute,
+		}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIFilecoinReadiness(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body synapse.ReadinessResult
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got := body.PartialErrors["availability_providers"]; got != "availability query failed" {
+		t.Fatalf("availability provider partial error = %q, want sanitized message", got)
+	}
+}
+
+func TestFinishReadinessResultPrioritizesWarningOverUnknown(t *testing.T) {
+	result := finishReadinessResult(synapse.ReadinessResult{
+		Checks: []synapse.ReadinessCheck{
+			{ID: "unknown", Status: synapse.ReadinessStatusUnknown},
+			{ID: "warning", Status: synapse.ReadinessStatusWarning},
+		},
+	})
+	if result.Status != synapse.ReadinessStatusWarning {
+		t.Fatalf("Status = %q, want warning", result.Status)
 	}
 }
 
@@ -151,6 +330,11 @@ func TestFilecoinReadinessPreflightRejectsEnvManagedAndInvalidDraftFields(t *tes
 			payload: `{"filecoin":{"default_copies":0}}`,
 			want:    "filecoin.default_copies",
 		},
+		{
+			name:    "invalid availability draft",
+			payload: `{"filecoin":{"availability":{"timeout":"0s"}}}`,
+			want:    "filecoin.availability.timeout",
+		},
 	}
 
 	for _, tt := range tests {
@@ -207,6 +391,19 @@ func assertPreflightStatus(t *testing.T, srv *Server, req *http.Request, want in
 	return rr
 }
 
+func assertReadinessCheckStatus(t *testing.T, checks []synapse.ReadinessCheck, id string, want synapse.ReadinessStatus) {
+	t.Helper()
+	for _, check := range checks {
+		if check.ID == id {
+			if check.Status != want {
+				t.Fatalf("check %s status = %s, want %s", id, check.Status, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("check %s missing in %#v", id, checks)
+}
+
 func readyFilecoinReadinessResult(mode synapse.ReadinessMode) synapse.ReadinessResult {
 	return synapse.ReadinessResult{
 		Status:    synapse.ReadinessStatusReady,
@@ -231,4 +428,37 @@ func (f *fakeFilecoinReadinessProbe) CheckDraft(_ context.Context, cfg synapse.R
 	f.draftCalls++
 	f.draftConfig = cfg
 	return f.draft
+}
+
+type availabilityReadinessStore struct {
+	providers   availability.ProviderSnapshotPage
+	dataSets    availability.DataSetSnapshotPage
+	providerErr error
+	dataSetErr  error
+}
+
+func (s *availabilityReadinessStore) ReplaceProviderSnapshots(context.Context, []availability.ProviderSnapshot) error {
+	return nil
+}
+
+func (s *availabilityReadinessStore) ListProviderSnapshots(context.Context, availability.ListOptions) (availability.ProviderSnapshotPage, error) {
+	if s.providerErr != nil {
+		return availability.ProviderSnapshotPage{}, s.providerErr
+	}
+	return s.providers, nil
+}
+
+func (s *availabilityReadinessStore) ReplaceDataSetSnapshots(context.Context, []availability.DataSetSnapshot) error {
+	return nil
+}
+
+func (s *availabilityReadinessStore) ListDataSetSnapshots(context.Context, availability.ListOptions) (availability.DataSetSnapshotPage, error) {
+	if s.dataSetErr != nil {
+		return availability.DataSetSnapshotPage{}, s.dataSetErr
+	}
+	return s.dataSets, nil
+}
+
+func (s *availabilityReadinessStore) GetDataSetSnapshotsByLocalIDs(context.Context, []int64) (map[int64]availability.DataSetSnapshot, error) {
+	return nil, nil
 }

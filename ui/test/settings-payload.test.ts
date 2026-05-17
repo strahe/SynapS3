@@ -20,6 +20,7 @@ function baseConfig(): SettingsEditableConfig {
       with_cdn: false,
       allow_private_networks: false,
       default_copies: 2,
+      availability: { interval: '5m0s', timeout: '5s', concurrency: 8 },
     },
     cache: {
       dir: '/tmp/cache',
@@ -62,4 +63,36 @@ test('settings payload omits env-managed s3 access logging fields', () => {
   })
 
   assert.deepEqual(payload.logging?.s3_access, {})
+})
+
+test('settings payload includes editable filecoin availability fields', () => {
+  const initial = baseConfig()
+  const form = baseConfig()
+  form.filecoin.availability.interval = '10m0s'
+  form.filecoin.availability.timeout = '10s'
+  form.filecoin.availability.concurrency = 4
+
+  const payload = buildSettingsPayload(form, initial, {})
+
+  assert.deepEqual(payload.filecoin?.availability, {
+    interval: '10m0s',
+    timeout: '10s',
+    concurrency: 4,
+  })
+})
+
+test('settings payload omits env-managed filecoin availability fields', () => {
+  const initial = baseConfig()
+  const form = baseConfig()
+  form.filecoin.availability.interval = '10m0s'
+  form.filecoin.availability.timeout = '10s'
+  form.filecoin.availability.concurrency = 4
+
+  const payload = buildSettingsPayload(form, initial, {
+    'filecoin.availability.interval': 'SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL',
+    'filecoin.availability.timeout': 'SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT',
+    'filecoin.availability.concurrency': 'SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY',
+  })
+
+  assert.deepEqual(payload.filecoin?.availability, {})
 })
