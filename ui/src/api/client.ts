@@ -481,7 +481,7 @@ export interface SettingsData {
   mode: 'ready' | 'setup'
   config_path: string
   writable: boolean
-  runtime_available: boolean
+  runtime_available?: boolean
   restart_required: boolean
   s3_users: SettingsS3UsersStatus
   config: SettingsEditableConfig
@@ -493,6 +493,10 @@ export interface SettingsData {
   validation_errors?: SettingsFieldError[]
   write_header: string
   write_header_value: string
+}
+
+export interface SettingsValidationData {
+  validation_errors: SettingsFieldError[]
 }
 
 export interface SettingsFieldMetadata {
@@ -847,6 +851,14 @@ export const api = {
   updateSettings: (payload: SettingsUpdatePayload) =>
     fetchJSON<SettingsData>('/settings', {
       method: 'PUT',
+      headers: {
+        'X-SynapS3-Settings-Write': '1',
+      },
+      body: JSON.stringify(payload),
+    }),
+  validateSettings: (payload: SettingsUpdatePayload) =>
+    fetchJSON<SettingsValidationData>('/settings/validate', {
+      method: 'POST',
       headers: {
         'X-SynapS3-Settings-Write': '1',
       },

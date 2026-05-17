@@ -54,9 +54,52 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	next, fieldPresence, fieldErrs, err := s.settingsDraft(req)
+	if err != nil {
+		return settingsResponse{}, nil, err
+	}
+	if len(fieldErrs) > 0 {
+		resp := s.snapshotFromConfig(next, writable)
+		resp.ValidationErrors = fieldErrs
+		return resp, fieldErrs, nil
+	}
+
+	if err := config.SaveForSettings(s.source.Path, next, fieldPresence); err != nil {
+		return settingsResponse{}, nil, err
+	}
+	effective, err := config.LoadSource(s.source)
+	if err != nil {
+		return settingsResponse{}, nil, fmt.Errorf("reloading saved config: %w", err)
+	}
+	persisted, _, err := config.LoadFileForSettings(s.source.Path)
+	if err != nil {
+		return settingsResponse{}, nil, fmt.Errorf("reloading persisted config: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.effective = cloneConfig(effective)
+	s.persisted = cloneConfig(persisted)
+	s.restartRequired = true
+
+	return s.snapshotLocked(writable), nil, nil
+}
+
+func (s *SettingsService) Validate(req settingsUpdateRequest) ([]config.FieldError, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	_, _, fieldErrs, err := s.settingsDraft(req)
+	if err != nil {
+		return nil, err
+	}
+	return fieldErrs, nil
+}
+
+func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Config, config.PersistedFieldPresence, []config.FieldError, error) {
 	persisted, fieldPresence, err := config.LoadFileForSettings(s.source.Path)
 	if err != nil {
-		return settingsResponse{}, nil, fmt.Errorf("loading current config: %w", err)
+		return nil, config.PersistedFieldPresence{}, nil, fmt.Errorf("loading current config: %w", err)
 	}
 	next := cloneConfig(persisted)
 	managed := config.EnvManagedFieldPaths()
@@ -148,31 +191,7 @@ func (s *SettingsService) Update(req settingsUpdateRequest, writable bool) (sett
 	if len(fieldErrs) == 0 {
 		fieldErrs = editableValidationErrors(next)
 	}
-	if len(fieldErrs) > 0 {
-		resp := s.snapshotFromConfig(next, writable)
-		resp.ValidationErrors = fieldErrs
-		return resp, fieldErrs, nil
-	}
-
-	if err := config.SaveForSettings(s.source.Path, next, fieldPresence); err != nil {
-		return settingsResponse{}, nil, err
-	}
-	effective, err := config.LoadSource(s.source)
-	if err != nil {
-		return settingsResponse{}, nil, fmt.Errorf("reloading saved config: %w", err)
-	}
-	persisted, _, err = config.LoadFileForSettings(s.source.Path)
-	if err != nil {
-		return settingsResponse{}, nil, fmt.Errorf("reloading persisted config: %w", err)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.effective = cloneConfig(effective)
-	s.persisted = cloneConfig(persisted)
-	s.restartRequired = true
-
-	return s.snapshotLocked(writable), nil, nil
+	return next, fieldPresence, fieldErrs, nil
 }
 
 func (s *SettingsService) FilecoinDraftConfig(req *settingsFilecoinUpdate) (*config.Config, []config.FieldError) {
@@ -638,6 +657,10 @@ type settingsErrorResponse struct {
 	Fields []config.FieldError `json:"fields,omitempty"`
 }
 
+type settingsValidationResponse struct {
+	ValidationErrors []config.FieldError `json:"validation_errors"`
+}
+
 func (s *Server) handleAPIGetSettings(w http.ResponseWriter, _ *http.Request) {
 	if s.settings == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "settings not available"})
@@ -647,34 +670,8 @@ func (s *Server) handleAPIGetSettings(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleAPIUpdateSettings(w http.ResponseWriter, r *http.Request) {
-	if s.settings == nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "settings not available"})
-		return
-	}
-	if !s.settingsWritable() {
-		writeJSON(w, http.StatusForbidden, settingsErrorResponse{Error: "settings writes require loopback admin binding"})
-		return
-	}
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "settings writes require application/json"})
-		return
-	}
-	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "missing settings write header"})
-		return
-	}
-
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	var req settingsUpdateRequest
-	if err := dec.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings payload"})
-		return
-	}
-	var extra struct{}
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings payload"})
+	req, ok := s.readSettingsUpdateRequest(w, r)
+	if !ok {
 		return
 	}
 
@@ -689,6 +686,58 @@ func (s *Server) handleAPIUpdateSettings(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, s.decorateSettingsResponse(resp))
+}
+
+func (s *Server) handleAPIValidateSettings(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.readSettingsUpdateRequest(w, r)
+	if !ok {
+		return
+	}
+
+	fieldErrs, err := s.settings.Validate(req)
+	if err != nil {
+		s.logger.Error("failed to validate settings", "error", err)
+		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
+		return
+	}
+	if fieldErrs == nil {
+		fieldErrs = []config.FieldError{}
+	}
+	writeJSON(w, http.StatusOK, settingsValidationResponse{ValidationErrors: fieldErrs})
+}
+
+func (s *Server) readSettingsUpdateRequest(w http.ResponseWriter, r *http.Request) (settingsUpdateRequest, bool) {
+	var req settingsUpdateRequest
+	if s.settings == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "settings not available"})
+		return req, false
+	}
+	if !s.settingsWritable() {
+		writeJSON(w, http.StatusForbidden, settingsErrorResponse{Error: "settings writes require loopback admin binding"})
+		return req, false
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "settings writes require application/json"})
+		return req, false
+	}
+	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "missing settings write header"})
+		return req, false
+	}
+
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings payload"})
+		return req, false
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid settings payload"})
+		return req, false
+	}
+	return req, true
 }
 
 func (s *Server) decorateSettingsResponse(resp settingsResponse) settingsResponse {

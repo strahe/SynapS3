@@ -135,6 +135,43 @@ test('filecoin preflight sends settings write header and payload', async () => {
   })
 })
 
+test('settings validate sends settings write header and payload', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedURL = ''
+  let requestedMethod = ''
+  let requestedHeaders = new Headers()
+  let requestedBody: unknown
+  globalThis.fetch = (async (input, init) => {
+    requestedURL = input.toString()
+    requestedMethod = init?.method ?? ''
+    requestedHeaders = new Headers(init?.headers)
+    requestedBody = JSON.parse(init?.body?.toString() ?? '{}') as unknown
+    return new Response(JSON.stringify({ validation_errors: [] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    await api.validateSettings({
+      server: {
+        port: ':8080',
+      },
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(requestedURL, '/api/v1/settings/validate')
+  assert.equal(requestedMethod, 'POST')
+  assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), '1')
+  assert.deepEqual(requestedBody, {
+    server: {
+      port: ':8080',
+    },
+  })
+})
+
 test('object download URL encodes bucket name and object key', () => {
   assert.equal(
     api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),

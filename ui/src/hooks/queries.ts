@@ -303,6 +303,12 @@ export function useUpdateSettings() {
   })
 }
 
+export function useValidateSettings() {
+  return useMutation({
+    mutationFn: api.validateSettings,
+  })
+}
+
 export function useS3Users(enabled = true) {
   return useQuery({
     queryKey: ['s3Users'],

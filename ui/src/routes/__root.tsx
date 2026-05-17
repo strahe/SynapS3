@@ -63,7 +63,12 @@ import {
 } from '@/lib/theme'
 import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '@/lib/upload-progress-events'
 import { applyWalletOperationEventData } from '@/lib/wallet-operation-events'
-import { filecoinRuntimeReadinessEnabled, rootContentKind } from './-root-content'
+import {
+  filecoinRuntimeReadinessEnabled,
+  fullRuntimeAvailable,
+  rootContentKind,
+  rootUsesSetupShell,
+} from './-root-content'
 
 interface RouterContext {
   queryClient: QueryClient
@@ -103,8 +108,8 @@ function RootLayout() {
   const [systemPrefersDark, setSystemPrefersDark] = useState(readSystemPrefersDark)
   const location = useLocation()
   const { data: settings, isLoading: settingsLoading } = useSettings()
-  const setupMode = settings?.mode === 'setup'
-  const activeNavItems = settingsLoading || setupMode ? setupNavItems : navItems
+  const runtimeAvailable = fullRuntimeAvailable(settings, settingsLoading)
+  const activeNavItems = settingsLoading || rootUsesSetupShell(settings) ? setupNavItems : navItems
   const contentKind = rootContentKind(settings, location.pathname)
   const dark = resolveThemeDark(themePreference, systemPrefersDark)
 
@@ -141,7 +146,7 @@ function RootLayout() {
 
   return (
     <SidebarProvider defaultOpen={readSidebarDefaultOpen()}>
-      <AdminEventsBridge enabled={!settingsLoading && !setupMode} />
+      <AdminEventsBridge enabled={runtimeAvailable} />
       <AppSidebar
         activeNavItems={activeNavItems}
         pathname={location.pathname}

@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { AlertTriangle, CheckCircle2, Loader2, RefreshCw, Save } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   FilecoinReadinessData,
   SettingsData,
@@ -37,7 +37,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useFilecoinPreflight, useSettings, useUpdateSettings } from '@/hooks/queries'
+import { useFilecoinPreflight, useSettings, useUpdateSettings, useValidateSettings } from '@/hooks/queries'
 import {
   buildFilecoinPreflightPayload,
   filecoinPreflightPayloadKey,
@@ -52,6 +52,17 @@ import {
   settingsRiskNeedsStrongConfirmation,
 } from '@/lib/risk-confirmation'
 import { buildSettingsPayload } from '@/lib/settings-payload'
+import {
+  settingsRuntimeRestartBannerVisible,
+  settingsSavedBannerVisible,
+  settingsSetupBannerVisible,
+} from '@/lib/settings-status'
+import {
+  activeSettingsValidationErrors,
+  type SettingsValidationDraft,
+  settingsDraftValidationEnabled,
+  settingsValidationPayloadKey,
+} from '@/lib/settings-validation'
 
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
@@ -95,13 +106,25 @@ const tabFields = {
 function SettingsPage() {
   const { data, isLoading, error } = useSettings()
   const updateSettings = useUpdateSettings()
+  const validateSettings = useValidateSettings()
   const filecoinPreflight = useFilecoinPreflight()
   const [form, setForm] = useState<SettingsEditableConfig | null>(null)
+  const [draftValidation, setDraftValidation] = useState<SettingsValidationDraft | null>(null)
   const [checkedPreflightKey, setCheckedPreflightKey] = useState<string | null>(null)
   const [generatedCredentials, setGeneratedCredentials] = useState<SettingsS3Credentials | null>(null)
   const [preflightDetailData, setPreflightDetailData] = useState<FilecoinReadinessData | null>(null)
   const [pendingSettingsPayload, setPendingSettingsPayload] = useState<SettingsUpdatePayload | null>(null)
   const [pendingRiskChanges, setPendingRiskChanges] = useState<SettingsRiskChange[]>([])
+  const currentSettingsPayload = useMemo(
+    () => (form && data ? buildSettingsPayload(form, data.config, data.env_managed) : null),
+    [form, data]
+  )
+  const currentSettingsPayloadKey = useMemo(
+    () => (currentSettingsPayload ? settingsValidationPayloadKey(currentSettingsPayload) : null),
+    [currentSettingsPayload]
+  )
+  const currentSettingsPayloadKeyRef = useRef<string | null>(currentSettingsPayloadKey)
+  const validateSettingsMutateRef = useRef(validateSettings.mutate)
   const formDirty = Boolean(form && data && JSON.stringify(form) !== JSON.stringify(data.config))
   const strongRiskConfirmation = settingsRiskNeedsStrongConfirmation(pendingRiskChanges)
 
@@ -109,7 +132,44 @@ function SettingsPage() {
     if (data && (!form || !formDirty)) setForm(data.config)
   }, [data, form, formDirty])
 
-  const fieldErrors = useMemo(() => toFieldErrorMap(data?.validation_errors ?? []), [data?.validation_errors])
+  useEffect(() => {
+    currentSettingsPayloadKeyRef.current = currentSettingsPayloadKey
+  }, [currentSettingsPayloadKey])
+
+  useEffect(() => {
+    validateSettingsMutateRef.current = validateSettings.mutate
+  }, [validateSettings.mutate])
+
+  useEffect(() => {
+    const draftValidationInput = {
+      writable: data?.writable,
+      formDirty,
+      payload: currentSettingsPayload,
+      payloadKey: currentSettingsPayloadKey,
+    }
+    if (!settingsDraftValidationEnabled(draftValidationInput)) {
+      setDraftValidation(null)
+      return
+    }
+
+    const { payload, payloadKey } = draftValidationInput
+    const timer = window.setTimeout(() => {
+      validateSettingsMutateRef.current(payload, {
+        onSuccess: (result) => {
+          if (currentSettingsPayloadKeyRef.current !== payloadKey) return
+          setDraftValidation({ payloadKey, validation_errors: result.validation_errors ?? [] })
+        },
+      })
+    }, 300)
+
+    return () => window.clearTimeout(timer)
+  }, [currentSettingsPayload, currentSettingsPayloadKey, data?.writable, formDirty])
+
+  const activeValidationErrors = useMemo(
+    () => activeSettingsValidationErrors(data?.validation_errors ?? [], draftValidation, currentSettingsPayloadKey),
+    [data?.validation_errors, draftValidation, currentSettingsPayloadKey]
+  )
+  const fieldErrors = useMemo(() => toFieldErrorMap(activeValidationErrors), [activeValidationErrors])
   const currentFilecoinPreflightPayload =
     form && data ? buildFilecoinPreflightPayload(form.filecoin, data.env_managed) : null
   const currentFilecoinPreflightKey = currentFilecoinPreflightPayload
@@ -139,9 +199,9 @@ function SettingsPage() {
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!data || !form || submitDisabled) return
+    if (!data || !form || !currentSettingsPayload || submitDisabled) return
     updateSettings.reset()
-    const payload = buildSettingsPayload(form, data.config, data.env_managed)
+    const payload = currentSettingsPayload
     const riskChanges = collectSettingsRiskChanges(data.config, form, data.env_managed, data.metadata)
     if (riskChanges.length > 0) {
       setPendingSettingsPayload(payload)
@@ -229,7 +289,13 @@ function SettingsPage() {
 
       <Tabs defaultValue="s3" className="gap-4">
         <TabsList className="w-full justify-start overflow-x-auto">
-          <SettingsTabTrigger value="s3" label="S3" data={data} errors={fieldErrors} missing={s3Missing(data)} />
+          <SettingsTabTrigger
+            value="s3"
+            label="S3"
+            data={data}
+            errors={fieldErrors}
+            missing={s3Missing(activeValidationErrors)}
+          />
           <SettingsTabTrigger value="server" label="Server" data={data} errors={fieldErrors} />
           <SettingsTabTrigger
             value="filecoin"
@@ -612,9 +678,14 @@ function FilecoinPreflightSummary({
 function StatusBanners({ data, mutationError }: { data: SettingsData; mutationError: Error | null }) {
   return (
     <div className="flex flex-col gap-3">
-      {data.mode === 'setup' && (
+      {settingsSetupBannerVisible(data) && (
         <Banner tone="warning" icon={AlertTriangle}>
           Setup mode is active. Save settings here, then restart the service.
+        </Banner>
+      )}
+      {settingsRuntimeRestartBannerVisible(data) && (
+        <Banner tone="warning" icon={AlertTriangle}>
+          Settings are valid. Restart SynapS3 to enable the full dashboard.
         </Banner>
       )}
       {!data.writable && (
@@ -622,7 +693,7 @@ function StatusBanners({ data, mutationError }: { data: SettingsData; mutationEr
           Settings writes are disabled because the admin server is not bound to a loopback address.
         </Banner>
       )}
-      {data.restart_required && (
+      {settingsSavedBannerVisible(data) && (
         <Banner tone="success" icon={CheckCircle2}>
           Settings were saved. Restart SynapS3 to apply runtime changes.
         </Banner>
@@ -958,8 +1029,8 @@ function CopyableSecret({ label, value }: { label: string; value: string }) {
   return <SettingsValueField label={label} value={value} copy mono />
 }
 
-function s3Missing(data: SettingsData) {
-  return Boolean(data.validation_errors?.some((error) => error.field.startsWith('s3.')))
+function s3Missing(errors: SettingsFieldError[]) {
+  return errors.some((error) => error.field.startsWith('s3.'))
 }
 
 function toFieldErrorMap(errors: SettingsFieldError[]) {

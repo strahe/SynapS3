@@ -269,6 +269,169 @@ func TestSettingsPUTRequiresLoopbackAndWriteHeaders(t *testing.T) {
 	}
 }
 
+func TestSettingsValidateReportsDraftErrorsWithoutPersisting(t *testing.T) {
+	cfg := validSettingsConfig(t)
+	cfg.Server.Port = ":8080"
+	cfg.Server.MaxConnections = 100
+	cfg.Server.MaxRequests = 10
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
+	if err := config.Save(source.Path, cfg); err != nil {
+		t.Fatalf("Save initial config: %v", err)
+	}
+	source.Exists = true
+	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
+	initialData, err := os.ReadFile(source.Path)
+	if err != nil {
+		t.Fatalf("ReadFile initial config: %v", err)
+	}
+
+	resp := postSettingsValidate(t, srv, `{"server":{"port":":80801"}}`)
+	if !hasFieldError(resp.ValidationErrors, "server.port") {
+		t.Fatalf("validation_errors = %#v, want server.port error", resp.ValidationErrors)
+	}
+	data, err := os.ReadFile(source.Path)
+	if err != nil {
+		t.Fatalf("ReadFile after invalid validate: %v", err)
+	}
+	if string(data) != string(initialData) {
+		t.Fatalf("validate wrote config:\n%s", string(data))
+	}
+
+	resp = postSettingsValidate(t, srv, `{"server":{"port":":8080"}}`)
+	if len(resp.ValidationErrors) != 0 {
+		t.Fatalf("validation_errors = %#v, want none", resp.ValidationErrors)
+	}
+	if !strings.Contains(resp.Raw, `"validation_errors":[]`) {
+		t.Fatalf("valid response should include empty validation_errors array: %s", resp.Raw)
+	}
+	data, err = os.ReadFile(source.Path)
+	if err != nil {
+		t.Fatalf("ReadFile after valid validate: %v", err)
+	}
+	if string(data) != string(initialData) {
+		t.Fatalf("valid validate wrote config:\n%s", string(data))
+	}
+	if got := getSettingsResponse(t, srv).RestartRequired; got {
+		t.Fatal("RestartRequired = true after validate, want false")
+	}
+}
+
+func TestSettingsValidateReportsDraftValidationRules(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		field   string
+		envName string
+	}{
+		{
+			name:    "cross field server concurrency",
+			payload: `{"server":{"max_connections":10,"max_requests":11}}`,
+			field:   "server.max_requests",
+		},
+		{
+			name:    "duration parse",
+			payload: `{"worker":{"upload":{"poll_interval":"not-a-duration"}}}`,
+			field:   "worker.upload.poll_interval",
+		},
+		{
+			name:    "env managed field",
+			payload: `{"server":{"port":":8088"}}`,
+			field:   "server.port",
+			envName: "SYNAPS3_SERVER_PORT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envName != "" {
+				t.Setenv(tt.envName, ":9999")
+			}
+			cfg := validSettingsConfig(t)
+			source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
+			if err := config.Save(source.Path, cfg); err != nil {
+				t.Fatalf("Save initial config: %v", err)
+			}
+			source.Exists = true
+			srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
+
+			resp := postSettingsValidate(t, srv, tt.payload)
+
+			if !hasFieldError(resp.ValidationErrors, tt.field) {
+				t.Fatalf("validation_errors = %#v, want %s", resp.ValidationErrors, tt.field)
+			}
+			if tt.envName != "" && !strings.Contains(resp.Raw, tt.envName) {
+				t.Fatalf("response should mention %s: %s", tt.envName, resp.Raw)
+			}
+		})
+	}
+}
+
+func TestSettingsValidateRequiresWriteGuardsAndValidJSON(t *testing.T) {
+	cfg := validSettingsConfig(t)
+	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
+
+	tests := []struct {
+		name        string
+		addr        string
+		contentType string
+		writeHeader string
+		body        string
+		wantStatus  int
+	}{
+		{
+			name:        "non-loopback",
+			addr:        "0.0.0.0:9090",
+			contentType: "application/json",
+			writeHeader: settingsWriteHeaderValue,
+			body:        `{"cache":{"max_size_gb":8}}`,
+			wantStatus:  http.StatusForbidden,
+		},
+		{
+			name:        "missing write header",
+			addr:        "127.0.0.1:9090",
+			contentType: "application/json",
+			body:        `{"cache":{"max_size_gb":8}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "invalid content type",
+			addr:        "127.0.0.1:9090",
+			contentType: "application/jsonp",
+			writeHeader: settingsWriteHeaderValue,
+			body:        `{"cache":{"max_size_gb":8}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "invalid json",
+			addr:        "127.0.0.1:9090",
+			contentType: "application/json",
+			writeHeader: settingsWriteHeaderValue,
+			body:        `{"cache":{"max_size_gb":8}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newSettingsAPITestServer(t, tt.addr, cfg, source)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/validate", strings.NewReader(tt.body))
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+			if tt.writeHeader != "" {
+				req.Header.Set(settingsWriteHeader, tt.writeHeader)
+			}
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIValidateSettings(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.T) {
 	cfg := validSettingsConfig(t)
 	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
@@ -701,4 +864,30 @@ func containsEnabledTOMLKey(text, key string) bool {
 		}
 	}
 	return false
+}
+
+type settingsValidateTestResponse struct {
+	ValidationErrors []config.FieldError `json:"validation_errors"`
+	Raw              string
+}
+
+func postSettingsValidate(t *testing.T, srv *Server, payload string) settingsValidateTestResponse {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/validate", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIValidateSettings(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp settingsValidateTestResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	resp.Raw = rr.Body.String()
+	return resp
 }

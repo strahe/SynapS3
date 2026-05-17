@@ -222,6 +222,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.settings != nil {
 		mux.HandleFunc("GET /api/v1/settings", s.handleAPIGetSettings)
 		mux.HandleFunc("PUT /api/v1/settings", s.handleAPIUpdateSettings)
+		mux.HandleFunc("POST /api/v1/settings/validate", s.handleAPIValidateSettings)
 		mux.HandleFunc("POST /api/v1/filecoin/readiness/preflight", s.handleAPIFilecoinReadinessPreflight)
 	}
 
