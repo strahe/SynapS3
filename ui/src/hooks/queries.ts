@@ -252,11 +252,11 @@ export function useFilecoinPreflight() {
   })
 }
 
-export function useRefreshDataSetAvailability() {
+export function useRefreshDataSetStorageHealth() {
   const qc = useQueryClient()
 
   return useMutation({
-    mutationFn: ({ bucket }: { bucket?: string } = {}) => api.refreshDataSetAvailability({ bucket }),
+    mutationFn: ({ bucket }: { bucket?: string } = {}) => api.refreshDataSetStorageHealth({ bucket }),
     onSuccess: (_, variables) => {
       if (variables?.bucket) qc.invalidateQueries({ queryKey: ['bucket', variables.bucket] })
       qc.invalidateQueries({ queryKey: ['filecoinReadiness'] })

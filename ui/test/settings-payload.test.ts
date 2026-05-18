@@ -20,7 +20,7 @@ function baseConfig(): SettingsEditableConfig {
       with_cdn: false,
       allow_private_networks: false,
       default_copies: 2,
-      availability: { interval: '5m0s', timeout: '5s', concurrency: 8 },
+      observability: { interval: '5m0s', timeout: '5s', concurrency: 8 },
     },
     cache: {
       dir: '/tmp/cache',
@@ -65,34 +65,34 @@ test('settings payload omits env-managed s3 access logging fields', () => {
   assert.deepEqual(payload.logging?.s3_access, {})
 })
 
-test('settings payload includes editable filecoin availability fields', () => {
+test('settings payload includes editable filecoin observability fields', () => {
   const initial = baseConfig()
   const form = baseConfig()
-  form.filecoin.availability.interval = '10m0s'
-  form.filecoin.availability.timeout = '10s'
-  form.filecoin.availability.concurrency = 4
+  form.filecoin.observability.interval = '10m0s'
+  form.filecoin.observability.timeout = '10s'
+  form.filecoin.observability.concurrency = 4
 
   const payload = buildSettingsPayload(form, initial, {})
 
-  assert.deepEqual(payload.filecoin?.availability, {
+  assert.deepEqual(payload.filecoin?.observability, {
     interval: '10m0s',
     timeout: '10s',
     concurrency: 4,
   })
 })
 
-test('settings payload omits env-managed filecoin availability fields', () => {
+test('settings payload omits env-managed filecoin observability fields', () => {
   const initial = baseConfig()
   const form = baseConfig()
-  form.filecoin.availability.interval = '10m0s'
-  form.filecoin.availability.timeout = '10s'
-  form.filecoin.availability.concurrency = 4
+  form.filecoin.observability.interval = '10m0s'
+  form.filecoin.observability.timeout = '10s'
+  form.filecoin.observability.concurrency = 4
 
   const payload = buildSettingsPayload(form, initial, {
-    'filecoin.availability.interval': 'SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL',
-    'filecoin.availability.timeout': 'SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT',
-    'filecoin.availability.concurrency': 'SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY',
+    'filecoin.observability.interval': 'SYNAPS3_FILECOIN_OBSERVABILITY_INTERVAL',
+    'filecoin.observability.timeout': 'SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT',
+    'filecoin.observability.concurrency': 'SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY',
   })
 
-  assert.deepEqual(payload.filecoin?.availability, {})
+  assert.deepEqual(payload.filecoin?.observability, {})
 })

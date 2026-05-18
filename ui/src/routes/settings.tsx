@@ -86,9 +86,9 @@ const tabFields = {
     'filecoin.with_cdn',
     'filecoin.allow_private_networks',
     'filecoin.default_copies',
-    'filecoin.availability.interval',
-    'filecoin.availability.timeout',
-    'filecoin.availability.concurrency',
+    'filecoin.observability.interval',
+    'filecoin.observability.timeout',
+    'filecoin.observability.concurrency',
   ],
   cache: ['cache.dir', 'cache.max_size_gb', 'cache.eviction_policy'],
   workers: [
@@ -463,9 +463,9 @@ function SettingsPage() {
                 }
               />
               <TextField
-                label="Availability Interval"
-                field="filecoin.availability.interval"
-                value={form.filecoin.availability.interval}
+                label="Observability Interval"
+                field="filecoin.observability.interval"
+                value={form.filecoin.observability.interval}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) =>
@@ -473,15 +473,15 @@ function SettingsPage() {
                     ...form,
                     filecoin: {
                       ...form.filecoin,
-                      availability: { ...form.filecoin.availability, interval: value },
+                      observability: { ...form.filecoin.observability, interval: value },
                     },
                   })
                 }
               />
               <TextField
-                label="Availability Timeout"
-                field="filecoin.availability.timeout"
-                value={form.filecoin.availability.timeout}
+                label="Observability Timeout"
+                field="filecoin.observability.timeout"
+                value={form.filecoin.observability.timeout}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) =>
@@ -489,15 +489,15 @@ function SettingsPage() {
                     ...form,
                     filecoin: {
                       ...form.filecoin,
-                      availability: { ...form.filecoin.availability, timeout: value },
+                      observability: { ...form.filecoin.observability, timeout: value },
                     },
                   })
                 }
               />
               <NumberField
-                label="Availability Concurrency"
-                field="filecoin.availability.concurrency"
-                value={form.filecoin.availability.concurrency}
+                label="Observability Concurrency"
+                field="filecoin.observability.concurrency"
+                value={form.filecoin.observability.concurrency}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) =>
@@ -505,7 +505,7 @@ function SettingsPage() {
                     ...form,
                     filecoin: {
                       ...form.filecoin,
-                      availability: { ...form.filecoin.availability, concurrency: value },
+                      observability: { ...form.filecoin.observability, concurrency: value },
                     },
                   })
                 }

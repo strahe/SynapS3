@@ -16,11 +16,11 @@ import (
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/observability"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
 )
@@ -97,16 +97,16 @@ type storageDataSetSummaryResponse struct {
 	CurrentVersions    int64                     `json:"current_version_count"`
 	CreatedAt          string                    `json:"created_at"`
 	UpdatedAt          string                    `json:"updated_at"`
-	Availability       *dataSetAvailabilityInfo  `json:"availability,omitempty"`
+	StorageHealth      *dataSetStorageHealthInfo `json:"storage_health,omitempty"`
 }
 
-type dataSetAvailabilityInfo struct {
-	Status           string                    `json:"status"`
-	ReasonCodes      []availability.ReasonCode `json:"reason_codes"`
-	ActivePieceCount *int64                    `json:"active_piece_count,omitempty"`
-	LastCheckedAt    string                    `json:"last_checked_at,omitempty"`
-	LastError        *string                   `json:"last_error,omitempty"`
-	Stale            bool                      `json:"stale"`
+type dataSetStorageHealthInfo struct {
+	Status           string                     `json:"status"`
+	ReasonCodes      []observability.ReasonCode `json:"reason_codes"`
+	ActivePieceCount *int64                     `json:"active_piece_count,omitempty"`
+	LastCheckedAt    string                     `json:"last_checked_at,omitempty"`
+	LastError        *string                    `json:"last_error,omitempty"`
+	Stale            bool                       `json:"stale"`
 }
 
 type bucketOwnerUpdateRequest struct {
@@ -536,11 +536,11 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 		localIDs = append(localIDs, summary.ID)
 	}
 	identities := s.providerIdentities(providerIDs)
-	availabilityByLocalID, availabilityFailed := s.dataSetAvailabilitySnapshots(ctx, localIDs)
+	healthByLocalID, healthFailed := s.dataSetStorageHealthStates(ctx, localIDs)
 	for _, summary := range summaries {
-		availabilityInfo := s.dataSetAvailabilityInfo(availabilityByLocalID[summary.ID])
-		if availabilityFailed {
-			availabilityInfo = dataSetAvailabilityQueryFailureInfo()
+		storageHealth := s.dataSetStorageHealthInfo(healthByLocalID[summary.ID])
+		if healthFailed {
+			storageHealth = dataSetStorageHealthQueryFailureInfo()
 		}
 		out = append(out, storageDataSetSummaryResponse{
 			ID:                 summary.ID,
@@ -561,56 +561,56 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			CurrentVersions:    summary.CurrentVersions,
 			CreatedAt:          summary.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:          summary.UpdatedAt.Format(time.RFC3339),
-			Availability:       availabilityInfo,
+			StorageHealth:      storageHealth,
 		})
 	}
 	return out
 }
 
-func (s *Server) dataSetAvailabilitySnapshots(ctx context.Context, localIDs []int64) (map[int64]availability.DataSetSnapshot, bool) {
-	if s.availability == nil || len(localIDs) == 0 {
+func (s *Server) dataSetStorageHealthStates(ctx context.Context, localIDs []int64) (map[int64]observability.DataSetState, bool) {
+	if s.observability == nil || len(localIDs) == 0 {
 		return nil, false
 	}
-	snapshots, err := s.availability.DataSetSnapshotsByLocalIDs(ctx, localIDs)
+	states, err := s.observability.DataSetStatesByLocalIDs(ctx, localIDs)
 	if err != nil {
 		if s.logger != nil {
-			s.logger.Warn("api: failed to enrich bucket data set availability", "error", err)
+			s.logger.Warn("api: failed to enrich bucket data set storage health", "error", err)
 		}
 		return nil, true
 	}
-	return snapshots, false
+	return states, false
 }
 
-func (s *Server) dataSetAvailabilityInfo(snapshot availability.DataSetSnapshot) *dataSetAvailabilityInfo {
-	if snapshot.LocalDataSetID == 0 {
+func (s *Server) dataSetStorageHealthInfo(state observability.DataSetState) *dataSetStorageHealthInfo {
+	if state.LocalDataSetID == 0 {
 		return nil
 	}
-	reasonCodes := make([]availability.ReasonCode, 0, len(snapshot.ReasonCodes))
-	reasonCodes = append(reasonCodes, snapshot.ReasonCodes...)
-	stale, _ := availabilityFreshness(&snapshot.LastCheckedAt, s.availability.RefreshInterval())
-	if stale && !reasonCodeContains(reasonCodes, availability.ReasonStaleSnapshot) {
-		reasonCodes = append(reasonCodes, availability.ReasonStaleSnapshot)
+	reasonCodes := make([]observability.ReasonCode, 0, len(state.ReasonCodes))
+	reasonCodes = append(reasonCodes, state.ReasonCodes...)
+	stale, _ := observabilityFreshness(&state.LastCheckedAt, s.observability.RefreshInterval())
+	if stale && !reasonCodeContains(reasonCodes, observability.ReasonStaleState) {
+		reasonCodes = append(reasonCodes, observability.ReasonStaleState)
 	}
-	return &dataSetAvailabilityInfo{
-		Status:           string(snapshot.Status),
+	return &dataSetStorageHealthInfo{
+		Status:           string(state.Status),
 		ReasonCodes:      reasonCodes,
-		ActivePieceCount: snapshot.ActivePieceCount,
-		LastCheckedAt:    snapshot.LastCheckedAt.Format(time.RFC3339),
-		LastError:        snapshot.LastError,
+		ActivePieceCount: state.ActivePieceCount,
+		LastCheckedAt:    state.LastCheckedAt.Format(time.RFC3339),
+		LastError:        state.LastError,
 		Stale:            stale,
 	}
 }
 
-func dataSetAvailabilityQueryFailureInfo() *dataSetAvailabilityInfo {
-	errText := "availability query failed"
-	return &dataSetAvailabilityInfo{
-		Status:      string(availability.StatusUnknown),
-		ReasonCodes: []availability.ReasonCode{},
+func dataSetStorageHealthQueryFailureInfo() *dataSetStorageHealthInfo {
+	errText := "storage health query failed"
+	return &dataSetStorageHealthInfo{
+		Status:      string(observability.StatusUnknown),
+		ReasonCodes: []observability.ReasonCode{},
 		LastError:   &errText,
 	}
 }
 
-func reasonCodeContains(codes []availability.ReasonCode, want availability.ReasonCode) bool {
+func reasonCodeContains(codes []observability.ReasonCode, want observability.ReasonCode) bool {
 	for _, code := range codes {
 		if code == want {
 			return true

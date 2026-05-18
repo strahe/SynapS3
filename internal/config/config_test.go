@@ -240,24 +240,24 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			},
 		},
 		{
-			name:  "filecoin availability interval",
-			field: "filecoin.availability.interval",
+			name:  "filecoin observability interval",
+			field: "filecoin.observability.interval",
 			mutate: func(cfg *Config) {
-				cfg.Filecoin.Availability.Interval = 0
+				cfg.Filecoin.Observability.Interval = 0
 			},
 		},
 		{
-			name:  "filecoin availability timeout",
-			field: "filecoin.availability.timeout",
+			name:  "filecoin observability timeout",
+			field: "filecoin.observability.timeout",
 			mutate: func(cfg *Config) {
-				cfg.Filecoin.Availability.Timeout = 0
+				cfg.Filecoin.Observability.Timeout = 0
 			},
 		},
 		{
-			name:  "filecoin availability concurrency",
-			field: "filecoin.availability.concurrency",
+			name:  "filecoin observability concurrency",
+			field: "filecoin.observability.concurrency",
 			mutate: func(cfg *Config) {
-				cfg.Filecoin.Availability.Concurrency = 0
+				cfg.Filecoin.Observability.Concurrency = 0
 			},
 		},
 		{
@@ -346,14 +346,14 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Filecoin.DefaultCopies != 3 {
 		t.Errorf("Filecoin.DefaultCopies = %d, want 3", cfg.Filecoin.DefaultCopies)
 	}
-	if cfg.Filecoin.Availability.Interval != 5*time.Minute {
-		t.Errorf("Filecoin.Availability.Interval = %s, want 5m", cfg.Filecoin.Availability.Interval)
+	if cfg.Filecoin.Observability.Interval != 5*time.Minute {
+		t.Errorf("Filecoin.Observability.Interval = %s, want 5m", cfg.Filecoin.Observability.Interval)
 	}
-	if cfg.Filecoin.Availability.Timeout != 5*time.Second {
-		t.Errorf("Filecoin.Availability.Timeout = %s, want 5s", cfg.Filecoin.Availability.Timeout)
+	if cfg.Filecoin.Observability.Timeout != 5*time.Second {
+		t.Errorf("Filecoin.Observability.Timeout = %s, want 5s", cfg.Filecoin.Observability.Timeout)
 	}
-	if cfg.Filecoin.Availability.Concurrency != 8 {
-		t.Errorf("Filecoin.Availability.Concurrency = %d, want 8", cfg.Filecoin.Availability.Concurrency)
+	if cfg.Filecoin.Observability.Concurrency != 8 {
+		t.Errorf("Filecoin.Observability.Concurrency = %d, want 8", cfg.Filecoin.Observability.Concurrency)
 	}
 	if cfg.Logging.Format != "text" {
 		t.Errorf("Logging.Format = %q, want text", cfg.Logging.Format)
@@ -419,9 +419,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_WITH_CDN", "true")
 	t.Setenv("SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS", "true")
 	t.Setenv("SYNAPS3_FILECOIN_DEFAULT_COPIES", "4")
-	t.Setenv("SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL", "3m")
-	t.Setenv("SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT", "4s")
-	t.Setenv("SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY", "6")
+	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_INTERVAL", "3m")
+	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT", "4s")
+	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY", "6")
 	t.Setenv("SYNAPS3_CACHE_MAX_SIZE_GB", "7")
 	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "manual")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
@@ -447,10 +447,10 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	if !cfg.Filecoin.WithCDN || !cfg.Filecoin.AllowPrivateNetworks || cfg.Filecoin.DefaultCopies != 4 {
 		t.Fatalf("filecoin config = %#v, want env values", cfg.Filecoin)
 	}
-	if cfg.Filecoin.Availability.Interval != 3*time.Minute ||
-		cfg.Filecoin.Availability.Timeout != 4*time.Second ||
-		cfg.Filecoin.Availability.Concurrency != 6 {
-		t.Fatalf("filecoin availability = %#v, want env values", cfg.Filecoin.Availability)
+	if cfg.Filecoin.Observability.Interval != 3*time.Minute ||
+		cfg.Filecoin.Observability.Timeout != 4*time.Second ||
+		cfg.Filecoin.Observability.Concurrency != 6 {
+		t.Fatalf("filecoin observability = %#v, want env values", cfg.Filecoin.Observability)
 	}
 	if cfg.Cache.MaxSizeGB != 7 || cfg.Cache.EvictionPolicy != "manual" {
 		t.Fatalf("cache config = %#v, want env values", cfg.Cache)
@@ -463,6 +463,39 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 	if cfg.Logging.S3Access.Enabled || cfg.Logging.S3Access.Level != "debug" {
 		t.Fatalf("s3 access logging = %#v, want disabled debug", cfg.Logging.S3Access)
+	}
+}
+
+func TestLoad_IgnoresLegacyFilecoinHealthConfig(t *testing.T) {
+	legacySection := "avail" + "ability"
+	t.Setenv("SYNAPS3_FILECOIN_"+strings.ToUpper(legacySection)+"_INTERVAL", "3m")
+	t.Setenv("SYNAPS3_FILECOIN_"+strings.ToUpper(legacySection)+"_TIMEOUT", "4s")
+	t.Setenv("SYNAPS3_FILECOIN_"+strings.ToUpper(legacySection)+"_CONCURRENCY", "6")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load('') with legacy env overrides failed: %v", err)
+	}
+	if cfg.Filecoin.Observability.Interval != 5*time.Minute ||
+		cfg.Filecoin.Observability.Timeout != 5*time.Second ||
+		cfg.Filecoin.Observability.Concurrency != 8 {
+		t.Fatalf("filecoin observability = %#v, want defaults", cfg.Filecoin.Observability)
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgTOML := []byte("[filecoin." + legacySection + "]\ninterval = \"3m\"\ntimeout = \"4s\"\nconcurrency = 6\n")
+	if err := os.WriteFile(cfgPath, cfgTOML, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load(%q) with legacy section failed: %v", cfgPath, err)
+	}
+	if cfg.Filecoin.Observability.Interval != 5*time.Minute ||
+		cfg.Filecoin.Observability.Timeout != 5*time.Second ||
+		cfg.Filecoin.Observability.Concurrency != 8 {
+		t.Fatalf("filecoin observability = %#v, want defaults", cfg.Filecoin.Observability)
 	}
 }
 

@@ -100,22 +100,22 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_FILECOIN_DEFAULT_COPIES",
 		Editable:    true,
 	},
-	"filecoin.availability.interval": {
-		Label:       "Availability Interval",
-		Description: "Interval between background provider and local data set availability checks. Restart required.",
-		Env:         "SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL",
+	"filecoin.observability.interval": {
+		Label:       "Observability Interval",
+		Description: "Interval between background provider and local data set health checks. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_OBSERVABILITY_INTERVAL",
 		Editable:    true,
 	},
-	"filecoin.availability.timeout": {
-		Label:       "Availability Timeout",
+	"filecoin.observability.timeout": {
+		Label:       "Observability Timeout",
 		Description: "Base timeout used to derive bounded registry, wallet scan, provider lookup, and health check deadlines. Restart required.",
-		Env:         "SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT",
+		Env:         "SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT",
 		Editable:    true,
 	},
-	"filecoin.availability.concurrency": {
-		Label:       "Availability Concurrency",
-		Description: "Maximum concurrent provider availability checks. Restart required.",
-		Env:         "SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY",
+	"filecoin.observability.concurrency": {
+		Label:       "Observability Concurrency",
+		Description: "Maximum concurrent provider health checks. Restart required.",
+		Env:         "SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY",
 		Editable:    true,
 	},
 	"database.driver": {

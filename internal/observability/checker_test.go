@@ -1,4 +1,4 @@
-package availability
+package observability
 
 import (
 	"context"
@@ -35,10 +35,10 @@ func TestCheckProvidersMergesLocalAndRegistrySources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckProviders: %v", err)
 	}
-	byProvider := providerSnapshotsByID(got)
+	byProvider := providerStatesByID(got)
 
-	assertProviderSnapshot(t, byProvider["101"], StatusUnavailable, []ReasonCode{ReasonProviderInactive})
-	assertProviderSnapshot(t, byProvider["202"], StatusAvailable, nil)
+	assertProviderState(t, byProvider["101"], StatusUnavailable, []ReasonCode{ReasonProviderInactive})
+	assertProviderState(t, byProvider["202"], StatusAvailable, nil)
 }
 
 func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
@@ -58,7 +58,7 @@ func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
 		t.Fatalf("CheckProviders: %v", err)
 	}
 
-	assertProviderSnapshot(t, providerSnapshotsByID(got)["202"], StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
+	assertProviderState(t, providerStatesByID(got)["202"], StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
 }
 
 func TestCheckProvidersDegradesMissingServiceURL(t *testing.T) {
@@ -78,7 +78,7 @@ func TestCheckProvidersDegradesMissingServiceURL(t *testing.T) {
 		t.Fatalf("CheckProviders: %v", err)
 	}
 
-	assertProviderSnapshot(t, providerSnapshotsByID(got)["202"], StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
+	assertProviderState(t, providerStatesByID(got)["202"], StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
 }
 
 func TestCheckProvidersReturnsRegistryListFailure(t *testing.T) {
@@ -115,10 +115,10 @@ func TestCheckProvidersMarksLookupFailureUnknownWithSanitizedError(t *testing.T)
 		t.Fatalf("CheckProviders: %v", err)
 	}
 
-	snapshot := providerSnapshotsByID(got)["101"]
-	assertProviderSnapshot(t, snapshot, StatusUnknown, []ReasonCode{ReasonRegistryLookupFailed})
-	if snapshot.LastError == nil || *snapshot.LastError != "RPC call failed" {
-		t.Fatalf("LastError = %#v, want sanitized RPC call failed", snapshot.LastError)
+	state := providerStatesByID(got)["101"]
+	assertProviderState(t, state, StatusUnknown, []ReasonCode{ReasonRegistryLookupFailed})
+	if state.LastError == nil || *state.LastError != "RPC call failed" {
+		t.Fatalf("LastError = %#v, want sanitized RPC call failed", state.LastError)
 	}
 }
 
@@ -161,10 +161,10 @@ func TestCheckProvidersMarksMissingPDPUnavailable(t *testing.T) {
 		t.Fatalf("CheckProviders: %v", err)
 	}
 
-	snapshot := providerSnapshotsByID(got)["202"]
-	assertProviderSnapshot(t, snapshot, StatusUnavailable, []ReasonCode{ReasonProviderInactive})
-	if snapshot.Evidence["has_pdp"] != false {
-		t.Fatalf("has_pdp evidence = %#v, want false", snapshot.Evidence["has_pdp"])
+	state := providerStatesByID(got)["202"]
+	assertProviderState(t, state, StatusUnavailable, []ReasonCode{ReasonProviderInactive})
+	if state.Evidence["has_pdp"] != false {
+		t.Fatalf("has_pdp evidence = %#v, want false", state.Evidence["has_pdp"])
 	}
 }
 
@@ -330,19 +330,19 @@ func TestCheckDataSetsClassifiesLocalAndChainEvidence(t *testing.T) {
 		t.Fatalf("CheckDataSets: %v", err)
 	}
 	if len(got) != len(local) {
-		t.Fatalf("CheckDataSets returned %d snapshots, want %d local bindings", len(got), len(local))
+		t.Fatalf("CheckDataSets returned %d states, want %d local bindings", len(got), len(local))
 	}
-	byLocal := dataSetSnapshotsByLocalID(got)
+	byLocal := dataSetStatesByLocalID(got)
 
-	assertDataSetSnapshot(t, byLocal[1], StatusAvailable, nil, int64Ptr(7))
-	assertDataSetSnapshot(t, byLocal[2], StatusUnavailable, []ReasonCode{ReasonChainDataSetMissing}, nil)
-	assertDataSetSnapshot(t, byLocal[3], StatusUnavailable, []ReasonCode{ReasonChainDataSetMissing}, nil)
-	assertDataSetSnapshot(t, byLocal[4], StatusUnavailable, []ReasonCode{ReasonChainDataSetInactive}, int64Ptr(0))
-	assertDataSetSnapshot(t, byLocal[5], StatusDegraded, []ReasonCode{ReasonChainDataSetUnmanaged}, int64Ptr(3))
-	assertDataSetSnapshot(t, byLocal[6], StatusDegraded, []ReasonCode{ReasonProviderMismatch, ReasonMetadataMismatch}, int64Ptr(4))
-	assertDataSetSnapshot(t, byLocal[7], StatusDegraded, []ReasonCode{ReasonLocalStatusNotReady}, int64Ptr(1))
-	assertDataSetSnapshot(t, byLocal[8], StatusUnavailable, []ReasonCode{ReasonLocalStatusNotReady}, int64Ptr(2))
-	assertDataSetSnapshot(t, byLocal[9], StatusAvailable, nil, int64Ptr(5))
+	assertDataSetState(t, byLocal[1], StatusAvailable, nil, int64Ptr(7))
+	assertDataSetState(t, byLocal[2], StatusUnavailable, []ReasonCode{ReasonChainDataSetMissing}, nil)
+	assertDataSetState(t, byLocal[3], StatusUnavailable, []ReasonCode{ReasonChainDataSetMissing}, nil)
+	assertDataSetState(t, byLocal[4], StatusUnavailable, []ReasonCode{ReasonChainDataSetInactive}, int64Ptr(0))
+	assertDataSetState(t, byLocal[5], StatusDegraded, []ReasonCode{ReasonChainDataSetUnmanaged}, int64Ptr(3))
+	assertDataSetState(t, byLocal[6], StatusDegraded, []ReasonCode{ReasonProviderMismatch, ReasonMetadataMismatch}, int64Ptr(4))
+	assertDataSetState(t, byLocal[7], StatusDegraded, []ReasonCode{ReasonLocalStatusNotReady}, int64Ptr(1))
+	assertDataSetState(t, byLocal[8], StatusUnavailable, []ReasonCode{ReasonLocalStatusNotReady}, int64Ptr(2))
+	assertDataSetState(t, byLocal[9], StatusAvailable, nil, int64Ptr(5))
 }
 
 func TestCheckDataSetsMergesWalletScanFailureWithLocalStatus(t *testing.T) {
@@ -380,10 +380,10 @@ func TestCheckDataSetsMergesWalletScanFailureWithLocalStatus(t *testing.T) {
 		t.Fatalf("CheckDataSets: %v", err)
 	}
 
-	byLocal := dataSetSnapshotsByLocalID(got)
-	assertDataSetSnapshot(t, byLocal[1], StatusUnknown, []ReasonCode{ReasonChainLookupFailed}, nil)
-	assertDataSetSnapshot(t, byLocal[2], StatusUnknown, []ReasonCode{ReasonChainLookupFailed, ReasonLocalStatusNotReady}, nil)
-	assertDataSetSnapshot(t, byLocal[3], StatusUnavailable, []ReasonCode{ReasonChainLookupFailed, ReasonLocalStatusNotReady}, nil)
+	byLocal := dataSetStatesByLocalID(got)
+	assertDataSetState(t, byLocal[1], StatusUnknown, []ReasonCode{ReasonChainLookupFailed}, nil)
+	assertDataSetState(t, byLocal[2], StatusUnknown, []ReasonCode{ReasonChainLookupFailed, ReasonLocalStatusNotReady}, nil)
+	assertDataSetState(t, byLocal[3], StatusUnavailable, []ReasonCode{ReasonChainLookupFailed, ReasonLocalStatusNotReady}, nil)
 	for _, id := range []int64{1, 2, 3} {
 		if byLocal[id].LastError == nil || *byLocal[id].LastError != "RPC call failed" {
 			t.Fatalf("local data set %d LastError = %#v, want sanitized RPC call failed", id, byLocal[id].LastError)
@@ -428,23 +428,23 @@ func (f fakeDataSetScanner) ScanWalletDataSets(context.Context) ([]ChainDataSet,
 	return f.dataSets, nil
 }
 
-func providerSnapshotsByID(snapshots []ProviderSnapshot) map[string]ProviderSnapshot {
-	out := make(map[string]ProviderSnapshot, len(snapshots))
-	for _, snapshot := range snapshots {
-		out[snapshot.ProviderID.String()] = snapshot
+func providerStatesByID(states []ProviderState) map[string]ProviderState {
+	out := make(map[string]ProviderState, len(states))
+	for _, state := range states {
+		out[state.ProviderID.String()] = state
 	}
 	return out
 }
 
-func dataSetSnapshotsByLocalID(snapshots []DataSetSnapshot) map[int64]DataSetSnapshot {
-	out := make(map[int64]DataSetSnapshot, len(snapshots))
-	for _, snapshot := range snapshots {
-		out[snapshot.LocalDataSetID] = snapshot
+func dataSetStatesByLocalID(states []DataSetState) map[int64]DataSetState {
+	out := make(map[int64]DataSetState, len(states))
+	for _, state := range states {
+		out[state.LocalDataSetID] = state
 	}
 	return out
 }
 
-func assertProviderSnapshot(t *testing.T, got ProviderSnapshot, status Status, reasons []ReasonCode) {
+func assertProviderState(t *testing.T, got ProviderState, status Status, reasons []ReasonCode) {
 	t.Helper()
 	if got.Status != status {
 		t.Fatalf("provider %s status = %s, want %s", got.ProviderID, got.Status, status)
@@ -457,7 +457,7 @@ func assertProviderSnapshot(t *testing.T, got ProviderSnapshot, status Status, r
 	}
 }
 
-func assertDataSetSnapshot(t *testing.T, got DataSetSnapshot, status Status, reasons []ReasonCode, activePieces *int64) {
+func assertDataSetState(t *testing.T, got DataSetState, status Status, reasons []ReasonCode, activePieces *int64) {
 	t.Helper()
 	if got.Status != status {
 		t.Fatalf("local data set %d status = %s, want %s", got.LocalDataSetID, got.Status, status)

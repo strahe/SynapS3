@@ -1,4 +1,4 @@
-package availability
+package observability
 
 import (
 	"context"
@@ -76,7 +76,7 @@ func NewChecker(opts CheckerOptions) *Checker {
 	}
 }
 
-func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataSet) ([]ProviderSnapshot, error) {
+func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataSet) ([]ProviderState, error) {
 	checkedAt := c.checkedAt()
 	providerIDs := make(map[string]types.OnChainID)
 	providers := make(map[string]Provider)
@@ -95,7 +95,7 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 		cancel()
 		if err != nil {
 			if c.logger != nil {
-				c.logger.Warn("availability provider registry list failed", "error", safeAvailabilityError(err))
+				c.logger.Warn("observability provider registry list failed", "error", safeObservabilityError(err))
 			}
 			return nil, err
 		}
@@ -114,10 +114,10 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 	healthCtx, healthCancel := context.WithTimeout(ctx, boundedFanoutTimeout(c.timeout, len(providers), c.concurrency))
 	health := c.checkProviderHealth(healthCtx, providers)
 	healthCancel()
-	snapshots := make([]ProviderSnapshot, 0, len(providerIDs))
+	states := make([]ProviderState, 0, len(providerIDs))
 	for key, id := range providerIDs {
 		if errText, ok := providerErrors[key]; ok {
-			snapshots = append(snapshots, ProviderSnapshot{
+			states = append(states, ProviderState{
 				ProviderID:    id,
 				Status:        StatusUnknown,
 				ReasonCodes:   []ReasonCode{ReasonRegistryLookupFailed},
@@ -156,7 +156,7 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 			}
 		}
 
-		snapshots = append(snapshots, ProviderSnapshot{
+		states = append(states, ProviderState{
 			ProviderID:    id,
 			Status:        status,
 			ReasonCodes:   reasons,
@@ -170,13 +170,13 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 		})
 	}
 
-	sort.Slice(snapshots, func(i, j int) bool {
-		return lessOnChainID(snapshots[i].ProviderID, snapshots[j].ProviderID)
+	sort.Slice(states, func(i, j int) bool {
+		return lessOnChainID(states[i].ProviderID, states[j].ProviderID)
 	})
-	return snapshots, nil
+	return states, nil
 }
 
-func (c *Checker) CheckDataSets(ctx context.Context, localDataSets []LocalDataSet) ([]DataSetSnapshot, error) {
+func (c *Checker) CheckDataSets(ctx context.Context, localDataSets []LocalDataSet) ([]DataSetState, error) {
 	checkedAt := c.checkedAt()
 	needsChain := false
 	for _, local := range localDataSets {
@@ -206,9 +206,9 @@ func (c *Checker) CheckDataSets(ctx context.Context, localDataSets []LocalDataSe
 	}
 	matchedChainIDs := make(map[string]struct{}, len(localDataSets))
 
-	snapshots := make([]DataSetSnapshot, 0, len(localDataSets))
+	states := make([]DataSetState, 0, len(localDataSets))
 	for _, local := range localDataSets {
-		snapshot := DataSetSnapshot{
+		state := DataSetState{
 			LocalDataSetID:  local.ID,
 			BucketID:        local.BucketID,
 			BucketName:      local.BucketName,
@@ -223,65 +223,65 @@ func (c *Checker) CheckDataSets(ctx context.Context, localDataSets []LocalDataSe
 		}
 
 		if local.DataSetID == nil || local.DataSetID.IsZero() {
-			snapshot.Status = StatusUnavailable
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonChainDataSetMissing)
-			snapshots = append(snapshots, snapshot)
+			state.Status = StatusUnavailable
+			state.ReasonCodes = append(state.ReasonCodes, ReasonChainDataSetMissing)
+			states = append(states, state)
 			continue
 		}
 		if chainErr != nil {
-			errText := safeAvailabilityError(chainErr)
-			snapshot.Status = StatusUnknown
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonChainLookupFailed)
-			snapshot.LastError = &errText
+			errText := safeObservabilityError(chainErr)
+			state.Status = StatusUnknown
+			state.ReasonCodes = append(state.ReasonCodes, ReasonChainLookupFailed)
+			state.LastError = &errText
 			if localSeverity := localStatusSeverity(local.Status); localSeverity != StatusAvailable {
 				if localSeverity == StatusUnavailable {
-					snapshot.Status = StatusUnavailable
+					state.Status = StatusUnavailable
 				}
-				snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonLocalStatusNotReady)
+				state.ReasonCodes = append(state.ReasonCodes, ReasonLocalStatusNotReady)
 			}
-			snapshots = append(snapshots, snapshot)
+			states = append(states, state)
 			continue
 		}
 		chainDataSet, ok := chainByID[local.DataSetID.String()]
 		if !ok {
-			snapshot.Status = StatusUnavailable
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonChainDataSetMissing)
-			snapshots = append(snapshots, snapshot)
+			state.Status = StatusUnavailable
+			state.ReasonCodes = append(state.ReasonCodes, ReasonChainDataSetMissing)
+			states = append(states, state)
 			continue
 		}
 		matchedChainIDs[local.DataSetID.String()] = struct{}{}
 
-		snapshot.ActivePieceCount = chainDataSet.ActivePieceCount
-		snapshot.Evidence = chainEvidence(chainDataSet)
+		state.ActivePieceCount = chainDataSet.ActivePieceCount
+		state.Evidence = chainEvidence(chainDataSet)
 		if !chainDataSet.IsLive {
-			snapshot.Status = worseStatus(snapshot.Status, StatusUnavailable)
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonChainDataSetInactive)
+			state.Status = worseStatus(state.Status, StatusUnavailable)
+			state.ReasonCodes = append(state.ReasonCodes, ReasonChainDataSetInactive)
 		}
 		if !chainDataSet.IsManaged {
-			snapshot.Status = worseStatus(snapshot.Status, StatusDegraded)
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonChainDataSetUnmanaged)
+			state.Status = worseStatus(state.Status, StatusDegraded)
+			state.ReasonCodes = append(state.ReasonCodes, ReasonChainDataSetUnmanaged)
 		}
 		if !chainDataSet.ProviderID.IsZero() && !chainDataSet.ProviderID.Equal(local.ProviderID) {
-			snapshot.Status = worseStatus(snapshot.Status, StatusDegraded)
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonProviderMismatch)
+			state.Status = worseStatus(state.Status, StatusDegraded)
+			state.ReasonCodes = append(state.ReasonCodes, ReasonProviderMismatch)
 		}
 		if bucketName, ok := chainDataSet.Metadata["bucket"]; ok && bucketName != "" && bucketName != local.BucketName {
-			snapshot.Status = worseStatus(snapshot.Status, StatusDegraded)
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonMetadataMismatch)
+			state.Status = worseStatus(state.Status, StatusDegraded)
+			state.ReasonCodes = append(state.ReasonCodes, ReasonMetadataMismatch)
 		}
 		if localStatusSeverity(local.Status) != StatusAvailable {
 			localSeverity := localStatusSeverity(local.Status)
-			snapshot.Status = worseStatus(snapshot.Status, localSeverity)
-			snapshot.ReasonCodes = append(snapshot.ReasonCodes, ReasonLocalStatusNotReady)
+			state.Status = worseStatus(state.Status, localSeverity)
+			state.ReasonCodes = append(state.ReasonCodes, ReasonLocalStatusNotReady)
 		}
-		snapshots = append(snapshots, snapshot)
+		states = append(states, state)
 	}
 	c.logUnmatchedChainDataSets(chainByID, matchedChainIDs)
 
-	sort.Slice(snapshots, func(i, j int) bool {
-		return snapshots[i].LocalDataSetID < snapshots[j].LocalDataSetID
+	sort.Slice(states, func(i, j int) bool {
+		return states[i].LocalDataSetID < states[j].LocalDataSetID
 	})
-	return snapshots, nil
+	return states, nil
 }
 
 func (c *Checker) lookupMissingProviders(
@@ -305,7 +305,7 @@ func (c *Checker) lookupMissingProviders(
 	})
 	if c.providerSource == nil {
 		for _, id := range missing {
-			providerErrors[id.String()] = safeAvailabilityError(ErrProviderNotFound)
+			providerErrors[id.String()] = safeObservabilityError(ErrProviderNotFound)
 		}
 		return
 	}
@@ -340,14 +340,14 @@ func (c *Checker) lookupMissingProviders(
 
 	for result := range results {
 		if result.err != nil {
-			providerErrors[result.key] = safeAvailabilityError(result.err)
+			providerErrors[result.key] = safeObservabilityError(result.err)
 			continue
 		}
 		providers[result.key] = result.provider
 	}
 
 	if err := lookupCtx.Err(); err != nil {
-		errText := safeAvailabilityError(err)
+		errText := safeObservabilityError(err)
 		for _, id := range missing {
 			key := id.String()
 			if _, ok := providers[key]; ok {
@@ -380,7 +380,7 @@ func (c *Checker) logUnmatchedChainDataSets(chainByID map[string]ChainDataSet, m
 		return
 	}
 	c.logger.Debug(
-		"availability wallet data sets ignored without local binding",
+		"observability wallet data sets ignored without local binding",
 		"count", count,
 		"sample_chain_data_set_ids", samples,
 	)
@@ -466,7 +466,7 @@ func clampDuration(value, min, max time.Duration) time.Duration {
 	return value
 }
 
-func safeAvailabilityError(err error) string {
+func safeObservabilityError(err error) string {
 	switch {
 	case err == nil:
 		return ""

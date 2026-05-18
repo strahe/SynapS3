@@ -1,4 +1,4 @@
-package availability
+package observability
 
 import (
 	"errors"
@@ -31,7 +31,7 @@ const (
 	ReasonLocalStatusNotReady     ReasonCode = "local_status_not_ready"
 	ReasonProviderMismatch        ReasonCode = "provider_mismatch"
 	ReasonMetadataMismatch        ReasonCode = "metadata_mismatch"
-	ReasonStaleSnapshot           ReasonCode = "stale_snapshot"
+	ReasonStaleState              ReasonCode = "stale_state"
 )
 
 var ErrProviderNotFound = errors.New("provider not found")
@@ -65,8 +65,8 @@ type ChainDataSet struct {
 	Metadata         map[string]string
 }
 
-type ProviderSnapshot struct {
-	bun.BaseModel `bun:"table:availability_provider_snapshots"`
+type ProviderState struct {
+	bun.BaseModel `bun:"table:observability_provider_states"`
 
 	ProviderID    types.OnChainID `bun:"provider_id,pk,type:text" json:"provider_id"`
 	Status        Status          `bun:"status,notnull" json:"status"`
@@ -80,8 +80,8 @@ type ProviderSnapshot struct {
 	UpdatedAt     time.Time       `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
-type DataSetSnapshot struct {
-	bun.BaseModel `bun:"table:availability_data_set_snapshots"`
+type DataSetState struct {
+	bun.BaseModel `bun:"table:observability_data_set_states"`
 
 	LocalDataSetID   int64                      `bun:"local_data_set_id,pk" json:"local_data_set_id"`
 	BucketID         int64                      `bun:"bucket_id,notnull" json:"bucket_id"`
@@ -116,20 +116,20 @@ type ListOptions struct {
 	ProviderID *types.OnChainID
 }
 
-type ProviderSnapshotPage struct {
-	Items         []ProviderSnapshot `json:"items"`
-	Summary       Summary            `json:"summary"`
-	LastCheckedAt *time.Time         `json:"last_checked_at,omitempty"`
-	Total         int                `json:"total"`
-	Limit         int                `json:"limit"`
-	Offset        int                `json:"offset"`
+type ProviderStatePage struct {
+	Items         []ProviderState `json:"items"`
+	Summary       Summary         `json:"summary"`
+	LastCheckedAt *time.Time      `json:"last_checked_at,omitempty"`
+	Total         int             `json:"total"`
+	Limit         int             `json:"limit"`
+	Offset        int             `json:"offset"`
 }
 
-type DataSetSnapshotPage struct {
-	Items         []DataSetSnapshot `json:"items"`
-	Summary       Summary           `json:"summary"`
-	LastCheckedAt *time.Time        `json:"last_checked_at,omitempty"`
-	Total         int               `json:"total"`
-	Limit         int               `json:"limit"`
-	Offset        int               `json:"offset"`
+type DataSetStatePage struct {
+	Items         []DataSetState `json:"items"`
+	Summary       Summary        `json:"summary"`
+	LastCheckedAt *time.Time     `json:"last_checked_at,omitempty"`
+	Total         int            `json:"total"`
+	Limit         int            `json:"limit"`
+	Offset        int            `json:"offset"`
 }

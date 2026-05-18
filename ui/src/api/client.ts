@@ -85,13 +85,13 @@ export interface StorageDataSetSummary {
   current_version_count: number
   created_at: string
   updated_at: string
-  availability?: DataSetAvailabilityInfo
+  storage_health?: DataSetStorageHealthInfo
 }
 
-export type AvailabilityStatus = 'available' | 'degraded' | 'unavailable' | 'unknown'
+export type StorageHealthStatus = 'available' | 'degraded' | 'unavailable' | 'unknown'
 
-export interface DataSetAvailabilityInfo {
-  status: AvailabilityStatus
+export interface DataSetStorageHealthInfo {
+  status: StorageHealthStatus
   reason_codes: string[] | null
   active_piece_count?: number
   last_checked_at?: string
@@ -99,7 +99,7 @@ export interface DataSetAvailabilityInfo {
   stale: boolean
 }
 
-export interface AvailabilityListResponse<T> {
+export interface ObservabilityListResponse<T> {
   items: T[]
   summary: {
     total: number
@@ -578,10 +578,10 @@ export interface SettingsFilecoinConfig {
   with_cdn: boolean
   allow_private_networks: boolean
   default_copies: number
-  availability: SettingsAvailabilityConfig
+  observability: SettingsObservabilityConfig
 }
 
-export interface SettingsAvailabilityConfig {
+export interface SettingsObservabilityConfig {
   interval: string
   timeout: string
   concurrency: number
@@ -665,8 +665,8 @@ export type SettingsUpdatePayload = Partial<{
     max_requests: number
   }>
   s3: Partial<SettingsS3Config>
-  filecoin: Partial<Omit<SettingsFilecoinConfig, 'availability'>> & {
-    availability?: Partial<SettingsAvailabilityConfig>
+  filecoin: Partial<Omit<SettingsFilecoinConfig, 'observability'>> & {
+    observability?: Partial<SettingsObservabilityConfig>
   }
   cache: Partial<SettingsCacheConfig>
   worker: Partial<{
@@ -680,8 +680,8 @@ export type SettingsUpdatePayload = Partial<{
 }>
 
 export interface FilecoinReadinessPreflightPayload {
-  filecoin: Partial<Omit<SettingsFilecoinConfig, 'availability'>> & {
-    availability?: Partial<SettingsAvailabilityConfig>
+  filecoin: Partial<Omit<SettingsFilecoinConfig, 'observability'>> & {
+    observability?: Partial<SettingsObservabilityConfig>
   }
 }
 
@@ -862,15 +862,15 @@ export const api = {
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
   getWallet: () => fetchJSON<WalletData>('/wallet'),
   getFilecoinReadiness: () => fetchJSON<FilecoinReadinessData>('/filecoin/readiness'),
-  refreshDataSetAvailability: (params: { bucket?: string; bucket_id?: number } = {}) => {
+  refreshDataSetStorageHealth: (params: { bucket?: string; bucket_id?: number } = {}) => {
     const sp = new URLSearchParams()
     if (params.bucket) sp.set('bucket', params.bucket)
     if (params.bucket_id !== undefined) sp.set('bucket_id', params.bucket_id.toString())
     const qs = sp.toString()
-    return fetchJSON<AvailabilityListResponse<unknown>>(`/availability/data-sets/refresh${qs ? `?${qs}` : ''}`, {
+    return fetchJSON<ObservabilityListResponse<unknown>>(`/observability/data-sets/refresh${qs ? `?${qs}` : ''}`, {
       method: 'POST',
       headers: {
-        'X-SynapS3-Settings-Write': '1',
+        'X-SynapS3-Observability-Refresh': '1',
       },
     })
   },

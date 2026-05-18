@@ -127,7 +127,7 @@ func TestSettingsGETReportsS3UsersUnavailableInSetupMode(t *testing.T) {
 	}
 }
 
-func TestSettingsGETReportsRuntimeAvailability(t *testing.T) {
+func TestSettingsGETReportsRuntimeObservability(t *testing.T) {
 	cfg := validSettingsConfig(t)
 	setupSrv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, config.Source{Path: filepath.Join(t.TempDir(), "config.toml")})
 	setupResp := getSettingsResponse(t, setupSrv)

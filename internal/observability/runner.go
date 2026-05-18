@@ -1,4 +1,4 @@
-package availability
+package observability
 
 import (
 	"context"
@@ -44,6 +44,6 @@ func (r *Runner) Run(ctx context.Context) {
 
 func (r *Runner) refresh(ctx context.Context) {
 	if err := r.service.RefreshAll(ctx); err != nil && r.logger != nil && ctx.Err() == nil {
-		r.logger.Warn("availability refresh failed", "error", err)
+		r.logger.Warn("observability refresh failed", "error", err)
 	}
 }

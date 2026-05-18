@@ -172,6 +172,33 @@ test('settings validate sends settings write header and payload', async () => {
   })
 })
 
+test('data set storage health refresh sends refresh intent header', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedURL = ''
+  let requestedMethod = ''
+  let requestedHeaders = new Headers()
+  globalThis.fetch = (async (input, init) => {
+    requestedURL = input.toString()
+    requestedMethod = init?.method ?? ''
+    requestedHeaders = new Headers(init?.headers)
+    return new Response(JSON.stringify({ items: [], summary: {}, warnings: [], total: 0, limit: 100, offset: 0 }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    await api.refreshDataSetStorageHealth({ bucket: 'bucket-a' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(requestedURL, '/api/v1/observability/data-sets/refresh?bucket=bucket-a')
+  assert.equal(requestedMethod, 'POST')
+  assert.equal(requestedHeaders.get('X-SynapS3-Observability-Refresh'), '1')
+  assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), null)
+})
+
 test('object download URL encodes bucket name and object key', () => {
   assert.equal(
     api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),

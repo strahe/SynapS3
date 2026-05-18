@@ -1,4 +1,4 @@
-package availability
+package observability
 
 import (
 	"context"

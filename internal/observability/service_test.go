@@ -1,4 +1,4 @@
-package availability
+package observability
 
 import (
 	"context"
@@ -15,15 +15,15 @@ func TestServiceMergesConcurrentProviderRefreshes(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
 	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderSnapshot, error) {
+		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderState, error) {
 			if atomic.AddInt32(&calls, 1) == 1 {
 				close(started)
 				<-release
 			}
-			return []ProviderSnapshot{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
+			return []ProviderState{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
 		},
 	}
-	store := &fakeSnapshotStore{}
+	store := &fakeStateStore{}
 	service := NewService(ServiceOptions{
 		Checker:         checker,
 		LocalDataSets:   LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
@@ -66,15 +66,15 @@ func TestServiceMergesConcurrentDataSetRefreshes(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
 	checker := &fakeRefreshChecker{
-		checkDataSets: func(context.Context, []LocalDataSet) ([]DataSetSnapshot, error) {
+		checkDataSets: func(context.Context, []LocalDataSet) ([]DataSetState, error) {
 			if atomic.AddInt32(&calls, 1) == 1 {
 				close(started)
 				<-release
 			}
-			return []DataSetSnapshot{{LocalDataSetID: 1, Status: StatusAvailable}}, nil
+			return []DataSetState{{LocalDataSetID: 1, Status: StatusAvailable}}, nil
 		},
 	}
-	store := &fakeSnapshotStore{}
+	store := &fakeStateStore{}
 	service := NewService(ServiceOptions{
 		Checker: checker,
 		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) {
@@ -117,19 +117,19 @@ func TestServiceRefreshIgnoresRequestCancellation(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	checker := &fakeRefreshChecker{
-		checkProviders: func(ctx context.Context, _ []LocalDataSet) ([]ProviderSnapshot, error) {
+		checkProviders: func(ctx context.Context, _ []LocalDataSet) ([]ProviderState, error) {
 			close(started)
 			<-release
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			return []ProviderSnapshot{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
+			return []ProviderState{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
 		},
 	}
 	service := NewService(ServiceOptions{
 		Checker:       checker,
 		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
-		Store:         &fakeSnapshotStore{},
+		Store:         &fakeStateStore{},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -150,14 +150,14 @@ func TestServiceRefreshIgnoresRequestCancellation(t *testing.T) {
 func TestServiceRefreshCleansUpAfterPanic(t *testing.T) {
 	var calls int32
 	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderSnapshot, error) {
+		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderState, error) {
 			if atomic.AddInt32(&calls, 1) == 1 {
 				panic("boom")
 			}
-			return []ProviderSnapshot{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
+			return []ProviderState{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
 		},
 	}
-	store := &fakeSnapshotStore{}
+	store := &fakeStateStore{}
 	service := NewService(ServiceOptions{
 		Checker:       checker,
 		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
@@ -180,7 +180,7 @@ func TestServiceRefreshCleansUpAfterPanic(t *testing.T) {
 
 func TestServiceRefreshAppliesRefreshTimeout(t *testing.T) {
 	checker := &fakeRefreshChecker{
-		checkProviders: func(ctx context.Context, _ []LocalDataSet) ([]ProviderSnapshot, error) {
+		checkProviders: func(ctx context.Context, _ []LocalDataSet) ([]ProviderState, error) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
@@ -188,7 +188,7 @@ func TestServiceRefreshAppliesRefreshTimeout(t *testing.T) {
 	service := NewService(ServiceOptions{
 		Checker:        checker,
 		LocalDataSets:  LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
-		Store:          &fakeSnapshotStore{},
+		Store:          &fakeStateStore{},
 		RefreshTimeout: 5 * time.Millisecond,
 	})
 
@@ -200,14 +200,14 @@ func TestServiceRefreshAppliesRefreshTimeout(t *testing.T) {
 func TestServiceRefreshAllAttemptsDataSetsAfterProviderFailure(t *testing.T) {
 	providerErr := errors.New("provider refresh failed")
 	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderSnapshot, error) {
+		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderState, error) {
 			return nil, providerErr
 		},
-		checkDataSets: func(context.Context, []LocalDataSet) ([]DataSetSnapshot, error) {
-			return []DataSetSnapshot{{LocalDataSetID: 1, Status: StatusAvailable}}, nil
+		checkDataSets: func(context.Context, []LocalDataSet) ([]DataSetState, error) {
+			return []DataSetState{{LocalDataSetID: 1, Status: StatusAvailable}}, nil
 		},
 	}
-	store := &fakeSnapshotStore{}
+	store := &fakeStateStore{}
 	service := NewService(ServiceOptions{
 		Checker: checker,
 		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) {
@@ -242,51 +242,51 @@ func (c *observedDoneContext) Done() <-chan struct{} {
 }
 
 type fakeRefreshChecker struct {
-	checkProviders func(context.Context, []LocalDataSet) ([]ProviderSnapshot, error)
-	checkDataSets  func(context.Context, []LocalDataSet) ([]DataSetSnapshot, error)
+	checkProviders func(context.Context, []LocalDataSet) ([]ProviderState, error)
+	checkDataSets  func(context.Context, []LocalDataSet) ([]DataSetState, error)
 }
 
-func (f *fakeRefreshChecker) CheckProviders(ctx context.Context, local []LocalDataSet) ([]ProviderSnapshot, error) {
+func (f *fakeRefreshChecker) CheckProviders(ctx context.Context, local []LocalDataSet) ([]ProviderState, error) {
 	return f.checkProviders(ctx, local)
 }
 
-func (f *fakeRefreshChecker) CheckDataSets(ctx context.Context, local []LocalDataSet) ([]DataSetSnapshot, error) {
+func (f *fakeRefreshChecker) CheckDataSets(ctx context.Context, local []LocalDataSet) ([]DataSetState, error) {
 	return f.checkDataSets(ctx, local)
 }
 
-type fakeSnapshotStore struct {
+type fakeStateStore struct {
 	providerReplaces int
 	dataSetReplaces  int
-	providers        []ProviderSnapshot
-	dataSets         []DataSetSnapshot
+	providers        []ProviderState
+	dataSets         []DataSetState
 }
 
-func (f *fakeSnapshotStore) ReplaceProviderSnapshots(_ context.Context, snapshots []ProviderSnapshot) error {
+func (f *fakeStateStore) ReplaceProviderStates(_ context.Context, states []ProviderState) error {
 	f.providerReplaces++
-	f.providers = snapshots
+	f.providers = states
 	return nil
 }
 
-func (f *fakeSnapshotStore) ListProviderSnapshots(_ context.Context, opts ListOptions) (ProviderSnapshotPage, error) {
-	return ProviderSnapshotPage{Items: f.providers, Summary: Summary{Total: len(f.providers)}, Total: len(f.providers), Limit: opts.Limit, Offset: opts.Offset}, nil
+func (f *fakeStateStore) ListProviderStates(_ context.Context, opts ListOptions) (ProviderStatePage, error) {
+	return ProviderStatePage{Items: f.providers, Summary: Summary{Total: len(f.providers)}, Total: len(f.providers), Limit: opts.Limit, Offset: opts.Offset}, nil
 }
 
-func (f *fakeSnapshotStore) ReplaceDataSetSnapshots(_ context.Context, snapshots []DataSetSnapshot) error {
+func (f *fakeStateStore) ReplaceDataSetStates(_ context.Context, states []DataSetState) error {
 	f.dataSetReplaces++
-	f.dataSets = snapshots
+	f.dataSets = states
 	return nil
 }
 
-func (f *fakeSnapshotStore) ListDataSetSnapshots(_ context.Context, opts ListOptions) (DataSetSnapshotPage, error) {
-	return DataSetSnapshotPage{Items: f.dataSets, Summary: Summary{Total: len(f.dataSets)}, Total: len(f.dataSets), Limit: opts.Limit, Offset: opts.Offset}, nil
+func (f *fakeStateStore) ListDataSetStates(_ context.Context, opts ListOptions) (DataSetStatePage, error) {
+	return DataSetStatePage{Items: f.dataSets, Summary: Summary{Total: len(f.dataSets)}, Total: len(f.dataSets), Limit: opts.Limit, Offset: opts.Offset}, nil
 }
 
-func (f *fakeSnapshotStore) GetDataSetSnapshotsByLocalIDs(_ context.Context, ids []int64) (map[int64]DataSetSnapshot, error) {
-	out := make(map[int64]DataSetSnapshot)
-	for _, snapshot := range f.dataSets {
+func (f *fakeStateStore) GetDataSetStatesByLocalIDs(_ context.Context, ids []int64) (map[int64]DataSetState, error) {
+	out := make(map[int64]DataSetState)
+	for _, state := range f.dataSets {
 		for _, id := range ids {
-			if snapshot.LocalDataSetID == id {
-				out[id] = snapshot
+			if state.LocalDataSetID == id {
+				out[id] = state
 			}
 		}
 	}

@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
 )
@@ -422,12 +422,12 @@ type WalletOperationRepository interface {
 	ListRecent(ctx context.Context, limit int) ([]model.WalletOperation, error)
 }
 
-type AvailabilityRepository interface {
-	ReplaceProviderSnapshots(ctx context.Context, snapshots []availability.ProviderSnapshot) error
-	ListProviderSnapshots(ctx context.Context, opts availability.ListOptions) (availability.ProviderSnapshotPage, error)
-	ReplaceDataSetSnapshots(ctx context.Context, snapshots []availability.DataSetSnapshot) error
-	ListDataSetSnapshots(ctx context.Context, opts availability.ListOptions) (availability.DataSetSnapshotPage, error)
-	GetDataSetSnapshotsByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]availability.DataSetSnapshot, error)
+type ObservabilityRepository interface {
+	ReplaceProviderStates(ctx context.Context, states []observability.ProviderState) error
+	ListProviderStates(ctx context.Context, opts observability.ListOptions) (observability.ProviderStatePage, error)
+	ReplaceDataSetStates(ctx context.Context, states []observability.DataSetState) error
+	ListDataSetStates(ctx context.Context, opts observability.ListOptions) (observability.DataSetStatePage, error)
+	GetDataSetStatesByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]observability.DataSetState, error)
 }
 
 type CreateWalletOperationInput struct {

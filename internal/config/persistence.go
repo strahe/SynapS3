@@ -241,11 +241,11 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			},
 		},
 		{
-			Name: "filecoin.availability",
+			Name: "filecoin.observability",
 			Fields: []initFieldDescriptor{
-				{Field: "filecoin.availability.interval", Key: "interval", Value: quoteTOMLString(cfg.Filecoin.Availability.Interval.String()), Enabled: saveMode},
-				{Field: "filecoin.availability.timeout", Key: "timeout", Value: quoteTOMLString(cfg.Filecoin.Availability.Timeout.String()), Enabled: saveMode},
-				{Field: "filecoin.availability.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Filecoin.Availability.Concurrency), Enabled: saveMode},
+				{Field: "filecoin.observability.interval", Key: "interval", Value: quoteTOMLString(cfg.Filecoin.Observability.Interval.String()), Enabled: saveMode},
+				{Field: "filecoin.observability.timeout", Key: "timeout", Value: quoteTOMLString(cfg.Filecoin.Observability.Timeout.String()), Enabled: saveMode},
+				{Field: "filecoin.observability.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Filecoin.Observability.Concurrency), Enabled: saveMode},
 			},
 		},
 		{

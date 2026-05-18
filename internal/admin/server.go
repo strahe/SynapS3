@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
@@ -43,7 +43,7 @@ type Server struct {
 	workerHealth             WorkerHealthChecker
 	wallet                   synapse.WalletQuerier
 	filecoinReadiness        filecoinReadinessProbe
-	availability             *availability.Service
+	observability            *observability.Service
 	providerIdentity         providerIdentityLookup
 	events                   *EventHub
 	settings                 *SettingsService
@@ -149,8 +149,8 @@ func (s *Server) WithFilecoinReadiness(probe filecoinReadinessProbe) *Server {
 	return s
 }
 
-func (s *Server) WithAvailability(service *availability.Service) *Server {
-	s.availability = service
+func (s *Server) WithObservability(service *observability.Service) *Server {
+	s.observability = service
 	return s
 }
 
@@ -218,10 +218,10 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("POST /api/v1/wallet/withdraw", s.handleAPIWalletWithdraw)
 		mux.HandleFunc("GET /api/v1/wallet/operations", s.handleAPIWalletOperations)
 		mux.HandleFunc("GET /api/v1/filecoin/readiness", s.handleAPIFilecoinReadiness)
-		mux.HandleFunc("GET /api/v1/availability/providers", s.handleAPIAvailabilityProviders)
-		mux.HandleFunc("POST /api/v1/availability/providers/refresh", s.handleAPIRefreshAvailabilityProviders)
-		mux.HandleFunc("GET /api/v1/availability/data-sets", s.handleAPIAvailabilityDataSets)
-		mux.HandleFunc("POST /api/v1/availability/data-sets/refresh", s.handleAPIRefreshAvailabilityDataSets)
+		mux.HandleFunc("GET /api/v1/observability/providers", s.handleAPIObservabilityProviders)
+		mux.HandleFunc("POST /api/v1/observability/providers/refresh", s.handleAPIRefreshObservabilityProviders)
+		mux.HandleFunc("GET /api/v1/observability/data-sets", s.handleAPIObservabilityDataSets)
+		mux.HandleFunc("POST /api/v1/observability/data-sets/refresh", s.handleAPIRefreshObservabilityDataSets)
 		if s.s3IAM != nil {
 			mux.HandleFunc("GET /api/v1/s3-users", s.handleAPIListS3Users)
 			mux.HandleFunc("POST /api/v1/s3-users", s.handleAPICreateS3User)

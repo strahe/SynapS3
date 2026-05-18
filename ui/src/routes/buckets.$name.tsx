@@ -21,7 +21,6 @@ import {
 } from 'lucide-react'
 import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
-  type AvailabilityStatus,
   api,
   type DeletedObjectItem,
   maxFOCUploadSize,
@@ -38,6 +37,7 @@ import {
   type ObjectVersionItem,
   type ProviderIdentity,
   type StorageDataSetSummary,
+  type StorageHealthStatus,
   type UploadTransferProgress,
   validateFOCUploadSize,
 } from '@/api/client'
@@ -97,7 +97,7 @@ import {
   useObjectStatusDetail,
   usePermanentDeleteBucketObjectVersion,
   usePermanentDeleteDeletedBucketObject,
-  useRefreshDataSetAvailability,
+  useRefreshDataSetStorageHealth,
   useRestoreBucketObject,
   useS3Users,
   useUpdateBucketCopyPolicy,
@@ -112,7 +112,7 @@ import {
   copyPolicyOptions,
   inheritedCopyPolicyValue,
 } from '@/lib/bucket-copy-policy'
-import { dataSetAvailabilityDetailParts, dataSetAvailabilityRefreshErrorMessage } from '@/lib/data-set-availability'
+import { dataSetStorageHealthDetailParts, dataSetStorageHealthRefreshErrorMessage } from '@/lib/data-set-storage-health'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
@@ -1687,7 +1687,7 @@ function BucketDetailField({ label, value, title }: { label: string; value: stri
 }
 
 function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; dataSets: StorageDataSetSummary[] }) {
-  const refreshAvailability = useRefreshDataSetAvailability()
+  const refreshStorageHealth = useRefreshDataSetStorageHealth()
   const [refreshError, setRefreshError] = useState<string | null>(null)
 
   if (dataSets.length === 0) {
@@ -1707,19 +1707,19 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
           type="button"
           variant="outline"
           size="sm"
-          disabled={refreshAvailability.isPending}
+          disabled={refreshStorageHealth.isPending}
           onClick={() => {
             setRefreshError(null)
-            refreshAvailability.mutate(
+            refreshStorageHealth.mutate(
               { bucket: bucketName },
               {
                 onSuccess: () => setRefreshError(null),
-                onError: (error) => setRefreshError(dataSetAvailabilityRefreshErrorMessage(error)),
+                onError: (error) => setRefreshError(dataSetStorageHealthRefreshErrorMessage(error)),
               }
             )
           }}
         >
-          <RefreshCw data-icon="inline-start" className={refreshAvailability.isPending ? 'animate-spin' : undefined} />
+          <RefreshCw data-icon="inline-start" className={refreshStorageHealth.isPending ? 'animate-spin' : undefined} />
           Refresh
         </Button>
       </div>
@@ -1736,7 +1736,7 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
               <TableHead className="px-4">Replica Slot</TableHead>
               <TableHead className="px-4">Provider</TableHead>
               <TableHead className="px-4">Data Set ID</TableHead>
-              <TableHead className="px-4">Availability</TableHead>
+              <TableHead className="px-4">Storage Health</TableHead>
               <TableHead className="px-4">Last Used</TableHead>
             </TableRow>
           </TableHeader>
@@ -1751,7 +1751,7 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
                   {dataSet.data_set_id ?? '—'}
                 </TableCell>
                 <TableCell className="px-4">
-                  <DataSetAvailabilityCell dataSet={dataSet} />
+                  <DataSetStorageHealthCell dataSet={dataSet} />
                 </TableCell>
                 <TableCell className="px-4 text-muted-foreground" title={dataSet.updated_at}>
                   {timeAgo(dataSet.updated_at)}
@@ -1766,11 +1766,11 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
   )
 }
 
-function DataSetAvailabilityCell({ dataSet }: { dataSet: StorageDataSetSummary }) {
-  const availability = dataSet.availability
-  const detailParts = dataSetAvailabilityDetailParts(dataSet)
+function DataSetStorageHealthCell({ dataSet }: { dataSet: StorageDataSetSummary }) {
+  const storageHealth = dataSet.storage_health
+  const detailParts = dataSetStorageHealthDetailParts(dataSet)
   const details = detailParts.join(' · ')
-  if (!availability) {
+  if (!storageHealth) {
     return (
       <div className="flex min-w-0 flex-col gap-1">
         <StatusBadge tone="neutral">unknown</StatusBadge>
@@ -1784,8 +1784,8 @@ function DataSetAvailabilityCell({ dataSet }: { dataSet: StorageDataSetSummary }
   return (
     <div className="flex min-w-0 flex-col gap-1">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <StatusBadge tone={availabilityStatusTone(availability.status)}>{availability.status}</StatusBadge>
-        {availability.stale && (
+        <StatusBadge tone={storageHealthStatusTone(storageHealth.status)}>{storageHealth.status}</StatusBadge>
+        {storageHealth.stale && (
           <StatusBadge tone="warning" className="shrink-0">
             stale
           </StatusBadge>
@@ -1798,7 +1798,7 @@ function DataSetAvailabilityCell({ dataSet }: { dataSet: StorageDataSetSummary }
   )
 }
 
-function availabilityStatusTone(status: AvailabilityStatus): StatusTone {
+function storageHealthStatusTone(status: StorageHealthStatus): StatusTone {
   switch (status) {
     case 'available':
       return 'success'

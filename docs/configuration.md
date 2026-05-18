@@ -70,9 +70,9 @@ SYNAPS3_FILECOIN_NETWORK             -> filecoin.network
 SYNAPS3_FILECOIN_RPC_URL             -> filecoin.rpc_url
 SYNAPS3_FILECOIN_PRIVATE_KEY         -> filecoin.private_key
 SYNAPS3_FILECOIN_DEFAULT_COPIES      -> filecoin.default_copies
-SYNAPS3_FILECOIN_AVAILABILITY_INTERVAL    -> filecoin.availability.interval
-SYNAPS3_FILECOIN_AVAILABILITY_TIMEOUT     -> filecoin.availability.timeout
-SYNAPS3_FILECOIN_AVAILABILITY_CONCURRENCY -> filecoin.availability.concurrency
+SYNAPS3_FILECOIN_OBSERVABILITY_INTERVAL    -> filecoin.observability.interval
+SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT     -> filecoin.observability.timeout
+SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY -> filecoin.observability.concurrency
 SYNAPS3_DATABASE_DRIVER              -> database.driver
 SYNAPS3_DATABASE_DSN                 -> database.dsn
 SYNAPS3_CACHE_DIR                    -> cache.dir
@@ -91,7 +91,7 @@ SYNAPS3_ADMIN_ADDR                   -> admin.addr
 | `server` | `port`, `max_connections`, `max_requests`, `tls.*` | S3 API listener |
 | `s3` | `region` | Region reported to S3 clients |
 | `filecoin` | `network`, `rpc_url`, `private_key`, `source`, `with_cdn`, `allow_private_networks`, `default_copies` | Filecoin uploads |
-| `filecoin.availability` | `interval`, `timeout`, `concurrency` | Provider and local data set health checks |
+| `filecoin.observability` | `interval`, `timeout`, `concurrency` | Provider and local data set health checks |
 | `database` | `driver`, `dsn`, `max_open_conns`, `max_idle_conns` | Metadata database |
 | `cache` | `dir`, `max_size_gb`, `eviction_policy` | Local object cache |
 | `worker.*` | `concurrency`, `poll_interval`, `max_retries` | Background work |
@@ -102,9 +102,9 @@ Allowed values:
 
 - `filecoin.network`: `calibration`, `mainnet`
 - `filecoin.default_copies`: `1` through `8`, defaults to `3`; used for buckets without an Admin API copy policy override.
-- `filecoin.availability.interval`: duration, defaults to `5m`; background provider/local data set check cadence.
-- `filecoin.availability.timeout`: duration, defaults to `5s`; base timeout used to derive bounded registry, wallet scan, provider lookup, and HTTP health deadlines.
-- `filecoin.availability.concurrency`: integer >= `1`, defaults to `8`; provider lookup and HTTP health fanout concurrency.
+- `filecoin.observability.interval`: duration, defaults to `5m`; background provider/local data set check cadence.
+- `filecoin.observability.timeout`: duration, defaults to `5s`; base timeout used to derive bounded registry, wallet scan, provider lookup, and HTTP health deadlines.
+- `filecoin.observability.concurrency`: integer >= `1`, defaults to `8`; provider lookup and HTTP health fanout concurrency.
 - `database.driver`: `sqlite`, `postgres`
 - `cache.eviction_policy`: `lru`, `manual`, `none`
 - `logging.level`: `debug`, `info`, `warn`, `error`
@@ -124,7 +124,7 @@ SynapS3 manages SQLite runtime pragmas. Postgres DSNs are passed through unchang
 
 `cache.eviction_policy = "lru"` queues local cache eviction after remote storage succeeds. It is not a general LRU scanner.
 
-Availability checks record latest provider and local data set snapshots. Wallet scan rows without a local SynapS3 binding are ignored in first-phase health signals and are reserved for the future Storage Topology Inventory work.
+Observability checks record latest provider and local data set health state. Wallet scan rows without a local SynapS3 binding are ignored in first-phase health signals and are reserved for the future Storage Topology Inventory work.
 
 Default capacity settings are conservative for one node:
 

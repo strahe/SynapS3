@@ -1,4 +1,4 @@
-package availability
+package observability
 
 import (
 	"context"
@@ -9,8 +9,8 @@ import (
 )
 
 type RefreshChecker interface {
-	CheckProviders(context.Context, []LocalDataSet) ([]ProviderSnapshot, error)
-	CheckDataSets(context.Context, []LocalDataSet) ([]DataSetSnapshot, error)
+	CheckProviders(context.Context, []LocalDataSet) ([]ProviderState, error)
+	CheckDataSets(context.Context, []LocalDataSet) ([]DataSetState, error)
 }
 
 type LocalDataSetSource interface {
@@ -23,18 +23,18 @@ func (f LocalDataSetSourceFunc) ListLocalDataSets(ctx context.Context) ([]LocalD
 	return f(ctx)
 }
 
-type SnapshotStore interface {
-	ReplaceProviderSnapshots(context.Context, []ProviderSnapshot) error
-	ListProviderSnapshots(context.Context, ListOptions) (ProviderSnapshotPage, error)
-	ReplaceDataSetSnapshots(context.Context, []DataSetSnapshot) error
-	ListDataSetSnapshots(context.Context, ListOptions) (DataSetSnapshotPage, error)
-	GetDataSetSnapshotsByLocalIDs(context.Context, []int64) (map[int64]DataSetSnapshot, error)
+type StateStore interface {
+	ReplaceProviderStates(context.Context, []ProviderState) error
+	ListProviderStates(context.Context, ListOptions) (ProviderStatePage, error)
+	ReplaceDataSetStates(context.Context, []DataSetState) error
+	ListDataSetStates(context.Context, ListOptions) (DataSetStatePage, error)
+	GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]DataSetState, error)
 }
 
 type ServiceOptions struct {
 	Checker         RefreshChecker
 	LocalDataSets   LocalDataSetSource
-	Store           SnapshotStore
+	Store           StateStore
 	RefreshInterval time.Duration
 	RefreshTimeout  time.Duration
 }
@@ -42,7 +42,7 @@ type ServiceOptions struct {
 type Service struct {
 	checker         RefreshChecker
 	localDataSets   LocalDataSetSource
-	store           SnapshotStore
+	store           StateStore
 	refreshInterval time.Duration
 	refreshTimeout  time.Duration
 	providerRefresh refreshGroup
@@ -81,36 +81,36 @@ func (s *Service) RefreshTimeout() time.Duration {
 	return s.refreshTimeout
 }
 
-func (s *Service) RefreshProviders(ctx context.Context, opts ListOptions) (ProviderSnapshotPage, error) {
+func (s *Service) RefreshProviders(ctx context.Context, opts ListOptions) (ProviderStatePage, error) {
 	if err := s.providerRefresh.Do(ctx, s.refreshTimeout, func(refreshCtx context.Context) error {
 		local, err := s.listLocalDataSets(refreshCtx)
 		if err != nil {
 			return err
 		}
-		snapshots, err := s.checker.CheckProviders(refreshCtx, local)
+		states, err := s.checker.CheckProviders(refreshCtx, local)
 		if err != nil {
 			return err
 		}
-		return s.store.ReplaceProviderSnapshots(refreshCtx, snapshots)
+		return s.store.ReplaceProviderStates(refreshCtx, states)
 	}); err != nil {
-		return ProviderSnapshotPage{}, err
+		return ProviderStatePage{}, err
 	}
 	return s.ListProviders(ctx, opts)
 }
 
-func (s *Service) RefreshDataSets(ctx context.Context, opts ListOptions) (DataSetSnapshotPage, error) {
+func (s *Service) RefreshDataSets(ctx context.Context, opts ListOptions) (DataSetStatePage, error) {
 	if err := s.dataSetRefresh.Do(ctx, s.refreshTimeout, func(refreshCtx context.Context) error {
 		local, err := s.listLocalDataSets(refreshCtx)
 		if err != nil {
 			return err
 		}
-		snapshots, err := s.checker.CheckDataSets(refreshCtx, local)
+		states, err := s.checker.CheckDataSets(refreshCtx, local)
 		if err != nil {
 			return err
 		}
-		return s.store.ReplaceDataSetSnapshots(refreshCtx, snapshots)
+		return s.store.ReplaceDataSetStates(refreshCtx, states)
 	}); err != nil {
-		return DataSetSnapshotPage{}, err
+		return DataSetStatePage{}, err
 	}
 	return s.ListDataSets(ctx, opts)
 }
@@ -126,16 +126,16 @@ func (s *Service) RefreshAll(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-func (s *Service) ListProviders(ctx context.Context, opts ListOptions) (ProviderSnapshotPage, error) {
-	return s.store.ListProviderSnapshots(ctx, opts)
+func (s *Service) ListProviders(ctx context.Context, opts ListOptions) (ProviderStatePage, error) {
+	return s.store.ListProviderStates(ctx, opts)
 }
 
-func (s *Service) ListDataSets(ctx context.Context, opts ListOptions) (DataSetSnapshotPage, error) {
-	return s.store.ListDataSetSnapshots(ctx, opts)
+func (s *Service) ListDataSets(ctx context.Context, opts ListOptions) (DataSetStatePage, error) {
+	return s.store.ListDataSetStates(ctx, opts)
 }
 
-func (s *Service) DataSetSnapshotsByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]DataSetSnapshot, error) {
-	return s.store.GetDataSetSnapshotsByLocalIDs(ctx, localIDs)
+func (s *Service) DataSetStatesByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]DataSetState, error) {
+	return s.store.GetDataSetStatesByLocalIDs(ctx, localIDs)
 }
 
 func (s *Service) listLocalDataSets(ctx context.Context) ([]LocalDataSet, error) {
@@ -179,7 +179,7 @@ func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, fn func(co
 	defer cancel()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			call.err = fmt.Errorf("availability refresh panic: %v", recovered)
+			call.err = fmt.Errorf("observability refresh panic: %v", recovered)
 		}
 		g.mu.Lock()
 		if g.call == call {

@@ -63,14 +63,14 @@ const filecoinPayloadFieldPaths: Record<(typeof filecoinPayloadKeys)[number], st
   default_copies: 'filecoin.default_copies',
 }
 
-const filecoinAvailabilityPayloadKeys = ['interval', 'timeout', 'concurrency'] as const satisfies Array<
-  keyof SettingsFilecoinConfig['availability']
+const filecoinObservabilityPayloadKeys = ['interval', 'timeout', 'concurrency'] as const satisfies Array<
+  keyof SettingsFilecoinConfig['observability']
 >
 
-const filecoinAvailabilityPayloadFieldPaths: Record<(typeof filecoinAvailabilityPayloadKeys)[number], string> = {
-  interval: 'filecoin.availability.interval',
-  timeout: 'filecoin.availability.timeout',
-  concurrency: 'filecoin.availability.concurrency',
+const filecoinObservabilityPayloadFieldPaths: Record<(typeof filecoinObservabilityPayloadKeys)[number], string> = {
+  interval: 'filecoin.observability.interval',
+  timeout: 'filecoin.observability.timeout',
+  concurrency: 'filecoin.observability.concurrency',
 }
 
 const checkTitles: Record<string, string> = {
@@ -176,19 +176,19 @@ export function buildFilecoinPreflightPayload(
       Object.assign(out, { [key]: value })
     }
   }
-  const availabilitySource = source.availability
-  if (availabilitySource && typeof availabilitySource === 'object' && !Array.isArray(availabilitySource)) {
-    const availability: NonNullable<FilecoinReadinessPreflightPayload['filecoin']['availability']> = {}
-    const availabilityRecord = availabilitySource as Record<string, unknown>
-    for (const key of filecoinAvailabilityPayloadKeys) {
-      if (Object.keys(envManaged).includes(filecoinAvailabilityPayloadFieldPaths[key])) continue
-      const value = availabilityRecord[key]
+  const observabilitySource = source.observability
+  if (observabilitySource && typeof observabilitySource === 'object' && !Array.isArray(observabilitySource)) {
+    const observability: NonNullable<FilecoinReadinessPreflightPayload['filecoin']['observability']> = {}
+    const observabilityRecord = observabilitySource as Record<string, unknown>
+    for (const key of filecoinObservabilityPayloadKeys) {
+      if (Object.keys(envManaged).includes(filecoinObservabilityPayloadFieldPaths[key])) continue
+      const value = observabilityRecord[key]
       if (value !== undefined) {
-        Object.assign(availability, { [key]: value })
+        Object.assign(observability, { [key]: value })
       }
     }
-    if (Object.keys(availability).length > 0) {
-      out.availability = availability
+    if (Object.keys(observability).length > 0) {
+      out.observability = observability
     }
   }
   return { filecoin: out }

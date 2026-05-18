@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 )
 
@@ -53,11 +53,11 @@ func TestFilecoinReadinessRuntime(t *testing.T) {
 	}
 }
 
-func TestFilecoinReadinessAvailabilityNoSnapshotWarns(t *testing.T) {
+func TestFilecoinReadinessObservabilityNoStateWarns(t *testing.T) {
 	srv := (&Server{logger: testLogger()}).
 		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithAvailability(availability.NewService(availability.ServiceOptions{
-			Store:           &availabilityAPIStore{},
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store:           &observabilityAPIStore{},
 			RefreshInterval: time.Minute,
 		}))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
@@ -75,21 +75,21 @@ func TestFilecoinReadinessAvailabilityNoSnapshotWarns(t *testing.T) {
 	if body.Status != synapse.ReadinessStatusWarning {
 		t.Fatalf("readiness status = %s, want warning", body.Status)
 	}
-	assertReadinessCheckStatus(t, body.Checks, "availability_providers", synapse.ReadinessStatusWarning)
-	assertReadinessCheckStatus(t, body.Checks, "availability_data_sets", synapse.ReadinessStatusWarning)
+	assertReadinessCheckStatus(t, body.Checks, "observability_providers", synapse.ReadinessStatusWarning)
+	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusWarning)
 }
 
 func TestFilecoinReadinessEmptyDataSetInventoryIsReady(t *testing.T) {
 	checkedAt := time.Now().UTC()
 	srv, _ := newBucketAPITestServer(t)
 	srv.WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithAvailability(availability.NewService(availability.ServiceOptions{
-			Store: &availabilityReadinessStore{
-				providers: availability.ProviderSnapshotPage{
-					Summary:       availability.Summary{Total: 1, Available: 1},
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityReadinessStore{
+				providers: observability.ProviderStatePage{
+					Summary:       observability.Summary{Total: 1, Available: 1},
 					LastCheckedAt: &checkedAt,
 				},
-				dataSets: availability.DataSetSnapshotPage{},
+				dataSets: observability.DataSetStatePage{},
 			},
 			RefreshInterval: time.Minute,
 		}))
@@ -105,13 +105,13 @@ func TestFilecoinReadinessEmptyDataSetInventoryIsReady(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	assertReadinessCheckStatus(t, body.Checks, "availability_data_sets", synapse.ReadinessStatusReady)
+	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusReady)
 	if body.Status != synapse.ReadinessStatusReady {
 		t.Fatalf("readiness status = %s, want ready", body.Status)
 	}
 }
 
-func TestFilecoinReadinessLocalDataSetWithoutSnapshotWarns(t *testing.T) {
+func TestFilecoinReadinessLocalDataSetWithoutStateWarns(t *testing.T) {
 	checkedAt := time.Now().UTC()
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
@@ -133,13 +133,13 @@ func TestFilecoinReadinessLocalDataSetWithoutSnapshotWarns(t *testing.T) {
 		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
 	})
 	srv.WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithAvailability(availability.NewService(availability.ServiceOptions{
-			Store: &availabilityReadinessStore{
-				providers: availability.ProviderSnapshotPage{
-					Summary:       availability.Summary{Total: 1, Available: 1},
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityReadinessStore{
+				providers: observability.ProviderStatePage{
+					Summary:       observability.Summary{Total: 1, Available: 1},
 					LastCheckedAt: &checkedAt,
 				},
-				dataSets: availability.DataSetSnapshotPage{},
+				dataSets: observability.DataSetStatePage{},
 			},
 			RefreshInterval: time.Minute,
 		}))
@@ -155,21 +155,21 @@ func TestFilecoinReadinessLocalDataSetWithoutSnapshotWarns(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	assertReadinessCheckStatus(t, body.Checks, "availability_data_sets", synapse.ReadinessStatusWarning)
+	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusWarning)
 }
 
 func TestFilecoinReadinessProviderHTTPDegradedDoesNotWarn(t *testing.T) {
 	checkedAt := time.Now().UTC()
 	srv := (&Server{logger: testLogger()}).
 		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithAvailability(availability.NewService(availability.ServiceOptions{
-			Store: &availabilityReadinessStore{
-				providers: availability.ProviderSnapshotPage{
-					Summary:       availability.Summary{Total: 11, Degraded: 11},
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityReadinessStore{
+				providers: observability.ProviderStatePage{
+					Summary:       observability.Summary{Total: 11, Degraded: 11},
 					LastCheckedAt: &checkedAt,
 				},
-				dataSets: availability.DataSetSnapshotPage{
-					Summary:       availability.Summary{Total: 1, Available: 1},
+				dataSets: observability.DataSetStatePage{
+					Summary:       observability.Summary{Total: 1, Available: 1},
 					LastCheckedAt: &checkedAt,
 				},
 			},
@@ -187,14 +187,14 @@ func TestFilecoinReadinessProviderHTTPDegradedDoesNotWarn(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	assertReadinessCheckStatus(t, body.Checks, "availability_providers", synapse.ReadinessStatusReady)
+	assertReadinessCheckStatus(t, body.Checks, "observability_providers", synapse.ReadinessStatusReady)
 }
 
-func TestFilecoinReadinessAvailabilityPartialErrorsAreSanitized(t *testing.T) {
+func TestFilecoinReadinessObservabilityPartialErrorsAreSanitized(t *testing.T) {
 	srv := (&Server{logger: testLogger()}).
 		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithAvailability(availability.NewService(availability.ServiceOptions{
-			Store: &availabilityReadinessStore{
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityReadinessStore{
 				providerErr: errors.New("rpc failed with sensitive detail"),
 			},
 			RefreshInterval: time.Minute,
@@ -211,8 +211,8 @@ func TestFilecoinReadinessAvailabilityPartialErrorsAreSanitized(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	if got := body.PartialErrors["availability_providers"]; got != "availability query failed" {
-		t.Fatalf("availability provider partial error = %q, want sanitized message", got)
+	if got := body.PartialErrors["observability_providers"]; got != "health query failed" {
+		t.Fatalf("provider health partial error = %q, want sanitized message", got)
 	}
 }
 
@@ -331,9 +331,9 @@ func TestFilecoinReadinessPreflightRejectsEnvManagedAndInvalidDraftFields(t *tes
 			want:    "filecoin.default_copies",
 		},
 		{
-			name:    "invalid availability draft",
-			payload: `{"filecoin":{"availability":{"timeout":"0s"}}}`,
-			want:    "filecoin.availability.timeout",
+			name:    "invalid observability draft",
+			payload: `{"filecoin":{"observability":{"timeout":"0s"}}}`,
+			want:    "filecoin.observability.timeout",
 		},
 	}
 
@@ -430,35 +430,35 @@ func (f *fakeFilecoinReadinessProbe) CheckDraft(_ context.Context, cfg synapse.R
 	return f.draft
 }
 
-type availabilityReadinessStore struct {
-	providers   availability.ProviderSnapshotPage
-	dataSets    availability.DataSetSnapshotPage
+type observabilityReadinessStore struct {
+	providers   observability.ProviderStatePage
+	dataSets    observability.DataSetStatePage
 	providerErr error
 	dataSetErr  error
 }
 
-func (s *availabilityReadinessStore) ReplaceProviderSnapshots(context.Context, []availability.ProviderSnapshot) error {
+func (s *observabilityReadinessStore) ReplaceProviderStates(context.Context, []observability.ProviderState) error {
 	return nil
 }
 
-func (s *availabilityReadinessStore) ListProviderSnapshots(context.Context, availability.ListOptions) (availability.ProviderSnapshotPage, error) {
+func (s *observabilityReadinessStore) ListProviderStates(context.Context, observability.ListOptions) (observability.ProviderStatePage, error) {
 	if s.providerErr != nil {
-		return availability.ProviderSnapshotPage{}, s.providerErr
+		return observability.ProviderStatePage{}, s.providerErr
 	}
 	return s.providers, nil
 }
 
-func (s *availabilityReadinessStore) ReplaceDataSetSnapshots(context.Context, []availability.DataSetSnapshot) error {
+func (s *observabilityReadinessStore) ReplaceDataSetStates(context.Context, []observability.DataSetState) error {
 	return nil
 }
 
-func (s *availabilityReadinessStore) ListDataSetSnapshots(context.Context, availability.ListOptions) (availability.DataSetSnapshotPage, error) {
+func (s *observabilityReadinessStore) ListDataSetStates(context.Context, observability.ListOptions) (observability.DataSetStatePage, error) {
 	if s.dataSetErr != nil {
-		return availability.DataSetSnapshotPage{}, s.dataSetErr
+		return observability.DataSetStatePage{}, s.dataSetErr
 	}
 	return s.dataSets, nil
 }
 
-func (s *availabilityReadinessStore) GetDataSetSnapshotsByLocalIDs(context.Context, []int64) (map[int64]availability.DataSetSnapshot, error) {
+func (s *observabilityReadinessStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
 	return nil, nil
 }

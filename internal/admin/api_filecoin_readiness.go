@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 )
 
@@ -30,7 +30,7 @@ func (s *Server) handleAPIFilecoinReadiness(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	result := s.filecoinReadiness.CheckRuntime(r.Context())
-	result = s.withAvailabilityReadiness(r.Context(), result)
+	result = s.withObservabilityReadiness(r.Context(), result)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -78,69 +78,69 @@ func (s *Server) handleAPIFilecoinReadinessPreflight(w http.ResponseWriter, r *h
 	writeJSON(w, http.StatusOK, s.filecoinReadiness.CheckDraft(r.Context(), filecoinReadinessConfig(cfg)))
 }
 
-func (s *Server) withAvailabilityReadiness(ctx context.Context, result synapse.ReadinessResult) synapse.ReadinessResult {
-	if s.availability == nil {
+func (s *Server) withObservabilityReadiness(ctx context.Context, result synapse.ReadinessResult) synapse.ReadinessResult {
+	if s.observability == nil {
 		return result
 	}
-	providers, err := s.availability.ListProviders(ctx, availabilityReadinessListOptions())
+	providers, err := s.observability.ListProviders(ctx, observabilityReadinessListOptions())
 	if err != nil {
 		result.Checks = append(result.Checks, synapse.ReadinessCheck{
-			ID:      "availability_providers",
+			ID:      "observability_providers",
 			Status:  synapse.ReadinessStatusWarning,
-			Message: "Provider availability snapshots could not be loaded.",
+			Message: "Provider health state could not be loaded.",
 		})
-		addReadinessPartialError(&result, "availability_providers", err)
+		addReadinessPartialError(&result, "observability_providers", err)
 		return finishReadinessResult(result)
 	}
-	result.Checks = append(result.Checks, providerAvailabilityReadinessCheck(
-		"availability_providers",
-		"Provider availability has no unavailable or unknown snapshots.",
-		"Provider availability needs attention.",
+	result.Checks = append(result.Checks, providerObservabilityReadinessCheck(
+		"observability_providers",
+		"Provider health has no unavailable or unknown state.",
+		"Provider health needs attention.",
 		providers.Summary,
 		providers.LastCheckedAt,
-		s.availability.RefreshInterval(),
+		s.observability.RefreshInterval(),
 	))
 
-	dataSets, err := s.availability.ListDataSets(ctx, availabilityReadinessListOptions())
+	dataSets, err := s.observability.ListDataSets(ctx, observabilityReadinessListOptions())
 	if err != nil {
 		result.Checks = append(result.Checks, synapse.ReadinessCheck{
-			ID:      "availability_data_sets",
+			ID:      "observability_data_sets",
 			Status:  synapse.ReadinessStatusWarning,
-			Message: "Local data set availability snapshots could not be loaded.",
+			Message: "Local data set storage health state could not be loaded.",
 		})
-		addReadinessPartialError(&result, "availability_data_sets", err)
+		addReadinessPartialError(&result, "observability_data_sets", err)
 		return finishReadinessResult(result)
 	}
-	result.Checks = append(result.Checks, availabilityReadinessCheck(
-		"availability_data_sets",
-		"Local data set availability snapshots are healthy.",
-		"Local data set availability needs attention.",
+	result.Checks = append(result.Checks, observabilityReadinessCheck(
+		"observability_data_sets",
+		"Local data set storage health is healthy.",
+		"Local data set storage health needs attention.",
 		dataSets.Summary,
 		dataSets.LastCheckedAt,
-		s.availability.RefreshInterval(),
+		s.observability.RefreshInterval(),
 		dataSets.LastCheckedAt == nil && dataSets.Summary.Total == 0 && s.localDataSetInventoryEmpty(ctx),
 	))
 	return finishReadinessResult(result)
 }
 
-func availabilityReadinessListOptions() availability.ListOptions {
-	return availability.ListOptions{Limit: 1}
+func observabilityReadinessListOptions() observability.ListOptions {
+	return observability.ListOptions{Limit: 1}
 }
 
-func providerAvailabilityReadinessCheck(id, readyMessage, attentionMessage string, summary availability.Summary, lastCheckedAt *time.Time, interval time.Duration) synapse.ReadinessCheck {
+func providerObservabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, lastCheckedAt *time.Time, interval time.Duration) synapse.ReadinessCheck {
 	if lastCheckedAt == nil {
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " No availability snapshot has been recorded yet.",
+			Message: attentionMessage + " No health state has been recorded yet.",
 		}
 	}
-	stale, _ := availabilityFreshness(lastCheckedAt, interval)
+	stale, _ := observabilityFreshness(lastCheckedAt, interval)
 	if stale {
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " The latest availability snapshot is stale.",
+			Message: attentionMessage + " The latest health state is stale.",
 		}
 	}
 	if summary.Unknown > 0 || summary.Unavailable > 0 {
@@ -158,7 +158,7 @@ func providerAvailabilityReadinessCheck(id, readyMessage, attentionMessage strin
 	return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
 }
 
-func availabilityReadinessCheck(id, readyMessage, attentionMessage string, summary availability.Summary, lastCheckedAt *time.Time, interval time.Duration, emptyInventory bool) synapse.ReadinessCheck {
+func observabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, lastCheckedAt *time.Time, interval time.Duration, emptyInventory bool) synapse.ReadinessCheck {
 	if lastCheckedAt == nil {
 		if emptyInventory && summary.Total == 0 {
 			return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
@@ -166,15 +166,15 @@ func availabilityReadinessCheck(id, readyMessage, attentionMessage string, summa
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " No availability snapshot has been recorded yet.",
+			Message: attentionMessage + " No health state has been recorded yet.",
 		}
 	}
-	stale, _ := availabilityFreshness(lastCheckedAt, interval)
+	stale, _ := observabilityFreshness(lastCheckedAt, interval)
 	if stale {
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " The latest availability snapshot is stale.",
+			Message: attentionMessage + " The latest health state is stale.",
 		}
 	}
 	if summary.Unknown > 0 || summary.Unavailable > 0 || summary.Degraded > 0 {
@@ -219,7 +219,7 @@ func addReadinessPartialError(result *synapse.ReadinessResult, field string, err
 	if result.PartialErrors == nil {
 		result.PartialErrors = make(map[string]string)
 	}
-	result.PartialErrors[field] = "availability query failed"
+	result.PartialErrors[field] = "health query failed"
 }
 
 func filecoinReadinessConfig(cfg *config.Config) synapse.ReadinessConfig {

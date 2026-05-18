@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -902,7 +902,7 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDataSetSummaries: %v", err)
 	}
-	if err := repos.Availability.ReplaceDataSetSnapshots(ctx, []availability.DataSetSnapshot{
+	if err := repos.Observability.ReplaceDataSetStates(ctx, []observability.DataSetState{
 		{
 			LocalDataSetID: summaries[0].ID,
 			BucketID:       bucket.ID,
@@ -910,16 +910,16 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 			ProviderID:     summaries[0].ProviderID,
 			ChainDataSetID: summaries[0].DataSetID,
 			LocalStatus:    summaries[0].Status,
-			Status:         availability.StatusDegraded,
-			ReasonCodes:    []availability.ReasonCode{availability.ReasonChainDataSetUnmanaged},
+			Status:         observability.StatusDegraded,
+			ReasonCodes:    []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged},
 			LastCheckedAt:  time.Now().UTC(),
 			Evidence:       map[string]any{},
 		},
 	}); err != nil {
-		t.Fatalf("ReplaceDataSetSnapshots: %v", err)
+		t.Fatalf("ReplaceDataSetStates: %v", err)
 	}
-	srv.WithAvailability(availability.NewService(availability.ServiceOptions{
-		Store:           repos.Availability,
+	srv.WithObservability(observability.NewService(observability.ServiceOptions{
+		Store:           repos.Observability,
 		RefreshInterval: time.Hour,
 	}))
 
@@ -934,6 +934,26 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	var raw struct {
+		DataSets []map[string]json.RawMessage `json:"data_sets"`
+	}
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		t.Fatalf("Unmarshal raw: %v", err)
+	}
+	if len(raw.DataSets) == 0 {
+		t.Fatal("raw data_sets is empty")
+	}
+	if _, ok := raw.DataSets[0]["avail"+"ability"]; ok {
+		t.Fatalf("legacy data set field is present: %s", payload)
+	}
+	if _, ok := raw.DataSets[0]["observability"]; ok {
+		t.Fatalf("internal data set field is present: %s", payload)
+	}
+
 	var body struct {
 		DataSets []struct {
 			CopyIndex        int                       `json:"copy_index"`
@@ -941,15 +961,15 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
 			DataSetID        string                    `json:"data_set_id"`
 			Status           string                    `json:"status"`
-			Availability     *struct {
-				Status      string                    `json:"status"`
-				ReasonCodes []availability.ReasonCode `json:"reason_codes"`
-				Stale       bool                      `json:"stale"`
-			} `json:"availability"`
+			StorageHealth    *struct {
+				Status      string                     `json:"status"`
+				ReasonCodes []observability.ReasonCode `json:"reason_codes"`
+				Stale       bool                       `json:"stale"`
+			} `json:"storage_health"`
 		} `json:"data_sets"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
 	}
 	if len(body.DataSets) != 2 {
 		t.Fatalf("data_sets len = %d, want 2", len(body.DataSets))
@@ -960,11 +980,11 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if body.DataSets[0].ProviderIdentity == nil || body.DataSets[0].ProviderIdentity.Name != "alpha-pdp" || body.DataSets[0].ProviderIdentity.FilecoinActorID != "f01234" {
 		t.Fatalf("provider_identity = %#v, want enriched provider identity", body.DataSets[0].ProviderIdentity)
 	}
-	if body.DataSets[0].Availability == nil ||
-		body.DataSets[0].Availability.Status != string(availability.StatusDegraded) ||
-		!reflect.DeepEqual(body.DataSets[0].Availability.ReasonCodes, []availability.ReasonCode{availability.ReasonChainDataSetUnmanaged}) ||
-		body.DataSets[0].Availability.Stale {
-		t.Fatalf("availability = %#v, want fresh degraded data set availability", body.DataSets[0].Availability)
+	if body.DataSets[0].StorageHealth == nil ||
+		body.DataSets[0].StorageHealth.Status != string(observability.StatusDegraded) ||
+		!reflect.DeepEqual(body.DataSets[0].StorageHealth.ReasonCodes, []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged}) ||
+		body.DataSets[0].StorageHealth.Stale {
+		t.Fatalf("storage_health = %#v, want fresh degraded data set storage health", body.DataSets[0].StorageHealth)
 	}
 	if body.DataSets[1].ProviderID != "202" || body.DataSets[1].ProviderIdentity != nil {
 		t.Fatalf("second data set = %#v, want provider_id compatibility without identity when lookup fails", body.DataSets[1])
@@ -974,11 +994,11 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	}
 }
 
-func TestAPIBucketDetail_DataSetAvailabilityQueryFailureReturnsUnknownPlaceholder(t *testing.T) {
+func TestAPIBucketDetail_DataSetStorageHealthQueryFailureReturnsUnknownPlaceholder(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "detail-datasets-availability-error", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "detail-datasets-storage-health-error", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -986,23 +1006,23 @@ func TestAPIBucketDetail_DataSetAvailabilityQueryFailureReturnsUnknownPlaceholde
 		BucketID:        bucket.ID,
 		SourceVersionID: "01J000000000000000AVAILERR",
 		ContentSize:     1,
-		Checksum:        "checksum-dataset-availability-error",
+		Checksum:        "checksum-dataset-storage-health-error",
 		RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
 	}
-	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, "bafk2bzaceavailabilityerror", []adminStorageCopySeed{
+	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, "bafk2bzacestoragehealtherror", []adminStorageCopySeed{
 		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
 	})
-	srv.WithAvailability(availability.NewService(availability.ServiceOptions{
-		Store: &bucketAvailabilityErrorStore{err: errors.New("database password leaked detail")},
+	srv.WithObservability(observability.NewService(observability.ServiceOptions{
+		Store: &bucketStorageHealthErrorStore{err: errors.New("database password leaked detail")},
 	}))
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/detail-datasets-availability-error")
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/detail-datasets-storage-health-error")
 	if err != nil {
 		t.Fatalf("GET bucket detail: %v", err)
 	}
@@ -1012,11 +1032,11 @@ func TestAPIBucketDetail_DataSetAvailabilityQueryFailureReturnsUnknownPlaceholde
 	}
 	var body struct {
 		DataSets []struct {
-			Availability *struct {
-				Status      string                    `json:"status"`
-				ReasonCodes []availability.ReasonCode `json:"reason_codes"`
-				LastError   string                    `json:"last_error"`
-			} `json:"availability"`
+			StorageHealth *struct {
+				Status      string                     `json:"status"`
+				ReasonCodes []observability.ReasonCode `json:"reason_codes"`
+				LastError   string                     `json:"last_error"`
+			} `json:"storage_health"`
 		} `json:"data_sets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -1025,23 +1045,23 @@ func TestAPIBucketDetail_DataSetAvailabilityQueryFailureReturnsUnknownPlaceholde
 	if len(body.DataSets) != 1 {
 		t.Fatalf("data_sets len = %d, want 1", len(body.DataSets))
 	}
-	info := body.DataSets[0].Availability
-	if info == nil || info.Status != string(availability.StatusUnknown) || len(info.ReasonCodes) != 0 || info.LastError != "availability query failed" {
-		t.Fatalf("availability = %#v, want sanitized unknown placeholder", info)
+	info := body.DataSets[0].StorageHealth
+	if info == nil || info.Status != string(observability.StatusUnknown) || len(info.ReasonCodes) != 0 || info.LastError != "storage health query failed" {
+		t.Fatalf("storage_health = %#v, want sanitized unknown placeholder", info)
 	}
 	if strings.Contains(info.LastError, "password") {
-		t.Fatalf("availability last_error leaked detail: %q", info.LastError)
+		t.Fatalf("storage health last_error leaked detail: %q", info.LastError)
 	}
 }
 
-func TestDataSetAvailabilityInfoEncodesEmptyReasonCodesArray(t *testing.T) {
+func TestDataSetStorageHealthInfoEncodesEmptyReasonCodesArray(t *testing.T) {
 	checkedAt := time.Now().UTC()
 	srv := (&Server{logger: testLogger()}).
-		WithAvailability(availability.NewService(availability.ServiceOptions{RefreshInterval: time.Hour}))
+		WithObservability(observability.NewService(observability.ServiceOptions{RefreshInterval: time.Hour}))
 
-	info := srv.dataSetAvailabilityInfo(availability.DataSetSnapshot{
+	info := srv.dataSetStorageHealthInfo(observability.DataSetState{
 		LocalDataSetID: 1,
-		Status:         availability.StatusAvailable,
+		Status:         observability.StatusAvailable,
 		LastCheckedAt:  checkedAt,
 	})
 	body, err := json.Marshal(info)
@@ -1049,34 +1069,34 @@ func TestDataSetAvailabilityInfoEncodesEmptyReasonCodesArray(t *testing.T) {
 		t.Fatalf("Marshal: %v", err)
 	}
 	if strings.Contains(string(body), `"reason_codes":null`) {
-		t.Fatalf("availability reason_codes encoded as null: %s", body)
+		t.Fatalf("storage health reason_codes encoded as null: %s", body)
 	}
 	if !strings.Contains(string(body), `"reason_codes":[]`) {
-		t.Fatalf("availability reason_codes should be an empty array: %s", body)
+		t.Fatalf("storage health reason_codes should be an empty array: %s", body)
 	}
 }
 
-type bucketAvailabilityErrorStore struct {
+type bucketStorageHealthErrorStore struct {
 	err error
 }
 
-func (s *bucketAvailabilityErrorStore) ReplaceProviderSnapshots(context.Context, []availability.ProviderSnapshot) error {
+func (s *bucketStorageHealthErrorStore) ReplaceProviderStates(context.Context, []observability.ProviderState) error {
 	return nil
 }
 
-func (s *bucketAvailabilityErrorStore) ListProviderSnapshots(context.Context, availability.ListOptions) (availability.ProviderSnapshotPage, error) {
-	return availability.ProviderSnapshotPage{}, nil
+func (s *bucketStorageHealthErrorStore) ListProviderStates(context.Context, observability.ListOptions) (observability.ProviderStatePage, error) {
+	return observability.ProviderStatePage{}, nil
 }
 
-func (s *bucketAvailabilityErrorStore) ReplaceDataSetSnapshots(context.Context, []availability.DataSetSnapshot) error {
+func (s *bucketStorageHealthErrorStore) ReplaceDataSetStates(context.Context, []observability.DataSetState) error {
 	return nil
 }
 
-func (s *bucketAvailabilityErrorStore) ListDataSetSnapshots(context.Context, availability.ListOptions) (availability.DataSetSnapshotPage, error) {
-	return availability.DataSetSnapshotPage{}, nil
+func (s *bucketStorageHealthErrorStore) ListDataSetStates(context.Context, observability.ListOptions) (observability.DataSetStatePage, error) {
+	return observability.DataSetStatePage{}, nil
 }
 
-func (s *bucketAvailabilityErrorStore) GetDataSetSnapshotsByLocalIDs(context.Context, []int64) (map[int64]availability.DataSetSnapshot, error) {
+func (s *bucketStorageHealthErrorStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
 	return nil, s.err
 }
 

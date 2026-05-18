@@ -14,13 +14,13 @@ import (
 
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/strahe/synaps3/internal/admin"
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/buildinfo"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/provider"
 	"github.com/strahe/synaps3/internal/s3access"
 	"github.com/strahe/synaps3/internal/s3iam"
@@ -313,7 +313,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		synapse.AdaptReadinessClient(client),
 		synapse.WithReadinessLogger(logger),
 	)
-	availabilitySvc := newAvailabilityService(cfg, repos, client, logger)
+	observabilitySvc := newObservabilityService(cfg, repos, client, logger)
 	walletReceiptClient, err := ethclient.DialContext(ctx, cfg.Filecoin.RPCURL)
 	if err != nil {
 		return fmt.Errorf("creating wallet receipt client: %w", err)
@@ -380,7 +380,7 @@ func runServe(ctx context.Context, src config.Source) error {
 			worker.WithWalletOperationEventPublisher(adminEvents)),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
 	go wm.Start(ctx)
-	go availability.NewRunner(availabilitySvc, logger).Run(ctx)
+	go observability.NewRunner(observabilitySvc, logger).Run(ctx)
 
 	// Start admin server (healthz + metrics).
 	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, cfg.Filecoin.DefaultCopies, logger).
@@ -390,7 +390,7 @@ func runServe(ctx context.Context, src config.Source) error {
 		WithProviderIdentityResolver(admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger)).
 		WithSettings(settingsSvc).
 		WithFilecoinReadiness(filecoinReadiness).
-		WithAvailability(availabilitySvc).
+		WithObservability(observabilitySvc).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithS3IAM(iamSvc, rootAccount.Access)
 	errCh := make(chan error, 2)
@@ -449,26 +449,26 @@ func runSetupMode(ctx context.Context, cfg *config.Config, settingsSvc *admin.Se
 	return nil
 }
 
-func newAvailabilityService(cfg *config.Config, repos *repository.Repositories, client *sdk.Client, logger *slog.Logger) *availability.Service {
+func newObservabilityService(cfg *config.Config, repos *repository.Repositories, client *sdk.Client, logger *slog.Logger) *observability.Service {
 	providerHealth := provider.NewHealthChecker(nil)
-	checker := availability.NewChecker(availability.CheckerOptions{
-		ProviderSource: availability.NewRegistryProviderSource(provider.NewRegistryService(client.SPRegistry())),
+	checker := observability.NewChecker(observability.CheckerOptions{
+		ProviderSource: observability.NewRegistryProviderSource(provider.NewRegistryService(client.SPRegistry())),
 		ProviderHealth: providerHealth.Check,
-		DataSetScanner: availability.NewStorageDataSetScanner(client.Storage()),
-		Timeout:        cfg.Filecoin.Availability.Timeout,
-		Concurrency:    cfg.Filecoin.Availability.Concurrency,
+		DataSetScanner: observability.NewStorageDataSetScanner(client.Storage()),
+		Timeout:        cfg.Filecoin.Observability.Timeout,
+		Concurrency:    cfg.Filecoin.Observability.Concurrency,
 		Logger:         logger,
 	})
-	return availability.NewService(availability.ServiceOptions{
+	return observability.NewService(observability.ServiceOptions{
 		Checker: checker,
-		LocalDataSets: availability.LocalDataSetSourceFunc(func(ctx context.Context) ([]availability.LocalDataSet, error) {
+		LocalDataSets: observability.LocalDataSetSourceFunc(func(ctx context.Context) ([]observability.LocalDataSet, error) {
 			summaries, err := repos.Uploads.ListDataSetSummaries(ctx, 0)
 			if err != nil {
 				return nil, err
 			}
-			out := make([]availability.LocalDataSet, 0, len(summaries))
+			out := make([]observability.LocalDataSet, 0, len(summaries))
 			for _, summary := range summaries {
-				out = append(out, availability.LocalDataSet{
+				out = append(out, observability.LocalDataSet{
 					ID:              summary.ID,
 					BucketID:        summary.BucketID,
 					BucketName:      summary.BucketName,
@@ -481,8 +481,8 @@ func newAvailabilityService(cfg *config.Config, repos *repository.Repositories, 
 			}
 			return out, nil
 		}),
-		Store:           repos.Availability,
-		RefreshInterval: cfg.Filecoin.Availability.Interval,
+		Store:           repos.Observability,
+		RefreshInterval: cfg.Filecoin.Observability.Interval,
 	})
 }
 
@@ -515,9 +515,9 @@ func setupModeAllowedField(field string) bool {
 		"filecoin.private_key",
 		"filecoin.source",
 		"filecoin.default_copies",
-		"filecoin.availability.interval",
-		"filecoin.availability.timeout",
-		"filecoin.availability.concurrency",
+		"filecoin.observability.interval",
+		"filecoin.observability.timeout",
+		"filecoin.observability.concurrency",
 		"worker.upload.concurrency",
 		"worker.upload.poll_interval",
 		"worker.upload.max_retries",

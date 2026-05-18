@@ -5,23 +5,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/availability"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/uptrace/bun"
 )
 
-func TestAvailabilityRepoReplacesProviderSnapshotsAndSummarizes(t *testing.T) {
+func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
 
-	err := repos.Availability.ReplaceProviderSnapshots(ctx, []availability.ProviderSnapshot{
+	err := repos.Observability.ReplaceProviderStates(ctx, []observability.ProviderState{
 		{
 			ProviderID:    onChainID(t, "101"),
-			Status:        availability.StatusAvailable,
-			ReasonCodes:   []availability.ReasonCode{},
+			Status:        observability.StatusAvailable,
+			ReasonCodes:   []observability.ReasonCode{},
 			Active:        true,
 			HealthStatus:  "reachable",
 			LastCheckedAt: checkedAt,
@@ -29,8 +29,8 @@ func TestAvailabilityRepoReplacesProviderSnapshotsAndSummarizes(t *testing.T) {
 		},
 		{
 			ProviderID:    onChainID(t, "202"),
-			Status:        availability.StatusDegraded,
-			ReasonCodes:   []availability.ReasonCode{availability.ReasonProviderHTTPUnreachable},
+			Status:        observability.StatusDegraded,
+			ReasonCodes:   []observability.ReasonCode{observability.ReasonProviderHTTPUnreachable},
 			Active:        true,
 			HealthStatus:  "unreachable",
 			LastCheckedAt: checkedAt,
@@ -38,68 +38,68 @@ func TestAvailabilityRepoReplacesProviderSnapshotsAndSummarizes(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("ReplaceProviderSnapshots: %v", err)
+		t.Fatalf("ReplaceProviderStates: %v", err)
 	}
 
-	page, err := repos.Availability.ListProviderSnapshots(ctx, availability.ListOptions{Limit: 10})
+	page, err := repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 10})
 	if err != nil {
-		t.Fatalf("ListProviderSnapshots: %v", err)
+		t.Fatalf("ListProviderStates: %v", err)
 	}
 	if page.Total != 2 || page.Summary.Total != 2 || page.Summary.Available != 1 || page.Summary.Degraded != 1 {
 		t.Fatalf("provider page summary = total:%d summary:%+v, want two providers split available/degraded", page.Total, page.Summary)
 	}
 
-	page, err = repos.Availability.ListProviderSnapshots(ctx, availability.ListOptions{
-		Status: availability.StatusDegraded,
+	page, err = repos.Observability.ListProviderStates(ctx, observability.ListOptions{
+		Status: observability.StatusDegraded,
 		Limit:  10,
 	})
 	if err != nil {
-		t.Fatalf("ListProviderSnapshots filtered: %v", err)
+		t.Fatalf("ListProviderStates filtered: %v", err)
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ProviderID.String() != "202" {
 		t.Fatalf("filtered provider page = total:%d items:%+v, want provider 202", page.Total, page.Items)
 	}
 
-	if err := repos.Availability.ReplaceProviderSnapshots(ctx, []availability.ProviderSnapshot{
+	if err := repos.Observability.ReplaceProviderStates(ctx, []observability.ProviderState{
 		{
 			ProviderID:    onChainID(t, "101"),
-			Status:        availability.StatusUnavailable,
-			ReasonCodes:   []availability.ReasonCode{availability.ReasonProviderInactive},
+			Status:        observability.StatusUnavailable,
+			ReasonCodes:   []observability.ReasonCode{observability.ReasonProviderInactive},
 			Active:        false,
 			HealthStatus:  "reachable",
 			LastCheckedAt: checkedAt.Add(time.Minute),
 			Evidence:      map[string]any{},
 		},
 	}); err != nil {
-		t.Fatalf("ReplaceProviderSnapshots prune: %v", err)
+		t.Fatalf("ReplaceProviderStates prune: %v", err)
 	}
 
-	page, err = repos.Availability.ListProviderSnapshots(ctx, availability.ListOptions{Limit: 10})
+	page, err = repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 10})
 	if err != nil {
-		t.Fatalf("ListProviderSnapshots after prune: %v", err)
+		t.Fatalf("ListProviderStates after prune: %v", err)
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ProviderID.String() != "101" {
 		t.Fatalf("provider page after prune = total:%d items:%+v, want only provider 101", page.Total, page.Items)
 	}
 }
 
-func TestAvailabilityRepoProviderOrderAndPaginatedSummary(t *testing.T) {
+func TestObservabilityRepoProviderOrderAndPaginatedSummary(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
 
-	if err := repos.Availability.ReplaceProviderSnapshots(ctx, []availability.ProviderSnapshot{
-		{ProviderID: onChainID(t, "10"), Status: availability.StatusDegraded, ReasonCodes: []availability.ReasonCode{}, Active: true, HealthStatus: "reachable", LastCheckedAt: checkedAt},
-		{ProviderID: onChainID(t, "2"), Status: availability.StatusAvailable, ReasonCodes: []availability.ReasonCode{}, Active: true, HealthStatus: "reachable", LastCheckedAt: checkedAt},
-		{ProviderID: onChainID(t, "101"), Status: availability.StatusUnknown, ReasonCodes: []availability.ReasonCode{}, Active: true, HealthStatus: "unknown", LastCheckedAt: checkedAt},
+	if err := repos.Observability.ReplaceProviderStates(ctx, []observability.ProviderState{
+		{ProviderID: onChainID(t, "10"), Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{}, Active: true, HealthStatus: "reachable", LastCheckedAt: checkedAt},
+		{ProviderID: onChainID(t, "2"), Status: observability.StatusAvailable, ReasonCodes: []observability.ReasonCode{}, Active: true, HealthStatus: "reachable", LastCheckedAt: checkedAt},
+		{ProviderID: onChainID(t, "101"), Status: observability.StatusUnknown, ReasonCodes: []observability.ReasonCode{}, Active: true, HealthStatus: "unknown", LastCheckedAt: checkedAt},
 	}); err != nil {
-		t.Fatalf("ReplaceProviderSnapshots: %v", err)
+		t.Fatalf("ReplaceProviderStates: %v", err)
 	}
 
-	page, err := repos.Availability.ListProviderSnapshots(ctx, availability.ListOptions{Limit: 2, Offset: 1})
+	page, err := repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 2, Offset: 1})
 	if err != nil {
-		t.Fatalf("ListProviderSnapshots: %v", err)
+		t.Fatalf("ListProviderStates: %v", err)
 	}
 	if page.Total != 3 || page.Summary.Total != 3 || page.Summary.Available != 1 || page.Summary.Degraded != 1 || page.Summary.Unknown != 1 {
 		t.Fatalf("paginated provider summary = total:%d summary:%+v, want aggregate over all rows", page.Total, page.Summary)
@@ -109,7 +109,7 @@ func TestAvailabilityRepoProviderOrderAndPaginatedSummary(t *testing.T) {
 	}
 }
 
-func TestAvailabilityRepoReplacesDataSetSnapshotsAndFilters(t *testing.T) {
+func TestObservabilityRepoReplacesDataSetStatesAndFilters(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -120,7 +120,7 @@ func TestAvailabilityRepoReplacesDataSetSnapshotsAndFilters(t *testing.T) {
 	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
 
 	activePieces := int64(7)
-	err := repos.Availability.ReplaceDataSetSnapshots(ctx, []availability.DataSetSnapshot{
+	err := repos.Observability.ReplaceDataSetStates(ctx, []observability.DataSetState{
 		{
 			LocalDataSetID:   localA.ID,
 			BucketID:         bucketA.ID,
@@ -129,8 +129,8 @@ func TestAvailabilityRepoReplacesDataSetSnapshotsAndFilters(t *testing.T) {
 			ChainDataSetID:   localA.DataSetID,
 			ClientDataSetID:  localA.ClientDataSetID,
 			LocalStatus:      localA.Status,
-			Status:           availability.StatusAvailable,
-			ReasonCodes:      []availability.ReasonCode{},
+			Status:           observability.StatusAvailable,
+			ReasonCodes:      []observability.ReasonCode{},
 			ActivePieceCount: &activePieces,
 			LastCheckedAt:    checkedAt,
 			Evidence:         map[string]any{"active_piece_count": activePieces},
@@ -142,22 +142,22 @@ func TestAvailabilityRepoReplacesDataSetSnapshotsAndFilters(t *testing.T) {
 			ProviderID:     localB.ProviderID,
 			ChainDataSetID: localB.DataSetID,
 			LocalStatus:    localB.Status,
-			Status:         availability.StatusUnavailable,
-			ReasonCodes:    []availability.ReasonCode{availability.ReasonChainDataSetMissing},
+			Status:         observability.StatusUnavailable,
+			ReasonCodes:    []observability.ReasonCode{observability.ReasonChainDataSetMissing},
 			LastCheckedAt:  checkedAt,
 			Evidence:       map[string]any{},
 		},
 	})
 	if err != nil {
-		t.Fatalf("ReplaceDataSetSnapshots: %v", err)
+		t.Fatalf("ReplaceDataSetStates: %v", err)
 	}
 
-	page, err := repos.Availability.ListDataSetSnapshots(ctx, availability.ListOptions{
+	page, err := repos.Observability.ListDataSetStates(ctx, observability.ListOptions{
 		BucketID: bucketA.ID,
 		Limit:    10,
 	})
 	if err != nil {
-		t.Fatalf("ListDataSetSnapshots filtered by bucket: %v", err)
+		t.Fatalf("ListDataSetStates filtered by bucket: %v", err)
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].LocalDataSetID != localA.ID {
 		t.Fatalf("bucket-filtered data set page = total:%d items:%+v, want local data set A", page.Total, page.Items)
@@ -166,24 +166,24 @@ func TestAvailabilityRepoReplacesDataSetSnapshotsAndFilters(t *testing.T) {
 		t.Fatalf("active_piece_count = %#v, want 7", page.Items[0].ActivePieceCount)
 	}
 
-	page, err = repos.Availability.ListDataSetSnapshots(ctx, availability.ListOptions{Limit: 1, Offset: 1})
+	page, err = repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 1, Offset: 1})
 	if err != nil {
-		t.Fatalf("ListDataSetSnapshots paginated: %v", err)
+		t.Fatalf("ListDataSetStates paginated: %v", err)
 	}
 	if page.Total != 2 || page.Summary.Total != 2 || page.Summary.Available != 1 || page.Summary.Unavailable != 1 || len(page.Items) != 1 {
 		t.Fatalf("paginated data set page = total:%d summary:%+v items:%+v, want aggregate over filtered rows", page.Total, page.Summary, page.Items)
 	}
 
-	byLocalID, err := repos.Availability.GetDataSetSnapshotsByLocalIDs(ctx, []int64{localA.ID, localB.ID, 999})
+	byLocalID, err := repos.Observability.GetDataSetStatesByLocalIDs(ctx, []int64{localA.ID, localB.ID, 999})
 	if err != nil {
-		t.Fatalf("GetDataSetSnapshotsByLocalIDs: %v", err)
+		t.Fatalf("GetDataSetStatesByLocalIDs: %v", err)
 	}
-	snapshotB, ok := byLocalID[localB.ID]
-	if len(byLocalID) != 2 || !ok || snapshotB.ActivePieceCount != nil {
-		t.Fatalf("snapshots by local id = %+v, want two rows and nil active_piece_count for local B", byLocalID)
+	stateB, ok := byLocalID[localB.ID]
+	if len(byLocalID) != 2 || !ok || stateB.ActivePieceCount != nil {
+		t.Fatalf("states by local id = %+v, want two rows and nil active_piece_count for local B", byLocalID)
 	}
 
-	if err := repos.Availability.ReplaceDataSetSnapshots(ctx, []availability.DataSetSnapshot{
+	if err := repos.Observability.ReplaceDataSetStates(ctx, []observability.DataSetState{
 		{
 			LocalDataSetID: localA.ID,
 			BucketID:       bucketA.ID,
@@ -191,18 +191,18 @@ func TestAvailabilityRepoReplacesDataSetSnapshotsAndFilters(t *testing.T) {
 			ProviderID:     localA.ProviderID,
 			ChainDataSetID: localA.DataSetID,
 			LocalStatus:    localA.Status,
-			Status:         availability.StatusDegraded,
-			ReasonCodes:    []availability.ReasonCode{availability.ReasonChainDataSetUnmanaged},
+			Status:         observability.StatusDegraded,
+			ReasonCodes:    []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged},
 			LastCheckedAt:  checkedAt.Add(time.Minute),
 			Evidence:       map[string]any{},
 		},
 	}); err != nil {
-		t.Fatalf("ReplaceDataSetSnapshots prune: %v", err)
+		t.Fatalf("ReplaceDataSetStates prune: %v", err)
 	}
 
-	page, err = repos.Availability.ListDataSetSnapshots(ctx, availability.ListOptions{Limit: 10})
+	page, err = repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 10})
 	if err != nil {
-		t.Fatalf("ListDataSetSnapshots after prune: %v", err)
+		t.Fatalf("ListDataSetStates after prune: %v", err)
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].LocalDataSetID != localA.ID {
 		t.Fatalf("data set page after prune = total:%d items:%+v, want only local data set A", page.Total, page.Items)

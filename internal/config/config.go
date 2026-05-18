@@ -52,17 +52,17 @@ type S3Config struct {
 }
 
 type FilecoinConfig struct {
-	Network              string                     `koanf:"network"` // calibration | mainnet
-	RPCURL               string                     `koanf:"rpc_url"`
-	PrivateKey           string                     `koanf:"private_key"`
-	Source               string                     `koanf:"source"`
-	WithCDN              bool                       `koanf:"with_cdn"`
-	AllowPrivateNetworks bool                       `koanf:"allow_private_networks"`
-	DefaultCopies        int                        `koanf:"default_copies"`
-	Availability         FilecoinAvailabilityConfig `koanf:"availability"`
+	Network              string                      `koanf:"network"` // calibration | mainnet
+	RPCURL               string                      `koanf:"rpc_url"`
+	PrivateKey           string                      `koanf:"private_key"`
+	Source               string                      `koanf:"source"`
+	WithCDN              bool                        `koanf:"with_cdn"`
+	AllowPrivateNetworks bool                        `koanf:"allow_private_networks"`
+	DefaultCopies        int                         `koanf:"default_copies"`
+	Observability        FilecoinObservabilityConfig `koanf:"observability"`
 }
 
-type FilecoinAvailabilityConfig struct {
+type FilecoinObservabilityConfig struct {
 	Interval    time.Duration `koanf:"interval"`
 	Timeout     time.Duration `koanf:"timeout"`
 	Concurrency int           `koanf:"concurrency"`
@@ -155,7 +155,7 @@ func defaultConfig() *Config {
 			RPCURL:        defaultFilecoinRPCURLs["calibration"],
 			Source:        "synaps3",
 			DefaultCopies: DefaultFilecoinCopies,
-			Availability: FilecoinAvailabilityConfig{
+			Observability: FilecoinObservabilityConfig{
 				Interval:    5 * time.Minute,
 				Timeout:     5 * time.Second,
 				Concurrency: 8,
@@ -410,14 +410,14 @@ func (c *Config) FieldValidationErrors() []FieldError {
 			add("filecoin.default_copies", fmt.Sprintf("must be <= %d, got %d", model.StorageCopiesMax, c.Filecoin.DefaultCopies))
 		}
 	}
-	if c.Filecoin.Availability.Interval <= 0 {
-		add("filecoin.availability.interval", fmt.Sprintf("must be > 0, got %s", c.Filecoin.Availability.Interval))
+	if c.Filecoin.Observability.Interval <= 0 {
+		add("filecoin.observability.interval", fmt.Sprintf("must be > 0, got %s", c.Filecoin.Observability.Interval))
 	}
-	if c.Filecoin.Availability.Timeout <= 0 {
-		add("filecoin.availability.timeout", fmt.Sprintf("must be > 0, got %s", c.Filecoin.Availability.Timeout))
+	if c.Filecoin.Observability.Timeout <= 0 {
+		add("filecoin.observability.timeout", fmt.Sprintf("must be > 0, got %s", c.Filecoin.Observability.Timeout))
 	}
-	if c.Filecoin.Availability.Concurrency < 1 {
-		add("filecoin.availability.concurrency", fmt.Sprintf("must be >= 1, got %d", c.Filecoin.Availability.Concurrency))
+	if c.Filecoin.Observability.Concurrency < 1 {
+		add("filecoin.observability.concurrency", fmt.Sprintf("must be >= 1, got %d", c.Filecoin.Observability.Concurrency))
 	}
 
 	// S3 credentials.

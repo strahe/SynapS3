@@ -9,11 +9,11 @@ import (
 )
 
 func init() {
-	Migrations.MustRegister(up2026051701AvailabilitySnapshots, down2026051701AvailabilitySnapshots)
+	Migrations.MustRegister(up2026051701ObservabilityStates, down2026051701ObservabilityStates)
 }
 
-type availabilityProviderSnapshot2026051701 struct {
-	bun.BaseModel `bun:"table:availability_provider_snapshots"`
+type observabilityProviderState2026051701 struct {
+	bun.BaseModel `bun:"table:observability_provider_states"`
 
 	ProviderID    string         `bun:"provider_id,pk,type:text"`
 	Status        string         `bun:"status,notnull"`
@@ -27,8 +27,8 @@ type availabilityProviderSnapshot2026051701 struct {
 	UpdatedAt     time.Time      `bun:"updated_at,nullzero,notnull,default:current_timestamp"`
 }
 
-type availabilityDataSetSnapshot2026051701 struct {
-	bun.BaseModel `bun:"table:availability_data_set_snapshots"`
+type observabilityDataSetState2026051701 struct {
+	bun.BaseModel `bun:"table:observability_data_set_states"`
 
 	LocalDataSetID   int64          `bun:"local_data_set_id,pk"`
 	BucketID         int64          `bun:"bucket_id,notnull"`
@@ -47,65 +47,65 @@ type availabilityDataSetSnapshot2026051701 struct {
 	UpdatedAt        time.Time      `bun:"updated_at,nullzero,notnull,default:current_timestamp"`
 }
 
-func up2026051701AvailabilitySnapshots(ctx context.Context, db *bun.DB) error {
+func up2026051701ObservabilityStates(ctx context.Context, db *bun.DB) error {
 	if _, err := db.NewCreateTable().
-		Model((*availabilityProviderSnapshot2026051701)(nil)).
+		Model((*observabilityProviderState2026051701)(nil)).
 		IfNotExists().
-		ColumnExpr("CONSTRAINT chk_availability_provider_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown'))").
+		ColumnExpr("CONSTRAINT chk_observability_provider_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown'))").
 		Exec(ctx); err != nil {
-		return fmt.Errorf("creating availability_provider_snapshots table: %w", err)
+		return fmt.Errorf("creating observability_provider_states table: %w", err)
 	}
 
 	if _, err := db.NewCreateIndex().
-		Model((*availabilityProviderSnapshot2026051701)(nil)).
-		Index("idx_availability_provider_status").
+		Model((*observabilityProviderState2026051701)(nil)).
+		Index("idx_observability_provider_states_status").
 		Column("status", "last_checked_at").
 		IfNotExists().
 		Exec(ctx); err != nil {
-		return fmt.Errorf("creating availability provider status index: %w", err)
+		return fmt.Errorf("creating observability provider status index: %w", err)
 	}
 
 	if _, err := db.NewCreateTable().
-		Model((*availabilityDataSetSnapshot2026051701)(nil)).
+		Model((*observabilityDataSetState2026051701)(nil)).
 		IfNotExists().
 		ForeignKey("(local_data_set_id) REFERENCES storage_data_sets(id) ON UPDATE CASCADE ON DELETE CASCADE").
-		ColumnExpr("CONSTRAINT chk_availability_data_set_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown'))").
+		ColumnExpr("CONSTRAINT chk_observability_data_set_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown'))").
 		Exec(ctx); err != nil {
-		return fmt.Errorf("creating availability_data_set_snapshots table: %w", err)
+		return fmt.Errorf("creating observability_data_set_states table: %w", err)
 	}
 
 	if _, err := db.NewCreateIndex().
-		Model((*availabilityDataSetSnapshot2026051701)(nil)).
-		Index("idx_availability_data_set_bucket_status").
+		Model((*observabilityDataSetState2026051701)(nil)).
+		Index("idx_observability_data_set_states_bucket_status").
 		Column("bucket_id", "status", "last_checked_at").
 		IfNotExists().
 		Exec(ctx); err != nil {
-		return fmt.Errorf("creating availability data set bucket status index: %w", err)
+		return fmt.Errorf("creating observability data set bucket status index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*availabilityDataSetSnapshot2026051701)(nil)).
-		Index("idx_availability_data_set_provider_status").
+		Model((*observabilityDataSetState2026051701)(nil)).
+		Index("idx_observability_data_set_states_provider_status").
 		Column("provider_id", "status", "last_checked_at").
 		IfNotExists().
 		Exec(ctx); err != nil {
-		return fmt.Errorf("creating availability data set provider status index: %w", err)
+		return fmt.Errorf("creating observability data set provider status index: %w", err)
 	}
 
 	return nil
 }
 
-func down2026051701AvailabilitySnapshots(ctx context.Context, db *bun.DB) error {
+func down2026051701ObservabilityStates(ctx context.Context, db *bun.DB) error {
 	if _, err := db.NewDropTable().
-		Model((*availabilityDataSetSnapshot2026051701)(nil)).
+		Model((*observabilityDataSetState2026051701)(nil)).
 		IfExists().
 		Exec(ctx); err != nil {
-		return fmt.Errorf("dropping availability_data_set_snapshots table: %w", err)
+		return fmt.Errorf("dropping observability_data_set_states table: %w", err)
 	}
 	if _, err := db.NewDropTable().
-		Model((*availabilityProviderSnapshot2026051701)(nil)).
+		Model((*observabilityProviderState2026051701)(nil)).
 		IfExists().
 		Exec(ctx); err != nil {
-		return fmt.Errorf("dropping availability_provider_snapshots table: %w", err)
+		return fmt.Errorf("dropping observability_provider_states table: %w", err)
 	}
 	return nil
 }
