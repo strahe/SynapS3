@@ -567,11 +567,11 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 	return out
 }
 
-func (s *Server) dataSetStorageHealthStates(ctx context.Context, localIDs []int64) (map[int64]observability.DataSetState, bool) {
+func (s *Server) dataSetStorageHealthStates(ctx context.Context, localIDs []int64) (map[int64]observability.DataSetObservation, bool) {
 	if s.observability == nil || len(localIDs) == 0 {
 		return nil, false
 	}
-	states, err := s.observability.DataSetStatesByLocalIDs(ctx, localIDs)
+	states, err := s.observability.DataSetObservationsByLocalIDs(ctx, localIDs)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Warn("api: failed to enrich bucket data set storage health", "error", err)
@@ -581,23 +581,23 @@ func (s *Server) dataSetStorageHealthStates(ctx context.Context, localIDs []int6
 	return states, false
 }
 
-func (s *Server) dataSetStorageHealthInfo(state observability.DataSetState) *dataSetStorageHealthInfo {
-	if state.LocalDataSetID == 0 {
+func (s *Server) dataSetStorageHealthInfo(observation observability.DataSetObservation) *dataSetStorageHealthInfo {
+	if observation.Facts.LocalDataSetID == 0 {
 		return nil
 	}
-	reasonCodes := make([]observability.ReasonCode, 0, len(state.ReasonCodes))
-	reasonCodes = append(reasonCodes, state.ReasonCodes...)
-	stale, _ := observabilityFreshness(&state.LastCheckedAt, s.observability.RefreshInterval())
-	if stale && !reasonCodeContains(reasonCodes, observability.ReasonStaleState) {
-		reasonCodes = append(reasonCodes, observability.ReasonStaleState)
+	reasonCodes := make([]observability.ReasonCode, 0, len(observation.Signal.ReasonCodes))
+	reasonCodes = append(reasonCodes, observation.Signal.ReasonCodes...)
+	var lastCheckedAt string
+	if observation.Signal.Freshness.LastCheckedAt != nil {
+		lastCheckedAt = observation.Signal.Freshness.LastCheckedAt.Format(time.RFC3339)
 	}
 	return &dataSetStorageHealthInfo{
-		Status:           string(state.Status),
+		Status:           string(observation.Signal.Status),
 		ReasonCodes:      reasonCodes,
-		ActivePieceCount: state.ActivePieceCount,
-		LastCheckedAt:    state.LastCheckedAt.Format(time.RFC3339),
-		LastError:        state.LastError,
-		Stale:            stale,
+		ActivePieceCount: observation.Facts.ActivePieceCount,
+		LastCheckedAt:    lastCheckedAt,
+		LastError:        observation.Signal.LastError,
+		Stale:            observation.Signal.Freshness.Stale,
 	}
 }
 
@@ -608,15 +608,6 @@ func dataSetStorageHealthQueryFailureInfo() *dataSetStorageHealthInfo {
 		ReasonCodes: []observability.ReasonCode{},
 		LastError:   &errText,
 	}
-}
-
-func reasonCodeContains(codes []observability.ReasonCode, want observability.ReasonCode) bool {
-	for _, code := range codes {
-		if code == want {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) providerIdentities(providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {

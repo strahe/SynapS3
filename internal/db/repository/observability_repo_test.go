@@ -17,13 +17,15 @@ func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
 
-	err := repos.Observability.ReplaceProviderStates(ctx, []observability.ProviderState{
+	err := repos.Observability.ReplaceProviderStates(ctx, checkedAt, []observability.ProviderState{
 		{
 			ProviderID:    onChainID(t, "101"),
 			Status:        observability.StatusAvailable,
 			ReasonCodes:   []observability.ReasonCode{},
-			Active:        true,
-			HealthStatus:  "reachable",
+			Active:        boolPtr(true),
+			HasPDP:        boolPtr(true),
+			ServiceURL:    stringPtr("https://provider-101.test"),
+			HealthStatus:  stringPtr("reachable"),
 			LastCheckedAt: checkedAt,
 			Evidence:      map[string]any{"service_url": "https://provider-101.test"},
 		},
@@ -31,8 +33,10 @@ func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 			ProviderID:    onChainID(t, "202"),
 			Status:        observability.StatusDegraded,
 			ReasonCodes:   []observability.ReasonCode{observability.ReasonProviderHTTPUnreachable},
-			Active:        true,
-			HealthStatus:  "unreachable",
+			Active:        boolPtr(true),
+			HasPDP:        boolPtr(true),
+			ServiceURL:    stringPtr("https://provider-202.test"),
+			HealthStatus:  stringPtr("unreachable"),
 			LastCheckedAt: checkedAt,
 			Evidence:      map[string]any{"service_url": "https://provider-202.test"},
 		},
@@ -48,6 +52,9 @@ func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 	if page.Total != 2 || page.Summary.Total != 2 || page.Summary.Available != 1 || page.Summary.Degraded != 1 {
 		t.Fatalf("provider page summary = total:%d summary:%+v, want two providers split available/degraded", page.Total, page.Summary)
 	}
+	if page.LastCheckedAt == nil || !page.LastCheckedAt.Equal(checkedAt) {
+		t.Fatalf("provider collection last checked = %v, want %s", page.LastCheckedAt, checkedAt)
+	}
 
 	page, err = repos.Observability.ListProviderStates(ctx, observability.ListOptions{
 		Status: observability.StatusDegraded,
@@ -60,13 +67,14 @@ func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 		t.Fatalf("filtered provider page = total:%d items:%+v, want provider 202", page.Total, page.Items)
 	}
 
-	if err := repos.Observability.ReplaceProviderStates(ctx, []observability.ProviderState{
+	if err := repos.Observability.ReplaceProviderStates(ctx, checkedAt.Add(time.Minute), []observability.ProviderState{
 		{
 			ProviderID:    onChainID(t, "101"),
 			Status:        observability.StatusUnavailable,
 			ReasonCodes:   []observability.ReasonCode{observability.ReasonProviderInactive},
-			Active:        false,
-			HealthStatus:  "reachable",
+			Active:        boolPtr(false),
+			HasPDP:        boolPtr(true),
+			HealthStatus:  stringPtr("reachable"),
 			LastCheckedAt: checkedAt.Add(time.Minute),
 			Evidence:      map[string]any{},
 		},
@@ -89,10 +97,10 @@ func TestObservabilityRepoProviderOrderAndPaginatedSummary(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
 
-	if err := repos.Observability.ReplaceProviderStates(ctx, []observability.ProviderState{
-		{ProviderID: onChainID(t, "10"), Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{}, Active: true, HealthStatus: "reachable", LastCheckedAt: checkedAt},
-		{ProviderID: onChainID(t, "2"), Status: observability.StatusAvailable, ReasonCodes: []observability.ReasonCode{}, Active: true, HealthStatus: "reachable", LastCheckedAt: checkedAt},
-		{ProviderID: onChainID(t, "101"), Status: observability.StatusUnknown, ReasonCodes: []observability.ReasonCode{}, Active: true, HealthStatus: "unknown", LastCheckedAt: checkedAt},
+	if err := repos.Observability.ReplaceProviderStates(ctx, checkedAt, []observability.ProviderState{
+		{ProviderID: onChainID(t, "10"), Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{}, Active: boolPtr(true), HealthStatus: stringPtr("reachable"), LastCheckedAt: checkedAt},
+		{ProviderID: onChainID(t, "2"), Status: observability.StatusAvailable, ReasonCodes: []observability.ReasonCode{}, Active: boolPtr(true), HealthStatus: stringPtr("reachable"), LastCheckedAt: checkedAt},
+		{ProviderID: onChainID(t, "101"), Status: observability.StatusUnknown, ReasonCodes: []observability.ReasonCode{}, Active: boolPtr(true), HealthStatus: stringPtr("unknown"), LastCheckedAt: checkedAt},
 	}); err != nil {
 		t.Fatalf("ReplaceProviderStates: %v", err)
 	}
@@ -109,6 +117,36 @@ func TestObservabilityRepoProviderOrderAndPaginatedSummary(t *testing.T) {
 	}
 }
 
+func TestObservabilityRepoRecordsCollectionStateForEmptyRefresh(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
+
+	if err := repos.Observability.ReplaceProviderStates(ctx, checkedAt, nil); err != nil {
+		t.Fatalf("ReplaceProviderStates empty: %v", err)
+	}
+	providers, err := repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListProviderStates: %v", err)
+	}
+	if providers.Total != 0 || providers.LastCheckedAt == nil || !providers.LastCheckedAt.Equal(checkedAt) {
+		t.Fatalf("provider empty page = total:%d last:%v, want empty page with collection timestamp %s", providers.Total, providers.LastCheckedAt, checkedAt)
+	}
+
+	dataSetCheckedAt := checkedAt.Add(time.Minute)
+	if err := repos.Observability.ReplaceDataSetStates(ctx, dataSetCheckedAt, nil); err != nil {
+		t.Fatalf("ReplaceDataSetStates empty: %v", err)
+	}
+	dataSets, err := repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDataSetStates: %v", err)
+	}
+	if dataSets.Total != 0 || dataSets.LastCheckedAt == nil || !dataSets.LastCheckedAt.Equal(dataSetCheckedAt) {
+		t.Fatalf("data set empty page = total:%d last:%v, want empty page with collection timestamp %s", dataSets.Total, dataSets.LastCheckedAt, dataSetCheckedAt)
+	}
+}
+
 func TestObservabilityRepoReplacesDataSetStatesAndFilters(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
@@ -120,11 +158,12 @@ func TestObservabilityRepoReplacesDataSetStatesAndFilters(t *testing.T) {
 	checkedAt := time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC)
 
 	activePieces := int64(7)
-	err := repos.Observability.ReplaceDataSetStates(ctx, []observability.DataSetState{
+	err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
 		{
 			LocalDataSetID:   localA.ID,
 			BucketID:         bucketA.ID,
 			BucketName:       bucketA.Name,
+			CopyIndex:        localA.CopyIndex,
 			ProviderID:       localA.ProviderID,
 			ChainDataSetID:   localA.DataSetID,
 			ClientDataSetID:  localA.ClientDataSetID,
@@ -139,6 +178,7 @@ func TestObservabilityRepoReplacesDataSetStatesAndFilters(t *testing.T) {
 			LocalDataSetID: localB.ID,
 			BucketID:       bucketB.ID,
 			BucketName:     bucketB.Name,
+			CopyIndex:      localB.CopyIndex,
 			ProviderID:     localB.ProviderID,
 			ChainDataSetID: localB.DataSetID,
 			LocalStatus:    localB.Status,
@@ -165,6 +205,12 @@ func TestObservabilityRepoReplacesDataSetStatesAndFilters(t *testing.T) {
 	if page.Items[0].ActivePieceCount == nil || *page.Items[0].ActivePieceCount != 7 {
 		t.Fatalf("active_piece_count = %#v, want 7", page.Items[0].ActivePieceCount)
 	}
+	if page.Items[0].CopyIndex != localA.CopyIndex {
+		t.Fatalf("copy_index = %d, want %d", page.Items[0].CopyIndex, localA.CopyIndex)
+	}
+	if page.LastCheckedAt == nil || !page.LastCheckedAt.Equal(checkedAt) {
+		t.Fatalf("data set collection last checked = %v, want %s", page.LastCheckedAt, checkedAt)
+	}
 
 	page, err = repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 1, Offset: 1})
 	if err != nil {
@@ -183,11 +229,12 @@ func TestObservabilityRepoReplacesDataSetStatesAndFilters(t *testing.T) {
 		t.Fatalf("states by local id = %+v, want two rows and nil active_piece_count for local B", byLocalID)
 	}
 
-	if err := repos.Observability.ReplaceDataSetStates(ctx, []observability.DataSetState{
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt.Add(time.Minute), []observability.DataSetState{
 		{
 			LocalDataSetID: localA.ID,
 			BucketID:       bucketA.ID,
 			BucketName:     bucketA.Name,
+			CopyIndex:      localA.CopyIndex,
 			ProviderID:     localA.ProviderID,
 			ChainDataSetID: localA.DataSetID,
 			LocalStatus:    localA.Status,
@@ -222,4 +269,12 @@ func seedStorageDataSet(t *testing.T, db *bun.DB, bucketID int64, providerID str
 		t.Fatalf("seeding storage data set: %v", err)
 	}
 	return row
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func stringPtr(value string) *string {
+	return &value
 }

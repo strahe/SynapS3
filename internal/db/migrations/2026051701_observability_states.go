@@ -18,8 +18,10 @@ type observabilityProviderState2026051701 struct {
 	ProviderID    string         `bun:"provider_id,pk,type:text"`
 	Status        string         `bun:"status,notnull"`
 	ReasonCodes   []string       `bun:"reason_codes,type:jsonb,notnull"`
-	Active        bool           `bun:"active,notnull"`
-	HealthStatus  string         `bun:"health_status,notnull"`
+	Active        *bool          `bun:"active"`
+	HasPDP        *bool          `bun:"has_pdp"`
+	ServiceURL    *string        `bun:"service_url"`
+	HealthStatus  *string        `bun:"health_status"`
 	LastCheckedAt time.Time      `bun:"last_checked_at,nullzero,notnull"`
 	LastError     *string        `bun:"last_error,nullzero"`
 	Evidence      map[string]any `bun:"evidence_json,type:jsonb,notnull"`
@@ -33,6 +35,7 @@ type observabilityDataSetState2026051701 struct {
 	LocalDataSetID   int64          `bun:"local_data_set_id,pk"`
 	BucketID         int64          `bun:"bucket_id,notnull"`
 	BucketName       string         `bun:"bucket_name,notnull"`
+	CopyIndex        int            `bun:"copy_index,notnull"`
 	ProviderID       string         `bun:"provider_id,type:text,notnull"`
 	ChainDataSetID   *string        `bun:"chain_data_set_id,type:text"`
 	ClientDataSetID  *string        `bun:"client_data_set_id,type:text"`
@@ -47,7 +50,24 @@ type observabilityDataSetState2026051701 struct {
 	UpdatedAt        time.Time      `bun:"updated_at,nullzero,notnull,default:current_timestamp"`
 }
 
+type observabilityCollectionState2026051701 struct {
+	bun.BaseModel `bun:"table:observability_collection_states"`
+
+	CollectionType string    `bun:"collection_type,pk,type:text"`
+	LastCheckedAt  time.Time `bun:"last_checked_at,nullzero,notnull"`
+	CreatedAt      time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp"`
+	UpdatedAt      time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp"`
+}
+
 func up2026051701ObservabilityStates(ctx context.Context, db *bun.DB) error {
+	if _, err := db.NewCreateTable().
+		Model((*observabilityCollectionState2026051701)(nil)).
+		IfNotExists().
+		ColumnExpr("CONSTRAINT chk_observability_collection_type CHECK (collection_type IN ('providers', 'data_sets'))").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("creating observability_collection_states table: %w", err)
+	}
+
 	if _, err := db.NewCreateTable().
 		Model((*observabilityProviderState2026051701)(nil)).
 		IfNotExists().
@@ -106,6 +126,12 @@ func down2026051701ObservabilityStates(ctx context.Context, db *bun.DB) error {
 		IfExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("dropping observability_provider_states table: %w", err)
+	}
+	if _, err := db.NewDropTable().
+		Model((*observabilityCollectionState2026051701)(nil)).
+		IfExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("dropping observability_collection_states table: %w", err)
 	}
 	return nil
 }

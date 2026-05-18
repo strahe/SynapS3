@@ -29,7 +29,7 @@ func TestCheckProvidersMergesLocalAndRegistrySources(t *testing.T) {
 		Concurrency:    2,
 	})
 
-	got, err := checker.CheckProviders(context.Background(), []LocalDataSet{
+	got, err := checker.CheckProviders(context.Background(), time.Time{}, []LocalDataSet{
 		{ProviderID: onChainID(t, "101")},
 	})
 	if err != nil {
@@ -53,7 +53,7 @@ func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
 		Concurrency:    1,
 	})
 
-	got, err := checker.CheckProviders(context.Background(), nil)
+	got, err := checker.CheckProviders(context.Background(), time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("CheckProviders: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestCheckProvidersDegradesMissingServiceURL(t *testing.T) {
 		Concurrency:    1,
 	})
 
-	got, err := checker.CheckProviders(context.Background(), nil)
+	got, err := checker.CheckProviders(context.Background(), time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("CheckProviders: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestCheckProvidersReturnsRegistryListFailure(t *testing.T) {
 		Concurrency:    1,
 	})
 
-	if _, err := checker.CheckProviders(context.Background(), []LocalDataSet{
+	if _, err := checker.CheckProviders(context.Background(), time.Time{}, []LocalDataSet{
 		{ProviderID: onChainID(t, "101")},
 	}); err == nil {
 		t.Fatal("CheckProviders returned nil error for registry list failure")
@@ -108,7 +108,7 @@ func TestCheckProvidersMarksLookupFailureUnknownWithSanitizedError(t *testing.T)
 		Concurrency:    1,
 	})
 
-	got, err := checker.CheckProviders(context.Background(), []LocalDataSet{
+	got, err := checker.CheckProviders(context.Background(), time.Time{}, []LocalDataSet{
 		{ProviderID: onChainID(t, "101")},
 	})
 	if err != nil {
@@ -117,6 +117,9 @@ func TestCheckProvidersMarksLookupFailureUnknownWithSanitizedError(t *testing.T)
 
 	state := providerStatesByID(got)["101"]
 	assertProviderState(t, state, StatusUnknown, []ReasonCode{ReasonRegistryLookupFailed})
+	if state.Active != nil || state.HasPDP != nil || state.ServiceURL != nil || state.HealthStatus != nil {
+		t.Fatalf("lookup failure facts = active:%v has_pdp:%v service_url:%v health:%v, want all nil", state.Active, state.HasPDP, state.ServiceURL, state.HealthStatus)
+	}
 	if state.LastError == nil || *state.LastError != "RPC call failed" {
 		t.Fatalf("LastError = %#v, want sanitized RPC call failed", state.LastError)
 	}
@@ -130,7 +133,7 @@ func TestCheckProvidersLimitsLookupConcurrency(t *testing.T) {
 		Concurrency:    2,
 	})
 
-	_, err := checker.CheckProviders(context.Background(), []LocalDataSet{
+	_, err := checker.CheckProviders(context.Background(), time.Time{}, []LocalDataSet{
 		{ProviderID: onChainID(t, "101")},
 		{ProviderID: onChainID(t, "102")},
 		{ProviderID: onChainID(t, "103")},
@@ -156,13 +159,13 @@ func TestCheckProvidersMarksMissingPDPUnavailable(t *testing.T) {
 		Concurrency:    1,
 	})
 
-	got, err := checker.CheckProviders(context.Background(), nil)
+	got, err := checker.CheckProviders(context.Background(), time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("CheckProviders: %v", err)
 	}
 
 	state := providerStatesByID(got)["202"]
-	assertProviderState(t, state, StatusUnavailable, []ReasonCode{ReasonProviderInactive})
+	assertProviderState(t, state, StatusUnavailable, []ReasonCode{ReasonProviderMissingPDP})
 	if state.Evidence["has_pdp"] != false {
 		t.Fatalf("has_pdp evidence = %#v, want false", state.Evidence["has_pdp"])
 	}
@@ -325,7 +328,7 @@ func TestCheckDataSetsClassifiesLocalAndChainEvidence(t *testing.T) {
 		},
 	})
 
-	got, err := checker.CheckDataSets(context.Background(), local)
+	got, err := checker.CheckDataSets(context.Background(), time.Time{}, local)
 	if err != nil {
 		t.Fatalf("CheckDataSets: %v", err)
 	}
@@ -350,7 +353,7 @@ func TestCheckDataSetsMergesWalletScanFailureWithLocalStatus(t *testing.T) {
 		DataSetScanner: fakeDataSetScanner{err: errors.New("rpc unavailable https://rpc.example.test?token=secret")},
 	})
 
-	got, err := checker.CheckDataSets(context.Background(), []LocalDataSet{
+	got, err := checker.CheckDataSets(context.Background(), time.Time{}, []LocalDataSet{
 		{
 			ID:         1,
 			BucketID:   10,

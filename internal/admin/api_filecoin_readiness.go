@@ -8,7 +8,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"time"
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/observability"
@@ -97,11 +96,20 @@ func (s *Server) withObservabilityReadiness(ctx context.Context, result synapse.
 		"Provider health has no unavailable or unknown state.",
 		"Provider health needs attention.",
 		providers.Summary,
-		providers.LastCheckedAt,
-		s.observability.RefreshInterval(),
+		s.observability.ProviderReadinessSignal(providers),
 	))
 
 	dataSets, err := s.observability.ListDataSets(ctx, observabilityReadinessListOptions())
+	if err != nil {
+		result.Checks = append(result.Checks, synapse.ReadinessCheck{
+			ID:      "observability_data_sets",
+			Status:  synapse.ReadinessStatusWarning,
+			Message: "Local data set storage health state could not be loaded.",
+		})
+		addReadinessPartialError(&result, "observability_data_sets", err)
+		return finishReadinessResult(result)
+	}
+	dataSetSignal, err := s.observability.DataSetReadinessSignal(ctx, dataSets)
 	if err != nil {
 		result.Checks = append(result.Checks, synapse.ReadinessCheck{
 			ID:      "observability_data_sets",
@@ -116,9 +124,7 @@ func (s *Server) withObservabilityReadiness(ctx context.Context, result synapse.
 		"Local data set storage health is healthy.",
 		"Local data set storage health needs attention.",
 		dataSets.Summary,
-		dataSets.LastCheckedAt,
-		s.observability.RefreshInterval(),
-		dataSets.LastCheckedAt == nil && dataSets.Summary.Total == 0 && s.localDataSetInventoryEmpty(ctx),
+		dataSetSignal,
 	))
 	return finishReadinessResult(result)
 }
@@ -127,84 +133,81 @@ func observabilityReadinessListOptions() observability.ListOptions {
 	return observability.ListOptions{Limit: 1}
 }
 
-func providerObservabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, lastCheckedAt *time.Time, interval time.Duration) synapse.ReadinessCheck {
-	if lastCheckedAt == nil {
+func providerObservabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, signal observability.SummarySignal) synapse.ReadinessCheck {
+	if signal.Level == observability.SignalOK {
+		return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
+	}
+	if freshnessContains(signal.Freshness, observability.FreshnessNoStateRecorded) {
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
 			Message: attentionMessage + " No health state has been recorded yet.",
 		}
 	}
-	stale, _ := observabilityFreshness(lastCheckedAt, interval)
-	if stale {
+	if signal.Freshness.Stale {
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
 			Message: attentionMessage + " The latest health state is stale.",
 		}
 	}
-	if summary.Unknown > 0 || summary.Unavailable > 0 {
-		return synapse.ReadinessCheck{
-			ID:     id,
-			Status: synapse.ReadinessStatusWarning,
-			Message: fmt.Sprintf(
-				"%s unavailable=%d unknown=%d.",
-				attentionMessage,
-				summary.Unavailable,
-				summary.Unknown,
-			),
-		}
+	return synapse.ReadinessCheck{
+		ID:     id,
+		Status: synapse.ReadinessStatusWarning,
+		Message: fmt.Sprintf(
+			"%s unavailable=%d unknown=%d.",
+			attentionMessage,
+			summary.Unavailable,
+			summary.Unknown,
+		),
 	}
-	return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
 }
 
-func observabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, lastCheckedAt *time.Time, interval time.Duration, emptyInventory bool) synapse.ReadinessCheck {
-	if lastCheckedAt == nil {
-		if emptyInventory && summary.Total == 0 {
-			return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
+func observabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, signal observability.SummarySignal) synapse.ReadinessCheck {
+	if signal.Level == observability.SignalOK {
+		return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
+	}
+	if summary.Total == 0 && summary.Unknown == 0 && summary.Unavailable == 0 && summary.Degraded == 0 {
+		return synapse.ReadinessCheck{
+			ID:      id,
+			Status:  synapse.ReadinessStatusWarning,
+			Message: attentionMessage + " Some local data sets have no recorded health state.",
 		}
+	}
+	if freshnessContains(signal.Freshness, observability.FreshnessNoStateRecorded) {
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
 			Message: attentionMessage + " No health state has been recorded yet.",
 		}
 	}
-	stale, _ := observabilityFreshness(lastCheckedAt, interval)
-	if stale {
+	if signal.Freshness.Stale {
 		return synapse.ReadinessCheck{
 			ID:      id,
 			Status:  synapse.ReadinessStatusWarning,
 			Message: attentionMessage + " The latest health state is stale.",
 		}
 	}
-	if summary.Unknown > 0 || summary.Unavailable > 0 || summary.Degraded > 0 {
-		return synapse.ReadinessCheck{
-			ID:     id,
-			Status: synapse.ReadinessStatusWarning,
-			Message: fmt.Sprintf(
-				"%s degraded=%d unavailable=%d unknown=%d.",
-				attentionMessage,
-				summary.Degraded,
-				summary.Unavailable,
-				summary.Unknown,
-			),
-		}
+	return synapse.ReadinessCheck{
+		ID:     id,
+		Status: synapse.ReadinessStatusWarning,
+		Message: fmt.Sprintf(
+			"%s degraded=%d unavailable=%d unknown=%d.",
+			attentionMessage,
+			summary.Degraded,
+			summary.Unavailable,
+			summary.Unknown,
+		),
 	}
-	return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
 }
 
-func (s *Server) localDataSetInventoryEmpty(ctx context.Context) bool {
-	if s == nil || s.repos == nil || s.repos.Uploads == nil {
-		return false
-	}
-	summaries, err := s.repos.Uploads.ListDataSetSummaries(ctx, 0)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("api: failed to list local data set inventory for readiness", "error", err)
+func freshnessContains(freshness observability.Freshness, warning observability.FreshnessWarning) bool {
+	for _, got := range freshness.Warnings {
+		if got == warning {
+			return true
 		}
-		return false
 	}
-	return len(summaries) == 0
+	return false
 }
 
 func finishReadinessResult(result synapse.ReadinessResult) synapse.ReadinessResult {

@@ -76,12 +76,12 @@ func TestFilecoinReadinessObservabilityNoStateWarns(t *testing.T) {
 		t.Fatalf("readiness status = %s, want warning", body.Status)
 	}
 	assertReadinessCheckStatus(t, body.Checks, "observability_providers", synapse.ReadinessStatusWarning)
-	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusWarning)
+	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusReady)
 }
 
 func TestFilecoinReadinessEmptyDataSetInventoryIsReady(t *testing.T) {
 	checkedAt := time.Now().UTC()
-	srv, _ := newBucketAPITestServer(t)
+	srv, repos := newBucketAPITestServer(t)
 	srv.WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityReadinessStore{
@@ -91,6 +91,7 @@ func TestFilecoinReadinessEmptyDataSetInventoryIsReady(t *testing.T) {
 				},
 				dataSets: observability.DataSetStatePage{},
 			},
+			LocalDataSets:   observability.LocalDataSetSourceFunc(testObservabilityLocalDataSets(repos)),
 			RefreshInterval: time.Minute,
 		}))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
@@ -141,6 +142,7 @@ func TestFilecoinReadinessLocalDataSetWithoutStateWarns(t *testing.T) {
 				},
 				dataSets: observability.DataSetStatePage{},
 			},
+			LocalDataSets:   observability.LocalDataSetSourceFunc(testObservabilityLocalDataSets(repos)),
 			RefreshInterval: time.Minute,
 		}))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
@@ -155,7 +157,10 @@ func TestFilecoinReadinessLocalDataSetWithoutStateWarns(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusWarning)
+	check := assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusWarning)
+	if !strings.Contains(check.Message, "Some local data sets have no recorded health state.") {
+		t.Fatalf("data set readiness message = %q, want missing local state detail", check.Message)
+	}
 }
 
 func TestFilecoinReadinessProviderHTTPDegradedDoesNotWarn(t *testing.T) {
@@ -391,17 +396,18 @@ func assertPreflightStatus(t *testing.T, srv *Server, req *http.Request, want in
 	return rr
 }
 
-func assertReadinessCheckStatus(t *testing.T, checks []synapse.ReadinessCheck, id string, want synapse.ReadinessStatus) {
+func assertReadinessCheckStatus(t *testing.T, checks []synapse.ReadinessCheck, id string, want synapse.ReadinessStatus) synapse.ReadinessCheck {
 	t.Helper()
 	for _, check := range checks {
 		if check.ID == id {
 			if check.Status != want {
 				t.Fatalf("check %s status = %s, want %s", id, check.Status, want)
 			}
-			return
+			return check
 		}
 	}
 	t.Fatalf("check %s missing in %#v", id, checks)
+	return synapse.ReadinessCheck{}
 }
 
 func readyFilecoinReadinessResult(mode synapse.ReadinessMode) synapse.ReadinessResult {
@@ -437,7 +443,7 @@ type observabilityReadinessStore struct {
 	dataSetErr  error
 }
 
-func (s *observabilityReadinessStore) ReplaceProviderStates(context.Context, []observability.ProviderState) error {
+func (s *observabilityReadinessStore) ReplaceProviderStates(context.Context, time.Time, []observability.ProviderState) error {
 	return nil
 }
 
@@ -448,7 +454,7 @@ func (s *observabilityReadinessStore) ListProviderStates(context.Context, observ
 	return s.providers, nil
 }
 
-func (s *observabilityReadinessStore) ReplaceDataSetStates(context.Context, []observability.DataSetState) error {
+func (s *observabilityReadinessStore) ReplaceDataSetStates(context.Context, time.Time, []observability.DataSetState) error {
 	return nil
 }
 
@@ -461,4 +467,27 @@ func (s *observabilityReadinessStore) ListDataSetStates(context.Context, observa
 
 func (s *observabilityReadinessStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
 	return nil, nil
+}
+
+func testObservabilityLocalDataSets(repos *repository.Repositories) func(context.Context) ([]observability.LocalDataSet, error) {
+	return func(ctx context.Context) ([]observability.LocalDataSet, error) {
+		summaries, err := repos.Uploads.ListDataSetSummaries(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]observability.LocalDataSet, 0, len(summaries))
+		for _, summary := range summaries {
+			out = append(out, observability.LocalDataSet{
+				ID:              summary.ID,
+				BucketID:        summary.BucketID,
+				BucketName:      summary.BucketName,
+				CopyIndex:       summary.CopyIndex,
+				ProviderID:      summary.ProviderID,
+				DataSetID:       summary.DataSetID,
+				ClientDataSetID: summary.ClientDataSetID,
+				Status:          summary.Status,
+			})
+		}
+		return out, nil
+	}
 }

@@ -9,8 +9,8 @@ import (
 )
 
 type RefreshChecker interface {
-	CheckProviders(context.Context, []LocalDataSet) ([]ProviderState, error)
-	CheckDataSets(context.Context, []LocalDataSet) ([]DataSetState, error)
+	CheckProviders(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error)
+	CheckDataSets(context.Context, time.Time, []LocalDataSet) ([]DataSetState, error)
 }
 
 type LocalDataSetSource interface {
@@ -24,9 +24,9 @@ func (f LocalDataSetSourceFunc) ListLocalDataSets(ctx context.Context) ([]LocalD
 }
 
 type StateStore interface {
-	ReplaceProviderStates(context.Context, []ProviderState) error
+	ReplaceProviderStates(context.Context, time.Time, []ProviderState) error
 	ListProviderStates(context.Context, ListOptions) (ProviderStatePage, error)
-	ReplaceDataSetStates(context.Context, []DataSetState) error
+	ReplaceDataSetStates(context.Context, time.Time, []DataSetState) error
 	ListDataSetStates(context.Context, ListOptions) (DataSetStatePage, error)
 	GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]DataSetState, error)
 }
@@ -37,6 +37,7 @@ type ServiceOptions struct {
 	Store           StateStore
 	RefreshInterval time.Duration
 	RefreshTimeout  time.Duration
+	Now             func() time.Time
 }
 
 type Service struct {
@@ -45,6 +46,7 @@ type Service struct {
 	store           StateStore
 	refreshInterval time.Duration
 	refreshTimeout  time.Duration
+	now             func() time.Time
 	providerRefresh refreshGroup
 	dataSetRefresh  refreshGroup
 }
@@ -58,12 +60,17 @@ func NewService(opts ServiceOptions) *Service {
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
+	now := opts.Now
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
 	return &Service{
 		checker:         opts.Checker,
 		localDataSets:   opts.LocalDataSets,
 		store:           opts.Store,
 		refreshInterval: interval,
 		refreshTimeout:  timeout,
+		now:             now,
 	}
 }
 
@@ -87,11 +94,12 @@ func (s *Service) RefreshProviders(ctx context.Context, opts ListOptions) (Provi
 		if err != nil {
 			return err
 		}
-		states, err := s.checker.CheckProviders(refreshCtx, local)
+		checkedAt := s.checkedAt()
+		states, err := s.checker.CheckProviders(refreshCtx, checkedAt, local)
 		if err != nil {
 			return err
 		}
-		return s.store.ReplaceProviderStates(refreshCtx, states)
+		return s.store.ReplaceProviderStates(refreshCtx, checkedAt, states)
 	}); err != nil {
 		return ProviderStatePage{}, err
 	}
@@ -104,11 +112,12 @@ func (s *Service) RefreshDataSets(ctx context.Context, opts ListOptions) (DataSe
 		if err != nil {
 			return err
 		}
-		states, err := s.checker.CheckDataSets(refreshCtx, local)
+		checkedAt := s.checkedAt()
+		states, err := s.checker.CheckDataSets(refreshCtx, checkedAt, local)
 		if err != nil {
 			return err
 		}
-		return s.store.ReplaceDataSetStates(refreshCtx, states)
+		return s.store.ReplaceDataSetStates(refreshCtx, checkedAt, states)
 	}); err != nil {
 		return DataSetStatePage{}, err
 	}
@@ -130,12 +139,101 @@ func (s *Service) ListProviders(ctx context.Context, opts ListOptions) (Provider
 	return s.store.ListProviderStates(ctx, opts)
 }
 
+func (s *Service) ListProviderObservations(ctx context.Context, opts ListOptions) (ProviderObservationPage, error) {
+	page, err := s.ListProviders(ctx, opts)
+	if err != nil {
+		return ProviderObservationPage{}, err
+	}
+	return s.providerObservationPage(page), nil
+}
+
+func (s *Service) RefreshProviderObservations(ctx context.Context, opts ListOptions) (ProviderObservationPage, error) {
+	page, err := s.RefreshProviders(ctx, opts)
+	if err != nil {
+		return ProviderObservationPage{}, err
+	}
+	return s.providerObservationPage(page), nil
+}
+
 func (s *Service) ListDataSets(ctx context.Context, opts ListOptions) (DataSetStatePage, error) {
 	return s.store.ListDataSetStates(ctx, opts)
 }
 
+func (s *Service) ListDataSetObservations(ctx context.Context, opts ListOptions) (DataSetObservationPage, error) {
+	page, err := s.ListDataSets(ctx, opts)
+	if err != nil {
+		return DataSetObservationPage{}, err
+	}
+	return s.dataSetObservationPage(page), nil
+}
+
+func (s *Service) RefreshDataSetObservations(ctx context.Context, opts ListOptions) (DataSetObservationPage, error) {
+	page, err := s.RefreshDataSets(ctx, opts)
+	if err != nil {
+		return DataSetObservationPage{}, err
+	}
+	return s.dataSetObservationPage(page), nil
+}
+
 func (s *Service) DataSetStatesByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]DataSetState, error) {
 	return s.store.GetDataSetStatesByLocalIDs(ctx, localIDs)
+}
+
+func (s *Service) DataSetObservationsByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]DataSetObservation, error) {
+	states, err := s.DataSetStatesByLocalIDs(ctx, localIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64]DataSetObservation, len(states))
+	now := s.checkedAt()
+	for id, state := range states {
+		out[id] = DataSetObservationFromState(state, s.RefreshInterval(), now)
+	}
+	return out, nil
+}
+
+func (s *Service) ProviderReadinessSignal(page ProviderStatePage) SummarySignal {
+	return ProviderReadinessSummarySignal(page.Summary, page.LastCheckedAt, s.RefreshInterval(), s.checkedAt())
+}
+
+func (s *Service) DataSetReadinessSignal(ctx context.Context, page DataSetStatePage) (SummarySignal, error) {
+	local, err := s.listLocalDataSets(ctx)
+	if err != nil {
+		return SummarySignal{}, err
+	}
+	return DataSetReadinessSummarySignal(page.Summary, page.LastCheckedAt, s.RefreshInterval(), s.checkedAt(), len(local)), nil
+}
+
+func (s *Service) providerObservationPage(page ProviderStatePage) ProviderObservationPage {
+	items := make([]ProviderObservation, 0, len(page.Items))
+	now := s.checkedAt()
+	for _, state := range page.Items {
+		items = append(items, ProviderObservationFromState(state, s.RefreshInterval(), now))
+	}
+	return ProviderObservationPage{
+		Items:         items,
+		Summary:       page.Summary,
+		SummarySignal: DefaultAttentionSummarySignal(page.Summary, page.LastCheckedAt, s.RefreshInterval(), now),
+		Total:         page.Total,
+		Limit:         page.Limit,
+		Offset:        page.Offset,
+	}
+}
+
+func (s *Service) dataSetObservationPage(page DataSetStatePage) DataSetObservationPage {
+	items := make([]DataSetObservation, 0, len(page.Items))
+	now := s.checkedAt()
+	for _, state := range page.Items {
+		items = append(items, DataSetObservationFromState(state, s.RefreshInterval(), now))
+	}
+	return DataSetObservationPage{
+		Items:         items,
+		Summary:       page.Summary,
+		SummarySignal: DefaultAttentionSummarySignal(page.Summary, page.LastCheckedAt, s.RefreshInterval(), now),
+		Total:         page.Total,
+		Limit:         page.Limit,
+		Offset:        page.Offset,
+	}
 }
 
 func (s *Service) listLocalDataSets(ctx context.Context) ([]LocalDataSet, error) {
@@ -143,6 +241,13 @@ func (s *Service) listLocalDataSets(ctx context.Context) ([]LocalDataSet, error)
 		return nil, nil
 	}
 	return s.localDataSets.ListLocalDataSets(ctx)
+}
+
+func (s *Service) checkedAt() time.Time {
+	if s == nil || s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
 }
 
 type refreshGroup struct {

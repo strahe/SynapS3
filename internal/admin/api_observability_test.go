@@ -19,7 +19,7 @@ func TestAPIObservabilityRefreshRequiresLoopbackAndRefreshHeader(t *testing.T) {
 	var calls int32
 	service := observability.NewService(observability.ServiceOptions{
 		Checker: &observabilityAPIRefreshChecker{
-			providers: func(context.Context, []observability.LocalDataSet) ([]observability.ProviderState, error) {
+			providers: func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.ProviderState, error) {
 				atomic.AddInt32(&calls, 1)
 				return []observability.ProviderState{
 					{ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable, LastCheckedAt: time.Now().UTC()},
@@ -62,18 +62,15 @@ func TestAPIObservabilityRefreshRequiresLoopbackAndRefreshHeader(t *testing.T) {
 				t.Fatalf("refresh calls = %d, want %d", calls, tt.wantCalls)
 			}
 			if tt.wantStatus == http.StatusOK {
-				var body struct {
-					Items    []observability.ProviderState `json:"items"`
-					Warnings []string                      `json:"warnings"`
-				}
+				var body observability.ProviderObservationPage
 				if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 					t.Fatalf("Decode: %v", err)
 				}
-				if len(body.Items) != 1 || body.Items[0].ProviderID.String() != "101" {
+				if len(body.Items) != 1 || body.Items[0].Facts.ProviderID.String() != "101" {
 					t.Fatalf("items = %+v, want provider 101", body.Items)
 				}
-				if body.Warnings == nil || len(body.Warnings) != 0 {
-					t.Fatalf("warnings = %#v, want empty array", body.Warnings)
+				if body.SummarySignal.Level != observability.SignalOK {
+					t.Fatalf("summary signal = %#v, want ok", body.SummarySignal)
 				}
 			}
 		})
@@ -83,7 +80,7 @@ func TestAPIObservabilityRefreshRequiresLoopbackAndRefreshHeader(t *testing.T) {
 func TestAPIObservabilityRefreshExtendsWriteDeadline(t *testing.T) {
 	service := observability.NewService(observability.ServiceOptions{
 		Checker: &observabilityAPIRefreshChecker{
-			providers: func(context.Context, []observability.LocalDataSet) ([]observability.ProviderState, error) {
+			providers: func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.ProviderState, error) {
 				return []observability.ProviderState{
 					{ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable, LastCheckedAt: time.Now().UTC()},
 				}, nil
@@ -160,24 +157,27 @@ func TestAPIObservabilityDataSetBucketFilters(t *testing.T) {
 }
 
 type observabilityAPIRefreshChecker struct {
-	providers func(context.Context, []observability.LocalDataSet) ([]observability.ProviderState, error)
+	providers func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.ProviderState, error)
 }
 
-func (c *observabilityAPIRefreshChecker) CheckProviders(ctx context.Context, local []observability.LocalDataSet) ([]observability.ProviderState, error) {
-	return c.providers(ctx, local)
+func (c *observabilityAPIRefreshChecker) CheckProviders(ctx context.Context, checkedAt time.Time, local []observability.LocalDataSet) ([]observability.ProviderState, error) {
+	return c.providers(ctx, checkedAt, local)
 }
 
-func (c *observabilityAPIRefreshChecker) CheckDataSets(context.Context, []observability.LocalDataSet) ([]observability.DataSetState, error) {
+func (c *observabilityAPIRefreshChecker) CheckDataSets(context.Context, time.Time, []observability.LocalDataSet) ([]observability.DataSetState, error) {
 	return nil, nil
 }
 
 type observabilityAPIStore struct {
 	providers              []observability.ProviderState
+	providerLastCheckedAt  *time.Time
+	dataSetLastCheckedAt   *time.Time
 	lastDataSetListOptions observability.ListOptions
 }
 
-func (s *observabilityAPIStore) ReplaceProviderStates(_ context.Context, states []observability.ProviderState) error {
+func (s *observabilityAPIStore) ReplaceProviderStates(_ context.Context, checkedAt time.Time, states []observability.ProviderState) error {
 	s.providers = states
+	s.providerLastCheckedAt = &checkedAt
 	return nil
 }
 
@@ -185,30 +185,23 @@ func (s *observabilityAPIStore) ListProviderStates(_ context.Context, opts obser
 	return observability.ProviderStatePage{
 		Items:         s.providers,
 		Summary:       observability.Summary{Total: len(s.providers), Available: len(s.providers)},
-		LastCheckedAt: latestProviderCheckedAt(s.providers),
+		LastCheckedAt: s.providerLastCheckedAt,
 		Total:         len(s.providers),
 		Limit:         opts.Limit,
 		Offset:        opts.Offset,
 	}, nil
 }
 
-func (s *observabilityAPIStore) ReplaceDataSetStates(context.Context, []observability.DataSetState) error {
+func (s *observabilityAPIStore) ReplaceDataSetStates(_ context.Context, checkedAt time.Time, _ []observability.DataSetState) error {
+	s.dataSetLastCheckedAt = &checkedAt
 	return nil
 }
 
 func (s *observabilityAPIStore) ListDataSetStates(_ context.Context, opts observability.ListOptions) (observability.DataSetStatePage, error) {
 	s.lastDataSetListOptions = opts
-	return observability.DataSetStatePage{}, nil
+	return observability.DataSetStatePage{LastCheckedAt: s.dataSetLastCheckedAt, Limit: opts.Limit, Offset: opts.Offset}, nil
 }
 
 func (s *observabilityAPIStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
 	return nil, nil
-}
-
-func latestProviderCheckedAt(rows []observability.ProviderState) *time.Time {
-	if len(rows) == 0 {
-		return nil
-	}
-	last := rows[0].LastCheckedAt
-	return &last
 }

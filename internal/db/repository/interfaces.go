@@ -423,9 +423,9 @@ type WalletOperationRepository interface {
 }
 
 type ObservabilityRepository interface {
-	ReplaceProviderStates(ctx context.Context, states []observability.ProviderState) error
+	ReplaceProviderStates(ctx context.Context, checkedAt time.Time, states []observability.ProviderState) error
 	ListProviderStates(ctx context.Context, opts observability.ListOptions) (observability.ProviderStatePage, error)
-	ReplaceDataSetStates(ctx context.Context, states []observability.DataSetState) error
+	ReplaceDataSetStates(ctx context.Context, checkedAt time.Time, states []observability.DataSetState) error
 	ListDataSetStates(ctx context.Context, opts observability.ListOptions) (observability.DataSetStatePage, error)
 	GetDataSetStatesByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]observability.DataSetState, error)
 }

@@ -76,8 +76,10 @@ func NewChecker(opts CheckerOptions) *Checker {
 	}
 }
 
-func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataSet) ([]ProviderState, error) {
-	checkedAt := c.checkedAt()
+func (c *Checker) CheckProviders(ctx context.Context, checkedAt time.Time, localDataSets []LocalDataSet) ([]ProviderState, error) {
+	if checkedAt.IsZero() {
+		checkedAt = c.checkedAt()
+	}
 	providerIDs := make(map[string]types.OnChainID)
 	providers := make(map[string]Provider)
 	providerErrors := make(map[string]string)
@@ -121,7 +123,6 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 				ProviderID:    id,
 				Status:        StatusUnknown,
 				ReasonCodes:   []ReasonCode{ReasonRegistryLookupFailed},
-				HealthStatus:  "unknown",
 				LastCheckedAt: checkedAt,
 				LastError:     &errText,
 				Evidence:      map[string]any{},
@@ -138,8 +139,8 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 		}
 		if !provider.HasPDP {
 			status = worseStatus(status, StatusUnavailable)
-			if !reasonCodeContains(reasons, ReasonProviderInactive) {
-				reasons = append(reasons, ReasonProviderInactive)
+			if !reasonCodeContains(reasons, ReasonProviderMissingPDP) {
+				reasons = append(reasons, ReasonProviderMissingPDP)
 			}
 		}
 		healthStatus := health[key]
@@ -160,8 +161,10 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 			ProviderID:    id,
 			Status:        status,
 			ReasonCodes:   reasons,
-			Active:        provider.Active,
-			HealthStatus:  healthStatus,
+			Active:        boolPtr(provider.Active),
+			HasPDP:        boolPtr(provider.HasPDP),
+			ServiceURL:    stringPtr(provider.ServiceURL),
+			HealthStatus:  stringPtr(healthStatus),
 			LastCheckedAt: checkedAt,
 			Evidence: map[string]any{
 				"service_url": provider.ServiceURL,
@@ -176,8 +179,10 @@ func (c *Checker) CheckProviders(ctx context.Context, localDataSets []LocalDataS
 	return states, nil
 }
 
-func (c *Checker) CheckDataSets(ctx context.Context, localDataSets []LocalDataSet) ([]DataSetState, error) {
-	checkedAt := c.checkedAt()
+func (c *Checker) CheckDataSets(ctx context.Context, checkedAt time.Time, localDataSets []LocalDataSet) ([]DataSetState, error) {
+	if checkedAt.IsZero() {
+		checkedAt = c.checkedAt()
+	}
 	needsChain := false
 	for _, local := range localDataSets {
 		if local.DataSetID != nil && !local.DataSetID.IsZero() {
@@ -212,6 +217,7 @@ func (c *Checker) CheckDataSets(ctx context.Context, localDataSets []LocalDataSe
 			LocalDataSetID:  local.ID,
 			BucketID:        local.BucketID,
 			BucketName:      local.BucketName,
+			CopyIndex:       local.CopyIndex,
 			ProviderID:      local.ProviderID,
 			ChainDataSetID:  local.DataSetID,
 			ClientDataSetID: local.ClientDataSetID,
@@ -548,6 +554,14 @@ func chainEvidence(dataSet ChainDataSet) map[string]any {
 		evidence["active_piece_count"] = *dataSet.ActivePieceCount
 	}
 	return evidence
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func stringPtr(value string) *string {
+	return &value
 }
 
 func (r ReasonCode) String() string {

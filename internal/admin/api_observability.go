@@ -16,28 +16,6 @@ const (
 	observabilityRefreshHeaderValue = "1"
 )
 
-type observabilityProviderListResponse struct {
-	Items         []observability.ProviderState `json:"items"`
-	Summary       observability.Summary         `json:"summary"`
-	LastCheckedAt *time.Time                    `json:"last_checked_at,omitempty"`
-	Stale         bool                          `json:"stale"`
-	Warnings      []string                      `json:"warnings"`
-	Total         int                           `json:"total"`
-	Limit         int                           `json:"limit"`
-	Offset        int                           `json:"offset"`
-}
-
-type observabilityDataSetListResponse struct {
-	Items         []observability.DataSetState `json:"items"`
-	Summary       observability.Summary        `json:"summary"`
-	LastCheckedAt *time.Time                   `json:"last_checked_at,omitempty"`
-	Stale         bool                         `json:"stale"`
-	Warnings      []string                     `json:"warnings"`
-	Total         int                          `json:"total"`
-	Limit         int                          `json:"limit"`
-	Offset        int                          `json:"offset"`
-}
-
 func (s *Server) handleAPIObservabilityProviders(w http.ResponseWriter, r *http.Request) {
 	if s.observability == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "observability not available"})
@@ -47,13 +25,13 @@ func (s *Server) handleAPIObservabilityProviders(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
-	page, err := s.observability.ListProviders(r.Context(), opts)
+	page, err := s.observability.ListProviderObservations(r.Context(), opts)
 	if err != nil {
 		s.logger.Error("api: failed to list provider observability", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.providerObservabilityResponse(page))
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) handleAPIRefreshObservabilityProviders(w http.ResponseWriter, r *http.Request) {
@@ -69,13 +47,13 @@ func (s *Server) handleAPIRefreshObservabilityProviders(w http.ResponseWriter, r
 		return
 	}
 	s.extendObservabilityRefreshWriteDeadline(w)
-	page, err := s.observability.RefreshProviders(r.Context(), opts)
+	page, err := s.observability.RefreshProviderObservations(r.Context(), opts)
 	if err != nil {
 		s.logger.Error("api: failed to refresh provider observability", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.providerObservabilityResponse(page))
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) handleAPIObservabilityDataSets(w http.ResponseWriter, r *http.Request) {
@@ -87,13 +65,13 @@ func (s *Server) handleAPIObservabilityDataSets(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	page, err := s.observability.ListDataSets(r.Context(), opts)
+	page, err := s.observability.ListDataSetObservations(r.Context(), opts)
 	if err != nil {
 		s.logger.Error("api: failed to list data set observability", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.dataSetObservabilityResponse(page))
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) handleAPIRefreshObservabilityDataSets(w http.ResponseWriter, r *http.Request) {
@@ -109,13 +87,13 @@ func (s *Server) handleAPIRefreshObservabilityDataSets(w http.ResponseWriter, r 
 		return
 	}
 	s.extendObservabilityRefreshWriteDeadline(w)
-	page, err := s.observability.RefreshDataSets(r.Context(), opts)
+	page, err := s.observability.RefreshDataSetObservations(r.Context(), opts)
 	if err != nil {
 		s.logger.Error("api: failed to refresh data set observability", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.dataSetObservabilityResponse(page))
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) parseObservabilityListOptions(w http.ResponseWriter, r *http.Request, allowBucket bool) (observability.ListOptions, bool) {
@@ -231,47 +209,6 @@ func (s *Server) extendObservabilityRefreshWriteDeadline(w http.ResponseWriter) 
 	if err := http.NewResponseController(w).SetWriteDeadline(deadline); err != nil && s.logger != nil {
 		s.logger.Warn("api: failed to set observability refresh write deadline", "error", err)
 	}
-}
-
-func (s *Server) providerObservabilityResponse(page observability.ProviderStatePage) observabilityProviderListResponse {
-	stale, warnings := observabilityFreshness(page.LastCheckedAt, s.observability.RefreshInterval())
-	return observabilityProviderListResponse{
-		Items:         page.Items,
-		Summary:       page.Summary,
-		LastCheckedAt: page.LastCheckedAt,
-		Stale:         stale,
-		Warnings:      warnings,
-		Total:         page.Total,
-		Limit:         page.Limit,
-		Offset:        page.Offset,
-	}
-}
-
-func (s *Server) dataSetObservabilityResponse(page observability.DataSetStatePage) observabilityDataSetListResponse {
-	stale, warnings := observabilityFreshness(page.LastCheckedAt, s.observability.RefreshInterval())
-	return observabilityDataSetListResponse{
-		Items:         page.Items,
-		Summary:       page.Summary,
-		LastCheckedAt: page.LastCheckedAt,
-		Stale:         stale,
-		Warnings:      warnings,
-		Total:         page.Total,
-		Limit:         page.Limit,
-		Offset:        page.Offset,
-	}
-}
-
-func observabilityFreshness(lastCheckedAt *time.Time, interval time.Duration) (bool, []string) {
-	if lastCheckedAt == nil {
-		return false, []string{"no_state_recorded"}
-	}
-	if interval <= 0 {
-		interval = 5 * time.Minute
-	}
-	if time.Since(*lastCheckedAt) > interval*2 {
-		return true, []string{string(observability.ReasonStaleState)}
-	}
-	return false, []string{}
 }
 
 func (s *Server) requireObservabilityRefresh(w http.ResponseWriter, r *http.Request) bool {

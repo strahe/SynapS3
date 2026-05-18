@@ -108,9 +108,14 @@ export interface ObservabilityListResponse<T> {
     unavailable: number
     unknown: number
   }
-  last_checked_at?: string
-  stale: boolean
-  warnings: string[]
+  summary_signal: {
+    level: 'ok' | 'warning' | 'blocking'
+    freshness: {
+      last_checked_at?: string
+      stale: boolean
+      warnings: string[]
+    }
+  }
   total: number
   limit: number
   offset: number

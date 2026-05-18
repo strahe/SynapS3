@@ -15,7 +15,7 @@ func TestServiceMergesConcurrentProviderRefreshes(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
 	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderState, error) {
+		checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
 			if atomic.AddInt32(&calls, 1) == 1 {
 				close(started)
 				<-release
@@ -66,7 +66,7 @@ func TestServiceMergesConcurrentDataSetRefreshes(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
 	checker := &fakeRefreshChecker{
-		checkDataSets: func(context.Context, []LocalDataSet) ([]DataSetState, error) {
+		checkDataSets: func(context.Context, time.Time, []LocalDataSet) ([]DataSetState, error) {
 			if atomic.AddInt32(&calls, 1) == 1 {
 				close(started)
 				<-release
@@ -117,7 +117,7 @@ func TestServiceRefreshIgnoresRequestCancellation(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	checker := &fakeRefreshChecker{
-		checkProviders: func(ctx context.Context, _ []LocalDataSet) ([]ProviderState, error) {
+		checkProviders: func(ctx context.Context, _ time.Time, _ []LocalDataSet) ([]ProviderState, error) {
 			close(started)
 			<-release
 			if err := ctx.Err(); err != nil {
@@ -150,7 +150,7 @@ func TestServiceRefreshIgnoresRequestCancellation(t *testing.T) {
 func TestServiceRefreshCleansUpAfterPanic(t *testing.T) {
 	var calls int32
 	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderState, error) {
+		checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
 			if atomic.AddInt32(&calls, 1) == 1 {
 				panic("boom")
 			}
@@ -180,7 +180,7 @@ func TestServiceRefreshCleansUpAfterPanic(t *testing.T) {
 
 func TestServiceRefreshAppliesRefreshTimeout(t *testing.T) {
 	checker := &fakeRefreshChecker{
-		checkProviders: func(ctx context.Context, _ []LocalDataSet) ([]ProviderState, error) {
+		checkProviders: func(ctx context.Context, _ time.Time, _ []LocalDataSet) ([]ProviderState, error) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
@@ -200,10 +200,10 @@ func TestServiceRefreshAppliesRefreshTimeout(t *testing.T) {
 func TestServiceRefreshAllAttemptsDataSetsAfterProviderFailure(t *testing.T) {
 	providerErr := errors.New("provider refresh failed")
 	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, []LocalDataSet) ([]ProviderState, error) {
+		checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
 			return nil, providerErr
 		},
-		checkDataSets: func(context.Context, []LocalDataSet) ([]DataSetState, error) {
+		checkDataSets: func(context.Context, time.Time, []LocalDataSet) ([]DataSetState, error) {
 			return []DataSetState{{LocalDataSetID: 1, Status: StatusAvailable}}, nil
 		},
 	}
@@ -242,16 +242,16 @@ func (c *observedDoneContext) Done() <-chan struct{} {
 }
 
 type fakeRefreshChecker struct {
-	checkProviders func(context.Context, []LocalDataSet) ([]ProviderState, error)
-	checkDataSets  func(context.Context, []LocalDataSet) ([]DataSetState, error)
+	checkProviders func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error)
+	checkDataSets  func(context.Context, time.Time, []LocalDataSet) ([]DataSetState, error)
 }
 
-func (f *fakeRefreshChecker) CheckProviders(ctx context.Context, local []LocalDataSet) ([]ProviderState, error) {
-	return f.checkProviders(ctx, local)
+func (f *fakeRefreshChecker) CheckProviders(ctx context.Context, checkedAt time.Time, local []LocalDataSet) ([]ProviderState, error) {
+	return f.checkProviders(ctx, checkedAt, local)
 }
 
-func (f *fakeRefreshChecker) CheckDataSets(ctx context.Context, local []LocalDataSet) ([]DataSetState, error) {
-	return f.checkDataSets(ctx, local)
+func (f *fakeRefreshChecker) CheckDataSets(ctx context.Context, checkedAt time.Time, local []LocalDataSet) ([]DataSetState, error) {
+	return f.checkDataSets(ctx, checkedAt, local)
 }
 
 type fakeStateStore struct {
@@ -261,7 +261,7 @@ type fakeStateStore struct {
 	dataSets         []DataSetState
 }
 
-func (f *fakeStateStore) ReplaceProviderStates(_ context.Context, states []ProviderState) error {
+func (f *fakeStateStore) ReplaceProviderStates(_ context.Context, _ time.Time, states []ProviderState) error {
 	f.providerReplaces++
 	f.providers = states
 	return nil
@@ -271,7 +271,7 @@ func (f *fakeStateStore) ListProviderStates(_ context.Context, opts ListOptions)
 	return ProviderStatePage{Items: f.providers, Summary: Summary{Total: len(f.providers)}, Total: len(f.providers), Limit: opts.Limit, Offset: opts.Offset}, nil
 }
 
-func (f *fakeStateStore) ReplaceDataSetStates(_ context.Context, states []DataSetState) error {
+func (f *fakeStateStore) ReplaceDataSetStates(_ context.Context, _ time.Time, states []DataSetState) error {
 	f.dataSetReplaces++
 	f.dataSets = states
 	return nil

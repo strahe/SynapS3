@@ -902,17 +902,19 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDataSetSummaries: %v", err)
 	}
-	if err := repos.Observability.ReplaceDataSetStates(ctx, []observability.DataSetState{
+	checkedAt := time.Now().UTC()
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
 		{
 			LocalDataSetID: summaries[0].ID,
 			BucketID:       bucket.ID,
 			BucketName:     bucket.Name,
+			CopyIndex:      summaries[0].CopyIndex,
 			ProviderID:     summaries[0].ProviderID,
 			ChainDataSetID: summaries[0].DataSetID,
 			LocalStatus:    summaries[0].Status,
 			Status:         observability.StatusDegraded,
 			ReasonCodes:    []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged},
-			LastCheckedAt:  time.Now().UTC(),
+			LastCheckedAt:  checkedAt,
 			Evidence:       map[string]any{},
 		},
 	}); err != nil {
@@ -1059,10 +1061,18 @@ func TestDataSetStorageHealthInfoEncodesEmptyReasonCodesArray(t *testing.T) {
 	srv := (&Server{logger: testLogger()}).
 		WithObservability(observability.NewService(observability.ServiceOptions{RefreshInterval: time.Hour}))
 
-	info := srv.dataSetStorageHealthInfo(observability.DataSetState{
-		LocalDataSetID: 1,
-		Status:         observability.StatusAvailable,
-		LastCheckedAt:  checkedAt,
+	info := srv.dataSetStorageHealthInfo(observability.DataSetObservation{
+		Facts: observability.DataSetFacts{
+			LocalDataSetID: 1,
+		},
+		Signal: observability.Signal{
+			Status:      observability.StatusAvailable,
+			ReasonCodes: []observability.ReasonCode{},
+			Freshness: observability.Freshness{
+				LastCheckedAt: &checkedAt,
+				Warnings:      []observability.FreshnessWarning{},
+			},
+		},
 	})
 	body, err := json.Marshal(info)
 	if err != nil {
@@ -1080,7 +1090,7 @@ type bucketStorageHealthErrorStore struct {
 	err error
 }
 
-func (s *bucketStorageHealthErrorStore) ReplaceProviderStates(context.Context, []observability.ProviderState) error {
+func (s *bucketStorageHealthErrorStore) ReplaceProviderStates(context.Context, time.Time, []observability.ProviderState) error {
 	return nil
 }
 
@@ -1088,7 +1098,7 @@ func (s *bucketStorageHealthErrorStore) ListProviderStates(context.Context, obse
 	return observability.ProviderStatePage{}, nil
 }
 
-func (s *bucketStorageHealthErrorStore) ReplaceDataSetStates(context.Context, []observability.DataSetState) error {
+func (s *bucketStorageHealthErrorStore) ReplaceDataSetStates(context.Context, time.Time, []observability.DataSetState) error {
 	return nil
 }
 
