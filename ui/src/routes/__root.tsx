@@ -45,8 +45,6 @@ import { useFilecoinReadiness, useSettings } from '@/hooks/queries'
 import {
   filecoinReadinessStatusLabel,
   filecoinReadinessStatusTone,
-  filecoinReadinessSummary,
-  importantFilecoinReadinessChecks,
   isDismissibleFilecoinReadinessCheck,
   readDismissedFilecoinReadinessChecks,
   writeDismissedFilecoinReadinessCheck,
@@ -66,6 +64,7 @@ import { applyWalletOperationEventData } from '@/lib/wallet-operation-events'
 import {
   filecoinRuntimeReadinessEnabled,
   fullRuntimeAvailable,
+  globalFilecoinReadinessAlertState,
   rootContentKind,
   rootUsesSetupShell,
 } from './-root-content'
@@ -177,21 +176,21 @@ function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [dismissedCheckIds, setDismissedCheckIds] = useState(() => readDismissedFilecoinReadinessChecks())
   const data = readiness.data
-  const status = data?.status ?? 'unknown'
-  const failed = readiness.error instanceof Error
-  const visibleChecks = data ? importantFilecoinReadinessChecks(data.checks, dismissedCheckIds) : []
-  const primaryCheck = visibleChecks[0]
-  const showDataAlert =
-    data != null && data.status !== 'ready' && (visibleChecks.length > 0 || data.checks.length === 0)
-  const show = enabled && (failed || showDataAlert)
+  const alert = globalFilecoinReadinessAlertState({
+    enabled,
+    data,
+    error: readiness.error,
+    dismissedCheckIds,
+  })
 
-  if (!show) return null
+  if (!alert.show) return null
 
-  const title = failed ? 'Filecoin readiness could not be checked' : 'Filecoin uploads need attention'
-  const summary = failed ? readiness.error?.message : filecoinReadinessSummary(data, dismissedCheckIds)
-  const danger = failed || status === 'blocked'
+  const danger = alert.failed || alert.status === 'blocked'
   const attention = !danger
-  const canDismissPrimaryCheck = Boolean(primaryCheck && isDismissibleFilecoinReadinessCheck(primaryCheck.id))
+  const canDismissPrimaryCheck = Boolean(
+    alert.primaryCheck && isDismissibleFilecoinReadinessCheck(alert.primaryCheck.id)
+  )
+  const dismissiblePrimaryCheck = canDismissPrimaryCheck ? alert.primaryCheck : undefined
 
   function dismissCheck(id: string) {
     writeDismissedFilecoinReadinessCheck(id, true)
@@ -215,19 +214,24 @@ function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
         >
           <AlertTriangle />
           <AlertTitle className="flex flex-wrap items-center gap-2">
-            {title}
-            {!failed && (
-              <StatusBadge tone={filecoinReadinessStatusTone(status)}>
-                {filecoinReadinessStatusLabel(status)}
+            {alert.title}
+            {!alert.failed && (
+              <StatusBadge tone={filecoinReadinessStatusTone(alert.status)}>
+                {filecoinReadinessStatusLabel(alert.status)}
               </StatusBadge>
             )}
           </AlertTitle>
           <AlertDescription className={attention ? 'text-[color:var(--status-warning)]' : undefined}>
             <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-              <span className="min-w-0 flex-1 break-words">{summary}</span>
+              <span className="min-w-0 flex-1 break-words">{alert.summary}</span>
               <div className="flex shrink-0 flex-wrap items-center gap-2">
-                {canDismissPrimaryCheck && primaryCheck && (
-                  <Button type="button" variant="outline" size="sm" onClick={() => dismissCheck(primaryCheck.id)}>
+                {dismissiblePrimaryCheck && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => dismissCheck(dismissiblePrimaryCheck.id)}
+                  >
                     <BellOff data-icon="inline-start" />
                     Dismiss
                   </Button>

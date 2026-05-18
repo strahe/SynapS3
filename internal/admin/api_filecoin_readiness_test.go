@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/config"
-	"github.com/strahe/synaps3/internal/db/repository"
-	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 )
@@ -53,183 +51,58 @@ func TestFilecoinReadinessRuntime(t *testing.T) {
 	}
 }
 
-func TestFilecoinReadinessObservabilityNoStateWarns(t *testing.T) {
-	srv := (&Server{logger: testLogger()}).
-		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithObservability(observability.NewService(observability.ServiceOptions{
-			Store:           &observabilityAPIStore{},
-			RefreshInterval: time.Minute,
-		}))
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIFilecoinReadiness(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body synapse.ReadinessResult
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if body.Status != synapse.ReadinessStatusWarning {
-		t.Fatalf("readiness status = %s, want warning", body.Status)
-	}
-	assertReadinessCheckStatus(t, body.Checks, "observability_providers", synapse.ReadinessStatusWarning)
-	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusReady)
-}
-
-func TestFilecoinReadinessEmptyDataSetInventoryIsReady(t *testing.T) {
+func TestFilecoinReadinessRuntimeIgnoresObservabilityState(t *testing.T) {
 	checkedAt := time.Now().UTC()
-	srv, repos := newBucketAPITestServer(t)
-	srv.WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithObservability(observability.NewService(observability.ServiceOptions{
-			Store: &observabilityReadinessStore{
-				providers: observability.ProviderStatePage{
-					Summary:       observability.Summary{Total: 1, Available: 1},
-					LastCheckedAt: &checkedAt,
-				},
-				dataSets: observability.DataSetStatePage{},
+	tests := []struct {
+		name  string
+		store *observabilityStateStore
+	}{
+		{name: "no state", store: &observabilityStateStore{}},
+		{
+			name: "provider and data set warnings",
+			store: &observabilityStateStore{
+				providers: observability.ProviderStatePage{Summary: observability.Summary{Total: 11, Degraded: 11}, LastCheckedAt: &checkedAt},
+				dataSets:  observability.DataSetStatePage{Summary: observability.Summary{Total: 2, Unavailable: 1, Unknown: 1}, LastCheckedAt: &checkedAt},
 			},
-			LocalDataSets:   observability.LocalDataSetSourceFunc(testObservabilityLocalDataSets(repos)),
-			RefreshInterval: time.Minute,
-		}))
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIFilecoinReadiness(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body synapse.ReadinessResult
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusReady)
-	if body.Status != synapse.ReadinessStatusReady {
-		t.Fatalf("readiness status = %s, want ready", body.Status)
-	}
-}
-
-func TestFilecoinReadinessLocalDataSetWithoutStateWarns(t *testing.T) {
-	checkedAt := time.Now().UTC()
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "readiness-local-dataset", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: "01J000000000000000READYDS",
-		ContentSize:     1,
-		Checksum:        "checksum-readiness-local-dataset",
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
-	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, "bafk2bzacereadinessdataset", []adminStorageCopySeed{
-		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
-	})
-	srv.WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithObservability(observability.NewService(observability.ServiceOptions{
-			Store: &observabilityReadinessStore{
-				providers: observability.ProviderStatePage{
-					Summary:       observability.Summary{Total: 1, Available: 1},
-					LastCheckedAt: &checkedAt,
-				},
-				dataSets: observability.DataSetStatePage{},
-			},
-			LocalDataSets:   observability.LocalDataSetSourceFunc(testObservabilityLocalDataSets(repos)),
-			RefreshInterval: time.Minute,
-		}))
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIFilecoinReadiness(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body synapse.ReadinessResult
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	check := assertReadinessCheckStatus(t, body.Checks, "observability_data_sets", synapse.ReadinessStatusWarning)
-	if !strings.Contains(check.Message, "Some local data sets have no recorded health state.") {
-		t.Fatalf("data set readiness message = %q, want missing local state detail", check.Message)
-	}
-}
-
-func TestFilecoinReadinessProviderHTTPDegradedDoesNotWarn(t *testing.T) {
-	checkedAt := time.Now().UTC()
-	srv := (&Server{logger: testLogger()}).
-		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithObservability(observability.NewService(observability.ServiceOptions{
-			Store: &observabilityReadinessStore{
-				providers: observability.ProviderStatePage{
-					Summary:       observability.Summary{Total: 11, Degraded: 11},
-					LastCheckedAt: &checkedAt,
-				},
-				dataSets: observability.DataSetStatePage{
-					Summary:       observability.Summary{Total: 1, Available: 1},
-					LastCheckedAt: &checkedAt,
-				},
-			},
-			RefreshInterval: time.Minute,
-		}))
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIFilecoinReadiness(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body synapse.ReadinessResult
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	assertReadinessCheckStatus(t, body.Checks, "observability_providers", synapse.ReadinessStatusReady)
-}
-
-func TestFilecoinReadinessObservabilityPartialErrorsAreSanitized(t *testing.T) {
-	srv := (&Server{logger: testLogger()}).
-		WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
-		WithObservability(observability.NewService(observability.ServiceOptions{
-			Store: &observabilityReadinessStore{
-				providerErr: errors.New("rpc failed with sensitive detail"),
-			},
-			RefreshInterval: time.Minute,
-		}))
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIFilecoinReadiness(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body synapse.ReadinessResult
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if got := body.PartialErrors["observability_providers"]; got != "health query failed" {
-		t.Fatalf("provider health partial error = %q, want sanitized message", got)
-	}
-}
-
-func TestFinishReadinessResultPrioritizesWarningOverUnknown(t *testing.T) {
-	result := finishReadinessResult(synapse.ReadinessResult{
-		Checks: []synapse.ReadinessCheck{
-			{ID: "unknown", Status: synapse.ReadinessStatusUnknown},
-			{ID: "warning", Status: synapse.ReadinessStatusWarning},
 		},
-	})
-	if result.Status != synapse.ReadinessStatusWarning {
-		t.Fatalf("Status = %q, want warning", result.Status)
+		{
+			name: "query failure",
+			store: &observabilityStateStore{
+				providerErr: errors.New("provider query failed"),
+				dataSetErr:  errors.New("data set query failed"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := (&Server{logger: testLogger()}).
+				WithFilecoinReadiness(&fakeFilecoinReadinessProbe{runtime: readyFilecoinReadinessResult(synapse.ReadinessModeRuntime)}).
+				WithObservability(observability.NewService(observability.ServiceOptions{
+					Store:           tt.store,
+					RefreshInterval: time.Minute,
+				}))
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/filecoin/readiness", nil)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIFilecoinReadiness(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+			}
+			var body synapse.ReadinessResult
+			if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if body.Status != synapse.ReadinessStatusReady {
+				t.Fatalf("readiness status = %s, want ready", body.Status)
+			}
+			assertReadinessCheckMissing(t, body.Checks, "observability_providers")
+			assertReadinessCheckMissing(t, body.Checks, "observability_data_sets")
+			if len(body.PartialErrors) > 0 {
+				t.Fatalf("partial errors = %#v, want none", body.PartialErrors)
+			}
+		})
 	}
 }
 
@@ -396,18 +269,13 @@ func assertPreflightStatus(t *testing.T, srv *Server, req *http.Request, want in
 	return rr
 }
 
-func assertReadinessCheckStatus(t *testing.T, checks []synapse.ReadinessCheck, id string, want synapse.ReadinessStatus) synapse.ReadinessCheck {
+func assertReadinessCheckMissing(t *testing.T, checks []synapse.ReadinessCheck, id string) {
 	t.Helper()
 	for _, check := range checks {
 		if check.ID == id {
-			if check.Status != want {
-				t.Fatalf("check %s status = %s, want %s", id, check.Status, want)
-			}
-			return check
+			t.Fatalf("check %s present: %#v", id, check)
 		}
 	}
-	t.Fatalf("check %s missing in %#v", id, checks)
-	return synapse.ReadinessCheck{}
 }
 
 func readyFilecoinReadinessResult(mode synapse.ReadinessMode) synapse.ReadinessResult {
@@ -420,13 +288,15 @@ func readyFilecoinReadinessResult(mode synapse.ReadinessMode) synapse.ReadinessR
 }
 
 type fakeFilecoinReadinessProbe struct {
-	runtime     synapse.ReadinessResult
-	draft       synapse.ReadinessResult
-	draftConfig synapse.ReadinessConfig
-	draftCalls  int
+	runtime      synapse.ReadinessResult
+	draft        synapse.ReadinessResult
+	draftConfig  synapse.ReadinessConfig
+	runtimeCalls int
+	draftCalls   int
 }
 
 func (f *fakeFilecoinReadinessProbe) CheckRuntime(context.Context) synapse.ReadinessResult {
+	f.runtimeCalls++
 	return f.runtime
 }
 
@@ -436,58 +306,35 @@ func (f *fakeFilecoinReadinessProbe) CheckDraft(_ context.Context, cfg synapse.R
 	return f.draft
 }
 
-type observabilityReadinessStore struct {
+type observabilityStateStore struct {
 	providers   observability.ProviderStatePage
 	dataSets    observability.DataSetStatePage
 	providerErr error
 	dataSetErr  error
 }
 
-func (s *observabilityReadinessStore) ReplaceProviderStates(context.Context, time.Time, []observability.ProviderState) error {
+func (s *observabilityStateStore) ReplaceProviderStates(context.Context, time.Time, []observability.ProviderState) error {
 	return nil
 }
 
-func (s *observabilityReadinessStore) ListProviderStates(context.Context, observability.ListOptions) (observability.ProviderStatePage, error) {
+func (s *observabilityStateStore) ListProviderStates(context.Context, observability.ListOptions) (observability.ProviderStatePage, error) {
 	if s.providerErr != nil {
 		return observability.ProviderStatePage{}, s.providerErr
 	}
 	return s.providers, nil
 }
 
-func (s *observabilityReadinessStore) ReplaceDataSetStates(context.Context, time.Time, []observability.DataSetState) error {
+func (s *observabilityStateStore) ReplaceDataSetStates(context.Context, time.Time, []observability.DataSetState) error {
 	return nil
 }
 
-func (s *observabilityReadinessStore) ListDataSetStates(context.Context, observability.ListOptions) (observability.DataSetStatePage, error) {
+func (s *observabilityStateStore) ListDataSetStates(context.Context, observability.ListOptions) (observability.DataSetStatePage, error) {
 	if s.dataSetErr != nil {
 		return observability.DataSetStatePage{}, s.dataSetErr
 	}
 	return s.dataSets, nil
 }
 
-func (s *observabilityReadinessStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
+func (s *observabilityStateStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
 	return nil, nil
-}
-
-func testObservabilityLocalDataSets(repos *repository.Repositories) func(context.Context) ([]observability.LocalDataSet, error) {
-	return func(ctx context.Context) ([]observability.LocalDataSet, error) {
-		summaries, err := repos.Uploads.ListDataSetSummaries(ctx, 0)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]observability.LocalDataSet, 0, len(summaries))
-		for _, summary := range summaries {
-			out = append(out, observability.LocalDataSet{
-				ID:              summary.ID,
-				BucketID:        summary.BucketID,
-				BucketName:      summary.BucketName,
-				CopyIndex:       summary.CopyIndex,
-				ProviderID:      summary.ProviderID,
-				DataSetID:       summary.DataSetID,
-				ClientDataSetID: summary.ClientDataSetID,
-				Status:          summary.Status,
-			})
-		}
-		return out, nil
-	}
 }

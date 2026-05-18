@@ -1,11 +1,22 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { CheckCircle2, ChevronRight, Database, FileBox, HardDrive, Loader2 } from 'lucide-react'
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import type { OverviewData } from '@/api/client'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useOverview } from '@/hooks/queries'
-import { attentionDisplayRows, overviewPipelineRows, type PipelineDisplayRow, workerHealthRows } from '@/lib/overview'
+import {
+  attentionDisplayRows,
+  filecoinStorageHealthCheckedLabel,
+  filecoinStorageHealthLevelStyle,
+  filecoinStorageHealthPartialErrorRows,
+  filecoinStorageHealthStatusLabel,
+  filecoinStorageHealthSummaryRow,
+  overviewPipelineRows,
+  type PipelineDisplayRow,
+  workerHealthRows,
+} from '@/lib/overview'
 import { formatBytes, formatDuration, formatNumber } from '@/lib/utils'
 
 export const Route = createFileRoute('/')({
@@ -51,6 +62,8 @@ function OverviewPage() {
           sub={`${formatBytes(data.cache.used_bytes)} / ${formatBytes(data.cache.max_bytes)}`}
         />
       </div>
+
+      <StorageHealthCard health={data.filecoin_storage_health} />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
@@ -141,6 +154,122 @@ function OverviewPage() {
       </div>
     </div>
   )
+}
+
+function StorageHealthCard({ health }: { health: OverviewData['filecoin_storage_health'] }) {
+  const partialErrors = filecoinStorageHealthPartialErrorRows(health.partial_errors ?? {})
+  const providers = filecoinStorageHealthSummaryRow('providers', 'Providers', health.providers)
+  const dataSets = filecoinStorageHealthSummaryRow('data_sets', 'Data Sets', health.data_sets)
+  const healthStyle = filecoinStorageHealthLevelStyle(health.level)
+  return (
+    <Card size="sm">
+      <CardContent>
+        <div className="grid min-w-0 gap-6 text-xs lg:grid-cols-2 lg:items-center">
+          <div className="grid min-w-0 gap-2">
+            <div className="flex min-w-0 items-baseline justify-between gap-4">
+              <CardTitle className="truncate">Storage Health</CardTitle>
+              <span className={`shrink-0 font-medium ${healthStyle.textClassName}`}>
+                {filecoinStorageHealthStatusLabel(health)}
+              </span>
+            </div>
+            <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-baseline gap-3">
+              <span className="text-muted-foreground">Storage copies</span>
+              <span className="truncate font-semibold text-foreground">
+                {formatOptionalNumber(dataSets.available)} / {formatOptionalNumber(dataSets.total)} ready
+              </span>
+              <span className="font-semibold text-foreground">{formatOptionalPercent(dataSets.readyPercent)}</span>
+            </div>
+            <div className="h-2 min-w-0 overflow-hidden rounded-full bg-muted">
+              <div
+                className={`h-full rounded-full ${healthStyle.progressClassName}`}
+                style={{ width: `${dataSets.readyPercent ?? 0}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="grid min-w-0 gap-2">
+            <div className="h-4" aria-hidden="true" />
+            <CompactMetric
+              label="Providers"
+              value={`${formatOptionalNumber(providers.available)} / ${formatOptionalNumber(providers.total)} available`}
+            />
+            <div className="flex min-w-0 flex-wrap items-baseline gap-x-4 gap-y-1">
+              <span className="shrink-0 text-muted-foreground">Copy states</span>
+              <div className="flex min-w-0 flex-wrap gap-x-4 gap-y-1">
+                <InlineMetric label="Unavailable" value={dataSets.unavailable} tone="danger" />
+                <InlineMetric label="Degraded" value={dataSets.degraded} />
+                <InlineMetric label="Unknown" value={dataSets.unknown} />
+              </div>
+              <div className="ml-auto">
+                <CompactMetric label="Checked" value={filecoinStorageHealthCheckedLabel(health)} align="end" />
+              </div>
+            </div>
+          </div>
+
+          {partialErrors.length > 0 && (
+            <div className="flex flex-wrap gap-1 lg:col-span-2">
+              {partialErrors.map((error) => (
+                <StatusBadge key={error.key} tone="warning">
+                  {error.label}
+                </StatusBadge>
+              ))}
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function CompactMetric({
+  label,
+  value,
+  suffix,
+  align = 'start',
+}: {
+  label: string
+  value: string
+  suffix?: string
+  align?: 'start' | 'end'
+}) {
+  return (
+    <div className={`flex min-w-0 items-baseline gap-2 ${align === 'end' ? 'justify-end' : ''}`}>
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className="truncate font-semibold text-foreground">{value}</span>
+      {suffix && <span className="shrink-0 font-semibold text-foreground">{suffix}</span>}
+    </div>
+  )
+}
+
+function InlineMetric({
+  label,
+  value,
+  tone = 'neutral',
+}: {
+  label: string
+  value: number | null
+  tone?: 'neutral' | 'warning' | 'danger'
+}) {
+  const effectiveTone = value != null && value > 0 ? tone : 'neutral'
+  const toneClassName =
+    effectiveTone === 'danger'
+      ? 'text-[color:var(--status-danger)]'
+      : effectiveTone === 'warning'
+        ? 'text-[color:var(--status-warning)]'
+        : 'text-muted-foreground'
+  return (
+    <span className={toneClassName}>
+      {label} <span className="font-medium text-foreground">{formatOptionalNumber(value)}</span>
+    </span>
+  )
+}
+
+function formatOptionalNumber(value: number | null) {
+  return value == null ? '—' : formatNumber(value)
+}
+
+function formatOptionalPercent(value: number | null) {
+  return value == null ? '—' : `${value}%`
 }
 
 function AttentionLinkRow({ row }: { row: ReturnType<typeof attentionDisplayRows>[number] }) {

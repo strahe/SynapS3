@@ -3,13 +3,16 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
@@ -126,6 +129,186 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	}
 }
 
+func TestAPIOverviewFilecoinStorageHealthUsesObservabilitySummaries(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityStateStore{
+				providers: observability.ProviderStatePage{
+					Summary:       observability.Summary{Total: 2, Available: 2},
+					LastCheckedAt: &checkedAt,
+				},
+				dataSets: observability.DataSetStatePage{
+					Summary:       observability.Summary{Total: 3, Available: 3},
+					LastCheckedAt: &checkedAt,
+				},
+			},
+			RefreshInterval: time.Minute,
+			Now:             func() time.Time { return checkedAt },
+		}))
+
+	body := decodeOverviewResponse(t, srv)
+	if body.FilecoinStorageHealth.Level != observability.SignalOK {
+		t.Fatalf("filecoin storage health level = %s, want ok", body.FilecoinStorageHealth.Level)
+	}
+	if body.FilecoinStorageHealth.Providers == nil || body.FilecoinStorageHealth.Providers.Summary.Available != 2 {
+		t.Fatalf("provider summary = %#v, want available=2", body.FilecoinStorageHealth.Providers)
+	}
+	if body.FilecoinStorageHealth.DataSets == nil || body.FilecoinStorageHealth.DataSets.Summary.Available != 3 {
+		t.Fatalf("data set summary = %#v, want available=3", body.FilecoinStorageHealth.DataSets)
+	}
+	if len(body.FilecoinStorageHealth.PartialErrors) != 0 {
+		t.Fatalf("partial errors = %#v, want empty", body.FilecoinStorageHealth.PartialErrors)
+	}
+}
+
+func TestAPIOverviewFilecoinStorageHealthWarnsForObservabilitySignalsWithoutReinterpretingSummary(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityStateStore{
+				providers: observability.ProviderStatePage{
+					Summary:       observability.Summary{Total: 1, Degraded: 1},
+					LastCheckedAt: &checkedAt,
+				},
+				dataSets: observability.DataSetStatePage{
+					Summary:       observability.Summary{Total: 1, Unknown: 1},
+					LastCheckedAt: &checkedAt,
+				},
+			},
+			RefreshInterval: time.Minute,
+			Now:             func() time.Time { return checkedAt },
+		}))
+
+	body := decodeOverviewResponse(t, srv)
+	if body.FilecoinStorageHealth.Level != observability.SignalWarning {
+		t.Fatalf("filecoin storage health level = %s, want warning", body.FilecoinStorageHealth.Level)
+	}
+}
+
+func TestAPIOverviewFilecoinStorageHealthRollsUpBlockingObservabilitySignal(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityStateStore{
+				providers: observability.ProviderStatePage{
+					Summary:       observability.Summary{Total: 1, Unavailable: 1},
+					LastCheckedAt: &checkedAt,
+				},
+				dataSets: observability.DataSetStatePage{
+					Summary:       observability.Summary{Total: 1, Available: 1},
+					LastCheckedAt: &checkedAt,
+				},
+			},
+			RefreshInterval: time.Minute,
+			Now:             func() time.Time { return checkedAt },
+		}))
+
+	body := decodeOverviewResponse(t, srv)
+	if body.FilecoinStorageHealth.Level != observability.SignalBlocking {
+		t.Fatalf("filecoin storage health level = %s, want blocking", body.FilecoinStorageHealth.Level)
+	}
+}
+
+func TestAPIOverviewFilecoinStorageHealthHandlesMissingObservability(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+
+	body := decodeOverviewResponse(t, srv)
+	if body.FilecoinStorageHealth.Level != observability.SignalWarning {
+		t.Fatalf("filecoin storage health level = %s, want warning", body.FilecoinStorageHealth.Level)
+	}
+	if body.FilecoinStorageHealth.Providers != nil || body.FilecoinStorageHealth.DataSets != nil {
+		t.Fatalf("observability sections = providers:%#v data_sets:%#v, want nil", body.FilecoinStorageHealth.Providers, body.FilecoinStorageHealth.DataSets)
+	}
+	if got := body.FilecoinStorageHealth.PartialErrors["observability"]; got != "observability not available" {
+		t.Fatalf("observability partial error = %q, want sanitized missing service", got)
+	}
+}
+
+func TestAPIOverviewFilecoinStorageHealthHandlesObservabilityQueryFailures(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityStateStore{
+				providerErr: errors.New("provider rpc failed with sensitive detail"),
+				dataSetErr:  errors.New("data set rpc failed with sensitive detail"),
+			},
+			RefreshInterval: time.Minute,
+		}))
+
+	body := decodeOverviewResponse(t, srv)
+	if body.FilecoinStorageHealth.Level != observability.SignalWarning {
+		t.Fatalf("filecoin storage health level = %s, want warning", body.FilecoinStorageHealth.Level)
+	}
+	if got := body.FilecoinStorageHealth.PartialErrors["observability_providers"]; got != "provider health query failed" {
+		t.Fatalf("provider partial error = %q, want sanitized query failure", got)
+	}
+	if got := body.FilecoinStorageHealth.PartialErrors["observability_data_sets"]; got != "data set health query failed" {
+		t.Fatalf("data set partial error = %q, want sanitized query failure", got)
+	}
+}
+
+func TestAPIOverviewFilecoinStorageHealthIgnoresTaskPressure(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	overviewSeedTask(t, repos, model.TaskTypeUpload, "ingress_store", model.TaskStatusRunning)
+	overviewSeedTask(t, repos, model.TaskTypeUpload, "ingress_store", model.TaskStatusFailed)
+	overviewSeedTask(t, repos, model.TaskTypeEvictCache, "", model.TaskStatusExhausted)
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+		WithObservability(observability.NewService(observability.ServiceOptions{
+			Store: &observabilityStateStore{
+				providers: observability.ProviderStatePage{
+					Summary:       observability.Summary{Total: 1, Available: 1},
+					LastCheckedAt: &checkedAt,
+				},
+				dataSets: observability.DataSetStatePage{
+					Summary:       observability.Summary{Total: 1, Available: 1},
+					LastCheckedAt: &checkedAt,
+				},
+			},
+			RefreshInterval: time.Minute,
+			Now:             func() time.Time { return checkedAt },
+		}))
+
+	body, raw := decodeOverviewResponseWithRaw(t, srv)
+	if body.FilecoinStorageHealth.Level != observability.SignalOK {
+		t.Fatalf("filecoin storage health level = %s, want ok when only task pressure exists", body.FilecoinStorageHealth.Level)
+	}
+	if _, ok := raw["filecoin_health"]; ok {
+		t.Fatalf("overview includes legacy filecoin_health key, want filecoin_storage_health")
+	}
+	storageHealth, ok := raw["filecoin_storage_health"].(map[string]any)
+	if !ok {
+		t.Fatalf("filecoin_storage_health raw response = %#v, want object", raw["filecoin_storage_health"])
+	}
+	if _, ok := storageHealth["task_pressure"]; ok {
+		t.Fatalf("filecoin_storage_health includes task_pressure, want Observability-only payload: %#v", storageHealth)
+	}
+}
+
+func TestAPIOverviewDoesNotCallFilecoinReadiness(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	probe := &fakeFilecoinReadinessProbe{}
+	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+		WithFilecoinReadiness(probe)
+
+	_ = decodeOverviewResponse(t, srv)
+	if probe.runtimeCalls != 0 {
+		t.Fatalf("runtime readiness calls = %d, want 0", probe.runtimeCalls)
+	}
+}
+
 func overviewSeedBucket(t *testing.T, db *bun.DB, name string) *model.Bucket {
 	t.Helper()
 	bucket := &model.Bucket{Name: name, Status: model.BucketStatusActive}
@@ -176,4 +359,30 @@ func overviewMustExec(t *testing.T, db *bun.DB, query string, args ...interface{
 	if _, err := db.NewRaw(query, args...).Exec(context.Background()); err != nil {
 		t.Fatalf("exec %q: %v", query, err)
 	}
+}
+
+func decodeOverviewResponse(t *testing.T, srv *Server) overviewResponse {
+	t.Helper()
+	body, _ := decodeOverviewResponseWithRaw(t, srv)
+	return body
+}
+
+func decodeOverviewResponseWithRaw(t *testing.T, srv *Server) (overviewResponse, map[string]any) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/overview", nil)
+	srv.handleAPIOverview(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
+	}
+	data := rr.Body.Bytes()
+	var body overviewResponse
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("decode overview: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode raw overview: %v", err)
+	}
+	return body, raw
 }

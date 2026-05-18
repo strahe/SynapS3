@@ -45,38 +45,31 @@ func BuildSignal(status Status, reasons []ReasonCode, lastError *string, lastChe
 func DefaultAttentionSummarySignal(summary Summary, lastCheckedAt *time.Time, interval time.Duration, now time.Time) SummarySignal {
 	freshness := BuildFreshness(lastCheckedAt, interval, now)
 	level := SignalOK
-	if len(freshness.Warnings) > 0 || summary.Degraded > 0 || summary.Unknown > 0 || summary.Unavailable > 0 {
-		level = SignalWarning
+	if len(freshness.Warnings) > 0 || summary.Degraded > 0 || summary.Unknown > 0 {
+		level = WorstSignalLevel(level, SignalWarning)
+	}
+	if summary.Unavailable > 0 {
+		level = WorstSignalLevel(level, SignalBlocking)
 	}
 	return SummarySignal{Level: level, Freshness: freshness}
 }
 
-func ProviderReadinessSummarySignal(summary Summary, lastCheckedAt *time.Time, interval time.Duration, now time.Time) SummarySignal {
-	freshness := BuildFreshness(lastCheckedAt, interval, now)
-	level := SignalOK
-	if len(freshness.Warnings) > 0 || summary.Unknown > 0 || summary.Unavailable > 0 {
-		level = SignalWarning
+func WorstSignalLevel(current SignalLevel, candidate SignalLevel) SignalLevel {
+	if signalLevelRank(candidate) > signalLevelRank(current) {
+		return candidate
 	}
-	return SummarySignal{Level: level, Freshness: freshness}
+	return current
 }
 
-func DataSetReadinessSummarySignal(summary Summary, lastCheckedAt *time.Time, interval time.Duration, now time.Time, localInventoryTotal int) SummarySignal {
-	if localInventoryTotal == 0 && summary.Total == 0 {
-		return SummarySignal{
-			Level:     SignalOK,
-			Freshness: BuildFreshness(lastCheckedAt, interval, now),
-		}
+func signalLevelRank(level SignalLevel) int {
+	switch level {
+	case SignalBlocking:
+		return 2
+	case SignalWarning:
+		return 1
+	default:
+		return 0
 	}
-	freshness := BuildFreshness(lastCheckedAt, interval, now)
-	level := SignalOK
-	if len(freshness.Warnings) > 0 ||
-		localInventoryTotal > summary.Total ||
-		summary.Degraded > 0 ||
-		summary.Unknown > 0 ||
-		summary.Unavailable > 0 {
-		level = SignalWarning
-	}
-	return SummarySignal{Level: level, Freshness: freshness}
 }
 
 func ProviderObservationFromState(state ProviderState, interval time.Duration, now time.Time) ProviderObservation {

@@ -23,6 +23,16 @@ func (f LocalDataSetSourceFunc) ListLocalDataSets(ctx context.Context) ([]LocalD
 	return f(ctx)
 }
 
+type LocalDataSetCountSource interface {
+	CountLocalDataSets(context.Context) (int, error)
+}
+
+type LocalDataSetCountSourceFunc func(context.Context) (int, error)
+
+func (f LocalDataSetCountSourceFunc) CountLocalDataSets(ctx context.Context) (int, error) {
+	return f(ctx)
+}
+
 type StateStore interface {
 	ReplaceProviderStates(context.Context, time.Time, []ProviderState) error
 	ListProviderStates(context.Context, ListOptions) (ProviderStatePage, error)
@@ -32,23 +42,25 @@ type StateStore interface {
 }
 
 type ServiceOptions struct {
-	Checker         RefreshChecker
-	LocalDataSets   LocalDataSetSource
-	Store           StateStore
-	RefreshInterval time.Duration
-	RefreshTimeout  time.Duration
-	Now             func() time.Time
+	Checker           RefreshChecker
+	LocalDataSets     LocalDataSetSource
+	LocalDataSetCount LocalDataSetCountSource
+	Store             StateStore
+	RefreshInterval   time.Duration
+	RefreshTimeout    time.Duration
+	Now               func() time.Time
 }
 
 type Service struct {
-	checker         RefreshChecker
-	localDataSets   LocalDataSetSource
-	store           StateStore
-	refreshInterval time.Duration
-	refreshTimeout  time.Duration
-	now             func() time.Time
-	providerRefresh refreshGroup
-	dataSetRefresh  refreshGroup
+	checker           RefreshChecker
+	localDataSets     LocalDataSetSource
+	localDataSetCount LocalDataSetCountSource
+	store             StateStore
+	refreshInterval   time.Duration
+	refreshTimeout    time.Duration
+	now               func() time.Time
+	providerRefresh   refreshGroup
+	dataSetRefresh    refreshGroup
 }
 
 func NewService(opts ServiceOptions) *Service {
@@ -65,12 +77,13 @@ func NewService(opts ServiceOptions) *Service {
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Service{
-		checker:         opts.Checker,
-		localDataSets:   opts.LocalDataSets,
-		store:           opts.Store,
-		refreshInterval: interval,
-		refreshTimeout:  timeout,
-		now:             now,
+		checker:           opts.Checker,
+		localDataSets:     opts.LocalDataSets,
+		localDataSetCount: opts.LocalDataSetCount,
+		store:             opts.Store,
+		refreshInterval:   interval,
+		refreshTimeout:    timeout,
+		now:               now,
 	}
 }
 
@@ -164,7 +177,11 @@ func (s *Service) ListDataSetObservations(ctx context.Context, opts ListOptions)
 	if err != nil {
 		return DataSetObservationPage{}, err
 	}
-	return s.dataSetObservationPage(page), nil
+	localInventoryTotal, err := s.localDataSetCoverageTotal(ctx, opts, page.Summary.Total)
+	if err != nil {
+		return DataSetObservationPage{}, err
+	}
+	return s.dataSetObservationPage(page, localInventoryTotal), nil
 }
 
 func (s *Service) RefreshDataSetObservations(ctx context.Context, opts ListOptions) (DataSetObservationPage, error) {
@@ -172,7 +189,11 @@ func (s *Service) RefreshDataSetObservations(ctx context.Context, opts ListOptio
 	if err != nil {
 		return DataSetObservationPage{}, err
 	}
-	return s.dataSetObservationPage(page), nil
+	localInventoryTotal, err := s.localDataSetCoverageTotal(ctx, opts, page.Summary.Total)
+	if err != nil {
+		return DataSetObservationPage{}, err
+	}
+	return s.dataSetObservationPage(page, localInventoryTotal), nil
 }
 
 func (s *Service) DataSetStatesByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]DataSetState, error) {
@@ -192,18 +213,6 @@ func (s *Service) DataSetObservationsByLocalIDs(ctx context.Context, localIDs []
 	return out, nil
 }
 
-func (s *Service) ProviderReadinessSignal(page ProviderStatePage) SummarySignal {
-	return ProviderReadinessSummarySignal(page.Summary, page.LastCheckedAt, s.RefreshInterval(), s.checkedAt())
-}
-
-func (s *Service) DataSetReadinessSignal(ctx context.Context, page DataSetStatePage) (SummarySignal, error) {
-	local, err := s.listLocalDataSets(ctx)
-	if err != nil {
-		return SummarySignal{}, err
-	}
-	return DataSetReadinessSummarySignal(page.Summary, page.LastCheckedAt, s.RefreshInterval(), s.checkedAt(), len(local)), nil
-}
-
 func (s *Service) providerObservationPage(page ProviderStatePage) ProviderObservationPage {
 	items := make([]ProviderObservation, 0, len(page.Items))
 	now := s.checkedAt()
@@ -220,16 +229,17 @@ func (s *Service) providerObservationPage(page ProviderStatePage) ProviderObserv
 	}
 }
 
-func (s *Service) dataSetObservationPage(page DataSetStatePage) DataSetObservationPage {
+func (s *Service) dataSetObservationPage(page DataSetStatePage, localInventoryTotal int) DataSetObservationPage {
 	items := make([]DataSetObservation, 0, len(page.Items))
 	now := s.checkedAt()
+	summary := dataSetSummaryWithCoverage(page.Summary, localInventoryTotal)
 	for _, state := range page.Items {
 		items = append(items, DataSetObservationFromState(state, s.RefreshInterval(), now))
 	}
 	return DataSetObservationPage{
 		Items:         items,
-		Summary:       page.Summary,
-		SummarySignal: DefaultAttentionSummarySignal(page.Summary, page.LastCheckedAt, s.RefreshInterval(), now),
+		Summary:       summary,
+		SummarySignal: DefaultAttentionSummarySignal(summary, page.LastCheckedAt, s.RefreshInterval(), now),
 		Total:         page.Total,
 		Limit:         page.Limit,
 		Offset:        page.Offset,
@@ -241,6 +251,43 @@ func (s *Service) listLocalDataSets(ctx context.Context) ([]LocalDataSet, error)
 		return nil, nil
 	}
 	return s.localDataSets.ListLocalDataSets(ctx)
+}
+
+func (s *Service) localDataSetCoverageTotal(ctx context.Context, opts ListOptions, summaryTotal int) (int, error) {
+	if opts.Status != "" {
+		return summaryTotal, nil
+	}
+	if opts.BucketID == 0 && opts.ProviderID == nil && s.localDataSetCount != nil {
+		return s.localDataSetCount.CountLocalDataSets(ctx)
+	}
+	local, err := s.listLocalDataSets(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if opts.BucketID == 0 && opts.ProviderID == nil {
+		return len(local), nil
+	}
+	count := 0
+	for _, dataSet := range local {
+		if opts.BucketID > 0 && dataSet.BucketID != opts.BucketID {
+			continue
+		}
+		if opts.ProviderID != nil && dataSet.ProviderID.String() != opts.ProviderID.String() {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+func dataSetSummaryWithCoverage(summary Summary, localInventoryTotal int) Summary {
+	if localInventoryTotal <= summary.Total {
+		return summary
+	}
+	missing := localInventoryTotal - summary.Total
+	summary.Total = localInventoryTotal
+	summary.Unknown += missing
+	return summary
 }
 
 func (s *Service) checkedAt() time.Time {

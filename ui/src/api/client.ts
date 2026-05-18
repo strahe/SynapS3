@@ -52,6 +52,40 @@ export interface OverviewData {
   cache: { used_bytes: number; max_bytes: number }
   workers: Record<string, boolean>
   system: { version: string; commit: string; build_date: string; uptime_seconds: number }
+  filecoin_storage_health: OverviewFilecoinStorageHealth
+}
+
+export type ObservabilitySignalLevel = 'ok' | 'warning' | 'blocking'
+
+export interface ObservabilitySummary {
+  total: number
+  available: number
+  degraded: number
+  unavailable: number
+  unknown: number
+}
+
+export interface ObservabilityFreshness {
+  last_checked_at?: string
+  stale: boolean
+  warnings: string[]
+}
+
+export interface ObservabilitySummarySignal {
+  level: ObservabilitySignalLevel
+  freshness: ObservabilityFreshness
+}
+
+export interface OverviewFilecoinStorageHealthSection {
+  summary: ObservabilitySummary
+  summary_signal: ObservabilitySummarySignal
+}
+
+export interface OverviewFilecoinStorageHealth {
+  level: ObservabilitySignalLevel
+  providers: OverviewFilecoinStorageHealthSection | null
+  data_sets: OverviewFilecoinStorageHealthSection | null
+  partial_errors: Record<string, string>
 }
 
 export interface BucketItem {
@@ -101,21 +135,8 @@ export interface DataSetStorageHealthInfo {
 
 export interface ObservabilityListResponse<T> {
   items: T[]
-  summary: {
-    total: number
-    available: number
-    degraded: number
-    unavailable: number
-    unknown: number
-  }
-  summary_signal: {
-    level: 'ok' | 'warning' | 'blocking'
-    freshness: {
-      last_checked_at?: string
-      stale: boolean
-      warnings: string[]
-    }
-  }
+  summary: ObservabilitySummary
+  summary_signal: ObservabilitySummarySignal
   total: number
   limit: number
   offset: number

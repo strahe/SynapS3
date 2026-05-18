@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
 
 	"github.com/strahe/synaps3/internal/config"
-	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 )
 
@@ -29,7 +27,6 @@ func (s *Server) handleAPIFilecoinReadiness(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	result := s.filecoinReadiness.CheckRuntime(r.Context())
-	result = s.withObservabilityReadiness(r.Context(), result)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -75,154 +72,6 @@ func (s *Server) handleAPIFilecoinReadinessPreflight(w http.ResponseWriter, r *h
 		return
 	}
 	writeJSON(w, http.StatusOK, s.filecoinReadiness.CheckDraft(r.Context(), filecoinReadinessConfig(cfg)))
-}
-
-func (s *Server) withObservabilityReadiness(ctx context.Context, result synapse.ReadinessResult) synapse.ReadinessResult {
-	if s.observability == nil {
-		return result
-	}
-	providers, err := s.observability.ListProviders(ctx, observabilityReadinessListOptions())
-	if err != nil {
-		result.Checks = append(result.Checks, synapse.ReadinessCheck{
-			ID:      "observability_providers",
-			Status:  synapse.ReadinessStatusWarning,
-			Message: "Provider health state could not be loaded.",
-		})
-		addReadinessPartialError(&result, "observability_providers", err)
-		return finishReadinessResult(result)
-	}
-	result.Checks = append(result.Checks, providerObservabilityReadinessCheck(
-		"observability_providers",
-		"Provider health has no unavailable or unknown state.",
-		"Provider health needs attention.",
-		providers.Summary,
-		s.observability.ProviderReadinessSignal(providers),
-	))
-
-	dataSets, err := s.observability.ListDataSets(ctx, observabilityReadinessListOptions())
-	if err != nil {
-		result.Checks = append(result.Checks, synapse.ReadinessCheck{
-			ID:      "observability_data_sets",
-			Status:  synapse.ReadinessStatusWarning,
-			Message: "Local data set storage health state could not be loaded.",
-		})
-		addReadinessPartialError(&result, "observability_data_sets", err)
-		return finishReadinessResult(result)
-	}
-	dataSetSignal, err := s.observability.DataSetReadinessSignal(ctx, dataSets)
-	if err != nil {
-		result.Checks = append(result.Checks, synapse.ReadinessCheck{
-			ID:      "observability_data_sets",
-			Status:  synapse.ReadinessStatusWarning,
-			Message: "Local data set storage health state could not be loaded.",
-		})
-		addReadinessPartialError(&result, "observability_data_sets", err)
-		return finishReadinessResult(result)
-	}
-	result.Checks = append(result.Checks, observabilityReadinessCheck(
-		"observability_data_sets",
-		"Local data set storage health is healthy.",
-		"Local data set storage health needs attention.",
-		dataSets.Summary,
-		dataSetSignal,
-	))
-	return finishReadinessResult(result)
-}
-
-func observabilityReadinessListOptions() observability.ListOptions {
-	return observability.ListOptions{Limit: 1}
-}
-
-func providerObservabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, signal observability.SummarySignal) synapse.ReadinessCheck {
-	if signal.Level == observability.SignalOK {
-		return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
-	}
-	if freshnessContains(signal.Freshness, observability.FreshnessNoStateRecorded) {
-		return synapse.ReadinessCheck{
-			ID:      id,
-			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " No health state has been recorded yet.",
-		}
-	}
-	if signal.Freshness.Stale {
-		return synapse.ReadinessCheck{
-			ID:      id,
-			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " The latest health state is stale.",
-		}
-	}
-	return synapse.ReadinessCheck{
-		ID:     id,
-		Status: synapse.ReadinessStatusWarning,
-		Message: fmt.Sprintf(
-			"%s unavailable=%d unknown=%d.",
-			attentionMessage,
-			summary.Unavailable,
-			summary.Unknown,
-		),
-	}
-}
-
-func observabilityReadinessCheck(id, readyMessage, attentionMessage string, summary observability.Summary, signal observability.SummarySignal) synapse.ReadinessCheck {
-	if signal.Level == observability.SignalOK {
-		return synapse.ReadinessCheck{ID: id, Status: synapse.ReadinessStatusReady, Message: readyMessage}
-	}
-	if summary.Total == 0 && summary.Unknown == 0 && summary.Unavailable == 0 && summary.Degraded == 0 {
-		return synapse.ReadinessCheck{
-			ID:      id,
-			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " Some local data sets have no recorded health state.",
-		}
-	}
-	if freshnessContains(signal.Freshness, observability.FreshnessNoStateRecorded) {
-		return synapse.ReadinessCheck{
-			ID:      id,
-			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " No health state has been recorded yet.",
-		}
-	}
-	if signal.Freshness.Stale {
-		return synapse.ReadinessCheck{
-			ID:      id,
-			Status:  synapse.ReadinessStatusWarning,
-			Message: attentionMessage + " The latest health state is stale.",
-		}
-	}
-	return synapse.ReadinessCheck{
-		ID:     id,
-		Status: synapse.ReadinessStatusWarning,
-		Message: fmt.Sprintf(
-			"%s degraded=%d unavailable=%d unknown=%d.",
-			attentionMessage,
-			summary.Degraded,
-			summary.Unavailable,
-			summary.Unknown,
-		),
-	}
-}
-
-func freshnessContains(freshness observability.Freshness, warning observability.FreshnessWarning) bool {
-	for _, got := range freshness.Warnings {
-		if got == warning {
-			return true
-		}
-	}
-	return false
-}
-
-func finishReadinessResult(result synapse.ReadinessResult) synapse.ReadinessResult {
-	result.Finish()
-	return result
-}
-
-func addReadinessPartialError(result *synapse.ReadinessResult, field string, err error) {
-	if result == nil || err == nil {
-		return
-	}
-	if result.PartialErrors == nil {
-		result.PartialErrors = make(map[string]string)
-	}
-	result.PartialErrors[field] = "health query failed"
 }
 
 func filecoinReadinessConfig(cfg *config.Config) synapse.ReadinessConfig {

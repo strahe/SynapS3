@@ -481,6 +481,9 @@ func newObservabilityService(cfg *config.Config, repos *repository.Repositories,
 			}
 			return out, nil
 		}),
+		LocalDataSetCount: observability.LocalDataSetCountSourceFunc(func(ctx context.Context) (int, error) {
+			return repos.Buckets.CountStorageDataSets(ctx)
+		}),
 		Store:           repos.Observability,
 		RefreshInterval: cfg.Filecoin.Observability.Interval,
 	})

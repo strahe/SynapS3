@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -9,15 +10,17 @@ import (
 	"github.com/strahe/synaps3/internal/buildinfo"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 )
 
 type overviewResponse struct {
-	Buckets bucketOverview  `json:"buckets"`
-	Objects objectOverview  `json:"objects"`
-	Tasks   taskOverview    `json:"tasks"`
-	Cache   cacheOverview   `json:"cache"`
-	Workers map[string]bool `json:"workers"`
-	System  systemOverview  `json:"system"`
+	Buckets               bucketOverview                `json:"buckets"`
+	Objects               objectOverview                `json:"objects"`
+	Tasks                 taskOverview                  `json:"tasks"`
+	Cache                 cacheOverview                 `json:"cache"`
+	Workers               map[string]bool               `json:"workers"`
+	System                systemOverview                `json:"system"`
+	FilecoinStorageHealth filecoinStorageHealthOverview `json:"filecoin_storage_health"`
 }
 
 type bucketOverview struct {
@@ -64,6 +67,18 @@ type systemOverview struct {
 	Commit        string `json:"commit"`
 	BuildDate     string `json:"build_date"`
 	UptimeSeconds int64  `json:"uptime_seconds"`
+}
+
+type filecoinStorageHealthOverview struct {
+	Level         observability.SignalLevel                 `json:"level"`
+	Providers     *filecoinStorageHealthObservationOverview `json:"providers"`
+	DataSets      *filecoinStorageHealthObservationOverview `json:"data_sets"`
+	PartialErrors map[string]string                         `json:"partial_errors"`
+}
+
+type filecoinStorageHealthObservationOverview struct {
+	Summary       observability.Summary       `json:"summary"`
+	SummarySignal observability.SummarySignal `json:"summary_signal"`
 }
 
 func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
@@ -133,6 +148,7 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	} else {
 		resp.Tasks.ActivePipeline = taskPipelineOverviewRows(taskPipelineCounts)
 	}
+	resp.FilecoinStorageHealth = s.filecoinStorageHealthOverview(ctx)
 
 	// Cache
 	resp.Cache = cacheOverview{
@@ -156,6 +172,50 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) filecoinStorageHealthOverview(ctx context.Context) filecoinStorageHealthOverview {
+	health := filecoinStorageHealthOverview{
+		Level:         observability.SignalOK,
+		PartialErrors: make(map[string]string),
+	}
+
+	if s.observability == nil {
+		health.PartialErrors["observability"] = "observability not available"
+		health.Level = observability.WorstSignalLevel(health.Level, observability.SignalWarning)
+		return health
+	}
+
+	providers, err := s.observability.ListProviderObservations(ctx, observability.ListOptions{Limit: 1})
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("overview: failed to load provider observability summary", "error", err)
+		}
+		health.PartialErrors["observability_providers"] = "provider health query failed"
+		health.Level = observability.WorstSignalLevel(health.Level, observability.SignalWarning)
+	} else {
+		health.Providers = &filecoinStorageHealthObservationOverview{
+			Summary:       providers.Summary,
+			SummarySignal: providers.SummarySignal,
+		}
+		health.Level = observability.WorstSignalLevel(health.Level, providers.SummarySignal.Level)
+	}
+
+	dataSets, err := s.observability.ListDataSetObservations(ctx, observability.ListOptions{Limit: 1})
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("overview: failed to load data set observability summary", "error", err)
+		}
+		health.PartialErrors["observability_data_sets"] = "data set health query failed"
+		health.Level = observability.WorstSignalLevel(health.Level, observability.SignalWarning)
+	} else {
+		health.DataSets = &filecoinStorageHealthObservationOverview{
+			Summary:       dataSets.Summary,
+			SummarySignal: dataSets.SummarySignal,
+		}
+		health.Level = observability.WorstSignalLevel(health.Level, dataSets.SummarySignal.Level)
+	}
+	return health
 }
 
 func taskPipelineOverviewRows(counts []repository.TaskPipelineCount) []taskPipelineOverview {

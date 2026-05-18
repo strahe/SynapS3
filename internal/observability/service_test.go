@@ -228,6 +228,92 @@ func TestServiceRefreshAllAttemptsDataSetsAfterProviderFailure(t *testing.T) {
 	}
 }
 
+func TestServiceDataSetObservationSummaryWarnsForIncompleteLocalInventory(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	var countCalls int
+	var listCalls int
+	service := NewService(ServiceOptions{
+		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) {
+			listCalls++
+			return []LocalDataSet{{ID: 1}, {ID: 2}}, nil
+		}),
+		LocalDataSetCount: LocalDataSetCountSourceFunc(func(context.Context) (int, error) {
+			countCalls++
+			return 2, nil
+		}),
+		Store: &fakeStateStore{
+			dataSets: []DataSetState{{LocalDataSetID: 1, Status: StatusAvailable, LastCheckedAt: now}},
+		},
+		RefreshInterval: time.Minute,
+		Now:             func() time.Time { return now },
+	})
+
+	page, err := service.ListDataSetObservations(context.Background(), ListOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListDataSetObservations: %v", err)
+	}
+	if page.SummarySignal.Level != SignalWarning {
+		t.Fatalf("data set summary signal = %s, want warning", page.SummarySignal.Level)
+	}
+	if page.Summary.Total != 2 || page.Summary.Available != 1 || page.Summary.Unknown != 1 {
+		t.Fatalf("data set summary = %#v, want total=2 available=1 unknown=1", page.Summary)
+	}
+	if countCalls != 1 || listCalls != 0 {
+		t.Fatalf("inventory calls = count:%d list:%d, want count only", countCalls, listCalls)
+	}
+}
+
+func TestServiceDataSetObservationSummaryUsesScopedInventoryForFilteredLists(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	providerID := onChainID(t, "101")
+	var listCalls int
+	service := NewService(ServiceOptions{
+		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) {
+			listCalls++
+			return []LocalDataSet{
+				{ID: 1, BucketID: 1, ProviderID: providerID},
+				{ID: 2, BucketID: 1, ProviderID: providerID},
+				{ID: 3, BucketID: 2, ProviderID: onChainID(t, "102")},
+			}, nil
+		}),
+		Store: &fakeStateStore{
+			dataSets: []DataSetState{
+				{LocalDataSetID: 1, BucketID: 1, ProviderID: providerID, Status: StatusAvailable, LastCheckedAt: now},
+				{LocalDataSetID: 3, BucketID: 2, ProviderID: onChainID(t, "102"), Status: StatusAvailable, LastCheckedAt: now},
+			},
+		},
+		RefreshInterval: time.Minute,
+		Now:             func() time.Time { return now },
+	})
+
+	statusPage, err := service.ListDataSetObservations(context.Background(), ListOptions{Status: StatusAvailable})
+	if err != nil {
+		t.Fatalf("ListDataSetObservations(status): %v", err)
+	}
+	if statusPage.SummarySignal.Level != SignalOK {
+		t.Fatalf("status summary signal = %s, want ok", statusPage.SummarySignal.Level)
+	}
+	if listCalls != 0 {
+		t.Fatalf("status filter inventory calls = %d, want 0", listCalls)
+	}
+
+	for _, opts := range []ListOptions{{BucketID: 1}, {ProviderID: &providerID}} {
+		page, err := service.ListDataSetObservations(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("ListDataSetObservations(%+v): %v", opts, err)
+		}
+		if page.SummarySignal.Level != SignalWarning {
+			t.Fatalf("data set summary signal for opts %+v = %s, want warning", opts, page.SummarySignal.Level)
+		}
+		if page.Summary.Total != 2 || page.Summary.Available != 1 || page.Summary.Unknown != 1 {
+			t.Fatalf("data set summary for opts %+v = %#v, want total=2 available=1 unknown=1", opts, page.Summary)
+		}
+	}
+	if listCalls != 2 {
+		t.Fatalf("bucket/provider inventory calls = %d, want 2", listCalls)
+	}
+}
+
 type observedDoneContext struct {
 	context.Context
 	observed chan<- struct{}
@@ -278,7 +364,50 @@ func (f *fakeStateStore) ReplaceDataSetStates(_ context.Context, _ time.Time, st
 }
 
 func (f *fakeStateStore) ListDataSetStates(_ context.Context, opts ListOptions) (DataSetStatePage, error) {
-	return DataSetStatePage{Items: f.dataSets, Summary: Summary{Total: len(f.dataSets)}, Total: len(f.dataSets), Limit: opts.Limit, Offset: opts.Offset}, nil
+	dataSets := fakeDataSetStatesForOptions(f.dataSets, opts)
+	summary := Summary{Total: len(dataSets)}
+	var lastCheckedAt *time.Time
+	for _, state := range dataSets {
+		switch state.Status {
+		case StatusAvailable:
+			summary.Available++
+		case StatusDegraded:
+			summary.Degraded++
+		case StatusUnavailable:
+			summary.Unavailable++
+		case StatusUnknown:
+			summary.Unknown++
+		}
+		if !state.LastCheckedAt.IsZero() && (lastCheckedAt == nil || state.LastCheckedAt.After(*lastCheckedAt)) {
+			checkedAt := state.LastCheckedAt
+			lastCheckedAt = &checkedAt
+		}
+	}
+	return DataSetStatePage{
+		Items:         dataSets,
+		Summary:       summary,
+		LastCheckedAt: lastCheckedAt,
+		Total:         len(dataSets),
+		Limit:         opts.Limit,
+		Offset:        opts.Offset,
+	}, nil
+}
+
+func fakeDataSetStatesForOptions(states []DataSetState, opts ListOptions) []DataSetState {
+	out := make([]DataSetState, 0, len(states))
+	for _, state := range states {
+		if opts.Status != "" && state.Status != opts.Status {
+			continue
+		}
+		if opts.BucketID > 0 && state.BucketID != opts.BucketID {
+			continue
+		}
+		if opts.ProviderID != nil && state.ProviderID.String() != opts.ProviderID.String() {
+			continue
+		}
+		out = append(out, state)
+	}
+	return out
 }
 
 func (f *fakeStateStore) GetDataSetStatesByLocalIDs(_ context.Context, ids []int64) (map[int64]DataSetState, error) {

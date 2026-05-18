@@ -466,7 +466,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 }
 
-func TestLoad_IgnoresLegacyFilecoinHealthConfig(t *testing.T) {
+func TestLoad_IgnoresLegacyFilecoinAvailabilityConfig(t *testing.T) {
 	legacySection := "avail" + "ability"
 	t.Setenv("SYNAPS3_FILECOIN_"+strings.ToUpper(legacySection)+"_INTERVAL", "3m")
 	t.Setenv("SYNAPS3_FILECOIN_"+strings.ToUpper(legacySection)+"_TIMEOUT", "4s")
