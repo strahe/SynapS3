@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newTestCache(t *testing.T) *Filesystem {
@@ -662,5 +663,125 @@ func TestAssemblePartsUsedBytes(t *testing.T) {
 	_ = fs.DeleteUpload(ctx, "up-ub")
 	if fs.UsedBytes() != int64(len(p1)+len(p2)) {
 		t.Errorf("UsedBytes after cleanup = %d, want %d", fs.UsedBytes(), len(p1)+len(p2))
+	}
+}
+
+func TestPutStagedRollbackIsRepeatable(t *testing.T) {
+	fs := newTestCache(t)
+	ctx := context.Background()
+	data := []byte("staged-data")
+
+	staged, err := fs.PutStaged(ctx, "bkt", "staged-key", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("PutStaged: %v", err)
+	}
+
+	if fs.Exists(ctx, "bkt", "staged-key") {
+		t.Fatal("Exists before Commit = true, want false")
+	}
+	if fs.UsedBytes() != 0 {
+		t.Fatalf("UsedBytes before Commit = %d, want 0", fs.UsedBytes())
+	}
+
+	if err := staged.Rollback(); err != nil {
+		t.Fatalf("Rollback first call: %v", err)
+	}
+	if err := staged.Rollback(); err != nil {
+		t.Fatalf("Rollback second call: %v", err)
+	}
+}
+
+func TestPutStagedCommitMakesObjectReadable(t *testing.T) {
+	fs := newTestCache(t)
+	ctx := context.Background()
+	data := []byte("staged-data")
+
+	staged, err := fs.PutStaged(ctx, "bkt", "commit-key", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("PutStaged: %v", err)
+	}
+
+	if err := staged.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := staged.Rollback(); err != nil {
+		t.Fatalf("Rollback after Commit: %v", err)
+	}
+
+	if !fs.Exists(ctx, "bkt", "commit-key") {
+		t.Fatal("Exists after Commit = false, want true")
+	}
+	if fs.UsedBytes() != int64(len(data)) {
+		t.Fatalf("UsedBytes after Commit = %d, want %d", fs.UsedBytes(), len(data))
+	}
+
+	rc, info, err := fs.Get(ctx, "bkt", "commit-key")
+	if err != nil {
+		t.Fatalf("Get after Commit: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("Read after Commit: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("Get data = %q, want %q", got, data)
+	}
+	if info.Size != int64(len(data)) {
+		t.Fatalf("Get Size = %d, want %d", info.Size, len(data))
+	}
+}
+
+func TestPutStagedCommitAndRollbackCanOverlap(t *testing.T) {
+	fs := newTestCache(t)
+	ctx := context.Background()
+	data := []byte("staged-data")
+
+	staged, err := fs.PutStaged(ctx, "bkt", "overlap-key", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("PutStaged: %v", err)
+	}
+
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- staged.Commit()
+	}()
+
+	// Keep Commit and Rollback unordered for the race detector.
+	timeout := time.After(5 * time.Second)
+	for !fs.Exists(ctx, "bkt", "overlap-key") {
+		select {
+		case <-timeout:
+			t.Fatal("timed out waiting for Commit to publish object")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	rollbackDone := make(chan error, 1)
+	go func() {
+		rollbackDone <- staged.Rollback()
+	}()
+
+	if err := <-commitDone; err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := <-rollbackDone; err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	rc, _, err := fs.Get(ctx, "bkt", "overlap-key")
+	if err != nil {
+		t.Fatalf("Get after overlapping Rollback: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("Read after overlapping Rollback: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("Get data = %q, want %q", got, data)
 	}
 }

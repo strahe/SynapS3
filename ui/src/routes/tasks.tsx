@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
-import { Loader2, RefreshCw, RotateCcw } from 'lucide-react'
+import { ListTodo, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
 import { api, type TaskItem, type TaskStorageCleanupDetail } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
@@ -10,6 +10,7 @@ import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressBar } from '@/components/app/UploadProgress'
 import { Button } from '@/components/ui/button'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Label } from '@/components/ui/label'
 import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -448,8 +449,16 @@ function TaskTableFrame({ children }: { children: ReactNode }) {
 function TaskEmptyRow({ colSpan }: { colSpan: number }) {
   return (
     <TableRow>
-      <TableCell colSpan={colSpan} className="h-24 text-center text-muted-foreground">
-        No tasks found
+      <TableCell colSpan={colSpan} className="h-60">
+        <Empty className="border-0">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <ListTodo />
+            </EmptyMedia>
+            <EmptyTitle>No tasks found</EmptyTitle>
+            <EmptyDescription>There are no tasks matching your current filters.</EmptyDescription>
+          </EmptyHeader>
+        </Empty>
       </TableCell>
     </TableRow>
   )

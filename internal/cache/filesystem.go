@@ -269,10 +269,14 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 		Checksum: hex.EncodeToString(sha256Hash.Sum(nil)),
 	}
 
+	var stateMu sync.Mutex
 	committed := false
 	return &StagedObject{
 		Info: info,
 		commit: func() error {
+			stateMu.Lock()
+			defer stateMu.Unlock()
+
 			if committed {
 				return nil
 			}
@@ -322,10 +326,17 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 			return nil
 		},
 		rollback: func() error {
+			stateMu.Lock()
+			defer stateMu.Unlock()
+
 			if committed {
 				return nil
 			}
-			return os.Remove(tmpPath)
+			err := os.Remove(tmpPath)
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
 		},
 	}, nil
 }
