@@ -20,6 +20,15 @@ export function formatNumber(n: number): string {
   return n.toString()
 }
 
+export function titleCaseEnum(value?: string | null): string {
+  if (!value) return ''
+  return value
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
 export function formatDuration(seconds: number): string {
   const d = Math.floor(seconds / 86400)
   const h = Math.floor((seconds % 86400) / 3600)

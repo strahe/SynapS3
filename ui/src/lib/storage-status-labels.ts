@@ -1,4 +1,5 @@
 import type { ObjectState, ObjectStatus, ObjectUploadStatus } from '@/api/client'
+import { titleCaseEnum } from './utils.ts'
 
 export const taskStageOptions = [
   'all',
@@ -155,13 +156,4 @@ export function objectStateLabel(
     default:
       return objectStatusLabel(status)
   }
-}
-
-function titleCaseEnum(value?: string) {
-  if (!value) return ''
-  return value
-    .split('_')
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ')
 }

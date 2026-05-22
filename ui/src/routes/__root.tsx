@@ -9,6 +9,7 @@ import {
   ListTodo,
   Monitor,
   Moon,
+  Network,
   PanelLeftOpen,
   RefreshCw,
   Settings,
@@ -80,6 +81,7 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 const navItems = [
   { to: '/' as const, label: 'Overview', icon: LayoutDashboard },
   { to: '/buckets' as const, label: 'Buckets', icon: Database },
+  { to: '/storage-topology' as const, label: 'Topology', icon: Network },
   { to: '/tasks' as const, label: 'Tasks', icon: ListTodo },
   { to: '/wallet' as const, label: 'Wallet', icon: Wallet },
   { to: '/settings' as const, label: 'Settings', icon: Settings },

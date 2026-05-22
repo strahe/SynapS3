@@ -199,6 +199,86 @@ test('data set storage health refresh sends refresh intent header', async () => 
   assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), null)
 })
 
+test('observability list APIs encode supported query parameters', async () => {
+  const originalFetch = globalThis.fetch
+  const requestedURLs: string[] = []
+  globalThis.fetch = (async (input) => {
+    requestedURLs.push(input.toString())
+    return new Response(
+      JSON.stringify({
+        items: [],
+        summary: { total: 0, available: 0, degraded: 0, unavailable: 0, unknown: 0 },
+        summary_signal: { level: 'ok', freshness: { stale: false, warnings: [] } },
+        total: 0,
+        limit: 100,
+        offset: 0,
+      }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    )
+  }) as typeof fetch
+
+  try {
+    await api.getObservabilityProviders({
+      status: 'degraded',
+      provider_id: '101',
+      limit: 20,
+      offset: 40,
+    })
+    await api.getObservabilityDataSets({
+      status: 'available',
+      provider_id: '202',
+      bucket: 'bucket-a',
+      limit: 50,
+      offset: 100,
+    })
+    await api.getObservabilityDataSets({
+      bucket_id: 3,
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.deepEqual(requestedURLs, [
+    '/api/v1/observability/providers?status=degraded&provider_id=101&limit=20&offset=40',
+    '/api/v1/observability/data-sets?status=available&provider_id=202&bucket=bucket-a&limit=50&offset=100',
+    '/api/v1/observability/data-sets?bucket_id=3',
+  ])
+})
+
+test('observability list APIs omit query string when params are empty', async () => {
+  const originalFetch = globalThis.fetch
+  const requestedURLs: string[] = []
+  globalThis.fetch = (async (input) => {
+    requestedURLs.push(input.toString())
+    return new Response(
+      JSON.stringify({
+        items: [],
+        summary: { total: 0, available: 0, degraded: 0, unavailable: 0, unknown: 0 },
+        summary_signal: { level: 'ok', freshness: { stale: false, warnings: [] } },
+        total: 0,
+        limit: 100,
+        offset: 0,
+      }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    )
+  }) as typeof fetch
+
+  try {
+    await api.getObservabilityProviders()
+    await api.getObservabilityDataSets()
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.deepEqual(requestedURLs, ['/api/v1/observability/providers', '/api/v1/observability/data-sets'])
+})
+
 test('object download URL encodes bucket name and object key', () => {
   assert.equal(
     api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),

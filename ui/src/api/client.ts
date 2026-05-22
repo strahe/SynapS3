@@ -56,6 +56,7 @@ export interface OverviewData {
 }
 
 export type ObservabilitySignalLevel = 'ok' | 'warning' | 'blocking'
+export type ObservabilityStatus = 'available' | 'degraded' | 'unavailable' | 'unknown'
 
 export interface ObservabilitySummary {
   total: number
@@ -74,6 +75,44 @@ export interface ObservabilityFreshness {
 export interface ObservabilitySummarySignal {
   level: ObservabilitySignalLevel
   freshness: ObservabilityFreshness
+}
+
+export interface ObservabilitySignal {
+  status: ObservabilityStatus
+  level: ObservabilitySignalLevel
+  reason_codes: string[]
+  last_error?: string
+  freshness: ObservabilityFreshness
+}
+
+export interface ObservabilityProviderFacts {
+  provider_id: string
+  active?: boolean
+  has_pdp?: boolean
+  service_url?: string
+  health_status?: string
+}
+
+export interface ObservabilityProviderObservation {
+  facts: ObservabilityProviderFacts
+  signal: ObservabilitySignal
+}
+
+export interface ObservabilityDataSetFacts {
+  local_data_set_id: number
+  bucket_id: number
+  bucket_name: string
+  copy_index: number
+  provider_id: string
+  chain_data_set_id?: string
+  client_data_set_id?: string
+  local_status: string
+  active_piece_count?: number
+}
+
+export interface ObservabilityDataSetObservation {
+  facts: ObservabilityDataSetFacts
+  signal: ObservabilitySignal
 }
 
 export interface OverviewFilecoinStorageHealthSection {
@@ -122,7 +161,7 @@ export interface StorageDataSetSummary {
   storage_health?: DataSetStorageHealthInfo
 }
 
-export type StorageHealthStatus = 'available' | 'degraded' | 'unavailable' | 'unknown'
+export type StorageHealthStatus = ObservabilityStatus
 
 export interface DataSetStorageHealthInfo {
   status: StorageHealthStatus
@@ -140,6 +179,15 @@ export interface ObservabilityListResponse<T> {
   total: number
   limit: number
   offset: number
+}
+
+export interface ObservabilityListParams {
+  status?: ObservabilityStatus | ''
+  provider_id?: string
+  bucket?: string
+  bucket_id?: number
+  limit?: number
+  offset?: number
 }
 
 export interface BucketDetail extends BucketItem {
@@ -888,6 +936,16 @@ export const api = {
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),
   getWallet: () => fetchJSON<WalletData>('/wallet'),
   getFilecoinReadiness: () => fetchJSON<FilecoinReadinessData>('/filecoin/readiness'),
+  getObservabilityProviders: (
+    params: Pick<ObservabilityListParams, 'status' | 'provider_id' | 'limit' | 'offset'> = {}
+  ) =>
+    fetchJSON<ObservabilityListResponse<ObservabilityProviderObservation>>(
+      `/observability/providers${observabilityListQuery(params)}`
+    ),
+  getObservabilityDataSets: (params: ObservabilityListParams = {}) =>
+    fetchJSON<ObservabilityListResponse<ObservabilityDataSetObservation>>(
+      `/observability/data-sets${observabilityListQuery(params)}`
+    ),
   refreshDataSetStorageHealth: (params: { bucket?: string; bucket_id?: number } = {}) => {
     const sp = new URLSearchParams()
     if (params.bucket) sp.set('bucket', params.bucket)
@@ -974,4 +1032,16 @@ export const api = {
         'X-SynapS3-Settings-Write': '1',
       },
     }),
+}
+
+function observabilityListQuery(params: ObservabilityListParams) {
+  const sp = new URLSearchParams()
+  if (params.status) sp.set('status', params.status)
+  if (params.provider_id) sp.set('provider_id', params.provider_id)
+  if (params.bucket) sp.set('bucket', params.bucket)
+  if (params.bucket_id !== undefined) sp.set('bucket_id', params.bucket_id.toString())
+  if (params.limit !== undefined) sp.set('limit', params.limit.toString())
+  if (params.offset !== undefined) sp.set('offset', params.offset.toString())
+  const qs = sp.toString()
+  return qs ? `?${qs}` : ''
 }

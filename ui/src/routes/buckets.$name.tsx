@@ -116,7 +116,7 @@ import { dataSetStorageHealthDetailParts, dataSetStorageHealthRefreshErrorMessag
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
-import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
+import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 type ObjectBrowserSearch = {
   prefix?: string
@@ -742,18 +742,20 @@ function ProviderIdentityCell({ providerID, identity }: { providerID?: string; i
   const label = identity?.name?.trim() || (registryID ? `Registry #${registryID}` : '—')
 
   if (!identity) {
-    return (
-      <span className="block max-w-44 truncate font-mono text-xs text-muted-foreground" title={registryID}>
-        {label}
-      </span>
-    )
+    if (!registryID) {
+      return (
+        <span className="block max-w-44 truncate font-mono text-xs text-muted-foreground" title={registryID}>
+          {label}
+        </span>
+      )
+    }
+
+    return <ProviderTopologyLink providerID={registryID} label={label} className="font-mono text-xs" />
   }
 
   return (
     <div className="flex min-w-0 items-center gap-1.5">
-      <span className="min-w-0 max-w-44 truncate font-medium" title={label}>
-        {label}
-      </span>
+      {registryID ? <ProviderTopologyLink providerID={registryID} label={label} /> : <span>{label}</span>}
       <Popover open={detailsOpen} onOpenChange={setDetailsOpen}>
         <PopoverTrigger asChild>
           <Button
@@ -774,6 +776,27 @@ function ProviderIdentityCell({ providerID, identity }: { providerID?: string; i
         </PopoverContent>
       </Popover>
     </div>
+  )
+}
+
+function ProviderTopologyLink({
+  providerID,
+  label,
+  className,
+}: {
+  providerID: string
+  label: string
+  className?: string
+}) {
+  return (
+    <Link
+      to="/storage-topology"
+      search={{ provider: providerID }}
+      className={cn('block min-w-0 max-w-44 truncate font-medium hover:underline', className)}
+      title={label}
+    >
+      {label}
+    </Link>
   )
 }
 
@@ -1748,7 +1771,13 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
                   <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
                 </TableCell>
                 <TableCell className="px-4 font-mono text-xs text-muted-foreground">
-                  {dataSet.data_set_id ?? '—'}
+                  <Link
+                    to="/storage-topology"
+                    search={storageDataSetTopologySearch(bucketName, dataSet)}
+                    className="hover:text-foreground hover:underline"
+                  >
+                    {storageDataSetTopologyLabel(dataSet)}
+                  </Link>
                 </TableCell>
                 <TableCell className="px-4">
                   <DataSetStorageHealthCell dataSet={dataSet} />
@@ -1764,6 +1793,21 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
       </ScrollArea>
     </div>
   )
+}
+
+function storageDataSetTopologySearch(bucketName: string, dataSet: StorageDataSetSummary) {
+  const scope = {
+    bucket: bucketName,
+    provider: dataSet.provider_id,
+    local_data_set_id: dataSet.id,
+    selection_provider: dataSet.provider_id,
+    selection_bucket: bucketName,
+  }
+  return dataSet.data_set_id ? { ...scope, chain_data_set_id: dataSet.data_set_id } : scope
+}
+
+function storageDataSetTopologyLabel(dataSet: StorageDataSetSummary) {
+  return dataSet.data_set_id ? `#${dataSet.data_set_id}` : 'No chain data set'
 }
 
 function DataSetStorageHealthCell({ dataSet }: { dataSet: StorageDataSetSummary }) {

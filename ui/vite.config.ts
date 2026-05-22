@@ -26,7 +26,8 @@ export default defineConfig({
         manualChunks(id) {
           if (!id.includes('node_modules')) return undefined
           if (id.includes('@tanstack')) return 'tanstack'
-          if (id.includes('recharts') || id.includes('victory-vendor') || id.includes('/d3-')) return 'charts'
+          if (id.includes('@xyflow')) return 'react-flow'
+          if (id.includes('recharts') || id.includes('victory-vendor')) return 'charts'
           return 'vendor'
         },
       },

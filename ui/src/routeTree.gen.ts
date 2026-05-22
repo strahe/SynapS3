@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as WalletRouteImport } from './routes/wallet'
 import { Route as TasksRouteImport } from './routes/tasks'
+import { Route as StorageTopologyRouteImport } from './routes/storage-topology'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as BucketsRouteImport } from './routes/buckets'
 import { Route as IndexRouteImport } from './routes/index'
@@ -25,6 +26,11 @@ const WalletRoute = WalletRouteImport.update({
 const TasksRoute = TasksRouteImport.update({
   id: '/tasks',
   path: '/tasks',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const StorageTopologyRoute = StorageTopologyRouteImport.update({
+  id: '/storage-topology',
+  path: '/storage-topology',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SettingsRoute = SettingsRouteImport.update({
@@ -57,6 +63,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
   '/settings': typeof SettingsRoute
+  '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
   '/wallet': typeof WalletRoute
   '/buckets/$name': typeof BucketsNameRoute
@@ -65,6 +72,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/settings': typeof SettingsRoute
+  '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
   '/wallet': typeof WalletRoute
   '/buckets/$name': typeof BucketsNameRoute
@@ -75,6 +83,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/buckets': typeof BucketsRouteWithChildren
   '/settings': typeof SettingsRoute
+  '/storage-topology': typeof StorageTopologyRoute
   '/tasks': typeof TasksRoute
   '/wallet': typeof WalletRoute
   '/buckets/$name': typeof BucketsNameRoute
@@ -86,17 +95,26 @@ export interface FileRouteTypes {
     | '/'
     | '/buckets'
     | '/settings'
+    | '/storage-topology'
     | '/tasks'
     | '/wallet'
     | '/buckets/$name'
     | '/buckets/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/settings' | '/tasks' | '/wallet' | '/buckets/$name' | '/buckets'
+  to:
+    | '/'
+    | '/settings'
+    | '/storage-topology'
+    | '/tasks'
+    | '/wallet'
+    | '/buckets/$name'
+    | '/buckets'
   id:
     | '__root__'
     | '/'
     | '/buckets'
     | '/settings'
+    | '/storage-topology'
     | '/tasks'
     | '/wallet'
     | '/buckets/$name'
@@ -107,6 +125,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   BucketsRoute: typeof BucketsRouteWithChildren
   SettingsRoute: typeof SettingsRoute
+  StorageTopologyRoute: typeof StorageTopologyRoute
   TasksRoute: typeof TasksRoute
   WalletRoute: typeof WalletRoute
 }
@@ -125,6 +144,13 @@ declare module '@tanstack/react-router' {
       path: '/tasks'
       fullPath: '/tasks'
       preLoaderRoute: typeof TasksRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/storage-topology': {
+      id: '/storage-topology'
+      path: '/storage-topology'
+      fullPath: '/storage-topology'
+      preLoaderRoute: typeof StorageTopologyRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/settings': {
@@ -182,6 +208,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   BucketsRoute: BucketsRouteWithChildren,
   SettingsRoute: SettingsRoute,
+  StorageTopologyRoute: StorageTopologyRoute,
   TasksRoute: TasksRoute,
   WalletRoute: WalletRoute,
 }

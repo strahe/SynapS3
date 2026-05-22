@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { FilecoinReadinessPreflightPayload, S3UserRole } from '@/api/client'
+import type { FilecoinReadinessPreflightPayload, ObservabilityListParams, S3UserRole } from '@/api/client'
 import { api } from '@/api/client'
 
 export function useOverview() {
@@ -249,6 +249,27 @@ export function useFilecoinReadiness(enabled = true) {
 export function useFilecoinPreflight() {
   return useMutation({
     mutationFn: (payload: FilecoinReadinessPreflightPayload) => api.preflightFilecoin(payload),
+  })
+}
+
+export function useObservabilityProviders(
+  params: Pick<ObservabilityListParams, 'status' | 'provider_id' | 'limit' | 'offset'>,
+  enabled = true
+) {
+  return useQuery({
+    queryKey: ['observabilityProviders', params],
+    queryFn: () => api.getObservabilityProviders(params),
+    enabled,
+    refetchInterval: 30_000,
+  })
+}
+
+export function useObservabilityDataSets(params: ObservabilityListParams, enabled = true) {
+  return useQuery({
+    queryKey: ['observabilityDataSets', params],
+    queryFn: () => api.getObservabilityDataSets(params),
+    enabled,
+    refetchInterval: 30_000,
   })
 }
 

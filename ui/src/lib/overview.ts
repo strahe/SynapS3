@@ -1,6 +1,6 @@
 import type { ObservabilityFreshness, OverviewData } from '@/api/client'
 import type { StatusTone } from '@/components/app/StatusBadge'
-import { timeAgo } from './utils.ts'
+import { timeAgo, titleCaseEnum } from './utils.ts'
 
 export type AttentionTone = 'warning' | 'danger'
 export type FilecoinStorageHealthLevel = OverviewData['filecoin_storage_health']['level']
@@ -300,12 +300,4 @@ function filecoinStorageHealthFreshnessTime(freshness: ObservabilityFreshness) {
   if (!freshness.last_checked_at) return Number.NEGATIVE_INFINITY
   const value = Date.parse(freshness.last_checked_at)
   return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY
-}
-
-function titleCaseEnum(value: string) {
-  return value
-    .split('_')
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ')
 }
