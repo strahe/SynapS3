@@ -329,87 +329,86 @@ func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
 	}
 }
 
-func TestEvictor_MissingVersion(t *testing.T) {
-	mc := &testutil.MockCache{}
-	env := newTestWorkerEnvWithMockCache(t, mc)
-	_, objID, _ := seedStoredObject(t, env)
-
-	task := &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		RefType:        "object",
-		RefID:          objID,
-		RefVersionID:   "01J000000000000000MISSING1",
-		IdempotencyKey: "evict_cache:missing",
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     5,
-		ScheduledAt:    time.Now(),
-	}
-	if err := env.repos.Tasks.Create(context.Background(), task); err != nil {
-		t.Fatalf("creating task: %v", err)
-	}
-
-	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
-
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("expected task failed, got %s", got.Status)
-	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "object not found") {
-		t.Errorf("expected object not found error, got %v", got.LastError)
-	}
-}
-
-func TestEvictor_WrongState(t *testing.T) {
-	mc := &testutil.MockCache{}
-	env := newTestWorkerEnvWithMockCache(t, mc)
-	// Object in "uploading" state, not "stored"
-	_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
-	ctx := context.Background()
-
-	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("transition: %v", err)
-	}
-
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
-
-	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
-
-	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("expected task failed, got %s", got.Status)
-	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "not stored") {
-		t.Errorf("expected not stored error, got %v", got.LastError)
-	}
-}
-
-func TestEvictor_NoReadableCopies(t *testing.T) {
-	mc := &testutil.MockCache{}
-	env := newTestWorkerEnvWithMockCache(t, mc)
-	ctx := context.Background()
-
-	_, objID, versionID := seedStoredObject(t, env)
-	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
-	if err != nil || version == nil || version.StorageUploadID == nil {
-		t.Fatalf("stored version upload: version=%v err=%v", version, err)
-	}
-	if _, err := env.db.NewDelete().Model((*model.StorageUploadCopy)(nil)).Where("upload_id = ?", *version.StorageUploadID).Exec(ctx); err != nil {
-		t.Fatalf("remove readable copies: %v", err)
+func TestEvictor_Preconditions(t *testing.T) {
+	tests := []struct {
+		name          string
+		setup         func(ctx context.Context, t *testing.T, env *testWorkerEnv) *model.Task
+		wantLastError string
+	}{
+		{
+			name: "MissingVersion",
+			setup: func(ctx context.Context, t *testing.T, env *testWorkerEnv) *model.Task {
+				_, objID, _ := seedStoredObject(t, env)
+				task := &model.Task{
+					Type:           model.TaskTypeEvictCache,
+					RefType:        "object",
+					RefID:          objID,
+					RefVersionID:   "01J000000000000000MISSING1",
+					IdempotencyKey: "evict_cache:missing",
+					Status:         model.TaskStatusQueued,
+					MaxRetries:     5,
+					ScheduledAt:    time.Now(),
+				}
+				if err := env.repos.Tasks.Create(ctx, task); err != nil {
+					t.Fatalf("creating task: %v", err)
+				}
+				return task
+			},
+			wantLastError: "object not found",
+		},
+		{
+			name: "WrongState",
+			setup: func(ctx context.Context, t *testing.T, env *testWorkerEnv) *model.Task {
+				_, objID, versionID := seedObjectInDB(t, env, model.BucketStatusActive)
+				if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+					t.Fatalf("transition: %v", err)
+				}
+				return seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+			},
+			wantLastError: "not stored",
+		},
+		{
+			name: "NoReadableCopies",
+			setup: func(ctx context.Context, t *testing.T, env *testWorkerEnv) *model.Task {
+				_, objID, versionID := seedStoredObject(t, env)
+				version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+				if err != nil || version == nil || version.StorageUploadID == nil {
+					t.Fatalf("stored version upload: version=%v err=%v", version, err)
+				}
+				if _, err := env.db.NewDelete().Model((*model.StorageUploadCopy)(nil)).Where("upload_id = ?", *version.StorageUploadID).Exec(ctx); err != nil {
+					t.Fatalf("remove readable copies: %v", err)
+				}
+				return seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+			},
+			wantLastError: "no readable upload copies",
+		},
 	}
 
-	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &testutil.MockCache{}
+			env := newTestWorkerEnvWithMockCache(t, mc)
+			ctx := context.Background()
 
-	evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
+			task := tt.setup(ctx, t, env)
 
-	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("expected task failed, got %s", got.Status)
-	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "no readable upload copies") {
-		t.Errorf("expected no readable upload copies error, got %v", got.LastError)
+			evictor := worker.NewEvictor(env.repos, env.cache, env.sm, 1, 50*time.Millisecond, slog.Default())
+			runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
+
+			got, err := env.repos.Tasks.GetByID(ctx, task.ID)
+			if err != nil {
+				t.Fatalf("getting task: %v", err)
+			}
+			if got == nil {
+				t.Fatalf("task %d not found", task.ID)
+			}
+			if got.Status != model.TaskStatusFailed {
+				t.Errorf("expected task failed, got %s", got.Status)
+			}
+			if got.LastError == nil || !strings.Contains(*got.LastError, tt.wantLastError) {
+				t.Errorf("expected last error to contain %q, got %v", tt.wantLastError, got.LastError)
+			}
+		})
 	}
 }
 
