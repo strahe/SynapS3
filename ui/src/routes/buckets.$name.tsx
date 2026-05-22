@@ -22,6 +22,8 @@ import {
 import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   api,
+  type CopyHealthInfo,
+  type CopyHealthSummary,
   type DeletedObjectItem,
   maxFOCUploadSize,
   minFOCUploadSize,
@@ -57,6 +59,7 @@ import {
   BreadcrumbSeparator,
 } from '@/components/ui/breadcrumb'
 import { Button } from '@/components/ui/button'
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -112,6 +115,13 @@ import {
   copyPolicyOptions,
   inheritedCopyPolicyValue,
 } from '@/lib/bucket-copy-policy'
+import {
+  copyHealthInfoTitle,
+  copyHealthStatusLabel,
+  copyHealthStatusTone,
+  copyHealthSummaryLabel,
+  copyHealthSummaryTitle,
+} from '@/lib/copy-health'
 import { dataSetStorageHealthDetailParts, dataSetStorageHealthRefreshErrorMessage } from '@/lib/data-set-storage-health'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
@@ -701,6 +711,11 @@ function ProvenanceSummary({ data }: { data: ObjectProvenance }) {
       />
       <ProvenanceSummaryItem label="Upload" value={uploadLabel} />
       <ProvenanceSummaryItem label="Replicas" value={`${data.success_copies} / ${data.requested_copies}`} />
+      <ProvenanceSummaryItem
+        label="Object copy health"
+        value={copyHealthSummaryLabel(data.copy_health)}
+        title={copyHealthSummaryTitle(data.copy_health)}
+      />
       <ProvenanceSummaryItem label="Updated" value={timeAgo(data.updated_at)} title={data.updated_at} />
       <ProvenanceSummaryItem
         label="Piece CID"
@@ -842,12 +857,13 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
     <div className="overflow-hidden rounded-md border border-border">
       <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Replicas</div>
       <ScrollArea className="w-full">
-        <Table className="min-w-[960px]">
+        <Table className="min-w-[1080px]">
           <TableHeader>
             <TableRow>
               <TableHead className="px-3">Replica</TableHead>
               <TableHead className="px-3">Transfer</TableHead>
               <TableHead className="px-3">Status</TableHead>
+              <TableHead className="px-3">Health</TableHead>
               <TableHead className="px-3">Provider</TableHead>
               <TableHead className="px-3">Data Set ID</TableHead>
               <TableHead className="px-3">Piece ID</TableHead>
@@ -861,7 +877,10 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 <TableCell className="px-3 font-mono text-xs">{replicaLabel(copy.copy_index)}</TableCell>
                 <TableCell className="px-3">{transferMethodLabel(copy.transfer_method)}</TableCell>
                 <TableCell className="px-3">
-                  <StatusBadge tone={copyStatusTone(copy.status)}>{copy.status}</StatusBadge>
+                  <StatusBadge tone={copyStatusTone(copy.status)}>{copyStatusLabel(copy.status)}</StatusBadge>
+                </TableCell>
+                <TableCell className="px-3">
+                  <CopyHealthCell health={copy.health} />
                 </TableCell>
                 <TableCell className="px-3">
                   <ProviderIdentityCell providerID={copy.provider_id} identity={copy.provider_identity} />
@@ -894,7 +913,7 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
             ))}
             {copies.length === 0 && (
               <TableRow>
-                <TableCell colSpan={8} className="h-20 text-center text-muted-foreground">
+                <TableCell colSpan={9} className="h-20 text-center text-muted-foreground">
                   No replicas recorded
                 </TableCell>
               </TableRow>
@@ -1100,6 +1119,21 @@ function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
       return 'info'
     case 'pending':
       return 'neutral'
+  }
+}
+
+function copyStatusLabel(status: ObjectProvenanceCopy['status']) {
+  switch (status) {
+    case 'pending':
+      return 'Waiting'
+    case 'piece_ready':
+      return 'Ready'
+    case 'committing':
+      return 'Registering'
+    case 'committed':
+      return 'Stored'
+    case 'failed':
+      return 'Failed'
   }
 }
 
@@ -1635,37 +1669,47 @@ function BucketDetailsSheet({
   onChangeOwner: () => void
   onDeleteBucket: () => void
 }) {
+  const [objectCopyHealthError, setObjectCopyHealthError] = useState<string | null>(null)
+
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="min-w-0 !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]">
-        <SheetHeader>
-          <SheetTitle>Bucket details</SheetTitle>
-          <SheetDescription>
-            <span className="block max-w-full truncate font-mono text-xs" title={bucket.name}>
-              {bucket.name}
-            </span>
-          </SheetDescription>
-        </SheetHeader>
-        <ScrollArea className="min-h-0 min-w-0 flex-1">
-          <div className="flex min-w-0 flex-col gap-6 px-4 pb-4">
-            <BucketDetailsSection title="Overview">
-              <BucketDetailsOverview bucket={bucket} />
-            </BucketDetailsSection>
-            <BucketDetailsSection title="Storage">
-              <BucketStorageDataSets bucketName={bucket.name} dataSets={bucket.data_sets ?? []} />
-            </BucketDetailsSection>
-            <BucketDetailsSection title="Settings">
-              <BucketDetailsSettings
-                bucket={bucket}
-                canDelete={canDelete}
-                onChangeOwner={onChangeOwner}
-                onDeleteBucket={onDeleteBucket}
-              />
-            </BucketDetailsSection>
-          </div>
-        </ScrollArea>
-      </SheetContent>
-    </Sheet>
+    <>
+      <Sheet open={open} onOpenChange={onOpenChange}>
+        <SheetContent className="min-w-0 !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]">
+          <SheetHeader>
+            <SheetTitle>Bucket details</SheetTitle>
+            <SheetDescription>
+              <span className="block max-w-full truncate font-mono text-xs" title={bucket.name}>
+                {bucket.name}
+              </span>
+            </SheetDescription>
+          </SheetHeader>
+          <ScrollArea className="min-h-0 min-w-0 flex-1">
+            <div className="flex min-w-0 flex-col gap-6 px-4 pb-4">
+              <BucketDetailsSection title="Overview">
+                <BucketDetailsOverview bucket={bucket} />
+              </BucketDetailsSection>
+              <BucketCopyHealthSummary health={bucket.copy_health} onOpenLastError={setObjectCopyHealthError} />
+              <BucketDetailsSection title="Storage">
+                <BucketStorageDataSets bucketName={bucket.name} dataSets={bucket.data_sets ?? []} />
+              </BucketDetailsSection>
+              <BucketDetailsSection title="Settings">
+                <BucketDetailsSettings
+                  bucket={bucket}
+                  canDelete={canDelete}
+                  onChangeOwner={onChangeOwner}
+                  onDeleteBucket={onDeleteBucket}
+                />
+              </BucketDetailsSection>
+            </div>
+          </ScrollArea>
+        </SheetContent>
+      </Sheet>
+      <DetailTextDialog
+        title="Object Copy Health Error"
+        text={objectCopyHealthError}
+        onClose={() => setObjectCopyHealthError(null)}
+      />
+    </>
   )
 }
 
@@ -1698,12 +1742,69 @@ function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<type
   )
 }
 
+function BucketCopyHealthSummary({
+  health,
+  onOpenLastError,
+}: {
+  health: CopyHealthSummary
+  onOpenLastError: (error: string) => void
+}) {
+  const lastError = health.last_error
+
+  return (
+    <Card size="sm">
+      <CardHeader>
+        <CardTitle>Object Copy Health</CardTitle>
+        <CardAction title={copyHealthSummaryTitle(health)}>
+          <StatusBadge tone={copyHealthStatusTone(health)}>{copyHealthSummaryLabel(health)}</StatusBadge>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <BucketDetailField
+            label="Objects needing attention"
+            value={`${formatNumber(health.unhealthy_objects)} of ${formatNumber(health.total_objects)}`}
+          />
+          <BucketDetailField
+            label="Readable object copies"
+            value={`${formatNumber(health.readable_copies)} of ${formatNumber(health.requested_copies)}`}
+          />
+          <BucketDetailField label="Pending object copies" value={formatObjectCopyCount(health.pending_copies)} />
+          <BucketDetailField label="Failed object copies" value={formatObjectCopyCount(health.failed_copies)} />
+          <BucketDetailField label="Unverified object copies" value={formatObjectCopyCount(health.unknown_copies)} />
+          {lastError && (
+            <BucketDetailAction label="Last error" value="Error details" onClick={() => onOpenLastError(lastError)} />
+          )}
+        </dl>
+      </CardContent>
+    </Card>
+  )
+}
+
+function formatObjectCopyCount(count: number) {
+  return `${formatNumber(count)} object ${count === 1 ? 'copy' : 'copies'}`
+}
+
 function BucketDetailField({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
     <div>
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="mt-1 truncate font-medium" title={title ?? value}>
         {value}
+      </dd>
+    </div>
+  )
+}
+
+function BucketDetailAction({ label, value, onClick }: { label: string; value: string; onClick: () => void }) {
+  return (
+    <div>
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd className="mt-1">
+        <Button type="button" variant="outline" size="xs" onClick={onClick} className="justify-start">
+          <Info data-icon="inline-start" />
+          {value}
+        </Button>
       </dd>
     </div>
   )
@@ -1839,6 +1940,16 @@ function DataSetStorageHealthCell({ dataSet }: { dataSet: StorageDataSetSummary 
         {details}
       </div>
     </div>
+  )
+}
+
+function CopyHealthCell({ health }: { health: CopyHealthInfo }) {
+  return (
+    <span className="inline-flex" title={copyHealthInfoTitle(health)}>
+      <StatusBadge tone={copyHealthStatusTone(health)} className="whitespace-nowrap">
+        {copyHealthStatusLabel(health.status)}
+      </StatusBadge>
+    </span>
   )
 }
 

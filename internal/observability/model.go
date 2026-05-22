@@ -32,6 +32,15 @@ const (
 	ReasonLocalStatusNotReady     ReasonCode = "local_status_not_ready"
 	ReasonProviderMismatch        ReasonCode = "provider_mismatch"
 	ReasonMetadataMismatch        ReasonCode = "metadata_mismatch"
+	ReasonCopyUnderReplicated     ReasonCode = "copy_under_replicated"
+	ReasonCopyPending             ReasonCode = "copy_pending"
+	ReasonCopyCommitting          ReasonCode = "copy_committing"
+	ReasonCopyFailed              ReasonCode = "copy_failed"
+	ReasonCopyMissingProvider     ReasonCode = "copy_missing_provider"
+	ReasonCopyMissingDataSet      ReasonCode = "copy_missing_data_set"
+	ReasonCopyMissingPiece        ReasonCode = "copy_missing_piece"
+	ReasonCopyMissingRetrievalURL ReasonCode = "copy_missing_retrieval_url"
+	ReasonCopyObservationMissing  ReasonCode = "copy_observation_missing"
 )
 
 var ErrProviderNotFound = errors.New("provider not found")
@@ -177,6 +186,16 @@ type DataSetFacts struct {
 	ClientDataSetID  *types.OnChainID           `json:"client_data_set_id,omitempty"`
 	LocalStatus      model.StorageDataSetStatus `json:"local_status"`
 	ActivePieceCount *int64                     `json:"active_piece_count,omitempty"`
+}
+
+type CopyFacts struct {
+	Status         model.StorageUploadCopyStatus `json:"status"`
+	ProviderID     *types.OnChainID              `json:"provider_id,omitempty"`
+	LocalDataSetID *int64                        `json:"local_data_set_id,omitempty"`
+	ChainDataSetID *types.OnChainID              `json:"chain_data_set_id,omitempty"`
+	PieceID        *types.OnChainID              `json:"piece_id,omitempty"`
+	RetrievalURL   *string                       `json:"retrieval_url,omitempty"`
+	LastError      *string                       `json:"last_error,omitempty"`
 }
 
 type Freshness struct {

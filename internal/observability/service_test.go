@@ -314,6 +314,42 @@ func TestServiceDataSetObservationSummaryUsesScopedInventoryForFilteredLists(t *
 	}
 }
 
+func TestServiceDataSetObservationsByLocalIDsBatchesLookups(t *testing.T) {
+	const sqliteBindParameterLimit = 999
+	if dataSetStateLookupBatchSize > sqliteBindParameterLimit {
+		t.Fatalf("data set state lookup batch size = %d, want <= %d", dataSetStateLookupBatchSize, sqliteBindParameterLimit)
+	}
+	const ids = dataSetStateLookupBatchSize + 3
+	store := &fakeStateStore{}
+	store.dataSets = make([]DataSetState, 0, ids)
+	for i := 1; i <= ids; i++ {
+		store.dataSets = append(store.dataSets, DataSetState{
+			LocalDataSetID: int64(i),
+			Status:         StatusAvailable,
+			LastCheckedAt:  time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC),
+		})
+	}
+	service := NewService(ServiceOptions{Store: store})
+
+	localIDs := make([]int64, 0, ids)
+	for i := 1; i <= ids; i++ {
+		localIDs = append(localIDs, int64(i))
+	}
+	got, err := service.DataSetObservationsByLocalIDs(context.Background(), localIDs)
+	if err != nil {
+		t.Fatalf("DataSetObservationsByLocalIDs: %v", err)
+	}
+	if len(got) != ids {
+		t.Fatalf("observations len = %d, want %d", len(got), ids)
+	}
+	if len(store.dataSetStateIDBatches) != 2 {
+		t.Fatalf("lookup batches = %#v, want 2 batches", store.dataSetStateIDBatches)
+	}
+	if len(store.dataSetStateIDBatches[0]) != dataSetStateLookupBatchSize || len(store.dataSetStateIDBatches[1]) != 3 {
+		t.Fatalf("lookup batch sizes = %d/%d, want %d/3", len(store.dataSetStateIDBatches[0]), len(store.dataSetStateIDBatches[1]), dataSetStateLookupBatchSize)
+	}
+}
+
 type observedDoneContext struct {
 	context.Context
 	observed chan<- struct{}
@@ -341,10 +377,11 @@ func (f *fakeRefreshChecker) CheckDataSets(ctx context.Context, checkedAt time.T
 }
 
 type fakeStateStore struct {
-	providerReplaces int
-	dataSetReplaces  int
-	providers        []ProviderState
-	dataSets         []DataSetState
+	providerReplaces      int
+	dataSetReplaces       int
+	providers             []ProviderState
+	dataSets              []DataSetState
+	dataSetStateIDBatches [][]int64
 }
 
 func (f *fakeStateStore) ReplaceProviderStates(_ context.Context, _ time.Time, states []ProviderState) error {
@@ -411,6 +448,7 @@ func fakeDataSetStatesForOptions(states []DataSetState, opts ListOptions) []Data
 }
 
 func (f *fakeStateStore) GetDataSetStatesByLocalIDs(_ context.Context, ids []int64) (map[int64]DataSetState, error) {
+	f.dataSetStateIDBatches = append(f.dataSetStateIDBatches, append([]int64(nil), ids...))
 	out := make(map[int64]DataSetState)
 	for _, state := range f.dataSets {
 		for _, id := range ids {

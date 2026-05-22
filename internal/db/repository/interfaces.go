@@ -232,6 +232,28 @@ type ReadableStorageCopy struct {
 	RetrievalURL   string          `bun:"retrieval_url"`
 }
 
+type CurrentObjectCopyHealthSummary struct {
+	BucketID                int64      `bun:"bucket_id"`
+	Status                  string     `bun:"status"`
+	TotalObjects            int        `bun:"total_objects"`
+	UnhealthyObjects        int        `bun:"unhealthy_objects"`
+	RequestedCopies         int        `bun:"requested_copies"`
+	ReadableCopies          int        `bun:"readable_copies"`
+	PendingCopies           int        `bun:"pending_copies"`
+	FailedCopies            int        `bun:"failed_copies"`
+	UnknownCopies           int        `bun:"unknown_copies"`
+	CopyUnderReplicated     bool       `bun:"copy_under_replicated"`
+	CopyPending             bool       `bun:"copy_pending"`
+	CopyCommitting          bool       `bun:"copy_committing"`
+	CopyFailed              bool       `bun:"copy_failed"`
+	CopyMissingProvider     bool       `bun:"copy_missing_provider"`
+	CopyMissingDataSet      bool       `bun:"copy_missing_data_set"`
+	CopyMissingPiece        bool       `bun:"copy_missing_piece"`
+	CopyMissingRetrievalURL bool       `bun:"copy_missing_retrieval_url"`
+	CopyObservationMissing  bool       `bun:"copy_observation_missing"`
+	LastCheckedAt           *time.Time `bun:"last_checked_at"`
+}
+
 type StorageCleanupRepository interface {
 	ListCopiesForTask(ctx context.Context, taskID int64) ([]model.StorageCleanupCopy, error)
 	MarkCopyRemoved(ctx context.Context, id int64) error
@@ -329,6 +351,7 @@ type StorageUploadRepository interface {
 	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
 	ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
+	ListCurrentObjectCopyHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time) ([]CurrentObjectCopyHealthSummary, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
 	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)

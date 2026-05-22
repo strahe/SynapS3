@@ -36,15 +36,16 @@ const (
 )
 
 type bucketListItem struct {
-	ID              int64   `json:"id"`
-	Name            string  `json:"name"`
-	OwnerAccessKey  *string `json:"owner_access_key"`
-	DefaultCopies   *int    `json:"default_copies"`
-	EffectiveCopies int     `json:"effective_copies"`
-	Status          string  `json:"status"`
-	ObjectCount     int64   `json:"object_count"`
-	TotalSizeBytes  int64   `json:"total_size_bytes"`
-	CreatedAt       string  `json:"created_at"`
+	ID              int64                     `json:"id"`
+	Name            string                    `json:"name"`
+	OwnerAccessKey  *string                   `json:"owner_access_key"`
+	DefaultCopies   *int                      `json:"default_copies"`
+	EffectiveCopies int                       `json:"effective_copies"`
+	Status          string                    `json:"status"`
+	ObjectCount     int64                     `json:"object_count"`
+	TotalSizeBytes  int64                     `json:"total_size_bytes"`
+	CopyHealth      copyHealthSummaryResponse `json:"copy_health"`
+	CreatedAt       string                    `json:"created_at"`
 }
 
 type bucketCreateRequest struct {
@@ -71,6 +72,7 @@ type bucketDetailResponse struct {
 	Status             string                          `json:"status"`
 	ObjectCount        int64                           `json:"object_count"`
 	TotalSizeBytes     int64                           `json:"total_size_bytes"`
+	CopyHealth         copyHealthSummaryResponse       `json:"copy_health"`
 	CreatedAt          string                          `json:"created_at"`
 	UpdatedAt          string                          `json:"updated_at"`
 	VersioningStatus   string                          `json:"versioning_status"`
@@ -171,6 +173,7 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("api: failed to aggregate object stats by bucket", "error", err)
 		statsMap = make(map[int64]repository.BucketObjectStats)
 	}
+	copyHealthMap, copyHealthFailed := s.bucketCopyHealthSummaries(ctx, 0)
 
 	items := make([]bucketListItem, 0, len(buckets))
 	for _, b := range buckets {
@@ -187,6 +190,7 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 			Status:          string(b.Status),
 			ObjectCount:     stats.Count,
 			TotalSizeBytes:  stats.TotalSize,
+			CopyHealth:      copyHealthSummaryForBucket(copyHealthMap, b.ID, copyHealthFailed),
 			CreatedAt:       b.CreatedAt.Format(time.RFC3339),
 		})
 	}
@@ -310,6 +314,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		}
 		dataSets = s.storageDataSetSummaryResponses(ctx, summaries)
 	}
+	copyHealthMap, copyHealthFailed := s.bucketCopyHealthSummaries(ctx, bucket.ID)
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
 		ID:                 bucket.ID,
@@ -320,6 +325,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		Status:             string(bucket.Status),
 		ObjectCount:        stats.Count,
 		TotalSizeBytes:     stats.TotalSize,
+		CopyHealth:         copyHealthSummaryForBucket(copyHealthMap, bucket.ID, copyHealthFailed),
 		CreatedAt:          bucket.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:          bucket.UpdatedAt.Format(time.RFC3339),
 		VersioningStatus:   "Enabled",
@@ -681,6 +687,7 @@ type objectProvenanceResponse struct {
 	PieceCID        *string                           `json:"piece_cid,omitempty"`
 	RequestedCopies int                               `json:"requested_copies"`
 	SuccessCopies   int                               `json:"success_copies"`
+	CopyHealth      copyHealthSummaryResponse         `json:"copy_health"`
 	Copies          []objectProvenanceCopyResponse    `json:"copies"`
 	Failures        []objectProvenanceFailureResponse `json:"failures"`
 	UpdatedAt       string                            `json:"updated_at"`
@@ -689,6 +696,7 @@ type objectProvenanceResponse struct {
 type objectProvenanceCopyResponse struct {
 	CopyIndex        int                       `json:"copy_index"`
 	Status           string                    `json:"status"`
+	Health           copyHealthInfo            `json:"health"`
 	ProviderID       *string                   `json:"provider_id,omitempty"`
 	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
 	DataSetID        *string                   `json:"data_set_id,omitempty"`
@@ -1672,12 +1680,13 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 	}
 
 	resp := objectProvenanceResponse{
-		VersionID: version.VersionID,
-		State:     string(version.State),
-		Status:    objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, nil),
-		Copies:    make([]objectProvenanceCopyResponse, 0),
-		Failures:  make([]objectProvenanceFailureResponse, 0),
-		UpdatedAt: version.UpdatedAt.Format(time.RFC3339),
+		VersionID:  version.VersionID,
+		State:      string(version.State),
+		Status:     objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, nil),
+		CopyHealth: emptyCopyHealthSummary(),
+		Copies:     make([]objectProvenanceCopyResponse, 0),
+		Failures:   make([]objectProvenanceFailureResponse, 0),
+		UpdatedAt:  version.UpdatedAt.Format(time.RFC3339),
 	}
 
 	upload, err := s.objectAdminStorageUpload(ctx, *version)
@@ -1687,6 +1696,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		return
 	}
 	if upload == nil {
+		resp.CopyHealth = noUploadCopyHealthSummary()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -1727,10 +1737,23 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		}
 	}
 	providerIdentities := s.providerIdentities(providerIDs)
+	copyFacts := provenanceCopyHealthFacts(bucket.ID, version.VersionID, provenance.Upload, provenance.Copies)
+	copyObservations, copyHealthFailed := s.copyHealthDataSetObservations(ctx, copyHealthLocalDataSetIDs(copyFacts))
+	copyHealthInterval := s.copyHealthRefreshInterval()
+	resp.CopyHealth = copyHealthSummaryForBucket(copyHealthSummariesByBucket(copyFacts, copyObservations, copyHealthFailed, copyHealthInterval), bucket.ID, false)
+	copyHealthByIndex := make(map[int]copyHealthInfo, len(provenance.Copies))
+	copyHealthNow := time.Now().UTC()
+	for _, fact := range copyFacts {
+		if fact.CopyIndex == nil {
+			continue
+		}
+		copyHealthByIndex[*fact.CopyIndex] = copyHealthInfoFromSignal(copyHealthSignalFromFact(fact, copyObservations, copyHealthFailed, copyHealthInterval, copyHealthNow))
+	}
 	for _, copyRow := range provenance.Copies {
 		resp.Copies = append(resp.Copies, objectProvenanceCopyResponse{
 			CopyIndex:        copyRow.CopyIndex,
 			Status:           string(copyRow.Status),
+			Health:           copyHealthByIndex[copyRow.CopyIndex],
 			ProviderID:       onChainIDStringPtr(copyRow.ProviderID),
 			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, copyRow.ProviderID),
 			DataSetID:        onChainIDStringPtr(copyRow.DataSetID),

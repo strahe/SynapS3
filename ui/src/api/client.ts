@@ -136,6 +136,7 @@ export interface BucketItem {
   status: string
   object_count: number
   total_size_bytes: number
+  copy_health: CopyHealthSummary
   created_at: string
 }
 
@@ -162,6 +163,7 @@ export interface StorageDataSetSummary {
 }
 
 export type StorageHealthStatus = ObservabilityStatus
+export type CopyHealthStatus = ObservabilityStatus
 
 export interface DataSetStorageHealthInfo {
   status: StorageHealthStatus
@@ -170,6 +172,24 @@ export interface DataSetStorageHealthInfo {
   last_checked_at?: string
   last_error?: string
   stale: boolean
+}
+
+export interface CopyHealthInfo {
+  status: CopyHealthStatus
+  reason_codes: string[]
+  stale: boolean
+  last_checked_at?: string
+  last_error?: string
+}
+
+export interface CopyHealthSummary extends CopyHealthInfo {
+  total_objects: number
+  unhealthy_objects: number
+  requested_copies: number
+  readable_copies: number
+  pending_copies: number
+  failed_copies: number
+  unknown_copies: number
 }
 
 export interface ObservabilityListResponse<T> {
@@ -371,6 +391,7 @@ export interface ProviderIdentity {
 export interface ObjectProvenanceCopy {
   copy_index: number
   status: ObjectUploadCopyStatus
+  health: CopyHealthInfo
   provider_id?: string
   provider_identity?: ProviderIdentity
   data_set_id?: string
@@ -398,6 +419,7 @@ export interface ObjectProvenance {
   piece_cid?: string
   requested_copies: number
   success_copies: number
+  copy_health: CopyHealthSummary
   copies: ObjectProvenanceCopy[]
   failures: ObjectProvenanceFailure[]
   updated_at: string

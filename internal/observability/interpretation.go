@@ -1,6 +1,11 @@
 package observability
 
-import "time"
+import (
+	"strings"
+	"time"
+
+	"github.com/strahe/synaps3/internal/model"
+)
 
 func BuildFreshness(lastCheckedAt *time.Time, interval time.Duration, now time.Time) Freshness {
 	warnings := make([]FreshnessWarning, 0, 1)
@@ -102,6 +107,67 @@ func DataSetObservationFromState(state DataSetState, interval time.Duration, now
 		},
 		Signal: BuildSignal(state.Status, state.ReasonCodes, state.LastError, checkedAt, interval, now),
 	}
+}
+
+func CopyHealthFromFacts(facts CopyFacts, dataSetObservation *DataSetObservation, interval time.Duration, now time.Time) Signal {
+	switch facts.Status {
+	case model.StorageUploadCopyStatusPending, model.StorageUploadCopyStatusPieceReady:
+		return BuildSignal(StatusDegraded, []ReasonCode{ReasonCopyPending}, facts.LastError, nil, interval, now)
+	case model.StorageUploadCopyStatusCommitting:
+		return BuildSignal(StatusDegraded, []ReasonCode{ReasonCopyCommitting}, facts.LastError, nil, interval, now)
+	case model.StorageUploadCopyStatusFailed:
+		return BuildSignal(StatusUnavailable, []ReasonCode{ReasonCopyFailed}, facts.LastError, nil, interval, now)
+	case model.StorageUploadCopyStatusCommitted:
+		return committedCopyHealthFromFacts(facts, dataSetObservation, interval, now)
+	default:
+		return BuildSignal(StatusUnknown, []ReasonCode{ReasonCopyObservationMissing}, facts.LastError, nil, interval, now)
+	}
+}
+
+func committedCopyHealthFromFacts(facts CopyFacts, dataSetObservation *DataSetObservation, interval time.Duration, now time.Time) Signal {
+	reasons := committedCopyEvidenceReasons(facts)
+	if len(reasons) > 0 {
+		return BuildSignal(StatusUnknown, reasons, facts.LastError, nil, interval, now)
+	}
+	if dataSetObservation == nil || dataSetObservation.Facts.LocalDataSetID == 0 {
+		return BuildSignal(StatusUnknown, []ReasonCode{ReasonCopyObservationMissing}, facts.LastError, nil, interval, now)
+	}
+	checkedAt := dataSetObservation.Signal.Freshness.LastCheckedAt
+	status := StatusAvailable
+	if dataSetObservation.Signal.Status != StatusAvailable || dataSetObservation.Signal.Freshness.Stale {
+		status = StatusUnknown
+	}
+	reasons = []ReasonCode{}
+	if status != StatusAvailable {
+		reasons = []ReasonCode{ReasonCopyObservationMissing}
+	}
+	return BuildSignal(status, reasons, firstStringPtr(facts.LastError, dataSetObservation.Signal.LastError), checkedAt, interval, now)
+}
+
+func committedCopyEvidenceReasons(facts CopyFacts) []ReasonCode {
+	reasons := make([]ReasonCode, 0, 4)
+	if facts.ProviderID == nil || facts.ProviderID.IsZero() {
+		reasons = append(reasons, ReasonCopyMissingProvider)
+	}
+	if facts.LocalDataSetID == nil || *facts.LocalDataSetID == 0 || facts.ChainDataSetID == nil || facts.ChainDataSetID.IsZero() {
+		reasons = append(reasons, ReasonCopyMissingDataSet)
+	}
+	if facts.PieceID == nil || facts.PieceID.IsZero() {
+		reasons = append(reasons, ReasonCopyMissingPiece)
+	}
+	if facts.RetrievalURL == nil || strings.TrimSpace(*facts.RetrievalURL) == "" {
+		reasons = append(reasons, ReasonCopyMissingRetrievalURL)
+	}
+	return reasons
+}
+
+func firstStringPtr(values ...*string) *string {
+	for _, value := range values {
+		if value != nil && *value != "" {
+			return value
+		}
+	}
+	return nil
 }
 
 func signalLevelForStatus(status Status) SignalLevel {

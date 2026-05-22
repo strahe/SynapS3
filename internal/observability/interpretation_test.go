@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/strahe/synaps3/internal/model"
 )
 
 func TestBuildFreshnessClassifiesNoStateFreshAndStale(t *testing.T) {
@@ -58,6 +60,146 @@ func TestBuildSignalMapsStatusAndStale(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	localDataSetID := int64(11)
+	retrievalURL := "https://provider.example/piece"
+	healthyObservation := copyHealthDataSetObservation(t, localDataSetID, StatusAvailable, nil, now)
+
+	tests := []struct {
+		name        string
+		facts       CopyFacts
+		observation *DataSetObservation
+		wantStatus  Status
+		wantReasons []ReasonCode
+	}{
+		{
+			name: "healthy committed copy",
+			facts: CopyFacts{
+				Status:         model.StorageUploadCopyStatusCommitted,
+				ProviderID:     onChainIDPtr(t, "101"),
+				LocalDataSetID: &localDataSetID,
+				ChainDataSetID: onChainIDPtr(t, "1001"),
+				PieceID:        onChainIDPtr(t, "2001"),
+				RetrievalURL:   &retrievalURL,
+			},
+			observation: &healthyObservation,
+			wantStatus:  StatusAvailable,
+			wantReasons: []ReasonCode{},
+		},
+		{
+			name: "pending copy",
+			facts: CopyFacts{
+				Status: model.StorageUploadCopyStatusPending,
+			},
+			wantStatus:  StatusDegraded,
+			wantReasons: []ReasonCode{ReasonCopyPending},
+		},
+		{
+			name: "committing copy",
+			facts: CopyFacts{
+				Status: model.StorageUploadCopyStatusCommitting,
+			},
+			wantStatus:  StatusDegraded,
+			wantReasons: []ReasonCode{ReasonCopyCommitting},
+		},
+		{
+			name: "failed copy",
+			facts: CopyFacts{
+				Status:    model.StorageUploadCopyStatusFailed,
+				LastError: stringPtr("provider rejected piece"),
+			},
+			wantStatus:  StatusUnavailable,
+			wantReasons: []ReasonCode{ReasonCopyFailed},
+		},
+		{
+			name: "committed copy missing evidence",
+			facts: CopyFacts{
+				Status:         model.StorageUploadCopyStatusCommitted,
+				LocalDataSetID: &localDataSetID,
+				ChainDataSetID: onChainIDPtr(t, "1001"),
+			},
+			observation: &healthyObservation,
+			wantStatus:  StatusUnknown,
+			wantReasons: []ReasonCode{ReasonCopyMissingProvider, ReasonCopyMissingPiece, ReasonCopyMissingRetrievalURL},
+		},
+		{
+			name: "committed copy missing observation",
+			facts: CopyFacts{
+				Status:         model.StorageUploadCopyStatusCommitted,
+				ProviderID:     onChainIDPtr(t, "101"),
+				LocalDataSetID: &localDataSetID,
+				ChainDataSetID: onChainIDPtr(t, "1001"),
+				PieceID:        onChainIDPtr(t, "2001"),
+				RetrievalURL:   &retrievalURL,
+			},
+			wantStatus:  StatusUnknown,
+			wantReasons: []ReasonCode{ReasonCopyObservationMissing},
+		},
+		{
+			name: "unavailable data set observation",
+			facts: CopyFacts{
+				Status:         model.StorageUploadCopyStatusCommitted,
+				ProviderID:     onChainIDPtr(t, "101"),
+				LocalDataSetID: &localDataSetID,
+				ChainDataSetID: onChainIDPtr(t, "1001"),
+				PieceID:        onChainIDPtr(t, "2001"),
+				RetrievalURL:   &retrievalURL,
+			},
+			observation: ptr(copyHealthDataSetObservation(t, localDataSetID, StatusUnavailable, []ReasonCode{ReasonChainLookupFailed}, now)),
+			wantStatus:  StatusUnknown,
+			wantReasons: []ReasonCode{ReasonCopyObservationMissing},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CopyHealthFromFacts(tt.facts, tt.observation, time.Hour, now)
+			if got.Status != tt.wantStatus || !reflect.DeepEqual(got.ReasonCodes, tt.wantReasons) {
+				t.Fatalf("copy health = status:%s reasons:%#v, want status:%s reasons:%#v", got.Status, got.ReasonCodes, tt.wantStatus, tt.wantReasons)
+			}
+		})
+	}
+}
+
+func TestCopyHealthFromFactsTreatsStaleDataSetAsUnknown(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	checkedAt := now.Add(-3 * time.Hour)
+	localDataSetID := int64(12)
+	retrievalURL := "https://provider.example/piece"
+
+	observation := copyHealthDataSetObservation(t, localDataSetID, StatusAvailable, nil, checkedAt)
+	observation.Signal = BuildSignal(StatusAvailable, nil, nil, &checkedAt, time.Hour, now)
+	got := CopyHealthFromFacts(CopyFacts{
+		Status:         model.StorageUploadCopyStatusCommitted,
+		ProviderID:     onChainIDPtr(t, "101"),
+		LocalDataSetID: &localDataSetID,
+		ChainDataSetID: onChainIDPtr(t, "1001"),
+		PieceID:        onChainIDPtr(t, "2001"),
+		RetrievalURL:   &retrievalURL,
+	}, &observation, time.Hour, now)
+	if got.Status != StatusUnknown || !got.Freshness.Stale {
+		t.Fatalf("copy health = status:%s stale:%v, want unknown stale", got.Status, got.Freshness.Stale)
+	}
+}
+
+func copyHealthDataSetObservation(t *testing.T, localID int64, status Status, reasons []ReasonCode, checkedAt time.Time) DataSetObservation {
+	t.Helper()
+	return DataSetObservation{
+		Facts: DataSetFacts{
+			LocalDataSetID: localID,
+			ProviderID:     onChainID(t, "101"),
+			ChainDataSetID: onChainIDPtr(t, "1001"),
+			LocalStatus:    model.StorageDataSetStatusReady,
+		},
+		Signal: BuildSignal(status, reasons, nil, &checkedAt, time.Hour, checkedAt),
+	}
+}
+
+func ptr[T any](value T) *T {
+	return &value
 }
 
 func TestDefaultAttentionSummarySignalMapsHealthSummary(t *testing.T) {

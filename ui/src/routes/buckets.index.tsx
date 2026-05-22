@@ -23,6 +23,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBuckets, useCreateBucket, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
 import { bucketCopyPolicyLabel, copyPolicyOptions, inheritedCopyPolicyValue } from '@/lib/bucket-copy-policy'
+import { copyHealthStatusTone, copyHealthSummaryLabel, copyHealthSummaryTitle } from '@/lib/copy-health'
 import { ownerLabel } from '@/lib/s3-owner'
 import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
@@ -399,6 +400,7 @@ function BucketsPage() {
                 <TableHead className="px-4">Name</TableHead>
                 <TableHead className="px-4">Owner</TableHead>
                 <TableHead className="px-4">Replicas</TableHead>
+                <TableHead className="px-4">Object Copy Health</TableHead>
                 <TableHead className="px-4">Status</TableHead>
                 <TableHead className="px-4 text-right">Objects</TableHead>
                 <TableHead className="px-4 text-right">Size</TableHead>
@@ -426,6 +428,9 @@ function BucketsPage() {
                         <OwnerCell ownerAccessKey={bucket.owner_access_key} />
                       </TableCell>
                       <TableCell className="px-4">{bucketCopyPolicyLabel(bucket)}</TableCell>
+                      <TableCell className="px-4">
+                        <BucketCopyHealthCell bucket={bucket} />
+                      </TableCell>
                       <TableCell className="px-4">
                         <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
                       </TableCell>
@@ -457,7 +462,7 @@ function BucketsPage() {
                 })
               ) : (
                 <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
                     No buckets found
                   </TableCell>
                 </TableRow>
@@ -478,4 +483,15 @@ function OwnerCell({ ownerAccessKey }: { ownerAccessKey: string | null }) {
     return <StatusBadge tone="neutral">Internal root</StatusBadge>
   }
   return <code className="block max-w-56 truncate text-xs text-muted-foreground">{ownerAccessKey}</code>
+}
+
+function BucketCopyHealthCell({ bucket }: { bucket: BucketItem }) {
+  const health = bucket.copy_health
+  return (
+    <span className="inline-flex" title={copyHealthSummaryTitle(health)}>
+      <StatusBadge tone={copyHealthStatusTone(health)} className="whitespace-nowrap">
+        {copyHealthSummaryLabel(health)}
+      </StatusBadge>
+    </span>
+  )
 }

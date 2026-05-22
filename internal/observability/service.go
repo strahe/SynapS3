@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const dataSetStateLookupBatchSize = 900
+
 type RefreshChecker interface {
 	CheckProviders(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error)
 	CheckDataSets(context.Context, time.Time, []LocalDataSet) ([]DataSetState, error)
@@ -197,7 +199,18 @@ func (s *Service) RefreshDataSetObservations(ctx context.Context, opts ListOptio
 }
 
 func (s *Service) DataSetStatesByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]DataSetState, error) {
-	return s.store.GetDataSetStatesByLocalIDs(ctx, localIDs)
+	out := make(map[int64]DataSetState)
+	for start := 0; start < len(localIDs); start += dataSetStateLookupBatchSize {
+		end := min(start+dataSetStateLookupBatchSize, len(localIDs))
+		batch, err := s.store.GetDataSetStatesByLocalIDs(ctx, localIDs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for id, state := range batch {
+			out[id] = state
+		}
+	}
+	return out, nil
 }
 
 func (s *Service) DataSetObservationsByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]DataSetObservation, error) {
