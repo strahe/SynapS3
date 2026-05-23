@@ -1,39 +1,28 @@
+![SynapS3 dashboard](docs/assets/readme-dashboard.png)
+
 # SynapS3
 
-SynapS3 lets S3 clients use Filecoin storage.
+[![CI](https://github.com/strahe/SynapS3/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/ci.yml)
+[![Package](https://img.shields.io/badge/package-ghcr.io%2Fstrahe%2Fsynaps3-blue?logo=github)](https://github.com/strahe/SynapS3/pkgs/container/synaps3)
+[![Go Report](https://goreportcard.com/badge/github.com/strahe/synaps3)](https://goreportcard.com/report/github.com/strahe/synaps3)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/strahe/SynapS3?filename=go.mod)](go.mod)
 
-> SynapS3 is a developer preview and is not ready for production use. Test with Filecoin Calibration first, and feedback is welcome.
+SynapS3 is an S3-compatible gateway for storing objects on Filecoin.
 
-## Why SynapS3
+## Highlights
 
-- Use existing S3 clients, SDKs, and tools.
-- Store object data through Filecoin providers.
-- Manage buckets, objects, settings, tasks, and health from one dashboard.
-
-## Core Features
-
-| Feature | Status | Note |
-| --- | --- | --- |
-| S3-compatible API | ✅ | Works with standard S3 clients and tools |
-| Bucket and object operations | ✅ | Create buckets; upload, list, read, and delete objects |
-| Multipart uploads | ✅ | S3 multipart flow for large objects |
-| Object versioning | ✅ | Version IDs, current versions, and delete markers |
-| Web dashboard | ✅ | Buckets, objects, tasks, settings, and health views |
-| S3 user management | ✅ | Access keys for S3 client authentication |
-| Filecoin storage backend | ✅ | Stores object data through Synapse providers |
-| Automatic provider selection | ✅ | Selects provider contexts through Synapse |
-| Configurable storage copies | ✅ | Global and per-bucket copy targets |
-| Provider-backed reads | ✅ | Reads from cache first, then provider storage |
-| Wallet and payment tools | ✅ | Wallet setup, Calibration funding, and USDFC deposit |
-| Background task management | ✅ | Task monitoring, retry, and recovery controls |
-| Managed provider policy | 📝 | Provider allow/deny and placement controls |
-| Automatic repair | 📝 | Background replica reconciliation |
-| One-click deployment | 📝 | Packaged deployment automation |
-| Production readiness | 📝 | Security and operations hardening |
+- S3-compatible bucket and object APIs.
+- Object storage backed by Filecoin storage providers.
+- Web dashboard for buckets, objects, wallet, tasks, topology, settings, and health.
+- Multipart uploads for large objects.
+- Wallet funding, USDFC deposit, and background task controls.
 
 ## Quick Start
 
-This Quick Start uses `docker run` for quick evaluation. For Docker Compose deployment, use the [Docker deployment guide](docs/deployment/docker.md). To compile locally, use the [source build guide](docs/deployment/source.md).
+Choose the path that matches how you want to run SynapS3. Each option includes the core commands; full deployment details live in the linked guides.
+
+<details>
+<summary>Quick evaluation with docker run</summary>
 
 Prerequisites:
 
@@ -85,6 +74,109 @@ Clean up the testing container when done:
 docker rm -f synaps3-test
 docker volume rm synaps3-test-data
 ```
+
+</details>
+
+<details>
+<summary>Long-running deployment with Docker Compose</summary>
+
+Use this flow for a single Linux host. See the [Docker deployment guide](docs/deployment/docker.md) for full deployment, upgrade, backup, and operations notes.
+
+Prerequisites:
+
+- [Docker Engine](https://docs.docker.com/engine/install/) with [Docker Compose v2.24 or later](https://docs.docker.com/compose/install/)
+- A durable local disk for the Docker volume
+
+Prepare local environment overrides:
+
+```bash
+cp .env.example .env
+```
+
+Generate a wallet:
+
+```bash
+docker compose run --rm synaps3 synaps3 wallet generate
+```
+
+Copy the generated private key into `.env`, then fund the generated address on Calibration:
+
+```bash
+docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
+```
+
+Start SynapS3:
+
+```bash
+docker compose up -d
+docker compose logs --tail=50 synaps3
+```
+
+Check health and deposit USDFC:
+
+```bash
+curl http://127.0.0.1:9090/healthz
+docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml admin status
+docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2
+```
+
+Open the dashboard at `http://127.0.0.1:9090`. If the host is remote, use an SSH tunnel:
+
+```bash
+ssh -L 9090:127.0.0.1:9090 user@server
+```
+
+</details>
+
+<details>
+<summary>Build from source</summary>
+
+Use this flow for local development or custom binaries. See the [source build guide](docs/deployment/source.md) for the full build and first-upload flow.
+
+Prerequisites:
+
+- [Go](https://go.dev/doc/install) 1.26.3 or later
+- [make](https://www.gnu.org/software/make/)
+- C toolchain for cgo, such as [gcc](https://gcc.gnu.org/install/) or [clang](https://clang.llvm.org/get_started.html)
+- [Node.js](https://nodejs.org/en/download) 22.12 or later
+- [pnpm](https://pnpm.io/installation) 11
+
+Clone and build SynapS3 with the embedded dashboard:
+
+```bash
+git clone https://github.com/strahe/SynapS3.git
+cd SynapS3
+make build
+```
+
+Initialize local app data and generate a wallet:
+
+```bash
+./bin/synaps3 init
+./bin/synaps3 wallet generate
+```
+
+Set `filecoin.private_key` in `~/.synaps3/config.toml`, then fund the generated address on Calibration:
+
+```bash
+./bin/synaps3 wallet fund-testnet 0x...
+```
+
+Start SynapS3:
+
+```bash
+./bin/synaps3 serve
+```
+
+In another terminal, deposit USDFC before uploading:
+
+```bash
+./bin/synaps3 wallet deposit 2
+```
+
+Open the dashboard at `http://127.0.0.1:9090`.
+
+</details>
 
 ## Documentation
 

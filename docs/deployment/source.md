@@ -5,6 +5,7 @@ Use this flow for local development or when you need to build the binary yoursel
 ## Prerequisites
 
 - [Go](https://go.dev/doc/install) 1.26.3 or later
+- [make](https://www.gnu.org/software/make/)
 - C toolchain for cgo, such as [gcc](https://gcc.gnu.org/install/) or [clang](https://clang.llvm.org/get_started.html)
 - [Node.js](https://nodejs.org/en/download) 22.12 or later
 - [pnpm](https://pnpm.io/installation) 11
@@ -62,7 +63,7 @@ Start SynapS3:
 Default endpoints:
 
 - S3 API: `http://localhost:8080`
-- Dashboard and admin API: `http://localhost:9090`
+- Dashboard and admin API: `http://127.0.0.1:9090`
 - Runtime data: `~/.synaps3/`
 
 Do not expose the dashboard and admin API directly to an untrusted network.
@@ -97,6 +98,6 @@ Check health and task recovery:
 
 ```bash
 ./bin/synaps3 admin status
-curl http://localhost:9090/healthz
+curl http://127.0.0.1:9090/healthz
 ./bin/synaps3 admin task list --status exhausted --limit 100
 ```
