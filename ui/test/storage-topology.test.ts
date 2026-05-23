@@ -4,6 +4,7 @@ import test from 'node:test'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '../src/api/client.ts'
 import {
   bucketIssueTone,
+  bucketStorageDataSetTopologyLinkModel,
   buildStorageTopologyGraph,
   buildTopologyProviderOptions,
   clampPageForLoadedTotal,
@@ -15,6 +16,7 @@ import {
   findDataSetTopologyNodeByLocalID,
   findProviderTopologyNode,
   findStorageTopologySelection,
+  formatOptionalTopologyID,
   formatOptionalTopologyText,
   freshnessLabel,
   mergeTopologyDataSetSnapshots,
@@ -365,6 +367,67 @@ test('storage topology data set selection search keeps chain, local fallback, an
   })
 })
 
+test('storage topology bucket data set links keep local fallback and raw chain copy values', () => {
+  assert.deepEqual(
+    bucketStorageDataSetTopologyLinkModel('media-prod', {
+      id: 11,
+      provider_id: '101',
+      data_set_id: '51001',
+    }),
+    {
+      label: '51001',
+      copyValue: '51001',
+      search: {
+        bucket: 'media-prod',
+        provider: '101',
+        chain_data_set_id: '51001',
+        local_data_set_id: 11,
+        selection_provider: '101',
+        selection_bucket: 'media-prod',
+      },
+    }
+  )
+
+  assert.deepEqual(
+    bucketStorageDataSetTopologyLinkModel('research-data', {
+      id: 31,
+      provider_id: '101',
+    }),
+    {
+      label: 'No chain data set',
+      copyValue: undefined,
+      search: {
+        bucket: 'research-data',
+        provider: '101',
+        chain_data_set_id: undefined,
+        local_data_set_id: 31,
+        selection_provider: '101',
+        selection_bucket: 'research-data',
+      },
+    }
+  )
+
+  assert.deepEqual(
+    bucketStorageDataSetTopologyLinkModel('research-data', {
+      id: 32,
+      provider_id: '101',
+      data_set_id: '   ',
+    }),
+    {
+      label: 'No chain data set',
+      copyValue: undefined,
+      search: {
+        bucket: 'research-data',
+        provider: '101',
+        chain_data_set_id: undefined,
+        local_data_set_id: 32,
+        selection_provider: '101',
+        selection_bucket: 'research-data',
+      },
+    }
+  )
+})
+
 test('storage topology clears selection search without changing visible filters', () => {
   assert.deepEqual(
     clearStorageTopologySelectionSearch({
@@ -424,9 +487,13 @@ test('storage topology optional text formatter treats blank values as missing', 
   assert.equal(formatOptionalTopologyText('reachable'), 'reachable')
 })
 
-test('storage topology uses chain data set identity for labels and paths', () => {
+test('storage topology uses raw ids for value fields and prefixed ids for labels and paths', () => {
+  assert.equal(formatOptionalTopologyID(undefined), '—')
+  assert.equal(formatOptionalTopologyID(null), '—')
+  assert.equal(formatOptionalTopologyID(''), '—')
+  assert.equal(formatOptionalTopologyID(' 51002 '), '51002')
   assert.equal(dataSetDisplayLabel(mediaReplicaDataSet), 'Data Set #51002')
-  assert.equal(dataSetChainIDValue(mediaReplicaDataSet), '#51002')
+  assert.equal(dataSetChainIDValue(mediaReplicaDataSet), '51002')
   assert.equal(dataSetChainIDValue(missingChainDataSet), '—')
   assert.equal(dataSetDisplayLabel(missingChainDataSet), 'No chain data set')
   assert.equal(dataSetTopologyPath(mediaReplicaDataSet), 'media-prod -> Replica 2 -> Data Set #51002 -> Provider #202')

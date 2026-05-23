@@ -8,6 +8,7 @@ import type {
   SettingsEditableConfig,
   SettingsS3Credentials,
 } from '@/api/client'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge } from '@/components/app/StatusBadge'
@@ -17,6 +18,7 @@ import {
   SettingsSection as S3Section,
   SettingsSelect,
 } from '@/components/settings/settings-form'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -27,8 +29,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useCreateS3User, useDeleteS3User, useRotateS3UserSecret, useS3Users, useUpdateS3User } from '@/hooks/queries'
 import { syncClosedRoleDraft } from './change-role-draft'
@@ -89,8 +91,7 @@ function S3UsersSection({
   const [rotateTarget, setRotateTarget] = useState<S3User | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<S3User | null>(null)
 
-  const mutationError = createUser.error ?? rotateUserSecret.error ?? deleteUser.error ?? null
-  const errorMessage = error instanceof Error ? error.message : mutationError?.message
+  const errorMessage = error instanceof Error ? error.message : null
   const rotatePending = rotateUserSecret.isPending
   const deletePending = deleteUser.isPending
 
@@ -133,6 +134,20 @@ function S3UsersSection({
     if (deletePending) return
     deleteUser.reset()
     setDeleteTarget(user)
+  }
+
+  function handleRotateOpenChange(open: boolean) {
+    if (!open) {
+      rotateUserSecret.reset()
+      setRotateTarget(null)
+    }
+  }
+
+  function handleDeleteOpenChange(open: boolean) {
+    if (!open) {
+      deleteUser.reset()
+      setDeleteTarget(null)
+    }
   }
 
   function handleDeleteUser() {
@@ -198,16 +213,23 @@ function S3UsersSection({
                     ]}
                   />
                 ) : (
-                  <div className="flex flex-col gap-2">
-                    <Label htmlFor="create-s3-user-role">Role</Label>
-                    <RoleSelect
-                      id="create-s3-user-role"
-                      value={createRole}
-                      disabled={!s3UsersAvailable || createUser.isPending}
-                      onChange={setCreateRole}
-                    />
-                    <p className="text-xs text-muted-foreground">{roleDescription(createRole)}</p>
-                  </div>
+                  <FieldGroup>
+                    <Field>
+                      <FieldLabel htmlFor="create-s3-user-role">Role</FieldLabel>
+                      <RoleSelect
+                        id="create-s3-user-role"
+                        value={createRole}
+                        disabled={!s3UsersAvailable || createUser.isPending}
+                        onChange={setCreateRole}
+                      />
+                      <FieldDescription>{roleDescription(createRole)}</FieldDescription>
+                    </Field>
+                  </FieldGroup>
+                )}
+                {createUser.error && (
+                  <Alert variant="destructive">
+                    <AlertDescription>{createUser.error.message}</AlertDescription>
+                  </Alert>
                 )}
                 <DialogFooter>
                   <Button
@@ -263,7 +285,7 @@ function S3UsersSection({
                     return (
                       <TableRow key={user.access_key}>
                         <TableCell className="max-w-0 px-3">
-                          <code className="block truncate text-xs">{user.access_key}</code>
+                          <CopyableValue label="Access key" value={user.access_key} monospace maxLength={28} />
                         </TableCell>
                         <TableCell className="px-3">
                           <RolePill role={user.role} />
@@ -311,7 +333,7 @@ function S3UsersSection({
 
       <DangerActionAlertDialog
         open={Boolean(rotateTarget)}
-        onOpenChange={(open) => !open && setRotateTarget(null)}
+        onOpenChange={handleRotateOpenChange}
         title="Rotate S3 secret?"
         description={
           rotateTarget
@@ -328,7 +350,7 @@ function S3UsersSection({
 
       <DangerActionAlertDialog
         open={Boolean(deleteTarget)}
-        onOpenChange={(open) => !open && setDeleteTarget(null)}
+        onOpenChange={handleDeleteOpenChange}
         title="Delete S3 user?"
         description={
           deleteTarget ? `Delete ${deleteTarget.access_key}. Existing requests signed with this key will fail.` : ''
@@ -397,19 +419,25 @@ function ChangeRoleDialog({ user, disabled }: { user: S3User; disabled?: boolean
         {reviewing ? (
           <ReviewDetails
             rows={[
-              { id: 'access-key', label: 'Access key', value: user.access_key },
+              { id: 'access-key', label: 'Access key', value: user.access_key, copyable: true },
               { id: 'current-role', label: 'Current role', value: roleLabel(user.role) },
               { id: 'new-role', label: 'New role', value: roleLabel(role) },
             ]}
           />
         ) : (
-          <div className="flex flex-col gap-2">
-            <Label htmlFor={`role-${user.access_key}`}>Role</Label>
-            <RoleSelect id={`role-${user.access_key}`} value={role} disabled={updating} onChange={setRole} />
-            <p className="text-xs text-muted-foreground">{roleDescription(role)}</p>
-          </div>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor={`role-${user.access_key}`}>Role</FieldLabel>
+              <RoleSelect id={`role-${user.access_key}`} value={role} disabled={updating} onChange={setRole} />
+              <FieldDescription>{roleDescription(role)}</FieldDescription>
+            </Field>
+          </FieldGroup>
         )}
-        {updateUser.error && <p className="text-sm text-destructive">{updateUser.error.message}</p>}
+        {updateUser.error && (
+          <Alert variant="destructive">
+            <AlertDescription>{updateUser.error.message}</AlertDescription>
+          </Alert>
+        )}
         <DialogFooter>
           <Button
             type="button"

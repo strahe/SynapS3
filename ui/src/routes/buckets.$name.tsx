@@ -45,12 +45,15 @@ import {
 } from '@/api/client'
 import { BreadcrumbCurrentPage } from '@/components/app/BreadcrumbCurrentPage'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
+import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -77,9 +80,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
-import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Progress } from '@/components/ui/progress'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
@@ -126,6 +128,7 @@ import { dataSetStorageHealthDetailParts, dataSetStorageHealthRefreshErrorMessag
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
+import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
 import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
 type ObjectBrowserSearch = {
@@ -228,20 +231,26 @@ function DeleteBucketDetailDialog({
               : 'This empty bucket will be marked for deletion. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
           </DialogDescription>
         </DialogHeader>
-        <div className="flex flex-col gap-2">
-          <Label htmlFor="confirm-delete-detail">
-            Type <span className="font-mono font-semibold">{bucketName}</span> to confirm
-          </Label>
-          <Input
-            id="confirm-delete-detail"
-            value={confirmName}
-            onChange={(e) => setConfirmName(e.target.value)}
-            placeholder={bucketName}
-            autoFocus
-            disabled={deleteBucket.isPending}
-          />
-        </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="confirm-delete-detail">
+              Type <span className="font-mono font-semibold">{bucketName}</span> to confirm
+            </FieldLabel>
+            <Input
+              id="confirm-delete-detail"
+              value={confirmName}
+              onChange={(e) => setConfirmName(e.target.value)}
+              placeholder={bucketName}
+              autoFocus
+              disabled={deleteBucket.isPending}
+            />
+          </Field>
+        </FieldGroup>
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
         <DialogFooter>
           <Button
             type="button"
@@ -342,30 +351,47 @@ function ChangeBucketOwnerDetailDialog({
         {reviewing ? (
           <ReviewDetails
             rows={[
-              { id: 'bucket', label: 'Bucket', value: bucketName },
-              { id: 'current-owner', label: 'Current owner', value: ownerLabel(ownerAccessKey) },
-              { id: 'new-owner', label: 'New owner', value: ownerLabel(selectedOwner) },
+              { id: 'bucket', label: 'Bucket', value: bucketName, copyable: true },
+              {
+                id: 'current-owner',
+                label: 'Current owner',
+                value: ownerAccessKey ?? ownerLabel(ownerAccessKey),
+                displayValue: ownerLabel(ownerAccessKey),
+                copyable: Boolean(ownerAccessKey),
+              },
+              {
+                id: 'new-owner',
+                label: 'New owner',
+                value: selectedOwner || ownerLabel(null),
+                displayValue: ownerLabel(selectedOwner),
+                copyable: Boolean(selectedOwner),
+              },
             ]}
           />
         ) : (
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="bucket-detail-owner">Owner</Label>
-            <BucketOwnerSelect
-              id="bucket-detail-owner"
-              value={selectedOwner}
-              onChange={setSelectedOwner}
-              disabled={updateOwner.isPending || usersLoading}
-              users={users}
-            />
-            {users.length === 0 && !usersLoading && (
-              <p className="text-xs text-muted-foreground">
-                No S3 users yet. Internal root can be used as fallback owner.
-              </p>
-            )}
-            {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
-          </div>
+          <FieldGroup>
+            <Field data-invalid={Boolean(usersError)}>
+              <FieldLabel htmlFor="bucket-detail-owner">Owner</FieldLabel>
+              <BucketOwnerSelect
+                id="bucket-detail-owner"
+                value={selectedOwner}
+                onChange={setSelectedOwner}
+                disabled={updateOwner.isPending || usersLoading}
+                invalid={Boolean(usersError)}
+                users={users}
+              />
+              {users.length === 0 && !usersLoading && (
+                <FieldDescription>No S3 users yet. Internal root can be used as fallback owner.</FieldDescription>
+              )}
+              {usersError && <FieldError>Failed to load S3 users.</FieldError>}
+            </Field>
+          </FieldGroup>
         )}
-        {updateOwner.error && <p className="text-sm text-destructive">{updateOwner.error.message}</p>}
+        {updateOwner.error && (
+          <Alert variant="destructive">
+            <AlertDescription>{updateOwner.error.message}</AlertDescription>
+          </Alert>
+        )}
         <DialogFooter>
           <Button
             type="button"
@@ -422,10 +448,11 @@ function ObjectVersionsDialog({
             Object versions
           </DialogTitle>
           <DialogDescription className="pr-8">
-            <span className="block max-w-full truncate font-mono text-xs" title={objectKey}>
-              {objectKey}
-            </span>
+            <span className="sr-only">Object versions for selected object.</span>
           </DialogDescription>
+          <div className="pr-8 text-muted-foreground">
+            <CopyableValue label="Object key" value={objectKey} monospace className="max-w-full" />
+          </div>
         </DialogHeader>
         {versions.isLoading ? (
           <div className="flex h-40 items-center justify-center">
@@ -459,9 +486,9 @@ function ObjectVersionsDialog({
               <TableBody>
                 {versions.data?.versions.map((version) => (
                   <TableRow key={version.version_id}>
-                    <TableCell className="overflow-hidden px-2" title={version.version_id}>
+                    <TableCell className="overflow-hidden px-2">
                       <div className="flex min-w-0 items-center gap-2">
-                        <span className="min-w-0 truncate font-mono text-xs">{version.version_id}</span>
+                        <CopyableValue label="Version" value={version.version_id} monospace maxLength={22} />
                         {version.is_delete_marker ? (
                           <StatusBadge tone="neutral" className="shrink-0">
                             Deleted
@@ -488,17 +515,15 @@ function ObjectVersionsDialog({
                     <TableCell className="overflow-hidden px-2">
                       <LocationBadges location={version.location} />
                     </TableCell>
-                    <TableCell
-                      className="overflow-hidden truncate px-2 font-mono text-xs text-muted-foreground"
-                      title={version.etag}
-                    >
-                      {version.etag}
+                    <TableCell className="overflow-hidden px-2 text-muted-foreground">
+                      <CopyableValue label="ETag" value={version.etag} monospace maxLength={22} />
                     </TableCell>
-                    <TableCell
-                      className="overflow-hidden truncate px-2 font-mono text-xs text-muted-foreground"
-                      title={version.piece_cid ?? undefined}
-                    >
-                      {version.piece_cid ?? '—'}
+                    <TableCell className="overflow-hidden px-2 text-muted-foreground">
+                      {version.piece_cid ? (
+                        <CopyableValue label="Piece CID" value={version.piece_cid} monospace maxLength={24} />
+                      ) : (
+                        '—'
+                      )}
                     </TableCell>
                     <TableCell
                       className="overflow-hidden truncate px-2 text-muted-foreground"
@@ -621,8 +646,8 @@ function VersionActions({
       >
         <ReviewDetails
           rows={[
-            { id: 'key', label: 'Object', value: objectKey },
-            { id: 'version', label: 'Version', value: version.version_id },
+            { id: 'key', label: 'Object', value: objectKey, copyable: true, maxLength: 36 },
+            { id: 'version', label: 'Version', value: version.version_id, copyable: true },
             { id: 'size', label: 'Size', value: formatBytes(version.size) },
           ]}
         />
@@ -660,13 +685,12 @@ function ObjectProvenanceDialog({
           <DialogHeader>
             <DialogTitle>Storage provenance</DialogTitle>
             <DialogDescription className="pr-8">
-              <span className="block max-w-full truncate font-mono text-xs" title={objectKey}>
-                {objectKey}
-              </span>
-              <span className="block max-w-full truncate font-mono text-xs" title={versionID}>
-                {versionID}
-              </span>
+              <span className="sr-only">Storage provenance for selected object version.</span>
             </DialogDescription>
+            <div className="flex min-w-0 flex-col gap-1 pr-8 text-muted-foreground">
+              <CopyableValue label="Object key" value={objectKey} monospace className="max-w-full" />
+              <CopyableValue label="Version" value={versionID} monospace className="max-w-full" />
+            </div>
           </DialogHeader>
 
           {provenance.isLoading ? (
@@ -723,6 +747,7 @@ function ProvenanceSummary({ data }: { data: ObjectProvenance }) {
         title={data.piece_cid}
         className="sm:col-span-2 lg:col-span-4"
         mono
+        copyable={Boolean(data.piece_cid)}
       />
     </dl>
   )
@@ -734,18 +759,29 @@ function ProvenanceSummaryItem({
   title,
   className,
   mono = false,
+  copyable = false,
 }: {
   label: string
   value: string
   title?: string
   className?: string
   mono?: boolean
+  copyable?: boolean
 }) {
+  const copyableValue = copyable && value !== '—'
+
   return (
     <div className={className}>
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className={`mt-1 truncate ${mono ? 'font-mono text-xs' : 'font-medium'}`} title={title ?? value}>
-        {value}
+      <dd
+        className={cn('mt-1 min-w-0', mono ? 'font-mono text-xs' : 'font-medium')}
+        title={copyableValue ? undefined : (title ?? value)}
+      >
+        {copyableValue ? (
+          <CopyableValue label={label} value={value} monospace={mono} maxLength={36} />
+        ) : (
+          <span className="truncate">{value}</span>
+        )}
       </dd>
     </div>
   )
@@ -754,7 +790,7 @@ function ProvenanceSummaryItem({
 function ProviderIdentityCell({ providerID, identity }: { providerID?: string; identity?: ProviderIdentity }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const registryID = identity?.registry_provider_id ?? providerID
-  const label = identity?.name?.trim() || (registryID ? `Registry #${registryID}` : '—')
+  const label = identity?.name?.trim() || (registryID ? `Registry ${registryID}` : '—')
 
   if (!identity) {
     if (!registryID) {
@@ -832,19 +868,19 @@ function ProviderIdentityDetails({ providerID, identity }: { providerID?: string
   return (
     <div className="flex w-full select-text flex-col gap-3">
       <div className="font-medium">
-        {identity.name?.trim() || `Registry #${identity.registry_provider_id || providerID}`}
+        {identity.name?.trim() || `Registry ${identity.registry_provider_id || providerID}`}
       </div>
       <div className="grid grid-cols-1 gap-x-3 gap-y-2 text-xs sm:grid-cols-[9rem_minmax(0,1fr)]">
         {fields.map(([label, value]) => (
           <Fragment key={label}>
             <span className="text-muted-foreground">{label}</span>
-            <span className="min-w-0 break-words font-mono leading-relaxed">{value}</span>
+            <CopyableValue label={label} value={value} monospace maxLength={32} className="leading-relaxed" />
           </Fragment>
         ))}
         {extras.map(([label, value]) => (
           <Fragment key={label}>
             <span className="text-muted-foreground">{label}</span>
-            <span className="min-w-0 break-words font-mono leading-relaxed">{value}</span>
+            <CopyableValue label={label} value={value} monospace maxLength={32} className="leading-relaxed" />
           </Fragment>
         ))}
       </div>
@@ -885,26 +921,27 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 <TableCell className="px-3">
                   <ProviderIdentityCell providerID={copy.provider_id} identity={copy.provider_identity} />
                 </TableCell>
-                <TableCell className="px-3 font-mono text-xs text-muted-foreground">
-                  {copy.data_set_id ?? '—'}
+                <TableCell className="px-3 text-muted-foreground">
+                  <OptionalCopyableValue label="Data Set ID" value={copy.data_set_id} />
                 </TableCell>
-                <TableCell className="px-3 font-mono text-xs text-muted-foreground">{copy.piece_id ?? '—'}</TableCell>
+                <TableCell className="px-3 text-muted-foreground">
+                  <OptionalCopyableValue label="Piece ID" value={copy.piece_id} maxLength={24} />
+                </TableCell>
                 <TableCell className="px-3">
                   <StatusBadge tone={copy.is_new_data_set ? 'info' : 'neutral'}>
                     {copy.is_new_data_set ? 'Yes' : 'No'}
                   </StatusBadge>
                 </TableCell>
-                <TableCell className="max-w-72 overflow-hidden truncate px-3 font-mono text-xs text-muted-foreground">
+                <TableCell className="max-w-72 overflow-hidden px-3 text-muted-foreground">
                   {copy.retrieval_url ? (
-                    <a
-                      href={copy.retrieval_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="hover:text-foreground hover:underline"
-                      title={copy.retrieval_url}
-                    >
-                      {copy.retrieval_url}
-                    </a>
+                    <CopyableValue
+                      label="Retrieval URL"
+                      value={copy.retrieval_url}
+                      monospace
+                      maxLength={36}
+                      linkHref={copy.retrieval_url}
+                      external
+                    />
                   ) : (
                     '—'
                   )}
@@ -969,6 +1006,19 @@ function ProvenanceFailures({
       </Table>
     </div>
   )
+}
+
+function OptionalCopyableValue({
+  label,
+  value,
+  maxLength = 24,
+}: {
+  label: string
+  value?: string | null
+  maxLength?: number
+}) {
+  if (!value) return <span className="font-mono text-xs">—</span>
+  return <CopyableValue label={label} value={value} monospace maxLength={maxLength} />
 }
 
 function ProvenanceFailureErrorCell({
@@ -1276,7 +1326,7 @@ function ObjectBrowserPage() {
         }
       />
 
-      {bucket.error && <div className="text-sm text-destructive">Failed to load bucket details</div>}
+      {bucket.error && <PageErrorState title="Failed to load bucket details" className="min-h-24 p-0" />}
 
       <Tabs value={view} onValueChange={(value) => navigateToView(value === 'deleted' ? 'deleted' : 'objects')}>
         <TabsList className="max-w-full justify-start overflow-x-auto">
@@ -1288,7 +1338,7 @@ function ObjectBrowserPage() {
       {view === 'objects' && objects.isLoading ? (
         <ObjectBrowserSkeleton />
       ) : view === 'objects' && objects.error ? (
-        <div className="text-destructive">Failed to load objects</div>
+        <PageErrorState title="Failed to load objects" className="h-64" />
       ) : view === 'objects' ? (
         <ObjectBrowserTable
           bucketName={name}
@@ -1304,7 +1354,7 @@ function ObjectBrowserPage() {
       ) : view === 'deleted' && deletedObjects.isLoading ? (
         <ObjectBrowserSkeleton />
       ) : view === 'deleted' && deletedObjects.error ? (
-        <div className="text-destructive">Failed to load trash</div>
+        <PageErrorState title="Failed to load trash" className="h-64" />
       ) : view === 'deleted' ? (
         <DeletedObjectsTable
           bucketName={name}
@@ -1678,10 +1728,11 @@ function BucketDetailsSheet({
           <SheetHeader>
             <SheetTitle>Bucket details</SheetTitle>
             <SheetDescription>
-              <span className="block max-w-full truncate font-mono text-xs" title={bucket.name}>
-                {bucket.name}
-              </span>
+              <span className="sr-only">Details for selected bucket.</span>
             </SheetDescription>
+            <div className="pr-8 text-muted-foreground">
+              <CopyableValue label="Bucket" value={bucket.name} monospace className="max-w-full" />
+            </div>
           </SheetHeader>
           <ScrollArea className="min-h-0 min-w-0 flex-1">
             <div className="flex min-w-0 flex-col gap-6 px-4 pb-4">
@@ -1729,7 +1780,13 @@ function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<type
       <BucketDetailField label="Total size" value={formatBytes(bucket.total_size_bytes)} />
       <BucketDetailField label="Replicas" value={bucketCopyPolicyLabel(bucket)} />
       <BucketDetailField label="Versioning" value={bucket.versioning_status} />
-      <BucketDetailField label="Owner" value={ownerLabel(bucket.owner_access_key)} />
+      <BucketDetailField
+        label="Owner"
+        value={bucket.owner_access_key ?? ownerLabel(bucket.owner_access_key)}
+        displayValue={ownerLabel(bucket.owner_access_key)}
+        copyValue={bucket.owner_access_key ?? undefined}
+        copyable={Boolean(bucket.owner_access_key)}
+      />
       <BucketDetailField label="Created" value={timeAgo(bucket.created_at)} title={bucket.created_at} />
       <BucketDetailField label="Updated" value={timeAgo(bucket.updated_at)} title={bucket.updated_at} />
       <div>
@@ -1785,12 +1842,34 @@ function formatObjectCopyCount(count: number) {
   return `${formatNumber(count)} object ${count === 1 ? 'copy' : 'copies'}`
 }
 
-function BucketDetailField({ label, value, title }: { label: string; value: string; title?: string }) {
+function BucketDetailField({
+  label,
+  value,
+  displayValue,
+  copyValue,
+  title,
+  copyable,
+}: {
+  label: string
+  value: string
+  displayValue?: string
+  copyValue?: string
+  title?: string
+  copyable?: boolean
+}) {
+  const displayText = displayValue ?? value
+  const copiedValue = copyValue ?? value
+  const copyableValue = copyable && copiedValue !== '—'
+
   return (
     <div>
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 truncate font-medium" title={title ?? value}>
-        {value}
+      <dd className="mt-1 truncate font-medium" title={copyableValue ? undefined : (title ?? displayText)}>
+        {copyableValue ? (
+          <CopyableValue label={label} value={copiedValue} displayValue={displayText} maxLength={28} />
+        ) : (
+          displayText
+        )}
       </dd>
     </div>
   )
@@ -1865,50 +1944,48 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
             </TableRow>
           </TableHeader>
           <TableBody>
-            {dataSets.map((dataSet) => (
-              <TableRow key={dataSet.id}>
-                <TableCell className="px-4 font-mono text-xs">{replicaLabel(dataSet.copy_index)}</TableCell>
-                <TableCell className="px-4">
-                  <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
-                </TableCell>
-                <TableCell className="px-4 font-mono text-xs text-muted-foreground">
-                  <Link
-                    to="/storage-topology"
-                    search={storageDataSetTopologySearch(bucketName, dataSet)}
-                    className="hover:text-foreground hover:underline"
-                  >
-                    {storageDataSetTopologyLabel(dataSet)}
-                  </Link>
-                </TableCell>
-                <TableCell className="px-4">
-                  <DataSetStorageHealthCell dataSet={dataSet} />
-                </TableCell>
-                <TableCell className="px-4 text-muted-foreground" title={dataSet.updated_at}>
-                  {timeAgo(dataSet.updated_at)}
-                </TableCell>
-              </TableRow>
-            ))}
+            {dataSets.map((dataSet) => {
+              const topologyLink = bucketStorageDataSetTopologyLinkModel(bucketName, dataSet)
+              const link = (
+                <Link
+                  to="/storage-topology"
+                  search={topologyLink.search}
+                  className="min-w-0 truncate font-mono text-xs hover:text-foreground hover:underline"
+                >
+                  {topologyLink.label}
+                </Link>
+              )
+
+              return (
+                <TableRow key={dataSet.id}>
+                  <TableCell className="px-4 font-mono text-xs">{replicaLabel(dataSet.copy_index)}</TableCell>
+                  <TableCell className="px-4">
+                    <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
+                  </TableCell>
+                  <TableCell className="px-4 text-muted-foreground">
+                    {topologyLink.copyValue ? (
+                      <CopyableValue label="Data Set ID" value={topologyLink.copyValue} monospace maxLength={24}>
+                        {link}
+                      </CopyableValue>
+                    ) : (
+                      link
+                    )}
+                  </TableCell>
+                  <TableCell className="px-4">
+                    <DataSetStorageHealthCell dataSet={dataSet} />
+                  </TableCell>
+                  <TableCell className="px-4 text-muted-foreground" title={dataSet.updated_at}>
+                    {timeAgo(dataSet.updated_at)}
+                  </TableCell>
+                </TableRow>
+              )
+            })}
           </TableBody>
         </Table>
         <ScrollBar orientation="horizontal" />
       </ScrollArea>
     </div>
   )
-}
-
-function storageDataSetTopologySearch(bucketName: string, dataSet: StorageDataSetSummary) {
-  const scope = {
-    bucket: bucketName,
-    provider: dataSet.provider_id,
-    local_data_set_id: dataSet.id,
-    selection_provider: dataSet.provider_id,
-    selection_bucket: bucketName,
-  }
-  return dataSet.data_set_id ? { ...scope, chain_data_set_id: dataSet.data_set_id } : scope
-}
-
-function storageDataSetTopologyLabel(dataSet: StorageDataSetSummary) {
-  return dataSet.data_set_id ? `#${dataSet.data_set_id}` : 'No chain data set'
 }
 
 function DataSetStorageHealthCell({ dataSet }: { dataSet: StorageDataSetSummary }) {
@@ -2022,8 +2099,17 @@ function BucketDetailsSettings({
     <div className="flex min-w-0 flex-col gap-4">
       <section className="rounded-md border border-border p-4">
         <h3 className="text-sm font-medium">Owner</h3>
-        <p className="mt-1 truncate text-sm text-muted-foreground" title={ownerLabel(bucket.owner_access_key)}>
-          {ownerLabel(bucket.owner_access_key)}
+        <p className="mt-1 text-sm text-muted-foreground">
+          {bucket.owner_access_key ? (
+            <CopyableValue
+              label="Owner"
+              value={bucket.owner_access_key}
+              displayValue={ownerLabel(bucket.owner_access_key)}
+              maxLength={32}
+            />
+          ) : (
+            ownerLabel(bucket.owner_access_key)
+          )}
         </p>
         <Button variant="outline" size="sm" className="mt-3" onClick={onChangeOwner}>
           <UserRound data-icon="inline-start" />
@@ -2065,7 +2151,7 @@ function BucketDetailsSettings({
           </Button>
         </div>
         {copyPolicyNotice && (
-          <p className="mt-2 inline-flex items-center gap-1.5 text-sm text-emerald-500" role="status">
+          <p className="mt-2 inline-flex items-center gap-1.5 text-sm text-status-success" role="status">
             <CheckCircle2 className="size-4" />
             {copyPolicyNotice}
           </p>
@@ -2179,9 +2265,12 @@ function ObjectBrowserTable({
                     <TableCell className="px-4">
                       <div className="flex min-w-0 items-center gap-1.5">
                         <FileIcon className="size-4 shrink-0 text-muted-foreground" />
-                        <span className="min-w-0 truncate" title={object.key}>
-                          {objectDisplayName(object.key, prefix)}
-                        </span>
+                        <CopyableValue
+                          label="Object key"
+                          value={object.key}
+                          displayValue={objectDisplayName(object.key, prefix)}
+                          maxLength={36}
+                        />
                         <ObjectStatusIcon
                           bucketName={bucketName}
                           versionID={object.current_version_id}
@@ -2295,18 +2384,21 @@ function DeletedObjectsTable({
                     <TableCell className="px-4">
                       <div className="flex min-w-0 items-center gap-1.5">
                         <FileIcon className="size-4 shrink-0 text-muted-foreground" />
-                        <span className="min-w-0 truncate" title={object.key}>
-                          {objectDisplayName(object.key, prefix)}
-                        </span>
+                        <CopyableValue
+                          label="Object key"
+                          value={object.key}
+                          displayValue={objectDisplayName(object.key, prefix)}
+                          maxLength={36}
+                        />
                       </div>
                     </TableCell>
                     <TableCell className="overflow-hidden px-4">
-                      <span
-                        className="block truncate font-mono text-xs text-muted-foreground"
-                        title={object.restore_version_id}
-                      >
-                        {object.restore_version_id}
-                      </span>
+                      <CopyableValue
+                        label="Restore target"
+                        value={object.restore_version_id}
+                        monospace
+                        maxLength={24}
+                      />
                     </TableCell>
                     <TableCell className="px-4 text-right">{formatBytes(object.restore_size)}</TableCell>
                     <TableCell className="px-4 text-muted-foreground">
@@ -2441,7 +2533,7 @@ function PermanentDeleteDeletedObjectDialog({
     >
       <ReviewDetails
         rows={[
-          { id: 'key', label: 'Object', value: object.key },
+          { id: 'key', label: 'Object', value: object.key, copyable: true, maxLength: 36 },
           { id: 'size', label: 'Latest size', value: formatBytes(object.restore_size) },
         ]}
       />
@@ -2487,13 +2579,17 @@ function RestoreDeletedObjectDialog({
         </DialogHeader>
         <ReviewDetails
           rows={[
-            { id: 'key', label: 'Object', value: object.key },
-            { id: 'marker', label: 'Deletion record', value: object.delete_marker_version_id },
-            { id: 'target', label: 'Restore version', value: object.restore_version_id },
+            { id: 'key', label: 'Object', value: object.key, copyable: true, maxLength: 36 },
+            { id: 'marker', label: 'Deletion record', value: object.delete_marker_version_id, copyable: true },
+            { id: 'target', label: 'Restore version', value: object.restore_version_id, copyable: true },
             { id: 'size', label: 'Size', value: formatBytes(object.restore_size) },
           ]}
         />
-        {restoreObject.error && <p className="text-sm text-destructive">{restoreObject.error.message}</p>}
+        {restoreObject.error && (
+          <Alert variant="destructive">
+            <AlertDescription>{restoreObject.error.message}</AlertDescription>
+          </Alert>
+        )}
         <DialogFooter>
           <Button
             type="button"

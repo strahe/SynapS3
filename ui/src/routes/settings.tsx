@@ -12,6 +12,7 @@ import type {
 } from '@/api/client'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
+import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { S3SettingsPanel } from '@/components/settings/S3SettingsPanel'
@@ -187,7 +188,7 @@ function SettingsPage() {
   }, [preflightDetailData, preflightMatchesCurrentDraft])
 
   if (error) {
-    return <div className="flex h-full items-center justify-center text-destructive">Failed to load settings</div>
+    return <PageErrorState title="Failed to load settings" />
   }
 
   if (isLoading || !data || !form) {
@@ -890,6 +891,7 @@ function CheckboxField({
       <SettingsCheckbox
         checked={checked}
         disabled={disabled}
+        invalid={Boolean(errors[field])}
         label={data.metadata[field]?.label ?? label}
         onChange={onChange}
       />
@@ -998,7 +1000,7 @@ function SettingsRiskChangeList({
 
           return (
             <div key={change.field} className="grid gap-3 p-3">
-              <div className="min-w-0 space-y-1">
+              <div className="flex min-w-0 flex-col gap-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">{change.label}</span>
                   <StatusBadge tone={confirmation === 'strong' ? 'danger' : 'warning'}>
@@ -1023,7 +1025,7 @@ function SettingsRiskChangeList({
 
 function RiskValue({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-0 space-y-1">
+    <div className="flex min-w-0 flex-col gap-1">
       <span className="text-xs font-medium text-muted-foreground">{label}</span>
       <code className="block min-h-8 break-all rounded-md bg-muted px-2 py-1.5 text-xs">{value || '(empty)'}</code>
     </div>

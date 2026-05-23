@@ -2,8 +2,9 @@ import { createFileRoute } from '@tanstack/react-router'
 import { AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Clock, Wallet } from 'lucide-react'
 import { type ReactNode, useMemo, useState } from 'react'
 import type { PaymentAccountData, WalletOperation, WalletOperationStatus } from '@/api/client'
-import { CopyButton } from '@/components/app/CopyButton'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
+import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -88,7 +89,7 @@ function WalletPage() {
   if (isLoading) return <WalletSkeleton />
 
   if (error || !data) {
-    return <div className="flex h-full items-center justify-center text-destructive">Failed to load wallet data</div>
+    return <PageErrorState title="Failed to load wallet data" />
   }
 
   if (!data.configured) {
@@ -382,7 +383,11 @@ function WalletPage() {
             <div className="text-xs text-muted-foreground">Amount</div>
             <div className="mt-1 font-mono text-sm">{pendingOperation?.confirmation.amount ?? '—'}</div>
           </div>
-          {mutationError && <p className="text-sm text-destructive">{mutationError}</p>}
+          {mutationError && (
+            <Alert variant="destructive">
+              <AlertDescription>{mutationError}</AlertDescription>
+            </Alert>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={isMutating}>Cancel</AlertDialogCancel>
             <Button type="button" disabled={isMutating} onClick={confirmPendingOperation}>
@@ -469,12 +474,13 @@ function IdentityField({
           <StatusBadge tone="info" className="capitalize">
             {value}
           </StatusBadge>
+        ) : copyable && value !== '—' ? (
+          <CopyableValue label={label} value={value} monospace maxLength={36} />
         ) : (
           <span className="min-w-0 truncate font-mono text-sm" title={value}>
             {value}
           </span>
         )}
-        {copyable && value !== '—' && <CopyButton value={value} label={label} size="icon-xs" />}
       </dd>
     </div>
   )
@@ -649,12 +655,7 @@ function OperationsTable({
               <TableCell className="font-mono">{formatTokenAmount(operation.amount, decimals, 'USDFC')}</TableCell>
               <TableCell>
                 {operation.tx_hash ? (
-                  <span className="inline-flex max-w-48 items-center gap-1">
-                    <span className="truncate font-mono text-xs" title={operation.tx_hash}>
-                      {operation.tx_hash}
-                    </span>
-                    <CopyButton value={operation.tx_hash} label="Transaction hash" size="icon-xs" />
-                  </span>
+                  <CopyableValue label="Transaction hash" value={operation.tx_hash} monospace maxLength={24} />
                 ) : (
                   <span className="text-muted-foreground">—</span>
                 )}

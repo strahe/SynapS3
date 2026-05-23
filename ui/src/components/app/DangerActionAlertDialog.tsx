@@ -1,5 +1,6 @@
 import { Loader2 } from 'lucide-react'
 import { type ReactNode, useEffect, useId, useRef, useState } from 'react'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -10,8 +11,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { Field, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { confirmationMatches } from '@/lib/risk-confirmation'
 
 export interface DangerActionAlertDialogProps {
@@ -70,23 +71,29 @@ export function DangerActionAlertDialog({
         {children}
 
         {needsTypedConfirmation && (
-          <div className="flex flex-col gap-2">
-            <Label htmlFor={inputId}>
-              {typedTargetLabel} <span className="font-mono font-semibold">{typedTarget}</span>
-            </Label>
-            <Input
-              id={inputId}
-              ref={inputRef}
-              value={confirmInput}
-              disabled={pending}
-              autoFocus
-              aria-invalid={Boolean(confirmInput && !typedConfirmationValid)}
-              onChange={(event) => setConfirmInput(event.target.value)}
-            />
-          </div>
+          <FieldGroup>
+            <Field data-invalid={Boolean(confirmInput && !typedConfirmationValid)}>
+              <FieldLabel htmlFor={inputId}>
+                {typedTargetLabel} <span className="font-mono font-semibold">{typedTarget}</span>
+              </FieldLabel>
+              <Input
+                id={inputId}
+                ref={inputRef}
+                value={confirmInput}
+                disabled={pending}
+                autoFocus
+                aria-invalid={Boolean(confirmInput && !typedConfirmationValid)}
+                onChange={(event) => setConfirmInput(event.target.value)}
+              />
+            </Field>
+          </FieldGroup>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
 
         <AlertDialogFooter>
           <AlertDialogCancel type="button">Cancel</AlertDialogCancel>

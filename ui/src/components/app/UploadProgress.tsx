@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import type { UploadTransferProgress } from '@/api/client'
+import { Progress } from '@/components/ui/progress'
 
 export function uploadProgressPercent(progress?: UploadTransferProgress, options: { includeDone?: boolean } = {}) {
   if (!progress || (!options.includeDone && progress.done) || typeof progress.percent !== 'number') return null
@@ -41,15 +42,7 @@ export function UploadProgressBar({ progress }: { progress?: UploadTransferProgr
 
   return (
     <div className="inline-flex w-32 shrink-0 items-center gap-2" title={`${percent}% uploaded`}>
-      <div
-        className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted"
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={percent}
-      >
-        <div className="h-full rounded-full bg-status-info" style={{ width: `${percent}%` }} />
-      </div>
+      <Progress value={percent} className="min-w-0 flex-1 [&_[data-slot=progress-indicator]]:bg-status-info" />
       <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted-foreground">{percent}%</span>
     </div>
   )

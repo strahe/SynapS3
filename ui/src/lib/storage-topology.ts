@@ -7,6 +7,7 @@ import type {
   ObservabilitySignalLevel,
   ObservabilityStatus,
   ObservabilitySummary,
+  StorageDataSetSummary,
 } from '../api/client.ts'
 import { replicaLabel } from './storage-status-labels.ts'
 import { formatNumber, timeAgo } from './utils.ts'
@@ -133,6 +134,15 @@ export interface StorageTopologyDataSetSelectionSearch {
   selection_bucket?: string
 }
 
+export interface BucketStorageDataSetTopologyLinkModel {
+  label: string
+  copyValue?: string
+  search: StorageTopologyDataSetSelectionSearch & {
+    bucket: string
+    provider: string
+  }
+}
+
 export interface StorageTopologyPinnedContext {
   providers: ObservabilityProviderObservation[]
   dataSets: ObservabilityDataSetObservation[]
@@ -210,11 +220,31 @@ export function dataSetDisplayLabel(dataSet: DataSetDisplaySource) {
 
 export function dataSetChainIDValue(dataSet: DataSetDisplaySource) {
   const chainDataSetID = dataSetChainID(dataSet)
-  return chainDataSetID ? `#${chainDataSetID}` : '—'
+  return formatOptionalTopologyID(chainDataSetID)
 }
 
 export function dataSetTopologyPath(dataSet: ObservabilityDataSetObservation) {
   return `${dataSet.facts.bucket_name} -> ${replicaLabel(dataSet.facts.copy_index)} -> ${dataSetDisplayLabel(dataSet)} -> Provider #${dataSet.facts.provider_id}`
+}
+
+export function bucketStorageDataSetTopologyLinkModel(
+  bucketName: string,
+  dataSet: Pick<StorageDataSetSummary, 'id' | 'bucket_name' | 'provider_id' | 'data_set_id'>
+): BucketStorageDataSetTopologyLinkModel {
+  const chainDataSetID = nonEmptyTopologyText(dataSet.data_set_id)
+
+  return {
+    label: chainDataSetID ?? 'No chain data set',
+    copyValue: chainDataSetID,
+    search: {
+      bucket: bucketName,
+      provider: dataSet.provider_id,
+      chain_data_set_id: chainDataSetID,
+      local_data_set_id: dataSet.id,
+      selection_provider: dataSet.provider_id,
+      selection_bucket: bucketName,
+    },
+  }
 }
 
 export function buildTopologyProviderOptions(dataSets: ObservabilityDataSetObservation[]) {
@@ -235,8 +265,11 @@ export function topologySummaryLabel(graph: StorageTopologyGraph) {
 }
 
 export function formatOptionalTopologyText(value: string | null | undefined) {
-  const trimmed = value?.trim()
-  return trimmed ? trimmed : '—'
+  return nonEmptyTopologyText(value) ?? '—'
+}
+
+export function formatOptionalTopologyID(value: string | number | null | undefined) {
+  return formatOptionalTopologyText(value === undefined || value === null ? undefined : String(value))
 }
 
 export function reconcileStorageTopologySelectionSearch(
@@ -793,9 +826,14 @@ function providerNodeID(providerID: string) {
 }
 
 function dataSetChainID(dataSet: DataSetDisplaySource) {
-  if ('facts' in dataSet) return dataSet.facts.chain_data_set_id
-  return (
+  if ('facts' in dataSet) return nonEmptyTopologyText(dataSet.facts.chain_data_set_id)
+  return nonEmptyTopologyText(
     (dataSet as { chainDataSetID?: string }).chainDataSetID ??
-    (dataSet as { chain_data_set_id?: string }).chain_data_set_id
+      (dataSet as { chain_data_set_id?: string }).chain_data_set_id
   )
+}
+
+function nonEmptyTopologyText(value: string | null | undefined) {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
 }

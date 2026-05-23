@@ -7,24 +7,44 @@ export interface CopyableValueModelInput {
   value: string
   displayValue?: string
   maxLength?: number
+  linkHref?: string
+  external?: boolean
 }
 
 export interface CopyableValueModel {
   displayText: string
   tooltipValue: string
   copyValue: string
+  linkHref?: string
+  external: boolean
 }
 
 export function buildCopyableValueModel({
   value,
   displayValue,
   maxLength,
+  linkHref,
+  external = false,
 }: CopyableValueModelInput): CopyableValueModel {
   const visibleValue = displayValue ?? value
+  const safeLinkHref = safeAbsoluteHttpURL(linkHref)
   return {
     displayText: middleTruncate(visibleValue, maxLength),
     tooltipValue: value,
     copyValue: value,
+    linkHref: safeLinkHref,
+    external: Boolean(safeLinkHref && external),
+  }
+}
+
+function safeAbsoluteHttpURL(value: string | undefined) {
+  if (!value) return undefined
+
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : undefined
+  } catch {
+    return undefined
   }
 }
 

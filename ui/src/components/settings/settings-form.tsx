@@ -1,7 +1,7 @@
 import { AlertTriangle, Info } from 'lucide-react'
 import { type ReactNode, useId } from 'react'
 import type { SettingsData } from '@/api/client'
-import { CopyButton } from '@/components/app/CopyButton'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -148,11 +148,13 @@ export function SettingsSelect({
 export function SettingsCheckbox({
   checked,
   disabled,
+  invalid,
   label,
   onChange,
 }: {
   checked: boolean
   disabled?: boolean
+  invalid?: boolean
   label: string
   onChange: (checked: boolean) => void
 }) {
@@ -164,6 +166,7 @@ export function SettingsCheckbox({
         id={generatedId}
         checked={checked}
         disabled={disabled}
+        aria-invalid={invalid}
         onCheckedChange={(next) => onChange(next === true)}
       />
       <FieldLabel htmlFor={generatedId}>{label}</FieldLabel>
@@ -209,10 +212,13 @@ export function SettingsValueField({
   return (
     <Field>
       <FieldLabel className="text-xs text-muted-foreground">{label}</FieldLabel>
-      <div className="flex items-center gap-2">
+      {copy ? (
+        <div className="flex min-h-8 min-w-0 items-center rounded-md border border-input bg-background px-2 py-1">
+          <CopyableValue label={label} value={value} monospace={mono} maxLength={36} />
+        </div>
+      ) : (
         <Input readOnly value={value} className={mono ? 'font-mono text-xs' : undefined} />
-        {copy && <CopyButton value={value} label={label} />}
-      </div>
+      )}
     </Field>
   )
 }

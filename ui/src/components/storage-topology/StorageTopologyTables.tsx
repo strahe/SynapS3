@@ -2,6 +2,7 @@ import { Link } from '@tanstack/react-router'
 import { Database, Info } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '@/api/client'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
@@ -64,15 +65,22 @@ export function ProvidersTableCard({
             ) : rows.length > 0 ? (
               rows.map((row) => (
                 <TableRow key={row.providerID}>
-                  <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">#{row.providerID}</TableCell>
+                  <TableCell className="whitespace-nowrap px-3 py-2">
+                    <CopyableValue label="Provider" value={row.providerID} monospace maxLength={16} />
+                  </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2">
                     <StatusBadge tone={observabilityStatusTone(row.status)}>{row.status}</StatusBadge>
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                     {row.provider ? providerFactsSummary(row.provider) : '—'}
                   </TableCell>
-                  <TableCell className="max-w-72 truncate px-3 py-2 font-mono text-xs text-muted-foreground">
-                    {formatOptionalTopologyText(row.provider?.facts.service_url)}
+                  <TableCell className="max-w-72 px-3 py-2 text-muted-foreground">
+                    <OptionalCopyableValue
+                      label="Service URL"
+                      value={formatOptionalTopologyText(row.provider?.facts.service_url)}
+                      linkHref={row.provider?.facts.service_url}
+                      maxLength={36}
+                    />
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                     {row.freshness ? freshnessLabel(row.freshness) : '—'}
@@ -157,11 +165,11 @@ export function DataSetsTableCard({
                   <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">
                     {replicaLabel(dataSet.facts.copy_index)}
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">
-                    #{dataSet.facts.provider_id}
+                  <TableCell className="whitespace-nowrap px-3 py-2">
+                    <CopyableValue label="Provider" value={dataSet.facts.provider_id} monospace maxLength={16} />
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-3 py-2 font-mono text-xs">
-                    {dataSetChainIDValue(dataSet)}
+                  <TableCell className="whitespace-nowrap px-3 py-2">
+                    <OptionalCopyableValue label="Chain data set" value={dataSetChainIDValue(dataSet)} />
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2">
                     <StatusBadge tone={localStatusTone(dataSet.facts.local_status)}>
@@ -263,6 +271,30 @@ function providerFactsSummary(provider: ObservabilityProviderObservation) {
   const active = providerActiveFactBadge(provider.facts.active)
   const pdp = providerPDPFactBadge(provider.facts.has_pdp)
   return `${active.label} · ${pdp.label}`
+}
+
+function OptionalCopyableValue({
+  label,
+  value,
+  linkHref,
+  maxLength,
+}: {
+  label: string
+  value: string
+  linkHref?: string
+  maxLength?: number
+}) {
+  if (value === '—') return <span className="font-mono text-xs">—</span>
+  return (
+    <CopyableValue
+      label={label}
+      value={value}
+      monospace
+      maxLength={maxLength}
+      linkHref={linkHref}
+      external={Boolean(linkHref)}
+    />
+  )
 }
 
 function TopologyPagination({

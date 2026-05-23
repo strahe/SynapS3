@@ -6,6 +6,7 @@ import { api, type TaskDiagnostic, type TaskItem, type TaskStorageCleanupDetail 
 import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
+import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
@@ -868,7 +869,7 @@ function TasksPage() {
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
         </div>
       ) : error ? (
-        <div className="text-destructive">Failed to load tasks</div>
+        <PageErrorState title="Failed to load tasks" className="h-60" />
       ) : (
         <>
           {taskType === 'all' ? (
@@ -950,10 +951,20 @@ function TasksPage() {
             rows={[
               { id: 'task-id', label: 'Task ID', value: retryTarget.id.toString() },
               { id: 'type', label: 'Type', value: taskTypeLabel(retryTarget.type) },
-              { id: 'ref', label: 'Ref', value: `${retryTarget.ref_type}:${retryTarget.ref_id}` },
+              { id: 'ref', label: 'Ref', value: `${retryTarget.ref_type}:${retryTarget.ref_id}`, copyable: true },
               { id: 'retries', label: 'Retries', value: `${retryTarget.retry_count}/${retryTarget.max_retries}` },
-              { id: 'last-error', label: 'Last error', value: retryTarget.last_error ?? 'None' },
-              { id: 'status-message', label: 'Status message', value: retryTarget.status_message ?? 'None' },
+              {
+                id: 'last-error',
+                label: 'Last error',
+                value: retryTarget.last_error ?? 'None',
+                copyable: Boolean(retryTarget.last_error),
+              },
+              {
+                id: 'status-message',
+                label: 'Status message',
+                value: retryTarget.status_message ?? 'None',
+                copyable: Boolean(retryTarget.status_message),
+              },
             ]}
           />
         )}

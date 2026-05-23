@@ -5,18 +5,20 @@ export function BucketOwnerSelect({
   id,
   value,
   disabled,
+  invalid,
   users,
   onChange,
 }: {
   id: string
   value: string | undefined
   disabled?: boolean
+  invalid?: boolean
   users: Array<{ access_key: string; role: string }>
   onChange: (value: string) => void
 }) {
   return (
     <Select value={value || undefined} onValueChange={onChange} disabled={disabled}>
-      <SelectTrigger id={id} className="w-full">
+      <SelectTrigger id={id} className="w-full" aria-invalid={invalid}>
         <SelectValue placeholder="Select owner" />
       </SelectTrigger>
       <SelectContent>

@@ -6,6 +6,7 @@ import type {
   ObservabilityProviderObservation,
   ObservabilitySignal,
 } from '@/api/client'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -14,6 +15,7 @@ import { replicaLabel } from '@/lib/storage-status-labels'
 import {
   dataSetDisplayLabel,
   dataSetTopologyPath,
+  formatOptionalTopologyID,
   formatOptionalTopologyText,
   freshnessLabel,
   localStatusTone,
@@ -122,9 +124,14 @@ function InspectorContent({
           <DetailRow label="Path" value={edge.data.path} mono />
           <DetailRow label="Edge" value={edge.kind} />
           <DetailRow label="Bucket" value={formatOptionalTopologyText(edge.data.bucketName)} />
-          <DetailRow label="Chain data set" value={formatOptionalID(edge.data.chainDataSetID)} mono />
-          <DetailRow label="Client data set" value={formatOptionalID(edge.data.clientDataSetID)} mono />
-          <DetailRow label="Provider" value={edge.data.providerID ? `#${edge.data.providerID}` : '—'} mono />
+          <DetailRow label="Chain data set" value={formatOptionalTopologyID(edge.data.chainDataSetID)} mono copyable />
+          <DetailRow
+            label="Client data set"
+            value={formatOptionalTopologyID(edge.data.clientDataSetID)}
+            mono
+            copyable
+          />
+          <DetailRow label="Provider" value={formatOptionalTopologyID(edge.data.providerID)} mono copyable />
         </DetailBlock>
         {dataSet && <DataSetDetailContent dataSet={dataSet} provider={provider} compact />}
       </>
@@ -148,7 +155,7 @@ function InspectorContent({
       <>
         <DetailBlock title="Bucket">
           <DetailRow label="Name" value={node.data.bucketName ?? node.label} />
-          <DetailRow label="Bucket ID" value={`#${node.data.bucketID}`} mono />
+          <DetailRow label="Bucket ID" value={formatOptionalTopologyID(node.data.bucketID)} mono copyable />
           <DetailRow label="Replicas" value={formatNumber(node.data.replicaCount ?? 0)} />
           <DetailRow label="Issues" value={formatNumber(node.data.issueCount ?? 0)} />
         </DetailBlock>
@@ -178,7 +185,7 @@ function InspectorContent({
   return (
     <>
       <DetailBlock title="Relationship">
-        <DetailRow label="Provider" value={`#${node.data.providerID}`} mono />
+        <DetailRow label="Provider" value={formatOptionalTopologyID(node.data.providerID)} mono copyable />
         <DetailRow label="Buckets" value={formatRelatedBuckets(relatedDataSets)} />
         <DetailRow label="Data sets" value={formatRelatedDataSets(relatedDataSets)} mono />
       </DetailBlock>
@@ -211,10 +218,25 @@ function DataSetDetailContent({
       <DetailBlock title="Facts">
         <DetailRow label="Bucket" value={dataSet.facts.bucket_name} />
         <DetailRow label="Replica" value={replicaLabel(dataSet.facts.copy_index)} />
-        <DetailRow label="Provider" value={`#${dataSet.facts.provider_id}`} mono />
-        <DetailRow label="Chain data set ID" value={formatOptionalID(dataSet.facts.chain_data_set_id)} mono />
-        <DetailRow label="Client data set ID" value={formatOptionalID(dataSet.facts.client_data_set_id)} mono />
-        <DetailRow label="Internal local ID" value={`#${dataSet.facts.local_data_set_id}`} mono />
+        <DetailRow label="Provider" value={formatOptionalTopologyID(dataSet.facts.provider_id)} mono copyable />
+        <DetailRow
+          label="Chain data set ID"
+          value={formatOptionalTopologyID(dataSet.facts.chain_data_set_id)}
+          mono
+          copyable
+        />
+        <DetailRow
+          label="Client data set ID"
+          value={formatOptionalTopologyID(dataSet.facts.client_data_set_id)}
+          mono
+          copyable
+        />
+        <DetailRow
+          label="Internal local ID"
+          value={formatOptionalTopologyID(dataSet.facts.local_data_set_id)}
+          mono
+          copyable
+        />
         <DetailRow
           label="Local status"
           value={dataSet.facts.local_status}
@@ -234,11 +256,18 @@ function ProviderDetailContent({ provider }: { provider: ObservabilityProviderOb
   return (
     <>
       <DetailBlock title="Facts">
-        <DetailRow label="Provider" value={`#${provider.facts.provider_id}`} mono />
+        <DetailRow label="Provider" value={formatOptionalTopologyID(provider.facts.provider_id)} mono copyable />
         <DetailRow label="Active" value={formatOptionalBool(provider.facts.active)} />
         <DetailRow label="Has PDP" value={formatOptionalBool(provider.facts.has_pdp)} />
         <DetailRow label="Health" value={formatOptionalTopologyText(provider.facts.health_status)} />
-        <DetailRow label="Service URL" value={formatOptionalTopologyText(provider.facts.service_url)} mono />
+        <DetailRow
+          label="Service URL"
+          value={formatOptionalTopologyText(provider.facts.service_url)}
+          mono
+          copyable
+          linkHref={provider.facts.service_url}
+          external
+        />
       </DetailBlock>
       <SignalDetailBlock signal={provider.signal} />
     </>
@@ -275,7 +304,7 @@ function SignalDetailBlock({ signal }: { signal: ObservabilitySignal }) {
     <DetailBlock title="Signal">
       <DetailRow label="Status" value={signal.status} badgeTone={observabilityStatusTone(signal.status)} />
       <DetailRow label="Freshness" value={freshnessLabel(signal.freshness)} />
-      <DetailRow label="Last error" value={formatOptionalTopologyText(signal.last_error)} />
+      <DetailRow label="Last error" value={formatOptionalTopologyText(signal.last_error)} copyable />
     </DetailBlock>
   )
 }
@@ -294,17 +323,36 @@ function DetailRow({
   value,
   mono,
   badgeTone,
+  copyable,
+  linkHref,
+  external,
 }: {
   label: string
   value: string
   mono?: boolean
   badgeTone?: StatusTone
+  copyable?: boolean
+  linkHref?: string
+  external?: boolean
 }) {
   return (
     <>
       <dt className="text-muted-foreground">{label}</dt>
       <dd className={cn('min-w-0 break-words', mono && 'font-mono text-xs')}>
-        {badgeTone ? <StatusBadge tone={badgeTone}>{value}</StatusBadge> : value}
+        {badgeTone ? (
+          <StatusBadge tone={badgeTone}>{value}</StatusBadge>
+        ) : copyable && value !== '—' ? (
+          <CopyableValue
+            label={label}
+            value={value}
+            monospace={mono}
+            linkHref={linkHref}
+            external={external}
+            className="align-middle"
+          />
+        ) : (
+          value
+        )}
       </dd>
     </>
   )
@@ -328,9 +376,4 @@ function formatRelatedDataSets(dataSets: ObservabilityDataSetObservation[]) {
 function formatOptionalBool(value: boolean | undefined) {
   if (value === undefined) return '—'
   return value ? 'yes' : 'no'
-}
-
-function formatOptionalID(value: string | undefined) {
-  const text = formatOptionalTopologyText(value)
-  return text === '—' ? text : `#${text}`
 }

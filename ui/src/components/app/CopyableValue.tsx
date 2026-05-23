@@ -1,12 +1,11 @@
 import { Check, Copy } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { type ReactElement, useEffect, useRef } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useClipboardCopy } from '@/hooks/use-clipboard-copy'
 import { buildCopyableValueModel } from '@/lib/copyable-value'
 import { cn } from '@/lib/utils'
-
-type CopyState = 'idle' | 'copied' | 'failed'
 
 export function CopyableValue({
   value,
@@ -14,6 +13,9 @@ export function CopyableValue({
   label,
   monospace = false,
   maxLength,
+  linkHref,
+  external = false,
+  children,
   className,
 }: {
   value: string
@@ -21,38 +23,54 @@ export function CopyableValue({
   label: string
   monospace?: boolean
   maxLength?: number
+  linkHref?: string
+  external?: boolean
+  children?: ReactElement
   className?: string
 }) {
-  const [copyState, setCopyState] = useState<CopyState>('idle')
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const model = buildCopyableValueModel({ value, displayValue, maxLength })
-  const copyLabel = copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'
+  const { copyState, copy, reset } = useClipboardCopy()
+  const previousValueRef = useRef(value)
 
   useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [])
+    if (previousValueRef.current === value) return
+    previousValueRef.current = value
+    reset()
+  }, [value, reset])
 
-  async function handleCopy() {
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable')
-      await navigator.clipboard.writeText(model.copyValue)
-      setCopyState('copied')
-    } catch {
-      setCopyState('failed')
-    }
+  const model = buildCopyableValueModel({ value, displayValue, maxLength, linkHref, external })
+  const copyLabel = copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'
 
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => setCopyState('idle'), 2000)
-  }
+  const valueClassName = cn('min-w-0 truncate', monospace && 'font-mono text-xs')
+  const valueNode = children ? (
+    children
+  ) : model.linkHref ? (
+    <a
+      href={model.linkHref}
+      target={model.external ? '_blank' : undefined}
+      rel={model.external ? 'noreferrer' : undefined}
+      className={cn(valueClassName, 'hover:text-foreground hover:underline')}
+    >
+      {model.displayText}
+    </a>
+  ) : (
+    <span
+      role="note"
+      aria-label={`${label}: ${model.displayText}`}
+      // biome-ignore lint/a11y/noNoninteractiveTabindex: the value tooltip needs keyboard focus without adding button semantics.
+      tabIndex={0}
+      className={cn(
+        valueClassName,
+        'rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+      )}
+    >
+      {model.displayText}
+    </span>
+  )
 
   return (
     <span className={cn('inline-flex max-w-full min-w-0 items-center gap-1.5', className)}>
       <Tooltip delayDuration={200}>
-        <TooltipTrigger asChild>
-          <span className={cn('min-w-0 truncate', monospace && 'font-mono text-xs')}>{model.displayText}</span>
-        </TooltipTrigger>
+        <TooltipTrigger asChild>{valueNode}</TooltipTrigger>
         <TooltipContent
           side="top"
           className="max-h-72 max-w-[min(32rem,calc(100vw-4rem))] overflow-auto whitespace-pre-wrap break-all text-left"
@@ -66,7 +84,7 @@ export function CopyableValue({
             type="button"
             variant="ghost"
             size="icon-xs"
-            onClick={handleCopy}
+            onClick={() => copy(model.copyValue)}
             aria-label={`${copyLabel} ${label}`}
           >
             {copyState === 'copied' ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}

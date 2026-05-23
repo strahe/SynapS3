@@ -1,5 +1,5 @@
 import { Check, Copy } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect } from 'react'
 
 import { Button } from '@/components/ui/button'
 import {
@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { useClipboardCopy } from '@/hooks/use-clipboard-copy'
 
 export function DetailTextDialog({
   title,
@@ -20,32 +21,12 @@ export function DetailTextDialog({
   text: string | null
   onClose: () => void
 }) {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const { copyState, copy, reset } = useClipboardCopy()
+  const copyLabel = copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'
 
   useEffect(() => {
-    if (text !== null) {
-      setCopied(false)
-    }
-  }, [text])
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [])
-
-  const handleCopy = useCallback(async () => {
-    if (!text) return
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopied(true)
-      if (timerRef.current) clearTimeout(timerRef.current)
-      timerRef.current = setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Clipboard API may fail outside secure contexts.
-    }
-  }, [text])
+    if (text !== null) reset()
+  }, [reset, text])
 
   return (
     <Dialog
@@ -63,9 +44,9 @@ export function DetailTextDialog({
           <pre className="whitespace-pre-wrap break-all font-mono text-xs">{text}</pre>
         </div>
         <DialogFooter>
-          <Button type="button" variant="outline" onClick={handleCopy}>
-            {copied ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
-            {copied ? 'Copied' : 'Copy'}
+          <Button type="button" variant="outline" onClick={() => text && copy(text)}>
+            {copyState === 'copied' ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
+            {copyLabel}
           </Button>
         </DialogFooter>
       </DialogContent>

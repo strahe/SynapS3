@@ -17,6 +17,8 @@ jobs:
   check:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: auto
 
     steps:
       - name: Checkout

@@ -2,6 +2,7 @@ import { createFileRoute, Link } from '@tanstack/react-router'
 import { CheckCircle2, ChevronRight, Database, FileBox, HardDrive, Loader2 } from 'lucide-react'
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import type { OverviewData } from '@/api/client'
+import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -35,7 +36,7 @@ function OverviewPage() {
   }
 
   if (error || !data) {
-    return <div className="flex h-full items-center justify-center text-destructive">Failed to load overview data</div>
+    return <PageErrorState title="Failed to load overview data" />
   }
 
   const attentionRows = attentionDisplayRows({

@@ -4,9 +4,11 @@ import { Loader2, Plus, RefreshCw, Trash2, UserRound } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
 import { type BucketItem, internalRootOwnerAccessKey } from '@/api/client'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
+import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge } from '@/components/app/StatusBadge'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -17,8 +19,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBuckets, useCreateBucket, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
@@ -85,6 +87,10 @@ function CreateBucketDialog() {
     )
   }
 
+  const bucketNameError = error === 'Bucket name is required' ? error : null
+  const ownerError = error === 'Bucket owner is required' ? error : null
+  const formError = error && !bucketNameError && !ownerError ? error : null
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
@@ -99,52 +105,60 @@ function CreateBucketDialog() {
           <DialogDescription>Choose the S3 user that will own and manage this bucket.</DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="bucket-name">Bucket name</Label>
-            <Input
-              id="bucket-name"
-              value={bucketName}
-              onChange={(e) => setBucketName(e.target.value)}
-              placeholder="my-bucket"
-              autoFocus
-              disabled={createBucket.isPending}
-            />
-          </div>
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="bucket-owner">Owner</Label>
-            <BucketOwnerSelect
-              id="bucket-owner"
-              value={ownerAccessKey}
-              onChange={setOwnerAccessKey}
-              disabled={createBucket.isPending || usersLoading}
-              users={users}
-            />
-            {users.length === 0 && !usersLoading && (
-              <p className="text-xs text-muted-foreground">
-                No S3 users yet. Internal root can be used as fallback owner.
-              </p>
-            )}
-            {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
-          </div>
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="bucket-copies">Replicas</Label>
-            <Select value={copyPolicy} onValueChange={setCopyPolicy} disabled={createBucket.isPending}>
-              <SelectTrigger id="bucket-copies" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value={inheritedCopyPolicyValue}>Inherit global default</SelectItem>
-                  {copyPolicyOptions.map((copies) => (
-                    <SelectItem key={copies} value={copies.toString()}>
-                      {copies} {copies === 1 ? 'copy' : 'copies'}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          <FieldGroup>
+            <Field data-invalid={Boolean(bucketNameError)}>
+              <FieldLabel htmlFor="bucket-name">Bucket name</FieldLabel>
+              <Input
+                id="bucket-name"
+                value={bucketName}
+                onChange={(e) => setBucketName(e.target.value)}
+                placeholder="my-bucket"
+                autoFocus
+                disabled={createBucket.isPending}
+                aria-invalid={Boolean(bucketNameError)}
+              />
+              {bucketNameError && <FieldError>{bucketNameError}</FieldError>}
+            </Field>
+            <Field data-invalid={Boolean(ownerError || usersError)}>
+              <FieldLabel htmlFor="bucket-owner">Owner</FieldLabel>
+              <BucketOwnerSelect
+                id="bucket-owner"
+                value={ownerAccessKey}
+                onChange={setOwnerAccessKey}
+                disabled={createBucket.isPending || usersLoading}
+                invalid={Boolean(ownerError || usersError)}
+                users={users}
+              />
+              {users.length === 0 && !usersLoading && (
+                <FieldDescription>No S3 users yet. Internal root can be used as fallback owner.</FieldDescription>
+              )}
+              {ownerError && <FieldError>{ownerError}</FieldError>}
+              {usersError && <FieldError>Failed to load S3 users.</FieldError>}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="bucket-copies">Replicas</FieldLabel>
+              <Select value={copyPolicy} onValueChange={setCopyPolicy} disabled={createBucket.isPending}>
+                <SelectTrigger id="bucket-copies" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value={inheritedCopyPolicyValue}>Inherit global default</SelectItem>
+                    {copyPolicyOptions.map((copies) => (
+                      <SelectItem key={copies} value={copies.toString()}>
+                        {copies} {copies === 1 ? 'copy' : 'copies'}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </Field>
+          </FieldGroup>
+          {formError && (
+            <Alert variant="destructive">
+              <AlertDescription>{formError}</AlertDescription>
+            </Alert>
+          )}
           <DialogFooter>
             <Button
               type="button"
@@ -234,30 +248,47 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
         {reviewing ? (
           <ReviewDetails
             rows={[
-              { id: 'bucket', label: 'Bucket', value: bucket.name },
-              { id: 'current-owner', label: 'Current owner', value: ownerLabel(bucket.owner_access_key) },
-              { id: 'new-owner', label: 'New owner', value: ownerLabel(ownerAccessKey) },
+              { id: 'bucket', label: 'Bucket', value: bucket.name, copyable: true },
+              {
+                id: 'current-owner',
+                label: 'Current owner',
+                value: bucket.owner_access_key ?? ownerLabel(bucket.owner_access_key),
+                displayValue: ownerLabel(bucket.owner_access_key),
+                copyable: Boolean(bucket.owner_access_key),
+              },
+              {
+                id: 'new-owner',
+                label: 'New owner',
+                value: ownerAccessKey || ownerLabel(null),
+                displayValue: ownerLabel(ownerAccessKey),
+                copyable: Boolean(ownerAccessKey),
+              },
             ]}
           />
         ) : (
-          <div className="flex flex-col gap-2">
-            <Label htmlFor={`owner-${bucket.id}`}>Owner</Label>
-            <BucketOwnerSelect
-              id={`owner-${bucket.id}`}
-              value={ownerAccessKey}
-              onChange={setOwnerAccessKey}
-              disabled={updateOwner.isPending || usersLoading}
-              users={users}
-            />
-            {users.length === 0 && !usersLoading && (
-              <p className="text-xs text-muted-foreground">
-                No S3 users yet. Internal root can be used as fallback owner.
-              </p>
-            )}
-            {usersError && <p className="text-xs text-destructive">Failed to load S3 users.</p>}
-          </div>
+          <FieldGroup>
+            <Field data-invalid={Boolean(usersError)}>
+              <FieldLabel htmlFor={`owner-${bucket.id}`}>Owner</FieldLabel>
+              <BucketOwnerSelect
+                id={`owner-${bucket.id}`}
+                value={ownerAccessKey}
+                onChange={setOwnerAccessKey}
+                disabled={updateOwner.isPending || usersLoading}
+                invalid={Boolean(usersError)}
+                users={users}
+              />
+              {users.length === 0 && !usersLoading && (
+                <FieldDescription>No S3 users yet. Internal root can be used as fallback owner.</FieldDescription>
+              )}
+              {usersError && <FieldError>Failed to load S3 users.</FieldError>}
+            </Field>
+          </FieldGroup>
         )}
-        {updateOwner.error && <p className="text-sm text-destructive">{updateOwner.error.message}</p>}
+        {updateOwner.error && (
+          <Alert variant="destructive">
+            <AlertDescription>{updateOwner.error.message}</AlertDescription>
+          </Alert>
+        )}
         <DialogFooter>
           <Button
             type="button"
@@ -335,20 +366,26 @@ function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
               : 'This empty bucket will be marked for deletion. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
           </DialogDescription>
         </DialogHeader>
-        <div className="flex flex-col gap-2">
-          <Label htmlFor={`confirm-delete-${bucket.id}`}>
-            Type <span className="font-mono font-semibold">{bucket.name}</span> to confirm
-          </Label>
-          <Input
-            id={`confirm-delete-${bucket.id}`}
-            value={confirmName}
-            onChange={(e) => setConfirmName(e.target.value)}
-            placeholder={bucket.name}
-            autoFocus
-            disabled={deleteBucket.isPending}
-          />
-        </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor={`confirm-delete-${bucket.id}`}>
+              Type <span className="font-mono font-semibold">{bucket.name}</span> to confirm
+            </FieldLabel>
+            <Input
+              id={`confirm-delete-${bucket.id}`}
+              value={confirmName}
+              onChange={(e) => setConfirmName(e.target.value)}
+              placeholder={bucket.name}
+              autoFocus
+              disabled={deleteBucket.isPending}
+            />
+          </Field>
+        </FieldGroup>
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
         <DialogFooter>
           <Button
             type="button"
@@ -391,7 +428,7 @@ function BucketsPage() {
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
         </div>
       ) : error ? (
-        <div className="text-destructive">Failed to load buckets</div>
+        <PageErrorState title="Failed to load buckets" className="h-60" />
       ) : (
         <div className="overflow-hidden rounded-lg border border-border">
           <Table>
