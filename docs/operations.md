@@ -73,11 +73,13 @@ Key metrics:
 
 ## Recovery
 
+Task diagnostics are read-only. Opening a diagnostic gathers stored evidence only; manual refresh performs one synchronous provider status check with a short bounded timeout and should not be polled.
+
 | Scenario | Recovery |
 | --- | --- |
 | Storage provider unreachable | Restore connectivity, then retry exhausted tasks |
 | RPC node down | Restore RPC connectivity, then retry exhausted tasks |
-| Private retrieval URL blocked | Keep blocked by default; enable `filecoin.allow_private_networks` only for trusted private deployments |
+| Private provider URL blocked | Keep blocked by default; enable `filecoin.allow_private_networks` only for trusted private deployments that serve retrieval and diagnostic URLs |
 | Database full | Free space or scale the database |
 | Cache disk full | Increase disk, lower `cache.max_size_gb`, or evict data |
 | Process crash | Restart; startup recovery reconciles stale states and orphaned tasks |
@@ -93,7 +95,7 @@ synaps3 admin settings get
 synaps3 admin settings set logging.level=debug
 ```
 
-High-risk settings, such as switching Filecoin networks or allowing private retrieval URLs, require `--yes`.
+High-risk settings, such as switching Filecoin networks or allowing private provider URLs, require `--yes`.
 
 ```bash
 synaps3 admin settings set filecoin.network=mainnet --yes

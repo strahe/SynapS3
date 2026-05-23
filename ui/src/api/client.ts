@@ -36,6 +36,8 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+type APIRequestOptions = Pick<RequestInit, 'signal'>
+
 export interface OverviewData {
   buckets: { total: number; by_status: Record<string, number> }
   objects: {
@@ -451,6 +453,133 @@ export interface TaskListResponse {
   total: number
   limit: number
   offset: number
+}
+
+export type TaskDiagnosticCurrentState =
+  | 'not_applicable'
+  | 'preparing'
+  | 'transferring'
+  | 'waiting_for_chain'
+  | 'confirmed'
+  | 'rejected'
+  | 'mismatch'
+  | 'unavailable'
+  | 'unknown'
+
+export type TaskDiagnosticNextAction =
+  | 'none'
+  | 'wait'
+  | 'retry_task'
+  | 'check_wallet_funds'
+  | 'check_wallet_approval'
+  | 'inspect_provider'
+  | 'inspect_task'
+
+export type TaskDiagnosticOperation = 'none' | 'prepare_upload' | 'transfer_piece' | 'create_data_set' | 'add_pieces'
+
+export interface TaskDiagnosticTaskFacts {
+  id?: number
+  type: string
+  stage?: string
+  status: string
+  retry_count?: number
+  max_retries?: number
+  last_error?: string
+  status_message?: string
+  wait_reason?: string
+  scheduled_at?: string
+}
+
+export interface TaskDiagnosticUploadFacts {
+  id?: number
+  status?: string
+  requested_copies?: number
+  error_message?: string
+  accept_error?: string
+}
+
+export interface TaskDiagnosticCopyFacts {
+  upload_id?: number
+  copy_index?: number
+  status?: string
+  provider_id?: string
+  storage_data_set_id?: number
+  chain_data_set_id?: string
+  piece_id?: string
+  transfer_method?: string
+  commit_transaction_id?: string
+  last_error?: string
+}
+
+export interface TaskDiagnosticDataSetFacts {
+  id?: number
+  status?: string
+  provider_id?: string
+  copy_index?: number
+  chain_data_set_id?: string
+  client_data_set_id?: string
+  create_transaction_id?: string
+  create_status_url?: string
+  last_error?: string
+}
+
+export interface TaskDiagnosticProviderFacts {
+  provider_id?: string
+  status?: ObservabilityStatus
+  reason_codes?: string[]
+  service_url?: string
+  health_status?: string
+  last_error?: string
+}
+
+export interface TaskDiagnosticTransactionFacts {
+  kind: TaskDiagnosticOperation
+  status_url?: string
+  service_url?: string
+  data_set_id?: string
+  transaction_id?: string
+  piece_count?: number
+}
+
+export type TaskDiagnosticLiveState =
+  | 'skipped'
+  | 'pending'
+  | 'confirmed'
+  | 'rejected'
+  | 'mismatch'
+  | 'unavailable'
+  | 'unknown'
+
+export interface TaskDiagnosticLiveCheck {
+  state: TaskDiagnosticLiveState
+  status_url?: string
+  tx_status?: string
+  data_set_id?: string
+  data_set_created?: boolean
+  pieces_added?: boolean
+  piece_count?: number
+  confirmed_piece_ids?: string[]
+  error?: string
+}
+
+export interface TaskDiagnosticEvidence {
+  task: TaskDiagnosticTaskFacts
+  upload?: TaskDiagnosticUploadFacts
+  copy?: TaskDiagnosticCopyFacts
+  data_set?: TaskDiagnosticDataSetFacts
+  provider?: TaskDiagnosticProviderFacts
+  transaction?: TaskDiagnosticTransactionFacts
+  live_check?: TaskDiagnosticLiveCheck
+  operation: TaskDiagnosticOperation
+}
+
+export interface TaskDiagnostic {
+  checked_at: string
+  current_state: TaskDiagnosticCurrentState
+  signal: ObservabilitySignal
+  reason_codes: string[]
+  next_action: TaskDiagnosticNextAction
+  evidence: TaskDiagnosticEvidence
 }
 
 export interface TaskStatusCount {
@@ -952,6 +1081,10 @@ export const api = {
   },
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
   getTaskRefDetail: (id: number) => fetchJSON<TaskRefDetail>(`/tasks/${id}/ref-detail`),
+  getTaskDiagnostic: (id: number, options?: APIRequestOptions) =>
+    fetchJSON<TaskDiagnostic>(`/tasks/${id}/diagnostic`, options),
+  refreshTaskDiagnostic: (id: number, options?: APIRequestOptions) =>
+    fetchJSON<TaskDiagnostic>(`/tasks/${id}/diagnostic/refresh`, { method: 'POST', ...options }),
   retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
   getSystemInfo: () => fetchJSON<OverviewData['system']>('/system/info'),
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),

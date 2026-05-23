@@ -90,7 +90,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"filecoin.allow_private_networks": {
 		Label:       "Allow Private Networks",
-		Description: "Allows retrieval URLs on private networks; enable only in trusted environments.",
+		Description: "Allows private-network provider URLs for retrieval and diagnostics; enable only in trusted environments.",
 		Env:         "SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS",
 		Editable:    true,
 	},

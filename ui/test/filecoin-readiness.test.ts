@@ -58,7 +58,7 @@ test('dismissed filecoin readiness checks are excluded locally', () => {
   assert.deepEqual([...dismissed], ['private_networks'])
 
   const checks: FilecoinReadinessCheck[] = [
-    { id: 'private_networks', status: 'warning', message: 'Private network downloads are allowed.' },
+    { id: 'private_networks', status: 'warning', message: 'Private network provider URLs are allowed.' },
     { id: 'payment_runway', status: 'warning', message: 'Payment account runway is under 30 days.' },
   ]
   assert.deepEqual(

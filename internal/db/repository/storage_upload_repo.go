@@ -626,6 +626,21 @@ func (r *BunStorageUploadRepo) GetDataSetBindingByCopyIndex(ctx context.Context,
 	return binding, nil
 }
 
+func (r *BunStorageUploadRepo) GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error) {
+	binding := new(model.StorageDataSet)
+	err := r.db.NewSelect().
+		Model(binding).
+		Where("id = ?", id).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting storage data set binding by id: %w", err)
+	}
+	return binding, nil
+}
+
 func (r *BunStorageUploadRepo) EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error) {
 	var binding *model.StorageDataSet
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {

@@ -384,6 +384,9 @@ func runServe(ctx context.Context, src config.Source) error {
 
 	// Start admin server (healthz + metrics).
 	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, cfg.Filecoin.DefaultCopies, logger).
+		WithTaskDiagnosticStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
+			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+		})).
 		WithEventHub(adminEvents).
 		WithObjectUploader(be).
 		WithObjectStorage(storageClient).

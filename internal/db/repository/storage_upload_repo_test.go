@@ -146,6 +146,13 @@ func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testi
 	if err != nil || gotPending == nil {
 		t.Fatalf("GetDataSetBindingByCopyIndex pending: binding=%v err=%v", gotPending, err)
 	}
+	gotPendingByID, err := repos.Uploads.GetDataSetBindingByID(ctx, binding.ID)
+	if err != nil || gotPendingByID == nil {
+		t.Fatalf("GetDataSetBindingByID pending: binding=%v err=%v", gotPendingByID, err)
+	}
+	if gotPendingByID.ID != binding.ID || gotPendingByID.BucketID != bucket.ID || gotPendingByID.CopyIndex != 0 {
+		t.Fatalf("binding by ID = %#v, want id/bucket/copy index", gotPendingByID)
+	}
 	if gotPending.DataSetID != nil || gotPending.ClientDataSetID != nil {
 		t.Fatalf("pending binding ids = data:%v client:%v, want nil SQL NULLs", gotPending.DataSetID, gotPending.ClientDataSetID)
 	}
@@ -178,6 +185,13 @@ func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testi
 	}
 	if gotBinding.ProviderID.String() != providerID.String() || gotBinding.DataSetID == nil || gotBinding.DataSetID.String() != dataSetID.String() || gotBinding.ClientDataSetID == nil || gotBinding.ClientDataSetID.String() != "0" {
 		t.Fatalf("ready binding = %#v, want large provider/data set and client 0", gotBinding)
+	}
+	gotReadyByID, err := repos.Uploads.GetDataSetBindingByID(ctx, binding.ID)
+	if err != nil || gotReadyByID == nil {
+		t.Fatalf("GetDataSetBindingByID ready: binding=%v err=%v", gotReadyByID, err)
+	}
+	if gotReadyByID.DataSetID == nil || gotReadyByID.DataSetID.String() != dataSetID.String() {
+		t.Fatalf("ready binding by ID = %#v, want data set %s", gotReadyByID, dataSetID.String())
 	}
 	copies, err := repos.Uploads.ListCopies(ctx, upload.ID)
 	if err != nil {

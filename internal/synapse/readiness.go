@@ -193,8 +193,8 @@ func (c *ReadinessChecker) checkClient(ctx context.Context, cfg ReadinessConfig,
 	if cfg.AllowPrivateNetworks {
 		result.warning(
 			"private_networks",
-			"Private network downloads are allowed.",
-			"Use this only for trusted private infrastructure.",
+			"Private network provider URLs are allowed.",
+			"Use this only for trusted private infrastructure that serves retrieval and diagnostic URLs.",
 		)
 	}
 

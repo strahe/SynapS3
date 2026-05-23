@@ -202,7 +202,13 @@ func TestReadinessCheckerWarnsWhenPrivateNetworksAreAllowed(t *testing.T) {
 	got := checker.CheckRuntime(context.Background())
 
 	requireResultStatus(t, got, ReadinessStatusWarning)
-	requireCheckStatus(t, got.Checks, "private_networks", ReadinessStatusWarning)
+	check := requireCheckStatus(t, got.Checks, "private_networks", ReadinessStatusWarning)
+	if check.Message != "Private network provider URLs are allowed." {
+		t.Fatalf("private_networks message = %q, want provider URL warning", check.Message)
+	}
+	if check.Action != "Use this only for trusted private infrastructure that serves retrieval and diagnostic URLs." {
+		t.Fatalf("private_networks action = %q, want retrieval and diagnostic URL warning", check.Action)
+	}
 }
 
 func TestReadinessCheckerDraftUsesTemporaryClientAndCloses(t *testing.T) {

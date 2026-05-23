@@ -58,7 +58,7 @@ test('global filecoin readiness alert stays quiet for ready and warning states',
     globalFilecoinReadinessAlertState({
       enabled: true,
       data: readinessData('warning', [
-        { id: 'private_networks', status: 'warning', message: 'Private network downloads are allowed.' },
+        { id: 'private_networks', status: 'warning', message: 'Private network provider URLs are allowed.' },
       ]),
     }).show,
     false

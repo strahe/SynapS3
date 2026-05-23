@@ -279,6 +279,54 @@ test('observability list APIs omit query string when params are empty', async ()
   assert.deepEqual(requestedURLs, ['/api/v1/observability/providers', '/api/v1/observability/data-sets'])
 })
 
+test('task diagnostic APIs use task diagnostic endpoints without write header', async () => {
+  const originalFetch = globalThis.fetch
+  const controller = new AbortController()
+  const calls: Array<{ url: string; method: string; headers: Headers; signal?: AbortSignal | null }> = []
+  globalThis.fetch = (async (input, init) => {
+    calls.push({
+      url: input.toString(),
+      method: init?.method ?? 'GET',
+      headers: new Headers(init?.headers),
+      signal: init?.signal,
+    })
+    return new Response(
+      JSON.stringify({
+        checked_at: '2026-05-22T10:00:00Z',
+        current_state: 'waiting_for_chain',
+        signal: {
+          status: 'degraded',
+          level: 'warning',
+          reason_codes: ['task_chain_pending'],
+          freshness: { stale: false, warnings: [] },
+        },
+        reason_codes: ['task_chain_pending'],
+        next_action: 'wait',
+        evidence: { task: { id: 7, type: 'upload', status: 'waiting' }, operation: 'add_pieces' },
+      }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    )
+  }) as typeof fetch
+
+  try {
+    await api.getTaskDiagnostic(7, { signal: controller.signal })
+    await api.refreshTaskDiagnostic(7, { signal: controller.signal })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.deepEqual(
+    calls.map((call) => [call.url, call.method, call.headers.get('X-SynapS3-Settings-Write'), call.signal]),
+    [
+      ['/api/v1/tasks/7/diagnostic', 'GET', null, controller.signal],
+      ['/api/v1/tasks/7/diagnostic/refresh', 'POST', null, controller.signal],
+    ]
+  )
+})
+
 test('object download URL encodes bucket name and object key', () => {
   assert.equal(
     api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),

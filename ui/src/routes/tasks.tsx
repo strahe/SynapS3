@@ -1,19 +1,26 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
-import { ListTodo, Loader2, RefreshCw, RotateCcw } from 'lucide-react'
+import { ChevronDown, ListTodo, Loader2, RefreshCw, RotateCcw, Stethoscope, TriangleAlert } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
-import { api, type TaskItem, type TaskStorageCleanupDetail } from '@/api/client'
+import { api, type TaskDiagnostic, type TaskItem, type TaskStorageCleanupDetail } from '@/api/client'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressBar } from '@/components/app/UploadProgress'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Label } from '@/components/ui/label'
 import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Separator } from '@/components/ui/separator'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -27,7 +34,15 @@ import {
   taskStageOptions,
   taskTypeLabel,
 } from '@/lib/storage-status-labels'
-import { formatBytes, timeAgo } from '@/lib/utils'
+import {
+  buildTaskDiagnosticViewModel,
+  shouldRefreshTaskDiagnostic,
+  type TaskDiagnosticFactRow,
+  taskDiagnosticSheetContentClassName,
+  taskDiagnosticStateLabel,
+  taskDiagnosticStateTone,
+} from '@/lib/task-diagnostics'
+import { cn, formatBytes, timeAgo } from '@/lib/utils'
 
 const taskTypeTabs = ['all', 'upload', 'evict_cache', 'storage_cleanup'] as const
 const statusOptions = [
@@ -66,6 +81,7 @@ type TaskTableProps = {
   tasks: TaskItem[]
   retryPending: boolean
   onRetry: (task: TaskItem) => void
+  onOpenDiagnostic: (task: TaskItem) => void
   onOpenDetail: (dialog: TaskDetailDialogState) => void
 }
 
@@ -268,16 +284,53 @@ function TaskActionsCell({
   task,
   retryPending,
   onRetry,
+  onOpenDiagnostic,
 }: {
   task: TaskItem
   retryPending: boolean
   onRetry: (task: TaskItem) => void
+  onOpenDiagnostic: (task: TaskItem) => void
 }) {
-  if (task.status !== 'exhausted') return <span className="text-muted-foreground">—</span>
+  const showDiagnostic = task.type === 'upload'
+  const showRetry = task.status === 'exhausted'
+  if (!showDiagnostic && !showRetry) return <span className="text-muted-foreground">—</span>
+
   return (
-    <Button type="button" variant="outline" size="xs" onClick={() => onRetry(task)} disabled={retryPending}>
-      <RotateCcw data-icon="inline-start" /> Retry
-    </Button>
+    <div className="flex items-center gap-1">
+      {showDiagnostic && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-xs"
+              onClick={() => onOpenDiagnostic(task)}
+              aria-label="Open task diagnostics"
+            >
+              <Stethoscope data-icon="inline-start" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Diagnostics</TooltipContent>
+        </Tooltip>
+      )}
+      {showRetry && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-xs"
+              onClick={() => onRetry(task)}
+              disabled={retryPending}
+              aria-label="Retry task"
+            >
+              <RotateCcw data-icon="inline-start" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Retry</TooltipContent>
+        </Tooltip>
+      )}
+    </div>
   )
 }
 
@@ -285,11 +338,13 @@ function TaskCommonCells({
   task,
   retryPending,
   onRetry,
+  onOpenDiagnostic,
   onOpenDetail,
 }: {
   task: TaskItem
   retryPending: boolean
   onRetry: (task: TaskItem) => void
+  onOpenDiagnostic: (task: TaskItem) => void
   onOpenDetail: (dialog: TaskDetailDialogState) => void
 }) {
   return (
@@ -308,13 +363,18 @@ function TaskCommonCells({
       </TableCell>
       <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">{timeAgo(task.scheduled_at)}</TableCell>
       <TableCell className="whitespace-nowrap px-3 py-2">
-        <TaskActionsCell task={task} retryPending={retryPending} onRetry={onRetry} />
+        <TaskActionsCell
+          task={task}
+          retryPending={retryPending}
+          onRetry={onRetry}
+          onOpenDiagnostic={onOpenDiagnostic}
+        />
       </TableCell>
     </>
   )
 }
 
-function AllTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTableProps) {
+function AllTasksTable({ tasks, retryPending, onRetry, onOpenDiagnostic, onOpenDetail }: TaskTableProps) {
   return (
     <TaskTableFrame>
       <Table>
@@ -344,6 +404,7 @@ function AllTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTable
                   task={task}
                   retryPending={retryPending}
                   onRetry={onRetry}
+                  onOpenDiagnostic={onOpenDiagnostic}
                   onOpenDetail={onOpenDetail}
                 />
               </TableRow>
@@ -357,7 +418,7 @@ function AllTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTable
   )
 }
 
-function UploadTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTableProps) {
+function UploadTasksTable({ tasks, retryPending, onRetry, onOpenDiagnostic, onOpenDetail }: TaskTableProps) {
   return (
     <TaskTableFrame>
       <Table>
@@ -392,6 +453,7 @@ function UploadTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTa
                   task={task}
                   retryPending={retryPending}
                   onRetry={onRetry}
+                  onOpenDiagnostic={onOpenDiagnostic}
                   onOpenDetail={onOpenDetail}
                 />
               </TableRow>
@@ -405,7 +467,7 @@ function UploadTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTa
   )
 }
 
-function EvictCacheTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: TaskTableProps) {
+function EvictCacheTasksTable({ tasks, retryPending, onRetry, onOpenDiagnostic, onOpenDetail }: TaskTableProps) {
   return (
     <TaskTableFrame>
       <Table>
@@ -429,6 +491,7 @@ function EvictCacheTasksTable({ tasks, retryPending, onRetry, onOpenDetail }: Ta
                   task={task}
                   retryPending={retryPending}
                   onRetry={onRetry}
+                  onOpenDiagnostic={onOpenDiagnostic}
                   onOpenDetail={onOpenDetail}
                 />
               </TableRow>
@@ -464,6 +527,168 @@ function TaskEmptyRow({ colSpan }: { colSpan: number }) {
   )
 }
 
+function TaskDiagnosticSheet({
+  task,
+  diagnostic,
+  loading,
+  refreshing,
+  error,
+  onClose,
+}: {
+  task: TaskItem | null
+  diagnostic: TaskDiagnostic | null
+  loading: boolean
+  refreshing: boolean
+  error: string | null
+  onClose: () => void
+}) {
+  const checking = refreshing
+  const [detailsOpen, setDetailsOpen] = useState(true)
+  const view = diagnostic ? buildTaskDiagnosticViewModel(diagnostic) : null
+
+  return (
+    <Sheet
+      open={Boolean(task)}
+      onOpenChange={(open) => {
+        if (!open) {
+          setDetailsOpen(true)
+          onClose()
+        }
+      }}
+    >
+      <SheetContent className={taskDiagnosticSheetContentClassName}>
+        <SheetHeader>
+          <SheetTitle>Upload diagnostics</SheetTitle>
+          <SheetDescription>{task ? `Task #${task.id}` : 'Upload task diagnostics'}</SheetDescription>
+        </SheetHeader>
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="flex flex-col gap-5 px-4 pb-4">
+            {loading && !diagnostic ? (
+              <TaskDiagnosticSkeleton />
+            ) : diagnostic && view ? (
+              <>
+                <section className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <h2 className="text-xs font-medium text-muted-foreground">Current status</h2>
+                    <StatusBadge tone={taskDiagnosticStateTone(diagnostic.current_state)}>
+                      {taskDiagnosticStateLabel(diagnostic.current_state)}
+                    </StatusBadge>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <p className="text-base font-semibold leading-6">{view.title}</p>
+                  </div>
+                  {checking && (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="animate-spin" />
+                      Checking latest storage status
+                    </div>
+                  )}
+                </section>
+
+                <Separator />
+
+                <section className="flex flex-col gap-3">
+                  <h2 className="text-sm font-medium">Evidence</h2>
+                  <TaskDiagnosticFactList rows={view.primaryFacts} />
+                </section>
+
+                <Separator />
+
+                <Collapsible open={detailsOpen} onOpenChange={setDetailsOpen} className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <h2 className="text-sm font-medium">Recorded details</h2>
+                    <CollapsibleTrigger asChild>
+                      <Button type="button" variant="ghost" size="sm">
+                        {detailsOpen ? 'Hide' : 'Show'}
+                        <ChevronDown
+                          data-icon="inline-end"
+                          className={cn('transition-transform', detailsOpen && 'rotate-180')}
+                        />
+                      </Button>
+                    </CollapsibleTrigger>
+                  </div>
+                  <CollapsibleContent>
+                    <TaskDiagnosticFactList rows={view.detailFacts} />
+                  </CollapsibleContent>
+                </Collapsible>
+              </>
+            ) : null}
+
+            {error && (
+              <Alert variant="destructive">
+                <TriangleAlert />
+                <AlertTitle>Diagnostics unavailable</AlertTitle>
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            )}
+          </div>
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
+function TaskDiagnosticSkeleton() {
+  return (
+    <div className="flex flex-col gap-5">
+      <section className="flex flex-col gap-3">
+        <div className="flex items-center justify-between gap-3">
+          <Skeleton className="h-3 w-24" />
+          <Skeleton className="h-6 w-24 rounded-full" />
+        </div>
+        <Skeleton className="h-6 w-64 max-w-full" />
+      </section>
+      <Separator />
+      <section className="flex flex-col gap-3">
+        <Skeleton className="h-4 w-16" />
+        <div className="grid grid-cols-1 gap-x-3 gap-y-2 sm:grid-cols-[9rem_minmax(0,1fr)]">
+          <Skeleton className="h-4 w-20" />
+          <Skeleton className="h-4 w-48 max-w-full" />
+          <Skeleton className="h-4 w-24" />
+          <Skeleton className="h-4 w-56 max-w-full" />
+          <Skeleton className="h-4 w-20" />
+          <Skeleton className="h-4 w-40 max-w-full" />
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function TaskDiagnosticFactList({ rows }: { rows: TaskDiagnosticFactRow[] }) {
+  return (
+    <dl className="grid grid-cols-1 gap-x-3 gap-y-2 text-sm sm:grid-cols-[9rem_minmax(0,1fr)]">
+      {rows.map((row) => (
+        <TaskDiagnosticFactRowView key={`${row.label}:${row.value}`} row={row} />
+      ))}
+    </dl>
+  )
+}
+
+function TaskDiagnosticFactRowView({ row }: { row: TaskDiagnosticFactRow }) {
+  return (
+    <>
+      <dt className="text-muted-foreground">{row.label}</dt>
+      <dd className="min-w-0">
+        {row.detail ? (
+          <CopyableValue
+            label={row.label}
+            value={row.detailValue ?? row.value}
+            displayValue={row.detailValue ? row.value : undefined}
+            monospace={row.monospace}
+            maxLength={row.displayMaxLength}
+          />
+        ) : (
+          <span className={row.monospace ? 'truncate font-mono text-xs' : 'truncate'}>{row.value}</span>
+        )}
+      </dd>
+    </>
+  )
+}
+
+function isAbortError(err: unknown) {
+  return typeof err === 'object' && err !== null && 'name' in err && err.name === 'AbortError'
+}
+
 function TasksPage() {
   const search = Route.useSearch()
   const [status, setStatus] = useState(search.status ?? '')
@@ -476,6 +701,11 @@ function TasksPage() {
 
   const [retryTarget, setRetryTarget] = useState<TaskItem | null>(null)
   const [detailDialog, setDetailDialog] = useState<{ title: string; text: string } | null>(null)
+  const [diagnosticTarget, setDiagnosticTarget] = useState<TaskItem | null>(null)
+  const [diagnostic, setDiagnostic] = useState<TaskDiagnostic | null>(null)
+  const [diagnosticLoading, setDiagnosticLoading] = useState(false)
+  const [diagnosticRefreshing, setDiagnosticRefreshing] = useState(false)
+  const [diagnosticError, setDiagnosticError] = useState<string | null>(null)
   const retryMutation = useMutation({
     mutationFn: (taskId: number) => api.retryTask(taskId),
     onSuccess: () => setRetryTarget(null),
@@ -495,10 +725,58 @@ function TasksPage() {
     setOffset(0)
   }, [search.type, search.status])
 
+  useEffect(() => {
+    if (!diagnosticTarget) {
+      setDiagnostic(null)
+      setDiagnosticLoading(false)
+      setDiagnosticRefreshing(false)
+      setDiagnosticError(null)
+      return
+    }
+    let active = true
+    const controller = new AbortController()
+    setDiagnostic(null)
+    setDiagnosticError(null)
+    setDiagnosticLoading(true)
+    setDiagnosticRefreshing(false)
+
+    api
+      .getTaskDiagnostic(diagnosticTarget.id, { signal: controller.signal })
+      .then((initial) => {
+        if (!active) return null
+        setDiagnostic(initial)
+        setDiagnosticLoading(false)
+        if (!shouldRefreshTaskDiagnostic(initial)) return null
+        setDiagnosticRefreshing(true)
+        return api.refreshTaskDiagnostic(diagnosticTarget.id, { signal: controller.signal })
+      })
+      .then((refreshed) => {
+        if (active && refreshed) setDiagnostic(refreshed)
+      })
+      .catch((err: unknown) => {
+        if (isAbortError(err)) return
+        if (active) setDiagnosticError(err instanceof Error ? err.message : 'Failed to load task diagnostics')
+      })
+      .finally(() => {
+        if (!active) return
+        setDiagnosticLoading(false)
+        setDiagnosticRefreshing(false)
+      })
+
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [diagnosticTarget])
+
   function openRetryDialog(task: TaskItem) {
     if (retryPending) return
     retryMutation.reset()
     setRetryTarget(task)
+  }
+
+  function closeDiagnostic() {
+    setDiagnosticTarget(null)
   }
 
   return (
@@ -598,6 +876,7 @@ function TasksPage() {
               tasks={data?.tasks ?? []}
               retryPending={retryPending}
               onRetry={openRetryDialog}
+              onOpenDiagnostic={setDiagnosticTarget}
               onOpenDetail={setDetailDialog}
             />
           ) : taskType === 'upload' ? (
@@ -605,6 +884,7 @@ function TasksPage() {
               tasks={data?.tasks ?? []}
               retryPending={retryPending}
               onRetry={openRetryDialog}
+              onOpenDiagnostic={setDiagnosticTarget}
               onOpenDetail={setDetailDialog}
             />
           ) : (
@@ -612,6 +892,7 @@ function TasksPage() {
               tasks={data?.tasks ?? []}
               retryPending={retryPending}
               onRetry={openRetryDialog}
+              onOpenDiagnostic={setDiagnosticTarget}
               onOpenDetail={setDetailDialog}
             />
           )}
@@ -682,6 +963,16 @@ function TasksPage() {
         title={detailDialog?.title ?? 'Task Details'}
         text={detailDialog?.text ?? null}
         onClose={() => setDetailDialog(null)}
+      />
+
+      <TaskDiagnosticSheet
+        key={diagnosticTarget?.id ?? 'empty'}
+        task={diagnosticTarget}
+        diagnostic={diagnostic}
+        loading={diagnosticLoading}
+        refreshing={diagnosticRefreshing}
+        error={diagnosticError}
+        onClose={closeDiagnostic}
       />
     </div>
   )

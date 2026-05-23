@@ -44,6 +44,7 @@ type Server struct {
 	wallet                   synapse.WalletQuerier
 	filecoinReadiness        filecoinReadinessProbe
 	observability            *observability.Service
+	taskDiagnosticChecker    taskDiagnosticStatusChecker
 	providerIdentity         providerIdentityLookup
 	events                   *EventHub
 	settings                 *SettingsService
@@ -72,6 +73,7 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
 		workerHealth:             wh,
 		wallet:                   newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
+		taskDiagnosticChecker:    synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{}),
 		events:                   newAdminEventHub(),
 		filecoinDefaultCopies:    boundedBucketCopies(filecoinDefaultCopies),
 		storageCleanupMaxRetries: 5,
@@ -209,6 +211,8 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
 		mux.HandleFunc("GET /api/v1/tasks/{id}/ref-detail", s.handleAPITaskRefDetail)
+		mux.HandleFunc("GET /api/v1/tasks/{id}/diagnostic", s.handleAPITaskDiagnostic)
+		mux.HandleFunc("POST /api/v1/tasks/{id}/diagnostic/refresh", s.handleAPITaskDiagnosticRefresh)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryExhausted) // only retries exhausted tasks
 		mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
 		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)

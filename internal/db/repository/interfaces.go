@@ -354,6 +354,7 @@ type StorageUploadRepository interface {
 	ListCurrentObjectCopyHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time) ([]CurrentObjectCopyHealthSummary, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
 	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
+	GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error)
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error

@@ -104,7 +104,7 @@ export function collectSettingsRiskChanges(
       initial.filecoin.allow_private_networks,
       next.filecoin.allow_private_networks,
       'high',
-      'Allows private-network retrieval URLs; enable only in trusted environments.'
+      'Allows private-network provider URLs for retrieval and diagnostics; enable only in trusted environments.'
     )
   }
   addChanged(
