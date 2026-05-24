@@ -36,16 +36,16 @@ const (
 )
 
 type bucketListItem struct {
-	ID              int64                     `json:"id"`
-	Name            string                    `json:"name"`
-	OwnerAccessKey  *string                   `json:"owner_access_key"`
-	DefaultCopies   *int                      `json:"default_copies"`
-	EffectiveCopies int                       `json:"effective_copies"`
-	Status          string                    `json:"status"`
-	ObjectCount     int64                     `json:"object_count"`
-	TotalSizeBytes  int64                     `json:"total_size_bytes"`
-	CopyHealth      copyHealthSummaryResponse `json:"copy_health"`
-	CreatedAt       string                    `json:"created_at"`
+	ID              int64                              `json:"id"`
+	Name            string                             `json:"name"`
+	OwnerAccessKey  *string                            `json:"owner_access_key"`
+	DefaultCopies   *int                               `json:"default_copies"`
+	EffectiveCopies int                                `json:"effective_copies"`
+	Status          string                             `json:"status"`
+	ObjectCount     int64                              `json:"object_count"`
+	TotalSizeBytes  int64                              `json:"total_size_bytes"`
+	StorageHealth   bucketStorageHealthSummaryResponse `json:"storage_health"`
+	CreatedAt       string                             `json:"created_at"`
 }
 
 type bucketCreateRequest struct {
@@ -64,20 +64,20 @@ type bucketMutationResponse struct {
 }
 
 type bucketDetailResponse struct {
-	ID                 int64                           `json:"id"`
-	Name               string                          `json:"name"`
-	OwnerAccessKey     *string                         `json:"owner_access_key"`
-	DefaultCopies      *int                            `json:"default_copies"`
-	EffectiveCopies    int                             `json:"effective_copies"`
-	Status             string                          `json:"status"`
-	ObjectCount        int64                           `json:"object_count"`
-	TotalSizeBytes     int64                           `json:"total_size_bytes"`
-	CopyHealth         copyHealthSummaryResponse       `json:"copy_health"`
-	CreatedAt          string                          `json:"created_at"`
-	UpdatedAt          string                          `json:"updated_at"`
-	VersioningStatus   string                          `json:"versioning_status"`
-	VersioningEnforced bool                            `json:"versioning_enforced"`
-	DataSets           []storageDataSetSummaryResponse `json:"data_sets"`
+	ID                 int64                              `json:"id"`
+	Name               string                             `json:"name"`
+	OwnerAccessKey     *string                            `json:"owner_access_key"`
+	DefaultCopies      *int                               `json:"default_copies"`
+	EffectiveCopies    int                                `json:"effective_copies"`
+	Status             string                             `json:"status"`
+	ObjectCount        int64                              `json:"object_count"`
+	TotalSizeBytes     int64                              `json:"total_size_bytes"`
+	StorageHealth      bucketStorageHealthSummaryResponse `json:"storage_health"`
+	CreatedAt          string                             `json:"created_at"`
+	UpdatedAt          string                             `json:"updated_at"`
+	VersioningStatus   string                             `json:"versioning_status"`
+	VersioningEnforced bool                               `json:"versioning_enforced"`
+	DataSets           []storageDataSetSummaryResponse    `json:"data_sets"`
 }
 
 type storageDataSetSummaryResponse struct {
@@ -173,7 +173,7 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("api: failed to aggregate object stats by bucket", "error", err)
 		statsMap = make(map[int64]repository.BucketObjectStats)
 	}
-	copyHealthMap, copyHealthFailed := s.bucketCopyHealthSummaries(ctx, 0)
+	storageHealthMap, storageHealthFailed := s.bucketStorageHealthSummaries(ctx, 0)
 
 	items := make([]bucketListItem, 0, len(buckets))
 	for _, b := range buckets {
@@ -190,7 +190,7 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 			Status:          string(b.Status),
 			ObjectCount:     stats.Count,
 			TotalSizeBytes:  stats.TotalSize,
-			CopyHealth:      copyHealthSummaryForBucket(copyHealthMap, b.ID, copyHealthFailed),
+			StorageHealth:   bucketStorageHealthSummaryForBucket(storageHealthMap, b.ID, storageHealthFailed),
 			CreatedAt:       b.CreatedAt.Format(time.RFC3339),
 		})
 	}
@@ -314,7 +314,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		}
 		dataSets = s.storageDataSetSummaryResponses(ctx, summaries)
 	}
-	copyHealthMap, copyHealthFailed := s.bucketCopyHealthSummaries(ctx, bucket.ID)
+	storageHealthMap, storageHealthFailed := s.bucketStorageHealthSummaries(ctx, bucket.ID)
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
 		ID:                 bucket.ID,
@@ -325,7 +325,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		Status:             string(bucket.Status),
 		ObjectCount:        stats.Count,
 		TotalSizeBytes:     stats.TotalSize,
-		CopyHealth:         copyHealthSummaryForBucket(copyHealthMap, bucket.ID, copyHealthFailed),
+		StorageHealth:      bucketStorageHealthSummaryForBucket(storageHealthMap, bucket.ID, storageHealthFailed),
 		CreatedAt:          bucket.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:          bucket.UpdatedAt.Format(time.RFC3339),
 		VersioningStatus:   "Enabled",

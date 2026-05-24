@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import { Database } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { type ReactNode, useRef } from 'react'
 import type {
   ObservabilityDataSetObservation,
   ObservabilityProviderObservation,
@@ -39,6 +39,7 @@ export function TopologyDetailSheet({
   dataSets: ObservabilityDataSetObservation[]
   onOpenChange: (open: boolean) => void
 }) {
+  const titleRef = useRef<HTMLHeadingElement>(null)
   const title = selection ? topologyDetailTitle(selection) : 'Topology Details'
   const description = selection ? topologyDetailDescription(selection) : undefined
 
@@ -47,10 +48,16 @@ export function TopologyDetailSheet({
       <SheetContent
         side="right"
         className="data-[side=right]:w-[440px] data-[side=right]:max-w-[calc(100vw-2rem)] data-[side=right]:sm:max-w-[440px]"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault()
+          titleRef.current?.focus({ preventScroll: true })
+        }}
       >
         <SheetHeader>
           <div className="flex min-w-0 items-center gap-2 pr-8">
-            <SheetTitle className="truncate">{title}</SheetTitle>
+            <SheetTitle ref={titleRef} tabIndex={-1} className="truncate outline-none">
+              {title}
+            </SheetTitle>
             {selection && (
               <StatusBadge tone={topologySelectionTone(selection)}>{topologySelectionBadge(selection)}</StatusBadge>
             )}

@@ -5,7 +5,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
@@ -50,26 +49,6 @@ type copyHealthFact struct {
 	PieceID         *types.OnChainID
 	RetrievalURL    *string
 	LastError       *string
-}
-
-func (s *Server) bucketCopyHealthSummaries(ctx context.Context, bucketID int64) (map[int64]copyHealthSummaryResponse, bool) {
-	if s.repos.Uploads == nil {
-		return nil, false
-	}
-	interval := s.copyHealthRefreshInterval()
-	staleBefore := time.Now().UTC().Add(-(interval * 2))
-	summaries, err := s.repos.Uploads.ListCurrentObjectCopyHealthSummaries(ctx, bucketID, staleBefore)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("api: failed to load bucket copy health facts", "error", err, "bucketID", bucketID)
-		}
-		return nil, true
-	}
-	out := make(map[int64]copyHealthSummaryResponse, len(summaries))
-	for _, summary := range summaries {
-		out[summary.BucketID] = copyHealthSummaryFromRepository(summary, staleBefore)
-	}
-	return out, false
 }
 
 func (s *Server) copyHealthDataSetObservations(ctx context.Context, localIDs []int64) (map[int64]observability.DataSetObservation, bool) {
@@ -188,7 +167,7 @@ func copyHealthSummariesByBucket(facts []copyHealthFact, observations map[int64]
 			summary.LastError = object.lastError
 		}
 		for _, reason := range object.reasons {
-			summary.ReasonCodes = appendReason(summary.ReasonCodes, reason)
+			summary.ReasonCodes = observability.AppendReasonCode(summary.ReasonCodes, reason)
 		}
 		summaries[object.bucketID] = summary
 	}
@@ -517,62 +496,6 @@ func noUploadCopyHealthSummary() copyHealthSummaryResponse {
 	}
 }
 
-func copyHealthSummaryFromRepository(summary repository.CurrentObjectCopyHealthSummary, staleBefore time.Time) copyHealthSummaryResponse {
-	status := observability.Status(summary.Status)
-	if status == "" {
-		status = observability.StatusAvailable
-	}
-	var lastCheckedAt string
-	if summary.LastCheckedAt != nil {
-		lastCheckedAt = summary.LastCheckedAt.UTC().Format(time.RFC3339)
-	}
-	return copyHealthSummaryResponse{
-		Status:           string(status),
-		ReasonCodes:      copyHealthReasonsFromRepository(summary),
-		Stale:            summary.LastCheckedAt != nil && summary.LastCheckedAt.Before(staleBefore),
-		LastCheckedAt:    lastCheckedAt,
-		TotalObjects:     summary.TotalObjects,
-		UnhealthyObjects: summary.UnhealthyObjects,
-		RequestedCopies:  summary.RequestedCopies,
-		ReadableCopies:   summary.ReadableCopies,
-		PendingCopies:    summary.PendingCopies,
-		FailedCopies:     summary.FailedCopies,
-		UnknownCopies:    summary.UnknownCopies,
-	}
-}
-
-func copyHealthReasonsFromRepository(summary repository.CurrentObjectCopyHealthSummary) []observability.ReasonCode {
-	reasons := make([]observability.ReasonCode, 0, 4)
-	if summary.CopyUnderReplicated {
-		reasons = append(reasons, observability.ReasonCopyUnderReplicated)
-	}
-	if summary.CopyPending {
-		reasons = append(reasons, observability.ReasonCopyPending)
-	}
-	if summary.CopyCommitting {
-		reasons = append(reasons, observability.ReasonCopyCommitting)
-	}
-	if summary.CopyFailed {
-		reasons = append(reasons, observability.ReasonCopyFailed)
-	}
-	if summary.CopyMissingProvider {
-		reasons = append(reasons, observability.ReasonCopyMissingProvider)
-	}
-	if summary.CopyMissingDataSet {
-		reasons = append(reasons, observability.ReasonCopyMissingDataSet)
-	}
-	if summary.CopyMissingPiece {
-		reasons = append(reasons, observability.ReasonCopyMissingPiece)
-	}
-	if summary.CopyMissingRetrievalURL {
-		reasons = append(reasons, observability.ReasonCopyMissingRetrievalURL)
-	}
-	if summary.CopyObservationMissing {
-		reasons = append(reasons, observability.ReasonCopyObservationMissing)
-	}
-	return reasons
-}
-
 func oldestLastCheckedAtString(current string, candidate *time.Time) string {
 	if candidate == nil {
 		return current
@@ -612,15 +535,6 @@ func observabilityStatusRank(status observability.Status) int {
 	default:
 		return 0
 	}
-}
-
-func appendReason(reasons []observability.ReasonCode, reason observability.ReasonCode) []observability.ReasonCode {
-	for _, existing := range reasons {
-		if existing == reason {
-			return reasons
-		}
-	}
-	return append(reasons, reason)
 }
 
 func hasAnyReason(reasons []observability.ReasonCode, want ...observability.ReasonCode) bool {

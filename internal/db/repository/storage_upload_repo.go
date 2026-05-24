@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 )
@@ -291,253 +292,237 @@ func (r *BunStorageUploadRepo) ListReadableCommittedCopies(ctx context.Context, 
 	return copies, nil
 }
 
-func (r *BunStorageUploadRepo) ListCurrentObjectCopyHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time) ([]CurrentObjectCopyHealthSummary, error) {
-	var summaries []CurrentObjectCopyHealthSummary
-	currentVersionBucketFilter := ""
-	args := make([]interface{}, 0, 5)
+type bucketStorageHealthSummaryRow struct {
+	BucketID               int64      `bun:"bucket_id"`
+	AbnormalDataSets       int        `bun:"abnormal_data_sets"`
+	AffectedVersionsSeen   int        `bun:"affected_versions_seen"`
+	LocalStatusNotReady    bool       `bun:"local_status_not_ready"`
+	ObservationMissing     bool       `bun:"observation_missing"`
+	ObservationStale       bool       `bun:"observation_stale"`
+	ObservationUnavailable bool       `bun:"observation_unavailable"`
+	ObservationDegraded    bool       `bun:"observation_degraded"`
+	ObservationUnknown     bool       `bun:"observation_unknown"`
+	LastCheckedAt          *time.Time `bun:"last_checked_at"`
+}
+
+// bucketStorageHealthAffectedVersionExistsSQL expects dataSetSourceAlias to expose bucket_id and data_set_id.
+func bucketStorageHealthAffectedVersionExistsSQL(dataSetSourceAlias string) string {
+	return fmt.Sprintf(`EXISTS (
+					SELECT 1
+					FROM storage_upload_copies AS storage_copy
+					JOIN object_versions AS object_version
+					  ON object_version.storage_upload_id = storage_copy.upload_id
+					 AND object_version.bucket_id = %[1]s.bucket_id
+					 AND object_version.is_delete_marker = FALSE
+					WHERE storage_copy.storage_data_set_id = %[1]s.data_set_id
+					  AND storage_copy.status = 'committed'
+					  AND storage_copy.storage_data_set_id IS NOT NULL
+				)`, dataSetSourceAlias)
+}
+
+func (r *BunStorageUploadRepo) ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error) {
+	if affectedVersionCap < 1 {
+		affectedVersionCap = 1
+	}
+	var rows []bucketStorageHealthSummaryRow
+	dataSetBucketFilter := ""
+	args := []interface{}{staleBefore}
 	if bucketID > 0 {
-		currentVersionBucketFilter = `
-			  AND bucket_id = ?`
+		dataSetBucketFilter = `
+			  AND storage_data_set.bucket_id = ?`
 		args = append(args, bucketID)
 	}
-	query := fmt.Sprintf(`WITH current_versions AS (
-			SELECT bucket_id, version_id, storage_upload_id
-			FROM object_versions
-			WHERE is_current = TRUE
-			  AND is_delete_marker = FALSE
-%s
-		),
-		latest_upload_refs AS (
-			SELECT source_upload.source_version_id, MAX(source_upload.id) AS latest_upload_id
-			FROM storage_uploads AS source_upload
-			JOIN current_versions AS current_version
-			  ON current_version.version_id = source_upload.source_version_id
-			 AND current_version.storage_upload_id IS NULL
-			WHERE source_upload.source_version_id <> ''
-			GROUP BY source_upload.source_version_id
-		),
-		object_uploads AS (
+	query := fmt.Sprintf(`WITH bucket_data_sets AS (
+				SELECT
+					storage_data_set.id AS data_set_id,
+					storage_data_set.bucket_id,
+				CASE WHEN storage_data_set.status NOT IN ('ready', 'draining') THEN 1 ELSE 0 END AS local_status_not_ready,
+				CASE WHEN observation.local_data_set_id IS NULL THEN 1 ELSE 0 END AS observation_missing,
+				CASE WHEN observation.local_data_set_id IS NOT NULL AND observation.last_checked_at < ? THEN 1 ELSE 0 END AS observation_stale,
+				CASE WHEN observation.status = 'unavailable' THEN 1 ELSE 0 END AS observation_unavailable,
+				CASE WHEN observation.status = 'degraded' THEN 1 ELSE 0 END AS observation_degraded,
+				CASE WHEN observation.status = 'unknown' THEN 1 ELSE 0 END AS observation_unknown,
+				observation.last_checked_at
+				FROM storage_data_sets AS storage_data_set
+				LEFT JOIN observability_data_set_states AS observation ON observation.local_data_set_id = storage_data_set.id
+				WHERE 1 = 1
+	%s
+			),
+			bucket_observation AS (
+				SELECT
+					bucket_id,
+					COALESCE(MAX(observation_stale), 0) AS observation_stale,
+					MIN(last_checked_at) AS last_checked_at
+				FROM bucket_data_sets
+				GROUP BY bucket_id
+			),
+			abnormal_data_sets AS (
+				SELECT *
+				FROM bucket_data_sets
+				WHERE local_status_not_ready = 1
+				  OR observation_missing = 1
+				  OR observation_stale = 1
+				  OR observation_unavailable = 1
+				  OR observation_degraded = 1
+				  OR observation_unknown = 1
+			),
+			bucket_abnormal AS (
+				SELECT
+					bucket_id,
+					COUNT(*) AS abnormal_data_sets
+				FROM abnormal_data_sets
+				GROUP BY bucket_id
+			),
+			affected_data_sets AS (
+				SELECT
+					abnormal_data_set.*
+				FROM abnormal_data_sets AS abnormal_data_set
+				WHERE %s
+			),
+			affected_bucket_summary AS (
+				SELECT
+					bucket_id,
+					COUNT(*) AS affected_data_sets,
+					COALESCE(MAX(local_status_not_ready), 0) AS local_status_not_ready,
+					COALESCE(MAX(observation_missing), 0) AS observation_missing,
+					COALESCE(MAX(observation_stale), 0) AS observation_stale,
+					COALESCE(MAX(observation_unavailable), 0) AS observation_unavailable,
+					COALESCE(MAX(observation_degraded), 0) AS observation_degraded,
+					COALESCE(MAX(observation_unknown), 0) AS observation_unknown,
+					MIN(last_checked_at) AS last_checked_at
+				FROM affected_data_sets
+				GROUP BY bucket_id
+			)
 			SELECT
-				current_version.bucket_id,
-				current_version.version_id,
-				storage_upload.id AS upload_id,
-				storage_upload.status AS upload_status,
-				COALESCE(storage_upload.requested_copies, 0) AS requested_copies
-			FROM current_versions AS current_version
-			LEFT JOIN latest_upload_refs AS latest_upload_ref ON latest_upload_ref.source_version_id = current_version.version_id
-			LEFT JOIN storage_uploads AS storage_upload ON storage_upload.id = COALESCE(current_version.storage_upload_id, latest_upload_ref.latest_upload_id)
-		),
-		copy_inputs AS (
-			SELECT
-				object_upload.bucket_id,
-				object_upload.version_id,
-				object_upload.upload_id,
-				object_upload.upload_status,
-				object_upload.requested_copies,
-				storage_copy.copy_index,
-				storage_copy.status AS copy_status,
-				storage_copy.provider_id,
-				storage_data_set.id AS local_data_set_id,
-				storage_data_set.data_set_id AS chain_data_set_id,
-				storage_copy.piece_id,
-				storage_copy.retrieval_url,
-				observation.status AS observation_status,
-				observation.last_checked_at AS observation_last_checked_at
-			FROM object_uploads AS object_upload
-			LEFT JOIN storage_upload_copies AS storage_copy ON storage_copy.upload_id = object_upload.upload_id
-			LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-			LEFT JOIN observability_data_set_states AS observation ON observation.local_data_set_id = storage_data_set.id
-		),
-		copy_evidence AS (
-			SELECT
-				copy_inputs.*,
+				bucket_observation.bucket_id,
+				COALESCE(bucket_abnormal.abnormal_data_sets, 0) AS abnormal_data_sets,
+				COALESCE((
+					SELECT COUNT(*)
+					FROM (
+						SELECT DISTINCT object_version.version_id
+						FROM affected_data_sets AS affected_data_set
+						JOIN storage_upload_copies AS storage_copy
+						  ON storage_copy.storage_data_set_id = affected_data_set.data_set_id
+						JOIN object_versions AS object_version
+						  ON object_version.storage_upload_id = storage_copy.upload_id
+						 AND object_version.bucket_id = affected_data_set.bucket_id
+						 AND object_version.is_delete_marker = FALSE
+						WHERE affected_data_set.bucket_id = bucket_observation.bucket_id
+						  AND storage_copy.status = 'committed'
+						  AND storage_copy.storage_data_set_id IS NOT NULL
+						LIMIT ?
+					) AS capped_affected_versions
+				), 0) AS affected_versions_seen,
+				COALESCE(affected_bucket_summary.local_status_not_ready, 0) > 0 AS local_status_not_ready,
+				COALESCE(affected_bucket_summary.observation_missing, 0) > 0 AS observation_missing,
+				(CASE
+					WHEN COALESCE(affected_bucket_summary.affected_data_sets, 0) > 0
+						THEN COALESCE(affected_bucket_summary.observation_stale, 0)
+					ELSE bucket_observation.observation_stale
+				END) > 0 AS observation_stale,
+				COALESCE(affected_bucket_summary.observation_unavailable, 0) > 0 AS observation_unavailable,
+				COALESCE(affected_bucket_summary.observation_degraded, 0) > 0 AS observation_degraded,
+				COALESCE(affected_bucket_summary.observation_unknown, 0) > 0 AS observation_unknown,
 				CASE
-					WHEN copy_status = 'committed'
-					  AND provider_id IS NOT NULL AND provider_id <> ''
-					  AND local_data_set_id IS NOT NULL AND local_data_set_id <> 0
-					  AND chain_data_set_id IS NOT NULL AND chain_data_set_id <> ''
-					  AND piece_id IS NOT NULL AND piece_id <> ''
-					  AND retrieval_url IS NOT NULL AND TRIM(retrieval_url) <> ''
-					THEN 1 ELSE 0
-				END AS has_committed_evidence
-			FROM copy_inputs
-			WHERE copy_status IS NOT NULL
-		),
-		copy_candidates AS (
-			SELECT
-				copy_evidence.*,
-				CASE
-					WHEN copy_status = 'committed'
-					  AND has_committed_evidence = 1
-					  AND observation_status = 'available'
-					  AND observation_last_checked_at IS NOT NULL
-					  AND observation_last_checked_at >= ?
-					THEN 1 ELSE 0
-				END AS is_readable,
-				CASE WHEN copy_status IN ('pending', 'piece_ready') THEN 1 ELSE 0 END AS is_pending,
-				CASE WHEN copy_status = 'committing' THEN 1 ELSE 0 END AS is_committing,
-				CASE WHEN copy_status = 'failed' THEN 1 ELSE 0 END AS is_failed,
-				CASE
-					WHEN copy_status = 'committed'
-					  AND has_committed_evidence = 1
-					  AND NOT (
-						  observation_status = 'available'
-						  AND observation_last_checked_at IS NOT NULL
-						  AND observation_last_checked_at >= ?
-					  )
-					THEN 1 ELSE 0
-				END AS is_unverified,
-				CASE
-					WHEN copy_status = 'committed' AND has_committed_evidence = 0 THEN 1
-					WHEN copy_status NOT IN ('pending', 'piece_ready', 'committing', 'committed', 'failed') THEN 1
-					ELSE 0
-				END AS is_unknown,
-				CASE WHEN copy_status = 'committed' AND (provider_id IS NULL OR provider_id = '') THEN 1 ELSE 0 END AS reason_missing_provider,
-				CASE WHEN copy_status = 'committed' AND (local_data_set_id IS NULL OR local_data_set_id = 0 OR chain_data_set_id IS NULL OR chain_data_set_id = '') THEN 1 ELSE 0 END AS reason_missing_data_set,
-				CASE WHEN copy_status = 'committed' AND (piece_id IS NULL OR piece_id = '') THEN 1 ELSE 0 END AS reason_missing_piece,
-				CASE WHEN copy_status = 'committed' AND (retrieval_url IS NULL OR TRIM(retrieval_url) = '') THEN 1 ELSE 0 END AS reason_missing_retrieval_url,
-				CASE
-					WHEN copy_status = 'committed'
-					  AND has_committed_evidence = 1
-					  AND NOT (
-						  observation_status = 'available'
-						  AND observation_last_checked_at IS NOT NULL
-						  AND observation_last_checked_at >= ?
-					  )
-					THEN 1 ELSE 0
-				END AS reason_observation_missing,
-				CASE
-					WHEN copy_status = 'committed'
-					  AND has_committed_evidence = 1
-					  AND observation_status = 'available'
-					  AND observation_last_checked_at IS NOT NULL
-					  AND observation_last_checked_at >= ? THEN 0
-					WHEN copy_status = 'committed' AND has_committed_evidence = 1 THEN 1
-					WHEN copy_status IN ('pending', 'piece_ready', 'committing') THEN 2
-					WHEN copy_status = 'failed' THEN 3
-					ELSE 4
-				END AS selection_rank
-			FROM copy_evidence
-		),
-		ranked_candidates AS (
-			SELECT
-				copy_candidates.*,
-				ROW_NUMBER() OVER (
-					PARTITION BY bucket_id, version_id
-					ORDER BY selection_rank ASC, copy_index ASC
-				) AS candidate_rank
-			FROM copy_candidates
-		),
-		selected_candidates AS (
-			SELECT *
-			FROM ranked_candidates
-			WHERE requested_copies > 0
-			  AND candidate_rank <= requested_copies
-		),
-		object_rollup AS (
-			SELECT
-				object_upload.bucket_id,
-				object_upload.version_id,
-				object_upload.upload_id,
-				object_upload.upload_status,
-				object_upload.requested_copies,
-				COUNT(selected.copy_index) AS selected_copies,
-				COALESCE(SUM(CASE WHEN selected.is_readable = 1 THEN 1 ELSE 0 END), 0) AS readable_copies,
-				COALESCE(SUM(CASE WHEN selected.is_pending = 1 OR selected.is_committing = 1 THEN 1 ELSE 0 END), 0) AS pending_selected,
-				COALESCE(SUM(CASE WHEN selected.is_failed = 1 THEN 1 ELSE 0 END), 0) AS failed_selected,
-				COALESCE(SUM(CASE WHEN selected.is_unverified = 1 OR selected.is_unknown = 1 THEN 1 ELSE 0 END), 0) AS unknown_selected,
-				COALESCE(MAX(CASE WHEN selected.is_pending = 1 OR selected.is_committing = 1 OR selected.is_failed = 1 OR selected.is_unknown = 1 THEN 1 ELSE 0 END), 0) AS selected_under_replicated,
-				COALESCE(MAX(CASE WHEN selected.is_pending = 1 THEN 1 ELSE 0 END), 0) AS selected_pending,
-				COALESCE(MAX(CASE WHEN selected.is_committing = 1 THEN 1 ELSE 0 END), 0) AS selected_committing,
-				COALESCE(MAX(CASE WHEN selected.reason_missing_provider = 1 THEN 1 ELSE 0 END), 0) AS selected_missing_provider,
-				COALESCE(MAX(CASE WHEN selected.reason_missing_data_set = 1 THEN 1 ELSE 0 END), 0) AS selected_missing_data_set,
-				COALESCE(MAX(CASE WHEN selected.reason_missing_piece = 1 THEN 1 ELSE 0 END), 0) AS selected_missing_piece,
-				COALESCE(MAX(CASE WHEN selected.reason_missing_retrieval_url = 1 THEN 1 ELSE 0 END), 0) AS selected_missing_retrieval_url,
-				COALESCE(MAX(CASE WHEN selected.reason_observation_missing = 1 THEN 1 ELSE 0 END), 0) AS selected_observation_missing,
-				MIN(selected.observation_last_checked_at) AS last_checked_at
-			FROM object_uploads AS object_upload
-			LEFT JOIN selected_candidates AS selected
-			  ON selected.bucket_id = object_upload.bucket_id
-			 AND selected.version_id = object_upload.version_id
-			GROUP BY object_upload.bucket_id, object_upload.version_id, object_upload.upload_id, object_upload.upload_status, object_upload.requested_copies
-		),
-		object_counts AS (
-			SELECT
-				object_rollup.*,
-				CASE
-					WHEN requested_copies > selected_copies THEN requested_copies - selected_copies
-					ELSE 0
-				END AS gap_copies
-			FROM object_rollup
-		),
-		object_final AS (
-			SELECT
-				object_counts.*,
-				failed_selected + CASE WHEN upload_status IN ('failed', 'rejected') THEN gap_copies ELSE 0 END AS failed_copies,
-				pending_selected + CASE WHEN upload_status IN ('running', 'ingress_ready', 'readable') THEN gap_copies ELSE 0 END AS pending_copies,
-				unknown_selected + CASE
-					WHEN upload_id IS NOT NULL AND upload_status NOT IN ('failed', 'rejected', 'running', 'ingress_ready', 'readable') THEN gap_copies
-					ELSE 0
-				END AS unknown_copies
-			FROM object_counts
-		),
-		object_health AS (
-			SELECT
-				object_final.*,
-				CASE
-					WHEN failed_copies > 0 THEN 3
-					WHEN upload_id IS NULL OR unknown_copies > 0 THEN 2
-					WHEN pending_copies > 0 THEN 1
-					ELSE 0
-				END AS status_rank,
-				CASE WHEN selected_under_replicated > 0 OR gap_copies > 0 THEN 1 ELSE 0 END AS copy_under_replicated,
-				CASE WHEN pending_copies > 0 AND (selected_pending > 0 OR gap_copies > 0 AND upload_status IN ('running', 'ingress_ready', 'readable')) THEN 1 ELSE 0 END AS copy_pending,
-				CASE WHEN pending_copies > 0 AND selected_committing > 0 THEN 1 ELSE 0 END AS copy_committing,
-				CASE WHEN failed_copies > 0 THEN 1 ELSE 0 END AS copy_failed,
-				CASE WHEN unknown_copies > 0 AND selected_missing_provider > 0 THEN 1 ELSE 0 END AS copy_missing_provider,
-				CASE WHEN unknown_copies > 0 AND selected_missing_data_set > 0 THEN 1 ELSE 0 END AS copy_missing_data_set,
-				CASE WHEN unknown_copies > 0 AND selected_missing_piece > 0 THEN 1 ELSE 0 END AS copy_missing_piece,
-				CASE WHEN unknown_copies > 0 AND selected_missing_retrieval_url > 0 THEN 1 ELSE 0 END AS copy_missing_retrieval_url,
-				CASE
-					WHEN upload_id IS NULL THEN 1
-					WHEN unknown_copies > 0 AND (selected_observation_missing > 0 OR gap_copies > 0 AND upload_status NOT IN ('failed', 'rejected', 'running', 'ingress_ready', 'readable')) THEN 1
-					ELSE 0
-				END AS copy_observation_missing
-			FROM object_final
-		)
-		SELECT
-			bucket_id,
-			CASE MAX(status_rank)
-				WHEN 3 THEN 'unavailable'
-				WHEN 2 THEN 'unknown'
-				WHEN 1 THEN 'degraded'
-				ELSE 'available'
-			END AS status,
-			COUNT(*) AS total_objects,
-			COALESCE(SUM(CASE WHEN status_rank > 0 THEN 1 ELSE 0 END), 0) AS unhealthy_objects,
-			COALESCE(SUM(requested_copies), 0) AS requested_copies,
-			COALESCE(SUM(readable_copies), 0) AS readable_copies,
-			COALESCE(SUM(pending_copies), 0) AS pending_copies,
-			COALESCE(SUM(failed_copies), 0) AS failed_copies,
-			COALESCE(SUM(unknown_copies), 0) AS unknown_copies,
-			COALESCE(SUM(copy_under_replicated), 0) > 0 AS copy_under_replicated,
-			COALESCE(SUM(copy_pending), 0) > 0 AS copy_pending,
-			COALESCE(SUM(copy_committing), 0) > 0 AS copy_committing,
-			COALESCE(SUM(copy_failed), 0) > 0 AS copy_failed,
-			COALESCE(SUM(copy_missing_provider), 0) > 0 AS copy_missing_provider,
-			COALESCE(SUM(copy_missing_data_set), 0) > 0 AS copy_missing_data_set,
-			COALESCE(SUM(copy_missing_piece), 0) > 0 AS copy_missing_piece,
-			COALESCE(SUM(copy_missing_retrieval_url), 0) > 0 AS copy_missing_retrieval_url,
-			COALESCE(SUM(copy_observation_missing), 0) > 0 AS copy_observation_missing,
-			MIN(last_checked_at) AS last_checked_at
-		FROM object_health
-		GROUP BY bucket_id
-		ORDER BY bucket_id ASC`, currentVersionBucketFilter)
-	args = append(args, staleBefore, staleBefore, staleBefore, staleBefore)
-	if err := r.db.NewRaw(query, args...).Scan(ctx, &summaries); err != nil {
-		return nil, fmt.Errorf("listing current object copy health summaries: %w", err)
+					WHEN COALESCE(affected_bucket_summary.affected_data_sets, 0) > 0
+						THEN affected_bucket_summary.last_checked_at
+					ELSE bucket_observation.last_checked_at
+				END AS last_checked_at
+			FROM bucket_observation
+			LEFT JOIN bucket_abnormal ON bucket_abnormal.bucket_id = bucket_observation.bucket_id
+			LEFT JOIN affected_bucket_summary ON affected_bucket_summary.bucket_id = bucket_observation.bucket_id
+			ORDER BY bucket_observation.bucket_id ASC`, dataSetBucketFilter, bucketStorageHealthAffectedVersionExistsSQL("abnormal_data_set"))
+	args = append(args, affectedVersionCap+1)
+	if err := r.db.NewRaw(query, args...).Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("listing bucket storage health summaries: %w", err)
+	}
+	reasonCodes, err := r.listBucketStorageHealthReasonCodes(ctx, bucketID, staleBefore)
+	if err != nil {
+		return nil, err
+	}
+	summaries := make([]BucketStorageHealthSummary, 0, len(rows))
+	for _, row := range rows {
+		affectedVersions := row.AffectedVersionsSeen
+		exceedsCap := affectedVersions > affectedVersionCap
+		if exceedsCap {
+			affectedVersions = affectedVersionCap
+		}
+		reasons := reasonCodes[row.BucketID]
+		if reasons == nil {
+			reasons = []observability.ReasonCode{}
+		}
+		summaries = append(summaries, BucketStorageHealthSummary{
+			BucketID:                   row.BucketID,
+			AbnormalDataSets:           row.AbnormalDataSets,
+			AffectedVersionsCapped:     affectedVersions,
+			AffectedVersionsCap:        affectedVersionCap,
+			AffectedVersionsExceedsCap: exceedsCap,
+			LocalStatusNotReady:        row.LocalStatusNotReady,
+			ObservationMissing:         row.ObservationMissing,
+			ObservationStale:           row.ObservationStale,
+			ObservationUnavailable:     row.ObservationUnavailable,
+			ObservationDegraded:        row.ObservationDegraded,
+			ObservationUnknown:         row.ObservationUnknown,
+			ReasonCodes:                reasons,
+			LastCheckedAt:              row.LastCheckedAt,
+		})
 	}
 	return summaries, nil
+}
+
+type bucketStorageHealthReasonCodeRow struct {
+	BucketID    int64                      `bun:"bucket_id"`
+	LocalStatus model.StorageDataSetStatus `bun:"local_status"`
+	ReasonCodes []observability.ReasonCode `bun:"reason_codes"`
+}
+
+func (r *BunStorageUploadRepo) listBucketStorageHealthReasonCodes(ctx context.Context, bucketID int64, staleBefore time.Time) (map[int64][]observability.ReasonCode, error) {
+	dataSetBucketFilter := ""
+	args := make([]interface{}, 0, 2)
+	if bucketID > 0 {
+		dataSetBucketFilter = `
+			  AND storage_data_set.bucket_id = ?`
+		args = append(args, bucketID)
+	}
+	query := fmt.Sprintf(`WITH abnormal_data_sets AS (
+			SELECT
+				storage_data_set.id AS data_set_id,
+				storage_data_set.bucket_id,
+				storage_data_set.status AS local_status,
+				COALESCE(observation.reason_codes, '[]') AS reason_codes
+			FROM storage_data_sets AS storage_data_set
+			LEFT JOIN observability_data_set_states AS observation ON observation.local_data_set_id = storage_data_set.id
+			WHERE 1 = 1
+%s
+			  AND (
+				  storage_data_set.status NOT IN ('ready', 'draining')
+				  OR observation.local_data_set_id IS NULL
+				  OR observation.status IN ('degraded', 'unavailable', 'unknown')
+				  OR observation.last_checked_at < ?
+			  )
+		)
+		SELECT DISTINCT
+				abnormal_data_set.bucket_id,
+				abnormal_data_set.local_status,
+				abnormal_data_set.reason_codes
+		FROM abnormal_data_sets AS abnormal_data_set
+		WHERE %s
+		ORDER BY abnormal_data_set.bucket_id ASC`, dataSetBucketFilter, bucketStorageHealthAffectedVersionExistsSQL("abnormal_data_set"))
+	args = append(args, staleBefore)
+	var rows []bucketStorageHealthReasonCodeRow
+	if err := r.db.NewRaw(query, args...).Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("listing bucket storage health reason codes: %w", err)
+	}
+	out := make(map[int64][]observability.ReasonCode)
+	for _, row := range rows {
+		if row.LocalStatus != model.StorageDataSetStatusReady && row.LocalStatus != model.StorageDataSetStatusDraining {
+			out[row.BucketID] = observability.AppendReasonCode(out[row.BucketID], observability.ReasonLocalStatusNotReady)
+		}
+		for _, reason := range row.ReasonCodes {
+			out[row.BucketID] = observability.AppendReasonCode(out[row.BucketID], reason)
+		}
+	}
+	return out, nil
 }
 
 func (r *BunStorageUploadRepo) ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error) {

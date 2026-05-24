@@ -104,12 +104,12 @@ type writeDeadlineRecorder struct {
 	deadlines []time.Time
 }
 
-type failingCopyHealthSummaryUploadRepo struct {
+type failingBucketStorageHealthUploadRepo struct {
 	repository.StorageUploadRepository
 }
 
-func (r failingCopyHealthSummaryUploadRepo) ListCurrentObjectCopyHealthSummaries(context.Context, int64, time.Time) ([]repository.CurrentObjectCopyHealthSummary, error) {
-	return nil, errors.New("database password leaked copy health")
+func (r failingBucketStorageHealthUploadRepo) ListBucketStorageHealthSummaries(context.Context, int64, time.Time, int) ([]repository.BucketStorageHealthSummary, error) {
+	return nil, errors.New("database password leaked storage health")
 }
 
 type apiCopyHealthBody struct {
@@ -125,6 +125,18 @@ type apiCopyHealthBody struct {
 	PendingCopies    int                        `json:"pending_copies"`
 	FailedCopies     int                        `json:"failed_copies"`
 	UnknownCopies    int                        `json:"unknown_copies"`
+}
+
+type apiBucketStorageHealthBody struct {
+	Status                     string                     `json:"status"`
+	ReasonCodes                []observability.ReasonCode `json:"reason_codes"`
+	Stale                      bool                       `json:"stale"`
+	LastCheckedAt              string                     `json:"last_checked_at"`
+	LastError                  string                     `json:"last_error"`
+	AbnormalDataSets           int                        `json:"abnormal_data_sets"`
+	AffectedVersionsCapped     int                        `json:"affected_versions_capped"`
+	AffectedVersionsCap        int                        `json:"affected_versions_cap"`
+	AffectedVersionsExceedsCap bool                       `json:"affected_versions_exceeds_cap"`
 }
 
 func (r *writeDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
@@ -1109,17 +1121,35 @@ func TestDataSetStorageHealthInfoEncodesEmptyReasonCodesArray(t *testing.T) {
 	}
 }
 
-func TestAPIBucketsCopyHealthSummaryUsesCurrentObjectCopies(t *testing.T) {
+func TestAPIBucketsStorageHealthSummaryUsesRetainedVersionRisk(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "copy-health-summary-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-health-summary-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "partial.txt", 4, "etag-partial-copy-health", "checksum-partial-copy-health", "text/plain", "", model.ObjectStateCached)
-	bindAdminPartialUpload(t, repos, versionID)
-	replaceBucketDataSetObservability(t, repos, bucket.ID, observability.StatusAvailable, nil, time.Now().UTC())
+	seedAdminObjectVersion(t, repos, bucket, "stored.txt", 4, "etag-storage-health", "checksum-storage-health", "text/plain", "", model.ObjectStateStored)
+	unreferencedUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J0000000000000000APISH0",
+		ContentSize:     1,
+		Checksum:        "checksum-unreferenced-storage-health",
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt unreferenced: %v", err)
+	}
+	if _, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        onChainID(t, "202"),
+		CopyIndex:         1,
+		CreatedByUploadID: unreferencedUpload.ID,
+	}); err != nil {
+		t.Fatalf("EnsureDataSetBinding unreferenced: %v", err)
+	}
+	checkedAt := time.Now().UTC()
+	replaceBucketDataSetObservability(t, repos, bucket.ID, observability.StatusUnavailable, []observability.ReasonCode{observability.ReasonChainDataSetMissing}, checkedAt)
 	srv.WithObservability(observability.NewService(observability.ServiceOptions{
 		Store:           repos.Observability,
 		RefreshInterval: time.Hour,
@@ -1136,23 +1166,45 @@ func TestAPIBucketsCopyHealthSummaryUsesCurrentObjectCopies(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-	var listBody []struct {
-		Name       string            `json:"name"`
-		CopyHealth apiCopyHealthBody `json:"copy_health"`
+	var rawList []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&rawList); err != nil {
+		t.Fatalf("Decode raw list: %v", err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&listBody); err != nil {
+	var rawBucket map[string]any
+	for _, item := range rawList {
+		if item["name"] == bucket.Name {
+			rawBucket = item
+			break
+		}
+	}
+	if rawBucket == nil {
+		t.Fatalf("bucket list missing %s: %#v", bucket.Name, rawList)
+	}
+	if _, ok := rawBucket["copy_health"]; ok {
+		t.Fatalf("list includes legacy copy_health: %#v", rawBucket)
+	}
+	assertNoLegacyBucketStorageHealthFields(t, rawBucket)
+	rawBytes, err := json.Marshal(rawList)
+	if err != nil {
+		t.Fatalf("Marshal raw list: %v", err)
+	}
+	var listBody []struct {
+		Name          string                     `json:"name"`
+		StorageHealth apiBucketStorageHealthBody `json:"storage_health"`
+	}
+	if err := json.Unmarshal(rawBytes, &listBody); err != nil {
 		t.Fatalf("Decode list: %v", err)
 	}
-	var listHealth *apiCopyHealthBody
+	var listHealth *apiBucketStorageHealthBody
 	for i := range listBody {
 		if listBody[i].Name == bucket.Name {
-			listHealth = &listBody[i].CopyHealth
+			listHealth = &listBody[i].StorageHealth
 		}
 	}
 	if listHealth == nil {
 		t.Fatalf("bucket list missing %s: %#v", bucket.Name, listBody)
 	}
-	assertPartialCopyHealthSummary(t, *listHealth)
+	assertUnavailableBucketStorageHealth(t, *listHealth, observability.ReasonChainDataSetMissing)
 
 	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name)
 	if err != nil {
@@ -1162,18 +1214,30 @@ func TestAPIBucketsCopyHealthSummaryUsesCurrentObjectCopies(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("detail status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
+	var rawDetail map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&rawDetail); err != nil {
+		t.Fatalf("Decode raw detail: %v", err)
+	}
+	if _, ok := rawDetail["copy_health"]; ok {
+		t.Fatalf("detail includes legacy copy_health: %#v", rawDetail)
+	}
+	assertNoLegacyBucketStorageHealthFields(t, rawDetail)
+	rawDetailBytes, err := json.Marshal(rawDetail)
+	if err != nil {
+		t.Fatalf("Marshal raw detail: %v", err)
+	}
 	var detailBody struct {
-		CopyHealth apiCopyHealthBody `json:"copy_health"`
-		DataSets   []struct {
+		StorageHealth apiBucketStorageHealthBody `json:"storage_health"`
+		DataSets      []struct {
 			StorageHealth *struct {
 				Status string `json:"status"`
 			} `json:"storage_health"`
 		} `json:"data_sets"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&detailBody); err != nil {
+	if err := json.Unmarshal(rawDetailBytes, &detailBody); err != nil {
 		t.Fatalf("Decode detail: %v", err)
 	}
-	assertPartialCopyHealthSummary(t, detailBody.CopyHealth)
+	assertUnavailableBucketStorageHealth(t, detailBody.StorageHealth, observability.ReasonChainDataSetMissing)
 	if len(detailBody.DataSets) == 0 || detailBody.DataSets[0].StorageHealth == nil {
 		t.Fatalf("detail data set storage health missing: %#v", detailBody.DataSets)
 	}
@@ -1470,15 +1534,15 @@ func TestAPIBucketObjectProvenanceUsesStoredCopyHealthObservations(t *testing.T)
 	}
 }
 
-func TestAPIBucketsCopyHealthSummaryFailureReturnsUnknown(t *testing.T) {
+func TestAPIBucketsStorageHealthSummaryFailureReturnsUnknown(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "copy-health-summary-error", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-health-summary-error", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	repos.Uploads = failingCopyHealthSummaryUploadRepo{StorageUploadRepository: repos.Uploads}
+	repos.Uploads = failingBucketStorageHealthUploadRepo{StorageUploadRepository: repos.Uploads}
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -1492,24 +1556,24 @@ func TestAPIBucketsCopyHealthSummaryFailureReturnsUnknown(t *testing.T) {
 		t.Fatalf("list status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 	var listBody []struct {
-		Name       string            `json:"name"`
-		CopyHealth apiCopyHealthBody `json:"copy_health"`
+		Name          string                     `json:"name"`
+		StorageHealth apiBucketStorageHealthBody `json:"storage_health"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&listBody); err != nil {
 		t.Fatalf("Decode list: %v", err)
 	}
-	var listHealth *apiCopyHealthBody
+	var listHealth *apiBucketStorageHealthBody
 	for i := range listBody {
 		if listBody[i].Name == bucket.Name {
-			listHealth = &listBody[i].CopyHealth
+			listHealth = &listBody[i].StorageHealth
 			break
 		}
 	}
 	if listHealth == nil {
 		t.Fatalf("bucket %q not found in list response", bucket.Name)
 	}
-	if listHealth.Status != string(observability.StatusUnknown) || listHealth.LastError != "copy health query failed" || strings.Contains(listHealth.LastError, "password") {
-		t.Fatalf("list copy_health = %#v, want sanitized unknown query failure", *listHealth)
+	if listHealth.Status != string(observability.StatusUnknown) || listHealth.LastError != "storage health query failed" || strings.Contains(listHealth.LastError, "password") {
+		t.Fatalf("list storage_health = %#v, want sanitized unknown query failure", *listHealth)
 	}
 
 	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name)
@@ -1521,23 +1585,23 @@ func TestAPIBucketsCopyHealthSummaryFailureReturnsUnknown(t *testing.T) {
 		t.Fatalf("detail status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 	var detailBody struct {
-		CopyHealth apiCopyHealthBody `json:"copy_health"`
+		StorageHealth apiBucketStorageHealthBody `json:"storage_health"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&detailBody); err != nil {
 		t.Fatalf("Decode detail: %v", err)
 	}
-	if detailBody.CopyHealth.Status != string(observability.StatusUnknown) ||
-		detailBody.CopyHealth.LastError != "copy health query failed" ||
-		strings.Contains(detailBody.CopyHealth.LastError, "password") {
-		t.Fatalf("detail copy_health = %#v, want sanitized unknown query failure", detailBody.CopyHealth)
+	if detailBody.StorageHealth.Status != string(observability.StatusUnknown) ||
+		detailBody.StorageHealth.LastError != "storage health query failed" ||
+		strings.Contains(detailBody.StorageHealth.LastError, "password") {
+		t.Fatalf("detail storage_health = %#v, want sanitized unknown query failure", detailBody.StorageHealth)
 	}
 }
 
-func TestAPIBucketsCopyHealthNoUploadObjectReturnsUnknown(t *testing.T) {
+func TestAPIBucketsStorageHealthNoUploadObjectHasNoDataRisk(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "copy-health-no-upload", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-health-no-upload", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -1554,19 +1618,30 @@ func TestAPIBucketsCopyHealthNoUploadObjectReturnsUnknown(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("detail status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-	var detailBody struct {
-		CopyHealth apiCopyHealthBody `json:"copy_health"`
+	var rawDetail map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&rawDetail); err != nil {
+		t.Fatalf("Decode raw detail: %v", err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&detailBody); err != nil {
+	if _, ok := rawDetail["copy_health"]; ok {
+		t.Fatalf("detail includes legacy copy_health: %#v", rawDetail)
+	}
+	rawDetailBytes, err := json.Marshal(rawDetail)
+	if err != nil {
+		t.Fatalf("Marshal raw detail: %v", err)
+	}
+	var detailBody struct {
+		StorageHealth apiBucketStorageHealthBody `json:"storage_health"`
+	}
+	if err := json.Unmarshal(rawDetailBytes, &detailBody); err != nil {
 		t.Fatalf("Decode detail: %v", err)
 	}
-	if detailBody.CopyHealth.Status != string(observability.StatusUnknown) ||
-		detailBody.CopyHealth.TotalObjects != 1 ||
-		detailBody.CopyHealth.UnhealthyObjects != 1 ||
-		detailBody.CopyHealth.RequestedCopies != 0 ||
-		detailBody.CopyHealth.UnknownCopies != 0 ||
-		!hasReason(detailBody.CopyHealth.ReasonCodes, observability.ReasonCopyObservationMissing) {
-		t.Fatalf("copy_health = %#v, want no-upload object marked unknown without virtual copies", detailBody.CopyHealth)
+	if detailBody.StorageHealth.Status != string(observability.StatusAvailable) ||
+		detailBody.StorageHealth.AffectedVersionsCapped != 0 ||
+		detailBody.StorageHealth.AffectedVersionsCap != 200 ||
+		detailBody.StorageHealth.AffectedVersionsExceedsCap ||
+		detailBody.StorageHealth.AbnormalDataSets != 0 ||
+		len(detailBody.StorageHealth.ReasonCodes) != 0 {
+		t.Fatalf("storage_health = %#v, want no-upload object excluded from bucket data risk", detailBody.StorageHealth)
 	}
 
 	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/objects/provenance?version_id=" + url.QueryEscape(versionID))
@@ -1590,6 +1665,20 @@ func TestAPIBucketsCopyHealthNoUploadObjectReturnsUnknown(t *testing.T) {
 		provenanceBody.CopyHealth.UnknownCopies != 0 ||
 		!hasReason(provenanceBody.CopyHealth.ReasonCodes, observability.ReasonCopyObservationMissing) {
 		t.Fatalf("provenance copy_health = %#v, want no-upload object marked unknown without virtual copies", provenanceBody.CopyHealth)
+	}
+}
+
+func TestBucketStorageHealthSummaryFromRepositoryFormatsLastCheckedAtUTC(t *testing.T) {
+	checkedAt := time.Date(2026, 5, 23, 20, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	got := bucketStorageHealthSummaryFromRepository(repository.BucketStorageHealthSummary{
+		BucketID:               1,
+		ReasonCodes:            []observability.ReasonCode{},
+		AffectedVersionsCap:    200,
+		AffectedVersionsCapped: 0,
+		LastCheckedAt:          &checkedAt,
+	})
+	if got.LastCheckedAt != "2026-05-23T12:00:00Z" {
+		t.Fatalf("last_checked_at = %q, want UTC RFC3339", got.LastCheckedAt)
 	}
 }
 
@@ -1670,19 +1759,36 @@ func copyHealthDataSetObservationForTest(localID int64, checkedAt time.Time) obs
 	}, time.Hour, checkedAt)
 }
 
-func assertPartialCopyHealthSummary(t *testing.T, health apiCopyHealthBody) {
+func assertUnavailableBucketStorageHealth(t *testing.T, health apiBucketStorageHealthBody, wantReason observability.ReasonCode) {
 	t.Helper()
 	if health.Status != string(observability.StatusUnavailable) ||
-		health.TotalObjects != 1 ||
-		health.UnhealthyObjects != 1 ||
-		health.RequestedCopies != 2 ||
-		health.ReadableCopies != 1 ||
-		health.FailedCopies != 1 ||
-		health.PendingCopies != 0 ||
-		health.UnknownCopies != 0 ||
-		!hasReason(health.ReasonCodes, observability.ReasonCopyUnderReplicated) ||
-		!hasReason(health.ReasonCodes, observability.ReasonCopyFailed) {
-		t.Fatalf("copy_health = %#v, want one under-replicated object with one failed copy", health)
+		health.AbnormalDataSets != 2 ||
+		health.AffectedVersionsCapped != 1 ||
+		health.AffectedVersionsCap != 200 ||
+		health.AffectedVersionsExceedsCap ||
+		!hasReason(health.ReasonCodes, wantReason) ||
+		hasReason(health.ReasonCodes, observability.ReasonChainDataSetInactive) {
+		t.Fatalf("storage_health = %#v, want unavailable storage source risk from one retained version", health)
+	}
+}
+
+func assertNoLegacyBucketStorageHealthFields(t *testing.T, raw map[string]any) {
+	t.Helper()
+	health, ok := raw["storage_health"].(map[string]any)
+	if !ok {
+		t.Fatalf("storage_health missing or wrong shape: %#v", raw["storage_health"])
+	}
+	for _, field := range []string{
+		"affected_data_sets",
+		"affected_objects",
+		"objects_with_readable_copy",
+		"objects_without_readable_copy",
+		"unavailable_objects",
+		"unknown_objects",
+	} {
+		if _, ok := health[field]; ok {
+			t.Fatalf("storage_health includes legacy field %q: %#v", field, health)
+		}
 	}
 }
 

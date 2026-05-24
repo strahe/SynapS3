@@ -232,26 +232,20 @@ type ReadableStorageCopy struct {
 	RetrievalURL   string          `bun:"retrieval_url"`
 }
 
-type CurrentObjectCopyHealthSummary struct {
-	BucketID                int64      `bun:"bucket_id"`
-	Status                  string     `bun:"status"`
-	TotalObjects            int        `bun:"total_objects"`
-	UnhealthyObjects        int        `bun:"unhealthy_objects"`
-	RequestedCopies         int        `bun:"requested_copies"`
-	ReadableCopies          int        `bun:"readable_copies"`
-	PendingCopies           int        `bun:"pending_copies"`
-	FailedCopies            int        `bun:"failed_copies"`
-	UnknownCopies           int        `bun:"unknown_copies"`
-	CopyUnderReplicated     bool       `bun:"copy_under_replicated"`
-	CopyPending             bool       `bun:"copy_pending"`
-	CopyCommitting          bool       `bun:"copy_committing"`
-	CopyFailed              bool       `bun:"copy_failed"`
-	CopyMissingProvider     bool       `bun:"copy_missing_provider"`
-	CopyMissingDataSet      bool       `bun:"copy_missing_data_set"`
-	CopyMissingPiece        bool       `bun:"copy_missing_piece"`
-	CopyMissingRetrievalURL bool       `bun:"copy_missing_retrieval_url"`
-	CopyObservationMissing  bool       `bun:"copy_observation_missing"`
-	LastCheckedAt           *time.Time `bun:"last_checked_at"`
+type BucketStorageHealthSummary struct {
+	BucketID                   int64 `bun:"bucket_id"`
+	AbnormalDataSets           int   `bun:"abnormal_data_sets"`
+	AffectedVersionsCapped     int
+	AffectedVersionsCap        int
+	AffectedVersionsExceedsCap bool
+	LocalStatusNotReady        bool `bun:"local_status_not_ready"`
+	ObservationMissing         bool `bun:"observation_missing"`
+	ObservationStale           bool `bun:"observation_stale"`
+	ObservationUnavailable     bool `bun:"observation_unavailable"`
+	ObservationDegraded        bool `bun:"observation_degraded"`
+	ObservationUnknown         bool `bun:"observation_unknown"`
+	ReasonCodes                []observability.ReasonCode
+	LastCheckedAt              *time.Time `bun:"last_checked_at"`
 }
 
 type StorageCleanupRepository interface {
@@ -351,7 +345,7 @@ type StorageUploadRepository interface {
 	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
 	ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
-	ListCurrentObjectCopyHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time) ([]CurrentObjectCopyHealthSummary, error)
+	ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
 	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
 	GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error)

@@ -138,7 +138,7 @@ export interface BucketItem {
   status: string
   object_count: number
   total_size_bytes: number
-  copy_health: CopyHealthSummary
+  storage_health: BucketStorageHealthSummary
   created_at: string
 }
 
@@ -174,6 +174,18 @@ export interface DataSetStorageHealthInfo {
   last_checked_at?: string
   last_error?: string
   stale: boolean
+}
+
+export interface BucketStorageHealthSummary {
+  status: StorageHealthStatus
+  reason_codes: string[]
+  stale: boolean
+  last_checked_at?: string
+  last_error?: string
+  abnormal_data_sets: number
+  affected_versions_capped: number
+  affected_versions_cap: number
+  affected_versions_exceeds_cap: boolean
 }
 
 export interface CopyHealthInfo {

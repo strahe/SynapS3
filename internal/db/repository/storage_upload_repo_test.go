@@ -340,87 +340,142 @@ func TestStorageUploadRepo_GetUploadProvenanceIncludesCopiesAndFailures(t *testi
 	}
 }
 
-func TestStorageUploadRepo_ListCurrentObjectCopyHealthSummariesClassifiesCurrentObjects(t *testing.T) {
+func TestStorageUploadRepo_ListBucketStorageHealthSummariesClassifiesRetainedVersionRisk(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := seedBucket(t, db, "copy-health-summary-repo-bucket")
-	otherBucket := seedBucket(t, db, "copy-health-summary-other-bucket")
-	checkedAt := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	bucket := seedBucket(t, db, "storage-health-risk-bucket")
+	otherBucket := seedBucket(t, db, "storage-health-other-bucket")
+	checkedAt := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	staleBefore := checkedAt.Add(-time.Hour)
 
-	oldVersion := newObjectVersion(bucket.ID, "healthy.txt", "01J0000000000000000CHOLD", 9)
+	redundantVersion := newObjectVersion(bucket.ID, "redundant.txt", "01J0000000000000000SHREDU", 4)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, redundantVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent redundant: %v", err)
+	}
+	redundantUpload := startCopyHealthUpload(t, repos, bucket.ID, redundantVersion.VersionID, redundantVersion.Size, redundantVersion.Checksum, 2)
+	degraded := commitStorageHealthCopy(t, repos, bucket.ID, redundantUpload.ID, 0, "101", "2101", "3101", "https://provider.example/degraded")
+	readable := commitStorageHealthCopy(t, repos, bucket.ID, redundantUpload.ID, 1, "202", "2202", "3202", "https://provider.example/readable")
+	bindStorageHealthVersion(t, repos, bucket.ID, redundantUpload.ID, redundantVersion)
+
+	unavailableVersion := newObjectVersion(bucket.ID, "unavailable.txt", "01J0000000000000000SHUNAV", 5)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unavailableVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent unavailable: %v", err)
+	}
+	unavailableUpload := startCopyHealthUpload(t, repos, bucket.ID, unavailableVersion.VersionID, unavailableVersion.Size, unavailableVersion.Checksum, 1)
+	unavailable := commitStorageHealthCopy(t, repos, bucket.ID, unavailableUpload.ID, 2, "303", "2303", "3303", "https://provider.example/unavailable")
+	bindStorageHealthVersion(t, repos, bucket.ID, unavailableUpload.ID, unavailableVersion)
+	if err := repos.Uploads.MarkDataSetUnavailable(ctx, unavailable.ID, "provider offline"); err != nil {
+		t.Fatalf("MarkDataSetUnavailable: %v", err)
+	}
+
+	unknownVersion := newObjectVersion(bucket.ID, "unknown.txt", "01J0000000000000000SHUNKN", 6)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unknownVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent unknown: %v", err)
+	}
+	unknownUpload := startCopyHealthUpload(t, repos, bucket.ID, unknownVersion.VersionID, unknownVersion.Size, unknownVersion.Checksum, 1)
+	commitStorageHealthCopy(t, repos, bucket.ID, unknownUpload.ID, 3, "404", "2404", "3404", "https://provider.example/unknown")
+	bindStorageHealthVersion(t, repos, bucket.ID, unknownUpload.ID, unknownVersion)
+
+	oldVersion := newObjectVersion(bucket.ID, "old.txt", "01J0000000000000000SHOLD1", 7)
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent old: %v", err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, oldVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("old uploading: %v", err)
-	}
-	startCopyHealthUpload(t, repos, bucket.ID, oldVersion.VersionID, oldVersion.Size, oldVersion.Checksum, 5)
-
-	noUpload := newObjectVersion(bucket.ID, "no-upload.txt", "01J0000000000000000CHNOUP", 1)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, noUpload); err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent no upload: %v", err)
+	oldUpload := startCopyHealthUpload(t, repos, bucket.ID, oldVersion.VersionID, oldVersion.Size, oldVersion.Checksum, 1)
+	oldUnavailable := commitStorageHealthCopy(t, repos, bucket.ID, oldUpload.ID, 4, "505", "2505", "3505", "https://provider.example/old")
+	bindStorageHealthVersion(t, repos, bucket.ID, oldUpload.ID, oldVersion)
+	replacementVersion := newObjectVersion(bucket.ID, "old.txt", "01J0000000000000000SHCURR", 8)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacementVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent replacement: %v", err)
 	}
 
-	runningNoCopies := newObjectVersion(bucket.ID, "running.txt", "01J0000000000000000CHRUN", 2)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, runningNoCopies); err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent running: %v", err)
+	deleteVersion := newObjectVersion(bucket.ID, "deleted.txt", "01J0000000000000000SHDEL1", 9)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, deleteVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent delete data: %v", err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, runningNoCopies.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("running uploading: %v", err)
+	deleteUpload := startCopyHealthUpload(t, repos, bucket.ID, deleteVersion.VersionID, deleteVersion.Size, deleteVersion.Checksum, 1)
+	deleteUnavailable := commitStorageHealthCopy(t, repos, bucket.ID, deleteUpload.ID, 5, "606", "2606", "3606", "https://provider.example/delete")
+	bindStorageHealthVersion(t, repos, bucket.ID, deleteUpload.ID, deleteVersion)
+	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "deleted.txt", "01J0000000000000000SHDELM"); err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
 	}
-	startCopyHealthUpload(t, repos, bucket.ID, runningNoCopies.VersionID, runningNoCopies.Size, runningNoCopies.Checksum, 2)
 
-	failedNoCopies := newObjectVersion(bucket.ID, "failed.txt", "01J0000000000000000CHFAIL", 3)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, failedNoCopies); err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent failed: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionState(ctx, failedNoCopies.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("failed uploading: %v", err)
-	}
-	failedUpload := startCopyHealthUpload(t, repos, bucket.ID, failedNoCopies.VersionID, failedNoCopies.Size, failedNoCopies.Checksum, 3)
-	mustExec(t, db, `UPDATE storage_uploads SET status = ?, error_message = ? WHERE id = ?`, model.StorageUploadStatusFailed, "provider rejected piece", failedUpload.ID)
+	unreferencedUpload := startCopyHealthUpload(t, repos, bucket.ID, "01J0000000000000000SHUNRF", 1, "checksum-unreferenced", 1)
+	unreferenced := commitStorageHealthCopy(t, repos, bucket.ID, unreferencedUpload.ID, 6, "707", "2707", "3707", "https://provider.example/unreferenced")
 
-	healthy := newObjectVersion(bucket.ID, "healthy.txt", "01J0000000000000000CHGOOD", 4)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, healthy); err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent healthy: %v", err)
+	otherVersion := newObjectVersion(otherBucket.ID, "other.txt", "01J0000000000000000SHOTHR", 9)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, otherVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent other: %v", err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, healthy.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("healthy uploading: %v", err)
-	}
-	healthyUpload := startCopyHealthUpload(t, repos, bucket.ID, healthy.VersionID, healthy.Size, healthy.Checksum, 1)
-	healthyBinding := ensureCopyHealthBinding(t, repos, bucket.ID, healthyUpload.ID, 0, "101")
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: healthyBinding.ID, UploadID: healthyUpload.ID, DataSetID: onChainID(t, "2101")}); err != nil {
-		t.Fatalf("MarkDataSetReady healthy: %v", err)
-	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, healthyUpload.ID, []repository.UploadCopyBindingInput{{
-		StorageDataSetID: healthyBinding.ID,
-		CopyIndex:        0,
-		TransferMethod:   model.StorageCopyTransferMethodIngress,
-		ProviderID:       onChainID(t, "101"),
-	}}); err != nil {
-		t.Fatalf("CreateUploadCopiesForBindings healthy: %v", err)
-	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     healthyUpload.ID,
-		CopyIndex:    0,
-		PieceCID:     "bafk2bzacecopyhealthsummary",
-		PieceID:      onChainIDPtr(t, "3101"),
-		RetrievalURL: "https://provider.example/healthy",
+	otherUpload := startCopyHealthUpload(t, repos, otherBucket.ID, otherVersion.VersionID, otherVersion.Size, otherVersion.Checksum, 1)
+	otherUnavailable := commitStorageHealthCopy(t, repos, otherBucket.ID, otherUpload.ID, 0, "808", "2808", "3808", "https://provider.example/other")
+	bindStorageHealthVersion(t, repos, otherBucket.ID, otherUpload.ID, otherVersion)
+
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
+		{LocalDataSetID: degraded.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: onChainID(t, "101"), Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: readable.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 1, ProviderID: onChainID(t, "202"), Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: unavailable.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: onChainID(t, "303"), Status: observability.StatusUnavailable, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetMissing}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: oldUnavailable.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: onChainID(t, "505"), Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: deleteUnavailable.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: onChainID(t, "606"), Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: unreferenced.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: onChainID(t, "707"), Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: otherUnavailable.ID, BucketID: otherBucket.ID, BucketName: otherBucket.Name, CopyIndex: 0, ProviderID: onChainID(t, "808"), Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
 	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitted healthy: %v", err)
+		t.Fatalf("ReplaceDataSetStates: %v", err)
 	}
-	if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
-		UploadID:    healthyUpload.ID,
-		BucketID:    bucket.ID,
-		ContentSize: healthy.Size,
-		Checksum:    healthy.Checksum,
-		VersionID:   healthy.VersionID,
-	}); err != nil {
-		t.Fatalf("BindReadableUploadForVersion healthy: %v", err)
+
+	summaries, err := repos.Uploads.ListBucketStorageHealthSummaries(ctx, bucket.ID, staleBefore, 4)
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthSummaries: %v", err)
 	}
+	if len(summaries) != 1 {
+		t.Fatalf("summaries len = %d, want one bucket summary: %#v", len(summaries), summaries)
+	}
+	got := summaries[0]
+	if got.BucketID != bucket.ID ||
+		got.AbnormalDataSets != 6 ||
+		got.AffectedVersionsCapped != 4 ||
+		!got.AffectedVersionsExceedsCap ||
+		got.AffectedVersionsCap != 4 ||
+		!got.LocalStatusNotReady ||
+		!got.ObservationUnavailable ||
+		!got.ObservationDegraded ||
+		!got.ObservationMissing ||
+		got.ObservationStale ||
+		!hasStorageHealthReason(got.ReasonCodes, observability.ReasonChainDataSetUnmanaged) ||
+		!hasStorageHealthReason(got.ReasonCodes, observability.ReasonChainDataSetMissing) ||
+		!hasStorageHealthReason(got.ReasonCodes, observability.ReasonLocalStatusNotReady) ||
+		hasStorageHealthReason(got.ReasonCodes, observability.ReasonChainDataSetInactive) ||
+		got.LastCheckedAt == nil ||
+		!got.LastCheckedAt.Equal(checkedAt) {
+		t.Fatalf("summary = %#v, want retained version risk from affected abnormal data sets only", got)
+	}
+
+	allSummaries, err := repos.Uploads.ListBucketStorageHealthSummaries(ctx, 0, staleBefore, 200)
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthSummaries all: %v", err)
+	}
+	if len(allSummaries) != 2 {
+		t.Fatalf("all summaries len = %d, want both buckets with abnormal data sets: %#v", len(allSummaries), allSummaries)
+	}
+}
+
+func TestStorageUploadRepo_ListBucketStorageHealthSummariesReturnsHealthyBucketFreshness(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "storage-health-healthy-bucket")
+	checkedAt := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	staleBefore := checkedAt.Add(-time.Hour)
+
+	version := newObjectVersion(bucket.ID, "healthy.txt", "01J0000000000000000SHGOOD", 4)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 1)
+	ready := commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "2101", "3101", "https://provider.example/healthy")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
 	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{{
-		LocalDataSetID: healthyBinding.ID,
+		LocalDataSetID: ready.ID,
 		BucketID:       bucket.ID,
 		BucketName:     bucket.Name,
 		CopyIndex:      0,
@@ -432,186 +487,118 @@ func TestStorageUploadRepo_ListCurrentObjectCopyHealthSummariesClassifiesCurrent
 		t.Fatalf("ReplaceDataSetStates: %v", err)
 	}
 
-	otherVersion := newObjectVersion(otherBucket.ID, "other.txt", "01J0000000000000000CHSUMO", 5)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, otherVersion); err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent other: %v", err)
-	}
-	startCopyHealthUpload(t, repos, otherBucket.ID, otherVersion.VersionID, otherVersion.Size, otherVersion.Checksum, 1)
-
-	summaries, err := repos.Uploads.ListCurrentObjectCopyHealthSummaries(ctx, bucket.ID, checkedAt.Add(-time.Hour))
+	summaries, err := repos.Uploads.ListBucketStorageHealthSummaries(ctx, bucket.ID, staleBefore, 200)
 	if err != nil {
-		t.Fatalf("ListCurrentObjectCopyHealthSummaries: %v", err)
+		t.Fatalf("ListBucketStorageHealthSummaries: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("summaries len = %d, want one healthy bucket summary: %#v", len(summaries), summaries)
+	}
+	got := summaries[0]
+	if got.BucketID != bucket.ID ||
+		got.AbnormalDataSets != 0 ||
+		got.AffectedVersionsCapped != 0 ||
+		got.AffectedVersionsExceedsCap ||
+		got.ObservationStale ||
+		len(got.ReasonCodes) != 0 ||
+		got.LastCheckedAt == nil ||
+		!got.LastCheckedAt.Equal(checkedAt) {
+		t.Fatalf("summary = %#v, want available bucket observation freshness without data risk", got)
+	}
+}
+
+func TestStorageUploadRepo_ListBucketStorageHealthSummariesReportsNoAffectedStaleFreshness(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "storage-health-stale-unaffected-bucket")
+	checkedAt := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	staleBefore := checkedAt.Add(-time.Hour)
+	staleCheckedAt := checkedAt.Add(-2 * time.Hour)
+
+	upload := startCopyHealthUpload(t, repos, bucket.ID, "01J0000000000000000SHORPH", 1, "checksum-orphan", 1)
+	stale := commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "2101", "3101", "https://provider.example/stale-unaffected")
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{{
+		LocalDataSetID: stale.ID,
+		BucketID:       bucket.ID,
+		BucketName:     bucket.Name,
+		CopyIndex:      0,
+		ProviderID:     onChainID(t, "101"),
+		Status:         observability.StatusAvailable,
+		LastCheckedAt:  staleCheckedAt,
+		Evidence:       map[string]any{},
+	}}); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+
+	summaries, err := repos.Uploads.ListBucketStorageHealthSummaries(ctx, bucket.ID, staleBefore, 200)
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthSummaries: %v", err)
 	}
 	if len(summaries) != 1 {
 		t.Fatalf("summaries len = %d, want one bucket summary: %#v", len(summaries), summaries)
 	}
 	got := summaries[0]
 	if got.BucketID != bucket.ID ||
-		got.Status != string(observability.StatusUnavailable) ||
-		got.TotalObjects != 4 ||
-		got.UnhealthyObjects != 3 ||
-		got.RequestedCopies != 6 ||
-		got.ReadableCopies != 1 ||
-		got.PendingCopies != 2 ||
-		got.FailedCopies != 3 ||
-		got.UnknownCopies != 0 ||
-		!got.CopyUnderReplicated ||
-		!got.CopyPending ||
-		!got.CopyFailed ||
-		!got.CopyObservationMissing {
-		t.Fatalf("summary = %#v, want no-upload, pending gap, failed gap, and one healthy copy", got)
-	}
-	if got.LastCheckedAt == nil || !got.LastCheckedAt.Equal(checkedAt) {
-		t.Fatalf("last checked at = %v, want %s", got.LastCheckedAt, checkedAt)
-	}
-
-	allSummaries, err := repos.Uploads.ListCurrentObjectCopyHealthSummaries(ctx, 0, checkedAt.Add(-time.Hour))
-	if err != nil {
-		t.Fatalf("ListCurrentObjectCopyHealthSummaries all: %v", err)
-	}
-	if len(allSummaries) != 2 {
-		t.Fatalf("all summaries len = %d, want both buckets: %#v", len(allSummaries), allSummaries)
+		got.AbnormalDataSets != 1 ||
+		got.AffectedVersionsCapped != 0 ||
+		got.AffectedVersionsExceedsCap ||
+		!got.ObservationStale ||
+		got.ObservationMissing ||
+		got.ObservationUnavailable ||
+		got.ObservationDegraded ||
+		got.ObservationUnknown ||
+		len(got.ReasonCodes) != 0 ||
+		got.LastCheckedAt == nil ||
+		!got.LastCheckedAt.Equal(staleCheckedAt) {
+		t.Fatalf("summary = %#v, want stale bucket observation freshness without affected retained versions", got)
 	}
 }
 
-func TestStorageUploadRepo_ListCurrentObjectCopyHealthSummariesTreatsUnobservedCommittedCopyAsNotVerified(t *testing.T) {
+func TestStorageUploadRepo_ListBucketStorageHealthSummariesTreatsStaleOnlyRiskAsUnknown(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := seedBucket(t, db, "copy-health-unobserved-committed-bucket")
-	checkedAt := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	bucket := seedBucket(t, db, "storage-health-stale-bucket")
+	checkedAt := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	staleBefore := checkedAt.Add(-time.Hour)
 
-	version := newObjectVersion(bucket.ID, "unverified.txt", "01J0000000000000000CHUNVR", 4)
+	version := newObjectVersion(bucket.ID, "stale.txt", "01J0000000000000000SHSTAL", 4)
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
 	}
 	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 1)
-	binding := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 0, "101")
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2101")}); err != nil {
-		t.Fatalf("MarkDataSetReady: %v", err)
-	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
-		StorageDataSetID: binding.ID,
-		CopyIndex:        0,
-		TransferMethod:   model.StorageCopyTransferMethodIngress,
-		ProviderID:       onChainID(t, "101"),
+	stale := commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "2101", "3101", "https://provider.example/stale")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
+	staleCheckedAt := checkedAt.Add(-2 * time.Hour)
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{{
+		LocalDataSetID: stale.ID,
+		BucketID:       bucket.ID,
+		BucketName:     bucket.Name,
+		CopyIndex:      0,
+		ProviderID:     onChainID(t, "101"),
+		Status:         observability.StatusAvailable,
+		LastCheckedAt:  staleCheckedAt,
+		Evidence:       map[string]any{},
 	}}); err != nil {
-		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
-	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     upload.ID,
-		CopyIndex:    0,
-		PieceCID:     "bafk2bzacecopyhealthunverified",
-		PieceID:      onChainIDPtr(t, "3101"),
-		RetrievalURL: "https://provider.example/unverified",
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitted: %v", err)
-	}
-
-	summaries, err := repos.Uploads.ListCurrentObjectCopyHealthSummaries(ctx, bucket.ID, checkedAt.Add(-time.Hour))
-	if err != nil {
-		t.Fatalf("ListCurrentObjectCopyHealthSummaries: %v", err)
-	}
-	if len(summaries) != 1 {
-		t.Fatalf("summaries len = %d, want one bucket summary: %#v", len(summaries), summaries)
-	}
-	got := summaries[0]
-	if got.Status != string(observability.StatusUnknown) ||
-		got.TotalObjects != 1 ||
-		got.UnhealthyObjects != 1 ||
-		got.RequestedCopies != 1 ||
-		got.ReadableCopies != 0 ||
-		got.UnknownCopies != 1 ||
-		got.CopyUnderReplicated ||
-		!got.CopyObservationMissing {
-		t.Fatalf("summary = %#v, want unobserved committed copy marked not verified without under-replication", got)
-	}
-}
-
-func TestStorageUploadRepo_ListCurrentObjectCopyHealthSummariesIgnoresExtraStaleCopyAfterRequestedCopiesMet(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	bucket := seedBucket(t, db, "copy-health-extra-stale-bucket")
-	checkedAt := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
-	staleCheckedAt := checkedAt.Add(-3 * time.Hour)
-	staleBefore := checkedAt.Add(-time.Hour)
-
-	version := newObjectVersion(bucket.ID, "healthy.txt", "01J0000000000000000CHEXST", 4)
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
-		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
-	}
-	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 2)
-	first := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 0, "101")
-	second := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 1, "202")
-	extra := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 2, "303")
-	for _, input := range []struct {
-		binding   *model.StorageDataSet
-		dataSetID string
-	}{
-		{binding: first, dataSetID: "2101"},
-		{binding: second, dataSetID: "2202"},
-		{binding: extra, dataSetID: "2303"},
-	} {
-		if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: input.binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, input.dataSetID)}); err != nil {
-			t.Fatalf("MarkDataSetReady: %v", err)
-		}
-	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: first.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: second.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
-		{StorageDataSetID: extra.ID, CopyIndex: 2, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "303")},
-	}); err != nil {
-		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
-	}
-	for _, input := range []struct {
-		copyIndex int
-		pieceID   string
-		url       string
-	}{
-		{copyIndex: 0, pieceID: "3101", url: "https://provider.example/one"},
-		{copyIndex: 1, pieceID: "3202", url: "https://provider.example/two"},
-		{copyIndex: 2, pieceID: "3303", url: "https://provider.example/stale-extra"},
-	} {
-		if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-			UploadID:     upload.ID,
-			CopyIndex:    input.copyIndex,
-			PieceCID:     "bafk2bzacecopyhealthextrastale",
-			PieceID:      onChainIDPtr(t, input.pieceID),
-			RetrievalURL: input.url,
-		}); err != nil {
-			t.Fatalf("MarkUploadCopyCommitted: %v", err)
-		}
-	}
-	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
-		{LocalDataSetID: first.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
-		{LocalDataSetID: second.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 1, ProviderID: onChainID(t, "202"), Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
-		{LocalDataSetID: extra.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 2, ProviderID: onChainID(t, "303"), Status: observability.StatusAvailable, LastCheckedAt: staleCheckedAt, Evidence: map[string]any{}},
-	}); err != nil {
 		t.Fatalf("ReplaceDataSetStates: %v", err)
 	}
 
-	summaries, err := repos.Uploads.ListCurrentObjectCopyHealthSummaries(ctx, bucket.ID, staleBefore)
+	summaries, err := repos.Uploads.ListBucketStorageHealthSummaries(ctx, bucket.ID, staleBefore, 200)
 	if err != nil {
-		t.Fatalf("ListCurrentObjectCopyHealthSummaries: %v", err)
+		t.Fatalf("ListBucketStorageHealthSummaries: %v", err)
 	}
 	if len(summaries) != 1 {
 		t.Fatalf("summaries len = %d, want one bucket summary: %#v", len(summaries), summaries)
 	}
 	got := summaries[0]
-	if got.Status != string(observability.StatusAvailable) ||
-		got.TotalObjects != 1 ||
-		got.UnhealthyObjects != 0 ||
-		got.RequestedCopies != 2 ||
-		got.ReadableCopies != 2 ||
-		got.PendingCopies != 0 ||
-		got.FailedCopies != 0 ||
-		got.UnknownCopies != 0 ||
-		got.CopyUnderReplicated ||
-		got.CopyObservationMissing ||
+	if got.AffectedVersionsCapped != 1 ||
+		got.AffectedVersionsCap != 200 ||
+		got.AffectedVersionsExceedsCap ||
+		!got.ObservationStale ||
 		got.LastCheckedAt == nil ||
-		!got.LastCheckedAt.Equal(checkedAt) {
-		t.Fatalf("summary = %#v, want requested copies met without extra stale copy affecting health", got)
+		!got.LastCheckedAt.Equal(staleCheckedAt) {
+		t.Fatalf("summary = %#v, want stale-only risk classified as unknown", got)
 	}
 }
 
@@ -1628,6 +1615,65 @@ func ensureCopyHealthBinding(t *testing.T, repos *repository.Repositories, bucke
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
 	return binding
+}
+
+func commitStorageHealthCopy(t *testing.T, repos *repository.Repositories, bucketID int64, uploadID int64, copyIndex int, providerID, dataSetID, pieceID, retrievalURL string) *model.StorageDataSet {
+	t.Helper()
+	binding := ensureCopyHealthBinding(t, repos, bucketID, uploadID, copyIndex, providerID)
+	if err := repos.Uploads.MarkDataSetReady(context.Background(), repository.MarkDataSetReadyInput{
+		ID:        binding.ID,
+		UploadID:  uploadID,
+		DataSetID: onChainID(t, dataSetID),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(context.Background(), uploadID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        copyIndex,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       onChainID(t, providerID),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(context.Background(), repository.MarkUploadCopyCommittedInput{
+		UploadID:     uploadID,
+		CopyIndex:    copyIndex,
+		PieceCID:     "bafk2bzacestorhealth",
+		PieceID:      onChainIDPtr(t, pieceID),
+		RetrievalURL: retrievalURL,
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	got, err := repos.Uploads.GetDataSetBindingByID(context.Background(), binding.ID)
+	if err != nil {
+		t.Fatalf("GetDataSetBindingByID: %v", err)
+	}
+	return got
+}
+
+func bindStorageHealthVersion(t *testing.T, repos *repository.Repositories, bucketID int64, uploadID int64, version *model.ObjectVersion) {
+	t.Helper()
+	if err := repos.Objects.UpdateVersionState(context.Background(), version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState uploading: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForVersion(context.Background(), repository.BindReadableUploadForVersionInput{
+		UploadID:    uploadID,
+		BucketID:    bucketID,
+		ContentSize: version.Size,
+		Checksum:    version.Checksum,
+		VersionID:   version.VersionID,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForVersion: %v", err)
+	}
+}
+
+func hasStorageHealthReason(reasons []observability.ReasonCode, want observability.ReasonCode) bool {
+	for _, reason := range reasons {
+		if reason == want {
+			return true
+		}
+	}
+	return false
 }
 
 func strPtr(v string) *string {

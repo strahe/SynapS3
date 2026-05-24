@@ -22,8 +22,8 @@ import {
 import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   api,
+  type BucketStorageHealthSummary,
   type CopyHealthInfo,
-  type CopyHealthSummary,
   type DeletedObjectItem,
   maxFOCUploadSize,
   minFOCUploadSize,
@@ -117,6 +117,13 @@ import {
   copyPolicyOptions,
   inheritedCopyPolicyValue,
 } from '@/lib/bucket-copy-policy'
+import {
+  bucketStorageHealthAffectedVersionsLabel,
+  bucketStorageHealthLabel,
+  bucketStorageHealthObservationLabel,
+  bucketStorageHealthStatusTone,
+  bucketStorageHealthTitle,
+} from '@/lib/bucket-storage-health'
 import {
   copyHealthInfoTitle,
   copyHealthStatusLabel,
@@ -1719,7 +1726,7 @@ function BucketDetailsSheet({
   onChangeOwner: () => void
   onDeleteBucket: () => void
 }) {
-  const [objectCopyHealthError, setObjectCopyHealthError] = useState<string | null>(null)
+  const [storageHealthError, setStorageHealthError] = useState<string | null>(null)
 
   return (
     <>
@@ -1739,7 +1746,7 @@ function BucketDetailsSheet({
               <BucketDetailsSection title="Overview">
                 <BucketDetailsOverview bucket={bucket} />
               </BucketDetailsSection>
-              <BucketCopyHealthSummary health={bucket.copy_health} onOpenLastError={setObjectCopyHealthError} />
+              <BucketStorageHealthPanel health={bucket.storage_health} onOpenLastError={setStorageHealthError} />
               <BucketDetailsSection title="Storage">
                 <BucketStorageDataSets bucketName={bucket.name} dataSets={bucket.data_sets ?? []} />
               </BucketDetailsSection>
@@ -1756,9 +1763,9 @@ function BucketDetailsSheet({
         </SheetContent>
       </Sheet>
       <DetailTextDialog
-        title="Object Copy Health Error"
-        text={objectCopyHealthError}
-        onClose={() => setObjectCopyHealthError(null)}
+        title="Storage Health Error"
+        text={storageHealthError}
+        onClose={() => setStorageHealthError(null)}
       />
     </>
   )
@@ -1799,11 +1806,11 @@ function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<type
   )
 }
 
-function BucketCopyHealthSummary({
+function BucketStorageHealthPanel({
   health,
   onOpenLastError,
 }: {
-  health: CopyHealthSummary
+  health: BucketStorageHealthSummary
   onOpenLastError: (error: string) => void
 }) {
   const lastError = health.last_error
@@ -1811,24 +1818,29 @@ function BucketCopyHealthSummary({
   return (
     <Card size="sm">
       <CardHeader>
-        <CardTitle>Object Copy Health</CardTitle>
-        <CardAction title={copyHealthSummaryTitle(health)}>
-          <StatusBadge tone={copyHealthStatusTone(health)}>{copyHealthSummaryLabel(health)}</StatusBadge>
+        <CardTitle>Storage Health</CardTitle>
+        <CardAction title={bucketStorageHealthTitle(health)}>
+          <StatusBadge tone={bucketStorageHealthStatusTone(health)}>{bucketStorageHealthLabel(health)}</StatusBadge>
         </CardAction>
       </CardHeader>
       <CardContent>
         <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
           <BucketDetailField
-            label="Objects needing attention"
-            value={`${formatNumber(health.unhealthy_objects)} of ${formatNumber(health.total_objects)}`}
+            label="Retained versions at risk"
+            value={bucketStorageHealthAffectedVersionsLabel(health)}
+            title="Capped list triage count, not a diagnostic total"
+          />
+          <BucketDetailField label="Abnormal data sets" value={formatNumber(health.abnormal_data_sets)} />
+          <BucketDetailField
+            label="Observation"
+            value={bucketStorageHealthObservationLabel(health)}
+            title={health.last_checked_at}
           />
           <BucketDetailField
-            label="Readable object copies"
-            value={`${formatNumber(health.readable_copies)} of ${formatNumber(health.requested_copies)}`}
+            label="Checked"
+            value={health.last_checked_at ? timeAgo(health.last_checked_at) : 'Not checked'}
+            title={health.last_checked_at}
           />
-          <BucketDetailField label="Pending object copies" value={formatObjectCopyCount(health.pending_copies)} />
-          <BucketDetailField label="Failed object copies" value={formatObjectCopyCount(health.failed_copies)} />
-          <BucketDetailField label="Unverified object copies" value={formatObjectCopyCount(health.unknown_copies)} />
           {lastError && (
             <BucketDetailAction label="Last error" value="Error details" onClick={() => onOpenLastError(lastError)} />
           )}
@@ -1836,10 +1848,6 @@ function BucketCopyHealthSummary({
       </CardContent>
     </Card>
   )
-}
-
-function formatObjectCopyCount(count: number) {
-  return `${formatNumber(count)} object ${count === 1 ? 'copy' : 'copies'}`
 }
 
 function BucketDetailField({
