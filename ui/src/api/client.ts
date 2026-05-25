@@ -376,6 +376,43 @@ export interface ObjectVersionListResponse {
   next_version_marker?: string
 }
 
+export interface BucketStorageRiskDataSet {
+  local_data_set_id: number
+  bucket_id: number
+  copy_index: number
+  provider_id: string
+  provider_identity?: ProviderIdentity
+  data_set_id?: string
+  client_data_set_id?: string
+  local_status: string
+  storage_health: DataSetStorageHealthInfo
+}
+
+export interface BucketStorageRiskVersion {
+  key: string
+  version_id: string
+  size: number
+  state: ObjectState
+  is_current: boolean
+  in_cache: boolean
+  content_type: string
+  etag: string
+  created_at: string
+  updated_at: string
+  readable_alternative_count: number
+  has_readable_alternative: boolean
+  risk_data_sets: BucketStorageRiskDataSet[]
+}
+
+export interface BucketStorageRiskVersionsResponse {
+  versions: BucketStorageRiskVersion[]
+  has_more: boolean
+  next_key_marker?: string
+  next_version_marker?: string
+  next_created_at_marker?: string
+  stale_before: string
+}
+
 export interface ObjectStatusDetail {
   version_id: string
   state: ObjectState
@@ -1066,6 +1103,33 @@ export const api = {
     if (params.version_marker) sp.set('version_marker', params.version_marker)
     return fetchJSON<ObjectVersionListResponse>(
       `/buckets/${encodeURIComponent(name)}/objects/versions?${sp.toString()}`
+    )
+  },
+  getBucketStorageRiskVersions: (
+    name: string,
+    params: {
+      prefix?: string
+      key?: string
+      local_data_set_id?: number
+      key_marker?: string
+      version_marker?: string
+      created_at_marker?: string
+      stale_before?: string
+      limit?: number
+    }
+  ) => {
+    const sp = new URLSearchParams()
+    if (params.prefix) sp.set('prefix', params.prefix)
+    if (params.key) sp.set('key', params.key)
+    if (params.local_data_set_id) sp.set('local_data_set_id', params.local_data_set_id.toString())
+    if (params.key_marker) sp.set('key_marker', params.key_marker)
+    if (params.version_marker) sp.set('version_marker', params.version_marker)
+    if (params.created_at_marker) sp.set('created_at_marker', params.created_at_marker)
+    if (params.stale_before) sp.set('stale_before', params.stale_before)
+    if (params.limit) sp.set('limit', params.limit.toString())
+    const qs = sp.toString()
+    return fetchJSON<BucketStorageRiskVersionsResponse>(
+      `/buckets/${encodeURIComponent(name)}/storage-health/affected-versions${qs ? `?${qs}` : ''}`
     )
   },
   getObjectStatusDetail: (name: string, versionId: string) =>

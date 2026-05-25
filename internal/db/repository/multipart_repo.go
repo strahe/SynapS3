@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -55,8 +54,7 @@ func (r *BunMultipartRepo) ListByBucket(
 		OrderExpr("key ASC, upload_id ASC")
 
 	if prefix != "" {
-		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
-		q = q.Where("key LIKE ? ESCAPE '\\'", escaped+"%")
+		q = applyCaseSensitivePrefixFilter(r.db, q, "key", prefix)
 	}
 	if keyMarker != "" {
 		if uploadIDMarker != "" {

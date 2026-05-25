@@ -61,6 +61,28 @@ export function useBucketObjectVersions(name: string, key: string, versionMarker
   })
 }
 
+export function useBucketStorageRiskVersions(
+  name: string,
+  params: {
+    prefix?: string
+    key?: string
+    local_data_set_id?: number
+    key_marker?: string
+    version_marker?: string
+    created_at_marker?: string
+    stale_before?: string
+    limit?: number
+  },
+  enabled = true
+) {
+  return useQuery({
+    queryKey: ['bucketStorageRiskVersions', name, params],
+    queryFn: () => api.getBucketStorageRiskVersions(name, params),
+    enabled: Boolean(name && enabled),
+    refetchInterval: 15_000,
+  })
+}
+
 export function useObjectStatusDetail(name: string, versionId: string, enabled = true) {
   return useQuery({
     queryKey: ['objectStatusDetail', name, versionId],

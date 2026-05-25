@@ -319,6 +319,7 @@ func TestObjectRepo_ListByBucketReadsCurrentVersionOnly(t *testing.T) {
 	}{
 		{"a.txt", 1},
 		{"b.txt", 2},
+		{"Dir/c.txt", 4},
 		{"dir/c.txt", 3},
 	} {
 		v := newObjectVersion(bucket.ID, tc.key, "01J0000000000000000000000"+string(rune('3'+tc.size)), tc.size)
@@ -335,11 +336,18 @@ func TestObjectRepo_ListByBucketReadsCurrentVersionOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListByBucket: %v", err)
 	}
-	if len(all) != 3 {
-		t.Fatalf("object count = %d, want 3 current keys", len(all))
+	if len(all) != 4 {
+		t.Fatalf("object count = %d, want 4 current keys", len(all))
 	}
-	if all[1].Key != "b.txt" || all[1].VersionID != latestB.VersionID || all[1].Size != 22 {
-		t.Fatalf("b.txt current version = key:%s version:%s size:%d", all[1].Key, all[1].VersionID, all[1].Size)
+	var currentB *model.ObjectVersion
+	for i := range all {
+		if all[i].Key == "b.txt" {
+			currentB = &all[i]
+			break
+		}
+	}
+	if currentB == nil || currentB.VersionID != latestB.VersionID || currentB.Size != 22 {
+		t.Fatalf("b.txt current version = %#v", currentB)
 	}
 
 	prefixed, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "dir/", "", 0)
@@ -843,6 +851,20 @@ func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
 	if len(page) == 0 || page[0].VersionID != oldVersion.VersionID {
 		t.Fatalf("marker page first = %#v, want old version", page)
 	}
+
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "case/a.txt", "01J00000000000000000000077", 40)); err != nil {
+		t.Fatalf("create case version: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "Case/a.txt", "01J00000000000000000000078", 50)); err != nil {
+		t.Fatalf("create Case version: %v", err)
+	}
+	prefixed, err := repos.Objects.ListVersionsByBucket(ctx, bucket.ID, "case/", "", "", 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByBucket prefix: %v", err)
+	}
+	if len(prefixed) != 1 || prefixed[0].Key != "case/a.txt" {
+		t.Fatalf("case-sensitive prefix rows = %#v", prefixed)
+	}
 }
 
 func TestObjectRepo_CreateDeleteMarkerHidesCurrentObjectButKeepsVersionHistory(t *testing.T) {
@@ -1059,6 +1081,28 @@ func TestObjectRepo_DeleteMarkerStatsAndRecoverableListIgnoreUnrestorableMarkers
 	}
 	if deleted[0].Marker.VersionID != marker.VersionID || deleted[0].RestoreVersion.VersionID != data.VersionID {
 		t.Fatalf("recoverable marker = %#v, want marker %s restoring %s", deleted[0], marker.VersionID, data.VersionID)
+	}
+
+	lowerData := newObjectVersion(bucket.ID, "trash/lower.txt", "01J00000000000000000001003", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, lowerData); err != nil {
+		t.Fatalf("create lower trash data: %v", err)
+	}
+	lowerMarker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "trash/lower.txt", "01J00000000000000000001004")
+	if err != nil {
+		t.Fatalf("create lower trash marker: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "Trash/lower.txt", "01J00000000000000000001005", 10)); err != nil {
+		t.Fatalf("create upper trash data: %v", err)
+	}
+	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "Trash/lower.txt", "01J00000000000000000001006"); err != nil {
+		t.Fatalf("create upper trash marker: %v", err)
+	}
+	prefixedDeleted, err := repos.Objects.ListRecoverableDeleteMarkers(ctx, bucket.ID, "trash/", "", 10)
+	if err != nil {
+		t.Fatalf("ListRecoverableDeleteMarkers prefix: %v", err)
+	}
+	if len(prefixedDeleted) != 1 || prefixedDeleted[0].Marker.VersionID != lowerMarker.VersionID {
+		t.Fatalf("case-sensitive recoverable markers = %#v", prefixedDeleted)
 	}
 }
 

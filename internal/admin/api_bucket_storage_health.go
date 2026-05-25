@@ -2,15 +2,28 @@ package admin
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	idtypes "github.com/strahe/synaps3/internal/types"
 )
 
 const (
-	bucketStorageHealthAffectedVersionsCap   = 200
-	bucketStorageHealthQueryFailureLastError = "storage health query failed"
+	bucketStorageHealthAffectedVersionsCap     = 200
+	bucketStorageHealthQueryFailureLastError   = "storage health query failed"
+	bucketStorageHealthAffectedVersionsDefault = 50
+	bucketStorageHealthAffectedVersionsMax     = 1000
+)
+
+var (
+	errBucketStorageRiskMarkerIncomplete    = errors.New("key_marker, version_marker, created_at_marker, and stale_before must be provided together")
+	errBucketStorageRiskCreatedAtMarkerTime = errors.New("created_at_marker must be RFC3339Nano")
+	errBucketStorageRiskStaleBeforeTime     = errors.New("stale_before must be RFC3339Nano")
 )
 
 type bucketStorageHealthSummaryResponse struct {
@@ -25,12 +38,118 @@ type bucketStorageHealthSummaryResponse struct {
 	AffectedVersionsExceedsCap bool                       `json:"affected_versions_exceeds_cap"`
 }
 
+type bucketStorageHealthAffectedVersionsResponse struct {
+	Versions            []bucketStorageHealthAffectedVersionResponse `json:"versions"`
+	HasMore             bool                                         `json:"has_more"`
+	NextKeyMarker       string                                       `json:"next_key_marker,omitempty"`
+	NextVersionMarker   string                                       `json:"next_version_marker,omitempty"`
+	NextCreatedAtMarker string                                       `json:"next_created_at_marker,omitempty"`
+	StaleBefore         string                                       `json:"stale_before"`
+}
+
+type bucketStorageHealthAffectedVersionResponse struct {
+	Key                      string                                   `json:"key"`
+	VersionID                string                                   `json:"version_id"`
+	Size                     int64                                    `json:"size"`
+	State                    string                                   `json:"state"`
+	IsCurrent                bool                                     `json:"is_current"`
+	InCache                  bool                                     `json:"in_cache"`
+	ContentType              string                                   `json:"content_type"`
+	ETag                     string                                   `json:"etag"`
+	CreatedAt                string                                   `json:"created_at"`
+	UpdatedAt                string                                   `json:"updated_at"`
+	ReadableAlternativeCount int                                      `json:"readable_alternative_count"`
+	HasReadableAlternative   bool                                     `json:"has_readable_alternative"`
+	RiskDataSets             []bucketStorageHealthRiskDataSetResponse `json:"risk_data_sets"`
+}
+
+type bucketStorageHealthRiskDataSetResponse struct {
+	LocalDataSetID   int64                     `json:"local_data_set_id"`
+	BucketID         int64                     `json:"bucket_id"`
+	CopyIndex        int                       `json:"copy_index"`
+	ProviderID       string                    `json:"provider_id"`
+	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
+	DataSetID        *string                   `json:"data_set_id,omitempty"`
+	ClientDataSetID  *string                   `json:"client_data_set_id,omitempty"`
+	LocalStatus      string                    `json:"local_status"`
+	StorageHealth    dataSetStorageHealthInfo  `json:"storage_health"`
+}
+
+func (s *Server) handleAPIBucketStorageHealthAffectedVersions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucketName := r.PathValue("name")
+	if !bucketNameRe.MatchString(bucketName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
+		return
+	}
+	prefix := r.URL.Query().Get("prefix")
+	key := r.URL.Query().Get("key")
+	if prefix != "" && key != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "prefix and key are mutually exclusive"})
+		return
+	}
+	var localDataSetID int64
+	if raw := r.URL.Query().Get("local_data_set_id"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "local_data_set_id must be a positive integer"})
+			return
+		}
+		localDataSetID = parsed
+	}
+	limit := parseAdminPositiveLimit(r.URL.Query().Get("limit"), bucketStorageHealthAffectedVersionsDefault, bucketStorageHealthAffectedVersionsMax)
+	keyMarker := r.URL.Query().Get("key_marker")
+	versionMarker := r.URL.Query().Get("version_marker")
+	createdAtMarkerRaw := r.URL.Query().Get("created_at_marker")
+	staleBeforeRaw := r.URL.Query().Get("stale_before")
+	createdAtMarker, staleBefore, markerErr := parseBucketStorageRiskMarker(keyMarker, versionMarker, createdAtMarkerRaw, staleBeforeRaw)
+	if markerErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": markerErr.Error()})
+		return
+	}
+	if staleBefore.IsZero() {
+		staleBefore = s.bucketStorageHealthStaleBefore()
+	}
+
+	bucket, err := s.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		s.logger.Error("api: failed to get bucket storage risk", "error", err, "name", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if bucket == nil || !bucket.Status.IsAdminVisible() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+	if s.repos.Uploads == nil {
+		writeJSON(w, http.StatusOK, bucketStorageHealthAffectedVersionsResponse{Versions: []bucketStorageHealthAffectedVersionResponse{}})
+		return
+	}
+
+	page, err := s.repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:        bucket.ID,
+		LocalDataSetID:  localDataSetID,
+		Prefix:          prefix,
+		Key:             key,
+		KeyMarker:       keyMarker,
+		VersionIDMarker: versionMarker,
+		CreatedAtMarker: createdAtMarker,
+		StaleBefore:     staleBefore,
+		Limit:           limit,
+	})
+	if err != nil {
+		s.logger.Error("api: failed to list bucket storage risk versions", "error", err, "bucket", bucketName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.bucketStorageHealthAffectedVersionsResponse(page, staleBefore))
+}
+
 func (s *Server) bucketStorageHealthSummaries(ctx context.Context, bucketID int64) (map[int64]bucketStorageHealthSummaryResponse, bool) {
 	if s.repos.Uploads == nil {
 		return nil, false
 	}
-	interval := s.copyHealthRefreshInterval()
-	staleBefore := time.Now().UTC().Add(-(interval * 2))
+	staleBefore := s.bucketStorageHealthStaleBefore()
 	summaries, err := s.repos.Uploads.ListBucketStorageHealthSummaries(ctx, bucketID, staleBefore, bucketStorageHealthAffectedVersionsCap)
 	if err != nil {
 		if s.logger != nil {
@@ -89,6 +208,41 @@ func bucketStorageHealthSummaryFromRepository(summary repository.BucketStorageHe
 	return resp
 }
 
+func parseBucketStorageRiskMarker(keyMarker, versionMarker, createdAtMarkerRaw, staleBeforeRaw string) (time.Time, time.Time, error) {
+	// stale_before pins one Storage Risk pagination session to a stable risk snapshot.
+	hasKey := keyMarker != ""
+	hasVersion := versionMarker != ""
+	hasCreatedAt := createdAtMarkerRaw != ""
+	hasStaleBefore := staleBeforeRaw != ""
+	if !hasKey && !hasVersion && !hasCreatedAt {
+		if !hasStaleBefore {
+			return time.Time{}, time.Time{}, nil
+		}
+		staleBefore, err := time.Parse(time.RFC3339Nano, staleBeforeRaw)
+		if err != nil {
+			return time.Time{}, time.Time{}, errBucketStorageRiskStaleBeforeTime
+		}
+		return time.Time{}, staleBefore.UTC(), nil
+	}
+	if !hasKey || !hasVersion || !hasCreatedAt || !hasStaleBefore {
+		return time.Time{}, time.Time{}, errBucketStorageRiskMarkerIncomplete
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, createdAtMarkerRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, errBucketStorageRiskCreatedAtMarkerTime
+	}
+	staleBefore, err := time.Parse(time.RFC3339Nano, staleBeforeRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, errBucketStorageRiskStaleBeforeTime
+	}
+	return createdAt.UTC(), staleBefore.UTC(), nil
+}
+
+func (s *Server) bucketStorageHealthStaleBefore() time.Time {
+	// Allow one missed refresh interval before marking an observation stale.
+	return time.Now().UTC().Add(-(s.copyHealthRefreshInterval() * 2))
+}
+
 func bucketStorageHealthStatusFromRepository(summary repository.BucketStorageHealthSummary) observability.Status {
 	if summary.AffectedVersionsCapped == 0 {
 		return observability.StatusAvailable
@@ -114,4 +268,101 @@ func bucketStorageHealthReasonsFromRepository(summary repository.BucketStorageHe
 		reasons = observability.AppendReasonCode(reasons, observability.ReasonCopyObservationMissing)
 	}
 	return reasons
+}
+
+func (s *Server) bucketStorageHealthAffectedVersionsResponse(page repository.BucketStorageHealthAffectedVersionPage, staleBefore time.Time) bucketStorageHealthAffectedVersionsResponse {
+	providerIDs := make([]idtypes.OnChainID, 0)
+	seenProviderIDs := make(map[string]struct{})
+	for _, version := range page.Versions {
+		for _, dataSet := range version.RiskDataSets {
+			key := dataSet.ProviderID.String()
+			if _, ok := seenProviderIDs[key]; ok {
+				continue
+			}
+			seenProviderIDs[key] = struct{}{}
+			providerIDs = append(providerIDs, dataSet.ProviderID)
+		}
+	}
+	identities := s.providerIdentities(providerIDs)
+	resp := bucketStorageHealthAffectedVersionsResponse{
+		Versions:          make([]bucketStorageHealthAffectedVersionResponse, 0, len(page.Versions)),
+		HasMore:           page.HasMore,
+		NextKeyMarker:     page.NextKeyMarker,
+		NextVersionMarker: page.NextVersionIDMarker,
+		StaleBefore:       staleBefore.UTC().Format(time.RFC3339Nano),
+	}
+	if !page.NextCreatedAtMarker.IsZero() {
+		resp.NextCreatedAtMarker = page.NextCreatedAtMarker.UTC().Format(time.RFC3339Nano)
+	}
+	for _, version := range page.Versions {
+		riskDataSets := make([]bucketStorageHealthRiskDataSetResponse, 0, len(version.RiskDataSets))
+		for _, dataSet := range version.RiskDataSets {
+			riskDataSets = append(riskDataSets, bucketStorageHealthRiskDataSetResponse{
+				LocalDataSetID:   dataSet.LocalDataSetID,
+				BucketID:         dataSet.BucketID,
+				CopyIndex:        dataSet.CopyIndex,
+				ProviderID:       dataSet.ProviderID.String(),
+				ProviderIdentity: providerIdentityFromSnapshot(identities, dataSet.ProviderID),
+				DataSetID:        onChainIDStringPtr(dataSet.DataSetID),
+				ClientDataSetID:  onChainIDStringPtr(dataSet.ClientDataSetID),
+				LocalStatus:      string(dataSet.LocalStatus),
+				StorageHealth:    bucketStorageHealthRiskDataSetStorageHealth(dataSet),
+			})
+		}
+		resp.Versions = append(resp.Versions, bucketStorageHealthAffectedVersionResponse{
+			Key:                      version.Version.Key,
+			VersionID:                version.Version.VersionID,
+			Size:                     version.Version.Size,
+			State:                    string(version.Version.State),
+			IsCurrent:                version.Version.IsCurrent,
+			InCache:                  version.Version.InCache,
+			ContentType:              version.Version.ContentType,
+			ETag:                     version.Version.ETag,
+			CreatedAt:                version.Version.CreatedAt.UTC().Format(time.RFC3339Nano),
+			UpdatedAt:                version.Version.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			ReadableAlternativeCount: version.ReadableAlternativeCount,
+			HasReadableAlternative:   version.ReadableAlternativeCount > 0,
+			RiskDataSets:             riskDataSets,
+		})
+	}
+	return resp
+}
+
+func parseAdminPositiveLimit(raw string, defaultLimit int, maxLimit int) int {
+	n, err := strconv.Atoi(raw)
+	if raw == "" || err != nil || n <= 0 {
+		return defaultLimit
+	}
+	if n > maxLimit {
+		return maxLimit
+	}
+	return n
+}
+
+func bucketStorageHealthRiskDataSetStorageHealth(dataSet repository.BucketStorageHealthRiskDataSet) dataSetStorageHealthInfo {
+	status := observability.StatusUnknown
+	if dataSet.ObservationStatus != nil {
+		status = *dataSet.ObservationStatus
+	}
+	reasons := make([]observability.ReasonCode, 0, len(dataSet.ReasonCodes)+2)
+	for _, reason := range dataSet.ReasonCodes {
+		reasons = observability.AppendReasonCode(reasons, reason)
+	}
+	if dataSet.ObservationMissing || dataSet.ObservationStale || status == observability.StatusUnknown {
+		reasons = observability.AppendReasonCode(reasons, observability.ReasonCopyObservationMissing)
+	}
+	if dataSet.LocalStatus != model.StorageDataSetStatusReady && dataSet.LocalStatus != model.StorageDataSetStatusDraining {
+		reasons = observability.AppendReasonCode(reasons, observability.ReasonLocalStatusNotReady)
+	}
+	var lastCheckedAt string
+	if dataSet.LastCheckedAt != nil {
+		lastCheckedAt = dataSet.LastCheckedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return dataSetStorageHealthInfo{
+		Status:        string(status),
+		ReasonCodes:   reasons,
+		LastCheckedAt: lastCheckedAt,
+		LastError:     dataSet.LastError,
+		Stale:         dataSet.ObservationStale,
+	}
 }

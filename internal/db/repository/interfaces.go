@@ -248,6 +248,48 @@ type BucketStorageHealthSummary struct {
 	LastCheckedAt              *time.Time `bun:"last_checked_at"`
 }
 
+type BucketStorageHealthAffectedVersionsInput struct {
+	BucketID        int64
+	LocalDataSetID  int64
+	Prefix          string
+	Key             string
+	KeyMarker       string
+	VersionIDMarker string
+	CreatedAtMarker time.Time
+	StaleBefore     time.Time
+	Limit           int
+}
+
+type BucketStorageHealthAffectedVersionPage struct {
+	Versions            []BucketStorageHealthAffectedVersion
+	HasMore             bool
+	NextKeyMarker       string
+	NextVersionIDMarker string
+	NextCreatedAtMarker time.Time
+}
+
+type BucketStorageHealthAffectedVersion struct {
+	Version                  model.ObjectVersion
+	RiskDataSets             []BucketStorageHealthRiskDataSet
+	ReadableAlternativeCount int
+}
+
+type BucketStorageHealthRiskDataSet struct {
+	LocalDataSetID     int64                      `bun:"local_data_set_id"`
+	BucketID           int64                      `bun:"bucket_id"`
+	CopyIndex          int                        `bun:"copy_index"`
+	ProviderID         types.OnChainID            `bun:"provider_id"`
+	DataSetID          *types.OnChainID           `bun:"data_set_id"`
+	ClientDataSetID    *types.OnChainID           `bun:"client_data_set_id"`
+	LocalStatus        model.StorageDataSetStatus `bun:"local_status"`
+	ObservationStatus  *observability.Status      `bun:"observation_status"`
+	ObservationMissing bool                       `bun:"observation_missing"`
+	ObservationStale   bool                       `bun:"observation_stale"`
+	ReasonCodes        []observability.ReasonCode `bun:"reason_codes"`
+	LastCheckedAt      *time.Time                 `bun:"last_checked_at"`
+	LastError          *string                    `bun:"last_error"`
+}
+
 type StorageCleanupRepository interface {
 	ListCopiesForTask(ctx context.Context, taskID int64) ([]model.StorageCleanupCopy, error)
 	MarkCopyRemoved(ctx context.Context, id int64) error
@@ -346,6 +388,7 @@ type StorageUploadRepository interface {
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
 	ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
 	ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error)
+	ListBucketStorageHealthAffectedVersions(ctx context.Context, input BucketStorageHealthAffectedVersionsInput) (BucketStorageHealthAffectedVersionPage, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
 	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
 	GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error)

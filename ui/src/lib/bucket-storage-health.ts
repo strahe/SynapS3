@@ -1,7 +1,7 @@
 import type { BucketStorageHealthSummary } from '@/api/client'
 import type { StatusTone } from '@/components/app/StatusBadge'
-import { storageHealthReasonLabel } from './data-set-storage-health'
-import { formatNumber, timeAgo } from './utils'
+import { storageHealthReasonLabel } from './data-set-storage-health.ts'
+import { formatNumber, timeAgo } from './utils.ts'
 
 export function bucketStorageHealthLabel(health: BucketStorageHealthSummary) {
   if (health.status === 'unknown') return 'Not verified'

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -82,6 +83,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}", srv.handleAPIDeleteBucket)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects", srv.handleAPIBucketObjects)
 	mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", srv.handleAPIDeleteBucketObject)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/storage-health/affected-versions", srv.handleAPIBucketStorageHealthAffectedVersions)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/deleted", srv.handleAPIBucketDeletedObjects)
 	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/deleted/permanent-delete", srv.handleAPIPermanentDeleteDeletedBucketObject)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/deletions", srv.handleAPIBucketObjectDeletions)
@@ -1092,7 +1094,7 @@ func TestAPIBucketDetail_DataSetStorageHealthQueryFailureReturnsUnknownPlacehold
 }
 
 func TestDataSetStorageHealthInfoEncodesEmptyReasonCodesArray(t *testing.T) {
-	checkedAt := time.Now().UTC()
+	checkedAt := time.Date(2026, 5, 24, 12, 0, 0, 123456789, time.UTC)
 	srv := (&Server{logger: testLogger()}).
 		WithObservability(observability.NewService(observability.ServiceOptions{RefreshInterval: time.Hour}))
 
@@ -1665,6 +1667,500 @@ func TestAPIBucketsStorageHealthNoUploadObjectHasNoDataRisk(t *testing.T) {
 		provenanceBody.CopyHealth.UnknownCopies != 0 ||
 		!hasReason(provenanceBody.CopyHealth.ReasonCodes, observability.ReasonCopyObservationMissing) {
 		t.Fatalf("provenance copy_health = %#v, want no-upload object marked unknown without virtual copies", provenanceBody.CopyHealth)
+	}
+}
+
+func TestAPIBucketStorageHealthAffectedVersionsRequiresStableCutoff(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "storage-risk-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	otherBucket := &model.Bucket{Name: "storage-risk-other-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
+		t.Fatalf("Other Buckets.Create: %v", err)
+	}
+
+	currentVersion := &model.ObjectVersion{
+		VersionID:   "01J000000000000000APIR01",
+		BucketID:    bucket.ID,
+		Key:         "docs/current.txt",
+		Size:        4,
+		ETag:        "etag-current-risk",
+		Checksum:    "checksum-current-risk",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/current-risk",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent current: %v", err)
+	}
+	currentUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: currentVersion.VersionID,
+		ContentSize:     currentVersion.Size,
+		Checksum:        currentVersion.Checksum,
+		RequestedCopies: 2,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt current: %v", err)
+	}
+	seedAdminCommittedCopies(t, repos, bucket.ID, currentUpload.ID, "bafk2bzacestorageriskcurrent", []adminStorageCopySeed{
+		{CopyIndex: 0, ProviderID: onChainID(t, "501"), DataSetID: onChainID(t, "9501"), PieceID: onChainIDPtr(t, "9901"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/current-risk"},
+		{CopyIndex: 1, ProviderID: onChainID(t, "502"), DataSetID: onChainID(t, "9502"), PieceID: onChainIDPtr(t, "9902"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://provider.example/current-readable"},
+	})
+	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState current uploading: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+		UploadID:    currentUpload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: currentVersion.Size,
+		Checksum:    currentVersion.Checksum,
+		VersionID:   currentVersion.VersionID,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForVersion current: %v", err)
+	}
+
+	oldVersion := &model.ObjectVersion{
+		VersionID:   "01J000000000000000APIR02",
+		BucketID:    bucket.ID,
+		Key:         "docs/old.txt",
+		Size:        5,
+		ETag:        "etag-old-risk",
+		Checksum:    "checksum-old-risk",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/old-risk",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent old: %v", err)
+	}
+	oldUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: oldVersion.VersionID,
+		ContentSize:     oldVersion.Size,
+		Checksum:        oldVersion.Checksum,
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt old: %v", err)
+	}
+	seedAdminCommittedCopies(t, repos, bucket.ID, oldUpload.ID, "bafk2bzacestorageriskold", []adminStorageCopySeed{
+		{CopyIndex: 2, ProviderID: onChainID(t, "503"), DataSetID: onChainID(t, "9503"), PieceID: onChainIDPtr(t, "9903"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/old-risk"},
+	})
+	if err := repos.Objects.UpdateVersionState(ctx, oldVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState old uploading: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+		UploadID:    oldUpload.ID,
+		BucketID:    bucket.ID,
+		ContentSize: oldVersion.Size,
+		Checksum:    oldVersion.Checksum,
+		VersionID:   oldVersion.VersionID,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForVersion old: %v", err)
+	}
+	if err := repos.Objects.SetVersionCachePresence(ctx, oldVersion.VersionID, false); err != nil {
+		t.Fatalf("SetVersionCachePresence old: %v", err)
+	}
+	replacement := &model.ObjectVersion{
+		VersionID:   "01J000000000000000APIR03",
+		BucketID:    bucket.ID,
+		Key:         oldVersion.Key,
+		Size:        6,
+		ETag:        "etag-old-replacement",
+		Checksum:    "checksum-old-replacement",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/old-replacement",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent replacement: %v", err)
+	}
+
+	summaries, err := repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("ListDataSetSummaries: %v", err)
+	}
+	byCopyIndex := make(map[int]repository.StorageDataSetSummary)
+	for _, summary := range summaries {
+		byCopyIndex[summary.CopyIndex] = summary
+	}
+	checkedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if checkedAt.Nanosecond() == 0 {
+		checkedAt = checkedAt.Add(time.Microsecond)
+	}
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
+		{LocalDataSetID: byCopyIndex[0].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: byCopyIndex[0].ProviderID, ChainDataSetID: byCopyIndex[0].DataSetID, Status: observability.StatusUnavailable, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetMissing}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: byCopyIndex[1].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 1, ProviderID: byCopyIndex[1].ProviderID, ChainDataSetID: byCopyIndex[1].DataSetID, Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: byCopyIndex[2].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 2, ProviderID: byCopyIndex[2].ProviderID, ChainDataSetID: byCopyIndex[2].DataSetID, Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+	}); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?prefix=" + url.QueryEscape("docs/") + "&limit=1")
+	if err != nil {
+		t.Fatalf("GET affected versions: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var body struct {
+		CopyHealth json.RawMessage `json:"copy_health"`
+		Versions   []struct {
+			Key                      string          `json:"key"`
+			VersionID                string          `json:"version_id"`
+			CreatedAt                string          `json:"created_at"`
+			UpdatedAt                string          `json:"updated_at"`
+			IsCurrent                bool            `json:"is_current"`
+			InCache                  bool            `json:"in_cache"`
+			ReadableAlternativeCount int             `json:"readable_alternative_count"`
+			HasReadableAlternative   bool            `json:"has_readable_alternative"`
+			CopyHealth               json.RawMessage `json:"copy_health"`
+			RiskDataSets             []struct {
+				LocalDataSetID int64  `json:"local_data_set_id"`
+				CopyIndex      int    `json:"copy_index"`
+				ProviderID     string `json:"provider_id"`
+				DataSetID      string `json:"data_set_id"`
+				LocalStatus    string `json:"local_status"`
+				StorageHealth  struct {
+					Status      string                     `json:"status"`
+					ReasonCodes []observability.ReasonCode `json:"reason_codes"`
+					LastChecked string                     `json:"last_checked_at"`
+				} `json:"storage_health"`
+			} `json:"risk_data_sets"`
+		} `json:"versions"`
+		HasMore           bool   `json:"has_more"`
+		NextKeyMarker     string `json:"next_key_marker"`
+		NextVersionMarker string `json:"next_version_marker"`
+		NextCreatedAt     string `json:"next_created_at_marker"`
+		StaleBefore       string `json:"stale_before"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.CopyHealth != nil {
+		t.Fatalf("response copy_health = %s, want omitted", body.CopyHealth)
+	}
+	if len(body.Versions) != 1 || body.Versions[0].VersionID != currentVersion.VersionID || !body.Versions[0].IsCurrent {
+		t.Fatalf("first page versions = %#v, want current risk version first", body.Versions)
+	}
+	if !body.Versions[0].InCache {
+		t.Fatalf("current in_cache = false, want true")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, body.Versions[0].CreatedAt); err != nil {
+		t.Fatalf("created_at = %q, want RFC3339Nano: %v", body.Versions[0].CreatedAt, err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, body.Versions[0].UpdatedAt); err != nil {
+		t.Fatalf("updated_at = %q, want RFC3339Nano: %v", body.Versions[0].UpdatedAt, err)
+	}
+	if body.Versions[0].CopyHealth != nil {
+		t.Fatalf("version copy_health = %s, want omitted", body.Versions[0].CopyHealth)
+	}
+	if !body.Versions[0].HasReadableAlternative || body.Versions[0].ReadableAlternativeCount != 1 {
+		t.Fatalf("current alternative = %#v, want one recorded readable alternative", body.Versions[0])
+	}
+	if len(body.Versions[0].RiskDataSets) != 1 || body.Versions[0].RiskDataSets[0].LocalDataSetID != byCopyIndex[0].ID || body.Versions[0].RiskDataSets[0].StorageHealth.Status != string(observability.StatusUnavailable) {
+		t.Fatalf("current risk datasets = %#v, want unavailable dataset", body.Versions[0].RiskDataSets)
+	}
+	if !body.HasMore || body.NextKeyMarker != currentVersion.Key || body.NextVersionMarker != currentVersion.VersionID || body.NextCreatedAt == "" {
+		t.Fatalf("pagination = %#v, want next marker after current", body)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, body.NextCreatedAt); err != nil {
+		t.Fatalf("next_created_at_marker = %q, want RFC3339Nano: %v", body.NextCreatedAt, err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, body.StaleBefore); err != nil {
+		t.Fatalf("stale_before = %q, want RFC3339Nano: %v", body.StaleBefore, err)
+	}
+	if got, want := body.Versions[0].RiskDataSets[0].StorageHealth.LastChecked, checkedAt.Format(time.RFC3339Nano); got != want {
+		t.Fatalf("risk dataset last_checked_at = %q, want %q", got, want)
+	}
+
+	secondPageURL := ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?key_marker=" + url.QueryEscape(body.NextKeyMarker) + "&version_marker=" + url.QueryEscape(body.NextVersionMarker) + "&created_at_marker=" + url.QueryEscape(body.NextCreatedAt)
+	resp, err = http.Get(secondPageURL)
+	if err != nil {
+		t.Fatalf("GET affected versions second page: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var missingCutoffBody struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&missingCutoffBody); err != nil {
+		t.Fatalf("Decode missing cutoff: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || missingCutoffBody.Error != "key_marker, version_marker, created_at_marker, and stale_before must be provided together" {
+		t.Fatalf("second page without cutoff status/body = %d/%#v, want stable cutoff error", resp.StatusCode, missingCutoffBody)
+	}
+
+	secondPageURL += "&stale_before=" + url.QueryEscape(body.StaleBefore)
+	resp, err = http.Get(secondPageURL)
+	if err != nil {
+		t.Fatalf("GET affected versions second page with cutoff: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second page with cutoff status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?local_data_set_id=" + strconv.FormatInt(byCopyIndex[2].ID, 10))
+	if err != nil {
+		t.Fatalf("GET affected versions dataset: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("dataset status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var datasetBody struct {
+		Versions []struct {
+			VersionID                string `json:"version_id"`
+			IsCurrent                bool   `json:"is_current"`
+			InCache                  bool   `json:"in_cache"`
+			ReadableAlternativeCount int    `json:"readable_alternative_count"`
+		} `json:"versions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&datasetBody); err != nil {
+		t.Fatalf("Decode dataset: %v", err)
+	}
+	if len(datasetBody.Versions) != 1 || datasetBody.Versions[0].VersionID != oldVersion.VersionID || datasetBody.Versions[0].IsCurrent || datasetBody.Versions[0].ReadableAlternativeCount != 0 {
+		t.Fatalf("dataset filtered versions = %#v, want retained old version without alternative", datasetBody.Versions)
+	}
+	if datasetBody.Versions[0].InCache {
+		t.Fatalf("dataset filtered in_cache = true, want false")
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + otherBucket.Name + "/storage-health/affected-versions?local_data_set_id=" + strconv.FormatInt(byCopyIndex[0].ID, 10))
+	if err != nil {
+		t.Fatalf("GET affected versions other bucket dataset: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var emptyBody struct {
+		Versions []struct{} `json:"versions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&emptyBody); err != nil {
+		t.Fatalf("Decode other bucket dataset: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || len(emptyBody.Versions) != 0 {
+		t.Fatalf("other bucket dataset status/body = %d/%#v, want empty OK", resp.StatusCode, emptyBody)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?prefix=docs/&key=docs/current.txt")
+	if err != nil {
+		t.Fatalf("GET affected versions conflicting filters: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("conflicting filter status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?local_data_set_id=bad")
+	if err != nil {
+		t.Fatalf("GET affected versions invalid dataset: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid dataset status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	for _, query := range []string{
+		"key_marker=" + url.QueryEscape(currentVersion.Key),
+		"key_marker=" + url.QueryEscape(currentVersion.Key) + "&version_marker=" + url.QueryEscape(currentVersion.VersionID),
+	} {
+		resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?" + query)
+		if err != nil {
+			t.Fatalf("GET affected versions invalid marker %q: %v", query, err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid marker %q status = %d, want %d", query, resp.StatusCode, http.StatusBadRequest)
+		}
+	}
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?key_marker=" + url.QueryEscape(currentVersion.Key) + "&version_marker=" + url.QueryEscape(currentVersion.VersionID) + "&created_at_marker=not-a-time&stale_before=" + url.QueryEscape(body.StaleBefore))
+	if err != nil {
+		t.Fatalf("GET affected versions invalid marker time: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var invalidTimeBody struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&invalidTimeBody); err != nil {
+		t.Fatalf("Decode invalid marker time: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || invalidTimeBody.Error != "created_at_marker must be RFC3339Nano" {
+		t.Fatalf("invalid marker time status/body = %d/%#v, want RFC3339Nano error", resp.StatusCode, invalidTimeBody)
+	}
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?stale_before=not-a-time")
+	if err != nil {
+		t.Fatalf("GET affected versions invalid stale_before: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var invalidCutoffBody struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&invalidCutoffBody); err != nil {
+		t.Fatalf("Decode invalid stale_before: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || invalidCutoffBody.Error != "stale_before must be RFC3339Nano" {
+		t.Fatalf("invalid stale_before status/body = %d/%#v, want RFC3339Nano error", resp.StatusCode, invalidCutoffBody)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/BadBucket/storage-health/affected-versions")
+	if err != nil {
+		t.Fatalf("GET affected versions invalid bucket: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid bucket status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/missing-storage-risk-bucket/storage-health/affected-versions")
+	if err != nil {
+		t.Fatalf("GET affected versions missing bucket: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing bucket status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestAPIBucketStorageHealthAffectedVersionsClampsLimit(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "storage-risk-limit-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	for i := range 51 {
+		version := &model.ObjectVersion{
+			VersionID:   fmt.Sprintf("01J000000000000LIMIT%03d", i),
+			BucketID:    bucket.ID,
+			Key:         fmt.Sprintf("docs/limit-%03d.txt", i),
+			Size:        int64(i + 1),
+			ETag:        fmt.Sprintf("etag-limit-%03d", i),
+			Checksum:    fmt.Sprintf("checksum-limit-%03d", i),
+			ContentType: "text/plain",
+			CacheKey:    fmt.Sprintf(".versions/limit-%03d", i),
+			State:       model.ObjectStateCached,
+		}
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent %d: %v", i, err)
+		}
+		upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+			BucketID:        bucket.ID,
+			SourceVersionID: version.VersionID,
+			ContentSize:     version.Size,
+			Checksum:        version.Checksum,
+			RequestedCopies: 1,
+		})
+		if err != nil {
+			t.Fatalf("StartObjectUploadAttempt %d: %v", i, err)
+		}
+		seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, fmt.Sprintf("bafk2bzacelimit%03d", i), []adminStorageCopySeed{{
+			CopyIndex:      0,
+			ProviderID:     onChainID(t, "901"),
+			DataSetID:      onChainID(t, "9901"),
+			PieceID:        onChainIDPtr(t, fmt.Sprintf("99010%d", i)),
+			TransferMethod: model.StorageCopyTransferMethodIngress,
+			RetrievalURL:   fmt.Sprintf("https://provider.example/limit-%03d", i),
+		}})
+		if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+			t.Fatalf("UpdateVersionState %d: %v", i, err)
+		}
+		if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+			UploadID:    upload.ID,
+			BucketID:    bucket.ID,
+			ContentSize: version.Size,
+			Checksum:    version.Checksum,
+			VersionID:   version.VersionID,
+		}); err != nil {
+			t.Fatalf("BindReadableUploadForVersion %d: %v", i, err)
+		}
+	}
+
+	summaries, err := repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("ListDataSetSummaries: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("data set summaries = %d, want 1", len(summaries))
+	}
+	checkedAt := time.Now().UTC()
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{{
+		LocalDataSetID: summaries[0].ID,
+		BucketID:       bucket.ID,
+		BucketName:     bucket.Name,
+		CopyIndex:      summaries[0].CopyIndex,
+		ProviderID:     summaries[0].ProviderID,
+		ChainDataSetID: summaries[0].DataSetID,
+		Status:         observability.StatusUnavailable,
+		ReasonCodes:    []observability.ReasonCode{observability.ReasonChainDataSetMissing},
+		LastCheckedAt:  checkedAt,
+		Evidence:       map[string]any{},
+	}}); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/storage-health/affected-versions?limit=1001")
+	if err != nil {
+		t.Fatalf("GET affected versions: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body struct {
+		Versions []struct{} `json:"versions"`
+		HasMore  bool       `json:"has_more"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || body.HasMore || len(body.Versions) != 51 {
+		t.Fatalf("status/body = %d/%#v, want all 51 versions with clamped limit", resp.StatusCode, body)
+	}
+}
+
+func TestBucketStorageHealthAffectedVersionsResponseDeduplicatesProviderLookups(t *testing.T) {
+	providerID := onChainID(t, "501")
+	identityResolver := &fakeAPIProviderIdentityResolver{
+		identities: map[string]*providerIdentityResponse{
+			"501": {RegistryProviderID: "501", Name: "risk-pdp"},
+		},
+	}
+	srv := &Server{providerIdentity: identityResolver}
+	createdAt := time.Date(2026, 5, 23, 12, 30, 0, 123456789, time.UTC)
+	status := observability.StatusUnavailable
+
+	resp := srv.bucketStorageHealthAffectedVersionsResponse(repository.BucketStorageHealthAffectedVersionPage{
+		Versions: []repository.BucketStorageHealthAffectedVersion{{
+			Version: model.ObjectVersion{
+				VersionID: "01J000000000000000APIR99",
+				Key:       "docs/current.txt",
+				CreatedAt: createdAt,
+				UpdatedAt: createdAt,
+			},
+			RiskDataSets: []repository.BucketStorageHealthRiskDataSet{
+				{LocalDataSetID: 1, ProviderID: providerID, LocalStatus: model.StorageDataSetStatusReady, ObservationStatus: &status},
+				{LocalDataSetID: 2, ProviderID: providerID, LocalStatus: model.StorageDataSetStatusReady, ObservationStatus: &status},
+			},
+		}},
+	}, createdAt.Add(-time.Hour))
+
+	if got, want := identityResolver.requests, [][]string{{"501"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider identity requests = %#v, want %#v", got, want)
+	}
+	if len(resp.Versions) != 1 || len(resp.Versions[0].RiskDataSets) != 2 {
+		t.Fatalf("response risk datasets = %#v, want two datasets", resp.Versions)
+	}
+	for _, dataSet := range resp.Versions[0].RiskDataSets {
+		if dataSet.ProviderIdentity == nil || dataSet.ProviderIdentity.Name != "risk-pdp" {
+			t.Fatalf("provider identity = %#v, want reused identity", dataSet.ProviderIdentity)
+		}
 	}
 }
 

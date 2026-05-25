@@ -260,7 +260,7 @@ func (r *BunStorageUploadRepo) listFailures(ctx context.Context, uploadID int64)
 
 func (r *BunStorageUploadRepo) ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error) {
 	var copies []ReadableStorageCopy
-	query := `SELECT
+	query := fmt.Sprintf(`SELECT
 			storage_copy.upload_id,
 			storage_upload.piece_cid,
 			storage_copy.copy_index,
@@ -278,9 +278,11 @@ func (r *BunStorageUploadRepo) ListReadableCommittedCopies(ctx context.Context, 
 		  AND storage_copy.storage_data_set_id IS NOT NULL
 		  AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> ''
 		  AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> ''
-		  AND storage_data_set.status IN ('ready', 'draining')
+		  AND storage_data_set.status IN (%s)
 		  AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> ''
-		  AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> ''`
+		  AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> ''`,
+		storageHealthReadyDataSetStatusListSQL(),
+	)
 	args := []interface{}{uploadID, model.StorageUploadCopyStatusCommitted}
 	query += " ORDER BY storage_copy.copy_index ASC"
 	if err := r.db.NewRaw(query, args...).Scan(ctx, &copies); err != nil {
@@ -315,9 +317,9 @@ func bucketStorageHealthAffectedVersionExistsSQL(dataSetSourceAlias string) stri
 					 AND object_version.bucket_id = %[1]s.bucket_id
 					 AND object_version.is_delete_marker = FALSE
 					WHERE storage_copy.storage_data_set_id = %[1]s.data_set_id
-					  AND storage_copy.status = 'committed'
+					  AND storage_copy.status = %[2]s
 					  AND storage_copy.storage_data_set_id IS NOT NULL
-				)`, dataSetSourceAlias)
+				)`, dataSetSourceAlias, storageHealthCommittedCopyStatusSQL())
 }
 
 func (r *BunStorageUploadRepo) ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error) {
@@ -336,12 +338,12 @@ func (r *BunStorageUploadRepo) ListBucketStorageHealthSummaries(ctx context.Cont
 				SELECT
 					storage_data_set.id AS data_set_id,
 					storage_data_set.bucket_id,
-				CASE WHEN storage_data_set.status NOT IN ('ready', 'draining') THEN 1 ELSE 0 END AS local_status_not_ready,
+				CASE WHEN storage_data_set.status NOT IN (%s) THEN 1 ELSE 0 END AS local_status_not_ready,
 				CASE WHEN observation.local_data_set_id IS NULL THEN 1 ELSE 0 END AS observation_missing,
 				CASE WHEN observation.local_data_set_id IS NOT NULL AND observation.last_checked_at < ? THEN 1 ELSE 0 END AS observation_stale,
-				CASE WHEN observation.status = 'unavailable' THEN 1 ELSE 0 END AS observation_unavailable,
-				CASE WHEN observation.status = 'degraded' THEN 1 ELSE 0 END AS observation_degraded,
-				CASE WHEN observation.status = 'unknown' THEN 1 ELSE 0 END AS observation_unknown,
+				CASE WHEN observation.status = %s THEN 1 ELSE 0 END AS observation_unavailable,
+				CASE WHEN observation.status = %s THEN 1 ELSE 0 END AS observation_degraded,
+				CASE WHEN observation.status = %s THEN 1 ELSE 0 END AS observation_unknown,
 				observation.last_checked_at
 				FROM storage_data_sets AS storage_data_set
 				LEFT JOIN observability_data_set_states AS observation ON observation.local_data_set_id = storage_data_set.id
@@ -408,7 +410,7 @@ func (r *BunStorageUploadRepo) ListBucketStorageHealthSummaries(ctx context.Cont
 						 AND object_version.bucket_id = affected_data_set.bucket_id
 						 AND object_version.is_delete_marker = FALSE
 						WHERE affected_data_set.bucket_id = bucket_observation.bucket_id
-						  AND storage_copy.status = 'committed'
+						  AND storage_copy.status = %s
 						  AND storage_copy.storage_data_set_id IS NOT NULL
 						LIMIT ?
 					) AS capped_affected_versions
@@ -431,7 +433,15 @@ func (r *BunStorageUploadRepo) ListBucketStorageHealthSummaries(ctx context.Cont
 			FROM bucket_observation
 			LEFT JOIN bucket_abnormal ON bucket_abnormal.bucket_id = bucket_observation.bucket_id
 			LEFT JOIN affected_bucket_summary ON affected_bucket_summary.bucket_id = bucket_observation.bucket_id
-			ORDER BY bucket_observation.bucket_id ASC`, dataSetBucketFilter, bucketStorageHealthAffectedVersionExistsSQL("abnormal_data_set"))
+			ORDER BY bucket_observation.bucket_id ASC`,
+		storageHealthReadyDataSetStatusListSQL(),
+		storageHealthUnavailableObservationStatusSQL(),
+		storageHealthDegradedObservationStatusSQL(),
+		storageHealthUnknownObservationStatusSQL(),
+		dataSetBucketFilter,
+		bucketStorageHealthAffectedVersionExistsSQL("abnormal_data_set"),
+		storageHealthCommittedCopyStatusSQL(),
+	)
 	args = append(args, affectedVersionCap+1)
 	if err := r.db.NewRaw(query, args...).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("listing bucket storage health summaries: %w", err)
@@ -489,15 +499,15 @@ func (r *BunStorageUploadRepo) listBucketStorageHealthReasonCodes(ctx context.Co
 				storage_data_set.id AS data_set_id,
 				storage_data_set.bucket_id,
 				storage_data_set.status AS local_status,
-				COALESCE(observation.reason_codes, '[]') AS reason_codes
+				COALESCE(observation.reason_codes, %s) AS reason_codes
 			FROM storage_data_sets AS storage_data_set
 			LEFT JOIN observability_data_set_states AS observation ON observation.local_data_set_id = storage_data_set.id
 			WHERE 1 = 1
 %s
 			  AND (
-				  storage_data_set.status NOT IN ('ready', 'draining')
+				  storage_data_set.status NOT IN (%s)
 				  OR observation.local_data_set_id IS NULL
-				  OR observation.status IN ('degraded', 'unavailable', 'unknown')
+				  OR observation.status IN (%s)
 				  OR observation.last_checked_at < ?
 			  )
 		)
@@ -507,7 +517,13 @@ func (r *BunStorageUploadRepo) listBucketStorageHealthReasonCodes(ctx context.Co
 				abnormal_data_set.reason_codes
 		FROM abnormal_data_sets AS abnormal_data_set
 		WHERE %s
-		ORDER BY abnormal_data_set.bucket_id ASC`, dataSetBucketFilter, bucketStorageHealthAffectedVersionExistsSQL("abnormal_data_set"))
+		ORDER BY abnormal_data_set.bucket_id ASC`,
+		storageHealthEmptyJSONArraySQL(r.db),
+		dataSetBucketFilter,
+		storageHealthReadyDataSetStatusListSQL(),
+		storageHealthAbnormalObservationStatusListSQL(),
+		bucketStorageHealthAffectedVersionExistsSQL("abnormal_data_set"),
+	)
 	args = append(args, staleBefore)
 	var rows []bucketStorageHealthReasonCodeRow
 	if err := r.db.NewRaw(query, args...).Scan(ctx, &rows); err != nil {
@@ -539,7 +555,7 @@ func (r *BunStorageUploadRepo) ListDataSetBindings(ctx context.Context, bucketID
 
 func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error) {
 	var summaries []StorageDataSetSummary
-	query := `SELECT
+	query := fmt.Sprintf(`SELECT
 			storage_data_set.id,
 			storage_data_set.bucket_id,
 			bucket.name AS bucket_name,
@@ -564,7 +580,7 @@ func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketI
 				storage_copy.storage_data_set_id,
 				COUNT(*) AS committed_copies,
 				SUM(CASE
-					WHEN storage_data_set.status IN ('ready', 'draining')
+					WHEN storage_data_set.status IN (%s)
 					  AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> ''
 					  AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> ''
 					  AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> ''
@@ -573,8 +589,10 @@ func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketI
 				SUM(storage_upload.content_size) AS physical_bytes
 			FROM storage_upload_copies AS storage_copy
 			JOIN storage_uploads AS storage_upload ON storage_upload.id = storage_copy.upload_id
-			JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-			WHERE storage_copy.status = 'committed'
+			JOIN storage_data_sets AS storage_data_set
+			  ON storage_data_set.id = storage_copy.storage_data_set_id
+			 AND storage_data_set.bucket_id = storage_upload.bucket_id
+			WHERE storage_copy.status = %s
 			GROUP BY storage_copy.storage_data_set_id
 		) AS copy_stats ON copy_stats.storage_data_set_id = storage_data_set.id
 		LEFT JOIN (
@@ -583,13 +601,20 @@ func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketI
 				COUNT(DISTINCT object_version.version_id) AS referenced_versions,
 				COUNT(DISTINCT CASE WHEN object_version.is_current THEN object_version.version_id END) AS current_versions
 			FROM storage_upload_copies AS storage_copy
-			JOIN object_versions AS object_version ON object_version.storage_upload_id = storage_copy.upload_id
-			WHERE storage_copy.status = 'committed'
+			JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
+			JOIN object_versions AS object_version
+			  ON object_version.storage_upload_id = storage_copy.upload_id
+			 AND object_version.bucket_id = storage_data_set.bucket_id
+			WHERE storage_copy.status = %s
 			  AND object_version.is_delete_marker = FALSE
 			GROUP BY storage_copy.storage_data_set_id
 		) AS version_stats ON version_stats.storage_data_set_id = storage_data_set.id
 		WHERE (? = 0 OR storage_data_set.bucket_id = ?)
-		ORDER BY bucket.name ASC, storage_data_set.copy_index ASC`
+		ORDER BY bucket.name ASC, storage_data_set.copy_index ASC`,
+		storageHealthReadyDataSetStatusListSQL(),
+		storageHealthCommittedCopyStatusSQL(),
+		storageHealthCommittedCopyStatusSQL(),
+	)
 	if err := r.db.NewRaw(query, bucketID, bucketID).Scan(ctx, &summaries); err != nil {
 		return nil, fmt.Errorf("listing storage data set summaries: %w", err)
 	}
@@ -1283,7 +1308,7 @@ func countReadableCommittedCopies(ctx context.Context, db bun.IDB, uploadID int6
 	var row struct {
 		Count int `bun:"count"`
 	}
-	err := db.NewRaw(`SELECT COUNT(*) AS count
+	err := db.NewRaw(fmt.Sprintf(`SELECT COUNT(*) AS count
 		FROM storage_upload_copies AS storage_copy
 		JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
 		WHERE storage_copy.upload_id = ?
@@ -1291,9 +1316,11 @@ func countReadableCommittedCopies(ctx context.Context, db bun.IDB, uploadID int6
 		  AND storage_copy.storage_data_set_id IS NOT NULL
 		  AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> ''
 		  AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> ''
-		  AND storage_data_set.status IN ('ready', 'draining')
+		  AND storage_data_set.status IN (%s)
 		  AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> ''
 		  AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> ''`,
+		storageHealthReadyDataSetStatusListSQL(),
+	),
 		uploadID, model.StorageUploadCopyStatusCommitted,
 	).Scan(ctx, &row)
 	if err != nil {

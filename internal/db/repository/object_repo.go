@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"maps"
-	"strings"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -576,8 +575,7 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 		OrderExpr("object_version.key ASC")
 
 	if prefix != "" {
-		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
-		q = q.Where("object_version.key LIKE ? ESCAPE '\\'", escaped+"%")
+		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
 	}
 	if keyBoundary != "" {
 		if includeBoundary {
@@ -607,8 +605,7 @@ func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64
 	q = withObjectVersionStorageColumns(q, "object_version")
 
 	if prefix != "" {
-		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
-		q = q.Where("object_version.key LIKE ? ESCAPE '\\'", escaped+"%")
+		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
 	}
 	if keyMarker != "" {
 		if versionIDMarker == "" {
@@ -679,8 +676,7 @@ func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucket
 		OrderExpr("object_version.key ASC")
 
 	if prefix != "" {
-		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
-		q = q.Where("object_version.key LIKE ? ESCAPE '\\'", escaped+"%")
+		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
 	}
 	if afterKey != "" {
 		q = q.Where("object_version.key > ?", afterKey)

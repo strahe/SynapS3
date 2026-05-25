@@ -98,6 +98,9 @@ func TestMultipartRepo_ListByBucket(t *testing.T) {
 	if err := repos.Multiparts.Create(ctx, &model.MultipartUpload{BucketID: bucket.ID, Key: "other/x", UploadID: "u4"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := repos.Multiparts.Create(ctx, &model.MultipartUpload{BucketID: bucket.ID, Key: "Dir/u5", UploadID: "u5"}); err != nil {
+		t.Fatal(err)
+	}
 
 	uploads, err := repos.Multiparts.ListByBucket(ctx, bucket.ID, "dir/", "", "", 10)
 	if err != nil {

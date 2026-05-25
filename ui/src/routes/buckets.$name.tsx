@@ -23,6 +23,7 @@ import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState
 import {
   api,
   type BucketStorageHealthSummary,
+  type BucketStorageRiskVersion,
   type CopyHealthInfo,
   type DeletedObjectItem,
   maxFOCUploadSize,
@@ -37,7 +38,6 @@ import {
   type ObjectUploadClientProgress,
   type ObjectUploadStatus,
   type ObjectVersionItem,
-  type ProviderIdentity,
   type StorageDataSetSummary,
   type StorageHealthStatus,
   type UploadTransferProgress,
@@ -50,9 +50,11 @@ import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialo
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
+import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
+import { StorageRiskHeader, StorageRiskView } from '@/components/buckets/StorageRiskView'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   Breadcrumb,
@@ -82,7 +84,6 @@ import {
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Progress } from '@/components/ui/progress'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -95,6 +96,7 @@ import {
   useBucket,
   useBucketObjects,
   useBucketObjectVersions,
+  useBucketStorageRiskVersions,
   useDeleteBucket,
   useDeleteBucketObject,
   useDeletedBucketObjects,
@@ -117,6 +119,7 @@ import {
   copyPolicyOptions,
   inheritedCopyPolicyValue,
 } from '@/lib/bucket-copy-policy'
+import { type BucketRouteSearch, normalizeBucketRouteSearch } from '@/lib/bucket-route-search'
 import {
   bucketStorageHealthAffectedVersionsLabel,
   bucketStorageHealthLabel,
@@ -124,6 +127,7 @@ import {
   bucketStorageHealthStatusTone,
   bucketStorageHealthTitle,
 } from '@/lib/bucket-storage-health'
+import { dataSetNeedsStorageRiskReview } from '@/lib/bucket-storage-risk'
 import {
   copyHealthInfoTitle,
   copyHealthStatusLabel,
@@ -138,33 +142,14 @@ import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel 
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
 import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 
-type ObjectBrowserSearch = {
-  prefix?: string
-  marker?: string
-  view?: 'objects' | 'deleted'
-}
 type ProvenanceFailureDialogState = { title: string; text: string }
 
 const objectBrowserSkeletonRows = ['row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8']
 
 export const Route = createFileRoute('/buckets/$name')({
-  validateSearch: (search: Record<string, unknown>): ObjectBrowserSearch => ({
-    prefix: normalizePrefixSearch(search.prefix),
-    marker: normalizeSearchString(search.marker),
-    view: search.view === 'deleted' ? search.view : undefined,
-  }),
+  validateSearch: (search: Record<string, unknown>): BucketRouteSearch => normalizeBucketRouteSearch(search),
   component: ObjectBrowserPage,
 })
-
-function normalizeSearchString(value: unknown) {
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-function normalizePrefixSearch(value: unknown) {
-  const prefix = normalizeSearchString(value)
-  if (!prefix) return undefined
-  return prefix.endsWith('/') ? prefix : `${prefix}/`
-}
 
 function DeleteBucketDetailDialog({
   bucketName,
@@ -794,107 +779,6 @@ function ProvenanceSummaryItem({
   )
 }
 
-function ProviderIdentityCell({ providerID, identity }: { providerID?: string; identity?: ProviderIdentity }) {
-  const [detailsOpen, setDetailsOpen] = useState(false)
-  const registryID = identity?.registry_provider_id ?? providerID
-  const label = identity?.name?.trim() || (registryID ? `Registry ${registryID}` : '—')
-
-  if (!identity) {
-    if (!registryID) {
-      return (
-        <span className="block max-w-44 truncate font-mono text-xs text-muted-foreground" title={registryID}>
-          {label}
-        </span>
-      )
-    }
-
-    return <ProviderTopologyLink providerID={registryID} label={label} className="font-mono text-xs" />
-  }
-
-  return (
-    <div className="flex min-w-0 items-center gap-1.5">
-      {registryID ? <ProviderTopologyLink providerID={registryID} label={label} /> : <span>{label}</span>}
-      <Popover open={detailsOpen} onOpenChange={setDetailsOpen}>
-        <PopoverTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`Provider details for ${label}`}
-            aria-expanded={detailsOpen}
-          >
-            <Info />
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent
-          side="top"
-          className="max-h-[min(calc(100vh-2rem),32rem)] w-max max-w-[min(calc(100vw-2rem),36rem)] overflow-y-auto whitespace-normal p-3.5 text-left"
-        >
-          <ProviderIdentityDetails providerID={registryID} identity={identity} />
-        </PopoverContent>
-      </Popover>
-    </div>
-  )
-}
-
-function ProviderTopologyLink({
-  providerID,
-  label,
-  className,
-}: {
-  providerID: string
-  label: string
-  className?: string
-}) {
-  return (
-    <Link
-      to="/storage-topology"
-      search={{ provider: providerID }}
-      className={cn('block min-w-0 max-w-44 truncate font-medium hover:underline', className)}
-      title={label}
-    >
-      {label}
-    </Link>
-  )
-}
-
-function ProviderIdentityDetails({ providerID, identity }: { providerID?: string; identity: ProviderIdentity }) {
-  const allFields: Array<[string, string | undefined]> = [
-    ['Registry Provider ID', identity.registry_provider_id || providerID],
-    ['Actor ID', identity.filecoin_actor_id],
-    ['Filecoin address', identity.filecoin_address],
-    ['EVM service provider', identity.service_provider_address],
-    ['Payee address', identity.payee_address],
-    ['Service URL', identity.service_url],
-    ['Location', identity.location],
-    ['Description', identity.description],
-  ]
-  const fields = allFields.filter((field): field is [string, string] => Boolean(field[1]))
-  const extras = Object.entries(identity.extra_capabilities ?? {}).sort(([a], [b]) => a.localeCompare(b))
-
-  return (
-    <div className="flex w-full select-text flex-col gap-3">
-      <div className="font-medium">
-        {identity.name?.trim() || `Registry ${identity.registry_provider_id || providerID}`}
-      </div>
-      <div className="grid grid-cols-1 gap-x-3 gap-y-2 text-xs sm:grid-cols-[9rem_minmax(0,1fr)]">
-        {fields.map(([label, value]) => (
-          <Fragment key={label}>
-            <span className="text-muted-foreground">{label}</span>
-            <CopyableValue label={label} value={value} monospace maxLength={32} className="leading-relaxed" />
-          </Fragment>
-        ))}
-        {extras.map(([label, value]) => (
-          <Fragment key={label}>
-            <span className="text-muted-foreground">{label}</span>
-            <CopyableValue label={label} value={value} monospace maxLength={32} className="leading-relaxed" />
-          </Fragment>
-        ))}
-      </div>
-    </div>
-  )
-}
-
 function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
   return (
     <div className="overflow-hidden rounded-md border border-border">
@@ -1219,15 +1103,37 @@ function ObjectBrowserPage() {
   const navigate = useNavigate()
   const prefix = search.prefix ?? ''
   const marker = search.marker ?? ''
+  const riskPrefix = search.risk_prefix ?? ''
+  const riskKey = search.risk_key ?? ''
+  const riskDatasetID = search.risk_dataset ? Number(search.risk_dataset) : undefined
+  const riskKeyMarker = search.risk_key_marker ?? ''
+  const riskVersionMarker = search.risk_version_marker ?? ''
+  const riskCreatedAtMarker = search.risk_created_at_marker ?? ''
+  const riskStaleBefore = search.risk_stale_before ?? ''
   const view = search.view ?? 'objects'
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [changeOwnerOpen, setChangeOwnerOpen] = useState(false)
   const [deleteBucketOpen, setDeleteBucketOpen] = useState(false)
   const [uploadOpen, setUploadOpen] = useState(false)
+  const [riskProvenanceVersion, setRiskProvenanceVersion] = useState<BucketStorageRiskVersion | null>(null)
 
   const bucket = useBucket(name)
   const objects = useBucketObjects(name, prefix, marker, 50, '/', view === 'objects')
   const deletedObjects = useDeletedBucketObjects(name, prefix, marker, 50, view === 'deleted')
+  const storageRisk = useBucketStorageRiskVersions(
+    name,
+    {
+      prefix: riskKey ? undefined : riskPrefix || undefined,
+      key: riskKey || undefined,
+      local_data_set_id: riskDatasetID,
+      key_marker: riskKeyMarker || undefined,
+      version_marker: riskVersionMarker || undefined,
+      created_at_marker: riskCreatedAtMarker || undefined,
+      stale_before: riskStaleBefore || undefined,
+      limit: 50,
+    },
+    view === 'storage-risk'
+  )
   const qc = useQueryClient()
 
   const pathCrumbs = bucketPrefixCrumbs(prefix)
@@ -1239,7 +1145,15 @@ function ObjectBrowserPage() {
       search: {
         prefix: newPrefix || undefined,
         marker: undefined,
-        view: view === 'deleted' ? view : undefined,
+        version_marker: undefined,
+        risk_prefix: undefined,
+        risk_key: undefined,
+        risk_key_marker: undefined,
+        risk_version_marker: undefined,
+        risk_created_at_marker: undefined,
+        risk_stale_before: undefined,
+        risk_dataset: view === 'storage-risk' ? search.risk_dataset : undefined,
+        view: view === 'deleted' || view === 'storage-risk' ? view : undefined,
       },
     })
   }
@@ -1256,6 +1170,61 @@ function ObjectBrowserPage() {
     })
   }
 
+  const navigateToStorageRiskMarker = (
+    keyMarker: string,
+    nextVersionMarker: string,
+    nextCreatedAtMarker: string,
+    nextStaleBefore: string
+  ) => {
+    navigate({
+      to: '/buckets/$name',
+      params: { name },
+      search: {
+        prefix: undefined,
+        marker: undefined,
+        version_marker: undefined,
+        risk_prefix: riskKey ? undefined : riskPrefix || undefined,
+        risk_dataset: search.risk_dataset,
+        risk_key: riskKey || undefined,
+        risk_key_marker: keyMarker || undefined,
+        risk_version_marker: nextVersionMarker || undefined,
+        risk_created_at_marker: nextCreatedAtMarker || undefined,
+        risk_stale_before: nextStaleBefore || undefined,
+        view: 'storage-risk',
+      },
+    })
+  }
+
+  const navigateToStorageRiskFilters = (next: { prefix?: string; key?: string; dataSetID?: number }) => {
+    navigate({
+      to: '/buckets/$name',
+      params: { name },
+      search: {
+        prefix: undefined,
+        marker: undefined,
+        version_marker: undefined,
+        risk_prefix: next.key ? undefined : next.prefix || undefined,
+        risk_dataset: next.dataSetID ? next.dataSetID.toString() : undefined,
+        risk_key: next.key || undefined,
+        risk_key_marker: undefined,
+        risk_version_marker: undefined,
+        risk_created_at_marker: undefined,
+        risk_stale_before: undefined,
+        view: 'storage-risk',
+      },
+    })
+  }
+
+  const navigateToStorageRisk = () => {
+    navigateToStorageRiskFilters({})
+    setDetailsOpen(false)
+  }
+
+  const navigateToStorageRiskDataSet = (dataSetID: number) => {
+    navigateToStorageRiskFilters({ dataSetID })
+    setDetailsOpen(false)
+  }
+
   const navigateToView = (nextView: 'objects' | 'deleted') => {
     navigate({
       to: '/buckets/$name',
@@ -1263,6 +1232,14 @@ function ObjectBrowserPage() {
       search: {
         prefix: prefix || undefined,
         marker: undefined,
+        version_marker: undefined,
+        risk_prefix: undefined,
+        risk_dataset: undefined,
+        risk_key: undefined,
+        risk_key_marker: undefined,
+        risk_version_marker: undefined,
+        risk_created_at_marker: undefined,
+        risk_stale_before: undefined,
         view: nextView === 'objects' ? undefined : nextView,
       },
     })
@@ -1272,11 +1249,13 @@ function ObjectBrowserPage() {
     qc.invalidateQueries({ queryKey: ['bucket', name] })
     qc.invalidateQueries({ queryKey: ['objects', name] })
     qc.invalidateQueries({ queryKey: ['deletedObjects', name] })
+    qc.invalidateQueries({ queryKey: ['bucketStorageRiskVersions', name] })
   }
 
   const handleUploadCompleted = () => {
     qc.invalidateQueries({ queryKey: ['bucket', name] })
     qc.invalidateQueries({ queryKey: ['objects', name] })
+    qc.invalidateQueries({ queryKey: ['bucketStorageRiskVersions', name] })
     qc.invalidateQueries({ queryKey: ['tasks'] })
     qc.invalidateQueries({ queryKey: ['taskStats'] })
     if (marker) {
@@ -1335,12 +1314,16 @@ function ObjectBrowserPage() {
 
       {bucket.error && <PageErrorState title="Failed to load bucket details" className="min-h-24 p-0" />}
 
-      <Tabs value={view} onValueChange={(value) => navigateToView(value === 'deleted' ? 'deleted' : 'objects')}>
-        <TabsList className="max-w-full justify-start overflow-x-auto">
-          <TabsTrigger value="objects">Objects</TabsTrigger>
-          <TabsTrigger value="deleted">Trash</TabsTrigger>
-        </TabsList>
-      </Tabs>
+      {view === 'storage-risk' ? (
+        <StorageRiskHeader onBack={() => navigateToView('objects')} />
+      ) : (
+        <Tabs value={view} onValueChange={(value) => navigateToView(value === 'deleted' ? 'deleted' : 'objects')}>
+          <TabsList className="max-w-full justify-start overflow-x-auto">
+            <TabsTrigger value="objects">Objects</TabsTrigger>
+            <TabsTrigger value="deleted">Trash</TabsTrigger>
+          </TabsList>
+        </Tabs>
+      )}
 
       {view === 'objects' && objects.isLoading ? (
         <ObjectBrowserSkeleton />
@@ -1373,9 +1356,42 @@ function ObjectBrowserPage() {
           navigateToPrefix={navigateToPrefix}
           navigateToMarker={navigateToMarker}
         />
+      ) : view === 'storage-risk' && storageRisk.isLoading ? (
+        <ObjectBrowserSkeleton />
+      ) : view === 'storage-risk' && storageRisk.error ? (
+        <PageErrorState title="Failed to load storage risk" className="h-64" />
+      ) : view === 'storage-risk' ? (
+        <StorageRiskView
+          prefix={riskKey ? '' : riskPrefix}
+          exactKey={riskKey}
+          dataSetID={riskDatasetID}
+          dataSets={bucket.data?.data_sets ?? []}
+          versions={storageRisk.data?.versions ?? []}
+          hasMore={storageRisk.data?.has_more ?? false}
+          nextKeyMarker={storageRisk.data?.next_key_marker}
+          nextVersionMarker={storageRisk.data?.next_version_marker}
+          nextCreatedAtMarker={storageRisk.data?.next_created_at_marker}
+          staleBefore={storageRisk.data?.stale_before}
+          keyMarker={riskKeyMarker}
+          versionMarker={riskVersionMarker}
+          createdAtMarker={riskCreatedAtMarker}
+          staleBeforeMarker={riskStaleBefore}
+          navigateToMarker={navigateToStorageRiskMarker}
+          navigateToFilters={navigateToStorageRiskFilters}
+          onOpenProvenance={setRiskProvenanceVersion}
+        />
       ) : (
         <ObjectBrowserSkeleton />
       )}
+      <ObjectProvenanceDialog
+        bucketName={name}
+        objectKey={riskProvenanceVersion?.key ?? ''}
+        versionID={riskProvenanceVersion?.version_id ?? ''}
+        open={Boolean(riskProvenanceVersion)}
+        onOpenChange={(open) => {
+          if (!open) setRiskProvenanceVersion(null)
+        }}
+      />
       <UploadObjectsDialog
         bucketName={name}
         prefix={prefix}
@@ -1392,6 +1408,8 @@ function ObjectBrowserPage() {
             canDelete={canDelete}
             onChangeOwner={openChangeOwner}
             onDeleteBucket={openDeleteBucket}
+            onReviewStorageRisk={() => navigateToStorageRisk()}
+            onReviewStorageDataSetRisk={navigateToStorageRiskDataSet}
           />
           <ChangeBucketOwnerDetailDialog
             bucketName={name}
@@ -1718,6 +1736,8 @@ function BucketDetailsSheet({
   canDelete,
   onChangeOwner,
   onDeleteBucket,
+  onReviewStorageRisk,
+  onReviewStorageDataSetRisk,
 }: {
   bucket: NonNullable<ReturnType<typeof useBucket>['data']>
   open: boolean
@@ -1725,6 +1745,8 @@ function BucketDetailsSheet({
   canDelete: boolean
   onChangeOwner: () => void
   onDeleteBucket: () => void
+  onReviewStorageRisk: () => void
+  onReviewStorageDataSetRisk: (dataSetID: number) => void
 }) {
   const [storageHealthError, setStorageHealthError] = useState<string | null>(null)
 
@@ -1746,9 +1768,17 @@ function BucketDetailsSheet({
               <BucketDetailsSection title="Overview">
                 <BucketDetailsOverview bucket={bucket} />
               </BucketDetailsSection>
-              <BucketStorageHealthPanel health={bucket.storage_health} onOpenLastError={setStorageHealthError} />
+              <BucketStorageHealthPanel
+                health={bucket.storage_health}
+                onOpenLastError={setStorageHealthError}
+                onReviewVersions={onReviewStorageRisk}
+              />
               <BucketDetailsSection title="Storage">
-                <BucketStorageDataSets bucketName={bucket.name} dataSets={bucket.data_sets ?? []} />
+                <BucketStorageDataSets
+                  bucketName={bucket.name}
+                  dataSets={bucket.data_sets ?? []}
+                  onReviewStorageRisk={onReviewStorageDataSetRisk}
+                />
               </BucketDetailsSection>
               <BucketDetailsSection title="Settings">
                 <BucketDetailsSettings
@@ -1809,11 +1839,14 @@ function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<type
 function BucketStorageHealthPanel({
   health,
   onOpenLastError,
+  onReviewVersions,
 }: {
   health: BucketStorageHealthSummary
   onOpenLastError: (error: string) => void
+  onReviewVersions: () => void
 }) {
   const lastError = health.last_error
+  const hasAffectedVersions = !lastError && health.affected_versions_capped > 0
 
   return (
     <Card size="sm">
@@ -1843,6 +1876,9 @@ function BucketStorageHealthPanel({
           />
           {lastError && (
             <BucketDetailAction label="Last error" value="Error details" onClick={() => onOpenLastError(lastError)} />
+          )}
+          {hasAffectedVersions && (
+            <BucketDetailAction label="Affected versions" value="Review versions" onClick={onReviewVersions} />
           )}
         </dl>
       </CardContent>
@@ -1897,7 +1933,15 @@ function BucketDetailAction({ label, value, onClick }: { label: string; value: s
   )
 }
 
-function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; dataSets: StorageDataSetSummary[] }) {
+function BucketStorageDataSets({
+  bucketName,
+  dataSets,
+  onReviewStorageRisk,
+}: {
+  bucketName: string
+  dataSets: StorageDataSetSummary[]
+  onReviewStorageRisk: (dataSetID: number) => void
+}) {
   const refreshStorageHealth = useRefreshDataSetStorageHealth()
   const [refreshError, setRefreshError] = useState<string | null>(null)
 
@@ -1941,7 +1985,7 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
         </div>
       )}
       <ScrollArea className="w-full">
-        <Table className="min-w-[760px]">
+        <Table className="min-w-[820px]">
           <TableHeader>
             <TableRow>
               <TableHead className="px-4">Replica Slot</TableHead>
@@ -1949,6 +1993,7 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
               <TableHead className="px-4">Data Set ID</TableHead>
               <TableHead className="px-4">Storage Health</TableHead>
               <TableHead className="px-4">Last Used</TableHead>
+              <TableHead className="w-10 px-4 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1984,6 +2029,24 @@ function BucketStorageDataSets({ bucketName, dataSets }: { bucketName: string; d
                   </TableCell>
                   <TableCell className="px-4 text-muted-foreground" title={dataSet.updated_at}>
                     {timeAgo(dataSet.updated_at)}
+                  </TableCell>
+                  <TableCell className="px-4 text-right">
+                    {dataSetNeedsStorageRiskReview(dataSet) && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label={`Review affected versions for ${replicaLabel(dataSet.copy_index)}`}
+                            onClick={() => onReviewStorageRisk(dataSet.id)}
+                          >
+                            <TriangleAlert />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Affected versions</TooltipContent>
+                      </Tooltip>
+                    )}
                   </TableCell>
                 </TableRow>
               )

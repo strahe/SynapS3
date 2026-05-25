@@ -362,6 +362,37 @@ test('bucket object listing sends folder browser query parameters', async () => 
   )
 })
 
+test('bucket storage risk versions sends independent marker parameters', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedURL = ''
+  globalThis.fetch = (async (input) => {
+    requestedURL = input.toString()
+    return new Response(JSON.stringify({ versions: [], has_more: false }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    await api.getBucketStorageRiskVersions('bucket-a', {
+      prefix: ' reports/ ',
+      local_data_set_id: 42,
+      key_marker: ' reports/a.txt ',
+      version_marker: '01JMARKER',
+      created_at_marker: '2026-05-24T12:00:00.123456789Z',
+      stale_before: '2026-05-24T11:59:00.123456789Z',
+      limit: 50,
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(
+    requestedURL,
+    '/api/v1/buckets/bucket-a/storage-health/affected-versions?prefix=+reports%2F+&local_data_set_id=42&key_marker=+reports%2Fa.txt+&version_marker=01JMARKER&created_at_marker=2026-05-24T12%3A00%3A00.123456789Z&stale_before=2026-05-24T11%3A59%3A00.123456789Z&limit=50'
+  )
+})
+
 test('object upload uses XHR with write header and upload progress', async () => {
   const restore = installFakeXMLHttpRequest()
   const file = new File(['x'.repeat(minFOCUploadSize)], 'report summary.txt', { type: 'text/plain' })

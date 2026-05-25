@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -599,6 +600,289 @@ func TestStorageUploadRepo_ListBucketStorageHealthSummariesTreatsStaleOnlyRiskAs
 		got.LastCheckedAt == nil ||
 		!got.LastCheckedAt.Equal(staleCheckedAt) {
 		t.Fatalf("summary = %#v, want stale-only risk classified as unknown", got)
+	}
+}
+
+func TestStorageUploadRepo_ListBucketStorageHealthAffectedVersionsReportsRetainedVersionRisk(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "storage-health-affected-bucket")
+	otherBucket := seedBucket(t, db, "storage-health-affected-other-bucket")
+	checkedAt := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	staleBefore := checkedAt.Add(-time.Hour)
+
+	currentVersion := newObjectVersion(bucket.ID, "current.txt", "01J0000000000000000SHD001", 4)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent current: %v", err)
+	}
+	currentUpload := startCopyHealthUpload(t, repos, bucket.ID, currentVersion.VersionID, currentVersion.Size, currentVersion.Checksum, 3)
+	currentRiskA := commitStorageHealthCopy(t, repos, bucket.ID, currentUpload.ID, 0, "101", "2101", "3101", "https://provider.example/current-risk-a")
+	currentRiskB := commitStorageHealthCopy(t, repos, bucket.ID, currentUpload.ID, 1, "102", "2102", "3102", "https://provider.example/current-risk-b")
+	currentReadable := commitStorageHealthCopy(t, repos, bucket.ID, currentUpload.ID, 2, "103", "2103", "3103", "https://provider.example/current-readable")
+	bindStorageHealthVersion(t, repos, bucket.ID, currentUpload.ID, currentVersion)
+
+	oldVersion := newObjectVersion(bucket.ID, "archive/old.txt", "01J0000000000000000SHD002", 5)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent old: %v", err)
+	}
+	oldUpload := startCopyHealthUpload(t, repos, bucket.ID, oldVersion.VersionID, oldVersion.Size, oldVersion.Checksum, 1)
+	oldRisk := commitStorageHealthCopy(t, repos, bucket.ID, oldUpload.ID, 3, "104", "2104", "3104", "https://provider.example/old-risk")
+	bindStorageHealthVersion(t, repos, bucket.ID, oldUpload.ID, oldVersion)
+	replacementVersion := newObjectVersion(bucket.ID, "archive/old.txt", "01J0000000000000000SHD003", 6)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacementVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent replacement: %v", err)
+	}
+
+	trashVersion := newObjectVersion(bucket.ID, "trash.txt", "01J0000000000000000SHD004", 7)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, trashVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent trash: %v", err)
+	}
+	trashUpload := startCopyHealthUpload(t, repos, bucket.ID, trashVersion.VersionID, trashVersion.Size, trashVersion.Checksum, 1)
+	trashRisk := commitStorageHealthCopy(t, repos, bucket.ID, trashUpload.ID, 4, "105", "2105", "3105", "https://provider.example/trash-risk")
+	bindStorageHealthVersion(t, repos, bucket.ID, trashUpload.ID, trashVersion)
+	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "trash.txt", "01J0000000000000000SHD005"); err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	missingPieceVersion := newObjectVersion(bucket.ID, "missing-piece.txt", "01J0000000000000000SHD008", 9)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, missingPieceVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent missing piece: %v", err)
+	}
+	missingPieceUpload := startCopyHealthUpload(t, repos, bucket.ID, missingPieceVersion.VersionID, missingPieceVersion.Size, missingPieceVersion.Checksum, 2)
+	missingPieceRisk := commitStorageHealthCopy(t, repos, bucket.ID, missingPieceUpload.ID, 6, "107", "2107", "3107", "https://provider.example/missing-piece-risk")
+	missingPieceReadable := commitStorageHealthCopy(t, repos, bucket.ID, missingPieceUpload.ID, 7, "108", "2108", "3108", "https://provider.example/missing-piece-readable")
+	bindStorageHealthVersion(t, repos, bucket.ID, missingPieceUpload.ID, missingPieceVersion)
+	mustExec(t, db, `UPDATE storage_uploads SET piece_cid = NULL WHERE id = ?`, missingPieceUpload.ID)
+
+	unreferencedUpload := startCopyHealthUpload(t, repos, bucket.ID, "01J0000000000000000SHD006", 1, "checksum-unreferenced-risk", 1)
+	unreferencedRisk := commitStorageHealthCopy(t, repos, bucket.ID, unreferencedUpload.ID, 5, "106", "2106", "3106", "https://provider.example/unreferenced-risk")
+
+	otherVersion := newObjectVersion(otherBucket.ID, "other.txt", "01J0000000000000000SHD007", 8)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, otherVersion); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent other: %v", err)
+	}
+	otherUpload := startCopyHealthUpload(t, repos, otherBucket.ID, otherVersion.VersionID, otherVersion.Size, otherVersion.Checksum, 1)
+	otherRisk := commitStorageHealthCopy(t, repos, otherBucket.ID, otherUpload.ID, 0, "201", "2201", "3201", "https://provider.example/other-risk")
+	bindStorageHealthVersion(t, repos, otherBucket.ID, otherUpload.ID, otherVersion)
+
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
+		{LocalDataSetID: currentRiskA.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: currentRiskA.CopyIndex, ProviderID: currentRiskA.ProviderID, ChainDataSetID: currentRiskA.DataSetID, Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: currentRiskB.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: currentRiskB.CopyIndex, ProviderID: currentRiskB.ProviderID, ChainDataSetID: currentRiskB.DataSetID, Status: observability.StatusUnavailable, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetMissing}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: currentReadable.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: currentReadable.CopyIndex, ProviderID: currentReadable.ProviderID, ChainDataSetID: currentReadable.DataSetID, Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: oldRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: oldRisk.CopyIndex, ProviderID: oldRisk.ProviderID, ChainDataSetID: oldRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: trashRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: trashRisk.CopyIndex, ProviderID: trashRisk.ProviderID, ChainDataSetID: trashRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: missingPieceRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: missingPieceRisk.CopyIndex, ProviderID: missingPieceRisk.ProviderID, ChainDataSetID: missingPieceRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: missingPieceReadable.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: missingPieceReadable.CopyIndex, ProviderID: missingPieceReadable.ProviderID, ChainDataSetID: missingPieceReadable.DataSetID, Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: unreferencedRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: unreferencedRisk.CopyIndex, ProviderID: unreferencedRisk.ProviderID, ChainDataSetID: unreferencedRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: otherRisk.ID, BucketID: otherBucket.ID, BucketName: otherBucket.Name, CopyIndex: otherRisk.CopyIndex, ProviderID: otherRisk.ProviderID, ChainDataSetID: otherRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+	}); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+
+	page, err := repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:    bucket.ID,
+		StaleBefore: staleBefore,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthAffectedVersions: %v", err)
+	}
+	if page.HasMore || page.NextKeyMarker != "" || page.NextVersionIDMarker != "" || !page.NextCreatedAtMarker.IsZero() {
+		t.Fatalf("pagination = %#v, want single complete page", page)
+	}
+	if got, want := affectedVersionIDs(page.Versions), []string{oldVersion.VersionID, currentVersion.VersionID, missingPieceVersion.VersionID, trashVersion.VersionID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("version ids = %#v, want %#v", got, want)
+	}
+	current := affectedVersionByID(page.Versions, currentVersion.VersionID)
+	if current == nil || !current.Version.IsCurrent || current.ReadableAlternativeCount != 1 || len(current.RiskDataSets) != 2 {
+		t.Fatalf("current affected version = %#v, want current with two risk data sets and one alternative", current)
+	}
+	old := affectedVersionByID(page.Versions, oldVersion.VersionID)
+	if old == nil || old.Version.IsCurrent || old.ReadableAlternativeCount != 0 || len(old.RiskDataSets) != 1 {
+		t.Fatalf("old affected version = %#v, want retained old version without alternative", old)
+	}
+	trash := affectedVersionByID(page.Versions, trashVersion.VersionID)
+	if trash == nil || trash.Version.IsCurrent || trash.ReadableAlternativeCount != 0 || len(trash.RiskDataSets) != 1 {
+		t.Fatalf("trash affected version = %#v, want retained trashed data version without alternative", trash)
+	}
+	missingPiece := affectedVersionByID(page.Versions, missingPieceVersion.VersionID)
+	if missingPiece == nil || missingPiece.ReadableAlternativeCount != 0 || len(missingPiece.RiskDataSets) != 1 {
+		t.Fatalf("missing piece affected version = %#v, want no readable alternative without upload piece cid", missingPiece)
+	}
+}
+
+func TestStorageUploadRepo_ListBucketStorageHealthAffectedVersionsFiltersAndPaginates(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "storage-health-affected-filter-bucket")
+	checkedAt := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	staleBefore := checkedAt.Add(-time.Hour)
+
+	baseCreatedAt := time.Date(2026, 5, 23, 12, 30, 0, 123456000, time.UTC)
+	firstOldVersion := newObjectVersion(bucket.ID, "docs/a.txt", "01J0000000000000000SHF000", 1)
+	firstOldVersion.CreatedAt = baseCreatedAt.Add(-time.Minute)
+	firstOldVersion.UpdatedAt = firstOldVersion.CreatedAt
+	firstVersion := newObjectVersion(bucket.ID, "docs/a.txt", "01J0000000000000000SHF001", 1)
+	firstVersion.CreatedAt = baseCreatedAt
+	firstVersion.UpdatedAt = firstVersion.CreatedAt
+	secondVersion := newObjectVersion(bucket.ID, "docs/b.txt", "01J0000000000000000SHF002", 1)
+	secondVersion.CreatedAt = baseCreatedAt.Add(time.Minute)
+	secondVersion.UpdatedAt = secondVersion.CreatedAt
+	thirdVersion := newObjectVersion(bucket.ID, "logs/c.txt", "01J0000000000000000SHF003", 1)
+	thirdVersion.CreatedAt = baseCreatedAt.Add(2 * time.Minute)
+	thirdVersion.UpdatedAt = thirdVersion.CreatedAt
+	for _, version := range []*model.ObjectVersion{firstOldVersion, firstVersion, secondVersion, thirdVersion} {
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent %s: %v", version.VersionID, err)
+		}
+	}
+	firstOldUpload := startCopyHealthUpload(t, repos, bucket.ID, firstOldVersion.VersionID, firstOldVersion.Size, firstOldVersion.Checksum, 1)
+	firstUpload := startCopyHealthUpload(t, repos, bucket.ID, firstVersion.VersionID, firstVersion.Size, firstVersion.Checksum, 1)
+	secondUpload := startCopyHealthUpload(t, repos, bucket.ID, secondVersion.VersionID, secondVersion.Size, secondVersion.Checksum, 1)
+	thirdUpload := startCopyHealthUpload(t, repos, bucket.ID, thirdVersion.VersionID, thirdVersion.Size, thirdVersion.Checksum, 1)
+	firstOldRisk := commitStorageHealthCopy(t, repos, bucket.ID, firstOldUpload.ID, 3, "304", "3304", "4304", "https://provider.example/a-old")
+	firstRisk := commitStorageHealthCopy(t, repos, bucket.ID, firstUpload.ID, 0, "301", "3301", "4301", "https://provider.example/a")
+	secondRisk := commitStorageHealthCopy(t, repos, bucket.ID, secondUpload.ID, 1, "302", "3302", "4302", "https://provider.example/b")
+	thirdRisk := commitStorageHealthCopy(t, repos, bucket.ID, thirdUpload.ID, 2, "303", "3303", "4303", "https://provider.example/c")
+	bindStorageHealthVersion(t, repos, bucket.ID, firstOldUpload.ID, firstOldVersion)
+	bindStorageHealthVersion(t, repos, bucket.ID, firstUpload.ID, firstVersion)
+	bindStorageHealthVersion(t, repos, bucket.ID, secondUpload.ID, secondVersion)
+	bindStorageHealthVersion(t, repos, bucket.ID, thirdUpload.ID, thirdVersion)
+
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
+		{LocalDataSetID: firstOldRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: firstOldRisk.CopyIndex, ProviderID: firstOldRisk.ProviderID, ChainDataSetID: firstOldRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: firstRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: firstRisk.CopyIndex, ProviderID: firstRisk.ProviderID, ChainDataSetID: firstRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: secondRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: secondRisk.CopyIndex, ProviderID: secondRisk.ProviderID, ChainDataSetID: secondRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: thirdRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: thirdRisk.CopyIndex, ProviderID: thirdRisk.ProviderID, ChainDataSetID: thirdRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+	}); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+
+	prefixPage, err := repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:    bucket.ID,
+		Prefix:      "docs/",
+		StaleBefore: staleBefore,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthAffectedVersions prefix: %v", err)
+	}
+	if got, want := affectedVersionIDs(prefixPage.Versions), []string{firstVersion.VersionID, firstOldVersion.VersionID, secondVersion.VersionID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("prefix version ids = %#v, want %#v", got, want)
+	}
+
+	keyPage, err := repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:    bucket.ID,
+		Key:         "docs/b.txt",
+		StaleBefore: staleBefore,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthAffectedVersions key: %v", err)
+	}
+	if got, want := affectedVersionIDs(keyPage.Versions), []string{secondVersion.VersionID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("key version ids = %#v, want %#v", got, want)
+	}
+
+	dataSetPage, err := repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:       bucket.ID,
+		LocalDataSetID: secondRisk.ID,
+		StaleBefore:    staleBefore,
+		Limit:          10,
+	})
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthAffectedVersions dataset: %v", err)
+	}
+	if got, want := affectedVersionIDs(dataSetPage.Versions), []string{secondVersion.VersionID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dataset version ids = %#v, want %#v", got, want)
+	}
+
+	firstPage, err := repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:    bucket.ID,
+		StaleBefore: staleBefore,
+		Limit:       1,
+	})
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthAffectedVersions first page: %v", err)
+	}
+	if !firstPage.HasMore || firstPage.NextKeyMarker != "docs/a.txt" || firstPage.NextVersionIDMarker != firstVersion.VersionID || !firstPage.NextCreatedAtMarker.Equal(firstVersion.CreatedAt) {
+		t.Fatalf("first page pagination = %#v, want marker for docs/a.txt", firstPage)
+	}
+	secondPage, err := repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+		BucketID:        bucket.ID,
+		KeyMarker:       firstPage.NextKeyMarker,
+		VersionIDMarker: firstPage.NextVersionIDMarker,
+		CreatedAtMarker: firstPage.NextCreatedAtMarker,
+		StaleBefore:     staleBefore,
+		Limit:           2,
+	})
+	if err != nil {
+		t.Fatalf("ListBucketStorageHealthAffectedVersions second page: %v", err)
+	}
+	if got, want := affectedVersionIDs(secondPage.Versions), []string{firstOldVersion.VersionID, secondVersion.VersionID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("second page version ids = %#v, want %#v", got, want)
+	}
+
+	seedPrefixRisk := func(key, versionID string, copyIndex int, providerID, dataSetID, pieceID string) *model.StorageDataSet {
+		t.Helper()
+		version := newObjectVersion(bucket.ID, key, versionID, 1)
+		version.CreatedAt = baseCreatedAt.Add(time.Duration(copyIndex) * time.Minute)
+		version.UpdatedAt = version.CreatedAt
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent %s: %v", versionID, err)
+		}
+		upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 1)
+		risk := commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, copyIndex, providerID, dataSetID, pieceID, "https://provider.example/"+versionID)
+		bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
+		return risk
+	}
+	wildPercentRisk := seedPrefixRisk("wild%/literal.txt", "01J0000000000000000SHF101", 10, "401", "5401", "6401")
+	wildSiblingRisk := seedPrefixRisk("wildX/literal.txt", "01J0000000000000000SHF102", 11, "402", "5402", "6402")
+	underScoreRisk := seedPrefixRisk("under_/literal.txt", "01J0000000000000000SHF103", 12, "403", "5403", "6403")
+	underSiblingRisk := seedPrefixRisk("underX/literal.txt", "01J0000000000000000SHF104", 13, "404", "5404", "6404")
+	backslashRisk := seedPrefixRisk(`back\slash/literal.txt`, "01J0000000000000000SHF105", 14, "405", "5405", "6405")
+	unicodeRisk := seedPrefixRisk("¿/literal.txt", "01J0000000000000000SHF106", 15, "406", "5406", "6406")
+	unicodeSiblingRisk := seedPrefixRisk("?/literal.txt", "01J0000000000000000SHF107", 16, "407", "5407", "6407")
+	caseRisk := seedPrefixRisk("case/literal.txt", "01J0000000000000000SHF108", 17, "408", "5408", "6408")
+	caseSiblingRisk := seedPrefixRisk("Case/literal.txt", "01J0000000000000000SHF109", 18, "409", "5409", "6409")
+	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
+		{LocalDataSetID: wildPercentRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: wildPercentRisk.CopyIndex, ProviderID: wildPercentRisk.ProviderID, ChainDataSetID: wildPercentRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: wildSiblingRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: wildSiblingRisk.CopyIndex, ProviderID: wildSiblingRisk.ProviderID, ChainDataSetID: wildSiblingRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: underScoreRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: underScoreRisk.CopyIndex, ProviderID: underScoreRisk.ProviderID, ChainDataSetID: underScoreRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: underSiblingRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: underSiblingRisk.CopyIndex, ProviderID: underSiblingRisk.ProviderID, ChainDataSetID: underSiblingRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: backslashRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: backslashRisk.CopyIndex, ProviderID: backslashRisk.ProviderID, ChainDataSetID: backslashRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: unicodeRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: unicodeRisk.CopyIndex, ProviderID: unicodeRisk.ProviderID, ChainDataSetID: unicodeRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: unicodeSiblingRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: unicodeSiblingRisk.CopyIndex, ProviderID: unicodeSiblingRisk.ProviderID, ChainDataSetID: unicodeSiblingRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: caseRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: caseRisk.CopyIndex, ProviderID: caseRisk.ProviderID, ChainDataSetID: caseRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: caseSiblingRisk.ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: caseSiblingRisk.CopyIndex, ProviderID: caseSiblingRisk.ProviderID, ChainDataSetID: caseSiblingRisk.DataSetID, Status: observability.StatusUnavailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+	}); err != nil {
+		t.Fatalf("ReplaceDataSetStates special prefixes: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		want   []string
+	}{
+		{name: "percent", prefix: "wild%/", want: []string{"01J0000000000000000SHF101"}},
+		{name: "underscore", prefix: "under_/", want: []string{"01J0000000000000000SHF103"}},
+		{name: "backslash", prefix: `back\slash/`, want: []string{"01J0000000000000000SHF105"}},
+		{name: "unicode", prefix: "¿/", want: []string{"01J0000000000000000SHF106"}},
+		{name: "case-sensitive", prefix: "case/", want: []string{"01J0000000000000000SHF108"}},
+	} {
+		page, err := repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+			BucketID:    bucket.ID,
+			Prefix:      tc.prefix,
+			StaleBefore: staleBefore,
+			Limit:       10,
+		})
+		if err != nil {
+			t.Fatalf("ListBucketStorageHealthAffectedVersions prefix %s: %v", tc.name, err)
+		}
+		if got := affectedVersionIDs(page.Versions); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("prefix %s version ids = %#v, want %#v", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -1674,6 +1958,23 @@ func hasStorageHealthReason(reasons []observability.ReasonCode, want observabili
 		}
 	}
 	return false
+}
+
+func affectedVersionIDs(versions []repository.BucketStorageHealthAffectedVersion) []string {
+	out := make([]string, 0, len(versions))
+	for _, version := range versions {
+		out = append(out, version.Version.VersionID)
+	}
+	return out
+}
+
+func affectedVersionByID(versions []repository.BucketStorageHealthAffectedVersion, versionID string) *repository.BucketStorageHealthAffectedVersion {
+	for i := range versions {
+		if versions[i].Version.VersionID == versionID {
+			return &versions[i]
+		}
+	}
+	return nil
 }
 
 func strPtr(v string) *string {
