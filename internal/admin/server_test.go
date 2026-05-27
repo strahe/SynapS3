@@ -359,3 +359,27 @@ func TestRefreshMetrics(t *testing.T) {
 		}
 	}
 }
+
+func TestWithSecurityHeaders(t *testing.T) {
+	handler := withSecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	res := rec.Result()
+	defer func() { _ = res.Body.Close() }()
+
+	if got := res.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := res.Header.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
+	if got := res.Header.Get("Referrer-Policy"); got != "strict-origin-when-cross-origin" {
+		t.Errorf("Referrer-Policy = %q, want strict-origin-when-cross-origin", got)
+	}
+}

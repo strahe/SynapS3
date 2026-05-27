@@ -253,7 +253,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	srv := &http.Server{
 		Addr:              s.addr,
-		Handler:           mux,
+		Handler:           withSecurityHeaders(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -280,6 +280,15 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		return err
 	}
+}
+
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
 }
 
 type healthResponse struct {

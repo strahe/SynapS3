@@ -421,6 +421,42 @@ func TestTaskRepo_Complete(t *testing.T) {
 	}
 }
 
+func TestTaskRepo_CompleteWithMessage(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUpload)
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimReady: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	message := "completed successfully with special condition"
+	if err := repos.Tasks.CompleteWithMessage(ctx, claimed, message); err != nil {
+		t.Fatalf("CompleteWithMessage: %v", err)
+	}
+
+	task, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if task == nil {
+		t.Fatal("expected task to be found, got nil")
+	}
+	if task.Status != model.TaskStatusCompleted {
+		t.Errorf("expected status %s, got %s", model.TaskStatusCompleted, task.Status)
+	}
+	if task.StatusMessage == nil {
+		t.Errorf("expected status_message %q, got nil", message)
+	} else if *task.StatusMessage != message {
+		t.Errorf("expected status_message %q, got %q", message, *task.StatusMessage)
+	}
+}
+
 func TestTaskRepo_Complete_NotRunning(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

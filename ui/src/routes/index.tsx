@@ -180,7 +180,14 @@ function StorageHealthCard({ health }: { health: OverviewData['filecoin_storage_
               </span>
               <span className="font-semibold text-foreground">{formatOptionalPercent(dataSets.readyPercent)}</span>
             </div>
-            <div className="h-2 min-w-0 overflow-hidden rounded-full bg-muted">
+            <div
+              role="progressbar"
+              aria-label="Storage copy readiness"
+              aria-valuemin={dataSets.readyPercent != null ? 0 : undefined}
+              aria-valuemax={dataSets.readyPercent != null ? 100 : undefined}
+              aria-valuenow={dataSets.readyPercent ?? undefined}
+              className="h-2 min-w-0 overflow-hidden rounded-full bg-muted"
+            >
               <div
                 className={`h-full rounded-full ${healthStyle.progressClassName}`}
                 style={{ width: `${dataSets.readyPercent ?? 0}%` }}
