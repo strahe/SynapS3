@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,11 +13,6 @@ import (
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/securetoken"
-)
-
-const (
-	settingsWriteHeader      = "X-SynapS3-Settings-Write"
-	settingsWriteHeaderValue = "1"
 )
 
 type SettingsService struct {
@@ -306,20 +300,18 @@ func (s *SettingsService) snapshotFromConfigLocked(cfg *config.Config, writable 
 	}
 
 	return settingsResponse{
-		Mode:              mode,
-		ConfigPath:        s.source.Path,
-		Writable:          writable,
-		RuntimeAvailable:  false,
-		RestartRequired:   s.restartRequired,
-		Config:            toSettingsEditableConfig(cfg),
-		Manual:            toSettingsManualConfig(cfg),
-		Secrets:           toSettingsSecretStatus(cfg),
-		Metadata:          config.FieldMetadataByPath(),
-		Defaults:          settingsDefaults{FilecoinRPCURLs: config.DefaultFilecoinRPCURLs()},
-		EnvManaged:        config.EnvManagedFieldPaths(),
-		ValidationErrors:  validationErrs,
-		WritableHeader:    settingsWriteHeader,
-		WritableHeaderVal: settingsWriteHeaderValue,
+		Mode:             mode,
+		ConfigPath:       s.source.Path,
+		Writable:         writable,
+		RuntimeAvailable: false,
+		RestartRequired:  s.restartRequired,
+		Config:           toSettingsEditableConfig(cfg),
+		Manual:           toSettingsManualConfig(cfg),
+		Secrets:          toSettingsSecretStatus(cfg),
+		Metadata:         config.FieldMetadataByPath(),
+		Defaults:         settingsDefaults{FilecoinRPCURLs: config.DefaultFilecoinRPCURLs()},
+		EnvManaged:       config.EnvManagedFieldPaths(),
+		ValidationErrors: validationErrs,
 	}
 }
 
@@ -332,21 +324,19 @@ func cloneConfig(cfg *config.Config) *config.Config {
 }
 
 type settingsResponse struct {
-	Mode              string                          `json:"mode"`
-	ConfigPath        string                          `json:"config_path"`
-	Writable          bool                            `json:"writable"`
-	RuntimeAvailable  bool                            `json:"runtime_available"`
-	RestartRequired   bool                            `json:"restart_required"`
-	S3Users           settingsS3UsersStatus           `json:"s3_users"`
-	Config            settingsEditableConfig          `json:"config"`
-	Manual            settingsManualConfig            `json:"manual"`
-	Secrets           settingsSecretStatus            `json:"secrets"`
-	Metadata          map[string]config.FieldMetadata `json:"metadata"`
-	Defaults          settingsDefaults                `json:"defaults"`
-	EnvManaged        map[string]string               `json:"env_managed"`
-	ValidationErrors  []config.FieldError             `json:"validation_errors,omitempty"`
-	WritableHeader    string                          `json:"write_header"`
-	WritableHeaderVal string                          `json:"write_header_value"`
+	Mode             string                          `json:"mode"`
+	ConfigPath       string                          `json:"config_path"`
+	Writable         bool                            `json:"writable"`
+	RuntimeAvailable bool                            `json:"runtime_available"`
+	RestartRequired  bool                            `json:"restart_required"`
+	S3Users          settingsS3UsersStatus           `json:"s3_users"`
+	Config           settingsEditableConfig          `json:"config"`
+	Manual           settingsManualConfig            `json:"manual"`
+	Secrets          settingsSecretStatus            `json:"secrets"`
+	Metadata         map[string]config.FieldMetadata `json:"metadata"`
+	Defaults         settingsDefaults                `json:"defaults"`
+	EnvManaged       map[string]string               `json:"env_managed"`
+	ValidationErrors []config.FieldError             `json:"validation_errors,omitempty"`
 }
 
 type settingsDefaults struct {
@@ -758,17 +748,9 @@ func (s *Server) readSettingsUpdateRequest(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "settings not available"})
 		return req, false
 	}
-	if !s.settingsWritable() {
-		writeJSON(w, http.StatusForbidden, settingsErrorResponse{Error: "settings writes require loopback admin binding"})
-		return req, false
-	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "settings writes require application/json"})
-		return req, false
-	}
-	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "missing settings write header"})
 		return req, false
 	}
 
@@ -793,18 +775,5 @@ func (s *Server) decorateSettingsResponse(resp settingsResponse) settingsRespons
 }
 
 func (s *Server) settingsWritable() bool {
-	return isLoopbackAddr(s.addr)
-}
-
-func isLoopbackAddr(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	host = strings.Trim(host, "[]")
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return s.settings != nil
 }

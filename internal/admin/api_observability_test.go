@@ -15,7 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 )
 
-func TestAPIObservabilityRefreshRequiresLoopbackAndRefreshHeader(t *testing.T) {
+func TestAPIObservabilityRefreshRunsThroughAuthenticatedAdminSurface(t *testing.T) {
 	var calls int32
 	service := observability.NewService(observability.ServiceOptions{
 		Checker: &observabilityAPIRefreshChecker{
@@ -34,13 +34,11 @@ func TestAPIObservabilityRefreshRequiresLoopbackAndRefreshHeader(t *testing.T) {
 	tests := []struct {
 		name       string
 		addr       string
-		header     string
 		wantStatus int
 		wantCalls  int32
 	}{
-		{name: "non-loopback", addr: "0.0.0.0:9090", header: observabilityRefreshHeaderValue, wantStatus: http.StatusForbidden},
-		{name: "missing header", addr: "127.0.0.1:9090", wantStatus: http.StatusBadRequest},
-		{name: "allowed", addr: "127.0.0.1:9090", header: observabilityRefreshHeaderValue, wantStatus: http.StatusOK, wantCalls: 1},
+		{name: "loopback", addr: "127.0.0.1:9090", wantStatus: http.StatusOK, wantCalls: 1},
+		{name: "non-loopback", addr: "0.0.0.0:9090", wantStatus: http.StatusOK, wantCalls: 1},
 	}
 
 	for _, tt := range tests {
@@ -48,9 +46,6 @@ func TestAPIObservabilityRefreshRequiresLoopbackAndRefreshHeader(t *testing.T) {
 			atomic.StoreInt32(&calls, 0)
 			srv := &Server{addr: tt.addr, observability: service, logger: testLogger()}
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/observability/providers/refresh", nil)
-			if tt.header != "" {
-				req.Header.Set(observabilityRefreshHeader, tt.header)
-			}
 			rr := httptest.NewRecorder()
 
 			srv.handleAPIRefreshObservabilityProviders(rr, req)
@@ -92,7 +87,6 @@ func TestAPIObservabilityRefreshExtendsWriteDeadline(t *testing.T) {
 	})
 	srv := &Server{addr: "127.0.0.1:9090", observability: service, logger: testLogger()}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/observability/providers/refresh", nil)
-	req.Header.Set(observabilityRefreshHeader, observabilityRefreshHeaderValue)
 	rr := &writeDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
 	start := time.Now()
 

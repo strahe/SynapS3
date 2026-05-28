@@ -5,7 +5,7 @@ description: 监控 SynapS3 health、worker liveness、cache usage、task queues
 
 # 健康检查与指标
 
-Admin server 暴露健康检查、Prometheus metrics，以及 dashboard 使用的只读运维视图。
+Admin server 暴露健康检查、Prometheus metrics，以及 dashboard 使用的运维视图。`/healthz` 不需要认证；`/metrics` 和 dashboard API 端点需要 Admin auth。
 
 ## Health
 
@@ -59,6 +59,9 @@ scrape_configs:
     static_configs:
       - targets: ["synaps3:9090"]
     metrics_path: /metrics
+    basic_auth:
+      username: admin
+      password_file: /run/secrets/synaps3-admin-password
 ```
 
 关键指标：

@@ -40,7 +40,10 @@ func TestRootCommandWithoutSubcommandShowsHelp(t *testing.T) {
 func TestInitCommandCreatesConfigInCustomDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "synaps3-data")
 
-	if err := newRootCommand().Run(context.Background(), []string{"synaps3", "init", "--dir", dir}); err != nil {
+	var out bytes.Buffer
+	cmd := newRootCommand()
+	cmd.Writer = &out
+	if err := cmd.Run(context.Background(), []string{"synaps3", "init", "--dir", dir}); err != nil {
 		t.Fatalf("init command error = %v", err)
 	}
 
@@ -54,6 +57,30 @@ func TestInitCommandCreatesConfigInCustomDir(t *testing.T) {
 	}
 	if cfg.Cache.Dir != filepath.Join(dir, "cache") {
 		t.Fatalf("Cache.Dir = %q, want %q", cfg.Cache.Dir, filepath.Join(dir, "cache"))
+	}
+	if cfg.Admin.Auth.PasswordHash == "" {
+		t.Fatal("Admin.Auth.PasswordHash is empty")
+	}
+	passwordPath := filepath.Join(dir, "admin-initial-password")
+	password, err := os.ReadFile(passwordPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", passwordPath, err)
+	}
+	if strings.TrimSpace(string(password)) == "" {
+		t.Fatal("admin initial password file is empty")
+	}
+	info, err := os.Stat(passwordPath)
+	if err != nil {
+		t.Fatalf("Stat(%q): %v", passwordPath, err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("password file mode = %o, want 600", got)
+	}
+	if strings.Contains(out.String(), strings.TrimSpace(string(password))) {
+		t.Fatal("non-interactive init output must not print the admin password")
+	}
+	if !strings.Contains(out.String(), passwordPath) {
+		t.Fatalf("init output must include password file path:\n%s", out.String())
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestResolveSource_ExplicitPathWinsEvenWhenMissing(t *testing.T) {
@@ -138,6 +140,28 @@ func TestInitAppDataDir_DefaultCreatesReferenceConfigAndRuntimeDirs(t *testing.T
 	if loaded.Cache.Dir != filepath.Join(wantDir, "cache") {
 		t.Fatalf("Cache.Dir = %q, want %q", loaded.Cache.Dir, filepath.Join(wantDir, "cache"))
 	}
+	if loaded.Admin.Auth.Username != "admin" {
+		t.Fatalf("Admin.Auth.Username = %q, want admin", loaded.Admin.Auth.Username)
+	}
+	if loaded.Admin.Auth.PasswordHash == "" {
+		t.Fatal("Admin.Auth.PasswordHash is empty")
+	}
+	if _, err := bcrypt.Cost([]byte(loaded.Admin.Auth.PasswordHash)); err != nil {
+		t.Fatalf("Admin.Auth.PasswordHash is not a bcrypt hash: %v", err)
+	}
+	if loaded.Admin.Auth.SessionSecret == "" {
+		t.Fatal("Admin.Auth.SessionSecret is empty")
+	}
+	if result.AdminInitialPassword == "" {
+		t.Fatal("AdminInitialPassword is empty")
+	}
+	configData, err := os.ReadFile(result.ConfigPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", result.ConfigPath, err)
+	}
+	if strings.Contains(string(configData), result.AdminInitialPassword) {
+		t.Fatal("config must not contain the plaintext admin password")
+	}
 	defaults := defaultConfig()
 	if loaded.Server.Port != defaults.Server.Port {
 		t.Fatalf("Server.Port = %q, want default %q", loaded.Server.Port, defaults.Server.Port)
@@ -217,6 +241,12 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"[worker.upload]",
 		"[logging]",
 		"[logging.s3_access]",
+		"[admin.auth]",
+		"enabled = true",
+		"username = \"admin\"",
+		"password_hash = ",
+		"session_secret = ",
+		"# session_ttl = \"12h0m0s\"",
 		"[filecoin]",
 		"private_key = \"\"",
 		"# network = \"calibration\"",
@@ -244,7 +274,6 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"network = \"calibration\"",
 		"level = \"info\"",
 		"format = \"text\"",
-		"enabled = true",
 		"max_open_conns = 4",
 		"max_size_gb = 100",
 		"eviction_policy = \"lru\"",
@@ -394,6 +423,12 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 	} {
 		assertConfigLacksEnabledLine(t, text, disabled)
 	}
+	for _, disabledPrefix := range []string{
+		"password_hash = ",
+		"session_secret = ",
+	} {
+		assertConfigLacksEnabledPrefix(t, text, disabledPrefix)
+	}
 }
 
 func assertConfigContains(t *testing.T, text, want string) {
@@ -412,6 +447,15 @@ func assertConfigLacksEnabledLine(t *testing.T, text, want string) {
 	}
 }
 
+func assertConfigLacksEnabledPrefix(t *testing.T, text, prefix string) {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			t.Fatalf("generated config contains enabled line with prefix %q:\n%s", prefix, text)
+		}
+	}
+}
+
 func assertGeneratedTOMLOnlyEnablesInitFields(t *testing.T, text string) {
 	t.Helper()
 	for _, want := range []string{
@@ -422,6 +466,11 @@ func assertGeneratedTOMLOnlyEnablesInitFields(t *testing.T, text string) {
 		"dsn = ",
 		"[cache]\n# Filesystem directory used for cached object data.",
 		"dir = ",
+		"[admin.auth]\n# Requires login for the Admin UI and Admin API.",
+		"enabled = true",
+		"username = \"admin\"",
+		"password_hash = ",
+		"session_secret = ",
 	} {
 		assertConfigContains(t, text, want)
 	}
@@ -433,12 +482,16 @@ func TestEnvManagedFieldPaths_ReturnsRecognizedOverrides(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_NETWORK", "mainnet")
 	t.Setenv("SYNAPS3_FILECOIN_RPC_URL", "https://rpc.example.invalid")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
+	t.Setenv("SYNAPS3_ADMIN_AUTH_PASSWORD_HASH", "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W")
 
 	managed := EnvManagedFieldPaths()
 	for _, want := range []string{"server.port", "cache.dir", "filecoin.network", "filecoin.rpc_url", "logging.s3_access.enabled"} {
 		if managed[want] == "" {
 			t.Fatalf("EnvManagedFieldPaths() missing %q in %#v", want, managed)
 		}
+	}
+	if managed["admin.auth.password_hash"] != "" {
+		t.Fatalf("EnvManagedFieldPaths() exposes admin password hash in %#v", managed)
 	}
 }
 
@@ -458,6 +511,10 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 		{env: "SYNAPS3_LOGGING_S3_ACCESS_ENABLED", field: "logging.s3_access.enabled"},
 		{env: "SYNAPS3_LOGGING_S3_ACCESS_LEVEL", field: "logging.s3_access.level"},
 		{env: "SYNAPS3_ADMIN_ADDR", field: "admin.addr"},
+		{env: "SYNAPS3_ADMIN_AUTH_ENABLED", field: "admin.auth.enabled"},
+		{env: "SYNAPS3_ADMIN_AUTH_USERNAME", field: "admin.auth.username"},
+		{env: "SYNAPS3_ADMIN_AUTH_SESSION_SECRET", field: "admin.auth.session_secret"},
+		{env: "SYNAPS3_ADMIN_AUTH_SESSION_TTL", field: "admin.auth.session_ttl"},
 	}
 
 	for _, tt := range tests {
@@ -479,9 +536,18 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 			t.Fatalf("metadata[%q] must include label and description: %#v", tt.field, meta)
 		}
 	}
+	if field, ok := EnvFieldForName("SYNAPS3_ADMIN_AUTH_PASSWORD_HASH"); !ok || field != "admin.auth.password_hash" {
+		t.Fatalf("EnvFieldForName(SYNAPS3_ADMIN_AUTH_PASSWORD_HASH) = %q/%v, want admin.auth.password_hash/true", field, ok)
+	}
+	if _, ok := metadata["admin.auth.password_hash"]; ok {
+		t.Fatal("FieldMetadataByPath() exposes admin.auth.password_hash, want hidden")
+	}
 
 	if metadata["filecoin.private_key"].Editable {
 		t.Fatal("filecoin.private_key Editable = true, want false")
+	}
+	if !metadata["admin.auth.session_secret"].Secret {
+		t.Fatal("admin.auth.session_secret Secret = false, want true")
 	}
 }
 

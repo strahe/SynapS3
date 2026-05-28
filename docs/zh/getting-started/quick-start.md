@@ -20,7 +20,7 @@ description: 启动临时 SynapS3 节点，在 Calibration 上充值，并上传
 ## 前置条件
 
 - Docker Engine 或 Docker Desktop。
-- 启用 host networking。Docker Desktop 用户必须启用 host networking 才能完成完整流程，因为 Admin API 保持 loopback 监听，Admin 写操作要求 loopback binding。
+- 启用 host networking。Docker Desktop 用户必须启用 host networking 才能完成完整流程，因为 Admin API 默认保持 loopback 监听。
 - 能在运行节点的机器上执行 shell 命令。
 
 ## 创建配置和钱包
@@ -71,6 +71,12 @@ docker exec synaps3-test synaps3 --config /var/lib/synaps3/config.toml wallet de
 
 ## 打开 Dashboard
 
+读取生成的 Admin 密码：
+
+```bash
+ADMIN_PASSWORD=$(docker exec synaps3-test cat /var/lib/synaps3/admin-initial-password)
+```
+
 打开：
 
 ```text
@@ -83,14 +89,15 @@ http://127.0.0.1:9090
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-预期结果：Dashboard 显示 buckets、wallet status、tasks、topology、settings 和 health signals。
+预期结果：Dashboard 要求输入 Admin 用户名 `admin` 和生成的密码，然后显示 buckets、wallet status、tasks、topology、settings 和 health signals。
 
 ## 上传第一个对象
 
 创建 S3 用户：
 
 ```bash
-docker exec synaps3-test synaps3 --config /var/lib/synaps3/config.toml admin s3-user create
+docker exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3-test \
+  synaps3 --config /var/lib/synaps3/config.toml admin s3-user create
 ```
 
 将 access key 和 secret 用在 path-style S3 客户端中。以下示例使用 MinIO Client：

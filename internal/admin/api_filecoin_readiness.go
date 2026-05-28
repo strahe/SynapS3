@@ -39,20 +39,11 @@ func (s *Server) handleAPIFilecoinReadinessPreflight(w http.ResponseWriter, r *h
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "filecoin readiness not available"})
 		return
 	}
-	if !s.settingsWritable() {
-		writeJSON(w, http.StatusForbidden, settingsErrorResponse{Error: "settings writes require loopback admin binding"})
-		return
-	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "settings writes require application/json"})
 		return
 	}
-	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "missing settings write header"})
-		return
-	}
-
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	var req filecoinReadinessPreflightRequest

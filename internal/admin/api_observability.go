@@ -11,9 +11,7 @@ import (
 )
 
 const (
-	observabilityRefreshWriteGrace  = 5 * time.Second
-	observabilityRefreshHeader      = "X-SynapS3-Observability-Refresh"
-	observabilityRefreshHeaderValue = "1"
+	observabilityRefreshWriteGrace = 5 * time.Second
 )
 
 func (s *Server) handleAPIObservabilityProviders(w http.ResponseWriter, r *http.Request) {
@@ -212,13 +210,5 @@ func (s *Server) extendObservabilityRefreshWriteDeadline(w http.ResponseWriter) 
 }
 
 func (s *Server) requireObservabilityRefresh(w http.ResponseWriter, r *http.Request) bool {
-	if !s.settingsWritable() {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "observability refresh requires loopback admin binding"})
-		return false
-	}
-	if r.Header.Get(observabilityRefreshHeader) != observabilityRefreshHeaderValue {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing observability refresh header"})
-		return false
-	}
 	return true
 }

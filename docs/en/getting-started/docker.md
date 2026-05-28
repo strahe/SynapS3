@@ -64,6 +64,12 @@ docker compose logs --tail=50 synaps3
 
 Expected result: logs show the service starting without config validation errors.
 
+Read the generated Admin password from the runtime volume:
+
+```bash
+ADMIN_PASSWORD=$(docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password)
+```
+
 Default endpoints:
 
 | Endpoint | Address |
@@ -78,7 +84,8 @@ The Compose file uses host networking so the S3 API can listen publicly while th
 
 ```bash
 curl http://127.0.0.1:9090/healthz
-docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml admin status
+docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
+  synaps3 --config /var/lib/synaps3/config.toml admin status
 docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2 # 2 USDFC
 ```
 
@@ -91,7 +98,7 @@ ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
 ::: danger Admin exposure
-Do not publish the dashboard or Admin API directly to an untrusted network. Put it behind authenticated private access if remote access is required.
+Do not publish the dashboard or Admin API directly to an untrusted network. Use SSH tunneling or an HTTPS reverse proxy with explicit access control for remote access.
 :::
 
 ## Operate the Deployment
@@ -103,7 +110,8 @@ Useful commands:
 ```bash
 docker compose ps
 docker compose logs --tail=100 synaps3
-docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml admin task stats
+docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
+  synaps3 --config /var/lib/synaps3/config.toml admin task stats
 ```
 
 ## Upgrade

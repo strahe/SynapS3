@@ -27,8 +27,8 @@ SynapS3 focuses on path-style S3 bucket and object workflows needed for object s
 | Object | `PutObject` | Supported | Stores an object through cache-first durability. |
 | Object | `GetObject` | Supported | Reads from cache or committed provider storage. |
 | Object | `HeadObject` | Supported | Reads object metadata. |
-| Object | `DeleteObject` | Supported | Soft-deletes one object. |
-| Object | `DeleteObjects` | Supported | Soft-deletes multiple objects. |
+| Object | `DeleteObject` | Supported | Creates a delete marker, or deletes a specific `versionId`. |
+| Object | `DeleteObjects` | Supported | Creates delete markers, or deletes specific `versionId` entries. |
 | Object | `CopyObject` | Supported | Source object must be readable from cache or committed provider storage. |
 | Object | `ListObjects` | Supported | Marker pagination. |
 | Object | `ListObjectsV2` | Supported | Continuation-token pagination. |
@@ -44,7 +44,7 @@ SynapS3 focuses on path-style S3 bucket and object workflows needed for object s
 
 ## Versioning Behavior
 
-Buckets behave as versioning-enabled. Object deletes create delete markers, and version listing exposes object versions and delete markers.
+Buckets behave as versioning-enabled. A normal object delete creates a delete marker. A delete request with `versionId` deletes that specific version. Version listing exposes object versions and delete markers.
 
 ## What Is Intentionally Out of Scope
 

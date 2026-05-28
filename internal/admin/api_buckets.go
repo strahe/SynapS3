@@ -203,9 +203,6 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
 
 func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
-	if !s.requireBucketWrite(w, r) {
-		return
-	}
 	var req bucketCreateRequest
 	if !decodeBucketStrictJSON(w, r, &req) {
 		return
@@ -341,9 +338,6 @@ func (s *Server) handleAPIUpdateBucketOwner(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
 		return
 	}
-	if !s.requireBucketWrite(w, r) {
-		return
-	}
 
 	var req bucketOwnerUpdateRequest
 	if !decodeBucketStrictJSON(w, r, &req) {
@@ -409,9 +403,6 @@ func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
 		return
 	}
-	if !s.requireBucketWrite(w, r) {
-		return
-	}
 
 	var req bucketCopyPolicyUpdateRequest
 	if !decodeBucketStrictJSON(w, r, &req) {
@@ -466,18 +457,6 @@ func decodeBucketStrictJSON(w http.ResponseWriter, r *http.Request, dst any) boo
 	var extra struct{}
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-		return false
-	}
-	return true
-}
-
-func (s *Server) requireBucketWrite(w http.ResponseWriter, r *http.Request) bool {
-	if !s.settingsWritable() {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "bucket writes require loopback admin binding"})
-		return false
-	}
-	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing settings write header"})
 		return false
 	}
 	return true
@@ -1078,9 +1057,6 @@ func (s *Server) handleAPIDeleteBucketObject(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
 		return
 	}
-	if !s.requireBucketWrite(w, r) {
-		return
-	}
 	key := r.URL.Query().Get("key")
 	if key == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "object key is required"})
@@ -1178,9 +1154,6 @@ func (s *Server) handleAPIPermanentDeleteBucketObject(w http.ResponseWriter, r *
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
 		return
 	}
-	if !s.requireBucketWrite(w, r) {
-		return
-	}
 
 	var req permanentDeleteObjectRequest
 	if !decodeBucketStrictJSON(w, r, &req) {
@@ -1237,9 +1210,6 @@ func (s *Server) handleAPIPermanentDeleteDeletedBucketObject(w http.ResponseWrit
 	bucketName := r.PathValue("name")
 	if !bucketNameRe.MatchString(bucketName) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
-		return
-	}
-	if !s.requireBucketWrite(w, r) {
 		return
 	}
 
@@ -1376,9 +1346,6 @@ func (s *Server) handleAPIRestoreBucketObject(w http.ResponseWriter, r *http.Req
 	bucketName := r.PathValue("name")
 	if !bucketNameRe.MatchString(bucketName) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bucket name"})
-		return
-	}
-	if !s.requireBucketWrite(w, r) {
 		return
 	}
 
@@ -1863,10 +1830,6 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 
 func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if !s.settingsWritable() {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "object downloads require loopback admin binding"})
-		return
-	}
 
 	bucketName := r.PathValue("name")
 	if !bucketNameRe.MatchString(bucketName) {

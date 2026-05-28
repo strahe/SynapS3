@@ -49,12 +49,20 @@ Environment variables use the `SYNAPS3_` prefix and map underscores to config pa
 | `SYNAPS3_LOGGING_S3_ACCESS_ENABLED` | `logging.s3_access.enabled` |
 | `SYNAPS3_LOGGING_S3_ACCESS_LEVEL` | `logging.s3_access.level` |
 | `SYNAPS3_ADMIN_ADDR` | `admin.addr` |
+| `SYNAPS3_ADMIN_TRUSTED_PROXIES` | `admin.trusted_proxies` |
+| `SYNAPS3_ADMIN_AUTH_ENABLED` | `admin.auth.enabled` |
+| `SYNAPS3_ADMIN_AUTH_USERNAME` | `admin.auth.username` |
+| `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` | `admin.auth.session_secret` |
+| `SYNAPS3_ADMIN_AUTH_SESSION_TTL` | `admin.auth.session_ttl` |
+
+`SYNAPS3_ADMIN_TRUSTED_PROXIES` is a comma-separated list of IP or CIDR entries.
 
 ## When to Use Environment Variables
 
 Use environment variables for:
 
 - wallet private keys,
+- externally managed Admin session secrets,
 - container-only paths,
 - network-specific RPC URLs,
 - deployment-specific logging format,
@@ -64,7 +72,8 @@ Use the TOML config file for stable settings that should survive process restart
 
 ## Security Guidance
 
-- Keep `SYNAPS3_FILECOIN_PRIVATE_KEY` in a secret manager, `.env`, or host environment.
+- Keep `SYNAPS3_FILECOIN_PRIVATE_KEY` in a secret manager, `.env`, or host environment. `synaps3 init` and `synaps3 admin-auth reset-password` generate `admin.auth.session_secret`; use `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` only when deployment policy manages it outside TOML.
+- Keep `SYNAPS3_ADMIN_TRUSTED_PROXIES` empty unless trusted proxies strip untrusted forwarded headers before requests reach SynapS3.
 - Do not commit `.env`, `config.toml`, local databases, cache data, or wallet material.
 - Keep `filecoin.allow_private_networks = false` unless private provider URLs are explicitly trusted.
 - Remember that environment-managed fields override file values; changing the file will not affect them until the environment changes.

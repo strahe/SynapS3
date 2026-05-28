@@ -18,7 +18,7 @@ SynapS3 is an S3-compatible gateway for storing objects on Filecoin.
 
 - S3-compatible bucket and object APIs.
 - Object storage backed by Filecoin storage providers.
-- Web dashboard for buckets, objects, wallet, tasks, topology, settings, and health.
+- Admin-authenticated web dashboard for buckets, objects, wallet, tasks, topology, settings, and health.
 - Multipart uploads for large objects.
 - Wallet funding, USDFC deposit, and background task controls.
 
@@ -35,8 +35,8 @@ SynapS3 is an S3-compatible gateway for storing objects on Filecoin.
 | Object | `PutObject` | ✅ | Stores an object |
 | Object | `GetObject` | ✅ | Reads an object |
 | Object | `HeadObject` | ✅ | Reads object metadata |
-| Object | `DeleteObject` | ✅ | Soft-deletes one object |
-| Object | `DeleteObjects` | ✅ | Soft-deletes multiple objects |
+| Object | `DeleteObject` | ✅ | Creates a delete marker, or deletes a specific `versionId` |
+| Object | `DeleteObjects` | ✅ | Creates delete markers, or deletes specific `versionId` entries |
 | Object | `CopyObject` | ✅ | Source object must be readable from cache or committed provider storage |
 | Object | `ListObjects` | ✅ | Marker pagination |
 | Object | `ListObjectsV2` | ✅ | Continuation-token pagination |

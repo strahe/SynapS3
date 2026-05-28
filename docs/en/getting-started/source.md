@@ -36,6 +36,8 @@ Expected result: the command builds the React dashboard first, embeds it, and wr
 
 Expected result: `~/.synaps3/config.toml`, `db/`, and `cache/` are created. Add the generated private key to `~/.synaps3/config.toml`:
 
+`synaps3 init` also creates Admin auth. Save the printed Admin password. If init is non-interactive, read it from `~/.synaps3/admin-initial-password`.
+
 ```toml
 [filecoin]
 private_key = "0x..."
@@ -75,6 +77,7 @@ Expected result: health returns `{"status":"ok"}` and the deposit operation is a
 Create an S3 user:
 
 ```bash
+export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 ./bin/synaps3 admin s3-user create
 ```
 
@@ -96,4 +99,5 @@ Expected result: `mc cat` prints the uploaded object. See [S3 Clients](./s3-clie
 | --- | --- |
 | UI build fails | Confirm Node.js 22.12 or later and pnpm 11 are installed. |
 | Go build fails on cgo | Confirm a C toolchain is installed and visible in `PATH`. |
+| Serve fails with admin auth validation | Run `./bin/synaps3 init` for a fresh config, or `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml` for an existing config. |
 | Serve starts in setup mode | Set `filecoin.private_key` in config or `SYNAPS3_FILECOIN_PRIVATE_KEY`. |

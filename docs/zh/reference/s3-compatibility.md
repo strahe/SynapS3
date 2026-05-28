@@ -27,8 +27,8 @@ SynapS3 聚焦在把对象存储到 Filecoin 所需的 path-style S3 bucket 和 
 | Object | `PutObject` | 支持 | 通过 cache-first durability 存储对象。 |
 | Object | `GetObject` | 支持 | 从 cache 或已提交 provider storage 读取。 |
 | Object | `HeadObject` | 支持 | 读取对象元数据。 |
-| Object | `DeleteObject` | 支持 | 软删除单个对象。 |
-| Object | `DeleteObjects` | 支持 | 软删除多个对象。 |
+| Object | `DeleteObject` | 支持 | 创建 delete marker，或删除指定 `versionId`。 |
+| Object | `DeleteObjects` | 支持 | 创建 delete markers，或删除指定 `versionId` entries。 |
 | Object | `CopyObject` | 支持 | 源对象必须可从 cache 或已提交 provider storage 读取。 |
 | Object | `ListObjects` | 支持 | Marker 分页。 |
 | Object | `ListObjectsV2` | 支持 | Continuation-token 分页。 |
@@ -44,7 +44,7 @@ SynapS3 聚焦在把对象存储到 Filecoin 所需的 path-style S3 bucket 和 
 
 ## Versioning 行为
 
-Bucket 表现为 versioning-enabled。Object delete 会创建 delete marker，version listing 会暴露对象版本和 delete markers。
+Bucket 表现为 versioning-enabled。普通 object delete 会创建 delete marker。带 `versionId` 的 delete 会删除指定版本。Version listing 会暴露对象版本和 delete markers。
 
 ## 有意不支持
 

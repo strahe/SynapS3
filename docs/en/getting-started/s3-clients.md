@@ -13,12 +13,14 @@ After SynapS3 is serving and the admin API is reachable on `127.0.0.1:9090`, cre
 - `curl http://127.0.0.1:9090/healthz` returns `{"status":"ok"}`.
 - The S3 API is reachable at `http://localhost:8080`.
 - The admin API is reachable from the machine where you run `synaps3 admin`.
+- `SYNAPS3_ADMIN_PASSWORD` is set, `admin-initial-password` exists next to the config file, or you can enter the Admin password at the prompt.
 
 ## Create Credentials
 
 Create a regular S3 user:
 
 ```bash
+export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 synaps3 admin s3-user create
 ```
 

@@ -49,12 +49,20 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 | `SYNAPS3_LOGGING_S3_ACCESS_ENABLED` | `logging.s3_access.enabled` |
 | `SYNAPS3_LOGGING_S3_ACCESS_LEVEL` | `logging.s3_access.level` |
 | `SYNAPS3_ADMIN_ADDR` | `admin.addr` |
+| `SYNAPS3_ADMIN_TRUSTED_PROXIES` | `admin.trusted_proxies` |
+| `SYNAPS3_ADMIN_AUTH_ENABLED` | `admin.auth.enabled` |
+| `SYNAPS3_ADMIN_AUTH_USERNAME` | `admin.auth.username` |
+| `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` | `admin.auth.session_secret` |
+| `SYNAPS3_ADMIN_AUTH_SESSION_TTL` | `admin.auth.session_ttl` |
+
+`SYNAPS3_ADMIN_TRUSTED_PROXIES` 是逗号分隔的 IP 或 CIDR 列表。
 
 ## 何时使用环境变量
 
 适合使用环境变量的内容：
 
 - wallet private key，
+- 外部管理的 Admin session secret，
 - 容器专用路径，
 - 网络特定 RPC URL，
 - 部署特定日志格式，
@@ -64,7 +72,8 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 
 ## 安全建议
 
-- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在 secret manager、`.env` 或主机环境中。
+- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在 secret manager、`.env` 或主机环境中。`synaps3 init` 和 `synaps3 admin-auth reset-password` 会生成 `admin.auth.session_secret`；只有部署策略要求在 TOML 外管理时，才使用 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET`。
+- 除非可信代理会在请求到达 SynapS3 前清理不可信 forwarded headers，否则保持 `SYNAPS3_ADMIN_TRUSTED_PROXIES` 为空。
 - 不要提交 `.env`、`config.toml`、本地数据库、缓存数据或钱包材料。
 - 除非明确信任私有 provider URL，否则保持 `filecoin.allow_private_networks = false`。
 - 环境变量管理的字段会覆盖文件值；只改文件不会改变这些字段的生效值。

@@ -12,6 +12,7 @@ SynapS3 stores configuration, metadata, and cached object data on local disk. Fo
 ```text
 ~/.synaps3/
   config.toml
+  admin-initial-password
   db/
     synaps3.db
     synaps3.db-shm
@@ -28,6 +29,7 @@ The container uses `/var/lib/synaps3`:
 ```text
 /var/lib/synaps3/
   config.toml
+  admin-initial-password
   db/
   cache/
 ```
@@ -39,29 +41,10 @@ The Compose deployment mounts this path through the `synaps3-data` Docker volume
 | Data | Why it matters |
 | --- | --- |
 | `config.toml` | Holds stable runtime settings when they are not environment-managed. |
+| `admin-initial-password` | Stores the generated Admin password for non-interactive init and password reset. File mode is `0600`; remove or rotate it after storing the password securely. |
 | `db/` | Stores buckets, objects, versions, tasks, users, and storage metadata. |
 | `cache/` | Holds locally durable object bytes before and after Filecoin upload. |
 | Environment secrets | May hold the Filecoin private key and deployment-specific overrides. |
-
-## Cache Policy
-
-`cache.eviction_policy = "lru"` queues local cache eviction after remote storage succeeds. It is not a scanner for arbitrary old files.
-
-Default capacity settings are conservative for a single node:
-
-```toml
-[server]
-max_connections = 4096
-max_requests = 512
-
-[database]
-max_open_conns = 4
-max_idle_conns = 2
-
-[cache]
-max_size_gb = 100
-eviction_policy = "lru"
-```
 
 ## Backup Example
 
@@ -76,12 +59,3 @@ docker run --rm \
 ```
 
 Expected result: the archive contains config, database, and cache data from the volume.
-
-## Operator Checks
-
-```bash
-synaps3 admin status
-synaps3 admin settings get cache.max_size_gb
-```
-
-Expected result: the status output shows cache usage and worker health. If cache usage approaches capacity, see [Troubleshooting](../operations/troubleshooting.md).

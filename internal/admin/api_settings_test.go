@@ -216,7 +216,6 @@ func TestSettingsPUTRejectsSecretFieldsAndDoesNotPersistThem(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"s3":{"secret_key":"leak"}}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -229,37 +228,24 @@ func TestSettingsPUTRejectsSecretFieldsAndDoesNotPersistThem(t *testing.T) {
 	}
 }
 
-func TestSettingsPUTRequiresLoopbackAndWriteHeaders(t *testing.T) {
+func TestSettingsPUTUsesAdminAuthAndRequiresJSONContentType(t *testing.T) {
 	cfg := validSettingsConfig(t)
 	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	srv := newSettingsAPITestServer(t, "0.0.0.0:9090", cfg, source)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":8}}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403, body=%s", rr.Code, rr.Body.String())
-	}
-
-	srv = newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":8}}`))
-	req.Header.Set("Content-Type", "application/json")
-	rr = httptest.NewRecorder()
-
-	srv.handleAPIUpdateSettings(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status without write header = %d, want 400, body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rr.Code, rr.Body.String())
 	}
 
 	srv = newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
 	req = httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":8}}`))
 	req.Header.Set("Content-Type", "application/jsonp")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr = httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -366,7 +352,7 @@ func TestSettingsValidateReportsDraftValidationRules(t *testing.T) {
 	}
 }
 
-func TestSettingsValidateRequiresWriteGuardsAndValidJSON(t *testing.T) {
+func TestSettingsValidateRequiresValidJSON(t *testing.T) {
 	cfg := validSettingsConfig(t)
 	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 
@@ -374,30 +360,13 @@ func TestSettingsValidateRequiresWriteGuardsAndValidJSON(t *testing.T) {
 		name        string
 		addr        string
 		contentType string
-		writeHeader string
 		body        string
 		wantStatus  int
 	}{
 		{
-			name:        "non-loopback",
-			addr:        "0.0.0.0:9090",
-			contentType: "application/json",
-			writeHeader: settingsWriteHeaderValue,
-			body:        `{"cache":{"max_size_gb":8}}`,
-			wantStatus:  http.StatusForbidden,
-		},
-		{
-			name:        "missing write header",
-			addr:        "127.0.0.1:9090",
-			contentType: "application/json",
-			body:        `{"cache":{"max_size_gb":8}}`,
-			wantStatus:  http.StatusBadRequest,
-		},
-		{
 			name:        "invalid content type",
 			addr:        "127.0.0.1:9090",
 			contentType: "application/jsonp",
-			writeHeader: settingsWriteHeaderValue,
 			body:        `{"cache":{"max_size_gb":8}}`,
 			wantStatus:  http.StatusBadRequest,
 		},
@@ -405,7 +374,6 @@ func TestSettingsValidateRequiresWriteGuardsAndValidJSON(t *testing.T) {
 			name:        "invalid json",
 			addr:        "127.0.0.1:9090",
 			contentType: "application/json",
-			writeHeader: settingsWriteHeaderValue,
 			body:        `{"cache":{"max_size_gb":8}`,
 			wantStatus:  http.StatusBadRequest,
 		},
@@ -417,9 +385,6 @@ func TestSettingsValidateRequiresWriteGuardsAndValidJSON(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/validate", strings.NewReader(tt.body))
 			if tt.contentType != "" {
 				req.Header.Set("Content-Type", tt.contentType)
-			}
-			if tt.writeHeader != "" {
-				req.Header.Set(settingsWriteHeader, tt.writeHeader)
 			}
 			rr := httptest.NewRecorder()
 
@@ -449,7 +414,6 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 		"logging":{"format":"text","s3_access":{"enabled":false,"level":"debug"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -506,7 +470,6 @@ func TestSettingsPUTPreservesManualFieldsChangedOnDiskAfterServiceStart(t *testi
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":9}}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -558,7 +521,6 @@ max_size_gb = 7
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":8}}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -599,7 +561,6 @@ private_key = "manual-filecoin-private-key"
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"logging":{"format":"text"}}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -655,7 +616,6 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 		"cache":{"max_size_gb":12}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -694,7 +654,6 @@ func TestSettingsLifecycleFallbackConfigEnvPrecedenceAndManualSecretPreservation
 	srv = newSettingsAPITestServer(t, "127.0.0.1:9090", restarted, source)
 	req = httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":13}}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr = httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -764,7 +723,6 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(tt.payload))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 			rr := httptest.NewRecorder()
 
 			srv.handleAPIUpdateSettings(rr, req)
@@ -793,7 +751,6 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"logging":{"level":"verbose","format":"xml","s3_access":{"level":"verbose"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -826,7 +783,6 @@ func TestSettingsPUTRejectsTrailingJSON(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"cache":{"max_size_gb":8}} {}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIUpdateSettings(rr, req)
@@ -844,6 +800,8 @@ func validSettingsConfig(t *testing.T) *config.Config {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
 	cfg.Filecoin.PrivateKey = "filecoin-private-key"
+	cfg.Admin.Auth.PasswordHash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W"
+	cfg.Admin.Auth.SessionSecret = "admin-session-secret-with-enough-entropy"
 	return cfg
 }
 
@@ -876,7 +834,6 @@ func postSettingsValidate(t *testing.T, srv *Server, payload string) settingsVal
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/settings/validate", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 
 	srv.handleAPIValidateSettings(rr, req)

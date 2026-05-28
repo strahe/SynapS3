@@ -64,6 +64,12 @@ docker compose logs --tail=50 synaps3
 
 预期结果：日志显示服务启动，没有配置校验错误。
 
+从运行数据 volume 读取生成的 Admin 密码：
+
+```bash
+ADMIN_PASSWORD=$(docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password)
+```
+
 默认端点：
 
 | 端点 | 地址 |
@@ -78,7 +84,8 @@ Compose 文件使用 host networking，让 S3 API 可以公开监听，同时让
 
 ```bash
 curl http://127.0.0.1:9090/healthz
-docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml admin status
+docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
+  synaps3 --config /var/lib/synaps3/config.toml admin status
 docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2 # 2 USDFC
 ```
 
@@ -91,7 +98,7 @@ ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
 ::: danger Admin 暴露风险
-不要把 Dashboard 或 Admin API 直接发布到不可信网络。如果必须远程访问，请放在经过认证的私有访问层后面。
+不要把 Dashboard 或 Admin API 直接发布到不可信网络。远程访问请使用 SSH tunnel，或放在 HTTPS 反向代理和明确访问控制之后。
 :::
 
 ## 运维部署
@@ -103,7 +110,8 @@ ssh -L 9090:127.0.0.1:9090 user@server
 ```bash
 docker compose ps
 docker compose logs --tail=100 synaps3
-docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml admin task stats
+docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
+  synaps3 --config /var/lib/synaps3/config.toml admin task stats
 ```
 
 ## 升级

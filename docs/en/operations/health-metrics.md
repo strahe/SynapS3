@@ -5,7 +5,7 @@ description: Monitor SynapS3 health, worker liveness, cache usage, task queues, 
 
 # Health and Metrics
 
-The admin server exposes health checks, Prometheus metrics, and read-only operational views for the dashboard.
+The admin server exposes health checks, Prometheus metrics, and operational views for the dashboard. `/healthz` is unauthenticated; `/metrics` and dashboard API endpoints require Admin auth.
 
 ## Health
 
@@ -59,6 +59,9 @@ scrape_configs:
     static_configs:
       - targets: ["synaps3:9090"]
     metrics_path: /metrics
+    basic_auth:
+      username: admin
+      password_file: /run/secrets/synaps3-admin-password
 ```
 
 Key metrics:

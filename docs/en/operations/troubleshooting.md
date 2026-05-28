@@ -116,8 +116,8 @@ synaps3 admin task retry 42
 Check provider health and readiness in the dashboard, or inspect the Admin API:
 
 ```bash
-curl http://127.0.0.1:9090/api/v1/filecoin/readiness
-curl http://127.0.0.1:9090/api/v1/observability/providers
+curl -u "admin:${SYNAPS3_ADMIN_PASSWORD}" http://127.0.0.1:9090/api/v1/filecoin/readiness
+curl -u "admin:${SYNAPS3_ADMIN_PASSWORD}" http://127.0.0.1:9090/api/v1/observability/providers
 ```
 
 Recovery:

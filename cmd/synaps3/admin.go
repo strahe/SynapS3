@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -19,20 +21,23 @@ import (
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/term"
 )
 
 const (
-	defaultAdminTimeout      = 10 * time.Second
-	adminSettingsWriteHeader = "X-SynapS3-Settings-Write"
-	adminSettingsWriteValue  = "1"
+	defaultAdminTimeout = 10 * time.Second
 )
 
 type adminCommandOptions struct {
-	AdminURL   string
-	ConfigPath string
-	ConfigSet  bool
-	Timeout    time.Duration
-	JSON       bool
+	AdminURL      string
+	ConfigPath    string
+	ConfigSet     bool
+	Timeout       time.Duration
+	JSON          bool
+	AdminUsername string
+	AdminPassword string
+	AuthDisabled  bool
+	ConfigSource  string
 }
 
 func adminCommand() *cli.Command {
@@ -452,17 +457,29 @@ func adminTaskCommand() *cli.Command {
 
 type adminAPIClient struct {
 	baseURL    string
+	username   string
+	password   string
 	httpClient *http.Client
 }
 
 func newAdminClientFromCommand(ctx context.Context, cmd *cli.Command) (*adminAPIClient, adminCommandOptions, error) {
 	opts := adminOptionsFromCommand(cmd)
+	if err := resolveAdminClientConfig(ctx, &opts); err != nil {
+		return nil, adminCommandOptions{}, err
+	}
+	password, err := resolveAdminPassword(cmd, opts)
+	if err != nil {
+		return nil, adminCommandOptions{}, err
+	}
+	opts.AdminPassword = password
 	baseURL, err := resolveAdminBaseURL(ctx, opts)
 	if err != nil {
 		return nil, adminCommandOptions{}, err
 	}
 	return &adminAPIClient{
-		baseURL: baseURL,
+		baseURL:  baseURL,
+		username: opts.AdminUsername,
+		password: opts.AdminPassword,
 		httpClient: &http.Client{
 			Timeout: opts.Timeout,
 		},
@@ -476,12 +493,77 @@ func adminOptionsFromCommand(cmd *cli.Command) adminCommandOptions {
 		timeout = defaultAdminTimeout
 	}
 	return adminCommandOptions{
-		AdminURL:   cmd.String("admin-url"),
-		ConfigPath: root.String("config"),
-		ConfigSet:  root.IsSet("config"),
-		Timeout:    timeout,
-		JSON:       cmd.Bool("json"),
+		AdminURL:      cmd.String("admin-url"),
+		ConfigPath:    root.String("config"),
+		ConfigSet:     root.IsSet("config"),
+		Timeout:       timeout,
+		JSON:          cmd.Bool("json"),
+		AdminUsername: "admin",
+		AdminPassword: os.Getenv("SYNAPS3_ADMIN_PASSWORD"),
 	}
+}
+
+func resolveAdminClientConfig(_ context.Context, opts *adminCommandOptions) error {
+	src, err := config.ResolveSource(opts.ConfigPath, opts.ConfigSet)
+	if err != nil {
+		if strings.TrimSpace(opts.AdminURL) != "" && !opts.ConfigSet {
+			return nil
+		}
+		return err
+	}
+	opts.ConfigSource = src.Path
+	cfg, err := config.LoadSource(src)
+	if err != nil {
+		if strings.TrimSpace(opts.AdminURL) != "" && !opts.ConfigSet {
+			return nil
+		}
+		return fmt.Errorf("loading config for admin client: %w", err)
+	}
+	if username := strings.TrimSpace(cfg.Admin.Auth.Username); username != "" {
+		opts.AdminUsername = username
+	}
+	opts.AuthDisabled = !cfg.Admin.Auth.Enabled
+	return nil
+}
+
+func resolveAdminPassword(cmd *cli.Command, opts adminCommandOptions) (string, error) {
+	if opts.AdminPassword != "" || opts.AuthDisabled {
+		return opts.AdminPassword, nil
+	}
+	if opts.ConfigSource != "" {
+		password, ok, err := config.ReadAdminInitialPasswordFile(filepath.Dir(opts.ConfigSource))
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return password, nil
+		}
+	}
+	if !adminPasswordPromptAvailable(cmd.Root().ErrWriter) {
+		if strings.TrimSpace(opts.AdminURL) != "" && !opts.ConfigSet {
+			return opts.AdminPassword, nil
+		}
+		return "", errors.New("admin password is required but terminal is not interactive; set SYNAPS3_ADMIN_PASSWORD or create admin-initial-password next to the config file")
+	}
+	if _, err := fmt.Fprint(cmd.Root().ErrWriter, "Admin password: "); err != nil {
+		return "", err
+	}
+	passwordBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+	if err != nil {
+		return "", fmt.Errorf("reading admin password: %w", err)
+	}
+	if _, err := fmt.Fprintln(cmd.Root().ErrWriter); err != nil {
+		return "", err
+	}
+	return string(passwordBytes), nil
+}
+
+func adminPasswordPromptAvailable(errWriter io.Writer) bool {
+	errFile, ok := errWriter.(*os.File)
+	if !ok || errFile != os.Stderr {
+		return false
+	}
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(errFile.Fd()))
 }
 
 func resolveAdminBaseURL(_ context.Context, opts adminCommandOptions) (string, error) {
@@ -582,11 +664,9 @@ func (c *adminAPIClient) doJSON(ctx context.Context, method, path string, body a
 	if err != nil {
 		return err
 	}
-	if hasBody || writeHeader {
+	c.applyAuth(req)
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
-	}
-	if writeHeader {
-		req.Header.Set(adminSettingsWriteHeader, adminSettingsWriteValue)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -605,6 +685,17 @@ func (c *adminAPIClient) doJSON(ctx context.Context, method, path string, body a
 		return fmt.Errorf("decoding response JSON: %w", err)
 	}
 	return nil
+}
+
+func (c *adminAPIClient) applyAuth(req *http.Request) {
+	if c.password == "" {
+		return
+	}
+	username := strings.TrimSpace(c.username)
+	if username == "" {
+		username = "admin"
+	}
+	req.SetBasicAuth(username, c.password)
 }
 
 func (c *adminAPIClient) endpoint(path string) string {

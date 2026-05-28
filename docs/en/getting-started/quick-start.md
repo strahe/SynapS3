@@ -20,7 +20,7 @@ Outcome:
 ## Prerequisites
 
 - Docker Engine or Docker Desktop.
-- Host networking enabled. Docker Desktop users must enable host networking for the full flow because the Admin API stays bound to loopback and Admin write operations require loopback binding.
+- Host networking enabled. Docker Desktop users must enable host networking for the full flow because the Admin API stays bound to loopback by default.
 - A shell on the machine where the node will run.
 
 ## Create Configuration and Wallet
@@ -71,6 +71,12 @@ Expected result: health returns `{"status":"ok"}` and the deposit command accept
 
 ## Open the Dashboard
 
+Read the generated Admin password:
+
+```bash
+ADMIN_PASSWORD=$(docker exec synaps3-test cat /var/lib/synaps3/admin-initial-password)
+```
+
 Open:
 
 ```text
@@ -83,14 +89,15 @@ If the node runs on a remote host, keep the Admin API on loopback and tunnel it:
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-Expected result: the dashboard shows buckets, wallet status, tasks, topology, settings, and health signals.
+Expected result: the dashboard asks for the Admin username `admin` and the generated password, then shows buckets, wallet status, tasks, topology, settings, and health signals.
 
 ## Upload the First Object
 
 Create an S3 user:
 
 ```bash
-docker exec synaps3-test synaps3 --config /var/lib/synaps3/config.toml admin s3-user create
+docker exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3-test \
+  synaps3 --config /var/lib/synaps3/config.toml admin s3-user create
 ```
 
 Use the access key and secret with a path-style S3 client. This example uses MinIO Client:

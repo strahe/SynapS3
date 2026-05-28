@@ -34,7 +34,7 @@ make build
 ./bin/synaps3 wallet generate
 ```
 
-预期结果：创建 `~/.synaps3/config.toml`、`db/` 和 `cache/`。把生成的 private key 写入 `~/.synaps3/config.toml`：
+预期结果：创建 `~/.synaps3/config.toml`、`db/` 和 `cache/`。`synaps3 init` 也会创建 Admin auth；保存打印出的 Admin 密码。非交互 init 可从 `~/.synaps3/admin-initial-password` 读取密码。把生成的 private key 写入 `~/.synaps3/config.toml`：
 
 ```toml
 [filecoin]
@@ -75,6 +75,7 @@ curl http://127.0.0.1:9090/healthz
 创建 S3 用户：
 
 ```bash
+export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 ./bin/synaps3 admin s3-user create
 ```
 
@@ -96,4 +97,5 @@ mc cat synaps3/demo/hello.txt
 | --- | --- |
 | UI 构建失败 | 确认 Node.js 22.12 或更高版本，以及 pnpm 11 已安装。 |
 | Go 构建因 cgo 失败 | 确认 C toolchain 已安装并在 `PATH` 中。 |
+| Serve 因 admin auth 校验失败 | 新配置运行 `./bin/synaps3 init`；已有配置运行 `./bin/synaps3 admin-auth reset-password --config ~/.synaps3/config.toml`。 |
 | Serve 进入 setup mode | 设置 `filecoin.private_key` 或 `SYNAPS3_FILECOIN_PRIVATE_KEY`。 |

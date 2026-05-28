@@ -98,7 +98,6 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 }
 
 func setBucketWriteHeaders(req *http.Request) {
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 }
 
 type writeDeadlineRecorder struct {
@@ -805,36 +804,6 @@ func TestHandleAPIBuckets_CreateBucketRejectsMalformedStrictJSON(t *testing.T) {
 				t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
 			}
 		})
-	}
-}
-
-func TestHandleAPIBuckets_CreateBucketRequiresWriteHeader(t *testing.T) {
-	srv, _ := newBucketAPITestServerWithS3Users(t, "owner-access")
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"guarded-bucket","owner_access_key":"owner-access"}`))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-
-	srv.handleAPICreateBucket(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
-	}
-}
-
-func TestHandleAPIBuckets_CreateBucketRequiresLoopbackBinding(t *testing.T) {
-	srv, _ := newBucketAPITestServerWithS3Users(t, "owner-access")
-	srv.addr = "0.0.0.0:9090"
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"guarded-bucket","owner_access_key":"owner-access"}`))
-	req.Header.Set("Content-Type", "application/json")
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPICreateBucket(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
 	}
 }
 
@@ -2706,26 +2675,6 @@ func TestAPIBucketOwner_UpdateRejectsMalformedStrictJSON(t *testing.T) {
 	}
 }
 
-func TestAPIBucketOwner_UpdateRequiresWriteHeader(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "guarded-owner-target", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/guarded-owner-target/owner", strings.NewReader(`{"owner_access_key":"owner-access"}`))
-	req.SetPathValue("name", bucket.Name)
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIUpdateBucketOwner(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
-	}
-}
-
 func TestAPIBucketDetail_ActiveBucket(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
@@ -4377,40 +4326,6 @@ func TestAPIBucketObjectUpload_RejectsFOCSizeLimits(t *testing.T) {
 	}
 }
 
-func TestAPIBucketObjectUpload_RequiresWriteAccess(t *testing.T) {
-	srv, _ := newBucketAPITestServer(t)
-	uploader := &recordingObjectUploader{}
-	srv.WithObjectUploader(uploader)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-bucket/objects/upload?key=file.txt", strings.NewReader("body"))
-	req.SetPathValue("name", "upload-bucket")
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIUploadObject(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("missing header status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
-	}
-	if uploader.calls != 0 {
-		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
-	}
-
-	srv.addr = "0.0.0.0:9090"
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-bucket/objects/upload?key=file.txt", strings.NewReader("body"))
-	req.SetPathValue("name", "upload-bucket")
-	setBucketWriteHeaders(req)
-	rr = httptest.NewRecorder()
-
-	srv.handleAPIUploadObject(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("non-loopback status = %d, want %d, body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
-	}
-	if uploader.calls != 0 {
-		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
-	}
-}
-
 func validAdminUploadBody(seed string) string {
 	if len(seed) >= chain.MinUploadSize {
 		return seed
@@ -4652,21 +4567,6 @@ func TestAPIBucketObjectDownload_DeleteMarkerVersionIsMethodNotAllowed(t *testin
 
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusMethodNotAllowed, rr.Body.String())
-	}
-}
-
-func TestAPIBucketObjectDownload_RequiresLoopbackBinding(t *testing.T) {
-	srv, _ := newBucketAPITestServer(t)
-	srv.addr = "0.0.0.0:9090"
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/download-bucket/objects/download?key=file.txt", nil)
-	req.SetPathValue("name", "download-bucket")
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIDownloadObject(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
 	}
 }
 

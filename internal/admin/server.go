@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"time"
@@ -48,6 +49,8 @@ type Server struct {
 	providerIdentity         providerIdentityLookup
 	events                   *EventHub
 	settings                 *SettingsService
+	auth                     *authService
+	trustedProxies           []netip.Prefix
 	s3IAM                    auth.IAMService
 	s3RootAccess             string
 	filecoinDefaultCopies    int
@@ -235,6 +238,7 @@ func (s *Server) Run(ctx context.Context) error {
 			mux.HandleFunc("DELETE /api/v1/s3-users/{accessKey}", s.handleAPIDeleteS3User)
 		}
 	}
+	s.registerAuthRoutes(mux)
 	if s.settings != nil {
 		mux.HandleFunc("GET /api/v1/settings", s.handleAPIGetSettings)
 		mux.HandleFunc("PUT /api/v1/settings", s.handleAPIUpdateSettings)
@@ -253,7 +257,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	srv := &http.Server{
 		Addr:              s.addr,
-		Handler:           withSecurityHeaders(mux),
+		Handler:           withSecurityHeaders(s.withAdminAuth(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -287,6 +291,7 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'")
 		next.ServeHTTP(w, r)
 	})
 }

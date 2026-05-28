@@ -116,8 +116,8 @@ synaps3 admin task retry 42
 在仪表盘查看 provider health 和 readiness，或检查 Admin API：
 
 ```bash
-curl http://127.0.0.1:9090/api/v1/filecoin/readiness
-curl http://127.0.0.1:9090/api/v1/observability/providers
+curl -u "admin:${SYNAPS3_ADMIN_PASSWORD}" http://127.0.0.1:9090/api/v1/filecoin/readiness
+curl -u "admin:${SYNAPS3_ADMIN_PASSWORD}" http://127.0.0.1:9090/api/v1/observability/providers
 ```
 
 恢复方式：

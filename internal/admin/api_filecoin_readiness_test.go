@@ -106,7 +106,7 @@ func TestFilecoinReadinessRuntimeIgnoresObservabilityState(t *testing.T) {
 	}
 }
 
-func TestFilecoinReadinessPreflightRequiresLoopbackContentTypeAndWriteHeader(t *testing.T) {
+func TestFilecoinReadinessPreflightRequiresJSONContentType(t *testing.T) {
 	cfg := validSettingsConfig(t)
 	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
 	probe := &fakeFilecoinReadinessProbe{draft: readyFilecoinReadinessResult(synapse.ReadinessModeDraft)}
@@ -115,12 +115,10 @@ func TestFilecoinReadinessPreflightRequiresLoopbackContentTypeAndWriteHeader(t *
 		name        string
 		addr        string
 		contentType string
-		writeHeader string
 		wantStatus  int
 	}{
-		{name: "non-loopback", addr: "0.0.0.0:9090", contentType: "application/json", writeHeader: "1", wantStatus: http.StatusForbidden},
-		{name: "missing content type", addr: "127.0.0.1:9090", writeHeader: "1", wantStatus: http.StatusBadRequest},
-		{name: "missing write header", addr: "127.0.0.1:9090", contentType: "application/json", wantStatus: http.StatusBadRequest},
+		{name: "missing content type", addr: "127.0.0.1:9090", wantStatus: http.StatusBadRequest},
+		{name: "json content type", addr: "0.0.0.0:9090", contentType: "application/json", wantStatus: http.StatusOK},
 	}
 
 	for _, tt := range tests {
@@ -131,11 +129,6 @@ func TestFilecoinReadinessPreflightRequiresLoopbackContentTypeAndWriteHeader(t *
 				req.Header.Set("Content-Type", tt.contentType)
 			} else {
 				req.Header.Del("Content-Type")
-			}
-			if tt.writeHeader != "" {
-				req.Header.Set(settingsWriteHeader, tt.writeHeader)
-			} else {
-				req.Header.Del(settingsWriteHeader)
 			}
 			assertPreflightStatus(t, srv, req, tt.wantStatus)
 		})
@@ -255,7 +248,6 @@ func assertRuntimeReadinessResponse(t *testing.T, body []byte) {
 func newFilecoinPreflightRequest(body string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/filecoin/readiness/preflight", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	return req
 }
 

@@ -270,9 +270,6 @@ func (s *Server) s3UsersAvailable() (bool, int, string) {
 	if s.s3IAM == nil {
 		return false, http.StatusForbidden, "S3 user management is unavailable while setup mode is active"
 	}
-	if !s.settingsWritable() {
-		return false, http.StatusForbidden, "S3 user management requires loopback admin binding"
-	}
 	return true, http.StatusOK, ""
 }
 
@@ -280,10 +277,6 @@ func (s *Server) requireS3UserWrite(w http.ResponseWriter, r *http.Request) bool
 	ok, status, reason := s.s3UsersAvailable()
 	if !ok {
 		writeJSON(w, status, settingsErrorResponse{Error: reason})
-		return false
-	}
-	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "missing settings write header"})
 		return false
 	}
 	return true

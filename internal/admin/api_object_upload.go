@@ -35,9 +35,6 @@ func (s *Server) WithObjectUploader(uploader objectUploader) *Server {
 
 func (s *Server) handleAPIUploadObject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if !s.requireBucketWrite(w, r) {
-		return
-	}
 
 	bucketName := r.PathValue("name")
 	if !bucketNameRe.MatchString(bucketName) {

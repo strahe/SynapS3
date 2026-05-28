@@ -742,7 +742,7 @@ function StatusBanners({ data, mutationError }: { data: SettingsData; mutationEr
       )}
       {!data.writable && (
         <Banner tone="danger" icon={AlertTriangle}>
-          Settings writes are disabled because the admin server is not bound to a loopback address.
+          Settings changes cannot be saved because the configuration is read-only.
         </Banner>
       )}
       {settingsSavedBannerVisible(data) && (

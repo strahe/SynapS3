@@ -68,7 +68,6 @@ func TestS3UsersCreateDefaultsToUserPlusAndListDoesNotLeakSecrets(t *testing.T) 
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/s3-users", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 	srv.handleAPICreateS3User(rr, req)
 
@@ -106,7 +105,6 @@ func TestS3UsersCreateRejectsInvalidRole(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/s3-users", strings.NewReader(`{"role":"owner"}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 	srv.handleAPICreateS3User(rr, req)
 
@@ -120,7 +118,6 @@ func TestS3UsersUpdateRotateAndDelete(t *testing.T) {
 
 	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/s3-users", strings.NewReader(`{"role":"user"}`))
 	createReq.Header.Set("Content-Type", "application/json")
-	createReq.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	createRR := httptest.NewRecorder()
 	srv.handleAPICreateS3User(createRR, createReq)
 	if createRR.Code != http.StatusCreated {
@@ -134,7 +131,6 @@ func TestS3UsersUpdateRotateAndDelete(t *testing.T) {
 	updateReq := httptest.NewRequest(http.MethodPut, "/api/v1/s3-users/"+created.AccessKey, strings.NewReader(`{"role":"admin"}`))
 	updateReq.SetPathValue("accessKey", created.AccessKey)
 	updateReq.Header.Set("Content-Type", "application/json")
-	updateReq.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	updateRR := httptest.NewRecorder()
 	srv.handleAPIUpdateS3User(updateRR, updateReq)
 	if updateRR.Code != http.StatusOK {
@@ -161,7 +157,6 @@ func TestS3UsersUpdateRotateAndDelete(t *testing.T) {
 	rotateReq := httptest.NewRequest(http.MethodPost, "/api/v1/s3-users/"+created.AccessKey+"/secret", strings.NewReader(`{}`))
 	rotateReq.SetPathValue("accessKey", created.AccessKey)
 	rotateReq.Header.Set("Content-Type", "application/json")
-	rotateReq.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rotateRR := httptest.NewRecorder()
 	srv.handleAPIRotateS3UserSecret(rotateRR, rotateReq)
 	if rotateRR.Code != http.StatusOK {
@@ -177,7 +172,6 @@ func TestS3UsersUpdateRotateAndDelete(t *testing.T) {
 
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/s3-users/"+created.AccessKey, nil)
 	deleteReq.SetPathValue("accessKey", created.AccessKey)
-	deleteReq.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	deleteRR := httptest.NewRecorder()
 	srv.handleAPIDeleteS3User(deleteRR, deleteReq)
 	if deleteRR.Code != http.StatusNoContent {
@@ -296,7 +290,6 @@ func TestS3UsersUpdateIncludesOwnedBucketCount(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/s3-users/owner-access", strings.NewReader(`{"role":"userplus"}`))
 	req.SetPathValue("accessKey", "owner-access")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 	srv.handleAPIUpdateS3User(rr, req)
 
@@ -328,7 +321,6 @@ func TestS3UsersDeleteOwnedUserReturnsConflict(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/s3-users/owner-access", nil)
 	req.SetPathValue("accessKey", "owner-access")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 	srv.handleAPIDeleteS3User(rr, req)
 
@@ -345,7 +337,6 @@ func TestS3UsersDeleteMissingUserReturnsNotFound(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/s3-users/missing-user", nil)
 	req.SetPathValue("accessKey", "missing-user")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 	srv.handleAPIDeleteS3User(rr, req)
 
@@ -375,7 +366,6 @@ func TestS3UsersDeleteSucceedsAfterBucketsTransferredToRoot(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/s3-users/delete-owner", nil)
 	req.SetPathValue("accessKey", "delete-owner")
-	req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 	rr := httptest.NewRecorder()
 	srv.handleAPIDeleteS3User(rr, req)
 
@@ -425,7 +415,6 @@ func TestS3UsersRejectRootMutations(t *testing.T) {
 			if tc.body != "" {
 				req.Header.Set("Content-Type", "application/json")
 			}
-			req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 			rr := httptest.NewRecorder()
 			tc.call(rr, req)
 			if rr.Code != http.StatusBadRequest {
@@ -435,13 +424,13 @@ func TestS3UsersRejectRootMutations(t *testing.T) {
 	}
 }
 
-func TestS3UsersRequireLoopbackAndWriteHeader(t *testing.T) {
+func TestS3UsersUseAdminAuthInsteadOfLoopbackOrWriteHeaders(t *testing.T) {
 	nonLoopbackSrv, _ := newS3UsersAPITestServer(t, "0.0.0.0:9090")
 	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/s3-users", nil)
 	getRR := httptest.NewRecorder()
 	nonLoopbackSrv.handleAPIListS3Users(getRR, getReq)
-	if getRR.Code != http.StatusForbidden {
-		t.Fatalf("non-loopback GET status = %d, want 403", getRR.Code)
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("non-loopback GET status = %d, want 200", getRR.Code)
 	}
 
 	srv, _ := newS3UsersAPITestServer(t, "127.0.0.1:9090")
@@ -449,7 +438,7 @@ func TestS3UsersRequireLoopbackAndWriteHeader(t *testing.T) {
 	postReq.Header.Set("Content-Type", "application/json")
 	postRR := httptest.NewRecorder()
 	srv.handleAPICreateS3User(postRR, postReq)
-	if postRR.Code != http.StatusBadRequest {
-		t.Fatalf("missing-header POST status = %d, want 400", postRR.Code)
+	if postRR.Code != http.StatusCreated {
+		t.Fatalf("missing-header POST status = %d, want 201", postRR.Code)
 	}
 }

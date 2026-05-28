@@ -224,14 +224,6 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "wallet operations unavailable"})
 		return
 	}
-	if !s.settingsWritable() {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "wallet writes require loopback admin binding"})
-		return
-	}
-	if r.Header.Get(settingsWriteHeader) != settingsWriteHeaderValue {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing settings write header"})
-		return
-	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "wallet writes require application/json"})

@@ -12,21 +12,22 @@ Before running SynapS3 as a long-lived single-host service, verify local disk, d
 | Surface | Recommended exposure |
 | --- | --- |
 | S3 API | Expose only to trusted clients or an authenticated edge. |
-| Dashboard and Admin API | Keep on `127.0.0.1:9090`; use SSH tunneling for remote access. |
-| Metrics | Scrape from the private network or host-local agent only. |
+| Dashboard and Admin API | Keep on `127.0.0.1:9090`; use SSH tunneling or HTTPS reverse proxy for remote access. |
+| Metrics | Scrape with Admin auth from the private network or host-local agent only. |
 
 Do not publish the dashboard or Admin API directly to the internet. Settings, wallet, task retry, and S3 user endpoints are operational control surfaces.
 
 ## Runtime Data
 
 - Put `/var/lib/synaps3` or `~/.synaps3` on durable storage.
-- Back up `config.toml`, `db/`, and cache metadata before upgrades.
+- Back up `config.toml`, `db/`, and `cache/` data before upgrades.
 - Watch free space on the database volume and cache volume.
 - Keep `config.toml`, `.env`, databases, cache data, and wallet material out of git.
 
 ## Secrets and Wallet
 
 - Store `SYNAPS3_FILECOIN_PRIVATE_KEY` in a host environment, `.env`, or secret manager.
+- Store the Admin password securely. Rotate it offline with `synaps3 admin-auth reset-password --config <path>` when it is lost or exposed; this also invalidates existing browser sessions.
 - Confirm `synaps3 admin status` reports a healthy wallet after startup.
 - Deposit USDFC before expected uploads. This example deposits `2 USDFC`:
 
@@ -48,7 +49,10 @@ Review these values first:
 
 | Field | Check |
 | --- | --- |
-| `admin.addr` | Keep `127.0.0.1:9090` unless protected by private access. |
+| `admin.addr` | Keep `127.0.0.1:9090` unless protected by HTTPS and access control. |
+| `admin.trusted_proxies` | Keep empty unless trusted proxies strip untrusted forwarded headers. |
+| `admin.auth.enabled` | Keep `true` for production. |
+| Admin password hash and `admin.auth.session_secret` | Must be present; generate the hash with init/reset and manage the session secret as a secret. |
 | `filecoin.network` | `calibration` until you intentionally move to `mainnet` |
 | `filecoin.allow_private_networks` | `false` unless provider URLs are trusted private endpoints |
 | `cache.max_size_gb` | Size it for expected upload backlog |

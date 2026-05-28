@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/strahe/synaps3/internal/model"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -105,7 +107,17 @@ type LoggingS3AccessConfig struct {
 }
 
 type AdminConfig struct {
-	Addr string `koanf:"addr"`
+	Addr           string          `koanf:"addr"`
+	TrustedProxies []string        `koanf:"trusted_proxies"`
+	Auth           AdminAuthConfig `koanf:"auth"`
+}
+
+type AdminAuthConfig struct {
+	Enabled       bool          `koanf:"enabled"`
+	Username      string        `koanf:"username"`
+	PasswordHash  string        `koanf:"password_hash"`
+	SessionSecret string        `koanf:"session_secret"`
+	SessionTTL    time.Duration `koanf:"session_ttl"`
 }
 
 const appDataDirName = ".synaps3"
@@ -197,6 +209,11 @@ func defaultConfig() *Config {
 		},
 		Admin: AdminConfig{
 			Addr: "127.0.0.1:9090",
+			Auth: AdminAuthConfig{
+				Enabled:    true,
+				Username:   "admin",
+				SessionTTL: 12 * time.Hour,
+			},
 		},
 	}
 }
@@ -280,14 +297,17 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 
 	if includeEnv {
 		// Overlay environment variables: SYNAPS3_SERVER_PORT → server.port
-		if err := k.Load(env.Provider("SYNAPS3_", ".", func(s string) string {
+		if err := k.Load(env.ProviderWithValue("SYNAPS3_", ".", func(s, value string) (string, interface{}) {
 			if field, ok := EnvFieldForName(s); ok {
-				return field
+				if field == "admin.trusted_proxies" {
+					return field, splitEnvList(value)
+				}
+				return field, value
 			}
 			return strings.ReplaceAll(
 				strings.ToLower(strings.TrimPrefix(s, "SYNAPS3_")),
 				"_", ".",
-			)
+			), value
 		}), nil); err != nil {
 			return nil, PersistedFieldPresence{}, fmt.Errorf("loading env vars: %w", err)
 		}
@@ -310,13 +330,19 @@ func persistedFieldPresence(k *koanf.Koanf, fileLoaded bool) PersistedFieldPrese
 		return PersistedFieldPresence{}
 	}
 	return PersistedFieldPresence{
-		FilecoinPrivateKey: k.Exists("filecoin.private_key"),
-		DatabaseDriver:     k.Exists("database.driver"),
-		DatabaseDSN:        k.Exists("database.dsn"),
-		DatabaseMaxOpen:    k.Exists("database.max_open_conns"),
-		DatabaseMaxIdle:    k.Exists("database.max_idle_conns"),
-		CacheDir:           k.Exists("cache.dir"),
-		AdminAddr:          k.Exists("admin.addr"),
+		FilecoinPrivateKey:     k.Exists("filecoin.private_key"),
+		DatabaseDriver:         k.Exists("database.driver"),
+		DatabaseDSN:            k.Exists("database.dsn"),
+		DatabaseMaxOpen:        k.Exists("database.max_open_conns"),
+		DatabaseMaxIdle:        k.Exists("database.max_idle_conns"),
+		CacheDir:               k.Exists("cache.dir"),
+		AdminAddr:              k.Exists("admin.addr"),
+		AdminTrustedProxies:    k.Exists("admin.trusted_proxies"),
+		AdminAuthEnabled:       k.Exists("admin.auth.enabled"),
+		AdminAuthUsername:      k.Exists("admin.auth.username"),
+		AdminAuthPasswordHash:  k.Exists("admin.auth.password_hash"),
+		AdminAuthSessionSecret: k.Exists("admin.auth.session_secret"),
+		AdminAuthSessionTTL:    k.Exists("admin.auth.session_ttl"),
 	}
 }
 
@@ -462,8 +488,56 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	if strings.TrimSpace(c.Admin.Addr) == "" {
 		add("admin.addr", "must be non-empty")
 	}
+	for _, proxy := range c.Admin.TrustedProxies {
+		if !validIPOrCIDR(proxy) {
+			add("admin.trusted_proxies", fmt.Sprintf("must contain only IP or CIDR values, got %q", proxy))
+		}
+	}
+	if c.Admin.Auth.Enabled {
+		if strings.TrimSpace(c.Admin.Auth.Username) == "" {
+			add("admin.auth.username", "must be non-empty when admin auth is enabled")
+		}
+		if strings.TrimSpace(c.Admin.Auth.PasswordHash) == "" {
+			add("admin.auth.password_hash", "must be non-empty when admin auth is enabled")
+		} else if _, err := bcrypt.Cost([]byte(c.Admin.Auth.PasswordHash)); err != nil {
+			add("admin.auth.password_hash", "must be a valid bcrypt hash")
+		}
+		if strings.TrimSpace(c.Admin.Auth.SessionSecret) == "" {
+			add("admin.auth.session_secret", "must be non-empty when admin auth is enabled")
+		}
+		if c.Admin.Auth.SessionTTL <= 0 {
+			add("admin.auth.session_ttl", "must be positive when admin auth is enabled")
+		}
+	}
 
 	return errs
+}
+
+func splitEnvList(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func validIPOrCIDR(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if _, err := netip.ParsePrefix(value); err == nil {
+		return true
+	}
+	_, err := netip.ParseAddr(value)
+	return err == nil
 }
 
 func validateListenAddress(addr string) string {

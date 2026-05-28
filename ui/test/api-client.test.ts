@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { api, maxFOCUploadSize, minFOCUploadSize, validateFOCUploadSize } from '../src/api/client.ts'
+import {
+  addAuthInvalidationListener,
+  api,
+  maxFOCUploadSize,
+  minFOCUploadSize,
+  setAdminCSRFToken,
+  validateFOCUploadSize,
+} from '../src/api/client.ts'
 
 class FakeXMLHttpRequest {
   static instances: FakeXMLHttpRequest[] = []
@@ -14,6 +21,7 @@ class FakeXMLHttpRequest {
   status = 0
   responseText = ''
   timeout = 0
+  withCredentials = false
   onload: (() => void) | null = null
   onerror: (() => void) | null = null
   ontimeout: (() => void) | null = null
@@ -48,7 +56,7 @@ function installFakeXMLHttpRequest() {
   }
 }
 
-test('admin write mutations send settings write header', async () => {
+test('admin write mutations send csrf header', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ headers: Headers; method?: string }> = []
   globalThis.fetch = (async (_input, init) => {
@@ -60,6 +68,7 @@ test('admin write mutations send settings write header', async () => {
   }) as typeof fetch
 
   try {
+    setAdminCSRFToken('csrf-test-token')
     await api.createBucket({ name: 'bucket-a', owner_access_key: 'owner-a' })
     await api.updateBucketOwner('bucket-a', 'owner-b')
     await api.deleteBucketObject('bucket-a', 'folder/file.txt')
@@ -72,23 +81,135 @@ test('admin write mutations send settings write header', async () => {
       delete_marker_version_id: 'marker-1',
     })
   } finally {
+    setAdminCSRFToken('')
     globalThis.fetch = originalFetch
   }
 
   assert.equal(calls.length, 5)
   assert.equal(calls[0]?.method, 'POST')
-  assert.equal(calls[0]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[0]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(calls[0]?.headers.get('X-SynapS3-Settings-Write'), null)
   assert.equal(calls[1]?.method, 'PUT')
-  assert.equal(calls[1]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[1]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(calls[1]?.headers.get('X-SynapS3-Settings-Write'), null)
   assert.equal(calls[2]?.method, 'DELETE')
-  assert.equal(calls[2]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[2]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(calls[2]?.headers.get('X-SynapS3-Settings-Write'), null)
   assert.equal(calls[3]?.method, 'POST')
-  assert.equal(calls[3]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[3]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(calls[3]?.headers.get('X-SynapS3-Settings-Write'), null)
   assert.equal(calls[4]?.method, 'POST')
-  assert.equal(calls[4]?.headers.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(calls[4]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(calls[4]?.headers.get('X-SynapS3-Settings-Write'), null)
 })
 
-test('filecoin preflight sends settings write header and payload', async () => {
+test('401 responses notify auth invalidation and clear csrf token', async () => {
+  const originalFetch = globalThis.fetch
+  let invalidations = 0
+  const removeListener = addAuthInvalidationListener(() => {
+    invalidations++
+  })
+  const calls: Array<{ headers: Headers; method?: string }> = []
+  globalThis.fetch = (async (_input, init) => {
+    calls.push({ headers: new Headers(init?.headers), method: init?.method })
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({ error: 'admin authentication required' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    return new Response(JSON.stringify({ id: 1, name: 'bucket-a', owner_access_key: 'owner-a', status: 'active' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    setAdminCSRFToken('csrf-test-token')
+    await assert.rejects(() => api.getOverview(), /admin authentication required/)
+    await api.createBucket({ name: 'bucket-a', owner_access_key: 'owner-a' })
+  } finally {
+    removeListener()
+    setAdminCSRFToken('')
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(invalidations, 1)
+  assert.equal(calls[1]?.headers.get('X-SynapS3-CSRF'), null)
+})
+
+test('object upload 401 notifies auth invalidation and clears csrf token', async () => {
+  const restore = installFakeXMLHttpRequest()
+  const originalFetch = globalThis.fetch
+  const file = new File(['x'.repeat(minFOCUploadSize)], 'expired.bin')
+  const calls: Array<{ headers: Headers }> = []
+  let invalidations = 0
+  const removeListener = addAuthInvalidationListener(() => {
+    invalidations++
+  })
+  globalThis.fetch = (async (_input, init) => {
+    calls.push({ headers: new Headers(init?.headers) })
+    return new Response(JSON.stringify({ id: 1, name: 'bucket-a', owner_access_key: 'owner-a', status: 'active' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    setAdminCSRFToken('csrf-test-token')
+    const promise = api.uploadBucketObject('bucket-a', {
+      key: 'expired.bin',
+      file,
+    })
+
+    const xhr = FakeXMLHttpRequest.instances[0]
+    assert.ok(xhr)
+    xhr.load(401, JSON.stringify({ error: 'admin authentication required' }))
+
+    await assert.rejects(promise, /admin authentication required/)
+    await api.createBucket({ name: 'bucket-a', owner_access_key: 'owner-a' })
+  } finally {
+    removeListener()
+    setAdminCSRFToken('')
+    globalThis.fetch = originalFetch
+    restore()
+  }
+
+  assert.equal(invalidations, 1)
+  assert.equal(calls[0]?.headers.get('X-SynapS3-CSRF'), null)
+})
+
+test('logout clears csrf token even when server logout fails', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ headers: Headers; method?: string }> = []
+  globalThis.fetch = (async (_input, init) => {
+    calls.push({ headers: new Headers(init?.headers), method: init?.method })
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({ error: 'admin CSRF token required' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    return new Response(JSON.stringify({ id: 1, name: 'bucket-a', owner_access_key: 'owner-a', status: 'active' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    setAdminCSRFToken('csrf-test-token')
+    await assert.rejects(() => api.logout(), /admin CSRF token required/)
+    await api.createBucket({ name: 'bucket-a', owner_access_key: 'owner-a' })
+  } finally {
+    setAdminCSRFToken('')
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls[0]?.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(calls[1]?.headers.get('X-SynapS3-CSRF'), null)
+})
+
+test('filecoin preflight sends csrf header and payload', async () => {
   const originalFetch = globalThis.fetch
   let requestedURL = ''
   let requestedMethod = ''
@@ -114,6 +235,7 @@ test('filecoin preflight sends settings write header and payload', async () => {
   }) as typeof fetch
 
   try {
+    setAdminCSRFToken('csrf-test-token')
     await api.preflightFilecoin({
       filecoin: {
         network: 'calibration',
@@ -121,12 +243,14 @@ test('filecoin preflight sends settings write header and payload', async () => {
       },
     })
   } finally {
+    setAdminCSRFToken('')
     globalThis.fetch = originalFetch
   }
 
   assert.equal(requestedURL, '/api/v1/filecoin/readiness/preflight')
   assert.equal(requestedMethod, 'POST')
-  assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(requestedHeaders.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), null)
   assert.deepEqual(requestedBody, {
     filecoin: {
       network: 'calibration',
@@ -135,7 +259,7 @@ test('filecoin preflight sends settings write header and payload', async () => {
   })
 })
 
-test('settings validate sends settings write header and payload', async () => {
+test('settings validate sends csrf header and payload', async () => {
   const originalFetch = globalThis.fetch
   let requestedURL = ''
   let requestedMethod = ''
@@ -153,18 +277,21 @@ test('settings validate sends settings write header and payload', async () => {
   }) as typeof fetch
 
   try {
+    setAdminCSRFToken('csrf-test-token')
     await api.validateSettings({
       server: {
         port: ':8080',
       },
     })
   } finally {
+    setAdminCSRFToken('')
     globalThis.fetch = originalFetch
   }
 
   assert.equal(requestedURL, '/api/v1/settings/validate')
   assert.equal(requestedMethod, 'POST')
-  assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), '1')
+  assert.equal(requestedHeaders.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), null)
   assert.deepEqual(requestedBody, {
     server: {
       port: ':8080',
@@ -172,7 +299,7 @@ test('settings validate sends settings write header and payload', async () => {
   })
 })
 
-test('data set storage health refresh sends refresh intent header', async () => {
+test('data set storage health refresh sends csrf header', async () => {
   const originalFetch = globalThis.fetch
   let requestedURL = ''
   let requestedMethod = ''
@@ -188,14 +315,17 @@ test('data set storage health refresh sends refresh intent header', async () => 
   }) as typeof fetch
 
   try {
+    setAdminCSRFToken('csrf-test-token')
     await api.refreshDataSetStorageHealth({ bucket: 'bucket-a' })
   } finally {
+    setAdminCSRFToken('')
     globalThis.fetch = originalFetch
   }
 
   assert.equal(requestedURL, '/api/v1/observability/data-sets/refresh?bucket=bucket-a')
   assert.equal(requestedMethod, 'POST')
-  assert.equal(requestedHeaders.get('X-SynapS3-Observability-Refresh'), '1')
+  assert.equal(requestedHeaders.get('X-SynapS3-CSRF'), 'csrf-test-token')
+  assert.equal(requestedHeaders.get('X-SynapS3-Observability-Refresh'), null)
   assert.equal(requestedHeaders.get('X-SynapS3-Settings-Write'), null)
 })
 
@@ -393,12 +523,13 @@ test('bucket storage risk versions sends independent marker parameters', async (
   )
 })
 
-test('object upload uses XHR with write header and upload progress', async () => {
+test('object upload uses XHR with csrf header and upload progress', async () => {
   const restore = installFakeXMLHttpRequest()
   const file = new File(['x'.repeat(minFOCUploadSize)], 'report summary.txt', { type: 'text/plain' })
   const progress: Array<{ loaded: number; total: number; percent: number }> = []
 
   try {
+    setAdminCSRFToken('csrf-test-token')
     const promise = api.uploadBucketObject('bucket a', {
       key: 'reports/report summary.txt',
       file,
@@ -409,7 +540,9 @@ test('object upload uses XHR with write header and upload progress', async () =>
     assert.ok(xhr)
     assert.equal(xhr.method, 'POST')
     assert.equal(xhr.url, '/api/v1/buckets/bucket%20a/objects/upload?key=reports%2Freport%20summary.txt')
-    assert.equal(xhr.headers.get('X-SynapS3-Settings-Write'), '1')
+    assert.equal(xhr.withCredentials, true)
+    assert.equal(xhr.headers.get('X-SynapS3-CSRF'), 'csrf-test-token')
+    assert.equal(xhr.headers.get('X-SynapS3-Settings-Write'), null)
     assert.equal(xhr.headers.get('Content-Type'), 'text/plain')
     assert.equal(xhr.timeout, 60 * 60 * 1000)
     assert.equal(xhr.body, file)
@@ -435,6 +568,7 @@ test('object upload uses XHR with write header and upload progress', async () =>
     })
     assert.deepEqual(progress, [{ loaded: 6, total: 12, percent: 50 }])
   } finally {
+    setAdminCSRFToken('')
     restore()
   }
 })

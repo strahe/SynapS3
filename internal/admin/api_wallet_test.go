@@ -188,24 +188,19 @@ func TestHandleAPIWalletFund_RejectsUnsafeOrInvalidRequests(t *testing.T) {
 		name        string
 		body        string
 		contentType string
-		writeHeader bool
 		wantStatus  int
 	}{
-		{name: "missing write header", body: `{"client_request_id":"a","amount":"1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
-		{name: "non json", body: `{"client_request_id":"a","amount":"1"}`, contentType: "text/plain", writeHeader: true, wantStatus: http.StatusBadRequest},
-		{name: "empty amount", body: `{"client_request_id":"a","amount":""}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
-		{name: "zero amount", body: `{"client_request_id":"a","amount":"0"}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
-		{name: "negative amount", body: `{"client_request_id":"a","amount":"-1"}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
-		{name: "decimal amount", body: `{"client_request_id":"a","amount":"1.1"}`, contentType: "application/json", writeHeader: true, wantStatus: http.StatusBadRequest},
+		{name: "non json", body: `{"client_request_id":"a","amount":"1"}`, contentType: "text/plain", wantStatus: http.StatusBadRequest},
+		{name: "empty amount", body: `{"client_request_id":"a","amount":""}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
+		{name: "zero amount", body: `{"client_request_id":"a","amount":"0"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
+		{name: "negative amount", body: `{"client_request_id":"a","amount":"-1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
+		{name: "decimal amount", body: `{"client_request_id":"a","amount":"1.1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/fund", strings.NewReader(tt.body))
 			if tt.contentType != "" {
 				req.Header.Set("Content-Type", tt.contentType)
-			}
-			if tt.writeHeader {
-				req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 			}
 			rr := httptest.NewRecorder()
 			srv.handleAPIWalletFund(rr, req)
@@ -227,7 +222,6 @@ func TestHandleAPIWalletFund_IsIdempotentByClientRequestID(t *testing.T) {
 		body := []byte(`{"client_request_id":"same-request","amount":"` + amount + `"}`)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/fund", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(settingsWriteHeader, settingsWriteHeaderValue)
 		rr := httptest.NewRecorder()
 		srv.handleAPIWalletFund(rr, req)
 		var resp walletOperationResponse

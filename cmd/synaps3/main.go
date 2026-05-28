@@ -70,6 +70,7 @@ func newRootCommand() *cli.Command {
 			migrateCommand(),
 			providerCommand(),
 			walletCommand(),
+			adminAuthCommand(),
 			adminCommand(),
 			versionCommand(),
 		},
@@ -105,10 +106,21 @@ func initCommand() *cli.Command {
 }
 
 func writeInitResult(cmd *cli.Command, result config.InitResult) error {
+	adminPasswordLine := ""
+	if shouldPrintInitialAdminPassword(cmd.Root().Writer) {
+		adminPasswordLine = fmt.Sprintf("Admin username: admin\nAdmin initial password: %s\n", result.AdminInitialPassword)
+	} else {
+		passwordPath, err := config.WriteAdminInitialPasswordFile(result.Dir, result.AdminInitialPassword)
+		if err != nil {
+			return err
+		}
+		adminPasswordLine = fmt.Sprintf("Admin username: admin\nAdmin initial password file: %s\n", passwordPath)
+	}
 	output := fmt.Sprintf(
-		"Initialized SynapS3 app data directory: %s\nConfig: %s\nSet filecoin.private_key in the config file or SYNAPS3_FILECOIN_PRIVATE_KEY before serving.\n",
+		"Initialized SynapS3 app data directory: %s\nConfig: %s\n%sSet filecoin.private_key in the config file or SYNAPS3_FILECOIN_PRIVATE_KEY before serving.\n",
 		result.Dir,
 		result.ConfigPath,
+		adminPasswordLine,
 	)
 	if result.DefaultDir {
 		output += "Next: synaps3 serve\n"
@@ -124,6 +136,18 @@ func writeInitResult(cmd *cli.Command, result config.InitResult) error {
 		return io.ErrShortWrite
 	}
 	return nil
+}
+
+func shouldPrintInitialAdminPassword(w io.Writer) bool {
+	file, ok := w.(*os.File)
+	if !ok || file != os.Stdout {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func serveCommand() *cli.Command {
@@ -248,7 +272,7 @@ func runServe(ctx context.Context, src config.Source) error {
 
 	settingsSvc, err := admin.NewSettingsService(cfg, src)
 	if err != nil {
-		return fmt.Errorf("initialising settings service: %w", err)
+		return fmt.Errorf("initializing settings service: %w", err)
 	}
 
 	// Full config validation — only required for serve, not migrate.
@@ -285,7 +309,7 @@ func runServe(ctx context.Context, src config.Source) error {
 	maxCacheBytes := int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024
 	localCache, err := cache.NewFilesystem(cfg.Cache.Dir, maxCacheBytes)
 	if err != nil {
-		return fmt.Errorf("initialising cache: %w", err)
+		return fmt.Errorf("initializing cache: %w", err)
 	}
 
 	// Build state machine.
@@ -396,6 +420,12 @@ func runServe(ctx context.Context, src config.Source) error {
 		WithObservability(observabilitySvc).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithS3IAM(iamSvc, rootAccount.Access)
+	if err := adminSrv.WithTrustedProxies(cfg.Admin.TrustedProxies); err != nil {
+		return fmt.Errorf("initializing admin trusted proxies: %w", err)
+	}
+	if err := adminSrv.WithAuthConfig(cfg.Admin.Auth); err != nil {
+		return fmt.Errorf("initializing admin auth: %w", err)
+	}
 	errCh := make(chan error, 2)
 	go func() {
 		if err := adminSrv.Run(ctx); err != nil {
@@ -446,6 +476,12 @@ func runSetupMode(ctx context.Context, cfg *config.Config, settingsSvc *admin.Se
 	)
 	adminSrv := admin.NewSetup(cfg.Admin.Addr, settingsSvc, logger).
 		WithFilecoinReadiness(filecoinReadiness)
+	if err := adminSrv.WithTrustedProxies(cfg.Admin.TrustedProxies); err != nil {
+		return fmt.Errorf("initializing admin trusted proxies: %w", err)
+	}
+	if err := adminSrv.WithAuthConfig(cfg.Admin.Auth); err != nil {
+		return fmt.Errorf("initializing admin auth: %w", err)
+	}
 	if err := adminSrv.Run(ctx); err != nil {
 		return fmt.Errorf("admin setup server error: %w", err)
 	}

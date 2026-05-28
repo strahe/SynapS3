@@ -240,6 +240,32 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Description: "Address where the admin dashboard and API listen.",
 		Env:         "SYNAPS3_ADMIN_ADDR",
 	},
+	"admin.trusted_proxies": {
+		Label:       "Admin Trusted Proxies",
+		Description: "Trusted reverse proxy IPs or CIDRs whose forwarded client and proto headers may be used by the Admin API.",
+		Env:         "SYNAPS3_ADMIN_TRUSTED_PROXIES",
+	},
+	"admin.auth.enabled": {
+		Label:       "Admin Auth Enabled",
+		Description: "Requires login for the Admin UI and Admin API.",
+		Env:         "SYNAPS3_ADMIN_AUTH_ENABLED",
+	},
+	"admin.auth.username": {
+		Label:       "Admin Username",
+		Description: "Single administrator username for the Admin UI and Admin API.",
+		Env:         "SYNAPS3_ADMIN_AUTH_USERNAME",
+	},
+	"admin.auth.session_secret": {
+		Label:       "Admin Session Secret",
+		Description: "Secret used to sign Admin UI session cookies.",
+		Env:         "SYNAPS3_ADMIN_AUTH_SESSION_SECRET",
+		Secret:      true,
+	},
+	"admin.auth.session_ttl": {
+		Label:       "Admin Session TTL",
+		Description: "Maximum lifetime for Admin UI sessions.",
+		Env:         "SYNAPS3_ADMIN_AUTH_SESSION_TTL",
+	},
 }
 
 var envFieldByName = buildEnvFieldByName()
@@ -251,6 +277,7 @@ func buildEnvFieldByName() map[string]string {
 			out[strings.ToUpper(meta.Env)] = field
 		}
 	}
+	out["SYNAPS3_ADMIN_AUTH_PASSWORD_HASH"] = "admin.auth.password_hash"
 	return out
 }
 

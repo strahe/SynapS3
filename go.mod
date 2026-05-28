@@ -20,6 +20,8 @@ require (
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
 	github.com/urfave/cli/v3 v3.8.0
 	github.com/versity/versitygw v1.4.0
+	golang.org/x/crypto v0.50.0
+	golang.org/x/term v0.43.0
 	modernc.org/sqlite v1.48.1
 )
 
@@ -147,9 +149,8 @@ require (
 	github.com/valyala/fasthttp v1.69.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
-	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	modernc.org/libc v1.70.0 // indirect

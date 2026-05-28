@@ -13,12 +13,14 @@ SynapS3 启动且 Admin API 可通过 `127.0.0.1:9090` 访问后，创建 S3 用
 - `curl http://127.0.0.1:9090/healthz` 返回 `{"status":"ok"}`。
 - S3 API 可通过 `http://localhost:8080` 访问。
 - 运行 `synaps3 admin` 的机器能访问 Admin API。
+- 已设置 `SYNAPS3_ADMIN_PASSWORD`，或 config 同目录存在 `admin-initial-password`，或可以在提示中输入 Admin 密码。
 
 ## 创建凭据
 
 创建普通 S3 用户：
 
 ```bash
+export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 synaps3 admin s3-user create
 ```
 

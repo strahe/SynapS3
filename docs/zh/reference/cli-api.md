@@ -24,6 +24,7 @@ SynapS3 暴露 S3 API、Admin API 和用于本地操作的 CLI 命令。
 | `synaps3 init --dir /var/lib/synaps3` | 初始化自定义 app data directory。 |
 | `synaps3 serve` | 启动 S3 gateway、dashboard、Admin API 和 workers。 |
 | `synaps3 migrate` | 执行数据库迁移并退出。 |
+| `synaps3 admin-auth reset-password --config <path>` | 离线重置 Admin 密码，轮换 session secret，并写入新的 `admin-initial-password` 文件。 |
 | `synaps3 version` | 打印版本信息。 |
 
 ## Wallet 命令
@@ -38,7 +39,11 @@ synaps3 wallet deposit 2 # 2 USDFC
 
 ## Admin 命令
 
+Admin 命令使用 HTTP Basic auth。用户名来自 `admin.auth.username`；密码来自 `SYNAPS3_ADMIN_PASSWORD`、config 同目录的 `admin-initial-password` 或终端提示。
+
 ```bash
+export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
+
 synaps3 admin status
 synaps3 admin s3-user create
 synaps3 admin s3-user list
@@ -53,7 +58,7 @@ synaps3 admin task retry 42
 
 ## Settings 安全
 
-Admin API 包含 settings、wallet operations、task retries 和 S3 user management 的写端点。保持它绑定 loopback，或放在经过认证的私有访问层后面。
+Admin API 包含 settings、wallet operations、task retries 和 S3 user management 的写端点。默认需要 Admin auth。保持监听 loopback；远程访问应放在 HTTPS 和明确访问控制之后。
 
 高风险变更需要确认：
 
@@ -71,4 +76,4 @@ synaps3 admin s3-user delete <access-key> --yes
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-然后使用默认 admin URL 运行本地 admin 命令，或显式传入 `--admin-url`。
+然后使用默认 admin URL 运行本地 admin 命令，或显式传入 `--admin-url`。命令会优先使用 `SYNAPS3_ADMIN_PASSWORD`，其次读取 config 同目录的 `admin-initial-password`，最后再提示输入。浏览器访问时，用 init 或 `admin-auth reset-password` 得到的 Admin 用户名和密码登录。

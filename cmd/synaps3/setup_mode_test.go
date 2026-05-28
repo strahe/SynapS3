@@ -7,10 +7,8 @@ import (
 )
 
 func TestShouldStartSetupModeAllowsMissingManualCredentials(t *testing.T) {
-	cfg, err := config.DefaultConfig()
-	if err != nil {
-		t.Fatalf("DefaultConfig: %v", err)
-	}
+	cfg := validServeConfig(t)
+	cfg.Filecoin.PrivateKey = ""
 
 	for _, want := range []string{"filecoin.private_key"} {
 		if !hasServeConfigFieldError(cfg.FieldValidationErrors(), want) {
@@ -20,6 +18,15 @@ func TestShouldStartSetupModeAllowsMissingManualCredentials(t *testing.T) {
 
 	if !shouldStartSetupMode(cfg.FieldValidationErrors()) {
 		t.Fatal("missing manual credentials should allow setup mode")
+	}
+}
+
+func TestShouldStartSetupModeRequiresAdminAuthConfig(t *testing.T) {
+	cfg := validServeConfig(t)
+	cfg.Admin.Auth.PasswordHash = ""
+
+	if shouldStartSetupMode(cfg.FieldValidationErrors()) {
+		t.Fatal("missing admin auth config should remain fatal")
 	}
 }
 
@@ -79,6 +86,8 @@ func validServeConfig(t *testing.T) *config.Config {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
 	cfg.Filecoin.PrivateKey = "filecoin-private-key"
+	cfg.Admin.Auth.PasswordHash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W"
+	cfg.Admin.Auth.SessionSecret = "admin-session-secret-with-enough-entropy"
 	return cfg
 }
 

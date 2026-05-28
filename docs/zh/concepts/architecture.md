@@ -31,7 +31,7 @@ S3 client
 | `internal/db/repository` | backend 和 worker 的持久化边界。 |
 | `internal/state` | 对象生命周期状态转换校验。 |
 | `internal/worker` | 异步上传、缓存淘汰、租约、重试、恢复。 |
-| `internal/admin` 和 `ui/` | Dashboard、Admin API、健康检查、指标。 |
+| `internal/admin` 和 `ui/` | Dashboard、Admin API、Admin auth、健康检查、指标。 |
 | `internal/synapse` | Synapse SDK 行为的窄封装。 |
 
 ## 设计原则
@@ -50,8 +50,14 @@ S3 client
 | S3 写入成功是 local-first | Provider 故障不会让已接受写入消失。 |
 | 后台任务处理 Filecoin 存储 | 需要关注 task queues 和 exhausted tasks。 |
 | Cache 是持久性的一部分 | Cache 磁盘不是可随意丢弃的临时目录。 |
-| Admin API 控制运维操作 | 保持 loopback 或放在认证私有访问层后面。 |
+| Admin API 控制运维操作 | 使用 Admin auth；保持 loopback 或放在 HTTPS 和访问控制之后。 |
 
 ## Dashboard 角色
 
-内嵌 React dashboard 是运维界面。它展示 buckets、objects、wallet state、background tasks、storage topology、settings 和 health signals。它共享 admin server，不应直接暴露给不可信网络。
+内嵌 React dashboard 是运维界面。它展示 buckets、objects、wallet state、background tasks、storage topology、settings 和 health signals。它共享 admin server，使用 Admin auth session，不应直接暴露给不可信网络。
+
+## Admin Auth 边界
+
+Admin API 请求会先按 canonical path 分类，再进入 Go `ServeMux`。`/healthz` 保持公开；`/api/v1/*`、`/metrics` 和 `/admin/exhausted-tasks*` 需要 Admin auth。浏览器 session 使用 HttpOnly cookie，并在 unsafe methods 上要求 `X-SynapS3-CSRF`。CLI 和脚本可使用 HTTP Basic auth；浏览器来源的 unsafe Basic auth 请求会做来源校验。
+
+密码失败按解析后的客户端 IP 限流。只有直接来源命中 `admin.trusted_proxies` 时，才信任 forwarded client、scheme 和 host headers。Logout 会清除 cookie，并在当前进程内撤销当前 session token 直到过期。

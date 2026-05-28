@@ -382,4 +382,7 @@ func TestWithSecurityHeaders(t *testing.T) {
 	if got := res.Header.Get("Referrer-Policy"); got != "strict-origin-when-cross-origin" {
 		t.Errorf("Referrer-Policy = %q, want strict-origin-when-cross-origin", got)
 	}
+	if got := res.Header.Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") || !strings.Contains(got, "connect-src 'self'") {
+		t.Errorf("Content-Security-Policy = %q, want self-only baseline", got)
+	}
 }

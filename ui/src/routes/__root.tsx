@@ -1,4 +1,4 @@
-import { type QueryClient, useQueryClient } from '@tanstack/react-query'
+import { type QueryClient, useQuery, useQueryClient } from '@tanstack/react-query'
 import { createRootRouteWithContext, Link, Outlet, useLocation } from '@tanstack/react-router'
 import {
   AlertTriangle,
@@ -7,6 +7,8 @@ import {
   HardDrive,
   LayoutDashboard,
   ListTodo,
+  LoaderCircle,
+  LogOut,
   Monitor,
   Moon,
   Network,
@@ -16,7 +18,9 @@ import {
   Sun,
   Wallet,
 } from 'lucide-react'
-import { type MouseEvent, useEffect, useState } from 'react'
+import { type MouseEvent, useCallback, useEffect, useState } from 'react'
+import { type AuthSession, addAuthInvalidationListener, api } from '@/api/client'
+import { AdminLogin } from '@/components/app/AdminLogin'
 import { FilecoinReadinessDialog } from '@/components/app/FilecoinReadinessDialog'
 import { StatusBadge } from '@/components/app/StatusBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -62,6 +66,7 @@ import {
 } from '@/lib/theme'
 import { applyUploadProgressEventData, applyUploadStateChangedEventData } from '@/lib/upload-progress-events'
 import { applyWalletOperationEventData } from '@/lib/wallet-operation-events'
+import { authSessionQueryOptions, clearLocalAuthSession } from './-auth-session'
 import {
   filecoinRuntimeReadinessEnabled,
   fullRuntimeAvailable,
@@ -107,12 +112,18 @@ function readSidebarDefaultOpen() {
 function RootLayout() {
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => readThemePreference())
   const [systemPrefersDark, setSystemPrefersDark] = useState(readSystemPrefersDark)
-  const location = useLocation()
-  const { data: settings, isLoading: settingsLoading } = useSettings()
-  const runtimeAvailable = fullRuntimeAvailable(settings, settingsLoading)
-  const activeNavItems = settingsLoading || rootUsesSetupShell(settings) ? setupNavItems : navItems
-  const contentKind = rootContentKind(settings, location.pathname)
+  const queryClient = useQueryClient()
+  const authSession = useQuery({
+    queryKey: ['authSession'],
+    queryFn: api.getAuthSession,
+    retry: false,
+    ...authSessionQueryOptions,
+  })
   const dark = resolveThemeDark(themePreference, systemPrefersDark)
+
+  useEffect(() => {
+    return addAuthInvalidationListener(() => clearLocalAuthSession(queryClient))
+  }, [queryClient])
 
   useEffect(() => {
     const mq = getSystemThemeMediaQuery()
@@ -145,14 +156,67 @@ function RootLayout() {
     writeThemePreference(preference)
   }
 
+  if (authSession.isLoading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-background">
+        <LoaderCircle className="size-5 animate-spin text-muted-foreground" aria-hidden="true" />
+      </main>
+    )
+  }
+
+  if (authSession.isError || !authSession.data) {
+    return (
+      <AdminLogin
+        onAuthenticated={(session) => {
+          queryClient.setQueryData(['authSession'], session)
+        }}
+      />
+    )
+  }
+
+  return (
+    <AuthenticatedRootLayout
+      session={authSession.data}
+      themePreference={themePreference}
+      onThemePreferenceChange={handleThemePreferenceChange}
+    />
+  )
+}
+
+function AuthenticatedRootLayout({
+  session,
+  themePreference,
+  onThemePreferenceChange,
+}: {
+  session: AuthSession
+  themePreference: ThemePreference
+  onThemePreferenceChange: (preference: ThemePreference) => void
+}) {
+  const queryClient = useQueryClient()
+  const location = useLocation()
+  const { data: settings, isLoading: settingsLoading } = useSettings()
+  const runtimeAvailable = fullRuntimeAvailable(settings, settingsLoading)
+  const activeNavItems = settingsLoading || rootUsesSetupShell(settings) ? setupNavItems : navItems
+  const contentKind = rootContentKind(settings, location.pathname)
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await api.logout()
+    } finally {
+      clearLocalAuthSession(queryClient)
+    }
+  }, [queryClient])
+
   return (
     <SidebarProvider defaultOpen={readSidebarDefaultOpen()}>
       <AdminEventsBridge enabled={runtimeAvailable} />
       <AppSidebar
         activeNavItems={activeNavItems}
         pathname={location.pathname}
+        username={session.username}
         themePreference={themePreference}
-        onThemePreferenceChange={handleThemePreferenceChange}
+        onThemePreferenceChange={onThemePreferenceChange}
+        onLogout={handleLogout}
       />
 
       <SidebarInset className="overflow-auto">
@@ -302,13 +366,17 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
 function AppSidebar({
   activeNavItems,
   pathname,
+  username,
   themePreference,
   onThemePreferenceChange,
+  onLogout,
 }: {
   activeNavItems: NavItem[]
   pathname: string
+  username: string
   themePreference: ThemePreference
   onThemePreferenceChange: (preference: ThemePreference) => void
+  onLogout: () => void
 }) {
   const { isMobile, setOpenMobile, state, toggleSidebar } = useSidebar()
   const closeMobileSidebar = () => {
@@ -372,6 +440,12 @@ function AppSidebar({
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton tooltip={`Signed in as ${username}`} onClick={onLogout}>
+              <LogOut />
+              <span className="group-data-[collapsible=icon]:hidden">Sign Out</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
           <SidebarMenuItem>
             <ThemeMenu
               value={themePreference}

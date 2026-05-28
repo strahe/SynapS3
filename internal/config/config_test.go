@@ -17,6 +17,8 @@ func validConfig() *Config {
 		panic(err)
 	}
 	cfg.Filecoin.PrivateKey = "filecoin-private-key"
+	cfg.Admin.Auth.PasswordHash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W"
+	cfg.Admin.Auth.SessionSecret = "admin-session-secret-with-enough-entropy"
 	return cfg
 }
 
@@ -24,6 +26,54 @@ func TestValidate_DefaultConfig(t *testing.T) {
 	cfg := validConfig()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got: %v", err)
+	}
+}
+
+func TestLoadAdminTrustedProxiesFromConfigAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[filecoin]
+private_key = "filecoin-private-key"
+
+[database]
+dsn = "file://`+filepath.ToSlash(filepath.Join(dir, "synaps3.db"))+`"
+
+[cache]
+dir = "`+filepath.ToSlash(filepath.Join(dir, "cache"))+`"
+
+[admin]
+trusted_proxies = ["10.0.0.0/24", "127.0.0.1"]
+
+[admin.auth]
+password_hash = "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W"
+session_secret = "admin-session-secret-with-enough-entropy"
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile config: %v", err)
+	}
+	t.Setenv("SYNAPS3_ADMIN_TRUSTED_PROXIES", "192.0.2.0/24, 198.51.100.7 ")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"192.0.2.0/24", "198.51.100.7"}
+	if strings.Join(cfg.Admin.TrustedProxies, ",") != strings.Join(want, ",") {
+		t.Fatalf("Admin.TrustedProxies = %#v, want %#v", cfg.Admin.TrustedProxies, want)
+	}
+}
+
+func TestValidateAdminTrustedProxies(t *testing.T) {
+	cfg := validConfig()
+	cfg.Admin.TrustedProxies = []string{"10.0.0.0/24", "127.0.0.1"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() valid trusted proxies error = %v", err)
+	}
+
+	cfg.Admin.TrustedProxies = []string{"not-an-ip"}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "admin.trusted_proxies") {
+		t.Fatalf("Validate() error = %v, want admin.trusted_proxies error", err)
 	}
 }
 
@@ -281,6 +331,41 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 				cfg.Logging.S3Access.Level = "verbose"
 			},
 		},
+		{
+			name:  "admin auth username",
+			field: "admin.auth.username",
+			mutate: func(cfg *Config) {
+				cfg.Admin.Auth.Username = ""
+			},
+		},
+		{
+			name:  "admin auth password hash",
+			field: "admin.auth.password_hash",
+			mutate: func(cfg *Config) {
+				cfg.Admin.Auth.PasswordHash = ""
+			},
+		},
+		{
+			name:  "admin auth password hash format",
+			field: "admin.auth.password_hash",
+			mutate: func(cfg *Config) {
+				cfg.Admin.Auth.PasswordHash = "not-a-bcrypt-hash"
+			},
+		},
+		{
+			name:  "admin auth session secret",
+			field: "admin.auth.session_secret",
+			mutate: func(cfg *Config) {
+				cfg.Admin.Auth.SessionSecret = ""
+			},
+		},
+		{
+			name:  "admin auth session ttl",
+			field: "admin.auth.session_ttl",
+			mutate: func(cfg *Config) {
+				cfg.Admin.Auth.SessionTTL = 0
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -430,6 +515,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_WORKER_EVICTOR_MAX_RETRIES", "6")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_LEVEL", "debug")
+	t.Setenv("SYNAPS3_ADMIN_AUTH_PASSWORD_HASH", "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -463,6 +549,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 	if cfg.Logging.S3Access.Enabled || cfg.Logging.S3Access.Level != "debug" {
 		t.Fatalf("s3 access logging = %#v, want disabled debug", cfg.Logging.S3Access)
+	}
+	if cfg.Admin.Auth.PasswordHash != "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W" {
+		t.Fatalf("admin auth password hash = %q, want env value", cfg.Admin.Auth.PasswordHash)
 	}
 }
 

@@ -1,4 +1,8 @@
 const BASE = '/api/v1'
+const csrfHeader = 'X-SynapS3-CSRF'
+
+let adminCSRFToken = ''
+const authInvalidationListeners = new Set<() => void>()
 
 export const internalRootOwnerAccessKey = '__internal_root__'
 export const minFOCUploadSize = 127
@@ -14,16 +18,48 @@ export function validateFOCUploadSize(size: number) {
   return null
 }
 
+export interface AuthSession {
+  username: string
+  csrf_token: string
+  expires_at: string
+}
+
+export function setAdminCSRFToken(token: string) {
+  adminCSRFToken = token
+}
+
+export function addAuthInvalidationListener(listener: () => void) {
+  authInvalidationListeners.add(listener)
+  return () => {
+    authInvalidationListeners.delete(listener)
+  }
+}
+
+function notifyAuthInvalidated() {
+  for (const listener of authInvalidationListeners) {
+    listener()
+  }
+}
+
 async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   if (init?.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
+  const method = init?.method?.toUpperCase() ?? 'GET'
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && adminCSRFToken && !headers.has(csrfHeader)) {
+    headers.set(csrfHeader, adminCSRFToken)
+  }
 
   const res = await fetch(`${BASE}${path}`, {
     ...init,
+    credentials: 'same-origin',
     headers,
   })
+  if (res.status === 401) {
+    adminCSRFToken = ''
+    notifyAuthInvalidated()
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}) as Record<string, unknown>)
     const errorBody = body as { error?: string; fields?: SettingsFieldError[] }
@@ -794,8 +830,6 @@ export interface SettingsData {
   defaults: SettingsDefaults
   env_managed: Record<string, string>
   validation_errors?: SettingsFieldError[]
-  write_header: string
-  write_header_value: string
 }
 
 export interface SettingsValidationData {
@@ -960,31 +994,39 @@ export interface FilecoinReadinessPreflightPayload {
 }
 
 export const api = {
+  getAuthSession: () =>
+    fetchJSON<AuthSession>('/auth/session').then((session) => {
+      setAdminCSRFToken(session.csrf_token)
+      return session
+    }),
+  login: (payload: { username: string; password: string }) =>
+    fetchJSON<AuthSession>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }).then((session) => {
+      setAdminCSRFToken(session.csrf_token)
+      return session
+    }),
+  logout: () =>
+    fetchJSON<void>('/auth/logout', { method: 'POST' }).finally(() => {
+      setAdminCSRFToken('')
+    }),
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
   getBucket: (name: string) => fetchJSON<BucketDetail>(`/buckets/${encodeURIComponent(name)}`),
   createBucket: (payload: { name: string; owner_access_key: string; default_copies?: number | null }) =>
     fetchJSON<BucketMutationResponse>('/buckets', {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   updateBucketOwner: (name: string, ownerAccessKey: string) =>
     fetchJSON<BucketMutationResponse>(`/buckets/${encodeURIComponent(name)}/owner`, {
       method: 'PUT',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify({ owner_access_key: ownerAccessKey }),
     }),
   updateBucketCopyPolicy: (name: string, defaultCopies: number | null) =>
     fetchJSON<BucketMutationResponse>(`/buckets/${encodeURIComponent(name)}/copy-policy`, {
       method: 'PUT',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify({ default_copies: defaultCopies }),
     }),
   deleteBucket: (name: string, params: { recursive?: boolean } = {}) => {
@@ -1009,9 +1051,6 @@ export const api = {
     sp.set('key', key)
     return fetchJSON<ObjectDeleteMarkerResponse>(`/buckets/${encodeURIComponent(name)}/objects?${sp.toString()}`, {
       method: 'DELETE',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
     })
   },
   uploadBucketObject: (
@@ -1029,7 +1068,8 @@ export const api = {
         'POST',
         `${BASE}/buckets/${encodeURIComponent(name)}/objects/upload?key=${encodeURIComponent(params.key)}`
       )
-      xhr.setRequestHeader('X-SynapS3-Settings-Write', '1')
+      xhr.withCredentials = true
+      if (adminCSRFToken) xhr.setRequestHeader(csrfHeader, adminCSRFToken)
       xhr.setRequestHeader('Content-Type', params.file.type || 'application/octet-stream')
       xhr.timeout = 60 * 60 * 1000
       xhr.upload.onprogress = (event) => {
@@ -1041,6 +1081,10 @@ export const api = {
         })
       }
       xhr.onload = () => {
+        if (xhr.status === 401) {
+          setAdminCSRFToken('')
+          notifyAuthInvalidated()
+        }
         let body: unknown
         try {
           body = xhr.responseText ? JSON.parse(xhr.responseText) : undefined
@@ -1072,17 +1116,11 @@ export const api = {
   restoreBucketObject: (name: string, payload: { key: string; delete_marker_version_id: string }) =>
     fetchJSON<RestoreObjectResponse>(`/buckets/${encodeURIComponent(name)}/objects/restore`, {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   permanentlyDeleteBucketObjectVersion: (name: string, payload: { key: string; version_id: string }) =>
     fetchJSON<PermanentDeleteObjectResponse>(`/buckets/${encodeURIComponent(name)}/objects/permanent-delete`, {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   permanentlyDeleteDeletedBucketObject: (name: string, payload: { key: string; delete_marker_version_id: string }) =>
@@ -1090,9 +1128,6 @@ export const api = {
       `/buckets/${encodeURIComponent(name)}/objects/deleted/permanent-delete`,
       {
         method: 'POST',
-        headers: {
-          'X-SynapS3-Settings-Write': '1',
-        },
         body: JSON.stringify(payload),
       }
     ),
@@ -1184,84 +1219,54 @@ export const api = {
     const qs = sp.toString()
     return fetchJSON<ObservabilityListResponse<unknown>>(`/observability/data-sets/refresh${qs ? `?${qs}` : ''}`, {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Observability-Refresh': '1',
-      },
     })
   },
   preflightFilecoin: (payload: FilecoinReadinessPreflightPayload) =>
     fetchJSON<FilecoinReadinessData>('/filecoin/readiness/preflight', {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   getWalletOperations: (limit = 20) => fetchJSON<WalletOperationsResponse>(`/wallet/operations?limit=${limit}`),
   fundWallet: (payload: { client_request_id: string; amount: string }) =>
     fetchJSON<WalletOperationResponse>('/wallet/fund', {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   withdrawWallet: (payload: { client_request_id: string; amount: string }) =>
     fetchJSON<WalletOperationResponse>('/wallet/withdraw', {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   getSettings: () => fetchJSON<SettingsData>('/settings'),
   updateSettings: (payload: SettingsUpdatePayload) =>
     fetchJSON<SettingsData>('/settings', {
       method: 'PUT',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   validateSettings: (payload: SettingsUpdatePayload) =>
     fetchJSON<SettingsValidationData>('/settings/validate', {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   getS3Users: () => fetchJSON<S3User[]>('/s3-users'),
   createS3User: (payload: { role?: S3UserRole } = {}) =>
     fetchJSON<S3UserCredentials>('/s3-users', {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   updateS3User: (accessKey: string, payload: { role: S3UserRole }) =>
     fetchJSON<S3User>(`/s3-users/${encodeURIComponent(accessKey)}`, {
       method: 'PUT',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify(payload),
     }),
   rotateS3UserSecret: (accessKey: string) =>
     fetchJSON<S3UserCredentials>(`/s3-users/${encodeURIComponent(accessKey)}/secret`, {
       method: 'POST',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
       body: JSON.stringify({}),
     }),
   deleteS3User: (accessKey: string) =>
     fetchJSON<void>(`/s3-users/${encodeURIComponent(accessKey)}`, {
       method: 'DELETE',
-      headers: {
-        'X-SynapS3-Settings-Write': '1',
-      },
     }),
 }
 

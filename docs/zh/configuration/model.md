@@ -36,6 +36,8 @@ private_key = "0x..."
 
 不要把 private key 放进代码仓库、容器镜像或 shell history。
 
+当 `admin.auth.enabled = true` 时，Admin auth 还需要密码 hash 和 `admin.auth.session_secret`。新配置由 `synaps3 init` 创建；缺失或需要轮换密码时，用 `synaps3 admin-auth reset-password --config <path>` 生成。重置密码也会轮换 session secret。
+
 ## 主要配置段
 
 | 配置段 | 用途 |
@@ -50,7 +52,7 @@ private_key = "0x..."
 | `worker.evictor` | 本地缓存淘汰 worker 行为。 |
 | `worker.storage_cleanup` | 远端 replica cleanup worker 行为。 |
 | `logging` | 运行时日志等级、格式和 S3 access log。 |
-| `admin` | Dashboard 和 Admin API 监听地址。 |
+| `admin` | Dashboard、Admin API 监听地址和 Admin auth 设置。 |
 
 ## 重要默认值
 
@@ -71,6 +73,10 @@ private_key = "0x..."
 | `worker.upload.concurrency` | `4` |
 | `worker.upload.max_retries` | `5` |
 | `admin.addr` | `127.0.0.1:9090` |
+| `admin.trusted_proxies` | `[]` |
+| `admin.auth.enabled` | `true` |
+| `admin.auth.username` | `admin` |
+| `admin.auth.session_ttl` | `12h` |
 
 ## 允许值
 
@@ -80,12 +86,16 @@ private_key = "0x..."
 - `cache.eviction_policy`: `lru`, `manual`, `none`。
 - `logging.level`: `debug`, `info`, `warn`, `error`。
 - `logging.format`: `json`, `text`。
+- `admin.trusted_proxies`: IP 或 CIDR。除非可信反向代理会清理不可信 forwarded headers，否则保持空。
 
 ## 高风险字段
 
 | 字段 | 风险 |
 | --- | --- |
-| `admin.addr` | 暴露 Admin API 会允许运维写操作。除非有保护，否则保持 loopback。 |
+| `admin.addr` | 暴露 Admin API 会允许运维写操作。除非有 HTTPS 和访问控制保护，否则保持 loopback。 |
+| `admin.trusted_proxies` | 对匹配代理信任 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`。只配置你控制的代理。 |
+| Admin password hash | 控制 Admin 登录。不要手动配置；通过 `synaps3 init` 或 `synaps3 admin-auth reset-password` 生成。 |
+| `admin.auth.session_secret` | 用于签名 Admin 浏览器 session。按密钥处理。 |
 | `filecoin.private_key` | 控制钱包支付和存储操作。必须作为密钥处理。 |
 | `filecoin.network` | 切换到 `mainnet` 会改变支付和存储环境。 |
 | `filecoin.allow_private_networks` | 允许私有网络 provider URL。只在可信私有部署中开启。 |

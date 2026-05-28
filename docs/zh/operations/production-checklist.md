@@ -12,21 +12,22 @@ description: 准备长期运行的单机 SynapS3 部署。
 | 界面 | 建议暴露方式 |
 | --- | --- |
 | S3 API | 只暴露给可信客户端或认证后的入口。 |
-| Dashboard 和 Admin API | 保持在 `127.0.0.1:9090`；远程访问使用 SSH tunnel。 |
-| Metrics | 只允许私有网络或本机采集 agent 访问。 |
+| Dashboard 和 Admin API | 保持在 `127.0.0.1:9090`；远程访问使用 SSH tunnel 或 HTTPS 反向代理。 |
+| Metrics | 使用 Admin auth，只允许私有网络或本机采集 agent 访问。 |
 
 不要把 Dashboard 或 Admin API 直接发布到互联网。Settings、wallet、task retry 和 S3 user 端点都是运维控制面。
 
 ## 运行数据
 
 - 将 `/var/lib/synaps3` 或 `~/.synaps3` 放在可靠磁盘上。
-- 升级前备份 `config.toml`、`db/` 和缓存元数据。
+- 升级前备份 `config.toml`、`db/` 和 `cache/` 数据。
 - 监控数据库卷和缓存卷的剩余空间。
 - 不要把 `config.toml`、`.env`、数据库、缓存数据和钱包材料提交到 git。
 
 ## 密钥和钱包
 
 - 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在主机环境、`.env` 或 secret manager 中。
+- 安全保存 Admin 密码。密码丢失或泄露时，用 `synaps3 admin-auth reset-password --config <path>` 离线轮换；这也会让已有浏览器 session 失效。
 - 启动后确认 `synaps3 admin status` 显示钱包健康。
 - 在预期上传前 deposit USDFC。以下示例 deposit `2 USDFC`：
 
@@ -48,7 +49,10 @@ synaps3 admin settings get
 
 | 字段 | 检查点 |
 | --- | --- |
-| `admin.addr` | 除非有私有访问保护，否则保持 `127.0.0.1:9090`。 |
+| `admin.addr` | 除非有 HTTPS 和访问控制保护，否则保持 `127.0.0.1:9090`。 |
+| `admin.trusted_proxies` | 除非可信代理会清理不可信 forwarded headers，否则保持空。 |
+| `admin.auth.enabled` | 生产环境保持 `true`。 |
+| Admin password hash 和 `admin.auth.session_secret` | 必须存在；password hash 由 init/reset 生成，session secret 按密钥管理。 |
 | `filecoin.network` | 明确迁移到 `mainnet` 前保持 `calibration` |
 | `filecoin.allow_private_networks` | 除非 provider URL 是可信私有端点，否则保持 `false` |
 | `cache.max_size_gb` | 按预期上传积压量规划 |
