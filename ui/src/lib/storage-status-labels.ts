@@ -1,4 +1,5 @@
 import type { ObjectState, ObjectStatus, ObjectUploadStatus } from '@/api/client'
+import type { StatusTone } from '@/components/app/StatusBadge'
 import { titleCaseEnum } from './utils.ts'
 
 export const taskStageOptions = [
@@ -65,6 +66,39 @@ export function storageCleanupStatusLabel(copies: Array<{ status?: string }>) {
   if (copies.every((copy) => copy.status === 'removed')) return 'Remote replicas deleted'
   if (copies.some((copy) => copy.status === 'delete_scheduled')) return 'Replica deletion scheduled'
   return 'Waiting to delete replicas'
+}
+
+export function storageCleanupCopyStatusLabel(status?: string) {
+  switch (status) {
+    case 'pending':
+      return 'Waiting'
+    case 'delete_scheduled':
+      return 'Scheduled'
+    case 'removed':
+      return 'Removed'
+    case 'failed':
+      return 'Failed'
+    case 'unsupported':
+      return 'Unsupported'
+    default:
+      return titleCaseEnum(status) || 'Unknown'
+  }
+}
+
+export function storageCleanupCopyStatusTone(status?: string): StatusTone {
+  switch (status) {
+    case 'removed':
+      return 'success'
+    case 'delete_scheduled':
+      return 'info'
+    case 'failed':
+    case 'unsupported':
+      return 'danger'
+    case 'pending':
+      return 'neutral'
+    default:
+      return 'neutral'
+  }
 }
 
 function taskOperationBaseLabel(type: string | undefined, stage: string) {

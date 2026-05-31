@@ -17,6 +17,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Label } from '@/components/ui/label'
 import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
@@ -27,6 +28,8 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTaskRefDetail, useTasks } from '@/hooks/queries'
 import {
+  storageCleanupCopyStatusLabel,
+  storageCleanupCopyStatusTone,
   storageCleanupStatusLabel,
   taskHasByteTransfer,
   taskOperationLabel,
@@ -111,56 +114,55 @@ function taskDetailTitle(task: TaskItem) {
 }
 
 function TaskRefCell({ task }: { task: TaskItem }) {
-  const [detailEnabled, setDetailEnabled] = useState(false)
-  const detail = useTaskRefDetail(task.id, detailEnabled)
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const detail = useTaskRefDetail(task.id, detailsOpen)
   const refLabel = task.type === 'storage_cleanup' ? 'Deleted object' : `${task.ref_type}:${task.ref_id}`
 
-  const enableDetail = () => setDetailEnabled(true)
-
   return (
-    <Tooltip
-      delayDuration={250}
-      onOpenChange={(open) => {
-        if (open) enableDetail()
-      }}
-    >
-      <TooltipTrigger asChild>
+    <Popover open={detailsOpen} onOpenChange={setDetailsOpen}>
+      <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex max-w-48 truncate font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          onClick={enableDetail}
+          className="inline-flex max-w-48 truncate font-mono text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           aria-label={`${refLabel} details`}
         >
           {refLabel}
         </button>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-sm items-start whitespace-normal text-left">
-        <TaskRefTooltipContent detail={detail} enabled={detailEnabled} />
-      </TooltipContent>
-    </Tooltip>
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        aria-label={`${refLabel} details`}
+        className="max-h-[min(calc(100vh-2rem),32rem)] w-max max-w-[min(calc(100vw-2rem),28rem)] overflow-y-auto whitespace-normal p-3 text-left"
+      >
+        <TaskRefPopoverContent detail={detail} enabled={detailsOpen} />
+      </PopoverContent>
+    </Popover>
   )
 }
 
-function TaskRefTooltipContent({ detail, enabled }: { detail: ReturnType<typeof useTaskRefDetail>; enabled: boolean }) {
-  if (!enabled || detail.isLoading || (detail.isFetching && !detail.data)) {
-    return <span>Loading details</span>
+function TaskRefPopoverContent({ detail, enabled }: { detail: ReturnType<typeof useTaskRefDetail>; enabled: boolean }) {
+  if (detail.error) {
+    return <span>Details unavailable</span>
   }
-  if (detail.error || (!detail.data?.object && !detail.data?.storage_cleanup)) {
+  if (!detail.data) {
+    return <span>{enabled ? 'Loading details' : ''}</span>
+  }
+  if (!detail.data.object && !detail.data.storage_cleanup) {
     return <span>Details unavailable</span>
   }
 
   if (detail.data.storage_cleanup) {
-    return <TaskStorageCleanupTooltip cleanup={detail.data.storage_cleanup} />
+    return <TaskStorageCleanupContent cleanup={detail.data.storage_cleanup} />
   }
 
   if (!detail.data.object) {
     return <span>Details unavailable</span>
   }
 
-  return <TaskObjectRefTooltip object={detail.data.object} />
+  return <TaskObjectRefContent object={detail.data.object} />
 }
 
-function TaskStorageCleanupTooltip({ cleanup }: { cleanup: TaskStorageCleanupDetail }) {
+function TaskStorageCleanupContent({ cleanup }: { cleanup: TaskStorageCleanupDetail }) {
   const versions = cleanup.deleted_versions ?? []
   if (versions.length === 0) {
     return <span>Details unavailable</span>
@@ -168,35 +170,64 @@ function TaskStorageCleanupTooltip({ cleanup }: { cleanup: TaskStorageCleanupDet
 
   const totalSize = versions.reduce((sum, version) => sum + version.size, 0)
   const firstDeletedAt = versions.find((version) => version.deleted_at)?.deleted_at
+  const copies = cleanup.copies ?? []
+
   return (
-    <div className="grid max-w-xs grid-cols-[auto_1fr] gap-x-2 gap-y-1 text-xs">
-      <span className="text-muted-foreground">Bucket</span>
-      <span className="truncate font-medium">
-        {storageCleanupValueLabel(
-          versions.map((version) => version.bucket_name),
-          'buckets'
-        )}
-      </span>
-      <span className="text-muted-foreground">Key</span>
-      <span className="truncate font-medium">
-        {storageCleanupValueLabel(
-          versions.map((version) => version.key),
-          'objects'
-        )}
-      </span>
-      <span className="text-muted-foreground">Version</span>
-      <span className="truncate font-mono">{storageCleanupVersionLabel(versions)}</span>
-      <span className="text-muted-foreground">Status</span>
-      <span>{storageCleanupStatusLabel(cleanup.copies)}</span>
-      <span className="text-muted-foreground">Size</span>
-      <span>{formatBytes(totalSize)}</span>
-      <span className="text-muted-foreground">Deleted</span>
-      <span>{firstDeletedAt ? timeAgo(firstDeletedAt) : '—'}</span>
+    <div className="flex max-w-sm flex-col gap-3 text-xs">
+      <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-1">
+        <span className="text-muted-foreground">Bucket</span>
+        <span className="min-w-0 truncate font-medium">
+          {storageCleanupValueLabel(
+            versions.map((version) => version.bucket_name),
+            'buckets'
+          )}
+        </span>
+        <span className="text-muted-foreground">Key</span>
+        <span className="min-w-0 truncate font-medium">
+          {storageCleanupValueLabel(
+            versions.map((version) => version.key),
+            'objects'
+          )}
+        </span>
+        <span className="text-muted-foreground">Version</span>
+        <span className="min-w-0 truncate font-mono">{storageCleanupVersionLabel(versions)}</span>
+        <span className="text-muted-foreground">Status</span>
+        <span>{storageCleanupStatusLabel(copies)}</span>
+        <span className="text-muted-foreground">Size</span>
+        <span>{formatBytes(totalSize)}</span>
+        <span className="text-muted-foreground">Deleted</span>
+        <span>{firstDeletedAt ? timeAgo(firstDeletedAt) : '—'}</span>
+      </div>
+      {copies.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <span className="font-medium">Replica cleanup</span>
+          <div className="flex flex-col gap-2">
+            {copies.map((copy) => (
+              <div key={copy.copy_index} className="flex min-w-0 flex-col gap-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="font-mono text-muted-foreground">
+                    {taskReplicaLabel({ copy_index: copy.copy_index })}
+                  </span>
+                  <StatusBadge tone={storageCleanupCopyStatusTone(copy.status)}>
+                    {storageCleanupCopyStatusLabel(copy.status)}
+                  </StatusBadge>
+                </div>
+                {copy.delete_tx_hash && (
+                  <CopyableValue label="Delete transaction" value={copy.delete_tx_hash} monospace maxLength={24} />
+                )}
+                {copy.last_error && (
+                  <span className="whitespace-normal break-all text-destructive">{copy.last_error}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
-function TaskObjectRefTooltip({
+function TaskObjectRefContent({
   object,
 }: {
   object: NonNullable<ReturnType<typeof useTaskRefDetail>['data']>['object']

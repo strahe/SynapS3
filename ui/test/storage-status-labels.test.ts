@@ -4,6 +4,8 @@ import test from 'node:test'
 import {
   objectStateLabel,
   replicaLabel,
+  storageCleanupCopyStatusLabel,
+  storageCleanupCopyStatusTone,
   storageCleanupStatusLabel,
   taskHasByteTransfer,
   taskOperationLabel,
@@ -65,4 +67,20 @@ test('replica cleanup status labels describe user-visible cleanup state', () => 
   assert.equal(storageCleanupStatusLabel([{ status: 'removed' }]), 'Remote replicas deleted')
   assert.equal(storageCleanupStatusLabel([{ status: 'unsupported' }, { status: 'failed' }]), 'Needs attention')
   assert.equal(storageCleanupStatusLabel([]), 'No remote replicas to delete')
+})
+
+test('replica cleanup copy status labels expose each cleanup state', () => {
+  assert.equal(storageCleanupCopyStatusLabel('pending'), 'Waiting')
+  assert.equal(storageCleanupCopyStatusLabel('delete_scheduled'), 'Scheduled')
+  assert.equal(storageCleanupCopyStatusLabel('removed'), 'Removed')
+  assert.equal(storageCleanupCopyStatusLabel('failed'), 'Failed')
+  assert.equal(storageCleanupCopyStatusLabel('unsupported'), 'Unsupported')
+})
+
+test('replica cleanup copy status tones expose each cleanup state', () => {
+  assert.equal(storageCleanupCopyStatusTone('pending'), 'neutral')
+  assert.equal(storageCleanupCopyStatusTone('delete_scheduled'), 'info')
+  assert.equal(storageCleanupCopyStatusTone('removed'), 'success')
+  assert.equal(storageCleanupCopyStatusTone('failed'), 'danger')
+  assert.equal(storageCleanupCopyStatusTone('unsupported'), 'danger')
 })

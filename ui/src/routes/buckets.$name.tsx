@@ -127,7 +127,11 @@ import {
   bucketStorageHealthStatusTone,
   bucketStorageHealthTitle,
 } from '@/lib/bucket-storage-health'
-import { dataSetNeedsStorageRiskReview } from '@/lib/bucket-storage-risk'
+import {
+  dataSetNeedsStorageRiskReview,
+  dataSetStorageImpactLabel,
+  dataSetStorageImpactTone,
+} from '@/lib/bucket-storage-risk'
 import {
   copyHealthInfoTitle,
   copyHealthStatusLabel,
@@ -1753,7 +1757,7 @@ function BucketDetailsSheet({
   return (
     <>
       <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent className="min-w-0 !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]">
+        <SheetContent className="min-w-0 overflow-hidden !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]">
           <SheetHeader>
             <SheetTitle>Bucket details</SheetTitle>
             <SheetDescription>
@@ -1763,8 +1767,8 @@ function BucketDetailsSheet({
               <CopyableValue label="Bucket" value={bucket.name} monospace className="max-w-full" />
             </div>
           </SheetHeader>
-          <ScrollArea className="min-h-0 min-w-0 flex-1">
-            <div className="flex min-w-0 flex-col gap-6 px-4 pb-4">
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+            <div className="flex min-w-0 max-w-full flex-col gap-6 px-4 pb-4">
               <BucketDetailsSection title="Overview">
                 <BucketDetailsOverview bucket={bucket} />
               </BucketDetailsSection>
@@ -1789,7 +1793,7 @@ function BucketDetailsSheet({
                 />
               </BucketDetailsSection>
             </div>
-          </ScrollArea>
+          </div>
         </SheetContent>
       </Sheet>
       <DetailTextDialog
@@ -1803,7 +1807,7 @@ function BucketDetailsSheet({
 
 function BucketDetailsSection({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section className="flex min-w-0 flex-col gap-3">
+    <section className="flex min-w-0 max-w-full flex-col gap-3">
       <h3 className="text-sm font-medium">{title}</h3>
       {children}
     </section>
@@ -1955,8 +1959,8 @@ function BucketStorageDataSets({
   }
 
   return (
-    <div className="min-w-0 overflow-hidden rounded-md border border-border">
-      <div className="flex items-center justify-between gap-2 border-b border-border bg-muted/50 px-4 py-2">
+    <div className="min-w-0 max-w-full overflow-hidden rounded-md border border-border">
+      <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border bg-muted/50 px-4 py-2">
         <div className="text-sm font-medium">Data Sets</div>
         <Button
           type="button"
@@ -1984,16 +1988,28 @@ function BucketStorageDataSets({
           <span>{refreshError}</span>
         </div>
       )}
-      <ScrollArea className="w-full">
-        <Table className="min-w-[820px]">
+      <div className="max-w-full min-w-0 overflow-x-auto overflow-y-hidden">
+        <Table className="min-w-[820px] table-fixed">
           <TableHeader>
             <TableRow>
-              <TableHead className="px-4">Replica Slot</TableHead>
-              <TableHead className="px-4">Provider</TableHead>
-              <TableHead className="px-4">Data Set ID</TableHead>
-              <TableHead className="px-4">Storage Health</TableHead>
-              <TableHead className="px-4">Last Used</TableHead>
-              <TableHead className="w-10 px-4 text-right">Actions</TableHead>
+              <TableHead className="w-[9%] px-3">Replica</TableHead>
+              <TableHead className="w-[14%] px-3">Provider</TableHead>
+              <TableHead className="w-[12%] px-3">Data Set</TableHead>
+              <TableHead className="w-[19%] px-3">Storage Health</TableHead>
+              <TableHead className="w-[20%] px-3">Impact</TableHead>
+              <TableHead
+                className="w-[8%] px-2 text-right"
+                aria-label="Current object versions referencing this data set"
+              >
+                Current
+              </TableHead>
+              <TableHead
+                className="w-[9%] px-2 text-right"
+                aria-label="Total non-delete-marker versions referencing this data set"
+              >
+                Total
+              </TableHead>
+              <TableHead className="w-[9%] px-2 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -2003,7 +2019,7 @@ function BucketStorageDataSets({
                 <Link
                   to="/storage-topology"
                   search={topologyLink.search}
-                  className="min-w-0 truncate font-mono text-xs hover:text-foreground hover:underline"
+                  className="block min-w-0 max-w-full truncate font-mono text-xs hover:text-foreground hover:underline"
                 >
                   {topologyLink.label}
                 </Link>
@@ -2011,11 +2027,13 @@ function BucketStorageDataSets({
 
               return (
                 <TableRow key={dataSet.id}>
-                  <TableCell className="px-4 font-mono text-xs">{replicaLabel(dataSet.copy_index)}</TableCell>
-                  <TableCell className="px-4">
+                  <TableCell className="overflow-hidden px-3 font-mono text-xs">
+                    <span className="block max-w-full truncate">{replicaLabel(dataSet.copy_index)}</span>
+                  </TableCell>
+                  <TableCell className="overflow-hidden px-3">
                     <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
                   </TableCell>
-                  <TableCell className="px-4 text-muted-foreground">
+                  <TableCell className="overflow-hidden px-3 text-muted-foreground">
                     {topologyLink.copyValue ? (
                       <CopyableValue label="Data Set ID" value={topologyLink.copyValue} monospace maxLength={24}>
                         {link}
@@ -2024,13 +2042,27 @@ function BucketStorageDataSets({
                       link
                     )}
                   </TableCell>
-                  <TableCell className="px-4">
+                  <TableCell className="overflow-hidden px-3">
                     <DataSetStorageHealthCell dataSet={dataSet} />
                   </TableCell>
-                  <TableCell className="px-4 text-muted-foreground" title={dataSet.updated_at}>
-                    {timeAgo(dataSet.updated_at)}
+                  <TableCell className="overflow-hidden px-3">
+                    <DataSetImpactCell dataSet={dataSet} />
                   </TableCell>
-                  <TableCell className="px-4 text-right">
+                  <TableCell
+                    className="px-2 text-right text-muted-foreground"
+                    aria-label={`Current object versions referencing this data set: ${formatNumber(dataSet.current_version_count)}`}
+                    title="Current object versions referencing this data set"
+                  >
+                    {formatNumber(dataSet.current_version_count)}
+                  </TableCell>
+                  <TableCell
+                    className="px-2 text-right text-muted-foreground"
+                    aria-label={`Total non-delete-marker versions referencing this data set: ${formatNumber(dataSet.referenced_version_count)}`}
+                    title="Total non-delete-marker versions referencing this data set"
+                  >
+                    {formatNumber(dataSet.referenced_version_count)}
+                  </TableCell>
+                  <TableCell className="px-2 text-right">
                     {dataSetNeedsStorageRiskReview(dataSet) && (
                       <Tooltip>
                         <TooltipTrigger asChild>
@@ -2053,9 +2085,18 @@ function BucketStorageDataSets({
             })}
           </TableBody>
         </Table>
-        <ScrollBar orientation="horizontal" />
-      </ScrollArea>
+      </div>
     </div>
+  )
+}
+
+function DataSetImpactCell({ dataSet }: { dataSet: StorageDataSetSummary }) {
+  const label = dataSetStorageImpactLabel(dataSet)
+
+  return (
+    <StatusBadge tone={dataSetStorageImpactTone(dataSet)} className="max-w-full truncate" title={label}>
+      {label}
+    </StatusBadge>
   )
 }
 
@@ -2067,7 +2108,7 @@ function DataSetStorageHealthCell({ dataSet }: { dataSet: StorageDataSetSummary 
     return (
       <div className="flex min-w-0 flex-col gap-1">
         <StatusBadge tone="neutral">unknown</StatusBadge>
-        <span className="text-xs text-muted-foreground" title={details}>
+        <span className="block min-w-0 max-w-full truncate text-xs text-muted-foreground" title={details}>
           {details}
         </span>
       </div>
@@ -2075,7 +2116,7 @@ function DataSetStorageHealthCell({ dataSet }: { dataSet: StorageDataSetSummary 
   }
 
   return (
-    <div className="flex min-w-0 flex-col gap-1">
+    <div className="flex min-w-0 max-w-full flex-col gap-1 overflow-hidden">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         <StatusBadge tone={storageHealthStatusTone(storageHealth.status)}>{storageHealth.status}</StatusBadge>
         {storageHealth.stale && (

@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { ComponentPropsWithoutRef } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
@@ -19,13 +19,12 @@ export function StatusBadge({
   children,
   tone = 'neutral',
   className,
-}: {
-  children: ReactNode
+  ...props
+}: ComponentPropsWithoutRef<'span'> & {
   tone?: StatusTone
-  className?: string
 }) {
   return (
-    <Badge variant="outline" className={cn(toneClasses[tone], className)}>
+    <Badge variant="outline" className={cn(toneClasses[tone], className)} {...props}>
       {children}
     </Badge>
   )
