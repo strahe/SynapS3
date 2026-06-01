@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -226,8 +227,9 @@ func (u *cacheBackedObjectUploader) PutObject(ctx context.Context, input s3respo
 
 type cancelingDeleteCache struct {
 	cache.Cache
-	cancel  context.CancelFunc
-	deletes atomic.Int32
+	cancel    context.CancelFunc
+	deletes   atomic.Int32
+	deleteErr error
 }
 
 func (c *cancelingDeleteCache) Delete(context.Context, string, string) error {
@@ -235,7 +237,71 @@ func (c *cancelingDeleteCache) Delete(context.Context, string, string) error {
 	if c.cancel != nil {
 		c.cancel()
 	}
+	return c.deleteErr
+}
+
+type contextRecordingDeleteCache struct {
+	cache.Cache
+	mu       sync.Mutex
+	contexts []context.Context
+}
+
+func (c *contextRecordingDeleteCache) Delete(ctx context.Context, _, _ string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.contexts = append(c.contexts, ctx)
 	return nil
+}
+
+func (c *contextRecordingDeleteCache) recordedContexts() []context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]context.Context(nil), c.contexts...)
+}
+
+type blockingDeleteCache struct {
+	cache.Cache
+	started   chan struct{}
+	release   chan struct{}
+	failKey   string
+	deletes   atomic.Int32
+	active    atomic.Int32
+	maxActive atomic.Int32
+}
+
+func (c *blockingDeleteCache) Delete(ctx context.Context, _, key string) error {
+	currentActive := c.active.Add(1)
+	defer c.active.Add(-1)
+	for {
+		maxActive := c.maxActive.Load()
+		if currentActive <= maxActive || c.maxActive.CompareAndSwap(maxActive, currentActive) {
+			break
+		}
+	}
+	c.deletes.Add(1)
+	c.started <- struct{}{}
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if key == c.failKey {
+		return errors.New("cache error")
+	}
+	return nil
+}
+
+func waitDeleteStarts(t *testing.T, started <-chan struct{}, want int) {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for i := 0; i < want; i++ {
+		select {
+		case <-started:
+		case <-timer.C:
+			t.Fatalf("cache cleanup starts = %d, want %d", i, want)
+		}
+	}
 }
 
 type storageUploadSelectCounter struct {
@@ -3290,7 +3356,7 @@ func TestAPIBucketDeletedObjectPermanentDeleteRemovesDeletedObject(t *testing.T)
 	}
 }
 
-func TestAPIBucketDeletedObjectPermanentDeleteStopsCacheCleanupWhenRequestIsCanceled(t *testing.T) {
+func TestAPIBucketDeletedObjectPermanentDeleteCompletesCacheCleanupWhenRequestIsCanceled(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
@@ -3315,8 +3381,125 @@ func TestAPIBucketDeletedObjectPermanentDeleteStopsCacheCleanupWhenRequestIsCanc
 	rr := httptest.NewRecorder()
 	newBucketAPIMux(srv).ServeHTTP(rr, req)
 
-	if got := testCache.deletes.Load(); got != 1 {
-		t.Fatalf("cache cleanup deletes = %d, want 1 after request cancellation", got)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		DataVersionsDeleted int `json:"data_versions_deleted"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.DataVersionsDeleted != 2 {
+		t.Fatalf("data_versions_deleted = %d, want 2", body.DataVersionsDeleted)
+	}
+	if got := testCache.deletes.Load(); got != 2 {
+		t.Fatalf("cache cleanup deletes = %d, want 2 after request cancellation", got)
+	}
+}
+
+func TestAPIBucketDeletedObjectPermanentDeleteUsesIsolatedCacheCleanupContexts(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-permanent-delete-context-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", ".versions/context-first", model.ObjectStateCached)
+	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", ".versions/context-second", model.ObjectStateCached)
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	testCache := &contextRecordingDeleteCache{Cache: srv.cache}
+	srv.cache = testCache
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-context-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	contexts := testCache.recordedContexts()
+	if got := len(contexts); got != 2 {
+		t.Fatalf("cache cleanup contexts = %d, want 2", got)
+	}
+	if contexts[0] == contexts[1] {
+		t.Fatal("cache cleanup reused one context across deleted versions")
+	}
+}
+
+func TestAPIBucketDeletedObjectPermanentDeleteRunsCacheCleanupInParallel(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-permanent-delete-parallel-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", ".versions/parallel-first", model.ObjectStateCached)
+	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", ".versions/parallel-second", model.ObjectStateCached)
+	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 9, "etag-third", "checksum-third", "text/plain", ".versions/parallel-third", model.ObjectStateCached)
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	testCache := &blockingDeleteCache{
+		Cache:   srv.cache,
+		started: make(chan struct{}, 3),
+		release: make(chan struct{}),
+		failKey: ".versions/parallel-second",
+	}
+	srv.cache = testCache
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-parallel-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newBucketAPIMux(srv).ServeHTTP(rr, req)
+		close(done)
+	}()
+
+	waitDeleteStarts(t, testCache.started, 3)
+	if got := testCache.maxActive.Load(); got < 2 {
+		t.Fatalf("max concurrent cache cleanups = %d, want at least 2", got)
+	}
+	select {
+	case <-done:
+		t.Fatal("handler returned before cache cleanup completed")
+	default:
+	}
+	close(testCache.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after cache cleanup completed")
+	}
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		DataVersionsDeleted     int `json:"data_versions_deleted"`
+		CacheCleanupFailedCount int `json:"cache_cleanup_failed_count"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.DataVersionsDeleted != 3 {
+		t.Fatalf("data_versions_deleted = %d, want 3", body.DataVersionsDeleted)
+	}
+	if body.CacheCleanupFailedCount != 1 {
+		t.Fatalf("cache_cleanup_failed_count = %d, want 1", body.CacheCleanupFailedCount)
+	}
+	if got := testCache.deletes.Load(); got != 3 {
+		t.Fatalf("cache cleanup deletes = %d, want 3", got)
 	}
 }
 
@@ -3371,6 +3554,105 @@ func TestAPIBucketObjectPermanentDeleteRemovesVersion(t *testing.T) {
 	}
 	if !gotOldVersion.IsCurrent {
 		t.Fatalf("old version is_current = false, want true after current version permanent delete")
+	}
+}
+
+func TestAPIBucketObjectPermanentDeleteRecordsCacheCleanupWhenRequestIsCanceled(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "version-permanent-delete-cancel-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", "cache-key", model.ObjectStateCached)
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	testCache := &cancelingDeleteCache{Cache: srv.cache, cancel: cancel}
+	srv.cache = testCache
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/version-permanent-delete-cancel-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID))).WithContext(reqCtx)
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		CacheCleanupStatus string `json:"cache_cleanup_status"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.CacheCleanupStatus != string(model.CacheCleanupStatusDeleted) {
+		t.Fatalf("cache cleanup status = %q, want %q", body.CacheCleanupStatus, model.CacheCleanupStatusDeleted)
+	}
+	if got := testCache.deletes.Load(); got != 1 {
+		t.Fatalf("cache cleanup deletes = %d, want 1 after request cancellation", got)
+	}
+	var gotStatus model.CacheCleanupStatus
+	if err := srv.db.NewRaw(`SELECT cache_cleanup_status FROM object_deletions WHERE version_id = ?`, currentVersionID).Scan(ctx, &gotStatus); err != nil {
+		t.Fatalf("select object deletion cache cleanup status: %v", err)
+	}
+	if gotStatus != model.CacheCleanupStatusDeleted {
+		t.Fatalf("recorded cache cleanup status = %q, want %q", gotStatus, model.CacheCleanupStatusDeleted)
+	}
+}
+
+func TestAPIBucketObjectPermanentDeleteReportsCacheCleanupFailedOnCacheError(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "version-permanent-delete-cache-error-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", "cache-key", model.ObjectStateCached)
+
+	srv.cache = &cancelingDeleteCache{Cache: srv.cache, deleteErr: errors.New("cache error")}
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/version-permanent-delete-cache-error-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest permanent delete version: %v", err)
+	}
+	setBucketWriteHeaders(req)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST permanent delete version: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("permanent delete version status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	var body struct {
+		CacheCleanupStatus string `json:"cache_cleanup_status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode permanent delete version: %v", err)
+	}
+	if body.CacheCleanupStatus != string(model.CacheCleanupStatusFailed) {
+		t.Fatalf("cache cleanup status = %q, want %q", body.CacheCleanupStatus, model.CacheCleanupStatusFailed)
+	}
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, currentVersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(deleted): %v", err)
+	}
+	if gotVersion != nil {
+		t.Fatalf("data version still exists after cache cleanup failed: %#v", gotVersion)
+	}
+	var deletion model.ObjectDeletion
+	if err := srv.db.NewSelect().Model(&deletion).Where("version_id = ?", currentVersionID).Scan(ctx); err != nil {
+		t.Fatalf("select object deletion: %v", err)
+	}
+	if deletion.CacheCleanupStatus != model.CacheCleanupStatusFailed {
+		t.Fatalf("recorded cache cleanup status = %q, want %q", deletion.CacheCleanupStatus, model.CacheCleanupStatusFailed)
+	}
+	if deletion.CacheError == nil || !strings.Contains(*deletion.CacheError, "cache error") {
+		t.Fatalf("recorded cache error = %v, want cache error", deletion.CacheError)
 	}
 }
 

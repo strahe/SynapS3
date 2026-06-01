@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -23,6 +24,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -33,6 +35,9 @@ const (
 	objectAdminStatusSyncing     = "syncing"
 	objectAdminStatusSuccess     = "success"
 	objectAdminStatusWarning     = "warning"
+
+	permanentDeleteCacheCleanupTimeout     = 30 * time.Second
+	permanentDeleteCacheCleanupConcurrency = 10
 )
 
 type bucketListItem struct {
@@ -1196,7 +1201,7 @@ func (s *Server) handleAPIPermanentDeleteBucketObject(w http.ResponseWriter, r *
 		return
 	}
 
-	status := s.recordPermanentDeleteCacheCleanup(ctx, bucket.Name, versionID, result.CacheKey)
+	status := s.recordPermanentDeleteCacheCleanupWithTimeout(ctx, bucket.Name, versionID, result.CacheKey)
 	writeJSON(w, http.StatusOK, permanentDeleteObjectResponse{
 		Key:                  key,
 		VersionID:            versionID,
@@ -1254,16 +1259,7 @@ func (s *Server) handleAPIPermanentDeleteDeletedBucketObject(w http.ResponseWrit
 		return
 	}
 
-	cacheCleanupFailedCount := 0
-	for _, version := range result.DeletedVersions {
-		if err := ctx.Err(); err != nil {
-			s.logger.Warn("permanent delete cache cleanup stopped because request context ended", "bucket", bucketName, "key", key, "error", err)
-			return
-		}
-		if s.recordPermanentDeleteCacheCleanup(ctx, bucket.Name, version.VersionID, version.CacheKey) == model.CacheCleanupStatusFailed {
-			cacheCleanupFailedCount++
-		}
-	}
+	cacheCleanupFailedCount := s.recordDeletedObjectPermanentDeleteCacheCleanup(ctx, bucket.Name, result.DeletedVersions)
 	storageCleanupTaskIDs := result.StorageCleanupTaskIDs
 	if storageCleanupTaskIDs == nil {
 		storageCleanupTaskIDs = []int64{}
@@ -1339,6 +1335,29 @@ func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.R
 
 func (s *Server) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) model.CacheCleanupStatus {
 	return objectdeletion.RecordCacheCleanup(ctx, s.cache, s.repos.Objects, s.logger, bucketName, versionID, cacheKey)
+}
+
+func (s *Server) recordPermanentDeleteCacheCleanupWithTimeout(ctx context.Context, bucketName string, versionID string, cacheKey string) model.CacheCleanupStatus {
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), permanentDeleteCacheCleanupTimeout)
+	defer cancelCleanup()
+	return s.recordPermanentDeleteCacheCleanup(cleanupCtx, bucketName, versionID, cacheKey)
+}
+
+func (s *Server) recordDeletedObjectPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versions []repository.DeletedObjectVersionSnapshot) int {
+	var failed atomic.Int32
+	var group errgroup.Group
+	group.SetLimit(permanentDeleteCacheCleanupConcurrency)
+	for _, version := range versions {
+		version := version
+		group.Go(func() error {
+			if s.recordPermanentDeleteCacheCleanupWithTimeout(ctx, bucketName, version.VersionID, version.CacheKey) == model.CacheCleanupStatusFailed {
+				failed.Add(1)
+			}
+			return nil
+		})
+	}
+	_ = group.Wait()
+	return int(failed.Load())
 }
 
 func (s *Server) handleAPIRestoreBucketObject(w http.ResponseWriter, r *http.Request) {

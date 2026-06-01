@@ -5,6 +5,7 @@ import { Fragment, useState } from 'react'
 import type { ProviderIdentity } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { CopyableValue } from './CopyableValue'
 
@@ -29,19 +30,27 @@ export function ProviderIdentityCell({ providerID, identity }: { providerID?: st
     <div className="flex min-w-0 items-center gap-1.5">
       {registryID ? <ProviderTopologyLink providerID={registryID} label={label} /> : <span>{label}</span>}
       <Popover open={detailsOpen} onOpenChange={setDetailsOpen}>
-        <PopoverTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`Provider details for ${label}`}
-            aria-expanded={detailsOpen}
-          >
-            <Info />
-          </Button>
-        </PopoverTrigger>
+        <Tooltip open={detailsOpen ? false : undefined}>
+          <TooltipTrigger asChild>
+            <PopoverTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Provider details for ${label}`}
+                aria-expanded={detailsOpen}
+              >
+                <Info data-icon="inline-start" aria-hidden="true" />
+              </Button>
+            </PopoverTrigger>
+          </TooltipTrigger>
+          <TooltipContent>Provider details</TooltipContent>
+        </Tooltip>
         <PopoverContent
           side="top"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+          }}
           className="max-h-[min(calc(100vh-2rem),32rem)] w-max max-w-[min(calc(100vw-2rem),36rem)] overflow-y-auto whitespace-normal p-3.5 text-left"
         >
           <ProviderIdentityDetails providerID={registryID} identity={identity} />

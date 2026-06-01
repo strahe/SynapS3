@@ -1753,13 +1753,22 @@ function BucketDetailsSheet({
   onReviewStorageDataSetRisk: (dataSetID: number) => void
 }) {
   const [storageHealthError, setStorageHealthError] = useState<string | null>(null)
+  const titleRef = useRef<HTMLHeadingElement>(null)
 
   return (
     <>
       <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent className="min-w-0 overflow-hidden !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]">
+        <SheetContent
+          className="min-w-0 overflow-hidden !w-[min(64rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)]"
+          onOpenAutoFocus={(event) => {
+            event.preventDefault()
+            titleRef.current?.focus({ preventScroll: true })
+          }}
+        >
           <SheetHeader>
-            <SheetTitle>Bucket details</SheetTitle>
+            <SheetTitle ref={titleRef} tabIndex={-1} className="outline-none">
+              Bucket details
+            </SheetTitle>
             <SheetDescription>
               <span className="sr-only">Details for selected bucket.</span>
             </SheetDescription>

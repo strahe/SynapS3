@@ -83,7 +83,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}` | Read bucket detail. |
 | `PUT` | `/api/v1/buckets/{name}/owner` | Update bucket owner. |
 | `PUT` | `/api/v1/buckets/{name}/copy-policy` | Update default copy policy. |
-| `DELETE` | `/api/v1/buckets/{name}` | Delete a bucket through the dashboard lifecycle path. |
+| `DELETE` | `/api/v1/buckets/{name}` | Not implemented. Returns `501 Not Implemented`. |
 | `GET` | `/api/v1/buckets/{name}/objects` | List objects. |
 | `DELETE` | `/api/v1/buckets/{name}/objects` | Create an object delete marker. |
 | `POST` | `/api/v1/buckets/{name}/objects/upload` | Upload an object through the dashboard. |

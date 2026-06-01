@@ -83,7 +83,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/buckets/{name}` | 读取 bucket 详情。 |
 | `PUT` | `/api/v1/buckets/{name}/owner` | 更新 bucket owner。 |
 | `PUT` | `/api/v1/buckets/{name}/copy-policy` | 更新默认 copy policy。 |
-| `DELETE` | `/api/v1/buckets/{name}` | 通过 dashboard lifecycle 删除 bucket。 |
+| `DELETE` | `/api/v1/buckets/{name}` | 暂未实现（返回 `501 Not Implemented`）。 |
 | `GET` | `/api/v1/buckets/{name}/objects` | 列出对象。 |
 | `DELETE` | `/api/v1/buckets/{name}/objects` | 创建对象 delete marker。 |
 | `POST` | `/api/v1/buckets/{name}/objects/upload` | 通过仪表盘上传对象。 |
