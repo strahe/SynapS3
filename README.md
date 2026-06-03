@@ -7,7 +7,7 @@
 [![Go Report](https://goreportcard.com/badge/github.com/strahe/synaps3)](https://goreportcard.com/report/github.com/strahe/synaps3)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/strahe/SynapS3?filename=go.mod)](go.mod)
 
-SynapS3 is an S3-compatible gateway for storing objects on Filecoin.
+SynapS3 is an open-source, self-hosted S3-compatible gateway for storing objects on Filecoin.
 
 ## Documentation
 
@@ -17,10 +17,12 @@ SynapS3 is an S3-compatible gateway for storing objects on Filecoin.
 ## Highlights
 
 - S3-compatible bucket and object APIs.
-- Object storage backed by Filecoin storage providers.
-- Admin-authenticated web dashboard for buckets, objects, wallet, tasks, topology, settings, and health.
+- Filecoin-backed object storage through storage providers.
+- Open-source, self-hosted deployment with Docker or source builds.
+- Admin-authenticated dashboard for buckets, objects, wallet, tasks, topology, settings, and health.
 - Multipart uploads for large objects.
 - Wallet funding, USDFC deposit, and background task controls.
+- Coming soon: automatic replica repair when storage providers become unavailable.
 
 ## Core S3 Compatibility
 

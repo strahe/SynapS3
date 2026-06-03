@@ -9,14 +9,22 @@
 }
 
 @media (min-width: 960px) {
+  .VPHomeHero.VPHero {
+    padding-bottom: 96px;
+  }
+
   .VPHomeHero .image-container {
-    transform: translate(-12px, -24px);
+    transform: translate(-12px, 40px);
   }
 
   .VPHomeHero .image-src {
-    width: min(44vw, 560px);
-    max-width: min(44vw, 560px);
-    max-height: 360px;
+    width: min(40vw, 500px);
+    max-width: min(40vw, 500px);
+    max-height: 300px;
+  }
+
+  .VPHomeFeatures {
+    margin-top: 40px;
   }
 }
 

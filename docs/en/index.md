@@ -1,11 +1,10 @@
 ---
 layout: home
 title: SynapS3
-description: An S3-compatible gateway for Filecoin storage.
+description: An open-source, self-hosted S3-compatible gateway for Filecoin storage.
 hero:
   name: SynapS3
-  text: S3-compatible Filecoin storage
-  tagline: Store data on Filecoin using standard S3 clients, libraries, and integrations.
+  tagline: Open-source, self-hosted S3 gateway for Filecoin.
   image:
     src: /readme-dashboard.png
     alt: SynapS3 dashboard
@@ -14,23 +13,34 @@ hero:
       text: Quick Start
       link: /en/getting-started/quick-start
     - theme: alt
-      text: Production Checklist
-      link: /en/operations/production-checklist
+      text: Docker Deployment
+      link: /en/getting-started/docker
+    - theme: alt
+      text: S3 Clients
+      link: /en/getting-started/s3-clients
 features:
-  - title: Evaluate
-    details: Start a temporary node, fund a Calibration wallet, and upload a first object.
-    link: /en/getting-started/quick-start
-    linkText: Quick Start
-  - title: Deploy
-    details: Run a single-host Docker deployment with runtime data on durable storage.
+  - title: Self-Hosted Gateway
+    details: Run SynapS3 in your own environment with Docker or source builds.
     link: /en/getting-started/docker
     linkText: Docker Deployment
-  - title: Integrate S3 Clients
+  - title: S3 Client Compatibility
     details: Create S3 credentials and connect AWS CLI, rclone, or MinIO Client.
     link: /en/getting-started/s3-clients
     linkText: Client Examples
-  - title: Operate
-    details: Monitor health, inspect tasks, and recover common runtime failures.
+  - title: Filecoin Storage
+    details: Store objects through Filecoin storage providers while keeping standard S3 access.
+    link: /en/concepts/filecoin-storage-flow
+    linkText: Storage Flow
+  - title: Admin Dashboard
+    details: Manage buckets, objects, wallet, tasks, topology, settings, and health.
+    link: /en/reference/admin-api
+    linkText: Admin API
+  - title: Operations
+    details: Monitor health, inspect tasks, and handle upgrades, recovery, and troubleshooting.
     link: /en/operations/troubleshooting
     linkText: Troubleshooting
+  - title: Replica Repair
+    details: Coming soon. If a storage provider becomes unavailable, SynapS3 will copy data to another available provider to maintain the configured copy count.
+    link: /en/operations/upgrade-recovery
+    linkText: Recovery Guide
 ---
