@@ -1,6 +1,8 @@
 package backend_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"strings"
 	"testing"
@@ -105,6 +107,11 @@ func validTestObjectBody(seed string) string {
 		return seed
 	}
 	return seed + strings.Repeat(".", chain.MinUploadSize-len(seed))
+}
+
+func testSHA256Hex(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:])
 }
 
 func seedS3Account(t *testing.T, tb *testBackend, accessKey string) {

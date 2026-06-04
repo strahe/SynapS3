@@ -33,7 +33,7 @@ SynapS3 focuses on path-style S3 bucket and object workflows needed for object s
 | Object | `ListObjects` | Supported | Marker pagination. |
 | Object | `ListObjectsV2` | Supported | Continuation-token pagination. |
 | Object | `ListObjectVersions` | Supported | Lists object versions and delete markers. |
-| Object | `GetObjectAttributes` | Supported | Reports ETag, checksum, size, and storage class. |
+| Object | `GetObjectAttributes` | Supported | Reports metadata and multipart `ObjectParts`; `TotalPartsCount` is not emitted. |
 | Multipart | `CreateMultipartUpload` | Supported | Starts an upload. |
 | Multipart | `UploadPart` | Supported | Uploads one part. |
 | Multipart | `UploadPartCopy` | Partial | Whole-object copy only; range copy is not supported. |
@@ -50,6 +50,7 @@ Buckets behave as versioning-enabled. A normal object delete creates a delete ma
 
 - Bucket deletion.
 - Suspending bucket versioning.
+- `TotalPartsCount` in `GetObjectAttributes.ObjectParts`; the current VersityGW response type has no field for it.
 - Multipart range copy for `UploadPartCopy`.
 - Distributed coordination across multiple SynapS3 nodes.
 

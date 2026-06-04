@@ -43,7 +43,7 @@ SynapS3 is an open-source, self-hosted S3-compatible gateway for storing objects
 | Object | `ListObjects` | ✅ | Marker pagination |
 | Object | `ListObjectsV2` | ✅ | Continuation-token pagination |
 | Object | `ListObjectVersions` | ✅ | Lists object versions and delete markers |
-| Object | `GetObjectAttributes` | ✅ | Reports ETag, checksum, size, and storage class |
+| Object | `GetObjectAttributes` | ✅ | Reports metadata and multipart `ObjectParts`; `TotalPartsCount` is not emitted |
 | Multipart | `CreateMultipartUpload` | ✅ | Starts an upload |
 | Multipart | `UploadPart` | ✅ | Uploads one part |
 | Multipart | `UploadPartCopy` | ⚠️ | Whole-object copy only; range copy is not supported |

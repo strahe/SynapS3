@@ -108,7 +108,7 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	}
 
 	versionColumns := sqliteColumns(t, db, "object_versions")
-	for _, column := range []string{"is_current", "in_cache", "storage_upload_id"} {
+	for _, column := range []string{"is_current", "in_cache", "storage_upload_id", "multipart_upload_id"} {
 		if !versionColumns[column] {
 			t.Fatalf("object_versions.%s should exist", column)
 		}
@@ -133,6 +133,10 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	if !copyColumns["is_new_data_set"] {
 		t.Fatal("storage_upload_copies.is_new_data_set should exist")
 	}
+	partColumns := sqliteColumns(t, db, "multipart_parts")
+	if !partColumns["checksum"] {
+		t.Fatal("multipart_parts.checksum should exist")
+	}
 
 	indexes := sqliteIndexes(t, db, "objects")
 	if !indexes["idx_objects_bucket_key"] {
@@ -147,6 +151,9 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	}
 	if !versionIndexes["idx_object_versions_storage_upload"] {
 		t.Fatal("idx_object_versions_storage_upload should exist")
+	}
+	if !versionIndexes["idx_object_versions_multipart_upload"] {
+		t.Fatal("idx_object_versions_multipart_upload should exist")
 	}
 	if !versionIndexes["idx_object_versions_object_created"] {
 		t.Fatal("idx_object_versions_object_created should exist")
@@ -189,6 +196,11 @@ func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key) VALUES ('empty-cache-key', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '')`); err == nil {
 		t.Fatal("expected data version without cache_key to fail")
+	}
+	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id, status) VALUES (1, 'file.txt', 'upload-valid', 'completed')`)
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, multipart_upload_id) VALUES ('multipart-valid', 1, 1, 'file.txt', 1, 'etag-mp', 'sum-mp', '.versions/multipart-valid', 'upload-valid')`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, multipart_upload_id) VALUES ('multipart-missing', 1, 1, 'file.txt', 1, 'etag-missing', 'sum-missing', '.versions/multipart-missing', 'upload-missing')`); err == nil {
+		t.Fatal("expected object_versions multipart_upload_id without upload to fail")
 	}
 	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, content_type, cache_key, is_delete_marker, in_cache, state) VALUES ('marker-ok', 1, 1, 'file.txt', 0, '', '', '', '', TRUE, FALSE, 'cached')`)
 

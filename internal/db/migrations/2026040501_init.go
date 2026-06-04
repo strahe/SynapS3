@@ -26,6 +26,58 @@ type bucket2026040501 struct {
 	UpdatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
+type objectVersion2026040501 struct {
+	bun.BaseModel `bun:"table:object_versions"`
+
+	VersionID       string            `bun:",pk"`
+	ObjectID        int64             `bun:",notnull"`
+	BucketID        int64             `bun:",notnull"`
+	Key             string            `bun:",notnull"`
+	Size            int64             `bun:",notnull"`
+	ETag            string            `bun:",notnull"`
+	Checksum        string            `bun:",notnull"`
+	ContentType     string            `bun:",notnull,default:'application/octet-stream'"`
+	Metadata        map[string]string `bun:"type:jsonb"`
+	CacheKey        string            `bun:",notnull"`
+	StorageUploadID *int64            `bun:",nullzero"`
+	PieceCID        *string           `bun:",scanonly"`
+	RetrievalURL    *string           `bun:",scanonly"`
+	InCache         bool              `bun:",notnull,default:true"`
+	InFilecoin      bool              `bun:",scanonly"`
+	IsCurrent       bool              `bun:",notnull,default:false"`
+	IsDeleteMarker  bool              `bun:",notnull,default:false"`
+	State           string            `bun:",notnull,default:'cached'"`
+	FailedAtState   *string           `bun:",nullzero"`
+	LastError       *string           `bun:",nullzero"`
+	CreatedAt       time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt       time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type multipartUpload2026040501 struct {
+	bun.BaseModel `bun:"table:multipart_uploads"`
+
+	ID          int64             `bun:",pk,autoincrement"`
+	BucketID    int64             `bun:",notnull"`
+	Key         string            `bun:",notnull"`
+	UploadID    string            `bun:",notnull,unique"`
+	ContentType string            `bun:",notnull,default:'application/octet-stream'"`
+	Metadata    map[string]string `bun:"type:jsonb"`
+	Status      string            `bun:",notnull,default:'initiated'"`
+	CreatedAt   time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt   time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type multipartPart2026040501 struct {
+	bun.BaseModel `bun:"table:multipart_parts"`
+
+	ID         int64     `bun:",pk,autoincrement"`
+	UploadID   string    `bun:",notnull"`
+	PartNumber int       `bun:",notnull"`
+	Size       int64     `bun:",notnull"`
+	ETag       string    `bun:",notnull"`
+	CreatedAt  time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
 // up2026040501Init is the frozen development-preview baseline schema.
 // Follow-up schema changes must be added as separate migrations.
 func up2026040501Init(ctx context.Context, db *bun.DB) error {
@@ -81,7 +133,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 
 	// Object versions are the source of truth for current data and lifecycle.
 	if _, err := db.NewCreateTable().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(object_id, bucket_id, key) REFERENCES objects(id, bucket_id, key) ON UPDATE CASCADE ON DELETE CASCADE").
 		ForeignKey("(storage_upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE RESTRICT").
@@ -97,7 +149,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 
 	// Current-object reads use partial indexes over object_versions.is_current.
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		Index("idx_object_versions_current_unique").
 		Column("object_id").
 		Where(boolTrueWhere(db, "is_current")).
@@ -107,7 +159,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating current version unique index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		Index("idx_object_versions_current_bucket_key").
 		Column("bucket_id", "key").
 		Where(boolTrueWhere(db, "is_current")).
@@ -116,7 +168,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating current version listing index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		Index("idx_object_versions_bucket_key_created").
 		ColumnExpr("bucket_id, key, created_at DESC, version_id DESC").
 		IfNotExists().
@@ -124,7 +176,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating version history index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		Index("idx_object_versions_object_created").
 		ColumnExpr("object_id, created_at DESC, version_id DESC").
 		IfNotExists().
@@ -132,7 +184,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating object version history index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		Index("idx_object_versions_state_updated").
 		Column("state", "updated_at").
 		IfNotExists().
@@ -140,7 +192,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating version state index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		Index("idx_object_versions_content_reuse").
 		ColumnExpr("bucket_id, size, checksum, state, created_at DESC, version_id DESC").
 		IfNotExists().
@@ -148,7 +200,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating version content reuse index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectVersion)(nil)).
+		Model((*objectVersion2026040501)(nil)).
 		Index("idx_object_versions_storage_upload").
 		Column("storage_upload_id").
 		IfNotExists().
@@ -293,7 +345,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 
 	// Multipart uploads keep parts separate and cascade-delete parts with their upload.
 	if _, err := db.NewCreateTable().
-		Model((*model.MultipartUpload)(nil)).
+		Model((*multipartUpload2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
 		ColumnExpr("CONSTRAINT chk_multipart_uploads_status CHECK (status IN ('initiated', 'completing', 'completed', 'aborted'))").
@@ -302,7 +354,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateTable().
-		Model((*model.MultipartPart)(nil)).
+		Model((*multipartPart2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(upload_id) REFERENCES multipart_uploads(upload_id) ON UPDATE CASCADE ON DELETE CASCADE").
 		ColumnExpr("CONSTRAINT chk_multipart_parts_part_number CHECK (part_number >= 1 AND part_number <= 10000)").
@@ -312,7 +364,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateIndex().
-		Model((*model.MultipartUpload)(nil)).
+		Model((*multipartUpload2026040501)(nil)).
 		Index("idx_multipart_uploads_bucket_status_key_upload").
 		Column("bucket_id", "status", "key", "upload_id").
 		IfNotExists().
@@ -320,7 +372,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating multipart upload listing index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.MultipartPart)(nil)).
+		Model((*multipartPart2026040501)(nil)).
 		Index("idx_multipart_parts_upload_part").
 		Column("upload_id", "part_number").
 		Unique().

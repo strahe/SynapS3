@@ -125,6 +125,7 @@ func (r *BunMultipartRepo) CreatePart(ctx context.Context, part *model.Multipart
 		On("CONFLICT (upload_id, part_number) DO UPDATE").
 		Set("size = EXCLUDED.size").
 		Set("e_tag = EXCLUDED.e_tag").
+		Set("checksum = EXCLUDED.checksum").
 		Set("created_at = EXCLUDED.created_at").
 		Exec(ctx)
 	if err != nil {

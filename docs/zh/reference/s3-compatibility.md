@@ -33,7 +33,7 @@ SynapS3 聚焦在把对象存储到 Filecoin 所需的 path-style S3 bucket 和 
 | Object | `ListObjects` | 支持 | Marker 分页。 |
 | Object | `ListObjectsV2` | 支持 | Continuation-token 分页。 |
 | Object | `ListObjectVersions` | 支持 | 列出对象版本和 delete markers。 |
-| Object | `GetObjectAttributes` | 支持 | 返回 ETag、checksum、size 和 storage class。 |
+| Object | `GetObjectAttributes` | 支持 | 返回 metadata 和 multipart `ObjectParts`；不返回 `TotalPartsCount`。 |
 | Multipart | `CreateMultipartUpload` | 支持 | 开始上传。 |
 | Multipart | `UploadPart` | 支持 | 上传单个 part。 |
 | Multipart | `UploadPartCopy` | 部分支持 | 仅支持整对象复制，不支持 range copy。 |
@@ -50,6 +50,7 @@ Bucket 表现为 versioning-enabled。普通 object delete 会创建 delete mark
 
 - Bucket deletion。
 - 暂停 bucket versioning。
+- `GetObjectAttributes.ObjectParts` 中的 `TotalPartsCount`；当前 VersityGW response type 没有该字段。
 - `UploadPartCopy` 的 multipart range copy。
 - 多个 SynapS3 节点之间的分布式协调。
 

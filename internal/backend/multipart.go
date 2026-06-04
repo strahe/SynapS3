@@ -86,6 +86,7 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 		PartNumber: partNum,
 		Size:       cacheInfo.Size,
 		ETag:       cacheInfo.ETag,
+		Checksum:   &cacheInfo.Checksum,
 	}
 	if err := b.repos.Multiparts.CreatePart(ctx, part); err != nil {
 		return nil, fmt.Errorf("recording part: %w", err)
@@ -147,6 +148,7 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 		PartNumber: partNum,
 		Size:       cacheInfo.Size,
 		ETag:       cacheInfo.ETag,
+		Checksum:   &cacheInfo.Checksum,
 	}
 	if err := b.repos.Multiparts.CreatePart(ctx, part); err != nil {
 		return s3response.CopyPartResult{}, fmt.Errorf("recording copied part: %w", err)
@@ -272,18 +274,19 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		}
 
 		version := &model.ObjectVersion{
-			VersionID:       versionID,
-			BucketID:        upload.BucketID,
-			Key:             keyName,
-			Size:            cacheInfo.Size,
-			ETag:            s3ETag,
-			Checksum:        cacheInfo.Checksum,
-			ContentType:     upload.ContentType,
-			Metadata:        upload.Metadata,
-			CacheKey:        cacheKey,
-			StorageUploadID: reuse.StorageUploadID,
-			InCache:         true,
-			State:           reuse.State,
+			VersionID:         versionID,
+			BucketID:          upload.BucketID,
+			Key:               keyName,
+			Size:              cacheInfo.Size,
+			ETag:              s3ETag,
+			Checksum:          cacheInfo.Checksum,
+			ContentType:       upload.ContentType,
+			Metadata:          upload.Metadata,
+			CacheKey:          cacheKey,
+			MultipartUploadID: &uploadID,
+			StorageUploadID:   reuse.StorageUploadID,
+			InCache:           true,
+			State:             reuse.State,
 		}
 		createdState = version.State
 
@@ -431,9 +434,13 @@ func (b *SynapseBackend) ListParts(ctx context.Context, input *s3.ListPartsInput
 	}
 
 	if len(parts) > maxParts {
-		parts = parts[:maxParts]
+		if maxParts > 0 {
+			parts = parts[:maxParts]
+			result.NextPartNumberMarker = parts[len(parts)-1].PartNumber
+		} else {
+			parts = nil
+		}
 		result.IsTruncated = true
-		result.NextPartNumberMarker = parts[len(parts)-1].PartNumber
 	}
 
 	for _, p := range parts {

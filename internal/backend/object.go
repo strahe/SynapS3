@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -230,14 +231,22 @@ func (b *SynapseBackend) GetObjectAttributes(ctx context.Context, input *s3.GetO
 	}
 
 	checksum := types.Checksum{ChecksumSHA256: &meta.Checksum}
-	return s3response.GetObjectAttributesResponse{
+	resp := s3response.GetObjectAttributesResponse{
 		ETag:         &meta.QuotedETag,
 		ObjectSize:   &meta.Size,
 		StorageClass: types.StorageClassStandard,
 		Checksum:     &checksum,
 		VersionId:    &meta.VersionID,
 		LastModified: &meta.LastModified,
-	}, nil
+	}
+	if objectPartsRequested(input.ObjectAttributes) {
+		objectParts, err := b.getObjectAttributeParts(ctx, meta.MultipartUploadID, input)
+		if err != nil {
+			return s3response.GetObjectAttributesResponse{}, err
+		}
+		resp.ObjectParts = objectParts
+	}
+	return resp, nil
 }
 
 func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
@@ -801,12 +810,13 @@ func derefStr(s *string) string {
 }
 
 type objectMetadataResult struct {
-	Size         int64
-	QuotedETag   string
-	Checksum     string
-	ContentType  string
-	VersionID    string
-	LastModified time.Time
+	Size              int64
+	QuotedETag        string
+	Checksum          string
+	ContentType       string
+	VersionID         string
+	MultipartUploadID *string
+	LastModified      time.Time
 }
 
 func (b *SynapseBackend) objectMetadata(ctx context.Context, bucketID int64, key, versionID string) (objectMetadataResult, error) {
@@ -816,13 +826,87 @@ func (b *SynapseBackend) objectMetadata(ctx context.Context, bucketID int64, key
 	}
 	etag := fmt.Sprintf(`"%s"`, version.ETag)
 	return objectMetadataResult{
-		Size:         version.Size,
-		QuotedETag:   etag,
-		Checksum:     version.Checksum,
-		ContentType:  version.ContentType,
-		VersionID:    version.VersionID,
-		LastModified: version.CreatedAt,
+		Size:              version.Size,
+		QuotedETag:        etag,
+		Checksum:          version.Checksum,
+		ContentType:       version.ContentType,
+		VersionID:         version.VersionID,
+		MultipartUploadID: version.MultipartUploadID,
+		LastModified:      version.CreatedAt,
 	}, nil
+}
+
+func objectPartsRequested(attrs []types.ObjectAttributes) bool {
+	if len(attrs) == 0 {
+		return true
+	}
+	for _, attr := range attrs {
+		if attr == types.ObjectAttributesObjectParts {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *SynapseBackend) getObjectAttributeParts(ctx context.Context, uploadID *string, input *s3.GetObjectAttributesInput) (*s3response.ObjectParts, error) {
+	maxParts := 1000
+	if input.MaxParts != nil {
+		maxParts = int(*input.MaxParts)
+	}
+
+	partMarker := 0
+	if input.PartNumberMarker != nil {
+		if v := *input.PartNumberMarker; v != "" {
+			parsed, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, s3err.GetInvalidMaxLimiterErr("part-number-marker")
+			}
+			if parsed < 0 {
+				return nil, s3err.GetNegativeMaxLimiterErr("part-number-marker")
+			}
+			partMarker = parsed
+		}
+	}
+
+	result := &s3response.ObjectParts{
+		Parts:            []types.ObjectPart{},
+		MaxParts:         maxParts,
+		PartNumberMarker: partMarker,
+	}
+	if uploadID == nil || *uploadID == "" {
+		return result, nil
+	}
+
+	parts, err := b.repos.Multiparts.GetParts(ctx, *uploadID, partMarker, maxParts+1)
+	if err != nil {
+		return nil, fmt.Errorf("listing object attribute parts: %w", err)
+	}
+	if len(parts) > maxParts {
+		if maxParts > 0 {
+			parts = parts[:maxParts]
+			result.NextPartNumberMarker = parts[len(parts)-1].PartNumber
+		} else {
+			parts = nil
+		}
+		result.IsTruncated = true
+	}
+
+	result.Parts = make([]types.ObjectPart, 0, len(parts))
+	for _, p := range parts {
+		partNumber := int32(p.PartNumber)
+		size := p.Size
+		part := types.ObjectPart{
+			PartNumber: &partNumber,
+			Size:       &size,
+		}
+		if p.Checksum != nil && *p.Checksum != "" {
+			checksum := *p.Checksum
+			part.ChecksumSHA256 = &checksum
+		}
+		result.Parts = append(result.Parts, part)
+	}
+
+	return result, nil
 }
 
 func (b *SynapseBackend) versionForRead(ctx context.Context, bucketID int64, key, versionID string) (*model.ObjectVersion, error) {

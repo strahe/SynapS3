@@ -1214,6 +1214,250 @@ func TestGetObjectAttributes_WithVersionID(t *testing.T) {
 	}
 }
 
+type completedMultipartTestObject struct {
+	VersionID string
+	PartRows  []model.MultipartPart
+}
+
+func completeMultipartTestObject(t *testing.T, tb *testBackend, bucket, key string, partBodies []string) completedMultipartTestObject {
+	t.Helper()
+	ctx := context.Background()
+
+	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload(%s): %v", key, err)
+	}
+
+	completedParts := make([]types.CompletedPart, 0, len(partBodies))
+	for i, body := range partBodies {
+		partNumber := int32(i + 1)
+		partOut, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:     aws.String(bucket),
+			Key:        aws.String(key),
+			UploadId:   aws.String(initResult.UploadId),
+			PartNumber: &partNumber,
+			Body:       strings.NewReader(body),
+		})
+		if err != nil {
+			t.Fatalf("UploadPart(%s part %d): %v", key, partNumber, err)
+		}
+		completedParts = append(completedParts, types.CompletedPart{PartNumber: &partNumber, ETag: partOut.ETag})
+	}
+
+	_, versionID, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(initResult.UploadId),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload(%s): %v", key, err)
+	}
+
+	partRows, err := tb.repos.Multiparts.GetParts(ctx, initResult.UploadId, 0, len(partBodies)+1)
+	if err != nil {
+		t.Fatalf("GetParts(%s): %v", key, err)
+	}
+	if len(partRows) != len(partBodies) {
+		t.Fatalf("part rows = %d, want %d", len(partRows), len(partBodies))
+	}
+
+	return completedMultipartTestObject{
+		VersionID: versionID,
+		PartRows:  partRows,
+	}
+}
+
+func assertObjectPartMatchesMultipartPart(t *testing.T, got types.ObjectPart, want model.MultipartPart) {
+	t.Helper()
+	if got.PartNumber == nil || *got.PartNumber != int32(want.PartNumber) {
+		t.Fatalf("PartNumber = %v, want %d", got.PartNumber, want.PartNumber)
+	}
+	if got.Size == nil || *got.Size != want.Size {
+		t.Fatalf("Size = %v, want %d", got.Size, want.Size)
+	}
+	if want.Checksum == nil {
+		t.Fatal("expected test multipart part checksum")
+	}
+	if got.ChecksumSHA256 == nil || *got.ChecksumSHA256 != *want.Checksum {
+		t.Fatalf("ChecksumSHA256 = %v, want %s", got.ChecksumSHA256, *want.Checksum)
+	}
+}
+
+func TestGetObjectAttributes_ObjectParts(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "attrs-parts-bucket")
+
+	current := completeMultipartTestObject(t, tb, "attrs-parts-bucket", "current.bin", []string{
+		validTestObjectBody("part-one"),
+		"part-two",
+		"part-three",
+	})
+
+	maxParts := int32(2)
+	out, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+		Bucket:           aws.String("attrs-parts-bucket"),
+		Key:              aws.String("current.bin"),
+		ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectParts},
+		MaxParts:         &maxParts,
+	})
+	if err != nil {
+		t.Fatalf("GetObjectAttributes(ObjectParts): %v", err)
+	}
+	if out.ObjectParts == nil {
+		t.Fatal("ObjectParts = nil, want page")
+	}
+	if out.ObjectParts.MaxParts != 2 || out.ObjectParts.PartNumberMarker != 0 {
+		t.Fatalf("ObjectParts markers = max:%d marker:%d, want max:2 marker:0", out.ObjectParts.MaxParts, out.ObjectParts.PartNumberMarker)
+	}
+	if !out.ObjectParts.IsTruncated || out.ObjectParts.NextPartNumberMarker != 2 {
+		t.Fatalf("ObjectParts pagination = truncated:%t next:%d, want truncated:true next:2", out.ObjectParts.IsTruncated, out.ObjectParts.NextPartNumberMarker)
+	}
+	if len(out.ObjectParts.Parts) != 2 {
+		t.Fatalf("ObjectParts parts = %d, want 2", len(out.ObjectParts.Parts))
+	}
+	assertObjectPartMatchesMultipartPart(t, out.ObjectParts.Parts[0], current.PartRows[0])
+	assertObjectPartMatchesMultipartPart(t, out.ObjectParts.Parts[1], current.PartRows[1])
+
+	partMarker := "2"
+	page2, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+		Bucket:           aws.String("attrs-parts-bucket"),
+		Key:              aws.String("current.bin"),
+		ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectParts},
+		MaxParts:         &maxParts,
+		PartNumberMarker: &partMarker,
+	})
+	if err != nil {
+		t.Fatalf("GetObjectAttributes(ObjectParts page 2): %v", err)
+	}
+	if page2.ObjectParts == nil {
+		t.Fatal("page 2 ObjectParts = nil, want page")
+	}
+	if page2.ObjectParts.PartNumberMarker != 2 || page2.ObjectParts.IsTruncated {
+		t.Fatalf("page 2 markers = marker:%d truncated:%t, want marker:2 truncated:false", page2.ObjectParts.PartNumberMarker, page2.ObjectParts.IsTruncated)
+	}
+	if len(page2.ObjectParts.Parts) != 1 {
+		t.Fatalf("page 2 parts = %d, want 1", len(page2.ObjectParts.Parts))
+	}
+	assertObjectPartMatchesMultipartPart(t, page2.ObjectParts.Parts[0], current.PartRows[2])
+
+	controllerPath, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+		Bucket:   aws.String("attrs-parts-bucket"),
+		Key:      aws.String("current.bin"),
+		MaxParts: &maxParts,
+	})
+	if err != nil {
+		t.Fatalf("GetObjectAttributes(controller path): %v", err)
+	}
+	if controllerPath.ObjectParts == nil || len(controllerPath.ObjectParts.Parts) != 2 {
+		t.Fatalf("controller path ObjectParts = %#v, want 2 parts", controllerPath.ObjectParts)
+	}
+
+	metadataOnly, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+		Bucket:           aws.String("attrs-parts-bucket"),
+		Key:              aws.String("current.bin"),
+		ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesEtag, types.ObjectAttributesObjectSize, types.ObjectAttributesChecksum, types.ObjectAttributesStorageClass},
+	})
+	if err != nil {
+		t.Fatalf("GetObjectAttributes(metadata only): %v", err)
+	}
+	if metadataOnly.ObjectParts != nil {
+		t.Fatalf("metadata-only ObjectParts = %#v, want nil", metadataOnly.ObjectParts)
+	}
+
+	putTestObject(t, tb, "attrs-parts-bucket", "plain.txt", "plain")
+	plain, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+		Bucket:           aws.String("attrs-parts-bucket"),
+		Key:              aws.String("plain.txt"),
+		ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectParts},
+	})
+	if err != nil {
+		t.Fatalf("GetObjectAttributes(non-multipart): %v", err)
+	}
+	if plain.ObjectParts == nil {
+		t.Fatal("non-multipart ObjectParts = nil, want empty page")
+	}
+	if plain.ObjectParts.Parts == nil {
+		t.Fatal("non-multipart ObjectParts.Parts = nil, want empty slice")
+	}
+	if len(plain.ObjectParts.Parts) != 0 || plain.ObjectParts.IsTruncated {
+		t.Fatalf("non-multipart ObjectParts = %#v, want empty untruncated page", plain.ObjectParts)
+	}
+
+	versioned := completeMultipartTestObject(t, tb, "attrs-parts-bucket", "versioned.bin", []string{
+		validTestObjectBody("old-version-part"),
+	})
+	putTestObject(t, tb, "attrs-parts-bucket", "versioned.bin", "new-current")
+	versionOut, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+		Bucket:           aws.String("attrs-parts-bucket"),
+		Key:              aws.String("versioned.bin"),
+		VersionId:        aws.String(versioned.VersionID),
+		ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectParts},
+	})
+	if err != nil {
+		t.Fatalf("GetObjectAttributes(ObjectParts version): %v", err)
+	}
+	if versionOut.VersionId == nil || *versionOut.VersionId != versioned.VersionID {
+		t.Fatalf("VersionId = %v, want %s", versionOut.VersionId, versioned.VersionID)
+	}
+	if versionOut.ObjectParts == nil || len(versionOut.ObjectParts.Parts) != 1 {
+		t.Fatalf("version ObjectParts = %#v, want 1 part", versionOut.ObjectParts)
+	}
+	assertObjectPartMatchesMultipartPart(t, versionOut.ObjectParts.Parts[0], versioned.PartRows[0])
+}
+
+func TestGetObjectAttributes_ObjectPartsRejectsInvalidPartNumberMarker(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "attrs-invalid-marker-bucket")
+
+	completeMultipartTestObject(t, tb, "attrs-invalid-marker-bucket", "current.bin", []string{
+		validTestObjectBody("part-one"),
+	})
+
+	for _, tc := range []struct {
+		name    string
+		marker  string
+		wantErr s3err.APIError
+	}{
+		{
+			name:    "non-numeric",
+			marker:  "not-an-int",
+			wantErr: s3err.GetInvalidMaxLimiterErr("part-number-marker"),
+		},
+		{
+			name:    "negative",
+			marker:  "-1",
+			wantErr: s3err.GetNegativeMaxLimiterErr("part-number-marker"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+				Bucket:           aws.String("attrs-invalid-marker-bucket"),
+				Key:              aws.String("current.bin"),
+				ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectParts},
+				PartNumberMarker: &tc.marker,
+			})
+			if err == nil {
+				t.Fatal("GetObjectAttributes invalid part marker returned nil error")
+			}
+			apiErr, ok := err.(s3err.APIError)
+			if !ok {
+				t.Fatalf("GetObjectAttributes invalid part marker error = %T %v, want APIError", err, err)
+			}
+			if apiErr.Code != tc.wantErr.Code {
+				t.Fatalf("GetObjectAttributes invalid part marker code = %q, want %q", apiErr.Code, tc.wantErr.Code)
+			}
+		})
+	}
+}
+
 // ---------- ListObjects ----------
 
 func TestListObjects_Pagination(t *testing.T) {

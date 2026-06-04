@@ -65,12 +65,13 @@ func TestUploadPart_HappyPath(t *testing.T) {
 	}
 
 	partNum := int32(1)
+	partBody := "part-1-data"
 	partOut, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:     aws.String("up-bucket"),
 		Key:        aws.String("parts.bin"),
 		UploadId:   aws.String(initResult.UploadId),
 		PartNumber: &partNum,
-		Body:       strings.NewReader("part-1-data"),
+		Body:       strings.NewReader(partBody),
 	})
 	if err != nil {
 		t.Fatalf("UploadPart: %v", err)
@@ -89,6 +90,9 @@ func TestUploadPart_HappyPath(t *testing.T) {
 	}
 	if len(parts) > 0 && parts[0].PartNumber != 1 {
 		t.Errorf("part number = %d, want 1", parts[0].PartNumber)
+	}
+	if len(parts) > 0 && (parts[0].Checksum == nil || *parts[0].Checksum != testSHA256Hex(partBody)) {
+		t.Fatalf("part checksum = %v, want %s", parts[0].Checksum, testSHA256Hex(partBody))
 	}
 }
 
@@ -121,6 +125,16 @@ func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) 
 	}
 	if partOut.CopySourceVersionId != firstOut.VersionID {
 		t.Fatalf("CopySourceVersionId = %q, want %s", partOut.CopySourceVersionId, firstOut.VersionID)
+	}
+	parts, err := tb.repos.Multiparts.GetParts(ctx, initResult.UploadId, 0, 100)
+	if err != nil {
+		t.Fatalf("GetParts after UploadPartCopy: %v", err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("copied parts = %d, want 1", len(parts))
+	}
+	if parts[0].Checksum == nil || *parts[0].Checksum != testSHA256Hex(validTestObjectBody("old")) {
+		t.Fatalf("copied part checksum = %v, want %s", parts[0].Checksum, testSHA256Hex(validTestObjectBody("old")))
 	}
 
 	_, versionID, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
@@ -227,6 +241,9 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	}
 	if obj.State != model.ObjectStateCached {
 		t.Errorf("object state = %q, want %q", obj.State, model.ObjectStateCached)
+	}
+	if obj.MultipartUploadID == nil || *obj.MultipartUploadID != uploadID {
+		t.Fatalf("object multipart_upload_id = %v, want %s", obj.MultipartUploadID, uploadID)
 	}
 	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
 	if err != nil {
@@ -544,5 +561,25 @@ func TestListParts_HappyPath(t *testing.T) {
 		if p.PartNumber != i+1 {
 			t.Errorf("part[%d].PartNumber = %d, want %d", i, p.PartNumber, i+1)
 		}
+	}
+
+	maxParts := int32(0)
+	zeroMaxResult, err := tb.backend.ListParts(ctx, &s3.ListPartsInput{
+		Bucket:   aws.String("lp-bucket"),
+		Key:      aws.String("parts-file.bin"),
+		UploadId: aws.String(initResult.UploadId),
+		MaxParts: &maxParts,
+	})
+	if err != nil {
+		t.Fatalf("ListParts MaxParts=0: %v", err)
+	}
+	if len(zeroMaxResult.Parts) != 0 {
+		t.Fatalf("ListParts MaxParts=0 parts count = %d, want 0", len(zeroMaxResult.Parts))
+	}
+	if !zeroMaxResult.IsTruncated {
+		t.Fatal("ListParts MaxParts=0 IsTruncated = false, want true")
+	}
+	if zeroMaxResult.NextPartNumberMarker != 0 {
+		t.Fatalf("ListParts MaxParts=0 NextPartNumberMarker = %d, want 0", zeroMaxResult.NextPartNumberMarker)
 	}
 }

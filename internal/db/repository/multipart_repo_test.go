@@ -169,11 +169,13 @@ func TestMultipartRepo_Parts_CRUD(t *testing.T) {
 
 	// Create parts
 	for i := 1; i <= 3; i++ {
+		checksum := "checksum-" + string(rune('0'+i))
 		part := &model.MultipartPart{
 			UploadID:   "up-parts",
 			PartNumber: i,
 			Size:       int64(i * 1000),
 			ETag:       "etag-" + string(rune('0'+i)),
+			Checksum:   &checksum,
 		}
 		if err := repos.Multiparts.CreatePart(ctx, part); err != nil {
 			t.Fatalf("CreatePart %d: %v", i, err)
@@ -188,6 +190,9 @@ func TestMultipartRepo_Parts_CRUD(t *testing.T) {
 	if len(parts) != 3 {
 		t.Errorf("expected 3 parts, got %d", len(parts))
 	}
+	if parts[0].Checksum == nil || *parts[0].Checksum != "checksum-1" {
+		t.Fatalf("part 1 checksum = %v, want checksum-1", parts[0].Checksum)
+	}
 
 	// GetPartsByNumbers
 	specific, err := repos.Multiparts.GetPartsByNumbers(ctx, "up-parts", []int{1, 3})
@@ -199,11 +204,13 @@ func TestMultipartRepo_Parts_CRUD(t *testing.T) {
 	}
 
 	// UPSERT: overwrite part 2
+	newChecksum := "checksum-new"
 	overwrite := &model.MultipartPart{
 		UploadID:   "up-parts",
 		PartNumber: 2,
 		Size:       9999,
 		ETag:       "etag-new",
+		Checksum:   &newChecksum,
 	}
 	if err := repos.Multiparts.CreatePart(ctx, overwrite); err != nil {
 		t.Fatalf("CreatePart upsert: %v", err)
@@ -213,8 +220,8 @@ func TestMultipartRepo_Parts_CRUD(t *testing.T) {
 	if len(parts) != 3 {
 		t.Errorf("expected 3 parts after upsert, got %d", len(parts))
 	}
-	if parts[1].Size != 9999 || parts[1].ETag != "etag-new" {
-		t.Errorf("part 2 not updated: size=%d etag=%s", parts[1].Size, parts[1].ETag)
+	if parts[1].Size != 9999 || parts[1].ETag != "etag-new" || parts[1].Checksum == nil || *parts[1].Checksum != newChecksum {
+		t.Errorf("part 2 not updated: size=%d etag=%s checksum=%v", parts[1].Size, parts[1].ETag, parts[1].Checksum)
 	}
 
 	// DeleteParts
