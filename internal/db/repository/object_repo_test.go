@@ -160,6 +160,43 @@ func TestObjectRepo_CountOverviewAttention(t *testing.T) {
 	}
 }
 
+func TestObjectRepo_AggregateByStateIncludesTotalSize(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "state-aggregate-bucket")
+
+	cached := newObjectVersion(bucket.ID, "cached.txt", "01J00000000000000000000B01", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, cached); err != nil {
+		t.Fatalf("seed cached version: %v", err)
+	}
+	failed := newObjectVersion(bucket.ID, "failed.txt", "01J00000000000000000000B02", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, failed); err != nil {
+		t.Fatalf("seed failed version: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionStateToFailed(ctx, failed.VersionID, model.ObjectStateCached, "upload failed"); err != nil {
+		t.Fatalf("mark failed version: %v", err)
+	}
+	if _, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "deleted.txt", "01J00000000000000000000B03"); err != nil {
+		t.Fatalf("seed delete marker: %v", err)
+	}
+
+	rows, err := repos.Objects.AggregateByState(ctx)
+	if err != nil {
+		t.Fatalf("AggregateByState: %v", err)
+	}
+	byState := make(map[string]repository.ObjectStateAggregate, len(rows))
+	for _, row := range rows {
+		byState[row.State] = row
+	}
+	if got := byState[string(model.ObjectStateCached)]; got.Count != 1 || got.TotalSize != 10 {
+		t.Fatalf("cached aggregate = count:%d size:%d, want 1/10", got.Count, got.TotalSize)
+	}
+	if got := byState[string(model.ObjectStateFailed)]; got.Count != 1 || got.TotalSize != 20 {
+		t.Fatalf("failed aggregate = count:%d size:%d, want 1/20", got.Count, got.TotalSize)
+	}
+}
+
 func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.T) {
 	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {

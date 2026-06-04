@@ -103,21 +103,15 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Objects
-	objCounts, err := s.repos.Objects.CountByState(ctx)
+	objCounts, err := s.repos.Objects.AggregateByState(ctx)
 	if err != nil {
-		s.logger.Warn("overview: failed to count objects", "error", err)
+		s.logger.Warn("overview: failed to aggregate objects", "error", err)
 	} else {
 		for _, oc := range objCounts {
 			resp.Objects.ByState[oc.State] = oc.Count
 			resp.Objects.Total += oc.Count
+			resp.Objects.TotalSizeBytes += oc.TotalSize
 		}
-	}
-
-	totalSize, err := s.repos.Objects.TotalSize(ctx)
-	if err != nil {
-		s.logger.Warn("overview: failed to get total size", "error", err)
-	} else {
-		resp.Objects.TotalSizeBytes = totalSize
 	}
 	objectAttention, err := s.repos.Objects.CountOverviewAttention(ctx)
 	if err != nil {

@@ -1029,14 +1029,6 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ default_copies: defaultCopies }),
     }),
-  deleteBucket: (name: string, params: { recursive?: boolean } = {}) => {
-    const sp = new URLSearchParams()
-    if (params.recursive) sp.set('recursive', 'true')
-    const qs = sp.toString()
-    return fetchJSON<BucketMutationResponse>(`/buckets/${encodeURIComponent(name)}${qs ? `?${qs}` : ''}`, {
-      method: 'DELETE',
-    })
-  },
   getBucketObjects: (name: string, params: { prefix?: string; delimiter?: string; after?: string; limit?: number }) => {
     const sp = new URLSearchParams()
     if (params.prefix) sp.set('prefix', params.prefix)

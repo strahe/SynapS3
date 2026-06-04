@@ -880,6 +880,22 @@ func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, e
 	return counts, nil
 }
 
+// AggregateByState returns current object counts and sizes grouped by state.
+func (r *BunObjectRepo) AggregateByState(ctx context.Context) ([]ObjectStateAggregate, error) {
+	var rows []ObjectStateAggregate
+	err := r.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		ColumnExpr("state, COUNT(*) AS count, COALESCE(SUM(size), 0) AS total_size").
+		Where("is_current = ?", true).
+		Where("is_delete_marker = ?", false).
+		GroupExpr("state").
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating current object versions by state: %w", err)
+	}
+	return rows, nil
+}
+
 func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAttentionCount, error) {
 	var count ObjectAttentionCount
 	query := `WITH current_versions AS (
@@ -920,21 +936,6 @@ func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAtten
 		return ObjectAttentionCount{}, fmt.Errorf("counting overview object attention: %w", err)
 	}
 	return count, nil
-}
-
-// TotalSize returns the sum of all current object sizes in bytes.
-func (r *BunObjectRepo) TotalSize(ctx context.Context) (int64, error) {
-	var total int64
-	err := r.db.NewSelect().
-		Model((*model.ObjectVersion)(nil)).
-		ColumnExpr("COALESCE(SUM(size), 0)").
-		Where("is_current = ?", true).
-		Where("is_delete_marker = ?", false).
-		Scan(ctx, &total)
-	if err != nil {
-		return 0, fmt.Errorf("computing total current object size: %w", err)
-	}
-	return total, nil
 }
 
 // CountByBucket returns the number of current objects in a bucket.

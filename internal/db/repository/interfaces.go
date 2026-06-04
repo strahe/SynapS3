@@ -157,9 +157,9 @@ type ObjectRepository interface {
 	ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
 	// CountByState returns object counts grouped by state.
 	CountByState(ctx context.Context) ([]ObjectStateCount, error)
+	// AggregateByState returns object counts and sizes grouped by state.
+	AggregateByState(ctx context.Context) ([]ObjectStateAggregate, error)
 	CountOverviewAttention(ctx context.Context) (ObjectAttentionCount, error)
-	// TotalSize returns the sum of current object sizes in bytes.
-	TotalSize(ctx context.Context) (int64, error)
 	// CountByBucket returns the number of current objects in a bucket.
 	CountByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// TotalSizeByBucket returns the sum of current object sizes in a bucket.
@@ -514,6 +514,13 @@ type TaskPipelineCount struct {
 type ObjectStateCount struct {
 	State string `bun:"state"`
 	Count int64  `bun:"count"`
+}
+
+// ObjectStateAggregate holds object count and total size grouped by state.
+type ObjectStateAggregate struct {
+	State     string `bun:"state"`
+	Count     int64  `bun:"count"`
+	TotalSize int64  `bun:"total_size"`
 }
 
 type ObjectAttentionCount struct {

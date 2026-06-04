@@ -97,7 +97,6 @@ import {
   useBucketObjects,
   useBucketObjectVersions,
   useBucketStorageRiskVersions,
-  useDeleteBucket,
   useDeleteBucketObject,
   useDeletedBucketObjects,
   useObjectProvenance,
@@ -154,117 +153,6 @@ export const Route = createFileRoute('/buckets/$name')({
   validateSearch: (search: Record<string, unknown>): BucketRouteSearch => normalizeBucketRouteSearch(search),
   component: ObjectBrowserPage,
 })
-
-function DeleteBucketDetailDialog({
-  bucketName,
-  objectCount,
-  open: controlledOpen,
-  onOpenChange,
-  showTrigger = true,
-}: {
-  bucketName: string
-  objectCount: number
-  open?: boolean
-  onOpenChange?: (open: boolean) => void
-  showTrigger?: boolean
-}) {
-  const [internalOpen, setInternalOpen] = useState(false)
-  const [confirmName, setConfirmName] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const deleteBucket = useDeleteBucket()
-  const navigate = useNavigate()
-
-  const dialogOpen = controlledOpen ?? internalOpen
-  const setDialogOpen = onOpenChange ?? setInternalOpen
-  const recursive = objectCount > 0
-  const nameMatches = confirmName === bucketName
-
-  const reset = () => {
-    setConfirmName('')
-    setError(null)
-    deleteBucket.reset()
-  }
-
-  const handleOpenChange = (next: boolean) => {
-    if (!next) reset()
-    setDialogOpen(next)
-  }
-
-  const handleDelete = () => {
-    if (!nameMatches) return
-    setError(null)
-    deleteBucket.mutate(
-      { name: bucketName, recursive },
-      {
-        onSuccess: () => {
-          setDialogOpen(false)
-          reset()
-          navigate({ to: '/buckets' })
-        },
-        onError: (mutationError) => {
-          setError(mutationError instanceof Error ? mutationError.message : 'Failed to delete bucket')
-        },
-      }
-    )
-  }
-
-  return (
-    <Dialog open={dialogOpen} onOpenChange={handleOpenChange}>
-      {showTrigger && (
-        <DialogTrigger asChild>
-          <Button variant="destructive" size="sm">
-            <Trash2 data-icon="inline-start" />
-            Delete
-          </Button>
-        </DialogTrigger>
-      )}
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Delete bucket "{bucketName}"</DialogTitle>
-          <DialogDescription>
-            {recursive
-              ? `This will recursively purge ${formatNumber(objectCount)} object(s) and their cached data. Deletion is blocked while lifecycle tasks, object processing, or multipart uploads are in flight.`
-              : 'This empty bucket will be marked for deletion. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
-          </DialogDescription>
-        </DialogHeader>
-        <FieldGroup>
-          <Field>
-            <FieldLabel htmlFor="confirm-delete-detail">
-              Type <span className="font-mono font-semibold">{bucketName}</span> to confirm
-            </FieldLabel>
-            <Input
-              id="confirm-delete-detail"
-              value={confirmName}
-              onChange={(e) => setConfirmName(e.target.value)}
-              placeholder={bucketName}
-              autoFocus
-              disabled={deleteBucket.isPending}
-            />
-          </Field>
-        </FieldGroup>
-        {error && (
-          <Alert variant="destructive">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => handleOpenChange(false)}
-            disabled={deleteBucket.isPending}
-          >
-            Cancel
-          </Button>
-          <Button variant="destructive" onClick={handleDelete} disabled={!nameMatches || deleteBucket.isPending}>
-            {deleteBucket.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            Delete bucket
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
 
 function ChangeBucketOwnerDetailDialog({
   bucketName,
@@ -1117,7 +1005,6 @@ function ObjectBrowserPage() {
   const view = search.view ?? 'objects'
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [changeOwnerOpen, setChangeOwnerOpen] = useState(false)
-  const [deleteBucketOpen, setDeleteBucketOpen] = useState(false)
   const [uploadOpen, setUploadOpen] = useState(false)
   const [riskProvenanceVersion, setRiskProvenanceVersion] = useState<BucketStorageRiskVersion | null>(null)
 
@@ -1275,12 +1162,8 @@ function ObjectBrowserPage() {
     }
   }
 
-  const canDelete = bucket.data?.status === 'active'
   const openChangeOwner = () => {
     setChangeOwnerOpen(true)
-  }
-  const openDeleteBucket = () => {
-    setDeleteBucketOpen(true)
   }
 
   return (
@@ -1409,9 +1292,7 @@ function ObjectBrowserPage() {
             bucket={bucket.data}
             open={detailsOpen}
             onOpenChange={setDetailsOpen}
-            canDelete={canDelete}
             onChangeOwner={openChangeOwner}
-            onDeleteBucket={openDeleteBucket}
             onReviewStorageRisk={() => navigateToStorageRisk()}
             onReviewStorageDataSetRisk={navigateToStorageRiskDataSet}
           />
@@ -1420,13 +1301,6 @@ function ObjectBrowserPage() {
             ownerAccessKey={bucket.data.owner_access_key}
             open={changeOwnerOpen}
             onOpenChange={setChangeOwnerOpen}
-            showTrigger={false}
-          />
-          <DeleteBucketDetailDialog
-            bucketName={name}
-            objectCount={bucket.data.object_count}
-            open={deleteBucketOpen}
-            onOpenChange={setDeleteBucketOpen}
             showTrigger={false}
           />
         </>
@@ -1737,18 +1611,14 @@ function BucketDetailsSheet({
   bucket,
   open,
   onOpenChange,
-  canDelete,
   onChangeOwner,
-  onDeleteBucket,
   onReviewStorageRisk,
   onReviewStorageDataSetRisk,
 }: {
   bucket: NonNullable<ReturnType<typeof useBucket>['data']>
   open: boolean
   onOpenChange: (open: boolean) => void
-  canDelete: boolean
   onChangeOwner: () => void
-  onDeleteBucket: () => void
   onReviewStorageRisk: () => void
   onReviewStorageDataSetRisk: (dataSetID: number) => void
 }) {
@@ -1794,12 +1664,7 @@ function BucketDetailsSheet({
                 />
               </BucketDetailsSection>
               <BucketDetailsSection title="Settings">
-                <BucketDetailsSettings
-                  bucket={bucket}
-                  canDelete={canDelete}
-                  onChangeOwner={onChangeOwner}
-                  onDeleteBucket={onDeleteBucket}
-                />
+                <BucketDetailsSettings bucket={bucket} onChangeOwner={onChangeOwner} />
               </BucketDetailsSection>
             </div>
           </div>
@@ -2166,14 +2031,10 @@ function storageHealthStatusTone(status: StorageHealthStatus): StatusTone {
 
 function BucketDetailsSettings({
   bucket,
-  canDelete,
   onChangeOwner,
-  onDeleteBucket,
 }: {
   bucket: NonNullable<ReturnType<typeof useBucket>['data']>
-  canDelete: boolean
   onChangeOwner: () => void
-  onDeleteBucket: () => void
 }) {
   const updateCopyPolicy = useUpdateBucketCopyPolicy()
   const currentCopyPolicy = bucketCopyPolicyValue(bucket)
@@ -2278,18 +2139,6 @@ function BucketDetailsSettings({
           </p>
         )}
         {copyPolicyError && <p className="mt-2 text-sm text-destructive">{copyPolicyError}</p>}
-      </section>
-      <section className="rounded-md border border-destructive/30 p-4">
-        <h3 className="text-sm font-medium text-destructive">Delete bucket</h3>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {canDelete
-            ? 'Delete this bucket and its cached data after confirmation.'
-            : 'Deletion is unavailable while the bucket is not active.'}
-        </p>
-        <Button variant="destructive" size="sm" className="mt-3" onClick={onDeleteBucket} disabled={!canDelete}>
-          <Trash2 data-icon="inline-start" />
-          Delete bucket
-        </Button>
       </section>
     </div>
   )

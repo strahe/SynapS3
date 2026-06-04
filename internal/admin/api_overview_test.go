@@ -62,8 +62,9 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 
 	var body struct {
 		Objects struct {
-			ByState   map[string]int64 `json:"by_state"`
-			Attention struct {
+			ByState        map[string]int64 `json:"by_state"`
+			TotalSizeBytes int64            `json:"total_size_bytes"`
+			Attention      struct {
 				NeedsAttention int64 `json:"needs_attention"`
 				Unavailable    int64 `json:"unavailable"`
 			} `json:"attention"`
@@ -86,6 +87,9 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	}
 	if body.Objects.ByState[string(model.ObjectStateCached)] == 0 {
 		t.Fatal("overview should keep legacy object state counts")
+	}
+	if body.Objects.TotalSizeBytes != 30 {
+		t.Fatalf("total_size_bytes = %d, want 30", body.Objects.TotalSizeBytes)
 	}
 	if body.Tasks.ByStatus[string(model.TaskStatusCompleted)] == 0 {
 		t.Fatal("overview should keep legacy task status counts")

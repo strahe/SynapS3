@@ -146,19 +146,6 @@ export function useUpdateBucketCopyPolicy() {
   })
 }
 
-export function useDeleteBucket() {
-  const qc = useQueryClient()
-
-  return useMutation({
-    mutationFn: ({ name, recursive }: { name: string; recursive: boolean }) => api.deleteBucket(name, { recursive }),
-    onSuccess: (_, variables) => {
-      qc.invalidateQueries({ queryKey: ['buckets'] })
-      qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
-      qc.invalidateQueries({ queryKey: ['objects', variables.name] })
-    },
-  })
-}
-
 export function useDeleteBucketObject() {
   const qc = useQueryClient()
 

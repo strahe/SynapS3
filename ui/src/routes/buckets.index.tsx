@@ -1,6 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Loader2, Plus, RefreshCw, Trash2, UserRound } from 'lucide-react'
+import { Loader2, Plus, RefreshCw, UserRound } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
 import { type BucketItem, internalRootOwnerAccessKey } from '@/api/client'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
@@ -23,7 +23,7 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/c
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { useBuckets, useCreateBucket, useDeleteBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
+import { useBuckets, useCreateBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
 import { bucketCopyPolicyLabel, copyPolicyOptions, inheritedCopyPolicyValue } from '@/lib/bucket-copy-policy'
 import {
   bucketStorageHealthLabel,
@@ -36,8 +36,6 @@ import { formatBytes, formatNumber, timeAgo } from '@/lib/utils'
 export const Route = createFileRoute('/buckets/')({
   component: BucketsPage,
 })
-
-const deletableBucketStatuses = new Set(['active'])
 
 function CreateBucketDialog() {
   const [open, setOpen] = useState(false)
@@ -316,99 +314,6 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
   )
 }
 
-function DeleteBucketDialog({ bucket }: { bucket: BucketItem }) {
-  const [open, setOpen] = useState(false)
-  const [confirmName, setConfirmName] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const deleteBucket = useDeleteBucket()
-
-  const recursive = bucket.object_count > 0
-  const nameMatches = confirmName === bucket.name
-
-  const reset = () => {
-    setConfirmName('')
-    setError(null)
-    deleteBucket.reset()
-  }
-
-  const handleOpenChange = (next: boolean) => {
-    if (!next) reset()
-    setOpen(next)
-  }
-
-  const handleDelete = () => {
-    if (!nameMatches) return
-    setError(null)
-    deleteBucket.mutate(
-      { name: bucket.name, recursive },
-      {
-        onSuccess: () => {
-          setOpen(false)
-          reset()
-        },
-        onError: (mutationError) => {
-          setError(mutationError instanceof Error ? mutationError.message : 'Failed to delete bucket')
-        },
-      }
-    )
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogTrigger asChild>
-        <Button variant="destructive" size="xs">
-          <Trash2 data-icon="inline-start" />
-          Delete
-        </Button>
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Delete bucket "{bucket.name}"</DialogTitle>
-          <DialogDescription>
-            {recursive
-              ? `This will recursively purge ${formatNumber(bucket.object_count)} object(s) and their cached data. Deletion is blocked while lifecycle tasks, object processing, or multipart uploads are in flight.`
-              : 'This empty bucket will be marked for deletion. Deletion is blocked while lifecycle tasks or multipart uploads are in flight.'}
-          </DialogDescription>
-        </DialogHeader>
-        <FieldGroup>
-          <Field>
-            <FieldLabel htmlFor={`confirm-delete-${bucket.id}`}>
-              Type <span className="font-mono font-semibold">{bucket.name}</span> to confirm
-            </FieldLabel>
-            <Input
-              id={`confirm-delete-${bucket.id}`}
-              value={confirmName}
-              onChange={(e) => setConfirmName(e.target.value)}
-              placeholder={bucket.name}
-              autoFocus
-              disabled={deleteBucket.isPending}
-            />
-          </Field>
-        </FieldGroup>
-        {error && (
-          <Alert variant="destructive">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => handleOpenChange(false)}
-            disabled={deleteBucket.isPending}
-          >
-            Cancel
-          </Button>
-          <Button variant="destructive" onClick={handleDelete} disabled={!nameMatches || deleteBucket.isPending}>
-            {deleteBucket.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            Delete bucket
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 function BucketsPage() {
   const { data, isLoading, error } = useBuckets()
   const qc = useQueryClient()
@@ -451,56 +356,37 @@ function BucketsPage() {
             </TableHeader>
             <TableBody>
               {data && data.length > 0 ? (
-                data.map((bucket) => {
-                  const canDelete = deletableBucketStatuses.has(bucket.status)
-
-                  return (
-                    <TableRow key={bucket.id}>
-                      <TableCell className="px-4">
-                        <Link
-                          to="/buckets/$name"
-                          params={{ name: bucket.name }}
-                          className="font-medium text-primary hover:underline"
-                        >
-                          {bucket.name}
-                        </Link>
-                      </TableCell>
-                      <TableCell className="px-4">
-                        <OwnerCell ownerAccessKey={bucket.owner_access_key} />
-                      </TableCell>
-                      <TableCell className="px-4">{bucketCopyPolicyLabel(bucket)}</TableCell>
-                      <TableCell className="px-4">
-                        <BucketStorageHealthCell bucket={bucket} />
-                      </TableCell>
-                      <TableCell className="px-4">
-                        <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
-                      </TableCell>
-                      <TableCell className="px-4 text-right">{formatNumber(bucket.object_count)}</TableCell>
-                      <TableCell className="px-4 text-right">{formatBytes(bucket.total_size_bytes)}</TableCell>
-                      <TableCell className="px-4 text-muted-foreground" title={bucket.created_at}>
-                        {timeAgo(bucket.created_at)}
-                      </TableCell>
-                      <TableCell className="px-4">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <ChangeBucketOwnerDialog bucket={bucket} />
-                          {canDelete ? (
-                            <DeleteBucketDialog bucket={bucket} />
-                          ) : (
-                            <Button
-                              variant="destructive"
-                              size="xs"
-                              disabled
-                              title="Only active or creating buckets can be deleted"
-                            >
-                              <Trash2 data-icon="inline-start" />
-                              Delete
-                            </Button>
-                          )}
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })
+                data.map((bucket) => (
+                  <TableRow key={bucket.id}>
+                    <TableCell className="px-4">
+                      <Link
+                        to="/buckets/$name"
+                        params={{ name: bucket.name }}
+                        className="font-medium text-primary hover:underline"
+                      >
+                        {bucket.name}
+                      </Link>
+                    </TableCell>
+                    <TableCell className="px-4">
+                      <OwnerCell ownerAccessKey={bucket.owner_access_key} />
+                    </TableCell>
+                    <TableCell className="px-4">{bucketCopyPolicyLabel(bucket)}</TableCell>
+                    <TableCell className="px-4">
+                      <BucketStorageHealthCell bucket={bucket} />
+                    </TableCell>
+                    <TableCell className="px-4">
+                      <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
+                    </TableCell>
+                    <TableCell className="px-4 text-right">{formatNumber(bucket.object_count)}</TableCell>
+                    <TableCell className="px-4 text-right">{formatBytes(bucket.total_size_bytes)}</TableCell>
+                    <TableCell className="px-4 text-muted-foreground" title={bucket.created_at}>
+                      {timeAgo(bucket.created_at)}
+                    </TableCell>
+                    <TableCell className="px-4">
+                      <ChangeBucketOwnerDialog bucket={bucket} />
+                    </TableCell>
+                  </TableRow>
+                ))
               ) : (
                 <TableRow>
                   <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
