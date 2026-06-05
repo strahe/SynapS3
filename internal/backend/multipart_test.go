@@ -49,6 +49,71 @@ func TestCreateMultipartUpload_HappyPath(t *testing.T) {
 
 // ---------- UploadPart ----------
 
+func TestMultipartOperationsRejectNilInputsWithInvalidArgument(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "UploadPart",
+			run: func() error {
+				_, err := tb.backend.UploadPart(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "UploadPartCopy",
+			run: func() error {
+				_, err := tb.backend.UploadPartCopy(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "CompleteMultipartUpload",
+			run: func() error {
+				_, _, err := tb.backend.CompleteMultipartUpload(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "AbortMultipartUpload",
+			run: func() error {
+				return tb.backend.AbortMultipartUpload(ctx, nil)
+			},
+		},
+		{
+			name: "ListParts",
+			run: func() error {
+				_, err := tb.backend.ListParts(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "ListMultipartUploads nil input",
+			run: func() error {
+				_, err := tb.backend.ListMultipartUploads(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "ListMultipartUploads nil bucket",
+			run: func() error {
+				_, err := tb.backend.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireInvalidArgumentError(t, tt.run(), "Bucket")
+		})
+	}
+}
+
 func TestUploadPart_HappyPath(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
@@ -94,6 +159,20 @@ func TestUploadPart_HappyPath(t *testing.T) {
 	if len(parts) > 0 && (parts[0].Checksum == nil || *parts[0].Checksum != testSHA256Hex(partBody)) {
 		t.Fatalf("part checksum = %v, want %s", parts[0].Checksum, testSHA256Hex(partBody))
 	}
+}
+
+func TestUploadPartCopyMissingCopySourceUsesHeaderArgumentName(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	partNum := int32(1)
+
+	_, err := tb.backend.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		Bucket:     aws.String("bucket"),
+		Key:        aws.String("key"),
+		UploadId:   aws.String("upload-id"),
+		PartNumber: &partNum,
+	})
+	requireInvalidArgumentError(t, err, "x-amz-copy-source")
 }
 
 func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) {

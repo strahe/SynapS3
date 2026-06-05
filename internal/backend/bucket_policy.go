@@ -16,7 +16,7 @@ import (
 
 // GetBucketAcl returns the persisted ACL for the specified bucket.
 func (b *SynapseBackend) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) ([]byte, error) {
-	if input.Bucket == nil {
+	if input == nil || input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 
@@ -39,7 +39,7 @@ func (b *SynapseBackend) PutBucketAcl(ctx context.Context, bucket string, data [
 	}
 
 	if owner, err := ownerFromACL(data); err != nil {
-		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return invalidArgument("ACL")
 	} else if owner != "" {
 		if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
 			account, err := txRepos.S3Accounts.LockByAccessKey(ctx, owner)
@@ -62,7 +62,7 @@ func (b *SynapseBackend) PutBucketAcl(ctx context.Context, bucket string, data [
 	if bkt.OwnerAccessKey != nil && *bkt.OwnerAccessKey != "" {
 		acl, err := aclPreservingOwner(data, *bkt.OwnerAccessKey)
 		if err != nil {
-			return s3err.GetAPIError(s3err.ErrInvalidArgument)
+			return invalidArgument("ACL")
 		}
 		data = acl
 	}
@@ -124,7 +124,7 @@ func (b *SynapseBackend) PutBucketVersioning(ctx context.Context, bucket string,
 			HTTPStatusCode: http.StatusBadRequest,
 		}
 	default:
-		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return invalidArgument("Status")
 	}
 }
 
@@ -163,10 +163,8 @@ func (b *SynapseBackend) PutBucketOwnershipControls(ctx context.Context, bucket 
 	switch ownership {
 	case types.ObjectOwnershipBucketOwnerPreferred:
 		return nil
-	case types.ObjectOwnershipBucketOwnerEnforced, types.ObjectOwnershipObjectWriter:
-		return s3err.GetAPIError(s3err.ErrInvalidArgument)
 	default:
-		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3err.GetInvalidArgObjectOwnership(string(ownership))
 	}
 }
 
@@ -180,7 +178,7 @@ func (b *SynapseBackend) DeleteBucketOwnershipControls(ctx context.Context, buck
 // GetObjectAcl returns an empty ACL for the specified object.
 // TODO: verify object exists and return NoSuchKey for missing keys.
 func (b *SynapseBackend) GetObjectAcl(ctx context.Context, input *s3.GetObjectAclInput) (*s3.GetObjectAclOutput, error) {
-	if input.Bucket == nil {
+	if input == nil || input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 
@@ -194,7 +192,7 @@ func (b *SynapseBackend) GetObjectAcl(ctx context.Context, input *s3.GetObjectAc
 // PutObjectAcl accepts and discards object-level ACL updates.
 // TODO: verify object exists and return NoSuchKey for missing keys.
 func (b *SynapseBackend) PutObjectAcl(ctx context.Context, input *s3.PutObjectAclInput) error {
-	if input.Bucket == nil {
+	if input == nil || input.Bucket == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 

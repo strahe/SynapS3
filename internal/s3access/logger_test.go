@@ -48,15 +48,33 @@ func TestLoggerOmitsQueryAndObjectDetailFields(t *testing.T) {
 }
 
 func TestLoggerLogsS3ErrorStatusAndCode(t *testing.T) {
-	apiErr := s3err.GetAPIError(s3err.ErrNoSuchBucket)
-	record := captureRequestLog(t, http.MethodGet, "/missing", apiErr, nil, s3log.LogMeta{
-		Action: "HeadBucket",
-	})
+	tests := []struct {
+		name string
+		err  s3err.S3Error
+	}{
+		{
+			name: "api error",
+			err:  s3err.GetAPIError(s3err.ErrNoSuchBucket),
+		},
+		{
+			name: "typed invalid argument error",
+			err:  s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, "0"),
+		},
+	}
 
-	assertOnlyLogFields(t, record, "time", "level", "msg", "component", "operation", "method", "path", "status", "duration_ms", "error", "error_code")
-	assertLogNumber(t, record, "status", apiErr.HTTPStatusCode)
-	assertLogField(t, record, "error_code", apiErr.Code)
-	assertLogField(t, record, "error", apiErr.Error())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := captureRequestLog(t, http.MethodGet, "/missing", tt.err, nil, s3log.LogMeta{
+				Action: "HeadBucket",
+			})
+
+			baseErr := tt.err.BaseError()
+			assertOnlyLogFields(t, record, "time", "level", "msg", "component", "operation", "method", "path", "status", "duration_ms", "error", "error_code")
+			assertLogNumber(t, record, "status", baseErr.HTTPStatusCode)
+			assertLogField(t, record, "error_code", baseErr.Code)
+			assertLogField(t, record, "error", tt.err.Error())
+		})
+	}
 }
 
 func TestLoggerLogsPlainErrorAsInternalServerError(t *testing.T) {

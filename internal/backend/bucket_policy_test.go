@@ -91,6 +91,64 @@ func TestGetBucketAcl_NonExistentBucket(t *testing.T) {
 	}
 }
 
+func TestBucketACLOperationsRejectMissingBucketInput(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	want := s3err.GetAPIError(s3err.ErrInvalidBucketName)
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "GetBucketAcl nil input",
+			run: func() error {
+				_, err := tb.backend.GetBucketAcl(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "GetBucketAcl nil bucket",
+			run: func() error {
+				_, err := tb.backend.GetBucketAcl(ctx, &s3.GetBucketAclInput{})
+				return err
+			},
+		},
+		{
+			name: "GetObjectAcl nil input",
+			run: func() error {
+				_, err := tb.backend.GetObjectAcl(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "GetObjectAcl nil bucket",
+			run: func() error {
+				_, err := tb.backend.GetObjectAcl(ctx, &s3.GetObjectAclInput{})
+				return err
+			},
+		},
+		{
+			name: "PutObjectAcl nil input",
+			run: func() error {
+				return tb.backend.PutObjectAcl(ctx, nil)
+			},
+		},
+		{
+			name: "PutObjectAcl nil bucket",
+			run: func() error {
+				return tb.backend.PutObjectAcl(ctx, &s3.PutObjectAclInput{})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireAPIErrorCode(t, tt.run(), want)
+		})
+	}
+}
+
 // --- PutBucketAcl ---
 
 func TestPutBucketAcl_WritableBucket(t *testing.T) {
@@ -329,11 +387,12 @@ func TestPutBucketOwnershipControlsRejectsUnsupportedModes(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected PutBucketOwnershipControls(%s) to fail", ownership)
 		}
-		apiErr, ok := err.(s3err.APIError)
+		s3Err, ok := err.(s3err.S3Error)
 		if !ok {
-			t.Fatalf("expected s3err.APIError for %s, got %T: %v", ownership, err, err)
+			t.Fatalf("expected s3err.S3Error for %s, got %T: %v", ownership, err, err)
 		}
-		if want := s3err.GetAPIError(s3err.ErrInvalidArgument); apiErr.Code != want.Code {
+		apiErr := s3Err.BaseError()
+		if want := (s3err.InvalidArgumentError{}).BaseError(); apiErr.Code != want.Code {
 			t.Fatalf("error code for %s = %q, want %q", ownership, apiErr.Code, want.Code)
 		}
 		updated, err := tb.repos.Buckets.GetByName(ctx, bkt.Name)

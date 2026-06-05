@@ -3,7 +3,9 @@ package backend_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
+	"github.com/versity/versitygw/s3err"
 )
 
 // testBackend holds all components needed to test the SynapseBackend.
@@ -112,6 +115,46 @@ func validTestObjectBody(seed string) string {
 func testSHA256Hex(body string) string {
 	sum := sha256.Sum256([]byte(body))
 	return hex.EncodeToString(sum[:])
+}
+
+const testInvalidArgumentDescription = "Invalid request argument."
+
+func requireInvalidArgumentError(t *testing.T, err error, wantArgumentName string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil, want InvalidArgument")
+	}
+	var invalidArg s3err.InvalidArgumentError
+	if !errors.As(err, &invalidArg) {
+		t.Fatalf("error = %T %v, want InvalidArgumentError", err, err)
+	}
+	baseErr := invalidArg.BaseError()
+	if baseErr.Code != "InvalidArgument" {
+		t.Fatalf("error code = %q, want InvalidArgument", baseErr.Code)
+	}
+	if invalidArg.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", invalidArg.StatusCode(), http.StatusBadRequest)
+	}
+	if invalidArg.ArgumentName != wantArgumentName {
+		t.Fatalf("argument name = %q, want %q", invalidArg.ArgumentName, wantArgumentName)
+	}
+	if invalidArg.Description != testInvalidArgumentDescription {
+		t.Fatalf("description = %q, want %q", invalidArg.Description, testInvalidArgumentDescription)
+	}
+}
+
+func requireAPIErrorCode(t *testing.T, err error, want s3err.APIError) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("error = nil, want %s", want.Code)
+	}
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("error = %T %v, want APIError", err, err)
+	}
+	if apiErr.Code != want.Code {
+		t.Fatalf("error code = %q, want %q", apiErr.Code, want.Code)
+	}
 }
 
 func seedS3Account(t *testing.T, tb *testBackend, accessKey string) {

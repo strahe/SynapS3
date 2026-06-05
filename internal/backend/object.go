@@ -136,8 +136,14 @@ func objectSizeAPIError(err error) s3err.APIError {
 }
 
 func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+	if input == nil {
+		return nil, invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return nil, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+		)
 	}
 
 	var out *objectreader.Result
@@ -154,7 +160,7 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
 		switch {
 		case errors.Is(err, objectreader.ErrInvalidArgument):
-			return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
+			return nil, invalidArgument("")
 		case errors.Is(err, objectreader.ErrNoSuchBucket):
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		case errors.Is(err, objectreader.ErrNoSuchKey):
@@ -191,8 +197,14 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 }
 
 func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	if input == nil {
+		return nil, invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return nil, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+		)
 	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
@@ -216,8 +228,14 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 
 // GetObjectAttributes returns object metadata and honors an explicit versionId.
 func (b *SynapseBackend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
+	if input == nil {
+		return s3response.GetObjectAttributesResponse{}, invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil {
-		return s3response.GetObjectAttributesResponse{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.GetObjectAttributesResponse{}, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+		)
 	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
@@ -250,8 +268,8 @@ func (b *SynapseBackend) GetObjectAttributes(ctx context.Context, input *s3.GetO
 }
 
 func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
-	if input.Bucket == nil {
-		return s3response.ListObjectsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	if input == nil || input.Bucket == nil {
+		return s3response.ListObjectsResult{}, invalidArgument("Bucket")
 	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
@@ -320,8 +338,8 @@ func (b *SynapseBackend) ListObjects(ctx context.Context, input *s3.ListObjectsI
 
 // ListObjectVersions lists object versions and delete markers with S3 markers and delimiter grouping.
 func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
-	if input.Bucket == nil {
-		return s3response.ListVersionsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	if input == nil || input.Bucket == nil {
+		return s3response.ListVersionsResult{}, invalidArgument("Bucket")
 	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
@@ -334,7 +352,7 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 		maxKeys = *input.MaxKeys
 	}
 	if maxKeys < 0 {
-		return s3response.ListVersionsResult{}, s3err.GetAPIError(s3err.ErrNegativeMaxKeys)
+		return s3response.ListVersionsResult{}, s3err.GetInvalidArgumentErr(s3err.InvalidArgNegativeMaxKeys, fmt.Sprint(maxKeys))
 	}
 
 	isTruncated := false
@@ -397,8 +415,14 @@ func (b *SynapseBackend) ListObjectVersions(ctx context.Context, input *s3.ListO
 const deleteObjectsMaxObjects = 1000
 
 func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
-	if input == nil || input.Bucket == nil || input.Key == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	if input == nil {
+		return nil, invalidArgument("Bucket")
+	}
+	if input.Bucket == nil || input.Key == nil {
+		return nil, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+		)
 	}
 
 	bucket, err := b.requireActiveBucket(ctx, *input.Bucket)
@@ -409,8 +433,14 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 }
 
 func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
-	if input == nil || input.Bucket == nil || input.Delete == nil {
-		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	if input == nil {
+		return s3response.DeleteResult{}, invalidArgument("Bucket")
+	}
+	if input.Bucket == nil || input.Delete == nil {
+		return s3response.DeleteResult{}, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Delete", input.Delete == nil),
+		)
 	}
 
 	bucket, err := b.requireActiveBucket(ctx, *input.Bucket)
@@ -425,7 +455,7 @@ func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObje
 	result := s3response.DeleteResult{}
 	for _, obj := range input.Delete.Objects {
 		if obj.Key == nil || *obj.Key == "" {
-			result.Error = append(result.Error, deleteObjectsEntryError(obj.Key, obj.VersionId, s3err.GetAPIError(s3err.ErrInvalidArgument)))
+			result.Error = append(result.Error, deleteObjectsEntryError(obj.Key, obj.VersionId, invalidArgument("Key")))
 			continue
 		}
 
@@ -516,7 +546,9 @@ func deleteObjectsDeletedObject(obj types.ObjectIdentifier, out *s3.DeleteObject
 }
 
 func deleteObjectsEntryError(key *string, versionID *string, err error) types.Error {
-	if apiErr, ok := errors.AsType[s3err.APIError](err); ok {
+	var s3Err s3err.S3Error
+	if errors.As(err, &s3Err) {
+		apiErr := s3Err.BaseError()
 		code := apiErr.Code
 		message := apiErr.Description
 		return types.Error{
@@ -542,13 +574,17 @@ func (b *SynapseBackend) recordPermanentDeleteCacheCleanup(ctx context.Context, 
 
 func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
 	if input.Bucket == nil || input.Key == nil || input.CopySource == nil {
-		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.CopyObjectOutput{}, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+			requiredArg(copySourceArgumentName, input.CopySource == nil),
+		)
 	}
 
 	// Parse CopySource: "/<bucket>/<key>" or "<bucket>/<key>", optionally with ?versionId=...
 	srcBucketName, srcKey, srcVersionID, err := parseCopySource(*input.CopySource)
 	if err != nil {
-		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopySourceObject)
+		return s3response.CopyObjectOutput{}, s3err.GetInvalidArgumentErr(s3err.InvalidArgCopySourceObject, *input.CopySource)
 	}
 
 	dstBucketName := *input.Bucket
@@ -694,8 +730,8 @@ func parseCopySource(src string) (bucket, key, versionID string, err error) {
 }
 
 func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
-	if input.Bucket == nil {
-		return s3response.ListObjectsV2Result{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	if input == nil || input.Bucket == nil {
+		return s3response.ListObjectsV2Result{}, invalidArgument("Bucket")
 	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
@@ -859,10 +895,10 @@ func (b *SynapseBackend) getObjectAttributeParts(ctx context.Context, uploadID *
 		if v := *input.PartNumberMarker; v != "" {
 			parsed, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, s3err.GetInvalidMaxLimiterErr("part-number-marker")
+				return nil, s3err.GetInvalidArgMaxLimiter("part-number-marker", v)
 			}
 			if parsed < 0 {
-				return nil, s3err.GetNegativeMaxLimiterErr("part-number-marker")
+				return nil, s3err.GetInvalidArgNegativeMaxLimiter("part-number-marker", v)
 			}
 			partMarker = parsed
 		}
@@ -1097,7 +1133,7 @@ func (b *SynapseBackend) objectReaderError(err error) error {
 	}
 	switch {
 	case errors.Is(err, objectreader.ErrInvalidArgument):
-		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return invalidArgument("")
 	case errors.Is(err, objectreader.ErrNoSuchBucket):
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	case errors.Is(err, objectreader.ErrNoSuchKey):

@@ -41,9 +41,9 @@ func (l *Logger) Log(ctx *fiber.Ctx, err error, _ []byte, meta s3log.LogMeta) {
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())
-		var apiErr s3err.APIError
-		if errors.As(err, &apiErr) {
-			attrs = append(attrs, "error_code", apiErr.Code)
+		var s3Err s3err.S3Error
+		if errors.As(err, &s3Err) {
+			attrs = append(attrs, "error_code", s3Err.BaseError().Code)
 		}
 	}
 	l.logger.Log(ctx.UserContext(), l.level, "s3 request completed", attrs...)
@@ -71,9 +71,9 @@ func parseLevel(level string) slog.Level {
 }
 
 func statusCode(ctx *fiber.Ctx, err error, meta s3log.LogMeta) int {
-	var apiErr s3err.APIError
-	if err != nil && errors.As(err, &apiErr) {
-		return apiErr.HTTPStatusCode
+	var s3Err s3err.S3Error
+	if err != nil && errors.As(err, &s3Err) {
+		return s3Err.StatusCode()
 	}
 	if meta.HttpStatus != 0 {
 		return meta.HttpStatus

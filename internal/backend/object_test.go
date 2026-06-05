@@ -78,6 +78,117 @@ func putTestObjectOutput(t *testing.T, tb *testBackend, bucket, key, body string
 	return s3response.PutObjectOutput{ETag: etag, VersionID: versionID, Size: &info.Size}
 }
 
+func TestObjectOperationsRejectNilInputsWithInvalidArgument(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "GetObject",
+			run: func() error {
+				_, err := tb.backend.GetObject(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "HeadObject",
+			run: func() error {
+				_, err := tb.backend.HeadObject(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "GetObjectAttributes",
+			run: func() error {
+				_, err := tb.backend.GetObjectAttributes(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "DeleteObject",
+			run: func() error {
+				_, err := tb.backend.DeleteObject(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "DeleteObjects",
+			run: func() error {
+				_, err := tb.backend.DeleteObjects(ctx, nil)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireInvalidArgumentError(t, tt.run(), "Bucket")
+		})
+	}
+}
+
+func TestObjectListOperationsRejectMissingBucketInput(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "ListObjects nil input",
+			run: func() error {
+				_, err := tb.backend.ListObjects(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "ListObjects nil bucket",
+			run: func() error {
+				_, err := tb.backend.ListObjects(ctx, &s3.ListObjectsInput{})
+				return err
+			},
+		},
+		{
+			name: "ListObjectVersions nil input",
+			run: func() error {
+				_, err := tb.backend.ListObjectVersions(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "ListObjectVersions nil bucket",
+			run: func() error {
+				_, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{})
+				return err
+			},
+		},
+		{
+			name: "ListObjectsV2 nil input",
+			run: func() error {
+				_, err := tb.backend.ListObjectsV2(ctx, nil)
+				return err
+			},
+		},
+		{
+			name: "ListObjectsV2 nil bucket",
+			run: func() error {
+				_, err := tb.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireInvalidArgumentError(t, tt.run(), "Bucket")
+		})
+	}
+}
+
 func putValidTestObject(t *testing.T, tb *testBackend, bucket, key, body string) string {
 	t.Helper()
 	return putValidTestObjectOutput(t, tb, bucket, key, body).ETag
@@ -1424,17 +1535,17 @@ func TestGetObjectAttributes_ObjectPartsRejectsInvalidPartNumberMarker(t *testin
 	for _, tc := range []struct {
 		name    string
 		marker  string
-		wantErr s3err.APIError
+		wantErr s3err.S3Error
 	}{
 		{
 			name:    "non-numeric",
 			marker:  "not-an-int",
-			wantErr: s3err.GetInvalidMaxLimiterErr("part-number-marker"),
+			wantErr: s3err.GetInvalidArgMaxLimiter("part-number-marker", "not-an-int"),
 		},
 		{
 			name:    "negative",
 			marker:  "-1",
-			wantErr: s3err.GetNegativeMaxLimiterErr("part-number-marker"),
+			wantErr: s3err.GetInvalidArgNegativeMaxLimiter("part-number-marker", "-1"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1447,12 +1558,14 @@ func TestGetObjectAttributes_ObjectPartsRejectsInvalidPartNumberMarker(t *testin
 			if err == nil {
 				t.Fatal("GetObjectAttributes invalid part marker returned nil error")
 			}
-			apiErr, ok := err.(s3err.APIError)
+			s3Err, ok := err.(s3err.S3Error)
 			if !ok {
-				t.Fatalf("GetObjectAttributes invalid part marker error = %T %v, want APIError", err, err)
+				t.Fatalf("GetObjectAttributes invalid part marker error = %T %v, want S3Error", err, err)
 			}
-			if apiErr.Code != tc.wantErr.Code {
-				t.Fatalf("GetObjectAttributes invalid part marker code = %q, want %q", apiErr.Code, tc.wantErr.Code)
+			apiErr := s3Err.BaseError()
+			wantErr := tc.wantErr.BaseError()
+			if apiErr.Code != wantErr.Code {
+				t.Fatalf("GetObjectAttributes invalid part marker code = %q, want %q", apiErr.Code, wantErr.Code)
 			}
 		})
 	}
@@ -2135,6 +2248,7 @@ func TestDeleteObjects_MixedSuccessAndMissingVersionReturnsEntryResults(t *testi
 		Delete: &types.Delete{
 			Objects: []types.ObjectIdentifier{
 				{Key: aws.String("file.txt")},
+				{Key: aws.String("")},
 				{Key: aws.String("file.txt"), VersionId: aws.String(missingVersionID)},
 			},
 		},
@@ -2155,10 +2269,19 @@ func TestDeleteObjects_MixedSuccessAndMissingVersionReturnsEntryResults(t *testi
 	if deleted.DeleteMarkerVersionId == nil || *deleted.DeleteMarkerVersionId == "" {
 		t.Fatalf("deleted DeleteMarkerVersionId = %v, want marker version", deleted.DeleteMarkerVersionId)
 	}
-	if len(out.Error) != 1 {
-		t.Fatalf("Error = %#v, want one entry", out.Error)
+	if len(out.Error) != 2 {
+		t.Fatalf("Error = %#v, want two entries", out.Error)
 	}
-	entryErr := out.Error[0]
+	emptyKeyErr := out.Error[0]
+	invalidArgument := s3err.InvalidArgumentError{Description: testInvalidArgumentDescription}.BaseError()
+	if emptyKeyErr.Code == nil || *emptyKeyErr.Code != invalidArgument.Code {
+		t.Fatalf("empty key error code = %v, want %q", emptyKeyErr.Code, invalidArgument.Code)
+	}
+	if emptyKeyErr.Message == nil || *emptyKeyErr.Message != invalidArgument.Description {
+		t.Fatalf("empty key error message = %v, want %q", emptyKeyErr.Message, invalidArgument.Description)
+	}
+
+	entryErr := out.Error[1]
 	wantErr := s3err.GetAPIError(s3err.ErrNoSuchVersion)
 	if entryErr.Code == nil || *entryErr.Code != wantErr.Code {
 		t.Fatalf("error code = %v, want %q", entryErr.Code, wantErr.Code)
@@ -2334,6 +2457,17 @@ func TestCopyObject_HappyPath(t *testing.T) {
 	if dstObj.State != model.ObjectStateCached {
 		t.Errorf("dst state = %q, want %q", dstObj.State, model.ObjectStateCached)
 	}
+}
+
+func TestCopyObjectMissingCopySourceUsesHeaderArgumentName(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	_, err := tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
+		Bucket: aws.String("dst-bucket"),
+		Key:    aws.String("copied.txt"),
+	})
+	requireInvalidArgumentError(t, err, "x-amz-copy-source")
 }
 
 func TestCopyObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {

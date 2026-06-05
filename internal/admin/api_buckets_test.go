@@ -191,8 +191,11 @@ type cacheBackedObjectUploader struct {
 
 func (u *cacheBackedObjectUploader) PutObject(ctx context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
 	u.t.Helper()
-	if input.Bucket == nil || input.Key == nil {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	if input.Bucket == nil {
+		return s3response.PutObjectOutput{}, s3err.InvalidArgumentError{ArgumentName: "Bucket"}
+	}
+	if input.Key == nil {
+		return s3response.PutObjectOutput{}, s3err.InvalidArgumentError{ArgumentName: "Key"}
 	}
 	bucket, err := u.repos.Buckets.GetByName(ctx, *input.Bucket)
 	if err != nil {
@@ -4645,6 +4648,7 @@ func TestAPIBucketObjectUpload_MapsUploaderErrors(t *testing.T) {
 		wantError string
 	}{
 		{name: "s3 api error", err: s3err.GetAPIError(s3err.ErrNoSuchBucket), status: http.StatusNotFound},
+		{name: "typed s3 error", err: s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, "0"), status: http.StatusBadRequest, wantError: "InvalidArgument"},
 		{name: "cache full", err: fmt.Errorf("staging object: %w", cache.ErrCacheFull), status: http.StatusInsufficientStorage},
 		{
 			name:      "http max bytes",

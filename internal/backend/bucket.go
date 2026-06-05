@@ -14,14 +14,14 @@ import (
 )
 
 func (b *SynapseBackend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, defaultACL []byte) error {
-	if input.Bucket == nil {
+	if input == nil || input.Bucket == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 	name := *input.Bucket
 
 	owner, err := ownerFromACL(defaultACL)
 	if err != nil {
-		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return invalidArgument("ACL")
 	}
 	if owner != "" {
 		err = b.createBucketWithOwner(ctx, name, owner, defaultACL)
@@ -83,7 +83,7 @@ func ownerFromACL(data []byte) (string, error) {
 }
 
 func (b *SynapseBackend) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
-	if input.Bucket == nil {
+	if input == nil || input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 

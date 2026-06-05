@@ -116,9 +116,10 @@ func (s *Server) writeObjectUploadError(w http.ResponseWriter, err error, bucket
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid object path"})
 		return
 	}
-	var apiErr s3err.APIError
-	if errors.As(err, &apiErr) {
-		status := apiErr.HTTPStatusCode
+	var s3Err s3err.S3Error
+	if errors.As(err, &s3Err) {
+		apiErr := s3Err.BaseError()
+		status := s3Err.StatusCode()
 		if status == 0 {
 			status = http.StatusInternalServerError
 		}

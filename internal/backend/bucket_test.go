@@ -37,24 +37,22 @@ func TestCreateBucket_HappyPath(t *testing.T) {
 	}
 }
 
-func TestCreateBucket_NilInput(t *testing.T) {
+func TestCreateBucketRejectsMissingBucketInput(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	err := tb.backend.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: nil,
-	}, nil)
-	if err == nil {
-		t.Fatal("expected error for nil bucket name")
-	}
-
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("expected APIError, got %T: %v", err, err)
-	}
 	want := s3err.GetAPIError(s3err.ErrInvalidBucketName)
-	if apiErr.Code != want.Code {
-		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
+	for _, tc := range []struct {
+		name  string
+		input *s3.CreateBucketInput
+	}{
+		{name: "nil input", input: nil},
+		{name: "nil bucket", input: &s3.CreateBucketInput{Bucket: nil}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tb.backend.CreateBucket(ctx, tc.input, nil)
+			requireAPIErrorCode(t, err, want)
+		})
 	}
 }
 
@@ -192,6 +190,25 @@ func TestHeadBucket_NotFound(t *testing.T) {
 	want := s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	if apiErr.Code != want.Code {
 		t.Errorf("error code = %q, want %q", apiErr.Code, want.Code)
+	}
+}
+
+func TestHeadBucketRejectsMissingBucketInput(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+
+	want := s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	for _, tc := range []struct {
+		name  string
+		input *s3.HeadBucketInput
+	}{
+		{name: "nil input", input: nil},
+		{name: "nil bucket", input: &s3.HeadBucketInput{Bucket: nil}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tb.backend.HeadBucket(ctx, tc.input)
+			requireAPIErrorCode(t, err, want)
+		})
 	}
 }
 

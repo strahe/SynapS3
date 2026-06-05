@@ -56,8 +56,16 @@ func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3resp
 }
 
 func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
+	if input == nil {
+		return nil, invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return nil, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+			requiredArg("UploadId", input.UploadId == nil),
+			requiredArg("PartNumber", input.PartNumber == nil),
+		)
 	}
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)
@@ -70,7 +78,7 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 
 	partNum := int(*input.PartNumber)
 	if partNum < 1 || partNum > 10000 {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidPartNumber)
+		return nil, s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, fmt.Sprint(*input.PartNumber))
 	}
 
 	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(input.Body))
@@ -99,9 +107,18 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 }
 
 func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyInput) (s3response.CopyPartResult, error) {
+	if input == nil {
+		return s3response.CopyPartResult{}, invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil ||
 		input.PartNumber == nil || input.CopySource == nil {
-		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.CopyPartResult{}, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+			requiredArg("UploadId", input.UploadId == nil),
+			requiredArg("PartNumber", input.PartNumber == nil),
+			requiredArg(copySourceArgumentName, input.CopySource == nil),
+		)
 	}
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)
@@ -114,13 +131,13 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 
 	partNum := int(*input.PartNumber)
 	if partNum < 1 || partNum > 10000 {
-		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidPartNumber)
+		return s3response.CopyPartResult{}, s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, fmt.Sprint(*input.PartNumber))
 	}
 
 	// Parse and validate source object
 	srcBucketName, srcKey, srcVersionID, err := parseCopySource(*input.CopySource)
 	if err != nil {
-		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidCopySourceObject)
+		return s3response.CopyPartResult{}, s3err.GetInvalidArgumentErr(s3err.InvalidArgCopySourceObject, *input.CopySource)
 	}
 
 	var srcResult *objectreader.Result
@@ -164,8 +181,15 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 }
 
 func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	if input == nil {
+		return s3response.CompleteMultipartUploadResult{}, "", invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
-		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.CompleteMultipartUploadResult{}, "", missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+			requiredArg("UploadId", input.UploadId == nil),
+		)
 	}
 	if input.MultipartUpload == nil || len(input.MultipartUpload.Parts) == 0 {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrMalformedXML)
@@ -320,8 +344,15 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 }
 
 func (b *SynapseBackend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
+	if input == nil {
+		return invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
-		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+			requiredArg("UploadId", input.UploadId == nil),
+		)
 	}
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)
@@ -346,8 +377,11 @@ func (b *SynapseBackend) AbortMultipartUpload(ctx context.Context, input *s3.Abo
 }
 
 func (b *SynapseBackend) ListMultipartUploads(ctx context.Context, input *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
+	if input == nil {
+		return s3response.ListMultipartUploadsResult{}, invalidArgument("Bucket")
+	}
 	if input.Bucket == nil {
-		return s3response.ListMultipartUploadsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+		return s3response.ListMultipartUploadsResult{}, invalidArgument("Bucket")
 	}
 
 	bucket, err := b.getBucket(ctx, *input.Bucket)
@@ -395,8 +429,15 @@ func (b *SynapseBackend) ListMultipartUploads(ctx context.Context, input *s3.Lis
 }
 
 func (b *SynapseBackend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3response.ListPartsResult, error) {
+	if input == nil {
+		return s3response.ListPartsResult{}, invalidArgument("Bucket")
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
-		return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.ListPartsResult{}, missingRequiredArgument(
+			requiredArg("Bucket", input.Bucket == nil),
+			requiredArg("Key", input.Key == nil),
+			requiredArg("UploadId", input.UploadId == nil),
+		)
 	}
 
 	upload, err := b.getActiveUpload(ctx, *input.UploadId, *input.Bucket)
