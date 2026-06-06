@@ -5,23 +5,14 @@ description: Deploy SynapS3 as a long-running single-host service with Docker Co
 
 # Docker Deployment
 
-Use Docker Compose for a long-running single-host deployment. The container stores runtime data under `/var/lib/synaps3`, exposes the S3 API on port `8080`, and keeps the dashboard and Admin API on loopback by default.
-
-## Goal
-
-Outcome:
-
-- SynapS3 runs as a detached Compose service.
-- Runtime data is stored in the `synaps3-data` volume.
-- Health returns `ok`.
-- The dashboard is reachable locally or through an SSH tunnel.
+Use Docker Compose for a long-running single-host deployment. The container stores runtime data under `/var/lib/synaps3`, exposes the S3 API on port `8080`, and keeps the dashboard and Admin API bound to loopback by default.
 
 ## Prerequisites
 
 - Docker Engine with Docker Compose v2.24 or later.
-- A durable local disk for the `synaps3-data` volume.
+- Durable local disk for the `synaps3-data` volume.
 - SSH access if the dashboard is reached from another machine.
-- A funded Calibration wallet for evaluation.
+- A Calibration wallet you can fund, or use the wallet steps below.
 
 ## Prepare Configuration
 
@@ -39,7 +30,7 @@ Generate a wallet:
 docker compose run --rm synaps3 synaps3 wallet generate
 ```
 
-Expected result: the command prints a wallet address and private key. Edit `.env` and add the generated private key:
+The command prints a wallet address and private key. Edit `.env` and add the generated private key:
 
 ```text
 SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
@@ -53,7 +44,7 @@ Fund the generated address on Calibration:
 docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
-Expected result: the wallet receives test assets. If faucet funding is unreliable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/) before serving.
+If faucet funding is unreliable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/) before serving.
 
 ## Start SynapS3
 
@@ -62,7 +53,7 @@ docker compose up -d
 docker compose logs --tail=50 synaps3
 ```
 
-Expected result: logs show the service starting without config validation errors.
+The logs should show the service starting without config validation errors.
 
 Read the generated Admin password from the runtime volume:
 
@@ -78,7 +69,7 @@ Default endpoints:
 | Dashboard and Admin API | `http://127.0.0.1:9090` |
 | Runtime data | Docker volume `synaps3-data` |
 
-The Compose file uses host networking so the S3 API can listen publicly while the admin server stays on loopback.
+The Compose file uses host networking. This lets the S3 API listen on the host while the admin server stays on loopback.
 
 ## Verify the Node
 
@@ -89,7 +80,7 @@ docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
 docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2 # 2 USDFC
 ```
 
-Expected result: health returns `{"status":"ok"}` and `admin status` shows runtime, worker, and cache status. The deposit command submits a wallet operation.
+Expected result: health returns `{"status":"ok"}`, and `admin status` shows runtime, worker, and cache status. The deposit command submits a wallet operation.
 
 Access a remote dashboard through SSH:
 
@@ -97,9 +88,8 @@ Access a remote dashboard through SSH:
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-::: danger Admin exposure
-Do not publish the dashboard or Admin API directly to an untrusted network. Use SSH tunneling or an HTTPS reverse proxy with explicit access control for remote access.
-:::
+> [!CAUTION]
+> Do not publish the dashboard or Admin API directly to an untrusted network. Use SSH tunneling or an HTTPS reverse proxy with explicit access control for remote access.
 
 ## Operate the Deployment
 
@@ -121,7 +111,7 @@ docker compose pull
 docker compose up -d
 ```
 
-Expected result: Compose replaces the container and keeps `synaps3-data` mounted.
+Compose replaces the container and keeps `synaps3-data` mounted.
 
 ## Back Up Runtime Data
 
@@ -133,4 +123,4 @@ docker run --rm \
   tar czf /backup/synaps3-data.tgz -C /data .
 ```
 
-Expected result: `synaps3-data.tgz` contains `config.toml`, `db/`, and cache data from the mounted volume.
+The archive should contain `config.toml`, `db/`, and cache data from the mounted volume.

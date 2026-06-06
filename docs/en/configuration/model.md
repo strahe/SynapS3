@@ -5,7 +5,7 @@ description: Understand SynapS3 configuration sources, defaults, editable settin
 
 # Configuration Model
 
-SynapS3 reads TOML configuration and applies `SYNAPS3_` environment overrides. Use a config file for stable settings and environment variables for secrets or deployment-specific overrides.
+SynapS3 reads TOML configuration first, then applies `SYNAPS3_` environment overrides. Use a config file for stable settings and environment variables for secrets or deployment-specific overrides.
 
 ## Source Rules
 
@@ -15,7 +15,7 @@ SynapS3 reads TOML configuration and applies `SYNAPS3_` environment overrides. U
 - `synaps3 init --dir <path>` creates files but does not change the default config source.
 - Admin settings writes rewrite `config.toml`; comments and ordering are not preserved.
 
-Expected operator check:
+Check the effective settings:
 
 ```bash
 synaps3 admin settings get
@@ -49,8 +49,8 @@ Admin auth also requires a password hash and `admin.auth.session_secret` when `a
 | `database` | SQLite or Postgres metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
 | `worker.upload` | Background Filecoin upload concurrency, polling, and retries. |
-| `worker.evictor` | Local cache eviction worker behavior. |
-| `worker.storage_cleanup` | Remote replica cleanup worker behavior. |
+| `worker.evictor` | Local cache eviction worker. |
+| `worker.storage_cleanup` | Remote replica cleanup worker. |
 | `logging` | Runtime log level, format, and S3 access logs. |
 | `admin` | Dashboard, Admin API listener, and Admin auth settings. |
 

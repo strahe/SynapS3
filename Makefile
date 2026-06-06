@@ -12,7 +12,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go test test-fast test-race test-docker-entrypoint lint fmt check verify-fast verify-race clean run ui-install ui-build ui-dev
+.PHONY: all build build-go docs-build test test-fast test-race test-docker-entrypoint lint fmt check verify-fast verify-race clean run ui-install ui-build ui-dev
 
 all: build
 
@@ -21,6 +21,10 @@ ui-install:
 
 ui-build: ui-install
 	cd ui && pnpm run build
+
+docs-build:
+	cd docs && pnpm install --frozen-lockfile
+	cd docs && pnpm run build
 
 build: ui-build build-go
 

@@ -5,37 +5,37 @@ description: 准备长期运行的单机 SynapS3 部署。
 
 # 生产环境检查清单
 
-把 SynapS3 作为长期运行的单机服务前，检查本地磁盘、数据库健康、后台 worker 和恢复路径。
+把 SynapS3 作为长期运行的单机服务前，先检查本地磁盘、数据库健康、后台工作进程和恢复路径。
 
 ## 网络暴露
 
 | 界面 | 建议暴露方式 |
 | --- | --- |
 | S3 API | 只暴露给可信客户端或认证后的入口。 |
-| Dashboard 和 Admin API | 保持在 `127.0.0.1:9090`；远程访问使用 SSH tunnel 或 HTTPS 反向代理。 |
-| Metrics | 使用 Admin auth，只允许私有网络或本机采集 agent 访问。 |
+| 仪表盘和 Admin API | 保持在 `127.0.0.1:9090`；远程访问使用 SSH 隧道或 HTTPS 反向代理。 |
+| 指标 | 使用 Admin 认证，只允许私有网络或本机采集 agent 访问。 |
 
-不要把 Dashboard 或 Admin API 直接发布到互联网。Settings、wallet、task retry 和 S3 user 端点都是运维控制面。
+不要把仪表盘或 Admin API 直接发布到互联网。设置、钱包、任务重试和 S3 用户端点都属于运维控制面。
 
 ## 运行数据
 
 - 将 `/var/lib/synaps3` 或 `~/.synaps3` 放在可靠磁盘上。
-- 升级前备份 `config.toml`、`db/` 和 `cache/` 数据。
+- 升级前备份 `config.toml`、`db/` 和缓存数据。
 - 监控数据库卷和缓存卷的剩余空间。
 - 不要把 `config.toml`、`.env`、数据库、缓存数据和钱包材料提交到 git。
 
 ## 密钥和钱包
 
-- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在主机环境、`.env` 或 secret manager 中。
+- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在主机环境、`.env` 或密钥管理系统中。
 - 安全保存 Admin 密码。密码丢失或泄露时，用 `synaps3 admin-auth reset-password --config <path>` 离线轮换；这也会让已有浏览器 session 失效。
-- 启动后确认 `synaps3 admin status` 显示钱包健康。
-- 在预期上传前 deposit USDFC。以下示例 deposit `2 USDFC`：
+- 启动后确认 `synaps3 admin status` 显示钱包状态正常。
+- 在预期上传前存入 USDFC。以下示例存入 `2 USDFC`：
 
 ```bash
 synaps3 wallet deposit 2 # 2 USDFC
 ```
 
-预期结果：wallet operation 被接受，随后可在仪表盘或 `GET /api/v1/wallet/operations` 中看到。
+钱包操作应被接受，随后可以在仪表盘或 `GET /api/v1/wallet/operations` 中看到。
 
 ## 配置检查
 
@@ -55,7 +55,7 @@ synaps3 admin settings get
 | Admin password hash 和 `admin.auth.session_secret` | 必须存在；password hash 由 init/reset 生成，session secret 按密钥管理。 |
 | `filecoin.network` | 明确迁移到 `mainnet` 前保持 `calibration` |
 | `filecoin.allow_private_networks` | 除非 provider URL 是可信私有端点，否则保持 `false` |
-| `cache.max_size_gb` | 按预期上传积压量规划 |
+| `cache.max_size_gb` | 按预计上传积压量规划 |
 | `logging.format` | Compose 设置为 `json`；内置默认值是 `text`。 |
 
 高风险设置需要显式确认：
@@ -70,13 +70,13 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 
 - `GET /healthz`
 - `GET /metrics`
-- cache usage
-- task queue depth
-- exhausted task count
-- worker liveness
-- provider 和 data set health
+- 缓存使用量
+- 任务队列深度
+- exhausted 任务数量
+- 工作进程存活状态
+- 存储提供方和 data set 健康状态
 
-`{"status":"unhealthy"}` 应视为需要处理的信号。它表示数据库、缓存或 worker 检查失败。
+`{"status":"unhealthy"}` 表示数据库、缓存或工作进程检查失败，需要处理。
 
 ## 升级准备
 
@@ -88,7 +88,7 @@ synaps3 admin task stats
 synaps3 admin task list --status exhausted --limit 50
 ```
 
-预期结果：health 为 `ok`，任务队列状态已确认，任何 exhausted task 都已经有明确处理决策。
+预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 exhausted 任务都有明确处理方式。
 
 ## 恢复入口
 

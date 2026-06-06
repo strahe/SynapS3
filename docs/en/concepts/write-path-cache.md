@@ -5,16 +5,16 @@ description: Learn how SynapS3 accepts S3 writes, persists bytes locally, and us
 
 # Write Path and Cache
 
-SynapS3 uses a cache-first durability model. A successful S3 write means object bytes are durable on local disk and metadata is committed to the database.
+SynapS3 uses a cache-first write model. A successful S3 write means object bytes are durable on local disk and metadata is committed to the database.
 
 ## PutObject Flow
 
-```text
-Client PUT /bucket/key
-  -> SynapseBackend.PutObject
-  -> cache.Put(bucket, key, body)
-  -> repositories transaction
-  -> return 200 OK with ETag
+```mermaid
+flowchart TD
+  request["Client PUT /bucket/key"] --> backend["SynapseBackend.PutObject"]
+  backend --> cache["cache.Put(bucket, key, body)"]
+  cache --> tx["repositories transaction"]
+  tx --> response["200 OK with ETag"]
 ```
 
 The cache write:
@@ -29,15 +29,14 @@ The database transaction upserts the object, bumps its generation, and creates a
 
 ## Durability Invariant
 
-::: tip
-SynapS3 returns success only after both local cache persistence and database commit succeed.
-:::
+> [!IMPORTANT]
+> SynapS3 returns success only after both local cache persistence and database commit succeed.
 
-This keeps the S3 response independent from Filecoin provider latency. Provider upload happens after the write is accepted.
+The S3 response does not wait for Filecoin provider latency. After the write is accepted, a background task continues the upload.
 
 ## Read Path
 
-`GetObject` reads local cache first. If the cache entry is missing and committed provider metadata is available, SynapS3 can retrieve the object from provider storage, verify the checksum, serve the response, and best-effort rehydrate cache.
+`GetObject` reads local cache first. If the cache entry is missing and committed remote metadata is available, SynapS3 can retrieve the object from the provider, verify the checksum, serve the response, and best-effort rehydrate cache.
 
 ## Multipart Uploads
 
@@ -49,7 +48,7 @@ Multipart uploads stage parts in the cache. Completion validates requested parts
 | --- | --- |
 | Cache disk is full | New writes can fail before Filecoin storage is involved. |
 | Upload worker is down | Confirmed writes remain local, but remote storage will not progress. |
-| Cache entry is evicted | Reads can still succeed when provider metadata and retrieval are available. |
+| Cache entry is evicted | Reads can still succeed when remote metadata exists and retrieval works. |
 | Database commit fails | The S3 write does not return success. |
 
 For capacity and recovery steps, see [Runtime Data](../configuration/runtime-data.md) and [Troubleshooting](../operations/troubleshooting.md).

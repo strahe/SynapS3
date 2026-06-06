@@ -1,6 +1,6 @@
 ---
 title: Health and Metrics
-description: Monitor SynapS3 health, worker liveness, cache usage, task queues, and Prometheus metrics.
+description: Monitor SynapS3 health checks, worker activity, cache usage, task queues, and Prometheus metrics.
 ---
 
 # Health and Metrics
@@ -9,11 +9,11 @@ The admin server exposes health checks, Prometheus metrics, and operational view
 
 ## Health
 
-In normal serve mode, `GET /healthz` checks database connectivity, cache directory availability, and worker liveness.
+During normal operation, `GET /healthz` checks database connectivity, cache directory availability, and worker activity.
 
 ```bash
 synaps3 admin status
-curl http://localhost:9090/healthz
+curl http://127.0.0.1:9090/healthz
 ```
 
 Healthy response:
@@ -22,23 +22,23 @@ Healthy response:
 {"status":"ok"}
 ```
 
-Setup response:
+Missing required configuration:
 
 ```json
 {"status":"setup"}
 ```
 
-Unhealthy response:
+Failed check:
 
 ```json
 {"status":"unhealthy","errors":["worker/uploader: not responding"]}
 ```
 
-Use `setup` to complete missing configuration. Treat `unhealthy` as an operational incident and check the error list first.
+`setup` means required configuration is missing. `unhealthy` means a database, cache, or worker check failed; check the returned errors first.
 
-## Worker Liveness
+## Worker Activity
 
-Workers are unhealthy when they have no active work and no recent tick for longer than `3 * poll_interval`. This catches stopped workers without requiring active uploads.
+Workers are unhealthy when they have no active task and no recent tick for longer than `3 * poll_interval`. This catches stopped workers even when no uploads are active.
 
 Check worker state:
 
@@ -47,7 +47,7 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-Expected result: status shows workers as healthy, and task stats show whether work is queued, running, failed, or exhausted.
+Status should show workers as healthy. Task stats show whether work is queued, running, failed, or exhausted.
 
 ## Prometheus Metrics
 
@@ -73,6 +73,7 @@ Key metrics:
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | Cache read behavior. |
 | `synaps3_worker_tasks_processed_total` | Worker throughput by result. |
 | `synaps3_worker_tasks_exhausted_total` | Tasks that exhausted retries. |
+| `synaps3_worker_task_duration_seconds` | Worker task processing duration. |
 | `synaps3_task_queue_depth` | Active tasks by type and status. |
 | `synaps3_object_state_distribution` | Object counts by lifecycle state. |
 
@@ -80,8 +81,8 @@ Key metrics:
 
 | Signal | Action |
 | --- | --- |
-| Health is `setup` | Set missing required configuration, usually `filecoin.private_key`. |
-| Health is `unhealthy` | Check database, cache directory, and worker error messages. |
+| `/healthz` returns `setup` | Set missing required configuration, usually `filecoin.private_key`. |
+| `/healthz` returns `unhealthy` | Check database, cache directory, and worker error messages. |
 | Cache usage approaches capacity | Increase capacity or restore upload and eviction progress. |
 | Exhausted task count increases | Fix the dependency, then retry tasks. |
 | Provider health is degraded | Check RPC, provider URLs, and network reachability. |

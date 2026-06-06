@@ -15,7 +15,7 @@ Before running SynapS3 as a long-lived single-host service, verify local disk, d
 | Dashboard and Admin API | Keep on `127.0.0.1:9090`; use SSH tunneling or HTTPS reverse proxy for remote access. |
 | Metrics | Scrape with Admin auth from the private network or host-local agent only. |
 
-Do not publish the dashboard or Admin API directly to the internet. Settings, wallet, task retry, and S3 user endpoints are operational control surfaces.
+Do not publish the dashboard or Admin API directly to the internet. Settings, wallet, task retry, and S3 user endpoints can change the node.
 
 ## Runtime Data
 
@@ -35,7 +35,7 @@ Do not publish the dashboard or Admin API directly to the internet. Settings, wa
 synaps3 wallet deposit 2 # 2 USDFC
 ```
 
-Expected result: the wallet operation is accepted and later appears in the dashboard or `GET /api/v1/wallet/operations`.
+The wallet operation should be accepted and later appear in the dashboard or `GET /api/v1/wallet/operations`.
 
 ## Configuration Review
 
@@ -73,10 +73,10 @@ At minimum, monitor:
 - cache usage
 - task queue depth
 - exhausted task count
-- worker liveness
+- worker activity
 - provider and data set health
 
-Treat `{"status":"unhealthy"}` as actionable. It means database, cache, or worker checks failed.
+Treat `{"status":"unhealthy"}` as a problem to investigate. It means database, cache, or worker checks failed.
 
 ## Upgrade Readiness
 
@@ -88,7 +88,7 @@ synaps3 admin task stats
 synaps3 admin task list --status exhausted --limit 50
 ```
 
-Expected result: health is `ok`, task queues are understood, and any exhausted task has an owner decision before the process is replaced.
+Expected result: health is `ok`, task queues are understood, and every exhausted task has a clear handling decision before the process is replaced.
 
 ## Recovery Entry Points
 

@@ -5,7 +5,7 @@ description: Upgrade SynapS3 safely and recover from common single-node failure 
 
 # Upgrade and Recovery
 
-SynapS3 is a single-node gateway. Recovery focuses on durable local data, background task retries, and clear operator action when dependencies fail.
+SynapS3 is a single-node gateway. During recovery, protect durable local data first, then handle background tasks. When a dependency fails, restore it before retrying tasks.
 
 ## Before Upgrading
 
@@ -17,7 +17,7 @@ synaps3 admin task stats
 synaps3 admin task list --status exhausted --limit 50
 ```
 
-Expected result: health is `ok`, and any exhausted task is understood before the process is replaced.
+Expected result: health is `ok`, and every exhausted task has a clear handling decision before the process is replaced.
 
 Back up runtime data before major changes:
 
@@ -59,7 +59,7 @@ PutObject -> cache + DB -> worker -> storage provider + Filecoin
 | Private provider URL blocked | Keep blocked by default; enable `filecoin.allow_private_networks` only for trusted private deployments. |
 | Database full | Free space or scale the database. |
 | Cache disk full | Increase disk, raise `cache.max_size_gb`, or restore upload and eviction progress. |
-| Process crash | Restart; startup recovery releases expired leases and resets stale upload states. |
+| Process crash | Restart; startup recovery releases expired leases and resets stalled upload states. |
 
 Useful commands:
 

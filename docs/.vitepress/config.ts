@@ -49,14 +49,14 @@ gtag('config', ${encodedGtagId});`,
 }
 
 const enNav: DefaultTheme.NavItem[] = [
-  { text: 'Get Started', link: '/en/getting-started/quick-start' },
+  { text: 'Get Started', link: '/en/getting-started/overview' },
   { text: 'Deploy', link: '/en/getting-started/docker' },
   { text: 'Operate', link: '/en/operations/production-checklist' },
   { text: 'Reference', link: '/en/reference/s3-compatibility' },
 ]
 
 const zhNav: DefaultTheme.NavItem[] = [
-  { text: '入门', link: '/zh/getting-started/quick-start' },
+  { text: '入门', link: '/zh/getting-started/overview' },
   { text: '部署', link: '/zh/getting-started/docker' },
   { text: '运维', link: '/zh/operations/production-checklist' },
   { text: '参考', link: '/zh/reference/s3-compatibility' },
@@ -66,7 +66,7 @@ const enSidebar: DefaultTheme.Sidebar = [
   {
     text: 'Getting Started',
     items: [
-      { text: 'Overview', link: '/en/' },
+      { text: 'Overview', link: '/en/getting-started/overview' },
       { text: 'Quick Start', link: '/en/getting-started/quick-start' },
       { text: 'S3 Clients', link: '/en/getting-started/s3-clients' },
     ],
@@ -112,7 +112,7 @@ const zhSidebar: DefaultTheme.Sidebar = [
   {
     text: '入门',
     items: [
-      { text: '概览', link: '/zh/' },
+      { text: '概览', link: '/zh/getting-started/overview' },
       { text: '快速开始', link: '/zh/getting-started/quick-start' },
       { text: 'S3 客户端', link: '/zh/getting-started/s3-clients' },
     ],
@@ -154,6 +154,53 @@ const zhSidebar: DefaultTheme.Sidebar = [
   },
 ]
 
+type MarkdownFenceRenderer = (
+  tokens: Array<{ content: string; info: string; map: [number, number] | null }>,
+  idx: number,
+  options: unknown,
+  env: { path?: string; relativePath?: string } | undefined,
+  self: { renderToken: MarkdownFenceRenderer },
+) => string
+
+type MarkdownItLike = {
+  renderer: {
+    rules: {
+      fence?: MarkdownFenceRenderer
+    }
+  }
+}
+
+function stableHash(value: string) {
+  let hash = 0
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = Math.imul(31, hash) + value.charCodeAt(index)
+  }
+
+  return (hash >>> 0).toString(36)
+}
+
+function configureMermaidMarkdown(md: MarkdownItLike) {
+  const defaultFence = md.renderer.rules.fence
+
+  md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+    const token = tokens[idx]
+    const language = token.info.trim().split(/\s+/, 1)[0]
+
+    if (language !== 'mermaid' && language !== 'mmd') {
+      return defaultFence
+        ? defaultFence(tokens, idx, options, env, self)
+        : self.renderToken(tokens, idx, options, env, self)
+    }
+
+    const source = `${env?.path || env?.relativePath || 'page'}:${idx}:${token.map?.join('-') || ''}`
+    const id = `mermaid-${stableHash(source)}`
+    const code = encodeURIComponent(token.content)
+
+    return `<ClientOnly><MermaidBlock id="${id}" code="${code}" /></ClientOnly>`
+  }
+}
+
 export default defineConfig({
   title: 'SynapS3',
   titleTemplate: ':title | SynapS3',
@@ -166,6 +213,9 @@ export default defineConfig({
     hostname: siteBaseUrl,
   },
   head,
+  markdown: {
+    config: configureMermaidMarkdown,
+  },
   transformPageData(pageData) {
     if (pageData.relativePath !== 'index.md') {
       return

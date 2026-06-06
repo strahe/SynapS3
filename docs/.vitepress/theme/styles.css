@@ -37,3 +37,60 @@
 .dark .VPHomeHero .image-src {
   box-shadow: 0 16px 48px rgb(0 0 0 / 36%);
 }
+
+.architecture-overview {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+}
+
+.architecture-overview--dark {
+  display: none;
+}
+
+.dark .architecture-overview--light {
+  display: none;
+}
+
+.dark .architecture-overview--dark {
+  display: block;
+}
+
+.mermaid-block {
+  margin: 24px 0;
+  overflow-x: auto;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  background: var(--vp-c-bg-soft);
+}
+
+.mermaid-block__svg {
+  min-width: min-content;
+  padding: 20px;
+}
+
+.mermaid-block__svg svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+
+.mermaid-block__error {
+  padding: 16px;
+  color: var(--vp-c-danger-1);
+}
+
+.mermaid-block__error p {
+  margin: 0 0 12px;
+  font-weight: 600;
+}
+
+.mermaid-block__error pre {
+  margin: 0;
+  overflow-x: auto;
+  color: var(--vp-c-text-1);
+  white-space: pre;
+}

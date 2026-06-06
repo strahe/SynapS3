@@ -5,7 +5,7 @@ description: Reference for SynapS3 health, metrics, dashboard, settings, wallet,
 
 # Admin API
 
-The Admin API powers the dashboard and CLI. Admin authentication is enabled by default. Keep the listener on loopback for local access; use an HTTPS reverse proxy or SSH tunnel for remote access.
+The Admin API is used by the dashboard and CLI. Admin authentication is enabled by default. Keep the listener on loopback for local access; use an HTTPS reverse proxy or SSH tunnel for remote access.
 
 Default base URL:
 
@@ -15,22 +15,36 @@ http://127.0.0.1:9090
 
 ## Auth Model
 
-`/healthz` is public so process health checks can run without credentials. The dashboard shell and static assets can load before login, but dashboard data and mutations are gated by Admin auth.
+`/healthz` is public so process health checks can run without credentials. The dashboard shell and static assets can load before login, but dashboard data and write operations require Admin auth.
 
 | Surface | Required auth |
 | --- | --- |
 | `/healthz` | None. |
-| `/api/v1/auth/login`, `/api/v1/auth/session` | Login/session endpoints. Session returns `401` when no valid browser session exists. |
+| `/api/v1/auth/login`, `/api/v1/auth/session` | Login and session endpoints. Session returns `401` when no valid browser session exists. |
 | `/api/v1/auth/logout` | Requires a valid browser session and CSRF header; HTTP Basic auth is not accepted. |
 | `/api/v1/*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 | `/metrics` | Browser session cookie or HTTP Basic auth. |
 | `/admin/exhausted-tasks*` | Browser session cookie or HTTP Basic auth. |
 
-Browser login sets the `synaps3_admin_session` HttpOnly cookie and returns a CSRF token. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests must include `X-SynapS3-CSRF`. CLI and script calls can use HTTP Basic auth and do not need a CSRF header; logout is the exception and only accepts browser sessions. Basic-authenticated browser requests are rejected when `Sec-Fetch-Site`, `Origin`, or `Referer` show a cross-site origin. Requests without browser-origin headers continue to work for CLI and scripts. Failed password checks are rate-limited by resolved client IP and fail closed when the limiter is full. Successful Basic auth credentials are cached briefly per client IP to avoid repeated bcrypt work.
+### Browser Sessions
+
+Browser login sets the `synaps3_admin_session` HttpOnly cookie and returns a CSRF token. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests must include `X-SynapS3-CSRF`. Logout only accepts browser sessions.
+
+### CLI and Basic Auth
+
+CLI and script calls can use HTTP Basic auth and do not need a CSRF header. Browser Basic-auth requests are rejected when `Sec-Fetch-Site`, `Origin`, or `Referer` show a cross-site origin. Requests without browser-origin headers still work for CLI and scripts.
+
+Failed password checks are rate-limited by resolved client IP; requests fail closed when the limiter is full. Successful Basic auth credentials are cached briefly per client IP to avoid repeated bcrypt work.
+
+### Reverse Proxies
 
 When SynapS3 is behind a reverse proxy, forwarded client, scheme, and host headers are used only when `admin.trusted_proxies` contains the proxy IP or CIDR. Keep it empty unless the proxy removes untrusted `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, and `X-Forwarded-Host` headers.
 
-Admin credentials are created by `synaps3 init`. Interactive init prints the password once. Non-interactive and Docker init write it to `admin-initial-password` in the app data directory with file mode `0600`. Local `synaps3 admin` commands use `SYNAPS3_ADMIN_PASSWORD` first, then `admin-initial-password` next to the config file, then the prompt. Resetting the password also rotates `admin.auth.session_secret`, invalidating existing browser sessions. Reset it offline with:
+### Admin Credentials
+
+Admin credentials are created by `synaps3 init`. Interactive init prints the password once. Non-interactive and Docker init write it to `admin-initial-password` in the runtime data directory with file mode `0600`. Local `synaps3 admin` commands use `SYNAPS3_ADMIN_PASSWORD` first, then `admin-initial-password` next to the config file, then the prompt.
+
+Resetting the password also rotates `admin.auth.session_secret`, invalidating existing browser sessions. Reset it offline with:
 
 ```bash
 synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
@@ -48,7 +62,7 @@ The dashboard also clears local auth state after any logout attempt or `401` API
 
 ## Security Headers
 
-Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. The CSP is same-origin by default and permits current inline script/style required by the embedded dashboard.
+Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. The CSP is same-origin by default and permits the inline script/style currently required by the embedded dashboard.
 
 ## High-Risk Operations
 
@@ -69,7 +83,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/healthz` | Health status for database, cache, and workers. |
 | `GET` | `/metrics` | Prometheus metrics. Requires Admin auth. |
 | `GET` | `/api/v1/system/info` | Version and runtime information. |
-| `GET` | `/api/v1/workers` | Worker liveness map. |
+| `GET` | `/api/v1/workers` | Worker activity and health. |
 | `GET` | `/api/v1/cache/stats` | Cache usage and capacity. |
 
 ## Dashboard Data
@@ -106,7 +120,7 @@ For object upload, the HTTP `Content-Type` is the uploaded object's content type
 | --- | --- | --- |
 | `GET` | `/api/v1/tasks` | List background tasks. Supports filters such as `type`, `stage`, `status`, `limit`, and `offset`. |
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
-| `GET` | `/api/v1/tasks/{id}/ref-detail` | Resolve the object or storage upload behind a task. |
+| `GET` | `/api/v1/tasks/{id}/ref-detail` | Resolve the object or storage upload related to a task. |
 | `GET` | `/api/v1/tasks/{id}/diagnostic` | Read task diagnostics. |
 | `POST` | `/api/v1/tasks/{id}/diagnostic/refresh` | Refresh diagnostics. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Retry an exhausted task. |
@@ -150,4 +164,4 @@ curl -X POST http://127.0.0.1:9090/api/v1/s3-users \
   -d '{"role":"user"}'
 ```
 
-Expected result: the response contains an access key, secret key, and role.
+The response contains an access key, secret key, and role.

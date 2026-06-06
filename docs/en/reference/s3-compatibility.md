@@ -5,7 +5,7 @@ description: Supported SynapS3 bucket, object, versioning, and multipart S3 oper
 
 # S3 Compatibility
 
-SynapS3 focuses on path-style S3 bucket and object workflows needed for object storage on Filecoin.
+SynapS3 mainly supports path-style S3 access for writing bucket and object data to Filecoin.
 
 ## Client Requirements
 
@@ -24,12 +24,12 @@ SynapS3 focuses on path-style S3 bucket and object workflows needed for object s
 | Bucket | `DeleteBucket` | Not supported | Bucket deletion is not part of the SynapS3 lifecycle. |
 | Bucket | `GetBucketVersioning` | Supported | Buckets are always versioning-enabled. |
 | Bucket | `PutBucketVersioning` | Partial | Accepts `Enabled`; rejects `Suspended`. |
-| Object | `PutObject` | Supported | Stores an object through cache-first durability. |
-| Object | `GetObject` | Supported | Reads from cache or committed provider storage. |
+| Object | `PutObject` | Supported | Stores an object through the cache-first write model. |
+| Object | `GetObject` | Supported | Reads from cache or committed remote storage. |
 | Object | `HeadObject` | Supported | Reads object metadata. |
 | Object | `DeleteObject` | Supported | Creates a delete marker, or deletes a specific `versionId`. |
 | Object | `DeleteObjects` | Supported | Creates delete markers, or deletes specific `versionId` entries. |
-| Object | `CopyObject` | Supported | Source object must be readable from cache or committed provider storage. |
+| Object | `CopyObject` | Supported | Source object must be readable from cache or committed remote storage. |
 | Object | `ListObjects` | Supported | Marker pagination. |
 | Object | `ListObjectsV2` | Supported | Continuation-token pagination. |
 | Object | `ListObjectVersions` | Supported | Lists object versions and delete markers. |
@@ -44,7 +44,7 @@ SynapS3 focuses on path-style S3 bucket and object workflows needed for object s
 
 ## Versioning Behavior
 
-Buckets behave as versioning-enabled. A normal object delete creates a delete marker. A delete request with `versionId` deletes that specific version. Version listing exposes object versions and delete markers.
+Buckets behave as versioning-enabled. A normal object delete creates a delete marker. A delete request with `versionId` deletes that specific version. Version listing returns object versions and delete markers.
 
 ## What Is Intentionally Out of Scope
 

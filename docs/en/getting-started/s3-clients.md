@@ -5,7 +5,7 @@ description: Create SynapS3 S3 credentials and verify path-style access with com
 
 # S3 Clients
 
-After SynapS3 is serving and the admin API is reachable on `127.0.0.1:9090`, create an S3 user and verify bucket and object operations with a path-style client.
+After SynapS3 is running, confirm the Admin API is reachable on `127.0.0.1:9090`. Then create an S3 user and verify bucket/object operations with a path-style client.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 synaps3 admin s3-user create
 ```
 
-Expected result: the command prints an access key, secret key, and role. Store the secret once; rotate it if it is exposed.
+The command prints an access key, secret key, and role. Store the secret once; rotate it if it is exposed.
 
 List users later with:
 
@@ -40,7 +40,10 @@ Create one test file before choosing a client:
 printf '%*s\n' 128 'hello synaps3' > hello.txt
 ```
 
-Expected result: `hello.txt` is at least 128 bytes. The Filecoin upload path requires objects of at least 127 bytes.
+`hello.txt` should be at least 128 bytes.
+
+> [!IMPORTANT]
+> The Filecoin upload path requires objects of at least 127 bytes. Keep test files at 128 bytes or larger.
 
 ## AWS CLI
 
@@ -61,7 +64,7 @@ aws --profile synaps3 --endpoint-url http://localhost:8080 s3 cp hello.txt s3://
 aws --profile synaps3 --endpoint-url http://localhost:8080 s3 cp s3://demo/hello.txt -
 ```
 
-Expected result: the final command prints the padded `hello synaps3` content.
+The final command prints the padded `hello synaps3` content.
 
 ## rclone
 
@@ -86,7 +89,7 @@ rclone copyto hello.txt synaps3:demo/hello.txt
 rclone cat synaps3:demo/hello.txt
 ```
 
-Expected result: `rclone cat` prints the uploaded object.
+`rclone cat` prints the uploaded object.
 
 ## MinIO Client
 
@@ -99,7 +102,7 @@ mc cp hello.txt synaps3/demo/hello.txt
 mc cat synaps3/demo/hello.txt
 ```
 
-Expected result: `mc cat` prints the uploaded object.
+`mc cat` prints the uploaded object.
 
 ## Common Failures
 

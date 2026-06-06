@@ -42,8 +42,8 @@ Compose 部署通过 `synaps3-data` Docker volume 挂载该路径。
 | --- | --- |
 | `config.toml` | 保存未由环境变量管理的稳定运行设置。 |
 | `admin-initial-password` | 保存非交互 init 和密码重置生成的 Admin 密码。文件权限为 `0600`；安全保存密码后应删除或轮换。 |
-| `db/` | 保存 buckets、objects、versions、tasks、users 和 storage metadata。 |
-| `cache/` | 保存 Filecoin 上传前后本地持久化对象字节。 |
+| `db/` | 保存 bucket、object、version、任务、S3 用户和存储元数据。 |
+| `cache/` | 保存本地持久化的对象字节，用于 Filecoin 上传和读取回填。 |
 | 环境密钥 | 可能保存 Filecoin private key 和部署特定覆盖项。 |
 
 ## 备份示例
@@ -58,4 +58,4 @@ docker run --rm \
   tar czf /backup/synaps3-data.tgz -C /data .
 ```
 
-预期结果：归档包含 volume 中的配置、数据库和缓存数据。
+归档应包含 volume 中的配置、数据库和缓存数据。

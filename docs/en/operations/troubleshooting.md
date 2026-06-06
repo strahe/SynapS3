@@ -5,7 +5,7 @@ description: Diagnose common SynapS3 setup, health, wallet, cache, task, and pro
 
 # Troubleshooting
 
-Start here when a user-visible workflow fails. Check health first, then narrow by wallet, cache, task, or provider signals.
+Start here when a user-visible workflow fails. Check health first, then narrow the problem by wallet, cache, task, or provider signals.
 
 ## First Checks
 
@@ -31,7 +31,7 @@ Health may return:
 {"status":"setup"}
 ```
 
-This means SynapS3 started in setup mode because required settings are missing, usually `filecoin.private_key`.
+This means SynapS3 is missing required settings, usually `filecoin.private_key`.
 
 Fix:
 
@@ -58,7 +58,7 @@ synaps3 admin task stats
 synaps3 admin task list --status running --limit 20
 ```
 
-If the process recently restarted, stale leases should be released during startup recovery. If the worker stays unhealthy, inspect logs and restart the service after capturing the current task state.
+If the process recently restarted, startup recovery should release stale leases. If the worker stays unhealthy, capture the current task state, inspect logs, and then restart the service.
 
 ## Wallet Funding or Deposit Fails
 
@@ -94,7 +94,7 @@ synaps3 admin settings get cache.max_size_gb
 Recovery options:
 
 - Increase `cache.max_size_gb` if disk capacity allows.
-- Restore provider or worker connectivity so queued uploads can complete and eviction can run.
+- Restore provider or worker connectivity so queued uploads can complete and cache eviction can run.
 - Keep `cache.eviction_policy = "lru"` if local cache cleanup should be queued after remote storage succeeds.
 
 ## Exhausted Tasks
@@ -113,7 +113,7 @@ synaps3 admin task retry 42
 
 ## Provider or RPC Issues
 
-Check provider health and readiness in the dashboard, or inspect the Admin API:
+Check provider health and Filecoin readiness in the dashboard, or inspect the Admin API:
 
 ```bash
 curl -u "admin:${SYNAPS3_ADMIN_PASSWORD}" http://127.0.0.1:9090/api/v1/filecoin/readiness

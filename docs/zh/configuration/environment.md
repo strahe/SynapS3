@@ -5,7 +5,7 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 
 # 环境变量
 
-环境变量使用 `SYNAPS3_` 前缀，并将下划线映射到配置路径。它们会覆盖文件值，适合保存部署密钥和主机特定设置。
+配置环境变量使用 `SYNAPS3_` 前缀，下划线会映射到配置路径。环境变量会覆盖文件值，适合放部署密钥和主机专用设置。
 
 ## 常用覆盖项
 
@@ -57,22 +57,42 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 
 `SYNAPS3_ADMIN_TRUSTED_PROXIES` 是逗号分隔的 IP 或 CIDR 列表。
 
+## 高级生成字段
+
+| 环境变量 | 配置路径 |
+| --- | --- |
+| `SYNAPS3_ADMIN_AUTH_PASSWORD_HASH` | `admin.auth.password_hash` |
+
+`admin.auth.password_hash` 通常由 `synaps3 init` 或 `synaps3 admin-auth reset-password` 生成。除非外部流程已经接管 Admin 密码 hash，否则不要手写。
+
+## 容器入口变量
+
+Docker entrypoint 还会读取下面这些变量。它们只控制容器启动路径，不映射到 TOML 配置字段。
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `SYNAPS3_DATA_DIR` | 自动执行 `synaps3 init` 时使用的运行数据目录；默认是 `/var/lib/synaps3`。 |
+| `SYNAPS3_CONFIG` | `synaps3 serve` 使用的配置文件；默认是 `$SYNAPS3_DATA_DIR/config.toml`。 |
+
 ## 何时使用环境变量
 
-适合使用环境变量的内容：
+适合放在环境变量中的内容：
 
-- wallet private key，
+- 钱包 private key，
 - 外部管理的 Admin session secret，
 - 容器专用路径，
 - 网络特定 RPC URL，
 - 部署特定日志格式，
 - 排障期间的临时覆盖。
 
-稳定且希望被 `synaps3 admin settings get` 清楚展示的设置，建议放在 TOML 配置文件中。
+稳定设置如果希望在 `synaps3 admin settings get` 中清楚展示，建议放在 TOML 配置文件中。`SYNAPS3_DATA_DIR` 和 `SYNAPS3_CONFIG` 只用于 Docker entrypoint 路径控制。
 
 ## 安全建议
 
-- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在 secret manager、`.env` 或主机环境中。`synaps3 init` 和 `synaps3 admin-auth reset-password` 会生成 `admin.auth.session_secret`；只有部署策略要求在 TOML 外管理时，才使用 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET`。
+> [!WARNING]
+> 不要把钱包 private key 和 Admin session secret 放进 git、容器镜像或 shell history。
+
+- 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在密钥管理系统、`.env` 或主机环境中。`synaps3 init` 和 `synaps3 admin-auth reset-password` 会生成 `admin.auth.session_secret`；只有部署策略要求在 TOML 外管理时，才使用 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET`。
 - 除非可信代理会在请求到达 SynapS3 前清理不可信 forwarded headers，否则保持 `SYNAPS3_ADMIN_TRUSTED_PROXIES` 为空。
 - 不要提交 `.env`、`config.toml`、本地数据库、缓存数据或钱包材料。
 - 除非明确信任私有 provider URL，否则保持 `filecoin.allow_private_networks = false`。
@@ -84,4 +104,4 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 synaps3 admin settings get
 ```
 
-预期结果：输出显示当前值和 settings 是否可写。
+输出会显示当前值，以及每个设置是否可写。

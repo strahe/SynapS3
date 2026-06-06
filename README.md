@@ -1,5 +1,3 @@
-![SynapS3 dashboard](docs/assets/readme-dashboard.png)
-
 # SynapS3
 
 [![CI](https://github.com/strahe/SynapS3/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/ci.yml)
@@ -7,22 +5,31 @@
 [![Go Report](https://goreportcard.com/badge/github.com/strahe/synaps3)](https://goreportcard.com/report/github.com/strahe/synaps3)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/strahe/SynapS3?filename=go.mod)](go.mod)
 
-SynapS3 is an open-source, self-hosted S3-compatible gateway for storing objects on Filecoin.
+SynapS3 is an open-source, self-hosted S3-compatible gateway for Filecoin storage.
 
 ## Documentation
 
-- [Documentation](https://synaps3.strahe.com/)
+- [Documentation](https://synaps3.strahe.com/en/)
 - [中文文档](https://synaps3.strahe.com/zh/)
 
 ## Highlights
 
-- S3-compatible bucket and object APIs.
-- Filecoin-backed object storage through storage providers.
-- Open-source, self-hosted deployment with Docker or source builds.
-- Admin-authenticated dashboard for buckets, objects, wallet, tasks, topology, settings, and health.
-- Multipart uploads for large objects.
-- Wallet funding, USDFC deposit, and background task controls.
-- Coming soon: automatic replica repair when storage providers become unavailable.
+- S3-compatible bucket, object, versioning, and multipart APIs.
+- Cache-first reads and writes, with Filecoin upload handled in the background.
+- Admin dashboard for objects, wallet, tasks, topology, settings, and health.
+- Docker Compose or source build for single-node deployments.
+
+Coming soon: replica repair for provider outages.
+
+## Dashboard
+
+![SynapS3 dashboard](docs/assets/readme-dashboard.png)
+
+## Architecture
+
+![SynapS3 architecture](docs/public/architecture-overview.svg)
+
+Writes commit to local cache and metadata before returning success. Reads use local cache first, then committed Filecoin copies when available.
 
 ## Core S3 Compatibility
 
@@ -39,7 +46,7 @@ SynapS3 is an open-source, self-hosted S3-compatible gateway for storing objects
 | Object | `HeadObject` | ✅ | Reads object metadata |
 | Object | `DeleteObject` | ✅ | Creates a delete marker, or deletes a specific `versionId` |
 | Object | `DeleteObjects` | ✅ | Creates delete markers, or deletes specific `versionId` entries |
-| Object | `CopyObject` | ✅ | Source object must be readable from cache or committed provider storage |
+| Object | `CopyObject` | ✅ | Source object must be readable from cache or committed Filecoin storage |
 | Object | `ListObjects` | ✅ | Marker pagination |
 | Object | `ListObjectsV2` | ✅ | Continuation-token pagination |
 | Object | `ListObjectVersions` | ✅ | Lists object versions and delete markers |

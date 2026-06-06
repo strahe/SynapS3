@@ -10,8 +10,8 @@ hero:
     alt: SynapS3 dashboard
   actions:
     - theme: brand
-      text: Quick Start
-      link: /en/getting-started/quick-start
+      text: Get Started
+      link: /en/getting-started/overview
     - theme: alt
       text: Docker Deployment
       link: /en/getting-started/docker
@@ -20,7 +20,7 @@ hero:
       link: /en/getting-started/s3-clients
 features:
   - title: Self-Hosted Gateway
-    details: Run SynapS3 in your own environment with Docker or source builds.
+    details: Run SynapS3 in your own environment with Docker or a local build.
     link: /en/getting-started/docker
     linkText: Docker Deployment
   - title: S3 Client Compatibility
@@ -28,19 +28,19 @@ features:
     link: /en/getting-started/s3-clients
     linkText: Client Examples
   - title: Filecoin Storage
-    details: Store objects through Filecoin storage providers while keeping standard S3 access.
+    details: Write objects to Filecoin while keeping standard S3 access.
     link: /en/concepts/filecoin-storage-flow
     linkText: Storage Flow
   - title: Admin Dashboard
-    details: Manage buckets, objects, wallet, tasks, topology, settings, and health.
+    details: View buckets, objects, wallet, tasks, topology, settings, and health.
     link: /en/reference/admin-api
     linkText: Admin API
   - title: Operations
-    details: Monitor health, inspect tasks, and handle upgrades, recovery, and troubleshooting.
+    details: Check health and task queues, then handle upgrades, recovery, and troubleshooting.
     link: /en/operations/troubleshooting
     linkText: Troubleshooting
   - title: Replica Repair
-    details: Coming soon. If a storage provider becomes unavailable, SynapS3 will copy data to another available provider to maintain the configured copy count.
+    details: "Coming soon: replica repair for provider outages."
     link: /en/operations/upgrade-recovery
     linkText: Recovery Guide
 ---

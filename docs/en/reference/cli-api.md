@@ -5,7 +5,7 @@ description: Common SynapS3 CLI commands for setup, serving, wallet operations, 
 
 # CLI Reference
 
-SynapS3 exposes the S3 API, an Admin API, and CLI commands for local operations.
+SynapS3 provides the S3 API, the Admin API, and CLI commands for local operations.
 
 ## Endpoints
 
@@ -21,7 +21,7 @@ SynapS3 exposes the S3 API, an Admin API, and CLI commands for local operations.
 | Command | Purpose |
 | --- | --- |
 | `synaps3 init` | Initialize `~/.synaps3` runtime data. |
-| `synaps3 init --dir /var/lib/synaps3` | Initialize a custom app data directory. |
+| `synaps3 init --dir /var/lib/synaps3` | Initialize a custom runtime data directory. |
 | `synaps3 serve` | Start the S3 gateway, dashboard, Admin API, and workers. |
 | `synaps3 migrate` | Run database migrations and exit. |
 | `synaps3 admin-auth reset-password --config <path>` | Reset the Admin password offline, rotate the session secret, and write a new `admin-initial-password` file. |
@@ -35,7 +35,7 @@ synaps3 wallet fund-testnet 0x...
 synaps3 wallet deposit 2 # 2 USDFC
 ```
 
-Expected result: `generate` prints wallet material, `fund-testnet` claims Calibration assets, and `deposit` submits a `2 USDFC` deposit using the configured private key.
+`generate` prints wallet material, `fund-testnet` claims Calibration assets, and `deposit` submits a `2 USDFC` deposit using the configured private key.
 
 ## Admin Commands
 

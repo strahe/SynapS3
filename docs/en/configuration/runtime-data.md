@@ -43,7 +43,7 @@ The Compose deployment mounts this path through the `synaps3-data` Docker volume
 | `config.toml` | Holds stable runtime settings when they are not environment-managed. |
 | `admin-initial-password` | Stores the generated Admin password for non-interactive init and password reset. File mode is `0600`; remove or rotate it after storing the password securely. |
 | `db/` | Stores buckets, objects, versions, tasks, users, and storage metadata. |
-| `cache/` | Holds locally durable object bytes before and after Filecoin upload. |
+| `cache/` | Holds locally durable object bytes for Filecoin upload and read rehydration. |
 | Environment secrets | May hold the Filecoin private key and deployment-specific overrides. |
 
 ## Backup Example
@@ -58,4 +58,4 @@ docker run --rm \
   tar czf /backup/synaps3-data.tgz -C /data .
 ```
 
-Expected result: the archive contains config, database, and cache data from the volume.
+The archive should contain config, database, and cache data from the volume.

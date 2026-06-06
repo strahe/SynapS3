@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640" role="img" aria-labelledby="title desc">
+  <title id="title">SynapS3 architecture overview</title>
+  <desc id="desc">SynapS3 accepts S3 read and write requests from Web2 object storage clients, confirms writes through local cache and metadata, reads from cache or committed Filecoin copies, exposes Dashboard and Admin API operations, and runs background workers for upload, retry, repair, and cleanup.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c2410c"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <style>
+      .canvas { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .synaps3 { fill: #ecfeff; stroke: #0f766e; stroke-width: 3; }
+      .node { fill: #ffffff; stroke: #0f766e; stroke-width: 2; }
+      .external { fill: #ffffff; stroke: #64748b; stroke-width: 2; }
+      .filecoin { fill: #fff7ed; stroke: #c2410c; stroke-width: 2; }
+      .dash { fill: #f0fdf4; stroke: #15803d; stroke-width: 2; }
+      .title { fill: #0f172a; font: 700 28px Arial, sans-serif; }
+      .heading { fill: #0f172a; font: 700 20px Arial, sans-serif; }
+      .label { fill: #0f172a; font: 700 17px Arial, sans-serif; }
+      .body { fill: #334155; font: 15px Arial, sans-serif; }
+      .small { fill: #475569; font: 13px Arial, sans-serif; }
+      .arrow { fill: none; stroke: #334155; stroke-width: 2.6; marker-end: url(#arrow); }
+      .read { fill: none; stroke: #2563eb; stroke-width: 2.5; marker-end: url(#arrow-blue); }
+      .async { fill: none; stroke: #c2410c; stroke-width: 2.5; marker-end: url(#arrow-orange); }
+      .ops { fill: none; stroke: #15803d; stroke-width: 2.4; stroke-dasharray: 7 7; marker-end: url(#arrow-green); }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1200" height="640" rx="24"/>
+  <rect class="panel" x="24" y="24" width="1152" height="592" rx="18"/>
+
+  <text class="title" x="64" y="74">How SynapS3 Works</text>
+
+  <rect class="external" x="64" y="244" width="192" height="116" rx="14"/>
+  <text class="heading" x="160" y="282" text-anchor="middle">Web2 object</text>
+  <text class="heading" x="160" y="306" text-anchor="middle">storage clients</text>
+  <text class="small" x="160" y="332" text-anchor="middle">AWS CLI, rclone, MinIO</text>
+
+  <rect class="synaps3" x="330" y="120" width="540" height="410" rx="18"/>
+  <text class="heading" x="600" y="160" text-anchor="middle">SynapS3</text>
+
+  <rect class="node" x="374" y="202" width="196" height="92" rx="12"/>
+  <text class="label" x="472" y="235" text-anchor="middle">S3 Gateway</text>
+  <text class="small" x="472" y="258" text-anchor="middle">accept read / write</text>
+  <text class="small" x="472" y="275" text-anchor="middle">bucket, object, multipart</text>
+
+  <rect class="node" x="628" y="202" width="198" height="92" rx="12"/>
+  <text class="label" x="727" y="235" text-anchor="middle">Local Cache + DB</text>
+  <text class="small" x="727" y="258" text-anchor="middle">write success after local save</text>
+  <text class="small" x="727" y="275" text-anchor="middle">serve reads from cache first</text>
+
+  <rect class="dash" x="374" y="384" width="196" height="92" rx="12"/>
+  <text class="label" x="472" y="410" text-anchor="middle">Dashboard</text>
+  <text class="small" x="472" y="432" text-anchor="middle">Admin API control plane</text>
+  <text class="small" x="472" y="449" text-anchor="middle">buckets, tasks, wallet</text>
+  <text class="small" x="472" y="466" text-anchor="middle">health and topology</text>
+
+  <rect class="node" x="628" y="384" width="198" height="92" rx="12"/>
+  <text class="label" x="727" y="417" text-anchor="middle">Background Workers</text>
+  <text class="small" x="727" y="440" text-anchor="middle">upload, retry, repair</text>
+  <text class="small" x="727" y="457" text-anchor="middle">clean cache safely</text>
+
+  <rect class="filecoin" x="936" y="244" width="210" height="116" rx="14"/>
+  <text class="heading" x="1041" y="282" text-anchor="middle">Filecoin storage</text>
+  <text class="body" x="1041" y="309" text-anchor="middle">storage providers</text>
+  <text class="body" x="1041" y="331" text-anchor="middle">remote copies</text>
+
+  <path class="arrow" d="M 256 286 H 330"/>
+  <path class="read" d="M 330 318 H 256"/>
+  <text class="small" x="293" y="268" text-anchor="middle">S3 write</text>
+  <text class="small" x="293" y="343" text-anchor="middle">S3 read</text>
+
+  <path class="arrow" d="M 570 240 H 628"/>
+  <path class="read" d="M 628 276 H 570"/>
+
+  <path class="async" d="M 727 294 V 384"/>
+  <path class="async" d="M 826 430 C 892 430 888 302 936 302"/>
+
+  <path class="read" d="M 936 330 C 888 330 892 278 826 278"/>
+
+  <path class="ops" d="M 570 414 C 616 350 666 318 704 294"/>
+  <path class="ops" d="M 570 446 C 594 446 604 430 628 430"/>
+</svg>
