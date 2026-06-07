@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 
@@ -27,6 +28,22 @@ func NewTestDB(t *testing.T) *bun.DB {
 	t.Helper()
 
 	dsn := fmt.Sprintf("file:synaps3-test-%d?mode=memory&cache=shared&_pragma=foreign_keys(1)", testDBCounter.Add(1))
+	return newTestSQLiteDB(t, dsn)
+}
+
+// NewTestFileDB creates a fresh file-backed SQLite DB with all migrations applied.
+// Use it for tests that cancel database contexts while worker goroutines are active.
+func NewTestFileDB(t *testing.T) *bun.DB {
+	t.Helper()
+
+	path := filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3-test.db"))
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	return newTestSQLiteDB(t, dsn)
+}
+
+func newTestSQLiteDB(t *testing.T, dsn string) *bun.DB {
+	t.Helper()
+
 	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatalf("opening test db: %v", err)

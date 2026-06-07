@@ -5,12 +5,28 @@ import (
 	"testing"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
 )
 
 func TestNewTestDBCreatesIsolatedDatabases(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		newDB func(*testing.T) *bun.DB
+	}{
+		{name: "Memory", newDB: NewTestDB},
+		{name: "File", newDB: NewTestFileDB},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assertTestDBsAreIsolated(t, tt.newDB)
+		})
+	}
+}
+
+func assertTestDBsAreIsolated(t *testing.T, newDB func(*testing.T) *bun.DB) {
+	t.Helper()
 	ctx := context.Background()
-	first := NewTestDB(t)
-	second := NewTestDB(t)
+	first := newDB(t)
+	second := newDB(t)
 
 	bucket := &model.Bucket{Name: "isolated-db-bucket", Status: model.BucketStatusActive}
 	if _, err := first.NewInsert().Model(bucket).Exec(ctx); err != nil {

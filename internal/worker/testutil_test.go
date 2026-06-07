@@ -22,11 +22,11 @@ type testWorkerEnv struct {
 	db      *bun.DB
 }
 
-// newTestWorkerEnv constructs a test environment with in-memory SQLite
+// newTestWorkerEnv constructs a test environment with file-backed SQLite
 // and a real filesystem cache.
 func newTestWorkerEnv(t *testing.T) *testWorkerEnv {
 	t.Helper()
-	db := testutil.NewTestDB(t)
+	db := testutil.NewTestFileDB(t)
 	repos := repository.NewRepositories(db)
 	fsCache := newWorkerTestCache(t, 1<<30)
 	sm := state.NewObjectStateMachine()
@@ -44,7 +44,7 @@ func newTestWorkerEnv(t *testing.T) *testWorkerEnv {
 // newTestWorkerEnvWithMockCache constructs a test environment with mock cache.
 func newTestWorkerEnvWithMockCache(t *testing.T, mc *testutil.MockCache) *testWorkerEnv {
 	t.Helper()
-	db := testutil.NewTestDB(t)
+	db := testutil.NewTestFileDB(t)
 	repos := repository.NewRepositories(db)
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
