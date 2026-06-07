@@ -12,7 +12,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go docs-build test test-fast test-race test-docker-entrypoint lint fmt check verify-fast verify-race clean run ui-install ui-build ui-dev
+.PHONY: all build build-go docs-build test test-fast test-race test-docker-entrypoint lint fmt check verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev
 
 all: build
 
@@ -62,7 +62,7 @@ check: ui-build
 	cd ui && pnpm run test
 	$(MAKE) test-race
 
-verify-fast: ui-build
+verify-norace: ui-build
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }
 	golangci-lint config verify
 	golangci-lint fmt --diff
@@ -70,8 +70,10 @@ verify-fast: ui-build
 	cd ui && pnpm run check
 	cd ui && pnpm run test
 	$(MAKE) test-docker-entrypoint
-	$(MAKE) test-fast
 	$(MAKE) build-go
+
+verify-fast: verify-norace
+	$(MAKE) test-fast
 
 verify-race:
 	$(CGO) go test -race -tags dev -count=1 ./cmd/... ./internal/...

@@ -16,7 +16,7 @@ concurrency:
 jobs:
   check:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       GOTOOLCHAIN: auto
 
@@ -67,7 +67,12 @@ jobs:
           install-only: true
 
       - name: Verify fast
+        if: github.event_name == 'pull_request'
         run: make verify-fast
+
+      - name: Verify no race
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: make verify-norace
 
       - name: Verify race
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

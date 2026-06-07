@@ -481,27 +481,15 @@ func TestAdminAuthBasicAuthPasswordLockDoesNotCoverProtectedHandler(t *testing.T
 	srv := newTestAuthServerWithCost(t, "admin-password", bcrypt.MinCost+4)
 	mux := http.NewServeMux()
 	srv.registerAuthRoutes(mux)
-	var handler http.Handler
 	mux.HandleFunc("GET /api/v1/system/info", func(w http.ResponseWriter, _ *http.Request) {
-		done := make(chan int, 1)
-		go func() {
-			loginReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"admin-password"}`))
-			loginReq.RemoteAddr = "203.0.113.22:1000"
-			loginRR := httptest.NewRecorder()
-			handler.ServeHTTP(loginRR, loginReq)
-			done <- loginRR.Code
-		}()
-		select {
-		case code := <-done:
-			if code != http.StatusOK {
-				t.Errorf("nested login status = %d, want 200", code)
-			}
-			writeJSON(w, http.StatusOK, map[string]string{"version": "test"})
-		case <-time.After(500 * time.Millisecond):
-			http.Error(w, "nested login blocked by password lock", http.StatusGatewayTimeout)
+		if passwordLockHeldForTest(srv.auth.passwordLocks, loginFailureKey("203.0.113.22")) {
+			t.Error("basic auth password lock was still held while serving protected handler")
+			http.Error(w, "password lock held during protected handler", http.StatusGatewayTimeout)
+			return
 		}
+		writeJSON(w, http.StatusOK, map[string]string{"version": "test"})
 	})
-	handler = srv.withAdminAuth(mux)
+	handler := srv.withAdminAuth(mux)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/system/info", nil)
 	req.RemoteAddr = "203.0.113.22:1000"
@@ -511,6 +499,20 @@ func TestAdminAuthBasicAuthPasswordLockDoesNotCoverProtectedHandler(t *testing.T
 	if rr.Code != http.StatusOK {
 		t.Fatalf("basic auth status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
+}
+
+func passwordLockHeldForTest(locks *keyedLockSet, key string) bool {
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	lock := locks.locks[key]
+	if lock == nil {
+		return false
+	}
+	if lock.mu.TryLock() {
+		lock.mu.Unlock()
+		return false
+	}
+	return true
 }
 
 func TestAdminAuthSerializesConcurrentPasswordChecksByClientIP(t *testing.T) {
