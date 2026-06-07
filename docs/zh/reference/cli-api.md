@@ -16,6 +16,10 @@ SynapS3 提供 S3 API、Admin API，以及用于本地操作的 CLI 命令。
 | 健康检查 | `GET http://127.0.0.1:9090/healthz` |
 | 指标 | `GET http://127.0.0.1:9090/metrics` |
 
+## 配置文件来源
+
+需要配置文件的命令优先使用 `--config <path>`；未传时读取非空 `SYNAPS3_CONFIG`；仍未设置时使用 `~/.synaps3/config.toml`。`synaps3 init` 只用 `--dir` 选择运行目录，不读取 `SYNAPS3_CONFIG`。`admin-auth reset-password` 必须通过 `--config` 或 `SYNAPS3_CONFIG` 指定目标配置。
+
 ## 运行时命令
 
 | 命令 | 用途 |
@@ -76,4 +80,4 @@ synaps3 admin s3-user delete <access-key> --yes
 ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-然后使用默认 admin URL 运行本地 admin 命令，或显式传入 `--admin-url`。命令会优先使用 `SYNAPS3_ADMIN_PASSWORD`，其次读取 config 同目录的 `admin-initial-password`，最后再提示输入。浏览器访问时，用 init 或 `admin-auth reset-password` 得到的 Admin 用户名和密码登录。
+然后使用默认 admin URL 运行本地 admin 命令，或显式传入 `--admin-url`。命令会优先使用 `SYNAPS3_ADMIN_PASSWORD`，其次读取 config 同目录的 `admin-initial-password`，最后提示输入。浏览器访问时，用 init 或 `admin-auth reset-password` 得到的 Admin 用户名和密码登录。

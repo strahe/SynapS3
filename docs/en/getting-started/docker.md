@@ -1,11 +1,11 @@
 ---
 title: Docker Deployment
-description: Deploy SynapS3 as a long-running single-host service with Docker Compose.
+description: Deploy SynapS3 with Docker Compose.
 ---
 
 # Docker Deployment
 
-Use Docker Compose for a long-running single-host deployment. The container stores runtime data under `/var/lib/synaps3`, exposes the S3 API on port `8080`, and keeps the dashboard and Admin API bound to loopback by default.
+The container stores runtime data under `/var/lib/synaps3`, exposes the S3 API on port `8080`, and keeps the dashboard and Admin API bound to loopback by default.
 
 ## Prerequisites
 
@@ -55,12 +55,6 @@ docker compose logs --tail=50 synaps3
 
 The logs should show the service starting without config validation errors.
 
-Read the generated Admin password from the runtime volume:
-
-```bash
-ADMIN_PASSWORD=$(docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password)
-```
-
 Default endpoints:
 
 | Endpoint | Address |
@@ -71,13 +65,20 @@ Default endpoints:
 
 The Compose file uses host networking. This lets the S3 API listen on the host while the admin server stays on loopback.
 
+For dashboard login, read the generated Admin password:
+
+```bash
+docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password
+```
+
+The username is `admin`. Container-local `synaps3 admin` commands read this password file automatically.
+
 ## Verify the Node
 
 ```bash
 curl http://127.0.0.1:9090/healthz
-docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
-  synaps3 --config /var/lib/synaps3/config.toml admin status
-docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2 # 2 USDFC
+docker compose exec synaps3 synaps3 admin status
+docker compose exec synaps3 synaps3 wallet deposit 2 # 2 USDFC
 ```
 
 Expected result: health returns `{"status":"ok"}`, and `admin status` shows runtime, worker, and cache status. The deposit command submits a wallet operation.
@@ -100,8 +101,7 @@ Useful commands:
 ```bash
 docker compose ps
 docker compose logs --tail=100 synaps3
-docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
-  synaps3 --config /var/lib/synaps3/config.toml admin task stats
+docker compose exec synaps3 synaps3 admin task stats
 ```
 
 ## Upgrade

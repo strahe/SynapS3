@@ -37,7 +37,10 @@ import (
 	"github.com/versity/versitygw/s3log"
 )
 
-const defaultS3MultipartMaxParts = 10000
+const (
+	defaultS3MultipartMaxParts = 10000
+	configEnvVar               = "SYNAPS3_CONFIG"
+)
 
 func main() {
 	if err := newRootCommand().Run(context.Background(), os.Args); err != nil {
@@ -196,8 +199,24 @@ func versionCommand() *cli.Command {
 }
 
 func configSourceFromCommand(cmd *cli.Command) (config.Source, error) {
+	path, explicit := configPathFromCommand(cmd)
+	return config.ResolveSource(path, explicit)
+}
+
+func configPathFromCommand(cmd *cli.Command) (string, bool) {
 	root := cmd.Root()
-	return config.ResolveSource(root.String("config"), root.IsSet("config"))
+	if root.IsSet("config") {
+		return root.String("config"), true
+	}
+	if envPath := strings.TrimSpace(os.Getenv(configEnvVar)); envPath != "" {
+		return envPath, true
+	}
+	return root.String("config"), false
+}
+
+func configSourceExplicitlyProvided(cmd *cli.Command) bool {
+	_, explicit := configPathFromCommand(cmd)
+	return explicit
 }
 
 // loadConfigAndDB is the shared setup used by serve and migrate.

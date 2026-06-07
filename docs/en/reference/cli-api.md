@@ -16,6 +16,10 @@ SynapS3 provides the S3 API, the Admin API, and CLI commands for local operation
 | Health | `GET http://127.0.0.1:9090/healthz` |
 | Metrics | `GET http://127.0.0.1:9090/metrics` |
 
+## Config File Source
+
+Commands that need a config file use `--config <path>` first, then non-empty `SYNAPS3_CONFIG`, then `~/.synaps3/config.toml`. `synaps3 init` uses `--dir` for the runtime data directory and does not read `SYNAPS3_CONFIG`. `admin-auth reset-password` requires `--config` or `SYNAPS3_CONFIG`.
+
 ## Runtime Commands
 
 | Command | Purpose |

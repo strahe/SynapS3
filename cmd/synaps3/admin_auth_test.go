@@ -62,6 +62,62 @@ func TestAdminAuthResetPasswordUpdatesConfigAndWritesPasswordFile(t *testing.T) 
 	}
 }
 
+func TestAdminAuthResetPasswordUsesSYNAPS3Config(t *testing.T) {
+	dir := t.TempDir()
+	initCmd := newRootCommand()
+	initCmd.Writer = &bytes.Buffer{}
+	if err := initCmd.Run(context.Background(), []string{"synaps3", "init", "--dir", dir}); err != nil {
+		t.Fatalf("init command error = %v", err)
+	}
+	cfgPath := filepath.Join(dir, "config.toml")
+	before, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load before reset: %v", err)
+	}
+	t.Setenv(configEnvVar, cfgPath)
+
+	var out bytes.Buffer
+	cmd := newRootCommand()
+	cmd.Writer = &out
+	if err := cmd.Run(context.Background(), []string{"synaps3", "admin-auth", "reset-password"}); err != nil {
+		t.Fatalf("reset-password command error = %v", err)
+	}
+
+	after, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load after reset: %v", err)
+	}
+	if after.Admin.Auth.PasswordHash == before.Admin.Auth.PasswordHash {
+		t.Fatal("password hash was not updated")
+	}
+	if after.Admin.Auth.SessionSecret == before.Admin.Auth.SessionSecret {
+		t.Fatal("session secret was not updated")
+	}
+	passwordPath := filepath.Join(dir, "admin-initial-password")
+	if !strings.Contains(out.String(), passwordPath) {
+		t.Fatalf("reset output must include password file path:\n%s", out.String())
+	}
+}
+
+func TestAdminAuthResetPasswordRequiresConfigSource(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(configEnvVar, " \t ")
+	initCmd := newRootCommand()
+	initCmd.Writer = &bytes.Buffer{}
+	if err := initCmd.Run(context.Background(), []string{"synaps3", "init"}); err != nil {
+		t.Fatalf("init command error = %v", err)
+	}
+
+	err := newRootCommand().Run(context.Background(), []string{"synaps3", "admin-auth", "reset-password"})
+	if err == nil {
+		t.Fatal("expected reset-password without config source to fail")
+	}
+	if !strings.Contains(err.Error(), "requires --config or SYNAPS3_CONFIG") {
+		t.Fatalf("error = %v, want config source requirement", err)
+	}
+}
+
 func TestAdminAuthResetPasswordRestoresPasswordFileWhenConfigSaveFails(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")

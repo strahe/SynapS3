@@ -1,11 +1,11 @@
 ---
 title: Docker 部署
-description: 使用 Docker Compose 将 SynapS3 部署为长期运行的单机服务。
+description: 使用 Docker Compose 部署 SynapS3。
 ---
 
 # Docker 部署
 
-使用 Docker Compose 运行长期单机部署。容器会把运行数据保存在 `/var/lib/synaps3`，在 `8080` 暴露 S3 API，并默认让仪表盘和 Admin API 只监听本机回环地址。
+容器会把运行数据保存在 `/var/lib/synaps3`，在 `8080` 暴露 S3 API，并默认让仪表盘和 Admin API 只监听本机回环地址。
 
 ## 前置条件
 
@@ -55,12 +55,6 @@ docker compose logs --tail=50 synaps3
 
 日志应显示服务启动，且没有配置校验错误。
 
-从运行数据 volume 读取生成的 Admin 密码：
-
-```bash
-ADMIN_PASSWORD=$(docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password)
-```
-
 默认端点：
 
 | 端点 | 地址 |
@@ -71,13 +65,20 @@ ADMIN_PASSWORD=$(docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-
 
 Compose 文件使用 host networking。这样 S3 API 可以对外监听，Admin 服务仍保持在本机回环地址。
 
+浏览器登录仪表盘时，读取生成的 Admin 密码：
+
+```bash
+docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password
+```
+
+用户名是 `admin`。容器内 `synaps3 admin` 命令会自动读取该密码文件。
+
 ## 验证节点
 
 ```bash
 curl http://127.0.0.1:9090/healthz
-docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
-  synaps3 --config /var/lib/synaps3/config.toml admin status
-docker compose exec synaps3 synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2 # 2 USDFC
+docker compose exec synaps3 synaps3 admin status
+docker compose exec synaps3 synaps3 wallet deposit 2 # 2 USDFC
 ```
 
 预期结果：`/healthz` 返回 `{"status":"ok"}`，`admin status` 显示运行时、工作进程和缓存状态。deposit 命令提交钱包操作。
@@ -100,8 +101,7 @@ ssh -L 9090:127.0.0.1:9090 user@server
 ```bash
 docker compose ps
 docker compose logs --tail=100 synaps3
-docker compose exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3 \
-  synaps3 --config /var/lib/synaps3/config.toml admin task stats
+docker compose exec synaps3 synaps3 admin task stats
 ```
 
 ## 升级

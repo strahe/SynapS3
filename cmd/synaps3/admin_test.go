@@ -69,6 +69,8 @@ func TestAdminURLResolution(t *testing.T) {
 }
 
 func TestAdminStatusHandlesReadySetupAndUnhealthy(t *testing.T) {
+	t.Setenv(configEnvVar, "")
+
 	t.Run("sends basic auth when admin password env is set", func(t *testing.T) {
 		t.Setenv("SYNAPS3_ADMIN_PASSWORD", "admin-password")
 		var gotUser, gotPassword string
@@ -167,6 +169,46 @@ func TestAdminStatusHandlesReadySetupAndUnhealthy(t *testing.T) {
 		}
 
 		if _, err := runAdminCommand(t, []string{"synaps3", "--config", cfgPath, "admin", "--json", "status"}); err != nil {
+			t.Fatalf("admin status: %v", err)
+		}
+		if gotUser != "root" || gotPassword != "file-password" {
+			t.Fatalf("basic auth = %q/%q, want root/file-password", gotUser, gotPassword)
+		}
+	})
+
+	t.Run("reads config and initial password from SYNAPS3_CONFIG", func(t *testing.T) {
+		var gotUser, gotPassword string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/healthz" {
+				gotUser, gotPassword, _ = r.BasicAuth()
+			}
+			switch r.URL.Path {
+			case "/healthz":
+				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"status": "ok"})
+			case "/api/v1/system/info":
+				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"version": "test-version", "commit": "abc", "build_date": "today", "uptime_seconds": 12})
+			case "/api/v1/workers":
+				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"workers": map[string]bool{"upload": true}})
+			case "/api/v1/cache/stats":
+				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"used_bytes": 1, "max_bytes": 2})
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		defer ts.Close()
+
+		dir := t.TempDir()
+		cfgPath := filepath.Join(dir, "config.toml")
+		cfg := fmt.Sprintf("[admin]\naddr = %q\n\n[admin.auth]\nusername = \"root\"\n", ts.URL)
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+			t.Fatalf("WriteFile config: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "admin-initial-password"), []byte("file-password\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile password: %v", err)
+		}
+		t.Setenv(configEnvVar, cfgPath)
+
+		if _, err := runAdminCommand(t, []string{"synaps3", "admin", "--json", "status"}); err != nil {
 			t.Fatalf("admin status: %v", err)
 		}
 		if gotUser != "root" || gotPassword != "file-password" {
@@ -427,6 +469,8 @@ func TestAdminStatusHandlesReadySetupAndUnhealthy(t *testing.T) {
 }
 
 func TestAdminS3UserCommands(t *testing.T) {
+	t.Setenv(configEnvVar, "")
+
 	t.Run("create admin requires yes before sending request", func(t *testing.T) {
 		var called bool
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +556,8 @@ func TestAdminS3UserCommands(t *testing.T) {
 }
 
 func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
+	t.Setenv(configEnvVar, "")
+
 	t.Run("summary output groups editable settings", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet || r.URL.Path != "/api/v1/settings" {
@@ -711,6 +757,8 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 }
 
 func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
+	t.Setenv(configEnvVar, "")
+
 	t.Run("task list query and retry path", func(t *testing.T) {
 		var sawList, sawRetry bool
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

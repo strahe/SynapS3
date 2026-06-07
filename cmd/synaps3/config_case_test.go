@@ -138,6 +138,7 @@ func TestResolveRPCAndNetwork_UsesDefaultRPCWhenEnvOverridesConfigNetwork(t *tes
 func TestResolveRPCAndNetwork_UsesFallbackAppDataConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv(configEnvVar, "")
 	t.Chdir(t.TempDir())
 
 	cfgDir := filepath.Join(home, ".synaps3")
@@ -179,6 +180,7 @@ func TestResolveRPCAndNetwork_UsesFallbackAppDataConfig(t *testing.T) {
 func TestConfigSourceFromCommand_DefaultIgnoresWorkingDirectoryConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv(configEnvVar, "")
 	cwd := t.TempDir()
 	t.Chdir(cwd)
 
@@ -214,9 +216,80 @@ func TestConfigSourceFromCommand_DefaultIgnoresWorkingDirectoryConfig(t *testing
 	}
 }
 
+func TestConfigSourceFromCommand_UsesSYNAPS3Config(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[filecoin]\nnetwork = \"mainnet\"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile env config: %v", err)
+	}
+	t.Setenv(configEnvVar, cfgPath)
+
+	var got config.Source
+	cmd := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Value: "config.toml"},
+		},
+		Action: func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			got, err = configSourceFromCommand(cmd)
+			return err
+		},
+	}
+
+	if err := cmd.Run(context.Background(), []string{"synaps3"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got.Path != cfgPath {
+		t.Fatalf("source path = %q, want %q", got.Path, cfgPath)
+	}
+	if !got.Explicit {
+		t.Fatal("Explicit = false, want true")
+	}
+	if !got.Exists {
+		t.Fatal("Exists = false, want true")
+	}
+	if got.GeneratedDefault {
+		t.Fatal("GeneratedDefault = true, want false")
+	}
+}
+
+func TestConfigSourceFromCommand_BlankSYNAPS3ConfigUsesDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(configEnvVar, " \t ")
+	t.Chdir(t.TempDir())
+
+	var got config.Source
+	cmd := &cli.Command{
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Value: "config.toml"},
+		},
+		Action: func(_ context.Context, cmd *cli.Command) error {
+			var err error
+			got, err = configSourceFromCommand(cmd)
+			return err
+		},
+	}
+
+	if err := cmd.Run(context.Background(), []string{"synaps3"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := filepath.Join(home, ".synaps3", "config.toml")
+	if got.Path != want {
+		t.Fatalf("source path = %q, want %q", got.Path, want)
+	}
+	if got.Explicit {
+		t.Fatal("Explicit = true, want false")
+	}
+	if !got.GeneratedDefault {
+		t.Fatal("GeneratedDefault = false, want true")
+	}
+}
+
 func TestConfigSourceFromCommand_ExplicitRelativeConfigBecomesAbsolute(t *testing.T) {
 	cwd := t.TempDir()
 	t.Chdir(cwd)
+	t.Setenv(configEnvVar, filepath.Join(t.TempDir(), "env-config.toml"))
 
 	var got config.Source
 	cmd := &cli.Command{

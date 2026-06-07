@@ -487,15 +487,15 @@ func newAdminClientFromCommand(ctx context.Context, cmd *cli.Command) (*adminAPI
 }
 
 func adminOptionsFromCommand(cmd *cli.Command) adminCommandOptions {
-	root := cmd.Root()
+	configPath, configSet := configPathFromCommand(cmd)
 	timeout := cmd.Duration("timeout")
 	if timeout <= 0 {
 		timeout = defaultAdminTimeout
 	}
 	return adminCommandOptions{
 		AdminURL:      cmd.String("admin-url"),
-		ConfigPath:    root.String("config"),
-		ConfigSet:     root.IsSet("config"),
+		ConfigPath:    configPath,
+		ConfigSet:     configSet,
 		Timeout:       timeout,
 		JSON:          cmd.Bool("json"),
 		AdminUsername: "admin",

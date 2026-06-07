@@ -28,8 +28,8 @@ func adminAuthCommand() *cli.Command {
 						return fmt.Errorf("unexpected argument %q, reset-password takes no positional arguments", cmd.Args().First())
 					}
 					root := cmd.Root()
-					if !root.IsSet("config") {
-						return errors.New("admin-auth reset-password requires --config")
+					if !configSourceExplicitlyProvided(cmd) {
+						return errors.New("admin-auth reset-password requires --config or SYNAPS3_CONFIG")
 					}
 					src, err := configSourceFromCommand(cmd)
 					if err != nil {

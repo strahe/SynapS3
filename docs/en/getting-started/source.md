@@ -7,7 +7,7 @@ description: Build SynapS3 locally, initialize runtime data, and verify the embe
 
 Build from source when you are developing SynapS3, need a custom binary, or want to inspect the embedded dashboard build.
 
-For ordinary long-running operation, prefer [Docker Deployment](./docker.md).
+For deployment, prefer [Docker Deployment](./docker.md).
 
 ## Prerequisites
 

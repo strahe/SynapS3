@@ -42,7 +42,7 @@ When SynapS3 is behind a reverse proxy, forwarded client, scheme, and host heade
 
 ### Admin Credentials
 
-Admin credentials are created by `synaps3 init`. Interactive init prints the password once. Non-interactive and Docker init write it to `admin-initial-password` in the runtime data directory with file mode `0600`. Local `synaps3 admin` commands use `SYNAPS3_ADMIN_PASSWORD` first, then `admin-initial-password` next to the config file, then the prompt.
+Admin credentials are created by `synaps3 init`. Interactive init prints the password once. Non-interactive and Docker init write it to `admin-initial-password` in the runtime data directory with file mode `0600`. Local `synaps3 admin` commands locate config through `--config`, `SYNAPS3_CONFIG`, then the default path; they use `SYNAPS3_ADMIN_PASSWORD` first, then `admin-initial-password` next to the config file, then the prompt.
 
 Resetting the password also rotates `admin.auth.session_secret`, invalidating existing browser sessions. Reset it offline with:
 

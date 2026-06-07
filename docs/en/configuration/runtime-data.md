@@ -5,7 +5,7 @@ description: Understand where SynapS3 stores configuration, metadata, cache data
 
 # Runtime Data
 
-SynapS3 stores configuration, metadata, and cached object data on local disk. For long-running nodes, place this data on durable storage and back it up before upgrades.
+SynapS3 stores configuration, metadata, and cached object data on local disk. For deployment, place this data on durable storage and back it up before upgrades.
 
 ## Default Local Layout
 

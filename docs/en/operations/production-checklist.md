@@ -1,11 +1,11 @@
 ---
 title: Production Checklist
-description: Prepare a long-running single-host SynapS3 deployment.
+description: Prepare a SynapS3 deployment.
 ---
 
 # Production Checklist
 
-Before running SynapS3 as a long-lived single-host service, verify local disk, database health, background workers, and recovery paths.
+Before serving traffic, verify local disk, database health, background workers, and recovery paths.
 
 ## Network Exposure
 

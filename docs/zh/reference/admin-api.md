@@ -42,7 +42,7 @@ SynapS3 位于反向代理之后时，只有代理 IP 或 CIDR 配置在 `admin.
 
 ### Admin 凭据
 
-Admin 凭据由 `synaps3 init` 创建。交互式 init 只打印一次密码。非交互和 Docker init 会把密码写到运行数据目录下的 `admin-initial-password`，文件权限为 `0600`。本地 `synaps3 admin` 命令会优先使用 `SYNAPS3_ADMIN_PASSWORD`，其次读取配置文件同目录的 `admin-initial-password`，最后提示输入。
+Admin 凭据由 `synaps3 init` 创建。交互式 init 只打印一次密码。非交互和 Docker init 会把密码写到运行数据目录下的 `admin-initial-password`，文件权限为 `0600`。本地 `synaps3 admin` 命令按 `--config`、`SYNAPS3_CONFIG`、默认路径定位配置，再优先使用 `SYNAPS3_ADMIN_PASSWORD`，其次读取配置文件同目录的 `admin-initial-password`，最后提示输入。
 
 重置密码会同时轮换 `admin.auth.session_secret`，使已有浏览器会话失效。离线重置密码：
 

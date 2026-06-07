@@ -7,7 +7,7 @@ description: Start a temporary SynapS3 node, fund it on Calibration, and upload 
 
 For a quick evaluation, start a temporary Docker container, create a Calibration wallet, and upload one S3 object.
 
-For a long-lived node, use [Docker Deployment](./docker.md).
+For deployment, use [Docker Deployment](./docker.md).
 
 ## Prerequisites
 
@@ -46,6 +46,7 @@ docker volume create synaps3-test-data
 docker run -d --name synaps3-test \
   --network host \
   --env-file .env \
+  -e SYNAPS3_CONFIG=/var/lib/synaps3/config.toml \
   -v synaps3-test-data:/var/lib/synaps3 \
   ghcr.io/strahe/synaps3:edge
 ```
@@ -56,17 +57,17 @@ Check health and deposit USDFC:
 
 ```bash
 curl http://127.0.0.1:9090/healthz
-docker exec synaps3-test synaps3 --config /var/lib/synaps3/config.toml wallet deposit 2 # 2 USDFC
+docker exec synaps3-test synaps3 wallet deposit 2 # 2 USDFC
 ```
 
 Expected result: health returns `{"status":"ok"}` and the deposit command accepts the wallet operation. If health returns `setup` or `unhealthy`, use [Troubleshooting](../operations/troubleshooting.md).
 
 ## Open the Dashboard
 
-Read the generated Admin password:
+Browser login needs the generated Admin password:
 
 ```bash
-ADMIN_PASSWORD=$(docker exec synaps3-test cat /var/lib/synaps3/admin-initial-password)
+docker exec synaps3-test cat /var/lib/synaps3/admin-initial-password
 ```
 
 Open:
@@ -88,8 +89,7 @@ The dashboard asks for the Admin username `admin` and the generated password. Af
 Create an S3 user:
 
 ```bash
-docker exec -e SYNAPS3_ADMIN_PASSWORD="$ADMIN_PASSWORD" synaps3-test \
-  synaps3 --config /var/lib/synaps3/config.toml admin s3-user create
+docker exec synaps3-test synaps3 admin s3-user create
 ```
 
 Use the access key and secret with a path-style S3 client. This example uses MinIO Client:
@@ -113,4 +113,4 @@ docker rm -f synaps3-test
 docker volume rm synaps3-test-data
 ```
 
-Do not run these cleanup commands against a long-lived deployment.
+Do not run these cleanup commands against a real deployment.

@@ -8,6 +8,7 @@ services:
         required: false
     environment:
       SYNAPS3_DATA_DIR: /var/lib/synaps3
+      SYNAPS3_CONFIG: ${SYNAPS3_CONFIG:-/var/lib/synaps3/config.toml}
       SYNAPS3_ADMIN_ADDR: 127.0.0.1:9090
       SYNAPS3_LOGGING_FORMAT: json
     volumes:
