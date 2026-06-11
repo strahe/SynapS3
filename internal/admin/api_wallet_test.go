@@ -177,13 +177,7 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 	}
 }
 
-func TestHandleAPIWalletFund_RejectsUnsafeOrInvalidRequests(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
-		info: &synapse.WalletInfo{Address: "0xabc"},
-	}, config.DefaultFilecoinCopies, testLogger())
-
+func TestHandleAPIWalletOperation_RejectsUnsafeOrInvalidRequests(t *testing.T) {
 	tests := []struct {
 		name        string
 		body        string
@@ -196,63 +190,110 @@ func TestHandleAPIWalletFund_RejectsUnsafeOrInvalidRequests(t *testing.T) {
 		{name: "negative amount", body: `{"client_request_id":"a","amount":"-1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
 		{name: "decimal amount", body: `{"client_request_id":"a","amount":"1.1"}`, contentType: "application/json", wantStatus: http.StatusBadRequest},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/fund", strings.NewReader(tt.body))
-			if tt.contentType != "" {
-				req.Header.Set("Content-Type", tt.contentType)
-			}
-			rr := httptest.NewRecorder()
-			srv.handleAPIWalletFund(rr, req)
-			if rr.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
+
+	for _, op := range walletOperationAPIHandlers() {
+		t.Run(op.name, func(t *testing.T) {
+			srv, _ := newWalletOperationTestServer(t)
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					req := httptest.NewRequest(http.MethodPost, op.path, strings.NewReader(tt.body))
+					if tt.contentType != "" {
+						req.Header.Set("Content-Type", tt.contentType)
+					}
+					rr := httptest.NewRecorder()
+					op.handler(srv, rr, req)
+					if rr.Code != tt.wantStatus {
+						t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
+					}
+				})
 			}
 		})
 	}
 }
 
-func TestHandleAPIWalletFund_IsIdempotentByClientRequestID(t *testing.T) {
+func TestHandleAPIWalletOperation_IsIdempotentByClientRequestID(t *testing.T) {
+	for _, op := range walletOperationAPIHandlers() {
+		t.Run(op.name, func(t *testing.T) {
+			srv, repos := newWalletOperationTestServer(t)
+			create := func(t *testing.T, amount string) (walletOperationDTO, int) {
+				t.Helper()
+				body := []byte(`{"client_request_id":"same-request","amount":"` + amount + `"}`)
+				req := httptest.NewRequest(http.MethodPost, op.path, bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				rr := httptest.NewRecorder()
+				op.handler(srv, rr, req)
+				var resp walletOperationResponse
+				if rr.Code == http.StatusAccepted {
+					if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+						t.Fatalf("Unmarshal operation response: %v", err)
+					}
+				}
+				return resp.Operation, rr.Code
+			}
+
+			first, status := create(t, "100")
+			if status != http.StatusAccepted {
+				t.Fatalf("first status = %d, want 202", status)
+			}
+			second, status := create(t, "100")
+			if status != http.StatusAccepted {
+				t.Fatalf("second status = %d, want 202", status)
+			}
+			if first.ID == 0 || second.ID != first.ID {
+				t.Fatalf("idempotent ID = %d then %d, want same non-zero ID", first.ID, second.ID)
+			}
+			if first.Type != string(op.operationType) || second.Type != string(op.operationType) {
+				t.Fatalf("operation types = %q then %q, want %q", first.Type, second.Type, op.operationType)
+			}
+			if _, status := create(t, "101"); status != http.StatusConflict {
+				t.Fatalf("conflict status = %d, want 409", status)
+			}
+
+			ops, err := repos.WalletOperations.ListRecent(context.Background(), 20)
+			if err != nil {
+				t.Fatalf("ListRecent: %v", err)
+			}
+			if len(ops) != 1 {
+				t.Fatalf("operation count = %d, want 1", len(ops))
+			}
+			if ops[0].Type != op.operationType {
+				t.Fatalf("operation type = %q, want %q", ops[0].Type, op.operationType)
+			}
+		})
+	}
+}
+
+type walletOperationAPIHandler struct {
+	name          string
+	path          string
+	operationType model.WalletOperationType
+	handler       func(*Server, http.ResponseWriter, *http.Request)
+}
+
+func walletOperationAPIHandlers() []walletOperationAPIHandler {
+	return []walletOperationAPIHandler{
+		{
+			name:          "fund",
+			path:          "/api/v1/wallet/fund",
+			operationType: model.WalletOperationTypeFund,
+			handler:       (*Server).handleAPIWalletFund,
+		},
+		{
+			name:          "withdraw",
+			path:          "/api/v1/wallet/withdraw",
+			operationType: model.WalletOperationTypeWithdraw,
+			handler:       (*Server).handleAPIWalletWithdraw,
+		},
+	}
+}
+
+func newWalletOperationTestServer(t *testing.T) (*Server, *repository.Repositories) {
+	t.Helper()
+
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	srv := New("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
 		info: &synapse.WalletInfo{Address: "0xabc"},
 	}, config.DefaultFilecoinCopies, testLogger())
-
-	create := func(amount string) (walletOperationDTO, int) {
-		body := []byte(`{"client_request_id":"same-request","amount":"` + amount + `"}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/fund", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rr := httptest.NewRecorder()
-		srv.handleAPIWalletFund(rr, req)
-		var resp walletOperationResponse
-		if rr.Code == http.StatusAccepted {
-			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-				t.Fatalf("Unmarshal operation response: %v", err)
-			}
-		}
-		return resp.Operation, rr.Code
-	}
-
-	first, status := create("100")
-	if status != http.StatusAccepted {
-		t.Fatalf("first status = %d, want 202", status)
-	}
-	second, status := create("100")
-	if status != http.StatusAccepted {
-		t.Fatalf("second status = %d, want 202", status)
-	}
-	if first.ID == 0 || second.ID != first.ID {
-		t.Fatalf("idempotent ID = %d then %d, want same non-zero ID", first.ID, second.ID)
-	}
-	if _, status := create("101"); status != http.StatusConflict {
-		t.Fatalf("conflict status = %d, want 409", status)
-	}
-
-	ops, err := repos.WalletOperations.ListRecent(context.Background(), 20)
-	if err != nil {
-		t.Fatalf("ListRecent: %v", err)
-	}
-	if len(ops) != 1 {
-		t.Fatalf("operation count = %d, want 1", len(ops))
-	}
+	return srv, repos
 }

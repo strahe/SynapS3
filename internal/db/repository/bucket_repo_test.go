@@ -114,6 +114,80 @@ func TestBucketRepo_SetDefaultCopiesMissingBucket(t *testing.T) {
 	}
 }
 
+func TestBucketRepo_SetACL(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "acl-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	acl := []byte(`{"owner":"user1"}`)
+	if err := repos.Buckets.SetACL(ctx, bucket.Name, acl); err != nil {
+		t.Fatalf("SetACL: %v", err)
+	}
+
+	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetByName after set: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetByName after set returned nil")
+	}
+	if string(got.ACL) != string(acl) {
+		t.Fatalf("ACL after set = %s, want %s", got.ACL, acl)
+	}
+
+	if err := repos.Buckets.SetACL(ctx, "missing-bucket", acl); err == nil {
+		t.Fatal("SetACL on missing bucket succeeded, want error")
+	}
+}
+
+func TestBucketRepo_SetOwnerAndACL(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	owner := strptr("user2")
+	if err := repos.S3Accounts.Create(ctx, &model.S3Account{
+		AccessKey: *owner,
+		SecretKey: "secret-" + *owner,
+		Role:      auth.RoleUserPlus,
+	}); err != nil {
+		t.Fatalf("S3Accounts.Create: %v", err)
+	}
+
+	bucket := &model.Bucket{Name: "owner-acl-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	acl := []byte(`{"owner":"user2"}`)
+	if err := repos.Buckets.SetOwnerAndACL(ctx, bucket.Name, owner, acl); err != nil {
+		t.Fatalf("SetOwnerAndACL: %v", err)
+	}
+
+	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetByName after set: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetByName after set returned nil")
+	}
+	if string(got.ACL) != string(acl) {
+		t.Fatalf("ACL after set = %s, want %s", got.ACL, acl)
+	}
+	if got.OwnerAccessKey == nil || *got.OwnerAccessKey != *owner {
+		t.Fatalf("Owner after set = %v, want %v", got.OwnerAccessKey, owner)
+	}
+
+	if err := repos.Buckets.SetOwnerAndACL(ctx, "missing-bucket", owner, acl); err == nil {
+		t.Fatal("SetOwnerAndACL on missing bucket succeeded, want error")
+	}
+}
+
 func TestBucketRepo_ListActive(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

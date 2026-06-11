@@ -324,6 +324,112 @@ func TestStorageCleanupWorkerSchedulesDeletionByPieceID(t *testing.T) {
 	}
 }
 
+func TestStorageCleanupWorkerWaitsWhenObjectUsesUpload(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	pieceCID := testCID(t).String()
+
+	bucket := &model.Bucket{Name: "storage-cleanup-object-ref-bucket", Status: model.BucketStatusActive}
+	if err := env.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	targetUpload, err := env.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "deleted-version",
+		ContentSize:     10,
+		Checksum:        "same-checksum",
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt(target): %v", err)
+	}
+	seedStorageCleanupWorkerCommittedCopy(t, env, bucket.ID, targetUpload.ID, pieceCID, "101", "1001", "2001")
+	if finalized, _, err := env.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: targetUpload.ID}); err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet: %v", err)
+	} else if !finalized {
+		t.Fatal("target upload finalized = false, want true")
+	}
+
+	if _, err := env.repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+		BucketID:        bucket.ID,
+		Key:             "active-object",
+		VersionID:       "active-object-version",
+		State:           model.ObjectStateStored,
+		StorageUploadID: &targetUpload.ID,
+		Size:            10,
+		ContentType:     "text/plain",
+		ETag:            "etag",
+		Checksum:        "same-checksum",
+		CacheKey:        "cache-key",
+	}); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+
+	task := &model.Task{
+		Type:           model.TaskTypeStorageCleanup,
+		RefType:        "storage_upload",
+		RefID:          targetUpload.ID,
+		IdempotencyKey: "storage_cleanup:object-ref",
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     3,
+		ScheduledAt:    time.Now(),
+		Payload: map[string]interface{}{
+			"storage_upload_id": targetUpload.ID,
+			"piece_cid":         pieceCID,
+		},
+	}
+	if err := env.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create cleanup task: %v", err)
+	}
+	copy := &model.StorageCleanupCopy{
+		TaskID:          task.ID,
+		UploadID:        targetUpload.ID,
+		CopyIndex:       0,
+		ProviderID:      onChainIDPtr(t, "101"),
+		DataSetID:       onChainIDPtr(t, "1001"),
+		ClientDataSetID: onChainIDPtr(t, "5001"),
+		PieceID:         onChainIDPtr(t, "2001"),
+		PieceCID:        pieceCID,
+		Status:          model.StorageCleanupCopyStatusPending,
+	}
+	if _, err := env.db.NewInsert().Model(copy).Exec(ctx); err != nil {
+		t.Fatalf("insert cleanup copy: %v", err)
+	}
+
+	var cleanupContextCalls atomic.Int32
+	env.storage.CreateCleanupContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.CleanupContext, error) {
+		cleanupContextCalls.Add(1)
+		return fakeCleanupContext{}, nil
+	}
+
+	cleanup := worker.NewStorageCleanupWorker(env.repos, env.storage, 1, 20*time.Millisecond, slog.Default())
+	runWorkerUntilTaskStatus(t, env, cleanup, task.ID, model.TaskStatusWaiting, 5*time.Second)
+
+	gotTask, err := env.repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if gotTask.Status != model.TaskStatusWaiting {
+		t.Fatalf("task status = %s, want waiting", gotTask.Status)
+	}
+	if gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonDependency {
+		t.Fatalf("task wait reason = %v, want dependency", gotTask.WaitReason)
+	}
+	if gotTask.StatusMessage == nil || *gotTask.StatusMessage != "Waiting for object references to clear" {
+		t.Fatalf("task status message = %v, want object reference wait message", gotTask.StatusMessage)
+	}
+	gotCopy := new(model.StorageCleanupCopy)
+	if err := env.db.NewSelect().Model(gotCopy).Where("id = ?", copy.ID).Scan(ctx); err != nil {
+		t.Fatalf("select cleanup copy: %v", err)
+	}
+	if gotCopy.Status != model.StorageCleanupCopyStatusPending {
+		t.Fatalf("copy status = %s, want pending while waiting for references", gotCopy.Status)
+	}
+	if cleanupContextCalls.Load() != 0 {
+		t.Fatalf("cleanup context calls = %d, want 0 while object references upload", cleanupContextCalls.Load())
+	}
+}
+
 func TestStorageCleanupWorkerWaitsWhenActiveUploadUsesSamePiece(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	ctx := context.Background()
