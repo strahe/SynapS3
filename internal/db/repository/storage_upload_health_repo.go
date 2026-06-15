@@ -133,6 +133,7 @@ func (r *BunStorageUploadRepo) listBucketStorageHealthAffectedVersionRows(ctx co
 	dataSetFilter, dataSetArgs := bucketStorageHealthAffectedVersionDataSetFilter(input)
 	args = append(args, dataSetArgs...)
 	args = append(args, limit)
+	keyOrder := keyOrderExpr(r.db, "object_version.key")
 	query := fmt.Sprintf(`WITH %s
 		SELECT
 			object_version.version_id,
@@ -165,8 +166,8 @@ func (r *BunStorageUploadRepo) listBucketStorageHealthAffectedVersionRows(ctx co
 				  AND storage_copy.status = %s
 %s
 		  )
-		ORDER BY object_version.key ASC, object_version.created_at DESC, object_version.version_id DESC
-		LIMIT ?`, bucketStorageHealthDataSetCTE(r.db), filters, storageHealthCommittedCopyStatusSQL(), dataSetFilter)
+		ORDER BY %s ASC, object_version.created_at DESC, object_version.version_id DESC
+		LIMIT ?`, bucketStorageHealthDataSetCTE(r.db), filters, storageHealthCommittedCopyStatusSQL(), dataSetFilter, keyOrder)
 	var rows []affectedVersionRow
 	if err := r.db.NewRaw(query, args...).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("listing bucket storage health affected versions: %w", err)
@@ -270,9 +271,13 @@ func bucketStorageHealthAffectedVersionObjectFilters(db bun.IDB, input BucketSto
 	if input.KeyMarker != "" {
 		filters.WriteString(`
 		  AND (
-				object_version.key > ?
+				`)
+		filters.WriteString(keyComparisonSQL(db, "object_version.key", ">"))
+		filters.WriteString(`
 				OR (
-					object_version.key = ?
+					`)
+		filters.WriteString(keyComparisonSQL(db, "object_version.key", "="))
+		filters.WriteString(`
 					AND (
 						object_version.created_at < ?
 						OR (

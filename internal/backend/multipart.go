@@ -22,6 +22,9 @@ import (
 func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3response.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
 	bucketName := derefStr(input.Bucket)
 	keyName := derefStr(input.Key)
+	if err := validateObjectKey(keyName); err != nil {
+		return s3response.InitiateMultipartUploadResult{}, err
+	}
 
 	bucket, err := b.requireActiveBucket(ctx, bucketName)
 	if err != nil {
@@ -205,6 +208,9 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 	}
 	if upload.Key != keyName {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	if err := validateObjectKey(upload.Key); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 
 	// CAS: initiated → completing

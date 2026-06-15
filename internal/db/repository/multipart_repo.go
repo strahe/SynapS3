@@ -47,20 +47,21 @@ func (r *BunMultipartRepo) ListByBucket(
 	maxUploads int,
 ) ([]model.MultipartUpload, error) {
 	var uploads []model.MultipartUpload
+	keyExpr := keyOrderExpr(r.db, "key")
 	q := r.db.NewSelect().
 		Model(&uploads).
 		Where("bucket_id = ?", bucketID).
 		Where("status = ?", model.MultipartStatusInitiated).
-		OrderExpr("key ASC, upload_id ASC")
+		OrderExpr(keyExpr + " ASC, upload_id ASC")
 
 	if prefix != "" {
 		q = applyCaseSensitivePrefixFilter(r.db, q, "key", prefix)
 	}
 	if keyMarker != "" {
 		if uploadIDMarker != "" {
-			q = q.Where("(key > ? OR (key = ? AND upload_id > ?))", keyMarker, keyMarker, uploadIDMarker)
+			q = q.Where("("+keyComparisonSQL(r.db, "key", ">")+" OR ("+keyComparisonSQL(r.db, "key", "=")+" AND upload_id > ?))", keyMarker, keyMarker, uploadIDMarker)
 		} else {
-			q = q.Where("key > ?", keyMarker)
+			q = q.Where(keyComparisonSQL(r.db, "key", ">"), keyMarker)
 		}
 	}
 	if maxUploads > 0 {

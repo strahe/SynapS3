@@ -410,6 +410,64 @@ func TestObjectRepo_ListByBucketReadsCurrentVersionOnly(t *testing.T) {
 	if len(fromKey) != 2 || fromKey[0].Key != "b.txt" {
 		t.Fatalf("fromKey result = %#v, want b.txt first", fromKey)
 	}
+
+	for _, tc := range []struct {
+		key       string
+		versionID string
+	}{
+		{"wild%/literal.txt", "01J00000000000000000002001"},
+		{"wildX/literal.txt", "01J00000000000000000002002"},
+		{"under_/literal.txt", "01J00000000000000000002003"},
+		{"underX/literal.txt", "01J00000000000000000002004"},
+	} {
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, tc.key, tc.versionID, 10)); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent(%s): %v", tc.key, err)
+		}
+	}
+
+	tests := []struct {
+		name   string
+		prefix string
+		want   []string
+	}{
+		{name: "percent", prefix: "wild%/", want: []string{"wild%/literal.txt"}},
+		{name: "underscore", prefix: "under_/", want: []string{"under_/literal.txt"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, tt.prefix, "", 10)
+			if err != nil {
+				t.Fatalf("ListCurrentVersionsByBucket(%q): %v", tt.prefix, err)
+			}
+			requireObjectVersionKeys(t, rows, tt.want)
+		})
+	}
+
+	page, err := repos.Objects.ListCurrentVersionsByBucket(ctx, bucket.ID, "under", "underX/literal.txt", 10)
+	if err != nil {
+		t.Fatalf("ListCurrentVersionsByBucket marker: %v", err)
+	}
+	requireObjectVersionKeys(t, page, []string{"under_/literal.txt"})
+}
+
+func requireObjectVersionKeys(t *testing.T, rows []model.ObjectVersion, want []string) {
+	t.Helper()
+	if len(rows) != len(want) {
+		t.Fatalf("keys = %#v, want %#v", objectVersionKeys(rows), want)
+	}
+	for i := range want {
+		if rows[i].Key != want[i] {
+			t.Fatalf("keys = %#v, want %#v", objectVersionKeys(rows), want)
+		}
+	}
+}
+
+func objectVersionKeys(rows []model.ObjectVersion) []string {
+	keys := make([]string, len(rows))
+	for i := range rows {
+		keys[i] = rows[i].Key
+	}
+	return keys
 }
 
 func TestObjectRepo_GetVersionByBucketKeyAndIDScopesVersion(t *testing.T) {

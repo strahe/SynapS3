@@ -3275,6 +3275,35 @@ func TestAPIBucketObjects_DeleteListAndRestore(t *testing.T) {
 	}
 }
 
+func TestAPIBucketObjectDeleteRejectsInvalidObjectKey(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	bucket := &model.Bucket{Name: "delete-key-validation-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(context.Background(), bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	key := strings.Repeat("你", 342)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/delete-key-validation-bucket/objects?key="+url.QueryEscape(key), nil)
+	req.SetPathValue("name", bucket.Name)
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIDeleteBucketObject(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "1024 UTF-8 bytes") {
+		t.Fatalf("body = %s, want object key byte-limit error", rr.Body.String())
+	}
+	version, err := repos.Objects.GetCurrentVersionByBucketAndKey(context.Background(), bucket.ID, key)
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if version != nil {
+		t.Fatalf("current version = %#v, want no persisted delete marker", version)
+	}
+}
+
 func TestAPIBucketDeletedObjectPermanentDeleteRemovesDeletedObject(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
@@ -4635,6 +4664,29 @@ func TestAPIBucketObjectUpload_RejectsEmptyKey(t *testing.T) {
 	}
 	if uploader.calls != 0 {
 		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
+	}
+}
+
+func TestAPIBucketObjectUpload_RejectsInvalidObjectKey(t *testing.T) {
+	srv, _ := newBucketAPITestServer(t)
+	uploader := &recordingObjectUploader{}
+	srv.WithObjectUploader(uploader)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/upload-bucket/objects/upload?key="+url.QueryEscape("folder/\x00/file.txt"), strings.NewReader(validAdminUploadBody("body")))
+	req.SetPathValue("name", "upload-bucket")
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUploadObject(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+	if uploader.calls != 0 {
+		t.Fatalf("uploader calls = %d, want 0", uploader.calls)
+	}
+	if !strings.Contains(rr.Body.String(), "NUL") {
+		t.Fatalf("body = %s, want NUL error", rr.Body.String())
 	}
 }
 

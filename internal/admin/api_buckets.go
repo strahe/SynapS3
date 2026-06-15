@@ -20,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
+	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -1065,6 +1066,10 @@ func (s *Server) handleAPIDeleteBucketObject(w http.ResponseWriter, r *http.Requ
 	key := r.URL.Query().Get("key")
 	if key == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "object key is required"})
+		return
+	}
+	if err := objectkey.Validate(key); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 

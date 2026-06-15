@@ -566,22 +566,23 @@ func (r *BunObjectRepo) ListCurrentVersionsByBucketAtOrAfter(ctx context.Context
 
 func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyBoundary string, includeBoundary bool, maxKeys int) ([]model.ObjectVersion, error) {
 	var versions []model.ObjectVersion
+	keyExpr := keyOrderExpr(r.db, "object_version.key")
 	q := r.db.NewSelect().
 		Model(&versions).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version").
 		Where("object_version.bucket_id = ? AND object_version.is_current = ?", bucketID, true).
 		Where("object_version.is_delete_marker = ?", false).
-		OrderExpr("object_version.key ASC")
+		OrderExpr(keyExpr + " ASC")
 
 	if prefix != "" {
 		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
 	}
 	if keyBoundary != "" {
 		if includeBoundary {
-			q = q.Where("object_version.key >= ?", keyBoundary)
+			q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">="), keyBoundary)
 		} else {
-			q = q.Where("object_version.key > ?", keyBoundary)
+			q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), keyBoundary)
 		}
 	}
 	if maxKeys > 0 {
@@ -595,11 +596,12 @@ func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketI
 
 func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error) {
 	var rows []ObjectVersionListItem
+	keyExpr := keyOrderExpr(r.db, "object_version.key")
 	q := r.db.NewSelect().
 		Model(&rows).
 		ModelTableExpr("object_versions AS object_version").
 		Where("object_version.bucket_id = ?", bucketID).
-		OrderExpr("object_version.key ASC").
+		OrderExpr(keyExpr + " ASC").
 		OrderExpr("object_version.created_at DESC").
 		OrderExpr("object_version.version_id DESC")
 	q = withObjectVersionStorageColumns(q, "object_version")
@@ -609,16 +611,16 @@ func (r *BunObjectRepo) ListVersionsByBucket(ctx context.Context, bucketID int64
 	}
 	if keyMarker != "" {
 		if versionIDMarker == "" {
-			q = q.Where("object_version.key > ?", keyMarker)
+			q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), keyMarker)
 		} else {
 			marker, err := r.GetVersionByBucketKeyAndID(ctx, bucketID, keyMarker, versionIDMarker)
 			if err != nil {
 				return nil, err
 			}
 			if marker == nil {
-				q = q.Where("object_version.key > ?", keyMarker)
+				q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), keyMarker)
 			} else {
-				q = q.Where("(object_version.key > ?) OR (object_version.key = ? AND (object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?)))",
+				q = q.Where("("+keyComparisonSQL(r.db, "object_version.key", ">")+") OR ("+keyComparisonSQL(r.db, "object_version.key", "=")+" AND (object_version.created_at < ? OR (object_version.created_at = ? AND object_version.version_id < ?)))",
 					keyMarker, keyMarker, marker.CreatedAt, marker.CreatedAt, marker.VersionID)
 			}
 		}
@@ -665,6 +667,7 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 
 func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error) {
 	var markers []model.ObjectVersion
+	keyExpr := keyOrderExpr(r.db, "object_version.key")
 	q := r.db.NewSelect().
 		Model(&markers).
 		ModelTableExpr("object_versions AS object_version")
@@ -673,13 +676,13 @@ func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucket
 		Where("object_version.is_current = ?", true).
 		Where("object_version.is_delete_marker = ?", true).
 		Where("EXISTS (SELECT 1 FROM object_versions AS data_version WHERE data_version.object_id = object_version.object_id AND data_version.is_delete_marker = ?)", false).
-		OrderExpr("object_version.key ASC")
+		OrderExpr(keyExpr + " ASC")
 
 	if prefix != "" {
 		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
 	}
 	if afterKey != "" {
-		q = q.Where("object_version.key > ?", afterKey)
+		q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), afterKey)
 	}
 	if maxKeys > 0 {
 		q = q.Limit(maxKeys)

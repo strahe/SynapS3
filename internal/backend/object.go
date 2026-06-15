@@ -18,6 +18,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
+	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/versity/versitygw/s3err"
@@ -27,6 +28,10 @@ import (
 func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
 	bucketName := derefStr(input.Bucket)
 	keyName := derefStr(input.Key)
+	if err := validateObjectKey(keyName); err != nil {
+		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		return s3response.PutObjectOutput{}, err
+	}
 
 	bucket, err := b.requireActiveBucket(ctx, bucketName)
 	if err != nil {
@@ -472,6 +477,9 @@ func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObje
 
 func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model.Bucket, key string, versionID string) (*s3.DeleteObjectOutput, error) {
 	if versionID == "" {
+		if err := validateObjectKey(key); err != nil {
+			return nil, err
+		}
 		marker, err := b.repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, key, model.NewVersionID())
 		if err != nil {
 			return nil, fmt.Errorf("creating delete marker: %w", err)
@@ -589,6 +597,9 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 
 	dstBucketName := *input.Bucket
 	dstKey := *input.Key
+	if err := validateObjectKey(dstKey); err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
 
 	// Validate source and destination buckets
 	srcBucket, err := b.getBucket(ctx, srcBucketName)
@@ -843,6 +854,16 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func validateObjectKey(key string) error {
+	if err := objectkey.Validate(key); err != nil {
+		return s3err.InvalidArgumentError{
+			Description:  err.Error(),
+			ArgumentName: "Key",
+		}
+	}
+	return nil
 }
 
 type objectMetadataResult struct {

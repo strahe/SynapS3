@@ -561,6 +561,106 @@ func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
 	}
 }
 
+func TestObjectKeyValidationRejectsCreatingNewKeys(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	bucket := seedActiveBucket(t, tb, "key-validation-bucket")
+	tooLongKey := strings.Repeat("你", 342)
+
+	_, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: aws.String("key-validation-bucket"),
+		Key:    aws.String(tooLongKey),
+		Body:   strings.NewReader(validTestObjectBody("body")),
+	})
+	requireObjectKeyInvalidArgument(t, err)
+
+	_, err = tb.backend.CopyObject(ctx, s3response.CopyObjectInput{
+		Bucket:     aws.String("key-validation-bucket"),
+		Key:        aws.String(tooLongKey),
+		CopySource: aws.String("/key-validation-bucket/source.txt"),
+	})
+	requireObjectKeyInvalidArgument(t, err)
+
+	_, err = tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String("key-validation-bucket"),
+		Key:    aws.String(tooLongKey),
+	})
+	requireObjectKeyInvalidArgument(t, err)
+
+	_, err = tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("key-validation-bucket"),
+		Key:    aws.String(tooLongKey),
+	})
+	requireObjectKeyInvalidArgument(t, err)
+
+	_, err = tb.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: aws.String("key-validation-bucket"),
+		Key:    aws.String("folder/\x00/file.txt"),
+		Body:   strings.NewReader(validTestObjectBody("body")),
+	})
+	requireObjectKeyInvalidArgument(t, err)
+
+	legacyUpload := &model.MultipartUpload{
+		BucketID: bucket.ID,
+		Key:      tooLongKey,
+		UploadID: "legacy-invalid-key-upload",
+	}
+	if err := tb.repos.Multiparts.Create(ctx, legacyUpload); err != nil {
+		t.Fatalf("seed legacy multipart upload: %v", err)
+	}
+	partNumber := int32(1)
+	_, _, err = tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String("key-validation-bucket"),
+		Key:      aws.String(tooLongKey),
+		UploadId: aws.String(legacyUpload.UploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{PartNumber: &partNumber}},
+		},
+	})
+	requireObjectKeyInvalidArgument(t, err)
+	gotUpload, err := tb.repos.Multiparts.GetByUploadID(ctx, legacyUpload.UploadID)
+	if err != nil {
+		t.Fatalf("get legacy multipart upload: %v", err)
+	}
+	if gotUpload == nil || gotUpload.Status != model.MultipartStatusInitiated {
+		t.Fatalf("legacy multipart status = %v, want initiated", gotUpload)
+	}
+}
+
+func TestObjectKeyValidationAllowsExactVersionDelete(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	bucket := seedActiveBucket(t, tb, "key-validation-delete-bucket")
+	key := strings.Repeat("你", 342)
+	_, versionID := seedBackendObjectVersion(t, tb, bucket, key, 10, "etag-key-validation", testSHA256Hex("key-validation"), "text/plain", model.ObjectStateCached, nil, nil)
+
+	out, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    aws.String("key-validation-delete-bucket"),
+		Key:       aws.String(key),
+		VersionId: aws.String(versionID),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject exact version: %v", err)
+	}
+	if out.VersionId == nil || *out.VersionId != versionID {
+		t.Fatalf("VersionId = %v, want %s", out.VersionId, versionID)
+	}
+}
+
+func requireObjectKeyInvalidArgument(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil, want InvalidArgument")
+	}
+	var invalidArg s3err.InvalidArgumentError
+	if !errors.As(err, &invalidArg) {
+		t.Fatalf("error = %T %v, want InvalidArgumentError", err, err)
+	}
+	if invalidArg.BaseError().Code != "InvalidArgument" || invalidArg.ArgumentName != "Key" {
+		t.Fatalf("invalid argument = %#v, want Key InvalidArgument", invalidArg)
+	}
+}
+
 func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(11))
 	ctx := context.Background()

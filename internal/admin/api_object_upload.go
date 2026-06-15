@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -44,6 +45,10 @@ func (s *Server) handleAPIUploadObject(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	if key == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "object key is required"})
+		return
+	}
+	if err := objectkey.Validate(key); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	if s.objectUploader == nil {

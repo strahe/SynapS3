@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -117,6 +118,49 @@ func TestMultipartRepo_ListByBucket(t *testing.T) {
 	}
 	if len(uploads) != 3 { // u2, u3, u4
 		t.Errorf("expected 3 uploads after marker, got %d", len(uploads))
+	}
+
+	for _, upload := range []*model.MultipartUpload{
+		{BucketID: bucket.ID, Key: "wild%/literal.txt", UploadID: "special-1"},
+		{BucketID: bucket.ID, Key: "wildX/literal.txt", UploadID: "special-2"},
+		{BucketID: bucket.ID, Key: "under_/literal.txt", UploadID: "special-3"},
+		{BucketID: bucket.ID, Key: "underX/literal.txt", UploadID: "special-4"},
+	} {
+		if err := repos.Multiparts.Create(ctx, upload); err != nil {
+			t.Fatalf("Create(%s): %v", upload.UploadID, err)
+		}
+	}
+
+	tests := []struct {
+		name   string
+		prefix string
+		want   []string
+	}{
+		{name: "percent", prefix: "wild%/", want: []string{"wild%/literal.txt"}},
+		{name: "underscore", prefix: "under_/", want: []string{"under_/literal.txt"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uploads, err := repos.Multiparts.ListByBucket(ctx, bucket.ID, tt.prefix, "", "", 10)
+			if err != nil {
+				t.Fatalf("ListByBucket(%q): %v", tt.prefix, err)
+			}
+			got := make([]string, len(uploads))
+			for i := range uploads {
+				got[i] = uploads[i].Key
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("keys = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+
+	page, err := repos.Multiparts.ListByBucket(ctx, bucket.ID, "under", "underX/literal.txt", "special-4", 10)
+	if err != nil {
+		t.Fatalf("ListByBucket marker: %v", err)
+	}
+	if len(page) != 1 || page[0].Key != "under_/literal.txt" {
+		t.Fatalf("marker page = %#v, want under_/literal.txt", page)
 	}
 }
 
