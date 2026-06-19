@@ -412,6 +412,85 @@ func TestCapacityEnforcement(t *testing.T) {
 	}
 }
 
+func TestPutPartCapacityEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	fs, err := NewFilesystem(dir, 10)
+	if err != nil {
+		t.Fatalf("NewFilesystem: %v", err)
+	}
+
+	if _, err := fs.PutPart(ctx, "up-cap", 1, bytes.NewReader([]byte("12345678"))); err != nil {
+		t.Fatalf("PutPart within capacity: %v", err)
+	}
+	if fs.UsedBytes() != 8 {
+		t.Fatalf("UsedBytes after first part = %d, want 8", fs.UsedBytes())
+	}
+
+	if _, err := fs.PutPart(ctx, "up-cap", 2, bytes.NewReader([]byte("12345"))); err != ErrCacheFull {
+		t.Fatalf("PutPart over capacity err = %v, want ErrCacheFull", err)
+	}
+	if fs.UsedBytes() != 8 {
+		t.Fatalf("UsedBytes after failed part = %d, want 8", fs.UsedBytes())
+	}
+	failedPart, err := fs.partPath("up-cap", 2)
+	if err != nil {
+		t.Fatalf("partPath: %v", err)
+	}
+	if _, err := os.Stat(failedPart); !os.IsNotExist(err) {
+		t.Fatalf("failed part exists: %v", err)
+	}
+
+	if _, err := fs.PutPart(ctx, "up-cap", 1, bytes.NewReader([]byte("abc"))); err != nil {
+		t.Fatalf("PutPart overwrite within capacity: %v", err)
+	}
+	if fs.UsedBytes() != 3 {
+		t.Fatalf("UsedBytes after smaller overwrite = %d, want 3", fs.UsedBytes())
+	}
+
+	if _, err := fs.PutPart(ctx, "up-cap", 2, bytes.NewReader([]byte("12345"))); err != nil {
+		t.Fatalf("PutPart after freeing space: %v", err)
+	}
+	if fs.UsedBytes() != 8 {
+		t.Fatalf("UsedBytes after second part = %d, want 8", fs.UsedBytes())
+	}
+}
+
+func TestAssemblePartsCapacityEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	fs, err := NewFilesystem(dir, 15)
+	if err != nil {
+		t.Fatalf("NewFilesystem: %v", err)
+	}
+
+	if _, err := fs.PutPart(ctx, "up-assemble-cap", 1, bytes.NewReader([]byte("12345"))); err != nil {
+		t.Fatalf("PutPart 1: %v", err)
+	}
+	if _, err := fs.PutPart(ctx, "up-assemble-cap", 2, bytes.NewReader([]byte("67890"))); err != nil {
+		t.Fatalf("PutPart 2: %v", err)
+	}
+	if fs.UsedBytes() != 10 {
+		t.Fatalf("UsedBytes after parts = %d, want 10", fs.UsedBytes())
+	}
+
+	if _, _, err := fs.AssembleParts(ctx, "bkt", "key", "up-assemble-cap", []int{1, 2}); err != ErrCacheFull {
+		t.Fatalf("AssembleParts over capacity err = %v, want ErrCacheFull", err)
+	}
+	if fs.UsedBytes() != 10 {
+		t.Fatalf("UsedBytes after failed assemble = %d, want 10", fs.UsedBytes())
+	}
+	target, err := fs.safePath("bkt", "key")
+	if err != nil {
+		t.Fatalf("safePath: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("assembled target exists: %v", err)
+	}
+}
+
 func TestCapacityExactBoundary(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()

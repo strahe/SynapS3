@@ -24,7 +24,7 @@ http://127.0.0.1:9090
 | `/api/v1/auth/logout` | Requires a valid browser session and CSRF header; HTTP Basic auth is not accepted. |
 | `/api/v1/*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 | `/metrics` | Browser session cookie or HTTP Basic auth. |
-| `/admin/exhausted-tasks*` | Browser session cookie or HTTP Basic auth. |
+| `/admin/exhausted-tasks*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 
 ### Browser Sessions
 
@@ -124,6 +124,8 @@ For object upload, the HTTP `Content-Type` is the uploaded object's content type
 | `GET` | `/api/v1/tasks/{id}/diagnostic` | Read task diagnostics. |
 | `POST` | `/api/v1/tasks/{id}/diagnostic/refresh` | Refresh diagnostics. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Retry an exhausted task. |
+| `GET` | `/admin/exhausted-tasks` | List exhausted tasks. Supports `limit` up to `1000`. |
+| `POST` | `/admin/exhausted-tasks/{id}/retry` | Retry an exhausted task (legacy path). |
 
 ## Wallet and Filecoin
 

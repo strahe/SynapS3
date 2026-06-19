@@ -17,43 +17,71 @@ import (
 )
 
 func TestWalletOperationRunner_SubmitsAndConfirmsPendingOperation(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
-		Type:            model.WalletOperationTypeFund,
-		ClientRequestID: "fund-1",
-		Amount:          "100",
-	})
-	if err != nil {
-		t.Fatalf("CreateOrGet: %v", err)
+	tests := []struct {
+		name   string
+		opType model.WalletOperationType
+		amount string
+	}{
+		{name: "fund", opType: model.WalletOperationTypeFund, amount: "100"},
+		{name: "withdraw", opType: model.WalletOperationTypeWithdraw, amount: "50"},
 	}
 
-	txHash := common.HexToHash("0xabc")
-	operator := &fakeWalletOperator{fundHash: txHash.Hex()}
-	receipts := &fakeWalletReceiptChecker{receipts: map[common.Hash]*ethtypes.Receipt{
-		txHash: {Status: ethtypes.ReceiptStatusSuccessful},
-	}}
-	publisher := &fakeWalletEventPublisher{}
-	runner := NewWalletOperationRunner(repos, operator, receipts, time.Millisecond, nil, WithWalletOperationEventPublisher(publisher))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testutil.NewTestDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+				Type:            tt.opType,
+				ClientRequestID: string(tt.opType) + "-1",
+				Amount:          tt.amount,
+			})
+			if err != nil {
+				t.Fatalf("CreateOrGet: %v", err)
+			}
 
-	runner.runOnce(ctx)
+			txHash := common.HexToHash("0xabc")
+			operator := &fakeWalletOperator{fundHash: txHash.Hex(), withdrawHash: txHash.Hex()}
+			receipts := &fakeWalletReceiptChecker{receipts: map[common.Hash]*ethtypes.Receipt{
+				txHash: {Status: ethtypes.ReceiptStatusSuccessful},
+			}}
+			publisher := &fakeWalletEventPublisher{}
+			runner := NewWalletOperationRunner(repos, operator, receipts, time.Millisecond, nil, WithWalletOperationEventPublisher(publisher))
 
-	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if got.Status != model.WalletOperationStatusConfirmed {
-		t.Fatalf("status = %q, want confirmed", got.Status)
-	}
-	if got.TxHash == nil || *got.TxHash != txHash.Hex() {
-		t.Fatalf("tx_hash = %v, want %s", got.TxHash, txHash.Hex())
-	}
-	if operator.fundAmount.String() != "100" {
-		t.Fatalf("fund amount = %s, want 100", operator.fundAmount)
-	}
-	if !publisher.hasStatus(model.WalletOperationStatusSubmitted) || !publisher.hasStatus(model.WalletOperationStatusConfirmed) {
-		t.Fatalf("published statuses = %v, want submitted and confirmed", publisher.statuses())
+			runner.runOnce(ctx)
+
+			got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+			if err != nil {
+				t.Fatalf("GetByID: %v", err)
+			}
+			if got.Status != model.WalletOperationStatusConfirmed {
+				t.Fatalf("status = %q, want confirmed", got.Status)
+			}
+			if got.TxHash == nil || *got.TxHash != txHash.Hex() {
+				t.Fatalf("tx_hash = %v, want %s", got.TxHash, txHash.Hex())
+			}
+			switch tt.opType {
+			case model.WalletOperationTypeFund:
+				if operator.fundAmount == nil || operator.fundAmount.String() != tt.amount {
+					t.Fatalf("fund amount = %v, want %s", operator.fundAmount, tt.amount)
+				}
+				if operator.withdrawAmount != nil {
+					t.Fatalf("withdraw amount = %s, want no withdraw", operator.withdrawAmount)
+				}
+			case model.WalletOperationTypeWithdraw:
+				if operator.withdrawAmount == nil || operator.withdrawAmount.String() != tt.amount {
+					t.Fatalf("withdraw amount = %v, want %s", operator.withdrawAmount, tt.amount)
+				}
+				if operator.fundAmount != nil {
+					t.Fatalf("fund amount = %s, want no fund", operator.fundAmount)
+				}
+			default:
+				t.Fatalf("unexpected operation type %q", tt.opType)
+			}
+			if !publisher.hasStatus(model.WalletOperationStatusSubmitted) || !publisher.hasStatus(model.WalletOperationStatusConfirmed) {
+				t.Fatalf("published statuses = %v, want submitted and confirmed", publisher.statuses())
+			}
+		})
 	}
 }
 

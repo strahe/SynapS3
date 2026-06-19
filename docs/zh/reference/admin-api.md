@@ -24,7 +24,7 @@ http://127.0.0.1:9090
 | `/api/v1/auth/logout` | 需要有效浏览器会话和 CSRF header；不接受 HTTP Basic auth。 |
 | `/api/v1/*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
 | `/metrics` | 浏览器 session cookie 或 HTTP Basic auth。 |
-| `/admin/exhausted-tasks*` | 浏览器 session cookie 或 HTTP Basic auth。 |
+| `/admin/exhausted-tasks*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
 
 ### 浏览器会话
 
@@ -124,6 +124,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/tasks/{id}/diagnostic` | 读取任务诊断。 |
 | `POST` | `/api/v1/tasks/{id}/diagnostic/refresh` | 刷新诊断。 |
 | `POST` | `/api/v1/tasks/{id}/retry` | 重试 exhausted 任务。 |
+| `GET` | `/admin/exhausted-tasks` | 列出 exhausted 任务。支持最大为 `1000` 的 `limit`。 |
+| `POST` | `/admin/exhausted-tasks/{id}/retry` | 重试 exhausted 任务（遗留路径）。 |
 
 ## 钱包和 Filecoin
 

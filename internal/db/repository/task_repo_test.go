@@ -1318,6 +1318,7 @@ func TestTaskRepo_CompleteByRefClearsWaitingFields(t *testing.T) {
 	bucket := seedBucket(t, db, "complete-ref-waiting-bucket")
 	waitReason := model.TaskWaitReasonDependency
 	statusMessage := "waiting for dependency"
+	lastError := "previous error"
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
 		RefType:        "bucket",
@@ -1327,6 +1328,7 @@ func TestTaskRepo_CompleteByRefClearsWaitingFields(t *testing.T) {
 		Status:         model.TaskStatusWaiting,
 		WaitReason:     &waitReason,
 		StatusMessage:  &statusMessage,
+		LastError:      &lastError,
 		ScheduledAt:    time.Now().Add(time.Minute),
 	}
 	if err := repos.Tasks.Create(ctx, task); err != nil {
