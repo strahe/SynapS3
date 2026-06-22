@@ -12,6 +12,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:e2e": "playwright test",
     "format": "biome check --write .",
     "check": "biome check ."
   },
@@ -33,6 +34,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.13",
+    "@playwright/test": "^1.61.0",
     "@tailwindcss/vite": "^4.1.10",
     "@tanstack/react-router-devtools": "^1.121.3",
     "@tanstack/router-plugin": "^1.121.3",

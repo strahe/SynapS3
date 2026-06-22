@@ -36,4 +36,6 @@ bin/
 config.yaml
 /synaps3.db*
 /cache/
+ui/playwright-report/
+ui/test-results/
 .pnpm-store/

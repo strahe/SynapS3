@@ -1,4 +1,5 @@
 BINARY   := synaps3
+SYSTEMTEST_BINARY := synaps3-systemtest
 MODULE   := github.com/strahe/synaps3
 PKG      := ./cmd/synaps3
 GOFLAGS  := -trimpath
@@ -12,7 +13,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go docs-build test test-fast test-race test-docker-entrypoint lint fmt check verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev
+.PHONY: all build build-go build-systemtest-server docs-build test test-fast test-race test-system test-ui-e2e test-docker-entrypoint lint fmt check verify-e2e verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev ui-e2e-install
 
 all: build
 
@@ -32,6 +33,10 @@ build-go:
 	@test -f ui/dist/index.html || { echo "ui/dist/index.html not found; run make ui-build first"; exit 1; }
 	$(CGO) go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) $(PKG)
 
+build-systemtest-server:
+	@test -f ui/dist/index.html || { echo "ui/dist/index.html not found; run make ui-build first"; exit 1; }
+	$(CGO) go build $(GOFLAGS) -tags=systemtest -o bin/$(SYSTEMTEST_BINARY) ./cmd/synaps3-systemtest
+
 test: test-race
 
 test-fast:
@@ -39,6 +44,17 @@ test-fast:
 
 test-race:
 	$(CGO) go test -race -count=1 ./cmd/... ./internal/...
+
+test-system:
+	$(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 ./internal/systemtest ./tests/system
+
+ui-e2e-install:
+	cd ui && pnpm exec playwright install $(PLAYWRIGHT_INSTALL_FLAGS) chromium
+
+test-ui-e2e:
+	@test -f ui/dist/index.html || { echo "ui/dist/index.html not found; run make ui-build first"; exit 1; }
+	@test -x bin/$(SYSTEMTEST_BINARY) || { echo "bin/$(SYSTEMTEST_BINARY) not found; run make build-systemtest-server first"; exit 1; }
+	cd ui && pnpm exec playwright test
 
 test-docker-entrypoint:
 	sh docker/entrypoint.test.sh
@@ -74,6 +90,8 @@ verify-norace: ui-build
 
 verify-fast: verify-norace
 	$(MAKE) test-fast
+
+verify-e2e: ui-build build-systemtest-server test-system test-ui-e2e
 
 verify-race:
 	$(CGO) go test -race -tags dev -count=1 ./cmd/... ./internal/...

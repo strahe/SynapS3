@@ -2,35 +2,13 @@ package main
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/urfave/cli/v3"
 )
-
-func TestIsAutoEvictEnabled_CaseInsensitive(t *testing.T) {
-	tests := []struct {
-		policy string
-		want   bool
-	}{
-		{policy: "lru", want: true},
-		{policy: "LRU", want: true},
-		{policy: " LrU ", want: true},
-		{policy: "manual", want: false},
-		{policy: "none", want: false},
-	}
-
-	for _, tt := range tests {
-		if got := isAutoEvictEnabled(tt.policy); got != tt.want {
-			t.Fatalf("isAutoEvictEnabled(%q) = %v, want %v", tt.policy, got, tt.want)
-		}
-	}
-}
 
 func TestResolveRPCAndNetwork_NormalizesConfigNetwork(t *testing.T) {
 	dir := t.TempDir()
@@ -313,39 +291,5 @@ func TestConfigSourceFromCommand_ExplicitRelativeConfigBecomesAbsolute(t *testin
 	}
 	if !got.Explicit {
 		t.Fatal("Explicit = false, want true")
-	}
-}
-
-func TestS3ServerOptions_TLS(t *testing.T) {
-	cfg := config.ServerConfig{
-		Port:           ":8080",
-		MaxConnections: 1,
-		MaxRequests:    1,
-		TLS: config.TLSConfig{
-			Enabled:  true,
-			CertFile: filepath.Join(t.TempDir(), "missing-cert.pem"),
-			KeyFile:  filepath.Join(t.TempDir(), "missing-key.pem"),
-		},
-	}
-
-	_, err := s3ServerOptions(cfg)
-	if err == nil {
-		t.Fatal("expected TLS certificate loading error")
-	}
-	if !strings.Contains(err.Error(), "TLS certificate") {
-		t.Fatalf("error = %v, want TLS certificate context", err)
-	}
-}
-
-func TestS3AccessLoggerFromConfig(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.LoggingS3AccessConfig{Enabled: true, Level: "debug"}
-	if got := s3AccessLogger(logger, cfg); got == nil {
-		t.Fatal("s3AccessLogger(enabled) = nil, want logger")
-	}
-
-	cfg.Enabled = false
-	if got := s3AccessLogger(logger, cfg); got != nil {
-		t.Fatalf("s3AccessLogger(disabled) = %#v, want nil", got)
 	}
 }

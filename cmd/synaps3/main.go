@@ -10,37 +10,22 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/strahe/synaps3/internal/admin"
-	"github.com/strahe/synaps3/internal/backend"
+	"github.com/strahe/synaps3/internal/app"
 	"github.com/strahe/synaps3/internal/buildinfo"
-	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db"
-	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/provider"
-	"github.com/strahe/synaps3/internal/s3access"
-	"github.com/strahe/synaps3/internal/s3iam"
-	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
-	"github.com/strahe/synaps3/internal/worker"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/uptrace/bun"
 	"github.com/urfave/cli/v3"
-	"github.com/versity/versitygw/auth"
-	"github.com/versity/versitygw/s3api"
-	"github.com/versity/versitygw/s3api/middlewares"
-	"github.com/versity/versitygw/s3api/utils"
-	"github.com/versity/versitygw/s3log"
 )
 
-const (
-	defaultS3MultipartMaxParts = 10000
-	configEnvVar               = "SYNAPS3_CONFIG"
-)
+const configEnvVar = "SYNAPS3_CONFIG"
 
 func main() {
 	if err := newRootCommand().Run(context.Background(), os.Args); err != nil {
@@ -256,32 +241,6 @@ func runMigrate(ctx context.Context, src config.Source) error {
 	return nil
 }
 
-func s3ServerOptions(cfg config.ServerConfig) ([]s3api.Option, error) {
-	opts := []s3api.Option{
-		s3api.WithHealth("/health"),
-		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
-		s3api.WithMpMaxParts(defaultS3MultipartMaxParts),
-		s3api.WithQuiet(),
-	}
-	if cfg.TLS.Enabled {
-		cs := utils.NewCertStorage()
-		if err := cs.SetCertificate(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
-			return nil, fmt.Errorf("loading S3 TLS certificate: %w", err)
-		}
-		opts = append(opts, s3api.WithTLS(cs))
-	}
-	return opts, nil
-}
-
-func newS3IAMService(ctx context.Context, repos *repository.Repositories) (auth.IAMService, auth.Account, error) {
-	iam := s3iam.NewService(repos)
-	root, err := iam.EnsureRootAccount(ctx)
-	if err != nil {
-		return nil, auth.Account{}, fmt.Errorf("initializing S3 IAM: %w", err)
-	}
-	return iam, root, nil
-}
-
 func runServe(ctx context.Context, src config.Source) error {
 	cfg, database, err := loadConfigAndDB(ctx, src)
 	if err != nil {
@@ -321,20 +280,6 @@ func runServe(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("running migrations: %w", err)
 	}
 
-	// Build repositories.
-	repos := repository.NewRepositories(database)
-
-	// Initialise local cache.
-	maxCacheBytes := int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024
-	localCache, err := cache.NewFilesystem(cfg.Cache.Dir, maxCacheBytes)
-	if err != nil {
-		return fmt.Errorf("initializing cache: %w", err)
-	}
-
-	// Build state machine.
-	sm := state.NewObjectStateMachine()
-	adminEvents := admin.NewEventHub()
-
 	// Initialize Filecoin SDK clients.
 	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
 		PrivateKey:           cfg.Filecoin.PrivateKey,
@@ -357,127 +302,32 @@ func runServe(ctx context.Context, src config.Source) error {
 		synapse.AdaptReadinessClient(client),
 		synapse.WithReadinessLogger(logger),
 	)
-	observabilitySvc := newObservabilityService(cfg, repos, client, logger)
+	observabilityChecker := newObservabilityChecker(cfg, client, logger)
 	walletReceiptClient, err := ethclient.DialContext(ctx, cfg.Filecoin.RPCURL)
 	if err != nil {
 		return fmt.Errorf("creating wallet receipt client: %w", err)
 	}
 	defer walletReceiptClient.Close()
 
-	autoEvict := isAutoEvictEnabled(cfg.Cache.EvictionPolicy)
-
-	// Create backend.
-	be := backend.New(repos, localCache, sm, storageClient, logger,
-		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
-		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
-		backend.WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries),
-		backend.WithAutoEvict(autoEvict),
-	)
-
-	// Set up DB-backed IAM for root auth plus persisted non-root S3 users.
-	iamSvc, rootAccount, err := newS3IAMService(ctx, repos)
+	runtime, err := app.NewRuntime(ctx, app.RuntimeOptions{
+		Config:   cfg,
+		Database: database,
+		Settings: settingsSvc,
+		Filecoin: app.FilecoinServices{
+			Storage:       storageClient,
+			WalletQuery:   walletQuerier,
+			Wallet:        walletOperator,
+			Receipts:      walletReceiptClient,
+			Readiness:     filecoinReadiness,
+			Observability: observabilityChecker,
+		},
+		ProviderIdentity: admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger),
+		Logger:           logger,
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("initializing application runtime: %w", err)
 	}
-	defer func() {
-		if err := iamSvc.Shutdown(); err != nil {
-			logger.Error("error shutting down S3 IAM service", "error", err)
-		}
-	}()
-	rootCfg := middlewares.RootUserConfig{
-		Access: rootAccount.Access,
-		Secret: rootAccount.Secret,
-	}
-
-	s3Opts, err := s3ServerOptions(cfg.Server)
-	if err != nil {
-		return err
-	}
-
-	// Create VersityGW S3 server.
-	srv, err := s3api.New(
-		be,
-		rootCfg,
-		cfg.S3.Region,
-		iamSvc,
-		s3AccessLogger(logger, cfg.Logging.S3Access),
-		nil, // admin logger
-		nil, // event sender
-		nil, // metrics manager
-		s3Opts...,
-	)
-	if err != nil {
-		return fmt.Errorf("creating S3 server: %w", err)
-	}
-
-	// Start background workers.
-	wm := worker.NewManager(repos, logger, autoEvict,
-		worker.NewUploader(repos, localCache, storageClient, walletQuerier, sm, autoEvict,
-			cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
-			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
-			worker.WithEventPublisher(adminEvents)),
-		worker.NewEvictor(repos, localCache, sm,
-			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
-		worker.NewStorageCleanupWorker(repos, storageClient,
-			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger),
-		worker.NewWalletOperationRunner(repos, walletOperator, walletReceiptClient, 5*time.Second, logger,
-			worker.WithWalletOperationEventPublisher(adminEvents)),
-	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
-	go wm.Start(ctx)
-	go observability.NewRunner(observabilitySvc, logger).Run(ctx)
-
-	// Start admin server (healthz + metrics).
-	adminSrv := admin.New(cfg.Admin.Addr, database, localCache, maxCacheBytes, repos, wm, walletQuerier, cfg.Filecoin.DefaultCopies, logger).
-		WithTaskDiagnosticStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
-			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-		})).
-		WithEventHub(adminEvents).
-		WithObjectUploader(be).
-		WithObjectStorage(storageClient).
-		WithProviderIdentityResolver(admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger)).
-		WithSettings(settingsSvc).
-		WithFilecoinReadiness(filecoinReadiness).
-		WithObservability(observabilitySvc).
-		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
-		WithS3IAM(iamSvc, rootAccount.Access)
-	if err := adminSrv.WithTrustedProxies(cfg.Admin.TrustedProxies); err != nil {
-		return fmt.Errorf("initializing admin trusted proxies: %w", err)
-	}
-	if err := adminSrv.WithAuthConfig(cfg.Admin.Auth); err != nil {
-		return fmt.Errorf("initializing admin auth: %w", err)
-	}
-	errCh := make(chan error, 2)
-	go func() {
-		if err := adminSrv.Run(ctx); err != nil {
-			errCh <- fmt.Errorf("admin server error: %w", err)
-		}
-	}()
-
-	// Start S3 server.
-	go func() {
-		logger.Info("S3 server listening", "port", cfg.Server.Port)
-		if err := srv.ServeMultiPort([]string{cfg.Server.Port}); err != nil {
-			errCh <- fmt.Errorf("S3 server error: %w", err)
-		}
-	}()
-
-	// Wait for shutdown signal or server error.
-	select {
-	case <-ctx.Done():
-		logger.Info("received shutdown signal")
-	case err := <-errCh:
-		return err
-	}
-
-	// Graceful shutdown.
-	logger.Info("shutting down...")
-	if err := srv.ShutDown(); err != nil {
-		logger.Error("error shutting down S3 server", "error", err)
-	}
-	be.Shutdown()
-
-	logger.Info("SynapS3 stopped")
-	return nil
+	return runtime.Run(ctx)
 }
 
 func runSetupMode(ctx context.Context, cfg *config.Config, settingsSvc *admin.SettingsService, fieldErrs []config.FieldError) error {
@@ -508,43 +358,15 @@ func runSetupMode(ctx context.Context, cfg *config.Config, settingsSvc *admin.Se
 	return nil
 }
 
-func newObservabilityService(cfg *config.Config, repos *repository.Repositories, client *sdk.Client, logger *slog.Logger) *observability.Service {
+func newObservabilityChecker(cfg *config.Config, client *sdk.Client, logger *slog.Logger) observability.RefreshChecker {
 	providerHealth := provider.NewHealthChecker(nil)
-	checker := observability.NewChecker(observability.CheckerOptions{
+	return observability.NewChecker(observability.CheckerOptions{
 		ProviderSource: observability.NewRegistryProviderSource(provider.NewRegistryService(client.SPRegistry())),
 		ProviderHealth: providerHealth.Check,
 		DataSetScanner: observability.NewStorageDataSetScanner(client.Storage()),
 		Timeout:        cfg.Filecoin.Observability.Timeout,
 		Concurrency:    cfg.Filecoin.Observability.Concurrency,
 		Logger:         logger,
-	})
-	return observability.NewService(observability.ServiceOptions{
-		Checker: checker,
-		LocalDataSets: observability.LocalDataSetSourceFunc(func(ctx context.Context) ([]observability.LocalDataSet, error) {
-			summaries, err := repos.Uploads.ListDataSetSummaries(ctx, 0)
-			if err != nil {
-				return nil, err
-			}
-			out := make([]observability.LocalDataSet, 0, len(summaries))
-			for _, summary := range summaries {
-				out = append(out, observability.LocalDataSet{
-					ID:              summary.ID,
-					BucketID:        summary.BucketID,
-					BucketName:      summary.BucketName,
-					CopyIndex:       summary.CopyIndex,
-					ProviderID:      summary.ProviderID,
-					DataSetID:       summary.DataSetID,
-					ClientDataSetID: summary.ClientDataSetID,
-					Status:          summary.Status,
-				})
-			}
-			return out, nil
-		}),
-		LocalDataSetCount: observability.LocalDataSetCountSourceFunc(func(ctx context.Context) (int, error) {
-			return repos.Buckets.CountStorageDataSets(ctx)
-		}),
-		Store:           repos.Observability,
-		RefreshInterval: cfg.Filecoin.Observability.Interval,
 	})
 }
 
@@ -605,17 +427,6 @@ func joinFieldErrors(fieldErrs []config.FieldError) error {
 		errs = append(errs, fieldErr)
 	}
 	return errors.Join(errs...)
-}
-
-func isAutoEvictEnabled(policy string) bool {
-	return strings.EqualFold(strings.TrimSpace(policy), "lru")
-}
-
-func s3AccessLogger(logger *slog.Logger, cfg config.LoggingS3AccessConfig) s3log.AuditLogger {
-	if !cfg.Enabled {
-		return nil
-	}
-	return s3access.NewLogger(logger, cfg.Level)
 }
 
 func setupLogger(cfg config.LoggingConfig) *slog.Logger {

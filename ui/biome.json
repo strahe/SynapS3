@@ -6,6 +6,8 @@
       "**",
       "!dist",
       "!node_modules",
+      "!playwright-report",
+      "!test-results",
       "!src/components/ui",
       "!src/hooks/use-mobile.ts",
       "!src/routeTree.gen.ts",

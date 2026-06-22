@@ -172,8 +172,21 @@ func (s *Server) WithStorageCleanupMaxRetries(maxRetries int) *Server {
 	return s
 }
 
-// Run starts the admin HTTP server. Blocks until ctx is cancelled.
+// Run starts the admin HTTP server at its configured address.
 func (s *Server) Run(ctx context.Context) error {
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", s.addr, err)
+	}
+	return s.Serve(ctx, listener)
+}
+
+// Serve serves the admin API on listener until ctx is cancelled. The listener
+// is owned by Serve and closed during shutdown.
+func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
+	if listener == nil {
+		return errors.New("admin listener is required")
+	}
 	if !s.setupOnly {
 		go s.refreshMetricsLoop(ctx)
 		if runner, ok := s.providerIdentity.(providerIdentityRunner); ok {
@@ -257,7 +270,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	srv := &http.Server{
-		Addr:              s.addr,
+		Addr:              listener.Addr().String(),
 		Handler:           withSecurityHeaders(s.withAdminAuth(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -267,8 +280,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		s.logger.Info("admin server listening", "addr", s.addr)
-		errCh <- srv.ListenAndServe()
+		s.logger.Info("admin server listening", "addr", listener.Addr().String())
+		errCh <- srv.Serve(listener)
 	}()
 
 	select {
@@ -283,7 +296,9 @@ func (s *Server) Run(ctx context.Context) error {
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
-		return err
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return errors.Join(err, srv.Shutdown(shutCtx))
 	}
 }
 

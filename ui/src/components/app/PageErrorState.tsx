@@ -14,7 +14,7 @@ export function PageErrorState({
   className?: string
 }) {
   return (
-    <div className={cn('flex h-full items-center justify-center p-4', className)}>
+    <div role="alert" className={cn('flex h-full items-center justify-center p-4', className)}>
       <Alert variant="destructive" className="max-w-xl">
         <AlertTriangle />
         <AlertTitle>{title}</AlertTitle>

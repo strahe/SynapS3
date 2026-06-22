@@ -16,7 +16,7 @@ concurrency:
 jobs:
   check:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       GOTOOLCHAIN: auto
 
@@ -77,3 +77,24 @@ jobs:
       - name: Verify race
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: make verify-race
+
+      - name: Test system runtime
+        run: make test-system
+
+      - name: Build dashboard systemtest server
+        run: make build-systemtest-server
+
+      - name: Install Chromium
+        run: make ui-e2e-install PLAYWRIGHT_INSTALL_FLAGS=--with-deps
+
+      - name: Test dashboard end to end
+        run: make test-ui-e2e
+
+      - name: Upload Playwright diagnostics
+        if: failure() && hashFiles('ui/test-results/e2e/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-diagnostics
+          path: ui/test-results/e2e
+          if-no-files-found: ignore
+          retention-days: 7
