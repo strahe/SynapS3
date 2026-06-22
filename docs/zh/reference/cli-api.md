@@ -37,9 +37,10 @@ SynapS3 提供 S3 API、Admin API，以及用于本地操作的 CLI 命令。
 synaps3 wallet generate
 synaps3 wallet fund-testnet 0x...
 synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
 ```
 
-`generate` 输出钱包材料，`fund-testnet` 领取 Calibration 资产，`deposit` 使用已配置的 private key 存入 `2 USDFC`。
+`generate` 输出钱包材料，`fund-testnet` 领取 Calibration 资产，`deposit` 使用已配置的 private key 存入 `2 USDFC`，`approve` 使用已配置的 private key 批准 FWSS 支付额度。
 
 ## Admin 命令
 

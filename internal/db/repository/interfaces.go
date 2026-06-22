@@ -477,6 +477,7 @@ type WalletOperationRepository interface {
 	ClaimPending(ctx context.Context, leaseDuration time.Duration) (*model.WalletOperation, error)
 	MarkSubmitted(ctx context.Context, id int64, txHash string) error
 	MarkConfirmed(ctx context.Context, id int64) error
+	MarkConfirmedWithoutTransaction(ctx context.Context, id int64) error
 	MarkFailed(ctx context.Context, id int64, lastError string) error
 	MarkExpiredRunningUnknown(ctx context.Context) ([]model.WalletOperation, error)
 	ListSubmitted(ctx context.Context, limit int) ([]model.WalletOperation, error)

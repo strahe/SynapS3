@@ -53,14 +53,15 @@ docker run -d --name synaps3-test \
 
 Docker 启动后会输出 container ID。
 
-检查健康状态，并存入 USDFC：
+检查健康状态、存入 USDFC，并批准 FWSS：
 
 ```bash
 curl http://127.0.0.1:9090/healthz
 docker exec synaps3-test synaps3 wallet deposit 2 # 2 USDFC
+docker exec synaps3-test synaps3 wallet approve
 ```
 
-预期结果：`/healthz` 返回 `{"status":"ok"}`，deposit 命令接受钱包操作。如果 `/healthz` 返回 `setup` 或 `unhealthy`，查看[故障排查](../operations/troubleshooting.md)。
+预期结果：`/healthz` 返回 `{"status":"ok"}`，deposit 和 approve 命令都接受钱包操作。如果 `/healthz` 返回 `setup` 或 `unhealthy`，查看[故障排查](../operations/troubleshooting.md)。
 
 ## 打开仪表盘
 

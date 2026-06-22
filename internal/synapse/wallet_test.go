@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/payments"
 )
@@ -59,6 +60,19 @@ func (m *mockWalletPayments) accountInfoCalls(token common.Address) int {
 	return m.accountInfoCall[token]
 }
 
+func resolvedWalletTestAddresses(c chain.Chain) sdk.ResolvedAddresses {
+	addrs := c.Addresses()
+	return sdk.ResolvedAddresses{
+		FWSS:               addrs.FWSS,
+		PDPVerifier:        addrs.PDPVerifier,
+		SPRegistry:         addrs.SPRegistry,
+		USDFC:              addrs.USDFC,
+		Payments:           addrs.Payments,
+		ViewContract:       addrs.StateView,
+		SessionKeyRegistry: addrs.SessionKeyRegistry,
+	}
+}
+
 func TestWalletQuerier_ReturnsGasBalanceAndUSDFCPaymentAccount(t *testing.T) {
 	addrs := chain.Calibration.Addresses()
 	owner := common.HexToAddress("0x1111111111111111111111111111111111111111")
@@ -79,7 +93,7 @@ func TestWalletQuerier_ReturnsGasBalanceAndUSDFCPaymentAccount(t *testing.T) {
 		return big.NewInt(789), nil
 	}
 
-	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration, addrs: resolvedWalletTestAddresses(chain.Calibration)}).GetWalletInfo(context.Background())
 	if err != nil {
 		t.Fatalf("GetWalletInfo: %v", err)
 	}
@@ -126,7 +140,7 @@ func TestWalletQuerier_FILGasBalanceErrorDoesNotHidePaymentAccount(t *testing.T)
 		return big.NewInt(789), nil
 	}
 
-	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration, addrs: resolvedWalletTestAddresses(chain.Calibration)}).GetWalletInfo(context.Background())
 	if err != nil {
 		t.Fatalf("GetWalletInfo: %v", err)
 	}
@@ -152,7 +166,7 @@ func TestWalletQuerier_ZeroLockupRateHasNoActiveSpend(t *testing.T) {
 		return accountStateWithRate(456, 0, 0), nil
 	}
 
-	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration, addrs: resolvedWalletTestAddresses(chain.Calibration)}).GetWalletInfo(context.Background())
 	if err != nil {
 		t.Fatalf("GetWalletInfo: %v", err)
 	}
@@ -180,7 +194,7 @@ func TestWalletQuerier_Uint256MaxFundedUntilHasNoActiveSpend(t *testing.T) {
 		return acct, nil
 	}
 
-	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration, addrs: resolvedWalletTestAddresses(chain.Calibration)}).GetWalletInfo(context.Background())
 	if err != nil {
 		t.Fatalf("GetWalletInfo: %v", err)
 	}
@@ -208,7 +222,7 @@ func TestWalletQuerier_MissingFundedUntilWithLockupRateHasUnknownRunway(t *testi
 		return acct, nil
 	}
 
-	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration}).GetWalletInfo(context.Background())
+	info, err := (&walletQuerier{payments: pay, address: owner, chain: chain.Calibration, addrs: resolvedWalletTestAddresses(chain.Calibration)}).GetWalletInfo(context.Background())
 	if err != nil {
 		t.Fatalf("GetWalletInfo: %v", err)
 	}

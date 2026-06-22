@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/payments"
 )
@@ -21,21 +22,22 @@ type walletQuerier struct {
 	payments walletPayments
 	address  common.Address
 	chain    chain.Chain
+	addrs    sdk.ResolvedAddresses
 }
 
 // NewWalletQuerier creates a WalletQuerier backed by synapse-go payments.Service.
-func NewWalletQuerier(paySvc *payments.Service, address common.Address, c chain.Chain) WalletQuerier {
+func NewWalletQuerier(paySvc *payments.Service, address common.Address, c chain.Chain, addrs sdk.ResolvedAddresses) WalletQuerier {
 	return &walletQuerier{
 		payments: paySvc,
 		address:  address,
 		chain:    c,
+		addrs:    addrs,
 	}
 }
 
 // GetWalletInfo queries on-chain state in parallel. Individual RPC failures
 // produce nil fields and entries in the Errors map instead of aborting.
 func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) {
-	addrs := w.chain.Addresses()
 	currentEpoch := chain.CurrentEpoch(w.chain)
 
 	info := &WalletInfo{
@@ -44,8 +46,8 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 		ChainID:              w.chain.ChainID(),
 		CurrentEpoch:         currentEpoch,
 		EpochDurationSeconds: chain.EpochDurationSeconds,
-		PaymentsAddress:      addrs.Payments.Hex(),
-		USDFCAddress:         addrs.USDFC.Hex(),
+		PaymentsAddress:      w.addrs.Payments.Hex(),
+		USDFCAddress:         w.addrs.USDFC.Hex(),
 		USDFCDecimals:        18,
 		Errors:               make(map[string]string),
 	}
@@ -66,7 +68,7 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 
 	go func() {
 		defer wg.Done()
-		bal, err := w.payments.WalletBalance(ctx, addrs.USDFC, w.address)
+		bal, err := w.payments.WalletBalance(ctx, w.addrs.USDFC, w.address)
 		if err != nil {
 			setErr("usdfc_wallet_balance", err)
 			return
@@ -90,7 +92,7 @@ func (w *walletQuerier) GetWalletInfo(ctx context.Context) (*WalletInfo, error) 
 
 	go func() {
 		defer wg.Done()
-		acct, err := w.payments.AccountInfo(ctx, addrs.USDFC, w.address)
+		acct, err := w.payments.AccountInfo(ctx, w.addrs.USDFC, w.address)
 		if err != nil {
 			setErr("usdfc_account", err)
 			return

@@ -29,10 +29,11 @@ description: 准备 SynapS3 部署。
 - 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在主机环境、`.env` 或密钥管理系统中。
 - 安全保存 Admin 密码。密码丢失或泄露时，用 `synaps3 admin-auth reset-password --config <path>` 离线轮换；这也会让已有浏览器 session 失效。
 - 启动后确认 `synaps3 admin status` 显示钱包状态正常。
-- 在预期上传前存入 USDFC。以下示例存入 `2 USDFC`：
+- 在预期上传前存入 USDFC 并批准 FWSS。以下示例存入 `2 USDFC`：
 
 ```bash
 synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
 ```
 
 钱包操作应被接受，随后可以在仪表盘或 `GET /api/v1/wallet/operations` 中看到。

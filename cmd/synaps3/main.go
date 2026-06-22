@@ -348,9 +348,10 @@ func runServe(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("initializing Filecoin SDK: %w", err)
 	}
 	defer func() { _ = client.Close() }()
+	resolvedAddresses := client.ResolvedAddresses()
 	storageClient := synapse.AdaptStorageService(client.Storage())
-	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain())
-	walletOperator := synapse.NewWalletOperator(client.Payments(), client.Chain())
+	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain(), resolvedAddresses)
+	walletOperator := synapse.NewWalletOperator(client.Payments(), resolvedAddresses.USDFC)
 	filecoinReadiness := synapse.NewReadinessChecker(
 		synapse.ReadinessConfigFromFilecoinConfig(cfg.Filecoin),
 		synapse.AdaptReadinessClient(client),

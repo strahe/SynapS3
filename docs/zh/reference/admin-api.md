@@ -66,12 +66,12 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ## 高风险操作
 
-把这些端点当作变更窗口操作处理。它们可能改变数据、凭据、钱包余额或后台状态。
+把这些端点当作变更窗口操作处理。它们可能改变数据、凭据、钱包支付状态或后台状态。
 
 | 范围 | 端点 | 风险 |
 | --- | --- | --- |
 | 设置 | `PUT /api/v1/settings` | 变更可能需要重启，或把节点切换到不同 Filecoin 网络。保存前先验证设置和 Filecoin readiness。 |
-| 钱包 | `POST /api/v1/wallet/fund`、`POST /api/v1/wallet/withdraw` | 创建链上支付操作。 |
+| 钱包 | `POST /api/v1/wallet/fund`、`POST /api/v1/wallet/withdraw`、`POST /api/v1/wallet/approve` | 创建链上支付操作。 |
 | S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
 | Bucket/object | bucket 创建、owner/copy-policy 更新、object 上传/下载/删除/恢复/永久删除 | 改变或暴露用户可见的 S3 数据和元数据。 |
 | 任务和观测数据 | 任务重试、诊断刷新、provider/data-set refresh | 重新入队任务，或刷新运维状态。 |
@@ -134,6 +134,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/wallet` | 钱包身份、余额、合约状态和业务计数。 |
 | `POST` | `/api/v1/wallet/fund` | 创建钱包充值操作。 |
 | `POST` | `/api/v1/wallet/withdraw` | 创建钱包提现操作。 |
+| `POST` | `/api/v1/wallet/approve` | 创建显式 FWSS approval 操作。payload 只接受 `client_request_id`。 |
 | `GET` | `/api/v1/wallet/operations` | 列出钱包操作。 |
 | `GET` | `/api/v1/filecoin/readiness` | 检查 Filecoin readiness。 |
 | `POST` | `/api/v1/filecoin/readiness/preflight` | 验证待保存的 Filecoin 设置。 |

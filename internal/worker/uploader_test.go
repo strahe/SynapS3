@@ -401,6 +401,15 @@ func (f *fakeUploadContext) DataSetID() *sdktypes.BigInt {
 	return &id
 }
 
+func (f *fakeUploadContext) GetProviderInfo() storage.Provider {
+	return storage.Provider{
+		ID:         f.providerID.Copy(),
+		ServiceURL: f.ServiceURL(),
+	}
+}
+
+func (f *fakeUploadContext) WithCDN() bool { return false }
+
 func (f *fakeUploadContext) PieceURL(piece cid.Cid) string {
 	return fmt.Sprintf("https://provider-%s.example/piece/%s", f.providerID.String(), piece.String())
 }
@@ -1030,6 +1039,7 @@ func TestUploader_StagedPrepareReusesExistingUploadRequestedCopies(t *testing.T)
 	if err != nil || version == nil {
 		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
 	}
+	contextsByDataSet := make(map[string]*fakeUploadContext, 4)
 	upload, err := env.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
 		BucketID:        bucket.ID,
 		SourceVersionID: versionID,
@@ -1051,13 +1061,20 @@ func TestUploader_StagedPrepareReusesExistingUploadRequestedCopies(t *testing.T)
 		if err != nil {
 			t.Fatalf("EnsureDataSetBinding(%d): %v", copyIndex, err)
 		}
+		dataSetID := onChainID(t, fmt.Sprintf("%d", 1000+copyIndex))
 		if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 			ID:        binding.ID,
 			UploadID:  upload.ID,
-			DataSetID: onChainID(t, fmt.Sprintf("%d", 1000+copyIndex)),
+			DataSetID: dataSetID,
 		}); err != nil {
 			t.Fatalf("MarkDataSetReady(%d): %v", copyIndex, err)
 		}
+		contextsByDataSet[dataSetID.String()] = newFakeUploadContext(
+			providerID.SDK(),
+			dataSetID.SDK(),
+			sdktypes.NewBigInt(uint64(2000+copyIndex)),
+			testCID(t),
+		)
 		transferMethod := model.StorageCopyTransferMethodPeerPull
 		if copyIndex == 0 {
 			transferMethod = model.StorageCopyTransferMethodIngress
@@ -1081,9 +1098,13 @@ func TestUploader_StagedPrepareReusesExistingUploadRequestedCopies(t *testing.T)
 		createContextsCopies = append(createContextsCopies, opts.Copies)
 		return newFakeUploadContexts(t, opts.Copies, 10000), nil
 	}
-	env.storage.CreateContextFunc = func(ctx context.Context, _ *storage.CreateContextOptions) (synapse.UploadContext, error) {
-		<-ctx.Done()
-		return nil, ctx.Err()
+	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		if opts.DataSetID != nil {
+			if uploadCtx := contextsByDataSet[opts.DataSetID.String()]; uploadCtx != nil {
+				return uploadCtx, nil
+			}
+		}
+		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
 	stage := "prepare_upload"
@@ -2165,6 +2186,9 @@ func TestUploader_EnsureDatasetUnavailablePeerQueuesReplacement(t *testing.T) {
 		return []synapse.UploadContext{replacement}, nil
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		if createContextProviderIDEqual(opts, replacement.providerID) || createContextDataSetIDEqual(opts, replacement.dataSetID) {
+			return replacement, nil
+		}
 		return nil, fmt.Errorf("unexpected CreateContext opts for unavailable peer: %#v", opts)
 	}
 
@@ -2992,307 +3016,158 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 	}
 }
 
-func TestUploader_ZeroAvailableFunds_RequeuesTask(t *testing.T) {
-	env := newTestWorkerEnv(t)
-	_, objID, versionID := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
-
-	wallet := &testutil.MockWalletQuerier{
-		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			return &synapse.WalletInfo{
-				PaymentAccount: &synapse.PaymentAccountInfo{
-					Funds:          big.NewInt(0),
-					AvailableFunds: big.NewInt(0),
-					LockupCurrent:  big.NewInt(0),
-				},
-			}, nil
-		},
-	}
-
-	var uploadCalled atomic.Bool
-	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
-		uploadCalled.Store(true)
-		return nil, errors.New("upload should not be called when available funds are zero")
-	}
-
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
-
-	if uploadCalled.Load() {
-		t.Fatal("upload should not be called when available funds are zero")
-	}
-
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusScheduled {
-		t.Errorf("expected task scheduled for retry, got %s", got.Status)
-	}
-	if got.RetryCount != 1 {
-		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
-	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "USDFC available funds = 0") {
-		le := ""
-		if got.LastError != nil {
-			le = *got.LastError
-		}
-		t.Errorf("expected balance error message, got: %s", le)
-	}
-
-	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
-	if obj.State != model.ObjectStateUploading {
-		t.Errorf("expected object to remain uploading for retry, got %s", obj.State)
-	}
-}
-
-func TestUploader_StagedUploadZeroAvailableFundsRequeuesTask(t *testing.T) {
+func TestUploader_UploadFundingWaitsWithoutRetry(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
 
-	wallet := &testutil.MockWalletQuerier{
-		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			return &synapse.WalletInfo{
-				PaymentAccount: &synapse.PaymentAccountInfo{
-					Funds:          big.NewInt(0),
-					AvailableFunds: big.NewInt(0),
-					LockupCurrent:  big.NewInt(0),
-				},
-			}, nil
-		},
-	}
-
-	var createContextsCalled atomic.Bool
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalled.Store(true)
-		return nil, errors.New("CreateContexts should not be called when available funds are zero")
-	}
-
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
-
-	if createContextsCalled.Load() {
-		t.Fatal("CreateContexts should not be called when available funds are zero")
-	}
-
-	upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(context.Background(), versionID)
-	if err != nil {
-		t.Fatalf("FindLatestUploadBySourceVersion: %v", err)
-	}
-	if upload != nil {
-		t.Fatalf("expected no upload attempt when available funds are zero, got %d", upload.ID)
-	}
-
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusScheduled {
-		t.Errorf("expected task scheduled for retry, got %s", got.Status)
-	}
-	if got.RetryCount != 1 {
-		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
-	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "USDFC available funds = 0") {
-		le := ""
-		if got.LastError != nil {
-			le = *got.LastError
-		}
-		t.Errorf("expected balance error message, got: %s", le)
-	}
-}
-
-func TestUploader_LockedAvailableFunds_RequeuesTask(t *testing.T) {
-	env := newTestWorkerEnv(t)
-	_, objID, versionID := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
-
-	wallet := &testutil.MockWalletQuerier{
-		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			return &synapse.WalletInfo{
-				PaymentAccount: &synapse.PaymentAccountInfo{
-					Funds:          big.NewInt(100),
-					AvailableFunds: big.NewInt(0),
-					LockupCurrent:  big.NewInt(100),
-				},
-			}, nil
-		},
-	}
-
-	var uploadCalled atomic.Bool
-	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
-		uploadCalled.Store(true)
-		return nil, errors.New("upload should not be called when funds are locked")
-	}
-
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
-
-	if uploadCalled.Load() {
-		t.Fatal("upload should not be called when available funds are zero")
-	}
-
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusScheduled {
-		t.Errorf("expected task scheduled for retry, got %s", got.Status)
-	}
-	if got.RetryCount != 1 {
-		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
-	}
-}
-
-func TestUploader_AvailableFundsFallback_RequeuesTask(t *testing.T) {
-	env := newTestWorkerEnv(t)
-	_, objID, versionID := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
-
-	wallet := &testutil.MockWalletQuerier{
-		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			return &synapse.WalletInfo{
-				PaymentAccount: &synapse.PaymentAccountInfo{
-					Funds:         big.NewInt(100),
-					LockupCurrent: big.NewInt(100),
-				},
-			}, nil
-		},
-	}
-
-	var uploadCalled atomic.Bool
-	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
-		uploadCalled.Store(true)
-		return nil, errors.New("upload should not be called when fallback available funds are zero")
-	}
-
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
-
-	if uploadCalled.Load() {
-		t.Fatal("upload should not be called when fallback available funds are zero")
-	}
-
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusScheduled {
-		t.Errorf("expected task scheduled for retry, got %s", got.Status)
-	}
-	if got.RetryCount != 1 {
-		t.Errorf("expected retry_count=1, got %d", got.RetryCount)
-	}
-}
-
-func TestUploader_NegativeAvailableFunds_RequeuesTask(t *testing.T) {
-	env := newTestWorkerEnv(t)
-	_, objID, versionID := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
-
-	wallet := &testutil.MockWalletQuerier{
-		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			return &synapse.WalletInfo{
-				PaymentAccount: &synapse.PaymentAccountInfo{
-					Funds:          big.NewInt(100),
-					AvailableFunds: big.NewInt(-1),
-					LockupCurrent:  big.NewInt(101),
-				},
-			}, nil
-		},
-	}
-
-	var uploadCalled atomic.Bool
-	env.storage.UploadFunc = func(_ context.Context, _ io.Reader, _ *storage.UploadOptions) (*storage.UploadResult, error) {
-		uploadCalled.Store(true)
-		return nil, errors.New("upload should not be called when available funds are negative")
-	}
-
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
-
-	if uploadCalled.Load() {
-		t.Fatal("upload should not be called when available funds are negative")
-	}
-
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusScheduled {
-		t.Errorf("expected task scheduled for retry, got %s", got.Status)
-	}
-}
-
-func TestUploader_ZeroAvailableFunds_ExhaustedRetryRemainsRecoverable(t *testing.T) {
-	env := newTestWorkerEnv(t)
-	_, objID, versionID := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 1, 0)
-
-	var walletCalls atomic.Int32
-	wallet := &testutil.MockWalletQuerier{
-		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			if walletCalls.Add(1) == 1 {
-				return &synapse.WalletInfo{
-					PaymentAccount: &synapse.PaymentAccountInfo{
-						Funds:          big.NewInt(0),
-						AvailableFunds: big.NewInt(0),
-						LockupCurrent:  big.NewInt(0),
-					},
-				}, nil
-			}
-			return &synapse.WalletInfo{
-				PaymentAccount: &synapse.PaymentAccountInfo{
-					Funds:          big.NewInt(100),
-					AvailableFunds: big.NewInt(100),
-					LockupCurrent:  big.NewInt(0),
-				},
-			}, nil
-		},
-	}
-
-	var uploadContexts []synapse.UploadContext
+	var createContextsCalled atomic.Int32
 	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		uploadContexts = newFakeUploadContexts(t, opts.Copies, 0)
+		createContextsCalled.Add(1)
+		return newFakeUploadContexts(t, opts.Copies, 0), nil
+	}
+	env.storage.PrepareUploadFunc = func(_ context.Context, dataSize uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+		if dataSize == 0 {
+			t.Fatal("PrepareUpload data size must be positive")
+		}
+		if len(contexts) != config.DefaultFilecoinCopies {
+			t.Fatalf("PrepareUpload contexts = %d, want %d", len(contexts), config.DefaultFilecoinCopies)
+		}
+		return &storage.MultiContextCosts{
+			DepositNeeded:        big.NewInt(123),
+			NeedsFWSSMaxApproval: true,
+			Ready:                false,
+		}, nil
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskStatus(t, env, uploader, task.ID, model.TaskStatusWaiting, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if got.Status != model.TaskStatusWaiting {
+		t.Errorf("expected task waiting for funding, got %s", got.Status)
+	}
+	if got.RetryCount != 0 {
+		t.Errorf("expected retry_count=0, got %d", got.RetryCount)
+	}
+	if got.WaitReason == nil || *got.WaitReason != model.TaskWaitReasonDependency {
+		t.Fatalf("wait_reason = %v, want dependency", got.WaitReason)
+	}
+	if got.StatusMessage == nil || !strings.Contains(*got.StatusMessage, "deposit 123") || !strings.Contains(*got.StatusMessage, "approve FWSS") {
+		message := ""
+		if got.StatusMessage != nil {
+			message = *got.StatusMessage
+		}
+		t.Fatalf("status_message = %q, want deposit and approval guidance", message)
+	}
+	if createContextsCalled.Load() != 1 {
+		t.Fatalf("CreateContexts calls = %d, want 1", createContextsCalled.Load())
+	}
+	upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(context.Background(), versionID)
+	if err != nil || upload == nil {
+		t.Fatalf("expected upload attempt before funding wait, upload=%v err=%v", upload, err)
+	}
+	copies, err := env.repos.Uploads.ListCopies(context.Background(), upload.ID)
+	if err != nil {
+		t.Fatalf("ListCopies: %v", err)
+	}
+	if len(copies) != 0 {
+		t.Fatalf("copy rows before funding ready = %d, want 0", len(copies))
+	}
+}
+
+func TestUploader_UploadFundingRetryReusesBindings(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	bucket, objID, versionID := seedCachedObject(t, env)
+	task := seedStagedUploadTask(t, env, objID, versionID, 5)
+	ctx := context.Background()
+
+	var (
+		createContextsCalled atomic.Int32
+		prepareCalled        atomic.Int32
+		uploadContexts       []synapse.UploadContext
+	)
+	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		createContextsCalled.Add(1)
+		uploadContexts = newFakeUploadContexts(t, config.DefaultFilecoinCopies, 0)
 		return uploadContexts, nil
 	}
 	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
 		for _, uploadCtx := range uploadContexts {
 			fakeCtx := uploadCtx.(*fakeUploadContext)
-			if createContextProviderIDEqual(opts, fakeCtx.providerID) {
-				return fakeCtx, nil
-			}
-			if createContextDataSetIDEqual(opts, fakeCtx.dataSetID) {
+			if createContextProviderIDEqual(opts, fakeCtx.providerID) || createContextDataSetIDEqual(opts, fakeCtx.dataSetID) {
 				return fakeCtx, nil
 			}
 		}
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
+	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+		if len(contexts) != config.DefaultFilecoinCopies {
+			t.Fatalf("PrepareUpload contexts = %d, want %d", len(contexts), config.DefaultFilecoinCopies)
+		}
+		if prepareCalled.Add(1) == 1 {
+			return &storage.MultiContextCosts{DepositNeeded: big.NewInt(10), Ready: false}, nil
+		}
+		return &storage.MultiContextCosts{DepositNeeded: big.NewInt(0), Ready: true}, nil
+	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	runWorkerUntilTaskStatus(t, env, uploader, task.ID, model.TaskStatusWaiting, 5*time.Second)
+
+	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
+	if got.RetryCount != 0 {
+		t.Fatalf("retry_count after funding wait = %d, want 0", got.RetryCount)
+	}
+	if _, err := env.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-time.Second)).
+		Where("id = ?", task.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("reschedule funding wait: %v", err)
+	}
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
-	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
-	if got.Status != model.TaskStatusExhausted {
-		t.Fatalf("expected task exhausted, got %s", got.Status)
-	}
-	obj, _ := env.repos.Objects.GetCurrentVersionByObjectID(context.Background(), objID)
-	if obj.State != model.ObjectStateUploading {
-		t.Fatalf("expected object to remain uploading for manual retry, got %s", obj.State)
-	}
-
-	if err := env.repos.Tasks.RetryExhausted(context.Background(), task.ID); err != nil {
-		t.Fatalf("retrying exhausted task: %v", err)
-	}
-	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
-
-	got, _ = env.repos.Tasks.GetByID(context.Background(), task.ID)
+	got, _ = env.repos.Tasks.GetByID(ctx, task.ID)
 	if got.Status != model.TaskStatusCompleted {
 		t.Fatalf("expected retried task completed, got %s", got.Status)
 	}
-	upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(context.Background(), versionID)
+	if createContextsCalled.Load() != 1 {
+		t.Fatalf("CreateContexts calls = %d, want 1", createContextsCalled.Load())
+	}
+	if prepareCalled.Load() != 2 {
+		t.Fatalf("PrepareUpload calls = %d, want 2", prepareCalled.Load())
+	}
+	bindings, err := env.repos.Uploads.ListDataSetBindings(ctx, bucket.ID)
+	if err != nil {
+		t.Fatalf("ListDataSetBindings: %v", err)
+	}
+	if len(bindings) != config.DefaultFilecoinCopies {
+		t.Fatalf("bindings = %d, want %d", len(bindings), config.DefaultFilecoinCopies)
+	}
+	upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(ctx, versionID)
 	if err != nil || upload == nil {
-		t.Fatalf("expected retried prepare to create upload, upload=%v err=%v", upload, err)
+		t.Fatalf("expected upload attempt, upload=%v err=%v", upload, err)
+	}
+	copies, err := env.repos.Uploads.ListCopies(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("ListCopies: %v", err)
+	}
+	if len(copies) != config.DefaultFilecoinCopies {
+		t.Fatalf("copy rows = %d, want %d", len(copies), config.DefaultFilecoinCopies)
 	}
 }
 
-func TestUploader_WalletError_ProceedsWithUpload(t *testing.T) {
+func TestUploader_PrepareFundingDoesNotQueryWallet(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, versionID := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
+	task := seedStagedUploadTask(t, env, objID, versionID, 5)
 
+	var walletCalled atomic.Bool
 	wallet := &testutil.MockWalletQuerier{
 		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			return nil, errors.New("RPC timeout")
+			walletCalled.Store(true)
+			return nil, errors.New("wallet should not be queried during upload funding preparation")
 		},
 	}
-
 	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
 		return newFakeUploadContexts(t, opts.Copies, 0), nil
 	}
@@ -3301,35 +3176,12 @@ func TestUploader_WalletError_ProceedsWithUpload(t *testing.T) {
 	got := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	if got.Status != model.TaskStatusCompleted {
-		t.Errorf("expected task completed (wallet error should not block upload), got %s", got.Status)
+		t.Errorf("expected task completed, got %s", got.Status)
+	}
+	if walletCalled.Load() {
+		t.Fatal("wallet should not be queried before upload funding preparation")
 	}
 	if upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(context.Background(), versionID); err != nil || upload == nil {
-		t.Fatalf("expected upload attempt after wallet error, upload=%v err=%v", upload, err)
-	}
-}
-
-func TestUploader_WalletNilInfo_NoPanic(t *testing.T) {
-	env := newTestWorkerEnv(t)
-	_, objID, versionID := seedCachedObject(t, env)
-	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
-
-	wallet := &testutil.MockWalletQuerier{
-		GetWalletInfoFunc: func(_ context.Context) (*synapse.WalletInfo, error) {
-			return nil, nil // (nil, nil) — edge case
-		},
-	}
-
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		return newFakeUploadContexts(t, opts.Copies, 0), nil
-	}
-
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
-	got := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
-
-	if got.Status != model.TaskStatusCompleted {
-		t.Errorf("expected task completed (nil info should not panic), got %s", got.Status)
-	}
-	if upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(context.Background(), versionID); err != nil || upload == nil {
-		t.Fatalf("expected upload attempt after nil wallet info, upload=%v err=%v", upload, err)
+		t.Fatalf("expected upload attempt, upload=%v err=%v", upload, err)
 	}
 }

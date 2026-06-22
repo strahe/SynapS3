@@ -7,7 +7,6 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/payments"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -19,11 +18,11 @@ type walletPaymentOperator interface {
 
 type walletOperator struct {
 	payments walletPaymentOperator
-	chain    chain.Chain
+	usdfc    common.Address
 }
 
-func NewWalletOperator(paySvc *payments.Service, c chain.Chain) WalletOperator {
-	return &walletOperator{payments: paySvc, chain: c}
+func NewWalletOperator(paySvc *payments.Service, usdfc common.Address) WalletOperator {
+	return &walletOperator{payments: paySvc, usdfc: usdfc}
 }
 
 func (o *walletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (string, error) {
@@ -32,8 +31,13 @@ func (o *walletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (string
 }
 
 func (o *walletOperator) WithdrawUSDFC(ctx context.Context, amount *big.Int) (string, error) {
-	res, err := o.payments.Withdraw(ctx, o.chain.Addresses().USDFC, amount)
+	res, err := o.payments.Withdraw(ctx, o.usdfc, amount)
 	return writeResultHash(res, err, "withdraw USDFC")
+}
+
+func (o *walletOperator) ApproveFWSS(ctx context.Context) (string, error) {
+	res, err := o.payments.Fund(ctx, big.NewInt(0))
+	return writeResultHash(res, err, "approve FWSS")
 }
 
 func writeResultHash(res *sdktypes.WriteResult, err error, action string) (string, error) {

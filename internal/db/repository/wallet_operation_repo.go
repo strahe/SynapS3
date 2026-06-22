@@ -23,7 +23,7 @@ type BunWalletOperationRepo struct {
 var _ WalletOperationRepository = (*BunWalletOperationRepo)(nil)
 
 func (r *BunWalletOperationRepo) CreateOrGet(ctx context.Context, input CreateWalletOperationInput) (*model.WalletOperation, bool, error) {
-	if !validWalletOperationAmount(input.Amount) {
+	if !validWalletOperationAmount(input.Type, input.Amount) {
 		return nil, false, ErrWalletOperationInvalidAmount
 	}
 	if existing, err := r.getByTypeAndClientRequestID(ctx, input.Type, input.ClientRequestID); err != nil {
@@ -135,6 +135,23 @@ func (r *BunWalletOperationRepo) MarkConfirmed(ctx context.Context, id int64) er
 	return requireRows(res, err, "marking wallet operation confirmed")
 }
 
+func (r *BunWalletOperationRepo) MarkConfirmedWithoutTransaction(ctx context.Context, id int64) error {
+	now := time.Now()
+	res, err := r.db.NewUpdate().
+		Model((*model.WalletOperation)(nil)).
+		Set("status = ?", model.WalletOperationStatusConfirmed).
+		Set("tx_hash = NULL").
+		Set("last_error = NULL").
+		Set("lease_until = NULL").
+		Set("submitted_at = NULL").
+		Set("completed_at = ?", now).
+		Set("updated_at = ?", now).
+		Where("id = ?", id).
+		Where("status = ?", model.WalletOperationStatusRunning).
+		Exec(ctx)
+	return requireRows(res, err, "marking wallet operation confirmed without transaction")
+}
+
 func (r *BunWalletOperationRepo) MarkFailed(ctx context.Context, id int64, lastError string) error {
 	now := time.Now()
 	res, err := r.db.NewUpdate().
@@ -230,7 +247,13 @@ func normalizeWalletOperationLimit(limit int) int {
 	return limit
 }
 
-func validWalletOperationAmount(amount string) bool {
+func validWalletOperationAmount(opType model.WalletOperationType, amount string) bool {
+	if opType == model.WalletOperationTypeApprove {
+		return amount == "0"
+	}
+	if opType != model.WalletOperationTypeFund && opType != model.WalletOperationTypeWithdraw {
+		return false
+	}
 	if amount == "" || amount[0] == '0' {
 		return false
 	}

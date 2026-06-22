@@ -66,12 +66,12 @@ Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosn
 
 ## High-Risk Operations
 
-Treat these endpoints as change-window operations. They can change data, credentials, wallet balance, or background state.
+Treat these endpoints as change-window operations. They can change data, credentials, wallet payment state, or background state.
 
 | Area | Endpoints | Risk |
 | --- | --- | --- |
 | Settings | `PUT /api/v1/settings` | Changes can require restart or move the node to a different Filecoin network. Validate settings and Filecoin readiness before saving. |
-| Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw` | Creates on-chain payment operations. |
+| Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw`, `POST /api/v1/wallet/approve` | Creates on-chain payment operations. |
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
 | Tasks and observability | task retry, diagnostic refresh, provider/data-set refresh | Requeues work or refreshes operational state. |
@@ -134,6 +134,7 @@ For object upload, the HTTP `Content-Type` is the uploaded object's content type
 | `GET` | `/api/v1/wallet` | Wallet identity, balances, contract state, and business counters. |
 | `POST` | `/api/v1/wallet/fund` | Create a wallet funding operation. |
 | `POST` | `/api/v1/wallet/withdraw` | Create a wallet withdrawal operation. |
+| `POST` | `/api/v1/wallet/approve` | Create an explicit FWSS approval operation. Payload only accepts `client_request_id`. |
 | `GET` | `/api/v1/wallet/operations` | List wallet operations. |
 | `GET` | `/api/v1/filecoin/readiness` | Check Filecoin readiness. |
 | `POST` | `/api/v1/filecoin/readiness/preflight` | Validate pending Filecoin settings. |

@@ -27,6 +27,19 @@ test('wallet fund action requires an explicit confirmation summary', () => {
   assert.equal(confirmation.actionLabel, 'Confirm fund')
 })
 
+test('wallet approve action has no transfer amount', () => {
+  const draft = createWalletOperationDraft({
+    type: 'approve',
+    amountBaseUnits: '0',
+    decimals: 18,
+    requestPrefix: 'approve-fwss',
+  })
+
+  assert.equal(draft.confirmation.title, 'Confirm FWSS approval')
+  assert.equal(draft.confirmation.amount, 'No USDFC transfer')
+  assert.deepEqual(walletOperationPayload(draft), { client_request_id: draft.clientRequestID })
+})
+
 test('wallet operation draft reuses the same client request id for retry', () => {
   const draft = createWalletOperationDraft({
     type: 'fund',
@@ -49,11 +62,13 @@ test('wallet operation confirmation keeps the draft while submit is pending', ()
 test('wallet operation mutation error follows the active operation type', () => {
   const fundError = new Error('fund failed')
   const withdrawError = new Error('withdraw failed')
+  const approveError = new Error('approve failed')
 
-  assert.equal(walletOperationMutationError('fund', fundError, withdrawError), 'fund failed')
-  assert.equal(walletOperationMutationError('withdraw', fundError, withdrawError), 'withdraw failed')
-  assert.equal(walletOperationMutationError('withdraw', fundError, null), null)
-  assert.equal(walletOperationMutationError(null, fundError, withdrawError), null)
+  assert.equal(walletOperationMutationError('fund', fundError, withdrawError, approveError), 'fund failed')
+  assert.equal(walletOperationMutationError('withdraw', fundError, withdrawError, approveError), 'withdraw failed')
+  assert.equal(walletOperationMutationError('approve', fundError, withdrawError, approveError), 'approve failed')
+  assert.equal(walletOperationMutationError('withdraw', fundError, null, approveError), null)
+  assert.equal(walletOperationMutationError(null, fundError, withdrawError, approveError), null)
 })
 
 test('wallet operation detail exposes failure reason', () => {
@@ -89,6 +104,20 @@ test('wallet operation detail keeps long failure text intact', () => {
   }
 
   assert.equal(walletOperationDetail(operation), longError)
+})
+
+test('wallet operation detail identifies no-op approve', () => {
+  const operation: WalletOperation = {
+    id: 1,
+    type: 'approve',
+    client_request_id: 'approve-1',
+    amount: '0',
+    status: 'confirmed',
+    created_at: '2026-05-06T00:00:00Z',
+    updated_at: '2026-05-06T00:00:00Z',
+  }
+
+  assert.equal(walletOperationDetail(operation), 'Already approved')
 })
 
 test('wallet decimal input rejects more than 18 fractional digits', () => {

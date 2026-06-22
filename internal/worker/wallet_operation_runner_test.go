@@ -14,6 +14,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synapse-go/payments"
 )
 
 func TestWalletOperationRunner_SubmitsAndConfirmsPendingOperation(t *testing.T) {
@@ -82,6 +83,90 @@ func TestWalletOperationRunner_SubmitsAndConfirmsPendingOperation(t *testing.T) 
 				t.Fatalf("published statuses = %v, want submitted and confirmed", publisher.statuses())
 			}
 		})
+	}
+}
+
+func TestWalletOperationRunner_SubmitsAndConfirmsApproveOperation(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+		Type:            model.WalletOperationTypeApprove,
+		ClientRequestID: "approve-1",
+		Amount:          "0",
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGet: %v", err)
+	}
+
+	txHash := common.HexToHash("0xabc")
+	operator := &fakeWalletOperator{approveHash: txHash.Hex()}
+	receipts := &fakeWalletReceiptChecker{receipts: map[common.Hash]*ethtypes.Receipt{
+		txHash: {Status: ethtypes.ReceiptStatusSuccessful},
+	}}
+	publisher := &fakeWalletEventPublisher{}
+	runner := NewWalletOperationRunner(repos, operator, receipts, time.Millisecond, nil, WithWalletOperationEventPublisher(publisher))
+
+	runner.runOnce(ctx)
+
+	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != model.WalletOperationStatusConfirmed {
+		t.Fatalf("status = %q, want confirmed", got.Status)
+	}
+	if got.TxHash == nil || *got.TxHash != txHash.Hex() {
+		t.Fatalf("tx_hash = %v, want %s", got.TxHash, txHash.Hex())
+	}
+	if !operator.approveCalled {
+		t.Fatal("ApproveFWSS was not called")
+	}
+	if operator.fundAmount != nil || operator.withdrawAmount != nil {
+		t.Fatalf("fund=%v withdraw=%v, want no fund or withdraw", operator.fundAmount, operator.withdrawAmount)
+	}
+	if !publisher.hasStatus(model.WalletOperationStatusSubmitted) || !publisher.hasStatus(model.WalletOperationStatusConfirmed) {
+		t.Fatalf("published statuses = %v, want submitted and confirmed", publisher.statuses())
+	}
+}
+
+func TestWalletOperationRunner_ConfirmsAlreadyApprovedWithoutTransaction(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+		Type:            model.WalletOperationTypeApprove,
+		ClientRequestID: "approve-already",
+		Amount:          "0",
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGet: %v", err)
+	}
+
+	operator := &fakeWalletOperator{approveErr: payments.ErrNothingToFund}
+	publisher := &fakeWalletEventPublisher{}
+	runner := NewWalletOperationRunner(repos, operator, nil, time.Millisecond, nil, WithWalletOperationEventPublisher(publisher))
+
+	runner.runOnce(ctx)
+
+	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != model.WalletOperationStatusConfirmed {
+		t.Fatalf("status = %q, want confirmed", got.Status)
+	}
+	if got.TxHash != nil {
+		t.Fatalf("tx_hash = %v, want nil", *got.TxHash)
+	}
+	if got.SubmittedAt != nil {
+		t.Fatalf("submitted_at = %v, want nil", got.SubmittedAt)
+	}
+	if !operator.approveCalled {
+		t.Fatal("ApproveFWSS was not called")
+	}
+	if !publisher.hasStatus(model.WalletOperationStatusConfirmed) {
+		t.Fatalf("published statuses = %v, want confirmed", publisher.statuses())
 	}
 }
 
@@ -453,11 +538,14 @@ func seedSubmittedWalletOperation(t *testing.T, repos *repository.Repositories, 
 type fakeWalletOperator struct {
 	fundHash       string
 	withdrawHash   string
+	approveHash    string
 	fundAmount     *big.Int
 	withdrawAmount *big.Int
+	approveCalled  bool
 	onFund         func(context.Context)
 	blockFund      bool
 	fundErr        error
+	approveErr     error
 }
 
 func (f *fakeWalletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (string, error) {
@@ -478,6 +566,14 @@ func (f *fakeWalletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (st
 func (f *fakeWalletOperator) WithdrawUSDFC(_ context.Context, amount *big.Int) (string, error) {
 	f.withdrawAmount = new(big.Int).Set(amount)
 	return f.withdrawHash, nil
+}
+
+func (f *fakeWalletOperator) ApproveFWSS(context.Context) (string, error) {
+	f.approveCalled = true
+	if f.approveErr != nil {
+		return "", f.approveErr
+	}
+	return f.approveHash, nil
 }
 
 type fakeWalletReceiptChecker struct {

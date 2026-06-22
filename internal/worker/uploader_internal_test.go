@@ -236,6 +236,12 @@ func (c submittedCommitTestContext) ProviderID() sdktypes.BigInt { return sdktyp
 
 func (c submittedCommitTestContext) DataSetID() *sdktypes.BigInt { return nil }
 
+func (c submittedCommitTestContext) GetProviderInfo() storage.Provider {
+	return storage.Provider{ID: c.ProviderID(), ServiceURL: c.ServiceURL()}
+}
+
+func (c submittedCommitTestContext) WithCDN() bool { return false }
+
 func (c submittedCommitTestContext) PieceURL(cid.Cid) string { return "" }
 
 func (c submittedCommitTestContext) ServiceURL() string { return c.serviceURL }

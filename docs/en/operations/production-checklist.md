@@ -29,13 +29,14 @@ Do not publish the dashboard or Admin API directly to the internet. Settings, wa
 - Store `SYNAPS3_FILECOIN_PRIVATE_KEY` in a host environment, `.env`, or secret manager.
 - Store the Admin password securely. Rotate it offline with `synaps3 admin-auth reset-password --config <path>` when it is lost or exposed; this also invalidates existing browser sessions.
 - Confirm `synaps3 admin status` reports a healthy wallet after startup.
-- Deposit USDFC before expected uploads. This example deposits `2 USDFC`:
+- Deposit USDFC and approve FWSS before expected uploads. This example deposits `2 USDFC`:
 
 ```bash
 synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
 ```
 
-The wallet operation should be accepted and later appear in the dashboard or `GET /api/v1/wallet/operations`.
+The wallet operations should be accepted and later appear in the dashboard or `GET /api/v1/wallet/operations`.
 
 ## Configuration Review
 

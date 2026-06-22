@@ -63,14 +63,15 @@ Default endpoints:
 | Dashboard and Admin API | `http://127.0.0.1:9090` |
 | Runtime data | `~/.synaps3/` |
 
-In another terminal, verify health and deposit USDFC:
+In another terminal, verify health, deposit USDFC, and approve FWSS:
 
 ```bash
 curl http://127.0.0.1:9090/healthz
 ./bin/synaps3 wallet deposit 2 # 2 USDFC
+./bin/synaps3 wallet approve
 ```
 
-Expected result: health returns `{"status":"ok"}` and the deposit operation is accepted.
+Expected result: health returns `{"status":"ok"}`, and the deposit and approve operations are accepted.
 
 ## Verify with an S3 Client
 

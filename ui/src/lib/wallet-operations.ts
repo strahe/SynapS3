@@ -44,6 +44,11 @@ export function createWalletOperationDraft({
 }
 
 export function walletOperationPayload(draft: WalletOperationDraft) {
+  if (draft.type === 'approve') {
+    return {
+      client_request_id: draft.clientRequestID,
+    }
+  }
   return {
     client_request_id: draft.clientRequestID,
     amount: draft.amount,
@@ -53,10 +58,12 @@ export function walletOperationPayload(draft: WalletOperationDraft) {
 export function walletOperationMutationError(
   activeType: WalletOperationType | null | undefined,
   fundError: unknown,
-  withdrawError: unknown
+  withdrawError: unknown,
+  approveError: unknown
 ) {
   if (activeType === 'fund') return errorMessage(fundError)
   if (activeType === 'withdraw') return errorMessage(withdrawError)
+  if (activeType === 'approve') return errorMessage(approveError)
   return null
 }
 
@@ -69,6 +76,14 @@ export function buildWalletOperationConfirmation({
   amountBaseUnits: string
   decimals: number
 }): WalletOperationConfirmation {
+  if (type === 'approve') {
+    return {
+      title: 'Confirm FWSS approval',
+      description: 'This will allow FWSS to spend USDFC for storage payments. It does not move funds.',
+      actionLabel: 'Approve FWSS',
+      amount: 'No USDFC transfer',
+    }
+  }
   const verb = type === 'withdraw' ? 'withdraw' : 'fund'
   return {
     title: `Confirm ${verb}`,
@@ -82,6 +97,7 @@ export function walletOperationDetail(operation: WalletOperation) {
   if (operation.last_error) return operation.last_error
   if (operation.status === 'failed') return 'Failed without a recorded reason'
   if (operation.status === 'unknown') return 'Operation state is unknown'
+  if (operation.type === 'approve' && operation.status === 'confirmed' && !operation.tx_hash) return 'Already approved'
   return ''
 }
 

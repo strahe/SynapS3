@@ -53,14 +53,15 @@ docker run -d --name synaps3-test \
 
 Docker prints a container ID when the node starts.
 
-Check health and deposit USDFC:
+Check health, deposit USDFC, and approve FWSS:
 
 ```bash
 curl http://127.0.0.1:9090/healthz
 docker exec synaps3-test synaps3 wallet deposit 2 # 2 USDFC
+docker exec synaps3-test synaps3 wallet approve
 ```
 
-Expected result: health returns `{"status":"ok"}` and the deposit command accepts the wallet operation. If health returns `setup` or `unhealthy`, use [Troubleshooting](../operations/troubleshooting.md).
+Expected result: health returns `{"status":"ok"}`, and the deposit and approve commands accept wallet operations. If health returns `setup` or `unhealthy`, use [Troubleshooting](../operations/troubleshooting.md).
 
 ## Open the Dashboard
 

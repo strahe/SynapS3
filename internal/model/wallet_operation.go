@@ -11,6 +11,7 @@ type WalletOperationType string
 const (
 	WalletOperationTypeFund     WalletOperationType = "fund"
 	WalletOperationTypeWithdraw WalletOperationType = "withdraw"
+	WalletOperationTypeApprove  WalletOperationType = "approve"
 )
 
 type WalletOperationStatus string

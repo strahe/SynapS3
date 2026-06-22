@@ -63,14 +63,15 @@ private_key = "0x..."
 | 仪表盘和 Admin API | `http://127.0.0.1:9090` |
 | 运行数据 | `~/.synaps3/` |
 
-在另一个终端检查健康状态，并存入 USDFC：
+在另一个终端检查健康状态、存入 USDFC，并批准 FWSS：
 
 ```bash
 curl http://127.0.0.1:9090/healthz
 ./bin/synaps3 wallet deposit 2 # 2 USDFC
+./bin/synaps3 wallet approve
 ```
 
-预期结果：`/healthz` 返回 `{"status":"ok"}`，deposit 操作被接受。
+预期结果：`/healthz` 返回 `{"status":"ok"}`，deposit 和 approve 操作被接受。
 
 ## 使用 S3 客户端验证
 

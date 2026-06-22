@@ -263,6 +263,50 @@ func TestHandleAPIWalletOperation_IsIdempotentByClientRequestID(t *testing.T) {
 	}
 }
 
+func TestHandleAPIWalletApprove_CreatesApproveOperation(t *testing.T) {
+	srv, repos := newWalletOperationTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/approve", strings.NewReader(`{"client_request_id":"approve-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIWalletApprove(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp walletOperationResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal operation response: %v", err)
+	}
+	if resp.Operation.Type != string(model.WalletOperationTypeApprove) {
+		t.Fatalf("operation type = %q, want approve", resp.Operation.Type)
+	}
+	if resp.Operation.Amount != "0" {
+		t.Fatalf("operation amount = %q, want 0", resp.Operation.Amount)
+	}
+
+	ops, err := repos.WalletOperations.ListRecent(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("ListRecent: %v", err)
+	}
+	if len(ops) != 1 || ops[0].Type != model.WalletOperationTypeApprove || ops[0].Amount != "0" {
+		t.Fatalf("stored approve operation = %#v", ops)
+	}
+}
+
+func TestHandleAPIWalletApprove_RejectsAmountField(t *testing.T) {
+	srv, _ := newWalletOperationTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallet/approve", strings.NewReader(`{"client_request_id":"approve-1","amount":"0"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIWalletApprove(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 type walletOperationAPIHandler struct {
 	name          string
 	path          string

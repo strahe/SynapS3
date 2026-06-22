@@ -77,6 +77,10 @@ type walletOperationRequest struct {
 	Amount          string `json:"amount"`
 }
 
+type walletApproveOperationRequest struct {
+	ClientRequestID string `json:"client_request_id"`
+}
+
 type walletOperationResponse struct {
 	Operation walletOperationDTO `json:"operation"`
 }
@@ -188,6 +192,10 @@ func (s *Server) handleAPIWalletWithdraw(w http.ResponseWriter, r *http.Request)
 	s.handleAPIWalletOperation(w, r, model.WalletOperationTypeWithdraw)
 }
 
+func (s *Server) handleAPIWalletApprove(w http.ResponseWriter, r *http.Request) {
+	s.handleAPIWalletOperation(w, r, model.WalletOperationTypeApprove)
+}
+
 func (s *Server) handleAPIWalletOperations(w http.ResponseWriter, r *http.Request) {
 	if s.repos == nil || s.repos.WalletOperations == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "wallet operations unavailable"})
@@ -230,26 +238,19 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var req walletOperationRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid wallet operation payload"})
-		return
-	}
-	var extra struct{}
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid wallet operation payload"})
-		return
-	}
 
-	clientRequestID := strings.TrimSpace(req.ClientRequestID)
-	amount := strings.TrimSpace(req.Amount)
+	clientRequestID, amount, err := decodeWalletOperationRequest(dec, opType)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid wallet operation payload"})
+		return
+	}
 	if clientRequestID == "" || len(clientRequestID) > 128 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "client_request_id is required"})
 		return
 	}
-	if !validBaseUnitAmount(amount) {
+	if opType != model.WalletOperationTypeApprove && !validBaseUnitAmount(amount) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "amount must be a positive integer string in USDFC base units"})
 		return
 	}
@@ -275,6 +276,30 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 }
 
 // --- Helpers ---
+
+func decodeWalletOperationRequest(dec *json.Decoder, opType model.WalletOperationType) (clientRequestID, amount string, err error) {
+	if opType == model.WalletOperationTypeApprove {
+		var req walletApproveOperationRequest
+		if err := dec.Decode(&req); err != nil {
+			return "", "", err
+		}
+		var extra struct{}
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return "", "", err
+		}
+		return strings.TrimSpace(req.ClientRequestID), "0", nil
+	}
+
+	var req walletOperationRequest
+	if err := dec.Decode(&req); err != nil {
+		return "", "", err
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return "", "", err
+	}
+	return strings.TrimSpace(req.ClientRequestID), strings.TrimSpace(req.Amount), nil
+}
 
 func bigIntToString(v *big.Int) *string {
 	if v == nil {

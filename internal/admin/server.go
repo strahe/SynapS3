@@ -224,6 +224,7 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/wallet", s.handleAPIWallet)
 		mux.HandleFunc("POST /api/v1/wallet/fund", s.handleAPIWalletFund)
 		mux.HandleFunc("POST /api/v1/wallet/withdraw", s.handleAPIWalletWithdraw)
+		mux.HandleFunc("POST /api/v1/wallet/approve", s.handleAPIWalletApprove)
 		mux.HandleFunc("GET /api/v1/wallet/operations", s.handleAPIWalletOperations)
 		mux.HandleFunc("GET /api/v1/filecoin/readiness", s.handleAPIFilecoinReadiness)
 		mux.HandleFunc("GET /api/v1/observability/providers", s.handleAPIObservabilityProviders)

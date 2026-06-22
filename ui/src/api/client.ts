@@ -774,6 +774,7 @@ export interface FilecoinReadinessCheck {
   status: FilecoinReadinessStatus
   message: string
   action?: string
+  required_usdfc?: string
 }
 
 export interface FilecoinReadinessData {
@@ -784,7 +785,7 @@ export interface FilecoinReadinessData {
   partial_errors?: Record<string, string>
 }
 
-export type WalletOperationType = 'fund' | 'withdraw'
+export type WalletOperationType = 'fund' | 'withdraw' | 'approve'
 export type WalletOperationStatus = 'pending' | 'running' | 'submitted' | 'confirmed' | 'failed' | 'unknown'
 
 export interface WalletOperation {
@@ -1226,6 +1227,11 @@ export const api = {
     }),
   withdrawWallet: (payload: { client_request_id: string; amount: string }) =>
     fetchJSON<WalletOperationResponse>('/wallet/withdraw', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  approveWallet: (payload: { client_request_id: string }) =>
+    fetchJSON<WalletOperationResponse>('/wallet/approve', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),

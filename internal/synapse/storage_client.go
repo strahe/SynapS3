@@ -23,6 +23,24 @@ func (s *StorageServiceAdapter) Download(ctx context.Context, pieceCID cid.Cid, 
 	return s.service.Download(ctx, pieceCID, opts)
 }
 
+func (s *StorageServiceAdapter) PrepareUpload(ctx context.Context, dataSize uint64, contexts []UploadContext) (*storage.MultiContextCosts, error) {
+	uploadContexts := make([]storage.UploadContext, 0, len(contexts))
+	for _, c := range contexts {
+		uploadContexts = append(uploadContexts, c)
+	}
+	prepared, err := s.service.Prepare(ctx, &storage.PrepareOptions{
+		DataSize: dataSize,
+		Contexts: uploadContexts,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if prepared == nil {
+		return nil, nil
+	}
+	return prepared.Costs, nil
+}
+
 func (s *StorageServiceAdapter) CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]UploadContext, error) {
 	contexts, err := s.service.CreateContexts(ctx, opts)
 	if err != nil {

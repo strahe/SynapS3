@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/payments"
 	"github.com/strahe/synapse-go/spregistry"
@@ -73,35 +74,51 @@ func TestReadinessCheckerUsesApprovedProviderInventoryAndCostEstimate(t *testing
 	requireChecksStatus(t, got.Checks, ReadinessStatusReady, "payment_account", "payment_runway", "providers", "storage_cost")
 }
 
-func TestReadinessCheckerIgnoresDepositNeededAndChecksApproval(t *testing.T) {
+func TestReadinessCheckerReportsFundingAndApprovalGaps(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
+		depositNeeded int64
 		needsApproval bool
 		want          ReadinessStatus
+		wantFunding   ReadinessStatus
 		wantApproval  ReadinessStatus
+		wantRequired  string
 	}{
 		{
-			name:         "deposit needed without approval gap",
+			name:          "deposit needed without approval gap",
+			depositNeeded: 10,
+			want:          ReadinessStatusBlocked,
+			wantFunding:   ReadinessStatusBlocked,
+			wantApproval:  ReadinessStatusReady,
+			wantRequired:  "10",
+		},
+		{
+			name:         "funding ready without approval gap",
 			want:         ReadinessStatusReady,
+			wantFunding:  ReadinessStatusReady,
 			wantApproval: ReadinessStatusReady,
 		},
 		{
 			name:          "approval gap",
 			needsApproval: true,
 			want:          ReadinessStatusBlocked,
+			wantFunding:   ReadinessStatusReady,
 			wantApproval:  ReadinessStatusBlocked,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := readyReadinessClient(1)
-			client.storage.costs = readinessCosts(10, tc.needsApproval, false)
+			client.storage.costs = readinessCosts(tc.depositNeeded, tc.needsApproval, false)
 			checker := NewReadinessChecker(readyReadinessConfig(), client)
 
 			got := checker.CheckRuntime(context.Background())
 
 			requireResultStatus(t, got, tc.want)
+			funding := requireCheckStatus(t, got.Checks, "payment_funding", tc.wantFunding)
+			if funding.RequiredUSDFC != tc.wantRequired {
+				t.Fatalf("payment_funding required_usdfc = %q, want %q", funding.RequiredUSDFC, tc.wantRequired)
+			}
 			requireCheckStatus(t, got.Checks, "fwss_approval", tc.wantApproval)
-			requireCheckAbsent(t, got.Checks, "payment_funding")
 		})
 	}
 }
@@ -404,13 +421,6 @@ func requireReadinessCheck(t *testing.T, checks []ReadinessCheck, id string) Rea
 	return *check
 }
 
-func requireCheckAbsent(t *testing.T, checks []ReadinessCheck, id string) {
-	t.Helper()
-	if check := findReadinessCheck(checks, id); check != nil {
-		t.Fatalf("unexpected readiness check %q: %#v", id, *check)
-	}
-}
-
 func findReadinessCheck(checks []ReadinessCheck, id string) *ReadinessCheck {
 	for i := range checks {
 		if checks[i].ID == id {
@@ -433,6 +443,7 @@ func countReadinessChecks(checks []ReadinessCheck, id string) int {
 type fakeReadinessClient struct {
 	address  common.Address
 	chain    chain.Chain
+	addrs    sdk.ResolvedAddresses
 	payments *fakeReadinessPayments
 	storage  *fakeReadinessStorage
 	closed   bool
@@ -441,6 +452,22 @@ type fakeReadinessClient struct {
 func (f *fakeReadinessClient) Address() common.Address { return f.address }
 
 func (f *fakeReadinessClient) Chain() chain.Chain { return f.chain }
+
+func (f *fakeReadinessClient) ResolvedAddresses() sdk.ResolvedAddresses {
+	if f.addrs != (sdk.ResolvedAddresses{}) {
+		return f.addrs
+	}
+	addrs := f.chain.Addresses()
+	return sdk.ResolvedAddresses{
+		FWSS:               addrs.FWSS,
+		PDPVerifier:        addrs.PDPVerifier,
+		SPRegistry:         addrs.SPRegistry,
+		USDFC:              addrs.USDFC,
+		Payments:           addrs.Payments,
+		ViewContract:       addrs.StateView,
+		SessionKeyRegistry: addrs.SessionKeyRegistry,
+	}
+}
 
 func (f *fakeReadinessClient) Payments() readinessPayments { return f.payments }
 

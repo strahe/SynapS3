@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Clock, Wallet } from 'lucide-react'
+import { AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Clock, ShieldCheck, Wallet } from 'lucide-react'
 import { type ReactNode, useMemo, useState } from 'react'
 import type { PaymentAccountData, WalletOperation, WalletOperationStatus } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
@@ -25,7 +25,7 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { useWallet, useWalletFund, useWalletOperations, useWalletWithdraw } from '@/hooks/queries'
+import { useWallet, useWalletApprove, useWalletFund, useWalletOperations, useWalletWithdraw } from '@/hooks/queries'
 import { cn, formatAttoFIL, formatDuration, formatTokenAmount, timeAgo } from '@/lib/utils'
 import {
   baseUnitsToDecimal,
@@ -66,6 +66,7 @@ function WalletPage() {
   const { data: operationsData } = useWalletOperations(operationsLimit)
   const fundMutation = useWalletFund()
   const withdrawMutation = useWalletWithdraw()
+  const approveMutation = useWalletApprove()
   const [fundAmount, setFundAmount] = useState('')
   const [withdrawAmount, setWithdrawAmount] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
@@ -76,8 +77,13 @@ function WalletPage() {
   const paymentAccount = data?.payment_account ?? null
   const decimals = data?.contracts?.usdfc_decimals ?? usdfcDecimals
   const operations = operationsData?.operations ?? []
-  const mutationError = walletOperationMutationError(pendingOperation?.type, fundMutation.error, withdrawMutation.error)
-  const isMutating = fundMutation.isPending || withdrawMutation.isPending
+  const mutationError = walletOperationMutationError(
+    pendingOperation?.type,
+    fundMutation.error,
+    withdrawMutation.error,
+    approveMutation.error
+  )
+  const isMutating = fundMutation.isPending || withdrawMutation.isPending || approveMutation.isPending
 
   const topUpAmounts = useMemo(() => {
     return topUpTargets.map((target) => ({
@@ -147,6 +153,12 @@ function WalletPage() {
     queueWalletOperation('fund', amount.toString(), undefined, `runway-${label.replace(/\s+/g, '-')}`)
   }
 
+  const submitApprove = () => {
+    setNotice(null)
+    setFormError(null)
+    queueWalletOperation('approve', '0', undefined, 'approve-fwss')
+  }
+
   const queueWalletOperation = (
     type: PendingWalletOperation['type'],
     amount: string,
@@ -155,6 +167,7 @@ function WalletPage() {
   ) => {
     fundMutation.reset()
     withdrawMutation.reset()
+    approveMutation.reset()
     const draft = createWalletOperationDraft({ type, amountBaseUnits: amount, decimals, requestPrefix })
     setPendingOperation({ ...draft, clearInput })
     setNotice(null)
@@ -165,6 +178,7 @@ function WalletPage() {
     if (walletOperationDialogShouldClearDraft(reason, isMutating)) {
       fundMutation.reset()
       withdrawMutation.reset()
+      approveMutation.reset()
       setPendingOperation(null)
     }
   }
@@ -175,15 +189,18 @@ function WalletPage() {
 
   const confirmPendingOperation = () => {
     if (!pendingOperation) return
-    const payload = walletOperationPayload(pendingOperation)
     const clearInput = pendingOperation.clearInput
     const onSuccess = () => {
       clearInput?.()
       clearPendingOperation('success')
     }
-    if (pendingOperation.type === 'withdraw') {
+    if (pendingOperation.type === 'approve') {
+      approveMutation.mutate(walletOperationPayload(pendingOperation), { onSuccess })
+    } else if (pendingOperation.type === 'withdraw') {
+      const payload = { client_request_id: pendingOperation.clientRequestID, amount: pendingOperation.amount }
       withdrawMutation.mutate(payload, { onSuccess })
     } else {
+      const payload = { client_request_id: pendingOperation.clientRequestID, amount: pendingOperation.amount }
       fundMutation.mutate(payload, { onSuccess })
     }
   }
@@ -276,6 +293,20 @@ function WalletPage() {
                     </Button>
                   }
                 />
+              </div>
+              <div className="rounded-md border border-border p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="text-sm font-medium">FWSS approval</div>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      Allow FWSS to spend USDFC for storage payments. This does not deposit or withdraw funds.
+                    </p>
+                  </div>
+                  <Button type="button" variant="outline" onClick={submitApprove} disabled={isMutating}>
+                    <ShieldCheck data-icon="inline-start" />
+                    Approve FWSS
+                  </Button>
+                </div>
               </div>
               <div className="flex flex-col gap-2">
                 <span className="text-sm text-muted-foreground">Top up to target runway</span>
@@ -652,7 +683,13 @@ function OperationsTable({
                   {operation.status}
                 </StatusBadge>
               </TableCell>
-              <TableCell className="font-mono">{formatTokenAmount(operation.amount, decimals, 'USDFC')}</TableCell>
+              <TableCell className="font-mono">
+                {operation.type === 'approve' ? (
+                  <span className="text-muted-foreground">—</span>
+                ) : (
+                  formatTokenAmount(operation.amount, decimals, 'USDFC')
+                )}
+              </TableCell>
               <TableCell>
                 {operation.tx_hash ? (
                   <CopyableValue label="Transaction hash" value={operation.tx_hash} monospace maxLength={24} />

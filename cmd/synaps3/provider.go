@@ -16,6 +16,7 @@ import (
 	"github.com/knadh/koanf/v2"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/provider"
+	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/spregistry"
 	"github.com/urfave/cli/v3"
@@ -87,7 +88,10 @@ func runProviderList(ctx context.Context, cmd *cli.Command) error {
 	}
 	defer ethClient.Close()
 
-	addrs := c.Addresses()
+	addrs, err := sdk.ResolveAddresses(ctx, ethClient, c.Addresses().FWSS)
+	if err != nil {
+		return fmt.Errorf("resolving contract addresses: %w", err)
+	}
 	svc, err := spregistry.New(spregistry.Options{
 		Client:  ethClient,
 		Address: addrs.SPRegistry,

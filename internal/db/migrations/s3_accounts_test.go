@@ -132,6 +132,48 @@ func TestBucketDefaultCopiesMigrationAddsNullableBoundedColumn(t *testing.T) {
 	}
 }
 
+func TestWalletApproveMigrationUpdatesSQLiteConstraints(t *testing.T) {
+	sqldb, err := sql.Open("sqlite", "file::memory:?cache=shared&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	migrator := migrate.NewMigrator(db, Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO wallet_operations (type, client_request_id, amount) VALUES ('approve', 'approve-1', '0')`); err != nil {
+		t.Fatalf("insert approve amount 0: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		opType string
+		amount string
+	}{
+		{name: "approve positive", opType: "approve", amount: "1"},
+		{name: "fund zero", opType: "fund", amount: "0"},
+		{name: "withdraw zero", opType: "withdraw", amount: "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := db.ExecContext(ctx, `INSERT INTO wallet_operations (type, client_request_id, amount) VALUES (?, ?, ?)`, tc.opType, tc.name, tc.amount)
+			if err == nil {
+				t.Fatalf("insert type=%s amount=%s succeeded, want constraint failure", tc.opType, tc.amount)
+			}
+		})
+	}
+
+	if _, err := migrator.Rollback(ctx); err == nil {
+		t.Fatal("rollback with approve operation succeeded, want refusal")
+	}
+}
+
 func sqliteTableExists(t *testing.T, db *bun.DB, table string) bool {
 	t.Helper()
 	var count int

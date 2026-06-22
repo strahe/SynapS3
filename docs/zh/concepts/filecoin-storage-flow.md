@@ -43,7 +43,7 @@ synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task retry 42
 ```
 
-重试前先修复底层问题，例如 RPC 连接、存储提供方可达性、钱包余额或缓存容量。
+重试前先修复底层问题，例如 RPC 连接、存储提供方可达性、payment funding、FWSS approval 或缓存容量。
 
 ## 存储提供方健康状态
 

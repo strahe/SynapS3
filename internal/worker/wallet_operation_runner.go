@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synapse-go/payments"
 )
 
 const walletOperationUpdatedTopic = "wallet_operation_updated"
@@ -41,6 +42,11 @@ type WalletOperationRunner struct {
 	receiptTTL   time.Duration
 	logger       *slog.Logger
 	*livenessTracker
+}
+
+type walletOperationBroadcastResult struct {
+	TxHash          string
+	AlreadyComplete bool
 }
 
 type WalletOperationRunnerOption func(*WalletOperationRunner)
@@ -174,13 +180,13 @@ func (r *WalletOperationRunner) processPending(ctx context.Context) {
 
 func (r *WalletOperationRunner) processClaimed(ctx context.Context, op *model.WalletOperation) {
 	amount, ok := new(big.Int).SetString(op.Amount, 10)
-	if !ok || amount.Sign() <= 0 {
+	if !ok || !validClaimedWalletOperationAmount(op.Type, amount) {
 		r.markFailedAndPublish(ctx, op.ID, "invalid wallet operation amount")
 		return
 	}
 
 	broadcastCtx, cancel := context.WithTimeout(ctx, r.broadcastTTL)
-	txHash, err := r.broadcast(broadcastCtx, op.Type, amount)
+	result, err := r.broadcast(broadcastCtx, op.Type, amount)
 	cancel()
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -190,11 +196,19 @@ func (r *WalletOperationRunner) processClaimed(ctx context.Context, op *model.Wa
 		r.markFailedAndPublish(ctx, op.ID, walletOperationError(err))
 		return
 	}
-	if txHash == "" {
+	if result.AlreadyComplete {
+		if err := r.repos.WalletOperations.MarkConfirmedWithoutTransaction(context.WithoutCancel(ctx), op.ID); err != nil {
+			r.logger.Error("marking wallet operation confirmed without transaction failed", "id", op.ID, "error", err)
+			return
+		}
+		r.publish(r.mustGet(ctx, op.ID))
+		return
+	}
+	if result.TxHash == "" {
 		r.markFailedAndPublish(ctx, op.ID, "wallet operation broadcast did not return a transaction hash")
 		return
 	}
-	if !r.markSubmittedAfterBroadcast(context.WithoutCancel(ctx), op.ID, txHash) {
+	if !r.markSubmittedAfterBroadcast(context.WithoutCancel(ctx), op.ID, result.TxHash) {
 		return
 	}
 	submitted := r.mustGet(ctx, op.ID)
@@ -222,14 +236,33 @@ func (r *WalletOperationRunner) markSubmittedAfterBroadcast(ctx context.Context,
 	return false
 }
 
-func (r *WalletOperationRunner) broadcast(ctx context.Context, opType model.WalletOperationType, amount *big.Int) (string, error) {
+func validClaimedWalletOperationAmount(opType model.WalletOperationType, amount *big.Int) bool {
+	switch opType {
+	case model.WalletOperationTypeApprove:
+		return amount.Sign() == 0
+	case model.WalletOperationTypeFund, model.WalletOperationTypeWithdraw:
+		return amount.Sign() > 0
+	default:
+		return false
+	}
+}
+
+func (r *WalletOperationRunner) broadcast(ctx context.Context, opType model.WalletOperationType, amount *big.Int) (walletOperationBroadcastResult, error) {
 	switch opType {
 	case model.WalletOperationTypeFund:
-		return r.operator.FundUSDFC(ctx, amount)
+		txHash, err := r.operator.FundUSDFC(ctx, amount)
+		return walletOperationBroadcastResult{TxHash: txHash}, err
 	case model.WalletOperationTypeWithdraw:
-		return r.operator.WithdrawUSDFC(ctx, amount)
+		txHash, err := r.operator.WithdrawUSDFC(ctx, amount)
+		return walletOperationBroadcastResult{TxHash: txHash}, err
+	case model.WalletOperationTypeApprove:
+		txHash, err := r.operator.ApproveFWSS(ctx)
+		if errors.Is(err, payments.ErrNothingToFund) {
+			return walletOperationBroadcastResult{AlreadyComplete: true}, nil
+		}
+		return walletOperationBroadcastResult{TxHash: txHash}, err
 	default:
-		return "", fmt.Errorf("unsupported wallet operation type %q", opType)
+		return walletOperationBroadcastResult{}, fmt.Errorf("unsupported wallet operation type %q", opType)
 	}
 }
 

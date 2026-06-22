@@ -32,6 +32,7 @@ var (
 		{Name: "Reiers", URL: "https://faucet.reiers.io/api/claim_token_all", SupportsAssets: true},
 	}
 	walletDeposit = runWalletDeposit
+	walletApprove = runWalletApprove
 )
 
 type walletFaucetEndpoint struct {
@@ -43,6 +44,12 @@ type walletFaucetEndpoint struct {
 type walletDepositResult struct {
 	TxHash    string `json:"tx_hash"`
 	Confirmed bool   `json:"confirmed"`
+}
+
+type walletApproveResult struct {
+	TxHash          string `json:"tx_hash,omitempty"`
+	Confirmed       bool   `json:"confirmed"`
+	AlreadyApproved bool   `json:"already_approved"`
 }
 
 type walletFaucetResult struct {
@@ -84,6 +91,7 @@ func walletCommand() *cli.Command {
 			walletGenerateCommand(),
 			walletFundTestnetCommand(),
 			walletDepositCommand(),
+			walletApproveCommand(),
 		},
 		Action: func(_ context.Context, cmd *cli.Command) error {
 			if cmd.Args().Len() > 0 {
@@ -186,6 +194,42 @@ func walletDepositCommand() *cli.Command {
 			}
 			result, err := walletDeposit(ctx, cfg, amount, timeout)
 			if writeErr := writeWalletDepositResult(cmd, result); writeErr != nil {
+				return writeErr
+			}
+			return err
+		},
+	}
+}
+
+func walletApproveCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "approve",
+		Usage: "approve FWSS spending using the configured Filecoin private key",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "json",
+				Usage: "output as JSON",
+			},
+			&cli.DurationFlag{
+				Name:  "timeout",
+				Value: 5 * time.Minute,
+				Usage: "transaction receipt wait timeout",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Len() != 0 {
+				return fmt.Errorf("wallet approve takes no positional arguments")
+			}
+			timeout := cmd.Duration("timeout")
+			if timeout <= 0 {
+				return fmt.Errorf("timeout must be positive")
+			}
+			cfg, err := loadWalletConfig(cmd)
+			if err != nil {
+				return err
+			}
+			result, err := walletApprove(ctx, cfg, timeout)
+			if writeErr := writeWalletApproveResult(cmd, result); writeErr != nil {
 				return writeErr
 			}
 			return err
@@ -545,9 +589,58 @@ func runWalletDeposit(ctx context.Context, cfg *config.Config, amount *big.Int, 
 	return result, nil
 }
 
+func runWalletApprove(ctx context.Context, cfg *config.Config, timeout time.Duration) (walletApproveResult, error) {
+	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
+		PrivateKey:           cfg.Filecoin.PrivateKey,
+		RPCURL:               cfg.Filecoin.RPCURL,
+		Source:               cfg.Filecoin.Source,
+		WithCDN:              cfg.Filecoin.WithCDN,
+		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+	})
+	if err != nil {
+		return walletApproveResult{}, fmt.Errorf("initializing Filecoin SDK: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	res, err := client.Payments().FundSync(ctx, big.NewInt(0), payments.WithWait(timeout))
+	result := walletApproveResult{}
+	if errors.Is(err, payments.ErrNothingToFund) {
+		result.Confirmed = true
+		result.AlreadyApproved = true
+		return result, nil
+	}
+	if res != nil {
+		result.TxHash = res.Hash.Hex()
+		result.Confirmed = res.Receipt != nil && res.Receipt.Status == 1
+	}
+	if err != nil {
+		return result, fmt.Errorf("approving FWSS: %w", err)
+	}
+	return result, nil
+}
+
 func writeWalletDepositResult(cmd *cli.Command, result walletDepositResult) error {
 	if cmd.Bool("json") {
 		return writeWalletJSON(cmd, result)
+	}
+	if result.TxHash == "" {
+		return nil
+	}
+	status := "submitted"
+	if result.Confirmed {
+		status = "confirmed"
+	}
+	_, err := fmt.Fprintf(cmd.Root().Writer, "Transaction: %s\nStatus: %s\n", result.TxHash, status)
+	return err
+}
+
+func writeWalletApproveResult(cmd *cli.Command, result walletApproveResult) error {
+	if cmd.Bool("json") {
+		return writeWalletJSON(cmd, result)
+	}
+	if result.AlreadyApproved {
+		_, err := fmt.Fprintln(cmd.Root().Writer, "FWSS approval: already approved")
+		return err
 	}
 	if result.TxHash == "" {
 		return nil

@@ -74,10 +74,11 @@ For Calibration, fund the wallet address again:
 synaps3 wallet fund-testnet 0x...
 ```
 
-Then retry deposit:
+Then retry deposit and FWSS approval:
 
 ```bash
 synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
 ```
 
 If faucet funding fails, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/), then rerun `synaps3 admin status`.
@@ -105,7 +106,7 @@ List exhausted work:
 synaps3 admin task list --status exhausted --limit 100
 ```
 
-Retry only after the underlying dependency is fixed. Typical dependencies are RPC connectivity, provider availability, wallet balance, or cache disk capacity.
+Retry only after the underlying dependency is fixed. Typical dependencies are RPC connectivity, provider availability, payment funding, FWSS approval, or cache disk capacity.
 
 ```bash
 synaps3 admin task retry 42

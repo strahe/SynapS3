@@ -74,10 +74,11 @@ synaps3 admin status
 synaps3 wallet fund-testnet 0x...
 ```
 
-然后重试 deposit：
+然后重试 deposit 和 FWSS approval：
 
 ```bash
 synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
 ```
 
 如果 faucet 失败，使用 [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) 或 [Plumbline](https://faucet.reiers.io/) 手动领取，然后重新运行 `synaps3 admin status`。
@@ -105,7 +106,7 @@ synaps3 admin settings get cache.max_size_gb
 synaps3 admin task list --status exhausted --limit 100
 ```
 
-只有在底层依赖修复后再重试。常见依赖包括 RPC 连接、存储提供方可用性、钱包余额或缓存磁盘容量。
+只有在底层依赖修复后再重试。常见依赖包括 RPC 连接、存储提供方可用性、payment funding、FWSS approval 或缓存磁盘容量。
 
 ```bash
 synaps3 admin task retry 42

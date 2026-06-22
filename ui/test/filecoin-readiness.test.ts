@@ -30,6 +30,7 @@ test('filecoin readiness status labels and tones are stable', () => {
 test('filecoin readiness check titles hide implementation ids', () => {
   assert.equal(filecoinReadinessCheckTitle('private_networks'), 'Private network access')
   assert.equal(filecoinReadinessCheckTitle('payment_runway'), 'Payment runway')
+  assert.equal(filecoinReadinessCheckTitle('payment_funding'), 'Payment funding')
   assert.equal(filecoinReadinessCheckTitle('wallet_fil_gas'), 'FIL gas balance')
   assert.equal(filecoinReadinessCheckTitle('custom_check'), 'custom check')
 })

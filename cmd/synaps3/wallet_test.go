@@ -424,6 +424,51 @@ func TestWalletDepositPreservesHashOnWaitFailure(t *testing.T) {
 	}
 }
 
+func TestWalletApproveReportsAlreadyApproved(t *testing.T) {
+	cfgPath := writeWalletTestConfig(t, "0x"+strings.Repeat("1", 64))
+	var gotCfg *config.Config
+	var gotTimeout time.Duration
+
+	origApprove := walletApprove
+	walletApprove = func(_ context.Context, cfg *config.Config, timeout time.Duration) (walletApproveResult, error) {
+		gotCfg = cfg
+		gotTimeout = timeout
+		return walletApproveResult{Confirmed: true, AlreadyApproved: true}, nil
+	}
+	t.Cleanup(func() { walletApprove = origApprove })
+
+	out, err := runWalletCommand(t, []string{"synaps3", "--config", cfgPath, "wallet", "approve", "--json", "--timeout", "11s"})
+	if err != nil {
+		t.Fatalf("wallet approve: %v\n%s", err, out)
+	}
+	if gotCfg == nil || gotCfg.Filecoin.RPCURL != "https://rpc.example.invalid" {
+		t.Fatalf("config = %#v, want loaded filecoin config", gotCfg)
+	}
+	if gotTimeout != 11*time.Second {
+		t.Fatalf("timeout = %s, want 11s", gotTimeout)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(out), &body); err != nil {
+		t.Fatalf("json output: %v\n%s", err, out)
+	}
+	if body["already_approved"] != true || body["confirmed"] != true {
+		t.Fatalf("json output = %#v, want already_approved and confirmed true", body)
+	}
+	if _, ok := body["tx_hash"]; ok {
+		t.Fatalf("json output = %#v, want no tx_hash for already approved", body)
+	}
+}
+
+func TestWalletApproveRejectsPositionalArguments(t *testing.T) {
+	out, err := runWalletCommand(t, []string{"synaps3", "wallet", "approve", "1"})
+	if err == nil {
+		t.Fatalf("wallet approve succeeded, output:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "no positional arguments") {
+		t.Fatalf("error = %v, want positional argument validation", err)
+	}
+}
+
 func runWalletCommand(t *testing.T, args []string) (string, error) {
 	t.Helper()
 	cmd := newRootCommand()

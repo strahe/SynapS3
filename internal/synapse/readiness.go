@@ -43,10 +43,11 @@ const (
 )
 
 type ReadinessCheck struct {
-	ID      string          `json:"id"`
-	Status  ReadinessStatus `json:"status"`
-	Message string          `json:"message"`
-	Action  string          `json:"action,omitempty"`
+	ID            string          `json:"id"`
+	Status        ReadinessStatus `json:"status"`
+	Message       string          `json:"message"`
+	Action        string          `json:"action,omitempty"`
+	RequiredUSDFC string          `json:"required_usdfc,omitempty"`
 }
 
 type ReadinessResult struct {
@@ -86,6 +87,7 @@ type readinessStorage interface {
 type ReadinessClient interface {
 	Address() common.Address
 	Chain() chain.Chain
+	ResolvedAddresses() sdk.ResolvedAddresses
 	Payments() readinessPayments
 	Storage() readinessStorage
 	Close() error
@@ -225,7 +227,7 @@ func (c *ReadinessChecker) checkWallet(ctx context.Context, client ReadinessClie
 		return
 	}
 
-	addrs := client.Chain().Addresses()
+	addrs := client.ResolvedAddresses()
 	fil, err := paymentsSvc.WalletBalance(ctx, payments.ZeroAddress, client.Address())
 	switch {
 	case err != nil:
@@ -269,16 +271,10 @@ func (c *ReadinessChecker) checkWallet(ctx context.Context, client ReadinessClie
 		result.unknown("payment_account", "USDFC payment account is unavailable.")
 	default:
 		converted := convertAccountState(account, client.Chain(), chain.CurrentEpoch(client.Chain()))
-		if converted == nil || converted.AvailableFunds == nil {
+		if converted == nil {
 			result.unknown("payment_account", "USDFC payment account funds are unavailable.")
-		} else if converted.AvailableFunds.Sign() <= 0 {
-			result.blocked(
-				"payment_account",
-				"Payment account has no available USDFC.",
-				"Fund the USDFC payment account before uploading to Filecoin.",
-			)
 		} else {
-			result.ready("payment_account", "Payment account has available USDFC.")
+			result.ready("payment_account", "USDFC payment account is available.")
 			addPaymentRunwayCheck(result, converted)
 		}
 	}
@@ -318,7 +314,7 @@ func (c *ReadinessChecker) checkStorage(
 	storageSvc := client.Storage()
 	if storageSvc == nil {
 		result.unknown("providers", "Storage provider inventory is unavailable.")
-		addStorageDependencyUnknowns(result, "Storage cost estimate is unavailable.", "FWSS approval could not be checked.")
+		addStorageDependencyUnknowns(result, "Storage cost estimate is unavailable.", "Payment funding could not be checked.", "FWSS approval could not be checked.")
 		return
 	}
 
@@ -328,7 +324,7 @@ func (c *ReadinessChecker) checkStorage(
 	}
 	if info == nil {
 		result.unknown("providers", "Approved storage providers could not be checked.")
-		addStorageDependencyUnknowns(result, "Storage cost estimate could not be calculated.", "FWSS approval could not be checked.")
+		addStorageDependencyUnknowns(result, "Storage cost estimate could not be calculated.", "Payment funding could not be checked.", "FWSS approval could not be checked.")
 		return
 	}
 
@@ -339,7 +335,7 @@ func (c *ReadinessChecker) checkStorage(
 			fmt.Sprintf("Only %d approved active providers are available; %d copies are configured.", len(refs), cfg.DefaultCopies),
 			"Lower the default copy count or wait for more approved providers.",
 		)
-		addStorageDependencyUnknowns(result, "Storage cost estimate needs enough approved providers.", "FWSS approval needs a storage cost estimate.")
+		addStorageDependencyUnknowns(result, "Storage cost estimate needs enough approved providers.", "Payment funding needs a storage cost estimate.", "FWSS approval needs a storage cost estimate.")
 		return
 	}
 	result.ready("providers", "Approved active providers are available.")
@@ -353,15 +349,27 @@ func (c *ReadinessChecker) checkStorage(
 	)
 	if err != nil {
 		c.addPartialError(result, "storage_cost", err)
-		addStorageDependencyUnknowns(result, "Storage cost estimate could not be calculated.", "FWSS approval could not be checked.")
+		addStorageDependencyUnknowns(result, "Storage cost estimate could not be calculated.", "Payment funding could not be checked.", "FWSS approval could not be checked.")
 		return
 	}
 	if costs == nil {
-		addStorageDependencyUnknowns(result, "Storage cost estimate is unavailable.", "FWSS approval could not be checked.")
+		addStorageDependencyUnknowns(result, "Storage cost estimate is unavailable.", "Payment funding could not be checked.", "FWSS approval could not be checked.")
 		return
 	}
 
 	result.ready("storage_cost", "Storage cost estimate is available.")
+	if costs.DepositNeeded == nil {
+		result.unknown("payment_funding", "Payment funding requirement is unavailable.")
+	} else if costs.DepositNeeded.Sign() > 0 {
+		result.blockedRequiredUSDFC(
+			"payment_funding",
+			"Payment account needs additional USDFC for configured storage.",
+			"Fund the USDFC payment account before uploading to Filecoin.",
+			costs.DepositNeeded.String(),
+		)
+	} else {
+		result.ready("payment_funding", "Payment account funding is sufficient.")
+	}
 	if costs.NeedsFWSSMaxApproval {
 		result.blocked(
 			"fwss_approval",
@@ -373,8 +381,9 @@ func (c *ReadinessChecker) checkStorage(
 	}
 }
 
-func addStorageDependencyUnknowns(result *ReadinessResult, storageCost, fwssApproval string) {
+func addStorageDependencyUnknowns(result *ReadinessResult, storageCost, paymentFunding, fwssApproval string) {
 	result.unknown("storage_cost", storageCost)
+	result.unknown("payment_funding", paymentFunding)
 	result.unknown("fwss_approval", fwssApproval)
 }
 
@@ -492,15 +501,19 @@ func newReadinessResult(mode ReadinessMode) ReadinessResult {
 }
 
 func (r *ReadinessResult) addCheck(id string, status ReadinessStatus, message, action string) {
-	if r == nil {
-		return
-	}
-	r.Checks = append(r.Checks, ReadinessCheck{
+	r.add(ReadinessCheck{
 		ID:      id,
 		Status:  status,
 		Message: message,
 		Action:  action,
 	})
+}
+
+func (r *ReadinessResult) add(check ReadinessCheck) {
+	if r == nil {
+		return
+	}
+	r.Checks = append(r.Checks, check)
 }
 
 func (r *ReadinessResult) ready(id, message string) {
@@ -521,6 +534,16 @@ func (r *ReadinessResult) warning(id, message, action string) {
 
 func (r *ReadinessResult) blocked(id, message, action string) {
 	r.addCheck(id, ReadinessStatusBlocked, message, action)
+}
+
+func (r *ReadinessResult) blockedRequiredUSDFC(id, message, action, amount string) {
+	r.add(ReadinessCheck{
+		ID:            id,
+		Status:        ReadinessStatusBlocked,
+		Message:       message,
+		Action:        action,
+		RequiredUSDFC: amount,
+	})
 }
 
 func (r *ReadinessResult) addPartialError(field string, err error) {
@@ -604,6 +627,10 @@ type sdkReadinessClient struct {
 func (c *sdkReadinessClient) Address() common.Address { return c.client.Address() }
 
 func (c *sdkReadinessClient) Chain() chain.Chain { return c.client.Chain() }
+
+func (c *sdkReadinessClient) ResolvedAddresses() sdk.ResolvedAddresses {
+	return c.client.ResolvedAddresses()
+}
 
 func (c *sdkReadinessClient) Payments() readinessPayments { return c.client.Payments() }
 

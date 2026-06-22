@@ -9,6 +9,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synapse-go/storage"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 // Compile-time interface checks.
@@ -22,6 +23,7 @@ var (
 type MockStorageClient struct {
 	UploadFunc               func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
 	DownloadFunc             func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
+	PrepareUploadFunc        func(ctx context.Context, dataSize uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error)
 	CreateContextsFunc       func(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error)
 	CreateContextFunc        func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error)
 	CreateCleanupContextFunc func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error)
@@ -41,6 +43,13 @@ func (m *MockStorageClient) Download(ctx context.Context, pieceCID cid.Cid, opts
 	return nil, errors.New("MockStorageClient.Download not configured")
 }
 
+func (m *MockStorageClient) PrepareUpload(ctx context.Context, dataSize uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+	if m.PrepareUploadFunc != nil {
+		return m.PrepareUploadFunc(ctx, dataSize, contexts)
+	}
+	return &storage.MultiContextCosts{Ready: true}, nil
+}
+
 func (m *MockStorageClient) CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
 	if m.CreateContextsFunc != nil {
 		return m.CreateContextsFunc(ctx, opts)
@@ -52,7 +61,7 @@ func (m *MockStorageClient) CreateContext(ctx context.Context, opts *storage.Cre
 	if m.CreateContextFunc != nil {
 		return m.CreateContextFunc(ctx, opts)
 	}
-	return nil, errors.New("MockStorageClient.CreateContext not configured")
+	return NewMockUploadContext(opts), nil
 }
 
 func (m *MockStorageClient) CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error) {
@@ -71,6 +80,83 @@ func (m *MockStorageClient) CreateCleanupContext(ctx context.Context, opts *stor
 		return cleanupCtx, nil
 	}
 	return nil, errors.New("MockStorageClient.CreateCleanupContext not configured")
+}
+
+// MockUploadContext is a minimal UploadContext for tests that only need
+// provider metadata for upload preparation.
+type MockUploadContext struct {
+	ProviderIDValue sdktypes.BigInt
+	DataSetIDValue  *sdktypes.BigInt
+	ServiceURLValue string
+	WithCDNValue    bool
+}
+
+func NewMockUploadContext(opts *storage.CreateContextOptions) *MockUploadContext {
+	ctx := &MockUploadContext{ServiceURLValue: "https://provider.example"}
+	if opts != nil {
+		if opts.ProviderID != nil {
+			ctx.ProviderIDValue = opts.ProviderID.Copy()
+		}
+		if opts.DataSetID != nil {
+			id := opts.DataSetID.Copy()
+			ctx.DataSetIDValue = &id
+		}
+		if opts.WithCDN != nil {
+			ctx.WithCDNValue = *opts.WithCDN
+		}
+	}
+	return ctx
+}
+
+func (m *MockUploadContext) ProviderID() sdktypes.BigInt { return m.ProviderIDValue.Copy() }
+
+func (m *MockUploadContext) DataSetID() *sdktypes.BigInt {
+	if m.DataSetIDValue == nil {
+		return nil
+	}
+	id := m.DataSetIDValue.Copy()
+	return &id
+}
+
+func (m *MockUploadContext) GetProviderInfo() storage.Provider {
+	return storage.Provider{ID: m.ProviderID(), ServiceURL: m.ServiceURL()}
+}
+
+func (m *MockUploadContext) WithCDN() bool { return m.WithCDNValue }
+
+func (m *MockUploadContext) PieceURL(piece cid.Cid) string {
+	return m.ServiceURL() + "/piece/" + piece.String()
+}
+
+func (m *MockUploadContext) ServiceURL() string {
+	if m.ServiceURLValue != "" {
+		return m.ServiceURLValue
+	}
+	return "https://provider.example"
+}
+
+func (m *MockUploadContext) CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+	return nil, errors.New("MockUploadContext.CreateDataSet not configured")
+}
+
+func (m *MockUploadContext) WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+	return nil, errors.New("MockUploadContext.WaitForDataSetCreated not configured")
+}
+
+func (m *MockUploadContext) Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+	return nil, errors.New("MockUploadContext.Store not configured")
+}
+
+func (m *MockUploadContext) PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error) {
+	return nil, errors.New("MockUploadContext.PresignForCommit not configured")
+}
+
+func (m *MockUploadContext) Pull(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+	return nil, errors.New("MockUploadContext.Pull not configured")
+}
+
+func (m *MockUploadContext) Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error) {
+	return nil, errors.New("MockUploadContext.Commit not configured")
 }
 
 // MockWalletQuerier is a configurable test double for synapse.WalletQuerier.

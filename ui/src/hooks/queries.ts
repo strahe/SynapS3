@@ -326,6 +326,19 @@ export function useWalletWithdraw() {
   })
 }
 
+export function useWalletApprove() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: api.approveWallet,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['wallet'] })
+      qc.invalidateQueries({ queryKey: ['walletOperations'] })
+      qc.invalidateQueries({ queryKey: ['filecoinReadiness'] })
+    },
+  })
+}
+
 export function useSettings() {
   return useQuery({
     queryKey: ['settings'],

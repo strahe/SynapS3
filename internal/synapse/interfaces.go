@@ -15,6 +15,8 @@ import (
 type UploadContext interface {
 	ProviderID() sdktypes.BigInt
 	DataSetID() *sdktypes.BigInt
+	GetProviderInfo() storage.Provider
+	WithCDN() bool
 	PieceURL(cid.Cid) string
 	ServiceURL() string
 	CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
@@ -35,6 +37,7 @@ type CleanupContext interface {
 // staged provider operations.
 type StorageClient interface {
 	Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
+	PrepareUpload(ctx context.Context, dataSize uint64, contexts []UploadContext) (*storage.MultiContextCosts, error)
 	CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]UploadContext, error)
 	CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (UploadContext, error)
 	CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (CleanupContext, error)
@@ -49,6 +52,7 @@ type WalletQuerier interface {
 type WalletOperator interface {
 	FundUSDFC(ctx context.Context, amount *big.Int) (string, error)
 	WithdrawUSDFC(ctx context.Context, amount *big.Int) (string, error)
+	ApproveFWSS(ctx context.Context) (string, error)
 }
 
 // WalletInfo holds a snapshot of the wallet's on-chain state.

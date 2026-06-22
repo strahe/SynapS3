@@ -79,9 +79,10 @@ docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password
 curl http://127.0.0.1:9090/healthz
 docker compose exec synaps3 synaps3 admin status
 docker compose exec synaps3 synaps3 wallet deposit 2 # 2 USDFC
+docker compose exec synaps3 synaps3 wallet approve
 ```
 
-预期结果：`/healthz` 返回 `{"status":"ok"}`，`admin status` 显示运行时、工作进程和缓存状态。deposit 命令提交钱包操作。
+预期结果：`/healthz` 返回 `{"status":"ok"}`，`admin status` 显示运行时、工作进程和缓存状态。deposit 和 approve 命令提交钱包操作。
 
 远程访问仪表盘使用 SSH：
 

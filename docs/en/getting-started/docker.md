@@ -79,9 +79,10 @@ The username is `admin`. Container-local `synaps3 admin` commands read this pass
 curl http://127.0.0.1:9090/healthz
 docker compose exec synaps3 synaps3 admin status
 docker compose exec synaps3 synaps3 wallet deposit 2 # 2 USDFC
+docker compose exec synaps3 synaps3 wallet approve
 ```
 
-Expected result: health returns `{"status":"ok"}`, and `admin status` shows runtime, worker, and cache status. The deposit command submits a wallet operation.
+Expected result: health returns `{"status":"ok"}`, and `admin status` shows runtime, worker, and cache status. The deposit and approve commands submit wallet operations.
 
 Access a remote dashboard through SSH:
 

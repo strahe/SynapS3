@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -23,6 +22,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -34,6 +34,7 @@ import (
 const (
 	submittedCommitPollInterval   = 4 * time.Second
 	terminalFailureCleanupTimeout = 5 * time.Second
+	uploadFundingWaitDelay        = time.Minute
 )
 
 var errCommitRejected = errors.New("commit transaction rejected")
@@ -515,11 +516,6 @@ func (u *Uploader) prepareStagedUpload(ctx context.Context, task *model.Task, ve
 		return
 	}
 
-	if err := u.checkPaymentBalancePreflight(ctx, logger); err != nil {
-		u.handleBalancePreflightFailure(ctx, task, logger, err)
-		return
-	}
-
 	targetCopies := u.targetCopiesForBucket(bucket)
 	upload, err := u.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
 		BucketID:        version.BucketID,
@@ -537,6 +533,9 @@ func (u *Uploader) prepareStagedUpload(ctx context.Context, task *model.Task, ve
 	bindings, err := u.ensureBucketProviderBindings(ctx, bucket, upload.ID, targetCopies)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "ensure provider bindings", err)
+		return
+	}
+	if !u.ensureUploadFundingReady(ctx, task, version.Size, bucket, upload.ID, bindings, logger) {
 		return
 	}
 	copyInputs := make([]repository.UploadCopyBindingInput, 0, len(bindings))
@@ -637,8 +636,12 @@ func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.
 	}
 	missing := upload.RequestedCopies - len(readableCopies) - pendingPeers
 	for missing > 0 {
-		if err := u.createReplacementPeerCopy(ctx, task, bucket, uploadID, logger); err != nil {
+		ready, err := u.createReplacementPeerCopy(ctx, task, bucket, uploadID, logger)
+		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "create repair peer copy", err)
+			return
+		}
+		if !ready {
 			return
 		}
 		missing--
@@ -665,7 +668,7 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 	for _, binding := range bindings {
 		existing[binding.CopyIndex] = struct{}{}
 		excluded = append(excluded, binding.ProviderID.SDK())
-		if binding.Status == model.StorageDataSetStatusReady && len(selected) < targetCopies {
+		if uploadCanUseDataSetBinding(uploadID, &binding) && len(selected) < targetCopies {
 			selected = append(selected, binding)
 		}
 	}
@@ -717,6 +720,82 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 	}
 	sort.Slice(selected, func(i, j int) bool { return selected[i].CopyIndex < selected[j].CopyIndex })
 	return selected, nil
+}
+
+func (u *Uploader) ensureUploadFundingReady(
+	ctx context.Context,
+	task *model.Task,
+	contentSize int64,
+	bucket *model.Bucket,
+	uploadID int64,
+	bindings []model.StorageDataSet,
+	logger *slog.Logger,
+) bool {
+	contexts, err := u.contextsForDataSetBindings(ctx, bucket, bindings)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "prepare upload funding contexts", err)
+		return false
+	}
+	dataSize := uint64(objectlimits.MinFOCUploadSize)
+	if contentSize > int64(dataSize) {
+		dataSize = uint64(contentSize)
+	}
+	costs, err := u.storage.PrepareUpload(ctx, dataSize, contexts)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "prepare upload funding", err)
+		return false
+	}
+	if costs == nil {
+		u.handleTaskFailure(ctx, task, logger, "prepare upload funding", errors.New("missing storage cost estimate"))
+		return false
+	}
+	if costs.Ready {
+		return true
+	}
+	message := uploadFundingWaitMessage(costs)
+	if err := u.repos.Tasks.WaitRunning(ctx, task, model.TaskWaitReasonDependency, message, uploadFundingWaitDelay); err != nil {
+		logger.Error("failed to wait for upload funding", "uploadID", uploadID, "error", err)
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		return false
+	}
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
+	logger.Info("upload funding deferred", "uploadID", uploadID, "message", message)
+	return false
+}
+
+func (u *Uploader) contextsForDataSetBindings(ctx context.Context, bucket *model.Bucket, bindings []model.StorageDataSet) ([]synapse.UploadContext, error) {
+	contexts := make([]synapse.UploadContext, 0, len(bindings))
+	for i := range bindings {
+		binding := &bindings[i]
+		var (
+			storageCtx synapse.UploadContext
+			err        error
+		)
+		if binding.Status == model.StorageDataSetStatusReady && binding.DataSetID != nil && !binding.DataSetID.IsZero() {
+			storageCtx, err = u.contextForReadyBinding(ctx, binding, bucket.Name)
+		} else {
+			storageCtx, err = u.contextForBindingProvider(ctx, binding, bucket.Name)
+		}
+		if err != nil {
+			return nil, err
+		}
+		contexts = append(contexts, storageCtx)
+	}
+	return contexts, nil
+}
+
+func uploadFundingWaitMessage(costs *storage.MultiContextCosts) string {
+	parts := make([]string, 0, 2)
+	if costs != nil && costs.DepositNeeded != nil && costs.DepositNeeded.Sign() > 0 {
+		parts = append(parts, fmt.Sprintf("deposit %s USDFC base units", costs.DepositNeeded.String()))
+	}
+	if costs != nil && costs.NeedsFWSSMaxApproval {
+		parts = append(parts, "approve FWSS spending")
+	}
+	if len(parts) == 0 {
+		return "Waiting for Filecoin payment funding"
+	}
+	return "Waiting for Filecoin payment funding: " + strings.Join(parts, "; ")
 }
 
 func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, logger *slog.Logger) {
@@ -1559,27 +1638,44 @@ func (u *Uploader) replacePeerCopy(ctx context.Context, task *model.Task, bucket
 		u.handleTaskFailure(ctx, task, logger, "mark peer copy failed", markErr)
 		return
 	}
-	if replaceErr := u.createReplacementPeerCopy(ctx, task, bucket, uploadID, logger); replaceErr != nil {
+	ready, replaceErr := u.createReplacementPeerCopy(ctx, task, bucket, uploadID, logger)
+	if replaceErr != nil {
 		u.handleTaskFailure(ctx, task, logger, "create replacement peer copy", replaceErr)
+		return
+	}
+	if !ready {
 		return
 	}
 	logger.Error(stage+" failed; replacement peer copy queued", "error", err)
 	completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 }
 
-func (u *Uploader) createReplacementPeerCopy(ctx context.Context, task *model.Task, bucket *model.Bucket, uploadID int64, logger *slog.Logger) error {
+func (u *Uploader) createReplacementPeerCopy(ctx context.Context, task *model.Task, bucket *model.Bucket, uploadID int64, logger *slog.Logger) (bool, error) {
 	if bucket == nil {
-		return errors.New("bucket is required for replacement peer copy")
+		return false, errors.New("bucket is required for replacement peer copy")
+	}
+	upload, err := u.repos.Uploads.GetByID(ctx, uploadID)
+	if err != nil || upload == nil {
+		if err == nil {
+			err = fmt.Errorf("storage upload %d not found", uploadID)
+		}
+		return false, err
 	}
 	binding, err := u.reusableReplacementPeerBinding(ctx, bucket, uploadID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if binding == nil {
 		binding, err = u.createNewBucketProviderBinding(ctx, bucket, uploadID)
 		if err != nil {
-			return err
+			return false, err
 		}
+	}
+	if binding == nil {
+		return false, errors.New("replacement dataset binding is required")
+	}
+	if !u.ensureUploadFundingReady(ctx, task, upload.ContentSize, bucket, uploadID, []model.StorageDataSet{*binding}, logger) {
+		return false, nil
 	}
 	if err := u.repos.Uploads.CreateUploadCopiesForBindings(ctx, uploadID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
@@ -1587,15 +1683,15 @@ func (u *Uploader) createReplacementPeerCopy(ctx context.Context, task *model.Ta
 		TransferMethod:   model.StorageCopyTransferMethodPeerPull,
 		ProviderID:       binding.ProviderID,
 	}}); err != nil {
-		return err
+		return false, err
 	}
 	if err := u.enqueueUploadStage(ctx, task, uploadStageEnsureDataSet, uploadID, binding.CopyIndex, model.StorageCopyTransferMethodPeerPull); err != nil {
-		return err
+		return false, err
 	}
 	if logger != nil {
 		logger.Info("queued replacement peer copy", "uploadID", uploadID, "copyIndex", binding.CopyIndex)
 	}
-	return nil
+	return true, nil
 }
 
 func (u *Uploader) reusableReplacementPeerBinding(ctx context.Context, bucket *model.Bucket, uploadID int64) (*model.StorageDataSet, error) {
@@ -2024,6 +2120,18 @@ func dataSetBindingCanEnsureWrite(binding *model.StorageDataSet) bool {
 	return binding != nil && dataSetStatusCanEnsureWrite(binding.Status)
 }
 
+func uploadCanUseDataSetBinding(uploadID int64, binding *model.StorageDataSet) bool {
+	if binding == nil {
+		return false
+	}
+	if binding.Status == model.StorageDataSetStatusReady {
+		return true
+	}
+	return binding.CreatedByUploadID != nil &&
+		*binding.CreatedByUploadID == uploadID &&
+		dataSetBindingCanEnsureWrite(binding)
+}
+
 func dataSetStatusCanEnsureWrite(status model.StorageDataSetStatus) bool {
 	switch status {
 	case model.StorageDataSetStatusPending,
@@ -2034,52 +2142,6 @@ func dataSetStatusCanEnsureWrite(status model.StorageDataSetStatus) bool {
 	default:
 		return false
 	}
-}
-
-func availableUSDFCFunds(acct *synapse.PaymentAccountInfo) *big.Int {
-	if acct == nil {
-		return nil
-	}
-	if acct.AvailableFunds != nil {
-		available := new(big.Int).Set(acct.AvailableFunds)
-		if available.Sign() < 0 {
-			return big.NewInt(0)
-		}
-		return available
-	}
-	if acct.Funds == nil || acct.LockupCurrent == nil {
-		return nil
-	}
-	available := new(big.Int).Sub(acct.Funds, acct.LockupCurrent)
-	if available.Sign() < 0 {
-		return big.NewInt(0)
-	}
-	return available
-}
-
-func (u *Uploader) checkPaymentBalancePreflight(ctx context.Context, logger *slog.Logger) error {
-	if u.wallet == nil {
-		return nil
-	}
-	info, err := u.wallet.GetWalletInfo(ctx)
-	if err != nil {
-		logger.Warn("wallet balance pre-check failed, proceeding with upload", "error", err)
-		return nil
-	}
-	if info == nil {
-		return nil
-	}
-	available := availableUSDFCFunds(info.PaymentAccount)
-	if available == nil || available.Sign() != 0 {
-		return nil
-	}
-	return errors.New("insufficient payment account balance: USDFC available funds = 0; deposit USDFC into your payment account or wait for locked funds to become available before uploading")
-}
-
-func (u *Uploader) handleBalancePreflightFailure(ctx context.Context, task *model.Task, logger *slog.Logger, err error) {
-	logger.Warn("wallet balance pre-check failed", "error", err)
-	scheduleTaskRetry(ctx, u.repos, task, "uploader", logger, err)
-	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 }
 
 func (u *Uploader) handleTaskFailure(ctx context.Context, task *model.Task, logger *slog.Logger, stage string, err error) {

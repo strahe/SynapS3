@@ -37,9 +37,10 @@ Commands that need a config file use `--config <path>` first, then non-empty `SY
 synaps3 wallet generate
 synaps3 wallet fund-testnet 0x...
 synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
 ```
 
-`generate` prints wallet material, `fund-testnet` claims Calibration assets, and `deposit` submits a `2 USDFC` deposit using the configured private key.
+`generate` prints wallet material, `fund-testnet` claims Calibration assets, `deposit` submits a `2 USDFC` deposit, and `approve` approves FWSS spending using the configured private key.
 
 ## Admin Commands
 

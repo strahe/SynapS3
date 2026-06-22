@@ -43,7 +43,7 @@ synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task retry 42
 ```
 
-Retry after fixing the underlying issue, such as RPC connectivity, provider reachability, wallet balance, or cache capacity.
+Retry after fixing the underlying issue, such as RPC connectivity, provider reachability, payment funding, FWSS approval, or cache capacity.
 
 ## Provider Health
 

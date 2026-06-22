@@ -88,6 +88,7 @@ const checkTitles: Record<string, string> = {
   payment_runway: 'Payment runway',
   providers: 'Storage providers',
   storage_cost: 'Storage cost estimate',
+  payment_funding: 'Payment funding',
   fwss_approval: 'FWSS approval',
 }
 
