@@ -24,6 +24,9 @@ export function applyWalletOperationEventData(queryClient: QueryClient, raw: str
   }
   queryClient.invalidateQueries({ queryKey: ['walletOperations'] })
   queryClient.invalidateQueries({ queryKey: ['wallet'] })
+  if (operation.type === 'approve' && operation.status === 'confirmed') {
+    queryClient.invalidateQueries({ queryKey: ['filecoinReadiness'] })
+  }
 }
 
 function applyWalletOperationSnapshot(

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import type { WalletOperation } from '../src/api/client.ts'
+import type { FilecoinReadinessData, WalletOperation } from '../src/api/client.ts'
 import {
   buildWalletOperationConfirmation,
   createWalletOperationDraft,
@@ -9,6 +9,7 @@ import {
   fundedUntilCaption,
   fundedUntilTone,
   topUpNeeded,
+  walletFwssApprovalState,
   walletOperationDetail,
   walletOperationDialogShouldClearDraft,
   walletOperationMutationError,
@@ -69,6 +70,63 @@ test('wallet operation mutation error follows the active operation type', () => 
   assert.equal(walletOperationMutationError('approve', fundError, withdrawError, approveError), 'approve failed')
   assert.equal(walletOperationMutationError('withdraw', fundError, null, approveError), null)
   assert.equal(walletOperationMutationError(null, fundError, withdrawError, approveError), null)
+})
+
+test('wallet FWSS approval action follows readiness state', () => {
+  const ready = walletFwssApprovalState({
+    readiness: readinessData('ready', [
+      { id: 'fwss_approval', status: 'ready', message: 'FWSS approval is sufficient.' },
+    ]),
+  })
+  assert.equal(ready.status, 'ready')
+  assert.equal(ready.canApprove, false)
+
+  const blocked = walletFwssApprovalState({
+    readiness: readinessData('blocked', [
+      {
+        id: 'fwss_approval',
+        status: 'blocked',
+        message: 'FWSS payment approval is missing or too low.',
+        action: 'Approve FWSS spending before uploading to Filecoin.',
+      },
+    ]),
+  })
+  assert.equal(blocked.status, 'blocked')
+  assert.equal(blocked.canApprove, true)
+  assert.equal(blocked.action, 'Approve FWSS spending before uploading to Filecoin.')
+
+  const blockedWithoutMessage = walletFwssApprovalState({
+    readiness: readinessData('blocked', [{ id: 'fwss_approval', status: 'blocked', message: '' }]),
+  })
+  assert.equal(blockedWithoutMessage.message, 'FWSS approval is required.')
+
+  const unknown = walletFwssApprovalState({
+    readiness: readinessData('unknown', [
+      { id: 'fwss_approval', status: 'unknown', message: 'FWSS approval could not be checked.' },
+    ]),
+  })
+  assert.equal(unknown.status, 'unknown')
+  assert.equal(unknown.canApprove, false)
+
+  assert.equal(walletFwssApprovalState({ readiness: readinessData('ready', []) }).canApprove, false)
+  assert.equal(
+    walletFwssApprovalState({
+      readiness: readinessData('blocked', [
+        { id: 'fwss_approval', status: 'blocked', message: 'FWSS approval is required.' },
+      ]),
+      isLoading: true,
+    }).canApprove,
+    false
+  )
+  assert.equal(
+    walletFwssApprovalState({
+      readiness: readinessData('blocked', [
+        { id: 'fwss_approval', status: 'blocked', message: 'FWSS approval is required.' },
+      ]),
+      error: new Error('readiness unavailable'),
+    }).canApprove,
+    false
+  )
 })
 
 test('wallet operation detail exposes failure reason', () => {
@@ -179,3 +237,15 @@ test('funded until tone highlights low runway ranges', () => {
   assert.equal(fundedUntilTone({ ...base, runway_seconds: 45 * 86_400 }), 'neutral')
   assert.equal(fundedUntilTone({ ...base, no_active_spend: true, runway_seconds: undefined }), 'neutral')
 })
+
+function readinessData(
+  status: FilecoinReadinessData['status'],
+  checks: FilecoinReadinessData['checks']
+): FilecoinReadinessData {
+  return {
+    status,
+    mode: 'runtime',
+    checked_at: '2026-06-22T00:00:00Z',
+    checks,
+  }
+}

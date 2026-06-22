@@ -25,7 +25,15 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { useWallet, useWalletApprove, useWalletFund, useWalletOperations, useWalletWithdraw } from '@/hooks/queries'
+import {
+  useFilecoinReadiness,
+  useWallet,
+  useWalletApprove,
+  useWalletFund,
+  useWalletOperations,
+  useWalletWithdraw,
+} from '@/hooks/queries'
+import { filecoinReadinessStatusLabel, filecoinReadinessStatusTone } from '@/lib/filecoin-readiness'
 import { cn, formatAttoFIL, formatDuration, formatTokenAmount, timeAgo } from '@/lib/utils'
 import {
   baseUnitsToDecimal,
@@ -37,6 +45,7 @@ import {
   type WalletOperationDialogCloseReason,
   type WalletOperationDraft,
   type WalletRunwayTone,
+  walletFwssApprovalState,
   walletOperationDetail,
   walletOperationDialogShouldClearDraft,
   walletOperationMutationError,
@@ -62,6 +71,7 @@ interface PendingWalletOperation extends WalletOperationDraft {
 
 function WalletPage() {
   const { data, isLoading, error } = useWallet()
+  const readiness = useFilecoinReadiness(Boolean(data?.configured))
   const [operationsLimit, setOperationsLimit] = useState(walletOperationsDefaultLimit)
   const { data: operationsData } = useWalletOperations(operationsLimit)
   const fundMutation = useWalletFund()
@@ -77,6 +87,11 @@ function WalletPage() {
   const paymentAccount = data?.payment_account ?? null
   const decimals = data?.contracts?.usdfc_decimals ?? usdfcDecimals
   const operations = operationsData?.operations ?? []
+  const fwssApproval = walletFwssApprovalState({
+    readiness: readiness.data,
+    error: readiness.error,
+    isLoading: readiness.isLoading || readiness.isFetching,
+  })
   const mutationError = walletOperationMutationError(
     pendingOperation?.type,
     fundMutation.error,
@@ -297,15 +312,21 @@ function WalletPage() {
               <div className="rounded-md border border-border p-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <div className="text-sm font-medium">FWSS approval</div>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      Allow FWSS to spend USDFC for storage payments. This does not deposit or withdraw funds.
-                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-sm font-medium">FWSS approval</div>
+                      <StatusBadge tone={filecoinReadinessStatusTone(fwssApproval.status)}>
+                        {filecoinReadinessStatusLabel(fwssApproval.status)}
+                      </StatusBadge>
+                    </div>
+                    <p className="mt-1 text-sm text-muted-foreground">{fwssApproval.message}</p>
+                    {fwssApproval.action && <p className="mt-1 text-xs text-muted-foreground">{fwssApproval.action}</p>}
                   </div>
-                  <Button type="button" variant="outline" onClick={submitApprove} disabled={isMutating}>
-                    <ShieldCheck data-icon="inline-start" />
-                    Approve FWSS
-                  </Button>
+                  {fwssApproval.canApprove && (
+                    <Button type="button" variant="outline" onClick={submitApprove} disabled={isMutating}>
+                      <ShieldCheck data-icon="inline-start" />
+                      Approve FWSS
+                    </Button>
+                  )}
                 </div>
               </div>
               <div className="flex flex-col gap-2">

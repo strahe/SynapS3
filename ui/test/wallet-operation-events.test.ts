@@ -5,7 +5,7 @@ import { QueryClient } from '@tanstack/react-query'
 import type { WalletOperation, WalletOperationsResponse } from '../src/api/client.ts'
 import { applyWalletOperationEventData } from '../src/lib/wallet-operation-events.ts'
 
-function walletOperation(id: number, createdAt: string): WalletOperation {
+function walletOperation(id: number, createdAt: string, overrides: Partial<WalletOperation> = {}): WalletOperation {
   return {
     id,
     type: 'fund',
@@ -14,6 +14,7 @@ function walletOperation(id: number, createdAt: string): WalletOperation {
     status: 'submitted',
     created_at: createdAt,
     updated_at: createdAt,
+    ...overrides,
   }
 }
 
@@ -63,4 +64,35 @@ test('wallet operation events grow up to the selected operation count', () => {
     data?.operations.map((operation) => operation.id),
     [4, 3, 2, 1]
   )
+})
+
+test('confirmed approve events invalidate Filecoin readiness', () => {
+  const qc = new QueryClient()
+  const readinessKey = ['filecoinReadiness']
+  qc.setQueryData(readinessKey, { status: 'blocked' })
+
+  applyWalletOperationEventData(
+    qc,
+    JSON.stringify({
+      topic: 'wallet_operation_updated',
+      operation: walletOperation(1, '2026-06-22T00:00:00Z', {
+        type: 'approve',
+        amount: '0',
+      }),
+    })
+  )
+  assert.equal(qc.getQueryState(readinessKey)?.isInvalidated, false)
+
+  applyWalletOperationEventData(
+    qc,
+    JSON.stringify({
+      topic: 'wallet_operation_updated',
+      operation: walletOperation(1, '2026-06-22T00:00:00Z', {
+        type: 'approve',
+        amount: '0',
+        status: 'confirmed',
+      }),
+    })
+  )
+  assert.equal(qc.getQueryState(readinessKey)?.isInvalidated, true)
 })

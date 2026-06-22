@@ -1,7 +1,20 @@
-import type { PaymentAccountData, WalletOperation, WalletOperationType } from '@/api/client'
+import type {
+  FilecoinReadinessData,
+  FilecoinReadinessStatus,
+  PaymentAccountData,
+  WalletOperation,
+  WalletOperationType,
+} from '@/api/client'
 import { formatTokenAmount } from './utils.ts'
 
 export type WalletRunwayTone = 'danger' | 'warning' | 'neutral'
+
+export interface WalletFwssApprovalState {
+  status: FilecoinReadinessStatus
+  message: string
+  action?: string
+  canApprove: boolean
+}
 
 export interface WalletOperationConfirmation {
   title: string
@@ -65,6 +78,58 @@ export function walletOperationMutationError(
   if (activeType === 'withdraw') return errorMessage(withdrawError)
   if (activeType === 'approve') return errorMessage(approveError)
   return null
+}
+
+export function walletFwssApprovalState({
+  readiness,
+  error,
+  isLoading,
+}: {
+  readiness?: FilecoinReadinessData
+  error?: unknown
+  isLoading?: boolean
+}): WalletFwssApprovalState {
+  if (error) {
+    return {
+      status: 'unknown',
+      message: 'FWSS approval status could not be checked.',
+      canApprove: false,
+    }
+  }
+  if (isLoading) {
+    return {
+      status: 'unknown',
+      message: 'Checking FWSS approval status.',
+      canApprove: false,
+    }
+  }
+  if (!readiness) {
+    return {
+      status: 'unknown',
+      message: 'FWSS approval status unavailable.',
+      canApprove: false,
+    }
+  }
+  const check = readiness.checks.find((item) => item.id === 'fwss_approval')
+  if (!check) {
+    return {
+      status: 'unknown',
+      message: 'FWSS approval status unavailable.',
+      canApprove: false,
+    }
+  }
+  return {
+    status: check.status,
+    message:
+      check.message ||
+      (check.status === 'ready'
+        ? 'FWSS approval is sufficient.'
+        : check.status === 'blocked'
+          ? 'FWSS approval is required.'
+          : 'FWSS approval status unavailable.'),
+    action: check.action,
+    canApprove: check.status === 'blocked',
+  }
 }
 
 export function buildWalletOperationConfirmation({
