@@ -2,9 +2,12 @@ package provider
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/strahe/synapse-go/pdp"
 )
 
 const defaultHealthConcurrency = 10
@@ -12,19 +15,21 @@ const defaultHealthConcurrency = 10
 // HealthChecker performs provider health probes with a reusable HTTP client.
 type HealthChecker struct {
 	client *http.Client
+	logger *slog.Logger
 }
 
 // NewHealthChecker creates a provider health checker.
 func NewHealthChecker(client *http.Client) *HealthChecker {
 	if client == nil {
 		client = &http.Client{
+			// A PDP ping redirect indicates a misconfigured provider endpoint.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		}
 	}
-	return &HealthChecker{client: client}
+	return &HealthChecker{client: client, logger: slog.Default()}
 }
 
-// CheckHealth performs an HTTP HEAD request to the given service URL and returns
+// CheckHealth performs a PDP ping against the given service URL and returns
 // "reachable", "unreachable", or "n/a" (for empty URLs).
 func CheckHealth(ctx context.Context, serviceURL string, timeout time.Duration) string {
 	return NewHealthChecker(nil).Check(ctx, serviceURL, timeout)
@@ -42,16 +47,16 @@ func (h *HealthChecker) Check(ctx context.Context, serviceURL string, timeout ti
 		defer cancel()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, serviceURL, nil)
+	client, err := pdp.New(serviceURL, pdp.WithHTTPClient(h.client), pdp.WithMaxRetries(0))
 	if err != nil {
+		if h.logger != nil {
+			h.logger.Warn("failed to create PDP health client", "error", err)
+		}
 		return "unreachable"
 	}
-
-	resp, err := h.client.Do(req)
-	if err != nil {
+	if err := client.Ping(ctx); err != nil {
 		return "unreachable"
 	}
-	_ = resp.Body.Close()
 	return "reachable"
 }
 

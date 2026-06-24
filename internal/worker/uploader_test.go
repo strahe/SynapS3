@@ -648,6 +648,73 @@ func TestUploader_WaitsPollIntervalBeforeInitialClaim(t *testing.T) {
 	waitForTaskStatus(t, env, task.ID, model.TaskStatusCompleted, time.Second)
 }
 
+func TestUploader_CompletesRetryWhenObjectIsAlreadyStored(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	fixture := seedReadableUploadWithPendingPeer(t, env)
+	stage := "peer_commit"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          fixture.objID,
+		RefVersionID:   fixture.versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:peer_commit:%d:1", fixture.versionID, fixture.upload.ID),
+		Payload:        map[string]interface{}{"upload_id": fixture.upload.ID, "copy_index": 1, "transfer_method": string(model.StorageCopyTransferMethodPeerPull)},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := env.repos.Tasks.Create(context.Background(), task); err != nil {
+		t.Fatalf("create peer commit task: %v", err)
+	}
+
+	claimed, err := env.repos.Tasks.ClaimReady(context.Background(), model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimReady: task=%v err=%v", claimed, err)
+	}
+	if err := env.repos.Uploads.MarkUploadCopyCommitted(context.Background(), repository.MarkUploadCopyCommittedInput{
+		UploadID:     fixture.upload.ID,
+		CopyIndex:    1,
+		PieceCID:     testCID(t).String(),
+		PieceID:      onChainIDPtr(t, "302"),
+		RetrievalURL: "https://peer.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	finalized, _, err := env.repos.Uploads.FinalizeUploadIfTargetCopiesMet(context.Background(), repository.FinalizeUploadInput{UploadID: fixture.upload.ID})
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet: %v", err)
+	}
+	if !finalized {
+		t.Fatal("FinalizeUploadIfTargetCopiesMet did not finalize the upload")
+	}
+	status, err := env.repos.Tasks.ScheduleRetryRunning(context.Background(), claimed, "late worker failure", 0)
+	if err != nil {
+		t.Fatalf("ScheduleRetryRunning: %v", err)
+	}
+	if status != model.TaskStatusScheduled {
+		t.Fatalf("retry status = %s, want scheduled", status)
+	}
+
+	var storageCalls atomic.Int32
+	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		storageCalls.Add(1)
+		return nil, errors.New("storage must not be called for a stored object")
+	}
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	got := runWorkerUntilTask(t, env, uploader, task.ID, time.Second)
+
+	if got.Status != model.TaskStatusCompleted {
+		t.Fatalf("task status = %s, want completed", got.Status)
+	}
+	if got.RetryCount != 1 {
+		t.Fatalf("retry count = %d, want 1", got.RetryCount)
+	}
+	if calls := storageCalls.Load(); calls != 0 {
+		t.Fatalf("storage calls = %d, want 0", calls)
+	}
+}
+
 func TestUploader_ClaimsLaterPendingTaskWhileAnotherUploadRuns(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, firstObjID, firstVersionID := seedCachedObject(t, env)

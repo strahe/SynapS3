@@ -3,22 +3,26 @@ package observability
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestServiceMergesConcurrentProviderRefreshes(t *testing.T) {
-	ctx := context.Background()
+func TestServiceMergesDetachedRefreshWithCancellableRefresh(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var calls int32
 	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
+		checkProviders: func(ctx context.Context, _ time.Time, _ []LocalDataSet) ([]ProviderState, error) {
 			if atomic.AddInt32(&calls, 1) == 1 {
 				close(started)
-				<-release
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			}
 			return []ProviderState{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
 		},
@@ -34,23 +38,88 @@ func TestServiceMergesConcurrentProviderRefreshes(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var firstErr, secondErr error
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	go func() {
 		defer wg.Done()
-		_, firstErr = service.RefreshProviders(ctx, ListOptions{Limit: 10})
+		_, firstErr = service.RefreshProvidersWithContext(firstCtx, ListOptions{Limit: 10})
 	}()
 	<-started
-	secondObserved := make(chan struct{})
-	secondCtx := &observedDoneContext{Context: ctx, observed: secondObserved}
 	go func() {
 		defer wg.Done()
-		_, secondErr = service.RefreshProviders(secondCtx, ListOptions{Limit: 10})
+		_, secondErr = service.RefreshProviders(context.Background(), ListOptions{Limit: 10})
 	}()
-	<-secondObserved
+
+	waitForDetachedRefreshWaiters(t, &service.providerRefresh, 1)
+	cancelFirst()
 	close(release)
 	wg.Wait()
 
-	if firstErr != nil || secondErr != nil {
-		t.Fatalf("RefreshProviders errors = %v, %v", firstErr, secondErr)
+	if !errors.Is(firstErr, context.Canceled) {
+		t.Fatalf("RefreshProvidersWithContext error = %v, want context canceled", firstErr)
+	}
+	if secondErr != nil {
+		t.Fatalf("RefreshProviders error = %v", secondErr)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("provider refresh calls = %d, want 1", got)
+	}
+	if store.providerReplaces != 1 {
+		t.Fatalf("provider replaces = %d, want 1", store.providerReplaces)
+	}
+}
+
+func TestServiceDetachedRefreshKeepsSharedRefreshAliveAfterCancellableJoinCancels(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int32
+	checker := &fakeRefreshChecker{
+		checkProviders: func(ctx context.Context, _ time.Time, _ []LocalDataSet) ([]ProviderState, error) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				close(started)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return []ProviderState{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
+		},
+	}
+	store := &fakeStateStore{}
+	service := NewService(ServiceOptions{
+		Checker:         checker,
+		LocalDataSets:   LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
+		Store:           store,
+		RefreshInterval: time.Minute,
+	})
+
+	detachedErr := make(chan error, 1)
+	go func() {
+		_, err := service.RefreshProviders(context.Background(), ListOptions{Limit: 10})
+		detachedErr <- err
+	}()
+	<-started
+
+	cancellableCtx, cancelCancellable := context.WithCancel(context.Background())
+	cancellableErr := make(chan error, 1)
+	go func() {
+		_, err := service.RefreshProvidersWithContext(cancellableCtx, ListOptions{Limit: 10})
+		cancellableErr <- err
+	}()
+	waitForRefreshWaiters(t, &service.providerRefresh, 1, 1)
+	cancelCancellable()
+
+	if err := <-cancellableErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RefreshProvidersWithContext error = %v, want context canceled", err)
+	}
+	select {
+	case err := <-detachedErr:
+		t.Fatalf("detached refresh returned before release: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-detachedErr; err != nil {
+		t.Fatalf("RefreshProviders error = %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("provider refresh calls = %d, want 1", got)
@@ -92,13 +161,11 @@ func TestServiceMergesConcurrentDataSetRefreshes(t *testing.T) {
 		_, firstErr = service.RefreshDataSets(ctx, ListOptions{Limit: 10})
 	}()
 	<-started
-	secondObserved := make(chan struct{})
-	secondCtx := &observedDoneContext{Context: ctx, observed: secondObserved}
 	go func() {
 		defer wg.Done()
-		_, secondErr = service.RefreshDataSets(secondCtx, ListOptions{Limit: 10})
+		_, secondErr = service.RefreshDataSets(ctx, ListOptions{Limit: 10})
 	}()
-	<-secondObserved
+	waitForDetachedRefreshWaiters(t, &service.dataSetRefresh, 2)
 	close(release)
 	wg.Wait()
 
@@ -144,6 +211,109 @@ func TestServiceRefreshIgnoresRequestCancellation(t *testing.T) {
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("RefreshProviders after request cancellation: %v", err)
+	}
+}
+
+func TestServiceRefreshSkipsAlreadyCancelledContext(t *testing.T) {
+	var calls int32
+	checker := &fakeRefreshChecker{
+		checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
+			atomic.AddInt32(&calls, 1)
+			return []ProviderState{{ProviderID: onChainID(t, "101"), Status: StatusAvailable}}, nil
+		},
+	}
+	service := NewService(ServiceOptions{
+		Checker:       checker,
+		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
+		Store:         &fakeStateStore{},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := service.RefreshProviders(ctx, ListOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RefreshProviders with cancelled context: %v, want context canceled", err)
+	}
+	if calls != 0 {
+		t.Fatalf("provider refresh calls = %d, want 0", calls)
+	}
+}
+
+func TestServiceRefreshProvidersWithContextRespectsCancellation(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	releaseRefresh := sync.OnceFunc(func() { close(release) })
+	defer releaseRefresh()
+	checker := &fakeRefreshChecker{
+		checkProviders: func(ctx context.Context, _ time.Time, _ []LocalDataSet) ([]ProviderState, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			<-release
+			return nil, ctx.Err()
+		},
+	}
+	service := NewService(ServiceOptions{
+		Checker:       checker,
+		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
+		Store:         &fakeStateStore{},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := service.RefreshProvidersWithContext(ctx, ListOptions{})
+		errCh <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not observe caller cancellation")
+	}
+	var earlyErr error
+	returnedEarly := false
+	select {
+	case earlyErr = <-errCh:
+		returnedEarly = true
+	default:
+	}
+	releaseRefresh()
+	if returnedEarly {
+		t.Fatalf("RefreshProvidersWithContext returned before its refresh stopped: %v", earlyErr)
+	}
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RefreshProvidersWithContext after cancellation: %v, want context canceled", err)
+	}
+}
+
+func TestServiceRefreshAllRespectsCancellation(t *testing.T) {
+	started := make(chan struct{})
+	checker := &fakeRefreshChecker{
+		checkProviders: func(ctx context.Context, _ time.Time, _ []LocalDataSet) ([]ProviderState, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	service := NewService(ServiceOptions{
+		Checker:       checker,
+		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) { return nil, nil }),
+		Store:         &fakeStateStore{},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- service.RefreshAll(ctx)
+	}()
+	<-started
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RefreshAll after cancellation: %v, want context canceled", err)
 	}
 }
 
@@ -350,22 +520,50 @@ func TestServiceDataSetObservationsByLocalIDsBatchesLookups(t *testing.T) {
 	}
 }
 
-type observedDoneContext struct {
-	context.Context
-	observed chan<- struct{}
-	once     sync.Once
-}
-
-func (c *observedDoneContext) Done() <-chan struct{} {
-	c.once.Do(func() {
-		close(c.observed)
-	})
-	return c.Context.Done()
-}
-
 type fakeRefreshChecker struct {
 	checkProviders func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error)
 	checkDataSets  func(context.Context, time.Time, []LocalDataSet) ([]DataSetState, error)
+}
+
+func waitForDetachedRefreshWaiters(t *testing.T, group *refreshGroup, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		group.mu.Lock()
+		got := 0
+		if group.call != nil {
+			got = group.call.detachedWaiters
+		}
+		group.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("detached refresh waiters = %d, want %d", got, want)
+		}
+		runtime.Gosched()
+	}
+}
+
+func waitForRefreshWaiters(t *testing.T, group *refreshGroup, wantCancellable, wantDetached int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		group.mu.Lock()
+		gotCancellable, gotDetached := 0, 0
+		if group.call != nil {
+			gotCancellable = group.call.cancellableWaiters
+			gotDetached = group.call.detachedWaiters
+		}
+		group.mu.Unlock()
+		if gotCancellable == wantCancellable && gotDetached == wantDetached {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh waiters = cancellable:%d detached:%d, want cancellable:%d detached:%d", gotCancellable, gotDetached, wantCancellable, wantDetached)
+		}
+		runtime.Gosched()
+	}
 }
 
 func (f *fakeRefreshChecker) CheckProviders(ctx context.Context, checkedAt time.Time, local []LocalDataSet) ([]ProviderState, error) {

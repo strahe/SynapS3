@@ -242,6 +242,9 @@ func (h *Harness) Done() <-chan struct{} { return h.done }
 // Err returns the runtime result after Done is closed.
 func (h *Harness) Err() error { return h.runErr }
 
+// S3SocketPath returns the runtime's Unix socket path for black-box S3 clients.
+func (h *Harness) S3SocketPath() string { return h.s3Socket }
+
 // S3Client returns a SigV4 client connected to the runtime's Unix socket.
 func (h *Harness) S3Client(accessKey, secretKey string) *awss3.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()

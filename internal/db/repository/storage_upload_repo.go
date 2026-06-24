@@ -1059,7 +1059,7 @@ func (r *BunStorageUploadRepo) BindReadableUploadForVersion(ctx context.Context,
 			return fmt.Errorf("binding readable upload for version: %w", err)
 		}
 		if len(refs) > 0 {
-			if err := completeUploadTasksForVersion(ctx, db, input.VersionID, now); err != nil {
+			if err := completeUploadTasksForVersion(ctx, db, input.VersionID, now, activeTaskStatuses()); err != nil {
 				return err
 			}
 		}
@@ -1106,6 +1106,11 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 		).Scan(ctx, &refs)
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("finalizing object versions for upload: %w", err)
+		}
+		for _, ref := range refs {
+			if err := completeUploadTasksForVersion(ctx, db, ref.VersionID, now, unclaimedTaskStatuses()); err != nil {
+				return err
+			}
 		}
 		finalized = true
 		return nil
@@ -1432,9 +1437,15 @@ func updateUploadReadable(ctx context.Context, db bun.IDB, uploadID int64, piece
 	return nil
 }
 
-func completeUploadTasksForVersion(ctx context.Context, db bun.IDB, versionID string, now time.Time) error {
+func completeUploadTasksForVersion(ctx context.Context, db bun.IDB, versionID string, now time.Time, statuses []model.TaskStatus) error {
 	if versionID == "" {
 		return nil
+	}
+	// Callers must pass an explicit active task status set. An empty set would
+	// silently leave upload tasks active after the upload becomes readable or
+	// stored.
+	if len(statuses) == 0 {
+		return fmt.Errorf("completing upload tasks for bound version: %w", ErrInvalidInput)
 	}
 	_, err := db.NewUpdate().
 		Model((*model.Task)(nil)).
@@ -1447,7 +1458,7 @@ func completeUploadTasksForVersion(ctx context.Context, db bun.IDB, versionID st
 		Set("lease_until = NULL").
 		Set("started_at = NULL").
 		Where("ref_type = ? AND ref_version_id = ? AND type = ?", "object", versionID, model.TaskTypeUpload).
-		Where("status IN (?)", bun.List(activeTaskStatuses())).
+		Where("status IN (?)", bun.List(statuses)).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("completing upload tasks for bound version: %w", err)

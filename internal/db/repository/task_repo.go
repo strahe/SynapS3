@@ -602,11 +602,14 @@ func (r *BunTaskRepo) CountOverviewActivePipeline(ctx context.Context) ([]TaskPi
 }
 
 func activeTaskStatuses() []model.TaskStatus {
+	return append(unclaimedTaskStatuses(), model.TaskStatusRunning)
+}
+
+func unclaimedTaskStatuses() []model.TaskStatus {
 	return []model.TaskStatus{
 		model.TaskStatusQueued,
 		model.TaskStatusScheduled,
 		model.TaskStatusWaiting,
-		model.TaskStatusRunning,
 	}
 }
 

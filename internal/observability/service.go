@@ -104,7 +104,16 @@ func (s *Service) RefreshTimeout() time.Duration {
 }
 
 func (s *Service) RefreshProviders(ctx context.Context, opts ListOptions) (ProviderStatePage, error) {
-	if err := s.providerRefresh.Do(ctx, s.refreshTimeout, func(refreshCtx context.Context) error {
+	return s.refreshProviders(ctx, opts, true)
+}
+
+// RefreshProvidersWithContext refreshes provider state using the caller context.
+func (s *Service) RefreshProvidersWithContext(ctx context.Context, opts ListOptions) (ProviderStatePage, error) {
+	return s.refreshProviders(ctx, opts, false)
+}
+
+func (s *Service) refreshProviders(ctx context.Context, opts ListOptions, detach bool) (ProviderStatePage, error) {
+	if err := s.providerRefresh.Do(ctx, s.refreshTimeout, detach, func(refreshCtx context.Context) error {
 		local, err := s.listLocalDataSets(refreshCtx)
 		if err != nil {
 			return err
@@ -122,7 +131,11 @@ func (s *Service) RefreshProviders(ctx context.Context, opts ListOptions) (Provi
 }
 
 func (s *Service) RefreshDataSets(ctx context.Context, opts ListOptions) (DataSetStatePage, error) {
-	if err := s.dataSetRefresh.Do(ctx, s.refreshTimeout, func(refreshCtx context.Context) error {
+	return s.refreshDataSets(ctx, opts, true)
+}
+
+func (s *Service) refreshDataSets(ctx context.Context, opts ListOptions, detach bool) (DataSetStatePage, error) {
+	if err := s.dataSetRefresh.Do(ctx, s.refreshTimeout, detach, func(refreshCtx context.Context) error {
 		local, err := s.listLocalDataSets(refreshCtx)
 		if err != nil {
 			return err
@@ -141,10 +154,10 @@ func (s *Service) RefreshDataSets(ctx context.Context, opts ListOptions) (DataSe
 
 func (s *Service) RefreshAll(ctx context.Context) error {
 	var errs []error
-	if _, err := s.RefreshProviders(ctx, ListOptions{}); err != nil {
+	if _, err := s.refreshProviders(ctx, ListOptions{}, false); err != nil {
 		errs = append(errs, err)
 	}
-	if _, err := s.RefreshDataSets(ctx, ListOptions{}); err != nil {
+	if _, err := s.refreshDataSets(ctx, ListOptions{}, false); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -316,32 +329,113 @@ type refreshGroup struct {
 }
 
 type refreshCall struct {
-	done chan struct{}
-	err  error
+	done               chan struct{}
+	cancel             context.CancelFunc
+	err                error
+	cancellableWaiters int
+	detachedWaiters    int
+	cancelled          bool
 }
 
-func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, fn func(context.Context) error) (err error) {
-	g.mu.Lock()
-	if g.call != nil {
-		call := g.call
-		g.mu.Unlock()
-		select {
-		case <-call.done:
-			return call.err
-		case <-ctx.Done():
-			return ctx.Err()
+func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, detach bool, fn func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for {
+		if !detach {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 		}
-	}
-	call := &refreshCall{done: make(chan struct{})}
-	g.call = call
-	g.mu.Unlock()
+		g.mu.Lock()
+		call := g.call
+		if call == nil {
+			refreshCtx := context.WithoutCancel(ctx)
+			var cancel context.CancelFunc
+			if timeout > 0 {
+				refreshCtx, cancel = context.WithTimeout(refreshCtx, timeout)
+			} else {
+				refreshCtx, cancel = context.WithCancel(refreshCtx)
+			}
+			call = &refreshCall{
+				done:   make(chan struct{}),
+				cancel: cancel,
+			}
+			if detach {
+				call.detachedWaiters = 1
+			} else {
+				call.cancellableWaiters = 1
+			}
+			g.call = call
+			g.mu.Unlock()
 
-	refreshCtx := context.WithoutCancel(ctx)
-	cancel := func() {}
-	if timeout > 0 {
-		refreshCtx, cancel = context.WithTimeout(refreshCtx, timeout)
+			go g.run(call, refreshCtx, fn)
+			return g.wait(ctx, call, detach)
+		}
+		if call.cancelled {
+			g.mu.Unlock()
+			if err := waitForRetiredRefresh(ctx, call, detach); err != nil {
+				return err
+			}
+			continue
+		}
+		if detach {
+			call.detachedWaiters++
+		} else {
+			call.cancellableWaiters++
+		}
+		g.mu.Unlock()
+		return g.wait(ctx, call, detach)
 	}
-	defer cancel()
+}
+
+func (g *refreshGroup) wait(ctx context.Context, call *refreshCall, detach bool) error {
+	if detach {
+		// Detached refreshes ignore caller cancellation but still wait for the
+		// shared refresh to finish, so they remain active waiters until done.
+		<-call.done
+		g.releaseDetached(call)
+		return call.err
+	}
+	select {
+	case <-call.done:
+		return call.err
+	case <-ctx.Done():
+		if g.release(call) {
+			<-call.done
+		}
+		return ctx.Err()
+	}
+}
+
+func (g *refreshGroup) releaseDetached(call *refreshCall) {
+	g.mu.Lock()
+	if call.detachedWaiters > 0 {
+		call.detachedWaiters--
+	}
+	g.mu.Unlock()
+}
+
+func (g *refreshGroup) release(call *refreshCall) bool {
+	g.mu.Lock()
+	if g.call != call || call.cancelled {
+		g.mu.Unlock()
+		return false
+	}
+	call.cancellableWaiters--
+	if call.cancellableWaiters > 0 || call.detachedWaiters > 0 {
+		g.mu.Unlock()
+		return false
+	}
+	call.cancelled = true
+	cancel := call.cancel
+	g.mu.Unlock()
+	cancel()
+	return true
+}
+
+func (g *refreshGroup) run(call *refreshCall, ctx context.Context, fn func(context.Context) error) {
+	defer call.cancel()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			call.err = fmt.Errorf("observability refresh panic: %v", recovered)
@@ -352,9 +446,22 @@ func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, fn func(co
 		}
 		close(call.done)
 		g.mu.Unlock()
-		err = call.err
 	}()
 
-	call.err = fn(refreshCtx)
-	return call.err
+	call.err = fn(ctx)
+}
+
+func waitForRetiredRefresh(ctx context.Context, call *refreshCall, detach bool) error {
+	// The retiring call belongs to earlier callers. Its error is intentionally
+	// ignored so Do can join or start a fresh call for the current caller.
+	if detach {
+		<-call.done
+		return nil
+	}
+	select {
+	case <-call.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

@@ -6,58 +6,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/strahe/synaps3/internal/systemtest"
+	"github.com/strahe/synaps3/tests/testutil/e2e"
 )
-
-const csrfHeader = "X-SynapS3-CSRF"
-
-type adminClient struct {
-	baseURL string
-	client  *http.Client
-	csrf    string
-}
-
-type objectListResponse struct {
-	Objects []struct {
-		Key              string `json:"key"`
-		CurrentVersionID string `json:"current_version_id"`
-		State            string `json:"state"`
-		Status           string `json:"status"`
-		UploadStatus     string `json:"upload_status"`
-		Location         struct {
-			Cache    bool `json:"cache"`
-			Filecoin bool `json:"filecoin"`
-		} `json:"location"`
-	} `json:"objects"`
-}
-
-type provenanceResponse struct {
-	Status          string `json:"status"`
-	UploadStatus    string `json:"upload_status"`
-	RequestedCopies int    `json:"requested_copies"`
-	SuccessCopies   int    `json:"success_copies"`
-	Copies          []struct {
-		Status       string `json:"status"`
-		ProviderID   string `json:"provider_id"`
-		DataSetID    string `json:"data_set_id"`
-		PieceID      string `json:"piece_id"`
-		RetrievalURL string `json:"retrieval_url"`
-	} `json:"copies"`
-}
 
 func TestSystemGoldenPath(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -77,18 +36,11 @@ func TestSystemGoldenPath(t *testing.T) {
 		}
 	})
 
-	admin := newAdminClient(t, harness.AdminURL)
-	admin.login(t, systemtest.AdminUsername, systemtest.AdminPassword)
-	var credentials struct {
-		AccessKey string `json:"access_key"`
-		SecretKey string `json:"secret_key"`
-	}
-	admin.postJSON(t, "/api/v1/s3-users", map[string]string{"role": "userplus"}, &credentials)
-	if credentials.AccessKey == "" || credentials.SecretKey == "" {
-		t.Fatalf("created S3 credentials are incomplete: %#v", credentials)
-	}
+	admin := e2e.NewAdminClient(t, harness.AdminURL)
+	admin.Login(t, t.Context(), systemtest.AdminUsername, systemtest.AdminPassword)
+	credentials := admin.CreateS3User(t, t.Context())
 
-	s3Client := harness.S3Client(credentials.AccessKey, credentials.SecretKey)
+	s3Client := e2e.NewUnixSocketS3Client(harness.S3SocketPath(), credentials.AccessKey, credentials.SecretKey)
 	bucket, key := "system-golden", "objects/golden.bin"
 	if _, err := s3Client.CreateBucket(t.Context(), &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
@@ -100,15 +52,15 @@ func TestSystemGoldenPath(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
-	assertS3Object(t, s3Client, bucket, key, content, checksum)
+	e2e.AssertS3Object(t, t.Context(), s3Client, bucket, key, content, checksum)
 
-	object := eventually(t, 10*time.Second, "object to complete three-copy upload", func() (struct {
+	object := e2e.Eventually(t, t.Context(), 10*time.Second, "object to complete three-copy upload", func(ctx context.Context) (struct {
 		VersionID string
 		Snapshot  string
 	}, bool, error,
 	) {
-		var list objectListResponse
-		raw, err := admin.getJSON("/api/v1/buckets/"+bucket+"/objects?prefix="+url.QueryEscape(key), &list)
+		var list e2e.ObjectListResponse
+		raw, err := admin.GetJSON(ctx, "/api/v1/buckets/"+bucket+"/objects?prefix="+url.QueryEscape(key), &list)
 		if err != nil {
 			return struct {
 				VersionID string
@@ -129,9 +81,9 @@ func TestSystemGoldenPath(t *testing.T) {
 	})
 
 	provenancePath := "/api/v1/buckets/" + bucket + "/objects/provenance?version_id=" + url.QueryEscape(object.VersionID)
-	provenance := eventually(t, 5*time.Second, "three readable committed copies", func() (provenanceResponse, bool, error) {
-		var value provenanceResponse
-		_, err := admin.getJSON(provenancePath, &value)
+	provenance := e2e.Eventually(t, t.Context(), 5*time.Second, "three readable committed copies", func(ctx context.Context) (e2e.ProvenanceResponse, bool, error) {
+		var value e2e.ProvenanceResponse
+		_, err := admin.GetJSON(ctx, provenancePath, &value)
 		if err != nil {
 			return value, false, err
 		}
@@ -149,14 +101,9 @@ func TestSystemGoldenPath(t *testing.T) {
 		t.Fatalf("provenance upload status = %q, want complete", provenance.UploadStatus)
 	}
 
-	eventually(t, 5*time.Second, "completed upload tasks", func() (string, bool, error) {
-		var tasks struct {
-			Tasks []struct {
-				Status       string `json:"status"`
-				RefVersionID string `json:"ref_version_id"`
-			} `json:"tasks"`
-		}
-		raw, err := admin.getJSON("/api/v1/tasks?type=upload&limit=100", &tasks)
+	e2e.Eventually(t, t.Context(), 5*time.Second, "completed upload tasks", func(ctx context.Context) (string, bool, error) {
+		var tasks e2e.TaskListResponse
+		raw, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload&limit=100", &tasks)
 		if err != nil {
 			return raw, false, err
 		}
@@ -175,33 +122,25 @@ func TestSystemGoldenPath(t *testing.T) {
 		return raw, completed > 0 && failed == 0, nil
 	})
 
-	eventually(t, 5*time.Second, "automatic cache eviction", func() (string, bool, error) {
-		var list objectListResponse
-		raw, err := admin.getJSON("/api/v1/buckets/"+bucket+"/objects?prefix="+url.QueryEscape(key), &list)
+	e2e.Eventually(t, t.Context(), 5*time.Second, "automatic cache eviction", func(ctx context.Context) (string, bool, error) {
+		var list e2e.ObjectListResponse
+		raw, err := admin.GetJSON(ctx, "/api/v1/buckets/"+bucket+"/objects?prefix="+url.QueryEscape(key), &list)
 		if err != nil {
 			return raw, false, err
 		}
 		ready := len(list.Objects) == 1 && !list.Objects[0].Location.Cache && list.Objects[0].Location.Filecoin
 		return raw, ready, nil
 	})
-	assertS3Object(t, s3Client, bucket, key, content, checksum)
+	e2e.AssertS3Object(t, t.Context(), s3Client, bucket, key, content, checksum)
 
-	eventually(t, 5*time.Second, "provider and dataset observability snapshots", func() (string, bool, error) {
-		var providers struct {
-			Summary struct {
-				Available int `json:"available"`
-			} `json:"summary"`
-		}
-		providerRaw, err := admin.getJSON("/api/v1/observability/providers?limit=20", &providers)
+	e2e.Eventually(t, t.Context(), 5*time.Second, "provider and dataset observability snapshots", func(ctx context.Context) (string, bool, error) {
+		var providers e2e.ProviderObservationPage
+		providerRaw, err := admin.GetJSON(ctx, "/api/v1/observability/providers?limit=20", &providers)
 		if err != nil {
 			return providerRaw, false, err
 		}
-		var dataSets struct {
-			Summary struct {
-				Available int `json:"available"`
-			} `json:"summary"`
-		}
-		dataSetRaw, err := admin.getJSON("/api/v1/observability/data-sets?limit=20", &dataSets)
+		var dataSets e2e.DataSetObservationPage
+		dataSetRaw, err := admin.GetJSON(ctx, "/api/v1/observability/data-sets?limit=20", &dataSets)
 		if err != nil {
 			return providerRaw + "\n" + dataSetRaw, false, err
 		}
@@ -214,125 +153,4 @@ func TestSystemGoldenPath(t *testing.T) {
 		t.Fatalf("Close harness: %v", err)
 	}
 	closed = true
-}
-
-func newAdminClient(t *testing.T, baseURL string) *adminClient {
-	t.Helper()
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar.New: %v", err)
-	}
-	return &adminClient{baseURL: baseURL, client: &http.Client{Jar: jar, Timeout: 5 * time.Second}}
-}
-
-func (a *adminClient) login(t *testing.T, username, password string) {
-	t.Helper()
-	var session struct {
-		CSRFToken string `json:"csrf_token"`
-	}
-	a.postJSON(t, "/api/v1/auth/login", map[string]string{"username": username, "password": password}, &session)
-	if session.CSRFToken == "" {
-		t.Fatal("admin login returned an empty CSRF token")
-	}
-	a.csrf = session.CSRFToken
-}
-
-func (a *adminClient) postJSON(t *testing.T, path string, payload, output any) {
-	t.Helper()
-	body, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("marshal %s payload: %v", path, err)
-	}
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, a.baseURL+path, bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("create %s request: %v", path, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if a.csrf != "" {
-		req.Header.Set(csrfHeader, a.csrf)
-	}
-	response, err := a.client.Do(req)
-	if err != nil {
-		t.Fatalf("POST %s: %v", path, err)
-	}
-	defer func() { _ = response.Body.Close() }()
-	raw, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read POST %s: %v", path, err)
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		t.Fatalf("POST %s status=%d body=%s", path, response.StatusCode, raw)
-	}
-	if err := json.Unmarshal(raw, output); err != nil {
-		t.Fatalf("decode POST %s: %v; body=%s", path, err, raw)
-	}
-}
-
-func (a *adminClient) getJSON(path string, output any) (string, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, a.baseURL+path, nil)
-	if err != nil {
-		return "", err
-	}
-	response, err := a.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = response.Body.Close() }()
-	raw, err := io.ReadAll(response.Body)
-	if err != nil {
-		return string(raw), err
-	}
-	if response.StatusCode != http.StatusOK {
-		return string(raw), fmt.Errorf("GET %s status=%d", path, response.StatusCode)
-	}
-	if err := json.Unmarshal(raw, output); err != nil {
-		return string(raw), err
-	}
-	return string(raw), nil
-}
-
-func assertS3Object(t *testing.T, client *awss3.Client, bucket, key string, want []byte, checksum [sha256.Size]byte) {
-	t.Helper()
-	output, err := client.GetObject(t.Context(), &awss3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
-	if err != nil {
-		t.Fatalf("GetObject: %v", err)
-	}
-	defer func() { _ = output.Body.Close() }()
-	got, err := io.ReadAll(output.Body)
-	if err != nil {
-		t.Fatalf("read GetObject: %v", err)
-	}
-	if !bytes.Equal(got, want) || sha256.Sum256(got) != checksum {
-		t.Fatal("GetObject content or checksum differs from uploaded object")
-	}
-}
-
-func eventually[T any](t *testing.T, timeout time.Duration, description string, poll func() (T, bool, error)) T {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), timeout)
-	defer cancel()
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	var last T
-	var lastErr error
-	for {
-		value, ready, err := poll()
-		last, lastErr = value, err
-		if err == nil && ready {
-			return value
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("timed out waiting for %s: last=%s error=%v", description, diagnosticValue(last), lastErr)
-		case <-ticker.C:
-		}
-	}
-}
-
-func diagnosticValue(value any) string {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Sprintf("%#v", value)
-	}
-	return strings.TrimSpace(string(raw))
 }

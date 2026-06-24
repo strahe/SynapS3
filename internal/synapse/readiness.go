@@ -342,7 +342,7 @@ func (c *ReadinessChecker) checkStorage(
 
 	costs, err := storageSvc.CalculateMultiContextCosts(
 		ctx,
-		uint64(objectlimits.MinFOCUploadSize),
+		readinessCostEstimateDataSize(),
 		refs,
 		storage.MultiCostOptions{EnableCDN: cfg.WithCDN},
 		client.Address(),
@@ -379,6 +379,12 @@ func (c *ReadinessChecker) checkStorage(
 	} else {
 		result.ready("fwss_approval", "FWSS payment approval is sufficient.")
 	}
+}
+
+func readinessCostEstimateDataSize() uint64 {
+	// Keep readiness cost estimation tied to the production minimum upload size
+	// and make that constant directly assertable in tests.
+	return uint64(objectlimits.MinFOCUploadSize)
 }
 
 func addStorageDependencyUnknowns(result *ReadinessResult, storageCost, paymentFunding, fwssApproval string) {

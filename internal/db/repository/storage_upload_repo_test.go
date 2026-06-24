@@ -1433,7 +1433,8 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 
 	version := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000020005", 10)
 	version.Checksum = "finalize-checksum"
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
 		t.Fatalf("create version: %v", err)
 	}
 	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
@@ -1532,6 +1533,40 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{UploadID: upload.ID, CopyIndex: 2, PieceCID: "bafk2bzacefinalize", PieceID: onChainIDPtr(t, "302"), RetrievalURL: "https://replacement.example/piece"}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted replacement: %v", err)
 	}
+	stage := "peer_commit"
+	claimedTask := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: "upload:finalize-preserves-claimed-task",
+		Status:         model.TaskStatusQueued,
+		ScheduledAt:    time.Now().Add(-time.Second),
+	}
+	if err := repos.Tasks.Create(ctx, claimedTask); err != nil {
+		t.Fatalf("Create claimed upload task: %v", err)
+	}
+	claimedTask, err = repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimReady upload task: %v", err)
+	}
+	if claimedTask == nil {
+		t.Fatal("ClaimReady upload task returned nil")
+	}
+	pendingTask := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: "upload:finalize-clears-pending-task",
+		Status:         model.TaskStatusQueued,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, pendingTask); err != nil {
+		t.Fatalf("Create pending upload task: %v", err)
+	}
 	done, refs, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
 	if err != nil {
 		t.Fatalf("FinalizeUploadIfTargetCopiesMet complete: %v", err)
@@ -1545,6 +1580,23 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 	}
 	if got.State != model.ObjectStateStored {
 		t.Fatalf("complete state = %s, want stored", got.State)
+	}
+	preservedTask, err := repos.Tasks.GetByID(ctx, claimedTask.ID)
+	if err != nil {
+		t.Fatalf("GetByID claimed task: %v", err)
+	}
+	if preservedTask.Status != model.TaskStatusRunning {
+		t.Fatalf("claimed upload task status = %s, want running", preservedTask.Status)
+	}
+	if err := repos.Tasks.Complete(ctx, claimedTask); err != nil {
+		t.Fatalf("Complete claimed upload task after finalization: %v", err)
+	}
+	finalizedTask, err := repos.Tasks.GetByID(ctx, pendingTask.ID)
+	if err != nil {
+		t.Fatalf("GetByID pending task: %v", err)
+	}
+	if finalizedTask.Status != model.TaskStatusCompleted {
+		t.Fatalf("pending upload task status = %s, want completed", finalizedTask.Status)
 	}
 }
 

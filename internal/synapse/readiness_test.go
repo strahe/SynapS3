@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/strahe/synaps3/internal/objectlimits"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/payments"
@@ -67,6 +68,9 @@ func TestReadinessCheckerUsesApprovedProviderInventoryAndCostEstimate(t *testing
 	requireResultStatus(t, got, ReadinessStatusReady)
 	if len(client.storage.costRefs) != cfg.DefaultCopies {
 		t.Fatalf("cost refs = %d, want %d", len(client.storage.costRefs), cfg.DefaultCopies)
+	}
+	if client.storage.costDataSize != uint64(objectlimits.MinFOCUploadSize) {
+		t.Fatalf("cost data size = %d, want %d", client.storage.costDataSize, objectlimits.MinFOCUploadSize)
 	}
 	if client.storage.costPayer != client.address {
 		t.Fatalf("cost payer = %s, want %s", client.storage.costPayer.Hex(), client.address.Hex())
@@ -502,12 +506,13 @@ func (f *fakeReadinessPayments) AccountInfo(context.Context, common.Address, com
 }
 
 type fakeReadinessStorage struct {
-	info      *storage.StorageInfo
-	infoErr   error
-	costs     *storage.MultiContextCosts
-	costErr   error
-	costRefs  []storage.ContextCostRef
-	costPayer common.Address
+	info         *storage.StorageInfo
+	infoErr      error
+	costs        *storage.MultiContextCosts
+	costErr      error
+	costRefs     []storage.ContextCostRef
+	costPayer    common.Address
+	costDataSize uint64
 }
 
 func (f *fakeReadinessStorage) GetStorageInfo(context.Context, *storage.GetStorageInfoOptions) (*storage.StorageInfo, error) {
@@ -516,12 +521,13 @@ func (f *fakeReadinessStorage) GetStorageInfo(context.Context, *storage.GetStora
 
 func (f *fakeReadinessStorage) CalculateMultiContextCosts(
 	_ context.Context,
-	_ uint64,
+	dataSize uint64,
 	refs []storage.ContextCostRef,
 	_ storage.MultiCostOptions,
 	payer common.Address,
 ) (*storage.MultiContextCosts, error) {
 	f.costRefs = append([]storage.ContextCostRef(nil), refs...)
 	f.costPayer = payer
+	f.costDataSize = dataSize
 	return f.costs, f.costErr
 }

@@ -1,24 +1,47 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/types"
 )
 
-func TestCheckHealth_Reachable(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+func TestCheckHealth_HTTPStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		want       string
+	}{
+		{name: "ok", statusCode: http.StatusOK, want: "reachable"},
+		{name: "4xx response", statusCode: http.StatusMethodNotAllowed, want: "unreachable"},
+		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, want: "unreachable"},
+	}
 
-	status := CheckHealth(context.Background(), srv.URL, 2*time.Second)
-	if status != "reachable" {
-		t.Errorf("expected reachable, got %q", status)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("method = %q, want GET", r.Method)
+				}
+				if r.URL.Path != "/pdp/ping" {
+					t.Errorf("path = %q, want /pdp/ping", r.URL.Path)
+				}
+				w.WriteHeader(tt.statusCode)
+			}))
+			defer srv.Close()
+
+			status := CheckHealth(context.Background(), srv.URL, 2*time.Second)
+			if status != tt.want {
+				t.Errorf("status = %q, want %q", status, tt.want)
+			}
+		})
 	}
 }
 
@@ -26,6 +49,21 @@ func TestCheckHealth_Unreachable(t *testing.T) {
 	status := CheckHealth(context.Background(), "http://127.0.0.1:1", 1*time.Second)
 	if status != "unreachable" {
 		t.Errorf("expected unreachable, got %q", status)
+	}
+}
+
+func TestCheckHealthLogsClientConstructionError(t *testing.T) {
+	var logs bytes.Buffer
+	checker := NewHealthChecker(nil)
+	checker.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	status := checker.Check(context.Background(), "ftp://provider.example", time.Second)
+
+	if status != "unreachable" {
+		t.Fatalf("status = %q, want unreachable", status)
+	}
+	if !strings.Contains(logs.String(), "failed to create PDP health client") {
+		t.Fatalf("logs = %q, want PDP client construction warning", logs.String())
 	}
 }
 
@@ -59,8 +97,11 @@ func TestHealthCheckerUsesProvidedClient(t *testing.T) {
 	if transport.calls != 1 {
 		t.Fatalf("round trip calls = %d, want 1", transport.calls)
 	}
-	if transport.method != http.MethodHead {
-		t.Fatalf("method = %q, want HEAD", transport.method)
+	if transport.method != http.MethodGet {
+		t.Fatalf("method = %q, want GET", transport.method)
+	}
+	if transport.path != "/pdp/ping" {
+		t.Fatalf("path = %q, want /pdp/ping", transport.path)
 	}
 }
 
@@ -98,11 +139,13 @@ func TestCheckHealthBatch_Empty(t *testing.T) {
 type recordingRoundTripper struct {
 	calls  int
 	method string
+	path   string
 }
 
 func (r *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	r.calls++
 	r.method = req.Method
+	r.path = req.URL.Path
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       http.NoBody,
