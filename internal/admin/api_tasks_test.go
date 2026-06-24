@@ -25,6 +25,108 @@ func (r failingTaskProgressUploadRepo) GetByIDs(_ context.Context, _ []int64) (m
 	return nil, errors.New("progress lookup failed")
 }
 
+func TestAPIListExhaustedUsesTaskListDTO(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		RefType:        "object",
+		RefID:          1,
+		RefVersionID:   "01J000000000000000TASKE1",
+		IdempotencyKey: "api-exhausted-list",
+		Status:         model.TaskStatusExhausted,
+		ScheduledAt:    time.Now(),
+		MaxRetries:     3,
+		RetryCount:     3,
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+
+	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /admin/exhausted-tasks", srv.handleListExhausted)
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/exhausted-tasks", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+
+	var tasks []taskListItem
+	if err := json.NewDecoder(rr.Body).Decode(&tasks); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task count = %d, want 1", len(tasks))
+	}
+	if tasks[0].ID != task.ID {
+		t.Fatalf("task id = %d, want %d", tasks[0].ID, task.ID)
+	}
+	if tasks[0].Status != string(model.TaskStatusExhausted) {
+		t.Fatalf("task status = %q, want exhausted", tasks[0].Status)
+	}
+	if tasks[0].Type != string(model.TaskTypeUpload) {
+		t.Fatalf("task type = %q, want upload", tasks[0].Type)
+	}
+}
+
+func TestAPIRetryExhaustedHTTPStatuses(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		RefType:        "object",
+		RefID:          2,
+		RefVersionID:   "01J000000000000000TASKE2",
+		IdempotencyKey: "api-exhausted-retry",
+		Status:         model.TaskStatusExhausted,
+		ScheduledAt:    time.Now(),
+		MaxRetries:     3,
+		RetryCount:     3,
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+
+	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /admin/exhausted-tasks/{id}/retry", srv.handleRetryExhausted)
+
+	for _, tc := range []struct {
+		name       string
+		path       string
+		wantStatus int
+	}{
+		{name: "invalid id", path: "/admin/exhausted-tasks/not-a-number/retry", wantStatus: http.StatusBadRequest},
+		{name: "missing task", path: "/admin/exhausted-tasks/999999/retry", wantStatus: http.StatusNotFound},
+		{name: "exhausted task", path: "/admin/exhausted-tasks/" + strconv.FormatInt(task.ID, 10) + "/retry", wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, tc.path, nil))
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rr.Code, tc.wantStatus, rr.Body.String())
+			}
+		})
+	}
+
+	got, err := repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("retried task was not found")
+	}
+	if got.Status != model.TaskStatusQueued {
+		t.Fatalf("task status = %s, want queued", got.Status)
+	}
+}
+
 func TestAPITasksStageFilter(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)

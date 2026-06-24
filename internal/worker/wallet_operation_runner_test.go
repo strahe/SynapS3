@@ -545,6 +545,7 @@ type fakeWalletOperator struct {
 	onFund         func(context.Context)
 	blockFund      bool
 	fundErr        error
+	withdrawErr    error
 	approveErr     error
 }
 
@@ -565,6 +566,9 @@ func (f *fakeWalletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (st
 
 func (f *fakeWalletOperator) WithdrawUSDFC(_ context.Context, amount *big.Int) (string, error) {
 	f.withdrawAmount = new(big.Int).Set(amount)
+	if f.withdrawErr != nil {
+		return "", f.withdrawErr
+	}
 	return f.withdrawHash, nil
 }
 
@@ -645,31 +649,45 @@ func (f *fakeWalletEventPublisher) statuses() []model.WalletOperationStatus {
 }
 
 func TestWalletOperationRunner_BroadcastErrorFailsOperation(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
-		Type:            model.WalletOperationTypeFund,
-		ClientRequestID: "fund-broadcast-error",
-		Amount:          "100",
-	})
-	if err != nil {
-		t.Fatalf("CreateOrGet: %v", err)
-	}
+	for _, tc := range []struct {
+		name   string
+		opType model.WalletOperationType
+		err    error
+	}{
+		{name: "fund", opType: model.WalletOperationTypeFund, err: errors.New("fund rpc node offline")},
+		{name: "withdraw", opType: model.WalletOperationTypeWithdraw, err: errors.New("withdraw rpc node offline")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testutil.NewTestDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+				Type:            tc.opType,
+				ClientRequestID: string(tc.opType) + "-broadcast-error",
+				Amount:          "100",
+			})
+			if err != nil {
+				t.Fatalf("CreateOrGet: %v", err)
+			}
 
-	operator := &fakeWalletOperator{fundErr: errors.New("rpc node offline")}
-	runner := NewWalletOperationRunner(repos, operator, nil, time.Millisecond, nil)
+			operator := &fakeWalletOperator{fundErr: tc.err, withdrawErr: tc.err}
+			runner := NewWalletOperationRunner(repos, operator, nil, time.Millisecond, nil)
 
-	runner.runOnce(ctx)
+			runner.runOnce(ctx)
 
-	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if got.Status != model.WalletOperationStatusFailed {
-		t.Fatalf("status = %q, want failed", got.Status)
-	}
-	if got.LastError == nil || !strings.Contains(*got.LastError, "rpc node offline") {
-		t.Fatalf("last_error = %v, want rpc node offline", got.LastError)
+			got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+			if err != nil {
+				t.Fatalf("GetByID: %v", err)
+			}
+			if got.Status != model.WalletOperationStatusFailed {
+				t.Fatalf("status = %q, want failed", got.Status)
+			}
+			if got.LastError == nil {
+				t.Fatalf("last_error is nil, want %q", tc.err.Error())
+			}
+			if !strings.Contains(*got.LastError, tc.err.Error()) {
+				t.Fatalf("last_error = %q, want %q", *got.LastError, tc.err.Error())
+			}
+		})
 	}
 }
