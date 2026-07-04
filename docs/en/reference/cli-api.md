@@ -52,6 +52,8 @@ export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 synaps3 admin status
 synaps3 admin s3-user create
 synaps3 admin s3-user list
+synaps3 admin s3-user update <access-key> --role userplus
+synaps3 admin s3-user rotate-secret <access-key>
 synaps3 admin settings get
 synaps3 admin settings set cache.max_size_gb=200
 synaps3 admin task stats
@@ -70,6 +72,7 @@ High-risk changes require confirmation:
 ```bash
 synaps3 admin settings set filecoin.network=mainnet --yes
 synaps3 admin s3-user create --role admin --yes
+synaps3 admin s3-user update <access-key> --role admin --yes
 synaps3 admin s3-user delete <access-key> --yes
 ```
 

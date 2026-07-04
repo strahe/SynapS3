@@ -25,6 +25,7 @@ func TestWalletOperationRunner_SubmitsAndConfirmsPendingOperation(t *testing.T) 
 	}{
 		{name: "fund", opType: model.WalletOperationTypeFund, amount: "100"},
 		{name: "withdraw", opType: model.WalletOperationTypeWithdraw, amount: "50"},
+		{name: "approve", opType: model.WalletOperationTypeApprove, amount: "0"},
 	}
 
 	for _, tt := range tests {
@@ -42,7 +43,7 @@ func TestWalletOperationRunner_SubmitsAndConfirmsPendingOperation(t *testing.T) 
 			}
 
 			txHash := common.HexToHash("0xabc")
-			operator := &fakeWalletOperator{fundHash: txHash.Hex(), withdrawHash: txHash.Hex()}
+			operator := &fakeWalletOperator{fundHash: txHash.Hex(), withdrawHash: txHash.Hex(), approveHash: txHash.Hex()}
 			receipts := &fakeWalletReceiptChecker{receipts: map[common.Hash]*ethtypes.Receipt{
 				txHash: {Status: ethtypes.ReceiptStatusSuccessful},
 			}}
@@ -69,12 +70,25 @@ func TestWalletOperationRunner_SubmitsAndConfirmsPendingOperation(t *testing.T) 
 				if operator.withdrawAmount != nil {
 					t.Fatalf("withdraw amount = %s, want no withdraw", operator.withdrawAmount)
 				}
+				if operator.approveCalled {
+					t.Fatal("ApproveFWSS was called, want no approve")
+				}
 			case model.WalletOperationTypeWithdraw:
 				if operator.withdrawAmount == nil || operator.withdrawAmount.String() != tt.amount {
 					t.Fatalf("withdraw amount = %v, want %s", operator.withdrawAmount, tt.amount)
 				}
 				if operator.fundAmount != nil {
 					t.Fatalf("fund amount = %s, want no fund", operator.fundAmount)
+				}
+				if operator.approveCalled {
+					t.Fatal("ApproveFWSS was called, want no approve")
+				}
+			case model.WalletOperationTypeApprove:
+				if !operator.approveCalled {
+					t.Fatal("ApproveFWSS was not called")
+				}
+				if operator.fundAmount != nil || operator.withdrawAmount != nil {
+					t.Fatalf("fund=%v withdraw=%v, want no fund or withdraw", operator.fundAmount, operator.withdrawAmount)
 				}
 			default:
 				t.Fatalf("unexpected operation type %q", tt.opType)
@@ -83,50 +97,6 @@ func TestWalletOperationRunner_SubmitsAndConfirmsPendingOperation(t *testing.T) 
 				t.Fatalf("published statuses = %v, want submitted and confirmed", publisher.statuses())
 			}
 		})
-	}
-}
-
-func TestWalletOperationRunner_SubmitsAndConfirmsApproveOperation(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
-		Type:            model.WalletOperationTypeApprove,
-		ClientRequestID: "approve-1",
-		Amount:          "0",
-	})
-	if err != nil {
-		t.Fatalf("CreateOrGet: %v", err)
-	}
-
-	txHash := common.HexToHash("0xabc")
-	operator := &fakeWalletOperator{approveHash: txHash.Hex()}
-	receipts := &fakeWalletReceiptChecker{receipts: map[common.Hash]*ethtypes.Receipt{
-		txHash: {Status: ethtypes.ReceiptStatusSuccessful},
-	}}
-	publisher := &fakeWalletEventPublisher{}
-	runner := NewWalletOperationRunner(repos, operator, receipts, time.Millisecond, nil, WithWalletOperationEventPublisher(publisher))
-
-	runner.runOnce(ctx)
-
-	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if got.Status != model.WalletOperationStatusConfirmed {
-		t.Fatalf("status = %q, want confirmed", got.Status)
-	}
-	if got.TxHash == nil || *got.TxHash != txHash.Hex() {
-		t.Fatalf("tx_hash = %v, want %s", got.TxHash, txHash.Hex())
-	}
-	if !operator.approveCalled {
-		t.Fatal("ApproveFWSS was not called")
-	}
-	if operator.fundAmount != nil || operator.withdrawAmount != nil {
-		t.Fatalf("fund=%v withdraw=%v, want no fund or withdraw", operator.fundAmount, operator.withdrawAmount)
-	}
-	if !publisher.hasStatus(model.WalletOperationStatusSubmitted) || !publisher.hasStatus(model.WalletOperationStatusConfirmed) {
-		t.Fatalf("published statuses = %v, want submitted and confirmed", publisher.statuses())
 	}
 }
 
@@ -445,7 +415,6 @@ func TestWalletOperationRunner_RemainsHealthyWhileBroadcasting(t *testing.T) {
 		close(done)
 	}()
 	<-started
-	time.Sleep(time.Millisecond)
 
 	if !runner.Healthy() {
 		t.Fatal("runner is unhealthy during an active wallet broadcast")
@@ -652,10 +621,12 @@ func TestWalletOperationRunner_BroadcastErrorFailsOperation(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		opType model.WalletOperationType
+		amount string
 		err    error
 	}{
-		{name: "fund", opType: model.WalletOperationTypeFund, err: errors.New("fund rpc node offline")},
-		{name: "withdraw", opType: model.WalletOperationTypeWithdraw, err: errors.New("withdraw rpc node offline")},
+		{name: "fund", opType: model.WalletOperationTypeFund, amount: "100", err: errors.New("fund rpc node offline")},
+		{name: "withdraw", opType: model.WalletOperationTypeWithdraw, amount: "100", err: errors.New("withdraw rpc node offline")},
+		{name: "approve", opType: model.WalletOperationTypeApprove, amount: "0", err: errors.New("approve rpc node offline")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testutil.NewTestDB(t)
@@ -664,13 +635,13 @@ func TestWalletOperationRunner_BroadcastErrorFailsOperation(t *testing.T) {
 			op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
 				Type:            tc.opType,
 				ClientRequestID: string(tc.opType) + "-broadcast-error",
-				Amount:          "100",
+				Amount:          tc.amount,
 			})
 			if err != nil {
 				t.Fatalf("CreateOrGet: %v", err)
 			}
 
-			operator := &fakeWalletOperator{fundErr: tc.err, withdrawErr: tc.err}
+			operator := &fakeWalletOperator{fundErr: tc.err, withdrawErr: tc.err, approveErr: tc.err}
 			runner := NewWalletOperationRunner(repos, operator, nil, time.Millisecond, nil)
 
 			runner.runOnce(ctx)

@@ -127,6 +127,66 @@ func TestAPIRetryExhaustedHTTPStatuses(t *testing.T) {
 	}
 }
 
+func TestAPITaskStats(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	tasks := []*model.Task{
+		{
+			Type:           model.TaskTypeUpload,
+			RefType:        "object",
+			RefID:          1,
+			RefVersionID:   "01J000000000000000STAT01",
+			IdempotencyKey: "api-task-stats-queued-1",
+			Status:         model.TaskStatusQueued,
+		},
+		{
+			Type:           model.TaskTypeUpload,
+			RefType:        "object",
+			RefID:          2,
+			RefVersionID:   "01J000000000000000STAT02",
+			IdempotencyKey: "api-task-stats-queued-2",
+			Status:         model.TaskStatusQueued,
+		},
+		{
+			Type:           model.TaskTypeUpload,
+			RefType:        "object",
+			RefID:          3,
+			RefVersionID:   "01J000000000000000STAT03",
+			IdempotencyKey: "api-task-stats-running",
+			Status:         model.TaskStatusRunning,
+		},
+	}
+	for _, task := range tasks {
+		if err := repos.Tasks.Create(ctx, task); err != nil {
+			t.Fatalf("Create task %q: %v", task.IdempotencyKey, err)
+		}
+	}
+
+	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	rr := httptest.NewRecorder()
+	srv.handleAPITaskStats(rr, httptest.NewRequest(http.MethodGet, "/api/v1/tasks/stats", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+
+	var body []repository.TaskStatusCount
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode stats: %v", err)
+	}
+	counts := make(map[[2]string]int64, len(body))
+	for _, count := range body {
+		counts[[2]string{count.Type, count.Status}] = count.Count
+	}
+	if got := counts[[2]string{string(model.TaskTypeUpload), string(model.TaskStatusQueued)}]; got != 2 {
+		t.Fatalf("queued upload count = %d, want 2", got)
+	}
+	if got := counts[[2]string{string(model.TaskTypeUpload), string(model.TaskStatusRunning)}]; got != 1 {
+		t.Fatalf("running upload count = %d, want 1", got)
+	}
+}
+
 func TestAPITasksStageFilter(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)

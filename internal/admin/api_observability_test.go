@@ -15,7 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 )
 
-func TestAPIObservabilityRefreshRunsThroughAuthenticatedAdminSurface(t *testing.T) {
+func TestAPIObservabilityRefreshRunsThroughAdminHandler(t *testing.T) {
 	var calls int32
 	service := observability.NewService(observability.ServiceOptions{
 		Checker: &observabilityAPIRefreshChecker{
@@ -150,20 +150,98 @@ func TestAPIObservabilityDataSetBucketFilters(t *testing.T) {
 	}
 }
 
+func TestAPIObservabilityProviders(t *testing.T) {
+	service := observability.NewService(observability.ServiceOptions{
+		Store: &observabilityAPIStore{
+			providers: []observability.ProviderState{
+				{ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable},
+			},
+		},
+	})
+	srv := &Server{addr: "127.0.0.1:9090", observability: service, logger: testLogger()}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/observability/providers", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIObservabilityProviders(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var body observability.ProviderObservationPage
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Items) != 1 || body.Items[0].Facts.ProviderID.String() != "101" {
+		t.Fatalf("items = %+v, want provider 101", body.Items)
+	}
+}
+
+func TestAPIObservabilityRefreshDataSets(t *testing.T) {
+	var calls int32
+	service := observability.NewService(observability.ServiceOptions{
+		Checker: &observabilityAPIRefreshChecker{
+			dataSets: func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.DataSetState, error) {
+				atomic.AddInt32(&calls, 1)
+				return []observability.DataSetState{
+					{
+						LocalDataSetID: 101,
+						BucketID:       7,
+						BucketName:     "photos",
+						ProviderID:     onChainID(t, "202"),
+						LocalStatus:    "ready",
+						Status:         observability.StatusAvailable,
+					},
+				}, nil
+			},
+		},
+		LocalDataSets: observability.LocalDataSetSourceFunc(func(context.Context) ([]observability.LocalDataSet, error) { return nil, nil }),
+		Store:         &observabilityAPIStore{},
+	})
+	srv := &Server{addr: "127.0.0.1:9090", observability: service, logger: testLogger()}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/observability/data-sets/refresh", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIRefreshObservabilityDataSets(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if gotCalls := atomic.LoadInt32(&calls); gotCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", gotCalls)
+	}
+
+	var body observability.DataSetObservationPage
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Items) != 1 || body.Items[0].Facts.LocalDataSetID != 101 {
+		t.Fatalf("items = %+v, want dataset 101", body.Items)
+	}
+}
+
 type observabilityAPIRefreshChecker struct {
 	providers func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.ProviderState, error)
+	dataSets  func(context.Context, time.Time, []observability.LocalDataSet) ([]observability.DataSetState, error)
 }
 
 func (c *observabilityAPIRefreshChecker) CheckProviders(ctx context.Context, checkedAt time.Time, local []observability.LocalDataSet) ([]observability.ProviderState, error) {
+	if c.providers == nil {
+		return nil, nil
+	}
 	return c.providers(ctx, checkedAt, local)
 }
 
-func (c *observabilityAPIRefreshChecker) CheckDataSets(context.Context, time.Time, []observability.LocalDataSet) ([]observability.DataSetState, error) {
+func (c *observabilityAPIRefreshChecker) CheckDataSets(ctx context.Context, checkedAt time.Time, local []observability.LocalDataSet) ([]observability.DataSetState, error) {
+	if c.dataSets != nil {
+		return c.dataSets(ctx, checkedAt, local)
+	}
 	return nil, nil
 }
 
 type observabilityAPIStore struct {
 	providers              []observability.ProviderState
+	dataSets               []observability.DataSetState
 	providerLastCheckedAt  *time.Time
 	dataSetLastCheckedAt   *time.Time
 	lastDataSetListOptions observability.ListOptions
@@ -186,14 +264,22 @@ func (s *observabilityAPIStore) ListProviderStates(_ context.Context, opts obser
 	}, nil
 }
 
-func (s *observabilityAPIStore) ReplaceDataSetStates(_ context.Context, checkedAt time.Time, _ []observability.DataSetState) error {
+func (s *observabilityAPIStore) ReplaceDataSetStates(_ context.Context, checkedAt time.Time, states []observability.DataSetState) error {
+	s.dataSets = states
 	s.dataSetLastCheckedAt = &checkedAt
 	return nil
 }
 
 func (s *observabilityAPIStore) ListDataSetStates(_ context.Context, opts observability.ListOptions) (observability.DataSetStatePage, error) {
 	s.lastDataSetListOptions = opts
-	return observability.DataSetStatePage{LastCheckedAt: s.dataSetLastCheckedAt, Limit: opts.Limit, Offset: opts.Offset}, nil
+	return observability.DataSetStatePage{
+		Items:         s.dataSets,
+		Summary:       observability.Summary{Total: len(s.dataSets), Available: len(s.dataSets)},
+		LastCheckedAt: s.dataSetLastCheckedAt,
+		Total:         len(s.dataSets),
+		Limit:         opts.Limit,
+		Offset:        opts.Offset,
+	}, nil
 }
 
 func (s *observabilityAPIStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {

@@ -26,6 +26,18 @@ func seedTask(t *testing.T, repos *repository.Repositories, taskType model.TaskT
 	return task
 }
 
+func assertTaskIDs(t *testing.T, tasks []model.Task, want ...int64) {
+	t.Helper()
+	if len(tasks) != len(want) {
+		t.Fatalf("task count = %d, want %d; tasks=%#v", len(tasks), len(want), tasks)
+	}
+	for i, task := range tasks {
+		if task.ID != want[i] {
+			t.Fatalf("task[%d].ID = %d, want %d; tasks=%#v", i, task.ID, want[i], tasks)
+		}
+	}
+}
+
 func TestTaskRepo_ClaimReady(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -470,7 +482,7 @@ func TestTaskRepo_Complete_NotRunning(t *testing.T) {
 	}
 }
 
-func TestTaskRepo_Fail(t *testing.T) {
+func TestTaskRepo_FailRunning(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -494,6 +506,21 @@ func TestTaskRepo_Fail(t *testing.T) {
 	}
 	if task.CompletedAt == nil {
 		t.Error("expected completed_at to be set")
+	}
+	if task.ClaimedAt != nil || task.LeaseUntil != nil || task.StartedAt != nil {
+		t.Fatalf("failed task lease fields = claimed:%v lease:%v started:%v, want cleared", task.ClaimedAt, task.LeaseUntil, task.StartedAt)
+	}
+
+	queued := seedTask(t, repos, model.TaskTypeUpload)
+	now := time.Now()
+	leaseUntil := now.Add(5 * time.Minute)
+	mustExec(t, db, `UPDATE tasks SET claimed_at = ?, lease_until = ?, started_at = ? WHERE id = ?`, now, leaseUntil, now, queued.ID)
+	queued.ClaimedAt = &now
+	queued.LeaseUntil = &leaseUntil
+	queued.StartedAt = &now
+	err := repos.Tasks.FailRunning(ctx, queued, "should fail")
+	if err == nil {
+		t.Fatal("expected error failing queued task")
 	}
 }
 
@@ -856,14 +883,19 @@ func TestTaskRepo_List(t *testing.T) {
 	}
 
 	// Seed tasks: 2 upload (queued), 1 evict_cache (queued).
-	seedTask(t, repos, model.TaskTypeUpload)
-	seedTask(t, repos, model.TaskTypeUpload)
-	seedTask(t, repos, model.TaskTypeEvictCache)
+	firstUpload := seedTask(t, repos, model.TaskTypeUpload)
+	secondUpload := seedTask(t, repos, model.TaskTypeUpload)
+	evict := seedTask(t, repos, model.TaskTypeEvictCache)
 
 	// Claim one upload task to make it running.
 	claimed, _ := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 5*time.Minute)
 	if claimed == nil {
 		t.Fatal("setup: could not claim task")
+	}
+	runningUploadID := claimed.ID
+	queuedUploadID := firstUpload.ID
+	if runningUploadID == firstUpload.ID {
+		queuedUploadID = secondUpload.ID
 	}
 
 	// List all — should return 3.
@@ -877,24 +909,27 @@ func TestTaskRepo_List(t *testing.T) {
 	if len(tasks) != 3 {
 		t.Errorf("expected 3 tasks, got %d", len(tasks))
 	}
+	assertTaskIDs(t, tasks, evict.ID, secondUpload.ID, firstUpload.ID)
 
 	// Filter by type.
-	_, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
+	tasks, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
 	if err != nil {
 		t.Fatalf("List by type: %v", err)
 	}
 	if total != 2 {
 		t.Errorf("expected 2 upload, got %d", total)
 	}
+	assertTaskIDs(t, tasks, secondUpload.ID, firstUpload.ID)
 
 	// Filter by status.
-	_, total, err = repos.Tasks.List(ctx, "", "", string(model.TaskStatusQueued), 10, 0)
+	tasks, total, err = repos.Tasks.List(ctx, "", "", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
 		t.Fatalf("List by status: %v", err)
 	}
 	if total != 2 {
 		t.Errorf("expected 2 queued, got %d", total)
 	}
+	assertTaskIDs(t, tasks, evict.ID, queuedUploadID)
 
 	// Filter by type + status.
 	tasks, total, err = repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", string(model.TaskStatusRunning), 10, 0)
@@ -907,6 +942,7 @@ func TestTaskRepo_List(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Errorf("expected 1 task, got %d", len(tasks))
 	}
+	assertTaskIDs(t, tasks, runningUploadID)
 
 	// Pagination: limit 2, offset 0.
 	tasks, total, err = repos.Tasks.List(ctx, "", "", "", 2, 0)
@@ -919,6 +955,7 @@ func TestTaskRepo_List(t *testing.T) {
 	if len(tasks) != 2 {
 		t.Errorf("expected 2 tasks with limit=2, got %d", len(tasks))
 	}
+	assertTaskIDs(t, tasks, evict.ID, secondUpload.ID)
 
 	// Pagination: limit 2, offset 2 — should return 1.
 	tasks, total, err = repos.Tasks.List(ctx, "", "", "", 2, 2)
@@ -931,6 +968,7 @@ func TestTaskRepo_List(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Errorf("expected 1 task at offset 2, got %d", len(tasks))
 	}
+	assertTaskIDs(t, tasks, firstUpload.ID)
 }
 
 func TestTaskRepo_ListFiltersByStage(t *testing.T) {

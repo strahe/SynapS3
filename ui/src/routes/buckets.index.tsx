@@ -1,6 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { Loader2, Plus, RefreshCw, UserRound } from 'lucide-react'
+import { Database, Loader2, Plus, RefreshCw, UserRound } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
 import { type BucketItem, internalRootOwnerAccessKey } from '@/api/client'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
@@ -19,6 +19,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -317,6 +318,7 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
 function BucketsPage() {
   const { data, isLoading, error } = useBuckets()
   const qc = useQueryClient()
+  const buckets = data ?? []
 
   return (
     <div className="flex flex-col gap-4 p-6">
@@ -338,6 +340,18 @@ function BucketsPage() {
         </div>
       ) : error ? (
         <PageErrorState title="Failed to load buckets" className="h-60" />
+      ) : buckets.length === 0 ? (
+        <div className="rounded-lg border border-border">
+          <Empty className="h-60 border-0">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <Database />
+              </EmptyMedia>
+              <EmptyTitle>No buckets found</EmptyTitle>
+              <EmptyDescription>You don't have any buckets yet.</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </div>
       ) : (
         <div className="overflow-hidden rounded-lg border border-border">
           <Table>
@@ -355,45 +369,37 @@ function BucketsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {data && data.length > 0 ? (
-                data.map((bucket) => (
-                  <TableRow key={bucket.id}>
-                    <TableCell className="px-4">
-                      <Link
-                        to="/buckets/$name"
-                        params={{ name: bucket.name }}
-                        className="font-medium text-primary hover:underline"
-                      >
-                        {bucket.name}
-                      </Link>
-                    </TableCell>
-                    <TableCell className="px-4">
-                      <OwnerCell ownerAccessKey={bucket.owner_access_key} />
-                    </TableCell>
-                    <TableCell className="px-4">{bucketCopyPolicyLabel(bucket)}</TableCell>
-                    <TableCell className="px-4">
-                      <BucketStorageHealthCell bucket={bucket} />
-                    </TableCell>
-                    <TableCell className="px-4">
-                      <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
-                    </TableCell>
-                    <TableCell className="px-4 text-right">{formatNumber(bucket.object_count)}</TableCell>
-                    <TableCell className="px-4 text-right">{formatBytes(bucket.total_size_bytes)}</TableCell>
-                    <TableCell className="px-4 text-muted-foreground" title={bucket.created_at}>
-                      {timeAgo(bucket.created_at)}
-                    </TableCell>
-                    <TableCell className="px-4">
-                      <ChangeBucketOwnerDialog bucket={bucket} />
-                    </TableCell>
-                  </TableRow>
-                ))
-              ) : (
-                <TableRow>
-                  <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
-                    No buckets found
+              {buckets.map((bucket) => (
+                <TableRow key={bucket.id}>
+                  <TableCell className="px-4">
+                    <Link
+                      to="/buckets/$name"
+                      params={{ name: bucket.name }}
+                      className="font-medium text-primary hover:underline"
+                    >
+                      {bucket.name}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="px-4">
+                    <OwnerCell ownerAccessKey={bucket.owner_access_key} />
+                  </TableCell>
+                  <TableCell className="px-4">{bucketCopyPolicyLabel(bucket)}</TableCell>
+                  <TableCell className="px-4">
+                    <BucketStorageHealthCell bucket={bucket} />
+                  </TableCell>
+                  <TableCell className="px-4">
+                    <StatusBadge tone={bucketStatusTone(bucket.status)}>{bucket.status}</StatusBadge>
+                  </TableCell>
+                  <TableCell className="px-4 text-right">{formatNumber(bucket.object_count)}</TableCell>
+                  <TableCell className="px-4 text-right">{formatBytes(bucket.total_size_bytes)}</TableCell>
+                  <TableCell className="px-4 text-muted-foreground" title={bucket.created_at}>
+                    {timeAgo(bucket.created_at)}
+                  </TableCell>
+                  <TableCell className="px-4">
+                    <ChangeBucketOwnerDialog bucket={bucket} />
                   </TableCell>
                 </TableRow>
-              )}
+              ))}
             </TableBody>
           </Table>
         </div>
