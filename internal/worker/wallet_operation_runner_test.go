@@ -351,77 +351,146 @@ func TestWalletOperationRunner_ReceiptLookupTimeoutDoesNotBlockRunner(t *testing
 }
 
 func TestWalletOperationRunner_BroadcastTimeoutDoesNotFailOperation(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
-		Type:            model.WalletOperationTypeFund,
-		ClientRequestID: "fund-broadcast-timeout",
-		Amount:          "100",
-	})
-	if err != nil {
-		t.Fatalf("CreateOrGet: %v", err)
-	}
+	for _, tc := range []struct {
+		name     string
+		opType   model.WalletOperationType
+		amount   string
+		operator *fakeWalletOperator
+	}{
+		{name: "fund", opType: model.WalletOperationTypeFund, amount: "100", operator: &fakeWalletOperator{blockFund: true}},
+		{name: "withdraw", opType: model.WalletOperationTypeWithdraw, amount: "100", operator: &fakeWalletOperator{blockWithdraw: true}},
+		{name: "approve", opType: model.WalletOperationTypeApprove, amount: "0", operator: &fakeWalletOperator{blockApprove: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testutil.NewTestDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+				Type:            tc.opType,
+				ClientRequestID: string(tc.opType) + "-broadcast-timeout",
+				Amount:          tc.amount,
+			})
+			if err != nil {
+				t.Fatalf("CreateOrGet: %v", err)
+			}
 
-	operator := &fakeWalletOperator{blockFund: true}
-	runner := NewWalletOperationRunner(repos, operator, nil, time.Millisecond, nil, WithWalletOperationTimeouts(time.Millisecond, 0))
+			runner := NewWalletOperationRunner(repos, tc.operator, nil, time.Millisecond, nil, WithWalletOperationTimeouts(time.Millisecond, 0))
 
-	started := time.Now()
-	runner.runOnce(ctx)
-	if time.Since(started) > time.Second {
-		t.Fatal("runOnce did not return after broadcast timeout")
-	}
+			started := time.Now()
+			runner.runOnce(ctx)
+			if time.Since(started) > time.Second {
+				t.Fatal("runOnce did not return after broadcast timeout")
+			}
 
-	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if got.Status != model.WalletOperationStatusRunning {
-		t.Fatalf("status = %q, want running until lease expiry", got.Status)
-	}
-	if got.TxHash != nil {
-		t.Fatalf("tx_hash = %v, want nil", got.TxHash)
+			got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+			if err != nil {
+				t.Fatalf("GetByID: %v", err)
+			}
+			if got.Status != model.WalletOperationStatusRunning {
+				t.Fatalf("status = %q, want running until lease expiry", got.Status)
+			}
+			if got.TxHash != nil {
+				t.Fatalf("tx_hash = %v, want nil", got.TxHash)
+			}
+		})
 	}
 }
 
 func TestWalletOperationRunner_RemainsHealthyWhileBroadcasting(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if _, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
-		Type:            model.WalletOperationTypeFund,
-		ClientRequestID: "fund-slow-broadcast",
-		Amount:          "100",
-	}); err != nil {
-		t.Fatalf("CreateOrGet: %v", err)
-	}
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	operator := &fakeWalletOperator{
-		fundHash: common.HexToHash("0x123").Hex(),
-		onFund: func(context.Context) {
-			close(started)
-			<-release
+	for _, tc := range []struct {
+		name     string
+		opType   model.WalletOperationType
+		amount   string
+		operator func(started, release chan struct{}) *fakeWalletOperator
+	}{
+		{
+			name:   "fund",
+			opType: model.WalletOperationTypeFund,
+			amount: "100",
+			operator: func(started, release chan struct{}) *fakeWalletOperator {
+				return &fakeWalletOperator{
+					fundHash: common.HexToHash("0x123").Hex(),
+					onFund: func(context.Context) {
+						close(started)
+						<-release
+					},
+				}
+			},
 		},
+		{
+			name:   "withdraw",
+			opType: model.WalletOperationTypeWithdraw,
+			amount: "100",
+			operator: func(started, release chan struct{}) *fakeWalletOperator {
+				return &fakeWalletOperator{
+					withdrawHash: common.HexToHash("0x123").Hex(),
+					onWithdraw: func(context.Context) {
+						close(started)
+						<-release
+					},
+				}
+			},
+		},
+		{
+			name:   "approve",
+			opType: model.WalletOperationTypeApprove,
+			amount: "0",
+			operator: func(started, release chan struct{}) *fakeWalletOperator {
+				return &fakeWalletOperator{
+					approveHash: common.HexToHash("0x123").Hex(),
+					onApprove: func(context.Context) {
+						close(started)
+						<-release
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testutil.NewTestDB(t)
+			repos := repository.NewRepositories(db)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			if _, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+				Type:            tc.opType,
+				ClientRequestID: string(tc.opType) + "-slow-broadcast",
+				Amount:          tc.amount,
+			}); err != nil {
+				t.Fatalf("CreateOrGet: %v", err)
+			}
+
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
+
+			operator := tc.operator(started, release)
+			runner := NewWalletOperationRunner(repos, operator, nil, time.Nanosecond, nil)
+
+			done := make(chan struct{})
+			go func() {
+				runner.runOnce(ctx)
+				close(done)
+			}()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("wallet broadcast did not start")
+			}
+
+			if !runner.Healthy() {
+				t.Fatal("runner is unhealthy during an active wallet broadcast")
+			}
+
+			releaseOnce.Do(func() { close(release) })
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("runOnce did not finish after releasing broadcast")
+			}
+		})
 	}
-	runner := NewWalletOperationRunner(repos, operator, nil, time.Nanosecond, nil)
-
-	done := make(chan struct{})
-	go func() {
-		runner.runOnce(ctx)
-		close(done)
-	}()
-	<-started
-
-	if !runner.Healthy() {
-		t.Fatal("runner is unhealthy during an active wallet broadcast")
-	}
-
-	close(release)
-	<-done
 }
 
 func TestWalletOperationRunner_RecoversSubmittedAndMarksExpiredRunningUnknown(t *testing.T) {
@@ -512,7 +581,11 @@ type fakeWalletOperator struct {
 	withdrawAmount *big.Int
 	approveCalled  bool
 	onFund         func(context.Context)
+	onWithdraw     func(context.Context)
+	onApprove      func(context.Context)
 	blockFund      bool
+	blockWithdraw  bool
+	blockApprove   bool
 	fundErr        error
 	withdrawErr    error
 	approveErr     error
@@ -533,16 +606,30 @@ func (f *fakeWalletOperator) FundUSDFC(ctx context.Context, amount *big.Int) (st
 	return f.fundHash, nil
 }
 
-func (f *fakeWalletOperator) WithdrawUSDFC(_ context.Context, amount *big.Int) (string, error) {
+func (f *fakeWalletOperator) WithdrawUSDFC(ctx context.Context, amount *big.Int) (string, error) {
 	f.withdrawAmount = new(big.Int).Set(amount)
+	if f.onWithdraw != nil {
+		f.onWithdraw(ctx)
+	}
+	if f.blockWithdraw {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if f.withdrawErr != nil {
 		return "", f.withdrawErr
 	}
 	return f.withdrawHash, nil
 }
 
-func (f *fakeWalletOperator) ApproveFWSS(context.Context) (string, error) {
+func (f *fakeWalletOperator) ApproveFWSS(ctx context.Context) (string, error) {
 	f.approveCalled = true
+	if f.onApprove != nil {
+		f.onApprove(ctx)
+	}
+	if f.blockApprove {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if f.approveErr != nil {
 		return "", f.approveErr
 	}

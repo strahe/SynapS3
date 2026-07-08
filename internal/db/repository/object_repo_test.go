@@ -962,6 +962,68 @@ func TestObjectRepo_ListVersionsByBucketOrdersAndMarksCurrent(t *testing.T) {
 	}
 }
 
+func TestObjectRepo_ListVersionsByKey(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "version-list-key-bucket")
+	otherBucket := seedBucket(t, db, "version-list-key-other-bucket")
+
+	oldVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000002001", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+		t.Fatalf("create old version: %v", err)
+	}
+	middleVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000002002", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, middleVersion); err != nil {
+		t.Fatalf("create middle version: %v", err)
+	}
+	currentVersion := newObjectVersion(bucket.ID, "file.txt", "01J00000000000000000002003", 30)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
+		t.Fatalf("create current version: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(bucket.ID, "other.txt", "01J00000000000000000002004", 40)); err != nil {
+		t.Fatalf("create other key version: %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, newObjectVersion(otherBucket.ID, "file.txt", "01J00000000000000000002005", 50)); err != nil {
+		t.Fatalf("create other bucket version: %v", err)
+	}
+
+	rows, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, "file.txt", "", 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByKey: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows len = %d, want 3", len(rows))
+	}
+	for i, row := range rows {
+		if row.BucketID != bucket.ID || row.Key != "file.txt" {
+			t.Fatalf("row %d = bucket:%d key:%q, want target bucket/file.txt", i, row.BucketID, row.Key)
+		}
+	}
+	if rows[0].VersionID != currentVersion.VersionID || !rows[0].IsCurrent {
+		t.Fatalf("first row = %#v, want current version %s", rows[0], currentVersion.VersionID)
+	}
+	if rows[1].VersionID != middleVersion.VersionID || rows[2].VersionID != oldVersion.VersionID {
+		t.Fatalf("ordered rows = %s/%s/%s, want current/middle/old", rows[0].VersionID, rows[1].VersionID, rows[2].VersionID)
+	}
+
+	page, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, "file.txt", currentVersion.VersionID, 10)
+	if err != nil {
+		t.Fatalf("ListVersionsByKey marker: %v", err)
+	}
+	if len(page) != 2 || page[0].VersionID != middleVersion.VersionID || page[1].VersionID != oldVersion.VersionID {
+		t.Fatalf("marker page = %#v, want middle then old", page)
+	}
+
+	limited, err := repos.Objects.ListVersionsByKey(ctx, bucket.ID, "file.txt", "", 2)
+	if err != nil {
+		t.Fatalf("ListVersionsByKey limit: %v", err)
+	}
+	if len(limited) != 2 || limited[0].VersionID != currentVersion.VersionID || limited[1].VersionID != middleVersion.VersionID {
+		t.Fatalf("limited rows = %#v, want current then middle", limited)
+	}
+}
+
 func TestObjectRepo_CreateDeleteMarkerHidesCurrentObjectButKeepsVersionHistory(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

@@ -307,6 +307,61 @@ func TestHandleAPIWalletApprove_RejectsAmountField(t *testing.T) {
 	}
 }
 
+func TestHandleAPIWalletOperations(t *testing.T) {
+	srv, repos := newWalletOperationTestServer(t)
+	ctx := context.Background()
+	for _, seed := range []repository.CreateWalletOperationInput{
+		{Type: model.WalletOperationTypeFund, ClientRequestID: "req-1", Amount: "100"},
+		{Type: model.WalletOperationTypeWithdraw, ClientRequestID: "req-2", Amount: "50"},
+		{Type: model.WalletOperationTypeApprove, ClientRequestID: "req-3", Amount: "0"},
+	} {
+		if _, _, err := repos.WalletOperations.CreateOrGet(ctx, seed); err != nil {
+			t.Fatalf("CreateOrGet %q: %v", seed.ClientRequestID, err)
+		}
+	}
+
+	tests := []struct {
+		name       string
+		query      string
+		wantStatus int
+		wantIDs    []string
+	}{
+		{name: "default limit returns recent operations", wantStatus: http.StatusOK, wantIDs: []string{"req-3", "req-2", "req-1"}},
+		{name: "custom limit returns most recent operations", query: "?limit=2", wantStatus: http.StatusOK, wantIDs: []string{"req-3", "req-2"}},
+		{name: "invalid limit", query: "?limit=abc", wantStatus: http.StatusBadRequest},
+		{name: "zero limit", query: "?limit=0", wantStatus: http.StatusBadRequest},
+		{name: "negative limit", query: "?limit=-1", wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/wallet/operations"+tt.query, nil)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIWalletOperations(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, tt.wantStatus, rr.Body.String())
+			}
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+			var resp walletOperationsResponse
+			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("Unmarshal operation response: %v", err)
+			}
+			if len(resp.Operations) != len(tt.wantIDs) {
+				t.Fatalf("operations count = %d, want %d", len(resp.Operations), len(tt.wantIDs))
+			}
+			for i, wantID := range tt.wantIDs {
+				if resp.Operations[i].ClientRequestID != wantID {
+					t.Fatalf("operations[%d].client_request_id = %q, want %q", i, resp.Operations[i].ClientRequestID, wantID)
+				}
+			}
+		})
+	}
+}
+
 type walletOperationAPIHandler struct {
 	name          string
 	path          string
