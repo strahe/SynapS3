@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectreader"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
@@ -2762,6 +2765,498 @@ func TestCopyObject_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) {
 	data, _ := io.ReadAll(got.Body)
 	if want := validTestObjectBody("old"); string(data) != want {
 		t.Fatalf("copied body = %q, want %q", string(data), want)
+	}
+}
+
+func TestRestoreObjectVersionCreatesNewCurrentAndPreservesHistory(t *testing.T) {
+	type setupResult struct {
+		sourceVersionID          string
+		expectedCurrentVersionID string
+		wantBody                 string
+		historyVersionIDs        []string
+	}
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *testBackend, string) setupResult
+	}{
+		{
+			name: "non-current data version",
+			setup: func(t *testing.T, tb *testBackend, bucketName string) setupResult {
+				source := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "old")
+				current := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "new")
+				return setupResult{
+					sourceVersionID:          source.VersionID,
+					expectedCurrentVersionID: current.VersionID,
+					wantBody:                 validTestObjectBody("old"),
+					historyVersionIDs:        []string{source.VersionID, current.VersionID},
+				}
+			},
+		},
+		{
+			name: "same data with different metadata",
+			setup: func(t *testing.T, tb *testBackend, bucketName string) setupResult {
+				put := func(metadata map[string]string) s3response.PutObjectOutput {
+					body := validTestObjectBody("same-data")
+					contentType := "text/plain"
+					out, err := tb.backend.PutObject(context.Background(), s3response.PutObjectInput{
+						Bucket:      aws.String(bucketName),
+						Key:         aws.String("file.txt"),
+						Body:        strings.NewReader(body),
+						ContentType: &contentType,
+						Metadata:    metadata,
+					})
+					if err != nil {
+						t.Fatalf("PutObject: %v", err)
+					}
+					return out
+				}
+				source := put(map[string]string{"revision": "source"})
+				current := put(map[string]string{"revision": "current"})
+				return setupResult{
+					sourceVersionID:          source.VersionID,
+					expectedCurrentVersionID: current.VersionID,
+					wantBody:                 validTestObjectBody("same-data"),
+					historyVersionIDs:        []string{source.VersionID, current.VersionID},
+				}
+			},
+		},
+		{
+			name: "data version hidden by delete marker",
+			setup: func(t *testing.T, tb *testBackend, bucketName string) setupResult {
+				source := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "hidden")
+				deleted, err := tb.backend.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+					Bucket: aws.String(bucketName),
+					Key:    aws.String("file.txt"),
+				})
+				if err != nil {
+					t.Fatalf("DeleteObject: %v", err)
+				}
+				if deleted.VersionId == nil || *deleted.VersionId == "" {
+					t.Fatal("delete marker version ID is empty")
+				}
+				return setupResult{
+					sourceVersionID:          source.VersionID,
+					expectedCurrentVersionID: *deleted.VersionId,
+					wantBody:                 validTestObjectBody("hidden"),
+					historyVersionIDs:        []string{source.VersionID, *deleted.VersionId},
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tb := newTestBackend(t)
+			ctx := context.Background()
+			bucketName := "restore-" + strings.ReplaceAll(tt.name, " ", "-")
+			bucket := seedActiveBucket(t, tb, bucketName)
+			setup := tt.setup(t, tb, bucketName)
+			sourceBefore, err := tb.repos.Objects.GetVersionByID(ctx, setup.sourceVersionID)
+			if err != nil || sourceBefore == nil {
+				t.Fatalf("source before restore: version=%v err=%v", sourceBefore, err)
+			}
+			beforeCount, err := tb.db.NewSelect().
+				Model((*model.ObjectVersion)(nil)).
+				Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").
+				Count(ctx)
+			if err != nil {
+				t.Fatalf("count before restore: %v", err)
+			}
+
+			versionID, err := tb.backend.RestoreObjectVersion(
+				ctx,
+				bucketName,
+				"file.txt",
+				setup.sourceVersionID,
+				setup.expectedCurrentVersionID,
+			)
+			if err != nil {
+				t.Fatalf("RestoreObjectVersion: %v", err)
+			}
+			if versionID == "" || versionID == setup.sourceVersionID {
+				t.Fatalf("restored version ID = %q, want a new ID", versionID)
+			}
+
+			current, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+			if err != nil || current == nil {
+				t.Fatalf("current after restore: version=%v err=%v", current, err)
+			}
+			if current.VersionID != versionID {
+				t.Fatalf("current version = %s, want %s", current.VersionID, versionID)
+			}
+			if current.CacheKey == sourceBefore.CacheKey || !tb.cache.Exists(ctx, bucketName, current.CacheKey) {
+				t.Fatalf("restored cache key = %q, source = %q, exists=%v", current.CacheKey, sourceBefore.CacheKey, tb.cache.Exists(ctx, bucketName, current.CacheKey))
+			}
+			if current.ContentType != sourceBefore.ContentType {
+				t.Fatalf("content type = %q, want %q", current.ContentType, sourceBefore.ContentType)
+			}
+			if !maps.Equal(current.Metadata, sourceBefore.Metadata) {
+				t.Fatalf("metadata = %#v, want %#v", current.Metadata, sourceBefore.Metadata)
+			}
+
+			got, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucketName), Key: aws.String("file.txt")})
+			if err != nil {
+				t.Fatalf("GetObject restored: %v", err)
+			}
+			body, readErr := io.ReadAll(got.Body)
+			closeErr := got.Body.Close()
+			if readErr != nil || closeErr != nil {
+				t.Fatalf("read restored body: read=%v close=%v", readErr, closeErr)
+			}
+			if string(body) != setup.wantBody {
+				t.Fatalf("restored body = %q, want %q", string(body), setup.wantBody)
+			}
+
+			for _, historicalVersionID := range setup.historyVersionIDs {
+				historical, err := tb.repos.Objects.GetVersionByID(ctx, historicalVersionID)
+				if err != nil || historical == nil {
+					t.Fatalf("historical version %s: version=%v err=%v", historicalVersionID, historical, err)
+				}
+				if historical.IsCurrent {
+					t.Fatalf("historical version %s is still current", historicalVersionID)
+				}
+			}
+			afterCount, err := tb.db.NewSelect().
+				Model((*model.ObjectVersion)(nil)).
+				Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").
+				Count(ctx)
+			if err != nil {
+				t.Fatalf("count after restore: %v", err)
+			}
+			if afterCount != beforeCount+1 {
+				t.Fatalf("version count = %d, want %d", afterCount, beforeCount+1)
+			}
+		})
+	}
+}
+
+func TestRestoreObjectVersionRejectsAlreadyCurrent(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *testBackend, string) (sourceVersionID, currentVersionID string)
+	}{
+		{
+			name: "current source",
+			setup: func(t *testing.T, tb *testBackend, bucketName string) (string, string) {
+				current := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "current")
+				return current.VersionID, current.VersionID
+			},
+		},
+		{
+			name: "historical source matching current",
+			setup: func(t *testing.T, tb *testBackend, bucketName string) (string, string) {
+				source := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "same")
+				current := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "same")
+				return source.VersionID, current.VersionID
+			},
+		},
+		{
+			name: "multipart source matching restored current",
+			setup: func(t *testing.T, tb *testBackend, bucketName string) (string, string) {
+				source := completeMultipartTestObject(t, tb, bucketName, "file.txt", []string{
+					validTestObjectBody("multipart-source"),
+				})
+				current := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "different")
+				restoredID, err := tb.backend.RestoreObjectVersion(
+					context.Background(),
+					bucketName,
+					"file.txt",
+					source.VersionID,
+					current.VersionID,
+				)
+				if err != nil {
+					t.Fatalf("first RestoreObjectVersion: %v", err)
+				}
+				sourceVersion, err := tb.repos.Objects.GetVersionByID(context.Background(), source.VersionID)
+				if err != nil || sourceVersion == nil {
+					t.Fatalf("source version: version=%v err=%v", sourceVersion, err)
+				}
+				restoredVersion, err := tb.repos.Objects.GetVersionByID(context.Background(), restoredID)
+				if err != nil || restoredVersion == nil {
+					t.Fatalf("restored version: version=%v err=%v", restoredVersion, err)
+				}
+				if sourceVersion.ETag == restoredVersion.ETag || sourceVersion.Checksum != restoredVersion.Checksum {
+					t.Fatalf(
+						"source/restored identity = etag:%q/%q checksum:%q/%q, want different ETags and matching checksums",
+						sourceVersion.ETag,
+						restoredVersion.ETag,
+						sourceVersion.Checksum,
+						restoredVersion.Checksum,
+					)
+				}
+				return source.VersionID, restoredID
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tb := newTestBackend(t)
+			ctx := context.Background()
+			bucketName := "restore-already-current-" + strings.ReplaceAll(tt.name, " ", "-")
+			bucket := seedActiveBucket(t, tb, bucketName)
+			sourceVersionID, currentVersionID := tt.setup(t, tb, bucketName)
+			usedBeforeRestore := tb.cache.UsedBytes()
+			versionsBeforeRestore, err := tb.db.NewSelect().
+				Model((*model.ObjectVersion)(nil)).
+				Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").
+				Count(ctx)
+			if err != nil {
+				t.Fatalf("count versions before restore: %v", err)
+			}
+			tasksBeforeRestore, err := tb.db.NewSelect().Model((*model.Task)(nil)).Count(ctx)
+			if err != nil {
+				t.Fatalf("count tasks before restore: %v", err)
+			}
+
+			_, err = tb.backend.RestoreObjectVersion(ctx, bucketName, "file.txt", sourceVersionID, currentVersionID)
+			if !errors.Is(err, repository.ErrAlreadyCurrent) {
+				t.Fatalf("error = %v, want ErrAlreadyCurrent", err)
+			}
+			if got := tb.cache.UsedBytes(); got != usedBeforeRestore {
+				t.Fatalf("cache used bytes = %d, want %d after no-op restore", got, usedBeforeRestore)
+			}
+			versionsAfterRestore, err := tb.db.NewSelect().
+				Model((*model.ObjectVersion)(nil)).
+				Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").
+				Count(ctx)
+			if err != nil {
+				t.Fatalf("count versions after restore: %v", err)
+			}
+			if versionsAfterRestore != versionsBeforeRestore {
+				t.Fatalf("version count = %d, want %d after no-op restore", versionsAfterRestore, versionsBeforeRestore)
+			}
+			tasksAfterRestore, err := tb.db.NewSelect().Model((*model.Task)(nil)).Count(ctx)
+			if err != nil {
+				t.Fatalf("count tasks after restore: %v", err)
+			}
+			if tasksAfterRestore != tasksBeforeRestore {
+				t.Fatalf("task count = %d, want %d after no-op restore", tasksAfterRestore, tasksBeforeRestore)
+			}
+		})
+	}
+}
+
+func TestRestoreObjectVersionRejectsUnavailableSources(t *testing.T) {
+	t.Run("existing but unreadable data version", func(t *testing.T) {
+		tb := newTestBackend(t)
+		ctx := context.Background()
+		bucket := seedActiveBucket(t, tb, "restore-unreadable-source")
+		versionID := "01J0000000000000000000BR00"
+		if _, err := tb.repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+			VersionID:   versionID,
+			BucketID:    bucket.ID,
+			Key:         "file.txt",
+			Size:        int64(len(validTestObjectBody("unreadable"))),
+			ETag:        "unreadable-etag",
+			Checksum:    "unreadable-checksum",
+			ContentType: "text/plain",
+			CacheKey:    ".versions/" + versionID,
+			State:       model.ObjectStateCached,
+		}); err != nil {
+			t.Fatalf("create unreadable version: %v", err)
+		}
+		current := putValidTestObjectOutput(t, tb, bucket.Name, "file.txt", "current")
+
+		_, err := tb.backend.RestoreObjectVersion(ctx, bucket.Name, "file.txt", versionID, current.VersionID)
+		if err == nil {
+			t.Fatal("RestoreObjectVersion succeeded for unreadable source")
+		}
+		if errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("error = %v, unreadable existing source must not map to ErrNotFound", err)
+		}
+		if !errors.Is(err, objectreader.ErrNoSuchVersion) {
+			t.Fatalf("error = %v, want underlying source read error", err)
+		}
+	})
+
+	t.Run("permanently deleted data version", func(t *testing.T) {
+		tb := newTestBackend(t)
+		ctx := context.Background()
+		bucket := seedActiveBucket(t, tb, "restore-permanently-deleted")
+		seed := func(versionID, body string) {
+			info, err := tb.cache.Put(ctx, bucket.Name, ".versions/"+versionID, strings.NewReader(validTestObjectBody(body)))
+			if err != nil {
+				t.Fatalf("cache Put: %v", err)
+			}
+			if _, err := tb.repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+				VersionID:   versionID,
+				BucketID:    bucket.ID,
+				Key:         "file.txt",
+				Size:        info.Size,
+				ETag:        info.ETag,
+				Checksum:    info.Checksum,
+				ContentType: "text/plain",
+				CacheKey:    ".versions/" + versionID,
+				State:       model.ObjectStateCached,
+			}); err != nil {
+				t.Fatalf("create version: %v", err)
+			}
+		}
+		sourceVersionID := "01J0000000000000000000BR01"
+		currentVersionID := "01J0000000000000000000BR02"
+		seed(sourceVersionID, "source")
+		seed(currentVersionID, "current")
+		if _, err := tb.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+			BucketID:  bucket.ID,
+			Key:       "file.txt",
+			VersionID: sourceVersionID,
+		}); err != nil {
+			t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+		}
+
+		_, err := tb.backend.RestoreObjectVersion(ctx, bucket.Name, "file.txt", sourceVersionID, currentVersionID)
+		if !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("delete marker", func(t *testing.T) {
+		tb := newTestBackend(t)
+		ctx := context.Background()
+		bucket := seedActiveBucket(t, tb, "restore-delete-marker")
+		putValidTestObject(t, tb, bucket.Name, "file.txt", "data")
+		deleted, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket.Name), Key: aws.String("file.txt")})
+		if err != nil {
+			t.Fatalf("DeleteObject: %v", err)
+		}
+		if deleted.VersionId == nil {
+			t.Fatal("delete marker version ID is nil")
+		}
+
+		_, err = tb.backend.RestoreObjectVersion(ctx, bucket.Name, "file.txt", *deleted.VersionId, *deleted.VersionId)
+		if !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("error = %v, want ErrConflict", err)
+		}
+	})
+}
+
+type currentChangingCache struct {
+	cache.Cache
+	once  sync.Once
+	onGet func()
+}
+
+func (c *currentChangingCache) Get(ctx context.Context, bucket, key string) (io.ReadCloser, *cache.ObjectInfo, error) {
+	body, info, err := c.Cache.Get(ctx, bucket, key)
+	if err == nil {
+		c.once.Do(c.onGet)
+	}
+	return body, info, err
+}
+
+type cancelingPutStagedCache struct {
+	cache.Cache
+	cancel context.CancelFunc
+}
+
+func (c *cancelingPutStagedCache) PutStaged(ctx context.Context, bucket, key string, body io.Reader) (*cache.StagedObject, error) {
+	staged, err := c.Cache.PutStaged(ctx, bucket, key, body)
+	if err == nil && c.cancel != nil {
+		c.cancel()
+	}
+	return staged, err
+}
+
+func TestRestoreObjectVersionCancellationCleansCommittedCache(t *testing.T) {
+	baseCache := newTestCache(t, 1<<30)
+	cancelingCache := &cancelingPutStagedCache{Cache: baseCache}
+	tb := newTestBackendWithCache(t, cancelingCache)
+	ctx := context.Background()
+	bucket := seedActiveBucket(t, tb, "restore-cancel-cleanup")
+	source := putValidTestObjectOutput(t, tb, bucket.Name, "file.txt", "source")
+	current := putValidTestObjectOutput(t, tb, bucket.Name, "file.txt", "current")
+
+	usedBeforeRestore := baseCache.UsedBytes()
+	versionsBeforeRestore, err := tb.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("count versions before restore: %v", err)
+	}
+	tasksBeforeRestore, err := tb.db.NewSelect().Model((*model.Task)(nil)).Count(ctx)
+	if err != nil {
+		t.Fatalf("count tasks before restore: %v", err)
+	}
+
+	restoreCtx, cancel := context.WithCancel(ctx)
+	cancelingCache.cancel = cancel
+	_, err = tb.backend.RestoreObjectVersion(restoreCtx, bucket.Name, "file.txt", source.VersionID, current.VersionID)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if got := baseCache.UsedBytes(); got != usedBeforeRestore {
+		t.Fatalf("cache used bytes = %d, want %d after canceled restore cleanup", got, usedBeforeRestore)
+	}
+	versionsAfterRestore, err := tb.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("count versions after restore: %v", err)
+	}
+	if versionsAfterRestore != versionsBeforeRestore {
+		t.Fatalf("version count = %d, want %d after canceled restore", versionsAfterRestore, versionsBeforeRestore)
+	}
+	tasksAfterRestore, err := tb.db.NewSelect().Model((*model.Task)(nil)).Count(ctx)
+	if err != nil {
+		t.Fatalf("count tasks after restore: %v", err)
+	}
+	if tasksAfterRestore != tasksBeforeRestore {
+		t.Fatalf("task count = %d, want %d after canceled restore", tasksAfterRestore, tasksBeforeRestore)
+	}
+}
+
+func TestRestoreObjectVersionCASConflictCleansCommittedCache(t *testing.T) {
+	baseCache := newTestCache(t, 1<<30)
+	changingCache := &currentChangingCache{Cache: baseCache}
+	tb := newTestBackendWithCache(t, changingCache)
+	ctx := context.Background()
+	bucket := seedActiveBucket(t, tb, "restore-cas-cleanup")
+	source := putValidTestObjectOutput(t, tb, bucket.Name, "file.txt", "source")
+	current := putValidTestObjectOutput(t, tb, bucket.Name, "file.txt", "current")
+
+	var usedAfterConcurrentWrite int64
+	changingCache.onGet = func() {
+		versionID := model.NewVersionID()
+		cacheKey := ".versions/" + versionID
+		info, err := baseCache.Put(ctx, bucket.Name, cacheKey, strings.NewReader(validTestObjectBody("concurrent")))
+		if err != nil {
+			t.Fatalf("cache concurrent version: %v", err)
+		}
+		if _, err := tb.repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
+			VersionID:   versionID,
+			BucketID:    bucket.ID,
+			Key:         "file.txt",
+			Size:        info.Size,
+			ETag:        info.ETag,
+			Checksum:    info.Checksum,
+			ContentType: "text/plain",
+			CacheKey:    cacheKey,
+			State:       model.ObjectStateCached,
+		}); err != nil {
+			t.Fatalf("create concurrent version: %v", err)
+		}
+		usedAfterConcurrentWrite = baseCache.UsedBytes()
+	}
+
+	_, err := tb.backend.RestoreObjectVersion(ctx, bucket.Name, "file.txt", source.VersionID, current.VersionID)
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("error = %v, want ErrConflict", err)
+	}
+	if got := baseCache.UsedBytes(); got != usedAfterConcurrentWrite {
+		t.Fatalf("cache used bytes = %d, want %d after failed restore cleanup", got, usedAfterConcurrentWrite)
+	}
+	versionCount, err := tb.db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("count versions: %v", err)
+	}
+	if versionCount != 3 {
+		t.Fatalf("version count = %d, want source + old current + concurrent current", versionCount)
 	}
 }
 

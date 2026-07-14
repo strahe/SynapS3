@@ -212,6 +212,38 @@ export function useRestoreBucketObject() {
   })
 }
 
+export function useRestoreBucketObjectVersion() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({
+      name,
+      key,
+      sourceVersionID,
+      expectedCurrentVersionID,
+    }: {
+      name: string
+      key: string
+      sourceVersionID: string
+      expectedCurrentVersionID: string
+    }) =>
+      api.restoreBucketObjectVersion(name, {
+        key,
+        version_id: sourceVersionID,
+        expected_current_version_id: expectedCurrentVersionID,
+      }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['buckets'] })
+      qc.invalidateQueries({ queryKey: ['bucket', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['deletedObjects', variables.name] })
+      qc.invalidateQueries({ queryKey: ['objectVersions', variables.name, variables.key] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+      qc.invalidateQueries({ queryKey: ['taskStats'] })
+    },
+  })
+}
+
 export function useTasks(taskType: string, stage: string, status: string, limit: number, offset: number) {
   return useQuery({
     queryKey: ['tasks', taskType, stage, status, limit, offset],

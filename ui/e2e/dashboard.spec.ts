@@ -48,6 +48,58 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   await provenance.getByRole('button', { name: 'Close' }).click()
   await expect(provenance).toBeHidden()
 
+  await page.getByRole('button', { name: 'Upload', exact: true }).click()
+  await uploadDialog.getByLabel('Files').setInputFiles({
+    name: 'dashboard.bin',
+    mimeType: 'application/octet-stream',
+    buffer: Buffer.alloc(132_000, 't'),
+  })
+  await uploadDialog.getByRole('button', { name: 'Upload', exact: true }).click()
+  await expect(uploadDialog.getByText('Uploaded', { exact: true })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(uploadDialog).toBeHidden()
+
+  await objectRow.getByRole('button', { name: 'Actions for dashboard.bin' }).click()
+  await page.getByRole('menuitem', { name: 'Versions' }).click()
+  const versionsDialog = page.getByRole('dialog', { name: 'Object versions' })
+  await expect(versionsDialog.locator('tbody tr')).toHaveCount(2)
+  const currentVersionAction = versionsDialog
+    .getByRole('row')
+    .filter({ hasText: 'Current' })
+    .getByRole('button', { name: /Actions for/ })
+  await currentVersionAction.click()
+  await expect(page.getByRole('menuitem', { name: 'Restore as new version' })).toHaveCount(0)
+  await page.keyboard.press('Escape')
+
+  const sourceVersionAction = versionsDialog
+    .locator('tbody tr')
+    .nth(1)
+    .getByRole('button', { name: /Actions for/ })
+  const sourceVersionActionName = await sourceVersionAction.getAttribute('aria-label')
+  expect(sourceVersionActionName).toBeTruthy()
+  await sourceVersionAction.click()
+  await page.getByRole('menuitem', { name: 'Restore as new version' }).click()
+  const restoreDialog = page.getByRole('dialog', { name: 'Restore as new version' })
+  await expect(restoreDialog.getByText('Current version', { exact: true })).toBeVisible()
+  await restoreDialog.getByRole('button', { name: 'Restore as new version' }).click()
+  await expect(restoreDialog).toBeHidden()
+  await expect(versionsDialog.locator('tbody tr')).toHaveCount(3)
+  await expect(versionsDialog.getByRole('row').filter({ hasText: 'Current' })).toHaveCount(1)
+  const retainedSourceAction = versionsDialog.getByRole('button', { name: sourceVersionActionName ?? '' })
+  await expect(retainedSourceAction).toBeVisible()
+
+  await retainedSourceAction.click()
+  await page.getByRole('menuitem', { name: 'Restore as new version' }).click()
+  await restoreDialog.getByRole('button', { name: 'Restore as new version' }).click()
+  await expect(
+    restoreDialog.getByText('This version already matches the current object. No new version was created.')
+  ).toBeVisible()
+  await expect(restoreDialog.getByRole('button', { name: 'Restore as new version' })).toBeDisabled()
+  await restoreDialog.getByRole('button', { name: 'Cancel' }).click()
+  await expect(versionsDialog.locator('tbody tr')).toHaveCount(3)
+  await page.keyboard.press('Escape')
+  await expect(versionsDialog).toBeHidden()
+
   await page.getByRole('link', { name: 'Topology' }).click()
   await expect(page.getByRole('heading', { name: 'Storage Topology' })).toBeVisible()
   await page.getByRole('tab', { name: 'Providers' }).click()

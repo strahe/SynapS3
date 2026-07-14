@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"path"
@@ -618,56 +619,106 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		return s3response.CopyObjectOutput{}, err
 	}
 
-	var srcResult *objectreader.Result
-	srcResult, err = b.objectReader.OpenVersion(ctx, srcBucketName, srcKey, srcVersion.VersionID, objectreader.S3Visibility)
+	result, err := b.copyObjectVersion(ctx, copyObjectVersionInput{
+		SourceBucket:      srcBucket,
+		SourceKey:         srcKey,
+		SourceVersion:     srcVersion,
+		DestinationBucket: dstBucket,
+		DestinationKey:    dstKey,
+		MetadataDirective: input.MetadataDirective,
+		Metadata:          input.Metadata,
+		ContentType:       input.ContentType,
+		SourceVisibility:  objectreader.S3Visibility,
+	})
 	if err != nil {
-		return s3response.CopyObjectOutput{}, b.objectReaderError(err)
+		return s3response.CopyObjectOutput{}, b.copyObjectError(err)
+	}
+	b.logger.Info("object copied", "src", srcBucketName+"/"+srcKey, "dst", dstBucketName+"/"+dstKey, "versionID", result.VersionID)
+
+	return s3response.CopyObjectOutput{
+		CopyObjectResult: &s3response.CopyObjectResult{
+			ETag:         &result.ETag,
+			LastModified: &result.LastModified,
+		},
+		CopySourceVersionId: &result.SourceVersionID,
+		VersionId:           &result.VersionID,
+	}, nil
+}
+
+type restoreVersionPrecondition struct {
+	SourceVersionID          string
+	ExpectedCurrentVersionID string
+}
+
+type copyObjectVersionInput struct {
+	SourceBucket      *model.Bucket
+	SourceKey         string
+	SourceVersion     *model.ObjectVersion
+	DestinationBucket *model.Bucket
+	DestinationKey    string
+	MetadataDirective types.MetadataDirective
+	Metadata          map[string]string
+	ContentType       *string
+	SourceVisibility  objectreader.BucketVisibility
+	Restore           *restoreVersionPrecondition
+}
+
+type copyObjectVersionResult struct {
+	SourceVersionID string
+	VersionID       string
+	ETag            string
+	LastModified    time.Time
+}
+
+func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObjectVersionInput) (copyObjectVersionResult, error) {
+	srcResult, err := b.objectReader.OpenVersionForCopy(
+		ctx,
+		input.SourceBucket.Name,
+		input.SourceKey,
+		input.SourceVersion.VersionID,
+		input.SourceVisibility,
+	)
+	if err != nil {
+		return copyObjectVersionResult{}, err
 	}
 	defer func() { _ = srcResult.Body.Close() }()
 
-	// Write to a version-specific destination cache key.
 	versionID := model.NewVersionID()
 	cacheKey := versionCacheKey(versionID)
-	staged, err := b.cache.PutStaged(ctx, dstBucketName, cacheKey, objectlimits.LimitFOCUploadReader(srcResult.Body))
+	staged, err := b.cache.PutStaged(ctx, input.DestinationBucket.Name, cacheKey, objectlimits.LimitFOCUploadReader(srcResult.Body))
 	if err != nil {
-		if errors.Is(err, objectlimits.ErrTooLarge) {
-			return s3response.CopyObjectOutput{}, objectSizeAPIError(err)
-		}
-		return s3response.CopyObjectOutput{}, fmt.Errorf("staging copy destination: %w", err)
+		return copyObjectVersionResult{}, fmt.Errorf("staging copy destination: %w", err)
 	}
 	defer func() { _ = staged.Rollback() }()
 	cacheInfo := staged.Info
 	if err := objectlimits.ValidateFOCUploadSize(cacheInfo.Size); err != nil {
-		return s3response.CopyObjectOutput{}, objectSizeAPIError(err)
+		return copyObjectVersionResult{}, err
 	}
 
-	// Determine metadata: COPY (default) preserves source, REPLACE uses request metadata
-	meta := make(map[string]string)
-	contentType := srcVersion.ContentType
+	metadata := make(map[string]string)
+	contentType := input.SourceVersion.ContentType
 	if input.MetadataDirective == types.MetadataDirectiveReplace {
 		if input.Metadata != nil {
-			meta = input.Metadata
+			metadata = input.Metadata
 		}
 		contentType = stringOrDefault(input.ContentType, "application/octet-stream")
 	} else {
-		if srcVersion.Metadata != nil {
-			for k, v := range srcVersion.Metadata {
-				meta[k] = v
-			}
+		for key, value := range input.SourceVersion.Metadata {
+			metadata[key] = value
 		}
 	}
 
 	if err := staged.Commit(); err != nil {
-		return s3response.CopyObjectOutput{}, fmt.Errorf("committing copy cache: %w", err)
+		return copyObjectVersionResult{}, fmt.Errorf("committing copy cache: %w", err)
 	}
 
 	var objectID int64
 	var createdState model.ObjectState
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
 		reuse := versionStorageReuse{State: model.ObjectStateCached}
-		if srcBucket.ID == dstBucket.ID {
+		if input.SourceBucket.ID == input.DestinationBucket.ID {
 			var err error
-			reuse, err = b.resolveVersionReuse(ctx, txRepos.Objects, dstBucket.ID, cacheInfo.Size, cacheInfo.Checksum)
+			reuse, err = b.resolveVersionReuse(ctx, txRepos.Objects, input.DestinationBucket.ID, cacheInfo.Size, cacheInfo.Checksum)
 			if err != nil {
 				return err
 			}
@@ -675,13 +726,13 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 
 		version := &model.ObjectVersion{
 			VersionID:       versionID,
-			BucketID:        dstBucket.ID,
-			Key:             dstKey,
+			BucketID:        input.DestinationBucket.ID,
+			Key:             input.DestinationKey,
 			Size:            cacheInfo.Size,
 			ETag:            cacheInfo.ETag,
 			Checksum:        cacheInfo.Checksum,
 			ContentType:     contentType,
-			Metadata:        meta,
+			Metadata:        metadata,
 			CacheKey:        cacheKey,
 			StorageUploadID: reuse.StorageUploadID,
 			InCache:         true,
@@ -689,31 +740,140 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		}
 		createdState = version.State
 
-		var err error
-		objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+		if input.Restore == nil {
+			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+		} else {
+			objectID, err = txRepos.Objects.CreateRestoredVersionAndSetCurrent(
+				ctx,
+				version,
+				input.Restore.SourceVersionID,
+				input.Restore.ExpectedCurrentVersionID,
+			)
+		}
 		if err != nil {
 			return fmt.Errorf("creating copy destination version: %w", err)
 		}
 		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.State)
 	}); err != nil {
-		b.deleteVersionCacheBestEffort(ctx, dstBucketName, cacheKey, "orphaned version cache file after copy tx failure")
-		return s3response.CopyObjectOutput{}, err
+		b.deleteVersionCacheBestEffort(ctx, input.DestinationBucket.Name, cacheKey, "orphaned version cache file after copy tx failure")
+		return copyObjectVersionResult{}, err
 	}
-	b.completeFollowerIfStoredReuseWonRace(ctx, dstBucket.ID, dstBucketName, cacheInfo.Size, cacheInfo.Checksum, objectID, versionID, createdState)
+	b.completeFollowerIfStoredReuseWonRace(
+		ctx,
+		input.DestinationBucket.ID,
+		input.DestinationBucket.Name,
+		cacheInfo.Size,
+		cacheInfo.Checksum,
+		objectID,
+		versionID,
+		createdState,
+	)
 
-	etag := fmt.Sprintf(`"%s"`, cacheInfo.ETag)
-	lastModified := time.Now()
-	b.logger.Info("object copied", "src", srcBucketName+"/"+srcKey, "dst", dstBucketName+"/"+dstKey, "versionID", versionID)
-
-	copySourceVersionID := srcVersion.VersionID
-	return s3response.CopyObjectOutput{
-		CopyObjectResult: &s3response.CopyObjectResult{
-			ETag:         &etag,
-			LastModified: &lastModified,
-		},
-		CopySourceVersionId: &copySourceVersionID,
-		VersionId:           &versionID,
+	return copyObjectVersionResult{
+		SourceVersionID: input.SourceVersion.VersionID,
+		VersionID:       versionID,
+		ETag:            fmt.Sprintf(`"%s"`, cacheInfo.ETag),
+		LastModified:    time.Now(),
 	}, nil
+}
+
+func (b *SynapseBackend) copyObjectError(err error) error {
+	if errors.Is(err, objectlimits.ErrTooSmall) || errors.Is(err, objectlimits.ErrTooLarge) {
+		return objectSizeAPIError(err)
+	}
+	return b.objectReaderError(err)
+}
+
+// RestoreObjectVersion copies a selected data version to a new current version of the same object.
+func (b *SynapseBackend) RestoreObjectVersion(ctx context.Context, bucketName, key, sourceVersionID, expectedCurrentVersionID string) (string, error) {
+	if bucketName == "" || key == "" || sourceVersionID == "" || expectedCurrentVersionID == "" {
+		return "", fmt.Errorf("restoring object version: %w", repository.ErrInvalidInput)
+	}
+	if err := objectkey.Validate(key); err != nil {
+		return "", fmt.Errorf("restoring object version: %w: %v", repository.ErrInvalidInput, err)
+	}
+
+	bucket, err := b.repos.Buckets.GetByName(ctx, bucketName)
+	if err != nil {
+		return "", fmt.Errorf("querying restore bucket: %w", err)
+	}
+	if bucket == nil || !bucket.Status.IsWritable() {
+		return "", fmt.Errorf("restoring object version: %w", repository.ErrNotFound)
+	}
+
+	sourceVersion, err := b.repos.Objects.GetVersionByBucketKeyAndID(ctx, bucket.ID, key, sourceVersionID)
+	if err != nil {
+		return "", fmt.Errorf("querying restore source version: %w", err)
+	}
+	if sourceVersion == nil {
+		return "", fmt.Errorf("restoring object version: %w", repository.ErrNotFound)
+	}
+	if sourceVersion.IsDeleteMarker {
+		return "", fmt.Errorf("restoring object version: %w", repository.ErrConflict)
+	}
+	current, err := b.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, key)
+	if err != nil {
+		return "", fmt.Errorf("querying current restore version: %w", err)
+	}
+	if current == nil || current.VersionID != expectedCurrentVersionID {
+		return "", fmt.Errorf("restoring object version: %w", repository.ErrConflict)
+	}
+	if restoreSourceAlreadyCurrent(sourceVersion, current) {
+		return "", fmt.Errorf("restoring object version: %w", repository.ErrAlreadyCurrent)
+	}
+
+	result, err := b.copyObjectVersion(ctx, copyObjectVersionInput{
+		SourceBucket:      bucket,
+		SourceKey:         key,
+		SourceVersion:     sourceVersion,
+		DestinationBucket: bucket,
+		DestinationKey:    key,
+		SourceVisibility:  objectreader.AdminVisibility,
+		Restore: &restoreVersionPrecondition{
+			SourceVersionID:          sourceVersionID,
+			ExpectedCurrentVersionID: expectedCurrentVersionID,
+		},
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, objectreader.ErrInvalidArgument):
+			return "", fmt.Errorf("restoring object version: %w", repository.ErrInvalidInput)
+		case errors.Is(err, objectreader.ErrNoSuchBucket), errors.Is(err, objectreader.ErrNoSuchKey):
+			return "", fmt.Errorf("restoring object version: %w", repository.ErrNotFound)
+		case errors.Is(err, objectreader.ErrNoSuchVersion):
+			remainingSource, queryErr := b.repos.Objects.GetVersionByBucketKeyAndID(ctx, bucket.ID, key, sourceVersionID)
+			if queryErr != nil {
+				return "", fmt.Errorf("rechecking restore source version: %w", queryErr)
+			}
+			if remainingSource == nil {
+				return "", fmt.Errorf("restoring object version: %w", repository.ErrNotFound)
+			}
+			return "", err
+		case errors.Is(err, objectreader.ErrMethodNotAllowed):
+			return "", fmt.Errorf("restoring object version: %w", repository.ErrConflict)
+		default:
+			return "", err
+		}
+	}
+
+	b.logger.Info("object version restored", "bucket", bucketName, "key", key, "sourceVersionID", sourceVersionID, "versionID", result.VersionID)
+	return result.VersionID, nil
+}
+
+func restoreSourceAlreadyCurrent(source, current *model.ObjectVersion) bool {
+	if source == nil || current == nil {
+		return false
+	}
+	if source.VersionID == current.VersionID {
+		return true
+	}
+	if current.State == model.ObjectStateFailed || current.IsDeleteMarker || (!current.InCache && !current.InFilecoin) {
+		return false
+	}
+	return current.Size == source.Size &&
+		current.Checksum == source.Checksum &&
+		current.ContentType == source.ContentType &&
+		maps.Equal(current.Metadata, source.Metadata)
 }
 
 // parseCopySource parses a CopySource header value into bucket and key.
@@ -1175,7 +1335,9 @@ func versionCacheKey(versionID string) string {
 }
 
 func (b *SynapseBackend) deleteVersionCacheBestEffort(ctx context.Context, bucketName, cacheKey, message string) {
-	if cleanupErr := b.cache.Delete(ctx, bucketName, cacheKey); cleanupErr != nil {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if cleanupErr := b.cache.Delete(cleanupCtx, bucketName, cacheKey); cleanupErr != nil {
 		b.logger.Warn(message, "bucket", bucketName, "cacheKey", cacheKey, "error", cleanupErr)
 	}
 }

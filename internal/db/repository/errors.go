@@ -19,6 +19,9 @@ var ErrInvalidInput = errors.New("invalid input")
 // ErrConflict is returned when a compare-and-restore operation sees stale state.
 var ErrConflict = errors.New("conflict")
 
+// ErrAlreadyCurrent is returned when a restore would not change the current object representation.
+var ErrAlreadyCurrent = errors.New("already current")
+
 var errConcurrentObjectCreate = errors.New("concurrent object create")
 
 // isUniqueViolation detects unique constraint violations for both PostgreSQL and SQLite.

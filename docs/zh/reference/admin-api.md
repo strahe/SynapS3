@@ -102,7 +102,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `DELETE` | `/api/v1/buckets/{name}/objects` | 创建对象 delete marker。 |
 | `POST` | `/api/v1/buckets/{name}/objects/upload` | 通过仪表盘上传对象。 |
 | `GET` | `/api/v1/buckets/{name}/objects/download` | 通过仪表盘下载对象。 |
-| `GET` | `/api/v1/buckets/{name}/objects/versions` | 列出对象版本。 |
+| `GET` | `/api/v1/buckets/{name}/objects/versions` | 列出对象版本，并返回当前版本 token。 |
+| `POST` | `/api/v1/buckets/{name}/objects/versions/restore` | 基于已有数据版本创建新的当前版本。 |
 | `GET` | `/api/v1/buckets/{name}/objects/provenance` | 查看对象存储来源。 |
 | `GET` | `/api/v1/buckets/{name}/objects/status-detail` | 读取对象详细状态。 |
 | `GET` | `/api/v1/buckets/{name}/objects/deleted` | 列出已删除对象。 |
@@ -113,6 +114,43 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | 列出受存储健康问题影响的版本。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
+
+### 恢复对象版本
+
+对象存在版本历史时，`GET /api/v1/buckets/{name}/objects/versions` 的每一页都会返回 `current_version_id`。确认恢复时把该值传回服务端：
+
+```json
+{
+  "key": "path/file.txt",
+  "version_id": "source-version-id",
+  "expected_current_version_id": "current-version-id"
+}
+```
+
+`POST /api/v1/buckets/{name}/objects/versions/restore` 会把选中的历史数据版本复制为同一 bucket、同一 key 下的新版本。已有数据版本和 delete marker 不会被修改或删除。选中版本必须与当前可读对象的表示不同；直接选择当前版本，或选择与当前版本等价的历史版本，请求会被拒绝，并且不会创建版本、缓存或任务。当前版本失败或不可用时，仍可使用可读的历史版本进行修复。
+
+成功响应：
+
+```json
+{
+  "key": "path/file.txt",
+  "source_version_id": "source-version-id",
+  "version_id": "new-current-version-id"
+}
+```
+
+选中 delete marker，或 `expected_current_version_id` 已不再是当前版本时，请求返回 `409 Conflict`。刷新版本列表后，使用新的 token 重新确认。如果选中版本已经与当前对象一致，响应会返回稳定错误码，客户端可将其作为无操作处理：
+
+```json
+{
+  "error": "selected version already matches the current object",
+  "code": "object_version_already_current"
+}
+```
+
+源版本不存在或已被永久删除时返回 `404 Not Found`；缓存容量不足时返回 `507 Insufficient Storage`；输入无效时返回 `400 Bad Request`；源版本读取失败或内部错误返回 `500 Internal Server Error`。
+
+恢复操作同步流式执行，最长一小时，并且缓存必须能容纳新的目标版本。源数据只存在于 provider 时，本次操作不会把它重新写回原 cache key。
 
 ## 任务
 

@@ -38,6 +38,7 @@ type Server struct {
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
 	objectUploader           objectUploader
+	objectVersionRestorer    objectVersionRestorer
 	cacheMaxBytes            int64
 	repos                    *repository.Repositories
 	bucketLifecycle          *bucketlifecycle.Service
@@ -223,6 +224,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/status-detail", s.handleAPIBucketObjectStatusDetail)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/provenance", s.handleAPIBucketObjectProvenance)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", s.handleAPIBucketObjectVersions)
+		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/versions/restore", s.handleAPIRestoreObjectVersion)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", s.handleAPIDownloadObject)
 		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", s.handleAPIUploadObject)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)

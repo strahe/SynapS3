@@ -82,6 +82,15 @@ func (r *Reader) Open(ctx context.Context, bucketName, key string, visible Bucke
 }
 
 func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility) (*Result, error) {
+	return r.openVersion(ctx, bucketName, key, versionID, visible, true)
+}
+
+// OpenVersionForCopy opens an explicit version without rehydrating a missing source cache entry.
+func (r *Reader) OpenVersionForCopy(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility) (*Result, error) {
+	return r.openVersion(ctx, bucketName, key, versionID, visible, false)
+}
+
+func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID string, visible BucketVisibility, rehydrate bool) (*Result, error) {
 	if versionID == "" {
 		return nil, ErrInvalidArgument
 	}
@@ -130,7 +139,10 @@ func (r *Reader) OpenVersion(ctx context.Context, bucketName, key, versionID str
 		return nil, fmt.Errorf("%w: %w: %w", ErrCacheMiss, ErrProviderDownload, err)
 	}
 
-	body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, version.VersionID, rc)
+	body = rc
+	if rehydrate {
+		body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, version.VersionID, rc)
+	}
 	return resultFromVersion(version, body, SourceProvider, true), nil
 }
 

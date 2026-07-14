@@ -1570,6 +1570,7 @@ type objectVersionListItem struct {
 type objectVersionListResponse struct {
 	Versions          []objectVersionListItem `json:"versions"`
 	HasMore           bool                    `json:"has_more"`
+	CurrentVersionID  string                  `json:"current_version_id,omitempty"`
 	NextVersionMarker string                  `json:"next_version_marker,omitempty"`
 }
 
@@ -1798,12 +1799,33 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 		}
 	}
 	afterVersionID := r.URL.Query().Get("version_marker")
-
 	versions, err := s.repos.Objects.ListVersionsByKey(ctx, bucket.ID, key, afterVersionID, limit+1)
 	if err != nil {
 		s.logger.Error("api: failed to list object versions", "error", err, "bucket", bucketName, "key", key)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
+	}
+	current, err := s.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, key)
+	if err != nil {
+		s.logger.Error("api: failed to get current object version", "error", err, "bucket", bucketName, "key", key)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	currentVersionID := ""
+	if len(versions) > 0 {
+		if current != nil {
+			currentVersionID = current.VersionID
+		} else {
+			for _, version := range versions {
+				if version.IsCurrent {
+					currentVersionID = version.VersionID
+					break
+				}
+			}
+			if currentVersionID == "" {
+				s.logger.Warn("api: object version history has no observable current version; omitting restore token", "bucket", bucketName, "key", key)
+			}
+		}
 	}
 
 	hasMore := len(versions) > limit
@@ -1843,8 +1865,9 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 	}
 
 	resp := objectVersionListResponse{
-		Versions: items,
-		HasMore:  hasMore,
+		Versions:         items,
+		HasMore:          hasMore,
+		CurrentVersionID: currentVersionID,
 	}
 	if hasMore && len(items) > 0 {
 		resp.NextVersionMarker = items[len(items)-1].VersionID

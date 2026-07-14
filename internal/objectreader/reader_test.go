@@ -103,6 +103,78 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	}
 }
 
+func TestOpenVersionForCopyUsesProviderWithoutRehydratingSourceCache(t *testing.T) {
+	putCalls := 0
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+		PutFunc: func(_ context.Context, _, _ string, _ io.Reader) (*cache.ObjectInfo, error) {
+			putCalls++
+			return nil, errors.New("unexpected source cache rehydration")
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "copy-reader-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	pieceCID := buildTestCID(t)
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR09",
+		BucketID:    bucket.ID,
+		Key:         "remote.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR09",
+		State:       model.ObjectStateUploading,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/copy")
+	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
+		t.Fatalf("SetVersionCachePresence: %v", err)
+	}
+
+	storageClient := &testutil.MockStorageClient{
+		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
+		},
+	}
+	reader := New(repos, mc, storageClient, slog.Default())
+
+	got, err := reader.OpenVersionForCopy(ctx, bucket.Name, version.Key, version.VersionID, S3Visibility)
+	if err != nil {
+		t.Fatalf("OpenVersionForCopy: %v", err)
+	}
+	body, readErr := io.ReadAll(got.Body)
+	closeErr := got.Body.Close()
+	if readErr != nil {
+		t.Fatalf("ReadAll: %v", readErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("Body.Close: %v", closeErr)
+	}
+	if string(body) != "remote" {
+		t.Fatalf("body = %q, want remote", string(body))
+	}
+	if putCalls != 0 {
+		t.Fatalf("source cache Put calls = %d, want 0", putCalls)
+	}
+	dbVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || dbVersion == nil {
+		t.Fatalf("version after copy read: version=%v err=%v", dbVersion, err)
+	}
+	if dbVersion.InCache {
+		t.Fatal("source version in_cache = true, want false")
+	}
+}
+
 func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 	mc := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {

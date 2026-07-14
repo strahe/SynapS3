@@ -4,7 +4,20 @@ const csrfHeader = 'X-SynapS3-CSRF'
 let adminCSRFToken = ''
 const authInvalidationListeners = new Set<() => void>()
 
+export class APIError extends Error {
+  readonly status: number
+  readonly code?: string
+
+  constructor(message: string, status: number, code?: string) {
+    super(message)
+    this.name = 'APIError'
+    this.status = status
+    this.code = code
+  }
+}
+
 export const internalRootOwnerAccessKey = '__internal_root__'
+export const objectVersionAlreadyCurrentCode = 'object_version_already_current'
 export const minFOCUploadSize = 127
 export const maxFOCUploadSize = 1_065_353_216
 
@@ -62,11 +75,15 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}) as Record<string, unknown>)
-    const errorBody = body as { error?: string; fields?: SettingsFieldError[] }
+    const errorBody = body as { error?: string; code?: string; fields?: SettingsFieldError[] }
     const fieldText = Array.isArray(errorBody.fields)
       ? errorBody.fields.map((field) => `${field.field}: ${field.message}`).join(', ')
       : ''
-    throw new Error([errorBody.error || `API error: ${res.status}`, fieldText].filter(Boolean).join(' - '))
+    throw new APIError(
+      [errorBody.error || `API error: ${res.status}`, fieldText].filter(Boolean).join(' - '),
+      res.status,
+      errorBody.code
+    )
   }
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
@@ -372,6 +389,12 @@ export interface RestoreObjectResponse {
   restored_version_id: string
 }
 
+export interface RestoreObjectVersionResponse {
+  key: string
+  source_version_id: string
+  version_id: string
+}
+
 export interface PermanentDeleteObjectResponse {
   key: string
   version_id: string
@@ -409,6 +432,7 @@ export interface ObjectVersionItem {
 export interface ObjectVersionListResponse {
   versions: ObjectVersionItem[]
   has_more: boolean
+  current_version_id?: string
   next_version_marker?: string
 }
 
@@ -1133,6 +1157,14 @@ export const api = {
       `/buckets/${encodeURIComponent(name)}/objects/versions?${sp.toString()}`
     )
   },
+  restoreBucketObjectVersion: (
+    name: string,
+    payload: { key: string; version_id: string; expected_current_version_id: string }
+  ) =>
+    fetchJSON<RestoreObjectVersionResponse>(`/buckets/${encodeURIComponent(name)}/objects/versions/restore`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   getBucketStorageRiskVersions: (
     name: string,
     params: {

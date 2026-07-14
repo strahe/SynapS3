@@ -3,6 +3,7 @@ package repository_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -77,6 +78,241 @@ func TestObjectRepo_CreateVersionAndSetCurrent_SecondUploadKeepsVersionHistory(t
 	}
 	if !gotV1.InCache || !gotV2.InCache || !current.InCache {
 		t.Fatalf("new versions should be marked in cache: v1=%v v2=%v current=%v", gotV1.InCache, gotV2.InCache, current.InCache)
+	}
+}
+
+func TestObjectRepo_CreateRestoredVersionAndSetCurrent(t *testing.T) {
+	t.Run("creates new current and preserves history", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+		bucket := seedBucket(t, db, "restore-version-bucket")
+
+		source := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R001", 10)
+		source.Metadata = map[string]string{"source": "old"}
+		objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source)
+		if err != nil {
+			t.Fatalf("create source: %v", err)
+		}
+		current := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R002", source.Size)
+		current.ETag = source.ETag
+		current.Checksum = source.Checksum
+		current.Metadata = map[string]string{"source": "new"}
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, current); err != nil {
+			t.Fatalf("create current: %v", err)
+		}
+
+		restored := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R003", source.Size)
+		restored.ETag = source.ETag
+		restored.Checksum = source.Checksum
+		restored.Metadata = map[string]string{"source": "old"}
+		gotObjectID, err := repos.Objects.CreateRestoredVersionAndSetCurrent(ctx, restored, source.VersionID, current.VersionID)
+		if err != nil {
+			t.Fatalf("CreateRestoredVersionAndSetCurrent: %v", err)
+		}
+		if gotObjectID != objectID {
+			t.Fatalf("object ID = %d, want %d", gotObjectID, objectID)
+		}
+
+		gotCurrent, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+		if err != nil || gotCurrent == nil {
+			t.Fatalf("get current: version=%v err=%v", gotCurrent, err)
+		}
+		if gotCurrent.VersionID != restored.VersionID {
+			t.Fatalf("current version = %s, want %s", gotCurrent.VersionID, restored.VersionID)
+		}
+		gotSource, err := repos.Objects.GetVersionByID(ctx, source.VersionID)
+		if err != nil || gotSource == nil {
+			t.Fatalf("get source: version=%v err=%v", gotSource, err)
+		}
+		if gotSource.IsCurrent || gotSource.Size != source.Size || gotSource.ETag != source.ETag || gotSource.Metadata["source"] != "old" {
+			t.Fatalf("source version changed unexpectedly: %#v", gotSource)
+		}
+		gotPrevious, err := repos.Objects.GetVersionByID(ctx, current.VersionID)
+		if err != nil || gotPrevious == nil || gotPrevious.IsCurrent {
+			t.Fatalf("previous current after restore: version=%v err=%v", gotPrevious, err)
+		}
+		count, err := db.NewSelect().Model((*model.ObjectVersion)(nil)).Where("object_id = ?", objectID).Count(ctx)
+		if err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		if count != 3 {
+			t.Fatalf("version count = %d, want 3", count)
+		}
+	})
+
+	t.Run("rejects missing source", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+		bucket := seedBucket(t, db, "restore-missing-source-bucket")
+		current := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R011", 10)
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, current); err != nil {
+			t.Fatalf("create current: %v", err)
+		}
+
+		_, err := repos.Objects.CreateRestoredVersionAndSetCurrent(
+			ctx,
+			newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R012", 10),
+			"01J0000000000000000000R099",
+			current.VersionID,
+		)
+		if !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("rejects current source", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+		bucket := seedBucket(t, db, "restore-current-source-bucket")
+		current := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R015", 10)
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, current); err != nil {
+			t.Fatalf("create current: %v", err)
+		}
+		restored := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R016", 10)
+
+		_, err := repos.Objects.CreateRestoredVersionAndSetCurrent(ctx, restored, current.VersionID, current.VersionID)
+		if !errors.Is(err, repository.ErrAlreadyCurrent) {
+			t.Fatalf("error = %v, want ErrAlreadyCurrent", err)
+		}
+		if got, err := repos.Objects.GetVersionByID(ctx, restored.VersionID); err != nil || got != nil {
+			t.Fatalf("no-op restore row = %v err=%v, want absent", got, err)
+		}
+	})
+
+	t.Run("rejects historical source matching readable current", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+		bucket := seedBucket(t, db, "restore-matching-source-bucket")
+		source := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R017", 10)
+		source.Metadata = map[string]string{"content": "same"}
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source); err != nil {
+			t.Fatalf("create source: %v", err)
+		}
+		current := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R018", source.Size)
+		current.ETag = "different-etag-for-the-same-content"
+		current.Checksum = source.Checksum
+		current.ContentType = source.ContentType
+		current.Metadata = map[string]string{"content": "same"}
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, current); err != nil {
+			t.Fatalf("create current: %v", err)
+		}
+		restored := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R019", source.Size)
+
+		_, err := repos.Objects.CreateRestoredVersionAndSetCurrent(ctx, restored, source.VersionID, current.VersionID)
+		if !errors.Is(err, repository.ErrAlreadyCurrent) {
+			t.Fatalf("error = %v, want ErrAlreadyCurrent", err)
+		}
+		if got, err := repos.Objects.GetVersionByID(ctx, restored.VersionID); err != nil || got != nil {
+			t.Fatalf("matching restore row = %v err=%v, want absent", got, err)
+		}
+		gotCurrent, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+		if err != nil || gotCurrent == nil || gotCurrent.VersionID != current.VersionID {
+			t.Fatalf("current after matching restore: version=%v err=%v", gotCurrent, err)
+		}
+	})
+
+	t.Run("rejects stale current token", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+		bucket := seedBucket(t, db, "restore-stale-token-bucket")
+		source := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R021", 10)
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source); err != nil {
+			t.Fatalf("create source: %v", err)
+		}
+		current := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R022", 20)
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, current); err != nil {
+			t.Fatalf("create current: %v", err)
+		}
+		restored := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R023", 10)
+
+		_, err := repos.Objects.CreateRestoredVersionAndSetCurrent(ctx, restored, source.VersionID, source.VersionID)
+		if !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("error = %v, want ErrConflict", err)
+		}
+		if got, err := repos.Objects.GetVersionByID(ctx, restored.VersionID); err != nil || got != nil {
+			t.Fatalf("stale restore row = %v err=%v, want absent", got, err)
+		}
+		gotCurrent, err := repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+		if err != nil || gotCurrent == nil || gotCurrent.VersionID != current.VersionID {
+			t.Fatalf("current after stale restore: version=%v err=%v", gotCurrent, err)
+		}
+	})
+}
+
+func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinner(t *testing.T) {
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "restore-objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("opening sqlite db: %v", err)
+	}
+	sqldb.SetMaxOpenConns(8)
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("running migrations: %v", err)
+	}
+
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "concurrent-restore-bucket")
+	source := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R031", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	current := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000R032", 20)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, current); err != nil {
+		t.Fatalf("create current: %v", err)
+	}
+
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := range 2 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			versionID := "01J0000000000000000000R04" + string(rune('0'+i))
+			_, err := repos.Objects.CreateRestoredVersionAndSetCurrent(
+				ctx,
+				newObjectVersion(bucket.ID, "file.txt", versionID, source.Size),
+				source.VersionID,
+				current.VersionID,
+			)
+			results <- err
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	succeeded := 0
+	conflicted := 0
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, repository.ErrConflict):
+			conflicted++
+		default:
+			t.Fatalf("unexpected concurrent restore error: %v", err)
+		}
+	}
+	if succeeded != 1 || conflicted != 1 {
+		t.Fatalf("results = success:%d conflict:%d, want 1/1", succeeded, conflicted)
+	}
+	count, err := db.NewSelect().Model((*model.ObjectVersion)(nil)).Where("bucket_id = ? AND key = ?", bucket.ID, "file.txt").Count(ctx)
+	if err != nil {
+		t.Fatalf("count versions: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("version count = %d, want source + previous current + winner", count)
 	}
 }
 

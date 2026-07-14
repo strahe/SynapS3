@@ -102,7 +102,8 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `DELETE` | `/api/v1/buckets/{name}/objects` | Create an object delete marker. |
 | `POST` | `/api/v1/buckets/{name}/objects/upload` | Upload an object through the dashboard. |
 | `GET` | `/api/v1/buckets/{name}/objects/download` | Download an object through the dashboard. |
-| `GET` | `/api/v1/buckets/{name}/objects/versions` | List object versions. |
+| `GET` | `/api/v1/buckets/{name}/objects/versions` | List object versions and return the current version token. |
+| `POST` | `/api/v1/buckets/{name}/objects/versions/restore` | Create a new current version from an existing data version. |
 | `GET` | `/api/v1/buckets/{name}/objects/provenance` | Inspect object storage provenance. |
 | `GET` | `/api/v1/buckets/{name}/objects/status-detail` | Read detailed object state. |
 | `GET` | `/api/v1/buckets/{name}/objects/deleted` | List deleted objects. |
@@ -113,6 +114,43 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | List versions affected by storage health issues. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
+
+### Restore an Object Version
+
+`GET /api/v1/buckets/{name}/objects/versions` includes `current_version_id` on every page when the object has version history. Pass that value when confirming a restore:
+
+```json
+{
+  "key": "path/file.txt",
+  "version_id": "source-version-id",
+  "expected_current_version_id": "current-version-id"
+}
+```
+
+`POST /api/v1/buckets/{name}/objects/versions/restore` copies a historical data version to a new version of the same bucket and key. It does not modify or remove existing data versions or delete markers. The selected version must differ from the readable current object representation. Selecting the current version, or an equivalent historical version, is rejected without creating a version, cache entry, or task. A failed or unavailable current version can still be repaired from a readable historical version.
+
+Successful response:
+
+```json
+{
+  "key": "path/file.txt",
+  "source_version_id": "source-version-id",
+  "version_id": "new-current-version-id"
+}
+```
+
+The request returns `409 Conflict` when the selected version is a delete marker or `expected_current_version_id` is no longer current. Refresh the version list and confirm again with the new token. When the selected version already matches the current object, the response uses a stable code so clients can treat it as a no-op:
+
+```json
+{
+  "error": "selected version already matches the current object",
+  "code": "object_version_already_current"
+}
+```
+
+A missing or permanently deleted source returns `404 Not Found`; insufficient cache capacity returns `507 Insufficient Storage`; invalid input returns `400 Bad Request`; source read and internal failures return `500 Internal Server Error`.
+
+The restore streams synchronously for up to one hour. It requires enough cache capacity for the new destination version. A provider-backed source is not added back to its old cache entry during this operation.
 
 ## Tasks
 

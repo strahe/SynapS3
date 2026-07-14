@@ -76,6 +76,24 @@ func newTestBackendWithMockCache(t *testing.T, mc *testutil.MockCache) *testBack
 	}
 }
 
+func newTestBackendWithCache(t *testing.T, c cache.Cache) *testBackend {
+	t.Helper()
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	sm := state.NewObjectStateMachine()
+	sc := &testutil.MockStorageClient{}
+	logger := slog.Default()
+
+	b := backend.New(repos, c, sm, sc, logger)
+	return &testBackend{
+		backend: b,
+		repos:   repos,
+		cache:   c,
+		storage: sc,
+		db:      db,
+	}
+}
+
 // newTestBackendWithSDK constructs a SynapseBackend with a custom SDK client.
 func newTestBackendWithSDK(t *testing.T, sc synapse.StorageClient) *testBackend {
 	t.Helper()

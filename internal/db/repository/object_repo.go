@@ -76,6 +76,39 @@ func (r *BunObjectRepo) CreateVersionAndSetCurrentIfChanged(ctx context.Context,
 	}
 }
 
+func (r *BunObjectRepo) CreateRestoredVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion, sourceVersionID, expectedCurrentVersionID string) (int64, error) {
+	if version == nil || version.BucketID == 0 || version.Key == "" || version.VersionID == "" || version.IsDeleteMarker || sourceVersionID == "" || expectedCurrentVersionID == "" {
+		return 0, fmt.Errorf("creating restored object version: %w", ErrInvalidInput)
+	}
+
+	var objectID int64
+	_, canRestartTx := r.db.(*bun.DB)
+	for attempt := 0; ; attempt++ {
+		err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+			id, err := createRestoredVersionAndSetCurrent(ctx, db, version, sourceVersionID, expectedCurrentVersionID)
+			objectID = id
+			return err
+		})
+		if err == nil {
+			return objectID, nil
+		}
+		if !shouldRetryObjectWrite(err, canRestartTx) || attempt >= 19 {
+			return 0, err
+		}
+		delay := time.Duration(attempt+1) * 25 * time.Millisecond
+		if delay > 200*time.Millisecond {
+			delay = 200 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error) {
 	if bucketID == 0 || key == "" || versionID == "" {
 		return nil, fmt.Errorf("creating delete marker: %w", ErrInvalidInput)
@@ -1364,6 +1397,69 @@ func createVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.
 	return result.ObjectID, nil
 }
 
+func createRestoredVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.ObjectVersion, sourceVersionID, expectedCurrentVersionID string) (int64, error) {
+	normalizeObjectVersion(version)
+	if err := lockCurrentObjectIfExists(ctx, db, version.BucketID, version.Key); err != nil {
+		return 0, err
+	}
+
+	source, err := selectVersionByBucketKeyAndID(ctx, db, version.BucketID, version.Key, sourceVersionID)
+	if err != nil {
+		return 0, err
+	}
+	if source == nil {
+		return 0, fmt.Errorf("creating restored object version: %w", ErrNotFound)
+	}
+	if source.IsDeleteMarker {
+		return 0, fmt.Errorf("creating restored object version: %w", ErrConflict)
+	}
+
+	current, err := selectCurrentVersionByBucketAndKey(ctx, db, version.BucketID, version.Key)
+	if err != nil {
+		return 0, err
+	}
+	if current == nil || current.VersionID != expectedCurrentVersionID || current.ObjectID != source.ObjectID {
+		return 0, fmt.Errorf("creating restored object version: %w", ErrConflict)
+	}
+	if restoreSourceAlreadyCurrent(source, current) {
+		return 0, fmt.Errorf("creating restored object version: %w", ErrAlreadyCurrent)
+	}
+
+	now := time.Now()
+	version.ObjectID = source.ObjectID
+	version.IsCurrent = true
+	if version.CreatedAt.IsZero() {
+		version.CreatedAt = now
+	}
+	if version.UpdatedAt.IsZero() {
+		version.UpdatedAt = now
+	}
+
+	res, err := db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("is_current = ?", false).
+		Where("object_id = ? AND version_id = ? AND is_current = ?", source.ObjectID, expectedCurrentVersionID, true).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("clearing expected current version: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows != 1 {
+		return 0, fmt.Errorf("creating restored object version: %w", ErrConflict)
+	}
+	if _, err := db.NewInsert().Model(version).Exec(ctx); err != nil {
+		return 0, fmt.Errorf("inserting restored object version: %w", err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("updated_at = ?", now).
+		Where("id = ?", source.ObjectID).
+		Exec(ctx); err != nil {
+		return 0, fmt.Errorf("updating restored object identity timestamp: %w", err)
+	}
+	return source.ObjectID, nil
+}
+
 func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, version *model.ObjectVersion, existing *model.Object, existingErr error) (ObjectVersionWriteResult, error) {
 	normalizeObjectVersion(version)
 	now := time.Now()
@@ -1779,6 +1875,22 @@ func objectVersionMatchesVersion(current *model.ObjectVersion, version *model.Ob
 		current.Checksum == version.Checksum &&
 		current.ContentType == version.ContentType &&
 		maps.Equal(current.Metadata, version.Metadata)
+}
+
+func restoreSourceAlreadyCurrent(source, current *model.ObjectVersion) bool {
+	if source == nil || current == nil {
+		return false
+	}
+	if source.VersionID == current.VersionID {
+		return true
+	}
+	if current.State == model.ObjectStateFailed || current.IsDeleteMarker || (!current.InCache && !current.InFilecoin) {
+		return false
+	}
+	return current.Size == source.Size &&
+		current.Checksum == source.Checksum &&
+		current.ContentType == source.ContentType &&
+		maps.Equal(current.Metadata, source.Metadata)
 }
 
 func updateVersionState(ctx context.Context, db bun.IDB, versionID string, from, to model.ObjectState) error {

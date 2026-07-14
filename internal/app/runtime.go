@@ -165,6 +165,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		})).
 		WithEventHub(events).
 		WithObjectUploader(appBackend).
+		WithObjectVersionRestorer(appBackend).
 		WithObjectStorage(opts.Filecoin.Storage).
 		WithSettings(opts.Settings).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).

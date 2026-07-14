@@ -124,6 +124,9 @@ type DeleteDeletedObjectResult struct {
 type ObjectRepository interface {
 	CreateVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion) (objectID int64, err error)
 	CreateVersionAndSetCurrentIfChanged(ctx context.Context, version *model.ObjectVersion) (ObjectVersionWriteResult, error)
+	// CreateRestoredVersionAndSetCurrent creates a new current data version only
+	// when the selected source still exists and the expected version is current.
+	CreateRestoredVersionAndSetCurrent(ctx context.Context, version *model.ObjectVersion, sourceVersionID, expectedCurrentVersionID string) (objectID int64, err error)
 	CreateDeleteMarkerAndSetCurrent(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
 	DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string) error
 	DeleteObjectVersionPermanently(ctx context.Context, input DeleteObjectVersionInput) (DeleteObjectVersionResult, error)

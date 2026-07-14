@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 import { type ChangeEvent, Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
+  APIError,
   api,
   type BucketStorageHealthSummary,
   type BucketStorageRiskVersion,
@@ -38,6 +39,7 @@ import {
   type ObjectUploadClientProgress,
   type ObjectUploadStatus,
   type ObjectVersionItem,
+  objectVersionAlreadyCurrentCode,
   type StorageDataSetSummary,
   type StorageHealthStatus,
   type UploadTransferProgress,
@@ -105,6 +107,7 @@ import {
   usePermanentDeleteDeletedBucketObject,
   useRefreshDataSetStorageHealth,
   useRestoreBucketObject,
+  useRestoreBucketObjectVersion,
   useS3Users,
   useUpdateBucketCopyPolicy,
   useUpdateBucketOwner,
@@ -310,13 +313,17 @@ function ObjectVersionsDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const [versionMarker, setVersionMarker] = useState('')
+  const [versionMarkers, setVersionMarkers] = useState([''])
+  const versionMarker = versionMarkers[versionMarkers.length - 1] ?? ''
   const titleRef = useRef<HTMLHeadingElement>(null)
   const versions = useBucketObjectVersions(bucketName, objectKey, versionMarker, 50, open)
 
   useEffect(() => {
-    if (open) setVersionMarker('')
+    if (open) setVersionMarkers([''])
   }, [open])
+
+  const hasPreviousPage = versionMarkers.length > 1
+  const nextVersionMarker = versions.data?.has_more ? versions.data.next_version_marker : undefined
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -416,7 +423,13 @@ function ObjectVersionsDialog({
                       {timeAgo(version.created_at)}
                     </TableCell>
                     <TableCell className="px-2 text-right">
-                      <VersionActions bucketName={bucketName} objectKey={objectKey} version={version} />
+                      <VersionActions
+                        bucketName={bucketName}
+                        objectKey={objectKey}
+                        version={version}
+                        currentVersionID={versions.data?.current_version_id}
+                        onVersionsChanged={() => setVersionMarkers([''])}
+                      />
                     </TableCell>
                   </TableRow>
                 ))}
@@ -431,15 +444,22 @@ function ObjectVersionsDialog({
             </Table>
           </div>
         )}
-        {versions.data?.has_more && versions.data.next_version_marker && (
+        {(hasPreviousPage || nextVersionMarker) && (
           <DialogFooter>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setVersionMarker(versions.data.next_version_marker ?? '')}
-            >
-              Next page
-            </Button>
+            {hasPreviousPage && (
+              <Button variant="outline" size="sm" onClick={() => setVersionMarkers((markers) => markers.slice(0, -1))}>
+                Previous page
+              </Button>
+            )}
+            {nextVersionMarker && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setVersionMarkers((markers) => [...markers, nextVersionMarker])}
+              >
+                Next page
+              </Button>
+            )}
           </DialogFooter>
         )}
       </DialogContent>
@@ -451,13 +471,20 @@ function VersionActions({
   bucketName,
   objectKey,
   version,
+  currentVersionID,
+  onVersionsChanged,
 }: {
   bucketName: string
   objectKey: string
   version: ObjectVersionItem
+  currentVersionID?: string
+  onVersionsChanged: () => void
 }) {
+  const queryClient = useQueryClient()
   const [provenanceOpen, setProvenanceOpen] = useState(false)
+  const [restoreOpen, setRestoreOpen] = useState(false)
   const [permanentDeleteOpen, setPermanentDeleteOpen] = useState(false)
+  const restore = useRestoreBucketObjectVersion()
   const permanentDelete = usePermanentDeleteBucketObjectVersion()
 
   if (version.is_delete_marker) {
@@ -475,6 +502,39 @@ function VersionActions({
       }
     )
   }
+
+  const handleRestoreOpenChange = (next: boolean) => {
+    setRestoreOpen(next)
+    if (!next) restore.reset()
+  }
+
+  const handleRestore = () => {
+    if (!currentVersionID) return
+    restore.mutate(
+      {
+        name: bucketName,
+        key: objectKey,
+        sourceVersionID: version.version_id,
+        expectedCurrentVersionID: currentVersionID,
+      },
+      {
+        onSuccess: () => {
+          setRestoreOpen(false)
+          restore.reset()
+          onVersionsChanged()
+        },
+        onError: (error) => {
+          if (error instanceof APIError && error.status === 409 && error.code !== objectVersionAlreadyCurrentCode) {
+            queryClient.invalidateQueries({ queryKey: ['objectVersions', bucketName, objectKey] })
+          }
+        },
+      }
+    )
+  }
+
+  const restoreAlreadyCurrent =
+    restore.error instanceof APIError && restore.error.code === objectVersionAlreadyCurrentCode
+  const restoreConflict = restore.error instanceof APIError && restore.error.status === 409 && !restoreAlreadyCurrent
 
   return (
     <>
@@ -499,6 +559,12 @@ function VersionActions({
               <Fingerprint data-icon="inline-start" />
               Provenance
             </DropdownMenuItem>
+            {!version.is_current && (
+              <DropdownMenuItem onSelect={() => setRestoreOpen(true)}>
+                <RotateCcw data-icon="inline-start" />
+                Restore as new version
+              </DropdownMenuItem>
+            )}
             {!version.is_delete_marker && (
               <DropdownMenuItem variant="destructive" onSelect={() => setPermanentDeleteOpen(true)}>
                 <Trash2 data-icon="inline-start" />
@@ -515,6 +581,58 @@ function VersionActions({
         open={provenanceOpen}
         onOpenChange={setProvenanceOpen}
       />
+      <Dialog open={restoreOpen} onOpenChange={handleRestoreOpenChange}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Restore as new version</DialogTitle>
+            <DialogDescription>
+              Create a new current version from this data. Existing versions and delete markers remain in history.
+            </DialogDescription>
+          </DialogHeader>
+          <ReviewDetails
+            rows={[
+              { id: 'key', label: 'Object', value: objectKey, copyable: true, maxLength: 36 },
+              { id: 'source-version', label: 'Source version', value: version.version_id, copyable: true },
+              {
+                id: 'current-version',
+                label: 'Current version',
+                value: currentVersionID ?? 'Unavailable',
+                copyable: Boolean(currentVersionID),
+              },
+              { id: 'size', label: 'Size', value: formatBytes(version.size) },
+            ]}
+          />
+          {restore.error && (
+            <Alert variant="destructive">
+              <AlertDescription>
+                {restoreAlreadyCurrent
+                  ? 'This version already matches the current object. No new version was created.'
+                  : restoreConflict
+                    ? 'Object versions changed while this dialog was open. The list has been refreshed; review the current version and confirm again.'
+                    : restore.error.message}
+              </AlertDescription>
+            </Alert>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleRestoreOpenChange(false)}
+              disabled={restore.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={handleRestore}
+              disabled={restore.isPending || !currentVersionID || restoreAlreadyCurrent}
+            >
+              {restore.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
+              Restore as new version
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <DangerActionAlertDialog
         open={permanentDeleteOpen}
         onOpenChange={(next) => {

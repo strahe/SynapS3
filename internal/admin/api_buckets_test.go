@@ -93,6 +93,7 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/status-detail", srv.handleAPIBucketObjectStatusDetail)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/provenance", srv.handleAPIBucketObjectProvenance)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/versions", srv.handleAPIBucketObjectVersions)
+	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/versions/restore", srv.handleAPIRestoreObjectVersion)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
 	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", srv.handleAPIUploadObject)
 	return mux
