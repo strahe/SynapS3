@@ -53,16 +53,7 @@ export function CopyableValue({
       {model.displayText}
     </a>
   ) : (
-    <span
-      role="note"
-      aria-label={`${label}: ${model.displayText}`}
-      // biome-ignore lint/a11y/noNoninteractiveTabindex: the value tooltip needs keyboard focus without adding button semantics.
-      tabIndex={0}
-      className={cn(
-        valueClassName,
-        'rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
-      )}
-    >
+    <span role="note" aria-label={`${label}: ${model.tooltipValue}`} className={valueClassName}>
       {model.displayText}
     </span>
   )
@@ -78,20 +69,16 @@ export function CopyableValue({
           <span className={cn(monospace && 'font-mono text-xs')}>{model.tooltipValue}</span>
         </TooltipContent>
       </Tooltip>
-      <Tooltip delayDuration={200}>
-        <TooltipTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            onClick={() => copy(model.copyValue)}
-            aria-label={`${copyLabel} ${label}`}
-          >
-            {copyState === 'copied' ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>{copyLabel}</TooltipContent>
-      </Tooltip>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        onClick={() => copy(model.copyValue)}
+        aria-label={`${copyLabel} ${label}`}
+        title={copyLabel}
+      >
+        {copyState === 'copied' ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
+      </Button>
     </span>
   )
 }

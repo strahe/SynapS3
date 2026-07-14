@@ -342,7 +342,13 @@ function ObjectVersionsDialog({
             <span className="sr-only">Object versions for selected object.</span>
           </DialogDescription>
           <div className="pr-8 text-muted-foreground">
-            <CopyableValue label="Object key" value={objectKey} monospace className="max-w-full" />
+            <CopyableValue
+              label="Object key"
+              value={objectKey}
+              monospace
+              maxLength={objectKey.length}
+              className="max-w-full"
+            />
           </div>
         </DialogHeader>
         {versions.isLoading ? (
@@ -690,8 +696,20 @@ function ObjectProvenanceDialog({
               <span className="sr-only">Storage provenance for selected object version.</span>
             </DialogDescription>
             <div className="flex min-w-0 flex-col gap-1 pr-8 text-muted-foreground">
-              <CopyableValue label="Object key" value={objectKey} monospace className="max-w-full" />
-              <CopyableValue label="Version" value={versionID} monospace className="max-w-full" />
+              <CopyableValue
+                label="Object key"
+                value={objectKey}
+                monospace
+                maxLength={objectKey.length}
+                className="max-w-full"
+              />
+              <CopyableValue
+                label="Version"
+                value={versionID}
+                monospace
+                maxLength={versionID.length}
+                className="max-w-full"
+              />
             </div>
           </DialogHeader>
 
@@ -730,24 +748,30 @@ function ProvenanceSummary({ data }: { data: ObjectProvenance }) {
   const uploadLabel = data.upload_status ? uploadStatusLabel(data.upload_status, progressPercent) : 'No upload recorded'
 
   return (
-    <dl className="grid gap-3 rounded-md border border-border p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+    <dl className="grid gap-x-8 gap-y-4 rounded-md border border-border p-3 text-sm sm:grid-cols-2 lg:grid-cols-6">
       <ProvenanceSummaryItem
         label="Object status"
         value={objectStateLabel(data.state, data.status, data.upload_status, progressPercent)}
+        className="lg:col-span-2"
       />
-      <ProvenanceSummaryItem label="Upload" value={uploadLabel} />
+      <ProvenanceSummaryItem label="Upload" value={uploadLabel} className="lg:col-span-2" />
       <ProvenanceSummaryItem label="Replicas" value={`${data.success_copies} / ${data.requested_copies}`} />
       <ProvenanceSummaryItem
         label="Object copy health"
         value={copyHealthSummaryLabel(data.copy_health)}
         title={copyHealthSummaryTitle(data.copy_health)}
       />
-      <ProvenanceSummaryItem label="Updated" value={timeAgo(data.updated_at)} title={data.updated_at} />
+      <ProvenanceSummaryItem
+        label="Updated"
+        value={timeAgo(data.updated_at)}
+        title={data.updated_at}
+        className="sm:col-span-2 lg:col-span-1"
+      />
       <ProvenanceSummaryItem
         label="Piece CID"
         value={data.piece_cid ?? '—'}
         title={data.piece_cid}
-        className="sm:col-span-2 lg:col-span-4"
+        className="sm:col-span-2 lg:col-span-5"
         mono
         copyable={Boolean(data.piece_cid)}
       />
@@ -773,16 +797,16 @@ function ProvenanceSummaryItem({
   const copyableValue = copyable && value !== '—'
 
   return (
-    <div className={className}>
+    <div className={cn('min-w-0', className)}>
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd
         className={cn('mt-1 min-w-0', mono ? 'font-mono text-xs' : 'font-medium')}
         title={copyableValue ? undefined : (title ?? value)}
       >
         {copyableValue ? (
-          <CopyableValue label={label} value={value} monospace={mono} maxLength={36} />
+          <CopyableValue label={label} value={value} monospace={mono} maxLength={value.length} />
         ) : (
-          <span className="truncate">{value}</span>
+          <span className="block break-words">{value}</span>
         )}
       </dd>
     </div>
