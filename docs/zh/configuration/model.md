@@ -23,9 +23,11 @@ synaps3 admin settings get
 
 输出会显示配置路径、是否允许写入，以及是否需要重启。
 
+保存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get`，确认实际生效值。
+
 ## 必需密钥
 
-正常启动服务前，需要设置 Filecoin 钱包 private key：
+正常启动服务前，需要设置 Filecoin 钱包私钥：
 
 ```toml
 [filecoin]
@@ -34,9 +36,30 @@ private_key = "0x..."
 
 也可以用 `SYNAPS3_FILECOIN_PRIVATE_KEY` 管理这个值；支持的覆盖项见[环境变量](./environment.md)。
 
-不要把 private key 放进代码仓库、容器镜像或 shell history。
+不要把私钥放进代码仓库、容器镜像或 shell history。
 
 当 `admin.auth.enabled = true` 时，Admin 认证还需要密码 hash 和 `admin.auth.session_secret`。新配置会由 `synaps3 init` 创建；如果缺失或需要轮换密码，运行 `synaps3 admin-auth reset-password --config <path>` 重新生成。重置密码也会轮换 session secret。
+
+配置、`.env` 和凭据文件都应保持 `0600` 权限。
+
+## S3 服务
+
+S3 API 通过以下字段支持原生 TLS：
+
+```toml
+[server.tls]
+enabled = true
+cert_file = "/path/to/tls.crt"
+key_file = "/path/to/tls.key"
+```
+
+证书和私钥必须允许 SynapS3 进程读取。在容器部署中，配置的路径必须存在于容器内，通常通过只读挂载提供。生产 S3 流量必须使用原生 TLS 或受控的 TLS 反向代理。
+
+Admin 端点有独立的暴露范围控制。让 `admin.addr` 保持回环地址、使用 SSH 隧道，或放在带访问控制的 HTTPS 反向代理之后。
+
+## 数据库选择
+
+SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL 运维体系或需要外置元数据数据库时，可以使用 PostgreSQL；其 DSN 必须保存在受保护的配置或密钥存储中。
 
 ## 主要配置段
 
@@ -45,12 +68,12 @@ private_key = "0x..."
 | `server` | S3 API 监听、并发限制和 TLS 字段。 |
 | `s3` | 返回给 S3 客户端的 region。 |
 | `filecoin` | 网络、RPC、钱包、存储提供方 URL 策略、CDN hints 和副本策略。 |
-| `filecoin.observability` | 存储提供方和本地 data set 健康检查。 |
-| `database` | SQLite 或 Postgres 元数据数据库。 |
+| `filecoin.observability` | 存储提供方和本地数据集健康检查。 |
+| `database` | SQLite 或 PostgreSQL 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
-| `worker.upload` | 后台 Filecoin 上传并发、轮询和重试。 |
-| `worker.evictor` | 本地缓存淘汰工作进程。 |
-| `worker.storage_cleanup` | 远端副本清理工作进程。 |
+| `worker.upload` | 后台 Filecoin 存储并发、轮询和重试。 |
+| `worker.evictor` | 本地缓存淘汰任务。 |
+| `worker.storage_cleanup` | 远端副本清理任务。 |
 | `logging` | 运行时日志等级、格式和 S3 access log。 |
 | `admin` | 仪表盘、Admin API 监听地址和 Admin 认证设置。 |
 
@@ -87,6 +110,12 @@ private_key = "0x..."
 - `logging.format`: `json`, `text`。
 - `admin.trusted_proxies`: IP 或 CIDR。除非可信反向代理会清理不可信 forwarded headers，否则保持空。
 
+缓存淘汰策略会产生以下用户可见结果：
+
+- `lru`：远端存储满足配置的副本策略后，SynapS3 会自动将符合条件的本地缓存加入清理队列。
+- `manual`：SynapS3 不会自动清理本地缓存。
+- `none`：SynapS3 不会自动清理本地缓存。
+
 ## 高风险字段
 
 | 字段 | 风险 |
@@ -95,9 +124,10 @@ private_key = "0x..."
 | `admin.trusted_proxies` | 对匹配代理信任 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`。只配置你控制的代理。 |
 | Admin password hash | 控制 Admin 登录。不要手动配置；用 `synaps3 init` 或 `synaps3 admin-auth reset-password` 生成。 |
 | `admin.auth.session_secret` | 用于签名 Admin 浏览器会话。按密钥处理。 |
-| `filecoin.private_key` | 控制钱包支付和存储操作。必须作为密钥处理。 |
+| `filecoin.private_key` | 控制钱包支付和存储操作。必须作为私钥处理。 |
+| `database.dsn` | 可能包含数据库凭据，必须作为敏感值处理。 |
 | `filecoin.network` | 切换到 `mainnet` 会改变支付和存储环境。 |
-| `filecoin.allow_private_networks` | 允许私有网络 provider URL。只在可信私有部署中开启。 |
+| `filecoin.allow_private_networks` | 允许私有网络存储提供方 URL。只在可信私有部署中开启。 |
 | `cache.max_size_gb` | 太小会阻塞写入；太大会占满主机磁盘。 |
 
 高风险设置可能需要显式确认：

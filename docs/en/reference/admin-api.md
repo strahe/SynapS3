@@ -13,6 +13,17 @@ Default base URL:
 http://127.0.0.1:9090
 ```
 
+## Setup Mode
+
+When `/healthz` returns `{"status":"setup"}`, the Admin endpoint exposes only the surfaces needed to finish configuration:
+
+- `/healthz`, Admin login, session, and logout;
+- the dashboard shell;
+- `GET /api/v1/settings`, `PUT /api/v1/settings`, and `POST /api/v1/settings/validate`;
+- `POST /api/v1/filecoin/readiness/preflight`.
+
+Runtime metrics, buckets, objects, tasks, wallet operations, storage health, and S3 user management are unavailable in setup mode. Save valid settings, restart SynapS3, and verify that `/healthz` returns `{"status":"ok"}` before using the full API.
+
 ## Auth Model
 
 `/healthz` is public so process health checks can run without credentials. The dashboard shell and static assets can load before login, but dashboard data and write operations require Admin auth.
@@ -34,7 +45,7 @@ Browser login sets the `synaps3_admin_session` HttpOnly cookie and returns a CSR
 
 CLI and script calls can use HTTP Basic auth and do not need a CSRF header. Browser Basic-auth requests are rejected when `Sec-Fetch-Site`, `Origin`, or `Referer` show a cross-site origin. Requests without browser-origin headers still work for CLI and scripts.
 
-Failed password checks are rate-limited by resolved client IP; requests fail closed when the limiter is full. Successful Basic auth credentials are cached briefly per client IP to avoid repeated bcrypt work.
+Failed password checks are rate-limited by resolved client IP; additional login attempts are rejected while the limit is active.
 
 ### Reverse Proxies
 
@@ -56,13 +67,13 @@ synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
 | --- | --- | --- |
 | `POST` | `/api/v1/auth/login` | Validate username and password, set the browser cookie, and return a CSRF token. |
 | `GET` | `/api/v1/auth/session` | Return the current browser session and CSRF token. |
-| `POST` | `/api/v1/auth/logout` | Require session and CSRF, revoke the current token in memory until it expires, then clear the browser cookie. |
+| `POST` | `/api/v1/auth/logout` | Require session and CSRF, end the current browser session, and clear the cookie. |
 
-The dashboard also clears local auth state after any logout attempt or `401` API response, so the UI returns to login even when the server-side logout request fails.
+After logout or a `401` API response, the dashboard returns to the login page.
 
 ## Security Headers
 
-Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. The CSP is same-origin by default and permits the inline script/style currently required by the embedded dashboard.
+Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. The default content policy keeps dashboard resources on the same origin.
 
 ## High-Risk Operations
 
@@ -74,16 +85,16 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw`, `POST /api/v1/wallet/approve` | Creates on-chain payment operations. |
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
-| Tasks and observability | task retry, diagnostic refresh, provider/data-set refresh | Requeues work or refreshes operational state. |
+| Tasks and storage health | task retry, diagnostic refresh, storage provider and data set refresh | Requeues work or refreshes operational status. |
 
 ## Health and Metrics
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/healthz` | Health status for database, cache, and workers. |
+| `GET` | `/healthz` | Health status for database, cache, and background tasks. |
 | `GET` | `/metrics` | Prometheus metrics. Requires Admin auth. |
 | `GET` | `/api/v1/system/info` | Version and runtime information. |
-| `GET` | `/api/v1/workers` | Worker activity and health. |
+| `GET` | `/api/v1/workers` | Background task activity and health. |
 | `GET` | `/api/v1/cache/stats` | Cache usage and capacity. |
 
 ## Dashboard Data
@@ -97,7 +108,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}` | Read bucket detail. |
 | `PUT` | `/api/v1/buckets/{name}/owner` | Update bucket owner. |
 | `PUT` | `/api/v1/buckets/{name}/copy-policy` | Update default copy policy. |
-| `DELETE` | `/api/v1/buckets/{name}` | Not implemented. Returns `501 Not Implemented`. |
+| `DELETE` | `/api/v1/buckets/{name}` | Not supported. Returns `501 Not Implemented`. |
 | `GET` | `/api/v1/buckets/{name}/objects` | List objects. |
 | `DELETE` | `/api/v1/buckets/{name}/objects` | Create an object delete marker. |
 | `POST` | `/api/v1/buckets/{name}/objects/upload` | Upload an object through the dashboard. |
@@ -127,7 +138,7 @@ For object upload, the HTTP `Content-Type` is the uploaded object's content type
 }
 ```
 
-`POST /api/v1/buckets/{name}/objects/versions/restore` copies a historical data version to a new version of the same bucket and key. It does not modify or remove existing data versions or delete markers. The selected version must differ from the readable current object representation. Selecting the current version, or an equivalent historical version, is rejected without creating a version, cache entry, or task. A failed or unavailable current version can still be repaired from a readable historical version.
+`POST /api/v1/buckets/{name}/objects/versions/restore` copies a historical data version to a new version of the same bucket and key. It does not modify or remove existing data versions or delete markers. The selected version must differ from the readable current object representation. Selecting the current version, or an equivalent historical version, is rejected without changing the object. A failed or unavailable current version can still be restored from a readable historical version.
 
 Successful response:
 
@@ -150,7 +161,7 @@ The request returns `409 Conflict` when the selected version is a delete marker 
 
 A missing or permanently deleted source returns `404 Not Found`; insufficient cache capacity returns `507 Insufficient Storage`; invalid input returns `400 Bad Request`; source read and internal failures return `500 Internal Server Error`.
 
-The restore streams synchronously for up to one hour. It requires enough cache capacity for the new destination version. A provider-backed source is not added back to its old cache entry during this operation.
+The restore streams synchronously for up to one hour and requires enough cache capacity for the new destination version.
 
 ## Tasks
 
@@ -158,7 +169,7 @@ The restore streams synchronously for up to one hour. It requires enough cache c
 | --- | --- | --- |
 | `GET` | `/api/v1/tasks` | List background tasks. Supports filters such as `type`, `stage`, `status`, `limit`, and `offset`. |
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
-| `GET` | `/api/v1/tasks/{id}/ref-detail` | Resolve the object or storage upload related to a task. |
+| `GET` | `/api/v1/tasks/{id}/ref-detail` | Resolve the object or storage operation related to a task. |
 | `GET` | `/api/v1/tasks/{id}/diagnostic` | Read task diagnostics. |
 | `POST` | `/api/v1/tasks/{id}/diagnostic/refresh` | Refresh diagnostics. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Retry an exhausted task. |
@@ -194,15 +205,15 @@ The restore streams synchronously for up to one hour. It requires enough cache c
 | `POST` | `/api/v1/s3-users/{accessKey}/secret` | Rotate an S3 secret key. |
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | Delete an S3 user. |
 
+After saving settings, restart SynapS3, check `/healthz`, and read settings again to confirm the effective values.
+
 ## Write Example
 
 ```bash
-export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
-
 curl -X POST http://127.0.0.1:9090/api/v1/s3-users \
-  -u "admin:${SYNAPS3_ADMIN_PASSWORD}" \
+  -u admin \
   -H 'Content-Type: application/json' \
   -d '{"role":"user"}'
 ```
 
-The response contains an access key, secret key, and role.
+Enter the Admin password at curl's no-echo prompt. The response contains an access key, secret key, and role. The secret is shown only once; save it in a credential file protected with `0600` and rotate it immediately if exposed.

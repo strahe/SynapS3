@@ -72,12 +72,13 @@ These variables do not map to TOML config fields.
 | --- | --- |
 | `SYNAPS3_DATA_DIR` | Runtime data directory used for automatic `synaps3 init`; defaults to `/var/lib/synaps3`. |
 | `SYNAPS3_CONFIG` | Config file used by CLI commands when `--config` is not set; the Compose example defaults it to `/var/lib/synaps3/config.toml` and allows override, and the entrypoint uses `$SYNAPS3_DATA_DIR/config.toml` when starting `serve`. |
+| `SYNAPS3_ADMIN_PASSWORD` | Admin password used only by CLI authentication. Prefer the no-echo terminal prompt or a protected secret source instead of placing it in shell history. |
 
 ## When to Use Environment Variables
 
 Use environment variables for:
 
-- wallet private keys,
+- wallet private keys and database DSNs,
 - externally managed Admin session secrets,
 - container-only paths,
 - network-specific RPC URLs,
@@ -89,9 +90,11 @@ Use the TOML config file for stable settings that should survive process restart
 ## Security Guidance
 
 > [!WARNING]
-> Keep wallet private keys and Admin session secrets out of git, container images, and shell history.
+> Keep wallet private keys, database credentials, Admin passwords, and Admin session secrets out of git, container images, and shell history.
 
 - Keep `SYNAPS3_FILECOIN_PRIVATE_KEY` in a secret manager, `.env`, or host environment. `synaps3 init` and `synaps3 admin-auth reset-password` generate `admin.auth.session_secret`; use `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` only when deployment policy manages it outside TOML.
+- Treat `SYNAPS3_DATABASE_DSN`, `SYNAPS3_ADMIN_PASSWORD`, and `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` as sensitive values. Use the CLI no-echo prompt for the Admin password whenever practical.
+- Keep `.env`, `config.toml`, and credential files at permission mode `0600`.
 - Keep `SYNAPS3_ADMIN_TRUSTED_PROXIES` empty unless trusted proxies strip untrusted forwarded headers before requests reach SynapS3.
 - Do not commit `.env`, `config.toml`, local databases, cache data, or wallet material.
 - Keep `filecoin.allow_private_networks = false` unless private provider URLs are explicitly trusted.
@@ -104,3 +107,5 @@ synaps3 admin settings get
 ```
 
 The output shows current values and whether settings writes are available.
+
+After changing settings, restart SynapS3, check `/healthz`, and run this command again to confirm the effective values. Environment variables continue to override file values.

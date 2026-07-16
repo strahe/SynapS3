@@ -34,7 +34,7 @@ The command builds the React dashboard, embeds it, and writes `bin/synaps3`.
 ./bin/synaps3 wallet generate
 ```
 
-`synaps3 init` creates `~/.synaps3/config.toml`, `db/`, `cache/`, and Admin auth. Save the printed Admin password. If init is non-interactive, read it from `~/.synaps3/admin-initial-password`.
+`synaps3 init` creates `~/.synaps3/config.toml`, `db/`, `cache/`, and Admin auth. Save the printed Admin password in a password manager. If init is non-interactive, read it from `~/.synaps3/admin-initial-password` in a private terminal. Keep the configuration and password file at permission mode `0600`.
 
 Add the generated wallet private key to `~/.synaps3/config.toml`:
 
@@ -43,11 +43,15 @@ Add the generated wallet private key to `~/.synaps3/config.toml`:
 private_key = "0x..."
 ```
 
+Do not place the private key in shell history. The configuration file contains wallet material and must remain readable only by the SynapS3 account.
+
 For Calibration testing, fund the wallet:
 
 ```bash
 ./bin/synaps3 wallet fund-testnet 0x...
 ```
+
+Successful faucet claims print `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`.
 
 ## Serve
 
@@ -71,28 +75,38 @@ curl http://127.0.0.1:9090/healthz
 ./bin/synaps3 wallet approve
 ```
 
-Expected result: health returns `{"status":"ok"}`, and the deposit and approve operations are accepted.
+Expected result: health returns `{"status":"ok"}`. A new deposit or approval prints `Transaction: <hash>` and `Status: confirmed`; an existing approval prints `FWSS approval: already approved`.
+
+These HTTP endpoints are for local evaluation. Production S3 traffic must use native TLS or a controlled TLS reverse proxy; keep the Admin endpoint on loopback, through an SSH tunnel, or behind an access-controlled HTTPS reverse proxy.
 
 ## Verify with an S3 Client
 
 Create an S3 user:
 
 ```bash
-export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 ./bin/synaps3 admin s3-user create
 ```
+
+Enter the Admin password at the no-echo prompt. The command prints the S3 secret only once; save it to a client credential file protected with `0600` and rotate it immediately if it is exposed.
 
 Then use a path-style S3 client:
 
 ```bash
 printf '%*s\n' 128 'hello synaps3' > hello.txt
-mc alias set synaps3 http://localhost:8080 replace-with-access-key replace-with-secret-key
+printf 'S3 access key: '
+read -r S3_ACCESS_KEY
+printf 'S3 secret key: '
+read -rs S3_SECRET_KEY
+printf '\n'
+mc alias set synaps3 http://localhost:8080 "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}"
+unset S3_ACCESS_KEY S3_SECRET_KEY
+chmod 600 ~/.mc/config.json
 mc mb synaps3/demo
 mc cp hello.txt synaps3/demo/hello.txt
 mc cat synaps3/demo/hello.txt
 ```
 
-`mc cat` prints the uploaded object. See [S3 Clients](./s3-clients.md) for more client examples.
+`mc cat` prints the uploaded object. The alias stores the credentials in `~/.mc/config.json`; keep that file at permission mode `0600`. See [S3 Clients](./s3-clients.md) for more client examples.
 
 ## Common Build Issues
 

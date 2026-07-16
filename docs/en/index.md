@@ -34,13 +34,13 @@ features:
   - title: Admin Dashboard
     details: View buckets, objects, wallet, tasks, topology, settings, and health.
     link: /en/reference/admin-api
-    linkText: Admin API
+    linkText: Admin API Reference
   - title: Operations
     details: Check health and task queues, then handle upgrades, recovery, and troubleshooting.
     link: /en/operations/troubleshooting
     linkText: Troubleshooting
   - title: Replica Repair
     details: "Coming soon: replica repair for provider outages."
-    link: /en/operations/upgrade-recovery
-    linkText: Recovery Guide
+    link: /en/concepts/filecoin-storage-flow#replica-repair-vision
+    linkText: Storage Vision
 ---

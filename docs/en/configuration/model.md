@@ -23,6 +23,8 @@ synaps3 admin settings get
 
 The output shows the config path, whether writes are allowed, and whether restart is required.
 
+After saving settings, restart SynapS3, check `/healthz`, and run `synaps3 admin settings get` again to confirm the effective values.
+
 ## Required Secrets
 
 Set the Filecoin wallet private key before normal serving:
@@ -38,6 +40,27 @@ Keep private keys out of commits, container images, and shell history.
 
 Admin auth also requires a password hash and `admin.auth.session_secret` when `admin.auth.enabled = true`. `synaps3 init` creates both for new configs; use `synaps3 admin-auth reset-password --config <path>` when a password is missing or must be rotated. Password reset also rotates the session secret.
 
+Keep configuration, `.env`, and credential files at permission mode `0600`.
+
+## S3 Server
+
+The S3 API supports native TLS through these fields:
+
+```toml
+[server.tls]
+enabled = true
+cert_file = "/path/to/tls.crt"
+key_file = "/path/to/tls.key"
+```
+
+The certificate and private key must be readable by the SynapS3 process. In a container deployment, their configured paths must exist inside the container, typically through read-only mounts. Production S3 traffic must use native TLS or a controlled TLS reverse proxy.
+
+The Admin endpoint has separate exposure controls. Keep `admin.addr` on loopback, use an SSH tunnel, or place it behind an access-controlled HTTPS reverse proxy.
+
+## Database Choice
+
+SQLite is the default and recommended database for SynapS3 single-node deployments. PostgreSQL remains available when a deployment already operates an external PostgreSQL service or needs an external metadata database. Keep its DSN in protected configuration or secret storage.
+
 ## Main Sections
 
 | Section | Purpose |
@@ -46,11 +69,11 @@ Admin auth also requires a password hash and `admin.auth.session_secret` when `a
 | `s3` | Region reported to S3 clients. |
 | `filecoin` | Network, RPC, wallet, provider URL policy, CDN hints, and copy policy. |
 | `filecoin.observability` | Provider and local data set health checks. |
-| `database` | SQLite or Postgres metadata database. |
+| `database` | SQLite or PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
-| `worker.upload` | Background Filecoin upload concurrency, polling, and retries. |
-| `worker.evictor` | Local cache eviction worker. |
-| `worker.storage_cleanup` | Remote replica cleanup worker. |
+| `worker.upload` | Background Filecoin storage concurrency, polling, and retries. |
+| `worker.evictor` | Local cache eviction tasks. |
+| `worker.storage_cleanup` | Remote copy cleanup tasks. |
 | `logging` | Runtime log level, format, and S3 access logs. |
 | `admin` | Dashboard, Admin API listener, and Admin auth settings. |
 
@@ -87,6 +110,12 @@ Admin auth also requires a password hash and `admin.auth.session_secret` when `a
 - `logging.format`: `json`, `text`.
 - `admin.trusted_proxies`: IP or CIDR entries. Keep empty unless a trusted reverse proxy strips untrusted forwarded headers.
 
+Cache eviction policies have these user-visible results:
+
+- `lru`: after remote storage satisfies the configured copy policy, SynapS3 automatically queues eligible local cache data for removal.
+- `manual`: SynapS3 does not automatically remove local cache data.
+- `none`: SynapS3 does not automatically remove local cache data.
+
 ## High-Risk Fields
 
 | Field | Risk |
@@ -96,6 +125,7 @@ Admin auth also requires a password hash and `admin.auth.session_secret` when `a
 | Admin password hash | Controls Admin login. Do not configure it manually; generate it with `synaps3 init` or `synaps3 admin-auth reset-password`. |
 | `admin.auth.session_secret` | Signs Admin browser sessions. Treat as secret. |
 | `filecoin.private_key` | Controls wallet spending and storage operations. Treat as a secret. |
+| `database.dsn` | May contain database credentials. Treat it as a secret. |
 | `filecoin.network` | Moving to `mainnet` changes payment and storage environment. |
 | `filecoin.allow_private_networks` | Allows private-network provider URLs. Enable only for trusted private deployments. |
 | `cache.max_size_gb` | Too small blocks writes; too large can consume the host disk. |

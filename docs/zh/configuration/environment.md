@@ -72,12 +72,13 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 | --- | --- |
 | `SYNAPS3_DATA_DIR` | 自动执行 `synaps3 init` 时使用的运行数据目录；默认是 `/var/lib/synaps3`。 |
 | `SYNAPS3_CONFIG` | CLI 命令在未传 `--config` 时使用的配置文件；Compose 示例默认使用 `/var/lib/synaps3/config.toml` 且允许覆盖，entrypoint 启动 `serve` 时默认使用 `$SYNAPS3_DATA_DIR/config.toml`。 |
+| `SYNAPS3_ADMIN_PASSWORD` | 仅用于 CLI 认证的 Admin 密码。优先使用终端无回显提示或受保护的密钥来源，不要让密码进入 shell history。 |
 
 ## 何时使用环境变量
 
 适合放在环境变量中的内容：
 
-- 钱包 private key，
+- 钱包私钥和数据库 DSN，
 - 外部管理的 Admin session secret，
 - 容器专用路径，
 - 网络特定 RPC URL，
@@ -89,12 +90,14 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 ## 安全建议
 
 > [!WARNING]
-> 不要把钱包 private key 和 Admin session secret 放进 git、容器镜像或 shell history。
+> 不要把钱包私钥、数据库凭据、Admin 密码和 Admin session secret 放进 git、容器镜像或 shell history。
 
 - 将 `SYNAPS3_FILECOIN_PRIVATE_KEY` 放在密钥管理系统、`.env` 或主机环境中。`synaps3 init` 和 `synaps3 admin-auth reset-password` 会生成 `admin.auth.session_secret`；只有部署策略要求在 TOML 外管理时，才使用 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET`。
+- 把 `SYNAPS3_DATABASE_DSN`、`SYNAPS3_ADMIN_PASSWORD` 和 `SYNAPS3_ADMIN_AUTH_SESSION_SECRET` 作为敏感值处理。只要条件允许，就通过 CLI 的无回显提示输入 Admin 密码。
+- 让 `.env`、`config.toml` 和凭据文件保持 `0600` 权限。
 - 除非可信代理会在请求到达 SynapS3 前清理不可信 forwarded headers，否则保持 `SYNAPS3_ADMIN_TRUSTED_PROXIES` 为空。
 - 不要提交 `.env`、`config.toml`、本地数据库、缓存数据或钱包材料。
-- 除非明确信任私有 provider URL，否则保持 `filecoin.allow_private_networks = false`。
+- 除非明确信任私有存储提供方 URL，否则保持 `filecoin.allow_private_networks = false`。
 - 环境变量管理的字段会覆盖文件值；只改文件不会改变这些字段的生效值。
 
 ## 验证生效设置
@@ -104,3 +107,5 @@ synaps3 admin settings get
 ```
 
 输出会显示当前值，以及每个设置是否可写。
+
+修改设置后，重启 SynapS3，检查 `/healthz`，再运行此命令确认实际生效值。环境变量仍会覆盖文件值。

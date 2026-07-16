@@ -5,7 +5,7 @@ description: Create SynapS3 S3 credentials and verify path-style access with com
 
 # S3 Clients
 
-After SynapS3 is running, confirm the Admin API is reachable on `127.0.0.1:9090`. Then create an S3 user and verify bucket/object operations with a path-style client.
+After SynapS3 is running, confirm the Admin API is reachable on `127.0.0.1:9090`. Then create an S3 user and verify bucket and object operations with a path-style client.
 
 ## Prerequisites
 
@@ -20,11 +20,10 @@ After SynapS3 is running, confirm the Admin API is reachable on `127.0.0.1:9090`
 Create a regular S3 user:
 
 ```bash
-export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 synaps3 admin s3-user create
 ```
 
-The command prints an access key, secret key, and role. Store the secret once; rotate it if it is exposed.
+Enter the Admin password at the no-echo prompt when no protected password file is available. The command prints an access key, secret key, and role. The secret is shown only once: save it in a client credential file protected with `0600`, and rotate it immediately if it is exposed.
 
 List users later with:
 
@@ -49,15 +48,23 @@ printf '%*s\n' 128 'hello synaps3' > hello.txt
 
 Bucket names may be recorded publicly on-chain. Do not include sensitive information.
 
+## Stable Object Limits
+
+- Object size must be from `127` through `1,065,353,216` bytes.
+- Object keys must be valid UTF-8, must not contain NUL, and must be no more than `1024` bytes.
+- Multipart uploads support at most `10,000` parts, and the completed object remains subject to the object size limit.
+
+See [S3 Compatibility](../reference/s3-compatibility.md) for the full support boundary.
+
 ## AWS CLI
 
-Configure path-style addressing for the profile that talks to SynapS3:
+Enter the access key and secret interactively, then configure path-style addressing:
 
 ```bash
-aws configure set profile.synaps3.aws_access_key_id replace-with-access-key
-aws configure set profile.synaps3.aws_secret_access_key replace-with-secret-key
+aws configure --profile synaps3
 aws configure set profile.synaps3.region us-east-1
 aws configure set profile.synaps3.s3.addressing_style path
+chmod 600 ~/.aws/credentials
 ```
 
 Create a bucket and upload a small test object:
@@ -95,12 +102,21 @@ rclone cat synaps3:demo/hello.txt
 
 `rclone cat` prints the uploaded object.
 
+Keep `rclone.conf` at permission mode `0600` because it contains the secret key.
+
 ## MinIO Client
 
-Create an alias and upload the same file:
+Read the credentials interactively, create an alias, and upload the same file:
 
 ```bash
-mc alias set synaps3 http://localhost:8080 replace-with-access-key replace-with-secret-key
+printf 'S3 access key: '
+read -r S3_ACCESS_KEY
+printf 'S3 secret key: '
+read -rs S3_SECRET_KEY
+printf '\n'
+mc alias set synaps3 http://localhost:8080 "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}"
+unset S3_ACCESS_KEY S3_SECRET_KEY
+chmod 600 ~/.mc/config.json
 mc mb synaps3/demo
 mc cp hello.txt synaps3/demo/hello.txt
 mc cat synaps3/demo/hello.txt
@@ -108,12 +124,16 @@ mc cat synaps3/demo/hello.txt
 
 `mc cat` prints the uploaded object.
 
+The alias stores credentials in `~/.mc/config.json`. The no-echo prompt keeps the secret key out of shell history; keep the resulting configuration protected with `0600` permissions.
+
+The HTTP endpoints in these examples are for local evaluation. For production, use the HTTPS endpoint provided by native TLS or your controlled TLS reverse proxy.
+
 ## Common Failures
 
 | Symptom | Check |
 | --- | --- |
-| `AccessDenied` | Confirm the access key and secret came from `synaps3 admin s3-user create`. |
+| `AccessDenied` | Confirm the access key and secret key came from `synaps3 admin s3-user create`. |
 | Client tries virtual-hosted buckets | Enable path-style addressing or equivalent client setting. |
 | Upload succeeds but Filecoin storage is pending | Check the dashboard task view or `synaps3 admin task list --status queued`. |
-| Small test object fails later in the pipeline | Use a file of at least 127 bytes. |
+| Object size is rejected | Keep the object between `127` and `1,065,353,216` bytes. |
 | Remote host cannot reach the admin dashboard | Keep admin on loopback and use `ssh -L 9090:127.0.0.1:9090 user@server`. |

@@ -5,13 +5,13 @@ description: Prepare a SynapS3 deployment.
 
 # Production Checklist
 
-Before serving traffic, verify local disk, database health, background workers, and recovery paths.
+Before serving traffic, verify local disk, database health, background tasks, transport security, and recovery paths.
 
 ## Network Exposure
 
 | Surface | Recommended exposure |
 | --- | --- |
-| S3 API | Expose only to trusted clients or an authenticated edge. |
+| S3 API | Require native TLS or a controlled TLS reverse proxy; expose only to trusted clients or an authenticated edge. |
 | Dashboard and Admin API | Keep on `127.0.0.1:9090`; use SSH tunneling or HTTPS reverse proxy for remote access. |
 | Metrics | Scrape with Admin auth from the private network or host-local agent only. |
 
@@ -20,9 +20,11 @@ Do not publish the dashboard or Admin API directly to the internet. Settings, wa
 ## Runtime Data
 
 - Put `/var/lib/synaps3` or `~/.synaps3` on durable storage.
-- Back up `config.toml`, `db/`, and `cache/` data before upgrades.
+- Use the default SQLite database unless deployment requirements call for an external PostgreSQL service.
+- Stop SynapS3 before backup. For SQLite, back up the complete runtime data volume. For PostgreSQL, use a database-native backup plus matching configuration and cache data.
+- Keep the database and cache at the same recovery point, verify backup archives, and test the documented restore order.
 - Watch free space on the database volume and cache volume.
-- Keep `config.toml`, `.env`, databases, cache data, and wallet material out of git.
+- Keep `config.toml`, `.env`, databases, cache data, and wallet material out of git. Protect configuration, secret, and credential files with `0600` permissions.
 
 ## Secrets and Wallet
 
@@ -36,7 +38,7 @@ synaps3 wallet deposit 2 # 2 USDFC
 synaps3 wallet approve
 ```
 
-The wallet operations should be accepted and later appear in the dashboard or `GET /api/v1/wallet/operations`.
+A new deposit or approval should print `Transaction: <hash>` and `Status: confirmed`; an existing approval prints `FWSS approval: already approved`.
 
 ## Configuration Review
 
@@ -59,6 +61,8 @@ Review these values first:
 | `cache.max_size_gb` | Size it for expected upload backlog |
 | `logging.format` | Compose sets `json`; built-in default is `text`. |
 
+After saving settings, restart SynapS3, check `/healthz`, and run `synaps3 admin settings get` again to verify the effective values.
+
 High-risk settings require explicit confirmation:
 
 ```bash
@@ -74,10 +78,10 @@ At minimum, monitor:
 - cache usage
 - task queue depth
 - exhausted task count
-- worker activity
+- background task activity
 - provider and data set health
 
-Treat `{"status":"unhealthy"}` as a problem to investigate. It means database, cache, or worker checks failed.
+Treat `{"status":"unhealthy"}` as a problem to investigate. It means database, cache, or background task checks failed.
 
 ## Upgrade Readiness
 

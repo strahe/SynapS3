@@ -34,20 +34,24 @@ make build
 ./bin/synaps3 wallet generate
 ```
 
-`synaps3 init` 会创建 `~/.synaps3/config.toml`、`db/`、`cache/` 和 Admin 认证。请保存命令打印出的 Admin 密码。非交互 init 可以从 `~/.synaps3/admin-initial-password` 读取密码。
+`synaps3 init` 会创建 `~/.synaps3/config.toml`、`db/`、`cache/` 和 Admin 认证。请把命令打印出的 Admin 密码保存到密码管理器。非交互 init 可以在私密终端中从 `~/.synaps3/admin-initial-password` 读取密码。配置文件和密码文件都应保持 `0600` 权限。
 
-把生成的钱包 private key 写入 `~/.synaps3/config.toml`：
+把生成的钱包私钥写入 `~/.synaps3/config.toml`：
 
 ```toml
 [filecoin]
 private_key = "0x..."
 ```
 
+不要让私钥进入 shell history。配置文件包含钱包材料，只应允许 SynapS3 运行账户读取。
+
 在 Calibration 测试时，为钱包充值：
 
 ```bash
 ./bin/synaps3 wallet fund-testnet 0x...
 ```
+
+Faucet 领取成功后会输出 `CalibnetUSDFC: <hash>` 和 `CalibnetFIL: <hash>`。
 
 ## 启动服务
 
@@ -71,28 +75,38 @@ curl http://127.0.0.1:9090/healthz
 ./bin/synaps3 wallet approve
 ```
 
-预期结果：`/healthz` 返回 `{"status":"ok"}`，deposit 和 approve 操作被接受。
+预期结果：`/healthz` 返回 `{"status":"ok"}`。新的 deposit 或 approval 会输出 `Transaction: <hash>` 和 `Status: confirmed`；已经完成 approval 时会输出 `FWSS approval: already approved`。
+
+这些 HTTP 端点用于本地评估。生产 S3 流量必须使用原生 TLS 或受控的 TLS 反向代理；Admin 端点继续使用回环地址、SSH 隧道，或带访问控制的 HTTPS 反向代理。
 
 ## 使用 S3 客户端验证
 
 创建 S3 用户：
 
 ```bash
-export SYNAPS3_ADMIN_PASSWORD='replace-with-admin-password'
 ./bin/synaps3 admin s3-user create
 ```
+
+在无回显提示中输入 Admin 密码。命令只显示一次 S3 secret key；请保存到权限为 `0600` 的客户端凭据文件，如果泄露则立即轮换。
 
 然后使用 path-style S3 客户端：
 
 ```bash
 printf '%*s\n' 128 'hello synaps3' > hello.txt
-mc alias set synaps3 http://localhost:8080 replace-with-access-key replace-with-secret-key
+printf 'S3 access key: '
+read -r S3_ACCESS_KEY
+printf 'S3 secret key: '
+read -rs S3_SECRET_KEY
+printf '\n'
+mc alias set synaps3 http://localhost:8080 "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}"
+unset S3_ACCESS_KEY S3_SECRET_KEY
+chmod 600 ~/.mc/config.json
 mc mb synaps3/demo
 mc cp hello.txt synaps3/demo/hello.txt
 mc cat synaps3/demo/hello.txt
 ```
 
-`mc cat` 会输出上传对象。更多客户端示例见 [S3 客户端](./s3-clients.md)。
+`mc cat` 会输出上传对象。alias 会把凭据保存到 `~/.mc/config.json`，该文件应保持 `0600` 权限。更多客户端示例见 [S3 客户端](./s3-clients.md)。
 
 ## 常见构建问题
 

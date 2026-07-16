@@ -5,13 +5,13 @@ description: 准备 SynapS3 部署。
 
 # 生产环境检查清单
 
-承载流量前，检查本地磁盘、数据库健康、后台工作进程和恢复路径。
+承载流量前，检查本地磁盘、数据库健康、后台任务、传输安全和恢复路径。
 
 ## 网络暴露
 
 | 界面 | 建议暴露方式 |
 | --- | --- |
-| S3 API | 只暴露给可信客户端或认证后的入口。 |
+| S3 API | 使用原生 TLS 或受控的 TLS 反向代理；只暴露给可信客户端或认证后的入口。 |
 | 仪表盘和 Admin API | 保持在 `127.0.0.1:9090`；远程访问使用 SSH 隧道或 HTTPS 反向代理。 |
 | 指标 | 使用 Admin 认证，只允许私有网络或本机采集 agent 访问。 |
 
@@ -20,9 +20,11 @@ description: 准备 SynapS3 部署。
 ## 运行数据
 
 - 将 `/var/lib/synaps3` 或 `~/.synaps3` 放在可靠磁盘上。
-- 升级前备份 `config.toml`、`db/` 和缓存数据。
+- 除非部署需要外置 PostgreSQL 服务，否则使用默认的 SQLite 数据库。
+- 备份前停止 SynapS3。SQLite 备份完整运行数据卷；PostgreSQL 使用数据库原生备份，并保存同一时间点的配置和缓存。
+- 让数据库与缓存处于同一恢复时间点，验证备份归档，并演练文档中的恢复顺序。
 - 监控数据库卷和缓存卷的剩余空间。
-- 不要把 `config.toml`、`.env`、数据库、缓存数据和钱包材料提交到 git。
+- 不要把 `config.toml`、`.env`、数据库、缓存数据和钱包材料提交到 git。配置、密钥和凭据文件使用 `0600` 权限。
 
 ## 密钥和钱包
 
@@ -36,7 +38,7 @@ synaps3 wallet deposit 2 # 2 USDFC
 synaps3 wallet approve
 ```
 
-钱包操作应被接受，随后可以在仪表盘或 `GET /api/v1/wallet/operations` 中看到。
+新的 deposit 或 approval 应输出 `Transaction: <hash>` 和 `Status: confirmed`；已经完成 approval 时会输出 `FWSS approval: already approved`。
 
 ## 配置检查
 
@@ -55,9 +57,11 @@ synaps3 admin settings get
 | `admin.auth.enabled` | 生产环境保持 `true`。 |
 | Admin password hash 和 `admin.auth.session_secret` | 必须存在；password hash 由 init/reset 生成，session secret 按密钥管理。 |
 | `filecoin.network` | 明确迁移到 `mainnet` 前保持 `calibration` |
-| `filecoin.allow_private_networks` | 除非 provider URL 是可信私有端点，否则保持 `false` |
+| `filecoin.allow_private_networks` | 除非存储提供方 URL 是可信私有端点，否则保持 `false` |
 | `cache.max_size_gb` | 按预计上传积压量规划 |
 | `logging.format` | Compose 设置为 `json`；内置默认值是 `text`。 |
+
+保存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get` 验证实际生效值。
 
 高风险设置需要显式确认：
 
@@ -74,10 +78,10 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 - 缓存使用量
 - 任务队列深度
 - exhausted 任务数量
-- 工作进程存活状态
-- 存储提供方和 data set 健康状态
+- 后台任务活动
+- 存储提供方和数据集健康状态
 
-`{"status":"unhealthy"}` 表示数据库、缓存或工作进程检查失败，需要处理。
+`{"status":"unhealthy"}` 表示数据库、缓存或后台任务检查失败，需要处理。
 
 ## 升级准备
 

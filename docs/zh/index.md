@@ -7,7 +7,7 @@ hero:
   tagline: 开源、可自托管的 Filecoin S3 网关。
   image:
     src: /readme-dashboard.png
-    alt: SynapS3 dashboard
+    alt: SynapS3 仪表盘
   actions:
     - theme: brand
       text: 入门概览
@@ -32,15 +32,15 @@ features:
     link: /zh/concepts/filecoin-storage-flow
     linkText: 存储流程
   - title: 仪表盘
-    details: 查看 bucket、object、钱包、后台任务、存储拓扑、设置和健康状态。
+    details: 查看存储桶、对象、钱包、后台任务、存储拓扑、设置和健康状态。
     link: /zh/reference/admin-api
-    linkText: Admin API
+    linkText: Admin API 参考
   - title: 运维
     details: 检查健康状态和任务队列，处理升级、恢复和故障排查。
     link: /zh/operations/troubleshooting
     linkText: 故障排查
   - title: 副本修复
     details: 即将支持：存储提供方不可用时的副本修复。
-    link: /zh/operations/upgrade-recovery
-    linkText: 恢复指南
+    link: /zh/concepts/filecoin-storage-flow#副本修复愿景
+    linkText: 存储愿景
 ---

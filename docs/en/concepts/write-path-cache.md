@@ -11,21 +11,13 @@ SynapS3 uses a cache-first write model. A successful S3 write means object bytes
 
 ```mermaid
 flowchart TD
-  request["Client PUT /bucket/key"] --> backend["SynapseBackend.PutObject"]
-  backend --> cache["cache.Put(bucket, key, body)"]
-  cache --> tx["repositories transaction"]
-  tx --> response["200 OK with ETag"]
+  request["Receive write"] --> save["Save object locally"]
+  save --> metadata["Record metadata"]
+  metadata --> response["Return success with ETag"]
+  response --> storage["Continue Filecoin storage in the background"]
 ```
 
-The cache write:
-
-- writes to a temporary file,
-- computes MD5 ETag and SHA-256 checksum,
-- fsyncs the file,
-- atomically renames the file into place,
-- fsyncs the parent directory.
-
-The database transaction upserts the object, bumps its generation, and creates an upload task.
+SynapS3 validates the request, saves the object and its metadata, and returns an S3-compatible ETag. Filecoin storage continues after the client receives success.
 
 ## Durability Invariant
 
@@ -36,18 +28,18 @@ The S3 response does not wait for Filecoin provider latency. After the write is 
 
 ## Read Path
 
-`GetObject` reads local cache first. If the cache entry is missing and committed remote metadata is available, SynapS3 can retrieve the object from the provider, verify the checksum, serve the response, and best-effort rehydrate cache.
+`GetObject` reads local cache first. If the cache entry is missing and an available remote copy is recorded, SynapS3 can retrieve the object from the storage provider, verify it, serve the response, and restore the local cache when possible.
 
 ## Multipart Uploads
 
-Multipart uploads stage parts in the cache. Completion validates requested parts, computes the S3 multipart ETag, assembles the final object, commits metadata, and then cleans up the upload staging directory.
+Multipart uploads keep parts in local storage until completion. Completing an upload validates the requested parts, assembles the final object, returns the S3 multipart ETag, and schedules background Filecoin storage.
 
 ## Operational Impact
 
 | Condition | Meaning |
 | --- | --- |
 | Cache disk is full | New writes can fail before Filecoin storage is involved. |
-| Upload worker is down | Confirmed writes remain local, but remote storage will not progress. |
+| Background storage is not running | Confirmed writes remain local, but remote storage will not progress. |
 | Cache entry is evicted | Reads can still succeed when remote metadata exists and retrieval works. |
 | Database commit fails | The S3 write does not return success. |
 

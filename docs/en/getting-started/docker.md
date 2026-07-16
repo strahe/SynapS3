@@ -30,13 +30,20 @@ Generate a wallet:
 docker compose run --rm synaps3 synaps3 wallet generate
 ```
 
-The command prints a wallet address and private key. Edit `.env` and add the generated private key:
+The command prints a wallet address and private key. Create a protected `.env` file:
+
+```bash
+touch .env
+chmod 600 .env
+```
+
+Then edit `.env` and add the generated private key:
 
 ```text
 SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
 ```
 
-Do not put the real private key directly in a shell command because it may be saved in shell history. See [Environment Variables](../configuration/environment.md) for other supported overrides.
+Keep `.env` at permission mode `0600`. Do not put the real private key directly in a shell command because it may be saved in shell history. See [Environment Variables](../configuration/environment.md) for other supported overrides.
 
 Fund the generated address on Calibration:
 
@@ -45,6 +52,8 @@ docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
 If faucet funding is unreliable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/) before serving.
+
+Successful faucet claims print `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`.
 
 ## Start SynapS3
 
@@ -65,6 +74,8 @@ Default endpoints:
 
 The Compose file uses host networking. This lets the S3 API listen on the host while the admin server stays on loopback.
 
+The HTTP addresses above are suitable for local evaluation. For production S3 traffic, either configure native TLS with `SYNAPS3_SERVER_TLS_ENABLED=true`, `SYNAPS3_SERVER_TLS_CERT_FILE`, and `SYNAPS3_SERVER_TLS_KEY_FILE`, or place the S3 API behind a controlled TLS reverse proxy. Certificate and key paths must be visible inside the container, typically through read-only mounts. Keep the Admin endpoint on loopback, through an SSH tunnel, or behind an access-controlled HTTPS reverse proxy.
+
 For dashboard login, read the generated Admin password:
 
 ```bash
@@ -72,6 +83,8 @@ docker compose exec synaps3 cat /var/lib/synaps3/admin-initial-password
 ```
 
 The username is `admin`. Container-local `synaps3 admin` commands read this password file automatically.
+
+Read the password only in a private terminal, store it in a password manager, and keep the password file at `0600`. Do not place the password directly in shell history.
 
 ## Verify the Node
 
@@ -82,7 +95,7 @@ docker compose exec synaps3 synaps3 wallet deposit 2 # 2 USDFC
 docker compose exec synaps3 synaps3 wallet approve
 ```
 
-Expected result: health returns `{"status":"ok"}`, and `admin status` shows runtime, worker, and cache status. The deposit and approve commands submit wallet operations.
+Expected result: health returns `{"status":"ok"}`, and `admin status` shows runtime, background task, and cache status. A new deposit or approval prints `Transaction: <hash>` and `Status: confirmed`; an existing approval prints `FWSS approval: already approved`.
 
 Access a remote dashboard through SSH:
 
@@ -107,21 +120,8 @@ docker compose exec synaps3 synaps3 admin task stats
 
 ## Upgrade
 
-```bash
-docker compose pull
-docker compose up -d
-```
-
-Compose replaces the container and keeps `synaps3-data` mounted.
+Follow [Upgrade and Recovery](../operations/upgrade-recovery.md). It includes preflight checks, a consistent backup, upgrade verification, and rollback order.
 
 ## Back Up Runtime Data
 
-```bash
-docker run --rm \
-  -v synaps3-data:/data:ro \
-  -v "$PWD":/backup \
-  alpine:3 \
-  tar czf /backup/synaps3-data.tgz -C /data .
-```
-
-The archive should contain `config.toml`, `db/`, and cache data from the mounted volume.
+Do not archive a live data volume. Check health and the task queue, stop SynapS3, then follow the driver-specific backup and restore steps in [Runtime Data](../configuration/runtime-data.md). Keep the database and cache at the same recovery point.
