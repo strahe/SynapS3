@@ -35,7 +35,6 @@ func TestShouldStartSetupModeAllowsEditableConfigErrors(t *testing.T) {
 	cfg.Server.Port = "not-a-port"
 	cfg.S3.Region = ""
 	cfg.Filecoin.RPCURL = "ftp://example.invalid/rpc"
-	cfg.Filecoin.Source = ""
 	cfg.Cache.MaxSizeGB = 0
 	cfg.Worker.Upload.PollInterval = 0
 	cfg.Worker.Upload.MaxRetries = -1

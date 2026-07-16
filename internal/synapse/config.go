@@ -7,7 +7,6 @@ func ReadinessConfigFromFilecoinConfig(cfg config.FilecoinConfig) ReadinessConfi
 		Network:              cfg.Network,
 		RPCURL:               cfg.RPCURL,
 		PrivateKey:           cfg.PrivateKey,
-		Source:               cfg.Source,
 		WithCDN:              cfg.WithCDN,
 		AllowPrivateNetworks: cfg.AllowPrivateNetworks,
 		DefaultCopies:        cfg.DefaultCopies,

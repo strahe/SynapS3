@@ -824,7 +824,6 @@ type adminSettingsS3Config struct {
 type adminSettingsFilecoinConfig struct {
 	Network              string `json:"network"`
 	RPCURL               string `json:"rpc_url"`
-	Source               string `json:"source"`
 	WithCDN              bool   `json:"with_cdn"`
 	AllowPrivateNetworks bool   `json:"allow_private_networks"`
 	DefaultCopies        int    `json:"default_copies"`
@@ -911,7 +910,6 @@ var adminEditableSettings = map[string]adminSettingSpec{
 	"s3.region":                            {path: []string{"s3", "region"}, kind: adminSettingString},
 	"filecoin.network":                     {path: []string{"filecoin", "network"}, kind: adminSettingString},
 	"filecoin.rpc_url":                     {path: []string{"filecoin", "rpc_url"}, kind: adminSettingString},
-	"filecoin.source":                      {path: []string{"filecoin", "source"}, kind: adminSettingString},
 	"filecoin.with_cdn":                    {path: []string{"filecoin", "with_cdn"}, kind: adminSettingBool},
 	"filecoin.allow_private_networks":      {path: []string{"filecoin", "allow_private_networks"}, kind: adminSettingBool},
 	"filecoin.default_copies":              {path: []string{"filecoin", "default_copies"}, kind: adminSettingInt},
@@ -1256,7 +1254,6 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 			rows: []adminOutputRow{
 				{Name: "filecoin.network", Value: settings.Config.Filecoin.Network},
 				{Name: "filecoin.rpc_url", Value: settings.Config.Filecoin.RPCURL},
-				{Name: "filecoin.source", Value: settings.Config.Filecoin.Source},
 				{Name: "filecoin.with_cdn", Value: formatAdminYesNo(settings.Config.Filecoin.WithCDN)},
 				{Name: "filecoin.allow_private_networks", Value: formatAdminYesNo(settings.Config.Filecoin.AllowPrivateNetworks)},
 				{Name: "filecoin.default_copies", Value: strconv.Itoa(settings.Config.Filecoin.DefaultCopies)},

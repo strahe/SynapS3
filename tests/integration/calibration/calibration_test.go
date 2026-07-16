@@ -26,12 +26,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/tests/testutil/e2e"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 const (
 	integrationNetwork = "calibration"
-	integrationSource  = "synaps3-calibration-e2e"
 	integrationCopies  = 3
 	uploadTaskTimeout  = 2 * time.Minute
 
@@ -99,6 +100,7 @@ func TestCalibrationBackedGoldenPath(t *testing.T) {
 
 	object := waitForStoredObject(t, admin, bucket, key, walletActions)
 	provenance := waitForCommittedCopies(t, admin, bucket, object.VersionID)
+	assertDataSetMetadata(t, t.Context(), privateKey, bucket, provenance)
 	waitForCompletedUploadTasks(t, admin, object.VersionID)
 	waitForCacheEviction(t, admin, bucket, key)
 	logStep(t, "verifying cold S3 read after cache eviction")
@@ -241,7 +243,6 @@ func (r *calibrationRuntime) PrepareConfig() error {
 	cfg.Filecoin.Network = integrationNetwork
 	cfg.Filecoin.RPCURL = rpcURL
 	cfg.Filecoin.PrivateKey = ""
-	cfg.Filecoin.Source = integrationSource
 	cfg.Filecoin.WithCDN = false
 	cfg.Filecoin.AllowPrivateNetworks = true
 	cfg.Filecoin.DefaultCopies = integrationCopies
@@ -829,6 +830,39 @@ func waitForCommittedCopies(t *testing.T, admin *e2e.AdminClient, bucket, versio
 		}
 		return provenance, true, nil
 	}, e2e.WithPollInterval(5*time.Second))
+}
+
+func assertDataSetMetadata(t *testing.T, ctx context.Context, privateKey, bucket string, provenance e2e.ProvenanceResponse) {
+	t.Helper()
+	rpcURL, ok := config.DefaultFilecoinRPCURL(integrationNetwork)
+	if !ok {
+		t.Fatalf("default RPC URL for %s is missing", integrationNetwork)
+	}
+	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
+		PrivateKey: privateKey,
+		RPCURL:     rpcURL,
+	})
+	if err != nil {
+		t.Fatalf("create metadata inspection client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	logStep(t, "verifying fixed dataset metadata for %d copies", len(provenance.Copies))
+	for _, copy := range provenance.Copies {
+		dataSetID, err := sdktypes.ParseBigInt(copy.DataSetID)
+		if err != nil {
+			t.Fatalf("parse dataset id %q: %v", copy.DataSetID, err)
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		metadata, err := client.WarmStorage().GetAllDataSetMetadata(queryCtx, dataSetID)
+		cancel()
+		if err != nil {
+			t.Fatalf("read dataset %s metadata: %v", copy.DataSetID, err)
+		}
+		if metadata["source"] != "synaps3" || metadata["bucket"] != bucket || len(metadata) != 2 {
+			t.Fatalf("dataset %s metadata = %#v, want source=synaps3 and bucket=%s", copy.DataSetID, metadata, bucket)
+		}
+	}
 }
 
 func waitForCompletedUploadTasks(t *testing.T, admin *e2e.AdminClient, versionID string) {

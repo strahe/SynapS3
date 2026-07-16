@@ -907,7 +907,6 @@ export interface SettingsS3Config {
 export interface SettingsFilecoinConfig {
   network: string
   rpc_url: string
-  source: string
   with_cdn: boolean
   allow_private_networks: boolean
   default_copies: number

@@ -21,7 +21,6 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 | `SYNAPS3_FILECOIN_NETWORK` | `filecoin.network` |
 | `SYNAPS3_FILECOIN_RPC_URL` | `filecoin.rpc_url` |
 | `SYNAPS3_FILECOIN_PRIVATE_KEY` | `filecoin.private_key` |
-| `SYNAPS3_FILECOIN_SOURCE` | `filecoin.source` |
 | `SYNAPS3_FILECOIN_WITH_CDN` | `filecoin.with_cdn` |
 | `SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS` | `filecoin.allow_private_networks` |
 | `SYNAPS3_FILECOIN_DEFAULT_COPIES` | `filecoin.default_copies` |

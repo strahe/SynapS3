@@ -45,6 +45,10 @@ printf '%*s\n' 128 'hello synaps3' > hello.txt
 > [!IMPORTANT]
 > The Filecoin upload path requires objects of at least 127 bytes. Keep test files at 128 bytes or larger.
 
+## Choose a Bucket Name
+
+Bucket names may be recorded publicly on-chain. Do not include sensitive information.
+
 ## AWS CLI
 
 Configure path-style addressing for the profile that talks to SynapS3:

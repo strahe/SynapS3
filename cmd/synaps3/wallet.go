@@ -568,7 +568,6 @@ func runWalletDeposit(ctx context.Context, cfg *config.Config, amount *big.Int, 
 	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
 		PrivateKey:           cfg.Filecoin.PrivateKey,
 		RPCURL:               cfg.Filecoin.RPCURL,
-		Source:               cfg.Filecoin.Source,
 		WithCDN:              cfg.Filecoin.WithCDN,
 		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 	})
@@ -593,7 +592,6 @@ func runWalletApprove(ctx context.Context, cfg *config.Config, timeout time.Dura
 	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
 		PrivateKey:           cfg.Filecoin.PrivateKey,
 		RPCURL:               cfg.Filecoin.RPCURL,
-		Source:               cfg.Filecoin.Source,
 		WithCDN:              cfg.Filecoin.WithCDN,
 		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 	})

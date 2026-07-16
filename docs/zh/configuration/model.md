@@ -44,7 +44,7 @@ private_key = "0x..."
 | --- | --- |
 | `server` | S3 API 监听、并发限制和 TLS 字段。 |
 | `s3` | 返回给 S3 客户端的 region。 |
-| `filecoin` | 网络、RPC、钱包、上传来源、存储提供方 URL 策略、CDN hints 和副本策略。 |
+| `filecoin` | 网络、RPC、钱包、存储提供方 URL 策略、CDN hints 和副本策略。 |
 | `filecoin.observability` | 存储提供方和本地 data set 健康检查。 |
 | `database` | SQLite 或 Postgres 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
@@ -63,7 +63,6 @@ private_key = "0x..."
 | `server.max_requests` | `512` |
 | `s3.region` | `us-east-1` |
 | `filecoin.network` | `calibration` |
-| `filecoin.source` | `synaps3` |
 | `filecoin.default_copies` | `3` |
 | `database.driver` | `sqlite` |
 | `database.max_open_conns` | `4` |

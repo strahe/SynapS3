@@ -739,19 +739,23 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 		}
 	})
 
-	t.Run("non editable fields are rejected before request", func(t *testing.T) {
-		var called bool
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			called = true
-		}))
-		defer ts.Close()
+	t.Run("unsupported fields are rejected before request", func(t *testing.T) {
+		for _, setting := range []string{"filecoin.private_key=secret", "filecoin.source=legacy"} {
+			t.Run(setting, func(t *testing.T) {
+				var called bool
+				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					called = true
+				}))
+				defer ts.Close()
 
-		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "settings", "set", "filecoin.private_key=secret"})
-		if err == nil {
-			t.Fatalf("expected error, output:\n%s", out)
-		}
-		if called {
-			t.Fatal("request was sent")
+				out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "settings", "set", setting})
+				if err == nil {
+					t.Fatalf("expected error, output:\n%s", out)
+				}
+				if called {
+					t.Fatal("request was sent")
+				}
+			})
 		}
 	})
 }
@@ -961,7 +965,6 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 			"filecoin": map[string]any{
 				"network":                network,
 				"rpc_url":                "https://rpc.example.test",
-				"source":                 "synaps3",
 				"with_cdn":               false,
 				"allow_private_networks": allowPrivate,
 				"default_copies":         3,

@@ -76,12 +76,6 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_FILECOIN_PRIVATE_KEY",
 		Secret:      true,
 	},
-	"filecoin.source": {
-		Label:       "Source",
-		Description: "Source identifier sent to synapse-go.",
-		Env:         "SYNAPS3_FILECOIN_SOURCE",
-		Editable:    true,
-	},
 	"filecoin.with_cdn": {
 		Label:       "Use CDN",
 		Description: "Requests CDN-backed retrieval hints for eligible uploads.",

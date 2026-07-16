@@ -83,7 +83,6 @@ const tabFields = {
     'filecoin.network',
     'filecoin.rpc_url',
     'filecoin.private_key',
-    'filecoin.source',
     'filecoin.with_cdn',
     'filecoin.allow_private_networks',
     'filecoin.default_copies',
@@ -428,14 +427,6 @@ function SettingsPage() {
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, rpc_url: value } })}
-              />
-              <TextField
-                label="Source"
-                field="filecoin.source"
-                value={form.filecoin.source}
-                data={data}
-                errors={fieldErrors}
-                onChange={(value) => setForm({ ...form, filecoin: { ...form.filecoin, source: value } })}
               />
               <NumberField
                 label="Default Copies"

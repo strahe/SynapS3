@@ -284,7 +284,6 @@ func runServe(ctx context.Context, src config.Source) error {
 	client, err := synapse.NewClient(ctx, synapse.ClientConfig{
 		PrivateKey:           cfg.Filecoin.PrivateKey,
 		RPCURL:               cfg.Filecoin.RPCURL,
-		Source:               cfg.Filecoin.Source,
 		WithCDN:              cfg.Filecoin.WithCDN,
 		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 		Logger:               logger,
@@ -397,7 +396,6 @@ func setupModeAllowedField(field string) bool {
 		"filecoin.network",
 		"filecoin.rpc_url",
 		"filecoin.private_key",
-		"filecoin.source",
 		"filecoin.default_copies",
 		"filecoin.observability.interval",
 		"filecoin.observability.timeout",

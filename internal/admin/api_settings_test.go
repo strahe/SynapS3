@@ -45,6 +45,9 @@ func TestSettingsGETRedactsSecretsAndReportsManualStatus(t *testing.T) {
 			t.Fatalf("settings response leaked %q: %s", leaked, body)
 		}
 	}
+	if strings.Contains(body, `"source":`) || strings.Contains(body, `"filecoin.source"`) {
+		t.Fatalf("settings response exposed removed source field: %s", body)
+	}
 
 	var resp settingsResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
@@ -209,22 +212,35 @@ func TestSettingsGETReportsManualSecretEnvSources(t *testing.T) {
 	}
 }
 
-func TestSettingsPUTRejectsSecretFieldsAndDoesNotPersistThem(t *testing.T) {
-	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
-
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{"s3":{"secret_key":"leak"}}`))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIUpdateSettings(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400, body=%s", rr.Code, rr.Body.String())
+func TestSettingsPUTRejectsUnknownFieldsAndDoesNotPersistThem(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		value   string
+	}{
+		{name: "secret", payload: `{"s3":{"secret_key":"leak"}}`, value: "leak"},
+		{name: "removed source", payload: `{"filecoin":{"source":"legacy"}}`, value: "legacy"},
 	}
-	if data, err := os.ReadFile(source.Path); err == nil && strings.Contains(string(data), "leak") {
-		t.Fatalf("secret field was persisted: %s", string(data))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validSettingsConfig(t)
+			source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
+			srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source)
+
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(tt.payload))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIUpdateSettings(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body=%s", rr.Code, rr.Body.String())
+			}
+			if data, err := os.ReadFile(source.Path); err == nil && strings.Contains(string(data), tt.value) {
+				t.Fatalf("unknown field was persisted: %s", string(data))
+			}
+		})
 	}
 }
 
@@ -375,6 +391,13 @@ func TestSettingsValidateRequiresValidJSON(t *testing.T) {
 			addr:        "127.0.0.1:9090",
 			contentType: "application/json",
 			body:        `{"cache":{"max_size_gb":8}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "removed source field",
+			addr:        "127.0.0.1:9090",
+			contentType: "application/json",
+			body:        `{"filecoin":{"source":"legacy"}}`,
 			wantStatus:  http.StatusBadRequest,
 		},
 	}
@@ -690,7 +713,6 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "s3 region", envName: "SYNAPS3_S3_REGION", payload: `{"s3":{"region":"eu-west-1"}}`, field: "s3.region"},
 		{name: "filecoin network", envName: "SYNAPS3_FILECOIN_NETWORK", payload: `{"filecoin":{"network":"mainnet"}}`, field: "filecoin.network"},
 		{name: "filecoin rpc url", envName: "SYNAPS3_FILECOIN_RPC_URL", payload: `{"filecoin":{"rpc_url":"https://rpc.example.invalid"}}`, field: "filecoin.rpc_url"},
-		{name: "filecoin source", envName: "SYNAPS3_FILECOIN_SOURCE", payload: `{"filecoin":{"source":"other"}}`, field: "filecoin.source"},
 		{name: "filecoin cdn", envName: "SYNAPS3_FILECOIN_WITH_CDN", payload: `{"filecoin":{"with_cdn":true}}`, field: "filecoin.with_cdn"},
 		{name: "filecoin private networks", envName: "SYNAPS3_FILECOIN_ALLOW_PRIVATE_NETWORKS", payload: `{"filecoin":{"allow_private_networks":true}}`, field: "filecoin.allow_private_networks"},
 		{name: "filecoin default copies", envName: "SYNAPS3_FILECOIN_DEFAULT_COPIES", payload: `{"filecoin":{"default_copies":3}}`, field: "filecoin.default_copies"},
@@ -746,7 +768,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":"not-a-port"},
 		"s3":{"region":""},
-		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","source":"","default_copies":0},
+		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","default_copies":0},
 		"worker":{"upload":{"max_retries":-1}},
 		"logging":{"level":"verbose","format":"xml","s3_access":{"level":"verbose"}}
 	}`))
@@ -763,7 +785,6 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"server.port",
 		"s3.region",
 		"filecoin.rpc_url",
-		"filecoin.source",
 		"filecoin.default_copies",
 		"worker.upload.max_retries",
 		"logging.level",

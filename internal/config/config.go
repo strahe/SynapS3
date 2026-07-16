@@ -57,7 +57,6 @@ type FilecoinConfig struct {
 	Network              string                      `koanf:"network"` // calibration | mainnet
 	RPCURL               string                      `koanf:"rpc_url"`
 	PrivateKey           string                      `koanf:"private_key"`
-	Source               string                      `koanf:"source"`
 	WithCDN              bool                        `koanf:"with_cdn"`
 	AllowPrivateNetworks bool                        `koanf:"allow_private_networks"`
 	DefaultCopies        int                         `koanf:"default_copies"`
@@ -165,7 +164,6 @@ func defaultConfig() *Config {
 		Filecoin: FilecoinConfig{
 			Network:       "calibration",
 			RPCURL:        defaultFilecoinRPCURLs["calibration"],
-			Source:        "synaps3",
 			DefaultCopies: DefaultFilecoinCopies,
 			Observability: FilecoinObservabilityConfig{
 				Interval:    5 * time.Minute,
@@ -422,9 +420,6 @@ func (c *Config) FieldValidationErrors() []FieldError {
 	}
 	if msg := validateRPCURL(c.Filecoin.RPCURL); msg != "" {
 		add("filecoin.rpc_url", msg)
-	}
-	if strings.TrimSpace(c.Filecoin.Source) == "" {
-		add("filecoin.source", "must be non-empty")
 	}
 	if strings.TrimSpace(c.Filecoin.PrivateKey) == "" {
 		add("filecoin.private_key", "must be non-empty")

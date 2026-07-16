@@ -33,13 +33,11 @@ func TestReadinessCheckerBlocksMissingConfig(t *testing.T) {
 		"config_private_key",
 		"config_rpc_url",
 		"config_network",
-		"config_source",
 		"config_default_copies",
 	)
 	requireCheckMessage(t, got.Checks, "config_private_key", "Filecoin private key is missing.")
 	requireCheckMessage(t, got.Checks, "config_rpc_url", "Filecoin RPC URL is missing or invalid.")
 	requireCheckMessage(t, got.Checks, "config_network", "Filecoin network is unsupported.")
-	requireCheckMessage(t, got.Checks, "config_source", "Filecoin source namespace is missing.")
 	requireCheckMessage(t, got.Checks, "config_default_copies", "Default Filecoin copy count is invalid.")
 }
 
@@ -289,7 +287,6 @@ func readyReadinessConfig() ReadinessConfig {
 		Network:              "calibration",
 		RPCURL:               "https://api.calibration.node.glif.io/rpc/v1",
 		PrivateKey:           "configured-private-key",
-		Source:               "synaps3",
 		DefaultCopies:        1,
 		AllowPrivateNetworks: false,
 	}

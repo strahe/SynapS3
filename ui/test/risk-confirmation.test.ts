@@ -57,7 +57,6 @@ function baseConfig(): SettingsEditableConfig {
     filecoin: {
       network: 'calibration',
       rpc_url: 'https://api.calibration.node.glif.io/rpc/v1',
-      source: 'synaps3',
       with_cdn: false,
       allow_private_networks: false,
       default_copies: 2,

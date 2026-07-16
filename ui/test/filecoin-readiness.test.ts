@@ -107,7 +107,6 @@ test('preflight payload includes editable filecoin fields and excludes private k
   const payload = buildFilecoinPreflightPayload({
     network: 'calibration',
     rpc_url: 'https://rpc.example.invalid',
-    source: 'synaps3',
     with_cdn: true,
     allow_private_networks: false,
     default_copies: 2,
@@ -120,7 +119,6 @@ test('preflight payload includes editable filecoin fields and excludes private k
     filecoin: {
       network: 'calibration',
       rpc_url: 'https://rpc.example.invalid',
-      source: 'synaps3',
       with_cdn: true,
       allow_private_networks: false,
       default_copies: 2,
@@ -133,7 +131,6 @@ test('preflight payload includes editable filecoin fields and excludes private k
     {
       network: 'calibration',
       rpc_url: 'https://env.example.invalid',
-      source: 'synaps3',
       with_cdn: true,
       allow_private_networks: false,
       default_copies: 2,
@@ -149,7 +146,6 @@ test('preflight payload includes editable filecoin fields and excludes private k
   assert.deepEqual(envManagedPayload, {
     filecoin: {
       network: 'calibration',
-      source: 'synaps3',
       with_cdn: true,
       allow_private_networks: false,
       observability: { interval: '10m0s' },

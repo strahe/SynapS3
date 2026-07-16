@@ -23,7 +23,6 @@ export function buildSettingsPayload(
   payload.filecoin = {}
   if (include('filecoin.network')) payload.filecoin.network = form.filecoin.network
   if (include('filecoin.rpc_url')) payload.filecoin.rpc_url = form.filecoin.rpc_url
-  if (include('filecoin.source')) payload.filecoin.source = form.filecoin.source
   if (include('filecoin.default_copies')) payload.filecoin.default_copies = form.filecoin.default_copies
   if (include('filecoin.with_cdn')) payload.filecoin.with_cdn = form.filecoin.with_cdn
   if (include('filecoin.allow_private_networks'))

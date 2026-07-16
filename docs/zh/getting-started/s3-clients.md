@@ -45,6 +45,10 @@ printf '%*s\n' 128 'hello synaps3' > hello.txt
 > [!IMPORTANT]
 > Filecoin 上传路径要求对象不小于 127 字节。测试文件请保持 128 字节或更大。
 
+## 选择 bucket 名
+
+bucket 名可能公开记录在链上，请勿包含敏感信息。
+
 ## AWS CLI
 
 为 SynapS3 profile 配置 path-style addressing：

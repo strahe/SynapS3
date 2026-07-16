@@ -48,7 +48,6 @@ const emptyDismissedChecks = new Set<string>()
 const filecoinPayloadKeys = [
   'network',
   'rpc_url',
-  'source',
   'with_cdn',
   'allow_private_networks',
   'default_copies',
@@ -57,7 +56,6 @@ const filecoinPayloadKeys = [
 const filecoinPayloadFieldPaths: Record<(typeof filecoinPayloadKeys)[number], string> = {
   network: 'filecoin.network',
   rpc_url: 'filecoin.rpc_url',
-  source: 'filecoin.source',
   with_cdn: 'filecoin.with_cdn',
   allow_private_networks: 'filecoin.allow_private_networks',
   default_copies: 'filecoin.default_copies',
@@ -77,7 +75,6 @@ const checkTitles: Record<string, string> = {
   config_private_key: 'Private key',
   config_rpc_url: 'RPC URL',
   config_network: 'Network selection',
-  config_source: 'Source namespace',
   config_default_copies: 'Default copy count',
   private_networks: 'Private network access',
   sdk_client: 'Filecoin SDK client',

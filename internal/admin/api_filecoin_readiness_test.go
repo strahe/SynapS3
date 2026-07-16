@@ -135,19 +135,31 @@ func TestFilecoinReadinessPreflightRequiresJSONContentType(t *testing.T) {
 	}
 }
 
-func TestFilecoinReadinessPreflightRejectsUnknownPrivateKeyWithoutLeakingIt(t *testing.T) {
-	cfg := validSettingsConfig(t)
-	source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
-	probe := &fakeFilecoinReadinessProbe{draft: readyFilecoinReadinessResult(synapse.ReadinessModeDraft)}
-	srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source).WithFilecoinReadiness(probe)
-	req := newFilecoinPreflightRequest(`{"filecoin":{"private_key":"raw-private-key"}}`)
-	rr := assertPreflightStatus(t, srv, req, http.StatusBadRequest)
-
-	if strings.Contains(rr.Body.String(), "raw-private-key") {
-		t.Fatalf("response leaked private key: %s", rr.Body.String())
+func TestFilecoinReadinessPreflightRejectsUnknownFieldsWithoutLeakingValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		value   string
+	}{
+		{name: "private key", payload: `{"filecoin":{"private_key":"raw-private-key"}}`, value: "raw-private-key"},
+		{name: "removed source", payload: `{"filecoin":{"source":"legacy"}}`, value: "legacy"},
 	}
-	if probe.draftCalls != 0 {
-		t.Fatalf("draft probe calls = %d, want 0", probe.draftCalls)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validSettingsConfig(t)
+			source := config.Source{Path: filepath.Join(t.TempDir(), "config.toml")}
+			probe := &fakeFilecoinReadinessProbe{draft: readyFilecoinReadinessResult(synapse.ReadinessModeDraft)}
+			srv := newSettingsAPITestServer(t, "127.0.0.1:9090", cfg, source).WithFilecoinReadiness(probe)
+			rr := assertPreflightStatus(t, srv, newFilecoinPreflightRequest(tt.payload), http.StatusBadRequest)
+
+			if strings.Contains(rr.Body.String(), tt.value) {
+				t.Fatalf("response leaked unknown value: %s", rr.Body.String())
+			}
+			if probe.draftCalls != 0 {
+				t.Fatalf("draft probe calls = %d, want 0", probe.draftCalls)
+			}
+		})
 	}
 }
 

@@ -8,11 +8,12 @@ import (
 	sdk "github.com/strahe/synapse-go"
 )
 
+const dataSetSource = "synaps3"
+
 // ClientConfig contains SynapS3 runtime settings forwarded into synapse-go.
 type ClientConfig struct {
 	PrivateKey           string
 	RPCURL               string
-	Source               string
 	WithCDN              bool
 	AllowPrivateNetworks bool
 	Logger               *slog.Logger
@@ -23,11 +24,9 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*sdk.Client, error) {
 	opts := []sdk.ClientOption{
 		sdk.WithPrivateKeyHex(cfg.PrivateKey),
 		sdk.WithRPCURL(cfg.RPCURL),
+		sdk.WithSource(dataSetSource),
 		sdk.WithCDN(cfg.WithCDN),
 		sdk.WithAllowPrivateNetworks(cfg.AllowPrivateNetworks),
-	}
-	if cfg.Source != "" {
-		opts = append(opts, sdk.WithSource(cfg.Source))
 	}
 	if cfg.Logger != nil {
 		opts = append(opts, sdk.WithLogger(cfg.Logger))

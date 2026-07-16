@@ -269,13 +269,6 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 			},
 		},
 		{
-			name:  "filecoin source",
-			field: "filecoin.source",
-			mutate: func(cfg *Config) {
-				cfg.Filecoin.Source = ""
-			},
-		},
-		{
 			name:  "worker max retries",
 			field: "worker.upload.max_retries",
 			mutate: func(cfg *Config) {
@@ -688,7 +681,6 @@ func TestLoad_FilecoinSDKOptions(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 	cfgTOML := []byte(`[filecoin]
-source = "synaps3-test"
 with_cdn = true
 allow_private_networks = true
 `)
@@ -699,9 +691,6 @@ allow_private_networks = true
 	cfg, err := Load(cfgPath)
 	if err != nil {
 		t.Fatalf("Load(%q) failed: %v", cfgPath, err)
-	}
-	if cfg.Filecoin.Source != "synaps3-test" {
-		t.Fatalf("filecoin.source = %q, want synaps3-test", cfg.Filecoin.Source)
 	}
 	if !cfg.Filecoin.WithCDN {
 		t.Fatal("filecoin.with_cdn = false, want true")

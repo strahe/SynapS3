@@ -62,7 +62,6 @@ type ReadinessConfig struct {
 	Network              string
 	RPCURL               string
 	PrivateKey           string
-	Source               string
 	WithCDN              bool
 	AllowPrivateNetworks bool
 	DefaultCopies        int
@@ -427,13 +426,6 @@ func validateReadinessConfig(cfg ReadinessConfig, result *ReadinessResult) bool 
 		"Use calibration or mainnet.",
 	)
 	add(
-		"config_source",
-		strings.TrimSpace(cfg.Source) == "",
-		"Filecoin source namespace is configured.",
-		"Filecoin source namespace is missing.",
-		"Set filecoin.source to a non-empty application namespace.",
-	)
-	add(
 		"config_default_copies",
 		!model.ValidStorageCopies(cfg.DefaultCopies),
 		"Default Filecoin copy count is valid.",
@@ -609,7 +601,6 @@ func defaultReadinessClientFactory(ctx context.Context, cfg ReadinessConfig) (Re
 	client, err := NewClient(ctx, ClientConfig{
 		PrivateKey:           cfg.PrivateKey,
 		RPCURL:               cfg.RPCURL,
-		Source:               cfg.Source,
 		WithCDN:              cfg.WithCDN,
 		AllowPrivateNetworks: cfg.AllowPrivateNetworks,
 	})

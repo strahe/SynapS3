@@ -369,6 +369,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 			t.Fatalf("generated TOML missing %q:\n%s", want, text)
 		}
 	}
+	if strings.Contains(text, "source =") {
+		t.Fatalf("generated TOML exposes removed filecoin source setting:\n%s", text)
+	}
 
 	loaded, err := Load(path)
 	if err != nil {

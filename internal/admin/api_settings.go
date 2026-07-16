@@ -156,7 +156,6 @@ func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Conf
 	if req.Filecoin != nil {
 		setString("filecoin.network", &next.Filecoin.Network, req.Filecoin.Network)
 		setString("filecoin.rpc_url", &next.Filecoin.RPCURL, req.Filecoin.RPCURL)
-		setString("filecoin.source", &next.Filecoin.Source, req.Filecoin.Source)
 		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.Filecoin.WithCDN)
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.Filecoin.AllowPrivateNetworks)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.Filecoin.DefaultCopies)
@@ -247,7 +246,6 @@ func (s *SettingsService) FilecoinDraftConfig(req *settingsFilecoinUpdate) (*con
 	if req != nil {
 		setString("filecoin.network", &next.Filecoin.Network, req.Network)
 		setString("filecoin.rpc_url", &next.Filecoin.RPCURL, req.RPCURL)
-		setString("filecoin.source", &next.Filecoin.Source, req.Source)
 		setBool("filecoin.with_cdn", &next.Filecoin.WithCDN, req.WithCDN)
 		setBool("filecoin.allow_private_networks", &next.Filecoin.AllowPrivateNetworks, req.AllowPrivateNetworks)
 		setInt("filecoin.default_copies", &next.Filecoin.DefaultCopies, req.DefaultCopies)
@@ -377,7 +375,6 @@ type settingsS3Config struct {
 type settingsFilecoinConfig struct {
 	Network              string                      `json:"network"`
 	RPCURL               string                      `json:"rpc_url"`
-	Source               string                      `json:"source"`
 	WithCDN              bool                        `json:"with_cdn"`
 	AllowPrivateNetworks bool                        `json:"allow_private_networks"`
 	DefaultCopies        int                         `json:"default_copies"`
@@ -482,7 +479,6 @@ type settingsS3Update struct {
 type settingsFilecoinUpdate struct {
 	Network              *string                      `json:"network,omitempty"`
 	RPCURL               *string                      `json:"rpc_url,omitempty"`
-	Source               *string                      `json:"source,omitempty"`
 	WithCDN              *bool                        `json:"with_cdn,omitempty"`
 	AllowPrivateNetworks *bool                        `json:"allow_private_networks,omitempty"`
 	DefaultCopies        *int                         `json:"default_copies,omitempty"`
@@ -542,7 +538,6 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 		Filecoin: settingsFilecoinConfig{
 			Network:              cfg.Filecoin.Network,
 			RPCURL:               cfg.Filecoin.RPCURL,
-			Source:               cfg.Filecoin.Source,
 			WithCDN:              cfg.Filecoin.WithCDN,
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
 			DefaultCopies:        cfg.Filecoin.DefaultCopies,
@@ -620,7 +615,6 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"cache.eviction_policy":                {},
 		"filecoin.network":                     {},
 		"filecoin.rpc_url":                     {},
-		"filecoin.source":                      {},
 		"filecoin.default_copies":              {},
 		"filecoin.observability.interval":      {},
 		"filecoin.observability.timeout":       {},
@@ -653,7 +647,6 @@ func filecoinEditableValidationErrors(cfg *config.Config) []config.FieldError {
 	editable := map[string]struct{}{
 		"filecoin.network":                   {},
 		"filecoin.rpc_url":                   {},
-		"filecoin.source":                    {},
 		"filecoin.default_copies":            {},
 		"filecoin.observability.interval":    {},
 		"filecoin.observability.timeout":     {},

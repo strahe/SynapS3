@@ -16,7 +16,6 @@ function baseConfig(): SettingsEditableConfig {
     filecoin: {
       network: 'calibration',
       rpc_url: 'https://rpc.example.invalid',
-      source: 'synaps3',
       with_cdn: false,
       allow_private_networks: false,
       default_copies: 2,

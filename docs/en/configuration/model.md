@@ -44,7 +44,7 @@ Admin auth also requires a password hash and `admin.auth.session_secret` when `a
 | --- | --- |
 | `server` | S3 API listener, concurrency limits, and TLS fields. |
 | `s3` | Region reported to S3 clients. |
-| `filecoin` | Network, RPC, wallet, upload source, provider URL policy, CDN hints, and copy policy. |
+| `filecoin` | Network, RPC, wallet, provider URL policy, CDN hints, and copy policy. |
 | `filecoin.observability` | Provider and local data set health checks. |
 | `database` | SQLite or Postgres metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
@@ -63,7 +63,6 @@ Admin auth also requires a password hash and `admin.auth.session_secret` when `a
 | `server.max_requests` | `512` |
 | `s3.region` | `us-east-1` |
 | `filecoin.network` | `calibration` |
-| `filecoin.source` | `synaps3` |
 | `filecoin.default_copies` | `3` |
 | `database.driver` | `sqlite` |
 | `database.max_open_conns` | `4` |
