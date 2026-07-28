@@ -43,24 +43,7 @@ func TestWalletOperationRepo_CreateOrGetIsIdempotentByTypeAndClientRequestID(t *
 	}
 }
 
-func TestWalletOperationRepo_CreateOrGetRejectsInvalidAmount(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	for _, amount := range []string{"", "0", "00", "-1", "1.5", "abc"} {
-		_, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
-			Type:            model.WalletOperationTypeFund,
-			ClientRequestID: "request-" + amount,
-			Amount:          amount,
-		})
-		if !errors.Is(err, repository.ErrWalletOperationInvalidAmount) {
-			t.Fatalf("CreateOrGet amount %q error = %v, want ErrWalletOperationInvalidAmount", amount, err)
-		}
-	}
-}
-
-func TestWalletOperationRepo_CreateOrGetValidatesAmountByType(t *testing.T) {
+func TestWalletOperationRepo_CreateOrGetValidatesAmount(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -82,8 +65,13 @@ func TestWalletOperationRepo_CreateOrGetValidatesAmountByType(t *testing.T) {
 		opType model.WalletOperationType
 		amount string
 	}{
-		{name: "approve positive", opType: model.WalletOperationTypeApprove, amount: "1"},
+		{name: "fund empty", opType: model.WalletOperationTypeFund, amount: ""},
 		{name: "fund zero", opType: model.WalletOperationTypeFund, amount: "0"},
+		{name: "fund leading zero", opType: model.WalletOperationTypeFund, amount: "00"},
+		{name: "fund negative", opType: model.WalletOperationTypeFund, amount: "-1"},
+		{name: "fund float", opType: model.WalletOperationTypeFund, amount: "1.5"},
+		{name: "fund string", opType: model.WalletOperationTypeFund, amount: "abc"},
+		{name: "approve positive", opType: model.WalletOperationTypeApprove, amount: "1"},
 		{name: "withdraw zero", opType: model.WalletOperationTypeWithdraw, amount: "0"},
 		{name: "unknown type", opType: model.WalletOperationType("unknown"), amount: "1"},
 	} {
@@ -162,6 +150,51 @@ func TestWalletOperationRepo_ClaimPendingAndMarkSubmitted(t *testing.T) {
 	}
 }
 
+func TestWalletOperationRepo_MarkConfirmed(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+		Type:            model.WalletOperationTypeFund,
+		ClientRequestID: "fund-confirm-1",
+		Amount:          "100",
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGet: %v", err)
+	}
+	claimed, err := repos.WalletOperations.ClaimPending(ctx, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if claimed == nil || claimed.ID != op.ID {
+		t.Fatalf("claimed = %#v, want operation %d", claimed, op.ID)
+	}
+	if err := repos.WalletOperations.MarkSubmitted(ctx, claimed.ID, "0xabc"); err != nil {
+		t.Fatalf("MarkSubmitted: %v", err)
+	}
+	if err := repos.WalletOperations.MarkConfirmed(ctx, claimed.ID); err != nil {
+		t.Fatalf("MarkConfirmed: %v", err)
+	}
+
+	got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != model.WalletOperationStatusConfirmed {
+		t.Fatalf("status = %q, want confirmed", got.Status)
+	}
+	if got.TxHash == nil || *got.TxHash != "0xabc" {
+		t.Fatalf("tx_hash = %v, want 0xabc", got.TxHash)
+	}
+	if got.SubmittedAt == nil {
+		t.Fatal("submitted_at = nil, want timestamp")
+	}
+	if got.CompletedAt == nil {
+		t.Fatal("completed_at = nil, want timestamp")
+	}
+}
+
 func TestWalletOperationRepo_MarkConfirmedWithoutTransaction(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -205,46 +238,139 @@ func TestWalletOperationRepo_MarkConfirmedWithoutTransaction(t *testing.T) {
 }
 
 func TestWalletOperationRepo_MarkFailed(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
+	t.Run("pending", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
 
-	op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
-		Type:            model.WalletOperationTypeFund,
-		ClientRequestID: "request-failed",
-		Amount:          "100",
+		op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+			Type:            model.WalletOperationTypeFund,
+			ClientRequestID: "request-failed-pending",
+			Amount:          "100",
+		})
+		if err != nil {
+			t.Fatalf("CreateOrGet: %v", err)
+		}
+		if err := repos.WalletOperations.MarkFailed(ctx, op.ID, "cancelled before claim"); err != nil {
+			t.Fatalf("MarkFailed: %v", err)
+		}
+		got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+		if got.Status != model.WalletOperationStatusFailed {
+			t.Fatalf("status = %q, want failed", got.Status)
+		}
+		if got.LastError == nil || *got.LastError != "cancelled before claim" {
+			t.Fatalf("last_error = %v, want cancelled before claim", got.LastError)
+		}
+		if got.CompletedAt == nil {
+			t.Fatal("completed_at = nil, want timestamp")
+		}
 	})
-	if err != nil {
-		t.Fatalf("CreateOrGet: %v", err)
-	}
-	claimed, err := repos.WalletOperations.ClaimPending(ctx, time.Minute)
-	if err != nil {
-		t.Fatalf("ClaimPending: %v", err)
-	}
-	if claimed == nil || claimed.ID != op.ID {
-		t.Fatalf("claimed = %#v, want operation %d", claimed, op.ID)
-	}
 
-	if err := repos.WalletOperations.MarkFailed(ctx, claimed.ID, "broadcast failed"); err != nil {
-		t.Fatalf("MarkFailed: %v", err)
-	}
+	t.Run("running", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
 
-	got, err := repos.WalletOperations.GetByID(ctx, claimed.ID)
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if got.Status != model.WalletOperationStatusFailed {
-		t.Fatalf("status = %q, want failed", got.Status)
-	}
-	if got.LastError == nil || *got.LastError != "broadcast failed" {
-		t.Fatalf("last_error = %v, want broadcast failed", got.LastError)
-	}
-	if got.LeaseUntil != nil {
-		t.Fatalf("lease_until = %v, want nil", got.LeaseUntil)
-	}
-	if got.CompletedAt == nil {
-		t.Fatal("completed_at = nil, want timestamp")
-	}
+		op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+			Type:            model.WalletOperationTypeFund,
+			ClientRequestID: "request-failed-running",
+			Amount:          "100",
+		})
+		if err != nil {
+			t.Fatalf("CreateOrGet: %v", err)
+		}
+		claimed, err := repos.WalletOperations.ClaimPending(ctx, time.Minute)
+		if err != nil {
+			t.Fatalf("ClaimPending: %v", err)
+		}
+		if claimed == nil || claimed.ID != op.ID {
+			t.Fatalf("claimed = %#v, want operation %d", claimed, op.ID)
+		}
+		if err := repos.WalletOperations.MarkFailed(ctx, claimed.ID, "broadcast failed"); err != nil {
+			t.Fatalf("MarkFailed: %v", err)
+		}
+
+		got, err := repos.WalletOperations.GetByID(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+		if got.Status != model.WalletOperationStatusFailed {
+			t.Fatalf("status = %q, want failed", got.Status)
+		}
+		if got.LastError == nil || *got.LastError != "broadcast failed" {
+			t.Fatalf("last_error = %v, want broadcast failed", got.LastError)
+		}
+		if got.LeaseUntil != nil {
+			t.Fatalf("lease_until = %v, want nil", got.LeaseUntil)
+		}
+		if got.CompletedAt == nil {
+			t.Fatal("completed_at = nil, want timestamp")
+		}
+	})
+
+	t.Run("submitted", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+
+		op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+			Type:            model.WalletOperationTypeFund,
+			ClientRequestID: "request-failed-submitted",
+			Amount:          "100",
+		})
+		if err != nil {
+			t.Fatalf("CreateOrGet: %v", err)
+		}
+		claimed, err := repos.WalletOperations.ClaimPending(ctx, time.Minute)
+		if err != nil {
+			t.Fatalf("ClaimPending: %v", err)
+		}
+		if err := repos.WalletOperations.MarkSubmitted(ctx, claimed.ID, "0xbad"); err != nil {
+			t.Fatalf("MarkSubmitted: %v", err)
+		}
+		if err := repos.WalletOperations.MarkFailed(ctx, claimed.ID, "failed after submit"); err != nil {
+			t.Fatalf("MarkFailed: %v", err)
+		}
+
+		got, err := repos.WalletOperations.GetByID(ctx, op.ID)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+		if got.Status != model.WalletOperationStatusFailed {
+			t.Fatalf("status = %q, want failed", got.Status)
+		}
+		if got.LastError == nil || *got.LastError != "failed after submit" {
+			t.Fatalf("last_error = %v, want failed after submit", got.LastError)
+		}
+	})
+
+	t.Run("confirmed rejected", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+
+		op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+			Type:            model.WalletOperationTypeApprove,
+			ClientRequestID: "approve-not-failed",
+			Amount:          "0",
+		})
+		if err != nil {
+			t.Fatalf("CreateOrGet: %v", err)
+		}
+		claimed, err := repos.WalletOperations.ClaimPending(ctx, time.Minute)
+		if err != nil {
+			t.Fatalf("ClaimPending: %v", err)
+		}
+		if err := repos.WalletOperations.MarkConfirmedWithoutTransaction(ctx, claimed.ID); err != nil {
+			t.Fatalf("MarkConfirmedWithoutTransaction: %v", err)
+		}
+		if err := repos.WalletOperations.MarkFailed(ctx, op.ID, "failed after confirm"); err == nil {
+			t.Fatal("expected error marking confirmed operation as failed")
+		}
+	})
 }
 
 func TestWalletOperationRepo_ListSubmitted(t *testing.T) {
@@ -383,7 +509,7 @@ func TestWalletOperationRepo_ClaimPendingWaitsForInFlightOperation(t *testing.T)
 	}
 }
 
-func TestWalletOperationRepo_MarkExpiredRunningUnknownLeavesSubmittedAlone(t *testing.T) {
+func TestWalletOperationRepo_MarkExpiredRunningUnknownLeavesPendingAndSubmittedAlone(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -403,6 +529,14 @@ func TestWalletOperationRepo_MarkExpiredRunningUnknownLeavesSubmittedAlone(t *te
 	})
 	if err != nil {
 		t.Fatalf("CreateOrGet submitted: %v", err)
+	}
+	pending, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+		Type:            model.WalletOperationTypeFund,
+		ClientRequestID: "pending",
+		Amount:          "100",
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGet pending: %v", err)
 	}
 
 	now := time.Now()
@@ -441,11 +575,15 @@ func TestWalletOperationRepo_MarkExpiredRunningUnknownLeavesSubmittedAlone(t *te
 
 	gotRunning, _ := repos.WalletOperations.GetByID(ctx, running.ID)
 	gotSubmitted, _ := repos.WalletOperations.GetByID(ctx, submitted.ID)
+	gotPending, _ := repos.WalletOperations.GetByID(ctx, pending.ID)
 	if gotRunning.Status != model.WalletOperationStatusUnknown {
 		t.Fatalf("running status = %q, want unknown", gotRunning.Status)
 	}
 	if gotSubmitted.Status != model.WalletOperationStatusSubmitted {
 		t.Fatalf("submitted status = %q, want submitted", gotSubmitted.Status)
+	}
+	if gotPending.Status != model.WalletOperationStatusPending {
+		t.Fatalf("pending status = %q, want pending", gotPending.Status)
 	}
 }
 

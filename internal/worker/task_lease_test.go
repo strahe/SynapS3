@@ -10,6 +10,22 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 )
 
+type renewLeaseNotifyRepo struct {
+	repository.TaskRepository
+	renewed chan struct{}
+}
+
+func (r *renewLeaseNotifyRepo) RenewLease(ctx context.Context, task *model.Task, leaseDuration time.Duration) error {
+	err := r.TaskRepository.RenewLease(ctx, task, leaseDuration)
+	if err == nil {
+		select {
+		case r.renewed <- struct{}{}:
+		default:
+		}
+	}
+	return err
+}
+
 func TestTaskLeaseRenewalExtendsLeaseUntilStopped(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -35,19 +51,26 @@ func TestTaskLeaseRenewalExtendsLeaseUntilStopped(t *testing.T) {
 	}
 	oldLeaseUntil := *claimed.LeaseUntil
 
+	notify := &renewLeaseNotifyRepo{
+		TaskRepository: repos.Tasks,
+		renewed:        make(chan struct{}, 1),
+	}
+	repos.Tasks = notify
+
 	stop := startTaskLeaseRenewal(nil, repos, claimed, 30*time.Millisecond)
 	defer stop()
 
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		got, err := repos.Tasks.GetByID(ctx, claimed.ID)
-		if err != nil {
-			t.Fatalf("GetByID: %v", err)
-		}
-		if got.LeaseUntil != nil && got.LeaseUntil.After(oldLeaseUntil) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-notify.renewed:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("lease renewal was not observed")
 	}
-	t.Fatal("lease_until was not renewed")
+
+	got, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.LeaseUntil == nil || !got.LeaseUntil.After(oldLeaseUntil) {
+		t.Fatal("lease_until was not renewed")
+	}
 }

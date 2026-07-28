@@ -469,16 +469,40 @@ func TestTaskRepo_CompleteWithMessage(t *testing.T) {
 	}
 }
 
-func TestTaskRepo_Complete_NotRunning(t *testing.T) {
+func TestTaskRepo_StateTransitionsRejectInvalidStatus(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	seeded := seedTask(t, repos, model.TaskTypeUpload)
-	// Try to complete a queued task — should fail.
-	err := repos.Tasks.Complete(ctx, seeded)
-	if err == nil {
-		t.Fatal("expected error completing queued task")
+	for _, tc := range []struct {
+		name string
+		fn   func(seeded *model.Task) error
+	}{
+		{
+			name: "Complete not running",
+			fn: func(seeded *model.Task) error {
+				return repos.Tasks.Complete(ctx, seeded)
+			},
+		},
+		{
+			name: "MarkRunningExhausted not running",
+			fn: func(seeded *model.Task) error {
+				return repos.Tasks.MarkRunningExhausted(ctx, seeded, "should fail")
+			},
+		},
+		{
+			name: "RetryExhausted not exhausted",
+			fn: func(seeded *model.Task) error {
+				return repos.Tasks.RetryExhausted(ctx, seeded.ID)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seeded := seedTask(t, repos, model.TaskTypeUpload)
+			if err := tc.fn(seeded); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
 	}
 }
 
@@ -650,18 +674,6 @@ func TestTaskRepo_MarkRunningExhausted(t *testing.T) {
 	}
 	if task.CompletedAt == nil {
 		t.Error("expected completed_at to be set")
-	}
-}
-
-func TestTaskRepo_MarkRunningExhausted_NotRunning(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	seeded := seedTask(t, repos, model.TaskTypeUpload)
-	err := repos.Tasks.MarkRunningExhausted(ctx, seeded, "should fail")
-	if err == nil {
-		t.Fatal("expected error marking queued task as exhausted")
 	}
 }
 
@@ -853,18 +865,6 @@ func TestTaskRepo_RetryPrimaryCommitExhaustedRestoresCommittingState(t *testing.
 	}
 	if got.FailedAtState != nil || got.LastError != nil {
 		t.Fatalf("failure details = failed_at_state:%#v last_error:%#v, want nil", got.FailedAtState, got.LastError)
-	}
-}
-
-func TestTaskRepo_RetryExhausted_NotExhausted(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	seeded := seedTask(t, repos, model.TaskTypeUpload)
-	err := repos.Tasks.RetryExhausted(ctx, seeded.ID)
-	if err == nil {
-		t.Fatal("expected error retrying non-exhausted task")
 	}
 }
 
