@@ -294,6 +294,14 @@ func (r *BunStorageUploadRepo) ListReadableCommittedCopies(ctx context.Context, 
 	return copies, nil
 }
 
+func (r *BunStorageUploadRepo) HasReadableCommittedCopy(ctx context.Context, uploadID int64) (bool, error) {
+	count, err := countReadableCommittedCopies(ctx, r.db, uploadID)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 type bucketStorageHealthSummaryRow struct {
 	BucketID               int64      `bun:"bucket_id"`
 	AbnormalDataSets       int        `bun:"abnormal_data_sets"`
@@ -1110,6 +1118,21 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 		for _, ref := range refs {
 			if err := completeUploadTasksForVersion(ctx, db, ref.VersionID, now, unclaimedTaskStatuses()); err != nil {
 				return err
+			}
+			if input.EnqueueAfterUploadEviction {
+				evictions := &BunCacheEvictionRepo{db: db}
+				if _, err := evictions.EnsureAfterUploadTask(
+					ctx,
+					ref.ObjectID,
+					ref.VersionID,
+					input.EvictionMaxRetries,
+				); err != nil {
+					return fmt.Errorf(
+						"creating after-upload eviction task for version %s: %w",
+						ref.VersionID,
+						err,
+					)
+				}
 			}
 		}
 		finalized = true

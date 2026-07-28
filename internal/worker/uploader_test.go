@@ -20,6 +20,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -129,8 +130,12 @@ func seedTask(t *testing.T, env *testWorkerEnv, taskType model.TaskType, refID i
 		MaxRetries:     maxRetries,
 		ScheduledAt:    time.Now(),
 	}
-	if taskType == model.TaskTypeUpload {
+	switch taskType {
+	case model.TaskTypeUpload:
 		task.Payload = map[string]interface{}{"stage": ""}
+	case model.TaskTypeEvictCache:
+		stage := cacheeviction.StageAfterUpload
+		task.Stage = &stage
 	}
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("creating task: %v", err)
@@ -627,7 +632,7 @@ func TestUploader_WaitsPollIntervalBeforeInitialClaim(t *testing.T) {
 		return contexts, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, pollInterval, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, pollInterval, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -701,7 +706,7 @@ func TestUploader_CompletesRetryWhenObjectIsAlreadyStored(t *testing.T) {
 		storageCalls.Add(1)
 		return nil, errors.New("storage must not be called for a stored object")
 	}
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 	got := runWorkerUntilTask(t, env, uploader, task.ID, time.Second)
 
 	if got.Status != model.TaskStatusCompleted {
@@ -748,7 +753,7 @@ func TestUploader_ClaimsLaterPendingTaskWhileAnotherUploadRuns(t *testing.T) {
 		return contexts, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 2, 20*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 2, 20*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -806,7 +811,7 @@ func TestUploader_HealthyWhileUploadTaskIsActive(t *testing.T) {
 		return contexts, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, pollInterval, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, pollInterval, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -832,8 +837,14 @@ func TestUploader_StagedPrimaryStoreRecordsTransferProgress(t *testing.T) {
 	upload, task, primaryCtx := seedReadyPrimaryStoreTask(t, env)
 	primaryCtx.storeProgress = []int64{5, 11}
 	publisher := &fakeAdminEventPublisher{}
+	before, err := env.repos.Objects.GetVersionByID(context.Background(), task.RefVersionID)
+	if err != nil || before == nil || before.CacheAccessedAt == nil {
+		t.Fatalf("GetVersionByID before upload: version=%v err=%v", before, err)
+	}
+	objects := &cacheAccessCountingObjectRepo{ObjectRepository: env.repos.Objects}
+	env.repos.Objects = objects
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default(), worker.WithEventPublisher(publisher))
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default(), worker.WithEventPublisher(publisher))
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	got, err := env.repos.Uploads.GetByID(context.Background(), upload.ID)
@@ -846,6 +857,26 @@ func TestUploader_StagedPrimaryStoreRecordsTransferProgress(t *testing.T) {
 	if !publisher.hasTopic("upload_progress_updated") {
 		t.Fatal("expected upload_progress_updated event")
 	}
+	if objects.writes != 0 {
+		t.Fatalf("background upload cache access writes = %d, want 0", objects.writes)
+	}
+	after, err := env.repos.Objects.GetVersionByID(context.Background(), task.RefVersionID)
+	if err != nil || after == nil || after.CacheAccessedAt == nil {
+		t.Fatalf("GetVersionByID after upload: version=%v err=%v", after, err)
+	}
+	if !after.CacheAccessedAt.Equal(*before.CacheAccessedAt) {
+		t.Fatalf("cache_accessed_at changed from %v to %v during background upload", before.CacheAccessedAt, after.CacheAccessedAt)
+	}
+}
+
+type cacheAccessCountingObjectRepo struct {
+	repository.ObjectRepository
+	writes int
+}
+
+func (r *cacheAccessCountingObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
+	r.writes++
+	return r.ObjectRepository.RecordVersionCacheAccess(ctx, versionID, accessedAt)
 }
 
 func TestUploader_StagedPrimaryCommitKeepsCacheUntilAllCopiesCommitted(t *testing.T) {
@@ -887,7 +918,7 @@ func TestUploader_StagedPrimaryCommitKeepsCacheUntilAllCopiesCommitted(t *testin
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 2, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -979,7 +1010,7 @@ func TestUploader_EmptyPayloadStartsStagedPrepare(t *testing.T) {
 		}, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 100*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 100*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	if legacyUploadCalled.Load() {
@@ -1037,7 +1068,7 @@ func TestUploader_StagedPrepareUsesConfiguredCopyCount(t *testing.T) {
 		}, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 4, 1, 100*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 4, 1, 100*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	ctx := context.Background()
@@ -1083,7 +1114,7 @@ func TestUploader_StagedPrepareUsesBucketCopyOverride(t *testing.T) {
 		return contexts, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 2, 1, 100*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 100*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	var uploads []model.StorageUpload
@@ -1189,7 +1220,7 @@ func TestUploader_StagedPrepareReusesExistingUploadRequestedCopies(t *testing.T)
 	if err := env.repos.Tasks.Create(ctx, retryTask); err != nil {
 		t.Fatalf("create retry prepare task: %v", err)
 	}
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 2, 1, 100*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 100*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, retryTask.ID, 5*time.Second)
 
 	if len(createContextsCopies) != 0 {
@@ -1225,7 +1256,7 @@ func TestUploader_StagedPrepareCapsConfiguredCopyCount(t *testing.T) {
 		return contexts, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 99, 1, 100*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 99, 1, 100*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	ctx := context.Background()
@@ -1314,7 +1345,7 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	if got := createCalls.Load(); got != 0 {
@@ -1387,7 +1418,7 @@ func TestUploader_EnsureDatasetContextTimeoutKeepsBindingPendingForRetry(t *test
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	gotBinding, err := env.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
@@ -1474,7 +1505,7 @@ func TestUploader_EnsureDatasetSubmittedCreateErrorResumesWait(t *testing.T) {
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	gotBinding, err := env.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
@@ -1580,7 +1611,7 @@ func TestUploader_EnsureDatasetCreatingWaitErrorKeepsSubmission(t *testing.T) {
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	gotBinding, err := env.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
@@ -1672,7 +1703,7 @@ func TestUploader_EnsureDatasetCreatingRejectedMarksBindingFailed(t *testing.T) 
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	gotBinding, err := env.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
@@ -1757,7 +1788,7 @@ func TestUploader_EnsureDatasetTerminalPrimaryFailureMarksUploadFailed(t *testin
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	gotTask, _ := env.repos.Tasks.GetByID(ctx, task.ID)
@@ -1875,7 +1906,7 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	gotVersion, err := env.repos.Objects.GetVersionByID(ctx, versionID)
@@ -1973,7 +2004,7 @@ func TestUploader_PeerFailureKeepsObjectReadableAndQueuesRepair(t *testing.T) {
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 2, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -2140,7 +2171,7 @@ func TestUploader_PeerTransientFailureKeepsCopyRetryable(t *testing.T) {
 		t.Fatalf("Create peer task: %v", err)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 1)
@@ -2276,7 +2307,7 @@ func TestUploader_EnsureDatasetUnavailablePeerQueuesReplacement(t *testing.T) {
 		t.Fatalf("Create ensure task: %v", err)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	gotTask, err := env.repos.Tasks.GetByID(ctx, task.ID)
@@ -2361,7 +2392,7 @@ func TestUploader_RepairPrepareCreatesReplacementForPeerDeficit(t *testing.T) {
 				t.Fatalf("Create repair task: %v", err)
 			}
 
-			uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+			uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 			runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 			gotTask, err := env.repos.Tasks.GetByID(ctx, task.ID)
@@ -2460,7 +2491,7 @@ func TestUploader_FailedNewPeerDataSetDoesNotRemainInBucketPool(t *testing.T) {
 		t.Fatalf("Create ensure task: %v", err)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, ensureTask.ID, 5*time.Second)
 
 	repairTasks, _, err := env.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", "", 10, 0)
@@ -2570,7 +2601,7 @@ func TestUploader_RepairReusesReplacementBindingWithoutUploadCopy(t *testing.T) 
 		t.Fatalf("Create repair task: %v", err)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	if got := createContextsCalls.Load(); got != 0 {
@@ -2649,7 +2680,7 @@ func TestUploader_FailedNewPeerDataSetDiscardDoesNotDependOnFailureLog(t *testin
 		t.Fatalf("Create ensure task: %v", err)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, ensureTask.ID, 5*time.Second)
 
 	binding, err := baseUploads.GetDataSetBindingByCopyIndex(ctx, fixture.upload.BucketID, 2)
@@ -2693,7 +2724,7 @@ func TestUploader_MissingVersion(t *testing.T) {
 		return nil, errors.New("should not be called")
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
@@ -2710,7 +2741,7 @@ func TestUploader_NilStorageClient(t *testing.T) {
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedTask(t, env, model.TaskTypeUpload, objID, versionID, 5, 0)
 
-	uploader := worker.NewUploader(env.repos, env.cache, nil, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, nil, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
@@ -2796,7 +2827,7 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
@@ -2908,7 +2939,7 @@ func TestUploader_StagedIngressStoreDataSetFailureReplans(t *testing.T) {
 				return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
 			}
 
-			uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+			uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 			runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 			gotTask, _ := env.repos.Tasks.GetByID(ctx, task.ID)
@@ -2974,7 +3005,7 @@ func TestUploader_SPUploadFailure_Retry(t *testing.T) {
 		return nil, errors.New("SP unavailable")
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
@@ -3007,7 +3038,7 @@ func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 		return nil, errors.New("SP permanent failure")
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	ctx := context.Background()
@@ -3046,8 +3077,10 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 	}
 
 	// Pre-create conflicting evict_cache task to trigger idempotency collision
+	evictionStage := cacheeviction.StageAfterUpload
 	conflict := &model.Task{
 		Type:           model.TaskTypeEvictCache,
+		Stage:          &evictionStage,
 		RefType:        "object",
 		RefID:          objID,
 		RefVersionID:   versionID,
@@ -3060,7 +3093,7 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 		t.Fatalf("creating conflict task: %v", err)
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, 1, 1, 10*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -3107,7 +3140,7 @@ func TestUploader_UploadFundingWaitsWithoutRetry(t *testing.T) {
 		}, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskStatus(t, env, uploader, task.ID, model.TaskStatusWaiting, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(context.Background(), task.ID)
@@ -3178,7 +3211,7 @@ func TestUploader_UploadFundingRetryReusesBindings(t *testing.T) {
 		return &storage.MultiContextCosts{DepositNeeded: big.NewInt(0), Ready: true}, nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTaskStatus(t, env, uploader, task.ID, model.TaskStatusWaiting, 5*time.Second)
 
 	got, _ := env.repos.Tasks.GetByID(ctx, task.ID)
@@ -3239,7 +3272,7 @@ func TestUploader_PrepareFundingDoesNotQueryWallet(t *testing.T) {
 		return newFakeUploadContexts(t, opts.Copies, 0), nil
 	}
 
-	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, true, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, wallet, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	got := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	if got.Status != model.TaskStatusCompleted {

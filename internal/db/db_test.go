@@ -108,7 +108,7 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	}
 
 	versionColumns := sqliteColumns(t, db, "object_versions")
-	for _, column := range []string{"is_current", "in_cache", "storage_upload_id", "multipart_upload_id"} {
+	for _, column := range []string{"is_current", "in_cache", "storage_upload_id", "multipart_upload_id", "cache_accessed_at"} {
 		if !versionColumns[column] {
 			t.Fatalf("object_versions.%s should exist", column)
 		}
@@ -157,6 +157,9 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	}
 	if !versionIndexes["idx_object_versions_object_created"] {
 		t.Fatal("idx_object_versions_object_created should exist")
+	}
+	if !versionIndexes["idx_object_versions_cache_lru"] {
+		t.Fatal("idx_object_versions_cache_lru should exist")
 	}
 	taskIndexes := sqliteIndexes(t, db, "tasks")
 	if !taskIndexes["idx_tasks_type_ready_scheduled"] {

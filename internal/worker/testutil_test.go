@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
@@ -15,11 +16,13 @@ import (
 
 // testWorkerEnv holds all components needed to test workers.
 type testWorkerEnv struct {
-	repos   *repository.Repositories
-	cache   cache.Cache
-	sm      *state.Machine
-	storage *testutil.MockStorageClient
-	db      *bun.DB
+	repos         *repository.Repositories
+	cache         cache.Cache
+	cacheGate     *cacheaccess.Gate
+	accessTracker *cacheaccess.Tracker
+	sm            *state.Machine
+	storage       *testutil.MockStorageClient
+	db            *bun.DB
 }
 
 // newTestWorkerEnv constructs a test environment with file-backed SQLite
@@ -31,13 +34,17 @@ func newTestWorkerEnv(t *testing.T) *testWorkerEnv {
 	fsCache := newWorkerTestCache(t, 1<<30)
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
+	cacheGate := cacheaccess.NewGate()
+	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 
 	return &testWorkerEnv{
-		repos:   repos,
-		cache:   fsCache,
-		sm:      sm,
-		storage: sc,
-		db:      db,
+		repos:         repos,
+		cache:         fsCache,
+		cacheGate:     cacheGate,
+		accessTracker: accessTracker,
+		sm:            sm,
+		storage:       sc,
+		db:            db,
 	}
 }
 
@@ -48,13 +55,17 @@ func newTestWorkerEnvWithMockCache(t *testing.T, mc *testutil.MockCache) *testWo
 	repos := repository.NewRepositories(db)
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
+	cacheGate := cacheaccess.NewGate()
+	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 
 	return &testWorkerEnv{
-		repos:   repos,
-		cache:   mc,
-		sm:      sm,
-		storage: sc,
-		db:      db,
+		repos:         repos,
+		cache:         mc,
+		cacheGate:     cacheGate,
+		accessTracker: accessTracker,
+		sm:            sm,
+		storage:       sc,
+		db:            db,
 	}
 }
 

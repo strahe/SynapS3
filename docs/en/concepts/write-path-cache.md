@@ -30,6 +30,20 @@ The S3 response does not wait for Filecoin provider latency. After the write is 
 
 `GetObject` reads local cache first. If the cache entry is missing and an available remote copy is recorded, SynapS3 can retrieve the object from the storage provider, verify it, serve the response, and restore the local cache when possible.
 
+Successful foreground cache opens refresh the entry's LRU access time. This includes S3 object and range reads, cached CopyObject sources, Admin content downloads, and version restores. Metadata-only operations such as `HeadObject` do not refresh it, and the background Uploader does not make an entry look recently used. A complete remote rehydration starts a new LRU age for the restored entry.
+
+Repeated reads of the same version coalesce access-time updates to at most one database write per minute. Access tracking is best effort and never turns a successful read into an error.
+
+## Cache Eviction
+
+| Policy | Behavior |
+| --- | --- |
+| `lru` | At the high capacity watermark, queue the least recently accessed remotely safe versions until planned usage reaches the low watermark. |
+| `after_upload` | Queue each version for removal after all target remote copies commit. |
+| `none` | Do not create or run automatic cache eviction work. |
+
+Only versions with a readable committed remote copy are eligible. Eviction waits for active reads of the same version to close. Because cleanup is asynchronous, writes can still return `507 Insufficient Storage` when cleanup cannot keep pace or no safe candidate exists.
+
 ## Multipart Uploads
 
 Multipart uploads keep parts in local storage until completion. Completing an upload validates the requested parts, assembles the final object, returns the S3 multipart ETag, and schedules background Filecoin storage.
@@ -41,6 +55,7 @@ Multipart uploads keep parts in local storage until completion. Completing an up
 | Cache disk is full | New writes can fail before Filecoin storage is involved. |
 | Background storage is not running | Confirmed writes remain local, but remote storage will not progress. |
 | Cache entry is evicted | Reads can still succeed when remote metadata exists and retrieval works. |
+| LRU has no safe candidate | Existing unsafe or in-progress data remains local; new writes can still fail with insufficient storage. |
 | Database commit fails | The S3 write does not return success. |
 
 For capacity and recovery steps, see [Runtime Data](../configuration/runtime-data.md) and [Troubleshooting](../operations/troubleshooting.md).

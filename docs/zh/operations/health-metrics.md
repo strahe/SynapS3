@@ -73,6 +73,7 @@ scrape_configs:
 | `synaps3_backend_object_operations_total` | 按类型和状态统计的 S3 操作。 |
 | `synaps3_cache_used_bytes` | 当前缓存磁盘使用量。 |
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | 缓存读取行为。 |
+| `synaps3_cache_lru_eviction_paused` | 因近期缓存访问记录无法安全保留而暂停 LRU 淘汰时为 `1`；请先排除持久化错误，再重启 SynapS3。 |
 | `synaps3_worker_tasks_processed_total` | 按结果统计的后台任务吞吐。 |
 | `synaps3_worker_tasks_exhausted_total` | 已耗尽重试次数的任务。 |
 | `synaps3_worker_task_duration_seconds` | 后台任务处理耗时。 |

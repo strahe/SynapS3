@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
@@ -37,6 +38,9 @@ type Server struct {
 	db                       *bun.DB
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
+	objectStorage            synapse.StorageClient
+	cacheGate                *cacheaccess.Gate
+	cacheAccessTracker       *cacheaccess.Tracker
 	objectUploader           objectUploader
 	objectVersionRestorer    objectVersionRestorer
 	cacheMaxBytes            int64
@@ -66,12 +70,32 @@ type Server struct {
 }
 
 // New creates a new admin HTTP server.
-func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, filecoinDefaultCopies int, logger *slog.Logger) *Server {
+func New(
+	addr string,
+	db *bun.DB,
+	c cache.Cache,
+	cacheGate *cacheaccess.Gate,
+	cacheAccessTracker *cacheaccess.Tracker,
+	cacheMaxBytes int64,
+	repos *repository.Repositories,
+	wh WorkerHealthChecker,
+	wallet synapse.WalletQuerier,
+	filecoinDefaultCopies int,
+	logger *slog.Logger,
+) *Server {
+	if cacheGate == nil {
+		panic("admin server requires a cache access gate")
+	}
+	if cacheAccessTracker == nil {
+		panic("admin server requires a cache access tracker")
+	}
 	s := &Server{
 		addr:                     addr,
 		db:                       db,
 		cache:                    c,
-		objectReader:             objectreader.New(repos, c, nil, logger),
+		cacheGate:                cacheGate,
+		cacheAccessTracker:       cacheAccessTracker,
+		objectReader:             objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
 		cacheMaxBytes:            cacheMaxBytes,
 		repos:                    repos,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
@@ -90,8 +114,20 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 
 // WithObjectStorage enables provider-backed object reads for admin downloads.
 func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
-	s.objectReader = objectreader.New(s.repos, s.cache, storage, s.logger)
+	s.objectStorage = storage
+	s.resetObjectReader()
 	return s
+}
+
+func (s *Server) resetObjectReader() {
+	s.objectReader = objectreader.New(
+		s.repos,
+		s.cache,
+		s.objectStorage,
+		s.cacheGate,
+		s.cacheAccessTracker,
+		s.logger,
+	)
 }
 
 func (s *Server) WithEventHub(events *EventHub) *Server {

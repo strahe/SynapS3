@@ -277,6 +277,8 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"max_open_conns = 4",
 		"max_size_gb = 100",
 		"eviction_policy = \"lru\"",
+		"lru_high_watermark_percent = 90",
+		"lru_low_watermark_percent = 80",
 	} {
 		assertConfigLacksEnabledLine(t, text, disabled)
 	}
@@ -322,6 +324,9 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	cfg.Filecoin.WithCDN = true
 	cfg.Filecoin.AllowPrivateNetworks = true
 	cfg.Cache.MaxSizeGB = 42
+	cfg.Cache.EvictionPolicy = "NONE"
+	cfg.Cache.LRUHighWatermarkPercent = 87
+	cfg.Cache.LRULowWatermarkPercent = 72
 	cfg.Worker.Upload.PollInterval = 7 * time.Second
 	cfg.Worker.Evictor.PollInterval = 2 * time.Minute
 	cfg.Logging.S3Access.Enabled = false
@@ -359,6 +364,10 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		"concurrency = 8",
 		"[worker.upload]",
 		"poll_interval = \"7s\"",
+		"[cache]",
+		"eviction_policy = \"none\"",
+		"lru_high_watermark_percent = 87",
+		"lru_low_watermark_percent = 72",
 		"[worker.evictor]",
 		"poll_interval = \"2m0s\"",
 		"[logging.s3_access]",
@@ -385,6 +394,11 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	}
 	if loaded.Worker.Evictor.PollInterval != cfg.Worker.Evictor.PollInterval {
 		t.Fatalf("Evictor poll interval = %s, want %s", loaded.Worker.Evictor.PollInterval, cfg.Worker.Evictor.PollInterval)
+	}
+	if loaded.Cache.EvictionPolicy != "none" ||
+		loaded.Cache.LRUHighWatermarkPercent != 87 ||
+		loaded.Cache.LRULowWatermarkPercent != 72 {
+		t.Fatalf("loaded cache config = %#v, want canonical none with 87/72 watermarks", loaded.Cache)
 	}
 }
 
@@ -511,6 +525,8 @@ func TestFieldMetadataDefinesEnvMappings(t *testing.T) {
 		{env: "SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT", field: "filecoin.observability.timeout"},
 		{env: "SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY", field: "filecoin.observability.concurrency"},
 		{env: "SYNAPS3_CACHE_MAX_SIZE_GB", field: "cache.max_size_gb"},
+		{env: "SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", field: "cache.lru_high_watermark_percent"},
+		{env: "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", field: "cache.lru_low_watermark_percent"},
 		{env: "SYNAPS3_LOGGING_S3_ACCESS_ENABLED", field: "logging.s3_access.enabled"},
 		{env: "SYNAPS3_LOGGING_S3_ACCESS_LEVEL", field: "logging.s3_access.level"},
 		{env: "SYNAPS3_ADMIN_ADDR", field: "admin.addr"},

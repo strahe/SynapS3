@@ -47,7 +47,7 @@ func newBucketAPITestServerWithRuntimeCopies(t *testing.T, filecoinDefaultCopies
 	}
 
 	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, filecoinDefaultCopies, testLogger())
+	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, filecoinDefaultCopies, testLogger())
 	return srv, repos
 }
 
@@ -4387,7 +4387,7 @@ func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 		t.Fatalf("creating test cache: %v", err)
 	}
 	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	ctx := context.Background()
 	bucket := &model.Bucket{Name: "batched-upload-status-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -4426,7 +4426,7 @@ func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
 		t.Fatalf("creating test cache: %v", err)
 	}
 	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	ctx := context.Background()
 	bucket := &model.Bucket{Name: "batched-version-status-bucket", Status: model.BucketStatusActive}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
@@ -4929,7 +4929,14 @@ func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
 		},
 	}
 	srv.cache = mockCache
-	srv.objectReader = objectreader.New(repos, mockCache, nil, testLogger())
+	srv.objectReader = objectreader.New(
+		repos,
+		mockCache,
+		nil,
+		srv.cacheGate,
+		srv.cacheAccessTracker,
+		testLogger(),
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/deadline-bucket/objects/download?key="+url.QueryEscape("folder/report.txt"), nil)
 	req.SetPathValue("name", "deadline-bucket")

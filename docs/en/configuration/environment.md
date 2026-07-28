@@ -34,6 +34,8 @@ Configuration environment variables use the `SYNAPS3_` prefix and map underscore
 | `SYNAPS3_CACHE_DIR` | `cache.dir` |
 | `SYNAPS3_CACHE_MAX_SIZE_GB` | `cache.max_size_gb` |
 | `SYNAPS3_CACHE_EVICTION_POLICY` | `cache.eviction_policy` |
+| `SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT` | `cache.lru_high_watermark_percent` |
+| `SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT` | `cache.lru_low_watermark_percent` |
 | `SYNAPS3_WORKER_UPLOAD_CONCURRENCY` | `worker.upload.concurrency` |
 | `SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL` | `worker.upload.poll_interval` |
 | `SYNAPS3_WORKER_UPLOAD_MAX_RETRIES` | `worker.upload.max_retries` |

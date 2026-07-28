@@ -16,7 +16,10 @@ flowchart TD
   uploading --> committing["committing"]
   committing --> replicating["replicating"]
   replicating --> stored["stored"]
-  stored --> evict["evict_cache task"]
+  stored --> policy{"cache eviction policy"}
+  policy -->|"after_upload"| evict["queue after-upload eviction"]
+  policy -->|"lru at high watermark"| evict
+  policy -->|"none"| retain["retain local cache"]
   evict --> evicted["cache_evicted"]
 ```
 
@@ -54,7 +57,7 @@ Health checks record storage provider and local data set status. The dashboard u
 - S3 upload can succeed before Filecoin storage finishes.
 - Dashboard task and topology views show storage progress.
 - Reads prefer local cache. If remote metadata exists, SynapS3 can retrieve the object from the provider.
-- Cache eviction is an operational optimization, not the write acceptance point.
+- Cache eviction is an operational optimization, not the write acceptance point. `after_upload` removes a version after storage completes, `lru` waits for capacity pressure, and `none` retains it.
 
 ## Replica Repair Vision
 

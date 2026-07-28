@@ -923,6 +923,8 @@ export interface SettingsCacheConfig {
   dir: string
   max_size_gb: number
   eviction_policy: string
+  lru_high_watermark_percent: number
+  lru_low_watermark_percent: number
 }
 
 export interface SettingsWorkerConfig {

@@ -46,8 +46,9 @@ func newIntegrationBackend(t *testing.T) *integrationBackend {
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
+	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, fsCache, sm, sc, logger)
+	b := backend.New(repos, fsCache, sm, sc, cacheGate, accessTracker, logger)
 	return &integrationBackend{
 		backend: b,
 		repos:   repos,

@@ -22,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	synaps3backend "github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
@@ -947,8 +948,8 @@ func TestPutObjectIdenticalReplicatingContentReusesPrimaryCommittedUpload(t *tes
 	}
 }
 
-func TestPutObjectIdenticalStoredContentQueuesEvictWhenAutoEvictEnabled(t *testing.T) {
-	tb := newTestBackendWithOptions(t, synaps3backend.WithAutoEvict(true), synaps3backend.WithEvictMaxRetries(9))
+func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) {
+	tb := newTestBackendWithOptions(t, synaps3backend.WithEvictionPolicy(cache.EvictionPolicyAfterUpload), synaps3backend.WithEvictMaxRetries(9))
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "stored-reuse-evict-bucket")
 
@@ -974,8 +975,49 @@ func TestPutObjectIdenticalStoredContentQueuesEvictWhenAutoEvictEnabled(t *testi
 	if task.RefVersionID != secondOut.VersionID {
 		t.Fatalf("evict task version = %s, want %s", task.RefVersionID, secondOut.VersionID)
 	}
+	if task.Stage == nil || *task.Stage != cacheeviction.StageAfterUpload {
+		t.Fatalf("evict task stage = %v, want %s", task.Stage, cacheeviction.StageAfterUpload)
+	}
+	if task.IdempotencyKey != "evict_cache:"+secondOut.VersionID {
+		t.Fatalf("evict task key = %q, want stable after_upload version key", task.IdempotencyKey)
+	}
 	if task.MaxRetries != 9 {
 		t.Fatalf("evict task MaxRetries = %d, want 9", task.MaxRetries)
+	}
+}
+
+func TestPutObjectIdenticalStoredContentDoesNotQueueImmediateEvictionOutsideAfterUpload(t *testing.T) {
+	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyLRU, cache.EvictionPolicyNone} {
+		t.Run(string(policy), func(t *testing.T) {
+			tb := newTestBackendWithOptions(t, synaps3backend.WithEvictionPolicy(policy))
+			ctx := context.Background()
+			bucketName := "stored-reuse-" + string(policy) + "-bucket"
+			seedActiveBucket(t, tb, bucketName)
+
+			putValidTestObject(t, tb, bucketName, "file.txt", "same data")
+			bucket, _ := tb.repos.Buckets.GetByName(ctx, bucketName)
+			first, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+			if err != nil || first == nil {
+				t.Fatalf("current object after first put: object=%v err=%v", first, err)
+			}
+			if err := tb.repos.Objects.UpdateVersionState(ctx, first.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+				t.Fatalf("mark first version uploading: %v", err)
+			}
+			acceptBackendVersionUpload(t, tb.repos, first.VersionID, "piece-"+string(policy), "https://provider.example/"+string(policy))
+
+			second := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "same data")
+			stored, err := tb.repos.Objects.GetVersionByID(ctx, second.VersionID)
+			if err != nil || stored == nil || stored.State != model.ObjectStateStored {
+				t.Fatalf("reused version = %#v err=%v, want stored", stored, err)
+			}
+			tasks, total, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeEvictCache), "", "", 10, 0)
+			if err != nil {
+				t.Fatalf("List eviction tasks: %v", err)
+			}
+			if total != 0 || len(tasks) != 0 {
+				t.Fatalf("policy %s immediate eviction tasks total=%d tasks=%#v, want none", policy, total, tasks)
+			}
+		})
 	}
 }
 

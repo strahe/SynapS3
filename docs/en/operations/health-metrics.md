@@ -73,6 +73,7 @@ Key metrics:
 | `synaps3_backend_object_operations_total` | S3 operations by type and status. |
 | `synaps3_cache_used_bytes` | Current cache disk usage. |
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | Cache read behavior. |
+| `synaps3_cache_lru_eviction_paused` | `1` when LRU eviction is paused because recent cache access could not be retained safely. Resolve the persistence error and restart SynapS3. |
 | `synaps3_worker_tasks_processed_total` | Background task throughput by result. |
 | `synaps3_worker_tasks_exhausted_total` | Tasks that exhausted retries. |
 | `synaps3_worker_task_duration_seconds` | Background task processing duration. |

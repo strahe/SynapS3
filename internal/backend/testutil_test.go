@@ -11,6 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
@@ -45,8 +46,18 @@ func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBacken
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
+	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, fsCache, sm, sc, logger, opts...)
+	b := backend.New(
+		repos,
+		fsCache,
+		sm,
+		sc,
+		cacheGate,
+		accessTracker,
+		logger,
+		opts...,
+	)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -65,8 +76,9 @@ func newTestBackendWithMockCache(t *testing.T, mc *testutil.MockCache) *testBack
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
+	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, mc, sm, sc, logger)
+	b := backend.New(repos, mc, sm, sc, cacheGate, accessTracker, logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -83,8 +95,9 @@ func newTestBackendWithCache(t *testing.T, c cache.Cache) *testBackend {
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
+	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, c, sm, sc, logger)
+	b := backend.New(repos, c, sm, sc, cacheGate, accessTracker, logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -102,14 +115,22 @@ func newTestBackendWithSDK(t *testing.T, sc synapse.StorageClient) *testBackend 
 	fsCache := newTestCache(t, 1<<30)
 	sm := state.NewObjectStateMachine()
 	logger := slog.Default()
+	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, fsCache, sm, sc, logger)
+	b := backend.New(repos, fsCache, sm, sc, cacheGate, accessTracker, logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
 		cache:   fsCache,
 		db:      db,
 	}
+}
+
+func newBackendCacheAccess(
+	repos *repository.Repositories,
+) (*cacheaccess.Gate, *cacheaccess.Tracker) {
+	return cacheaccess.NewGate(),
+		cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 }
 
 // newTestCache creates a real filesystem cache with the given max size.

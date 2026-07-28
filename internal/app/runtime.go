@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/observability"
@@ -73,6 +74,8 @@ type Runtime struct {
 	adminServer   *admin.Server
 	s3Server      *s3api.S3ApiServer
 	backend       *backend.SynapseBackend
+	cacheGate     *cacheaccess.Gate
+	accessTracker *cacheaccess.Tracker
 	iam           auth.IAMService
 	workers       *worker.Manager
 	observer      *observability.Runner
@@ -100,14 +103,19 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, fmt.Errorf("initializing cache: %w", err)
 	}
 
-	autoEvict := autoEvictEnabled(cfg.Cache.EvictionPolicy)
+	evictionPolicy, ok := cache.ParseEvictionPolicy(cfg.Cache.EvictionPolicy)
+	if !ok {
+		return nil, fmt.Errorf("initializing cache eviction policy: unsupported value %q", cfg.Cache.EvictionPolicy)
+	}
+	cacheGate := cacheaccess.NewGate()
+	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	stateMachine := state.NewObjectStateMachine()
 	events := admin.NewEventHub()
-	appBackend := backend.New(repos, localCache, stateMachine, opts.Filecoin.Storage, logger,
+	appBackend := backend.New(repos, localCache, stateMachine, opts.Filecoin.Storage, cacheGate, accessTracker, logger,
 		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
 		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
 		backend.WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries),
-		backend.WithAutoEvict(autoEvict),
+		backend.WithEvictionPolicy(evictionPolicy),
 	)
 
 	iamService := s3iam.NewService(repos)
@@ -145,20 +153,27 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 
 	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
-	manager := worker.NewManager(repos, logger, autoEvict,
-		worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, autoEvict,
+	manager := worker.NewManager(repos, logger, evictionPolicy,
+		worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, evictionPolicy,
 			cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
 			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
 			worker.WithEventPublisher(events)),
-		worker.NewEvictor(repos, localCache, stateMachine,
-			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
+		worker.NewEvictor(repos, localCache, cacheGate, accessTracker, stateMachine,
+			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger,
+			worker.WithCacheEvictionPolicy(
+				evictionPolicy,
+				maxCacheBytes,
+				cfg.Cache.LRUHighWatermarkPercent,
+				cfg.Cache.LRULowWatermarkPercent,
+				cfg.Worker.Evictor.MaxRetries,
+			)),
 		worker.NewStorageCleanupWorker(repos, opts.Filecoin.Storage,
 			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger),
 		worker.NewWalletOperationRunner(repos, opts.Filecoin.Wallet, opts.Filecoin.Receipts, 5*time.Second, logger,
 			worker.WithWalletOperationEventPublisher(events)),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
 
-	adminServer := admin.New(cfg.Admin.Addr, opts.Database, localCache, maxCacheBytes, repos, manager,
+	adminServer := admin.New(cfg.Admin.Addr, opts.Database, localCache, cacheGate, accessTracker, maxCacheBytes, repos, manager,
 		opts.Filecoin.WalletQuery, cfg.Filecoin.DefaultCopies, logger).
 		WithTaskDiagnosticStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
@@ -200,6 +215,8 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		adminServer:   adminServer,
 		s3Server:      s3Server,
 		backend:       appBackend,
+		cacheGate:     cacheGate,
+		accessTracker: accessTracker,
 		iam:           iamService,
 		workers:       manager,
 		observer:      observability.NewRunner(observabilityService, logger),
@@ -310,6 +327,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 		if groupCtx.Err() == nil {
 			return errors.New("observer stopped unexpectedly")
 		}
+		return nil
+	})
+	group.Go(func() error {
+		r.accessTracker.Run(groupCtx, r.cacheGate, r.logger)
 		return nil
 	})
 	group.Go(func() error {
@@ -425,10 +446,6 @@ func newObservabilityService(cfg *config.Config, repos *repository.Repositories,
 		Store:           repos.Observability,
 		RefreshInterval: cfg.Filecoin.Observability.Interval,
 	})
-}
-
-func autoEvictEnabled(policy string) bool {
-	return strings.EqualFold(strings.TrimSpace(policy), "lru")
 }
 
 func s3ServerOptions(cfg config.ServerConfig) ([]s3api.Option, error) {

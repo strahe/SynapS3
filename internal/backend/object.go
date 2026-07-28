@@ -578,7 +578,17 @@ func deleteObjectsEntryError(key *string, versionID *string, err error) types.Er
 }
 
 func (b *SynapseBackend) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) {
-	objectdeletion.RecordCacheCleanup(ctx, b.cache, b.repos.Objects, b.logger, bucketName, versionID, cacheKey)
+	objectdeletion.RecordCacheCleanup(
+		ctx,
+		b.cache,
+		b.cacheGate,
+		b.cacheAccessTracker,
+		b.repos.Objects,
+		b.logger,
+		bucketName,
+		versionID,
+		cacheKey,
+	)
 }
 
 func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
@@ -1239,12 +1249,26 @@ func (b *SynapseBackend) completeFollowerIfStoredReuseWonRace(ctx context.Contex
 		return
 	}
 
-	if err := b.repos.Objects.SetVersionStorageUploadAndTransition(ctx, versionID, *reusable.StorageUploadID, model.ObjectStateUploading, model.ObjectStateStored); err != nil {
+	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		if err := txRepos.Objects.SetVersionStorageUploadAndTransition(
+			ctx,
+			versionID,
+			*reusable.StorageUploadID,
+			model.ObjectStateUploading,
+			model.ObjectStateStored,
+		); err != nil {
+			return err
+		}
+		return b.enqueuePostWriteTask(
+			ctx,
+			txRepos,
+			objectID,
+			versionID,
+			model.ObjectStateStored,
+		)
+	}); err != nil {
 		b.logger.Debug("active upload follower already handled or still pending", "bucket", bucketName, "versionID", versionID, "error", err)
 		return
-	}
-	if err := b.enqueuePostWriteTask(ctx, b.repos, objectID, versionID, model.ObjectStateStored); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
-		b.logger.Warn("enqueueing eviction after active upload follower completion", "bucket", bucketName, "versionID", versionID, "error", err)
 	}
 }
 
@@ -1257,18 +1281,17 @@ func (b *SynapseBackend) completeReplicatingFollowerIfUploadFinalized(ctx contex
 	if version == nil || version.State != model.ObjectStateReplicating || version.StorageUploadID == nil {
 		return
 	}
-	finalized, refs, err := b.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: *version.StorageUploadID})
+	_, _, err = b.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		repository.NewFinalizeUploadInput(
+			*version.StorageUploadID,
+			b.evictionPolicy.EnqueuesAfterUploadEviction(),
+			b.evictMaxRetries,
+		),
+	)
 	if err != nil {
 		b.logger.Warn("finalizing replicating reuse after follower write", "bucket", bucketName, "versionID", versionID, "uploadID", *version.StorageUploadID, "error", err)
 		return
-	}
-	if !finalized {
-		return
-	}
-	for _, ref := range refs {
-		if err := b.enqueuePostWriteTask(ctx, b.repos, ref.ObjectID, ref.VersionID, model.ObjectStateStored); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
-			b.logger.Warn("enqueueing eviction after replicating reuse completion", "bucket", bucketName, "versionID", ref.VersionID, "error", err)
-		}
 	}
 }
 
@@ -1289,20 +1312,11 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 		}
 		return repos.Tasks.Create(ctx, task)
 	case model.ObjectStateStored:
-		if !b.autoEvict {
+		if !b.evictionPolicy.EnqueuesAfterUploadEviction() {
 			return nil
 		}
-		task := &model.Task{
-			Type:           model.TaskTypeEvictCache,
-			RefType:        "object",
-			RefID:          objectID,
-			RefVersionID:   versionID,
-			IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     b.evictMaxRetries,
-			ScheduledAt:    time.Now(),
-		}
-		return repos.Tasks.Create(ctx, task)
+		_, err := repos.CacheEvictions.EnsureAfterUploadTask(ctx, objectID, versionID, b.evictMaxRetries)
+		return err
 	default:
 		return nil
 	}

@@ -24,6 +24,8 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'cache.dir': meta('Cache Directory'),
   'cache.max_size_gb': meta('Cache Max Size'),
   'cache.eviction_policy': meta('Cache Eviction Policy'),
+  'cache.lru_high_watermark_percent': meta('LRU High Watermark'),
+  'cache.lru_low_watermark_percent': meta('LRU Low Watermark'),
   'worker.upload.concurrency': meta('Upload Concurrency'),
   'worker.upload.max_retries': meta('Upload Max Retries'),
   'worker.upload.poll_interval': meta('Upload Poll Interval'),
@@ -65,6 +67,8 @@ function baseConfig(): SettingsEditableConfig {
       dir: '/var/lib/synaps3/cache',
       max_size_gb: 100,
       eviction_policy: 'lru',
+      lru_high_watermark_percent: 90,
+      lru_low_watermark_percent: 80,
     },
     worker: {
       upload: {
@@ -151,7 +155,9 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.filecoin.default_copies = 3
   next.cache.dir = '/data/cache'
   next.cache.max_size_gb = 50
-  next.cache.eviction_policy = 'manual'
+  next.cache.eviction_policy = 'after_upload'
+  next.cache.lru_high_watermark_percent = 85
+  next.cache.lru_low_watermark_percent = 70
   next.worker.upload.concurrency = 8
   next.worker.upload.max_retries = 7
   next.worker.upload.poll_interval = '1s'
@@ -181,7 +187,9 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['filecoin.default_copies', 'Default Copies', '2', '3', 'medium'],
       ['cache.dir', 'Cache Directory', '/var/lib/synaps3/cache', '/data/cache', 'medium'],
       ['cache.max_size_gb', 'Cache Max Size', '100', '50', 'medium'],
-      ['cache.eviction_policy', 'Cache Eviction Policy', 'lru', 'manual', 'medium'],
+      ['cache.eviction_policy', 'Cache Eviction Policy', 'lru', 'after_upload', 'medium'],
+      ['cache.lru_high_watermark_percent', 'LRU High Watermark', '90', '85', 'medium'],
+      ['cache.lru_low_watermark_percent', 'LRU Low Watermark', '80', '70', 'medium'],
       ['worker.upload.concurrency', 'Upload Concurrency', '4', '8', 'medium'],
       ['worker.upload.poll_interval', 'Upload Poll Interval', '5s', '1s', 'medium'],
       ['worker.upload.max_retries', 'Upload Max Retries', '5', '7', 'medium'],

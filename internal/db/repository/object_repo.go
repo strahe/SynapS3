@@ -7,6 +7,7 @@ import (
 	"maps"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 )
@@ -779,6 +780,54 @@ func (r *BunObjectRepo) SetVersionCachePresence(ctx context.Context, versionID s
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		return setVersionCachePresence(ctx, db, versionID, inCache)
 	})
+}
+
+func (r *BunObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
+	return executeVersionCacheAccessUpdate(
+		ctx,
+		r.newVersionCacheAccessUpdate(versionID, accessedAt),
+		versionID,
+	)
+}
+
+func (r *BunObjectRepo) RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error {
+	query := r.newVersionCacheAccessUpdate(versionID, accessedAt).
+		Set("in_cache = ?", true)
+	return executeVersionCacheAccessUpdate(ctx, query, versionID)
+}
+
+func (r *BunObjectRepo) newVersionCacheAccessUpdate(
+	versionID string,
+	accessedAt time.Time,
+) *bun.UpdateQuery {
+	accessedAt = cacheeviction.NormalizeAccessTime(accessedAt)
+	return r.db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set(
+			`cache_accessed_at = CASE
+				WHEN cache_accessed_at IS NULL OR cache_accessed_at < ? THEN ?
+				ELSE cache_accessed_at
+			END`,
+			accessedAt,
+			accessedAt,
+		).
+		Where("version_id = ? AND is_delete_marker = ?", versionID, false)
+}
+
+func executeVersionCacheAccessUpdate(
+	ctx context.Context,
+	query *bun.UpdateQuery,
+	versionID string,
+) error {
+	res, err := query.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("recording version cache access: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("recording version cache access: version %s not found", versionID)
+	}
+	return nil
 }
 
 func (r *BunObjectRepo) SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error {
@@ -1722,6 +1771,13 @@ func normalizeObjectVersion(version *model.ObjectVersion) {
 	}
 	if version.State != model.ObjectStateCacheEvicted {
 		version.InCache = true
+	}
+	if version.InCache && !version.IsDeleteMarker && version.CacheAccessedAt == nil {
+		accessedAt := version.CreatedAt
+		if accessedAt.IsZero() {
+			accessedAt = time.Now()
+		}
+		version.CacheAccessedAt = &accessedAt
 	}
 	if version.ContentType == "" {
 		version.ContentType = "application/octet-stream"

@@ -1770,6 +1770,82 @@ func TestObjectRepo_SetVersionCachePresenceMirrorsOnlyCurrentVersion(t *testing.
 	}
 }
 
+func TestObjectRepo_CacheAccessAndCommitKeepPresenceSemanticsSeparate(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "cache-access-bucket")
+	version := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000CA01", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	lifecycleUpdatedAt := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
+	mustExec(
+		t,
+		db,
+		`UPDATE object_versions SET in_cache = FALSE, cache_accessed_at = NULL, updated_at = ? WHERE version_id = ?`,
+		lifecycleUpdatedAt,
+		version.VersionID,
+	)
+
+	accessedAt := lifecycleUpdatedAt.Add(2 * time.Hour)
+	if err := repos.Objects.RecordVersionCacheAccess(ctx, version.VersionID, accessedAt); err != nil {
+		t.Fatalf("RecordVersionCacheAccess: %v", err)
+	}
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", got, err)
+	}
+	if got.InCache {
+		t.Fatal("in_cache = true after access-only timestamp update, want false")
+	}
+	if got.CacheAccessedAt == nil || !got.CacheAccessedAt.Equal(accessedAt) {
+		t.Fatalf("cache_accessed_at = %v, want %v", got.CacheAccessedAt, accessedAt)
+	}
+	if !got.UpdatedAt.Equal(lifecycleUpdatedAt) {
+		t.Fatalf("updated_at = %v, want unchanged %v", got.UpdatedAt, lifecycleUpdatedAt)
+	}
+
+	committedAt := accessedAt.Add(time.Hour)
+	if err := repos.Objects.RecordVersionCacheCommit(ctx, version.VersionID, committedAt); err != nil {
+		t.Fatalf("RecordVersionCacheCommit: %v", err)
+	}
+	got, err = repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("GetVersionByID after cache commit: version=%v err=%v", got, err)
+	}
+	if !got.InCache {
+		t.Fatal("in_cache = false after cache commit, want true")
+	}
+	if got.CacheAccessedAt == nil || !got.CacheAccessedAt.Equal(committedAt) {
+		t.Fatalf("cache_accessed_at after commit = %v, want %v", got.CacheAccessedAt, committedAt)
+	}
+	if !got.UpdatedAt.Equal(lifecycleUpdatedAt) {
+		t.Fatalf("updated_at after cache commit = %v, want unchanged %v", got.UpdatedAt, lifecycleUpdatedAt)
+	}
+
+	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
+		t.Fatalf("SetVersionCachePresence(false): %v", err)
+	}
+	olderAccess := committedAt.Add(-time.Hour)
+	if err := repos.Objects.RecordVersionCacheAccess(ctx, version.VersionID, olderAccess); err != nil {
+		t.Fatalf("RecordVersionCacheAccess(older): %v", err)
+	}
+	got, err = repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("GetVersionByID after older access: version=%v err=%v", got, err)
+	}
+	if got.InCache {
+		t.Fatal("in_cache = true after access-only update of an absent cache entry")
+	}
+	if got.CacheAccessedAt == nil || !got.CacheAccessedAt.Equal(committedAt) {
+		t.Fatalf("cache_accessed_at after older write = %v, want monotonic %v", got.CacheAccessedAt, committedAt)
+	}
+	if !got.UpdatedAt.Equal(lifecycleUpdatedAt) {
+		t.Fatalf("updated_at after older access = %v, want unchanged %v", got.UpdatedAt, lifecycleUpdatedAt)
+	}
+}
+
 func TestObjectRepo_UpdateVersionStateMarksCacheEvictedLocation(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

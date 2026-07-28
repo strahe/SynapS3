@@ -5,6 +5,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/state"
@@ -20,13 +21,15 @@ type SynapseBackend struct {
 	repos                    *repository.Repositories
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
+	cacheGate                *cacheaccess.Gate
+	cacheAccessTracker       *cacheaccess.Tracker
 	bucketLifecycle          *bucketlifecycle.Service
 	stateMachine             *state.Machine
 	storage                  synapse.StorageClient
 	uploadMaxRetries         int
 	evictMaxRetries          int
 	storageCleanupMaxRetries int
-	autoEvict                bool
+	evictionPolicy           cache.EvictionPolicy
 	logger                   *slog.Logger
 }
 
@@ -60,30 +63,55 @@ func WithStorageCleanupMaxRetries(maxRetries int) Option {
 	}
 }
 
-// WithAutoEvict configures whether stored objects enqueue cache eviction tasks.
-func WithAutoEvict(autoEvict bool) Option {
+// WithEvictionPolicy configures automatic local cache eviction.
+func WithEvictionPolicy(policy cache.EvictionPolicy) Option {
 	return func(b *SynapseBackend) {
-		b.autoEvict = autoEvict
+		b.evictionPolicy = policy
 	}
 }
 
 // New creates a new SynapseBackend.
-func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc synapse.StorageClient, logger *slog.Logger, opts ...Option) *SynapseBackend {
+func New(
+	repos *repository.Repositories,
+	c cache.Cache,
+	sm *state.Machine,
+	sc synapse.StorageClient,
+	cacheGate *cacheaccess.Gate,
+	cacheAccessTracker *cacheaccess.Tracker,
+	logger *slog.Logger,
+	opts ...Option,
+) *SynapseBackend {
+	if cacheGate == nil {
+		panic("backend requires a cache access gate")
+	}
+	if cacheAccessTracker == nil {
+		panic("backend requires a cache access tracker")
+	}
 	b := &SynapseBackend{
 		repos:                    repos,
 		cache:                    c,
-		objectReader:             objectreader.New(repos, c, sc, logger),
+		cacheGate:                cacheGate,
+		cacheAccessTracker:       cacheAccessTracker,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
 		stateMachine:             sm,
 		storage:                  sc,
 		uploadMaxRetries:         defaultUploadMaxRetries,
 		evictMaxRetries:          defaultEvictMaxRetries,
 		storageCleanupMaxRetries: defaultStorageCleanupMaxRetries,
+		evictionPolicy:           cache.EvictionPolicyNone,
 		logger:                   logger,
 	}
 	for _, opt := range opts {
 		opt(b)
 	}
+	b.objectReader = objectreader.New(
+		repos,
+		c,
+		sc,
+		cacheGate,
+		cacheAccessTracker,
+		logger,
+	)
 	return b
 }
 

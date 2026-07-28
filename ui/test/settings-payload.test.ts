@@ -25,6 +25,8 @@ function baseConfig(): SettingsEditableConfig {
       dir: '/tmp/cache',
       max_size_gb: 100,
       eviction_policy: 'lru',
+      lru_high_watermark_percent: 90,
+      lru_low_watermark_percent: 80,
     },
     worker: {
       upload: { concurrency: 4, poll_interval: '5s', max_retries: 5 },
@@ -94,4 +96,31 @@ test('settings payload omits env-managed filecoin observability fields', () => {
   })
 
   assert.deepEqual(payload.filecoin?.observability, {})
+})
+
+test('settings payload includes editable LRU watermarks', () => {
+  const initial = baseConfig()
+  const form = baseConfig()
+  form.cache.lru_high_watermark_percent = 85
+  form.cache.lru_low_watermark_percent = 70
+
+  const payload = buildSettingsPayload(form, initial, {})
+
+  assert.equal(payload.cache?.lru_high_watermark_percent, 85)
+  assert.equal(payload.cache?.lru_low_watermark_percent, 70)
+})
+
+test('settings payload omits env-managed LRU watermarks', () => {
+  const initial = baseConfig()
+  const form = baseConfig()
+  form.cache.lru_high_watermark_percent = 85
+  form.cache.lru_low_watermark_percent = 70
+
+  const payload = buildSettingsPayload(form, initial, {
+    'cache.lru_high_watermark_percent': 'SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT',
+    'cache.lru_low_watermark_percent': 'SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT',
+  })
+
+  assert.equal(payload.cache?.lru_high_watermark_percent, undefined)
+  assert.equal(payload.cache?.lru_low_watermark_percent, undefined)
 })

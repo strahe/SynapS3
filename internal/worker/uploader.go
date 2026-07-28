@@ -51,7 +51,7 @@ type Uploader struct {
 	storage         synapse.StorageClient
 	wallet          synapse.WalletQuerier // optional; nil skips balance pre-check
 	stateMachine    *state.Machine
-	autoEvict       bool
+	evictionPolicy  cache.EvictionPolicy
 	evictMaxRetries int
 	targetCopies    int
 	eventPublisher  admin.EventPublisher
@@ -96,14 +96,14 @@ func boundedTargetCopies(copies int) int {
 }
 
 // NewUploader creates a new upload worker.
-func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, autoEvict bool, targetCopies int, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
+func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, evictionPolicy cache.EvictionPolicy, targetCopies int, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
 	u := &Uploader{
 		repos:           repos,
 		cache:           c,
 		storage:         sc,
 		wallet:          wallet,
 		stateMachine:    sm,
-		autoEvict:       autoEvict,
+		evictionPolicy:  evictionPolicy,
 		evictMaxRetries: defaultEvictMaxRetries,
 		targetCopies:    boundedTargetCopies(targetCopies),
 		concurrency:     concurrency,
@@ -309,6 +309,14 @@ func uploadProgressEventPayload(upload *model.StorageUpload, done bool) map[stri
 
 func (u *Uploader) Name() string { return "uploader" }
 
+func (u *Uploader) finalizeUploadInput(uploadID int64) repository.FinalizeUploadInput {
+	return repository.NewFinalizeUploadInput(
+		uploadID,
+		u.evictionPolicy.EnqueuesAfterUploadEviction(),
+		u.evictMaxRetries,
+	)
+}
+
 func (u *Uploader) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for range u.concurrency {
@@ -423,9 +431,6 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	defer u.publishUploadStateChanged(task, version, bucket)
 
 	if version.State == model.ObjectStateStored || version.State == model.ObjectStateCacheEvicted {
-		if version.State == model.ObjectStateStored {
-			u.enqueueEvictTask(ctx, logger, task.RefID, task.RefVersionID)
-		}
 		if !completeWorkerTask(ctx, u.repos, task, "uploader", logger) {
 			return
 		}
@@ -600,13 +605,15 @@ func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.
 		u.handleTaskFailure(ctx, task, logger, "prepare upload repair", errors.New("readable source copy not found"))
 		return
 	}
-	finalized, refs, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID})
+	finalized, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		u.finalizeUploadInput(uploadID),
+	)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "finalize repaired upload", err)
 		return
 	}
 	if finalized {
-		u.enqueueEvictTasksForRefs(ctx, logger, refs)
 		completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 		return
 	}
@@ -1142,13 +1149,13 @@ func (u *Uploader) finishReadable(ctx context.Context, task *model.Task, version
 		}
 	}
 	if len(copies) == 1 {
-		finalized, storedRefs, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID})
+		_, _, err = u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+			ctx,
+			u.finalizeUploadInput(uploadID),
+		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize single-copy upload", err)
 			return
-		}
-		if finalized {
-			u.enqueueEvictTasksForRefs(ctx, logger, storedRefs)
 		}
 	}
 	if !completeWorkerTask(ctx, u.repos, task, "uploader", logger) {
@@ -1186,13 +1193,13 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 		return
 	}
 	if copyCommitted(copyRow) {
-		finalized, refs, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID})
+		_, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+			ctx,
+			u.finalizeUploadInput(uploadID),
+		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
 			return
-		}
-		if finalized {
-			u.enqueueEvictTasksForRefs(ctx, logger, refs)
 		}
 		completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 		return
@@ -1274,13 +1281,13 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		return
 	}
 	if copyCommitted(copyRow) {
-		finalized, refs, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID})
+		_, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+			ctx,
+			u.finalizeUploadInput(uploadID),
+		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
 			return
-		}
-		if finalized {
-			u.enqueueEvictTasksForRefs(ctx, logger, refs)
 		}
 		completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 		return
@@ -1330,13 +1337,13 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 			u.handleTaskFailure(ctx, task, logger, "mark peer committed", err)
 			return
 		}
-		finalized, refs, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID})
+		_, _, err = u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+			ctx,
+			u.finalizeUploadInput(uploadID),
+		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
 			return
-		}
-		if finalized {
-			u.enqueueEvictTasksForRefs(ctx, logger, refs)
 		}
 		completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 		return
@@ -1393,40 +1400,15 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		u.handleTaskFailure(ctx, task, logger, "mark peer committed", err)
 		return
 	}
-	finalized, refs, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID})
+	_, _, err = u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		u.finalizeUploadInput(uploadID),
+	)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
 		return
 	}
-	if finalized {
-		u.enqueueEvictTasksForRefs(ctx, logger, refs)
-	}
 	completeWorkerTask(ctx, u.repos, task, "uploader", logger)
-}
-
-func (u *Uploader) enqueueEvictTask(ctx context.Context, logger *slog.Logger, objectID int64, versionID string) {
-	if !u.autoEvict {
-		return
-	}
-	evictTask := &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		RefType:        "object",
-		RefID:          objectID,
-		RefVersionID:   versionID,
-		IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     u.evictMaxRetries,
-		ScheduledAt:    time.Now(),
-	}
-	if err := u.repos.Tasks.Create(ctx, evictTask); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
-		logger.Warn("failed to enqueue eviction task (non-fatal)", "error", err, "versionID", versionID)
-	}
-}
-
-func (u *Uploader) enqueueEvictTasksForRefs(ctx context.Context, logger *slog.Logger, refs []repository.ObjectVersionRef) {
-	for _, ref := range refs {
-		u.enqueueEvictTask(ctx, logger, ref.ObjectID, ref.VersionID)
-	}
 }
 
 func (u *Uploader) enqueueUploadStage(ctx context.Context, parent *model.Task, stage string, uploadID int64, copyIndex int, transferMethod model.StorageCopyTransferMethod) error {

@@ -79,6 +79,7 @@ synaps3 admin s3-user update <access-key> --role userplus
 synaps3 admin s3-user rotate-secret <access-key>
 synaps3 admin settings get
 synaps3 admin settings set cache.max_size_gb=200
+synaps3 admin settings set cache.eviction_policy=lru cache.lru_high_watermark_percent=90 cache.lru_low_watermark_percent=80
 synaps3 admin task stats
 synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task retry 42
@@ -95,6 +96,8 @@ Admin global flags must appear after `admin` and before the subcommand:
 | `--timeout <duration>` | Set the Admin API request timeout. |
 
 Task listing supports `--type`, `--stage`, `--status`, `--limit`, and `--offset`. `--stage` requires `--type`.
+
+Cache eviction policy accepts `lru`, `after_upload`, or `none`. LRU watermarks must satisfy `0 <= low < high <= 100`; these settings are retained but inactive under the other policies.
 
 ## Settings Safety
 

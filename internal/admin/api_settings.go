@@ -171,6 +171,8 @@ func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Conf
 		}
 		setInt("cache.max_size_gb", &next.Cache.MaxSizeGB, req.Cache.MaxSizeGB)
 		setString("cache.eviction_policy", &next.Cache.EvictionPolicy, req.Cache.EvictionPolicy)
+		setInt("cache.lru_high_watermark_percent", &next.Cache.LRUHighWatermarkPercent, req.Cache.LRUHighWatermarkPercent)
+		setInt("cache.lru_low_watermark_percent", &next.Cache.LRULowWatermarkPercent, req.Cache.LRULowWatermarkPercent)
 	}
 	if req.Worker != nil {
 		applyWorkerPoolUpdate(req.Worker.Upload, &next.Worker.Upload, "worker.upload", setInt, setDuration)
@@ -186,6 +188,7 @@ func (s *SettingsService) settingsDraft(req settingsUpdateRequest) (*config.Conf
 		}
 	}
 
+	next.Normalize()
 	if len(fieldErrs) == 0 {
 		fieldErrs = editableValidationErrors(next)
 	}
@@ -318,6 +321,7 @@ func cloneConfig(cfg *config.Config) *config.Config {
 		return nil
 	}
 	clone := *cfg
+	clone.Normalize()
 	return &clone
 }
 
@@ -388,9 +392,11 @@ type settingsObservabilityConfig struct {
 }
 
 type settingsCacheConfig struct {
-	Dir            string `json:"dir"`
-	MaxSizeGB      int    `json:"max_size_gb"`
-	EvictionPolicy string `json:"eviction_policy"`
+	Dir                     string `json:"dir"`
+	MaxSizeGB               int    `json:"max_size_gb"`
+	EvictionPolicy          string `json:"eviction_policy"`
+	LRUHighWatermarkPercent int    `json:"lru_high_watermark_percent"`
+	LRULowWatermarkPercent  int    `json:"lru_low_watermark_percent"`
 }
 
 type settingsWorkerConfig struct {
@@ -492,9 +498,11 @@ type settingsObservabilityUpdate struct {
 }
 
 type settingsCacheUpdate struct {
-	Dir            *string `json:"dir,omitempty"`
-	MaxSizeGB      *int    `json:"max_size_gb,omitempty"`
-	EvictionPolicy *string `json:"eviction_policy,omitempty"`
+	Dir                     *string `json:"dir,omitempty"`
+	MaxSizeGB               *int    `json:"max_size_gb,omitempty"`
+	EvictionPolicy          *string `json:"eviction_policy,omitempty"`
+	LRUHighWatermarkPercent *int    `json:"lru_high_watermark_percent,omitempty"`
+	LRULowWatermarkPercent  *int    `json:"lru_low_watermark_percent,omitempty"`
 }
 
 type settingsWorkerUpdate struct {
@@ -548,9 +556,11 @@ func toSettingsEditableConfig(cfg *config.Config) settingsEditableConfig {
 			},
 		},
 		Cache: settingsCacheConfig{
-			Dir:            cfg.Cache.Dir,
-			MaxSizeGB:      cfg.Cache.MaxSizeGB,
-			EvictionPolicy: cfg.Cache.EvictionPolicy,
+			Dir:                     cfg.Cache.Dir,
+			MaxSizeGB:               cfg.Cache.MaxSizeGB,
+			EvictionPolicy:          cfg.Cache.EvictionPolicy,
+			LRUHighWatermarkPercent: cfg.Cache.LRUHighWatermarkPercent,
+			LRULowWatermarkPercent:  cfg.Cache.LRULowWatermarkPercent,
 		},
 		Worker: settingsWorkerConfig{
 			Upload:         toSettingsWorkerPoolConfig(cfg.Worker.Upload),
@@ -613,6 +623,8 @@ func editableValidationErrors(cfg *config.Config) []config.FieldError {
 		"cache.dir":                            {},
 		"cache.max_size_gb":                    {},
 		"cache.eviction_policy":                {},
+		"cache.lru_high_watermark_percent":     {},
+		"cache.lru_low_watermark_percent":      {},
 		"filecoin.network":                     {},
 		"filecoin.rpc_url":                     {},
 		"filecoin.default_copies":              {},

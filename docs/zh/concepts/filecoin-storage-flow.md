@@ -16,7 +16,10 @@ flowchart TD
   uploading --> committing["committing"]
   committing --> replicating["replicating"]
   replicating --> stored["stored"]
-  stored --> evict["evict_cache task"]
+  stored --> policy{"缓存淘汰策略"}
+  policy -->|"after_upload"| evict["排队执行上传后淘汰"]
+  policy -->|"lru 达到高水位"| evict
+  policy -->|"none"| retain["保留本地缓存"]
   evict --> evicted["cache_evicted"]
 ```
 
@@ -54,7 +57,7 @@ synaps3 admin task retry 42
 - S3 上传可以在 Filecoin 存储完成前成功。
 - 仪表盘的任务和拓扑视图会展示存储进度。
 - 读取优先使用本地缓存；已有远端元数据时，可以从存储提供方取回对象。
-- 缓存淘汰是运维优化，不是写入接受点。
+- 缓存淘汰是运维优化，不是写入接受点。`after_upload` 会在存储完成后清理版本，`lru` 等待容量压力，`none` 则保留本地缓存。
 
 ## 副本修复愿景
 

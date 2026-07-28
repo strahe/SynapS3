@@ -97,7 +97,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 	cfg.Admin.Addr = "127.0.0.1:0"
 	cfg.Cache.Dir = filepath.Join(tempDir, "cache")
 	cfg.Cache.MaxSizeGB = 1
-	cfg.Cache.EvictionPolicy = "lru"
+	cfg.Cache.EvictionPolicy = "after_upload"
 	cfg.Database = config.DatabaseConfig{
 		Driver: "sqlite",
 		DSN: "file:" + filepath.ToSlash(filepath.Join(tempDir, "system.db")) +

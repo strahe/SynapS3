@@ -24,6 +24,11 @@ func validConfig() *Config {
 
 func TestValidate_DefaultConfig(t *testing.T) {
 	cfg := validConfig()
+	if cfg.Cache.EvictionPolicy != "lru" ||
+		cfg.Cache.LRUHighWatermarkPercent != 90 ||
+		cfg.Cache.LRULowWatermarkPercent != 80 {
+		t.Fatalf("default cache config = %#v, want lru with 90/80 watermarks", cfg.Cache)
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got: %v", err)
 	}
@@ -501,7 +506,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT", "4s")
 	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY", "6")
 	t.Setenv("SYNAPS3_CACHE_MAX_SIZE_GB", "7")
-	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "manual")
+	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "After_Upload")
+	t.Setenv("SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", "88")
+	t.Setenv("SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", "73")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_MAX_RETRIES", "8")
 	t.Setenv("SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL", "2m")
@@ -531,7 +538,10 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 		cfg.Filecoin.Observability.Concurrency != 6 {
 		t.Fatalf("filecoin observability = %#v, want env values", cfg.Filecoin.Observability)
 	}
-	if cfg.Cache.MaxSizeGB != 7 || cfg.Cache.EvictionPolicy != "manual" {
+	if cfg.Cache.MaxSizeGB != 7 ||
+		cfg.Cache.EvictionPolicy != "after_upload" ||
+		cfg.Cache.LRUHighWatermarkPercent != 88 ||
+		cfg.Cache.LRULowWatermarkPercent != 73 {
 		t.Fatalf("cache config = %#v, want env values", cfg.Cache)
 	}
 	if cfg.Worker.Upload.PollInterval != 9*time.Second || cfg.Worker.Upload.MaxRetries != 8 {
@@ -754,11 +764,70 @@ func TestValidate_AdminAddr_Empty(t *testing.T) {
 }
 
 func TestValidate_EvictionPolicy_CaseInsensitive(t *testing.T) {
-	for _, policy := range []string{"LRU", "Manual", "NONE", "lru", "manual", "none"} {
+	for _, policy := range []string{"LRU", "After_Upload", "NONE", "lru", "after_upload", "none"} {
 		cfg := validConfig()
 		cfg.Cache.EvictionPolicy = policy
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("eviction_policy=%q should be valid, got: %v", policy, err)
+		}
+	}
+}
+
+func TestNormalizeEvictionPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		input string
+		want  string
+	}{
+		{input: " LRU ", want: "lru"},
+		{input: "After_Upload", want: "after_upload"},
+		{input: "NONE", want: "none"},
+	} {
+		cfg := validConfig()
+		cfg.Cache.EvictionPolicy = tt.input
+		cfg.Normalize()
+		if cfg.Cache.EvictionPolicy != tt.want {
+			t.Errorf("Normalize eviction_policy %q = %q, want %q", tt.input, cfg.Cache.EvictionPolicy, tt.want)
+		}
+	}
+}
+
+func TestValidate_LRUWatermarks(t *testing.T) {
+	tests := []struct {
+		name string
+		low  int
+		high int
+	}{
+		{name: "negative low", low: -1, high: 90},
+		{name: "low above range", low: 101, high: 90},
+		{name: "negative high", low: 0, high: -1},
+		{name: "high above range", low: 80, high: 101},
+		{name: "both zero", low: 0, high: 0},
+		{name: "equal", low: 80, high: 80},
+		{name: "low greater", low: 90, high: 80},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Cache.LRULowWatermarkPercent = tt.low
+			cfg.Cache.LRUHighWatermarkPercent = tt.high
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Validate() with low/high %d/%d succeeded, want error", tt.low, tt.high)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		low  int
+		high int
+	}{
+		{low: 0, high: 1},
+		{low: 99, high: 100},
+	} {
+		cfg := validConfig()
+		cfg.Cache.LRULowWatermarkPercent = tt.low
+		cfg.Cache.LRUHighWatermarkPercent = tt.high
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() with low/high %d/%d = %v, want valid", tt.low, tt.high, err)
 		}
 	}
 }

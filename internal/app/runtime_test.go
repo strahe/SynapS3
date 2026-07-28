@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 )
 
@@ -30,17 +31,18 @@ func TestNewRuntimeReportsAllMissingDependencies(t *testing.T) {
 func TestRuntimeConfigurationHelpers(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		policy string
-		want   bool
+		input string
+		want  cache.EvictionPolicy
 	}{
-		{policy: "lru", want: true},
-		{policy: "LRU", want: true},
-		{policy: " LrU ", want: true},
-		{policy: "manual", want: false},
-		{policy: "none", want: false},
+		{input: "lru", want: cache.EvictionPolicyLRU},
+		{input: "LRU", want: cache.EvictionPolicyLRU},
+		{input: " LrU ", want: cache.EvictionPolicyLRU},
+		{input: "after_upload", want: cache.EvictionPolicyAfterUpload},
+		{input: "none", want: cache.EvictionPolicyNone},
 	} {
-		if got := autoEvictEnabled(test.policy); got != test.want {
-			t.Errorf("autoEvictEnabled(%q) = %v, want %v", test.policy, got, test.want)
+		got, ok := cache.ParseEvictionPolicy(test.input)
+		if !ok || got != test.want {
+			t.Errorf("ParseEvictionPolicy(%q) = %q/%v, want %q/true", test.input, got, ok, test.want)
 		}
 	}
 

@@ -347,6 +347,40 @@ func (r *BunTaskRepo) ReleaseRunning(ctx context.Context, claimedTask *model.Tas
 	return nil
 }
 
+func (r *BunTaskRepo) CancelRunning(ctx context.Context, claimedTask *model.Task, message string) error {
+	taskID, claimedAt, err := runningTaskClaim(claimedTask)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	q := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusCancelled).
+		Set("completed_at = ?", now).
+		Set("last_error = NULL").
+		Set("wait_reason = NULL").
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
+		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
+		Where("claimed_at = ?", claimedAt).
+		Where("lease_until IS NOT NULL AND lease_until > ?", now)
+	if message == "" {
+		q = q.Set("status_message = NULL")
+	} else {
+		q = q.Set("status_message = ?", message)
+	}
+	res, err := q.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("cancelling running task: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("cancelling task %d: not in active running claim", taskID)
+	}
+	return nil
+}
+
 // ReleaseExpiredLeases resets running tasks whose lease has expired back to queued.
 func (r *BunTaskRepo) ReleaseExpiredLeases(ctx context.Context) (int, error) {
 	now := time.Now()

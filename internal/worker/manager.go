@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 )
@@ -27,7 +29,7 @@ type Manager struct {
 	repos            *repository.Repositories
 	workers          []Worker
 	logger           *slog.Logger
-	autoEvict        bool
+	evictionPolicy   cache.EvictionPolicy
 	uploadMaxRetries int
 	evictMaxRetries  int
 }
@@ -47,12 +49,12 @@ const (
 )
 
 // NewManager creates a new worker manager.
-func NewManager(repos *repository.Repositories, logger *slog.Logger, autoEvict bool, workers ...Worker) *Manager {
+func NewManager(repos *repository.Repositories, logger *slog.Logger, evictionPolicy cache.EvictionPolicy, workers ...Worker) *Manager {
 	return &Manager{
 		repos:            repos,
 		workers:          workers,
 		logger:           logger,
-		autoEvict:        autoEvict,
+		evictionPolicy:   evictionPolicy,
 		uploadMaxRetries: defaultUploadMaxRetries,
 		evictMaxRetries:  defaultEvictMaxRetries,
 	}
@@ -98,12 +100,23 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Info("released expired task leases", "count", released)
 	}
 
-	// Reconcile: ensure objects in cached/stored have corresponding tasks.
+	keepStage := ""
+	switch m.evictionPolicy {
+	case cache.EvictionPolicyLRU:
+		keepStage = cacheeviction.StageLRU
+	case cache.EvictionPolicyAfterUpload:
+		keepStage = cacheeviction.StageAfterUpload
+	}
+	cancelled, err := m.repos.CacheEvictions.CancelActiveTasksExcept(ctx, keepStage, "Cancelled because the cache eviction policy changed")
+	if err != nil {
+		m.logger.Error("failed to cancel incompatible cache eviction tasks", "error", err)
+	} else if cancelled > 0 {
+		m.logger.Info("cancelled incompatible cache eviction tasks", "count", cancelled, "policy", m.evictionPolicy)
+	}
+
+	// Reconcile unfinished upload work.
 	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUpload, "upload")
 	m.reconcileStagedUploads(ctx)
-	if m.autoEvict {
-		m.reconcileTasks(ctx, model.ObjectStateStored, model.TaskTypeEvictCache, "evict_cache")
-	}
 
 	// Log exhausted task count for operator awareness
 	exhaustedTasks, err := m.repos.Tasks.ListExhausted(ctx, 100)
@@ -329,13 +342,19 @@ func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.
 		version.State = model.ObjectStateReplicating
 		version.StorageUploadID = &upload.ID
 	}
-	finalized, refs, err := m.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	finalized, _, err := m.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		repository.NewFinalizeUploadInput(
+			upload.ID,
+			m.evictionPolicy.EnqueuesAfterUploadEviction(),
+			m.evictMaxRetries,
+		),
+	)
 	if err != nil {
 		m.logger.Error("failed to finalize recovered upload", "uploadID", upload.ID, "error", err)
 		return
 	}
 	if finalized {
-		m.enqueueRecoveredEvictTasks(ctx, refs)
 		return
 	}
 	recoverablePeerCount := 0
@@ -416,27 +435,6 @@ func (m *Manager) enqueueRecoveredUploadRepair(ctx context.Context, version mode
 	}
 	if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
 		m.logger.Error("failed to enqueue recovered upload repair", "uploadID", uploadID, "versionID", version.VersionID, "error", err)
-	}
-}
-
-func (m *Manager) enqueueRecoveredEvictTasks(ctx context.Context, refs []repository.ObjectVersionRef) {
-	if !m.autoEvict {
-		return
-	}
-	for _, ref := range refs {
-		task := &model.Task{
-			Type:           model.TaskTypeEvictCache,
-			RefType:        "object",
-			RefID:          ref.ObjectID,
-			RefVersionID:   ref.VersionID,
-			IdempotencyKey: fmt.Sprintf("evict_cache:%s", ref.VersionID),
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     m.evictMaxRetries,
-			ScheduledAt:    time.Now(),
-		}
-		if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
-			m.logger.Error("failed to enqueue recovered eviction task", "versionID", ref.VersionID, "error", err)
-		}
 	}
 }
 

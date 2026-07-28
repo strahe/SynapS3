@@ -12,6 +12,7 @@ import (
 
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -59,22 +60,40 @@ type Result struct {
 }
 
 type Reader struct {
-	repos   *repository.Repositories
-	cache   cache.Cache
-	storage synapse.StorageClient
-	logger  *slog.Logger
+	repos         *repository.Repositories
+	cache         cache.Cache
+	storage       synapse.StorageClient
+	cacheGate     *cacheaccess.Gate
+	accessTracker *cacheaccess.Tracker
+	logger        *slog.Logger
 }
 
-func New(repos *repository.Repositories, cache cache.Cache, storage synapse.StorageClient, logger *slog.Logger) *Reader {
+func New(
+	repos *repository.Repositories,
+	cache cache.Cache,
+	storage synapse.StorageClient,
+	cacheGate *cacheaccess.Gate,
+	accessTracker *cacheaccess.Tracker,
+	logger *slog.Logger,
+) *Reader {
+	if cacheGate == nil {
+		panic("object reader requires a cache access gate")
+	}
+	if accessTracker == nil {
+		panic("object reader requires a cache access tracker")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Reader{
-		repos:   repos,
-		cache:   cache,
-		storage: storage,
-		logger:  logger,
+	r := &Reader{
+		repos:         repos,
+		cache:         cache,
+		storage:       storage,
+		cacheGate:     cacheGate,
+		accessTracker: accessTracker,
+		logger:        logger,
 	}
+	return r
 }
 
 func (r *Reader) Open(ctx context.Context, bucketName, key string, visible BucketVisibility) (*Result, error) {
@@ -117,11 +136,8 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 		return nil, ErrMethodNotAllowed
 	}
 
-	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
+	body, cacheErr := r.openCached(ctx, bucketName, version)
 	if cacheErr == nil {
-		if !version.InCache {
-			r.markCachePresence(ctx, version.VersionID, true)
-		}
 		return resultFromVersion(version, body, SourceCache, false), nil
 	}
 	if !os.IsNotExist(cacheErr) {
@@ -141,7 +157,13 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 
 	body = rc
 	if rehydrate {
-		body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, version.VersionID, rc)
+		body = r.streamAndRehydrate(
+			ctx,
+			bucketName,
+			version.CacheKey,
+			version.VersionID,
+			rc,
+		)
 	}
 	return resultFromVersion(version, body, SourceProvider, true), nil
 }
@@ -170,11 +192,8 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 		return nil, ErrNoSuchKey
 	}
 
-	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
+	body, cacheErr := r.openCached(ctx, bucketName, version)
 	if cacheErr == nil {
-		if !version.InCache {
-			r.markCachePresence(ctx, version.VersionID, true)
-		}
 		return resultFromVersion(version, body, SourceCache, cacheMiss), nil
 	}
 	if !os.IsNotExist(cacheErr) {
@@ -207,7 +226,13 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 
 	body = rc
 	if dbErr == nil && cur != nil && cur.VersionID == version.VersionID {
-		body = r.streamAndRehydrate(ctx, bucketName, version.CacheKey, version.VersionID, rc)
+		body = r.streamAndRehydrate(
+			ctx,
+			bucketName,
+			version.CacheKey,
+			version.VersionID,
+			rc,
+		)
 	}
 	return resultFromVersion(version, body, SourceProvider, cacheMiss), nil
 }
@@ -263,7 +288,11 @@ func cacheMissError(err error) error {
 	return fmt.Errorf("%w: %w", ErrCacheMiss, err)
 }
 
-func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, cacheKey, versionID string, rc io.ReadCloser) io.ReadCloser {
+func (r *Reader) streamAndRehydrate(
+	ctx context.Context,
+	bucket, cacheKey, versionID string,
+	rc io.ReadCloser,
+) io.ReadCloser {
 	pr, pw := io.Pipe()
 	done := make(chan struct{})
 	body := &teeReadCloser{
@@ -275,13 +304,55 @@ func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, cacheKey, versi
 
 	go func() {
 		defer close(done)
-		if _, err := r.cache.Put(ctx, bucket, cacheKey, pr); err != nil {
+		var (
+			persistErr      error
+			skipRehydration bool
+		)
+		err := r.cacheGate.Commit(
+			versionID,
+			func() error {
+				persistedVersion, err := r.repos.Objects.GetVersionByID(ctx, versionID)
+				if err != nil {
+					return fmt.Errorf("checking object version before cache rehydration: %w", err)
+				}
+				if persistedVersion == nil ||
+					persistedVersion.IsDeleteMarker ||
+					persistedVersion.CacheKey != cacheKey {
+					skipRehydration = true
+					return nil
+				}
+				_, err = r.cache.Put(ctx, bucket, cacheKey, pr)
+				if err != nil {
+					return err
+				}
+				persistErr = r.accessTracker.RecordCommit(
+					ctx,
+					versionID,
+					persistedVersion.CacheAccessedAt,
+				)
+				return nil
+			},
+		)
+		if err != nil {
 			r.logger.Warn("cache rehydration failed (best-effort)", "cacheKey", cacheKey, "error", err)
 			_, _ = io.Copy(io.Discard, pr)
 			_ = pr.Close()
 			return
 		}
-		r.markCachePresence(ctx, versionID, true)
+		if skipRehydration {
+			_, _ = io.Copy(io.Discard, pr)
+			_ = pr.Close()
+			return
+		}
+		if persistErr != nil {
+			r.logger.Warn(
+				"cache access update failed",
+				"versionID",
+				versionID,
+				"error",
+				persistErr,
+			)
+		}
 		_ = pr.Close()
 	}()
 
@@ -295,6 +366,38 @@ func (r *Reader) markCachePresence(ctx context.Context, versionID string, inCach
 	if err := r.repos.Objects.SetVersionCachePresence(ctx, versionID, inCache); err != nil {
 		r.logger.Warn("cache location update failed", "versionID", versionID, "inCache", inCache, "error", err)
 	}
+}
+
+func (r *Reader) openCached(
+	ctx context.Context,
+	bucketName string,
+	version *model.ObjectVersion,
+) (io.ReadCloser, error) {
+	opened, err := r.cacheGate.Open(
+		version.VersionID,
+		func() (io.ReadCloser, *cache.ObjectInfo, error) {
+			return r.cache.Get(ctx, bucketName, version.CacheKey)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	var persistErr error
+	if version.InCache {
+		persistErr = r.accessTracker.RecordAccess(ctx, version.VersionID, version.CacheAccessedAt)
+	} else {
+		persistErr = r.accessTracker.RecordCommit(ctx, version.VersionID, version.CacheAccessedAt)
+	}
+	if persistErr != nil {
+		r.logger.Warn(
+			"cache access update failed",
+			"versionID",
+			version.VersionID,
+			"error",
+			persistErr,
+		)
+	}
+	return opened.Body, nil
 }
 
 type teeReadCloser struct {
