@@ -821,6 +821,19 @@ func (r *BunObjectRepo) ListLRUEvictionCandidates(ctx context.Context, limit int
 			  AND eviction_task.ref_version_id = object_version.version_id
 			  AND eviction_task.status IN (?)
 		)`, model.TaskTypeEvictCache, "object", bun.List(activeTaskStatuses())).
+		Where(`NOT EXISTS (
+			SELECT 1 FROM tasks AS terminal_lru_task
+			WHERE terminal_lru_task.type = ?
+			  AND terminal_lru_task.stage = ?
+			  AND terminal_lru_task.ref_type = ?
+			  AND terminal_lru_task.ref_version_id = object_version.version_id
+			  AND terminal_lru_task.status IN (?)
+		)`,
+			model.TaskTypeEvictCache,
+			CacheEvictionStageLRU,
+			"object",
+			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
+		).
 		OrderExpr("COALESCE(object_version.cache_accessed_at, object_version.created_at) ASC").
 		OrderExpr("object_version.created_at ASC").
 		OrderExpr("object_version.version_id ASC")

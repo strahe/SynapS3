@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -149,7 +148,6 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 		return nil
 	}
 
-	planID := model.NewVersionID()
 	var plannedBytes int64
 	plannedTasks := 0
 	for bytesToPlan > 0 {
@@ -162,12 +160,15 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 			break
 		}
 		for _, candidate := range candidates {
-			task := newLRUEvictionTask(candidate, planID, e.maxRetries)
-			if err := e.repos.Tasks.Create(ctx, task); err != nil {
-				if errors.Is(err, repository.ErrAlreadyExists) {
-					continue
-				}
+			activated, err := e.repos.Tasks.CreateOrReactivateCancelled(
+				ctx,
+				newLRUEvictionTask(candidate, e.maxRetries),
+			)
+			if err != nil {
 				return fmt.Errorf("creating LRU eviction task for version %s: %w", candidate.VersionID, err)
+			}
+			if !activated {
+				continue
 			}
 			plannedTasks++
 			createdThisBatch++
@@ -208,11 +209,13 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 	return nil
 }
 
-func newLRUEvictionTask(candidate repository.CacheEvictionCandidate, planID string, maxRetries int) *model.Task {
+func newLRUEvictionTask(candidate repository.CacheEvictionCandidate, maxRetries int) *model.Task {
 	stage := repository.CacheEvictionStageLRU
 	payload := make(map[string]interface{})
+	accessGeneration := "unaccessed"
 	if candidate.CacheAccessedAt != nil {
-		payload[lruAccessedAtPayloadKey] = candidate.CacheAccessedAt.UTC().Format(time.RFC3339Nano)
+		accessGeneration = candidate.CacheAccessedAt.UTC().Format(time.RFC3339Nano)
+		payload[lruAccessedAtPayloadKey] = accessGeneration
 	}
 	return &model.Task{
 		Type:           model.TaskTypeEvictCache,
@@ -220,7 +223,7 @@ func newLRUEvictionTask(candidate repository.CacheEvictionCandidate, planID stri
 		RefType:        "object",
 		RefID:          candidate.ObjectID,
 		RefVersionID:   candidate.VersionID,
-		IdempotencyKey: fmt.Sprintf("evict_cache:%s:%s:%s", stage, planID, candidate.VersionID),
+		IdempotencyKey: fmt.Sprintf("evict_cache:%s:%s:%s", stage, candidate.VersionID, accessGeneration),
 		Payload:        payload,
 		Status:         model.TaskStatusQueued,
 		MaxRetries:     maxRetries,

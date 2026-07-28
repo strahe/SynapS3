@@ -1896,6 +1896,30 @@ func TestObjectRepo_ListLRUEvictionCandidatesOrdersSafeCurrentAndHistoricalVersi
 	if activeBytes != middle.version.Size {
 		t.Fatalf("active eviction bytes = %d, want %d", activeBytes, middle.version.Size)
 	}
+
+	exhaustedAt := time.Now()
+	exhausted := &model.Task{
+		Type:           model.TaskTypeEvictCache,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          oldest.objectID,
+		RefVersionID:   oldest.version.VersionID,
+		IdempotencyKey: "evict_cache:lru:exhausted:" + oldest.version.VersionID,
+		Status:         model.TaskStatusExhausted,
+		MaxRetries:     3,
+		ScheduledAt:    exhaustedAt,
+		CompletedAt:    &exhaustedAt,
+	}
+	if err := repos.Tasks.Create(ctx, exhausted); err != nil {
+		t.Fatalf("Create exhausted LRU task: %v", err)
+	}
+	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListLRUEvictionCandidates after exhausted task: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].VersionID != newest.version.VersionID {
+		t.Fatalf("candidates with active and exhausted tasks = %#v, want newest only", candidates)
+	}
 }
 
 func TestObjectRepo_UpdateVersionStateMarksCacheEvictedLocation(t *testing.T) {
