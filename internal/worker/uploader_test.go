@@ -20,6 +20,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -133,7 +134,7 @@ func seedTask(t *testing.T, env *testWorkerEnv, taskType model.TaskType, refID i
 	case model.TaskTypeUpload:
 		task.Payload = map[string]interface{}{"stage": ""}
 	case model.TaskTypeEvictCache:
-		stage := repository.CacheEvictionStageAfterUpload
+		stage := cacheeviction.StageAfterUpload
 		task.Stage = &stage
 	}
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
@@ -3076,7 +3077,7 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 	}
 
 	// Pre-create conflicting evict_cache task to trigger idempotency collision
-	evictionStage := repository.CacheEvictionStageAfterUpload
+	evictionStage := cacheeviction.StageAfterUpload
 	conflict := &model.Task{
 		Type:           model.TaskTypeEvictCache,
 		Stage:          &evictionStage,

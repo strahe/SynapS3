@@ -1,10 +1,8 @@
 package worker
 
 import (
-	"context"
-
 	"github.com/strahe/synaps3/internal/cache"
-	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
 )
 
@@ -12,8 +10,8 @@ type evictionStagePolicy struct {
 	requiredPolicy       cache.EvictionPolicy
 	policyMismatchReason string
 	capacityBound        bool
-	eligibility          func(*model.ObjectVersion) guardedEvictionResult
-	reject               func(*Evictor, context.Context, *model.Task, string, string)
+	eligibility          func(*model.ObjectVersion) *evictionDecision
+	rejectionAction      evictionAction
 }
 
 var (
@@ -22,25 +20,32 @@ var (
 		policyMismatchReason: "Cache eviction policy no longer uses LRU",
 		capacityBound:        true,
 		eligibility:          lruEvictionEligibility,
-		reject:               cancelRejectedEviction,
+		rejectionAction:      evictionCancel,
 	}
 	afterUploadEvictionStagePolicy = evictionStagePolicy{
 		requiredPolicy:       cache.EvictionPolicyAfterUpload,
 		policyMismatchReason: "Cache eviction policy no longer removes objects after upload",
 		eligibility:          afterUploadEvictionEligibility,
-		reject:               failRejectedEviction,
+		rejectionAction:      evictionFail,
 	}
 )
 
 func evictionPolicyForTask(task *model.Task) (evictionStagePolicy, bool) {
 	switch taskStage(task) {
-	case repository.CacheEvictionStageLRU:
+	case cacheeviction.StageLRU:
 		return lruEvictionStagePolicy, true
-	case repository.CacheEvictionStageAfterUpload:
+	case cacheeviction.StageAfterUpload:
 		return afterUploadEvictionStagePolicy, true
 	default:
 		return evictionStagePolicy{}, false
 	}
+}
+
+func (p evictionStagePolicy) reject(reason, logMessage string) *evictionDecision {
+	if p.rejectionAction == evictionCancel {
+		return cancelEviction(reason)
+	}
+	return failEviction(reason, logMessage)
 }
 
 func taskStage(task *model.Task) string {
@@ -50,53 +55,23 @@ func taskStage(task *model.Task) string {
 	return *task.Stage
 }
 
-func lruEvictionEligibility(version *model.ObjectVersion) guardedEvictionResult {
+func lruEvictionEligibility(version *model.ObjectVersion) *evictionDecision {
 	if !version.InCache {
-		return guardedEvictionResult{
-			action: guardedEvictionReject,
-			reason: "Object is no longer present in the local cache",
-		}
+		return cancelEviction("Object is no longer present in the local cache")
 	}
 	if version.State != model.ObjectStateStored &&
 		version.State != model.ObjectStateCacheEvicted {
-		return guardedEvictionResult{
-			action: guardedEvictionReject,
-			reason: "Object is no longer eligible for LRU eviction",
-		}
+		return cancelEviction("Object is no longer eligible for LRU eviction")
 	}
-	return guardedEvictionResult{}
+	return nil
 }
 
-func afterUploadEvictionEligibility(version *model.ObjectVersion) guardedEvictionResult {
+func afterUploadEvictionEligibility(version *model.ObjectVersion) *evictionDecision {
 	if version.State == model.ObjectStateReplicating {
-		return guardedEvictionResult{action: guardedEvictionDefer}
+		return waitForEvictionDependency()
 	}
 	if version.State != model.ObjectStateStored {
-		return guardedEvictionResult{
-			action:     guardedEvictionReject,
-			reason:     "not stored",
-			logMessage: "object version not in stored state",
-		}
+		return failEviction("not stored", "object version not in stored state")
 	}
-	return guardedEvictionResult{}
-}
-
-func cancelRejectedEviction(
-	evictor *Evictor,
-	ctx context.Context,
-	task *model.Task,
-	reason string,
-	_ string,
-) {
-	evictor.cancelTask(ctx, task, reason)
-}
-
-func failRejectedEviction(
-	evictor *Evictor,
-	ctx context.Context,
-	task *model.Task,
-	reason string,
-	logMessage string,
-) {
-	evictor.failTask(ctx, task, reason, logMessage)
+	return nil
 }

@@ -6,8 +6,6 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
-	"github.com/strahe/synaps3/internal/db/repository"
-	"github.com/strahe/synaps3/internal/model"
 )
 
 func (e *Evictor) runLRUPlanner(ctx context.Context) {
@@ -35,7 +33,7 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 		return nil
 	}
 	lowBytes := watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent)
-	activeBytes, err := e.repos.Tasks.ActiveEvictionBytes(ctx, repository.CacheEvictionStageLRU)
+	activeBytes, err := e.repos.CacheEvictions.ActiveLRUBytes(ctx)
 	if err != nil {
 		return err
 	}
@@ -49,7 +47,7 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 	for bytesToPlan > 0 {
 		createdThisBatch := 0
 		terminalSince := time.Now().Add(-lruTerminalRetryDelay)
-		candidates, err := e.repos.Objects.ListLRUEvictionCandidates(
+		candidates, err := e.repos.CacheEvictions.ListLRUCandidates(
 			ctx,
 			terminalSince,
 			lruCandidateBatchSize,
@@ -61,13 +59,10 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 			break
 		}
 		for _, candidate := range candidates {
-			activated, err := e.repos.Tasks.CreateOrReactivateLRU(
+			activated, err := e.repos.CacheEvictions.PlanLRU(
 				ctx,
-				newLRUEvictionTask(
-					candidate,
-					e.maxRetries,
-					candidateAccessTime(candidate),
-				),
+				candidate,
+				e.maxRetries,
 				terminalSince,
 			)
 			if err != nil {
@@ -113,36 +108,6 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 		lowBytes,
 	)
 	return nil
-}
-
-func newLRUEvictionTask(
-	candidate repository.CacheEvictionCandidate,
-	maxRetries int,
-	accessedAt time.Time,
-) *model.Task {
-	stage := repository.CacheEvictionStageLRU
-	accessedAt = normalizeLRUAccessTime(accessedAt)
-	return &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          candidate.ObjectID,
-		RefVersionID:   candidate.VersionID,
-		IdempotencyKey: repository.LRUEvictionTaskKey(candidate.VersionID),
-		Payload: map[string]interface{}{
-			lruAccessedAtPayloadKey: accessedAt.Format(time.RFC3339Nano),
-		},
-		Status:      model.TaskStatusQueued,
-		MaxRetries:  maxRetries,
-		ScheduledAt: time.Now(),
-	}
-}
-
-func candidateAccessTime(candidate repository.CacheEvictionCandidate) time.Time {
-	if candidate.CacheAccessedAt != nil {
-		return *candidate.CacheAccessedAt
-	}
-	return candidate.CreatedAt
 }
 
 func watermarkBytes(maxBytes int64, percent int) int64 {

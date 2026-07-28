@@ -13,6 +13,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
@@ -230,7 +231,7 @@ func TestEvictor_LRUBelowHighWatermarkDoesNotPlanEviction(t *testing.T) {
 	tasks, total, err := env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageLRU,
+		cacheeviction.StageLRU,
 		"",
 		10,
 		0,
@@ -308,7 +309,7 @@ func TestEvictor_LRUEvictsLeastRecentlyUsedUntilLowWatermark(t *testing.T) {
 		_, completed, err := env.repos.Tasks.List(
 			context.Background(),
 			string(model.TaskTypeEvictCache),
-			repository.CacheEvictionStageLRU,
+			cacheeviction.StageLRU,
 			string(model.TaskStatusCompleted),
 			10,
 			0,
@@ -358,7 +359,7 @@ func TestEvictor_LRUEvictsLeastRecentlyUsedUntilLowWatermark(t *testing.T) {
 	completed, total, err := env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageLRU,
+		cacheeviction.StageLRU,
 		string(model.TaskStatusCompleted),
 		10,
 		0,
@@ -400,7 +401,7 @@ func TestEvictor_LRUSkipsUnexpectedNullAccessTime(t *testing.T) {
 		Exec(context.Background()); err != nil {
 		t.Fatalf("clear cache access time: %v", err)
 	}
-	candidates, err := env.repos.Objects.ListLRUEvictionCandidates(
+	candidates, err := env.repos.CacheEvictions.ListLRUCandidates(
 		context.Background(),
 		time.Now().Add(-time.Hour),
 		10,
@@ -432,7 +433,7 @@ func TestEvictor_LRUSkipsUnexpectedNullAccessTime(t *testing.T) {
 	tasks, total, err := env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageLRU,
+		cacheeviction.StageLRU,
 		"",
 		10,
 		0,
@@ -471,23 +472,14 @@ func TestEvictor_LRUReactivatesCancelledStableTask(t *testing.T) {
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, accessedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess: %v", err)
 	}
-	stage := repository.CacheEvictionStageLRU
 	completedAt := time.Now()
-	task := &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          objectID,
-		RefVersionID:   versionID,
-		IdempotencyKey: repository.LRUEvictionTaskKey(versionID),
-		Payload: map[string]interface{}{
-			"cache_accessed_at": accessedAt.Format(time.RFC3339Nano),
-		},
-		Status:      model.TaskStatusCancelled,
-		MaxRetries:  3,
-		ScheduledAt: completedAt,
-		CompletedAt: &completedAt,
-	}
+	task := cacheeviction.NewLRUTask(cacheeviction.Candidate{
+		ObjectID:   objectID,
+		VersionID:  versionID,
+		AccessedAt: accessedAt,
+	}, 3, completedAt)
+	task.Status = model.TaskStatusCancelled
+	task.CompletedAt = &completedAt
 	if err := env.repos.Tasks.Create(context.Background(), task); err != nil {
 		t.Fatalf("Create cancelled LRU task: %v", err)
 	}
@@ -510,7 +502,7 @@ func TestEvictor_LRUReactivatesCancelledStableTask(t *testing.T) {
 	tasks, total, err := env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageLRU,
+		cacheeviction.StageLRU,
 		"",
 		10,
 		0,
@@ -565,7 +557,7 @@ func TestEvictor_LRUExhaustedTaskWaitsForCooldownBeforeReplanning(t *testing.T) 
 		_, exhausted, err := env.repos.Tasks.List(
 			context.Background(),
 			string(model.TaskTypeEvictCache),
-			repository.CacheEvictionStageLRU,
+			cacheeviction.StageLRU,
 			string(model.TaskStatusExhausted),
 			10,
 			0,
@@ -582,7 +574,7 @@ func TestEvictor_LRUExhaustedTaskWaitsForCooldownBeforeReplanning(t *testing.T) 
 	tasks, total, err := env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageLRU,
+		cacheeviction.StageLRU,
 		"",
 		10,
 		0,
@@ -619,7 +611,7 @@ func TestEvictor_LRUExhaustedTaskWaitsForCooldownBeforeReplanning(t *testing.T) 
 		_, completed, err := env.repos.Tasks.List(
 			context.Background(),
 			string(model.TaskTypeEvictCache),
-			repository.CacheEvictionStageLRU,
+			cacheeviction.StageLRU,
 			string(model.TaskStatusCompleted),
 			10,
 			0,
@@ -629,7 +621,7 @@ func TestEvictor_LRUExhaustedTaskWaitsForCooldownBeforeReplanning(t *testing.T) 
 	tasks, total, err = env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageLRU,
+		cacheeviction.StageLRU,
 		"",
 		10,
 		0,
@@ -1007,23 +999,14 @@ func TestEvictor_LRUCanEvictRehydratedCacheEvictedVersion(t *testing.T) {
 	); err != nil {
 		t.Fatalf("UpdateVersionState(cache_evicted): %v", err)
 	}
-	stage := repository.CacheEvictionStageLRU
 	completedAt := time.Now()
-	previousTask := &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          objectID,
-		RefVersionID:   versionID,
-		IdempotencyKey: repository.LRUEvictionTaskKey(versionID),
-		Payload: map[string]interface{}{
-			"cache_accessed_at": previousAccess.Format(time.RFC3339Nano),
-		},
-		Status:      model.TaskStatusCompleted,
-		MaxRetries:  3,
-		ScheduledAt: completedAt,
-		CompletedAt: &completedAt,
-	}
+	previousTask := cacheeviction.NewLRUTask(cacheeviction.Candidate{
+		ObjectID:   objectID,
+		VersionID:  versionID,
+		AccessedAt: previousAccess,
+	}, 3, completedAt)
+	previousTask.Status = model.TaskStatusCompleted
+	previousTask.CompletedAt = &completedAt
 	if err := env.repos.Tasks.Create(context.Background(), previousTask); err != nil {
 		t.Fatalf("Create previous completed LRU task: %v", err)
 	}
@@ -1049,7 +1032,7 @@ func TestEvictor_LRUCanEvictRehydratedCacheEvictedVersion(t *testing.T) {
 	tasks, total, err := env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageLRU,
+		cacheeviction.StageLRU,
 		"",
 		10,
 		0,
@@ -1313,21 +1296,11 @@ func seedLRUEvictionTask(
 	accessedAt time.Time,
 ) *model.Task {
 	t.Helper()
-	stage := repository.CacheEvictionStageLRU
-	task := &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          objectID,
-		RefVersionID:   versionID,
-		IdempotencyKey: repository.LRUEvictionTaskKey(versionID),
-		Payload: map[string]interface{}{
-			"cache_accessed_at": accessedAt.UTC().Format(time.RFC3339Nano),
-		},
-		Status:      model.TaskStatusQueued,
-		MaxRetries:  3,
-		ScheduledAt: time.Now(),
-	}
+	task := cacheeviction.NewLRUTask(cacheeviction.Candidate{
+		ObjectID:   objectID,
+		VersionID:  versionID,
+		AccessedAt: accessedAt,
+	}, 3, time.Now())
 	if err := env.repos.Tasks.Create(context.Background(), task); err != nil {
 		t.Fatalf("Create LRU eviction task: %v", err)
 	}
@@ -1592,7 +1565,7 @@ func TestEvictor_Preconditions(t *testing.T) {
 			name: "MissingVersion",
 			setup: func(ctx context.Context, t *testing.T, env *testWorkerEnv) *model.Task {
 				_, objID, _ := seedStoredObject(t, env)
-				stage := repository.CacheEvictionStageAfterUpload
+				stage := cacheeviction.StageAfterUpload
 				task := &model.Task{
 					Type:           model.TaskTypeEvictCache,
 					Stage:          &stage,

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -1579,7 +1579,7 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 		ctx,
 		repository.NewFinalizeUploadInput(
 			upload.ID,
-			cache.EvictionPolicyAfterUpload,
+			true,
 			maxEvictionRetries,
 		),
 	)
@@ -1613,7 +1613,7 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 		ctx,
 		repository.NewFinalizeUploadInput(
 			upload.ID,
-			cache.EvictionPolicyAfterUpload,
+			true,
 			maxEvictionRetries,
 		),
 	)
@@ -1650,7 +1650,7 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 	evictionTasks, total, err := repos.Tasks.List(
 		ctx,
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageAfterUpload,
+		cacheeviction.StageAfterUpload,
 		"",
 		10,
 		0,

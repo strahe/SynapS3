@@ -3,7 +3,6 @@ package repository
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
@@ -45,108 +44,6 @@ func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
 		return fmt.Errorf("inserting task: %w", err)
 	}
 	return nil
-}
-
-func (r *BunTaskRepo) CreateOrReactivateCancelled(ctx context.Context, task *model.Task) (bool, error) {
-	return r.createOrReactivate(ctx, task, taskReactivationRule{
-		immediateStatuses: []model.TaskStatus{model.TaskStatusCancelled},
-		errorAction:       "reactivating task",
-	})
-}
-
-func (r *BunTaskRepo) CreateOrReactivateLRU(
-	ctx context.Context,
-	task *model.Task,
-	terminalBefore time.Time,
-) (bool, error) {
-	if task == nil || task.Stage == nil || *task.Stage != CacheEvictionStageLRU {
-		return false, errors.New("reactivating LRU task: LRU stage is required")
-	}
-	return r.createOrReactivate(ctx, task, taskReactivationRule{
-		immediateStatuses: []model.TaskStatus{
-			model.TaskStatusCancelled,
-			model.TaskStatusCompleted,
-		},
-		cooledStatuses: []model.TaskStatus{
-			model.TaskStatusFailed,
-			model.TaskStatusExhausted,
-		},
-		terminalBefore: &terminalBefore,
-		errorAction:    "reactivating LRU task",
-	})
-}
-
-type taskReactivationRule struct {
-	immediateStatuses []model.TaskStatus
-	cooledStatuses    []model.TaskStatus
-	terminalBefore    *time.Time
-	errorAction       string
-}
-
-func (r *BunTaskRepo) createOrReactivate(
-	ctx context.Context,
-	task *model.Task,
-	rule taskReactivationRule,
-) (bool, error) {
-	if err := r.Create(ctx, task); err == nil {
-		return true, nil
-	} else if !errors.Is(err, ErrAlreadyExists) {
-		return false, err
-	}
-
-	normalizeTaskStage(task)
-	now := time.Now()
-	q := r.reactivationQuery(task, now)
-	if len(rule.cooledStatuses) == 0 {
-		q = q.Where("status IN (?)", bun.List(rule.immediateStatuses))
-	} else {
-		if rule.terminalBefore == nil {
-			return false, errors.New("reactivating task: terminal cutoff is required")
-		}
-		q = q.Where(
-			`(
-				status IN (?)
-				OR (
-					status IN (?)
-					AND completed_at IS NOT NULL
-					AND completed_at <= ?
-				)
-			)`,
-			bun.List(rule.immediateStatuses),
-			bun.List(rule.cooledStatuses),
-			*rule.terminalBefore,
-		)
-	}
-	res, err := q.Exec(ctx)
-	if err != nil {
-		return false, fmt.Errorf("%s %q: %w", rule.errorAction, task.IdempotencyKey, err)
-	}
-	rows, _ := res.RowsAffected()
-	return rows > 0, nil
-}
-
-func (r *BunTaskRepo) reactivationQuery(task *model.Task, now time.Time) *bun.UpdateQuery {
-	normalizeTaskStage(task)
-	return r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("type = ?", task.Type).
-		Set("stage = ?", task.Stage).
-		Set("ref_type = ?", task.RefType).
-		Set("ref_id = ?", task.RefID).
-		Set("ref_version_id = ?", task.RefVersionID).
-		Set("payload = ?", task.Payload).
-		Set("status = ?", model.TaskStatusQueued).
-		Set("retry_count = 0").
-		Set("max_retries = ?", task.MaxRetries).
-		Set("scheduled_at = ?", now).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Set("completed_at = NULL").
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("status_message = NULL").
-		Where("idempotency_key = ?", task.IdempotencyKey)
 }
 
 func normalizeTaskStage(task *model.Task) {
@@ -504,56 +401,6 @@ func (r *BunTaskRepo) ReleaseExpiredLeases(ctx context.Context) (int, error) {
 	}
 	rows, _ := res.RowsAffected()
 	return int(rows), nil
-}
-
-func (r *BunTaskRepo) CancelActiveEvictionTasksExcept(ctx context.Context, keepStage string, message string) (int, error) {
-	now := time.Now()
-	q := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusCancelled).
-		Set("completed_at = ?", now).
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Where("type = ?", model.TaskTypeEvictCache).
-		Where("status IN (?)", bun.List(activeTaskStatuses()))
-	if keepStage != "" {
-		q = q.Where("(stage IS NULL OR stage <> ?)", keepStage)
-	}
-	if message == "" {
-		q = q.Set("status_message = NULL")
-	} else {
-		q = q.Set("status_message = ?", message)
-	}
-	res, err := q.Exec(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("cancelling incompatible cache eviction tasks: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	return int(rows), nil
-}
-
-func (r *BunTaskRepo) ActiveEvictionBytes(ctx context.Context, stage string) (int64, error) {
-	var total int64
-	err := r.db.NewSelect().
-		TableExpr("object_versions AS object_version").
-		ColumnExpr("COALESCE(SUM(object_version.size), 0)").
-		Where("object_version.in_cache = ?", true).
-		Where(`EXISTS (
-			SELECT 1 FROM tasks AS eviction_task
-			WHERE eviction_task.type = ?
-			  AND eviction_task.stage = ?
-			  AND eviction_task.ref_type = ?
-			  AND eviction_task.ref_version_id = object_version.version_id
-			  AND eviction_task.status IN (?)
-		)`, model.TaskTypeEvictCache, stage, "object", bun.List(activeTaskStatuses())).
-		Scan(ctx, &total)
-	if err != nil {
-		return 0, fmt.Errorf("summing active cache eviction bytes: %w", err)
-	}
-	return total, nil
 }
 
 // MarkRunningExhausted marks a running task as exhausted.

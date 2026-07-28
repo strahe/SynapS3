@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
@@ -86,16 +85,6 @@ type ObjectVersionRef struct {
 	VersionID string `bun:"version_id"`
 }
 
-// CacheEvictionCandidate is the persisted snapshot needed to plan one LRU
-// cache eviction without exposing it through object APIs.
-type CacheEvictionCandidate struct {
-	ObjectID        int64      `bun:"object_id"`
-	VersionID       string     `bun:"version_id"`
-	Size            int64      `bun:"size"`
-	CacheAccessedAt *time.Time `bun:"cache_accessed_at"`
-	CreatedAt       time.Time  `bun:"created_at"`
-}
-
 type DeleteObjectVersionInput struct {
 	BucketID                 int64
 	Key                      string
@@ -170,7 +159,6 @@ type ObjectRepository interface {
 	// RecordVersionCacheCommit marks a newly committed local cache file present
 	// and initializes or advances its LRU recency.
 	RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error
-	ListLRUEvictionCandidates(ctx context.Context, terminalSince time.Time, limit int) ([]CacheEvictionCandidate, error)
 	SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error
 	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)
 	ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error)
@@ -391,22 +379,22 @@ type BindReadableUploadForVersionInput struct {
 }
 
 type FinalizeUploadInput struct {
-	UploadID            int64
-	CacheEvictionPolicy cache.EvictionPolicy
-	EvictionMaxRetries  int
+	UploadID                   int64
+	EnqueueAfterUploadEviction bool
+	EvictionMaxRetries         int
 }
 
 // NewFinalizeUploadInput builds the shared upload-finalization contract used
 // by every upload completion path.
 func NewFinalizeUploadInput(
 	uploadID int64,
-	policy cache.EvictionPolicy,
+	enqueueAfterUploadEviction bool,
 	evictionMaxRetries int,
 ) FinalizeUploadInput {
 	return FinalizeUploadInput{
-		UploadID:            uploadID,
-		CacheEvictionPolicy: policy,
-		EvictionMaxRetries:  evictionMaxRetries,
+		UploadID:                   uploadID,
+		EnqueueAfterUploadEviction: enqueueAfterUploadEviction,
+		EvictionMaxRetries:         evictionMaxRetries,
 	}
 }
 
@@ -465,12 +453,6 @@ type BucketACLSnapshot struct {
 // TaskRepository defines persistence operations for Task entities.
 type TaskRepository interface {
 	Create(ctx context.Context, task *model.Task) error
-	// CreateOrReactivateCancelled creates a task or requeues the existing
-	// cancelled task with the same idempotency key. Other terminal tasks stay terminal.
-	CreateOrReactivateCancelled(ctx context.Context, task *model.Task) (bool, error)
-	// CreateOrReactivateLRU reuses the stable task for a cached version.
-	// Failed or exhausted work observes the requested cooldown.
-	CreateOrReactivateLRU(ctx context.Context, task *model.Task, terminalBefore time.Time) (bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
 
 	// ClaimReady atomically claims one ready task of the given type by
@@ -495,12 +477,6 @@ type TaskRepository interface {
 	CancelRunning(ctx context.Context, task *model.Task, message string) error
 	// ReleaseExpiredLeases resets running tasks whose lease has expired back to queued.
 	ReleaseExpiredLeases(ctx context.Context) (int, error)
-	// CancelActiveEvictionTasksExcept cancels active cache eviction tasks whose
-	// stage does not match keepStage. An empty keepStage cancels all of them.
-	CancelActiveEvictionTasksExcept(ctx context.Context, keepStage string, message string) (int, error)
-	// ActiveEvictionBytes returns the bytes represented by distinct cached
-	// object versions with an active eviction task in the requested stage.
-	ActiveEvictionBytes(ctx context.Context, stage string) (int64, error)
 	// MarkRunningExhausted marks the same running task claim as exhausted.
 	MarkRunningExhausted(ctx context.Context, task *model.Task, lastError string) error
 	// ListExhausted returns exhausted tasks, ordered by most recent first.

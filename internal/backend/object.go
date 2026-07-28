@@ -16,7 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/admin"
-	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
@@ -1276,7 +1275,7 @@ func (b *SynapseBackend) completeReplicatingFollowerIfUploadFinalized(ctx contex
 		ctx,
 		repository.NewFinalizeUploadInput(
 			*version.StorageUploadID,
-			b.evictionPolicy,
+			b.evictionPolicy.EnqueuesAfterUploadEviction(),
 			b.evictMaxRetries,
 		),
 	)
@@ -1303,10 +1302,10 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 		}
 		return repos.Tasks.Create(ctx, task)
 	case model.ObjectStateStored:
-		if b.evictionPolicy != cache.EvictionPolicyAfterUpload {
+		if !b.evictionPolicy.EnqueuesAfterUploadEviction() {
 			return nil
 		}
-		_, err := repository.EnsureAfterUploadEvictionTask(ctx, repos.Tasks, objectID, versionID, b.evictMaxRetries)
+		_, err := repos.CacheEvictions.EnsureAfterUploadTask(ctx, objectID, versionID, b.evictMaxRetries)
 		return err
 	default:
 		return nil

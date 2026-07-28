@@ -22,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	synaps3backend "github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
@@ -974,8 +975,8 @@ func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) 
 	if task.RefVersionID != secondOut.VersionID {
 		t.Fatalf("evict task version = %s, want %s", task.RefVersionID, secondOut.VersionID)
 	}
-	if task.Stage == nil || *task.Stage != repository.CacheEvictionStageAfterUpload {
-		t.Fatalf("evict task stage = %v, want %s", task.Stage, repository.CacheEvictionStageAfterUpload)
+	if task.Stage == nil || *task.Stage != cacheeviction.StageAfterUpload {
+		t.Fatalf("evict task stage = %v, want %s", task.Stage, cacheeviction.StageAfterUpload)
 	}
 	if task.IdempotencyKey != "evict_cache:"+secondOut.VersionID {
 		t.Fatalf("evict task key = %q, want stable after_upload version key", task.IdempotencyKey)

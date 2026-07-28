@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -920,14 +921,14 @@ func TestManager_RecoverOnStartupSwitchesEvictionPoliciesWithoutBackfill(t *test
 	bucket := testutil.SeedBucket(t, db, "mgr-eviction-policy-switch")
 	objectID, versionID := seedManagerVersion(t, repos, bucket, "stored-policy-switch", model.ObjectStateStored)
 
-	activated, err := repository.EnsureAfterUploadEvictionTask(ctx, repos.Tasks, objectID, versionID, 4)
+	activated, err := repos.CacheEvictions.EnsureAfterUploadTask(ctx, objectID, versionID, 4)
 	if err != nil || !activated {
 		t.Fatalf("EnsureAfterUploadEvictionTask: activated=%v err=%v", activated, err)
 	}
 	afterUploadTasks, total, err := repos.Tasks.List(
 		ctx,
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageAfterUpload,
+		cacheeviction.StageAfterUpload,
 		"",
 		10,
 		0,
@@ -936,7 +937,7 @@ func TestManager_RecoverOnStartupSwitchesEvictionPoliciesWithoutBackfill(t *test
 		t.Fatalf("after_upload tasks total=%d tasks=%#v err=%v", total, afterUploadTasks, err)
 	}
 	afterUploadTask := afterUploadTasks[0]
-	lruStage := repository.CacheEvictionStageLRU
+	lruStage := cacheeviction.StageLRU
 	lruTask := &model.Task{
 		Type:           model.TaskTypeEvictCache,
 		Stage:          &lruStage,
@@ -1067,7 +1068,7 @@ func TestManager_AfterUploadDoesNotRequeueRehydratedCacheEvictedVersion(t *testi
 	tasks, total, err := repos.Tasks.List(
 		ctx,
 		string(model.TaskTypeEvictCache),
-		repository.CacheEvictionStageAfterUpload,
+		cacheeviction.StageAfterUpload,
 		"",
 		10,
 		0,

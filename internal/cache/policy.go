@@ -25,3 +25,9 @@ func ParseEvictionPolicy(value string) (EvictionPolicy, bool) {
 		return "", false
 	}
 }
+
+// EnqueuesAfterUploadEviction reports whether upload finalization must create
+// an eviction task in the same transaction.
+func (p EvictionPolicy) EnqueuesAfterUploadEviction() bool {
+	return p == EvictionPolicyAfterUpload
+}

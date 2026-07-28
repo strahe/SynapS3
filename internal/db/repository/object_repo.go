@@ -7,6 +7,7 @@ import (
 	"maps"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 )
@@ -799,7 +800,7 @@ func (r *BunObjectRepo) newVersionCacheAccessUpdate(
 	versionID string,
 	accessedAt time.Time,
 ) *bun.UpdateQuery {
-	accessedAt = accessedAt.UTC().Truncate(time.Microsecond)
+	accessedAt = cacheeviction.NormalizeAccessTime(accessedAt)
 	return r.db.NewUpdate().
 		Model((*model.ObjectVersion)(nil)).
 		Set(
@@ -827,61 +828,6 @@ func executeVersionCacheAccessUpdate(
 		return fmt.Errorf("recording version cache access: version %s not found", versionID)
 	}
 	return nil
-}
-
-func (r *BunObjectRepo) ListLRUEvictionCandidates(
-	ctx context.Context,
-	terminalSince time.Time,
-	limit int,
-) ([]CacheEvictionCandidate, error) {
-	var candidates []CacheEvictionCandidate
-	q := r.db.NewSelect().
-		TableExpr("object_versions AS object_version").
-		ColumnExpr("object_version.object_id").
-		ColumnExpr("object_version.version_id").
-		ColumnExpr("object_version.size").
-		ColumnExpr("object_version.cache_accessed_at").
-		ColumnExpr("object_version.created_at").
-		Join("JOIN storage_uploads AS storage_upload ON storage_upload.id = object_version.storage_upload_id").
-		Where("object_version.in_cache = ?", true).
-		Where("object_version.is_delete_marker = ?", false).
-		Where("object_version.size > 0").
-		Where("object_version.cache_accessed_at IS NOT NULL").
-		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
-		Where("storage_upload.status = ?", model.StorageUploadStatusComplete).
-		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
-		Where(`NOT EXISTS (
-			SELECT 1 FROM tasks AS eviction_task
-			WHERE eviction_task.type = ?
-			  AND eviction_task.ref_type = ?
-			  AND eviction_task.ref_version_id = object_version.version_id
-			  AND eviction_task.status IN (?)
-		)`, model.TaskTypeEvictCache, "object", bun.List(activeTaskStatuses())).
-		Where(`NOT EXISTS (
-			SELECT 1 FROM tasks AS terminal_lru_task
-			WHERE terminal_lru_task.type = ?
-			  AND terminal_lru_task.stage = ?
-			  AND terminal_lru_task.ref_type = ?
-			  AND terminal_lru_task.ref_version_id = object_version.version_id
-			  AND terminal_lru_task.status IN (?)
-			  AND (terminal_lru_task.completed_at IS NULL OR terminal_lru_task.completed_at > ?)
-		)`,
-			model.TaskTypeEvictCache,
-			CacheEvictionStageLRU,
-			"object",
-			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
-			terminalSince,
-		).
-		OrderExpr("object_version.cache_accessed_at ASC").
-		OrderExpr("object_version.created_at ASC").
-		OrderExpr("object_version.version_id ASC")
-	if limit > 0 {
-		q = q.Limit(limit)
-	}
-	if err := q.Scan(ctx, &candidates); err != nil {
-		return nil, fmt.Errorf("listing LRU cache eviction candidates: %w", err)
-	}
-	return candidates, nil
 }
 
 func (r *BunObjectRepo) SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error {

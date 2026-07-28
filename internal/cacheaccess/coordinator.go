@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 )
 
 const (
@@ -205,15 +206,11 @@ func (c *Coordinator) GuardDeletion(versionID string, remove func(time.Time) boo
 	}
 }
 
-func normalizeAccessTime(value time.Time) time.Time {
-	return value.UTC().Truncate(time.Microsecond)
-}
-
 func nextAccessTime(now, inMemory time.Time, durable *time.Time) time.Time {
-	now = normalizeAccessTime(now)
-	previous := normalizeAccessTime(inMemory)
+	now = cacheeviction.NormalizeAccessTime(now)
+	previous := cacheeviction.NormalizeAccessTime(inMemory)
 	if durable != nil {
-		durableTime := normalizeAccessTime(*durable)
+		durableTime := cacheeviction.NormalizeAccessTime(*durable)
 		if durableTime.After(previous) {
 			previous = durableTime
 		}
@@ -232,11 +229,11 @@ func (c *Coordinator) recordAccess(
 	persist PersistFunc,
 	force bool,
 ) error {
-	now := normalizeAccessTime(c.now())
+	now := cacheeviction.NormalizeAccessTime(c.now())
 
 	entry.stateMu.Lock()
 	if durableAccess != nil {
-		durableTime := normalizeAccessTime(*durableAccess)
+		durableTime := cacheeviction.NormalizeAccessTime(*durableAccess)
 		if durableTime.After(entry.state.lastPersisted) {
 			entry.state.lastPersisted = durableTime
 		}
@@ -272,7 +269,7 @@ func (c *Coordinator) recordAccess(
 }
 
 func (c *Coordinator) sweep(ctx context.Context) (int, error) {
-	now := normalizeAccessTime(c.now())
+	now := cacheeviction.NormalizeAccessTime(c.now())
 	candidates := c.acquireIdleEntries()
 	var (
 		failed   int

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
@@ -1120,11 +1119,10 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 			if err := completeUploadTasksForVersion(ctx, db, ref.VersionID, now, unclaimedTaskStatuses()); err != nil {
 				return err
 			}
-			if input.CacheEvictionPolicy == cache.EvictionPolicyAfterUpload {
-				tasks := &BunTaskRepo{db: db}
-				if _, err := EnsureAfterUploadEvictionTask(
+			if input.EnqueueAfterUploadEviction {
+				evictions := &BunCacheEvictionRepo{db: db}
+				if _, err := evictions.EnsureAfterUploadTask(
 					ctx,
-					tasks,
 					ref.ObjectID,
 					ref.VersionID,
 					input.EvictionMaxRetries,
