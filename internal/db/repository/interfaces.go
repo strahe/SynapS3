@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
@@ -163,7 +164,12 @@ type ObjectRepository interface {
 	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
 	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
 	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error
+	// RecordVersionCacheAccess advances LRU recency without changing whether
+	// the local cache file is present.
 	RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error
+	// RecordVersionCacheCommit marks a newly committed local cache file present
+	// and initializes or advances its LRU recency.
+	RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error
 	ListLRUEvictionCandidates(ctx context.Context, terminalSince time.Time, limit int) ([]CacheEvictionCandidate, error)
 	SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error
 	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)
@@ -385,7 +391,23 @@ type BindReadableUploadForVersionInput struct {
 }
 
 type FinalizeUploadInput struct {
-	UploadID int64
+	UploadID            int64
+	CacheEvictionPolicy cache.EvictionPolicy
+	EvictionMaxRetries  int
+}
+
+// NewFinalizeUploadInput builds the shared upload-finalization contract used
+// by every upload completion path.
+func NewFinalizeUploadInput(
+	uploadID int64,
+	policy cache.EvictionPolicy,
+	evictionMaxRetries int,
+) FinalizeUploadInput {
+	return FinalizeUploadInput{
+		UploadID:            uploadID,
+		CacheEvictionPolicy: policy,
+		EvictionMaxRetries:  evictionMaxRetries,
+	}
 }
 
 type StorageUploadRepository interface {
@@ -402,6 +424,7 @@ type StorageUploadRepository interface {
 	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
 	ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
+	HasReadableCommittedCopy(ctx context.Context, uploadID int64) (bool, error)
 	ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error)
 	ListBucketStorageHealthAffectedVersions(ctx context.Context, input BucketStorageHealthAffectedVersionsInput) (BucketStorageHealthAffectedVersionPage, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)

@@ -71,6 +71,10 @@ func newAfterUploadEvictor(
 	)
 }
 
+func futureLRUAccessTime() time.Time {
+	return time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+}
+
 func TestEvictor_HappyPath(t *testing.T) {
 	mc := &testutil.MockCache{
 		DeleteFunc: func(_ context.Context, _, _ string) error {
@@ -98,6 +102,91 @@ func TestEvictor_HappyPath(t *testing.T) {
 	}
 	if obj.InCache {
 		t.Error("expected object cache location to be false after successful eviction")
+	}
+}
+
+type blockingReadableCheckRepo struct {
+	repository.StorageUploadRepository
+
+	calls         atomic.Int64
+	secondStarted chan struct{}
+	releaseSecond chan struct{}
+}
+
+func (r *blockingReadableCheckRepo) HasReadableCommittedCopy(
+	ctx context.Context,
+	uploadID int64,
+) (bool, error) {
+	if r.calls.Add(1) == 2 {
+		close(r.secondStarted)
+		select {
+		case <-r.releaseSecond:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	return r.StorageUploadRepository.HasReadableCommittedCopy(ctx, uploadID)
+}
+
+func TestEvictor_RechecksRemoteSafetyImmediatelyBeforeDelete(t *testing.T) {
+	var deleteCalls atomic.Int64
+	mc := &testutil.MockCache{
+		ExistsFunc: func(context.Context, string, string) bool { return true },
+		DeleteFunc: func(context.Context, string, string) error {
+			deleteCalls.Add(1)
+			return nil
+		},
+	}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	_, objectID, versionID := seedStoredObject(t, env)
+	version, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
+	if err != nil || version == nil || version.StorageUploadID == nil {
+		t.Fatalf("GetVersionByID: version=%#v err=%v", version, err)
+	}
+	copies, err := env.repos.Uploads.ListCopies(context.Background(), *version.StorageUploadID)
+	if err != nil || len(copies) == 0 || copies[0].StorageDataSetID == nil {
+		t.Fatalf("ListCopies: copies=%#v err=%v", copies, err)
+	}
+	dataSetID := *copies[0].StorageDataSetID
+
+	checks := &blockingReadableCheckRepo{
+		StorageUploadRepository: env.repos.Uploads,
+		secondStarted:           make(chan struct{}),
+		releaseSecond:           make(chan struct{}),
+	}
+	env.repos.Uploads = checks
+	task := seedTask(t, env, model.TaskTypeEvictCache, objectID, versionID, 5, 0)
+	evictor := newAfterUploadEvictor(env, 1, 10*time.Millisecond)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = evictor.Run(runCtx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		waitForSignal(t, done, time.Second, "remote-safety eviction shutdown")
+	}()
+
+	waitForSignal(t, checks.secondStarted, time.Second, "final remote-safety check")
+	if err := env.repos.Uploads.MarkDataSetUnavailable(
+		context.Background(),
+		dataSetID,
+		"provider unavailable",
+	); err != nil {
+		t.Fatalf("MarkDataSetUnavailable: %v", err)
+	}
+	close(checks.releaseSecond)
+	waitForTaskStatus(t, env, task.ID, model.TaskStatusFailed, 3*time.Second)
+
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("cache Delete calls after remote safety changed = %d, want 0", deleteCalls.Load())
+	}
+	gotVersion, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
+	if err != nil || gotVersion == nil || !gotVersion.InCache ||
+		gotVersion.State != model.ObjectStateStored {
+		t.Fatalf("version after remote safety changed = %#v err=%v", gotVersion, err)
 	}
 }
 
@@ -185,7 +274,7 @@ func TestEvictor_LRUEvictsLeastRecentlyUsedUntilLowWatermark(t *testing.T) {
 		_, objectID, versionID := seedStoredObject(t, env)
 		versions = append(versions, seeded{objectID: objectID, versionID: versionID})
 	}
-	base := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	base := futureLRUAccessTime()
 	for index, version := range versions {
 		if err := env.repos.Objects.RecordVersionCacheAccess(
 			context.Background(),
@@ -287,7 +376,7 @@ func TestEvictor_LRUEvictsLeastRecentlyUsedUntilLowWatermark(t *testing.T) {
 	}
 }
 
-func TestEvictor_LRUEvictsNullAccessTimeUsingCreatedAt(t *testing.T) {
+func TestEvictor_LRUSkipsUnexpectedNullAccessTime(t *testing.T) {
 	var used atomic.Int64
 	used.Store(11)
 	var deleteCalls atomic.Int64
@@ -304,10 +393,6 @@ func TestEvictor_LRUEvictsNullAccessTimeUsingCreatedAt(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, _, versionID := seedStoredObject(t, env)
-	createdVersion, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
-	if err != nil || createdVersion == nil {
-		t.Fatalf("GetVersionByID before clearing access time: version=%#v err=%v", createdVersion, err)
-	}
 	if _, err := env.db.NewUpdate().
 		Model((*model.ObjectVersion)(nil)).
 		Set("cache_accessed_at = NULL").
@@ -320,20 +405,8 @@ func TestEvictor_LRUEvictsNullAccessTimeUsingCreatedAt(t *testing.T) {
 		time.Now().Add(-time.Hour),
 		10,
 	)
-	if err != nil || len(candidates) != 1 || candidates[0].CacheAccessedAt == nil {
-		t.Fatalf("NULL-access LRU candidates = %#v err=%v, want one created_at snapshot", candidates, err)
-	}
-	currentVersion, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
-	if err != nil || currentVersion == nil {
-		t.Fatalf("NULL-access current version = %#v err=%v", currentVersion, err)
-	}
-	if !candidates[0].CacheAccessedAt.UTC().Truncate(time.Microsecond).
-		Equal(currentVersion.CreatedAt.UTC().Truncate(time.Microsecond)) {
-		t.Fatalf(
-			"candidate snapshot %v does not match current fallback %v",
-			candidates[0].CacheAccessedAt,
-			currentVersion.CreatedAt,
-		)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("NULL-access LRU candidates = %#v err=%v, want none", candidates, err)
 	}
 
 	evictor := worker.NewEvictor(
@@ -346,46 +419,36 @@ func TestEvictor_LRUEvictsNullAccessTimeUsingCreatedAt(t *testing.T) {
 		slog.Default(),
 		worker.WithCacheEvictionPolicy(cache.EvictionPolicyLRU, 10, 90, 50, 3),
 	)
-	runWorkerUntilCondition(t, evictor, 10*time.Millisecond, 3*time.Second, func() (bool, error) {
-		_, completed, err := env.repos.Tasks.List(
-			context.Background(),
-			string(model.TaskTypeEvictCache),
-			repository.CacheEvictionStageLRU,
-			string(model.TaskStatusCompleted),
-			10,
-			0,
-		)
-		return completed == 1, err
-	})
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = evictor.Run(runCtx)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	waitForSignal(t, done, time.Second, "NULL-access LRU test shutdown")
 
 	tasks, total, err := env.repos.Tasks.List(
 		context.Background(),
 		string(model.TaskTypeEvictCache),
 		repository.CacheEvictionStageLRU,
-		string(model.TaskStatusCompleted),
+		"",
 		10,
 		0,
 	)
 	if err != nil {
-		t.Fatalf("List completed NULL-access LRU tasks: %v", err)
+		t.Fatalf("List NULL-access LRU tasks: %v", err)
 	}
-	if total != 1 || len(tasks) != 1 {
-		t.Fatalf("completed NULL-access LRU tasks total=%d tasks=%#v, want one", total, tasks)
+	if total != 0 || len(tasks) != 0 {
+		t.Fatalf("NULL-access LRU tasks total=%d tasks=%#v, want none", total, tasks)
 	}
-	rawSnapshot, ok := tasks[0].Payload["cache_accessed_at"].(string)
-	if !ok {
-		t.Fatalf("NULL-access LRU payload = %#v, want created_at snapshot", tasks[0].Payload)
-	}
-	snapshot, err := time.Parse(time.RFC3339Nano, rawSnapshot)
-	if err != nil || !snapshot.Equal(createdVersion.CreatedAt.UTC().Truncate(time.Microsecond)) {
-		t.Fatalf("NULL-access LRU snapshot = %v err=%v, want created_at %v", snapshot, err, createdVersion.CreatedAt)
-	}
-	if deleteCalls.Load() != 1 {
-		t.Fatalf("NULL-access LRU delete calls = %d, want 1", deleteCalls.Load())
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("NULL-access LRU delete calls = %d, want 0", deleteCalls.Load())
 	}
 	version, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
-	if err != nil || version == nil || version.State != model.ObjectStateCacheEvicted || version.InCache {
-		t.Fatalf("NULL-access LRU version after eviction = %#v err=%v", version, err)
+	if err != nil || version == nil || version.State != model.ObjectStateStored || !version.InCache {
+		t.Fatalf("NULL-access LRU version = %#v err=%v, want stored in cache", version, err)
 	}
 }
 
@@ -404,7 +467,7 @@ func TestEvictor_LRUReactivatesCancelledStableTask(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objectID, versionID := seedStoredObject(t, env)
-	accessedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	accessedAt := futureLRUAccessTime()
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, accessedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess: %v", err)
 	}
@@ -481,7 +544,7 @@ func TestEvictor_LRUExhaustedTaskWaitsForCooldownBeforeReplanning(t *testing.T) 
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, _, versionID := seedStoredObject(t, env)
-	accessedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	accessedAt := futureLRUAccessTime()
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, accessedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess: %v", err)
 	}
@@ -633,7 +696,7 @@ func TestEvictor_LRUAccessAfterPlanningCancelsStaleTask(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objectID, versionID := seedStoredObject(t, env)
-	plannedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	plannedAt := futureLRUAccessTime()
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, plannedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess(planned): %v", err)
 	}
@@ -679,7 +742,7 @@ func TestEvictor_LRUTimestampPrecisionMatchesDatabaseValue(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objectID, versionID := seedStoredObject(t, env)
-	plannedAt := time.Date(2026, time.July, 1, 0, 0, 0, 123456789, time.UTC)
+	plannedAt := futureLRUAccessTime().Add(789 * time.Nanosecond)
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, plannedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess(planned): %v", err)
 	}
@@ -724,7 +787,7 @@ func TestEvictor_LRUWaitsForOpenBodyAndPreservesRecentAccess(t *testing.T) {
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	bucket, objectID, versionID := seedStoredObject(t, env)
 	coordinator := cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval)
-	plannedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	plannedAt := futureLRUAccessTime()
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, plannedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess(planned): %v", err)
 	}
@@ -932,7 +995,7 @@ func TestEvictor_LRUCanEvictRehydratedCacheEvictedVersion(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objectID, versionID := seedStoredObject(t, env)
-	previousAccess := time.Date(2026, time.June, 1, 0, 0, 0, 0, time.UTC)
+	previousAccess := futureLRUAccessTime()
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, previousAccess); err != nil {
 		t.Fatalf("RecordVersionCacheAccess(previous): %v", err)
 	}
@@ -964,9 +1027,9 @@ func TestEvictor_LRUCanEvictRehydratedCacheEvictedVersion(t *testing.T) {
 	if err := env.repos.Tasks.Create(context.Background(), previousTask); err != nil {
 		t.Fatalf("Create previous completed LRU task: %v", err)
 	}
-	accessedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
-	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, accessedAt); err != nil {
-		t.Fatalf("RecordVersionCacheAccess(rehydrated): %v", err)
+	accessedAt := previousAccess.Add(time.Hour)
+	if err := env.repos.Objects.RecordVersionCacheCommit(context.Background(), versionID, accessedAt); err != nil {
+		t.Fatalf("RecordVersionCacheCommit(rehydrated): %v", err)
 	}
 
 	evictor := worker.NewEvictor(
@@ -1017,7 +1080,7 @@ func TestEvictor_LRUReconcilesAlreadyMissingCacheEntry(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objectID, versionID := seedStoredObject(t, env)
-	accessedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	accessedAt := futureLRUAccessTime()
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, accessedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess: %v", err)
 	}
@@ -1061,7 +1124,7 @@ func TestEvictor_LRUTransientVersionLookupFailureSchedulesRetry(t *testing.T) {
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
 	_, objectID, versionID := seedStoredObject(t, env)
-	accessedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	accessedAt := futureLRUAccessTime()
 	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, accessedAt); err != nil {
 		t.Fatalf("RecordVersionCacheAccess: %v", err)
 	}
@@ -1104,19 +1167,32 @@ func TestEvictor_LRUConcurrentWorkersStopAtLowWatermark(t *testing.T) {
 	var used atomic.Int64
 	used.Store(33)
 	var deleteCalls atomic.Int64
+	var activeDeletes atomic.Int64
+	var concurrentOnce sync.Once
+	concurrentDeletes := make(chan struct{})
+	releaseDeletes := make(chan struct{})
 	mc := &testutil.MockCache{
 		UsedBytesFunc: used.Load,
 		ExistsFunc: func(_ context.Context, _, _ string) bool {
 			return true
 		},
-		DeleteFunc: func(_ context.Context, _, _ string) error {
+		DeleteFunc: func(ctx context.Context, _, _ string) error {
 			deleteCalls.Add(1)
+			if activeDeletes.Add(1) == 2 {
+				concurrentOnce.Do(func() { close(concurrentDeletes) })
+			}
+			defer activeDeletes.Add(-1)
+			select {
+			case <-releaseDeletes:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			used.Add(-11)
 			return nil
 		},
 	}
 	env := newTestWorkerEnvWithMockCache(t, mc)
-	accessedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	accessedAt := futureLRUAccessTime()
 	var taskIDs []int64
 	for range 3 {
 		_, objectID, versionID := seedStoredObject(t, env)
@@ -1141,6 +1217,15 @@ func TestEvictor_LRUConcurrentWorkersStopAtLowWatermark(t *testing.T) {
 		_ = evictor.Run(ctx)
 		close(done)
 	}()
+	select {
+	case <-concurrentDeletes:
+		close(releaseDeletes)
+	case <-time.After(time.Second):
+		close(releaseDeletes)
+		cancel()
+		waitForSignal(t, done, time.Second, "concurrent LRU evictor shutdown")
+		t.Fatal("LRU cache deletes did not run concurrently")
+	}
 	deadline := time.After(3 * time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()

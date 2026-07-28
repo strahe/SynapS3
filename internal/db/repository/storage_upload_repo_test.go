@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -1567,7 +1568,55 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 	if err := repos.Tasks.Create(ctx, pendingTask); err != nil {
 		t.Fatalf("Create pending upload task: %v", err)
 	}
-	done, refs, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	maxEvictionRetries := 7
+	mustExec(t, db, `CREATE TRIGGER reject_after_upload_eviction
+		BEFORE INSERT ON tasks
+		WHEN NEW.type = 'evict_cache'
+		BEGIN
+			SELECT RAISE(FAIL, 'injected eviction task failure');
+		END`)
+	_, _, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		repository.NewFinalizeUploadInput(
+			upload.ID,
+			cache.EvictionPolicyAfterUpload,
+			maxEvictionRetries,
+		),
+	)
+	if err == nil {
+		t.Fatal("FinalizeUploadIfTargetCopiesMet with task insert failure returned nil error")
+	}
+	got, getErr := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if getErr != nil || got == nil {
+		t.Fatalf("GetVersionByID after rolled-back finalize: got=%v err=%v", got, getErr)
+	}
+	if got.State != model.ObjectStateReplicating {
+		t.Fatalf("state after rolled-back finalize = %s, want replicating", got.State)
+	}
+	uploadAfterRollback, getErr := repos.Uploads.GetByID(ctx, upload.ID)
+	if getErr != nil || uploadAfterRollback == nil {
+		t.Fatalf("GetByID after rolled-back finalize: upload=%v err=%v", uploadAfterRollback, getErr)
+	}
+	if uploadAfterRollback.Status != model.StorageUploadStatusReadable {
+		t.Fatalf("upload status after rolled-back finalize = %s, want readable", uploadAfterRollback.Status)
+	}
+	pendingAfterRollback, getErr := repos.Tasks.GetByID(ctx, pendingTask.ID)
+	if getErr != nil || pendingAfterRollback == nil {
+		t.Fatalf("GetByID pending task after rollback: task=%v err=%v", pendingAfterRollback, getErr)
+	}
+	if pendingAfterRollback.Status != model.TaskStatusQueued {
+		t.Fatalf("pending task status after rollback = %s, want queued", pendingAfterRollback.Status)
+	}
+	mustExec(t, db, `DROP TRIGGER reject_after_upload_eviction`)
+
+	done, refs, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		repository.NewFinalizeUploadInput(
+			upload.ID,
+			cache.EvictionPolicyAfterUpload,
+			maxEvictionRetries,
+		),
+	)
 	if err != nil {
 		t.Fatalf("FinalizeUploadIfTargetCopiesMet complete: %v", err)
 	}
@@ -1597,6 +1646,30 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 	}
 	if finalizedTask.Status != model.TaskStatusCompleted {
 		t.Fatalf("pending upload task status = %s, want completed", finalizedTask.Status)
+	}
+	evictionTasks, total, err := repos.Tasks.List(
+		ctx,
+		string(model.TaskTypeEvictCache),
+		repository.CacheEvictionStageAfterUpload,
+		"",
+		10,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("List after-upload eviction tasks: %v", err)
+	}
+	if total != 1 || len(evictionTasks) != 1 {
+		t.Fatalf("after-upload eviction tasks total=%d tasks=%#v, want one", total, evictionTasks)
+	}
+	if evictionTasks[0].RefVersionID != version.VersionID ||
+		evictionTasks[0].MaxRetries != maxEvictionRetries {
+		t.Fatalf(
+			"after-upload eviction task = version:%s retries:%d, want version:%s retries:%d",
+			evictionTasks[0].RefVersionID,
+			evictionTasks[0].MaxRetries,
+			version.VersionID,
+			maxEvictionRetries,
+		)
 	}
 }
 

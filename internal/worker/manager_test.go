@@ -1059,8 +1059,8 @@ func TestManager_AfterUploadDoesNotRequeueRehydratedCacheEvictedVersion(t *testi
 	ctx := context.Background()
 	bucket := testutil.SeedBucket(t, db, "mgr-after-upload-rehydrated")
 	_, versionID := seedManagerVersion(t, repos, bucket, "rehydrated.txt", model.ObjectStateCacheEvicted)
-	if err := repos.Objects.RecordVersionCacheAccess(ctx, versionID, time.Now()); err != nil {
-		t.Fatalf("RecordVersionCacheAccess: %v", err)
+	if err := repos.Objects.RecordVersionCacheCommit(ctx, versionID, time.Now()); err != nil {
+		t.Fatalf("RecordVersionCacheCommit: %v", err)
 	}
 
 	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)

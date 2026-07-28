@@ -22,7 +22,13 @@ func up2026072801CacheLRU(ctx context.Context, db *bun.DB) error {
 	}
 	if _, err := db.ExecContext(
 		ctx,
-		"CREATE INDEX idx_object_versions_cache_lru ON object_versions (in_cache, state, cache_accessed_at, created_at, version_id)",
+		"UPDATE object_versions SET cache_accessed_at = created_at WHERE cache_accessed_at IS NULL",
+	); err != nil {
+		return fmt.Errorf("initializing object version cache access timestamps: %w", err)
+	}
+	if _, err := db.ExecContext(
+		ctx,
+		"CREATE INDEX idx_object_versions_cache_lru ON object_versions (in_cache, cache_accessed_at, created_at, version_id)",
 	); err != nil {
 		return fmt.Errorf("creating object version cache LRU index: %w", err)
 	}

@@ -333,6 +333,7 @@ type countingObjectRepo struct {
 
 	cachePresenceWrites int
 	cacheAccessWrites   int
+	cacheCommitWrites   int
 	cacheAccessErr      error
 }
 
@@ -347,6 +348,66 @@ func (r *countingObjectRepo) RecordVersionCacheAccess(ctx context.Context, versi
 		return r.cacheAccessErr
 	}
 	return r.ObjectRepository.RecordVersionCacheAccess(ctx, versionID, accessedAt)
+}
+
+func (r *countingObjectRepo) RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error {
+	r.cacheAccessWrites++
+	r.cacheCommitWrites++
+	if r.cacheAccessErr != nil {
+		return r.cacheAccessErr
+	}
+	return r.ObjectRepository.RecordVersionCacheCommit(ctx, versionID, accessedAt)
+}
+
+func TestOpenCacheHitReconcilesStaleAbsentPresence(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "cache-presence-reconcile-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR11",
+		BucketID:    bucket.ID,
+		Key:         "cached.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR11",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
+		t.Fatalf("SetVersionCachePresence(false): %v", err)
+	}
+	objects := &countingObjectRepo{ObjectRepository: repos.Objects}
+	repos.Objects = objects
+
+	reader := newTestReader(repos, mc, nil, slog.Default())
+	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_ = got.Body.Close()
+	if objects.cacheCommitWrites != 1 {
+		t.Fatalf("cache commit writes = %d, want 1", objects.cacheCommitWrites)
+	}
+	stored, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || stored == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", stored, err)
+	}
+	if !stored.InCache {
+		t.Fatal("in_cache = false after successful cache open reconciliation")
+	}
 }
 
 func TestOpenCacheHitIgnoresCacheAccessPersistenceFailure(t *testing.T) {

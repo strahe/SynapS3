@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/types"
@@ -292,6 +293,14 @@ func (r *BunStorageUploadRepo) ListReadableCommittedCopies(ctx context.Context, 
 		return nil, fmt.Errorf("listing readable storage copies: %w", err)
 	}
 	return copies, nil
+}
+
+func (r *BunStorageUploadRepo) HasReadableCommittedCopy(ctx context.Context, uploadID int64) (bool, error) {
+	count, err := countReadableCommittedCopies(ctx, r.db, uploadID)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 type bucketStorageHealthSummaryRow struct {
@@ -1110,6 +1119,22 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 		for _, ref := range refs {
 			if err := completeUploadTasksForVersion(ctx, db, ref.VersionID, now, unclaimedTaskStatuses()); err != nil {
 				return err
+			}
+			if input.CacheEvictionPolicy == cache.EvictionPolicyAfterUpload {
+				tasks := &BunTaskRepo{db: db}
+				if _, err := EnsureAfterUploadEvictionTask(
+					ctx,
+					tasks,
+					ref.ObjectID,
+					ref.VersionID,
+					input.EvictionMaxRetries,
+				); err != nil {
+					return fmt.Errorf(
+						"creating after-upload eviction task for version %s: %w",
+						ref.VersionID,
+						err,
+					)
+				}
 			}
 		}
 		finalized = true

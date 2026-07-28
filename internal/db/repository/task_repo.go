@@ -48,7 +48,10 @@ func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
 }
 
 func (r *BunTaskRepo) CreateOrReactivateCancelled(ctx context.Context, task *model.Task) (bool, error) {
-	return r.createOrReactivate(ctx, task, nil)
+	return r.createOrReactivate(ctx, task, taskReactivationRule{
+		immediateStatuses: []model.TaskStatus{model.TaskStatusCancelled},
+		errorAction:       "reactivating task",
+	})
 }
 
 func (r *BunTaskRepo) CreateOrReactivateLRU(
@@ -59,38 +62,31 @@ func (r *BunTaskRepo) CreateOrReactivateLRU(
 	if task == nil || task.Stage == nil || *task.Stage != CacheEvictionStageLRU {
 		return false, errors.New("reactivating LRU task: LRU stage is required")
 	}
-	if err := r.Create(ctx, task); err == nil {
-		return true, nil
-	} else if !errors.Is(err, ErrAlreadyExists) {
-		return false, err
-	}
+	return r.createOrReactivate(ctx, task, taskReactivationRule{
+		immediateStatuses: []model.TaskStatus{
+			model.TaskStatusCancelled,
+			model.TaskStatusCompleted,
+		},
+		cooledStatuses: []model.TaskStatus{
+			model.TaskStatusFailed,
+			model.TaskStatusExhausted,
+		},
+		terminalBefore: &terminalBefore,
+		errorAction:    "reactivating LRU task",
+	})
+}
 
-	now := time.Now()
-	q := r.reactivationQuery(task, now).
-		Where(`(
-			status IN (?)
-			OR (
-				status IN (?)
-				AND completed_at IS NOT NULL
-				AND completed_at <= ?
-			)
-		)`,
-			bun.List([]model.TaskStatus{model.TaskStatusCancelled, model.TaskStatusCompleted}),
-			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
-			terminalBefore,
-		)
-	res, err := q.Exec(ctx)
-	if err != nil {
-		return false, fmt.Errorf("reactivating LRU task %q: %w", task.IdempotencyKey, err)
-	}
-	rows, _ := res.RowsAffected()
-	return rows > 0, nil
+type taskReactivationRule struct {
+	immediateStatuses []model.TaskStatus
+	cooledStatuses    []model.TaskStatus
+	terminalBefore    *time.Time
+	errorAction       string
 }
 
 func (r *BunTaskRepo) createOrReactivate(
 	ctx context.Context,
 	task *model.Task,
-	terminalBefore *time.Time,
+	rule taskReactivationRule,
 ) (bool, error) {
 	if err := r.Create(ctx, task); err == nil {
 		return true, nil
@@ -101,26 +97,29 @@ func (r *BunTaskRepo) createOrReactivate(
 	normalizeTaskStage(task)
 	now := time.Now()
 	q := r.reactivationQuery(task, now)
-	if terminalBefore == nil {
-		q = q.Where("status = ?", model.TaskStatusCancelled)
+	if len(rule.cooledStatuses) == 0 {
+		q = q.Where("status IN (?)", bun.List(rule.immediateStatuses))
 	} else {
+		if rule.terminalBefore == nil {
+			return false, errors.New("reactivating task: terminal cutoff is required")
+		}
 		q = q.Where(
 			`(
-				status = ?
+				status IN (?)
 				OR (
 					status IN (?)
 					AND completed_at IS NOT NULL
 					AND completed_at <= ?
 				)
 			)`,
-			model.TaskStatusCancelled,
-			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
-			*terminalBefore,
+			bun.List(rule.immediateStatuses),
+			bun.List(rule.cooledStatuses),
+			*rule.terminalBefore,
 		)
 	}
 	res, err := q.Exec(ctx)
 	if err != nil {
-		return false, fmt.Errorf("reactivating task %q: %w", task.IdempotencyKey, err)
+		return false, fmt.Errorf("%s %q: %w", rule.errorAction, task.IdempotencyKey, err)
 	}
 	rows, _ := res.RowsAffected()
 	return rows > 0, nil

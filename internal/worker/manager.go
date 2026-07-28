@@ -341,13 +341,15 @@ func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.
 		version.State = model.ObjectStateReplicating
 		version.StorageUploadID = &upload.ID
 	}
-	finalized, refs, err := m.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	finalized, _, err := m.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		repository.NewFinalizeUploadInput(upload.ID, m.evictionPolicy, m.evictMaxRetries),
+	)
 	if err != nil {
 		m.logger.Error("failed to finalize recovered upload", "uploadID", upload.ID, "error", err)
 		return
 	}
 	if finalized {
-		m.enqueueRecoveredEvictTasks(ctx, refs)
 		return
 	}
 	recoverablePeerCount := 0
@@ -428,17 +430,6 @@ func (m *Manager) enqueueRecoveredUploadRepair(ctx context.Context, version mode
 	}
 	if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
 		m.logger.Error("failed to enqueue recovered upload repair", "uploadID", uploadID, "versionID", version.VersionID, "error", err)
-	}
-}
-
-func (m *Manager) enqueueRecoveredEvictTasks(ctx context.Context, refs []repository.ObjectVersionRef) {
-	if m.evictionPolicy != cache.EvictionPolicyAfterUpload {
-		return
-	}
-	for _, ref := range refs {
-		if _, err := repository.EnsureAfterUploadEvictionTask(ctx, m.repos.Tasks, ref.ObjectID, ref.VersionID, m.evictMaxRetries); err != nil {
-			m.logger.Error("failed to enqueue recovered eviction task", "versionID", ref.VersionID, "error", err)
-		}
 	}
 }
 

@@ -30,6 +30,12 @@ type OpenedCacheEntry struct {
 	PersistError error
 }
 
+// CacheCommitResult reports a best-effort metadata persistence failure after
+// the local cache commit itself succeeded.
+type CacheCommitResult struct {
+	PersistError error
+}
+
 type accessState struct {
 	lastAccess    time.Time
 	lastAttempt   time.Time
@@ -156,28 +162,32 @@ func (c *Coordinator) Open(
 	}, nil
 }
 
-// Record persists an access immediately after a cache entry is committed, and
-// records it in memory so an already-planned LRU task cannot remove it.
-func (c *Coordinator) Record(
+// Commit serializes a local cache commit and its metadata update with deletion
+// for the same version.
+func (c *Coordinator) Commit(
 	ctx context.Context,
 	versionID string,
 	durableAccess *time.Time,
+	commit func() error,
 	persist PersistFunc,
-) error {
+) (*CacheCommitResult, error) {
 	shard, entry := c.acquire(versionID)
 	defer c.release(shard, versionID, entry)
 
 	entry.gate.RLock()
 	defer entry.gate.RUnlock()
 
-	err := c.recordAccess(ctx, entry, versionID, durableAccess, persist, true)
+	if err := commit(); err != nil {
+		return nil, err
+	}
+	persistErr := c.recordAccess(ctx, entry, versionID, durableAccess, persist, true)
 	c.markActive(shard, entry)
-	return err
+	return &CacheCommitResult{PersistError: persistErr}, nil
 }
 
 // GuardDeletion serializes final checks and physical deletion with open bodies
 // for the same version. Returning true retires the removed entry.
-func (c *Coordinator) GuardDeletion(versionID string, remove func(lastAccess time.Time) bool) {
+func (c *Coordinator) GuardDeletion(versionID string, remove func(time.Time) bool) {
 	shard, entry := c.acquire(versionID)
 	defer c.release(shard, versionID, entry)
 
@@ -316,8 +326,8 @@ func (c *Coordinator) flushAndRetire(
 
 	entry.stateMu.Lock()
 	state := entry.state
-	dirty := state.persist != nil && state.lastAccess.After(state.lastPersisted)
-	due := dirty &&
+	dirty := state.lastAccess.After(state.lastPersisted)
+	due := dirty && state.persist != nil &&
 		(state.lastAttempt.IsZero() ||
 			c.persistenceInterval == 0 ||
 			now.Sub(state.lastAttempt) >= c.persistenceInterval)
@@ -338,7 +348,7 @@ func (c *Coordinator) flushAndRetire(
 		entry.stateMu.Unlock()
 	}
 
-	clean := state.persist == nil || !state.lastAccess.After(state.lastPersisted)
+	clean := !state.lastAccess.After(state.lastPersisted)
 	idle := !state.lastTouched.IsZero() && now.Sub(state.lastTouched) >= c.idleRetention
 	if clean && idle {
 		c.markRetired(acquired.shard, entry)
@@ -375,9 +385,6 @@ func evictOldestEntryLocked(shard *coordinatorShard) {
 		cleanID      string
 		cleanEntry   *accessEntry
 		cleanTouched time.Time
-		anyID        string
-		anyEntry     *accessEntry
-		anyTouched   time.Time
 	)
 	for versionID, entry := range shard.entries {
 		if entry.refs != 0 {
@@ -386,24 +393,15 @@ func evictOldestEntryLocked(shard *coordinatorShard) {
 		entry.stateMu.Lock()
 		state := entry.state
 		entry.stateMu.Unlock()
-		if anyEntry == nil || state.lastTouched.Before(anyTouched) {
-			anyID = versionID
-			anyEntry = entry
-			anyTouched = state.lastTouched
-		}
-		if (state.persist == nil || !state.lastAccess.After(state.lastPersisted)) &&
+		if !state.lastAccess.After(state.lastPersisted) &&
 			(cleanEntry == nil || state.lastTouched.Before(cleanTouched)) {
 			cleanID = versionID
 			cleanEntry = entry
 			cleanTouched = state.lastTouched
 		}
 	}
-	if cleanEntry != nil {
-		anyID = cleanID
-		anyEntry = cleanEntry
-	}
-	if anyEntry != nil && shard.entries[anyID] == anyEntry {
-		delete(shard.entries, anyID)
+	if cleanEntry != nil && shard.entries[cleanID] == cleanEntry {
+		delete(shard.entries, cleanID)
 	}
 }
 

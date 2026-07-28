@@ -92,6 +92,65 @@ func TestCoordinatorAdvancesAccessBeyondDurableSnapshotWhenClockIsEqual(t *testi
 	}
 }
 
+func TestCoordinatorSerializesCacheCommitAndMetadataWithDeletion(t *testing.T) {
+	now := time.Date(2026, time.July, 28, 0, 0, 0, 0, time.UTC)
+	coordinator := NewCoordinator(time.Minute)
+	coordinator.now = func() time.Time { return now }
+	commitEntered := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	type commitOutcome struct {
+		result *CacheCommitResult
+		err    error
+	}
+	commitDone := make(chan commitOutcome, 1)
+	var persisted atomic.Bool
+	go func() {
+		result, err := coordinator.Commit(
+			context.Background(),
+			"version-commit",
+			nil,
+			func() error {
+				close(commitEntered)
+				<-releaseCommit
+				return nil
+			},
+			func(context.Context, string, time.Time) error {
+				persisted.Store(true)
+				return nil
+			},
+		)
+		commitDone <- commitOutcome{result: result, err: err}
+	}()
+	<-commitEntered
+
+	deletionAccess := make(chan time.Time, 1)
+	go coordinator.GuardDeletion("version-commit", func(lastAccess time.Time) bool {
+		deletionAccess <- lastAccess
+		return false
+	})
+	select {
+	case <-deletionAccess:
+		t.Fatal("deletion entered before cache commit completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseCommit)
+	outcome := <-commitDone
+	if outcome.err != nil {
+		t.Fatalf("Commit: %v", outcome.err)
+	}
+	if outcome.result == nil || outcome.result.PersistError != nil {
+		t.Fatalf("Commit result = %#v, want successful metadata persistence", outcome.result)
+	}
+	lastAccess := <-deletionAccess
+	if !persisted.Load() {
+		t.Fatal("deletion entered before cache metadata was persisted")
+	}
+	if !lastAccess.Equal(now) {
+		t.Fatalf("deletion last access = %v, want committed %v", lastAccess, now)
+	}
+}
+
 func TestCoordinatorRetriesFailedPersistenceWithoutFailingCacheOpen(t *testing.T) {
 	start := time.Date(2026, time.July, 28, 0, 0, 0, 0, time.UTC)
 	now := start
@@ -444,19 +503,31 @@ func TestCoordinatorCapsCleanEntriesPerShard(t *testing.T) {
 	}
 }
 
-func TestCoordinatorCapsFailedPersistenceEntriesPerShard(t *testing.T) {
+func TestCoordinatorRetainsFailedPersistenceEntriesUntilFlushed(t *testing.T) {
+	start := time.Date(2026, time.July, 28, 0, 0, 0, 0, time.UTC)
+	now := start
 	coordinator := NewCoordinator(time.Minute)
 	coordinator.maxEntriesPerShard = 2
+	coordinator.now = func() time.Time { return now }
 	target := coordinator.shard("version-failed-capacity")
 	versionIDs := []string{"version-failed-capacity"}
-	for i := 0; len(versionIDs) < 3; i++ {
+	for i := 0; len(versionIDs) < 4; i++ {
 		candidate := fmt.Sprintf("version-failed-capacity-%d", i)
 		if coordinator.shard(candidate) == target {
 			versionIDs = append(versionIDs, candidate)
 		}
 	}
 	wantErr := errors.New("database unavailable")
-	for _, versionID := range versionIDs {
+	var persistenceFailing atomic.Bool
+	persistenceFailing.Store(true)
+	persist := func(context.Context, string, time.Time) error {
+		if persistenceFailing.Load() {
+			return wantErr
+		}
+		return nil
+	}
+	for index, versionID := range versionIDs[:3] {
+		now = start.Add(time.Duration(index) * time.Second)
 		opened, err := coordinator.Open(
 			context.Background(),
 			versionID,
@@ -464,7 +535,7 @@ func TestCoordinatorCapsFailedPersistenceEntriesPerShard(t *testing.T) {
 			func() (io.ReadCloser, *cache.ObjectInfo, error) {
 				return io.NopCloser(bytes.NewReader(nil)), &cache.ObjectInfo{}, nil
 			},
-			func(context.Context, string, time.Time) error { return wantErr },
+			persist,
 		)
 		if err != nil {
 			t.Fatalf("Open(%s): %v", versionID, err)
@@ -478,8 +549,44 @@ func TestCoordinatorCapsFailedPersistenceEntriesPerShard(t *testing.T) {
 	target.mu.Lock()
 	entryCount := len(target.entries)
 	target.mu.Unlock()
+	if entryCount != 3 {
+		t.Fatalf("dirty entries in one shard = %d, want all 3 retained", entryCount)
+	}
+	for index, versionID := range versionIDs[:3] {
+		var lastAccess time.Time
+		coordinator.GuardDeletion(versionID, func(accessedAt time.Time) bool {
+			lastAccess = accessedAt
+			return false
+		})
+		wantAccess := start.Add(time.Duration(index) * time.Second)
+		if !lastAccess.Equal(wantAccess) {
+			t.Fatalf("%s last access = %v, want retained %v", versionID, lastAccess, wantAccess)
+		}
+	}
+
+	persistenceFailing.Store(false)
+	now = start.Add(time.Minute + 3*time.Second)
+	if failed, err := coordinator.sweep(context.Background()); err != nil || failed != 0 {
+		t.Fatalf("sweep after persistence recovery: failed=%d err=%v", failed, err)
+	}
+	opened, err := coordinator.Open(
+		context.Background(),
+		versionIDs[3],
+		nil,
+		func() (io.ReadCloser, *cache.ObjectInfo, error) {
+			return io.NopCloser(bytes.NewReader(nil)), &cache.ObjectInfo{}, nil
+		},
+		persist,
+	)
+	if err != nil {
+		t.Fatalf("Open after persistence recovery: %v", err)
+	}
+	_ = opened.Body.Close()
+	target.mu.Lock()
+	entryCount = len(target.entries)
+	target.mu.Unlock()
 	if entryCount != coordinator.maxEntriesPerShard {
-		t.Fatalf("failed persistence entries in one shard = %d, want cap %d", entryCount, coordinator.maxEntriesPerShard)
+		t.Fatalf("entries after dirty timestamps flushed = %d, want cap %d", entryCount, coordinator.maxEntriesPerShard)
 	}
 }
 

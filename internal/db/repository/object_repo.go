@@ -782,13 +782,43 @@ func (r *BunObjectRepo) SetVersionCachePresence(ctx context.Context, versionID s
 }
 
 func (r *BunObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
+	return executeVersionCacheAccessUpdate(
+		ctx,
+		r.newVersionCacheAccessUpdate(versionID, accessedAt),
+		versionID,
+	)
+}
+
+func (r *BunObjectRepo) RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error {
+	query := r.newVersionCacheAccessUpdate(versionID, accessedAt).
+		Set("in_cache = ?", true)
+	return executeVersionCacheAccessUpdate(ctx, query, versionID)
+}
+
+func (r *BunObjectRepo) newVersionCacheAccessUpdate(
+	versionID string,
+	accessedAt time.Time,
+) *bun.UpdateQuery {
 	accessedAt = accessedAt.UTC().Truncate(time.Microsecond)
-	res, err := r.db.NewUpdate().
+	return r.db.NewUpdate().
 		Model((*model.ObjectVersion)(nil)).
-		Set("in_cache = ?", true).
-		Set("cache_accessed_at = ?", accessedAt).
-		Where("version_id = ? AND is_delete_marker = ?", versionID, false).
-		Exec(ctx)
+		Set(
+			`cache_accessed_at = CASE
+				WHEN cache_accessed_at IS NULL OR cache_accessed_at < ? THEN ?
+				ELSE cache_accessed_at
+			END`,
+			accessedAt,
+			accessedAt,
+		).
+		Where("version_id = ? AND is_delete_marker = ?", versionID, false)
+}
+
+func executeVersionCacheAccessUpdate(
+	ctx context.Context,
+	query *bun.UpdateQuery,
+	versionID string,
+) error {
+	res, err := query.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("recording version cache access: %w", err)
 	}
@@ -810,12 +840,13 @@ func (r *BunObjectRepo) ListLRUEvictionCandidates(
 		ColumnExpr("object_version.object_id").
 		ColumnExpr("object_version.version_id").
 		ColumnExpr("object_version.size").
-		ColumnExpr("COALESCE(object_version.cache_accessed_at, object_version.created_at) AS cache_accessed_at").
+		ColumnExpr("object_version.cache_accessed_at").
 		ColumnExpr("object_version.created_at").
 		Join("JOIN storage_uploads AS storage_upload ON storage_upload.id = object_version.storage_upload_id").
 		Where("object_version.in_cache = ?", true).
 		Where("object_version.is_delete_marker = ?", false).
 		Where("object_version.size > 0").
+		Where("object_version.cache_accessed_at IS NOT NULL").
 		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
 		Where("storage_upload.status = ?", model.StorageUploadStatusComplete).
 		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
@@ -841,7 +872,7 @@ func (r *BunObjectRepo) ListLRUEvictionCandidates(
 			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
 			terminalSince,
 		).
-		OrderExpr("COALESCE(object_version.cache_accessed_at, object_version.created_at) ASC").
+		OrderExpr("object_version.cache_accessed_at ASC").
 		OrderExpr("object_version.created_at ASC").
 		OrderExpr("object_version.version_id ASC")
 	if limit > 0 {

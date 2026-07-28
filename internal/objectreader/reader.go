@@ -301,13 +301,31 @@ func (r *Reader) streamAndRehydrate(
 
 	go func() {
 		defer close(done)
-		if _, err := r.cache.Put(ctx, bucket, cacheKey, pr); err != nil {
+		commitResult, err := r.access.Commit(
+			ctx,
+			versionID,
+			durableAccess,
+			func() error {
+				_, err := r.cache.Put(ctx, bucket, cacheKey, pr)
+				return err
+			},
+			r.repos.Objects.RecordVersionCacheCommit,
+		)
+		if err != nil {
 			r.logger.Warn("cache rehydration failed (best-effort)", "cacheKey", cacheKey, "error", err)
 			_, _ = io.Copy(io.Discard, pr)
 			_ = pr.Close()
 			return
 		}
-		r.recordCacheCommit(ctx, versionID, durableAccess)
+		if commitResult.PersistError != nil {
+			r.logger.Warn(
+				"cache access update failed",
+				"versionID",
+				versionID,
+				"error",
+				commitResult.PersistError,
+			)
+		}
 		_ = pr.Close()
 	}()
 
@@ -328,6 +346,10 @@ func (r *Reader) openCached(
 	bucketName string,
 	version *model.ObjectVersion,
 ) (io.ReadCloser, error) {
+	persist := r.repos.Objects.RecordVersionCacheAccess
+	if !version.InCache {
+		persist = r.repos.Objects.RecordVersionCacheCommit
+	}
 	opened, err := r.access.Open(
 		ctx,
 		version.VersionID,
@@ -335,7 +357,7 @@ func (r *Reader) openCached(
 		func() (io.ReadCloser, *cache.ObjectInfo, error) {
 			return r.cache.Get(ctx, bucketName, version.CacheKey)
 		},
-		r.repos.Objects.RecordVersionCacheAccess,
+		persist,
 	)
 	if err != nil {
 		return nil, err
@@ -350,15 +372,6 @@ func (r *Reader) openCached(
 		)
 	}
 	return opened.Body, nil
-}
-
-func (r *Reader) recordCacheCommit(ctx context.Context, versionID string, durableAccess *time.Time) {
-	if r == nil || r.repos == nil || r.repos.Objects == nil || versionID == "" {
-		return
-	}
-	if err := r.access.Record(ctx, versionID, durableAccess, r.repos.Objects.RecordVersionCacheAccess); err != nil {
-		r.logger.Warn("cache access update failed", "versionID", versionID, "error", err)
-	}
 }
 
 type teeReadCloser struct {

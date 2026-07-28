@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -39,9 +40,8 @@ type Evictor struct {
 	pollInterval         time.Duration
 	leaseTTL             time.Duration
 	logger               *slog.Logger
-	// lruFinalizeMu serializes only the final low-watermark check and local
-	// deletion so concurrent slots cannot all cross the low watermark.
-	lruFinalizeMu sync.Mutex
+	lruCapacityMu        sync.Mutex
+	lruReservedBytes     int64
 	*livenessTracker
 }
 
@@ -124,140 +124,6 @@ func (e *Evictor) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (e *Evictor) runLRUPlanner(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		e.recordTick()
-		if err := e.planLRUEvictions(ctx); err != nil && ctx.Err() == nil {
-			e.logger.Error("planning LRU cache evictions", "error", err)
-		}
-		if !sleepUntilNextWorkerPoll(ctx, e.pollInterval) {
-			return
-		}
-	}
-}
-
-func (e *Evictor) planLRUEvictions(ctx context.Context) error {
-	if e.policy != cache.EvictionPolicyLRU || e.maxCacheBytes <= 0 {
-		return nil
-	}
-	usedBytes := e.cache.UsedBytes()
-	highBytes := watermarkBytes(e.maxCacheBytes, e.highWatermarkPercent)
-	if usedBytes < highBytes {
-		return nil
-	}
-	lowBytes := watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent)
-	activeBytes, err := e.repos.Tasks.ActiveEvictionBytes(ctx, repository.CacheEvictionStageLRU)
-	if err != nil {
-		return err
-	}
-	bytesToPlan := usedBytes - lowBytes - activeBytes
-	if bytesToPlan <= 0 {
-		return nil
-	}
-
-	var plannedBytes int64
-	plannedTasks := 0
-	for bytesToPlan > 0 {
-		createdThisBatch := 0
-		terminalSince := time.Now().Add(-lruTerminalRetryDelay)
-		candidates, err := e.repos.Objects.ListLRUEvictionCandidates(
-			ctx,
-			terminalSince,
-			lruCandidateBatchSize,
-		)
-		if err != nil {
-			return err
-		}
-		if len(candidates) == 0 {
-			break
-		}
-		for _, candidate := range candidates {
-			activated, err := e.repos.Tasks.CreateOrReactivateLRU(
-				ctx,
-				newLRUEvictionTask(candidate, e.maxRetries),
-				terminalSince,
-			)
-			if err != nil {
-				return fmt.Errorf("creating LRU eviction task for version %s: %w", candidate.VersionID, err)
-			}
-			if !activated {
-				continue
-			}
-			plannedTasks++
-			createdThisBatch++
-			plannedBytes += candidate.Size
-			bytesToPlan -= candidate.Size
-			if bytesToPlan <= 0 {
-				break
-			}
-		}
-		if len(candidates) < lruCandidateBatchSize || createdThisBatch == 0 {
-			break
-		}
-	}
-
-	if plannedTasks == 0 {
-		e.logger.Warn(
-			"cache is above the LRU high watermark but no remotely safe entries can be evicted",
-			"usedBytes",
-			usedBytes,
-			"highBytes",
-			highBytes,
-			"lowBytes",
-			lowBytes,
-		)
-		return nil
-	}
-	e.logger.Info(
-		"planned LRU cache evictions",
-		"tasks",
-		plannedTasks,
-		"plannedBytes",
-		plannedBytes,
-		"usedBytes",
-		usedBytes,
-		"targetBytes",
-		lowBytes,
-	)
-	return nil
-}
-
-func newLRUEvictionTask(candidate repository.CacheEvictionCandidate, maxRetries int) *model.Task {
-	stage := repository.CacheEvictionStageLRU
-	accessedAt := candidate.CreatedAt
-	if candidate.CacheAccessedAt != nil {
-		accessedAt = *candidate.CacheAccessedAt
-	}
-	accessedAt = normalizeLRUAccessTime(accessedAt)
-	return &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          candidate.ObjectID,
-		RefVersionID:   candidate.VersionID,
-		IdempotencyKey: repository.LRUEvictionTaskKey(candidate.VersionID),
-		Payload: map[string]interface{}{
-			lruAccessedAtPayloadKey: accessedAt.Format(time.RFC3339Nano),
-		},
-		Status:      model.TaskStatusQueued,
-		MaxRetries:  maxRetries,
-		ScheduledAt: time.Now(),
-	}
-}
-
-func watermarkBytes(maxBytes int64, percent int) int64 {
-	if maxBytes <= 0 || percent <= 0 {
-		return 0
-	}
-	if percent >= 100 {
-		return maxBytes
-	}
-	return (maxBytes/100)*int64(percent) + (maxBytes%100)*int64(percent)/100
-}
-
 func (e *Evictor) runSlot(ctx context.Context) {
 	if !sleepUntilNextWorkerPoll(ctx, e.pollInterval) {
 		return
@@ -307,127 +173,274 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTaskDuration.WithLabelValues("evictor").Observe(time.Since(start).Seconds())
 	}()
 
-	stage := taskStage(task)
-	switch stage {
-	case repository.CacheEvictionStageLRU:
-		if e.policy != cache.EvictionPolicyLRU {
-			e.cancelTask(ctx, task, "Cache eviction policy no longer uses LRU")
-			return
-		}
-		e.processLRUTask(ctx, task)
-	case repository.CacheEvictionStageAfterUpload:
-		if e.policy != cache.EvictionPolicyAfterUpload {
-			e.cancelTask(ctx, task, "Cache eviction policy no longer removes objects after upload")
-			return
-		}
-		e.processAfterUploadTask(ctx, task)
-	default:
+	stagePolicy, ok := evictionPolicyForTask(task)
+	if !ok {
 		e.cancelTask(ctx, task, "Cache eviction task uses an unsupported stage")
+		return
 	}
-}
-
-func taskStage(task *model.Task) string {
-	if task == nil || task.Stage == nil {
-		return ""
+	if e.policy != stagePolicy.requiredPolicy {
+		e.cancelTask(ctx, task, stagePolicy.policyMismatchReason)
+		return
 	}
-	return *task.Stage
-}
-
-func (e *Evictor) processLRUTask(ctx context.Context, task *model.Task) {
-	if e.cache.UsedBytes() <= watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent) {
+	if stagePolicy.capacityBound &&
+		e.cache.UsedBytes() <= watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent) {
 		e.cancelTask(ctx, task, "LRU cache usage already reached the low watermark")
 		return
 	}
-	e.guardEviction(ctx, task)
+	e.guardEviction(ctx, task, stagePolicy)
 }
 
-func (e *Evictor) processAfterUploadTask(ctx context.Context, task *model.Task) {
-	e.guardEviction(ctx, task)
-}
+func (e *Evictor) guardEviction(
+	ctx context.Context,
+	task *model.Task,
+	stagePolicy evictionStagePolicy,
+) {
+	prepared, ok := e.prepareEviction(ctx, task, stagePolicy)
+	if !ok {
+		return
+	}
 
-func (e *Evictor) guardEviction(ctx context.Context, task *model.Task) {
+	var result guardedEvictionResult
 	e.cacheAccess.GuardDeletion(task.RefVersionID, func(lastAccess time.Time) bool {
-		return e.finalizeEviction(ctx, task, lastAccess)
+		result = e.deletePreparedEviction(ctx, task, prepared, stagePolicy, lastAccess)
+		return result.deleted
 	})
+	e.finishGuardedEviction(ctx, task, stagePolicy, result)
 }
 
-func (e *Evictor) finalizeEviction(ctx context.Context, task *model.Task, lastAccess time.Time) bool {
-	stage := taskStage(task)
+type preparedEviction struct {
+	version    *model.ObjectVersion
+	bucketName string
+}
+
+func (e *Evictor) prepareEviction(
+	ctx context.Context,
+	task *model.Task,
+	stagePolicy evictionStagePolicy,
+) (*preparedEviction, bool) {
 	version, err := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
 	if err != nil {
 		e.retryTask(ctx, task, err, "loading object version for cache eviction")
-		return false
+		return nil, false
 	}
 	if version == nil {
-		e.rejectEviction(ctx, task, "object not found", "object version not found for cache eviction")
-		return false
+		stagePolicy.reject(e, ctx, task, "object not found", "object version not found for cache eviction")
+		return nil, false
 	}
 
-	if !e.validateEvictionState(ctx, task, version) {
-		return false
+	eligibility := stagePolicy.eligibility(version)
+	if eligibility.action != guardedEvictionNone {
+		eligibility.version = version
+		e.finishGuardedEviction(ctx, task, stagePolicy, eligibility)
+		return nil, false
 	}
 
-	if stage == repository.CacheEvictionStageLRU {
-		if !lruAccessSnapshotMatches(task, effectiveLRUAccessTime(version)) ||
-			lruAccessOccurredAfterSnapshot(task, lastAccess) {
-			e.persistNewerInMemoryAccess(ctx, task, version.CacheAccessedAt, lastAccess)
-			e.cancelTask(ctx, task, "Object was accessed after this LRU eviction was planned")
-			return false
-		}
-	}
-
-	if !e.ensureRemoteReadable(ctx, task, version) {
-		return false
+	if !e.ensureRemoteReadable(ctx, task, stagePolicy, version) {
+		return nil, false
 	}
 
 	bucket, err := e.repos.Buckets.GetByID(ctx, version.BucketID)
 	if err != nil {
 		e.retryTask(ctx, task, err, "loading object bucket for cache eviction")
-		return false
+		return nil, false
 	}
 	if bucket == nil {
-		e.rejectEviction(ctx, task, "bucket not found", "bucket not found for cache eviction")
-		return false
+		stagePolicy.reject(e, ctx, task, "bucket not found", "bucket not found for cache eviction")
+		return nil, false
+	}
+	return &preparedEviction{version: version, bucketName: bucket.Name}, true
+}
+
+type guardedEvictionAction uint8
+
+const (
+	guardedEvictionNone guardedEvictionAction = iota
+	guardedEvictionRetry
+	guardedEvictionReject
+	guardedEvictionAccessed
+	guardedEvictionDefer
+	guardedEvictionLowWatermark
+)
+
+type guardedEvictionResult struct {
+	action       guardedEvictionAction
+	version      *model.ObjectVersion
+	lastAccess   time.Time
+	err          error
+	reason       string
+	logMessage   string
+	deleted      bool
+	cachePresent bool
+}
+
+func (e *Evictor) deletePreparedEviction(
+	ctx context.Context,
+	task *model.Task,
+	prepared *preparedEviction,
+	stagePolicy evictionStagePolicy,
+	lastAccess time.Time,
+) guardedEvictionResult {
+	result := guardedEvictionResult{lastAccess: lastAccess}
+	version, err := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
+	if err != nil {
+		result.action = guardedEvictionRetry
+		result.err = err
+		result.logMessage = "reloading object version before cache eviction"
+		return result
+	}
+	if version == nil {
+		result.action = guardedEvictionReject
+		result.reason = "object not found"
+		result.logMessage = "object version not found before cache eviction"
+		return result
+	}
+	result.version = version
+
+	eligibility := stagePolicy.eligibility(version)
+	if eligibility.action != guardedEvictionNone {
+		eligibility.version = version
+		eligibility.lastAccess = lastAccess
+		return eligibility
+	}
+	if stagePolicy.capacityBound {
+		effectiveAccess := effectiveLRUAccessTime(version)
+		if !lruAccessSnapshotMatches(task, effectiveAccess) ||
+			lruAccessOccurredAfterSnapshot(task, lastAccess) {
+			result.action = guardedEvictionAccessed
+			return result
+		}
 	}
 
-	if !e.deleteCacheEntry(ctx, task, bucket.Name, version) {
+	if !sameEvictionTarget(prepared.version, version) {
+		result.action = guardedEvictionRetry
+		result.err = errors.New("object version changed while preparing cache eviction")
+		result.logMessage = "object version changed before cache eviction"
+		return result
+	}
+	remoteReadable, err := e.repos.Uploads.HasReadableCommittedCopy(
+		ctx,
+		*version.StorageUploadID,
+	)
+	if err != nil {
+		result.action = guardedEvictionRetry
+		result.err = err
+		result.logMessage = "rechecking readable remote copies before cache eviction"
+		return result
+	}
+	if !remoteReadable {
+		result.action = guardedEvictionReject
+		result.reason = "no readable upload copies"
+		result.logMessage = "object version no longer has readable upload copies"
+		return result
+	}
+
+	reserved := false
+	if stagePolicy.capacityBound {
+		if !e.reserveLRUDeletion(version.Size) {
+			result.action = guardedEvictionLowWatermark
+			return result
+		}
+		reserved = true
+	}
+	if reserved {
+		defer func() {
+			if reserved {
+				e.releaseLRUDeletion(version.Size)
+			}
+		}()
+	}
+
+	result.cachePresent = e.cache.Exists(ctx, prepared.bucketName, version.CacheKey)
+	if err := e.cache.Delete(ctx, prepared.bucketName, version.CacheKey); err != nil {
+		result.action = guardedEvictionRetry
+		result.err = err
+		result.logMessage = "deleting cache entry"
+		return result
+	}
+	if reserved {
+		e.releaseLRUDeletion(version.Size)
+		reserved = false
+	}
+	result.deleted = true
+	if err := e.recordDeletedCacheState(ctx, task, version); err != nil {
+		result.action = guardedEvictionRetry
+		result.err = err
+		result.logMessage = "recording cache eviction state"
+	}
+	return result
+}
+
+func sameEvictionTarget(before, after *model.ObjectVersion) bool {
+	if before == nil || after == nil ||
+		before.BucketID != after.BucketID ||
+		before.CacheKey != after.CacheKey {
 		return false
 	}
-	e.recordDeletedCache(ctx, task, version)
+	if before.StorageUploadID == nil || after.StorageUploadID == nil {
+		return before.StorageUploadID == nil && after.StorageUploadID == nil
+	}
+	return *before.StorageUploadID == *after.StorageUploadID
+}
+
+func (e *Evictor) finishGuardedEviction(
+	ctx context.Context,
+	task *model.Task,
+	stagePolicy evictionStagePolicy,
+	result guardedEvictionResult,
+) {
+	switch result.action {
+	case guardedEvictionRetry:
+		e.retryTask(ctx, task, result.err, result.logMessage)
+	case guardedEvictionReject:
+		stagePolicy.reject(e, ctx, task, result.reason, result.logMessage)
+	case guardedEvictionAccessed:
+		e.persistNewerInMemoryAccess(
+			ctx,
+			task,
+			result.version.CacheAccessedAt,
+			result.lastAccess,
+		)
+		e.cancelTask(ctx, task, "Object was accessed after this LRU eviction was planned")
+	case guardedEvictionDefer:
+		e.deferReplicatingEviction(ctx, task)
+	case guardedEvictionLowWatermark:
+		e.cancelTask(ctx, task, "LRU cache usage already reached the low watermark")
+	case guardedEvictionNone:
+		if !result.deleted {
+			return
+		}
+		if !result.cachePresent {
+			e.taskLogger(task).Info("cache entry already absent; reconciling eviction state")
+		}
+		e.completeTask(ctx, task, e.taskLogger(task), "cache eviction completed")
+	}
+}
+
+func (e *Evictor) reserveLRUDeletion(size int64) bool {
+	e.lruCapacityMu.Lock()
+	defer e.lruCapacityMu.Unlock()
+
+	usedBytes := e.cache.UsedBytes()
+	lowBytes := watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent)
+	if usedBytes-e.lruReservedBytes <= lowBytes {
+		return false
+	}
+	if size > 0 {
+		e.lruReservedBytes += size
+	}
 	return true
 }
 
-func (e *Evictor) validateEvictionState(
-	ctx context.Context,
-	task *model.Task,
-	version *model.ObjectVersion,
-) bool {
-	switch taskStage(task) {
-	case repository.CacheEvictionStageLRU:
-		if !version.InCache {
-			e.cancelTask(ctx, task, "Object is no longer present in the local cache")
-			return false
-		}
-		if version.State != model.ObjectStateStored &&
-			version.State != model.ObjectStateCacheEvicted {
-			e.cancelTask(ctx, task, "Object is no longer eligible for LRU eviction")
-			return false
-		}
-		return true
-	case repository.CacheEvictionStageAfterUpload:
-		if version.State == model.ObjectStateReplicating {
-			e.deferReplicatingEviction(ctx, task)
-			return false
-		}
-		if version.State != model.ObjectStateStored {
-			e.failTask(ctx, task, "not stored", "object version not in stored state")
-			return false
-		}
-		return true
-	default:
-		e.cancelTask(ctx, task, "Cache eviction task uses an unsupported stage")
-		return false
+func (e *Evictor) releaseLRUDeletion(size int64) {
+	if size <= 0 {
+		return
 	}
+	e.lruCapacityMu.Lock()
+	e.lruReservedBytes -= size
+	if e.lruReservedBytes < 0 {
+		e.lruReservedBytes = 0
+	}
+	e.lruCapacityMu.Unlock()
 }
 
 func (e *Evictor) deferReplicatingEviction(ctx context.Context, task *model.Task) {
@@ -473,64 +486,33 @@ func (e *Evictor) persistNewerInMemoryAccess(
 	}
 }
 
-func (e *Evictor) ensureRemoteReadable(ctx context.Context, task *model.Task, version *model.ObjectVersion) bool {
+func (e *Evictor) ensureRemoteReadable(
+	ctx context.Context,
+	task *model.Task,
+	stagePolicy evictionStagePolicy,
+	version *model.ObjectVersion,
+) bool {
 	if version.StorageUploadID == nil {
-		e.rejectEviction(ctx, task, "no accepted upload", "object version has no accepted upload, refusing to evict")
+		stagePolicy.reject(e, ctx, task, "no accepted upload", "object version has no accepted upload, refusing to evict")
 		return false
 	}
-	copies, err := e.repos.Uploads.ListReadableCommittedCopies(ctx, *version.StorageUploadID)
+	readable, err := e.repos.Uploads.HasReadableCommittedCopy(ctx, *version.StorageUploadID)
 	if err != nil {
 		e.retryTask(ctx, task, err, "checking readable remote copies before cache eviction")
 		return false
 	}
-	if len(copies) == 0 {
-		e.rejectEviction(ctx, task, "no readable upload copies", "object version has no readable upload copies, refusing to evict")
+	if !readable {
+		stagePolicy.reject(e, ctx, task, "no readable upload copies", "object version has no readable upload copies, refusing to evict")
 		return false
 	}
 	return true
 }
 
-func (e *Evictor) deleteCacheEntry(
+func (e *Evictor) recordDeletedCacheState(
 	ctx context.Context,
 	task *model.Task,
-	bucketName string,
 	version *model.ObjectVersion,
-) bool {
-	if taskStage(task) == repository.CacheEvictionStageLRU {
-		e.lruFinalizeMu.Lock()
-		defer e.lruFinalizeMu.Unlock()
-		if e.cache.UsedBytes() <= watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent) {
-			e.cancelTask(ctx, task, "LRU cache usage already reached the low watermark")
-			return false
-		}
-	}
-
-	cachePresent := e.cache.Exists(ctx, bucketName, version.CacheKey)
-	if err := e.cache.Delete(ctx, bucketName, version.CacheKey); err != nil {
-		e.retryTask(ctx, task, err, "deleting cache entry")
-		return false
-	}
-	if !cachePresent {
-		e.taskLogger(task).Info("cache entry already absent; reconciling eviction state")
-	}
-	return true
-}
-
-func (e *Evictor) rejectEviction(
-	ctx context.Context,
-	task *model.Task,
-	reason string,
-	logMessage string,
-) {
-	if taskStage(task) == repository.CacheEvictionStageLRU {
-		e.cancelTask(ctx, task, reason)
-		return
-	}
-	e.failTask(ctx, task, reason, logMessage)
-}
-
-func (e *Evictor) recordDeletedCache(ctx context.Context, task *model.Task, version *model.ObjectVersion) {
-	logger := e.taskLogger(task)
+) error {
 	switch version.State {
 	case model.ObjectStateStored:
 		if err := state.TransitionState(
@@ -541,31 +523,22 @@ func (e *Evictor) recordDeletedCache(ctx context.Context, task *model.Task, vers
 			model.ObjectStateStored,
 			model.ObjectStateCacheEvicted,
 		); err != nil {
-			logger.Error("state transition stored→cache_evicted failed", "error", err)
 			if latest, latestErr := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID); latestErr == nil &&
 				latest != nil &&
 				latest.State == model.ObjectStateCacheEvicted &&
 				!latest.InCache {
-				e.completeTask(ctx, task, logger, "cache eviction already recorded")
-				return
+				return nil
 			}
-			scheduleTaskRetry(ctx, e.repos, task, "evictor", logger, err)
-			admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
-			return
+			return err
 		}
 	case model.ObjectStateCacheEvicted:
 		if err := e.repos.Objects.SetVersionCachePresence(ctx, task.RefVersionID, false); err != nil {
-			logger.Error("recording repeated cache eviction failed", "error", err)
-			scheduleTaskRetry(ctx, e.repos, task, "evictor", logger, err)
-			admin.WorkerTasksProcessed.WithLabelValues("evictor", "failure").Inc()
-			return
+			return err
 		}
 	default:
-		e.cancelTask(ctx, task, "Object is no longer eligible for cache eviction")
-		return
+		return fmt.Errorf("object is no longer eligible for cache eviction: state %s", version.State)
 	}
-
-	e.completeTask(ctx, task, logger, "cache eviction completed")
+	return nil
 }
 
 func (e *Evictor) completeTask(ctx context.Context, task *model.Task, logger *slog.Logger, message string) {
