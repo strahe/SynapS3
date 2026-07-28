@@ -655,12 +655,12 @@ func (r *BunTaskRepo) List(ctx context.Context, taskType string, stage string, s
 		return q
 	}
 
-	total, err := applyFilters(r.db.NewSelect().Model((*model.Task)(nil))).Count(ctx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("counting tasks: %w", err)
-	}
 	var tasks []model.Task
-	err = applyFilters(r.db.NewSelect().Model(&tasks)).OrderExpr("id DESC").Limit(limit).Offset(offset).Scan(ctx)
+	total, err := applyFilters(r.db.NewSelect().Model(&tasks)).
+		OrderExpr("id DESC").
+		Limit(limit).
+		Offset(offset).
+		ScanAndCount(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("listing tasks: %w", err)
 	}
