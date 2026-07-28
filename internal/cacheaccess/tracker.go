@@ -147,7 +147,8 @@ func (t *Tracker) FlushWhileGuarded(ctx context.Context, versionID string) error
 	return t.flush(ctx, versionID, cacheeviction.NormalizeAccessTime(t.now()), true)
 }
 
-// Forget removes tracking state after the local cache entry is deleted.
+// Forget removes tracking state after the cache entry is deleted or its
+// version is permanently removed.
 func (t *Tracker) Forget(versionID string) {
 	shard := t.shard(versionID)
 	shard.mu.Lock()

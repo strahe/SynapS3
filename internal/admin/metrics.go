@@ -38,6 +38,15 @@ var (
 		Help:      "Total cache misses (object not found locally)",
 	})
 
+	// CacheLRUEvictionPaused reports whether LRU eviction is paused because
+	// recent cache access could not be retained safely.
+	CacheLRUEvictionPaused = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "synaps3",
+		Subsystem: "cache",
+		Name:      "lru_eviction_paused",
+		Help:      "Whether LRU cache eviction is paused because recent cache access could not be retained safely",
+	})
+
 	// WorkerTasksProcessed counts tasks processed by worker type and result.
 	WorkerTasksProcessed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "synaps3",

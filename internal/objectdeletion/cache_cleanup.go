@@ -32,17 +32,19 @@ func RecordCacheCleanup(
 	}
 	status := model.CacheCleanupStatusSkipped
 	cacheErr := ""
-	if cacheKey != "" {
-		var deleteErr error
-		gate.GuardDeletion(versionID, func() {
+	var deleteErr error
+	gate.GuardDeletion(versionID, func() {
+		if cacheKey != "" {
 			deleteErr = c.Delete(ctx, bucketName, cacheKey)
-		})
+		}
+		tracker.Forget(versionID)
+	})
+	if cacheKey != "" {
 		if deleteErr != nil {
 			status = model.CacheCleanupStatusFailed
 			cacheErr = deleteErr.Error()
 			logger.Warn("permanent delete cache cleanup failed", "bucket", bucketName, "versionID", versionID, "cacheKey", cacheKey, "error", deleteErr)
 		} else {
-			tracker.Forget(versionID)
 			status = model.CacheCleanupStatusDeleted
 		}
 	}

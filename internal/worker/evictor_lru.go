@@ -17,7 +17,7 @@ func (e *Evictor) processLRUEviction(
 	if e.policy != cache.EvictionPolicyLRU {
 		return cancelEviction("Cache eviction policy no longer uses LRU")
 	}
-	if !e.cacheAccessTracker.SafeForLRU() {
+	if !e.lruAccessTrackingSafe() {
 		return cancelEviction("LRU eviction is paused because recent cache access could not be retained")
 	}
 	if e.cache.UsedBytes() <= watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent) {
@@ -40,7 +40,7 @@ func (e *Evictor) finalizeLRUEviction(
 	task *model.Task,
 	accessSnapshot time.Time,
 ) *evictionDecision {
-	if !e.cacheAccessTracker.SafeForLRU() {
+	if !e.lruAccessTrackingSafe() {
 		return cancelEviction("LRU eviction is paused because recent cache access could not be retained")
 	}
 
@@ -140,7 +140,7 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 	if e.policy != cache.EvictionPolicyLRU || e.maxCacheBytes <= 0 {
 		return nil
 	}
-	if !e.cacheAccessTracker.SafeForLRU() {
+	if !e.lruAccessTrackingSafe() {
 		return nil
 	}
 	usedBytes := e.cache.UsedBytes()

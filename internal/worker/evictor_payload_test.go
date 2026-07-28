@@ -42,6 +42,8 @@ func TestEvictor_LRUMalformedAccessSnapshotCancelsWithoutDeleting(t *testing.T) 
 		t.Fatalf("Create: %v", err)
 	}
 
+	// Disable planning so the cancelled fixture task is not immediately
+	// reactivated with a valid payload.
 	evictor := worker.NewEvictor(
 		env.repos,
 		env.cache,
@@ -51,7 +53,7 @@ func TestEvictor_LRUMalformedAccessSnapshotCancelsWithoutDeleting(t *testing.T) 
 		1,
 		10*time.Millisecond,
 		slog.Default(),
-		worker.WithCacheEvictionPolicy(cache.EvictionPolicyLRU, 10, 90, 50, 3),
+		worker.WithCacheEvictionPolicy(cache.EvictionPolicyLRU, 0, 90, 50, 3),
 	)
 	got := runWorkerUntilTask(t, env, evictor, task.ID, 3*time.Second)
 	if got.Status != model.TaskStatusCancelled {

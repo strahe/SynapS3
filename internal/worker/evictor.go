@@ -41,6 +41,7 @@ type Evictor struct {
 	logger               *slog.Logger
 	lruCapacityMu        sync.Mutex
 	lruReservedBytes     int64
+	lruPauseLogOnce      sync.Once
 	*livenessTracker
 }
 
@@ -170,6 +171,23 @@ func (e *Evictor) runSlot(ctx context.Context) {
 
 // Healthy returns true if the worker has ticked recently.
 func (e *Evictor) Healthy() bool { return e.healthy() }
+
+func (e *Evictor) lruAccessTrackingSafe() bool {
+	if e.cacheAccessTracker.SafeForLRU() {
+		return true
+	}
+	admin.CacheLRUEvictionPaused.Set(1)
+	e.lruPauseLogOnce.Do(func() {
+		e.logger.Error(
+			"LRU cache eviction paused until restart",
+			"reason",
+			cacheaccess.ErrLRUAccessUncertain,
+			"action",
+			"resolve cache access persistence errors and restart SynapS3",
+		)
+	})
+	return false
+}
 
 func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 	start := time.Now()

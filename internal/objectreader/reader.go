@@ -162,7 +162,6 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 			bucketName,
 			version.CacheKey,
 			version.VersionID,
-			version.CacheAccessedAt,
 			rc,
 		)
 	}
@@ -232,7 +231,6 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 			bucketName,
 			version.CacheKey,
 			version.VersionID,
-			version.CacheAccessedAt,
 			rc,
 		)
 	}
@@ -293,7 +291,6 @@ func cacheMissError(err error) error {
 func (r *Reader) streamAndRehydrate(
 	ctx context.Context,
 	bucket, cacheKey, versionID string,
-	durableAccess *time.Time,
 	rc io.ReadCloser,
 ) io.ReadCloser {
 	pr, pw := io.Pipe()
@@ -307,20 +304,42 @@ func (r *Reader) streamAndRehydrate(
 
 	go func() {
 		defer close(done)
-		var persistErr error
+		var (
+			persistErr      error
+			skipRehydration bool
+		)
 		err := r.cacheGate.Commit(
 			versionID,
 			func() error {
-				_, err := r.cache.Put(ctx, bucket, cacheKey, pr)
+				persistedVersion, err := r.repos.Objects.GetVersionByID(ctx, versionID)
+				if err != nil {
+					return fmt.Errorf("checking object version before cache rehydration: %w", err)
+				}
+				if persistedVersion == nil ||
+					persistedVersion.IsDeleteMarker ||
+					persistedVersion.CacheKey != cacheKey {
+					skipRehydration = true
+					return nil
+				}
+				_, err = r.cache.Put(ctx, bucket, cacheKey, pr)
 				if err != nil {
 					return err
 				}
-				persistErr = r.accessTracker.RecordCommit(ctx, versionID, durableAccess)
+				persistErr = r.accessTracker.RecordCommit(
+					ctx,
+					versionID,
+					persistedVersion.CacheAccessedAt,
+				)
 				return nil
 			},
 		)
 		if err != nil {
 			r.logger.Warn("cache rehydration failed (best-effort)", "cacheKey", cacheKey, "error", err)
+			_, _ = io.Copy(io.Discard, pr)
+			_ = pr.Close()
+			return
+		}
+		if skipRehydration {
 			_, _ = io.Copy(io.Discard, pr)
 			_ = pr.Close()
 			return
