@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
-	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -46,7 +45,8 @@ func TestEvictor_LRUMalformedAccessSnapshotCancelsWithoutDeleting(t *testing.T) 
 	evictor := worker.NewEvictor(
 		env.repos,
 		env.cache,
-		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		env.cacheGate,
+		env.accessTracker,
 		env.sm,
 		1,
 		10*time.Millisecond,

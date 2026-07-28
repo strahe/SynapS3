@@ -309,6 +309,14 @@ func uploadProgressEventPayload(upload *model.StorageUpload, done bool) map[stri
 
 func (u *Uploader) Name() string { return "uploader" }
 
+func (u *Uploader) finalizeUploadInput(uploadID int64) repository.FinalizeUploadInput {
+	return repository.NewFinalizeUploadInput(
+		uploadID,
+		u.evictionPolicy.EnqueuesAfterUploadEviction(),
+		u.evictMaxRetries,
+	)
+}
+
 func (u *Uploader) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for range u.concurrency {
@@ -599,11 +607,7 @@ func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.
 	}
 	finalized, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
 		ctx,
-		repository.NewFinalizeUploadInput(
-			uploadID,
-			u.evictionPolicy.EnqueuesAfterUploadEviction(),
-			u.evictMaxRetries,
-		),
+		u.finalizeUploadInput(uploadID),
 	)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "finalize repaired upload", err)
@@ -1147,11 +1151,7 @@ func (u *Uploader) finishReadable(ctx context.Context, task *model.Task, version
 	if len(copies) == 1 {
 		_, _, err = u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
 			ctx,
-			repository.NewFinalizeUploadInput(
-				uploadID,
-				u.evictionPolicy.EnqueuesAfterUploadEviction(),
-				u.evictMaxRetries,
-			),
+			u.finalizeUploadInput(uploadID),
 		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize single-copy upload", err)
@@ -1195,11 +1195,7 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 	if copyCommitted(copyRow) {
 		_, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
 			ctx,
-			repository.NewFinalizeUploadInput(
-				uploadID,
-				u.evictionPolicy.EnqueuesAfterUploadEviction(),
-				u.evictMaxRetries,
-			),
+			u.finalizeUploadInput(uploadID),
 		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
@@ -1287,11 +1283,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 	if copyCommitted(copyRow) {
 		_, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
 			ctx,
-			repository.NewFinalizeUploadInput(
-				uploadID,
-				u.evictionPolicy.EnqueuesAfterUploadEviction(),
-				u.evictMaxRetries,
-			),
+			u.finalizeUploadInput(uploadID),
 		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
@@ -1347,11 +1339,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		}
 		_, _, err = u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
 			ctx,
-			repository.NewFinalizeUploadInput(
-				uploadID,
-				u.evictionPolicy.EnqueuesAfterUploadEviction(),
-				u.evictMaxRetries,
-			),
+			u.finalizeUploadInput(uploadID),
 		)
 		if err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
@@ -1414,11 +1402,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 	}
 	_, _, err = u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
 		ctx,
-		repository.NewFinalizeUploadInput(
-			uploadID,
-			u.evictionPolicy.EnqueuesAfterUploadEviction(),
-			u.evictMaxRetries,
-		),
+		u.finalizeUploadInput(uploadID),
 	)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "finalize upload", err)

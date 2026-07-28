@@ -6,7 +6,120 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
+	"github.com/strahe/synaps3/internal/model"
 )
+
+func (e *Evictor) processLRUEviction(
+	ctx context.Context,
+	task *model.Task,
+) *evictionDecision {
+	if e.policy != cache.EvictionPolicyLRU {
+		return cancelEviction("Cache eviction policy no longer uses LRU")
+	}
+	if !e.cacheAccessTracker.SafeForLRU() {
+		return cancelEviction("LRU eviction is paused because recent cache access could not be retained")
+	}
+	if e.cache.UsedBytes() <= watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent) {
+		return cancelEviction("LRU cache usage already reached the low watermark")
+	}
+	payload, err := cacheeviction.ParseLRUTaskPayload(task)
+	if err != nil {
+		return cancelEviction("LRU eviction plan is no longer valid and can be replanned")
+	}
+
+	var decision *evictionDecision
+	e.cacheGate.GuardDeletion(task.RefVersionID, func() {
+		decision = e.finalizeLRUEviction(ctx, task, payload.AccessedAt)
+	})
+	return decision
+}
+
+func (e *Evictor) finalizeLRUEviction(
+	ctx context.Context,
+	task *model.Task,
+	accessSnapshot time.Time,
+) *evictionDecision {
+	if !e.cacheAccessTracker.SafeForLRU() {
+		return cancelEviction("LRU eviction is paused because recent cache access could not be retained")
+	}
+
+	version, err := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID)
+	if err != nil {
+		return retryEviction(err, "loading object version for LRU cache eviction")
+	}
+	if version == nil {
+		return cancelEviction("Object version no longer exists")
+	}
+	if !version.InCache {
+		return cancelEviction("Object is no longer present in the local cache")
+	}
+	if version.State != model.ObjectStateStored &&
+		version.State != model.ObjectStateCacheEvicted {
+		return cancelEviction("Object is no longer eligible for LRU eviction")
+	}
+
+	durableAccess := effectiveLRUAccessTime(version)
+	inMemoryAccess := e.cacheAccessTracker.Latest(task.RefVersionID)
+	if !cacheeviction.NormalizeAccessTime(durableAccess).Equal(accessSnapshot) ||
+		cacheeviction.NormalizeAccessTime(inMemoryAccess).After(accessSnapshot) {
+		if newerInMemoryAccess(version.CacheAccessedAt, inMemoryAccess).IsZero() {
+			return cancelEviction("Object was accessed after this LRU eviction was planned")
+		}
+		if err := e.cacheAccessTracker.FlushWhileGuarded(ctx, task.RefVersionID); err != nil {
+			e.taskLogger(task).Warn(
+				"persisting recent cache access before cancelling LRU eviction",
+				"error",
+				err,
+			)
+		}
+		return cancelEviction("Object was accessed after this LRU eviction was planned")
+	}
+
+	bucket, err := e.repos.Buckets.GetByID(ctx, version.BucketID)
+	if err != nil {
+		return retryEviction(err, "loading object bucket for LRU cache eviction")
+	}
+	if bucket == nil {
+		return cancelEviction("Object bucket no longer exists")
+	}
+
+	readable, err := e.hasReadableRemoteCopy(ctx, version)
+	if err != nil {
+		return retryEviction(err, "checking readable remote copies before LRU cache eviction")
+	}
+	if !readable {
+		return cancelEviction("Object no longer has a readable committed remote copy")
+	}
+
+	if !e.reserveLRUDeletion(version.Size) {
+		return cancelEviction("LRU cache usage already reached the low watermark")
+	}
+	defer e.releaseLRUDeletion(version.Size)
+	return e.deleteCacheEntry(ctx, task, bucket.Name, version)
+}
+
+func effectiveLRUAccessTime(version *model.ObjectVersion) time.Time {
+	if version == nil {
+		return time.Time{}
+	}
+	if version.CacheAccessedAt != nil {
+		return cacheeviction.NormalizeAccessTime(*version.CacheAccessedAt)
+	}
+	return cacheeviction.NormalizeAccessTime(version.CreatedAt)
+}
+
+func newerInMemoryAccess(durable *time.Time, inMemory time.Time) time.Time {
+	inMemory = cacheeviction.NormalizeAccessTime(inMemory)
+	if inMemory.IsZero() {
+		return time.Time{}
+	}
+	if durable != nil &&
+		!inMemory.After(cacheeviction.NormalizeAccessTime(*durable)) {
+		return time.Time{}
+	}
+	return inMemory
+}
 
 func (e *Evictor) runLRUPlanner(ctx context.Context) {
 	for {
@@ -25,6 +138,9 @@ func (e *Evictor) runLRUPlanner(ctx context.Context) {
 
 func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 	if e.policy != cache.EvictionPolicyLRU || e.maxCacheBytes <= 0 {
+		return nil
+	}
+	if !e.cacheAccessTracker.SafeForLRU() {
 		return nil
 	}
 	usedBytes := e.cache.UsedBytes()

@@ -797,10 +797,13 @@ func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
 	poll := 50 * time.Millisecond
 
 	up := worker.NewUploader(repos, mc, nil, nil, sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, poll, logger)
+	cacheGate := cacheaccess.NewGate()
+	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	ev := worker.NewEvictor(
 		repos,
 		mc,
-		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		cacheGate,
+		accessTracker,
 		sm,
 		1,
 		poll,

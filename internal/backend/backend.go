@@ -21,7 +21,8 @@ type SynapseBackend struct {
 	repos                    *repository.Repositories
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
-	cacheAccess              *cacheaccess.Coordinator
+	cacheGate                *cacheaccess.Gate
+	cacheAccessTracker       *cacheaccess.Tracker
 	bucketLifecycle          *bucketlifecycle.Service
 	stateMachine             *state.Machine
 	storage                  synapse.StorageClient
@@ -75,17 +76,22 @@ func New(
 	c cache.Cache,
 	sm *state.Machine,
 	sc synapse.StorageClient,
-	cacheAccess *cacheaccess.Coordinator,
+	cacheGate *cacheaccess.Gate,
+	cacheAccessTracker *cacheaccess.Tracker,
 	logger *slog.Logger,
 	opts ...Option,
 ) *SynapseBackend {
-	if cacheAccess == nil {
-		panic("backend requires a cache access coordinator")
+	if cacheGate == nil {
+		panic("backend requires a cache access gate")
+	}
+	if cacheAccessTracker == nil {
+		panic("backend requires a cache access tracker")
 	}
 	b := &SynapseBackend{
 		repos:                    repos,
 		cache:                    c,
-		cacheAccess:              cacheAccess,
+		cacheGate:                cacheGate,
+		cacheAccessTracker:       cacheAccessTracker,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
 		stateMachine:             sm,
 		storage:                  sc,
@@ -102,7 +108,8 @@ func New(
 		repos,
 		c,
 		sc,
-		cacheAccess,
+		cacheGate,
+		cacheAccessTracker,
 		logger,
 	)
 	return b

@@ -27,11 +27,14 @@ func newTestReader(
 	storageClient synapse.StorageClient,
 	logger *slog.Logger,
 ) *Reader {
+	gate := cacheaccess.NewGate()
+	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	return New(
 		repos,
 		c,
 		storageClient,
-		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		gate,
+		tracker,
 		logger,
 	)
 }

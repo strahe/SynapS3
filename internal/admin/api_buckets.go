@@ -1339,7 +1339,17 @@ func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) model.CacheCleanupStatus {
-	return objectdeletion.RecordCacheCleanup(ctx, s.cache, s.cacheAccess, s.repos.Objects, s.logger, bucketName, versionID, cacheKey)
+	return objectdeletion.RecordCacheCleanup(
+		ctx,
+		s.cache,
+		s.cacheGate,
+		s.cacheAccessTracker,
+		s.repos.Objects,
+		s.logger,
+		bucketName,
+		versionID,
+		cacheKey,
+	)
 }
 
 func (s *Server) recordPermanentDeleteCacheCleanupWithTimeout(ctx context.Context, bucketName string, versionID string, cacheKey string) model.CacheCleanupStatus {
@@ -1898,7 +1908,8 @@ func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request)
 			s.repos,
 			s.cache,
 			s.objectStorage,
-			s.cacheAccess,
+			s.cacheGate,
+			s.cacheAccessTracker,
 			s.logger,
 		)
 	}

@@ -16,7 +16,6 @@ import (
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
-	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
@@ -47,8 +46,9 @@ func newIntegrationBackend(t *testing.T) *integrationBackend {
 	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
+	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, fsCache, sm, sc, cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval), logger)
+	b := backend.New(repos, fsCache, sm, sc, cacheGate, accessTracker, logger)
 	return &integrationBackend{
 		backend: b,
 		repos:   repos,

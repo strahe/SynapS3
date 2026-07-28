@@ -578,7 +578,17 @@ func deleteObjectsEntryError(key *string, versionID *string, err error) types.Er
 }
 
 func (b *SynapseBackend) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) {
-	objectdeletion.RecordCacheCleanup(ctx, b.cache, b.cacheAccess, b.repos.Objects, b.logger, bucketName, versionID, cacheKey)
+	objectdeletion.RecordCacheCleanup(
+		ctx,
+		b.cache,
+		b.cacheGate,
+		b.cacheAccessTracker,
+		b.repos.Objects,
+		b.logger,
+		bucketName,
+		versionID,
+		cacheKey,
+	)
 }
 
 func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {

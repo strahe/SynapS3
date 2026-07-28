@@ -4929,7 +4929,14 @@ func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
 		},
 	}
 	srv.cache = mockCache
-	srv.objectReader = objectreader.New(repos, mockCache, nil, srv.cacheAccess, testLogger())
+	srv.objectReader = objectreader.New(
+		repos,
+		mockCache,
+		nil,
+		srv.cacheGate,
+		srv.cacheAccessTracker,
+		testLogger(),
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/deadline-bucket/objects/download?key="+url.QueryEscape("folder/report.txt"), nil)
 	req.SetPathValue("name", "deadline-bucket")

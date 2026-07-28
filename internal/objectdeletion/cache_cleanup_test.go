@@ -11,6 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -41,15 +42,14 @@ func TestRecordCacheCleanupWaitsForOpenResponseBody(t *testing.T) {
 			return nil
 		},
 	}
-	access := cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval)
-	opened, err := access.Open(
-		context.Background(),
+	repos := repository.NewRepositories(testutil.NewTestDB(t))
+	gate := cacheaccess.NewGate()
+	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
+	opened, err := gate.Open(
 		"version-1",
-		nil,
 		func() (io.ReadCloser, *cache.ObjectInfo, error) {
 			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
 		},
-		nil,
 	)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -61,7 +61,8 @@ func TestRecordCacheCleanupWaitsForOpenResponseBody(t *testing.T) {
 		cleanupDone <- objectdeletion.RecordCacheCleanup(
 			context.Background(),
 			mockCache,
-			access,
+			gate,
+			tracker,
 			recorder,
 			slog.Default(),
 			"bucket",

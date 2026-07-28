@@ -60,32 +60,38 @@ type Result struct {
 }
 
 type Reader struct {
-	repos   *repository.Repositories
-	cache   cache.Cache
-	storage synapse.StorageClient
-	access  *cacheaccess.Coordinator
-	logger  *slog.Logger
+	repos         *repository.Repositories
+	cache         cache.Cache
+	storage       synapse.StorageClient
+	cacheGate     *cacheaccess.Gate
+	accessTracker *cacheaccess.Tracker
+	logger        *slog.Logger
 }
 
 func New(
 	repos *repository.Repositories,
 	cache cache.Cache,
 	storage synapse.StorageClient,
-	access *cacheaccess.Coordinator,
+	cacheGate *cacheaccess.Gate,
+	accessTracker *cacheaccess.Tracker,
 	logger *slog.Logger,
 ) *Reader {
-	if access == nil {
-		panic("object reader requires a cache access coordinator")
+	if cacheGate == nil {
+		panic("object reader requires a cache access gate")
+	}
+	if accessTracker == nil {
+		panic("object reader requires a cache access tracker")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	r := &Reader{
-		repos:   repos,
-		cache:   cache,
-		storage: storage,
-		access:  access,
-		logger:  logger,
+		repos:         repos,
+		cache:         cache,
+		storage:       storage,
+		cacheGate:     cacheGate,
+		accessTracker: accessTracker,
+		logger:        logger,
 	}
 	return r
 }
@@ -301,15 +307,17 @@ func (r *Reader) streamAndRehydrate(
 
 	go func() {
 		defer close(done)
-		commitResult, err := r.access.Commit(
-			ctx,
+		var persistErr error
+		err := r.cacheGate.Commit(
 			versionID,
-			durableAccess,
 			func() error {
 				_, err := r.cache.Put(ctx, bucket, cacheKey, pr)
-				return err
+				if err != nil {
+					return err
+				}
+				persistErr = r.accessTracker.RecordCommit(ctx, versionID, durableAccess)
+				return nil
 			},
-			r.repos.Objects.RecordVersionCacheCommit,
 		)
 		if err != nil {
 			r.logger.Warn("cache rehydration failed (best-effort)", "cacheKey", cacheKey, "error", err)
@@ -317,13 +325,13 @@ func (r *Reader) streamAndRehydrate(
 			_ = pr.Close()
 			return
 		}
-		if commitResult.PersistError != nil {
+		if persistErr != nil {
 			r.logger.Warn(
 				"cache access update failed",
 				"versionID",
 				versionID,
 				"error",
-				commitResult.PersistError,
+				persistErr,
 			)
 		}
 		_ = pr.Close()
@@ -346,29 +354,28 @@ func (r *Reader) openCached(
 	bucketName string,
 	version *model.ObjectVersion,
 ) (io.ReadCloser, error) {
-	persist := r.repos.Objects.RecordVersionCacheAccess
-	if !version.InCache {
-		persist = r.repos.Objects.RecordVersionCacheCommit
-	}
-	opened, err := r.access.Open(
-		ctx,
+	opened, err := r.cacheGate.Open(
 		version.VersionID,
-		version.CacheAccessedAt,
 		func() (io.ReadCloser, *cache.ObjectInfo, error) {
 			return r.cache.Get(ctx, bucketName, version.CacheKey)
 		},
-		persist,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if opened.PersistError != nil {
+	var persistErr error
+	if version.InCache {
+		persistErr = r.accessTracker.RecordAccess(ctx, version.VersionID, version.CacheAccessedAt)
+	} else {
+		persistErr = r.accessTracker.RecordCommit(ctx, version.VersionID, version.CacheAccessedAt)
+	}
+	if persistErr != nil {
 		r.logger.Warn(
 			"cache access update failed",
 			"versionID",
 			version.VersionID,
 			"error",
-			opened.PersistError,
+			persistErr,
 		)
 	}
 	return opened.Body, nil

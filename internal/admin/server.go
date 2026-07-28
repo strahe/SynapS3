@@ -39,7 +39,8 @@ type Server struct {
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
 	objectStorage            synapse.StorageClient
-	cacheAccess              *cacheaccess.Coordinator
+	cacheGate                *cacheaccess.Gate
+	cacheAccessTracker       *cacheaccess.Tracker
 	objectUploader           objectUploader
 	objectVersionRestorer    objectVersionRestorer
 	cacheMaxBytes            int64
@@ -73,7 +74,8 @@ func New(
 	addr string,
 	db *bun.DB,
 	c cache.Cache,
-	cacheAccess *cacheaccess.Coordinator,
+	cacheGate *cacheaccess.Gate,
+	cacheAccessTracker *cacheaccess.Tracker,
 	cacheMaxBytes int64,
 	repos *repository.Repositories,
 	wh WorkerHealthChecker,
@@ -81,15 +83,19 @@ func New(
 	filecoinDefaultCopies int,
 	logger *slog.Logger,
 ) *Server {
-	if cacheAccess == nil {
-		panic("admin server requires a cache access coordinator")
+	if cacheGate == nil {
+		panic("admin server requires a cache access gate")
+	}
+	if cacheAccessTracker == nil {
+		panic("admin server requires a cache access tracker")
 	}
 	s := &Server{
 		addr:                     addr,
 		db:                       db,
 		cache:                    c,
-		cacheAccess:              cacheAccess,
-		objectReader:             objectreader.New(repos, c, nil, cacheAccess, logger),
+		cacheGate:                cacheGate,
+		cacheAccessTracker:       cacheAccessTracker,
+		objectReader:             objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
 		cacheMaxBytes:            cacheMaxBytes,
 		repos:                    repos,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
@@ -118,7 +124,8 @@ func (s *Server) resetObjectReader() {
 		s.repos,
 		s.cache,
 		s.objectStorage,
-		s.cacheAccess,
+		s.cacheGate,
+		s.cacheAccessTracker,
 		s.logger,
 	)
 }

@@ -50,11 +50,14 @@ func newTestServer(
 	filecoinDefaultCopies int,
 	logger *slog.Logger,
 ) *Server {
+	cacheGate := cacheaccess.NewGate()
+	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	return New(
 		addr,
 		db,
 		c,
-		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		cacheGate,
+		accessTracker,
 		cacheMaxBytes,
 		repos,
 		health,

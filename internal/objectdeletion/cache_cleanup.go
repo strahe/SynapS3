@@ -3,7 +3,6 @@ package objectdeletion
 import (
 	"context"
 	"log/slog"
-	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
@@ -17,29 +16,33 @@ type cacheCleanupRecorder interface {
 func RecordCacheCleanup(
 	ctx context.Context,
 	c cache.Cache,
-	access *cacheaccess.Coordinator,
+	gate *cacheaccess.Gate,
+	tracker *cacheaccess.Tracker,
 	recorder cacheCleanupRecorder,
 	logger *slog.Logger,
 	bucketName string,
 	versionID string,
 	cacheKey string,
 ) model.CacheCleanupStatus {
-	if access == nil {
-		panic("cache cleanup requires a cache access coordinator")
+	if gate == nil {
+		panic("cache cleanup requires a cache access gate")
+	}
+	if tracker == nil {
+		panic("cache cleanup requires a cache access tracker")
 	}
 	status := model.CacheCleanupStatusSkipped
 	cacheErr := ""
 	if cacheKey != "" {
 		var deleteErr error
-		access.GuardDeletion(versionID, func(time.Time) bool {
+		gate.GuardDeletion(versionID, func() {
 			deleteErr = c.Delete(ctx, bucketName, cacheKey)
-			return deleteErr == nil
 		})
 		if deleteErr != nil {
 			status = model.CacheCleanupStatusFailed
 			cacheErr = deleteErr.Error()
 			logger.Warn("permanent delete cache cleanup failed", "bucket", bucketName, "versionID", versionID, "cacheKey", cacheKey, "error", deleteErr)
 		} else {
+			tracker.Forget(versionID)
 			status = model.CacheCleanupStatusDeleted
 		}
 	}

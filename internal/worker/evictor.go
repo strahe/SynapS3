@@ -10,6 +10,7 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
@@ -26,7 +27,8 @@ const (
 type Evictor struct {
 	repos                *repository.Repositories
 	cache                cache.Cache
-	cacheAccess          *cacheaccess.Coordinator
+	cacheGate            *cacheaccess.Gate
+	cacheAccessTracker   *cacheaccess.Tracker
 	stateMachine         *state.Machine
 	policy               cache.EvictionPolicy
 	maxCacheBytes        int64
@@ -67,20 +69,25 @@ func WithCacheEvictionPolicy(
 func NewEvictor(
 	repos *repository.Repositories,
 	c cache.Cache,
-	cacheAccess *cacheaccess.Coordinator,
+	cacheGate *cacheaccess.Gate,
+	cacheAccessTracker *cacheaccess.Tracker,
 	sm *state.Machine,
 	concurrency int,
 	pollInterval time.Duration,
 	logger *slog.Logger,
 	opts ...EvictorOption,
 ) *Evictor {
-	if cacheAccess == nil {
-		panic("evictor requires a cache access coordinator")
+	if cacheGate == nil {
+		panic("evictor requires a cache access gate")
+	}
+	if cacheAccessTracker == nil {
+		panic("evictor requires a cache access tracker")
 	}
 	e := &Evictor{
 		repos:                repos,
 		cache:                c,
-		cacheAccess:          cacheAccess,
+		cacheGate:            cacheGate,
+		cacheAccessTracker:   cacheAccessTracker,
 		stateMachine:         sm,
 		policy:               cache.EvictionPolicyNone,
 		highWatermarkPercent: 90,
@@ -170,42 +177,15 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTaskDuration.WithLabelValues("evictor").Observe(time.Since(start).Seconds())
 	}()
 
-	stagePolicy, ok := evictionPolicyForTask(task)
-	if !ok {
-		e.applyEvictionDecision(
-			ctx,
-			task,
-			cancelEviction("Cache eviction task uses an unsupported stage"),
-		)
-		return
+	var decision *evictionDecision
+	switch taskStage(task) {
+	case cacheeviction.StageLRU:
+		decision = e.processLRUEviction(ctx, task)
+	case cacheeviction.StageAfterUpload:
+		decision = e.processAfterUploadEviction(ctx, task)
+	default:
+		decision = cancelEviction("Cache eviction task uses an unsupported stage")
 	}
-
-	prepared, decision := e.prepareEviction(ctx, task, stagePolicy)
-	if decision != nil {
-		e.applyEvictionDecision(ctx, task, decision)
-		return
-	}
-	if decision = e.remoteSafetyDecision(
-		ctx,
-		stagePolicy,
-		prepared.version,
-		"rechecking readable remote copies before cache eviction",
-	); decision != nil {
-		e.applyEvictionDecision(ctx, task, decision)
-		return
-	}
-
-	var deleted bool
-	e.cacheAccess.GuardDeletion(task.RefVersionID, func(lastAccess time.Time) bool {
-		decision, deleted = e.finalizePreparedEviction(
-			ctx,
-			task,
-			prepared,
-			stagePolicy,
-			lastAccess,
-		)
-		return deleted
-	})
 	e.applyEvictionDecision(ctx, task, decision)
 }
 
