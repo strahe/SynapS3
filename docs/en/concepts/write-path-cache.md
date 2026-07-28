@@ -32,7 +32,7 @@ The S3 response does not wait for Filecoin provider latency. After the write is 
 
 Successful foreground cache opens refresh the entry's LRU access time. This includes S3 object and range reads, cached CopyObject sources, Admin content downloads, and version restores. Metadata-only operations such as `HeadObject` do not refresh it, and the background Uploader does not make an entry look recently used. A complete remote rehydration starts a new LRU age for the restored entry.
 
-Access-time persistence is best effort and never turns a successful read into an error.
+SynapS3 records every successful open in memory and coalesces database updates for the same version to at most one per minute. This keeps repeated reads off the database write path while the process is running. A restart can lose up to one minute of unpersisted access ordering. Access-time persistence remains best effort and never turns a successful read into an error.
 
 ## Cache Eviction
 
@@ -42,11 +42,13 @@ Access-time persistence is best effort and never turns a successful read into an
 | `after_upload` | Queue each version for removal after all target remote copies commit. |
 | `none` | Do not create or run automatic cache eviction work. |
 
-LRU records an access-time snapshot when it plans each task and checks it again immediately before deletion. A newly accessed entry is kept and its stale task is cancelled. This is not a linearizable read/delete lock: an already opened file remains readable, while a very narrow race can make a later read fetch and rehydrate the remote copy.
+LRU records an access-time snapshot when it plans each task. Immediately before deletion, it reloads the version metadata and checks both the database timestamp and the latest in-process access. Successful cache opens and final deletion are serialized for that version: an open that wins the race keeps the entry and cancels the stale task; a deletion that wins makes the read use the normal remote fallback.
 
 Only versions with a readable committed remote copy are eligible. If usage is caused by multipart data, objects still awaiting remote durability, or other ineligible files, LRU may have nothing safe to remove.
 
 Eviction runs on the Evictor schedule. A new write does not synchronously run LRU, so writes can still return `507 Insufficient Storage` when cleanup cannot keep pace or no safe candidate exists.
+
+An LRU task that exhausts its retries is held for one hour before the same access generation can be tried again while cache usage remains high. The existing task row is reused. A later persisted access creates a new generation that is not blocked by the earlier failure. Operators can retry exhausted work sooner after fixing the underlying problem.
 
 ## Multipart Uploads
 

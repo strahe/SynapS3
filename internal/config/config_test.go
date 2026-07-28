@@ -792,6 +792,53 @@ func TestNormalizeEvictionPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadDetectsLegacyLRUConfigForStartupWarning(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "explicit legacy lru",
+			content: "[cache]\neviction_policy = \"lru\"\n",
+			want:    true,
+		},
+		{
+			name:    "implicit legacy default",
+			content: "[cache]\nmax_size_gb = 100\n",
+			want:    true,
+		},
+		{
+			name: "capacity watermarks present",
+			content: `[cache]
+eviction_policy = "lru"
+lru_high_watermark_percent = 90
+lru_low_watermark_percent = 80
+`,
+			want: false,
+		},
+		{
+			name:    "after upload",
+			content: "[cache]\neviction_policy = \"after_upload\"\n",
+			want:    false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := LoadFile(path)
+			if err != nil {
+				t.Fatalf("LoadFile: %v", err)
+			}
+			if got := cfg.ShouldWarnLRUBehaviorChange(); got != tt.want {
+				t.Fatalf("ShouldWarnLRUBehaviorChange() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidate_LRUWatermarks(t *testing.T) {
 	tests := []struct {
 		name string
@@ -802,6 +849,7 @@ func TestValidate_LRUWatermarks(t *testing.T) {
 		{name: "low above range", low: 101, high: 90},
 		{name: "negative high", low: 0, high: -1},
 		{name: "high above range", low: 80, high: 101},
+		{name: "both zero", low: 0, high: 0},
 		{name: "equal", low: 80, high: 80},
 		{name: "low greater", low: 90, high: 80},
 	}

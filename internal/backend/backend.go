@@ -5,6 +5,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/state"
@@ -20,6 +21,7 @@ type SynapseBackend struct {
 	repos                    *repository.Repositories
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
+	cacheAccess              *cacheaccess.Coordinator
 	bucketLifecycle          *bucketlifecycle.Service
 	stateMachine             *state.Machine
 	storage                  synapse.StorageClient
@@ -67,12 +69,21 @@ func WithEvictionPolicy(policy cache.EvictionPolicy) Option {
 	}
 }
 
+// WithCacheAccessCoordinator shares cache opens with final cache deletion.
+func WithCacheAccessCoordinator(coordinator *cacheaccess.Coordinator) Option {
+	return func(b *SynapseBackend) {
+		if coordinator != nil {
+			b.cacheAccess = coordinator
+		}
+	}
+}
+
 // New creates a new SynapseBackend.
 func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc synapse.StorageClient, logger *slog.Logger, opts ...Option) *SynapseBackend {
 	b := &SynapseBackend{
 		repos:                    repos,
 		cache:                    c,
-		objectReader:             objectreader.New(repos, c, sc, logger),
+		cacheAccess:              cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
 		stateMachine:             sm,
 		storage:                  sc,
@@ -85,6 +96,13 @@ func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc sy
 	for _, opt := range opts {
 		opt(b)
 	}
+	b.objectReader = objectreader.New(
+		repos,
+		c,
+		sc,
+		logger,
+		objectreader.WithCacheAccessCoordinator(b.cacheAccess),
+	)
 	return b
 }
 

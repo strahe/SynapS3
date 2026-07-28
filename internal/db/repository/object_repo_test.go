@@ -1796,6 +1796,13 @@ func TestObjectRepo_RecordVersionCacheAccessDoesNotChangeLifecycleTimestamp(t *t
 	if got.CacheAccessedAt == nil || !got.CacheAccessedAt.Equal(accessedAt) {
 		t.Fatalf("cache_accessed_at = %v, want %v", got.CacheAccessedAt, accessedAt)
 	}
+	if got.CacheAccessGeneration != repository.CacheAccessGeneration(&accessedAt) {
+		t.Fatalf(
+			"cache_access_generation = %q, want %q",
+			got.CacheAccessGeneration,
+			repository.CacheAccessGeneration(&accessedAt),
+		)
+	}
 	if !got.UpdatedAt.Equal(lifecycleUpdatedAt) {
 		t.Fatalf("updated_at = %v, want unchanged %v", got.UpdatedAt, lifecycleUpdatedAt)
 	}
@@ -1848,7 +1855,8 @@ func TestObjectRepo_ListLRUEvictionCandidatesOrdersSafeCurrentAndHistoricalVersi
 		}
 	}
 
-	candidates, err := repos.Objects.ListLRUEvictionCandidates(ctx, 10)
+	terminalSince := time.Now().Add(-time.Hour)
+	candidates, err := repos.Objects.ListLRUEvictionCandidates(ctx, terminalSince, 10)
 	if err != nil {
 		t.Fatalf("ListLRUEvictionCandidates: %v", err)
 	}
@@ -1880,7 +1888,7 @@ func TestObjectRepo_ListLRUEvictionCandidatesOrdersSafeCurrentAndHistoricalVersi
 		t.Fatalf("Create active eviction task: %v", err)
 	}
 
-	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, 10)
+	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, terminalSince, 10)
 	if err != nil {
 		t.Fatalf("ListLRUEvictionCandidates after active task: %v", err)
 	}
@@ -1899,26 +1907,61 @@ func TestObjectRepo_ListLRUEvictionCandidatesOrdersSafeCurrentAndHistoricalVersi
 
 	exhaustedAt := time.Now()
 	exhausted := &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          oldest.objectID,
-		RefVersionID:   oldest.version.VersionID,
-		IdempotencyKey: "evict_cache:lru:exhausted:" + oldest.version.VersionID,
-		Status:         model.TaskStatusExhausted,
-		MaxRetries:     3,
-		ScheduledAt:    exhaustedAt,
-		CompletedAt:    &exhaustedAt,
+		Type:         model.TaskTypeEvictCache,
+		Stage:        &stage,
+		RefType:      "object",
+		RefID:        oldest.objectID,
+		RefVersionID: oldest.version.VersionID,
+		IdempotencyKey: repository.LRUEvictionTaskKey(
+			oldest.version.VersionID,
+			repository.CacheAccessGeneration(&base),
+		),
+		Status:      model.TaskStatusExhausted,
+		MaxRetries:  3,
+		ScheduledAt: exhaustedAt,
+		CompletedAt: &exhaustedAt,
 	}
 	if err := repos.Tasks.Create(ctx, exhausted); err != nil {
 		t.Fatalf("Create exhausted LRU task: %v", err)
 	}
-	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, 10)
+	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, terminalSince, 10)
 	if err != nil {
 		t.Fatalf("ListLRUEvictionCandidates after exhausted task: %v", err)
 	}
 	if len(candidates) != 1 || candidates[0].VersionID != newest.version.VersionID {
 		t.Fatalf("candidates with active and exhausted tasks = %#v, want newest only", candidates)
+	}
+
+	mustExec(
+		t,
+		db,
+		`UPDATE tasks SET completed_at = ? WHERE id = ?`,
+		terminalSince.Add(-time.Second),
+		exhausted.ID,
+	)
+	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, terminalSince, 10)
+	if err != nil {
+		t.Fatalf("ListLRUEvictionCandidates after exhausted cooldown: %v", err)
+	}
+	if len(candidates) != 2 ||
+		candidates[0].VersionID != oldest.version.VersionID ||
+		candidates[1].VersionID != newest.version.VersionID {
+		t.Fatalf("candidates after exhausted cooldown = %#v, want oldest/newest", candidates)
+	}
+
+	mustExec(t, db, `UPDATE tasks SET completed_at = ? WHERE id = ?`, time.Now(), exhausted.ID)
+	newAccess := base.Add(4 * time.Hour)
+	if err := repos.Objects.RecordVersionCacheAccess(ctx, oldest.version.VersionID, newAccess); err != nil {
+		t.Fatalf("RecordVersionCacheAccess(new generation): %v", err)
+	}
+	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, terminalSince, 10)
+	if err != nil {
+		t.Fatalf("ListLRUEvictionCandidates after new access generation: %v", err)
+	}
+	if len(candidates) != 2 ||
+		candidates[0].VersionID != newest.version.VersionID ||
+		candidates[1].VersionID != oldest.version.VersionID {
+		t.Fatalf("candidates after new access generation = %#v, want newest/oldest", candidates)
 	}
 }
 

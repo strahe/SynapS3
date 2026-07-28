@@ -38,9 +38,11 @@ docker compose stop synaps3
 - 保持 `lru` 会使用默认的 `90%` 高水位和 `80%` 低水位，也可以显式设置两个值。
 - 旧值 `manual` 仍可读取，但会按 `none` 生效并在保存时写回 `none`。
 
+如果已有配置选择了 `lru`，但没有包含任一水位设置，启动日志会明确提示容量淘汰行为，并指出可改用 `after_upload`。
+
 迁移会为对象版本增加缓存访问时间。已有版本在首次读取前使用创建时间参与 LRU 排序。没有策略 stage 的旧活动淘汰任务会被取消并清除租约；终态任务历史会保留。down migration 会删除新增 schema，但不会恢复这些已取消任务。
 
-启动时，SynapS3 会取消与当前策略不匹配的活动淘汰任务。`after_upload` 只会恢复因策略切换而处于 cancelled 状态的同键任务；failed、exhausted 和 completed 任务仍保持终态。
+启动时，SynapS3 会取消与当前策略不匹配的活动淘汰任务。切换到 `after_upload` 不会扫描或回填全部已有的 stored 版本；它会在新上传完成，或中断上传在恢复期间完成最终确认时生效。已有 cancelled、failed、exhausted 和 completed 的 `after_upload` 任务保持终态，除非同一上传流程再次走到正常的任务创建步骤。
 
 ## 升级 Docker Compose
 

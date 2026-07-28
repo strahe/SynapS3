@@ -255,7 +255,7 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 	}
 }
 
-func TestOpenCacheHitRecordsEveryForegroundAccessWithoutLifecyclePresenceWrite(t *testing.T) {
+func TestOpenCacheHitCoalescesAccessPersistenceWithoutLifecyclePresenceWrite(t *testing.T) {
 	mc := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
@@ -306,8 +306,8 @@ func TestOpenCacheHitRecordsEveryForegroundAccessWithoutLifecyclePresenceWrite(t
 	if objects.cachePresenceWrites != 0 {
 		t.Fatalf("cache presence writes after OpenVersion cache hit = %d, want 0", objects.cachePresenceWrites)
 	}
-	if objects.cacheAccessWrites != 2 {
-		t.Fatalf("cache access writes after OpenVersion cache hit = %d, want 2", objects.cacheAccessWrites)
+	if objects.cacheAccessWrites != 1 {
+		t.Fatalf("cache access writes after OpenVersion cache hit = %d, want 1 coalesced write", objects.cacheAccessWrites)
 	}
 }
 

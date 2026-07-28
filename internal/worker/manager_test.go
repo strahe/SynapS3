@@ -795,7 +795,15 @@ func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
 	poll := 50 * time.Millisecond
 
 	up := worker.NewUploader(repos, mc, nil, nil, sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, poll, logger)
-	ev := worker.NewEvictor(repos, mc, sm, 1, poll, logger)
+	ev := worker.NewEvictor(
+		repos,
+		mc,
+		sm,
+		1,
+		poll,
+		logger,
+		worker.WithCacheEvictionPolicy(cache.EvictionPolicyAfterUpload, 0, 90, 80, 3),
+	)
 
 	mgr := worker.NewManager(repos, logger, cache.EvictionPolicyAfterUpload, up, ev)
 	health := mgr.WorkerHealth()
@@ -883,13 +891,13 @@ func TestManager_ReconcileTasks_NoneDoesNotCreateEvictionTask(t *testing.T) {
 	}
 }
 
-func TestManager_ReconcileTasks_AfterUploadCreatesEvictionTask(t *testing.T) {
+func TestManager_RecoverOnStartup_AfterUploadDoesNotBackfillStoredVersions(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-on")
-	objID, versionID := seedManagerVersion(t, repos, bucket, "stored-with-evict", model.ObjectStateStored)
+	seedManagerVersion(t, repos, bucket, "stored-without-backfill", model.ObjectStateStored)
 
 	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
@@ -898,18 +906,12 @@ func TestManager_ReconcileTasks_AfterUploadCreatesEvictionTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claiming evict task: %v", err)
 	}
-	if task == nil {
-		t.Fatal("expected evict_cache task under after_upload policy")
-	}
-	if task.RefID != objID || task.RefVersionID != versionID {
-		t.Fatalf("evict task refs = (%d,%s), want (%d,%s)", task.RefID, task.RefVersionID, objID, versionID)
-	}
-	if task.MaxRetries != 4 {
-		t.Fatalf("evict task MaxRetries = %d, want 4", task.MaxRetries)
+	if task != nil {
+		t.Fatalf("unexpected startup backfill task: %#v", task)
 	}
 }
 
-func TestManager_RecoverOnStartupSwitchesEvictionPoliciesAndOnlyReactivatesCancelledAfterUploadTask(t *testing.T) {
+func TestManager_RecoverOnStartupSwitchesEvictionPoliciesWithoutBackfill(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -958,8 +960,8 @@ func TestManager_RecoverOnStartupSwitchesEvictionPoliciesAndOnlyReactivatesCance
 	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)
 	gotAfterUpload, _ = repos.Tasks.GetByID(ctx, afterUploadTask.ID)
 	gotLRU, _ = repos.Tasks.GetByID(ctx, lruTask.ID)
-	if gotAfterUpload.Status != model.TaskStatusQueued || gotLRU.Status != model.TaskStatusCancelled {
-		t.Fatalf("after after_upload startup statuses = %s/%s, want queued/cancelled", gotAfterUpload.Status, gotLRU.Status)
+	if gotAfterUpload.Status != model.TaskStatusCancelled || gotLRU.Status != model.TaskStatusCancelled {
+		t.Fatalf("after after_upload startup statuses = %s/%s, want cancelled/cancelled", gotAfterUpload.Status, gotLRU.Status)
 	}
 
 	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).Start(ctx)
@@ -970,21 +972,8 @@ func TestManager_RecoverOnStartupSwitchesEvictionPoliciesAndOnlyReactivatesCance
 
 	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)
 	gotAfterUpload, _ = repos.Tasks.GetByID(ctx, afterUploadTask.ID)
-	if gotAfterUpload.Status != model.TaskStatusQueued {
-		t.Fatalf("after_upload task status after cancelled recovery = %s, want queued", gotAfterUpload.Status)
-	}
-	if _, err := db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusFailed).
-		Set("completed_at = ?", time.Now()).
-		Where("id = ?", afterUploadTask.ID).
-		Exec(ctx); err != nil {
-		t.Fatalf("mark after_upload task failed: %v", err)
-	}
-	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)
-	gotAfterUpload, _ = repos.Tasks.GetByID(ctx, afterUploadTask.ID)
-	if gotAfterUpload.Status != model.TaskStatusFailed {
-		t.Fatalf("failed after_upload task status after restart = %s, want failed", gotAfterUpload.Status)
+	if gotAfterUpload.Status != model.TaskStatusCancelled {
+		t.Fatalf("after_upload task status after restart = %s, want cancelled without backfill", gotAfterUpload.Status)
 	}
 }
 

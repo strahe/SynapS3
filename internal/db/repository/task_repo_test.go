@@ -161,6 +161,79 @@ func TestTaskRepo_CreateOrReactivateCancelledOnlyRequeuesCancelledTask(t *testin
 	}
 }
 
+func TestTaskRepo_CreateOrReactivateRecoverableHonorsTerminalCooldown(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	stage := repository.CacheEvictionStageLRU
+	completedAt := time.Now()
+	lastError := "permission denied"
+	original := &model.Task{
+		Type:           model.TaskTypeEvictCache,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          12,
+		RefVersionID:   "01J0000000000000000000CR02",
+		IdempotencyKey: "evict_cache:lru:01J0000000000000000000CR02:access",
+		Status:         model.TaskStatusExhausted,
+		RetryCount:     3,
+		MaxRetries:     3,
+		LastError:      &lastError,
+		ScheduledAt:    completedAt,
+		CompletedAt:    &completedAt,
+	}
+	if err := repos.Tasks.Create(ctx, original); err != nil {
+		t.Fatalf("Create exhausted task: %v", err)
+	}
+	replacement := &model.Task{
+		Type:           original.Type,
+		Stage:          &stage,
+		RefType:        original.RefType,
+		RefID:          original.RefID,
+		RefVersionID:   original.RefVersionID,
+		IdempotencyKey: original.IdempotencyKey,
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+
+	activated, err := repos.Tasks.CreateOrReactivateRecoverable(
+		ctx,
+		replacement,
+		time.Now().Add(-time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("CreateOrReactivateRecoverable(recent): %v", err)
+	}
+	if activated {
+		t.Fatal("recent exhausted task activated before cooldown")
+	}
+
+	mustExec(t, db, `UPDATE tasks SET completed_at = ? WHERE id = ?`, time.Now().Add(-2*time.Hour), original.ID)
+	activated, err = repos.Tasks.CreateOrReactivateRecoverable(
+		ctx,
+		replacement,
+		time.Now().Add(-time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("CreateOrReactivateRecoverable(cooled): %v", err)
+	}
+	if !activated {
+		t.Fatal("cooled exhausted task activated = false, want true")
+	}
+	got, err := repos.Tasks.GetByID(ctx, original.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID reactivated recoverable: task=%v err=%v", got, err)
+	}
+	if got.Status != model.TaskStatusQueued ||
+		got.RetryCount != 0 ||
+		got.MaxRetries != replacement.MaxRetries ||
+		got.CompletedAt != nil ||
+		got.LastError != nil {
+		t.Fatalf("reactivated recoverable task = %#v, want reset queued task", got)
+	}
+}
+
 func TestTaskRepo_CancelActiveEvictionTasksExceptPreservesMatchingStageAndTerminalHistory(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

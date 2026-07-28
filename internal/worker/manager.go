@@ -113,12 +113,9 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Info("cancelled incompatible cache eviction tasks", "count", cancelled, "policy", m.evictionPolicy)
 	}
 
-	// Reconcile: ensure objects in cached/stored have corresponding tasks.
+	// Reconcile unfinished upload work.
 	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUpload, "upload")
 	m.reconcileStagedUploads(ctx)
-	if m.evictionPolicy == cache.EvictionPolicyAfterUpload {
-		m.reconcileAfterUploadEvictions(ctx)
-	}
 
 	// Log exhausted task count for operator awareness
 	exhaustedTasks, err := m.repos.Tasks.ListExhausted(ctx, 100)
@@ -126,43 +123,6 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Error("failed to check exhausted tasks", "error", err)
 	} else if len(exhaustedTasks) > 0 {
 		m.logger.Warn("exhausted tasks found on startup, review via GET /admin/exhausted-tasks", "count", len(exhaustedTasks))
-	}
-}
-
-func (m *Manager) reconcileAfterUploadEvictions(ctx context.Context) {
-	created := 0
-	var cursor versionStateCursor
-	for {
-		versions, nextCursor, err := m.listVersionStateBatch(ctx, model.ObjectStateStored, cursor)
-		if err != nil {
-			return
-		}
-		if len(versions) == 0 {
-			break
-		}
-		for _, version := range versions {
-			activated, err := repository.EnsureAfterUploadEvictionTask(
-				ctx,
-				m.repos.Tasks,
-				version.ObjectID,
-				version.VersionID,
-				m.evictMaxRetries,
-			)
-			if err != nil {
-				m.logger.Error("failed to reconcile cache eviction task", "versionID", version.VersionID, "error", err)
-				continue
-			}
-			if activated {
-				created++
-			}
-		}
-		if len(versions) < reconcileBatchSize {
-			break
-		}
-		cursor = nextCursor
-	}
-	if created > 0 {
-		m.logger.Info("reconciled cache eviction tasks", "stage", repository.CacheEvictionStageAfterUpload, "created", created)
 	}
 }
 

@@ -58,6 +58,9 @@ func TestCacheLRUMigrationAddsAccessTrackingAndCancelsLegacyActiveTasks(t *testi
 	if !sqliteColumnExists(t, db, "object_versions", "cache_accessed_at") {
 		t.Fatal("object_versions.cache_accessed_at column missing")
 	}
+	if !sqliteColumnExists(t, db, "object_versions", "cache_access_generation") {
+		t.Fatal("object_versions.cache_access_generation column missing")
+	}
 	if !sqliteIndexExists(t, db, "idx_object_versions_cache_lru") {
 		t.Fatal("idx_object_versions_cache_lru index missing")
 	}
@@ -91,6 +94,9 @@ func TestCacheLRUMigrationAddsAccessTrackingAndCancelsLegacyActiveTasks(t *testi
 	}
 	if sqliteColumnExists(t, db, "object_versions", "cache_accessed_at") {
 		t.Fatal("object_versions.cache_accessed_at still exists after down migration")
+	}
+	if sqliteColumnExists(t, db, "object_versions", "cache_access_generation") {
+		t.Fatal("object_versions.cache_access_generation still exists after down migration")
 	}
 	if sqliteIndexExists(t, db, "idx_object_versions_cache_lru") {
 		t.Fatal("idx_object_versions_cache_lru still exists after down migration")

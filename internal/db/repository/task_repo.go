@@ -48,6 +48,22 @@ func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
 }
 
 func (r *BunTaskRepo) CreateOrReactivateCancelled(ctx context.Context, task *model.Task) (bool, error) {
+	return r.createOrReactivate(ctx, task, nil)
+}
+
+func (r *BunTaskRepo) CreateOrReactivateRecoverable(
+	ctx context.Context,
+	task *model.Task,
+	terminalBefore time.Time,
+) (bool, error) {
+	return r.createOrReactivate(ctx, task, &terminalBefore)
+}
+
+func (r *BunTaskRepo) createOrReactivate(
+	ctx context.Context,
+	task *model.Task,
+	terminalBefore *time.Time,
+) (bool, error) {
 	if err := r.Create(ctx, task); err == nil {
 		return true, nil
 	} else if !errors.Is(err, ErrAlreadyExists) {
@@ -56,7 +72,7 @@ func (r *BunTaskRepo) CreateOrReactivateCancelled(ctx context.Context, task *mod
 
 	now := time.Now()
 	normalizeTaskStage(task)
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
 		Set("type = ?", task.Type).
 		Set("stage = ?", task.Stage).
@@ -75,10 +91,27 @@ func (r *BunTaskRepo) CreateOrReactivateCancelled(ctx context.Context, task *mod
 		Set("last_error = NULL").
 		Set("wait_reason = NULL").
 		Set("status_message = NULL").
-		Where("idempotency_key = ? AND status = ?", task.IdempotencyKey, model.TaskStatusCancelled).
-		Exec(ctx)
+		Where("idempotency_key = ?", task.IdempotencyKey)
+	if terminalBefore == nil {
+		q = q.Where("status = ?", model.TaskStatusCancelled)
+	} else {
+		q = q.Where(
+			`(
+				status = ?
+				OR (
+					status IN (?)
+					AND completed_at IS NOT NULL
+					AND completed_at <= ?
+				)
+			)`,
+			model.TaskStatusCancelled,
+			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
+			*terminalBefore,
+		)
+	}
+	res, err := q.Exec(ctx)
 	if err != nil {
-		return false, fmt.Errorf("reactivating cancelled task %q: %w", task.IdempotencyKey, err)
+		return false, fmt.Errorf("reactivating task %q: %w", task.IdempotencyKey, err)
 	}
 	rows, _ := res.RowsAffected()
 	return rows > 0, nil

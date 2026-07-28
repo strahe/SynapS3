@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/observability"
@@ -104,6 +105,16 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	if !ok {
 		return nil, fmt.Errorf("initializing cache eviction policy: unsupported value %q", cfg.Cache.EvictionPolicy)
 	}
+	if cfg.ShouldWarnLRUBehaviorChange() {
+		logger.Warn(
+			"cache eviction policy 'lru' keeps local copies until capacity watermarks are reached; set cache.eviction_policy to 'after_upload' to remove them after upload",
+			"highWatermarkPercent",
+			cfg.Cache.LRUHighWatermarkPercent,
+			"lowWatermarkPercent",
+			cfg.Cache.LRULowWatermarkPercent,
+		)
+	}
+	cacheAccess := cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval)
 	stateMachine := state.NewObjectStateMachine()
 	events := admin.NewEventHub()
 	appBackend := backend.New(repos, localCache, stateMachine, opts.Filecoin.Storage, logger,
@@ -111,6 +122,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
 		backend.WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries),
 		backend.WithEvictionPolicy(evictionPolicy),
+		backend.WithCacheAccessCoordinator(cacheAccess),
 	)
 
 	iamService := s3iam.NewService(repos)
@@ -161,7 +173,8 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 				cfg.Cache.LRUHighWatermarkPercent,
 				cfg.Cache.LRULowWatermarkPercent,
 				cfg.Worker.Evictor.MaxRetries,
-			)),
+			),
+			worker.WithCacheAccessCoordinator(cacheAccess)),
 		worker.NewStorageCleanupWorker(repos, opts.Filecoin.Storage,
 			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger),
 		worker.NewWalletOperationRunner(repos, opts.Filecoin.Wallet, opts.Filecoin.Receipts, 5*time.Second, logger,
@@ -176,6 +189,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithEventHub(events).
 		WithObjectUploader(appBackend).
 		WithObjectVersionRestorer(appBackend).
+		WithCacheAccessCoordinator(cacheAccess).
 		WithObjectStorage(opts.Filecoin.Storage).
 		WithSettings(opts.Settings).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).

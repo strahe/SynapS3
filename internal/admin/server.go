@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
@@ -37,6 +38,8 @@ type Server struct {
 	db                       *bun.DB
 	cache                    cache.Cache
 	objectReader             *objectreader.Reader
+	objectStorage            synapse.StorageClient
+	cacheAccess              *cacheaccess.Coordinator
 	objectUploader           objectUploader
 	objectVersionRestorer    objectVersionRestorer
 	cacheMaxBytes            int64
@@ -67,11 +70,13 @@ type Server struct {
 
 // New creates a new admin HTTP server.
 func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, filecoinDefaultCopies int, logger *slog.Logger) *Server {
+	cacheAccess := cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval)
 	s := &Server{
 		addr:                     addr,
 		db:                       db,
 		cache:                    c,
-		objectReader:             objectreader.New(repos, c, nil, logger),
+		cacheAccess:              cacheAccess,
+		objectReader:             objectreader.New(repos, c, nil, logger, objectreader.WithCacheAccessCoordinator(cacheAccess)),
 		cacheMaxBytes:            cacheMaxBytes,
 		repos:                    repos,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
@@ -90,8 +95,28 @@ func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *rep
 
 // WithObjectStorage enables provider-backed object reads for admin downloads.
 func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
-	s.objectReader = objectreader.New(s.repos, s.cache, storage, s.logger)
+	s.objectStorage = storage
+	s.resetObjectReader()
 	return s
+}
+
+// WithCacheAccessCoordinator shares admin cache opens with final cache deletion.
+func (s *Server) WithCacheAccessCoordinator(coordinator *cacheaccess.Coordinator) *Server {
+	if coordinator != nil {
+		s.cacheAccess = coordinator
+		s.resetObjectReader()
+	}
+	return s
+}
+
+func (s *Server) resetObjectReader() {
+	s.objectReader = objectreader.New(
+		s.repos,
+		s.cache,
+		s.objectStorage,
+		s.logger,
+		objectreader.WithCacheAccessCoordinator(s.cacheAccess),
+	)
 }
 
 func (s *Server) WithEventHub(events *EventHub) *Server {

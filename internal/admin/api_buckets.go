@@ -1894,7 +1894,13 @@ func (s *Server) handleAPIDownloadObject(w http.ResponseWriter, r *http.Request)
 
 	reader := s.objectReader
 	if reader == nil {
-		reader = objectreader.New(s.repos, s.cache, nil, s.logger)
+		reader = objectreader.New(
+			s.repos,
+			s.cache,
+			s.objectStorage,
+			s.logger,
+			objectreader.WithCacheAccessCoordinator(s.cacheAccess),
+		)
 	}
 
 	versionID := r.URL.Query().Get("version_id")
