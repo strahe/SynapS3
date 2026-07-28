@@ -95,8 +95,12 @@ func (e *Evictor) finalizeLRUEviction(
 	if !e.reserveLRUDeletion(version.Size) {
 		return cancelEviction("LRU cache usage already reached the low watermark")
 	}
-	defer e.releaseLRUDeletion(version.Size)
-	return e.deleteCacheEntry(ctx, task, bucket.Name, version)
+	err = e.cache.Delete(ctx, bucket.Name, version.CacheKey)
+	e.finishLRUDeletion(version.Size, err == nil)
+	if err != nil {
+		return retryEviction(err, "deleting cache entry")
+	}
+	return e.recordCacheEntryDeleted(ctx, task, version)
 }
 
 func effectiveLRUAccessTime(version *model.ObjectVersion) time.Time {
@@ -145,10 +149,10 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 	}
 	usedBytes := e.cache.UsedBytes()
 	highBytes := watermarkBytes(e.maxCacheBytes, e.highWatermarkPercent)
-	if usedBytes < highBytes {
+	lowBytes := watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent)
+	if !e.shouldPlanLRUCycle(usedBytes, highBytes, lowBytes) {
 		return nil
 	}
-	lowBytes := watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent)
 	activeBytes, err := e.repos.CacheEvictions.ActiveLRUBytes(ctx)
 	if err != nil {
 		return err
@@ -202,7 +206,7 @@ func (e *Evictor) planLRUEvictions(ctx context.Context) error {
 
 	if plannedTasks == 0 {
 		e.logger.Warn(
-			"cache is above the LRU high watermark but no remotely safe entries can be evicted",
+			"LRU cache cleanup is active but no remotely safe entries can be evicted",
 			"usedBytes",
 			usedBytes,
 			"highBytes",

@@ -40,7 +40,9 @@ type Evictor struct {
 	leaseTTL             time.Duration
 	logger               *slog.Logger
 	lruCapacityMu        sync.Mutex
-	lruReservedBytes     int64
+	lruCycleActive       bool
+	lruProjectedBytes    int64
+	lruInFlightDeletes   int
 	lruPauseLogOnce      sync.Once
 	*livenessTracker
 }
@@ -211,27 +213,53 @@ func (e *Evictor) reserveLRUDeletion(size int64) bool {
 	e.lruCapacityMu.Lock()
 	defer e.lruCapacityMu.Unlock()
 
-	usedBytes := e.cache.UsedBytes()
+	// Use one projected-usage ledger for the whole concurrent deletion batch.
+	// Reading live usage mid-batch can count a completed unlink and its
+	// still-finishing reservation twice.
+	if e.lruInFlightDeletes == 0 {
+		e.lruProjectedBytes = e.cache.UsedBytes()
+	}
 	lowBytes := watermarkBytes(e.maxCacheBytes, e.lowWatermarkPercent)
-	if usedBytes-e.lruReservedBytes <= lowBytes {
+	if e.lruProjectedBytes <= lowBytes {
 		return false
 	}
 	if size > 0 {
-		e.lruReservedBytes += size
+		e.lruProjectedBytes -= size
+		e.lruInFlightDeletes++
 	}
 	return true
 }
 
-func (e *Evictor) releaseLRUDeletion(size int64) {
+func (e *Evictor) finishLRUDeletion(size int64, deleted bool) {
 	if size <= 0 {
 		return
 	}
 	e.lruCapacityMu.Lock()
-	e.lruReservedBytes -= size
-	if e.lruReservedBytes < 0 {
-		e.lruReservedBytes = 0
+	defer e.lruCapacityMu.Unlock()
+
+	if !deleted {
+		e.lruProjectedBytes += size
 	}
-	e.lruCapacityMu.Unlock()
+	e.lruInFlightDeletes--
+	if e.lruInFlightDeletes <= 0 {
+		e.lruInFlightDeletes = 0
+		e.lruProjectedBytes = 0
+	}
+}
+
+func (e *Evictor) shouldPlanLRUCycle(usedBytes, highBytes, lowBytes int64) bool {
+	e.lruCapacityMu.Lock()
+	defer e.lruCapacityMu.Unlock()
+
+	// Preserve the hysteresis cycle after crossing the high watermark even when
+	// individual planned tasks are cancelled or retried.
+	switch {
+	case usedBytes <= lowBytes:
+		e.lruCycleActive = false
+	case usedBytes >= highBytes:
+		e.lruCycleActive = true
+	}
+	return e.lruCycleActive
 }
 
 func (e *Evictor) deferReplicatingEviction(ctx context.Context, task *model.Task) {

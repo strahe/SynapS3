@@ -204,6 +204,127 @@ func TestEvictor_LRUEvictsLeastRecentlyUsedUntilLowWatermark(t *testing.T) {
 	}
 }
 
+func TestEvictor_LRUContinuesActiveCycleBelowHighWatermark(t *testing.T) {
+	var used atomic.Int64
+	used.Store(95)
+	var deleteCalls atomic.Int64
+	var touchOnce sync.Once
+	touchResult := make(chan error, 1)
+
+	var env *testWorkerEnv
+	var versionToTouch string
+	mc := &testutil.MockCache{
+		UsedBytesFunc: used.Load,
+		ExistsFunc: func(_ context.Context, _, _ string) bool {
+			return true
+		},
+		DeleteFunc: func(_ context.Context, _, _ string) error {
+			deleteCalls.Add(1)
+			used.Add(-11)
+			touchOnce.Do(func() {
+				touchResult <- env.repos.Objects.RecordVersionCacheAccess(
+					context.Background(),
+					versionToTouch,
+					futureLRUAccessTime().Add(24*time.Hour),
+				)
+			})
+			return nil
+		},
+	}
+	env = newTestWorkerEnvWithMockCache(t, mc)
+
+	var versionIDs []string
+	base := futureLRUAccessTime()
+	for index := range 3 {
+		_, _, versionID := seedStoredObject(t, env)
+		versionIDs = append(versionIDs, versionID)
+		if err := env.repos.Objects.RecordVersionCacheAccess(
+			context.Background(),
+			versionID,
+			base.Add(time.Duration(index)*time.Hour),
+		); err != nil {
+			t.Fatalf("RecordVersionCacheAccess(%s): %v", versionID, err)
+		}
+	}
+	versionToTouch = versionIDs[1]
+
+	evictor := worker.NewEvictor(
+		env.repos,
+		env.cache,
+		env.cacheGate,
+		env.accessTracker,
+		env.sm,
+		1,
+		10*time.Millisecond,
+		slog.Default(),
+		worker.WithCacheEvictionPolicy(cache.EvictionPolicyLRU, 100, 90, 80, 3),
+	)
+	runWorkerUntilCondition(t, evictor, 10*time.Millisecond, 3*time.Second, func() (bool, error) {
+		if used.Load() > 80 || deleteCalls.Load() != 2 {
+			return false, nil
+		}
+		tasks, total, err := env.repos.Tasks.List(
+			context.Background(),
+			string(model.TaskTypeEvictCache),
+			cacheeviction.StageLRU,
+			"",
+			10,
+			0,
+		)
+		if err != nil {
+			return false, err
+		}
+		var completed, cancelled int
+		for _, task := range tasks {
+			switch task.Status {
+			case model.TaskStatusCompleted:
+				completed++
+			case model.TaskStatusCancelled:
+				cancelled++
+			}
+		}
+		return total == 3 && completed == 2 && cancelled == 1, nil
+	})
+
+	select {
+	case err := <-touchResult:
+		if err != nil {
+			t.Fatalf("touching planned LRU candidate: %v", err)
+		}
+	default:
+		t.Fatal("planned LRU candidate was not touched during the first deletion")
+	}
+
+	tasks, total, err := env.repos.Tasks.List(
+		context.Background(),
+		string(model.TaskTypeEvictCache),
+		cacheeviction.StageLRU,
+		"",
+		10,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("List LRU tasks: %v", err)
+	}
+	var completed, cancelled int
+	for _, task := range tasks {
+		switch task.Status {
+		case model.TaskStatusCompleted:
+			completed++
+		case model.TaskStatusCancelled:
+			cancelled++
+		}
+	}
+	if total != 3 || completed != 2 || cancelled != 1 {
+		t.Fatalf(
+			"LRU tasks total/completed/cancelled = %d/%d/%d, want 3/2/1",
+			total,
+			completed,
+			cancelled,
+		)
+	}
+}
+
 func TestEvictor_LRUSkipsUnexpectedNullAccessTime(t *testing.T) {
 	var used atomic.Int64
 	used.Store(11)

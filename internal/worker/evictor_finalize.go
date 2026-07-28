@@ -32,6 +32,14 @@ func (e *Evictor) deleteCacheEntry(
 	if err := e.cache.Delete(ctx, bucketName, version.CacheKey); err != nil {
 		return retryEviction(err, "deleting cache entry")
 	}
+	return e.recordCacheEntryDeleted(ctx, task, version)
+}
+
+func (e *Evictor) recordCacheEntryDeleted(
+	ctx context.Context,
+	task *model.Task,
+	version *model.ObjectVersion,
+) *evictionDecision {
 	e.cacheAccessTracker.Forget(version.VersionID)
 	if err := e.recordDeletedCacheState(ctx, task, version); err != nil {
 		return retryEviction(err, "recording cache eviction state")
