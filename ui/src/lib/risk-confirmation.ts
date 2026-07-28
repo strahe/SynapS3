@@ -132,6 +132,20 @@ export function collectSettingsRiskChanges(
     'medium',
     'Changes local cache eviction behavior.'
   )
+  addChanged(
+    'cache.lru_high_watermark_percent',
+    initial.cache.lru_high_watermark_percent,
+    next.cache.lru_high_watermark_percent,
+    'medium',
+    'Changes when capacity-based cache eviction starts.'
+  )
+  addChanged(
+    'cache.lru_low_watermark_percent',
+    initial.cache.lru_low_watermark_percent,
+    next.cache.lru_low_watermark_percent,
+    'medium',
+    'Changes when capacity-based cache eviction stops.'
+  )
 
   addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'upload')
   addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'evictor')

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 )
@@ -27,7 +28,7 @@ type Manager struct {
 	repos            *repository.Repositories
 	workers          []Worker
 	logger           *slog.Logger
-	autoEvict        bool
+	evictionPolicy   cache.EvictionPolicy
 	uploadMaxRetries int
 	evictMaxRetries  int
 }
@@ -47,12 +48,12 @@ const (
 )
 
 // NewManager creates a new worker manager.
-func NewManager(repos *repository.Repositories, logger *slog.Logger, autoEvict bool, workers ...Worker) *Manager {
+func NewManager(repos *repository.Repositories, logger *slog.Logger, evictionPolicy cache.EvictionPolicy, workers ...Worker) *Manager {
 	return &Manager{
 		repos:            repos,
 		workers:          workers,
 		logger:           logger,
-		autoEvict:        autoEvict,
+		evictionPolicy:   evictionPolicy,
 		uploadMaxRetries: defaultUploadMaxRetries,
 		evictMaxRetries:  defaultEvictMaxRetries,
 	}
@@ -98,11 +99,25 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Info("released expired task leases", "count", released)
 	}
 
+	keepStage := ""
+	switch m.evictionPolicy {
+	case cache.EvictionPolicyLRU:
+		keepStage = repository.CacheEvictionStageLRU
+	case cache.EvictionPolicyAfterUpload:
+		keepStage = repository.CacheEvictionStageAfterUpload
+	}
+	cancelled, err := m.repos.Tasks.CancelActiveEvictionTasksExcept(ctx, keepStage, "Cancelled because the cache eviction policy changed")
+	if err != nil {
+		m.logger.Error("failed to cancel incompatible cache eviction tasks", "error", err)
+	} else if cancelled > 0 {
+		m.logger.Info("cancelled incompatible cache eviction tasks", "count", cancelled, "policy", m.evictionPolicy)
+	}
+
 	// Reconcile: ensure objects in cached/stored have corresponding tasks.
 	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUpload, "upload")
 	m.reconcileStagedUploads(ctx)
-	if m.autoEvict {
-		m.reconcileTasks(ctx, model.ObjectStateStored, model.TaskTypeEvictCache, "evict_cache")
+	if m.evictionPolicy == cache.EvictionPolicyAfterUpload {
+		m.reconcileAfterUploadEvictions(ctx)
 	}
 
 	// Log exhausted task count for operator awareness
@@ -111,6 +126,43 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Error("failed to check exhausted tasks", "error", err)
 	} else if len(exhaustedTasks) > 0 {
 		m.logger.Warn("exhausted tasks found on startup, review via GET /admin/exhausted-tasks", "count", len(exhaustedTasks))
+	}
+}
+
+func (m *Manager) reconcileAfterUploadEvictions(ctx context.Context) {
+	created := 0
+	var cursor versionStateCursor
+	for {
+		versions, nextCursor, err := m.listVersionStateBatch(ctx, model.ObjectStateStored, cursor)
+		if err != nil {
+			return
+		}
+		if len(versions) == 0 {
+			break
+		}
+		for _, version := range versions {
+			activated, err := repository.EnsureAfterUploadEvictionTask(
+				ctx,
+				m.repos.Tasks,
+				version.ObjectID,
+				version.VersionID,
+				m.evictMaxRetries,
+			)
+			if err != nil {
+				m.logger.Error("failed to reconcile cache eviction task", "versionID", version.VersionID, "error", err)
+				continue
+			}
+			if activated {
+				created++
+			}
+		}
+		if len(versions) < reconcileBatchSize {
+			break
+		}
+		cursor = nextCursor
+	}
+	if created > 0 {
+		m.logger.Info("reconciled cache eviction tasks", "stage", repository.CacheEvictionStageAfterUpload, "created", created)
 	}
 }
 
@@ -420,21 +472,11 @@ func (m *Manager) enqueueRecoveredUploadRepair(ctx context.Context, version mode
 }
 
 func (m *Manager) enqueueRecoveredEvictTasks(ctx context.Context, refs []repository.ObjectVersionRef) {
-	if !m.autoEvict {
+	if m.evictionPolicy != cache.EvictionPolicyAfterUpload {
 		return
 	}
 	for _, ref := range refs {
-		task := &model.Task{
-			Type:           model.TaskTypeEvictCache,
-			RefType:        "object",
-			RefID:          ref.ObjectID,
-			RefVersionID:   ref.VersionID,
-			IdempotencyKey: fmt.Sprintf("evict_cache:%s", ref.VersionID),
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     m.evictMaxRetries,
-			ScheduledAt:    time.Now(),
-		}
-		if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+		if _, err := repository.EnsureAfterUploadEvictionTask(ctx, m.repos.Tasks, ref.ObjectID, ref.VersionID, m.evictMaxRetries); err != nil {
 			m.logger.Error("failed to enqueue recovered eviction task", "versionID", ref.VersionID, "error", err)
 		}
 	}

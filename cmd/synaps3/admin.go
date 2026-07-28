@@ -830,9 +830,11 @@ type adminSettingsFilecoinConfig struct {
 }
 
 type adminSettingsCacheConfig struct {
-	Dir            string `json:"dir"`
-	MaxSizeGB      int    `json:"max_size_gb"`
-	EvictionPolicy string `json:"eviction_policy"`
+	Dir                     string `json:"dir"`
+	MaxSizeGB               int    `json:"max_size_gb"`
+	EvictionPolicy          string `json:"eviction_policy"`
+	LRUHighWatermarkPercent int    `json:"lru_high_watermark_percent"`
+	LRULowWatermarkPercent  int    `json:"lru_low_watermark_percent"`
 }
 
 type adminSettingsWorkerConfig struct {
@@ -916,6 +918,8 @@ var adminEditableSettings = map[string]adminSettingSpec{
 	"cache.dir":                            {path: []string{"cache", "dir"}, kind: adminSettingString},
 	"cache.max_size_gb":                    {path: []string{"cache", "max_size_gb"}, kind: adminSettingInt},
 	"cache.eviction_policy":                {path: []string{"cache", "eviction_policy"}, kind: adminSettingString},
+	"cache.lru_high_watermark_percent":     {path: []string{"cache", "lru_high_watermark_percent"}, kind: adminSettingInt},
+	"cache.lru_low_watermark_percent":      {path: []string{"cache", "lru_low_watermark_percent"}, kind: adminSettingInt},
 	"worker.upload.concurrency":            {path: []string{"worker", "upload", "concurrency"}, kind: adminSettingInt},
 	"worker.upload.poll_interval":          {path: []string{"worker", "upload", "poll_interval"}, kind: adminSettingString},
 	"worker.upload.max_retries":            {path: []string{"worker", "upload", "max_retries"}, kind: adminSettingInt},
@@ -1265,6 +1269,8 @@ func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) erro
 				{Name: "cache.dir", Value: settings.Config.Cache.Dir},
 				{Name: "cache.max_size_gb", Value: formatAdminGiB(settings.Config.Cache.MaxSizeGB)},
 				{Name: "cache.eviction_policy", Value: settings.Config.Cache.EvictionPolicy},
+				{Name: "cache.lru_high_watermark_percent", Value: strconv.Itoa(settings.Config.Cache.LRUHighWatermarkPercent)},
+				{Name: "cache.lru_low_watermark_percent", Value: strconv.Itoa(settings.Config.Cache.LRULowWatermarkPercent)},
 			},
 		},
 		{

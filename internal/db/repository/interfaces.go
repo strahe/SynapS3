@@ -85,6 +85,16 @@ type ObjectVersionRef struct {
 	VersionID string `bun:"version_id"`
 }
 
+// CacheEvictionCandidate is the persisted snapshot needed to plan one LRU
+// cache eviction without exposing it through object APIs.
+type CacheEvictionCandidate struct {
+	ObjectID        int64      `bun:"object_id"`
+	VersionID       string     `bun:"version_id"`
+	Size            int64      `bun:"size"`
+	CacheAccessedAt *time.Time `bun:"cache_accessed_at"`
+	CreatedAt       time.Time  `bun:"created_at"`
+}
+
 type DeleteObjectVersionInput struct {
 	BucketID                 int64
 	Key                      string
@@ -153,6 +163,8 @@ type ObjectRepository interface {
 	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
 	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
 	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error
+	RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error
+	ListLRUEvictionCandidates(ctx context.Context, limit int) ([]CacheEvictionCandidate, error)
 	SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error
 	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)
 	ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error)
@@ -430,6 +442,9 @@ type BucketACLSnapshot struct {
 // TaskRepository defines persistence operations for Task entities.
 type TaskRepository interface {
 	Create(ctx context.Context, task *model.Task) error
+	// CreateOrReactivateCancelled creates a task or requeues the existing
+	// cancelled task with the same idempotency key. Other terminal tasks stay terminal.
+	CreateOrReactivateCancelled(ctx context.Context, task *model.Task) (bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
 
 	// ClaimReady atomically claims one ready task of the given type by
@@ -450,8 +465,16 @@ type TaskRepository interface {
 	WaitRunning(ctx context.Context, task *model.Task, reason model.TaskWaitReason, message string, delay time.Duration) error
 	// ReleaseRunning releases the same running task claim back to queued without recording an error.
 	ReleaseRunning(ctx context.Context, task *model.Task) error
+	// CancelRunning marks the same running task claim as cancelled.
+	CancelRunning(ctx context.Context, task *model.Task, message string) error
 	// ReleaseExpiredLeases resets running tasks whose lease has expired back to queued.
 	ReleaseExpiredLeases(ctx context.Context) (int, error)
+	// CancelActiveEvictionTasksExcept cancels active cache eviction tasks whose
+	// stage does not match keepStage. An empty keepStage cancels all of them.
+	CancelActiveEvictionTasksExcept(ctx context.Context, keepStage string, message string) (int, error)
+	// ActiveEvictionBytes returns the bytes represented by distinct cached
+	// object versions with an active eviction task in the requested stage.
+	ActiveEvictionBytes(ctx context.Context, stage string) (int64, error)
 	// MarkRunningExhausted marks the same running task claim as exhausted.
 	MarkRunningExhausted(ctx context.Context, task *model.Task, lastError string) error
 	// ListExhausted returns exhausted tasks, ordered by most recent first.

@@ -1770,6 +1770,134 @@ func TestObjectRepo_SetVersionCachePresenceMirrorsOnlyCurrentVersion(t *testing.
 	}
 }
 
+func TestObjectRepo_RecordVersionCacheAccessDoesNotChangeLifecycleTimestamp(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "cache-access-bucket")
+	version := newObjectVersion(bucket.ID, "file.txt", "01J0000000000000000000CA01", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	lifecycleUpdatedAt := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
+	mustExec(t, db, `UPDATE object_versions SET in_cache = FALSE, updated_at = ? WHERE version_id = ?`, lifecycleUpdatedAt, version.VersionID)
+
+	accessedAt := lifecycleUpdatedAt.Add(2 * time.Hour)
+	if err := repos.Objects.RecordVersionCacheAccess(ctx, version.VersionID, accessedAt); err != nil {
+		t.Fatalf("RecordVersionCacheAccess: %v", err)
+	}
+	got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", got, err)
+	}
+	if !got.InCache {
+		t.Fatal("in_cache = false, want true after successful cache access")
+	}
+	if got.CacheAccessedAt == nil || !got.CacheAccessedAt.Equal(accessedAt) {
+		t.Fatalf("cache_accessed_at = %v, want %v", got.CacheAccessedAt, accessedAt)
+	}
+	if !got.UpdatedAt.Equal(lifecycleUpdatedAt) {
+		t.Fatalf("updated_at = %v, want unchanged %v", got.UpdatedAt, lifecycleUpdatedAt)
+	}
+}
+
+func TestObjectRepo_ListLRUEvictionCandidatesOrdersSafeCurrentAndHistoricalVersions(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "lru-candidates-bucket")
+
+	type seededVersion struct {
+		version  *model.ObjectVersion
+		objectID int64
+	}
+	seedStored := func(versionID string, size int64) seededVersion {
+		t.Helper()
+		version := newObjectVersion(bucket.ID, "file.txt", versionID, size)
+		objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+		if err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent(%s): %v", versionID, err)
+		}
+		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+			t.Fatalf("UpdateVersionState(%s): %v", versionID, err)
+		}
+		acceptTestStorageUploadForVersion(t, repos, bucket.ID, version, "piece-"+versionID)
+		return seededVersion{version: version, objectID: objectID}
+	}
+
+	oldest := seedStored("01J0000000000000000000LR01", 10)
+	middle := seedStored("01J0000000000000000000LR02", 20)
+	newest := seedStored("01J0000000000000000000LR03", 30)
+	unsafe := newObjectVersion(bucket.ID, "unsafe.txt", "01J0000000000000000000LR04", 40)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unsafe); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(unsafe): %v", err)
+	}
+
+	if err := repos.Objects.UpdateVersionState(
+		ctx,
+		newest.version.VersionID,
+		model.ObjectStateStored,
+		model.ObjectStateCacheEvicted,
+	); err != nil {
+		t.Fatalf("mark newest cache_evicted: %v", err)
+	}
+	base := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	for index, seeded := range []seededVersion{oldest, middle, newest} {
+		if err := repos.Objects.RecordVersionCacheAccess(ctx, seeded.version.VersionID, base.Add(time.Duration(index)*time.Hour)); err != nil {
+			t.Fatalf("RecordVersionCacheAccess(%s): %v", seeded.version.VersionID, err)
+		}
+	}
+
+	candidates, err := repos.Objects.ListLRUEvictionCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListLRUEvictionCandidates: %v", err)
+	}
+	if len(candidates) != 3 {
+		t.Fatalf("candidate count = %d, want 3: %#v", len(candidates), candidates)
+	}
+	for index, want := range []string{oldest.version.VersionID, middle.version.VersionID, newest.version.VersionID} {
+		if candidates[index].VersionID != want {
+			t.Fatalf("candidate[%d] = %s, want %s; candidates=%#v", index, candidates[index].VersionID, want, candidates)
+		}
+	}
+
+	// Existing rows can have a NULL access time after migration; created_at is
+	// the deterministic fallback and an access during planning will still set it.
+	mustExec(t, db, `UPDATE object_versions SET cache_accessed_at = NULL, created_at = ? WHERE version_id = ?`, base.Add(-time.Hour), oldest.version.VersionID)
+	stage := repository.CacheEvictionStageLRU
+	task := &model.Task{
+		Type:           model.TaskTypeEvictCache,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          middle.objectID,
+		RefVersionID:   middle.version.VersionID,
+		IdempotencyKey: "evict_cache:lru:test:" + middle.version.VersionID,
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     3,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create active eviction task: %v", err)
+	}
+
+	candidates, err = repos.Objects.ListLRUEvictionCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListLRUEvictionCandidates after active task: %v", err)
+	}
+	if len(candidates) != 2 ||
+		candidates[0].VersionID != oldest.version.VersionID ||
+		candidates[1].VersionID != newest.version.VersionID {
+		t.Fatalf("candidates with active task = %#v, want oldest/newest", candidates)
+	}
+	activeBytes, err := repos.Tasks.ActiveEvictionBytes(ctx, repository.CacheEvictionStageLRU)
+	if err != nil {
+		t.Fatalf("ActiveEvictionBytes: %v", err)
+	}
+	if activeBytes != middle.version.Size {
+		t.Fatalf("active eviction bytes = %d, want %d", activeBytes, middle.version.Size)
+	}
+}
+
 func TestObjectRepo_UpdateVersionStateMarksCacheEvictedLocation(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

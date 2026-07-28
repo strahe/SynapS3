@@ -58,6 +58,10 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/piece")
+	previousAccess := time.Now().Add(-24 * time.Hour)
+	if err := repos.Objects.RecordVersionCacheAccess(ctx, version.VersionID, previousAccess); err != nil {
+		t.Fatalf("RecordVersionCacheAccess before rehydrate: %v", err)
+	}
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -100,6 +104,9 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	}
 	if !dbVersion.InCache {
 		t.Fatal("version in_cache = false, want true after successful rehydrate")
+	}
+	if dbVersion.CacheAccessedAt == nil || !dbVersion.CacheAccessedAt.After(previousAccess) {
+		t.Fatalf("cache_accessed_at = %v, want refreshed after %v", dbVersion.CacheAccessedAt, previousAccess)
 	}
 }
 
@@ -248,7 +255,7 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 	}
 }
 
-func TestOpenCacheHitDoesNotRewritePresentCacheLocation(t *testing.T) {
+func TestOpenCacheHitRecordsEveryForegroundAccessWithoutLifecyclePresenceWrite(t *testing.T) {
 	mc := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
 			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
@@ -287,6 +294,9 @@ func TestOpenCacheHitDoesNotRewritePresentCacheLocation(t *testing.T) {
 	if objects.cachePresenceWrites != 0 {
 		t.Fatalf("cache presence writes after Open cache hit = %d, want 0", objects.cachePresenceWrites)
 	}
+	if objects.cacheAccessWrites != 1 {
+		t.Fatalf("cache access writes after Open cache hit = %d, want 1", objects.cacheAccessWrites)
+	}
 
 	got, err = reader.OpenVersion(ctx, bucket.Name, version.Key, version.VersionID, S3Visibility)
 	if err != nil {
@@ -296,17 +306,81 @@ func TestOpenCacheHitDoesNotRewritePresentCacheLocation(t *testing.T) {
 	if objects.cachePresenceWrites != 0 {
 		t.Fatalf("cache presence writes after OpenVersion cache hit = %d, want 0", objects.cachePresenceWrites)
 	}
+	if objects.cacheAccessWrites != 2 {
+		t.Fatalf("cache access writes after OpenVersion cache hit = %d, want 2", objects.cacheAccessWrites)
+	}
 }
 
 type countingObjectRepo struct {
 	repository.ObjectRepository
 
 	cachePresenceWrites int
+	cacheAccessWrites   int
+	cacheAccessErr      error
 }
 
 func (r *countingObjectRepo) SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error {
 	r.cachePresenceWrites++
 	return r.ObjectRepository.SetVersionCachePresence(ctx, versionID, inCache)
+}
+
+func (r *countingObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
+	r.cacheAccessWrites++
+	if r.cacheAccessErr != nil {
+		return r.cacheAccessErr
+	}
+	return r.ObjectRepository.RecordVersionCacheAccess(ctx, versionID, accessedAt)
+}
+
+func TestOpenCacheHitIgnoresCacheAccessPersistenceFailure(t *testing.T) {
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "cache-access-failure-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR10",
+		BucketID:    bucket.ID,
+		Key:         "cached.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+		CacheKey:    ".versions/01J0000000000000000000OR10",
+		State:       model.ObjectStateCached,
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+	objects := &countingObjectRepo{
+		ObjectRepository: repos.Objects,
+		cacheAccessErr:   errors.New("database unavailable"),
+	}
+	repos.Objects = objects
+
+	reader := New(repos, mc, nil, slog.Default())
+	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	body, readErr := io.ReadAll(got.Body)
+	closeErr := got.Body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("cache hit body errors: read=%v close=%v", readErr, closeErr)
+	}
+	if string(body) != "cached" {
+		t.Fatalf("body = %q, want cached", body)
+	}
+	if objects.cacheAccessWrites != 1 {
+		t.Fatalf("cache access writes = %d, want 1", objects.cacheAccessWrites)
+	}
 }
 
 func TestOpenCacheMissMarksCacheLocationAbsent(t *testing.T) {

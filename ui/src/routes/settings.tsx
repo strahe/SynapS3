@@ -90,7 +90,13 @@ const tabFields = {
     'filecoin.observability.timeout',
     'filecoin.observability.concurrency',
   ],
-  cache: ['cache.dir', 'cache.max_size_gb', 'cache.eviction_policy'],
+  cache: [
+    'cache.dir',
+    'cache.max_size_gb',
+    'cache.eviction_policy',
+    'cache.lru_high_watermark_percent',
+    'cache.lru_low_watermark_percent',
+  ],
   workers: [
     'worker.upload.concurrency',
     'worker.upload.poll_interval',
@@ -529,11 +535,39 @@ function SettingsPage() {
                 label="Eviction Policy"
                 field="cache.eviction_policy"
                 value={form.cache.eviction_policy}
-                options={['lru', 'manual', 'none']}
+                options={[
+                  { value: 'lru', label: 'LRU (capacity based)' },
+                  { value: 'after_upload', label: 'After remote upload' },
+                  { value: 'none', label: 'No automatic eviction' },
+                ]}
                 data={data}
                 errors={fieldErrors}
                 onChange={(value) => setForm({ ...form, cache: { ...form.cache, eviction_policy: value } })}
               />
+              {form.cache.eviction_policy === 'lru' && (
+                <>
+                  <NumberField
+                    label="LRU High Watermark %"
+                    field="cache.lru_high_watermark_percent"
+                    value={form.cache.lru_high_watermark_percent}
+                    data={data}
+                    errors={fieldErrors}
+                    onChange={(value) =>
+                      setForm({ ...form, cache: { ...form.cache, lru_high_watermark_percent: value } })
+                    }
+                  />
+                  <NumberField
+                    label="LRU Low Watermark %"
+                    field="cache.lru_low_watermark_percent"
+                    value={form.cache.lru_low_watermark_percent}
+                    data={data}
+                    errors={fieldErrors}
+                    onChange={(value) =>
+                      setForm({ ...form, cache: { ...form.cache, lru_low_watermark_percent: value } })
+                    }
+                  />
+                </>
+              )}
             </div>
           </Section>
         </TabsContent>
@@ -842,7 +876,7 @@ function SelectField({
   label: string
   field: string
   value: string
-  options: string[]
+  options: Array<string | { value: string; label: string }>
   data: SettingsData
   errors: Record<string, string>
   onChange: (value: string) => void

@@ -92,6 +92,8 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
+| `cache.lru_high_watermark_percent` | `90` |
+| `cache.lru_low_watermark_percent` | `80` |
 | `worker.upload.concurrency` | `4` |
 | `worker.upload.max_retries` | `5` |
 | `admin.addr` | `127.0.0.1:9090` |
@@ -105,16 +107,29 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 - `filecoin.network`: `calibration`, `mainnet`。
 - `filecoin.default_copies`: `1` 到 `8`。
 - `database.driver`: `sqlite`, `postgres`。
-- `cache.eviction_policy`: `lru`, `manual`, `none`。
+- `cache.eviction_policy`: `lru`, `after_upload`, `none`。
 - `logging.level`: `debug`, `info`, `warn`, `error`。
 - `logging.format`: `json`, `text`。
 - `admin.trusted_proxies`: IP 或 CIDR。除非可信反向代理会清理不可信 forwarded headers，否则保持空。
 
 缓存淘汰策略会产生以下用户可见结果：
 
-- `lru`：远端存储满足配置的副本策略后，SynapS3 会自动将符合条件的本地缓存加入清理队列。
-- `manual`：SynapS3 不会自动清理本地缓存。
+- `lru`：缓存使用量达到高水位后，SynapS3 按最近访问时间淘汰最久未使用且远端安全的条目，直到降至低水位。
+- `after_upload`：所有目标远端副本提交后，该版本会在下一次 Evictor 轮询时加入清理。之后从远端读取并回填的缓存不会再次被立即删除。
 - `none`：SynapS3 不会自动清理本地缓存。
+
+读取配置时仍兼容旧值 `manual`，但 Settings API 和后续保存都会把它规范化为 `none`。策略输入不区分大小写，对外统一返回小写值。
+
+LRU 水位始终必须满足 `0 <= low < high <= 100`。在 `after_upload` 或 `none` 下仍会保存这些值，但不会生效。
+
+```toml
+[cache]
+eviction_policy = "lru"
+lru_high_watermark_percent = 90
+lru_low_watermark_percent = 80
+```
+
+淘汰设置会在重启后生效。缓存清理是异步流程；`PutObject` 不会同步等待或触发一次 LRU 检查。
 
 ## 高风险字段
 
@@ -129,6 +144,8 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `filecoin.network` | 切换到 `mainnet` 会改变支付和存储环境。 |
 | `filecoin.allow_private_networks` | 允许私有网络存储提供方 URL。只在可信私有部署中开启。 |
 | `cache.max_size_gb` | 太小会阻塞写入；太大会占满主机磁盘。 |
+| `cache.lru_high_watermark_percent` | 高水位过高会减少淘汰追赶期间可供新写入使用的余量。 |
+| `cache.lru_low_watermark_percent` | 低水位过低会让每轮 LRU 清理更多缓存数据。 |
 
 高风险设置可能需要显式确认：
 

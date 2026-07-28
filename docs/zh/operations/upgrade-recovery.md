@@ -30,6 +30,18 @@ docker compose stop synaps3
 
 所有备份产物必须处于同一恢复时间点。准确的备份、校验和重启步骤见[运行数据](../configuration/runtime-data.md)。
 
+## 缓存策略升级说明
+
+`lru` 现在表示按容量运行的最近最少使用淘汰。旧版本曾用这个名称表示“远端上传完成后立即清理”。
+
+- 如果要保留旧行为，请在升级前或升级后立即设置 `cache.eviction_policy = "after_upload"`。
+- 保持 `lru` 会使用默认的 `90%` 高水位和 `80%` 低水位，也可以显式设置两个值。
+- 旧值 `manual` 仍可读取，但会按 `none` 生效并在保存时写回 `none`。
+
+迁移会为对象版本增加缓存访问时间。已有版本在首次读取前使用创建时间参与 LRU 排序。没有策略 stage 的旧活动淘汰任务会被取消并清除租约；终态任务历史会保留。down migration 会删除新增 schema，但不会恢复这些已取消任务。
+
+启动时，SynapS3 会取消与当前策略不匹配的活动淘汰任务。`after_upload` 只会恢复因策略切换而处于 cancelled 状态的同键任务；failed、exhausted 和 completed 任务仍保持终态。
+
 ## 升级 Docker Compose
 
 ```bash

@@ -92,6 +92,8 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
+| `cache.lru_high_watermark_percent` | `90` |
+| `cache.lru_low_watermark_percent` | `80` |
 | `worker.upload.concurrency` | `4` |
 | `worker.upload.max_retries` | `5` |
 | `admin.addr` | `127.0.0.1:9090` |
@@ -105,16 +107,29 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 - `filecoin.network`: `calibration`, `mainnet`.
 - `filecoin.default_copies`: `1` through `8`.
 - `database.driver`: `sqlite`, `postgres`.
-- `cache.eviction_policy`: `lru`, `manual`, `none`.
+- `cache.eviction_policy`: `lru`, `after_upload`, `none`.
 - `logging.level`: `debug`, `info`, `warn`, `error`.
 - `logging.format`: `json`, `text`.
 - `admin.trusted_proxies`: IP or CIDR entries. Keep empty unless a trusted reverse proxy strips untrusted forwarded headers.
 
 Cache eviction policies have these user-visible results:
 
-- `lru`: after remote storage satisfies the configured copy policy, SynapS3 automatically queues eligible local cache data for removal.
-- `manual`: SynapS3 does not automatically remove local cache data.
+- `lru`: when cache usage reaches the high watermark, SynapS3 removes the least recently accessed remotely safe entries until usage reaches the low watermark.
+- `after_upload`: after all target remote copies commit, SynapS3 queues that version for removal at the next Evictor poll. A later remote read can restore the cache, and that restored entry is not immediately removed again.
 - `none`: SynapS3 does not automatically remove local cache data.
+
+The legacy value `manual` is accepted when reading configuration and normalized to `none` when settings are returned or saved. Policy values are case-insensitive on input and canonicalized to lowercase.
+
+The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain saved but have no effect under `after_upload` or `none`.
+
+```toml
+[cache]
+eviction_policy = "lru"
+lru_high_watermark_percent = 90
+lru_low_watermark_percent = 80
+```
+
+Eviction settings take effect after restart. Cache cleanup is asynchronous: a `PutObject` does not wait for or trigger an immediate LRU pass.
 
 ## High-Risk Fields
 
@@ -129,6 +144,8 @@ Cache eviction policies have these user-visible results:
 | `filecoin.network` | Moving to `mainnet` changes payment and storage environment. |
 | `filecoin.allow_private_networks` | Allows private-network provider URLs. Enable only for trusted private deployments. |
 | `cache.max_size_gb` | Too small blocks writes; too large can consume the host disk. |
+| `cache.lru_high_watermark_percent` | A high value leaves less headroom for writes while eviction catches up. |
+| `cache.lru_low_watermark_percent` | A low value removes more cached data during each LRU cycle. |
 
 High-risk settings may require explicit confirmation:
 

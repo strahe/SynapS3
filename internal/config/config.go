@@ -16,6 +16,7 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	cachepkg "github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -77,9 +78,11 @@ type DatabaseConfig struct {
 }
 
 type CacheConfig struct {
-	Dir            string `koanf:"dir"`
-	MaxSizeGB      int    `koanf:"max_size_gb"`
-	EvictionPolicy string `koanf:"eviction_policy"` // lru | manual | none
+	Dir                     string `koanf:"dir"`
+	MaxSizeGB               int    `koanf:"max_size_gb"`
+	EvictionPolicy          string `koanf:"eviction_policy"` // lru | after_upload | none
+	LRUHighWatermarkPercent int    `koanf:"lru_high_watermark_percent"`
+	LRULowWatermarkPercent  int    `koanf:"lru_low_watermark_percent"`
 }
 
 type WorkerConfig struct {
@@ -177,8 +180,10 @@ func defaultConfig() *Config {
 			MaxIdleConns: 2,
 		},
 		Cache: CacheConfig{
-			MaxSizeGB:      100,
-			EvictionPolicy: "lru",
+			MaxSizeGB:               100,
+			EvictionPolicy:          string(cachepkg.EvictionPolicyLRU),
+			LRUHighWatermarkPercent: 90,
+			LRULowWatermarkPercent:  80,
 		},
 		Worker: WorkerConfig{
 			Upload: WorkerPoolConfig{
@@ -314,6 +319,7 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 	if err := k.Unmarshal("", cfg); err != nil {
 		return nil, PersistedFieldPresence{}, fmt.Errorf("unmarshalling config: %w", err)
 	}
+	cfg.Normalize()
 	if applyRuntimeDefaults {
 		if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir")); err != nil {
 			return nil, PersistedFieldPresence{}, fmt.Errorf("loading default runtime paths: %w", err)
@@ -321,6 +327,17 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 	}
 
 	return cfg, presence, nil
+}
+
+// Normalize canonicalizes compatibility aliases and case-insensitive config
+// values without changing invalid values that validation must report.
+func (c *Config) Normalize() {
+	if c == nil {
+		return
+	}
+	if policy, ok := cachepkg.ParseEvictionPolicy(c.Cache.EvictionPolicy); ok {
+		c.Cache.EvictionPolicy = string(policy)
+	}
 }
 
 func persistedFieldPresence(k *koanf.Koanf, fileLoaded bool) PersistedFieldPresence {
@@ -386,11 +403,33 @@ func (c *Config) FieldValidationErrors() []FieldError {
 		add("cache.max_size_gb", fmt.Sprintf("must be >= 1, got %d", c.Cache.MaxSizeGB))
 	}
 
-	// Eviction policy.
-	switch strings.ToLower(c.Cache.EvictionPolicy) {
-	case "lru", "manual", "none":
-	default:
-		add("cache.eviction_policy", fmt.Sprintf("must be one of [lru, manual, none], got %q", c.Cache.EvictionPolicy))
+	// Eviction policy and capacity watermarks.
+	if _, ok := cachepkg.ParseEvictionPolicy(c.Cache.EvictionPolicy); !ok {
+		add("cache.eviction_policy", fmt.Sprintf("must be one of [lru, after_upload, none], got %q", c.Cache.EvictionPolicy))
+	}
+	if c.Cache.LRULowWatermarkPercent < 0 {
+		add("cache.lru_low_watermark_percent", fmt.Sprintf("must be >= 0, got %d", c.Cache.LRULowWatermarkPercent))
+	} else if c.Cache.LRULowWatermarkPercent > 100 {
+		add("cache.lru_low_watermark_percent", fmt.Sprintf("must be <= 100, got %d", c.Cache.LRULowWatermarkPercent))
+	}
+	if c.Cache.LRUHighWatermarkPercent < 0 {
+		add("cache.lru_high_watermark_percent", fmt.Sprintf("must be >= 0, got %d", c.Cache.LRUHighWatermarkPercent))
+	} else if c.Cache.LRUHighWatermarkPercent > 100 {
+		add("cache.lru_high_watermark_percent", fmt.Sprintf("must be <= 100, got %d", c.Cache.LRUHighWatermarkPercent))
+	}
+	if c.Cache.LRULowWatermarkPercent >= 0 &&
+		c.Cache.LRULowWatermarkPercent <= 100 &&
+		c.Cache.LRUHighWatermarkPercent >= 0 &&
+		c.Cache.LRUHighWatermarkPercent <= 100 &&
+		c.Cache.LRUHighWatermarkPercent <= c.Cache.LRULowWatermarkPercent {
+		add(
+			"cache.lru_high_watermark_percent",
+			fmt.Sprintf(
+				"(%d) must be greater than cache.lru_low_watermark_percent (%d)",
+				c.Cache.LRUHighWatermarkPercent,
+				c.Cache.LRULowWatermarkPercent,
+			),
+		)
 	}
 
 	// Database.

@@ -58,6 +58,7 @@ type ObjectVersion struct {
 	State             ObjectState       `bun:",notnull,default:'cached'"`
 	FailedAtState     *ObjectState      `bun:",nullzero"`
 	LastError         *string           `bun:",nullzero"`
+	CacheAccessedAt   *time.Time        `bun:",nullzero"`
 	CreatedAt         time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt         time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
 

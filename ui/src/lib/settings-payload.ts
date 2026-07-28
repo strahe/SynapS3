@@ -39,6 +39,10 @@ export function buildSettingsPayload(
   if (include('cache.dir') && form.cache.dir !== initial.cache.dir) payload.cache.dir = form.cache.dir
   if (include('cache.max_size_gb')) payload.cache.max_size_gb = form.cache.max_size_gb
   if (include('cache.eviction_policy')) payload.cache.eviction_policy = form.cache.eviction_policy
+  if (include('cache.lru_high_watermark_percent'))
+    payload.cache.lru_high_watermark_percent = form.cache.lru_high_watermark_percent
+  if (include('cache.lru_low_watermark_percent'))
+    payload.cache.lru_low_watermark_percent = form.cache.lru_low_watermark_percent
 
   const upload: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['upload']> = {}
   const evictor: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['evictor']> = {}

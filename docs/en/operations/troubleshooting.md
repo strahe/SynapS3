@@ -99,15 +99,22 @@ Upload endpoints can fail when cache capacity is exhausted. Check usage:
 ```bash
 synaps3 admin status
 synaps3 admin settings get cache.max_size_gb
+synaps3 admin settings get cache.eviction_policy
+synaps3 admin settings get cache.lru_high_watermark_percent
+synaps3 admin settings get cache.lru_low_watermark_percent
 ```
 
 Recovery options:
 
 - Confirm the host has free disk space, then increase `cache.max_size_gb` if capacity allows.
 - Restore storage provider connectivity and background task progress so queued uploads can complete and cache eviction can run.
-- Keep `cache.eviction_policy = "lru"` if local cache cleanup should be queued after remote storage succeeds.
+- Use the default `lru` policy for capacity-based cleanup. Lower the high watermark to leave more write headroom, and keep `0 <= low < high <= 100`.
+- Use `after_upload` only when each version should be removed on the next Evictor poll after all target remote copies commit.
+- Use `none` when automatic removal must be disabled.
 
-After changing the cache setting, restart SynapS3, check `/healthz`, and verify the effective value with `synaps3 admin settings get cache.max_size_gb`.
+LRU cannot remove multipart staging data, versions that are not remotely durable, or versions without a readable committed remote copy. A write does not synchronously run eviction, so `507 Insufficient Storage` can continue until the Evictor catches up or safe candidates become available.
+
+After changing a cache setting, restart SynapS3, check `/healthz`, and verify the effective cache values with `synaps3 admin settings get`.
 
 ## Exhausted Tasks
 

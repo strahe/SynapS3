@@ -393,6 +393,8 @@ func setupModeAllowedField(field string) bool {
 		"cache.dir",
 		"cache.max_size_gb",
 		"cache.eviction_policy",
+		"cache.lru_high_watermark_percent",
+		"cache.lru_low_watermark_percent",
 		"filecoin.network",
 		"filecoin.rpc_url",
 		"filecoin.private_key",

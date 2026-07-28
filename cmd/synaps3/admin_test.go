@@ -571,7 +571,18 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 		if err != nil {
 			t.Fatalf("settings get: %v\n%s", err, out)
 		}
-		for _, want := range []string{"Settings", "Mode: ready", "Restart required: no", "Server", "Filecoin", "Cache", "100.00 GiB", "Logging"} {
+		for _, want := range []string{
+			"Settings",
+			"Mode: ready",
+			"Restart required: no",
+			"Server",
+			"Filecoin",
+			"Cache",
+			"100.00 GiB",
+			"cache.lru_high_watermark_percent",
+			"cache.lru_low_watermark_percent",
+			"Logging",
+		} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("settings summary missing %q:\n%s", want, out)
 			}
@@ -707,6 +718,12 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 				if cache["max_size_gb"] != float64(8) {
 					t.Fatalf("cache.max_size_gb = %#v, want 8", cache["max_size_gb"])
 				}
+				if cache["lru_high_watermark_percent"] != float64(85) {
+					t.Fatalf("cache.lru_high_watermark_percent = %#v, want 85", cache["lru_high_watermark_percent"])
+				}
+				if cache["lru_low_watermark_percent"] != float64(70) {
+					t.Fatalf("cache.lru_low_watermark_percent = %#v, want 70", cache["lru_low_watermark_percent"])
+				}
 				filecoin := body["filecoin"].(map[string]any)
 				if filecoin["with_cdn"] != true {
 					t.Fatalf("filecoin.with_cdn = %#v, want true", filecoin["with_cdn"])
@@ -731,7 +748,8 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 
 		out, err := runAdminCommand(t, []string{
 			"synaps3", "admin", "--admin-url", ts.URL,
-			"settings", "set", "cache.max_size_gb=8", "filecoin.with_cdn=true", "logging.level=debug",
+			"settings", "set", "cache.max_size_gb=8", "cache.lru_high_watermark_percent=85",
+			"cache.lru_low_watermark_percent=70", "filecoin.with_cdn=true", "logging.level=debug",
 			"logging.s3_access.enabled=false", "logging.s3_access.level=debug",
 		})
 		if err != nil {
@@ -970,9 +988,11 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 				"default_copies":         3,
 			},
 			"cache": map[string]any{
-				"dir":             "/tmp/cache",
-				"max_size_gb":     100,
-				"eviction_policy": "lru",
+				"dir":                        "/tmp/cache",
+				"max_size_gb":                100,
+				"eviction_policy":            "lru",
+				"lru_high_watermark_percent": 90,
+				"lru_low_watermark_percent":  80,
 			},
 			"worker": map[string]any{
 				"upload":  map[string]any{"concurrency": 4, "poll_interval": "5s", "max_retries": 5},

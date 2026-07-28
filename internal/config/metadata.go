@@ -147,8 +147,20 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"cache.eviction_policy": {
 		Label:       "Eviction Policy",
-		Description: "Cache eviction mode: lru automatically evicts local cache after remote storage; manual and none do not.",
+		Description: "Controls automatic cache cleanup. LRU keeps recently read objects, After Upload removes objects once remote storage is complete, and None disables automatic cleanup. Restart required.",
 		Env:         "SYNAPS3_CACHE_EVICTION_POLICY",
+		Editable:    true,
+	},
+	"cache.lru_high_watermark_percent": {
+		Label:       "LRU High Watermark",
+		Description: "Starts LRU cache cleanup when usage reaches this percentage of the configured maximum. Restart required.",
+		Env:         "SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT",
+		Editable:    true,
+	},
+	"cache.lru_low_watermark_percent": {
+		Label:       "LRU Low Watermark",
+		Description: "Stops LRU cache cleanup after usage falls to this percentage of the configured maximum. Restart required.",
+		Env:         "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT",
 		Editable:    true,
 	},
 	"worker.upload.concurrency": {

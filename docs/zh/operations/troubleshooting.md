@@ -99,15 +99,22 @@ Faucet 领取成功后会输出 `CalibnetUSDFC: <hash>` 和 `CalibnetFIL: <hash>
 ```bash
 synaps3 admin status
 synaps3 admin settings get cache.max_size_gb
+synaps3 admin settings get cache.eviction_policy
+synaps3 admin settings get cache.lru_high_watermark_percent
+synaps3 admin settings get cache.lru_low_watermark_percent
 ```
 
 恢复方式：
 
 - 先确认主机仍有可用磁盘空间，再按容量增大 `cache.max_size_gb`。
 - 恢复存储提供方连接和后台任务进度，让排队上传完成并触发缓存淘汰。
-- 如果希望远端存储成功后自动排队清理本地缓存，保持 `cache.eviction_policy = "lru"`。
+- 默认的 `lru` 适合按容量自动清理。降低高水位可以为新写入保留更多余量，并始终满足 `0 <= low < high <= 100`。
+- 只有希望所有目标远端副本提交后，在下一次 Evictor 轮询中删除对应版本时，才使用 `after_upload`。
+- 需要完全禁用自动清理时使用 `none`。
 
-修改缓存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get cache.max_size_gb` 验证实际生效值。
+LRU 无法清理 multipart 暂存数据、尚未远端持久化的版本，或没有可读已提交远端副本的版本。写入不会同步触发淘汰，因此在 Evictor 追赶完成或出现安全候选前，仍可能继续返回 `507 Insufficient Storage`。
+
+修改缓存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get` 验证实际生效的缓存设置。
 
 ## Exhausted 任务
 

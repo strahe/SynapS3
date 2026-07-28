@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/admin"
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
@@ -1289,20 +1290,11 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 		}
 		return repos.Tasks.Create(ctx, task)
 	case model.ObjectStateStored:
-		if !b.autoEvict {
+		if b.evictionPolicy != cache.EvictionPolicyAfterUpload {
 			return nil
 		}
-		task := &model.Task{
-			Type:           model.TaskTypeEvictCache,
-			RefType:        "object",
-			RefID:          objectID,
-			RefVersionID:   versionID,
-			IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     b.evictMaxRetries,
-			ScheduledAt:    time.Now(),
-		}
-		return repos.Tasks.Create(ctx, task)
+		_, err := repository.EnsureAfterUploadEvictionTask(ctx, repos.Tasks, objectID, versionID, b.evictMaxRetries)
+		return err
 	default:
 		return nil
 	}

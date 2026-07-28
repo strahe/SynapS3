@@ -205,6 +205,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `POST` | `/api/v1/s3-users/{accessKey}/secret` | 轮换 S3 secret key。 |
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | 删除 S3 用户。 |
 
+缓存设置在 `cache` 下提供 `eviction_policy`、`lru_high_watermark_percent` 和 `lru_low_watermark_percent`。有效策略为 `lru`、`after_upload` 和 `none`。策略输入不区分大小写，API 统一返回规范的小写值；旧值 `manual` 仍可读取，并规范化为 `none`。水位必须满足 `0 <= low < high <= 100`，且只在 `lru` 策略下生效。
+
 保存设置后，重启 SynapS3，检查 `/healthz`，再读取设置以确认实际生效值。
 
 ## 写请求示例

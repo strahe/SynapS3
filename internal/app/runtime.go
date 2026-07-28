@@ -100,14 +100,17 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, fmt.Errorf("initializing cache: %w", err)
 	}
 
-	autoEvict := autoEvictEnabled(cfg.Cache.EvictionPolicy)
+	evictionPolicy, ok := cache.ParseEvictionPolicy(cfg.Cache.EvictionPolicy)
+	if !ok {
+		return nil, fmt.Errorf("initializing cache eviction policy: unsupported value %q", cfg.Cache.EvictionPolicy)
+	}
 	stateMachine := state.NewObjectStateMachine()
 	events := admin.NewEventHub()
 	appBackend := backend.New(repos, localCache, stateMachine, opts.Filecoin.Storage, logger,
 		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
 		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
 		backend.WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries),
-		backend.WithAutoEvict(autoEvict),
+		backend.WithEvictionPolicy(evictionPolicy),
 	)
 
 	iamService := s3iam.NewService(repos)
@@ -145,13 +148,20 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 
 	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
-	manager := worker.NewManager(repos, logger, autoEvict,
-		worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, autoEvict,
+	manager := worker.NewManager(repos, logger, evictionPolicy,
+		worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, evictionPolicy,
 			cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
 			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
 			worker.WithEventPublisher(events)),
 		worker.NewEvictor(repos, localCache, stateMachine,
-			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger),
+			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger,
+			worker.WithCacheEvictionPolicy(
+				evictionPolicy,
+				maxCacheBytes,
+				cfg.Cache.LRUHighWatermarkPercent,
+				cfg.Cache.LRULowWatermarkPercent,
+				cfg.Worker.Evictor.MaxRetries,
+			)),
 		worker.NewStorageCleanupWorker(repos, opts.Filecoin.Storage,
 			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger),
 		worker.NewWalletOperationRunner(repos, opts.Filecoin.Wallet, opts.Filecoin.Receipts, 5*time.Second, logger,
@@ -425,10 +435,6 @@ func newObservabilityService(cfg *config.Config, repos *repository.Repositories,
 		Store:           repos.Observability,
 		RefreshInterval: cfg.Filecoin.Observability.Interval,
 	})
-}
-
-func autoEvictEnabled(policy string) bool {
-	return strings.EqualFold(strings.TrimSpace(policy), "lru")
 }
 
 func s3ServerOptions(cfg config.ServerConfig) ([]s3api.Option, error) {

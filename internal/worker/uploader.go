@@ -51,7 +51,7 @@ type Uploader struct {
 	storage         synapse.StorageClient
 	wallet          synapse.WalletQuerier // optional; nil skips balance pre-check
 	stateMachine    *state.Machine
-	autoEvict       bool
+	evictionPolicy  cache.EvictionPolicy
 	evictMaxRetries int
 	targetCopies    int
 	eventPublisher  admin.EventPublisher
@@ -96,14 +96,14 @@ func boundedTargetCopies(copies int) int {
 }
 
 // NewUploader creates a new upload worker.
-func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, autoEvict bool, targetCopies int, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
+func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, evictionPolicy cache.EvictionPolicy, targetCopies int, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
 	u := &Uploader{
 		repos:           repos,
 		cache:           c,
 		storage:         sc,
 		wallet:          wallet,
 		stateMachine:    sm,
-		autoEvict:       autoEvict,
+		evictionPolicy:  evictionPolicy,
 		evictMaxRetries: defaultEvictMaxRetries,
 		targetCopies:    boundedTargetCopies(targetCopies),
 		concurrency:     concurrency,
@@ -1405,20 +1405,10 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 }
 
 func (u *Uploader) enqueueEvictTask(ctx context.Context, logger *slog.Logger, objectID int64, versionID string) {
-	if !u.autoEvict {
+	if u.evictionPolicy != cache.EvictionPolicyAfterUpload {
 		return
 	}
-	evictTask := &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		RefType:        "object",
-		RefID:          objectID,
-		RefVersionID:   versionID,
-		IdempotencyKey: fmt.Sprintf("evict_cache:%s", versionID),
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     u.evictMaxRetries,
-		ScheduledAt:    time.Now(),
-	}
-	if err := u.repos.Tasks.Create(ctx, evictTask); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+	if _, err := repository.EnsureAfterUploadEvictionTask(ctx, u.repos.Tasks, objectID, versionID, u.evictMaxRetries); err != nil {
 		logger.Warn("failed to enqueue eviction task (non-fatal)", "error", err, "versionID", versionID)
 	}
 }

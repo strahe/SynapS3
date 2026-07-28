@@ -205,6 +205,8 @@ The restore streams synchronously for up to one hour and requires enough cache c
 | `POST` | `/api/v1/s3-users/{accessKey}/secret` | Rotate an S3 secret key. |
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | Delete an S3 user. |
 
+Cache settings expose `eviction_policy`, `lru_high_watermark_percent`, and `lru_low_watermark_percent` under `cache`. Valid policies are `lru`, `after_upload`, and `none`. Policy input is case-insensitive; the API returns the canonical lowercase value. The legacy value `manual` is accepted as an alias for `none`. Watermarks must satisfy `0 <= low < high <= 100` and only affect `lru`.
+
 After saving settings, restart SynapS3, check `/healthz`, and read settings again to confirm the effective values.
 
 ## Write Example

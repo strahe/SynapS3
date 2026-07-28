@@ -781,6 +781,58 @@ func (r *BunObjectRepo) SetVersionCachePresence(ctx context.Context, versionID s
 	})
 }
 
+func (r *BunObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
+	res, err := r.db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("in_cache = ?", true).
+		Set("cache_accessed_at = ?", accessedAt).
+		Where("version_id = ? AND is_delete_marker = ?", versionID, false).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("recording version cache access: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("recording version cache access: version %s not found", versionID)
+	}
+	return nil
+}
+
+func (r *BunObjectRepo) ListLRUEvictionCandidates(ctx context.Context, limit int) ([]CacheEvictionCandidate, error) {
+	var candidates []CacheEvictionCandidate
+	q := r.db.NewSelect().
+		TableExpr("object_versions AS object_version").
+		ColumnExpr("object_version.object_id").
+		ColumnExpr("object_version.version_id").
+		ColumnExpr("object_version.size").
+		ColumnExpr("object_version.cache_accessed_at").
+		ColumnExpr("object_version.created_at").
+		Join("JOIN storage_uploads AS storage_upload ON storage_upload.id = object_version.storage_upload_id").
+		Where("object_version.in_cache = ?", true).
+		Where("object_version.is_delete_marker = ?", false).
+		Where("object_version.size > 0").
+		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
+		Where("storage_upload.status = ?", model.StorageUploadStatusComplete).
+		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
+		Where(`NOT EXISTS (
+			SELECT 1 FROM tasks AS eviction_task
+			WHERE eviction_task.type = ?
+			  AND eviction_task.ref_type = ?
+			  AND eviction_task.ref_version_id = object_version.version_id
+			  AND eviction_task.status IN (?)
+		)`, model.TaskTypeEvictCache, "object", bun.List(activeTaskStatuses())).
+		OrderExpr("COALESCE(object_version.cache_accessed_at, object_version.created_at) ASC").
+		OrderExpr("object_version.created_at ASC").
+		OrderExpr("object_version.version_id ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Scan(ctx, &candidates); err != nil {
+		return nil, fmt.Errorf("listing LRU cache eviction candidates: %w", err)
+	}
+	return candidates, nil
+}
+
 func (r *BunObjectRepo) SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		now := time.Now()
@@ -1722,6 +1774,13 @@ func normalizeObjectVersion(version *model.ObjectVersion) {
 	}
 	if version.State != model.ObjectStateCacheEvicted {
 		version.InCache = true
+	}
+	if version.InCache && !version.IsDeleteMarker && version.CacheAccessedAt == nil {
+		accessedAt := version.CreatedAt
+		if accessedAt.IsZero() {
+			accessedAt = time.Now()
+		}
+		version.CacheAccessedAt = &accessedAt
 	}
 	if version.ContentType == "" {
 		version.ContentType = "application/octet-stream"

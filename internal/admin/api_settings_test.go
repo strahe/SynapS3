@@ -432,7 +432,12 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(`{
 		"server":{"port":":8088"},
 		"filecoin":{"network":"mainnet","with_cdn":true,"default_copies":3},
-		"cache":{"max_size_gb":8},
+		"cache":{
+			"max_size_gb":8,
+			"eviction_policy":"After_Upload",
+			"lru_high_watermark_percent":86,
+			"lru_low_watermark_percent":71
+		},
 		"worker":{"upload":{"poll_interval":"9s"}},
 		"logging":{"format":"text","s3_access":{"enabled":false,"level":"debug"}}
 	}`))
@@ -451,7 +456,12 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	if !resp.RestartRequired {
 		t.Fatal("RestartRequired = false, want true")
 	}
-	if resp.Config.Server.Port != ":8088" || resp.Config.Cache.MaxSizeGB != 8 || resp.Config.Filecoin.DefaultCopies != 3 {
+	if resp.Config.Server.Port != ":8088" ||
+		resp.Config.Cache.MaxSizeGB != 8 ||
+		resp.Config.Cache.EvictionPolicy != "after_upload" ||
+		resp.Config.Cache.LRUHighWatermarkPercent != 86 ||
+		resp.Config.Cache.LRULowWatermarkPercent != 71 ||
+		resp.Config.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("updated config = %#v", resp.Config)
 	}
 
@@ -467,6 +477,11 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	}
 	if loaded.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("saved filecoin.default_copies = %d, want 3", loaded.Filecoin.DefaultCopies)
+	}
+	if loaded.Cache.EvictionPolicy != "after_upload" ||
+		loaded.Cache.LRUHighWatermarkPercent != 86 ||
+		loaded.Cache.LRULowWatermarkPercent != 71 {
+		t.Fatalf("saved cache config = %#v, want canonical after_upload with 86/71", loaded.Cache)
 	}
 	if loaded.Logging.S3Access.Enabled || loaded.Logging.S3Access.Level != "debug" {
 		t.Fatalf("saved logging.s3_access = %#v, want disabled debug", loaded.Logging.S3Access)
@@ -719,6 +734,8 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "cache dir", envName: "SYNAPS3_CACHE_DIR", payload: `{"cache":{"dir":"/tmp/cache"}}`, field: "cache.dir"},
 		{name: "cache max size", envName: "SYNAPS3_CACHE_MAX_SIZE_GB", payload: `{"cache":{"max_size_gb":8}}`, field: "cache.max_size_gb"},
 		{name: "cache eviction policy", envName: "SYNAPS3_CACHE_EVICTION_POLICY", payload: `{"cache":{"eviction_policy":"manual"}}`, field: "cache.eviction_policy"},
+		{name: "cache LRU high watermark", envName: "SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", payload: `{"cache":{"lru_high_watermark_percent":85}}`, field: "cache.lru_high_watermark_percent"},
+		{name: "cache LRU low watermark", envName: "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", payload: `{"cache":{"lru_low_watermark_percent":70}}`, field: "cache.lru_low_watermark_percent"},
 		{name: "upload concurrency", envName: "SYNAPS3_WORKER_UPLOAD_CONCURRENCY", payload: `{"worker":{"upload":{"concurrency":2}}}`, field: "worker.upload.concurrency"},
 		{name: "upload poll interval", envName: "SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", payload: `{"worker":{"upload":{"poll_interval":"9s"}}}`, field: "worker.upload.poll_interval"},
 		{name: "upload max retries", envName: "SYNAPS3_WORKER_UPLOAD_MAX_RETRIES", payload: `{"worker":{"upload":{"max_retries":9}}}`, field: "worker.upload.max_retries"},

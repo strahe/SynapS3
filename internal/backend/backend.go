@@ -26,7 +26,7 @@ type SynapseBackend struct {
 	uploadMaxRetries         int
 	evictMaxRetries          int
 	storageCleanupMaxRetries int
-	autoEvict                bool
+	evictionPolicy           cache.EvictionPolicy
 	logger                   *slog.Logger
 }
 
@@ -60,10 +60,10 @@ func WithStorageCleanupMaxRetries(maxRetries int) Option {
 	}
 }
 
-// WithAutoEvict configures whether stored objects enqueue cache eviction tasks.
-func WithAutoEvict(autoEvict bool) Option {
+// WithEvictionPolicy configures automatic local cache eviction.
+func WithEvictionPolicy(policy cache.EvictionPolicy) Option {
 	return func(b *SynapseBackend) {
-		b.autoEvict = autoEvict
+		b.evictionPolicy = policy
 	}
 }
 
@@ -79,6 +79,7 @@ func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc sy
 		uploadMaxRetries:         defaultUploadMaxRetries,
 		evictMaxRetries:          defaultEvictMaxRetries,
 		storageCleanupMaxRetries: defaultStorageCleanupMaxRetries,
+		evictionPolicy:           cache.EvictionPolicyNone,
 		logger:                   logger,
 	}
 	for _, opt := range opts {

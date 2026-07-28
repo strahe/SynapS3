@@ -119,9 +119,7 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 
 	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
 	if cacheErr == nil {
-		if !version.InCache {
-			r.markCachePresence(ctx, version.VersionID, true)
-		}
+		r.recordCacheAccess(ctx, version.VersionID)
 		return resultFromVersion(version, body, SourceCache, false), nil
 	}
 	if !os.IsNotExist(cacheErr) {
@@ -172,9 +170,7 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 
 	body, _, cacheErr := r.cache.Get(ctx, bucketName, version.CacheKey)
 	if cacheErr == nil {
-		if !version.InCache {
-			r.markCachePresence(ctx, version.VersionID, true)
-		}
+		r.recordCacheAccess(ctx, version.VersionID)
 		return resultFromVersion(version, body, SourceCache, cacheMiss), nil
 	}
 	if !os.IsNotExist(cacheErr) {
@@ -281,7 +277,7 @@ func (r *Reader) streamAndRehydrate(ctx context.Context, bucket, cacheKey, versi
 			_ = pr.Close()
 			return
 		}
-		r.markCachePresence(ctx, versionID, true)
+		r.recordCacheAccess(ctx, versionID)
 		_ = pr.Close()
 	}()
 
@@ -294,6 +290,15 @@ func (r *Reader) markCachePresence(ctx context.Context, versionID string, inCach
 	}
 	if err := r.repos.Objects.SetVersionCachePresence(ctx, versionID, inCache); err != nil {
 		r.logger.Warn("cache location update failed", "versionID", versionID, "inCache", inCache, "error", err)
+	}
+}
+
+func (r *Reader) recordCacheAccess(ctx context.Context, versionID string) {
+	if r == nil || r.repos == nil || r.repos.Objects == nil || versionID == "" {
+		return
+	}
+	if err := r.repos.Objects.RecordVersionCacheAccess(ctx, versionID, time.Now()); err != nil {
+		r.logger.Warn("cache access update failed", "versionID", versionID, "error", err)
 	}
 }
 

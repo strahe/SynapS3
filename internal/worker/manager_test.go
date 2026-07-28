@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -52,7 +53,7 @@ func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 	}
 
 	// Start manager with no workers — returns immediately after recovery
-	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone)
 	mgr.Start(ctx)
 
 	// Task should be back to queued.
@@ -91,7 +92,7 @@ func TestManager_RecoverOnStartup_PreservesActiveLeases(t *testing.T) {
 		t.Fatalf("Create running task: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone)
 	mgr.Start(ctx)
 
 	got, err := repos.Tasks.GetByID(ctx, task.ID)
@@ -132,7 +133,7 @@ func TestManager_RecoverOnStartup_DoesNotResetStagedUploadingState(t *testing.T)
 
 	// Start manager. Staged uploads keep durable progress in upload/copy rows,
 	// so startup must not downgrade uploading back to cached.
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	got, err := repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
@@ -168,7 +169,7 @@ func TestManager_RecoverOnStartup_RequeuesOrphanCommittingState(t *testing.T) {
 		t.Fatalf("committing: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	got, err := repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
@@ -238,7 +239,7 @@ func TestManager_RecoverOnStartup_ReenqueuesPrimaryCommitStage(t *testing.T) {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ingress_commit", string(model.TaskStatusQueued), 10, 0)
@@ -302,7 +303,7 @@ func TestManager_RecoverOnStartup_BindsCommittedIngressBeforeSingleCopyFinalize(
 		t.Fatalf("MarkUploadCopyCommitted: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	got, err := repos.Objects.GetCurrentVersionByObjectID(ctx, objID)
@@ -390,7 +391,7 @@ func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *test
 		t.Fatalf("Create running task: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
@@ -467,7 +468,7 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ensure_dataset", string(model.TaskStatusQueued), 10, 0)
@@ -550,7 +551,7 @@ func TestManager_RecoverOnStartup_QueuesRepairForUnavailablePeerDeficit(t *testi
 		t.Fatalf("MarkDataSetUnavailable peer: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	ensureTasks, ensureTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ensure_dataset", string(model.TaskStatusQueued), 10, 0)
@@ -648,7 +649,7 @@ func TestManager_RecoverOnStartup_QueuesRepairForFailedPeerDeficitWithRecoverabl
 		t.Fatalf("MarkUploadCopyFailed: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	ensureTasks, ensureTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "peer_pull", string(model.TaskStatusQueued), 10, 0)
@@ -696,7 +697,7 @@ func TestManager_RecoverOnStartup_ReconcilesAllStagedUploads(t *testing.T) {
 		}
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusQueued), 200, 0)
@@ -714,7 +715,7 @@ func TestManager_RecoverOnStartup_UsesBoundedVersionBatches(t *testing.T) {
 	objects := &boundedVersionListRepo{ObjectRepository: repos.Objects}
 	repos.Objects = objects
 
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(context.Background())
 
 	if objects.sawUnbounded {
@@ -732,7 +733,7 @@ func TestManager_ReconcileTasks_CreatesMissingTasks(t *testing.T) {
 	objID, versionID := seedManagerVersion(t, repos, bucket, "mgr-reconcile-key", model.ObjectStateCached)
 
 	// No task exists yet — manager should create one during reconciliation
-	mgr := worker.NewManager(repos, slog.Default(), false).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	// Claim the task created by reconciliation
@@ -760,7 +761,7 @@ func TestManager_WorkerHealth(t *testing.T) {
 	w2 := &stubWorker{name: "beta", isHealthy: false}
 	w3 := &stubWorker{name: "gamma", isHealthy: true}
 
-	mgr := worker.NewManager(repos, slog.Default(), false, w1, w2, w3)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone, w1, w2, w3)
 	health := mgr.WorkerHealth()
 
 	if len(health) != 3 {
@@ -779,7 +780,7 @@ func TestManager_WorkerHealth(t *testing.T) {
 
 func TestManager_WorkerHealth_Empty(t *testing.T) {
 	repos := testutil.NewTestRepos(t)
-	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone)
 	health := mgr.WorkerHealth()
 	if len(health) != 0 {
 		t.Errorf("expected empty map, got %d entries", len(health))
@@ -793,10 +794,10 @@ func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
 	logger := slog.Default()
 	poll := 50 * time.Millisecond
 
-	up := worker.NewUploader(repos, mc, nil, nil, sm, true, config.DefaultFilecoinCopies, 1, poll, logger)
+	up := worker.NewUploader(repos, mc, nil, nil, sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, poll, logger)
 	ev := worker.NewEvictor(repos, mc, sm, 1, poll, logger)
 
-	mgr := worker.NewManager(repos, logger, true, up, ev)
+	mgr := worker.NewManager(repos, logger, cache.EvictionPolicyAfterUpload, up, ev)
 	health := mgr.WorkerHealth()
 
 	expected := map[string]bool{
@@ -840,7 +841,7 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 	}
 
 	// Start manager — reconciliation should skip (idempotency dedup)
-	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone)
 	mgr.Start(ctx)
 
 	// Claim the task — should be exactly one (the pre-existing one)
@@ -862,7 +863,7 @@ func TestManager_ReconcileTasks_IdempotencyDedup(t *testing.T) {
 	}
 }
 
-func TestManager_ReconcileTasks_AutoEvictGuard(t *testing.T) {
+func TestManager_ReconcileTasks_NoneDoesNotCreateEvictionTask(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -870,7 +871,7 @@ func TestManager_ReconcileTasks_AutoEvictGuard(t *testing.T) {
 	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-off")
 	seedManagerVersion(t, repos, bucket, "stored-no-evict", model.ObjectStateStored)
 
-	mgr := worker.NewManager(repos, slog.Default(), false)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone)
 	mgr.Start(ctx)
 
 	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
@@ -878,11 +879,11 @@ func TestManager_ReconcileTasks_AutoEvictGuard(t *testing.T) {
 		t.Fatalf("claiming evict task: %v", err)
 	}
 	if task != nil {
-		t.Fatal("expected no evict_cache task when autoEvict is disabled")
+		t.Fatal("expected no evict_cache task under none policy")
 	}
 }
 
-func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
+func TestManager_ReconcileTasks_AfterUploadCreatesEvictionTask(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -890,7 +891,7 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	bucket := testutil.SeedBucket(t, db, "mgr-autoevict-on")
 	objID, versionID := seedManagerVersion(t, repos, bucket, "stored-with-evict", model.ObjectStateStored)
 
-	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
@@ -898,7 +899,7 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 		t.Fatalf("claiming evict task: %v", err)
 	}
 	if task == nil {
-		t.Fatal("expected evict_cache task when autoEvict is enabled")
+		t.Fatal("expected evict_cache task under after_upload policy")
 	}
 	if task.RefID != objID || task.RefVersionID != versionID {
 		t.Fatalf("evict task refs = (%d,%s), want (%d,%s)", task.RefID, task.RefVersionID, objID, versionID)
@@ -908,7 +909,86 @@ func TestManager_ReconcileTasks_AutoEvictEnabled(t *testing.T) {
 	}
 }
 
-func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
+func TestManager_RecoverOnStartupSwitchesEvictionPoliciesAndOnlyReactivatesCancelledAfterUploadTask(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := testutil.SeedBucket(t, db, "mgr-eviction-policy-switch")
+	objectID, versionID := seedManagerVersion(t, repos, bucket, "stored-policy-switch", model.ObjectStateStored)
+
+	activated, err := repository.EnsureAfterUploadEvictionTask(ctx, repos.Tasks, objectID, versionID, 4)
+	if err != nil || !activated {
+		t.Fatalf("EnsureAfterUploadEvictionTask: activated=%v err=%v", activated, err)
+	}
+	afterUploadTasks, total, err := repos.Tasks.List(
+		ctx,
+		string(model.TaskTypeEvictCache),
+		repository.CacheEvictionStageAfterUpload,
+		"",
+		10,
+		0,
+	)
+	if err != nil || total != 1 || len(afterUploadTasks) != 1 {
+		t.Fatalf("after_upload tasks total=%d tasks=%#v err=%v", total, afterUploadTasks, err)
+	}
+	afterUploadTask := afterUploadTasks[0]
+	lruStage := repository.CacheEvictionStageLRU
+	lruTask := &model.Task{
+		Type:           model.TaskTypeEvictCache,
+		Stage:          &lruStage,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   versionID,
+		IdempotencyKey: "evict_cache:lru:startup-test:" + versionID,
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     4,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, lruTask); err != nil {
+		t.Fatalf("Create LRU task: %v", err)
+	}
+
+	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyLRU).Start(ctx)
+	gotAfterUpload, _ := repos.Tasks.GetByID(ctx, afterUploadTask.ID)
+	gotLRU, _ := repos.Tasks.GetByID(ctx, lruTask.ID)
+	if gotAfterUpload.Status != model.TaskStatusCancelled || gotLRU.Status != model.TaskStatusQueued {
+		t.Fatalf("after lru startup after_upload/lru statuses = %s/%s, want cancelled/queued", gotAfterUpload.Status, gotLRU.Status)
+	}
+
+	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)
+	gotAfterUpload, _ = repos.Tasks.GetByID(ctx, afterUploadTask.ID)
+	gotLRU, _ = repos.Tasks.GetByID(ctx, lruTask.ID)
+	if gotAfterUpload.Status != model.TaskStatusQueued || gotLRU.Status != model.TaskStatusCancelled {
+		t.Fatalf("after after_upload startup statuses = %s/%s, want queued/cancelled", gotAfterUpload.Status, gotLRU.Status)
+	}
+
+	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).Start(ctx)
+	gotAfterUpload, _ = repos.Tasks.GetByID(ctx, afterUploadTask.ID)
+	if gotAfterUpload.Status != model.TaskStatusCancelled {
+		t.Fatalf("after none startup after_upload status = %s, want cancelled", gotAfterUpload.Status)
+	}
+
+	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)
+	gotAfterUpload, _ = repos.Tasks.GetByID(ctx, afterUploadTask.ID)
+	if gotAfterUpload.Status != model.TaskStatusQueued {
+		t.Fatalf("after_upload task status after cancelled recovery = %s, want queued", gotAfterUpload.Status)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusFailed).
+		Set("completed_at = ?", time.Now()).
+		Where("id = ?", afterUploadTask.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("mark after_upload task failed: %v", err)
+	}
+	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)
+	gotAfterUpload, _ = repos.Tasks.GetByID(ctx, afterUploadTask.ID)
+	if gotAfterUpload.Status != model.TaskStatusFailed {
+		t.Fatalf("failed after_upload task status after restart = %s, want failed", gotAfterUpload.Status)
+	}
+}
+
+func TestManager_ReconcileTasks_AfterUploadSkipsReplicating(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -970,7 +1050,7 @@ func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
 		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
 
-	mgr := worker.NewManager(repos, slog.Default(), true).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).WithTaskMaxRetries(9, 4)
 	mgr.Start(ctx)
 
 	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
@@ -979,6 +1059,33 @@ func TestManager_ReconcileTasks_AutoEvictSkipsReplicating(t *testing.T) {
 	}
 	if task != nil {
 		t.Fatalf("unexpected evict_cache task for replicating version %d/%s: %#v", objID, versionID, task)
+	}
+}
+
+func TestManager_AfterUploadDoesNotRequeueRehydratedCacheEvictedVersion(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := testutil.SeedBucket(t, db, "mgr-after-upload-rehydrated")
+	_, versionID := seedManagerVersion(t, repos, bucket, "rehydrated.txt", model.ObjectStateCacheEvicted)
+	if err := repos.Objects.RecordVersionCacheAccess(ctx, versionID, time.Now()); err != nil {
+		t.Fatalf("RecordVersionCacheAccess: %v", err)
+	}
+
+	worker.NewManager(repos, slog.Default(), cache.EvictionPolicyAfterUpload).Start(ctx)
+	tasks, total, err := repos.Tasks.List(
+		ctx,
+		string(model.TaskTypeEvictCache),
+		repository.CacheEvictionStageAfterUpload,
+		"",
+		10,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("List after_upload tasks: %v", err)
+	}
+	if total != 0 || len(tasks) != 0 {
+		t.Fatalf("rehydrated cache_evicted after_upload tasks total=%d tasks=%#v, want none", total, tasks)
 	}
 }
 

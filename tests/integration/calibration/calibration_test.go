@@ -250,7 +250,7 @@ func (r *calibrationRuntime) PrepareConfig() error {
 	cfg.Filecoin.Observability.Timeout = 10 * time.Second
 	cfg.Filecoin.Observability.Concurrency = 4
 	cfg.Cache.MaxSizeGB = 1
-	cfg.Cache.EvictionPolicy = "lru"
+	cfg.Cache.EvictionPolicy = "after_upload"
 	cfg.Worker.Upload = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 5 * time.Second, MaxRetries: 3}
 	cfg.Worker.Evictor = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 5 * time.Second, MaxRetries: 3}
 	cfg.Worker.StorageCleanup = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 30 * time.Second, MaxRetries: 3}
