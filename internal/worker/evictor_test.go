@@ -281,6 +281,9 @@ func TestEvictor_LRUEvictsLeastRecentlyUsedUntilLowWatermark(t *testing.T) {
 		if _, ok := task.Payload["cache_accessed_at"].(string); !ok {
 			t.Fatalf("LRU task payload = %#v, want RFC3339Nano string snapshot", task.Payload)
 		}
+		if _, ok := task.Payload["cache_access_generation"].(string); !ok {
+			t.Fatalf("LRU task payload = %#v, want access generation snapshot", task.Payload)
+		}
 	}
 }
 
@@ -347,6 +350,9 @@ func TestEvictor_LRUEvictsLegacyNullAccessTime(t *testing.T) {
 	}
 	if _, planned := tasks[0].Payload["cache_accessed_at"]; planned {
 		t.Fatalf("legacy NULL LRU payload = %#v, want absent access snapshot", tasks[0].Payload)
+	}
+	if got := tasks[0].Payload["cache_access_generation"]; got != "unaccessed" {
+		t.Fatalf("legacy NULL LRU access generation = %#v, want unaccessed", got)
 	}
 	if deleteCalls.Load() != 1 {
 		t.Fatalf("legacy NULL LRU delete calls = %d, want 1", deleteCalls.Load())
@@ -632,6 +638,51 @@ func TestEvictor_LRUAccessAfterPlanningCancelsStaleTask(t *testing.T) {
 	}
 }
 
+func TestEvictor_LRUGenerationChangeCancelsTaskWhenTimestampIsUnchanged(t *testing.T) {
+	var deleteCalls atomic.Int64
+	mc := &testutil.MockCache{
+		UsedBytesFunc: func() int64 { return 11 },
+		ExistsFunc: func(_ context.Context, _, _ string) bool {
+			return true
+		},
+		DeleteFunc: func(_ context.Context, _, _ string) error {
+			deleteCalls.Add(1)
+			return nil
+		},
+	}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	_, objectID, versionID := seedStoredObject(t, env)
+	plannedAt := time.Date(2026, time.July, 1, 0, 0, 0, 123456000, time.UTC)
+	if err := env.repos.Objects.RecordVersionCacheAccess(context.Background(), versionID, plannedAt); err != nil {
+		t.Fatalf("RecordVersionCacheAccess(planned): %v", err)
+	}
+	task := seedLRUEvictionTask(t, env, objectID, versionID, plannedAt)
+	if _, err := env.db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("cache_access_generation = ?", "new-access-generation").
+		Where("version_id = ?", versionID).
+		Exec(context.Background()); err != nil {
+		t.Fatalf("replace cache access generation: %v", err)
+	}
+
+	evictor := worker.NewEvictor(
+		env.repos,
+		env.cache,
+		env.sm,
+		1,
+		10*time.Millisecond,
+		slog.Default(),
+		worker.WithCacheEvictionPolicy(cache.EvictionPolicyLRU, 20, 90, 50, 3),
+	)
+	got := runWorkerUntilTask(t, env, evictor, task.ID, 3*time.Second)
+	if got.Status != model.TaskStatusCancelled {
+		t.Fatalf("generation-stale LRU task status = %s, want cancelled", got.Status)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("cache Delete calls = %d, want 0 for generation-stale LRU task", deleteCalls.Load())
+	}
+}
+
 type blockingFirstVersionLookupRepo struct {
 	repository.ObjectRepository
 
@@ -753,6 +804,140 @@ func TestEvictor_LRUFinalCheckProtectsAccessAfterInitialVersionLoad(t *testing.T
 	}
 	if blockingRepo.accessWrites.Load() != 1 {
 		t.Fatalf("access writes after final LRU check = %d, want one deferred flush", blockingRepo.accessWrites.Load())
+	}
+}
+
+type cacheAccessRecordingObjectRepo struct {
+	repository.ObjectRepository
+
+	accessWrites atomic.Int64
+}
+
+func (r *cacheAccessRecordingObjectRepo) RecordVersionCacheAccess(
+	ctx context.Context,
+	versionID string,
+	accessedAt time.Time,
+) error {
+	r.accessWrites.Add(1)
+	return r.ObjectRepository.RecordVersionCacheAccess(ctx, versionID, accessedAt)
+}
+
+func TestEvictor_LRUFlushesNewerMemoryAccessBeforeDatabaseStaleCancellation(t *testing.T) {
+	var deleteCalls atomic.Int64
+	mc := &testutil.MockCache{
+		UsedBytesFunc: func() int64 { return 11 },
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return io.NopCloser(strings.NewReader("cached")), &cache.ObjectInfo{Size: 6}, nil
+		},
+		ExistsFunc: func(_ context.Context, _, _ string) bool {
+			return true
+		},
+		DeleteFunc: func(_ context.Context, _, _ string) error {
+			deleteCalls.Add(1)
+			return nil
+		},
+	}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	bucket, objectID, versionID := seedStoredObject(t, env)
+	coordinator := cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval)
+	reader := objectreader.New(
+		env.repos,
+		env.cache,
+		nil,
+		slog.Default(),
+		objectreader.WithCacheAccessCoordinator(coordinator),
+	)
+
+	first, err := reader.Open(
+		context.Background(),
+		bucket.Name,
+		"hello-"+versionID+".txt",
+		objectreader.S3Visibility,
+	)
+	if err != nil {
+		t.Fatalf("initial cache Open: %v", err)
+	}
+	_ = first.Body.Close()
+	plannedVersion, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
+	if err != nil || plannedVersion == nil || plannedVersion.CacheAccessedAt == nil {
+		t.Fatalf("version after initial cache access: version=%#v err=%v", plannedVersion, err)
+	}
+	task := seedLRUEvictionTask(
+		t,
+		env,
+		objectID,
+		versionID,
+		*plannedVersion.CacheAccessedAt,
+	)
+
+	durableAfterPlan := plannedVersion.CacheAccessedAt.Add(time.Minute)
+	if err := env.repos.Objects.RecordVersionCacheAccess(
+		context.Background(),
+		versionID,
+		durableAfterPlan,
+	); err != nil {
+		t.Fatalf("RecordVersionCacheAccess(after plan): %v", err)
+	}
+	second, err := reader.Open(
+		context.Background(),
+		bucket.Name,
+		"hello-"+versionID+".txt",
+		objectreader.S3Visibility,
+	)
+	if err != nil {
+		t.Fatalf("second cache Open: %v", err)
+	}
+	_ = second.Body.Close()
+
+	beforeEviction, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
+	if err != nil || beforeEviction == nil || beforeEviction.CacheAccessedAt == nil {
+		t.Fatalf("version before eviction: version=%#v err=%v", beforeEviction, err)
+	}
+	if !beforeEviction.CacheAccessedAt.Equal(durableAfterPlan) {
+		t.Fatalf(
+			"coalesced cache access persisted early at %v, want durable time %v",
+			beforeEviction.CacheAccessedAt,
+			durableAfterPlan,
+		)
+	}
+
+	recordingRepo := &cacheAccessRecordingObjectRepo{
+		ObjectRepository: env.repos.Objects,
+	}
+	env.repos.Objects = recordingRepo
+	evictor := worker.NewEvictor(
+		env.repos,
+		env.cache,
+		env.sm,
+		1,
+		10*time.Millisecond,
+		slog.Default(),
+		worker.WithCacheEvictionPolicy(cache.EvictionPolicyLRU, 20, 90, 50, 3),
+		worker.WithCacheAccessCoordinator(coordinator),
+	)
+	got := runWorkerUntilTask(t, env, evictor, task.ID, 3*time.Second)
+	if got.Status != model.TaskStatusCancelled {
+		t.Fatalf("stale LRU task status = %s, want cancelled", got.Status)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("cache Delete calls = %d, want 0 after newer cache access", deleteCalls.Load())
+	}
+	if recordingRepo.accessWrites.Load() != 1 {
+		t.Fatalf(
+			"access writes before stale cancellation = %d, want one deferred flush",
+			recordingRepo.accessWrites.Load(),
+		)
+	}
+	afterEviction, err := env.repos.Objects.GetVersionByID(context.Background(), versionID)
+	if err != nil || afterEviction == nil || afterEviction.CacheAccessedAt == nil {
+		t.Fatalf("version after stale cancellation: version=%#v err=%v", afterEviction, err)
+	}
+	if !afterEviction.CacheAccessedAt.After(durableAfterPlan) {
+		t.Fatalf(
+			"flushed cache access = %v, want after durable time %v",
+			afterEviction.CacheAccessedAt,
+			durableAfterPlan,
+		)
 	}
 }
 
@@ -1070,7 +1255,8 @@ func seedLRUEvictionTask(
 		RefVersionID:   versionID,
 		IdempotencyKey: "evict_cache:lru:test:" + model.NewVersionID(),
 		Payload: map[string]interface{}{
-			"cache_accessed_at": accessedAt.UTC().Format(time.RFC3339Nano),
+			"cache_accessed_at":       accessedAt.UTC().Format(time.RFC3339Nano),
+			"cache_access_generation": repository.CacheAccessGeneration(&accessedAt),
 		},
 		Status:      model.TaskStatusQueued,
 		MaxRetries:  3,

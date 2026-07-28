@@ -21,7 +21,10 @@ const (
 	lruTerminalRetryDelay      = time.Hour
 )
 
-const lruAccessedAtPayloadKey = "cache_accessed_at"
+const (
+	lruAccessedAtPayloadKey       = "cache_accessed_at"
+	lruAccessGenerationPayloadKey = "cache_access_generation"
+)
 
 // Evictor claims cache eviction tasks and removes remotely durable objects
 // according to the configured policy.
@@ -236,6 +239,7 @@ func newLRUEvictionTask(candidate repository.CacheEvictionCandidate, maxRetries 
 	if accessGeneration == "" {
 		accessGeneration = repository.CacheAccessGeneration(candidate.CacheAccessedAt)
 	}
+	payload[lruAccessGenerationPayloadKey] = accessGeneration
 	if candidate.CacheAccessedAt != nil {
 		payload[lruAccessedAtPayloadKey] = candidate.CacheAccessedAt.UTC().Format(time.RFC3339Nano)
 	}
@@ -397,18 +401,17 @@ func (e *Evictor) finalizeLRUEviction(
 		e.cancelTask(ctx, task, "Object is no longer eligible for LRU eviction")
 		return false
 	}
-	if !lruAccessSnapshotMatches(task, version.CacheAccessedAt) {
+	if !lruAccessSnapshotMatches(
+		task,
+		version.CacheAccessedAt,
+		version.CacheAccessGeneration,
+	) {
+		e.persistNewerInMemoryAccess(ctx, task, version.CacheAccessedAt, lastAccess)
 		e.cancelTask(ctx, task, "Object was accessed after this LRU eviction was planned")
 		return false
 	}
 	if lruAccessOccurredAfterSnapshot(task, lastAccess) {
-		if err := e.repos.Objects.RecordVersionCacheAccess(ctx, task.RefVersionID, lastAccess); err != nil {
-			e.taskLogger(task).Warn(
-				"persisting recent cache access before cancelling LRU eviction",
-				"error",
-				err,
-			)
-		}
+		e.persistNewerInMemoryAccess(ctx, task, version.CacheAccessedAt, lastAccess)
 		e.cancelTask(ctx, task, "Object was accessed after this LRU eviction was planned")
 		return false
 	}
@@ -444,6 +447,29 @@ func (e *Evictor) finalizeLRUEviction(
 	}
 	e.recordDeletedCache(ctx, task, version)
 	return true
+}
+
+func (e *Evictor) persistNewerInMemoryAccess(
+	ctx context.Context,
+	task *model.Task,
+	durableAccess *time.Time,
+	inMemoryAccess time.Time,
+) {
+	if inMemoryAccess.IsZero() ||
+		(durableAccess != nil && !inMemoryAccess.After(*durableAccess)) {
+		return
+	}
+	if err := e.repos.Objects.RecordVersionCacheAccess(
+		ctx,
+		task.RefVersionID,
+		inMemoryAccess,
+	); err != nil {
+		e.taskLogger(task).Warn(
+			"persisting recent cache access before cancelling LRU eviction",
+			"error",
+			err,
+		)
+	}
 }
 
 func (e *Evictor) processAfterUploadTask(ctx context.Context, task *model.Task) {
@@ -605,20 +631,39 @@ func (e *Evictor) taskLogger(task *model.Task) *slog.Logger {
 	return e.logger.With("taskID", task.ID, "objectID", task.RefID, "versionID", task.RefVersionID)
 }
 
-func lruAccessSnapshotMatches(task *model.Task, current *time.Time) bool {
+func lruAccessSnapshotMatches(
+	task *model.Task,
+	current *time.Time,
+	currentGeneration string,
+) bool {
 	raw, planned := task.Payload[lruAccessedAtPayloadKey]
 	if !planned {
-		return current == nil
+		if current != nil {
+			return false
+		}
+	} else {
+		text, ok := raw.(string)
+		if !ok || current == nil {
+			return false
+		}
+		expected, err := time.Parse(time.RFC3339Nano, text)
+		if err != nil || !current.Equal(expected) {
+			return false
+		}
 	}
-	text, ok := raw.(string)
-	if !ok || current == nil {
+
+	rawGeneration, plannedGeneration := task.Payload[lruAccessGenerationPayloadKey]
+	if !plannedGeneration {
+		return true
+	}
+	expectedGeneration, ok := rawGeneration.(string)
+	if !ok {
 		return false
 	}
-	expected, err := time.Parse(time.RFC3339Nano, text)
-	if err != nil {
-		return false
+	if currentGeneration == "" {
+		currentGeneration = repository.CacheAccessGeneration(current)
 	}
-	return current.Equal(expected)
+	return currentGeneration == expectedGeneration
 }
 
 func lruAccessOccurredAfterSnapshot(task *model.Task, current time.Time) bool {
