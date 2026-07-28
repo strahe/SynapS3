@@ -1,0 +1,8 @@
+services:
+  synaps3:
+    image: synaps3:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: local

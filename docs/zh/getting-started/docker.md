@@ -14,6 +14,22 @@ description: 使用 Docker Compose 部署 SynapS3。
 - 如果从另一台机器访问仪表盘，需要 SSH 权限。
 - 可充值的 Calibration 钱包，或按下面步骤生成并充值。
 
+## 选择镜像来源
+
+默认部署使用 `compose.yaml` 中的发布镜像。使用发布镜像时，继续执行[准备配置](#准备配置)。
+
+### 从源码构建镜像
+
+需要在本地构建镜像时，先安装 Git，再克隆完整源码并构建：
+
+```bash
+git clone https://github.com/strahe/SynapS3.git
+cd SynapS3
+docker compose -f compose.yaml -f compose.local.yaml build --no-cache
+```
+
+使用本地镜像时，跳过下一节创建部署目录和下载文件的命令。执行本文后续命令时，将开头的 `docker compose` 替换为 `docker compose -f compose.yaml -f compose.local.yaml`。
+
 ## 准备配置
 
 创建部署目录，并下载 Compose 文件：
