@@ -969,6 +969,15 @@ func TestTaskRepo_List(t *testing.T) {
 		t.Errorf("expected 1 task at offset 2, got %d", len(tasks))
 	}
 	assertTaskIDs(t, tasks, firstUpload.ID)
+
+	// Pagination: offset beyond the result set returns an empty page with the total unchanged.
+	tasks, total, err = repos.Tasks.List(ctx, "", "", "", 2, 4)
+	if err != nil {
+		t.Fatalf("List paginated beyond total: %v", err)
+	}
+	if total != 3 || len(tasks) != 0 {
+		t.Fatalf("expected 0 tasks with total 3 beyond the last page, got %d/%d", len(tasks), total)
+	}
 }
 
 func TestTaskRepo_ListFiltersByStage(t *testing.T) {
