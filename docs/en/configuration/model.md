@@ -118,8 +118,6 @@ Cache eviction policies have these user-visible results:
 - `after_upload`: after all target remote copies commit, SynapS3 queues that version for removal at the next Evictor poll. A later remote read can restore the cache, and that restored entry is not immediately removed again.
 - `none`: SynapS3 does not automatically remove local cache data.
 
-The legacy value `manual` is accepted when reading configuration and normalized to `none` when settings are returned or saved. Policy values are case-insensitive on input and canonicalized to lowercase.
-
 The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain saved but have no effect under `after_upload` or `none`.
 
 ```toml

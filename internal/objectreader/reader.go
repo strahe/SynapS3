@@ -67,26 +67,16 @@ type Reader struct {
 	logger  *slog.Logger
 }
 
-// Option configures foreground object reads.
-type Option func(*Reader)
-
-// WithCacheAccessCoordinator shares foreground cache accesses with cache
-// workers so a final deletion cannot race a successful cache open.
-func WithCacheAccessCoordinator(coordinator *cacheaccess.Coordinator) Option {
-	return func(r *Reader) {
-		if coordinator != nil {
-			r.access = coordinator
-		}
-	}
-}
-
 func New(
 	repos *repository.Repositories,
 	cache cache.Cache,
 	storage synapse.StorageClient,
+	access *cacheaccess.Coordinator,
 	logger *slog.Logger,
-	opts ...Option,
 ) *Reader {
+	if access == nil {
+		panic("object reader requires a cache access coordinator")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -94,11 +84,8 @@ func New(
 		repos:   repos,
 		cache:   cache,
 		storage: storage,
-		access:  cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		access:  access,
 		logger:  logger,
-	}
-	for _, opt := range opts {
-		opt(r)
 	}
 	return r
 }

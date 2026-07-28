@@ -114,7 +114,7 @@ Recovery options:
 
 LRU cannot remove multipart staging data, versions that are not remotely durable, or versions without a readable committed remote copy. A write does not synchronously run eviction, so `507 Insufficient Storage` can continue until the Evictor catches up or safe candidates become available.
 
-Failed LRU deletion tasks remain visible as exhausted work. When cache usage is still high, SynapS3 reuses the same access-generation task after a one-hour cooldown; a newer persisted access is planned as a separate generation. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` when the task should run immediately.
+Failed LRU deletion tasks remain visible as exhausted work and become eligible again after a one-hour cooldown. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` to retry sooner.
 
 After changing a cache setting, restart SynapS3, check `/healthz`, and verify the effective cache values with `synaps3 admin settings get`.
 

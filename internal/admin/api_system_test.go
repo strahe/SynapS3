@@ -17,7 +17,7 @@ func newSystemAPITestServer(t *testing.T) *Server {
 
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	return New(":0", db, &stubCache{rootDir: t.TempDir(), usedByte: 42}, 100, repos, &stubWorkerHealth{health: map[string]bool{"uploader": true}}, nil, config.DefaultFilecoinCopies, testLogger())
+	return newTestServer(":0", db, &stubCache{rootDir: t.TempDir(), usedByte: 42}, 100, repos, &stubWorkerHealth{health: map[string]bool{"uploader": true}}, nil, config.DefaultFilecoinCopies, testLogger())
 }
 
 func serveSystemAPI(server *Server, path string) *httptest.ResponseRecorder {

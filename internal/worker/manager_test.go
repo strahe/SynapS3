@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -798,6 +799,7 @@ func TestManager_WorkerHealth_RealWorkers(t *testing.T) {
 	ev := worker.NewEvictor(
 		repos,
 		mc,
+		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
 		sm,
 		1,
 		poll,

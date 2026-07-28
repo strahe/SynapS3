@@ -74,6 +74,7 @@ type Runtime struct {
 	adminServer   *admin.Server
 	s3Server      *s3api.S3ApiServer
 	backend       *backend.SynapseBackend
+	cacheAccess   *cacheaccess.Coordinator
 	iam           auth.IAMService
 	workers       *worker.Manager
 	observer      *observability.Runner
@@ -105,24 +106,14 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	if !ok {
 		return nil, fmt.Errorf("initializing cache eviction policy: unsupported value %q", cfg.Cache.EvictionPolicy)
 	}
-	if cfg.ShouldWarnLRUBehaviorChange() {
-		logger.Warn(
-			"cache eviction policy 'lru' keeps local copies until capacity watermarks are reached; set cache.eviction_policy to 'after_upload' to remove them after upload",
-			"highWatermarkPercent",
-			cfg.Cache.LRUHighWatermarkPercent,
-			"lowWatermarkPercent",
-			cfg.Cache.LRULowWatermarkPercent,
-		)
-	}
 	cacheAccess := cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval)
 	stateMachine := state.NewObjectStateMachine()
 	events := admin.NewEventHub()
-	appBackend := backend.New(repos, localCache, stateMachine, opts.Filecoin.Storage, logger,
+	appBackend := backend.New(repos, localCache, stateMachine, opts.Filecoin.Storage, cacheAccess, logger,
 		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
 		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
 		backend.WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries),
 		backend.WithEvictionPolicy(evictionPolicy),
-		backend.WithCacheAccessCoordinator(cacheAccess),
 	)
 
 	iamService := s3iam.NewService(repos)
@@ -165,7 +156,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 			cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
 			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
 			worker.WithEventPublisher(events)),
-		worker.NewEvictor(repos, localCache, stateMachine,
+		worker.NewEvictor(repos, localCache, cacheAccess, stateMachine,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger,
 			worker.WithCacheEvictionPolicy(
 				evictionPolicy,
@@ -173,15 +164,14 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 				cfg.Cache.LRUHighWatermarkPercent,
 				cfg.Cache.LRULowWatermarkPercent,
 				cfg.Worker.Evictor.MaxRetries,
-			),
-			worker.WithCacheAccessCoordinator(cacheAccess)),
+			)),
 		worker.NewStorageCleanupWorker(repos, opts.Filecoin.Storage,
 			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger),
 		worker.NewWalletOperationRunner(repos, opts.Filecoin.Wallet, opts.Filecoin.Receipts, 5*time.Second, logger,
 			worker.WithWalletOperationEventPublisher(events)),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
 
-	adminServer := admin.New(cfg.Admin.Addr, opts.Database, localCache, maxCacheBytes, repos, manager,
+	adminServer := admin.New(cfg.Admin.Addr, opts.Database, localCache, cacheAccess, maxCacheBytes, repos, manager,
 		opts.Filecoin.WalletQuery, cfg.Filecoin.DefaultCopies, logger).
 		WithTaskDiagnosticStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
 			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
@@ -189,7 +179,6 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithEventHub(events).
 		WithObjectUploader(appBackend).
 		WithObjectVersionRestorer(appBackend).
-		WithCacheAccessCoordinator(cacheAccess).
 		WithObjectStorage(opts.Filecoin.Storage).
 		WithSettings(opts.Settings).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).
@@ -224,6 +213,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		adminServer:   adminServer,
 		s3Server:      s3Server,
 		backend:       appBackend,
+		cacheAccess:   cacheAccess,
 		iam:           iamService,
 		workers:       manager,
 		observer:      observability.NewRunner(observabilityService, logger),
@@ -334,6 +324,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 		if groupCtx.Err() == nil {
 			return errors.New("observer stopped unexpectedly")
 		}
+		return nil
+	})
+	group.Go(func() error {
+		r.cacheAccess.Run(groupCtx, r.logger)
 		return nil
 	})
 	group.Go(func() error {

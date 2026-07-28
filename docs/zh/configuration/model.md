@@ -118,8 +118,6 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 - `after_upload`：所有目标远端副本提交后，该版本会在下一次 Evictor 轮询时加入清理。之后从远端读取并回填的缓存不会再次被立即删除。
 - `none`：SynapS3 不会自动清理本地缓存。
 
-读取配置时仍兼容旧值 `manual`，但 Settings API 和后续保存都会把它规范化为 `none`。策略输入不区分大小写，对外统一返回小写值。
-
 LRU 水位始终必须满足 `0 <= low < high <= 100`。在 `after_upload` 或 `none` 下仍会保存这些值，但不会生效。
 
 ```toml

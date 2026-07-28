@@ -12,15 +12,14 @@ const (
 	EvictionPolicyNone        EvictionPolicy = "none"
 )
 
-// ParseEvictionPolicy returns the canonical eviction policy. The legacy
-// "manual" value is accepted as an alias for "none".
+// ParseEvictionPolicy returns the canonical eviction policy.
 func ParseEvictionPolicy(value string) (EvictionPolicy, bool) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case string(EvictionPolicyLRU):
 		return EvictionPolicyLRU, true
 	case string(EvictionPolicyAfterUpload):
 		return EvictionPolicyAfterUpload, true
-	case string(EvictionPolicyNone), "manual":
+	case string(EvictionPolicyNone):
 		return EvictionPolicyNone, true
 	default:
 		return "", false

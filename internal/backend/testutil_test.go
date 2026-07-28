@@ -11,6 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
@@ -46,7 +47,15 @@ func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBacken
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, fsCache, sm, sc, logger, opts...)
+	b := backend.New(
+		repos,
+		fsCache,
+		sm,
+		sc,
+		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		logger,
+		opts...,
+	)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -66,7 +75,7 @@ func newTestBackendWithMockCache(t *testing.T, mc *testutil.MockCache) *testBack
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, mc, sm, sc, logger)
+	b := backend.New(repos, mc, sm, sc, cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval), logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -84,7 +93,7 @@ func newTestBackendWithCache(t *testing.T, c cache.Cache) *testBackend {
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 
-	b := backend.New(repos, c, sm, sc, logger)
+	b := backend.New(repos, c, sm, sc, cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval), logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,
@@ -103,7 +112,7 @@ func newTestBackendWithSDK(t *testing.T, sc synapse.StorageClient) *testBackend 
 	sm := state.NewObjectStateMachine()
 	logger := slog.Default()
 
-	b := backend.New(repos, fsCache, sm, sc, logger)
+	b := backend.New(repos, fsCache, sm, sc, cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval), logger)
 	return &testBackend{
 		backend: b,
 		repos:   repos,

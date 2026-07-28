@@ -38,7 +38,6 @@ func TestRuntimeConfigurationHelpers(t *testing.T) {
 		{input: "LRU", want: cache.EvictionPolicyLRU},
 		{input: " LrU ", want: cache.EvictionPolicyLRU},
 		{input: "after_upload", want: cache.EvictionPolicyAfterUpload},
-		{input: "manual", want: cache.EvictionPolicyNone},
 		{input: "none", want: cache.EvictionPolicyNone},
 	} {
 		got, ok := cache.ParseEvictionPolicy(test.input)

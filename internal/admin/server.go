@@ -69,14 +69,27 @@ type Server struct {
 }
 
 // New creates a new admin HTTP server.
-func New(addr string, db *bun.DB, c cache.Cache, cacheMaxBytes int64, repos *repository.Repositories, wh WorkerHealthChecker, wallet synapse.WalletQuerier, filecoinDefaultCopies int, logger *slog.Logger) *Server {
-	cacheAccess := cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval)
+func New(
+	addr string,
+	db *bun.DB,
+	c cache.Cache,
+	cacheAccess *cacheaccess.Coordinator,
+	cacheMaxBytes int64,
+	repos *repository.Repositories,
+	wh WorkerHealthChecker,
+	wallet synapse.WalletQuerier,
+	filecoinDefaultCopies int,
+	logger *slog.Logger,
+) *Server {
+	if cacheAccess == nil {
+		panic("admin server requires a cache access coordinator")
+	}
 	s := &Server{
 		addr:                     addr,
 		db:                       db,
 		cache:                    c,
 		cacheAccess:              cacheAccess,
-		objectReader:             objectreader.New(repos, c, nil, logger, objectreader.WithCacheAccessCoordinator(cacheAccess)),
+		objectReader:             objectreader.New(repos, c, nil, cacheAccess, logger),
 		cacheMaxBytes:            cacheMaxBytes,
 		repos:                    repos,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
@@ -100,22 +113,13 @@ func (s *Server) WithObjectStorage(storage synapse.StorageClient) *Server {
 	return s
 }
 
-// WithCacheAccessCoordinator shares admin cache opens with final cache deletion.
-func (s *Server) WithCacheAccessCoordinator(coordinator *cacheaccess.Coordinator) *Server {
-	if coordinator != nil {
-		s.cacheAccess = coordinator
-		s.resetObjectReader()
-	}
-	return s
-}
-
 func (s *Server) resetObjectReader() {
 	s.objectReader = objectreader.New(
 		s.repos,
 		s.cache,
 		s.objectStorage,
+		s.cacheAccess,
 		s.logger,
-		objectreader.WithCacheAccessCoordinator(s.cacheAccess),
 	)
 }
 

@@ -782,11 +782,11 @@ func (r *BunObjectRepo) SetVersionCachePresence(ctx context.Context, versionID s
 }
 
 func (r *BunObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
+	accessedAt = accessedAt.UTC().Truncate(time.Microsecond)
 	res, err := r.db.NewUpdate().
 		Model((*model.ObjectVersion)(nil)).
 		Set("in_cache = ?", true).
 		Set("cache_accessed_at = ?", accessedAt).
-		Set("cache_access_generation = ?", CacheAccessGeneration(&accessedAt)).
 		Where("version_id = ? AND is_delete_marker = ?", versionID, false).
 		Exec(ctx)
 	if err != nil {
@@ -810,8 +810,7 @@ func (r *BunObjectRepo) ListLRUEvictionCandidates(
 		ColumnExpr("object_version.object_id").
 		ColumnExpr("object_version.version_id").
 		ColumnExpr("object_version.size").
-		ColumnExpr("object_version.cache_accessed_at").
-		ColumnExpr("object_version.cache_access_generation").
+		ColumnExpr("COALESCE(object_version.cache_accessed_at, object_version.created_at) AS cache_accessed_at").
 		ColumnExpr("object_version.created_at").
 		Join("JOIN storage_uploads AS storage_upload ON storage_upload.id = object_version.storage_upload_id").
 		Where("object_version.in_cache = ?", true).
@@ -834,18 +833,12 @@ func (r *BunObjectRepo) ListLRUEvictionCandidates(
 			  AND terminal_lru_task.ref_type = ?
 			  AND terminal_lru_task.ref_version_id = object_version.version_id
 			  AND terminal_lru_task.status IN (?)
-			  AND terminal_lru_task.idempotency_key = (
-			      ? || object_version.version_id || ':' ||
-			      COALESCE(NULLIF(object_version.cache_access_generation, ''), ?)
-			  )
 			  AND (terminal_lru_task.completed_at IS NULL OR terminal_lru_task.completed_at > ?)
 		)`,
 			model.TaskTypeEvictCache,
 			CacheEvictionStageLRU,
 			"object",
 			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
-			cacheEvictionLRUKeyPrefix,
-			cacheAccessUnaccessed,
 			terminalSince,
 		).
 		OrderExpr("COALESCE(object_version.cache_accessed_at, object_version.created_at) ASC").
@@ -1808,9 +1801,6 @@ func normalizeObjectVersion(version *model.ObjectVersion) {
 			accessedAt = time.Now()
 		}
 		version.CacheAccessedAt = &accessedAt
-	}
-	if version.InCache && !version.IsDeleteMarker && version.CacheAccessGeneration == "" {
-		version.CacheAccessGeneration = CacheAccessGeneration(version.CacheAccessedAt)
 	}
 	if version.ContentType == "" {
 		version.ContentType = "application/octet-stream"

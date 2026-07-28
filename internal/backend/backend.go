@@ -69,21 +69,23 @@ func WithEvictionPolicy(policy cache.EvictionPolicy) Option {
 	}
 }
 
-// WithCacheAccessCoordinator shares cache opens with final cache deletion.
-func WithCacheAccessCoordinator(coordinator *cacheaccess.Coordinator) Option {
-	return func(b *SynapseBackend) {
-		if coordinator != nil {
-			b.cacheAccess = coordinator
-		}
-	}
-}
-
 // New creates a new SynapseBackend.
-func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc synapse.StorageClient, logger *slog.Logger, opts ...Option) *SynapseBackend {
+func New(
+	repos *repository.Repositories,
+	c cache.Cache,
+	sm *state.Machine,
+	sc synapse.StorageClient,
+	cacheAccess *cacheaccess.Coordinator,
+	logger *slog.Logger,
+	opts ...Option,
+) *SynapseBackend {
+	if cacheAccess == nil {
+		panic("backend requires a cache access coordinator")
+	}
 	b := &SynapseBackend{
 		repos:                    repos,
 		cache:                    c,
-		cacheAccess:              cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		cacheAccess:              cacheAccess,
 		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
 		stateMachine:             sm,
 		storage:                  sc,
@@ -100,8 +102,8 @@ func New(repos *repository.Repositories, c cache.Cache, sm *state.Machine, sc sy
 		repos,
 		c,
 		sc,
+		cacheAccess,
 		logger,
-		objectreader.WithCacheAccessCoordinator(b.cacheAccess),
 	)
 	return b
 }

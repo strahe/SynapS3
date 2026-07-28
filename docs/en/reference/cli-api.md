@@ -97,7 +97,7 @@ Admin global flags must appear after `admin` and before the subcommand:
 
 Task listing supports `--type`, `--stage`, `--status`, `--limit`, and `--offset`. `--stage` requires `--type`.
 
-Cache eviction policy accepts `lru`, `after_upload`, or `none`. Input is case-insensitive, and the legacy value `manual` is saved as `none`. LRU watermarks must satisfy `0 <= low < high <= 100`; these settings are retained but inactive under the other policies.
+Cache eviction policy accepts `lru`, `after_upload`, or `none`. LRU watermarks must satisfy `0 <= low < high <= 100`; these settings are retained but inactive under the other policies.
 
 ## Settings Safety
 

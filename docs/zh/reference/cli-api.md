@@ -97,7 +97,7 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 
 列出后台任务时支持 `--type`、`--stage`、`--status`、`--limit` 和 `--offset`。`--stage` 必须与 `--type` 一起使用。
 
-缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。输入不区分大小写，旧值 `manual` 会保存为 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
+缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
 
 ## 设置安全
 

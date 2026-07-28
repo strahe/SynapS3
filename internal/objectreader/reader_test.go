@@ -13,11 +13,28 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/storage"
 )
+
+func newTestReader(
+	repos *repository.Repositories,
+	c cache.Cache,
+	storageClient synapse.StorageClient,
+	logger *slog.Logger,
+) *Reader {
+	return New(
+		repos,
+		c,
+		storageClient,
+		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		logger,
+	)
+}
 
 func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	var rehydrated []byte
@@ -71,7 +88,7 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
 		},
 	}
-	reader := New(repos, mc, storageClient, slog.Default())
+	reader := newTestReader(repos, mc, storageClient, slog.Default())
 
 	got, err := reader.Open(ctx, "reader-bucket", "remote.txt", S3Visibility)
 	if err != nil {
@@ -153,7 +170,7 @@ func TestOpenVersionForCopyUsesProviderWithoutRehydratingSourceCache(t *testing.
 			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
 		},
 	}
-	reader := New(repos, mc, storageClient, slog.Default())
+	reader := newTestReader(repos, mc, storageClient, slog.Default())
 
 	got, err := reader.OpenVersionForCopy(ctx, bucket.Name, version.Key, version.VersionID, S3Visibility)
 	if err != nil {
@@ -236,7 +253,7 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
 		},
 	}
-	reader := New(repos, mc, storageClient, slog.Default())
+	reader := newTestReader(repos, mc, storageClient, slog.Default())
 
 	got, err := reader.Open(ctx, bucket.Name, "replicating.txt", S3Visibility)
 	if err != nil {
@@ -285,7 +302,7 @@ func TestOpenCacheHitCoalescesAccessPersistenceWithoutLifecyclePresenceWrite(t *
 	objects := &countingObjectRepo{ObjectRepository: repos.Objects}
 	repos.Objects = objects
 
-	reader := New(repos, mc, nil, slog.Default())
+	reader := newTestReader(repos, mc, nil, slog.Default())
 	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -365,7 +382,7 @@ func TestOpenCacheHitIgnoresCacheAccessPersistenceFailure(t *testing.T) {
 	}
 	repos.Objects = objects
 
-	reader := New(repos, mc, nil, slog.Default())
+	reader := newTestReader(repos, mc, nil, slog.Default())
 	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -411,7 +428,7 @@ func TestOpenCacheMissMarksCacheLocationAbsent(t *testing.T) {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 
-	reader := New(repos, mc, nil, slog.Default())
+	reader := newTestReader(repos, mc, nil, slog.Default())
 	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
 	if err == nil {
 		_ = got.Body.Close()
@@ -472,7 +489,7 @@ func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
 			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
 		},
 	}
-	reader := New(repos, mc, storageClient, slog.Default())
+	reader := newTestReader(repos, mc, storageClient, slog.Default())
 	got, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -552,7 +569,7 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
 		},
 	}
-	reader := New(repos, mc, storageClient, slog.Default())
+	reader := newTestReader(repos, mc, storageClient, slog.Default())
 
 	got, err := reader.Open(ctx, bucket.Name, "changed.txt", S3Visibility)
 	if err == nil {
@@ -620,7 +637,7 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 			return io.NopCloser(bytes.NewReader([]byte("old"))), nil
 		},
 	}
-	reader := New(repos, mc, storageClient, slog.Default())
+	reader := newTestReader(repos, mc, storageClient, slog.Default())
 
 	got, err := reader.OpenVersion(ctx, bucket.Name, "changed.txt", oldVersion.VersionID, S3Visibility)
 	if err != nil {

@@ -506,7 +506,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_TIMEOUT", "4s")
 	t.Setenv("SYNAPS3_FILECOIN_OBSERVABILITY_CONCURRENCY", "6")
 	t.Setenv("SYNAPS3_CACHE_MAX_SIZE_GB", "7")
-	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "manual")
+	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "After_Upload")
 	t.Setenv("SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", "88")
 	t.Setenv("SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", "73")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
@@ -539,7 +539,7 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 		t.Fatalf("filecoin observability = %#v, want env values", cfg.Filecoin.Observability)
 	}
 	if cfg.Cache.MaxSizeGB != 7 ||
-		cfg.Cache.EvictionPolicy != "none" ||
+		cfg.Cache.EvictionPolicy != "after_upload" ||
 		cfg.Cache.LRUHighWatermarkPercent != 88 ||
 		cfg.Cache.LRULowWatermarkPercent != 73 {
 		t.Fatalf("cache config = %#v, want env values", cfg.Cache)
@@ -764,7 +764,7 @@ func TestValidate_AdminAddr_Empty(t *testing.T) {
 }
 
 func TestValidate_EvictionPolicy_CaseInsensitive(t *testing.T) {
-	for _, policy := range []string{"LRU", "After_Upload", "Manual", "NONE", "lru", "after_upload", "manual", "none"} {
+	for _, policy := range []string{"LRU", "After_Upload", "NONE", "lru", "after_upload", "none"} {
 		cfg := validConfig()
 		cfg.Cache.EvictionPolicy = policy
 		if err := cfg.Validate(); err != nil {
@@ -780,7 +780,6 @@ func TestNormalizeEvictionPolicy(t *testing.T) {
 	}{
 		{input: " LRU ", want: "lru"},
 		{input: "After_Upload", want: "after_upload"},
-		{input: "Manual", want: "none"},
 		{input: "NONE", want: "none"},
 	} {
 		cfg := validConfig()
@@ -789,53 +788,6 @@ func TestNormalizeEvictionPolicy(t *testing.T) {
 		if cfg.Cache.EvictionPolicy != tt.want {
 			t.Errorf("Normalize eviction_policy %q = %q, want %q", tt.input, cfg.Cache.EvictionPolicy, tt.want)
 		}
-	}
-}
-
-func TestLoadDetectsLegacyLRUConfigForStartupWarning(t *testing.T) {
-	for _, tt := range []struct {
-		name    string
-		content string
-		want    bool
-	}{
-		{
-			name:    "explicit legacy lru",
-			content: "[cache]\neviction_policy = \"lru\"\n",
-			want:    true,
-		},
-		{
-			name:    "implicit legacy default",
-			content: "[cache]\nmax_size_gb = 100\n",
-			want:    true,
-		},
-		{
-			name: "capacity watermarks present",
-			content: `[cache]
-eviction_policy = "lru"
-lru_high_watermark_percent = 90
-lru_low_watermark_percent = 80
-`,
-			want: false,
-		},
-		{
-			name:    "after upload",
-			content: "[cache]\neviction_policy = \"after_upload\"\n",
-			want:    false,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.toml")
-			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
-				t.Fatalf("write config: %v", err)
-			}
-			cfg, err := LoadFile(path)
-			if err != nil {
-				t.Fatalf("LoadFile: %v", err)
-			}
-			if got := cfg.ShouldWarnLRUBehaviorChange(); got != tt.want {
-				t.Fatalf("ShouldWarnLRUBehaviorChange() = %v, want %v", got, tt.want)
-			}
-		})
 	}
 }
 

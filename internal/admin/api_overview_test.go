@@ -52,7 +52,7 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	overviewSeedTask(t, repos, model.TaskTypeUpload, "ingress_store", model.TaskStatusFailed)
 	overviewSeedTask(t, repos, model.TaskTypeEvictCache, "", model.TaskStatusExhausted)
 
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir(), usedByte: 42}, 100, repos, &stubWorkerHealth{health: map[string]bool{"uploader": true}}, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir(), usedByte: 42}, 100, repos, &stubWorkerHealth{health: map[string]bool{"uploader": true}}, nil, config.DefaultFilecoinCopies, testLogger())
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/overview", nil)
 	srv.handleAPIOverview(rr, req)
@@ -137,7 +137,7 @@ func TestAPIOverviewFilecoinStorageHealthUsesObservabilitySummaries(t *testing.T
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
 				providers: observability.ProviderStatePage{
@@ -172,7 +172,7 @@ func TestAPIOverviewFilecoinStorageHealthWarnsForObservabilitySignalsWithoutRein
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
 				providers: observability.ProviderStatePage{
@@ -198,7 +198,7 @@ func TestAPIOverviewFilecoinStorageHealthRollsUpBlockingObservabilitySignal(t *t
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
 				providers: observability.ProviderStatePage{
@@ -223,7 +223,7 @@ func TestAPIOverviewFilecoinStorageHealthRollsUpBlockingObservabilitySignal(t *t
 func TestAPIOverviewFilecoinStorageHealthHandlesMissingObservability(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 
 	body := decodeOverviewResponse(t, srv)
 	if body.FilecoinStorageHealth.Level != observability.SignalWarning {
@@ -240,7 +240,7 @@ func TestAPIOverviewFilecoinStorageHealthHandlesMissingObservability(t *testing.
 func TestAPIOverviewFilecoinStorageHealthHandlesObservabilityQueryFailures(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
 				providerErr: errors.New("provider rpc failed with sensitive detail"),
@@ -268,7 +268,7 @@ func TestAPIOverviewFilecoinStorageHealthIgnoresTaskPressure(t *testing.T) {
 	overviewSeedTask(t, repos, model.TaskTypeUpload, "ingress_store", model.TaskStatusRunning)
 	overviewSeedTask(t, repos, model.TaskTypeUpload, "ingress_store", model.TaskStatusFailed)
 	overviewSeedTask(t, repos, model.TaskTypeEvictCache, "", model.TaskStatusExhausted)
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
 				providers: observability.ProviderStatePage{
@@ -304,7 +304,7 @@ func TestAPIOverviewDoesNotCallFilecoinReadiness(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	probe := &fakeFilecoinReadinessProbe{}
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithFilecoinReadiness(probe)
 
 	_ = decodeOverviewResponse(t, srv)

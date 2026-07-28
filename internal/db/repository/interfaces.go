@@ -88,12 +88,11 @@ type ObjectVersionRef struct {
 // CacheEvictionCandidate is the persisted snapshot needed to plan one LRU
 // cache eviction without exposing it through object APIs.
 type CacheEvictionCandidate struct {
-	ObjectID              int64      `bun:"object_id"`
-	VersionID             string     `bun:"version_id"`
-	Size                  int64      `bun:"size"`
-	CacheAccessedAt       *time.Time `bun:"cache_accessed_at"`
-	CacheAccessGeneration string     `bun:"cache_access_generation"`
-	CreatedAt             time.Time  `bun:"created_at"`
+	ObjectID        int64      `bun:"object_id"`
+	VersionID       string     `bun:"version_id"`
+	Size            int64      `bun:"size"`
+	CacheAccessedAt *time.Time `bun:"cache_accessed_at"`
+	CreatedAt       time.Time  `bun:"created_at"`
 }
 
 type DeleteObjectVersionInput struct {
@@ -446,9 +445,9 @@ type TaskRepository interface {
 	// CreateOrReactivateCancelled creates a task or requeues the existing
 	// cancelled task with the same idempotency key. Other terminal tasks stay terminal.
 	CreateOrReactivateCancelled(ctx context.Context, task *model.Task) (bool, error)
-	// CreateOrReactivateRecoverable also requeues failed or exhausted work once
-	// its completion time is at or before terminalBefore.
-	CreateOrReactivateRecoverable(ctx context.Context, task *model.Task, terminalBefore time.Time) (bool, error)
+	// CreateOrReactivateLRU reuses the stable task for a cached version.
+	// Failed or exhausted work observes the requested cooldown.
+	CreateOrReactivateLRU(ctx context.Context, task *model.Task, terminalBefore time.Time) (bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
 
 	// ClaimReady atomically claims one ready task of the given type by

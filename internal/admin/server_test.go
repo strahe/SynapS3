@@ -13,10 +13,13 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/uptrace/bun"
 )
 
 // stubCache implements the subset of cache.Cache needed for health checks.
@@ -36,12 +39,37 @@ type stubWorkerHealth struct {
 
 func (s *stubWorkerHealth) WorkerHealth() map[string]bool { return s.health }
 
+func newTestServer(
+	addr string,
+	db *bun.DB,
+	c cache.Cache,
+	cacheMaxBytes int64,
+	repos *repository.Repositories,
+	health WorkerHealthChecker,
+	wallet synapse.WalletQuerier,
+	filecoinDefaultCopies int,
+	logger *slog.Logger,
+) *Server {
+	return New(
+		addr,
+		db,
+		c,
+		cacheaccess.NewCoordinator(cacheaccess.DefaultPersistenceInterval),
+		cacheMaxBytes,
+		repos,
+		health,
+		wallet,
+		filecoinDefaultCopies,
+		logger,
+	)
+}
+
 func TestHealthz_Healthy(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir, usedByte: 42}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -77,7 +105,7 @@ func TestHealthz_DBDown(t *testing.T) {
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -111,7 +139,7 @@ func TestMetrics_Endpoint(t *testing.T) {
 	cacheDir := t.TempDir()
 	sc := &stubCache{rootDir: cacheDir}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
 
 	// Increment metrics so we can verify their presence.
 	ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
@@ -165,7 +193,7 @@ func TestHealthz_CacheDirMissing(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	sc := &stubCache{rootDir: "/nonexistent/path/that/does/not/exist"}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, sc, 107374182400, repository.NewRepositories(db), nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -209,7 +237,7 @@ func TestHealthz_WorkerUnhealthy(t *testing.T) {
 		"onchain":  false,
 	}}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -255,7 +283,7 @@ func TestHealthz_WorkerHealthy(t *testing.T) {
 		"proofset": true,
 	}}
 
-	srv := New(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, sc, 107374182400, repository.NewRepositories(db), wh, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 
@@ -291,7 +319,7 @@ func TestRefreshMetrics(t *testing.T) {
 	sc := &stubCache{rootDir: cacheDir}
 
 	repos := repository.NewRepositories(db)
-	srv := New(":0", db, sc, 107374182400, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, sc, 107374182400, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 
 	ctx := context.Background()
 

@@ -114,7 +114,7 @@ synaps3 admin settings get cache.lru_low_watermark_percent
 
 LRU 无法清理 multipart 暂存数据、尚未远端持久化的版本，或没有可读已提交远端副本的版本。写入不会同步触发淘汰，因此在 Evictor 追赶完成或出现安全候选前，仍可能继续返回 `507 Insufficient Storage`。
 
-LRU 删除失败后，任务仍会作为 exhausted 工作保留。如果缓存仍高于水位，SynapS3 会在一小时冷却后复用同一访问代际的任务；后续持久化的新访问会作为新代际规划。先修复任务中报告的文件系统或数据库问题；需要立即执行时，运行 `synaps3 admin task retry <id>`。
+LRU 删除失败后，任务仍会作为 exhausted 工作保留，并在一小时冷却后重新具备执行资格。先修复任务中报告的文件系统或数据库问题；需要提前重试时，运行 `synaps3 admin task retry <id>`。
 
 修改缓存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get` 验证实际生效的缓存设置。
 

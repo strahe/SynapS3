@@ -279,7 +279,7 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			Fields: []initFieldDescriptor{
 				{Field: "cache.dir", Key: "dir", Value: quoteTOMLString(cfg.Cache.Dir), Enabled: !saveMode || presence.CacheDir, Notes: []string{"Enabled so this installation uses the initialized cache directory."}},
 				{Field: "cache.max_size_gb", Key: "max_size_gb", Value: strconv.Itoa(cfg.Cache.MaxSizeGB), Enabled: saveMode},
-				{Field: "cache.eviction_policy", Key: "eviction_policy", Value: quoteTOMLString(cfg.Cache.EvictionPolicy), Enabled: saveMode, Notes: []string{"Allowed: lru, after_upload, none.", "The legacy manual value is read as none."}},
+				{Field: "cache.eviction_policy", Key: "eviction_policy", Value: quoteTOMLString(cfg.Cache.EvictionPolicy), Enabled: saveMode, Notes: []string{"Allowed: lru, after_upload, none."}},
 				{Field: "cache.lru_high_watermark_percent", Key: "lru_high_watermark_percent", Value: strconv.Itoa(cfg.Cache.LRUHighWatermarkPercent), Enabled: saveMode},
 				{Field: "cache.lru_low_watermark_percent", Key: "lru_low_watermark_percent", Value: strconv.Itoa(cfg.Cache.LRULowWatermarkPercent), Enabled: saveMode},
 			},

@@ -96,7 +96,7 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 	}
 
 	nonce := uint64(7)
-	srv := New(":0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
+	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
 		info: &synapse.WalletInfo{
 			Address:              "0xabc",
 			Network:              "mainnet",
@@ -391,7 +391,7 @@ func newWalletOperationTestServer(t *testing.T) (*Server, *repository.Repositori
 
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	srv := New("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
+	srv := newTestServer("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
 		info: &synapse.WalletInfo{Address: "0xabc"},
 	}, config.DefaultFilecoinCopies, testLogger())
 	return srv, repos

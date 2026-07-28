@@ -30,20 +30,6 @@ docker compose stop synaps3
 
 Keep every backup artifact at the same recovery point. Follow [Runtime Data](../configuration/runtime-data.md) for exact backup, verification, and restart steps.
 
-## Cache Policy Upgrade Notes
-
-The `lru` policy now means capacity-based least-recently-used eviction. Earlier releases used that name for removal immediately after remote upload.
-
-- To preserve the earlier behavior, set `cache.eviction_policy = "after_upload"` before or immediately after upgrading.
-- Keep `lru` to use the default `90%` high and `80%` low watermarks, or set both values explicitly.
-- The legacy `manual` value is accepted as `none` and is saved back as `none`.
-
-When an existing config selects `lru` but does not contain either watermark setting, startup logs a warning that describes the capacity-based behavior and names `after_upload` as the alternative.
-
-The migration adds per-version cache access tracking. Existing versions start in LRU order from their creation time until they are read. Active legacy eviction tasks without a strategy stage are cancelled and their leases are cleared; terminal task history is retained. A down migration removes the new schema but does not restore those cancelled tasks.
-
-On startup, SynapS3 cancels active eviction tasks that do not match the selected policy. Switching to `after_upload` does not scan or backfill every already-stored version; it applies when a new upload completes or an interrupted upload is finalized during recovery. Previously cancelled, failed, exhausted, and completed `after_upload` tasks remain terminal unless the same upload workflow reaches its normal task-creation step again.
-
 ## Upgrade Docker Compose
 
 ```bash

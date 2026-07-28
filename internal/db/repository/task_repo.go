@@ -51,12 +51,40 @@ func (r *BunTaskRepo) CreateOrReactivateCancelled(ctx context.Context, task *mod
 	return r.createOrReactivate(ctx, task, nil)
 }
 
-func (r *BunTaskRepo) CreateOrReactivateRecoverable(
+func (r *BunTaskRepo) CreateOrReactivateLRU(
 	ctx context.Context,
 	task *model.Task,
 	terminalBefore time.Time,
 ) (bool, error) {
-	return r.createOrReactivate(ctx, task, &terminalBefore)
+	if task == nil || task.Stage == nil || *task.Stage != CacheEvictionStageLRU {
+		return false, errors.New("reactivating LRU task: LRU stage is required")
+	}
+	if err := r.Create(ctx, task); err == nil {
+		return true, nil
+	} else if !errors.Is(err, ErrAlreadyExists) {
+		return false, err
+	}
+
+	now := time.Now()
+	q := r.reactivationQuery(task, now).
+		Where(`(
+			status IN (?)
+			OR (
+				status IN (?)
+				AND completed_at IS NOT NULL
+				AND completed_at <= ?
+			)
+		)`,
+			bun.List([]model.TaskStatus{model.TaskStatusCancelled, model.TaskStatusCompleted}),
+			bun.List([]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusExhausted}),
+			terminalBefore,
+		)
+	res, err := q.Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reactivating LRU task %q: %w", task.IdempotencyKey, err)
+	}
+	rows, _ := res.RowsAffected()
+	return rows > 0, nil
 }
 
 func (r *BunTaskRepo) createOrReactivate(
@@ -70,28 +98,9 @@ func (r *BunTaskRepo) createOrReactivate(
 		return false, err
 	}
 
-	now := time.Now()
 	normalizeTaskStage(task)
-	q := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("type = ?", task.Type).
-		Set("stage = ?", task.Stage).
-		Set("ref_type = ?", task.RefType).
-		Set("ref_id = ?", task.RefID).
-		Set("ref_version_id = ?", task.RefVersionID).
-		Set("payload = ?", task.Payload).
-		Set("status = ?", model.TaskStatusQueued).
-		Set("retry_count = 0").
-		Set("max_retries = ?", task.MaxRetries).
-		Set("scheduled_at = ?", now).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Set("completed_at = NULL").
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("status_message = NULL").
-		Where("idempotency_key = ?", task.IdempotencyKey)
+	now := time.Now()
+	q := r.reactivationQuery(task, now)
 	if terminalBefore == nil {
 		q = q.Where("status = ?", model.TaskStatusCancelled)
 	} else {
@@ -115,6 +124,30 @@ func (r *BunTaskRepo) createOrReactivate(
 	}
 	rows, _ := res.RowsAffected()
 	return rows > 0, nil
+}
+
+func (r *BunTaskRepo) reactivationQuery(task *model.Task, now time.Time) *bun.UpdateQuery {
+	normalizeTaskStage(task)
+	return r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("type = ?", task.Type).
+		Set("stage = ?", task.Stage).
+		Set("ref_type = ?", task.RefType).
+		Set("ref_id = ?", task.RefID).
+		Set("ref_version_id = ?", task.RefVersionID).
+		Set("payload = ?", task.Payload).
+		Set("status = ?", model.TaskStatusQueued).
+		Set("retry_count = 0").
+		Set("max_retries = ?", task.MaxRetries).
+		Set("scheduled_at = ?", now).
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
+		Set("completed_at = NULL").
+		Set("last_error = NULL").
+		Set("wait_reason = NULL").
+		Set("status_message = NULL").
+		Where("idempotency_key = ?", task.IdempotencyKey)
 }
 
 func normalizeTaskStage(task *model.Task) {

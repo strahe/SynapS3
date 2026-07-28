@@ -161,7 +161,7 @@ func TestTaskRepo_CreateOrReactivateCancelledOnlyRequeuesCancelledTask(t *testin
 	}
 }
 
-func TestTaskRepo_CreateOrReactivateRecoverableHonorsTerminalCooldown(t *testing.T) {
+func TestTaskRepo_CreateOrReactivateLRUHonorsTerminalCooldown(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -174,7 +174,7 @@ func TestTaskRepo_CreateOrReactivateRecoverableHonorsTerminalCooldown(t *testing
 		RefType:        "object",
 		RefID:          12,
 		RefVersionID:   "01J0000000000000000000CR02",
-		IdempotencyKey: "evict_cache:lru:01J0000000000000000000CR02:access",
+		IdempotencyKey: repository.LRUEvictionTaskKey("01J0000000000000000000CR02"),
 		Status:         model.TaskStatusExhausted,
 		RetryCount:     3,
 		MaxRetries:     3,
@@ -197,26 +197,26 @@ func TestTaskRepo_CreateOrReactivateRecoverableHonorsTerminalCooldown(t *testing
 		ScheduledAt:    time.Now(),
 	}
 
-	activated, err := repos.Tasks.CreateOrReactivateRecoverable(
+	activated, err := repos.Tasks.CreateOrReactivateLRU(
 		ctx,
 		replacement,
 		time.Now().Add(-time.Hour),
 	)
 	if err != nil {
-		t.Fatalf("CreateOrReactivateRecoverable(recent): %v", err)
+		t.Fatalf("CreateOrReactivateLRU(recent): %v", err)
 	}
 	if activated {
 		t.Fatal("recent exhausted task activated before cooldown")
 	}
 
 	mustExec(t, db, `UPDATE tasks SET completed_at = ? WHERE id = ?`, time.Now().Add(-2*time.Hour), original.ID)
-	activated, err = repos.Tasks.CreateOrReactivateRecoverable(
+	activated, err = repos.Tasks.CreateOrReactivateLRU(
 		ctx,
 		replacement,
 		time.Now().Add(-time.Hour),
 	)
 	if err != nil {
-		t.Fatalf("CreateOrReactivateRecoverable(cooled): %v", err)
+		t.Fatalf("CreateOrReactivateLRU(cooled): %v", err)
 	}
 	if !activated {
 		t.Fatal("cooled exhausted task activated = false, want true")
@@ -231,6 +231,27 @@ func TestTaskRepo_CreateOrReactivateRecoverableHonorsTerminalCooldown(t *testing
 		got.CompletedAt != nil ||
 		got.LastError != nil {
 		t.Fatalf("reactivated recoverable task = %#v, want reset queued task", got)
+	}
+
+	completedAt = time.Now()
+	mustExec(
+		t,
+		db,
+		`UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?`,
+		model.TaskStatusCompleted,
+		completedAt,
+		original.ID,
+	)
+	activated, err = repos.Tasks.CreateOrReactivateLRU(
+		ctx,
+		replacement,
+		time.Now().Add(-time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("CreateOrReactivateLRU(completed): %v", err)
+	}
+	if !activated {
+		t.Fatal("completed LRU task activated = false, want true")
 	}
 }
 

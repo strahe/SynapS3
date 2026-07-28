@@ -45,7 +45,7 @@ func TestAPIListExhaustedUsesTaskListDTO(t *testing.T) {
 		t.Fatalf("Create task: %v", err)
 	}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/exhausted-tasks", srv.handleListExhausted)
 
@@ -93,7 +93,7 @@ func TestAPIRetryExhaustedHTTPStatuses(t *testing.T) {
 		t.Fatalf("Create task: %v", err)
 	}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/exhausted-tasks/{id}/retry", srv.handleRetryExhausted)
 
@@ -164,7 +164,7 @@ func TestAPITaskStats(t *testing.T) {
 		}
 	}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	rr := httptest.NewRecorder()
 	srv.handleAPITaskStats(rr, httptest.NewRequest(http.MethodGet, "/api/v1/tasks/stats", nil))
 	if rr.Code != http.StatusOK {
@@ -230,7 +230,7 @@ func TestAPITasksStageFilter(t *testing.T) {
 		}
 	}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
 	ts := httptest.NewServer(mux)
@@ -287,7 +287,7 @@ func TestAPITasksReturnsWaitingDetails(t *testing.T) {
 		t.Fatalf("Create task: %v", err)
 	}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
 	ts := httptest.NewServer(mux)
@@ -334,7 +334,7 @@ func TestAPITasksShowsLegacyPayloadStage(t *testing.T) {
 		t.Fatalf("insert legacy task: %v", err)
 	}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
 	ts := httptest.NewServer(mux)
@@ -403,7 +403,7 @@ func TestAPITasksIncludesPrimaryTransferProgress(t *testing.T) {
 		t.Fatalf("Create task: %v", err)
 	}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
 	ts := httptest.NewServer(mux)
@@ -451,7 +451,7 @@ func TestAPITasksSkipsProgressWhenLookupFails(t *testing.T) {
 	}
 	repos.Uploads = failingTaskProgressUploadRepo{StorageUploadRepository: repos.Uploads}
 
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks", srv.handleAPITasks)
 	ts := httptest.NewServer(mux)
@@ -656,7 +656,7 @@ func TestAPITaskRefDetailNonObject(t *testing.T) {
 
 func getTaskRefDetail(t *testing.T, db *bun.DB, repos *repository.Repositories, taskID int64) (taskRefDetailResponse, int) {
 	t.Helper()
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks/{id}/ref-detail", srv.handleAPITaskRefDetail)
 	ts := httptest.NewServer(mux)
@@ -683,7 +683,7 @@ func getTaskRefDetailUploadStatus(t *testing.T, db *bun.DB, repos *repository.Re
 }, int,
 ) {
 	t.Helper()
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks/{id}/ref-detail", srv.handleAPITaskRefDetail)
 	ts := httptest.NewServer(mux)

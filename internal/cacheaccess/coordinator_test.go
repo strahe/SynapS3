@@ -321,6 +321,220 @@ func TestCoordinatorDoesNotRetainFailedCacheOpen(t *testing.T) {
 	}
 }
 
+func TestCoordinatorKeepsDeletionBlockedUntilBodyClose(t *testing.T) {
+	coordinator := NewCoordinator(time.Minute)
+	opened, err := coordinator.Open(
+		context.Background(),
+		"version-open-body",
+		nil,
+		func() (io.ReadCloser, *cache.ObjectInfo, error) {
+			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
+		},
+		func(context.Context, string, time.Time) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	deletionEntered := make(chan struct{})
+	deletionDone := make(chan struct{})
+	go func() {
+		coordinator.GuardDeletion("version-open-body", func(time.Time) bool {
+			close(deletionEntered)
+			return true
+		})
+		close(deletionDone)
+	}()
+
+	select {
+	case <-deletionEntered:
+		t.Fatal("deletion started while the cache response body was still open")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := opened.Body.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-deletionEntered:
+	case <-time.After(time.Second):
+		t.Fatal("deletion did not resume after the cache response body closed")
+	}
+	<-deletionDone
+}
+
+func TestCoordinatorSweepsIdleEntriesAfterPersistingLatestAccess(t *testing.T) {
+	start := time.Date(2026, time.July, 28, 0, 0, 0, 0, time.UTC)
+	now := start
+	coordinator := NewCoordinator(time.Minute)
+	coordinator.now = func() time.Time { return now }
+	coordinator.idleRetention = time.Minute
+	var persisted atomic.Int64
+	persist := func(context.Context, string, time.Time) error {
+		persisted.Add(1)
+		return nil
+	}
+	open := func() (io.ReadCloser, *cache.ObjectInfo, error) {
+		return io.NopCloser(bytes.NewReader(nil)), &cache.ObjectInfo{}, nil
+	}
+
+	first, err := coordinator.Open(context.Background(), "version-idle", nil, open, persist)
+	if err != nil {
+		t.Fatalf("Open(first): %v", err)
+	}
+	_ = first.Body.Close()
+	now = now.Add(30 * time.Second)
+	second, err := coordinator.Open(context.Background(), "version-idle", nil, open, persist)
+	if err != nil {
+		t.Fatalf("Open(second): %v", err)
+	}
+	_ = second.Body.Close()
+	if persisted.Load() != 1 {
+		t.Fatalf("foreground persistence writes = %d, want one coalesced write", persisted.Load())
+	}
+
+	now = now.Add(91 * time.Second)
+	failed, err := coordinator.sweep(context.Background())
+	if err != nil || failed != 0 {
+		t.Fatalf("sweep failed=%d err=%v", failed, err)
+	}
+	if persisted.Load() != 2 {
+		t.Fatalf("persistence writes after sweep = %d, want latest access flushed", persisted.Load())
+	}
+	shard := coordinator.shard("version-idle")
+	shard.mu.Lock()
+	_, retained := shard.entries["version-idle"]
+	shard.mu.Unlock()
+	if retained {
+		t.Fatal("idle coordination entry was retained after a successful sweep")
+	}
+}
+
+func TestCoordinatorCapsCleanEntriesPerShard(t *testing.T) {
+	coordinator := NewCoordinator(time.Minute)
+	coordinator.maxEntriesPerShard = 2
+	target := coordinator.shard("version-capacity")
+	versionIDs := []string{"version-capacity"}
+	for i := 0; len(versionIDs) < 3; i++ {
+		candidate := fmt.Sprintf("version-capacity-%d", i)
+		if coordinator.shard(candidate) == target {
+			versionIDs = append(versionIDs, candidate)
+		}
+	}
+	for _, versionID := range versionIDs {
+		opened, err := coordinator.Open(
+			context.Background(),
+			versionID,
+			nil,
+			func() (io.ReadCloser, *cache.ObjectInfo, error) {
+				return io.NopCloser(bytes.NewReader(nil)), &cache.ObjectInfo{}, nil
+			},
+			func(context.Context, string, time.Time) error { return nil },
+		)
+		if err != nil {
+			t.Fatalf("Open(%s): %v", versionID, err)
+		}
+		_ = opened.Body.Close()
+	}
+
+	target.mu.Lock()
+	entryCount := len(target.entries)
+	target.mu.Unlock()
+	if entryCount != coordinator.maxEntriesPerShard {
+		t.Fatalf("entries in one shard = %d, want cap %d", entryCount, coordinator.maxEntriesPerShard)
+	}
+}
+
+func TestCoordinatorCapsFailedPersistenceEntriesPerShard(t *testing.T) {
+	coordinator := NewCoordinator(time.Minute)
+	coordinator.maxEntriesPerShard = 2
+	target := coordinator.shard("version-failed-capacity")
+	versionIDs := []string{"version-failed-capacity"}
+	for i := 0; len(versionIDs) < 3; i++ {
+		candidate := fmt.Sprintf("version-failed-capacity-%d", i)
+		if coordinator.shard(candidate) == target {
+			versionIDs = append(versionIDs, candidate)
+		}
+	}
+	wantErr := errors.New("database unavailable")
+	for _, versionID := range versionIDs {
+		opened, err := coordinator.Open(
+			context.Background(),
+			versionID,
+			nil,
+			func() (io.ReadCloser, *cache.ObjectInfo, error) {
+				return io.NopCloser(bytes.NewReader(nil)), &cache.ObjectInfo{}, nil
+			},
+			func(context.Context, string, time.Time) error { return wantErr },
+		)
+		if err != nil {
+			t.Fatalf("Open(%s): %v", versionID, err)
+		}
+		if !errors.Is(opened.PersistError, wantErr) {
+			t.Fatalf("Open(%s) PersistError = %v, want %v", versionID, opened.PersistError, wantErr)
+		}
+		_ = opened.Body.Close()
+	}
+
+	target.mu.Lock()
+	entryCount := len(target.entries)
+	target.mu.Unlock()
+	if entryCount != coordinator.maxEntriesPerShard {
+		t.Fatalf("failed persistence entries in one shard = %d, want cap %d", entryCount, coordinator.maxEntriesPerShard)
+	}
+}
+
+func TestCoordinatorReturnsToShardCapAfterConcurrentBodiesClose(t *testing.T) {
+	coordinator := NewCoordinator(time.Minute)
+	coordinator.maxEntriesPerShard = 2
+	target := coordinator.shard("version-active-capacity")
+	var versionIDs []string
+	for i := 0; len(versionIDs) < 4; i++ {
+		candidate := fmt.Sprintf("version-active-capacity-%d", i)
+		if coordinator.shard(candidate) == target {
+			versionIDs = append(versionIDs, candidate)
+		}
+	}
+	var bodies []io.ReadCloser
+	for _, versionID := range versionIDs[:3] {
+		opened, err := coordinator.Open(
+			context.Background(),
+			versionID,
+			nil,
+			func() (io.ReadCloser, *cache.ObjectInfo, error) {
+				return io.NopCloser(bytes.NewReader(nil)), &cache.ObjectInfo{}, nil
+			},
+			func(context.Context, string, time.Time) error { return nil },
+		)
+		if err != nil {
+			t.Fatalf("Open(%s): %v", versionID, err)
+		}
+		bodies = append(bodies, opened.Body)
+	}
+	for _, body := range bodies {
+		_ = body.Close()
+	}
+	opened, err := coordinator.Open(
+		context.Background(),
+		versionIDs[3],
+		nil,
+		func() (io.ReadCloser, *cache.ObjectInfo, error) {
+			return io.NopCloser(bytes.NewReader(nil)), &cache.ObjectInfo{}, nil
+		},
+		func(context.Context, string, time.Time) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("Open(after burst): %v", err)
+	}
+	_ = opened.Body.Close()
+
+	target.mu.Lock()
+	entryCount := len(target.entries)
+	target.mu.Unlock()
+	if entryCount != coordinator.maxEntriesPerShard {
+		t.Fatalf("entries after active burst = %d, want cap %d", entryCount, coordinator.maxEntriesPerShard)
+	}
+}
+
 func collidingVersionID(coordinator *Coordinator, versionID string) string {
 	target := coordinator.shard(versionID)
 	for i := 0; ; i++ {

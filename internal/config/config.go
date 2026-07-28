@@ -35,8 +35,6 @@ type Config struct {
 	Worker   WorkerConfig   `koanf:"worker"`
 	Logging  LoggingConfig  `koanf:"logging"`
 	Admin    AdminConfig    `koanf:"admin"`
-
-	warnLRUBehaviorChange bool
 }
 
 type ServerConfig struct {
@@ -321,7 +319,6 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 	if err := k.Unmarshal("", cfg); err != nil {
 		return nil, PersistedFieldPresence{}, fmt.Errorf("unmarshalling config: %w", err)
 	}
-	cfg.warnLRUBehaviorChange = shouldWarnLRUBehaviorChange(k, fileLoaded)
 	cfg.Normalize()
 	if applyRuntimeDefaults {
 		if err := applyDefaultRuntimePaths(cfg, k.Exists("database.dsn"), k.Exists("cache.dir")); err != nil {
@@ -332,28 +329,8 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 	return cfg, presence, nil
 }
 
-// ShouldWarnLRUBehaviorChange reports whether an existing config selected the
-// legacy lru value without any capacity watermarks.
-func (c *Config) ShouldWarnLRUBehaviorChange() bool {
-	return c != nil && c.warnLRUBehaviorChange
-}
-
-func shouldWarnLRUBehaviorChange(k *koanf.Koanf, fileLoaded bool) bool {
-	if !fileLoaded ||
-		k.Exists("cache.lru_high_watermark_percent") ||
-		k.Exists("cache.lru_low_watermark_percent") {
-		return false
-	}
-	raw := strings.TrimSpace(k.String("cache.eviction_policy"))
-	if raw == "" {
-		return true
-	}
-	policy, ok := cachepkg.ParseEvictionPolicy(raw)
-	return ok && policy == cachepkg.EvictionPolicyLRU
-}
-
-// Normalize canonicalizes compatibility aliases and case-insensitive config
-// values without changing invalid values that validation must report.
+// Normalize canonicalizes case-insensitive config values without changing
+// invalid values that validation must report.
 func (c *Config) Normalize() {
 	if c == nil {
 		return

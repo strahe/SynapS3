@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -15,12 +16,14 @@ const (
 	// keeping the durable LRU order reasonably current across restarts.
 	DefaultPersistenceInterval = time.Minute
 	coordinatorShardCount      = 256
+	defaultEntriesPerShard     = 64
 )
 
 // PersistFunc records one cache access in durable object metadata.
 type PersistFunc func(context.Context, string, time.Time) error
 
-// OpenedCacheEntry is a cache entry opened while serialized with cache deletion.
+// OpenedCacheEntry is a cache entry opened while coordinated with cache
+// deletion. Closing Body releases the deletion guard.
 type OpenedCacheEntry struct {
 	Body         io.ReadCloser
 	Info         *cache.ObjectInfo
@@ -28,8 +31,11 @@ type OpenedCacheEntry struct {
 }
 
 type accessState struct {
-	lastAccess  time.Time
-	lastAttempt time.Time
+	lastAccess    time.Time
+	lastAttempt   time.Time
+	lastPersisted time.Time
+	lastTouched   time.Time
+	persist       PersistFunc
 }
 
 type accessEntry struct {
@@ -37,7 +43,8 @@ type accessEntry struct {
 	stateMu sync.Mutex
 	state   accessState
 
-	// refs and retired are protected by the owning shard mutex.
+	// refs and retired are protected by the owning shard mutex. An open body
+	// owns one ref until Close.
 	refs    int
 	retired bool
 }
@@ -47,28 +54,74 @@ type coordinatorShard struct {
 	entries map[string]*accessEntry
 }
 
-// Coordinator coordinates foreground cache opens with final cache deletion for
-// the same object version and coalesces repeated durable access-time writes.
+type acquiredEntry struct {
+	shard     *coordinatorShard
+	versionID string
+	entry     *accessEntry
+}
+
+// Coordinator coordinates foreground cache reads with physical deletion and
+// coalesces durable access-time writes. It must be shared by every cache reader
+// and deleter in one process.
 type Coordinator struct {
 	persistenceInterval time.Duration
+	sweepInterval       time.Duration
+	idleRetention       time.Duration
+	maxEntriesPerShard  int
 	now                 func() time.Time
 	shards              [coordinatorShardCount]coordinatorShard
 }
 
-// NewCoordinator creates a shared cache-access coordinator.
+// NewCoordinator creates a cache-access coordinator.
 func NewCoordinator(persistenceInterval time.Duration) *Coordinator {
 	if persistenceInterval < 0 {
 		persistenceInterval = 0
 	}
+	sweepInterval := persistenceInterval
+	if sweepInterval <= 0 {
+		sweepInterval = DefaultPersistenceInterval
+	}
 	return &Coordinator{
 		persistenceInterval: persistenceInterval,
+		sweepInterval:       sweepInterval,
+		idleRetention:       2 * sweepInterval,
+		maxEntriesPerShard:  defaultEntriesPerShard,
 		now:                 time.Now,
 	}
 }
 
-// Open coordinates a successful cache open and its in-memory access record with
-// final cache deletion for the same version. Durable access metadata is written
-// at most once per persistence interval for the same version.
+// Run flushes coalesced access times and retires idle coordination entries.
+func (c *Coordinator) Run(ctx context.Context, logger *slog.Logger) {
+	if c == nil {
+		panic("nil cache access coordinator")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ticker := time.NewTicker(c.sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			failed, err := c.sweep(ctx)
+			if err != nil && ctx.Err() == nil {
+				logger.Warn(
+					"flushing cache access timestamps",
+					"failedEntries",
+					failed,
+					"error",
+					err,
+				)
+			}
+		}
+	}
+}
+
+// Open coordinates a successful cache open and keeps deletion blocked until
+// the returned body is closed. Durable metadata is written at most once per
+// persistence interval for the same version.
 func (c *Coordinator) Open(
 	ctx context.Context,
 	versionID string,
@@ -77,21 +130,27 @@ func (c *Coordinator) Open(
 	persist PersistFunc,
 ) (*OpenedCacheEntry, error) {
 	shard, entry := c.acquire(versionID)
-	defer c.release(shard, versionID, entry)
-
 	entry.gate.RLock()
-	defer entry.gate.RUnlock()
 
 	body, info, err := open()
 	if err != nil {
+		entry.gate.RUnlock()
+		c.release(shard, versionID, entry)
 		return nil, err
 	}
 
 	persistErr := c.recordAccess(ctx, entry, versionID, durableAccess, persist, false)
 	c.markActive(shard, entry)
+	guardedBody := &guardedReadCloser{
+		body: body,
+		release: func() {
+			entry.gate.RUnlock()
+			c.release(shard, versionID, entry)
+		},
+	}
 
 	return &OpenedCacheEntry{
-		Body:         body,
+		Body:         guardedBody,
 		Info:         info,
 		PersistError: persistErr,
 	}, nil
@@ -116,19 +175,8 @@ func (c *Coordinator) Record(
 	return err
 }
 
-func nextAccessTime(now, inMemory time.Time, durable *time.Time) time.Time {
-	previous := inMemory
-	if durable != nil && durable.After(previous) {
-		previous = *durable
-	}
-	if !previous.IsZero() && !now.After(previous) {
-		return previous.Add(time.Microsecond)
-	}
-	return now
-}
-
-// GuardDeletion runs the final checks and deletion while cache opens for
-// the same version are blocked. Returning true forgets the removed entry.
+// GuardDeletion serializes final checks and physical deletion with open bodies
+// for the same version. Returning true retires the removed entry.
 func (c *Coordinator) GuardDeletion(versionID string, remove func(lastAccess time.Time) bool) {
 	shard, entry := c.acquire(versionID)
 	defer c.release(shard, versionID, entry)
@@ -147,6 +195,25 @@ func (c *Coordinator) GuardDeletion(versionID string, remove func(lastAccess tim
 	}
 }
 
+func normalizeAccessTime(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
+}
+
+func nextAccessTime(now, inMemory time.Time, durable *time.Time) time.Time {
+	now = normalizeAccessTime(now)
+	previous := normalizeAccessTime(inMemory)
+	if durable != nil {
+		durableTime := normalizeAccessTime(*durable)
+		if durableTime.After(previous) {
+			previous = durableTime
+		}
+	}
+	if !previous.IsZero() && !now.After(previous) {
+		return previous.Add(time.Microsecond)
+	}
+	return now
+}
+
 func (c *Coordinator) recordAccess(
 	ctx context.Context,
 	entry *accessEntry,
@@ -155,21 +222,128 @@ func (c *Coordinator) recordAccess(
 	persist PersistFunc,
 	force bool,
 ) error {
-	entry.stateMu.Lock()
-	defer entry.stateMu.Unlock()
+	now := normalizeAccessTime(c.now())
 
-	now := c.now()
+	entry.stateMu.Lock()
+	if durableAccess != nil {
+		durableTime := normalizeAccessTime(*durableAccess)
+		if durableTime.After(entry.state.lastPersisted) {
+			entry.state.lastPersisted = durableTime
+		}
+	}
 	accessedAt := nextAccessTime(now, entry.state.lastAccess, durableAccess)
 	entry.state.lastAccess = accessedAt
-	if persist == nil ||
-		(!force &&
-			!entry.state.lastAttempt.IsZero() &&
-			c.persistenceInterval != 0 &&
-			now.Sub(entry.state.lastAttempt) < c.persistenceInterval) {
+	entry.state.lastTouched = now
+	if persist != nil {
+		entry.state.persist = persist
+	}
+	shouldPersist := persist != nil &&
+		(force ||
+			entry.state.lastAttempt.IsZero() ||
+			c.persistenceInterval == 0 ||
+			now.Sub(entry.state.lastAttempt) >= c.persistenceInterval)
+	if shouldPersist {
+		entry.state.lastAttempt = now
+	}
+	entry.stateMu.Unlock()
+
+	if !shouldPersist {
 		return nil
 	}
-	entry.state.lastAttempt = now
-	return persist(ctx, versionID, accessedAt)
+	if err := persist(ctx, versionID, accessedAt); err != nil {
+		return err
+	}
+	entry.stateMu.Lock()
+	if accessedAt.After(entry.state.lastPersisted) {
+		entry.state.lastPersisted = accessedAt
+	}
+	entry.stateMu.Unlock()
+	return nil
+}
+
+func (c *Coordinator) sweep(ctx context.Context) (int, error) {
+	now := normalizeAccessTime(c.now())
+	candidates := c.acquireIdleEntries()
+	var (
+		failed   int
+		firstErr error
+	)
+	for _, candidate := range candidates {
+		if ctx.Err() != nil {
+			c.release(candidate.shard, candidate.versionID, candidate.entry)
+			continue
+		}
+		if err := c.flushAndRetire(ctx, candidate, now); err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		c.release(candidate.shard, candidate.versionID, candidate.entry)
+	}
+	return failed, firstErr
+}
+
+func (c *Coordinator) acquireIdleEntries() []acquiredEntry {
+	var candidates []acquiredEntry
+	for index := range c.shards {
+		shard := &c.shards[index]
+		shard.mu.Lock()
+		for versionID, entry := range shard.entries {
+			if entry.refs != 0 {
+				continue
+			}
+			entry.refs++
+			candidates = append(candidates, acquiredEntry{
+				shard:     shard,
+				versionID: versionID,
+				entry:     entry,
+			})
+		}
+		shard.mu.Unlock()
+	}
+	return candidates
+}
+
+func (c *Coordinator) flushAndRetire(
+	ctx context.Context,
+	acquired acquiredEntry,
+	now time.Time,
+) error {
+	entry := acquired.entry
+	entry.gate.Lock()
+	defer entry.gate.Unlock()
+
+	entry.stateMu.Lock()
+	state := entry.state
+	dirty := state.persist != nil && state.lastAccess.After(state.lastPersisted)
+	due := dirty &&
+		(state.lastAttempt.IsZero() ||
+			c.persistenceInterval == 0 ||
+			now.Sub(state.lastAttempt) >= c.persistenceInterval)
+	if due {
+		entry.state.lastAttempt = now
+	}
+	entry.stateMu.Unlock()
+
+	if due {
+		if err := state.persist(ctx, acquired.versionID, state.lastAccess); err != nil {
+			return err
+		}
+		entry.stateMu.Lock()
+		if state.lastAccess.After(entry.state.lastPersisted) {
+			entry.state.lastPersisted = state.lastAccess
+		}
+		state = entry.state
+		entry.stateMu.Unlock()
+	}
+
+	clean := state.persist == nil || !state.lastAccess.After(state.lastPersisted)
+	idle := !state.lastTouched.IsZero() && now.Sub(state.lastTouched) >= c.idleRetention
+	if clean && idle {
+		c.markRetired(acquired.shard, entry)
+	}
+	return nil
 }
 
 func (c *Coordinator) acquire(versionID string) (*coordinatorShard, *accessEntry) {
@@ -182,11 +356,55 @@ func (c *Coordinator) acquire(versionID string) (*coordinatorShard, *accessEntry
 	}
 	entry := shard.entries[versionID]
 	if entry == nil {
+		for c.maxEntriesPerShard > 0 && len(shard.entries) >= c.maxEntriesPerShard {
+			entryCount := len(shard.entries)
+			evictOldestEntryLocked(shard)
+			if len(shard.entries) == entryCount {
+				break
+			}
+		}
 		entry = &accessEntry{retired: true}
 		shard.entries[versionID] = entry
 	}
 	entry.refs++
 	return shard, entry
+}
+
+func evictOldestEntryLocked(shard *coordinatorShard) {
+	var (
+		cleanID      string
+		cleanEntry   *accessEntry
+		cleanTouched time.Time
+		anyID        string
+		anyEntry     *accessEntry
+		anyTouched   time.Time
+	)
+	for versionID, entry := range shard.entries {
+		if entry.refs != 0 {
+			continue
+		}
+		entry.stateMu.Lock()
+		state := entry.state
+		entry.stateMu.Unlock()
+		if anyEntry == nil || state.lastTouched.Before(anyTouched) {
+			anyID = versionID
+			anyEntry = entry
+			anyTouched = state.lastTouched
+		}
+		if (state.persist == nil || !state.lastAccess.After(state.lastPersisted)) &&
+			(cleanEntry == nil || state.lastTouched.Before(cleanTouched)) {
+			cleanID = versionID
+			cleanEntry = entry
+			cleanTouched = state.lastTouched
+		}
+	}
+	if cleanEntry != nil {
+		anyID = cleanID
+		anyEntry = cleanEntry
+	}
+	if anyEntry != nil && shard.entries[anyID] == anyEntry {
+		delete(shard.entries, anyID)
+	}
 }
 
 func (c *Coordinator) release(shard *coordinatorShard, versionID string, entry *accessEntry) {
@@ -218,4 +436,23 @@ func (c *Coordinator) shard(versionID string) *coordinatorShard {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(versionID))
 	return &c.shards[h.Sum32()%coordinatorShardCount]
+}
+
+type guardedReadCloser struct {
+	body     io.ReadCloser
+	release  func()
+	once     sync.Once
+	closeErr error
+}
+
+func (r *guardedReadCloser) Read(p []byte) (int, error) {
+	return r.body.Read(p)
+}
+
+func (r *guardedReadCloser) Close() error {
+	r.once.Do(func() {
+		r.closeErr = r.body.Close()
+		r.release()
+	})
+	return r.closeErr
 }

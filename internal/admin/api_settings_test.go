@@ -733,7 +733,7 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "filecoin default copies", envName: "SYNAPS3_FILECOIN_DEFAULT_COPIES", payload: `{"filecoin":{"default_copies":3}}`, field: "filecoin.default_copies"},
 		{name: "cache dir", envName: "SYNAPS3_CACHE_DIR", payload: `{"cache":{"dir":"/tmp/cache"}}`, field: "cache.dir"},
 		{name: "cache max size", envName: "SYNAPS3_CACHE_MAX_SIZE_GB", payload: `{"cache":{"max_size_gb":8}}`, field: "cache.max_size_gb"},
-		{name: "cache eviction policy", envName: "SYNAPS3_CACHE_EVICTION_POLICY", payload: `{"cache":{"eviction_policy":"manual"}}`, field: "cache.eviction_policy"},
+		{name: "cache eviction policy", envName: "SYNAPS3_CACHE_EVICTION_POLICY", payload: `{"cache":{"eviction_policy":"after_upload"}}`, field: "cache.eviction_policy"},
 		{name: "cache LRU high watermark", envName: "SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", payload: `{"cache":{"lru_high_watermark_percent":85}}`, field: "cache.lru_high_watermark_percent"},
 		{name: "cache LRU low watermark", envName: "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", payload: `{"cache":{"lru_low_watermark_percent":70}}`, field: "cache.lru_low_watermark_percent"},
 		{name: "upload concurrency", envName: "SYNAPS3_WORKER_UPLOAD_CONCURRENCY", payload: `{"worker":{"upload":{"concurrency":2}}}`, field: "worker.upload.concurrency"},

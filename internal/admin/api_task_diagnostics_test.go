@@ -57,7 +57,7 @@ func TestAPITaskDiagnosticGETReturnsEvidence(t *testing.T) {
 		t.Fatalf("Create task: %v", err)
 	}
 	checker := &fakeTaskDiagnosticStatusChecker{}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithTaskDiagnosticStatusChecker(checker)
 	body, status := getTaskDiagnostic(t, srv, task.ID)
 	if status != http.StatusOK {
@@ -91,7 +91,7 @@ func TestAPITaskDiagnosticRefreshChecksLiveStatusWithoutMutatingTask(t *testing.
 			ConfirmedPieceIDs: []string{"2001"},
 		},
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos)).
 		WithTaskDiagnosticStatusChecker(checker)
 
@@ -126,7 +126,7 @@ func TestAPITaskDiagnosticRefreshPassesDataSetCreationEvidence(t *testing.T) {
 			DataSetCreated: false,
 		},
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos)).
 		WithTaskDiagnosticStatusChecker(checker)
 
@@ -155,7 +155,7 @@ func TestAPITaskDiagnosticRefreshUnavailableStillReturnsDiagnostic(t *testing.T)
 			Error:     "context deadline exceeded",
 		},
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos)).
 		WithTaskDiagnosticStatusChecker(checker)
 
@@ -200,7 +200,7 @@ func TestAPITaskDiagnosticRefreshOmitsUncertainLiveEvidence(t *testing.T) {
 			repos := repository.NewRepositories(db)
 			task, _ := seedTaskDiagnosticCommitTask(t, db, repos, "task-diagnostic-refresh-uncertain-"+tc.name, "01J000000000000000DIAG004")
 			checker := &fakeTaskDiagnosticStatusChecker{addPiecesResult: tc.result}
-			srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+			srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 				WithObservability(taskDiagnosticObservabilityService(t, repos)).
 				WithTaskDiagnosticStatusChecker(checker)
 
@@ -243,7 +243,7 @@ func TestAPITaskDiagnosticRefreshEncodesFalseLiveCheckFields(t *testing.T) {
 			PieceCount:  1,
 		},
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos)).
 		WithTaskDiagnosticStatusChecker(checker)
 
@@ -276,7 +276,7 @@ func TestAPITaskDiagnosticRefreshEncodesZeroAndEmptyAddPiecesEvidence(t *testing
 			ConfirmedPieceIDs: []string{},
 		},
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos)).
 		WithTaskDiagnosticStatusChecker(checker)
 
@@ -307,7 +307,7 @@ func TestAPITaskDiagnosticRefreshMissingProviderServiceURLReturnsDiagnosticUnava
 	if err != nil {
 		t.Fatalf("GetByID before: %v", err)
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 
 	body, status := refreshTaskDiagnostic(t, srv, task.ID)
 	if status != http.StatusOK {
@@ -347,7 +347,7 @@ func TestAPITaskDiagnosticRefreshSkipsLiveCheckWithoutTransactionEvidence(t *tes
 		t.Fatalf("Create task: %v", err)
 	}
 	checker := &fakeTaskDiagnosticStatusChecker{}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithTaskDiagnosticStatusChecker(checker)
 
 	body, status := refreshTaskDiagnostic(t, srv, task.ID)
@@ -375,7 +375,7 @@ func TestAPITaskDiagnosticRefreshSkipsAddPiecesWithoutCommitTransactionID(t *tes
 		t.Fatalf("clear commit transaction: %v", err)
 	}
 	checker := &fakeTaskDiagnosticStatusChecker{}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos)).
 		WithTaskDiagnosticStatusChecker(checker)
 
@@ -414,7 +414,7 @@ func TestAPITaskDiagnosticMissingCopyIndexDoesNotReadReplicaZero(t *testing.T) {
 	if err := repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("Create task: %v", err)
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos))
 
 	body, status := getTaskDiagnostic(t, srv, task.ID)
@@ -449,7 +449,7 @@ func TestAPITaskDiagnosticMissingUploadIDDoesNotFallbackToLatestUpload(t *testin
 	if err := repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("Create task: %v", err)
 	}
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(taskDiagnosticObservabilityService(t, repos))
 
 	body, status := getTaskDiagnostic(t, srv, task.ID)
@@ -464,7 +464,7 @@ func TestAPITaskDiagnosticMissingUploadIDDoesNotFallbackToLatestUpload(t *testin
 func TestAPITaskDiagnosticInvalidIDReturns400(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 
 	_, status := getTaskDiagnostic(t, srv, 0)
 	if status != http.StatusBadRequest {
@@ -475,7 +475,7 @@ func TestAPITaskDiagnosticInvalidIDReturns400(t *testing.T) {
 func TestAPITaskDiagnosticMissingTaskReturns404(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	srv := New(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	_, status := getTaskDiagnostic(t, srv, 404)
 	if status != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", status)

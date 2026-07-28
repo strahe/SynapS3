@@ -324,7 +324,7 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	cfg.Filecoin.WithCDN = true
 	cfg.Filecoin.AllowPrivateNetworks = true
 	cfg.Cache.MaxSizeGB = 42
-	cfg.Cache.EvictionPolicy = "Manual"
+	cfg.Cache.EvictionPolicy = "NONE"
 	cfg.Cache.LRUHighWatermarkPercent = 87
 	cfg.Cache.LRULowWatermarkPercent = 72
 	cfg.Worker.Upload.PollInterval = 7 * time.Second
