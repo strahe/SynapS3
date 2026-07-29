@@ -34,8 +34,9 @@ COPY --from=frontend /ui/dist /src/ui/dist
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
+ARG CGO_CFLAGS="-O2 -D__BLST_PORTABLE__"
 
-RUN CGO_ENABLED=1 go build -trimpath \
+RUN CGO_ENABLED=1 CGO_CFLAGS="${CGO_CFLAGS}" go build -trimpath \
     -ldflags "-X github.com/strahe/synaps3/internal/buildinfo.Version=${VERSION} \
               -X github.com/strahe/synaps3/internal/buildinfo.Commit=${COMMIT} \
               -X github.com/strahe/synaps3/internal/buildinfo.Date=${BUILD_DATE}" \

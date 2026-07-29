@@ -14,6 +14,22 @@ The container stores runtime data under `/var/lib/synaps3`, exposes the S3 API o
 - SSH access if the dashboard is reached from another machine.
 - A Calibration wallet you can fund, or use the wallet steps below.
 
+## Choose the Image Source
+
+The default deployment uses the published image from `compose.yaml`. Continue with [Prepare Configuration](#prepare-configuration) to use it.
+
+### Build the Image from Source
+
+Install Git, then clone the full source tree and build the image:
+
+```bash
+git clone https://github.com/strahe/SynapS3.git
+cd SynapS3
+docker compose -f compose.yaml -f compose.local.yaml build --no-cache
+```
+
+When using the local image, skip the deployment directory and download commands in the next section. For every later command in this guide, replace `docker compose` with `docker compose -f compose.yaml -f compose.local.yaml`.
+
 ## Prepare Configuration
 
 Create a deployment directory with the Compose file:
