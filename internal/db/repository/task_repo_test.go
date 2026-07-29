@@ -469,16 +469,40 @@ func TestTaskRepo_CompleteWithMessage(t *testing.T) {
 	}
 }
 
-func TestTaskRepo_Complete_NotRunning(t *testing.T) {
+func TestTaskRepo_StateTransitionsRejectInvalidStatus(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	seeded := seedTask(t, repos, model.TaskTypeUpload)
-	// Try to complete a queued task — should fail.
-	err := repos.Tasks.Complete(ctx, seeded)
-	if err == nil {
-		t.Fatal("expected error completing queued task")
+	for _, tc := range []struct {
+		name string
+		fn   func(seeded *model.Task) error
+	}{
+		{
+			name: "Complete not running",
+			fn: func(seeded *model.Task) error {
+				return repos.Tasks.Complete(ctx, seeded)
+			},
+		},
+		{
+			name: "MarkRunningExhausted not running",
+			fn: func(seeded *model.Task) error {
+				return repos.Tasks.MarkRunningExhausted(ctx, seeded, "should fail")
+			},
+		},
+		{
+			name: "RetryExhausted not exhausted",
+			fn: func(seeded *model.Task) error {
+				return repos.Tasks.RetryExhausted(ctx, seeded.ID)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seeded := seedTask(t, repos, model.TaskTypeUpload)
+			if err := tc.fn(seeded); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
 	}
 }
 
@@ -650,18 +674,6 @@ func TestTaskRepo_MarkRunningExhausted(t *testing.T) {
 	}
 	if task.CompletedAt == nil {
 		t.Error("expected completed_at to be set")
-	}
-}
-
-func TestTaskRepo_MarkRunningExhausted_NotRunning(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	seeded := seedTask(t, repos, model.TaskTypeUpload)
-	err := repos.Tasks.MarkRunningExhausted(ctx, seeded, "should fail")
-	if err == nil {
-		t.Fatal("expected error marking queued task as exhausted")
 	}
 }
 
@@ -856,18 +868,6 @@ func TestTaskRepo_RetryPrimaryCommitExhaustedRestoresCommittingState(t *testing.
 	}
 }
 
-func TestTaskRepo_RetryExhausted_NotExhausted(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	seeded := seedTask(t, repos, model.TaskTypeUpload)
-	err := repos.Tasks.RetryExhausted(ctx, seeded.ID)
-	if err == nil {
-		t.Fatal("expected error retrying non-exhausted task")
-	}
-}
-
 func TestTaskRepo_List(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -969,6 +969,15 @@ func TestTaskRepo_List(t *testing.T) {
 		t.Errorf("expected 1 task at offset 2, got %d", len(tasks))
 	}
 	assertTaskIDs(t, tasks, firstUpload.ID)
+
+	// Pagination: offset beyond the result set returns an empty page with the total unchanged.
+	tasks, total, err = repos.Tasks.List(ctx, "", "", "", 2, 4)
+	if err != nil {
+		t.Fatalf("List paginated beyond total: %v", err)
+	}
+	if total != 3 || len(tasks) != 0 {
+		t.Fatalf("expected 0 tasks with total 3 beyond the last page, got %d/%d", len(tasks), total)
+	}
 }
 
 func TestTaskRepo_ListFiltersByStage(t *testing.T) {
