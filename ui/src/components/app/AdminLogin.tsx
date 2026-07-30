@@ -4,12 +4,14 @@ import { type FormEvent, useState } from 'react'
 import { type AuthSession, api } from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { Field, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 
 export function AdminLogin({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
+  const [remember, setRemember] = useState(false)
   const login = useMutation({
     mutationFn: api.login,
     onSuccess: onAuthenticated,
@@ -17,7 +19,7 @@ export function AdminLogin({ onAuthenticated }: { onAuthenticated: (session: Aut
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    login.mutate({ username, password })
+    login.mutate({ username, password, remember })
   }
 
   return (
@@ -61,6 +63,17 @@ export function AdminLogin({ onAuthenticated }: { onAuthenticated: (session: Aut
               aria-invalid={login.isError}
               onChange={(event) => setPassword(event.target.value)}
             />
+          </Field>
+          <Field orientation="horizontal">
+            <Checkbox
+              id="admin-remember"
+              checked={remember}
+              onCheckedChange={(checked) => setRemember(checked === true)}
+            />
+            <FieldContent>
+              <FieldLabel htmlFor="admin-remember">Keep me signed in</FieldLabel>
+              <FieldDescription>Use only on a trusted device.</FieldDescription>
+            </FieldContent>
           </Field>
         </FieldGroup>
 

@@ -8,8 +8,18 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   await expect(page.getByRole('heading', { name: 'SynapS3 Admin' })).toBeVisible()
   await page.getByLabel('Username').fill('admin')
   await page.getByLabel('Password').fill('system-test-admin-password')
+  const rememberLogin = page.getByRole('checkbox', { name: 'Keep me signed in' })
+  await expect(rememberLogin).not.toBeChecked()
+  await expect(page.getByText('Use only on a trusted device.')).toBeVisible()
+  await rememberLogin.click()
+  await expect(rememberLogin).toBeChecked()
   await page.getByRole('button', { name: 'Sign In' }).click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
+  const adminSessionCookie = (await page.context().cookies(systemServer.adminURL)).find(
+    (cookie) => cookie.name === 'synaps3_admin_session'
+  )
+  expect(adminSessionCookie).toBeDefined()
+  expect(adminSessionCookie?.expires ?? 0).toBeGreaterThan(Math.floor(Date.now() / 1000) + 29 * 24 * 60 * 60)
   await expect(page.getByText('Setup required')).toHaveCount(0)
   for (const navigation of ['Overview', 'Buckets', 'Topology', 'Tasks', 'Wallet', 'Settings']) {
     await expect(page.getByRole('link', { name: navigation })).toBeVisible()

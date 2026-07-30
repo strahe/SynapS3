@@ -25,18 +25,20 @@ import (
 )
 
 const (
-	adminSessionCookieName = "synaps3_admin_session"
-	adminCSRFHeader        = "X-SynapS3-CSRF"
-	loginFailureLimit      = 5
-	loginFailureBlock      = time.Minute
-	loginFailureTTL        = 10 * time.Minute
-	loginFailureCleanup    = time.Minute
-	loginFailureMaxEntries = 4096
-	adminLoginMaxBodyBytes = 10 * 1024
-	basicAuthSuccessTTL    = time.Minute
-	basicAuthCacheMaxItems = 4096
-	revokedSessionMaxItems = 4096
-	authCleanupInterval    = time.Minute
+	adminSessionCookieName      = "synaps3_admin_session"
+	adminCSRFHeader             = "X-SynapS3-CSRF"
+	loginFailureLimit           = 5
+	loginFailureBlock           = time.Minute
+	loginFailureTTL             = 10 * time.Minute
+	loginFailureCleanup         = time.Minute
+	loginFailureMaxEntries      = 4096
+	adminLoginMaxBodyBytes      = 10 * 1024
+	basicAuthSuccessTTL         = time.Minute
+	basicAuthCacheMaxItems      = 4096
+	revokedSessionMaxItems      = 4096
+	authCleanupInterval         = time.Minute
+	adminSessionRefreshInterval = 5 * time.Minute
+	adminRememberedSessionTTL   = 30 * 24 * time.Hour
 )
 
 type authService struct {
@@ -53,7 +55,7 @@ type authService struct {
 	basicAuthCache       map[string]time.Time
 	basicAuthNextCleanup time.Time
 	revokedMu            sync.Mutex
-	revokedTokens        map[string]time.Time
+	revokedSessions      map[string]time.Time
 	revokedNextCleanup   time.Time
 }
 
@@ -62,17 +64,21 @@ type authSessionClaims struct {
 	IssuedAt  int64  `json:"issued_at"`
 	ExpiresAt int64  `json:"expires_at"`
 	CSRFToken string `json:"csrf_token"`
+	SessionID string `json:"session_id,omitempty"`
+	Remember  bool   `json:"remember,omitempty"`
 }
 
 type authSessionResponse struct {
-	Username  string `json:"username"`
-	CSRFToken string `json:"csrf_token"`
-	ExpiresAt string `json:"expires_at"`
+	Username     string `json:"username"`
+	CSRFToken    string `json:"csrf_token"`
+	ExpiresAt    string `json:"expires_at"`
+	RefreshAfter string `json:"refresh_after"`
 }
 
 type authLoginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+	Remember bool   `json:"remember"`
 }
 
 type keyedLockSet struct {
@@ -162,17 +168,17 @@ func newAuthService(cfg config.AdminAuthConfig) (*authService, error) {
 		return nil, fmt.Errorf("creating admin password dummy hash: %w", err)
 	}
 	return &authService{
-		username:       username,
-		passwordHash:   passwordHash,
-		sessionSecret:  []byte(cfg.SessionSecret),
-		sessionTTL:     cfg.SessionTTL,
-		dummyHash:      dummyHash,
-		now:            time.Now,
-		limiter:        newLoginFailureLimiter(),
-		passwordLocks:  newKeyedLockSet(),
-		bcryptGate:     make(chan struct{}, max(1, runtime.GOMAXPROCS(0))),
-		basicAuthCache: map[string]time.Time{},
-		revokedTokens:  map[string]time.Time{},
+		username:        username,
+		passwordHash:    passwordHash,
+		sessionSecret:   []byte(cfg.SessionSecret),
+		sessionTTL:      cfg.SessionTTL,
+		dummyHash:       dummyHash,
+		now:             time.Now,
+		limiter:         newLoginFailureLimiter(),
+		passwordLocks:   newKeyedLockSet(),
+		bcryptGate:      make(chan struct{}, max(1, runtime.GOMAXPROCS(0))),
+		basicAuthCache:  map[string]time.Time{},
+		revokedSessions: map[string]time.Time{},
 	}, nil
 }
 
@@ -182,6 +188,7 @@ func (s *Server) registerAuthRoutes(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("POST /api/v1/auth/login", s.handleAPIAuthLogin)
 	mux.HandleFunc("GET /api/v1/auth/session", s.handleAPIAuthSession)
+	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleAPIAuthRefresh)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.handleAPIAuthLogout)
 }
 
@@ -200,7 +207,7 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if rawAuthPath == authPath && adminAuthLogoutPath(authPath) {
+		if rawAuthPath == authPath && adminAuthBrowserSessionMutationPath(authPath) {
 			claims, ok := s.auth.sessionFromRequest(r)
 			if !ok {
 				clearAdminSessionCookie(w, s.requestScheme(r) == "https")
@@ -269,8 +276,13 @@ func adminAuthPublicPath(path string) bool {
 	}
 }
 
-func adminAuthLogoutPath(path string) bool {
-	return path == "/api/v1/auth/logout"
+func adminAuthBrowserSessionMutationPath(path string) bool {
+	switch path {
+	case "/api/v1/auth/refresh", "/api/v1/auth/logout":
+		return true
+	default:
+		return false
+	}
 }
 
 func unsafeMethod(method string) bool {
@@ -298,17 +310,20 @@ func (s *Server) handleAPIAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid admin credentials"})
 		return
 	}
-	token, claims, err := s.auth.newSession()
+	token, claims, err := s.auth.newSession(req.Remember)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create admin session"})
 		return
 	}
-	setAdminSessionCookie(w, token, s.auth.sessionTTL, time.Unix(claims.ExpiresAt, 0).UTC(), s.requestScheme(r) == "https")
-	writeJSON(w, http.StatusOK, authSessionResponse{
-		Username:  claims.Username,
-		CSRFToken: claims.CSRFToken,
-		ExpiresAt: time.Unix(claims.ExpiresAt, 0).UTC().Format(time.RFC3339),
-	})
+	setAdminSessionCookie(
+		w,
+		token,
+		sessionLifetime(claims),
+		time.Unix(claims.ExpiresAt, 0).UTC(),
+		claims.Remember,
+		s.requestScheme(r) == "https",
+	)
+	writeJSON(w, http.StatusOK, authSessionResponseFromClaims(claims))
 }
 
 func (s *Server) handleAPIAuthSession(w http.ResponseWriter, r *http.Request) {
@@ -318,11 +333,37 @@ func (s *Server) handleAPIAuthSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin authentication required"})
 		return
 	}
-	writeJSON(w, http.StatusOK, authSessionResponse{
-		Username:  claims.Username,
-		CSRFToken: claims.CSRFToken,
-		ExpiresAt: time.Unix(claims.ExpiresAt, 0).UTC().Format(time.RFC3339),
-	})
+	writeJSON(w, http.StatusOK, authSessionResponseFromClaims(claims))
+}
+
+func (s *Server) handleAPIAuthRefresh(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(adminSessionCookieName)
+	if err != nil {
+		clearAdminSessionCookie(w, s.requestScheme(r) == "https")
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin authentication required"})
+		return
+	}
+	token, claims, ok, err := s.auth.refreshSession(cookie.Value)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to refresh admin session"})
+		return
+	}
+	if !ok {
+		clearAdminSessionCookie(w, s.requestScheme(r) == "https")
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin authentication required"})
+		return
+	}
+	if token != "" {
+		setAdminSessionCookie(
+			w,
+			token,
+			sessionLifetime(claims),
+			time.Unix(claims.ExpiresAt, 0).UTC(),
+			claims.Remember,
+			s.requestScheme(r) == "https",
+		)
+	}
+	writeJSON(w, http.StatusOK, authSessionResponseFromClaims(claims))
 }
 
 func (s *Server) handleAPIAuthLogout(w http.ResponseWriter, r *http.Request) {
@@ -477,17 +518,24 @@ func (a *authService) basicAuthCacheKey(clientIP, username, password string) str
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func (a *authService) newSession() (string, authSessionClaims, error) {
+func (a *authService) newSession(remember bool) (string, authSessionClaims, error) {
 	now := a.now().UTC()
 	csrf, err := securetoken.URL(32)
 	if err != nil {
 		return "", authSessionClaims{}, err
 	}
+	sessionID, err := securetoken.URL(32)
+	if err != nil {
+		return "", authSessionClaims{}, err
+	}
+	lifetime := a.sessionLifetime(remember)
 	claims := authSessionClaims{
 		Username:  a.username,
 		IssuedAt:  now.Unix(),
-		ExpiresAt: now.Add(a.sessionTTL).Unix(),
+		ExpiresAt: now.Add(lifetime).Unix(),
 		CSRFToken: csrf,
+		SessionID: sessionID,
+		Remember:  remember,
 	}
 	token, err := a.signClaims(claims)
 	if err != nil {
@@ -501,11 +549,66 @@ func (a *authService) sessionFromRequest(r *http.Request) (authSessionClaims, bo
 	if err != nil {
 		return authSessionClaims{}, false
 	}
-	claims, ok := a.verifySession(cookie.Value)
-	if !ok || a.sessionRevoked(cookie.Value, a.now()) {
+	now := a.now()
+	claims, ok := a.verifySessionAt(cookie.Value, now)
+	if !ok || a.sessionRevoked(cookie.Value, claims, now) {
 		return authSessionClaims{}, false
 	}
 	return claims, true
+}
+
+func (a *authService) sessionLifetime(remember bool) time.Duration {
+	if remember {
+		return max(a.sessionTTL, adminRememberedSessionTTL)
+	}
+	return a.sessionTTL
+}
+
+func sessionLifetime(claims authSessionClaims) time.Duration {
+	return time.Duration(claims.ExpiresAt-claims.IssuedAt) * time.Second
+}
+
+func sessionRefreshAfter(claims authSessionClaims) time.Time {
+	lifetime := sessionLifetime(claims)
+	return time.Unix(claims.IssuedAt, 0).UTC().Add(min(adminSessionRefreshInterval, lifetime/2))
+}
+
+func authSessionResponseFromClaims(claims authSessionClaims) authSessionResponse {
+	return authSessionResponse{
+		Username:     claims.Username,
+		CSRFToken:    claims.CSRFToken,
+		ExpiresAt:    time.Unix(claims.ExpiresAt, 0).UTC().Format(time.RFC3339),
+		RefreshAfter: sessionRefreshAfter(claims).Format(time.RFC3339Nano),
+	}
+}
+
+func (a *authService) refreshSession(token string) (string, authSessionClaims, bool, error) {
+	a.revokedMu.Lock()
+	defer a.revokedMu.Unlock()
+	now := a.now().UTC()
+	claims, ok := a.verifySessionAt(token, now)
+	if !ok {
+		return "", authSessionClaims{}, false, nil
+	}
+	sessionID := a.sessionFamilyID(token, claims)
+
+	a.maybeCleanupRevokedSessionsLocked(now)
+	if a.sessionRevokedLocked(a.sessionRevocationKey(sessionID), now) {
+		return "", authSessionClaims{}, false, nil
+	}
+	if now.Before(sessionRefreshAfter(claims)) {
+		return "", claims, true, nil
+	}
+
+	lifetime := sessionLifetime(claims)
+	claims.IssuedAt = now.Unix()
+	claims.ExpiresAt = now.Add(lifetime).Unix()
+	claims.SessionID = sessionID
+	refreshedToken, err := a.signClaims(claims)
+	if err != nil {
+		return "", authSessionClaims{}, false, err
+	}
+	return refreshedToken, claims, true, nil
 }
 
 func (a *authService) signClaims(claims authSessionClaims) (string, error) {
@@ -519,6 +622,10 @@ func (a *authService) signClaims(claims authSessionClaims) (string, error) {
 }
 
 func (a *authService) verifySession(token string) (authSessionClaims, bool) {
+	return a.verifySessionAt(token, a.now())
+}
+
+func (a *authService) verifySessionAt(token string, now time.Time) (authSessionClaims, bool) {
 	payload, sigText, ok := strings.Cut(token, ".")
 	if !ok || payload == "" || sigText == "" {
 		return authSessionClaims{}, false
@@ -538,7 +645,11 @@ func (a *authService) verifySession(token string) (authSessionClaims, bool) {
 	if err := json.Unmarshal(data, &claims); err != nil {
 		return authSessionClaims{}, false
 	}
-	if claims.Username != a.username || claims.ExpiresAt <= a.now().Unix() || claims.CSRFToken == "" {
+	if claims.Username != a.username ||
+		claims.IssuedAt <= 0 ||
+		claims.ExpiresAt <= claims.IssuedAt ||
+		claims.ExpiresAt <= now.Unix() ||
+		claims.CSRFToken == "" {
 		return authSessionClaims{}, false
 	}
 	return claims, true
@@ -559,39 +670,46 @@ func (a *authService) revokeSessionFromRequest(r *http.Request) bool {
 	if !ok {
 		return true
 	}
-	return a.revokeSession(cookie.Value, time.Unix(claims.ExpiresAt, 0))
+	return a.revokeSession(cookie.Value, claims)
 }
 
-func (a *authService) revokeSession(token string, expiresAt time.Time) bool {
-	now := a.now()
-	if !expiresAt.After(now) {
+func (a *authService) revokeSession(token string, claims authSessionClaims) bool {
+	lifetime := sessionLifetime(claims)
+	if lifetime <= 0 {
 		return true
 	}
 	a.revokedMu.Lock()
 	defer a.revokedMu.Unlock()
+	now := a.now().UTC()
 	a.maybeCleanupRevokedSessionsLocked(now)
-	key := a.sessionTokenHash(token)
-	if _, ok := a.revokedTokens[key]; !ok && len(a.revokedTokens) >= revokedSessionMaxItems {
+	key := a.sessionRevocationKey(a.sessionFamilyID(token, claims))
+	if _, ok := a.revokedSessions[key]; !ok && len(a.revokedSessions) >= revokedSessionMaxItems {
 		a.cleanupRevokedSessionsLocked(now)
-		if len(a.revokedTokens) >= revokedSessionMaxItems {
+		if len(a.revokedSessions) >= revokedSessionMaxItems {
 			return false
 		}
 	}
-	a.revokedTokens[key] = expiresAt
+	revokedUntil := now.Add(lifetime)
+	if current, ok := a.revokedSessions[key]; !ok || current.Before(revokedUntil) {
+		a.revokedSessions[key] = revokedUntil
+	}
 	return true
 }
 
-func (a *authService) sessionRevoked(token string, now time.Time) bool {
+func (a *authService) sessionRevoked(token string, claims authSessionClaims, now time.Time) bool {
 	a.revokedMu.Lock()
 	defer a.revokedMu.Unlock()
 	a.maybeCleanupRevokedSessionsLocked(now)
-	key := a.sessionTokenHash(token)
-	expiresAt, ok := a.revokedTokens[key]
+	return a.sessionRevokedLocked(a.sessionRevocationKey(a.sessionFamilyID(token, claims)), now)
+}
+
+func (a *authService) sessionRevokedLocked(key string, now time.Time) bool {
+	expiresAt, ok := a.revokedSessions[key]
 	if !ok {
 		return false
 	}
 	if !expiresAt.After(now) {
-		delete(a.revokedTokens, key)
+		delete(a.revokedSessions, key)
 		return false
 	}
 	return true
@@ -605,11 +723,22 @@ func (a *authService) maybeCleanupRevokedSessionsLocked(now time.Time) {
 }
 
 func (a *authService) cleanupRevokedSessionsLocked(now time.Time) {
-	for key, expiresAt := range a.revokedTokens {
+	for key, expiresAt := range a.revokedSessions {
 		if !expiresAt.After(now) {
-			delete(a.revokedTokens, key)
+			delete(a.revokedSessions, key)
 		}
 	}
+}
+
+func (a *authService) sessionFamilyID(token string, claims authSessionClaims) string {
+	if claims.SessionID != "" {
+		return claims.SessionID
+	}
+	return a.sessionTokenHash(token)
+}
+
+func (a *authService) sessionRevocationKey(sessionID string) string {
+	return a.sessionTokenHash(sessionID)
 }
 
 func (a *authService) sessionTokenHash(token string) string {
@@ -617,17 +746,27 @@ func (a *authService) sessionTokenHash(token string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-func setAdminSessionCookie(w http.ResponseWriter, token string, ttl time.Duration, expiresAt time.Time, secure bool) {
-	http.SetCookie(w, &http.Cookie{
+func setAdminSessionCookie(
+	w http.ResponseWriter,
+	token string,
+	ttl time.Duration,
+	expiresAt time.Time,
+	persistent,
+	secure bool,
+) {
+	cookie := &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		MaxAge:   int(ttl.Seconds()),
-		Expires:  expiresAt,
 		Secure:   secure,
-	})
+	}
+	if persistent {
+		cookie.MaxAge = int(ttl.Seconds())
+		cookie.Expires = expiresAt
+	}
+	http.SetCookie(w, cookie)
 }
 
 func clearAdminSessionCookie(w http.ResponseWriter, secure bool) {

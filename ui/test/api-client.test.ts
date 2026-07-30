@@ -56,6 +56,68 @@ function installFakeXMLHttpRequest() {
   }
 }
 
+test('admin login sends remember mode and refreshes the stored csrf token', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; method?: string; headers: Headers; body?: BodyInit | null }> = []
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input)
+    calls.push({
+      url,
+      method: init?.method,
+      headers: new Headers(init?.headers),
+      body: init?.body,
+    })
+    if (url.endsWith('/auth/login')) {
+      return new Response(
+        JSON.stringify({
+          username: 'admin',
+          csrf_token: 'login-csrf-token',
+          expires_at: '2026-08-01T00:00:00Z',
+          refresh_after: '2026-07-31T12:05:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    }
+    if (url.endsWith('/auth/refresh')) {
+      return new Response(
+        JSON.stringify({
+          username: 'admin',
+          csrf_token: 'refreshed-csrf-token',
+          expires_at: '2026-08-01T00:05:00Z',
+          refresh_after: '2026-07-31T12:10:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    }
+    return new Response(null, { status: 204 })
+  }) as typeof fetch
+
+  try {
+    setAdminCSRFToken('')
+    await api.login({ username: 'admin', password: 'password', remember: true })
+    await api.refreshAuthSession()
+    await api.logout()
+  } finally {
+    setAdminCSRFToken('')
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls.length, 3)
+  assert.equal(calls[0]?.url, '/api/v1/auth/login')
+  assert.equal(calls[0]?.method, 'POST')
+  assert.deepEqual(JSON.parse(String(calls[0]?.body)), {
+    username: 'admin',
+    password: 'password',
+    remember: true,
+  })
+  assert.equal(calls[0]?.headers.get('X-SynapS3-CSRF'), null)
+  assert.equal(calls[1]?.url, '/api/v1/auth/refresh')
+  assert.equal(calls[1]?.method, 'POST')
+  assert.equal(calls[1]?.headers.get('X-SynapS3-CSRF'), 'login-csrf-token')
+  assert.equal(calls[2]?.url, '/api/v1/auth/logout')
+  assert.equal(calls[2]?.headers.get('X-SynapS3-CSRF'), 'refreshed-csrf-token')
+})
+
 test('admin write mutations send csrf header', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ headers: Headers; method?: string }> = []

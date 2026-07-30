@@ -35,10 +35,16 @@ export interface AuthSession {
   username: string
   csrf_token: string
   expires_at: string
+  refresh_after: string
 }
 
 export function setAdminCSRFToken(token: string) {
   adminCSRFToken = token
+}
+
+function storeAuthSession(session: AuthSession) {
+  setAdminCSRFToken(session.csrf_token)
+  return session
 }
 
 export function addAuthInvalidationListener(listener: () => void) {
@@ -1020,19 +1026,16 @@ export interface FilecoinReadinessPreflightPayload {
 }
 
 export const api = {
-  getAuthSession: () =>
-    fetchJSON<AuthSession>('/auth/session').then((session) => {
-      setAdminCSRFToken(session.csrf_token)
-      return session
-    }),
-  login: (payload: { username: string; password: string }) =>
+  getAuthSession: () => fetchJSON<AuthSession>('/auth/session').then(storeAuthSession),
+  login: (payload: { username: string; password: string; remember?: boolean }) =>
     fetchJSON<AuthSession>('/auth/login', {
       method: 'POST',
       body: JSON.stringify(payload),
-    }).then((session) => {
-      setAdminCSRFToken(session.csrf_token)
-      return session
-    }),
+    }).then(storeAuthSession),
+  refreshAuthSession: () =>
+    fetchJSON<AuthSession>('/auth/refresh', {
+      method: 'POST',
+    }).then(storeAuthSession),
   logout: () =>
     fetchJSON<void>('/auth/logout', { method: 'POST' }).finally(() => {
       setAdminCSRFToken('')
