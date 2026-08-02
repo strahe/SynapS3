@@ -12,21 +12,6 @@ SynapS3 is an open-source, self-hosted S3-compatible gateway for Filecoin storag
 - [Documentation](https://synaps3.strahe.com/en/)
 - [中文文档](https://synaps3.strahe.com/zh/)
 
-## Docker Deployment
-
-On a Linux host with a public Admin hostname pointing to it and ports 80/443 open:
-
-```bash
-git clone --depth 1 https://github.com/strahe/SynapS3.git
-cd SynapS3
-make docker-init ADMIN_DOMAIN=admin.example.com
-make docker-up
-make docker-verify
-make docker-password
-```
-
-This publishes the dashboard through Caddy with an automatically managed HTTPS certificate while keeping the Admin backend on `127.0.0.1:9090`. See [Docker Deployment](https://synaps3.strahe.com/en/getting-started/docker) for wallet setup, S3 TLS, operations, and recovery.
-
 ## Highlights
 
 - S3-compatible bucket, object, versioning, and multipart APIs.

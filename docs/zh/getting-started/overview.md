@@ -34,5 +34,5 @@ SynapS3 支持单机部署。缓存磁盘和数据库都是运行时数据，不
 ## 从哪里开始
 
 - 评估功能时，使用[快速开始](./quick-start.md)运行临时节点。
-- 部署节点时，使用 [Docker 部署](./docker.md)。
+- 根据运行方式选择 [Docker 部署](./docker.md)或[源码构建](./source.md)。
 - 连接工具时，使用 [S3 客户端](./s3-clients.md) 查看 AWS CLI、rclone 和 MinIO Client 示例。

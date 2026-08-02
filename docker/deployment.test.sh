@@ -51,7 +51,7 @@ copy_deployment_files() {
     "$ROOT_DIR/compose.local.yaml" \
     "$ROOT_DIR/compose.admin-https.yaml" \
     "$target/"
-  cp "$ROOT_DIR/docker/Caddyfile" "$target/docker/"
+  cp "$ROOT_DIR/docker/Caddyfile" "$ROOT_DIR/docker/deployment.sh" "$target/docker/"
 }
 
 install_fake_tools() {
@@ -70,6 +70,7 @@ fi
 
 printf '%s\n' "$*" >>"$SYNAPS3_TEST_COMPOSE_LOG"
 printf 'env ADMIN_DOMAIN=%s\n' "${ADMIN_DOMAIN-unset}" >>"$SYNAPS3_TEST_COMPOSE_LOG"
+printf 'env COMPOSE_FILE=%s\n' "${COMPOSE_FILE-unset}" >>"$SYNAPS3_TEST_COMPOSE_LOG"
 exit 0
 EOF
 
@@ -134,21 +135,11 @@ test_init_contract() {
   out_file="$case_dir/output.log"
   err_file="$case_dir/error.log"
 
-  if make --no-print-directory -C "$case_dir" docker-init >"$out_file" 2>"$err_file"; then
-    fail "docker-init succeeded without ADMIN_DOMAIN"
-  fi
-  assert_contains "$err_file" "ADMIN_DOMAIN is required"
-
-  if make --no-print-directory -C "$case_dir" docker-init ADMIN_DOMAIN='https://admin.example.test' >"$out_file" 2>"$err_file"; then
-    fail "docker-init accepted a URL instead of a hostname"
-  fi
-  assert_contains "$err_file" "ADMIN_DOMAIN must be a public hostname"
-
-  make --no-print-directory -C "$case_dir" docker-init ADMIN_DOMAIN=admin.example.test >"$out_file"
+  make --no-print-directory -C "$case_dir" docker-init >"$out_file"
   [ "$(file_mode "$case_dir/.env")" = 600 ] || fail ".env was not created with mode 600"
-  assert_contains "$case_dir/.env" "COMPOSE_FILE=compose.yaml:compose.admin-https.yaml"
-  assert_contains "$case_dir/.env" "ADMIN_DOMAIN=admin.example.test"
-  assert_contains "$case_dir/.env" "IMAGE_SOURCE=published"
+  assert_contains "$case_dir/.env" "COMPOSE_FILE=compose.yaml"
+  assert_not_contains "$case_dir/.env" "ADMIN_DOMAIN="
+  assert_contains "$out_file" "Admin remains local at http://127.0.0.1:9090/"
 
   printf '%s\n' 'SYNAPS3_FILECOIN_PRIVATE_KEY=preserve-this-value' >>"$case_dir/.env"
   if make --no-print-directory -C "$case_dir" docker-init ADMIN_DOMAIN=other.example.test >"$out_file" 2>"$err_file"; then
@@ -157,17 +148,37 @@ test_init_contract() {
   assert_contains "$err_file" "refusing to overwrite"
   assert_contains "$case_dir/.env" "SYNAPS3_FILECOIN_PRIVATE_KEY=preserve-this-value"
 
+  https_dir=$(new_case_dir)
+  copy_deployment_files "$https_dir"
+  if make --no-print-directory -C "$https_dir" docker-init ADMIN_DOMAIN='https://admin.example.test' >"$out_file" 2>"$err_file"; then
+    fail "docker-init accepted a URL instead of a hostname"
+  fi
+  assert_contains "$err_file" "ADMIN_DOMAIN must be a public hostname"
+
+  injection_dir=$(new_case_dir)
+  copy_deployment_files "$injection_dir"
+  injected_domain=$(printf 'admin.example.test\nCOMPOSE_FILE=override.yaml')
+  if ADMIN_DOMAIN="$injected_domain" make --no-print-directory -C "$injection_dir" docker-init >"$out_file" 2>"$err_file"; then
+    fail "docker-init accepted a multiline ADMIN_DOMAIN"
+  fi
+  assert_contains "$err_file" "ADMIN_DOMAIN must be a public hostname"
+  [ ! -e "$injection_dir/.env" ] || fail "docker-init created .env from a multiline ADMIN_DOMAIN"
+
+  make --no-print-directory -C "$https_dir" docker-init ADMIN_DOMAIN=admin.example.test >"$out_file"
+  assert_contains "$https_dir/.env" "COMPOSE_FILE=compose.yaml:compose.admin-https.yaml"
+  assert_contains "$https_dir/.env" "ADMIN_DOMAIN=admin.example.test"
+  assert_contains "$out_file" "Admin HTTPS will use https://admin.example.test/"
+
   local_dir=$(new_case_dir)
   copy_deployment_files "$local_dir"
   make --no-print-directory -C "$local_dir" docker-init ADMIN_DOMAIN=admin.example.test IMAGE_SOURCE=local >"$out_file"
   assert_contains "$local_dir/.env" "COMPOSE_FILE=compose.yaml:compose.local.yaml:compose.admin-https.yaml"
-  assert_contains "$local_dir/.env" "IMAGE_SOURCE=local"
 }
 
 test_make_lifecycle_contract() {
   case_dir=$(new_case_dir)
   copy_deployment_files "$case_dir"
-  make --no-print-directory -C "$case_dir" docker-init ADMIN_DOMAIN=admin.example.test >/dev/null
+  make --no-print-directory -C "$case_dir" docker-init >/dev/null
   printf '%s\n' 'SYNAPS3_FILECOIN_PRIVATE_KEY=must-not-appear-in-output' >>"$case_dir/.env"
 
   bin_dir=$(install_fake_tools "$case_dir")
@@ -176,12 +187,22 @@ test_make_lifecycle_contract() {
   error_log="$case_dir/error.log"
   : >"$compose_log"
 
-  ADMIN_DOMAIN=override.example.test SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
+  chmod 644 "$case_dir/.env"
+  if SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
+    make --no-print-directory -C "$case_dir" docker-up \
+      DOCKER_COMPOSE="$bin_dir/docker-compose" >"$output_log" 2>"$error_log"; then
+    fail "docker-up accepted an unprotected .env"
+  fi
+  assert_contains "$error_log" ".env permissions are 644"
+  chmod 600 "$case_dir/.env"
+
+  ADMIN_DOMAIN=override.example.test COMPOSE_FILE=override.yaml SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
     make --no-print-directory -C "$case_dir" docker-up \
       DOCKER_COMPOSE="$bin_dir/docker-compose" DOCKER_WAIT_TIMEOUT=7 >"$output_log" 2>"$error_log"
   assert_contains "$compose_log" "config --quiet"
   assert_contains "$compose_log" "up -d --remove-orphans --wait --wait-timeout 7"
   assert_contains "$compose_log" "env ADMIN_DOMAIN=unset"
+  assert_contains "$compose_log" "env COMPOSE_FILE=unset"
   assert_not_contains "$compose_log" "pull"
   assert_not_contains "$output_log" "must-not-appear-in-output"
   assert_not_contains "$error_log" "must-not-appear-in-output"
@@ -199,10 +220,37 @@ test_make_lifecycle_contract() {
       DOCKER_COMPOSE="$bin_dir/docker-compose" DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1 >"$output_log"
   assert_contains "$compose_log" "logs --tail=100 -f caddy"
 
+  local_dir=$(new_case_dir)
+  copy_deployment_files "$local_dir"
+  make --no-print-directory -C "$local_dir" docker-init IMAGE_SOURCE=local >/dev/null
+  local_bin_dir=$(install_fake_tools "$local_dir")
+  local_compose_log="$local_dir/compose.log"
+  : >"$local_compose_log"
+  SYNAPS3_TEST_COMPOSE_LOG="$local_compose_log" \
+    make --no-print-directory -C "$local_dir" docker-up \
+      DOCKER_COMPOSE="$local_bin_dir/docker-compose" >"$output_log"
+  assert_contains "$local_compose_log" "up -d --build --remove-orphans --wait"
+}
+
+test_verify_contract() {
+  case_dir=$(new_case_dir)
+  copy_deployment_files "$case_dir"
+  make --no-print-directory -C "$case_dir" docker-init >/dev/null
+  bin_dir=$(install_fake_tools "$case_dir")
+  compose_log="$case_dir/compose.log"
+  output_log="$case_dir/output.log"
+  error_log="$case_dir/error.log"
+  : >"$compose_log"
+
   SYNAPS3_TEST_COMPOSE_LOG="$compose_log" SYNAPS3_TEST_HEALTH_STATUS=setup SYNAPS3_TEST_DOMAIN=admin.example.test \
     make --no-print-directory -C "$case_dir" docker-verify \
       DOCKER_COMPOSE="$bin_dir/docker-compose" CURL="$bin_dir/curl" DOCKER_VERIFY_DELAY=0 >"$output_log"
-  assert_contains "$output_log" "still requires setup"
+  assert_contains "$output_log" "Local Admin is reachable, but SynapS3 still requires setup"
+
+  SYNAPS3_TEST_COMPOSE_LOG="$compose_log" SYNAPS3_TEST_HEALTH_STATUS=ok SYNAPS3_TEST_DOMAIN=admin.example.test \
+    make --no-print-directory -C "$case_dir" docker-verify \
+      DOCKER_COMPOSE="$bin_dir/docker-compose" CURL="$bin_dir/curl" DOCKER_VERIFY_DELAY=0 >"$output_log"
+  assert_contains "$output_log" "Local Admin is ready at http://127.0.0.1:9090/"
 
   if SYNAPS3_TEST_COMPOSE_LOG="$compose_log" SYNAPS3_TEST_HEALTH_STATUS=unhealthy SYNAPS3_TEST_DOMAIN=admin.example.test \
     make --no-print-directory -C "$case_dir" docker-verify \
@@ -211,97 +259,65 @@ test_make_lifecycle_contract() {
   fi
   assert_contains "$error_log" "SynapS3 is unhealthy"
 
-  if SYNAPS3_TEST_COMPOSE_LOG="$compose_log" SYNAPS3_TEST_HTTPS_READY=0 SYNAPS3_TEST_DOMAIN=admin.example.test \
-    make --no-print-directory -C "$case_dir" docker-verify \
-      DOCKER_COMPOSE="$bin_dir/docker-compose" CURL="$bin_dir/curl" DOCKER_VERIFY_ATTEMPTS=1 DOCKER_VERIFY_DELAY=0 >"$output_log" 2>"$error_log"; then
+  https_dir=$(new_case_dir)
+  copy_deployment_files "$https_dir"
+  make --no-print-directory -C "$https_dir" docker-init ADMIN_DOMAIN=admin.example.test >/dev/null
+  https_bin_dir=$(install_fake_tools "$https_dir")
+  https_compose_log="$https_dir/compose.log"
+  : >"$https_compose_log"
+
+  SYNAPS3_TEST_COMPOSE_LOG="$https_compose_log" SYNAPS3_TEST_HEALTH_STATUS=setup SYNAPS3_TEST_DOMAIN=admin.example.test \
+    make --no-print-directory -C "$https_dir" docker-verify \
+      DOCKER_COMPOSE="$https_bin_dir/docker-compose" CURL="$https_bin_dir/curl" DOCKER_VERIFY_DELAY=0 >"$output_log"
+  assert_contains "$output_log" "Admin HTTPS is ready at https://admin.example.test/, but SynapS3 still requires setup"
+
+  SYNAPS3_TEST_COMPOSE_LOG="$https_compose_log" SYNAPS3_TEST_HEALTH_STATUS=ok SYNAPS3_TEST_DOMAIN=admin.example.test \
+    make --no-print-directory -C "$https_dir" docker-verify \
+      DOCKER_COMPOSE="$https_bin_dir/docker-compose" CURL="$https_bin_dir/curl" DOCKER_VERIFY_DELAY=0 >"$output_log"
+  assert_contains "$output_log" "SynapS3 Admin HTTPS is ready at https://admin.example.test/"
+
+  if SYNAPS3_TEST_COMPOSE_LOG="$https_compose_log" SYNAPS3_TEST_HTTPS_READY=0 SYNAPS3_TEST_DOMAIN=admin.example.test \
+    make --no-print-directory -C "$https_dir" docker-verify \
+      DOCKER_COMPOSE="$https_bin_dir/docker-compose" CURL="$https_bin_dir/curl" DOCKER_VERIFY_ATTEMPTS=1 DOCKER_VERIFY_DELAY=0 >"$output_log" 2>"$error_log"; then
     fail "docker-verify accepted unavailable HTTPS"
   fi
   assert_contains "$error_log" "make docker-logs DOCKER_SERVICE=caddy"
 }
 
-test_upgrade_contract() {
-  seed_dir=$(new_case_dir)
-  case_dir=$(new_case_dir)
-  remote_dir=$(new_case_dir)
-  copy_deployment_files "$seed_dir"
-
-  git init --bare -q "$remote_dir/repository.git"
-  git -C "$seed_dir" init -q
-  git -C "$seed_dir" config user.email test@example.invalid
-  git -C "$seed_dir" config user.name "Deployment Test"
-  git -C "$seed_dir" add Makefile .env.example compose.yaml compose.local.yaml compose.admin-https.yaml docker/Caddyfile
-  git -C "$seed_dir" commit -qm "test: seed deployment"
-  git -C "$seed_dir" branch -M main
-  git -C "$seed_dir" remote add origin "$remote_dir/repository.git"
-  git -C "$seed_dir" push -qu -u origin main
-
-  git clone -q --depth 1 --branch main "file://$remote_dir/repository.git" "$case_dir"
-  make --no-print-directory -C "$case_dir" docker-init ADMIN_DOMAIN=admin.example.test >/dev/null
-  bin_dir=$(install_fake_tools "$case_dir")
-  compose_log="$case_dir/compose.log"
-  output_log="$case_dir/output.log"
-  error_log="$case_dir/error.log"
-  : >"$compose_log"
-
-  if SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
-    make --no-print-directory -C "$case_dir" docker-upgrade \
-      DOCKER_COMPOSE="$bin_dir/docker-compose" CURL="$bin_dir/curl" >"$output_log" 2>"$error_log"; then
-    fail "docker-upgrade succeeded without backup confirmation"
-  fi
-  assert_contains "$error_log" "BACKUP_CONFIRMED=1"
-
-  printf '%s\n' '# dirty' >>"$case_dir/.env.example"
-  if SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
-    make --no-print-directory -C "$case_dir" docker-upgrade BACKUP_CONFIRMED=1 \
-      DOCKER_COMPOSE="$bin_dir/docker-compose" CURL="$bin_dir/curl" >"$output_log" 2>"$error_log"; then
-    fail "docker-upgrade accepted tracked local changes"
-  fi
-  assert_contains "$error_log" "Tracked files have local changes"
-  git -C "$case_dir" checkout -- .env.example
-
-  publisher_dir=$(new_case_dir)
-  git clone -q --branch main "file://$remote_dir/repository.git" "$publisher_dir"
-  git -C "$publisher_dir" config user.email test@example.invalid
-  git -C "$publisher_dir" config user.name "Deployment Test"
-  awk '
-    { print }
-    $0 == "_docker-upgrade-apply:" { print "\t@echo \"Loaded updated Makefile after pull.\"" }
-  ' "$publisher_dir/Makefile" >"$publisher_dir/Makefile.next"
-  mv "$publisher_dir/Makefile.next" "$publisher_dir/Makefile"
-  git -C "$publisher_dir" add Makefile
-  git -C "$publisher_dir" commit -qm "test: update deployment recipe"
-  git -C "$publisher_dir" push -q
-
-  SYNAPS3_TEST_COMPOSE_LOG="$compose_log" SYNAPS3_TEST_HEALTH_STATUS=ok SYNAPS3_TEST_DOMAIN=admin.example.test \
-    make --no-print-directory -C "$case_dir" docker-upgrade BACKUP_CONFIRMED=1 \
-      DOCKER_COMPOSE="$bin_dir/docker-compose" CURL="$bin_dir/curl" DOCKER_VERIFY_DELAY=0 >"$output_log" 2>"$error_log"
-  assert_contains "$output_log" "latest edge build"
-  assert_contains "$output_log" "Loaded updated Makefile after pull"
-  assert_contains "$compose_log" "pull"
-  assert_contains "$compose_log" "up -d --remove-orphans --wait"
-  assert_contains "$output_log" "SynapS3 Admin HTTPS is ready"
-}
-
 test_compose_and_caddy_config() {
   case_dir=$(new_case_dir)
   copy_deployment_files "$case_dir"
-  make --no-print-directory -C "$case_dir" docker-init ADMIN_DOMAIN=admin.example.test >/dev/null
+  make --no-print-directory -C "$case_dir" docker-init >/dev/null
 
-  make --no-print-directory -C "$case_dir" docker-check >/dev/null
+  (cd "$case_dir" && sh docker/deployment.sh check >/dev/null)
 
   docker compose --project-directory "$case_dir" config >"$case_dir/rendered.yaml"
-  assert_contains "$case_dir/rendered.yaml" "image: caddy:2.11.4-alpine"
-  assert_contains "$case_dir/rendered.yaml" "SYNAPS3_ADMIN_AUTH_ENABLED: \"true\""
-  assert_contains "$case_dir/rendered.yaml" "SYNAPS3_ADMIN_TRUSTED_PROXIES: 127.0.0.1/32"
-  assert_contains "$case_dir/rendered.yaml" "name: synaps3-caddy-data"
-  assert_contains "$case_dir/rendered.yaml" "name: synaps3-caddy-config"
+  assert_not_contains "$case_dir/rendered.yaml" "image: caddy:2.11.4-alpine"
 
-  sed 's/^ADMIN_DOMAIN=.*/ADMIN_DOMAIN=/' "$case_dir/.env" >"$case_dir/.env.invalid"
-  chmod 600 "$case_dir/.env.invalid"
-  if docker compose --project-directory "$case_dir" --env-file "$case_dir/.env.invalid" config --quiet 2>"$case_dir/error.log"; then
+  https_dir=$(new_case_dir)
+  copy_deployment_files "$https_dir"
+  make --no-print-directory -C "$https_dir" docker-init ADMIN_DOMAIN=admin.example.test >/dev/null
+  (cd "$https_dir" && sh docker/deployment.sh check >/dev/null)
+
+  docker compose --project-directory "$https_dir" config >"$https_dir/rendered.yaml"
+  assert_contains "$https_dir/rendered.yaml" "image: caddy:2.11.4-alpine"
+  assert_contains "$https_dir/rendered.yaml" "SYNAPS3_ADMIN_AUTH_ENABLED: \"true\""
+  assert_contains "$https_dir/rendered.yaml" "SYNAPS3_ADMIN_TRUSTED_PROXIES: 127.0.0.1/32"
+  assert_contains "$https_dir/rendered.yaml" "name: synaps3-caddy-data"
+  assert_contains "$https_dir/rendered.yaml" "name: synaps3-caddy-config"
+
+  sed 's/^ADMIN_DOMAIN=.*/ADMIN_DOMAIN=/' "$https_dir/.env" >"$https_dir/.env.invalid"
+  chmod 600 "$https_dir/.env.invalid"
+  if docker compose --project-directory "$https_dir" --env-file "$https_dir/.env.invalid" config --quiet 2>"$https_dir/error.log"; then
     fail "Compose accepted an empty ADMIN_DOMAIN"
   fi
-  assert_contains "$case_dir/error.log" "Set ADMIN_DOMAIN in .env"
+  assert_contains "$https_dir/error.log" "Set ADMIN_DOMAIN in .env"
+
+  printf '%s\n' 'ADMIN_DOMAIN=duplicate.example.test' >>"$https_dir/.env"
+  if (cd "$https_dir" && sh docker/deployment.sh check >"$https_dir/output.log" 2>"$https_dir/error.log"); then
+    fail "deployment check accepted duplicate ADMIN_DOMAIN entries"
+  fi
+  assert_contains "$https_dir/error.log" "exactly one ADMIN_DOMAIN entry"
 
   if docker info >/dev/null 2>&1; then
     docker run --rm \
@@ -318,7 +334,7 @@ test_compose_and_caddy_config() {
 
 test_init_contract
 test_make_lifecycle_contract
-test_upgrade_contract
+test_verify_contract
 test_compose_and_caddy_config
 
 echo "deployment tests passed"

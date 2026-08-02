@@ -34,5 +34,5 @@ For deeper details, see [Architecture](../concepts/architecture.md), [Write Path
 ## Start Here
 
 - For evaluation, use [Quick Start](./quick-start.md) to run a temporary node.
-- For deployment, use [Docker Deployment](./docker.md).
+- Choose [Docker Deployment](./docker.md) or [Build from Source](./source.md) for the intended runtime.
 - To connect tooling, use [S3 Clients](./s3-clients.md) for AWS CLI, rclone, and MinIO Client examples.

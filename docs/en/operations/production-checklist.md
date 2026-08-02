@@ -12,10 +12,10 @@ Before serving traffic, verify local disk, database health, background tasks, tr
 | Surface | Recommended exposure |
 | --- | --- |
 | S3 API | Require native TLS or a controlled TLS reverse proxy; expose only to trusted clients or an authenticated edge. |
-| Dashboard and Admin API | Keep the backend on `127.0.0.1:9090`; publish only through the Docker deployment's authenticated Caddy HTTPS endpoint. |
-| Metrics | Keep Admin auth enabled and restrict scraping to the host, a private network, or an authenticated HTTPS client. |
+| Dashboard and Admin API | Keep on `127.0.0.1:9090`; use SSH tunneling or HTTPS reverse proxy for remote access. |
+| Metrics | Scrape with Admin auth from the private network or host-local agent only. |
 
-Never bind port 9090 to a public interface. Settings, wallet, task retry, and S3 user endpoints can change the node. For the public Admin hostname, confirm `make docker-verify` validates its certificate and HTTP redirect.
+Do not publish the dashboard or Admin API directly to the internet. Settings, wallet, task retry, and S3 user endpoints can change the node.
 
 ## Runtime Data
 
@@ -25,26 +25,27 @@ Never bind port 9090 to a public interface. Settings, wallet, task retry, and S3
 - Keep the database and cache at the same recovery point, verify backup archives, and test the documented restore order.
 - Watch free space on the database volume and cache volume.
 - Keep `config.toml`, `.env`, databases, cache data, and wallet material out of git. Protect configuration, secret, and credential files with `0600` permissions.
-- Preserve `synaps3-caddy-data` and `synaps3-caddy-config`; they contain the Admin certificate, private key, ACME account, and Caddy state.
 
 ## Secrets and Wallet
 
 - Store `SYNAPS3_FILECOIN_PRIVATE_KEY` in a host environment, `.env`, or secret manager.
 - Store the Admin password securely. Rotate it offline with `synaps3 admin-auth reset-password --config <path>` when it is lost or exposed; this also invalidates existing browser sessions.
-- Confirm the Admin dashboard or the following command reports a healthy wallet after startup:
+- Confirm `synaps3 admin status` reports a healthy wallet after startup.
+- Deposit USDFC and approve FWSS before expected uploads. This example deposits `2 USDFC`:
 
 ```bash
-make docker-admin ADMIN_ARGS='status'
+synaps3 wallet deposit 2 # 2 USDFC
+synaps3 wallet approve
 ```
 
-- Deposit USDFC and approve FWSS from the dashboard before expected uploads. Confirm each transaction reaches `confirmed` before relying on it.
+A new deposit or approval should print `Transaction: <hash>` and `Status: confirmed`; an existing approval prints `FWSS approval: already approved`.
 
 ## Configuration Review
 
 Check the effective settings:
 
 ```bash
-make docker-admin ADMIN_ARGS='settings get'
+synaps3 admin settings get
 ```
 
 Review these values first:
@@ -52,7 +53,7 @@ Review these values first:
 | Field | Check |
 | --- | --- |
 | `admin.addr` | Keep `127.0.0.1:9090` unless protected by HTTPS and access control. |
-| `admin.trusted_proxies` | The Admin HTTPS deployment must set only `127.0.0.1/32` for host-local Caddy. |
+| `admin.trusted_proxies` | Keep empty unless trusted proxies strip untrusted forwarded headers. |
 | `admin.auth.enabled` | Keep `true` for production. |
 | Admin password hash and `admin.auth.session_secret` | Must be present; generate the hash with init/reset and manage the session secret as a secret. |
 | `filecoin.network` | `calibration` until you intentionally move to `mainnet` |
@@ -60,12 +61,12 @@ Review these values first:
 | `cache.max_size_gb` | Size it for expected upload backlog |
 | `logging.format` | Compose sets `json`; built-in default is `text`. |
 
-After saving settings, run `make docker-stop`, `make docker-up`, `make docker-verify`, and the settings command again.
+After saving settings, restart SynapS3, check `/healthz`, and run `synaps3 admin settings get` again to verify the effective values.
 
 High-risk settings require explicit confirmation:
 
 ```bash
-make docker-admin ADMIN_ARGS='settings set filecoin.network=mainnet --yes'
+synaps3 admin settings set filecoin.network=mainnet --yes
 ```
 
 ## Monitoring
@@ -87,9 +88,9 @@ Treat `{"status":"unhealthy"}` as a problem to investigate. It means database, c
 Before upgrading:
 
 ```bash
-make docker-verify
-make docker-admin ADMIN_ARGS='task stats'
-make docker-admin ADMIN_ARGS='task list --status exhausted --limit 50'
+curl http://127.0.0.1:9090/healthz
+synaps3 admin task stats
+synaps3 admin task list --status exhausted --limit 50
 ```
 
 Expected result: health is `ok`, task queues are understood, and every exhausted task has a clear handling decision before the process is replaced.

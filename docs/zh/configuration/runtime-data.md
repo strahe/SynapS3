@@ -34,7 +34,7 @@ SQLite WAL 和 SHM 文件是正常现象。显式配置的 `database.dsn` 和 `c
   cache/
 ```
 
-Docker 部署通过 `synaps3-data` volume 挂载该路径。Admin HTTPS 还会使用 `synaps3-caddy-data` 保存证书和 ACME 账户状态，并使用 `synaps3-caddy-config` 保存 Caddy 运行配置。这两个 Caddy volume 不属于 SynapS3 数据库与缓存的一致性恢复点，但保留它们可以避免不必要的证书和账户替换。
+Docker 部署通过 `synaps3-data` volume 挂载该路径。Docker 专用的生命周期和备份命令见 [Docker 部署](../getting-started/docker.md)。
 
 ## 必须持久保存的数据
 
@@ -45,35 +45,29 @@ Docker 部署通过 `synaps3-data` volume 挂载该路径。Admin HTTPS 还会�
 | `db/` | 保存存储桶、对象、版本、后台任务、S3 用户和存储元数据。 |
 | `cache/` | 保存本地持久化的对象字节，用于 Filecoin 上传和读取回填。 |
 | 环境密钥 | 可能保存 Filecoin 私钥和部署特定覆盖项。 |
-| Caddy 数据和配置 volume | 保存 Admin 证书、证书私钥、ACME 账户和 Caddy 运行状态。 |
 
 让 `config.toml`、`.env`、凭据文件和导出的密钥保持 `0600` 权限。不要把钱包私钥提交到仓库或放进未受保护的归档。
 
 ## 备份前检查
 
-1. 运行 `make docker-verify`，并记录任何非 `ok` 结果。
-2. 运行 `make docker-admin ADMIN_ARGS='task stats'` 和 `make docker-admin ADMIN_ARGS='task list --status exhausted'`，检查活动任务和耗尽重试的任务。
-3. 运行 `make docker-stop`，避免备份过程中对象数据、元数据和任务状态继续变化。
+1. 检查 `curl http://127.0.0.1:9090/healthz`，并记录任何非 `ok` 结果。
+2. 运行 `synaps3 admin task stats` 和 `synaps3 admin task list --status exhausted`，检查活动任务和耗尽重试的任务。
+3. 使用当前部署方式的服务管理器停止 SynapS3，避免备份过程中对象数据、元数据和任务状态继续变化。
 
 不要在 SynapS3 仍在运行时创建文件系统归档。
 
 ## SQLite 备份
 
-SQLite 是默认数据库。停止 SynapS3 后，备份完整运行数据卷，让数据库、WAL/SHM 文件、配置和缓存处于同一恢复时间点：
+SQLite 是默认数据库。停止 SynapS3 后，备份完整运行数据目录，让数据库、WAL/SHM 文件、配置和缓存处于同一恢复时间点。以下示例使用源码部署的默认路径：
 
 ```bash
-docker run --rm \
-  -v synaps3-data:/data:ro \
-  -v "$PWD":/backup \
-  alpine:3 \
-  tar czf /backup/synaps3-data.tgz -C /data .
-docker run --rm \
-  -v "$PWD":/backup \
-  alpine:3 \
-  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256 && sha256sum -c synaps3-data.tgz.sha256'
+tar czf synaps3-data.tgz -C "$HOME/.synaps3" .
+tar tzf synaps3-data.tgz >/dev/null
+sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256
+sha256sum -c synaps3-data.tgz.sha256
 ```
 
-归档列表和校验和验证必须成功退出。将 `synaps3-data.tgz` 与 `synaps3-data.tgz.sha256` 一起保存到受保护的备份存储。
+当 `database.dsn` 或 `cache.dir` 指向其他路径时，替换上述路径，并把这些位置纳入同一恢复时间点。归档列表和校验和验证必须成功退出。将 `synaps3-data.tgz` 与 `synaps3-data.tgz.sha256` 一起保存到受保护的备份存储。
 
 ## PostgreSQL 备份
 
@@ -88,12 +82,11 @@ PostgreSQL 原生备份代替复制 SQLite 数据库目录，但不能代替配�
 
 ## 重启并验证
 
-备份成功后：
+备份成功后，使用当前部署方式的服务管理器启动 SynapS3，然后运行：
 
 ```bash
-make docker-up
-make docker-verify
-make docker-admin ADMIN_ARGS='task stats'
+curl http://127.0.0.1:9090/healthz
+synaps3 admin task stats
 ```
 
 `/healthz` 应返回 `{"status":"ok"}`。恢复 S3 流量前，先排查 `setup` 或 `unhealthy`。
@@ -103,16 +96,13 @@ make docker-admin ADMIN_ARGS='task stats'
 恢复 SQLite 归档前，先验证保存的副本：
 
 ```bash
-docker run --rm \
-  -v "$PWD":/backup:ro \
-  alpine:3 \
-  sh -c 'cd /backup && sha256sum -c synaps3-data.tgz.sha256'
+sha256sum -c synaps3-data.tgz.sha256
 ```
 
 1. 停止 SynapS3，并保持 S3 流量关闭。
 2. 验证归档校验和，确认数据库与缓存带有相同的恢复时间点标记。
 3. 把运行数据卷恢复到空的替换位置。PostgreSQL 部署先恢复数据库原生备份，再连接匹配的配置和缓存数据。
 4. 确认恢复后的配置和凭据文件权限为 `0600`，并允许 SynapS3 运行账户读取。
-5. 运行 `make docker-up`、`make docker-verify` 和 Admin 任务检查，再通过 S3 API 读取一个已知对象。
+5. 启动 SynapS3，检查 `/healthz`、任务统计和耗尽重试的任务，再通过 S3 API 读取一个已知对象。
 
 不要把一个时间点的数据库备份与另一个时间点的缓存数据混用。

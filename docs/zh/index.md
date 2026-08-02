@@ -13,16 +13,16 @@ hero:
       text: 入门概览
       link: /zh/getting-started/overview
     - theme: alt
-      text: Docker 部署
-      link: /zh/getting-started/docker
+      text: 安装方式
+      link: /zh/getting-started/quick-start
     - theme: alt
       text: S3 客户端
       link: /zh/getting-started/s3-clients
 features:
   - title: 自部署网关
     details: 使用 Docker 或源码构建，在自己的环境中运行 SynapS3。
-    link: /zh/getting-started/docker
-    linkText: Docker 部署
+    link: /zh/getting-started/quick-start
+    linkText: 安装方式
   - title: S3 客户端兼容
     details: 创建 S3 凭据，连接 AWS CLI、rclone 或 MinIO Client。
     link: /zh/getting-started/s3-clients

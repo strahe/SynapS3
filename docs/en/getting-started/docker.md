@@ -1,159 +1,205 @@
 ---
 title: Docker Deployment
-description: Deploy SynapS3 with automatic Admin HTTPS.
+description: Deploy SynapS3 with Docker and optionally enable automatic Admin HTTPS.
 ---
 
 # Docker Deployment
 
-This deployment runs SynapS3 and Caddy on one Linux host. SynapS3 keeps the Admin server on `127.0.0.1:9090`; Caddy publishes the dashboard at your HTTPS hostname and manages its certificate automatically.
+Docker keeps the dashboard and Admin API on `127.0.0.1:9090` by default. When a public Admin hostname is needed, select Caddy HTTPS during initialization. Caddy does not proxy the S3 API.
 
 ## Prerequisites
 
 - A Linux host with Git, Make, curl, Docker Engine, and Docker Compose v2.24 or later.
 - Durable local disk for the `synaps3-data` volume.
-- A public hostname such as `admin.example.com`.
-- Public DNS and firewall access:
-  - Point the hostname's A record to the host's public IPv4 address.
-  - Add an AAAA record only when IPv6 reaches the same host. Remove a broken AAAA record before starting.
-  - Allow inbound `80/TCP` and `443/TCP`. Allow `443/UDP` when HTTP/3 is wanted.
-  - If the domain uses CAA records, allow a public CA that Caddy can use.
-- A Calibration wallet you can fund, or use the wallet commands below.
+- SSH access or a usable public HTTPS hostname when Admin is accessed from another machine.
+- A fundable Calibration wallet. You can also start in `setup` state and configure the wallet later.
 
-Caddy's default certificate challenges require ports 80 or 443 to be reachable from the public internet. This deployment does not include DNS-provider plugins or wildcard certificate support.
+## Initialize the Deployment
 
-## Create the Deployment
-
-Clone the repository and initialize the protected environment file:
+Clone the repository:
 
 ```bash
 git clone --depth 1 https://github.com/strahe/SynapS3.git
 cd SynapS3
+```
+
+### Default: Local Admin
+
+Without a hostname, Admin remains bound to loopback:
+
+```bash
+make docker-init
+```
+
+### Optional: Automatic Admin HTTPS
+
+Public HTTPS also requires:
+
+- An A record pointing the Admin hostname to the host's public IPv4 address.
+- An AAAA record only when the host is also reachable over IPv6.
+- Inbound `80/TCP` and `443/TCP` through host and cloud firewalls.
+- A CAA policy, when present, that permits a public CA available to Caddy.
+
+Pass the hostname during initialization:
+
+```bash
 make docker-init ADMIN_DOMAIN=admin.example.com
 ```
 
-Use a bare hostname for `ADMIN_DOMAIN`; do not include `https://`, a port, path, or wildcard. The command creates `.env` with permission mode `0600` and selects the published SynapS3 image plus Admin HTTPS.
+Use only the hostname for `ADMIN_DOMAIN`; do not include a scheme, port, path, or wildcard. This mode loads Caddy, manages certificate issuance and renewal, and redirects HTTP to HTTPS. SynapS3 Admin remains bound to `127.0.0.1:9090`.
 
-Review `.env` before starting. Keep it at `0600`, and never put a private key directly in a shell command because shell history may retain it. See [Environment Variables](../configuration/environment.md) for supported SynapS3 overrides.
+### Build the Docker Image from This Checkout
 
-### Build the Image Locally
-
-To build from the checkout instead of using the published image, choose the local source during initialization:
+To build the container image from the current checkout:
 
 ```bash
-make docker-init ADMIN_DOMAIN=admin.example.com IMAGE_SOURCE=local
-make docker-build
+make docker-init IMAGE_SOURCE=local
 ```
 
-Choose the image source before `.env` exists. `docker-init` refuses to overwrite an existing file.
+Pass `ADMIN_DOMAIN` in the same command when Admin HTTPS is also needed. `make docker-up` builds the local image when required.
 
-## Prepare a Calibration Wallet
+`docker-init` creates `.env` at permission mode `0600` and refuses to overwrite an existing file. Review `.env` after selecting the deployment mode and keep it at `0600`.
 
-If you do not already have a wallet, generate one:
+## Prepare a Wallet
+
+Generate a wallet in a private terminal when needed:
 
 ```bash
-make docker-wallet
+docker compose run --rm synaps3 synaps3 wallet generate
 ```
 
-The command prints a wallet address and private key. Run it only in a private terminal, save the private key in a protected location, and add it to `.env`:
+Store the printed private key securely, then edit `.env`:
 
 ```text
 SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
 ```
 
-Request Calibration assets for the generated address:
+Do not put the real private key in a shell command. See [Environment Variables](../configuration/environment.md) for other supported overrides.
+
+Fund the wallet address on Calibration:
 
 ```bash
-make docker-fund WALLET_ADDRESS=0x...
+docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
-If faucet funding is unavailable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/). Successful claims print `CalibnetUSDFC: <hash>` and `CalibnetFIL: <hash>`.
-
-SynapS3 can start in `setup` state without a wallet key. Complete the remaining wallet settings in the dashboard before sending S3 traffic.
+If faucet funding is unavailable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/). You can also leave the wallet unset, start SynapS3 in `setup` state, and finish configuration in the dashboard.
 
 ## Start and Verify
-
-Start the deployment and verify both local health and public HTTPS:
 
 ```bash
 make docker-up
 make docker-verify
 ```
 
-`docker-up` waits for the containers to run and for the SynapS3 container health check. It does not claim that public certificate issuance has finished. `docker-verify` checks the loopback Admin endpoint, the trusted HTTPS certificate, and HTTP-to-HTTPS redirection.
-
-The health response has three relevant states:
+`docker-verify` always checks the local `/healthz` endpoint. When Admin HTTPS is enabled, it also verifies the trusted certificate and the HTTP-to-HTTPS redirect.
 
 | Status | Meaning |
 | --- | --- |
-| `setup` | HTTPS is ready, but required SynapS3 settings are still missing. |
-| `ok` | Admin HTTPS is ready and runtime health checks pass. |
-| `unhealthy` | HTTPS may be working, but the database, cache, or workers need attention. |
+| `setup` | Admin is reachable, but required settings are missing. |
+| `ok` | Admin is reachable and runtime health checks pass. |
+| `unhealthy` | The database, cache, or workers need attention. |
 
 Only `ok` is ready for normal S3 traffic.
 
-Deployment endpoints and data:
-
-| Surface | Address or location |
+| Surface or data | Address or location |
 | --- | --- |
 | S3 API | `http://<host>:8080` until S3 TLS is configured separately |
-| Dashboard and Admin API | `https://admin.example.com` |
-| Admin backend | `http://127.0.0.1:9090`, not publicly reachable |
+| Local Admin | `http://127.0.0.1:9090` |
+| Public Admin | HTTPS mode only: `https://admin.example.com` |
 | SynapS3 runtime data | Docker volume `synaps3-data` |
-| Caddy certificates and state | Docker volumes `synaps3-caddy-data` and `synaps3-caddy-config` |
+| Caddy state | HTTPS mode only: `synaps3-caddy-data` and `synaps3-caddy-config` |
 
-Read the generated Admin password in a private terminal:
+Read the initial Admin password:
 
 ```bash
 make docker-password
 ```
 
-The username is `admin`. Save the password in a password manager. Container-local Admin commands read the same protected password file automatically:
+The username is `admin`. Read the password only in a private terminal and store it in a password manager.
+
+Reach local Admin remotely through an SSH tunnel:
 
 ```bash
-make docker-admin ADMIN_ARGS='status'
+ssh -L 9090:127.0.0.1:9090 user@server
 ```
 
-Deposit USDFC and approve FWSS from the dashboard before expected uploads.
+When HTTPS is enabled, use the configured hostname directly. Never bind port 9090 to a public interface.
+
+Container-local Admin CLI operations continue to use the native command:
+
+```bash
+docker compose exec -T synaps3 synaps3 admin status
+```
 
 ## S3 Transport Security
 
-Caddy in this deployment protects the dashboard and Admin API only. It does not proxy the S3 API.
+Caddy protects only the dashboard and Admin API. It does not handle the S3 API.
 
-For production S3 traffic, configure native TLS with `SYNAPS3_SERVER_TLS_ENABLED=true`, `SYNAPS3_SERVER_TLS_CERT_FILE`, and `SYNAPS3_SERVER_TLS_KEY_FILE`, or place the S3 API behind a separately controlled TLS proxy. Certificate and key paths must be visible inside the container, normally through read-only mounts.
+For production S3 traffic, either configure native TLS with `SYNAPS3_SERVER_TLS_ENABLED=true`, `SYNAPS3_SERVER_TLS_CERT_FILE`, and `SYNAPS3_SERVER_TLS_KEY_FILE`, or place the S3 API behind a separate controlled TLS proxy. Certificate and key paths must be visible inside the container, typically through read-only mounts.
 
-## Operate the Deployment
-
-Use `make docker-help` to list the supported commands. Common operations are:
+## Daily Operations
 
 ```bash
 make docker-status
+make docker-logs
 make docker-logs DOCKER_SERVICE=synaps3
-make docker-logs DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1
-make docker-admin ADMIN_ARGS='task stats'
+make docker-logs DOCKER_SERVICE=caddy DOCKER_LOG_FOLLOW=1 # HTTPS mode only
+make docker-down
 ```
 
-`make docker-stop` stops both services but retains their containers and data. `make docker-down` removes the containers, but preserves `.env`, SynapS3 runtime data, and Caddy certificate volumes. No provided Make target deletes volumes.
+Logs show the latest 100 lines by default. `docker-down` removes containers but preserves `.env`, `synaps3-data`, and any existing Caddy certificate volumes.
 
-Before serving traffic, complete the [Production Checklist](../operations/production-checklist.md).
+## HTTPS Troubleshooting
 
-## Certificate Troubleshooting
+This section applies only when Admin HTTPS is enabled. If `make docker-verify` reports that HTTPS is not ready:
 
-If `make docker-verify` reports that HTTPS is not ready:
-
-1. Confirm the A and optional AAAA records resolve to this host.
-2. Confirm no other service is using ports 80 or 443.
-3. Confirm the host firewall and cloud firewall allow inbound 80/TCP and 443/TCP.
-4. Check whether CAA records restrict certificate issuance.
-5. Inspect Caddy's certificate logs:
+1. Check the A record and optional AAAA record.
+2. Confirm that no other service occupies ports 80 or 443.
+3. Check host firewall, cloud firewall, and CAA policy.
+4. Read the Caddy logs:
 
 ```bash
 make docker-logs DOCKER_SERVICE=caddy
 ```
 
-Caddy retries certificate issuance after DNS or firewall problems are corrected. Do not delete `synaps3-caddy-data`; it contains certificate keys and ACME account state.
+Caddy continues retrying after the problem is fixed. Do not delete `synaps3-caddy-data`; it contains certificate private keys and ACME account state.
 
-## Upgrade and Back Up
+## Back Up Docker Data
 
-Do not archive a live data volume. Check health and task queues, stop the deployment, then follow the driver-specific steps in [Runtime Data](../configuration/runtime-data.md). Keep the database and cache at the same recovery point.
+Check health and stop the containers first:
 
-After creating and verifying that backup, follow [Upgrade and Recovery](../operations/upgrade-recovery.md). The current published channel is the moving `edge` image, so an upgrade does not provide automatic rollback.
+```bash
+make docker-verify
+make docker-down
+```
+
+For the default SQLite deployment, archive the complete runtime data volume:
+
+```bash
+docker run --rm \
+  -v synaps3-data:/data:ro \
+  -v "$PWD":/backup \
+  alpine:3 \
+  tar czf /backup/synaps3-data.tgz -C /data .
+docker run --rm \
+  -v "$PWD":/backup \
+  alpine:3 \
+  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256 && sha256sum -c synaps3-data.tgz.sha256'
+```
+
+PostgreSQL deployments require a database-native backup plus configuration and cache data from the same recovery point. See [Runtime Data](../configuration/runtime-data.md) for consistency and restore order. Caddy volumes are outside the database-and-cache recovery point, but retain them to avoid replacing certificates and the ACME account.
+
+After the backup, run `make docker-up` and `make docker-verify`.
+
+## Upgrade
+
+Create and verify a consistent backup first. For a published-image deployment:
+
+```bash
+git pull --ff-only
+docker compose pull
+make docker-up
+make docker-verify
+```
+
+For a local-image deployment, omit `docker compose pull`; after updating the checkout, `make docker-up` rebuilds the image. The current release channel is the movable `edge` tag and has no automatic rollback. Complete the [Production Checklist](../operations/production-checklist.md) before restoring normal traffic.

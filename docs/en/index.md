@@ -13,16 +13,16 @@ hero:
       text: Get Started
       link: /en/getting-started/overview
     - theme: alt
-      text: Docker Deployment
-      link: /en/getting-started/docker
+      text: Installation Options
+      link: /en/getting-started/quick-start
     - theme: alt
       text: S3 Clients
       link: /en/getting-started/s3-clients
 features:
   - title: Self-Hosted Gateway
     details: Run SynapS3 in your own environment with Docker or a local build.
-    link: /en/getting-started/docker
-    linkText: Docker Deployment
+    link: /en/getting-started/quick-start
+    linkText: Installation Options
   - title: S3 Client Compatibility
     details: Create S3 credentials and connect AWS CLI, rclone, or MinIO Client.
     link: /en/getting-started/s3-clients
