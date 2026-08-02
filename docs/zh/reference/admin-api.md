@@ -17,7 +17,7 @@ http://127.0.0.1:9090
 
 当 `/healthz` 返回 `{"status":"setup"}` 时，Admin 端点只开放完成配置所需的范围：
 
-- `/healthz`，以及 Admin 登录、会话和退出端点；
+- `/healthz`，以及 Admin 登录、会话、续期和退出端点；
 - 仪表盘外壳；
 - `GET /api/v1/settings`、`PUT /api/v1/settings` 和 `POST /api/v1/settings/validate`；
 - `POST /api/v1/filecoin/readiness/preflight`。
@@ -32,14 +32,20 @@ Setup 模式不提供运行时指标、存储桶、对象、后台任务、钱�
 | --- | --- |
 | `/healthz` | 无。 |
 | `/api/v1/auth/login`、`/api/v1/auth/session` | 登录和会话端点。没有有效浏览器会话时，`/session` 返回 `401`。 |
-| `/api/v1/auth/logout` | 需要有效浏览器会话和 CSRF header；不接受 HTTP Basic auth。 |
+| `/api/v1/auth/refresh`、`/api/v1/auth/logout` | 需要有效浏览器会话和 CSRF header；不接受 HTTP Basic auth。 |
 | `/api/v1/*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
 | `/metrics` | 浏览器 session cookie 或 HTTP Basic auth。 |
 | `/admin/exhausted-tasks*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
 
 ### 浏览器会话
 
-浏览器登录会设置 `synaps3_admin_session` HttpOnly cookie，并返回 CSRF token。使用 cookie 认证的 `POST`、`PUT`、`PATCH`、`DELETE` 必须带 `X-SynapS3-CSRF`。Logout 只接受浏览器会话。
+浏览器登录会设置 `synaps3_admin_session` HttpOnly cookie，并返回 CSRF token。使用 cookie 认证的 `POST`、`PUT`、`PATCH`、`DELETE` 必须带 `X-SynapS3-CSRF`。续期和退出只接受浏览器会话。
+
+登录请求中的可选布尔字段 `remember` 默认为 `false`。普通登录使用 browser-session cookie 和配置的 `admin.auth.session_ttl`。`remember = true` 时，cookie 会持久化 30 天或配置的 session TTL，以较长者为准。部分浏览器在恢复上次浏览会话时也会恢复 browser-session cookie。
+
+登录、会话和续期响应包含 `username`、`csrf_token`、`expires_at` 和 `refresh_after`。到达 `refresh_after` 后，官方仪表盘会在下一次可信的指针、点击、键盘或滚轮操作时请求续期。仪表盘轮询和仅切回可见标签页不会触发续期。服务端不验证用户活动：任何持有有效 session cookie 和对应 CSRF token 的客户端，都可以在 `refresh_after` 之后请求续期。登录没有绝对时长上限。没有客户端请求续期时，token 会在 `expires_at` 到期。
+
+续期会保留会话时长、CSRF token 和登录 family。退出会撤销整个 family，包括最近一次续期之前签发的 token。撤销记录保存在内存中；重启 SynapS3 会清空这些记录，但正常退出时浏览器 cookie 仍会被删除。
 
 ### CLI 和 Basic auth
 
@@ -65,8 +71,9 @@ synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
 
 | Method | Path | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/auth/login` | 校验用户名和密码，设置浏览器 cookie，并返回 CSRF token。 |
-| `GET` | `/api/v1/auth/session` | 返回当前浏览器会话和 CSRF token。 |
+| `POST` | `/api/v1/auth/login` | 校验用户名和密码，接受可选的 `remember`，设置浏览器 cookie，并返回会话。 |
+| `GET` | `/api/v1/auth/session` | 返回当前浏览器会话。 |
+| `POST` | `/api/v1/auth/refresh` | 需要会话和 CSRF；会话允许续期时重新签发，过早请求只返回当前会话且不修改 cookie。 |
 | `POST` | `/api/v1/auth/logout` | 需要会话和 CSRF，结束当前浏览器会话并清除 cookie。 |
 
 退出登录或收到 `401` API 响应后，仪表盘会返回登录页。

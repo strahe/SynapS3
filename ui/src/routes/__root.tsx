@@ -47,6 +47,7 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar'
 import { useFilecoinReadiness, useSettings } from '@/hooks/queries'
+import { useAuthSessionRenewal } from '@/hooks/use-auth-session-renewal'
 import {
   filecoinReadinessStatusLabel,
   filecoinReadinessStatusTone,
@@ -195,17 +196,19 @@ function AuthenticatedRootLayout({
   const queryClient = useQueryClient()
   const location = useLocation()
   const { data: settings, isLoading: settingsLoading } = useSettings()
+  const stopSessionRenewal = useAuthSessionRenewal(session)
   const runtimeAvailable = fullRuntimeAvailable(settings, settingsLoading)
   const activeNavItems = settingsLoading || rootUsesSetupShell(settings) ? setupNavItems : navItems
   const contentKind = rootContentKind(settings, location.pathname)
 
   const handleLogout = useCallback(async () => {
+    await stopSessionRenewal()
     try {
       await api.logout()
     } finally {
       clearLocalAuthSession(queryClient)
     }
-  }, [queryClient])
+  }, [queryClient, stopSessionRenewal])
 
   return (
     <SidebarProvider defaultOpen={readSidebarDefaultOpen()}>

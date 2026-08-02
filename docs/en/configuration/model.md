@@ -102,6 +102,12 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
+## Admin Session Lifetime
+
+`admin.auth.session_ttl` controls the lifetime of each standard Admin UI session token. It is neither a server-enforced idle timeout nor an absolute cap on a login. After the earlier of five minutes or half the token lifetime, the server permits renewal. The official dashboard requests renewal only after a trusted pointer, click, keyboard, or wheel interaction; background polling and returning to a visible tab do not trigger it. Any client holding the valid session cookie and matching CSRF token can call the refresh endpoint after `refresh_after`. If no client requests renewal, the token expires at `expires_at`.
+
+The login page uses a browser-session cookie by default. Selecting **Keep me signed in** creates a persistent cookie and uses the greater of 30 days or `admin.auth.session_ttl`. While the dashboard continues to receive user activity, it can keep requesting renewal; the server applies no absolute login lifetime cap.
+
 ## Allowed Values
 
 - `filecoin.network`: `calibration`, `mainnet`.

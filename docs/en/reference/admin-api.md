@@ -17,7 +17,7 @@ http://127.0.0.1:9090
 
 When `/healthz` returns `{"status":"setup"}`, the Admin endpoint exposes only the surfaces needed to finish configuration:
 
-- `/healthz`, Admin login, session, and logout;
+- `/healthz`, Admin login, session, refresh, and logout;
 - the dashboard shell;
 - `GET /api/v1/settings`, `PUT /api/v1/settings`, and `POST /api/v1/settings/validate`;
 - `POST /api/v1/filecoin/readiness/preflight`.
@@ -32,14 +32,20 @@ Runtime metrics, buckets, objects, tasks, wallet operations, storage health, and
 | --- | --- |
 | `/healthz` | None. |
 | `/api/v1/auth/login`, `/api/v1/auth/session` | Login and session endpoints. Session returns `401` when no valid browser session exists. |
-| `/api/v1/auth/logout` | Requires a valid browser session and CSRF header; HTTP Basic auth is not accepted. |
+| `/api/v1/auth/refresh`, `/api/v1/auth/logout` | Require a valid browser session and CSRF header; HTTP Basic auth is not accepted. |
 | `/api/v1/*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 | `/metrics` | Browser session cookie or HTTP Basic auth. |
 | `/admin/exhausted-tasks*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 
 ### Browser Sessions
 
-Browser login sets the `synaps3_admin_session` HttpOnly cookie and returns a CSRF token. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests must include `X-SynapS3-CSRF`. Logout only accepts browser sessions.
+Browser login sets the `synaps3_admin_session` HttpOnly cookie and returns a CSRF token. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests must include `X-SynapS3-CSRF`. Refresh and logout only accept browser sessions.
+
+The optional `remember` boolean in the login request defaults to `false`. A standard login uses a browser-session cookie and the configured `admin.auth.session_ttl`. When `remember` is `true`, the cookie persists for the greater of 30 days or the configured session TTL. Some browsers can restore browser-session cookies when restoring a previous browsing session.
+
+Login, session, and refresh responses contain `username`, `csrf_token`, `expires_at`, and `refresh_after`. After `refresh_after`, the official dashboard requests renewal on the next trusted pointer, click, keyboard, or wheel interaction. Dashboard polling and returning to a visible tab do not trigger renewal. The server does not verify user activity: any client holding the valid session cookie and matching CSRF token can request renewal after `refresh_after`. The login has no absolute lifetime cap. If no client requests renewal, the token expires at `expires_at`.
+
+Refresh preserves the session lifetime, CSRF token, and login family. Logout revokes the whole family, including tokens issued before the latest refresh. Revocations are kept in memory; restarting SynapS3 clears them, although the browser cookie is still removed during a normal logout.
 
 ### CLI and Basic Auth
 
@@ -65,8 +71,9 @@ synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/v1/auth/login` | Validate username and password, set the browser cookie, and return a CSRF token. |
-| `GET` | `/api/v1/auth/session` | Return the current browser session and CSRF token. |
+| `POST` | `/api/v1/auth/login` | Validate username and password, accept optional `remember`, set the browser cookie, and return the session. |
+| `GET` | `/api/v1/auth/session` | Return the current browser session. |
+| `POST` | `/api/v1/auth/refresh` | Require session and CSRF, then renew an eligible browser session. Early requests return the current session without changing the cookie. |
 | `POST` | `/api/v1/auth/logout` | Require session and CSRF, end the current browser session, and clear the cookie. |
 
 After logout or a `401` API response, the dashboard returns to the login page.
