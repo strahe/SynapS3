@@ -29,9 +29,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  image_pr:
-    name: image-pr
-    if: github.event_name == 'pull_request'
+  deployment:
+    name: deployment
     runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 10
 
@@ -39,6 +38,20 @@ jobs:
       - &checkout
         name: Checkout
         uses: actions/checkout@v6
+
+      - name: Validate Docker deployment
+        env:
+          SYNAPS3_REQUIRE_DOCKER_DAEMON: '1'
+        run: make test-docker-deployment
+
+  image_pr:
+    name: image-pr
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ vars.RUNS_ON_AMD64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+
+    steps:
+      - *checkout
 
       - &setup-buildx
         name: Set up Docker Buildx

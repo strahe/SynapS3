@@ -12,9 +12,9 @@ SynapS3 is a single-node gateway. During an upgrade or recovery, protect locally
 Run:
 
 ```bash
-curl http://127.0.0.1:9090/healthz
-synaps3 admin task stats
-synaps3 admin task list --status exhausted --limit 50
+make docker-verify
+make docker-admin ADMIN_ARGS='task stats'
+make docker-admin ADMIN_ARGS='task list --status exhausted --limit 50'
 ```
 
 Expected result: health is `ok`, and every exhausted task has a clear handling decision before the process is replaced.
@@ -22,7 +22,7 @@ Expected result: health is `ok`, and every exhausted task has a clear handling d
 Stop S3 traffic and SynapS3 before creating a backup:
 
 ```bash
-docker compose stop synaps3
+make docker-stop
 ```
 
 - SQLite deployments: archive the complete runtime data volume, then verify the archive and its checksum.
@@ -30,18 +30,17 @@ docker compose stop synaps3
 
 Keep every backup artifact at the same recovery point. Follow [Runtime Data](../configuration/runtime-data.md) for exact backup, verification, and restart steps.
 
-## Upgrade Docker Compose
+## Upgrade the Docker Deployment
 
 ```bash
-docker compose pull
-docker compose up -d
-docker compose logs --tail=100 synaps3
-curl http://127.0.0.1:9090/healthz
-docker compose exec synaps3 synaps3 admin settings get
-docker compose exec synaps3 synaps3 admin task stats
+make docker-upgrade BACKUP_CONFIRMED=1
+make docker-admin ADMIN_ARGS='settings get'
+make docker-admin ADMIN_ARGS='task stats'
 ```
 
-Expected result: the service starts with the intended runtime data, health returns `ok`, effective settings match the deployment, and task queues resume without unexpected exhausted work. Read a known object through the S3 API before restoring normal traffic.
+The upgrade target requires a clean tracked worktree, updates the shallow checkout with a fast-forward pull, and replaces the deployment with the latest `edge` image or local build. It does not create a backup or provide automatic rollback.
+
+Expected result: `docker-verify` reports `ok`, effective settings match the deployment, and task queues resume without unexpected exhausted work. Read a known object through the S3 API before restoring normal traffic.
 
 ## Runtime Flow
 
@@ -73,18 +72,18 @@ A provider becoming unavailable after a copy has already been stored does not ne
 2. Verify archive checksums and select database and cache artifacts from the same recovery point.
 3. For SQLite, restore the complete runtime data volume. For PostgreSQL, restore the database-native backup first, then the matching configuration and cache data.
 4. If rolling back the application, start the pinned previous image only with data that is compatible with that version. When compatibility is uncertain, restore the pre-upgrade recovery point.
-5. Start SynapS3 and verify `/healthz`, effective settings, task statistics, exhausted tasks, wallet readiness, and a known S3 object.
+5. Run `make docker-up` and `make docker-verify`, then check effective settings, task statistics, exhausted tasks, wallet readiness, and a known S3 object.
 
 Do not resume normal traffic until these checks pass.
 
 Useful commands:
 
 ```bash
-synaps3 admin task list --status exhausted --limit 100
-synaps3 admin task stats
-synaps3 admin task retry 42
-synaps3 admin s3-user list
-synaps3 admin settings get
+make docker-admin ADMIN_ARGS='task list --status exhausted --limit 100'
+make docker-admin ADMIN_ARGS='task stats'
+make docker-admin ADMIN_ARGS='task retry 42'
+make docker-admin ADMIN_ARGS='s3-user list'
+make docker-admin ADMIN_ARGS='settings get'
 ```
 
-After changing a recovery-related setting, restart SynapS3 and verify both `/healthz` and `synaps3 admin settings get`.
+After changing a recovery-related setting, run `make docker-stop`, `make docker-up`, `make docker-verify`, and the settings check again.

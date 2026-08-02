@@ -34,7 +34,7 @@ SQLite WAL 和 SHM 文件是正常现象。显式配置的 `database.dsn` 和 `c
   cache/
 ```
 
-Compose 部署通过 `synaps3-data` Docker volume 挂载该路径。
+Docker 部署通过 `synaps3-data` volume 挂载该路径。Admin HTTPS 还会使用 `synaps3-caddy-data` 保存证书和 ACME 账户状态，并使用 `synaps3-caddy-config` 保存 Caddy 运行配置。这两个 Caddy volume 不属于 SynapS3 数据库与缓存的一致性恢复点，但保留它们可以避免不必要的证书和账户替换。
 
 ## 必须持久保存的数据
 
@@ -45,14 +45,15 @@ Compose 部署通过 `synaps3-data` Docker volume 挂载该路径。
 | `db/` | 保存存储桶、对象、版本、后台任务、S3 用户和存储元数据。 |
 | `cache/` | 保存本地持久化的对象字节，用于 Filecoin 上传和读取回填。 |
 | 环境密钥 | 可能保存 Filecoin 私钥和部署特定覆盖项。 |
+| Caddy 数据和配置 volume | 保存 Admin 证书、证书私钥、ACME 账户和 Caddy 运行状态。 |
 
 让 `config.toml`、`.env`、凭据文件和导出的密钥保持 `0600` 权限。不要把钱包私钥提交到仓库或放进未受保护的归档。
 
 ## 备份前检查
 
-1. 检查 `curl http://127.0.0.1:9090/healthz`，并记录任何非 `ok` 结果。
-2. 运行 `synaps3 admin task stats` 和 `synaps3 admin task list --status exhausted`，检查活动任务和耗尽重试的任务。
-3. 停止 SynapS3，避免备份过程中对象数据、元数据和任务状态继续变化。Compose 部署运行 `docker compose stop synaps3`。
+1. 运行 `make docker-verify`，并记录任何非 `ok` 结果。
+2. 运行 `make docker-admin ADMIN_ARGS='task stats'` 和 `make docker-admin ADMIN_ARGS='task list --status exhausted'`，检查活动任务和耗尽重试的任务。
+3. 运行 `make docker-stop`，避免备份过程中对象数据、元数据和任务状态继续变化。
 
 不要在 SynapS3 仍在运行时创建文件系统归档。
 
@@ -90,9 +91,9 @@ PostgreSQL 原生备份代替复制 SQLite 数据库目录，但不能代替配�
 备份成功后：
 
 ```bash
-docker compose start synaps3
-curl http://127.0.0.1:9090/healthz
-docker compose exec synaps3 synaps3 admin task stats
+make docker-up
+make docker-verify
+make docker-admin ADMIN_ARGS='task stats'
 ```
 
 `/healthz` 应返回 `{"status":"ok"}`。恢复 S3 流量前，先排查 `setup` 或 `unhealthy`。
@@ -112,6 +113,6 @@ docker run --rm \
 2. 验证归档校验和，确认数据库与缓存带有相同的恢复时间点标记。
 3. 把运行数据卷恢复到空的替换位置。PostgreSQL 部署先恢复数据库原生备份，再连接匹配的配置和缓存数据。
 4. 确认恢复后的配置和凭据文件权限为 `0600`，并允许 SynapS3 运行账户读取。
-5. 启动 SynapS3，检查 `/healthz`、任务统计和耗尽重试的任务，再通过 S3 API 读取一个已知对象。
+5. 运行 `make docker-up`、`make docker-verify` 和 Admin 任务检查，再通过 S3 API 读取一个已知对象。
 
 不要把一个时间点的数据库备份与另一个时间点的缓存数据混用。
