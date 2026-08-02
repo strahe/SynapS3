@@ -43,7 +43,7 @@ Setup 模式不提供运行时指标、存储桶、对象、后台任务、钱�
 
 登录请求中的可选布尔字段 `remember` 默认为 `false`。普通登录使用 browser-session cookie 和配置的 `admin.auth.session_ttl`。`remember = true` 时，cookie 会持久化 30 天或配置的 session TTL，以较长者为准。部分浏览器在恢复上次浏览会话时也会恢复 browser-session cookie。
 
-登录、会话和续期响应包含 `username`、`csrf_token`、`expires_at` 和 `refresh_after`。到达 `refresh_after` 后，仪表盘会在下一次可信的指针、点击、键盘或滚轮操作时请求续期。仪表盘轮询和仅切回可见标签页不会续期。活跃会话没有绝对时长上限；没有操作的会话会在配置时长附近过期，误差不超过最长 5 分钟的一次续期间隔。
+登录、会话和续期响应包含 `username`、`csrf_token`、`expires_at` 和 `refresh_after`。到达 `refresh_after` 后，官方仪表盘会在下一次可信的指针、点击、键盘或滚轮操作时请求续期。仪表盘轮询和仅切回可见标签页不会触发续期。服务端不验证用户活动：任何持有有效 session cookie 和对应 CSRF token 的客户端，都可以在 `refresh_after` 之后请求续期。登录没有绝对时长上限。没有客户端请求续期时，token 会在 `expires_at` 到期。
 
 续期会保留会话时长、CSRF token 和登录 family。退出会撤销整个 family，包括最近一次续期之前签发的 token。撤销记录保存在内存中；重启 SynapS3 会清空这些记录，但正常退出时浏览器 cookie 仍会被删除。
 

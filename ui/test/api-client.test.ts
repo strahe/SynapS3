@@ -58,7 +58,13 @@ function installFakeXMLHttpRequest() {
 
 test('admin login sends remember mode and refreshes the stored csrf token', async () => {
   const originalFetch = globalThis.fetch
-  const calls: Array<{ url: string; method?: string; headers: Headers; body?: BodyInit | null }> = []
+  const calls: Array<{
+    url: string
+    method?: string
+    headers: Headers
+    body?: BodyInit | null
+    signal?: AbortSignal | null
+  }> = []
   globalThis.fetch = (async (input, init) => {
     const url = String(input)
     calls.push({
@@ -66,6 +72,7 @@ test('admin login sends remember mode and refreshes the stored csrf token', asyn
       method: init?.method,
       headers: new Headers(init?.headers),
       body: init?.body,
+      signal: init?.signal,
     })
     if (url.endsWith('/auth/login')) {
       return new Response(
@@ -92,10 +99,11 @@ test('admin login sends remember mode and refreshes the stored csrf token', asyn
     return new Response(null, { status: 204 })
   }) as typeof fetch
 
+  const refreshController = new AbortController()
   try {
     setAdminCSRFToken('')
     await api.login({ username: 'admin', password: 'password', remember: true })
-    await api.refreshAuthSession()
+    await api.refreshAuthSession({ signal: refreshController.signal })
     await api.logout()
   } finally {
     setAdminCSRFToken('')
@@ -114,6 +122,7 @@ test('admin login sends remember mode and refreshes the stored csrf token', asyn
   assert.equal(calls[1]?.url, '/api/v1/auth/refresh')
   assert.equal(calls[1]?.method, 'POST')
   assert.equal(calls[1]?.headers.get('X-SynapS3-CSRF'), 'login-csrf-token')
+  assert.equal(calls[1]?.signal, refreshController.signal)
   assert.equal(calls[2]?.url, '/api/v1/auth/logout')
   assert.equal(calls[2]?.headers.get('X-SynapS3-CSRF'), 'refreshed-csrf-token')
 })

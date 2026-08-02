@@ -1032,9 +1032,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }).then(storeAuthSession),
-  refreshAuthSession: () =>
+  refreshAuthSession: (options?: APIRequestOptions) =>
     fetchJSON<AuthSession>('/auth/refresh', {
       method: 'POST',
+      ...options,
     }).then(storeAuthSession),
   logout: () =>
     fetchJSON<void>('/auth/logout', { method: 'POST' }).finally(() => {

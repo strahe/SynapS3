@@ -1,7 +1,21 @@
 import { Buffer } from 'node:buffer'
+import type { Page } from '@playwright/test'
 import { expect, test } from './fixtures'
 
 test.describe.configure({ mode: 'serial' })
+
+type AuthRefreshTestState = {
+  requests: number
+  completed: number
+  aborted: number
+  offsetMs: number
+}
+
+function readAuthRefreshTestState(page: Page) {
+  return page.evaluate(
+    () => (window as typeof window & { authRefreshTestState: AuthRefreshTestState }).authRefreshTestState
+  )
+}
 
 test('admin dashboard manages and observes a stored object', async ({ page, systemServer }) => {
   await page.goto(systemServer.adminURL)
@@ -132,4 +146,78 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   await page.getByRole('link', { name: 'Wallet' }).click()
   await expect(page.getByText('FWSS approval is sufficient.')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Approve FWSS' })).toHaveCount(0)
+})
+
+test('admin session renewal follows trusted activity and sign-out cancels an in-flight request', async ({
+  page,
+  systemServer,
+}) => {
+  await page.goto(systemServer.adminURL)
+  await page.getByLabel('Username').fill('admin')
+  await page.getByLabel('Password').fill('system-test-admin-password')
+  await page.getByRole('button', { name: 'Sign In' }).click()
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
+
+  await page.evaluate(() => {
+    const state: AuthRefreshTestState = { requests: 0, completed: 0, aborted: 0, offsetMs: 6 * 60 * 1000 }
+    const testWindow = window as typeof window & { authRefreshTestState: typeof state }
+    testWindow.authRefreshTestState = state
+    const originalFetch = window.fetch.bind(window)
+    const currentTime = Date.now.bind(Date)
+    Date.now = () => currentTime() + state.offsetMs
+    window.fetch = async (input, init) => {
+      const requestURL = input instanceof Request ? input.url : input.toString()
+      if (!requestURL.endsWith('/api/v1/auth/refresh')) {
+        return originalFetch(input, init)
+      }
+
+      state.requests += 1
+      if (state.requests === 1) {
+        const response = await originalFetch(input, init)
+        const session = (await response.json()) as { refresh_after: string }
+        session.refresh_after = new Date(Date.now() + 60_000).toISOString()
+        state.completed += 1
+        return new Response(JSON.stringify(session), {
+          status: response.status,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
+        const abort = () => {
+          state.aborted += 1
+          reject(new DOMException('The operation was aborted.', 'AbortError'))
+        }
+        if (signal?.aborted) {
+          abort()
+          return
+        }
+        signal?.addEventListener('abort', abort, { once: true })
+      })
+    }
+  })
+
+  await page.evaluate(() => {
+    document.dispatchEvent(new Event('visibilitychange'))
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab' }))
+  })
+  expect((await readAuthRefreshTestState(page)).requests).toBe(0)
+
+  await page.keyboard.press('Tab')
+  await expect.poll(async () => (await readAuthRefreshTestState(page)).completed).toBe(1)
+  await page.keyboard.press('Tab')
+  expect((await readAuthRefreshTestState(page)).requests).toBe(1)
+
+  await page.evaluate(() => {
+    const state = (window as typeof window & { authRefreshTestState: AuthRefreshTestState }).authRefreshTestState
+    state.offsetMs += 61_000
+  })
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
+  expect((await readAuthRefreshTestState(page)).requests).toBe(2)
+
+  await page.getByRole('button', { name: 'Sign Out' }).click()
+  await expect(page.getByRole('heading', { name: 'SynapS3 Admin' })).toBeVisible()
+  expect(await readAuthRefreshTestState(page)).toMatchObject({ requests: 2, completed: 1, aborted: 1 })
 })

@@ -104,9 +104,9 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 
 ## Admin 会话时长
 
-`admin.auth.session_ttl` 控制每个普通 Admin UI 会话 token 的有效时长，不是一次登录的绝对上限。经过 5 分钟或 token 有效时长的一半（取较短者）后，仪表盘可以在下一次可信用户操作时续期。后台轮询和仅切回可见标签页不会续期。之后没有用户操作时，会话会在配置时长附近过期，误差不超过一次续期间隔。
+`admin.auth.session_ttl` 控制每个普通 Admin UI 会话 token 的有效时长，既不是服务端强制的空闲超时，也不是一次登录的绝对上限。经过 5 分钟或 token 有效时长的一半（取较短者）后，服务端允许续期。官方仪表盘只在可信的指针、点击、键盘或滚轮操作后请求续期；后台轮询和仅切回可见标签页不会触发续期。任何持有有效 session cookie 和对应 CSRF token 的客户端，都可以在 `refresh_after` 之后调用续期接口。没有客户端请求续期时，token 会在 `expires_at` 到期。
 
-登录页默认使用 browser-session cookie。选择 **Keep me signed in** 后，会改用持久 cookie，并使用 30 天或 `admin.auth.session_ttl` 中较长的时长。持续活跃的会话可以继续续期，没有绝对时长上限。
+登录页默认使用 browser-session cookie。选择 **Keep me signed in** 后，会改用持久 cookie，并使用 30 天或 `admin.auth.session_ttl` 中较长的时长。只要仪表盘持续收到用户操作，就可以继续请求续期；服务端不设置登录的绝对时长上限。
 
 ## 允许值
 

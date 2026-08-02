@@ -269,7 +269,7 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 	},
 	"admin.auth.session_ttl": {
 		Label:       "Admin Session TTL",
-		Description: "Lifetime of a standard Admin UI session before activity-based renewal.",
+		Description: "Lifetime of each standard Admin UI token. This is not a server-enforced idle timeout.",
 		Env:         "SYNAPS3_ADMIN_AUTH_SESSION_TTL",
 	},
 }

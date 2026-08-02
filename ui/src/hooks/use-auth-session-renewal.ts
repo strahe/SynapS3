@@ -9,6 +9,7 @@ export function useAuthSessionRenewal(session: AuthSession) {
   const queryClient = useQueryClient()
   const sessionRef = useRef(session)
   const inFlightRef = useRef<Promise<void> | null>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
   const retryAfterRef = useRef(0)
   const stoppedRef = useRef(false)
   sessionRef.current = session
@@ -27,8 +28,10 @@ export function useAuthSessionRenewal(session: AuthSession) {
     }
 
     retryAfterRef.current = now + refreshRetryDelayMs
+    const abortController = new AbortController()
+    abortControllerRef.current = abortController
     const request = api
-      .refreshAuthSession()
+      .refreshAuthSession({ signal: abortController.signal })
       .then((refreshedSession) => {
         if (Date.parse(refreshedSession.refresh_after) > Date.now()) {
           retryAfterRef.current = 0
@@ -41,6 +44,9 @@ export function useAuthSessionRenewal(session: AuthSession) {
       .finally(() => {
         if (inFlightRef.current === request) {
           inFlightRef.current = null
+        }
+        if (abortControllerRef.current === abortController) {
+          abortControllerRef.current = null
         }
       })
     inFlightRef.current = request
@@ -58,6 +64,7 @@ export function useAuthSessionRenewal(session: AuthSession) {
     }
     return () => {
       stoppedRef.current = true
+      abortControllerRef.current?.abort()
       for (const eventName of authActivityEvents) {
         document.removeEventListener(eventName, handleActivity)
       }
@@ -66,6 +73,7 @@ export function useAuthSessionRenewal(session: AuthSession) {
 
   return useCallback(async () => {
     stoppedRef.current = true
+    abortControllerRef.current?.abort()
     await inFlightRef.current
   }, [])
 }
