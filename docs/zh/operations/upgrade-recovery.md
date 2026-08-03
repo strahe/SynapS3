@@ -19,29 +19,26 @@ synaps3 admin task list --status exhausted --limit 50
 
 预期结果：`/healthz` 返回 `ok`，并且所有 exhausted 任务在升级前都有明确处理方式。
 
-创建备份前，停止 S3 流量和 SynapS3：
-
-```bash
-docker compose stop synaps3
-```
+创建备份前，停止 S3 流量，并使用当前部署方式的服务管理器停止 SynapS3。
 
 - SQLite 部署：归档完整运行数据卷，并验证归档和校验和。
 - PostgreSQL 部署：创建数据库原生备份，并归档同一时间点的配置和缓存数据。
 
 所有备份产物必须处于同一恢复时间点。准确的备份、校验和重启步骤见[运行数据](../configuration/runtime-data.md)。
 
-## 升级 Docker Compose
+## 升级 SynapS3
+
+使用当前部署对应的安装方式替换可执行文件、软件包或容器镜像。Docker 专用命令见 [Docker 部署](../getting-started/docker.md)。
+
+使用当前部署方式的服务管理器启动 SynapS3，然后运行：
 
 ```bash
-docker compose pull
-docker compose up -d
-docker compose logs --tail=100 synaps3
 curl http://127.0.0.1:9090/healthz
-docker compose exec synaps3 synaps3 admin settings get
-docker compose exec synaps3 synaps3 admin task stats
+synaps3 admin settings get
+synaps3 admin task stats
 ```
 
-预期结果：服务使用预期运行数据启动，`/healthz` 返回 `ok`，生效设置与部署一致，任务队列恢复推进，并且没有意外出现耗尽重试的任务。恢复正常流量前，通过 S3 API 读取一个已知对象。
+预期结果：`/healthz` 返回 `ok`，生效设置与部署一致，任务队列恢复推进，并且没有意外出现耗尽重试的任务。恢复正常流量前，通过 S3 API 读取一个已知对象。
 
 ## 运行流程
 
@@ -65,15 +62,15 @@ docker compose exec synaps3 synaps3 admin task stats
 | 缓存磁盘空间不足 | 扩容磁盘、提高 `cache.max_size_gb`，或恢复上传和淘汰进度。 |
 | 进程崩溃 | 重启服务，再检查健康状态和任务统计；未完成任务会重新进入可继续处理的状态。 |
 
-副本完成存储后，如果存储提供方变为不可用，不一定会产生可重试任务。使用存储健康视图识别受影响副本；恢复目标副本数属于[副本修复愿景](../concepts/filecoin-storage-flow.md#副本修复愿景)。
+副本完成存储后，如果存储提供方变为不可用，不一定会产生可重试任务。使用存储健康视图识别受影响副本；恢复目标副本数属于[计划支持的副本修复](../concepts/filecoin-storage-flow.md#计划支持的副本修复)。
 
 ## 恢复或回退
 
 1. 停止 S3 流量和 SynapS3。
 2. 验证归档校验和，并选择同一恢复时间点的数据库和缓存产物。
 3. SQLite 恢复完整运行数据卷；PostgreSQL 先恢复数据库原生备份，再恢复匹配的配置和缓存数据。
-4. 回退应用版本时，只让固定的旧镜像使用与其兼容的数据。如果无法确认兼容性，恢复升级前的完整恢复时间点。
-5. 启动 SynapS3，检查 `/healthz`、生效设置、任务统计、耗尽重试的任务、钱包就绪状态，并通过 S3 读取一个已知对象。
+4. 回退应用版本时，只让旧版本使用与其兼容的数据。如果无法确认兼容性，恢复升级前的完整恢复时间点。
+5. 启动 SynapS3，再检查 `/healthz`、生效设置、任务统计、耗尽重试的任务、钱包就绪状态，并通过 S3 读取一个已知对象。
 
 这些检查通过前，不要恢复正常流量。
 

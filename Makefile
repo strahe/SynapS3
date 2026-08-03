@@ -7,6 +7,8 @@ GOFLAGS  := -trimpath
 CGO_ENABLED := 1
 CGO      := CGO_ENABLED=$(CGO_ENABLED)
 
+DOCKER_DEPLOYMENT ?= sh docker/deployment.sh
+
 VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT   := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE     := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -14,7 +16,8 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-system test-integration test-ui-e2e test-docker-entrypoint lint fmt check verify-e2e verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev ui-e2e-install
+.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-system test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev ui-e2e-install
+.PHONY: docker-init docker-up docker-verify docker-down docker-status docker-logs docker-password
 
 all: build
 
@@ -65,6 +68,30 @@ test-ui-e2e:
 
 test-docker-entrypoint:
 	sh docker/entrypoint.test.sh
+
+test-docker-deployment:
+	sh docker/deployment.test.sh
+
+docker-init:
+	@$(DOCKER_DEPLOYMENT) init
+
+docker-up:
+	@$(DOCKER_DEPLOYMENT) up
+
+docker-verify:
+	@$(DOCKER_DEPLOYMENT) verify
+
+docker-down:
+	@$(DOCKER_DEPLOYMENT) down
+
+docker-status:
+	@$(DOCKER_DEPLOYMENT) status
+
+docker-logs:
+	@$(DOCKER_DEPLOYMENT) logs
+
+docker-password:
+	@$(DOCKER_DEPLOYMENT) password
 
 lint:
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found"; exit 1; }

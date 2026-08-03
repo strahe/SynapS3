@@ -1,0 +1,32 @@
+services:
+  synaps3:
+    environment:
+      SYNAPS3_ADMIN_ADDR: 127.0.0.1:9090
+      SYNAPS3_ADMIN_AUTH_ENABLED: "true"
+      SYNAPS3_ADMIN_TRUSTED_PROXIES: 127.0.0.1/32
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ADMIN_DOMAIN: ${ADMIN_DOMAIN:?Set ADMIN_DOMAIN in .env to the public Admin hostname}
+    depends_on:
+      synaps3:
+        condition: service_started
+    configs:
+      - source: synaps3-admin-caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+
+configs:
+  synaps3-admin-caddyfile:
+    file: ./docker/Caddyfile
+
+volumes:
+  caddy-data:
+    name: synaps3-caddy-data
+  caddy-config:
+    name: synaps3-caddy-config

@@ -1,0 +1,9 @@
+{
+	admin off
+}
+
+{$ADMIN_DOMAIN} {
+	# Keep HSTS scoped to the Admin hostname; other subdomains may use different TLS policies.
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:9090
+}

@@ -34,7 +34,7 @@ SQLite WAL 和 SHM 文件是正常现象。显式配置的 `database.dsn` 和 `c
   cache/
 ```
 
-Compose 部署通过 `synaps3-data` Docker volume 挂载该路径。
+Docker 部署通过 `synaps3-data` volume 挂载该路径。Docker 专用的生命周期和备份命令见 [Docker 部署](../getting-started/docker.md)。
 
 ## 必须持久保存的数据
 
@@ -52,27 +52,22 @@ Compose 部署通过 `synaps3-data` Docker volume 挂载该路径。
 
 1. 检查 `curl http://127.0.0.1:9090/healthz`，并记录任何非 `ok` 结果。
 2. 运行 `synaps3 admin task stats` 和 `synaps3 admin task list --status exhausted`，检查活动任务和耗尽重试的任务。
-3. 停止 SynapS3，避免备份过程中对象数据、元数据和任务状态继续变化。Compose 部署运行 `docker compose stop synaps3`。
+3. 使用当前部署方式的服务管理器停止 SynapS3，避免备份过程中对象数据、元数据和任务状态继续变化。
 
 不要在 SynapS3 仍在运行时创建文件系统归档。
 
 ## SQLite 备份
 
-SQLite 是默认数据库。停止 SynapS3 后，备份完整运行数据卷，让数据库、WAL/SHM 文件、配置和缓存处于同一恢复时间点：
+SQLite 是默认数据库。停止 SynapS3 后，备份完整运行数据目录，让数据库、WAL/SHM 文件、配置和缓存处于同一恢复时间点。以下示例使用源码部署的默认路径：
 
 ```bash
-docker run --rm \
-  -v synaps3-data:/data:ro \
-  -v "$PWD":/backup \
-  alpine:3 \
-  tar czf /backup/synaps3-data.tgz -C /data .
-docker run --rm \
-  -v "$PWD":/backup \
-  alpine:3 \
-  sh -c 'cd /backup && tar tzf synaps3-data.tgz >/dev/null && sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256 && sha256sum -c synaps3-data.tgz.sha256'
+tar czf synaps3-data.tgz -C "$HOME/.synaps3" .
+tar tzf synaps3-data.tgz >/dev/null
+sha256sum synaps3-data.tgz > synaps3-data.tgz.sha256
+sha256sum -c synaps3-data.tgz.sha256
 ```
 
-归档列表和校验和验证必须成功退出。将 `synaps3-data.tgz` 与 `synaps3-data.tgz.sha256` 一起保存到受保护的备份存储。
+当 `database.dsn` 或 `cache.dir` 指向其他路径时，替换上述路径，并把这些位置纳入同一恢复时间点。归档列表和校验和验证必须成功退出。将 `synaps3-data.tgz` 与 `synaps3-data.tgz.sha256` 一起保存到受保护的备份存储。
 
 ## PostgreSQL 备份
 
@@ -87,12 +82,11 @@ PostgreSQL 原生备份代替复制 SQLite 数据库目录，但不能代替配�
 
 ## 重启并验证
 
-备份成功后：
+备份成功后，使用当前部署方式的服务管理器启动 SynapS3，然后运行：
 
 ```bash
-docker compose start synaps3
 curl http://127.0.0.1:9090/healthz
-docker compose exec synaps3 synaps3 admin task stats
+synaps3 admin task stats
 ```
 
 `/healthz` 应返回 `{"status":"ok"}`。恢复 S3 流量前，先排查 `setup` 或 `unhealthy`。
@@ -102,10 +96,7 @@ docker compose exec synaps3 synaps3 admin task stats
 恢复 SQLite 归档前，先验证保存的副本：
 
 ```bash
-docker run --rm \
-  -v "$PWD":/backup:ro \
-  alpine:3 \
-  sh -c 'cd /backup && sha256sum -c synaps3-data.tgz.sha256'
+sha256sum -c synaps3-data.tgz.sha256
 ```
 
 1. 停止 SynapS3，并保持 S3 流量关闭。

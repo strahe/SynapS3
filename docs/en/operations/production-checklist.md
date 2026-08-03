@@ -15,7 +15,7 @@ Before serving traffic, verify local disk, database health, background tasks, tr
 | Dashboard and Admin API | Keep on `127.0.0.1:9090`; use SSH tunneling or HTTPS reverse proxy for remote access. |
 | Metrics | Scrape with Admin auth from the private network or host-local agent only. |
 
-Do not publish the dashboard or Admin API directly to the internet. Settings, wallet, task retry, and S3 user endpoints can change the node.
+Do not bind the Admin listener or port 9090 to a public interface. For internet access, keep SynapS3 on loopback, use an HTTPS reverse proxy, and keep Admin authentication enabled.
 
 ## Runtime Data
 
