@@ -8,7 +8,7 @@ export default defineConfig({
   plugins: [TanStackRouterVite({ quoteStyle: 'single' }), react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   server: {
@@ -22,14 +22,15 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     chunkSizeWarningLimit: 700,
-    rollupOptions: {
+    rolldownOptions: {
       output: {
-        manualChunks(id) {
-          if (!id.includes('node_modules')) return undefined
-          if (id.includes('@tanstack')) return 'tanstack'
-          if (id.includes('@xyflow')) return 'react-flow'
-          if (id.includes('recharts') || id.includes('victory-vendor')) return 'charts'
-          return 'vendor'
+        codeSplitting: {
+          groups: [
+            { name: 'tanstack', test: /node_modules[\\/]@tanstack/ },
+            { name: 'react-flow', test: /node_modules[\\/]@xyflow/ },
+            { name: 'charts', test: /node_modules[\\/](?:recharts|victory-vendor)/ },
+            { name: 'vendor', test: /node_modules/ },
+          ],
         },
       },
     },
