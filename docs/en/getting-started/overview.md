@@ -25,7 +25,7 @@ S3 clients need an endpoint, credentials, and bucket/object operations. Filecoin
 
 A successful S3 write means the object is durable in local cache and its metadata has been recorded. Reads use local cache first; on a cache miss, SynapS3 can fetch an available remote copy. After the S3 response, background tasks complete the initial target copies, retry failures, and clean cache when the configured policy allows it.
 
-Repairing copies affected by a storage provider becoming unavailable is a separate product capability that is coming soon. See [Replica Repair Vision](../concepts/filecoin-storage-flow.md#replica-repair-vision).
+Repairing copies affected by a storage provider becoming unavailable is a separate product capability that is coming soon. See [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
 
 SynapS3 supports single-node deployments. The cache disk and database are runtime data; do not treat them as scratch storage.
 
@@ -33,6 +33,6 @@ For deeper details, see [Architecture](../concepts/architecture.md), [Write Path
 
 ## Start Here
 
-- For evaluation, use [Quick Start](./quick-start.md) to run a temporary node.
 - Choose [Docker Deployment](./docker.md) or [Build from Source](./source.md) for the intended runtime.
+- After installation, use [Quick Start](./quick-start.md) to check the node and upload the first object.
 - To connect tooling, use [S3 Clients](./s3-clients.md) for AWS CLI, rclone, and MinIO Client examples.

@@ -5,14 +5,14 @@ description: Deploy SynapS3 with Docker and optionally enable automatic Admin HT
 
 # Docker Deployment
 
-Docker keeps the dashboard and Admin API on `127.0.0.1:9090` by default. When a public Admin hostname is needed, select Caddy HTTPS during initialization. Caddy does not proxy the S3 API.
+Docker keeps the dashboard and Admin API on `127.0.0.1:9090` by default. When a public Admin hostname is needed, select Caddy HTTPS. Caddy does not proxy the S3 API.
 
 ## Prerequisites
 
 - A Linux host with Git, Make, curl, Docker Engine, and Docker Compose v2.24 or later.
 - Durable local disk for the `synaps3-data` volume.
 - SSH access or a usable public HTTPS hostname when Admin is accessed from another machine.
-- A fundable Calibration wallet. You can also start in `setup` state and configure the wallet later.
+- A fundable Calibration wallet. If you do not have one, follow the wallet generation steps below.
 
 ## Initialize the Deployment
 
@@ -23,15 +23,20 @@ git clone --depth 1 https://github.com/strahe/SynapS3.git
 cd SynapS3
 ```
 
-### Default: Local Admin
+`docker-init` creates `.env` with permission mode `0600`. Before the first initialization, choose one of these four combinations:
 
-Without a hostname, Admin remains bound to loopback:
+| Image source | Admin access | Initialization command |
+| --- | --- | --- |
+| Published image (default) | Local `127.0.0.1:9090` | `make docker-init` |
+| Published image (default) | Public HTTPS | `make docker-init ADMIN_DOMAIN=admin.example.com` |
+| Current checkout | Local `127.0.0.1:9090` | `make docker-init IMAGE_SOURCE=local` |
+| Current checkout | Public HTTPS | `make docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.com` |
 
-```bash
-make docker-init
-```
+The default uses the published image and keeps Admin on `127.0.0.1:9090`. `IMAGE_SOURCE=local` makes `make docker-up` build from the current checkout. `ADMIN_DOMAIN` loads Caddy, manages certificate issuance and renewal, and redirects HTTP to HTTPS. Both options can be used together.
 
-### Optional: Automatic Admin HTTPS
+`docker-init` refuses to overwrite an existing `.env`. Review the file after creation and keep its permission mode at `0600`.
+
+### Admin HTTPS Requirements
 
 Public HTTPS also requires:
 
@@ -40,41 +45,25 @@ Public HTTPS also requires:
 - Inbound `80/TCP` and `443/TCP` through host and cloud firewalls.
 - A CAA policy, when present, that permits a public CA available to Caddy.
 
-Pass the hostname during initialization:
+Use only the hostname for `ADMIN_DOMAIN`; do not include a scheme, port, path, or wildcard. SynapS3 Admin remains bound to `127.0.0.1:9090`.
 
-```bash
-make docker-init ADMIN_DOMAIN=admin.example.com
-```
+`docker-init` checks hostname syntax only. Certificate issuance still requires a publicly resolvable hostname accepted by a public CA; internal and reserved names will fail `docker-verify`. HSTS applies only to the configured Admin hostname, without subdomain inheritance or preload.
 
-Use only the hostname for `ADMIN_DOMAIN`; do not include a scheme, port, path, or wildcard. This mode loads Caddy, manages certificate issuance and renewal, and redirects HTTP to HTTPS. SynapS3 Admin remains bound to `127.0.0.1:9090`.
+## Configure the Wallet Private Key
 
-### Build the Docker Image from This Checkout
-
-To build the container image from the current checkout:
-
-```bash
-make docker-init IMAGE_SOURCE=local
-```
-
-Pass `ADMIN_DOMAIN` in the same command when Admin HTTPS is also needed. `make docker-up` builds the local image when required.
-
-`docker-init` creates `.env` at permission mode `0600` and refuses to overwrite an existing file. Review `.env` after selecting the deployment mode and keep it at `0600`.
-
-## Prepare a Wallet
-
-Generate a wallet in a private terminal when needed:
+If you already have a wallet, add its private key to `.env`. Otherwise, generate one in a private terminal:
 
 ```bash
 docker compose run --rm synaps3 synaps3 wallet generate
 ```
 
-Store the printed private key securely, then edit `.env`:
+Store the printed private key securely, then uncomment or add this entry in `.env`:
 
 ```text
 SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
 ```
 
-Do not put the real private key in a shell command. See [Environment Variables](../configuration/environment.md) for other supported overrides.
+Do not put the real private key in a shell command. The dashboard reports whether the key is configured, but it does not accept or store the key; Docker deployments should set it through `.env`. See [Environment Variables](../configuration/environment.md) for other supported overrides.
 
 Fund the wallet address on Calibration:
 
@@ -82,7 +71,9 @@ Fund the wallet address on Calibration:
 docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
-If faucet funding is unavailable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/). You can also leave the wallet unset, start SynapS3 in `setup` state, and finish configuration in the dashboard.
+If faucet funding is unavailable, claim manually from [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) or [Plumbline](https://faucet.reiers.io/).
+
+Without the private key, the container starts but SynapS3 exposes only Admin setup mode and cannot serve normal S3 traffic. After setting the key, start or restart the service, then run `make docker-verify` and confirm that the status is `ok`.
 
 ## Start and Verify
 
@@ -92,6 +83,8 @@ make docker-verify
 ```
 
 `docker-verify` always checks the local `/healthz` endpoint. When Admin HTTPS is enabled, it also verifies the trusted certificate and the HTTP-to-HTTPS redirect.
+
+With Admin HTTPS enabled, `https://admin.example.com/healthz` remains available without Admin credentials for external health checks. An `unhealthy` response can identify the affected database, cache, or worker. Use local Admin through an SSH tunnel instead if this status must not be public.
 
 | Status | Meaning |
 | --- | --- |
@@ -202,4 +195,4 @@ make docker-up
 make docker-verify
 ```
 
-For a local-image deployment, omit `docker compose pull`; after updating the checkout, `make docker-up` rebuilds the image. The current release channel is the movable `edge` tag and has no automatic rollback. Complete the [Production Checklist](../operations/production-checklist.md) before restoring normal traffic.
+For a local-image deployment, omit `docker compose pull`; after updating the checkout, `make docker-up` rebuilds the image. The current published channel is the movable `edge` tag and has no automatic rollback. Complete the [Production Checklist](../operations/production-checklist.md) before restoring normal traffic.

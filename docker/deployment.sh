@@ -17,7 +17,12 @@ compose() {
   $DOCKER_COMPOSE "$@"
 }
 
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
 valid_domain() {
+  # Public DNS and certificate eligibility are verified by Caddy and docker-verify.
   domain=$1
   [ -n "$domain" ] && [ "${#domain}" -le 253 ] || return 1
   case "$domain" in
@@ -27,15 +32,42 @@ valid_domain() {
   printf '%s\n' "${domain##*.}" | grep -Eq '[A-Za-z]'
 }
 
+write_deployment_env() {
+  umask 077
+  temp_file=$(mktemp "./.env.tmp.XXXXXX")
+  trap 'rm -f "$temp_file"' EXIT HUP INT TERM
+  {
+    printf '# Docker deployment selection. Managed by make docker-init.\n'
+    printf 'COMPOSE_FILE=%s\n' "$compose_files"
+    if [ -n "$domain" ]; then
+      printf 'ADMIN_DOMAIN=%s\n' "$domain"
+    fi
+    printf '\n'
+    cat .env.example
+  } >"$temp_file"
+  chmod 600 "$temp_file"
+
+  if ! ln "$temp_file" "$ENV_FILE" 2>/dev/null; then
+    if [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
+      echo "$ENV_FILE appeared while Docker initialization was running; no changes were made." >&2
+    else
+      echo "Could not create $ENV_FILE atomically. Check the current directory permissions and filesystem hard-link support." >&2
+    fi
+    exit 1
+  fi
+  rm -f "$temp_file"
+  trap - EXIT HUP INT TERM
+}
+
 init_deployment() {
-  if [ -e "$ENV_FILE" ]; then
+  if [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
     echo "$ENV_FILE already exists; refusing to overwrite it." >&2
     exit 1
   fi
 
   domain=${ADMIN_DOMAIN:-}
   if [ -n "$domain" ] && ! valid_domain "$domain"; then
-    echo "ADMIN_DOMAIN must be a public hostname such as admin.example.com, without a scheme, port, path, or wildcard." >&2
+    echo "ADMIN_DOMAIN must be a hostname such as admin.example.com, without a scheme, port, path, or wildcard." >&2
     exit 1
   fi
 
@@ -51,24 +83,14 @@ init_deployment() {
     compose_files=$compose_files:compose.admin-https.yaml
   fi
 
-  umask 077
-  set -C
-  {
-    printf '# Docker deployment selection. Managed by make docker-init.\n'
-    printf 'COMPOSE_FILE=%s\n' "$compose_files"
-    if [ -n "$domain" ]; then
-      printf 'ADMIN_DOMAIN=%s\n' "$domain"
-    fi
-    printf '\n'
-    cat .env.example
-  } >"$ENV_FILE"
-  chmod 600 "$ENV_FILE"
+  write_deployment_env
 
   if [ -n "$domain" ]; then
     echo "Created $ENV_FILE. Admin HTTPS will use https://$domain/."
   else
     echo "Created $ENV_FILE. Admin remains local at http://127.0.0.1:9090/."
   fi
+  echo "Next: set SYNAPS3_FILECOIN_PRIVATE_KEY in $ENV_FILE before serving normal S3 traffic."
 }
 
 check_deployment() {
@@ -98,7 +120,7 @@ check_deployment() {
     echo "$ENV_FILE not found. Run: make docker-init" >&2
     exit 1
   fi
-  mode=$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE")
+  mode=$(file_mode "$ENV_FILE")
   if [ "$mode" != 600 ]; then
     echo "$ENV_FILE permissions are $mode; run: chmod 600 $ENV_FILE" >&2
     exit 1
@@ -126,7 +148,7 @@ check_deployment() {
   esac
   if [ "$https_enabled" = 1 ]; then
     if ! valid_domain "$domain"; then
-      echo "ADMIN_DOMAIN in $ENV_FILE must be a public hostname such as admin.example.com." >&2
+      echo "ADMIN_DOMAIN in $ENV_FILE must be a hostname such as admin.example.com." >&2
       exit 1
     fi
   fi
@@ -287,9 +309,15 @@ logs_deployment() {
 }
 
 command=${1:-}
-if [ "$command" != init ]; then
-  unset ADMIN_DOMAIN COMPOSE_FILE
-fi
+case "$command" in
+  check | up | verify | down | status | logs | password)
+    if [ "${ADMIN_DOMAIN+x}" = x ] || [ "${COMPOSE_FILE+x}" = x ]; then
+      echo "This command reads ADMIN_DOMAIN and COMPOSE_FILE from $ENV_FILE. Unset the environment variables and retry; edit $ENV_FILE first to change the deployment selection." >&2
+      exit 1
+    fi
+    unset ADMIN_DOMAIN COMPOSE_FILE
+    ;;
+esac
 
 case "$command" in
   init) init_deployment ;;

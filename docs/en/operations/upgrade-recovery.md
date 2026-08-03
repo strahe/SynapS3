@@ -62,7 +62,7 @@ Receive write -> save object -> record metadata -> return success -> continue ba
 | Cache disk full | Increase disk, raise `cache.max_size_gb`, or restore upload and eviction progress. |
 | Process crash | Restart the service, then verify health and task statistics; unfinished tasks become eligible to continue. |
 
-A provider becoming unavailable after a copy has already been stored does not necessarily create a retryable task. Use storage-health views to identify affected copies. Restoring the target copy count is part of the [Replica Repair Vision](../concepts/filecoin-storage-flow.md#replica-repair-vision).
+A provider becoming unavailable after a copy has already been stored does not necessarily create a retryable task. Use storage-health views to identify affected copies. Restoring the target copy count is part of [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
 
 ## Restore or Roll Back
 

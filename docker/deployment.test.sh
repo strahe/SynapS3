@@ -140,6 +140,7 @@ test_init_contract() {
   assert_contains "$case_dir/.env" "COMPOSE_FILE=compose.yaml"
   assert_not_contains "$case_dir/.env" "ADMIN_DOMAIN="
   assert_contains "$out_file" "Admin remains local at http://127.0.0.1:9090/"
+  assert_contains "$out_file" "set SYNAPS3_FILECOIN_PRIVATE_KEY in .env"
 
   printf '%s\n' 'SYNAPS3_FILECOIN_PRIVATE_KEY=preserve-this-value' >>"$case_dir/.env"
   if make --no-print-directory -C "$case_dir" docker-init ADMIN_DOMAIN=other.example.test >"$out_file" 2>"$err_file"; then
@@ -153,7 +154,7 @@ test_init_contract() {
   if make --no-print-directory -C "$https_dir" docker-init ADMIN_DOMAIN='https://admin.example.test' >"$out_file" 2>"$err_file"; then
     fail "docker-init accepted a URL instead of a hostname"
   fi
-  assert_contains "$err_file" "ADMIN_DOMAIN must be a public hostname"
+  assert_contains "$err_file" "ADMIN_DOMAIN must be a hostname"
 
   injection_dir=$(new_case_dir)
   copy_deployment_files "$injection_dir"
@@ -161,7 +162,7 @@ test_init_contract() {
   if ADMIN_DOMAIN="$injected_domain" make --no-print-directory -C "$injection_dir" docker-init >"$out_file" 2>"$err_file"; then
     fail "docker-init accepted a multiline ADMIN_DOMAIN"
   fi
-  assert_contains "$err_file" "ADMIN_DOMAIN must be a public hostname"
+  assert_contains "$err_file" "ADMIN_DOMAIN must be a hostname"
   [ ! -e "$injection_dir/.env" ] || fail "docker-init created .env from a multiline ADMIN_DOMAIN"
 
   make --no-print-directory -C "$https_dir" docker-init ADMIN_DOMAIN=admin.example.test >"$out_file"
@@ -171,11 +172,53 @@ test_init_contract() {
 
   local_dir=$(new_case_dir)
   copy_deployment_files "$local_dir"
-  make --no-print-directory -C "$local_dir" docker-init ADMIN_DOMAIN=admin.example.test IMAGE_SOURCE=local >"$out_file"
+  make --no-print-directory -C "$local_dir" docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.test >"$out_file"
   assert_contains "$local_dir/.env" "COMPOSE_FILE=compose.yaml:compose.local.yaml:compose.admin-https.yaml"
+
+  failure_dir=$(new_case_dir)
+  copy_deployment_files "$failure_dir"
+  mv "$failure_dir/.env.example" "$failure_dir/.env.example.missing"
+  if make --no-print-directory -C "$failure_dir" docker-init >"$out_file" 2>"$err_file"; then
+    fail "docker-init succeeded without its environment template"
+  fi
+  [ ! -e "$failure_dir/.env" ] || fail "failed docker-init left a partial .env"
+  for leftover in "$failure_dir"/.env.tmp.*; do
+    [ ! -e "$leftover" ] || fail "failed docker-init left a temporary environment file"
+  done
+
+  link_failure_dir=$(new_case_dir)
+  copy_deployment_files "$link_failure_dir"
+  mkdir -p "$link_failure_dir/test-bin"
+  cat >"$link_failure_dir/test-bin/ln" <<'EOF'
+#!/usr/bin/env sh
+exit 1
+EOF
+  chmod +x "$link_failure_dir/test-bin/ln"
+  if PATH="$link_failure_dir/test-bin:$PATH" make --no-print-directory -C "$link_failure_dir" docker-init >"$out_file" 2>"$err_file"; then
+    fail "docker-init succeeded when .env could not be published"
+  fi
+  assert_contains "$err_file" "Could not create .env atomically"
+  [ ! -e "$link_failure_dir/.env" ] || fail "failed .env publication left a partial .env"
+  for leftover in "$link_failure_dir"/.env.tmp.*; do
+    [ ! -e "$leftover" ] || fail "failed .env publication left a temporary environment file"
+  done
 }
 
 test_make_lifecycle_contract() {
+  uninitialized_dir=$(new_case_dir)
+  copy_deployment_files "$uninitialized_dir"
+  uninitialized_bin_dir=$(install_fake_tools "$uninitialized_dir")
+  uninitialized_compose_log="$uninitialized_dir/compose.log"
+  uninitialized_output_log="$uninitialized_dir/output.log"
+  uninitialized_error_log="$uninitialized_dir/error.log"
+  : >"$uninitialized_compose_log"
+  if SYNAPS3_TEST_COMPOSE_LOG="$uninitialized_compose_log" \
+    make --no-print-directory -C "$uninitialized_dir" docker-up \
+      DOCKER_COMPOSE="$uninitialized_bin_dir/docker-compose" >"$uninitialized_output_log" 2>"$uninitialized_error_log"; then
+    fail "docker-up started without Docker deployment configuration"
+  fi
+  assert_contains "$uninitialized_error_log" ".env not found. Run: make docker-init"
+
   case_dir=$(new_case_dir)
   copy_deployment_files "$case_dir"
   make --no-print-directory -C "$case_dir" docker-init >/dev/null
@@ -196,7 +239,18 @@ test_make_lifecycle_contract() {
   assert_contains "$error_log" ".env permissions are 644"
   chmod 600 "$case_dir/.env"
 
-  ADMIN_DOMAIN=override.example.test COMPOSE_FILE=override.yaml SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
+  for deployment_override in ADMIN_DOMAIN COMPOSE_FILE; do
+    : >"$compose_log"
+    if env "$deployment_override=override.example.test" SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
+      make --no-print-directory -C "$case_dir" docker-up \
+        DOCKER_COMPOSE="$bin_dir/docker-compose" >"$output_log" 2>"$error_log"; then
+      fail "docker-up accepted the $deployment_override override"
+    fi
+    assert_contains "$error_log" "reads ADMIN_DOMAIN and COMPOSE_FILE from .env"
+    [ ! -s "$compose_log" ] || fail "docker-up invoked Compose after rejecting the $deployment_override override"
+  done
+
+  SYNAPS3_TEST_COMPOSE_LOG="$compose_log" \
     make --no-print-directory -C "$case_dir" docker-up \
       DOCKER_COMPOSE="$bin_dir/docker-compose" DOCKER_WAIT_TIMEOUT=7 >"$output_log" 2>"$error_log"
   assert_contains "$compose_log" "config --quiet"
@@ -288,6 +342,10 @@ test_compose_and_caddy_config() {
   case_dir=$(new_case_dir)
   copy_deployment_files "$case_dir"
   make --no-print-directory -C "$case_dir" docker-init >/dev/null
+
+  assert_contains "$ROOT_DIR/docker/Caddyfile" 'header Strict-Transport-Security "max-age=31536000"'
+  assert_not_contains "$ROOT_DIR/docker/Caddyfile" "includeSubDomains"
+  assert_not_contains "$ROOT_DIR/docker/Caddyfile" "preload"
 
   (cd "$case_dir" && sh docker/deployment.sh check >/dev/null)
 

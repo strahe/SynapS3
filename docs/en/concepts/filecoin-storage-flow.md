@@ -50,7 +50,7 @@ Retry after restoring RPC connectivity, storage provider reachability, wallet fu
 
 ## Provider Health
 
-Health checks record storage provider and local data set status. The dashboard uses those results to show copies that are `unavailable`, `degraded`, or `unknown`. These results are observational; recovery from provider unavailability is covered by the replica repair vision below.
+Health checks record storage provider and local data set status. The dashboard uses those results to show copies that are `unavailable`, `degraded`, or `unknown`. These results are observational; recovery from provider unavailability is part of the planned replica repair feature below.
 
 ## What Users See
 
@@ -59,12 +59,12 @@ Health checks record storage provider and local data set status. The dashboard u
 - Reads prefer local cache. If remote metadata exists, SynapS3 can retrieve the object from the provider.
 - Cache eviction is an operational optimization, not the write acceptance point. `after_upload` removes a version after storage completes, `lru` waits for capacity pressure, and `none` retains it.
 
-## Replica Repair Vision
+## Planned Replica Repair
 
-Coming soon, replica repair will help operators recover the configured target copy count after a storage provider becomes unavailable. It will:
+Replica repair is planned for a future release. After a storage provider becomes unavailable, it will:
 
-- identify copies affected by storage provider unavailability,
-- restore the target copy count through safe, traceable repair,
-- show repair progress and cases that require operator action.
+- identify stored copies affected by the provider outage,
+- create replacement copies until the configured target copy count is restored,
+- show repair progress and failures that require operator action.
 
 This is distinct from completing the initial target copies and retrying failed storage tasks.

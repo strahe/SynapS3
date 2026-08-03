@@ -5,14 +5,14 @@ description: 使用 Docker 部署 SynapS3，并按需为 Admin 启用自动 HTTP
 
 # Docker 部署
 
-Docker 默认让仪表盘和 Admin API 监听 `127.0.0.1:9090`。需要公网 Admin 域名时，可以在初始化时选择 Caddy HTTPS；Caddy 不代理 S3 API。
+Docker 默认让仪表盘和 Admin API 监听 `127.0.0.1:9090`。需要公网 Admin 域名时，可以选择 Caddy HTTPS；Caddy 不代理 S3 API。
 
 ## 前置条件
 
 - 安装了 Git、Make、curl、Docker Engine 和 Docker Compose v2.24 或更高版本的 Linux 主机。
 - 为 `synaps3-data` volume 准备可靠的本地磁盘。
 - 从其他机器访问本机 Admin 时，需要 SSH 权限或可用的公网 HTTPS 域名。
-- 可充值的 Calibration 钱包；也可以先以 `setup` 状态启动，再补全钱包设置。
+- 可充值的 Calibration 钱包；没有钱包时可以按本文步骤生成。
 
 ## 初始化部署
 
@@ -23,15 +23,20 @@ git clone --depth 1 https://github.com/strahe/SynapS3.git
 cd SynapS3
 ```
 
-### 默认：本机 Admin
+`docker-init` 创建权限为 `0600` 的 `.env`。首次初始化前，从下面四种组合中选择一条：
 
-不配置域名时，Admin 只监听回环地址：
+| 镜像来源 | Admin 访问方式 | 初始化命令 |
+| --- | --- | --- |
+| 发布镜像（默认） | 本机 `127.0.0.1:9090` | `make docker-init` |
+| 发布镜像（默认） | 公网 HTTPS | `make docker-init ADMIN_DOMAIN=admin.example.com` |
+| 当前源码构建 | 本机 `127.0.0.1:9090` | `make docker-init IMAGE_SOURCE=local` |
+| 当前源码构建 | 公网 HTTPS | `make docker-init IMAGE_SOURCE=local ADMIN_DOMAIN=admin.example.com` |
 
-```bash
-make docker-init
-```
+默认使用发布镜像，Admin 只监听 `127.0.0.1:9090`。`IMAGE_SOURCE=local` 让 `make docker-up` 从当前 checkout 构建镜像；`ADMIN_DOMAIN` 会加载 Caddy，自动签发和续签证书，并把 HTTP 重定向到 HTTPS。两项可以同时使用。
 
-### 可选：Admin 自动 HTTPS
+`docker-init` 拒绝覆盖已有 `.env`。创建后检查文件内容，并始终保持 `0600` 权限。
+
+### Admin HTTPS 要求
 
 公网 HTTPS 还需要：
 
@@ -40,41 +45,25 @@ make docker-init
 - 主机和云防火墙开放 `80/TCP` 与 `443/TCP`。
 - 如果域名使用 CAA，允许 Caddy 使用的公共 CA。
 
-初始化时传入域名：
+`ADMIN_DOMAIN` 只填写域名，不要包含 scheme、端口、路径或通配符。SynapS3 Admin 仍只监听 `127.0.0.1:9090`。
 
-```bash
-make docker-init ADMIN_DOMAIN=admin.example.com
-```
+`docker-init` 只检查域名语法。证书签发仍要求该域名可以从公网解析，并且公共 CA 接受签发；内部域名和保留域名会导致 `docker-verify` 失败。HSTS 只作用于配置的 Admin 域名，不继承到子域，也不申请 preload。
 
-`ADMIN_DOMAIN` 只填写域名，不要包含 scheme、端口、路径或通配符。此模式会加载 Caddy，自动签发和续签证书，并把 HTTP 重定向到 HTTPS。SynapS3 Admin 仍只监听 `127.0.0.1:9090`。
+## 配置钱包私钥
 
-### 从当前源码构建 Docker 镜像
-
-需要使用当前 checkout 构建容器镜像时：
-
-```bash
-make docker-init IMAGE_SOURCE=local
-```
-
-如果还需要 Admin HTTPS，同时传入 `ADMIN_DOMAIN`。`make docker-up` 会按需构建本地镜像。
-
-`docker-init` 会创建权限为 `0600` 的 `.env`，已有文件时拒绝覆盖。选择部署模式后，检查 `.env`，并让它始终保持 `0600` 权限。
-
-## 准备钱包
-
-没有钱包时，在私密终端中生成：
+已有钱包时，把私钥写入 `.env`。没有钱包时，先在私密终端中生成：
 
 ```bash
 docker compose run --rm synaps3 synaps3 wallet generate
 ```
 
-将输出的私钥保存到受保护的位置，然后编辑 `.env`：
+将输出的私钥保存到受保护的位置，然后在 `.env` 中取消注释或添加：
 
 ```text
 SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
 ```
 
-不要把真实私钥放进 shell 命令。其他覆盖项见[环境变量](../configuration/environment.md)。
+不要把真实私钥放进 shell 命令。仪表盘只显示私钥是否已配置，不接收或保存私钥；Docker 部署应通过 `.env` 设置。其他覆盖项见[环境变量](../configuration/environment.md)。
 
 为钱包地址申请 Calibration 测试资产：
 
@@ -82,7 +71,9 @@ SYNAPS3_FILECOIN_PRIVATE_KEY=0x...
 docker compose run --rm synaps3 synaps3 wallet fund-testnet 0x...
 ```
 
-如果 faucet 暂时不可用，可以使用 [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) 或 [Plumbline](https://faucet.reiers.io/) 手动领取。也可以暂不配置钱包，让 SynapS3 以 `setup` 状态启动后在仪表盘中完成设置。
+如果 faucet 暂时不可用，可以使用 [ChainSafe](https://forest-explorer.chainsafe.dev/faucet) 或 [Plumbline](https://faucet.reiers.io/) 手动领取。
+
+缺少私钥时容器仍会启动，但 SynapS3 只提供 Admin setup 模式，不能承载正常 S3 流量。写入私钥后启动或重启服务，再使用 `make docker-verify` 确认状态为 `ok`。
 
 ## 启动并验证
 
@@ -92,6 +83,8 @@ make docker-verify
 ```
 
 `docker-verify` 始终检查本机 `/healthz`。启用 Admin HTTPS 时，它还会检查可信证书和 HTTP 到 HTTPS 的跳转。
+
+启用 Admin HTTPS 后，`https://admin.example.com/healthz` 仍无需 Admin 凭据，便于外部健康检查。`unhealthy` 响应可能指出异常的数据库、缓存或 worker。如果不希望公开这些状态，请改用本机 Admin 和 SSH 隧道。
 
 | 状态 | 含义 |
 | --- | --- |
@@ -202,4 +195,4 @@ make docker-up
 make docker-verify
 ```
 
-本地镜像部署省略 `docker compose pull`；更新 checkout 后，`make docker-up` 会重新构建镜像。当前发布通道是可移动的 `edge`，没有自动回退。恢复正常流量前，完成[生产环境检查清单](../operations/production-checklist.md)。
+本地镜像部署省略 `docker compose pull`；更新 checkout 后，`make docker-up` 会重新构建镜像。当前发布通道是可移动的 `edge` 标签，没有自动回退。恢复正常流量前，完成[生产环境检查清单](../operations/production-checklist.md)。

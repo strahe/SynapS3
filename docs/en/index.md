@@ -14,14 +14,14 @@ hero:
       link: /en/getting-started/overview
     - theme: alt
       text: Installation Options
-      link: /en/getting-started/quick-start
+      link: /en/getting-started/overview#start-here
     - theme: alt
       text: S3 Clients
       link: /en/getting-started/s3-clients
 features:
   - title: Self-Hosted Gateway
     details: Run SynapS3 in your own environment with Docker or a local build.
-    link: /en/getting-started/quick-start
+    link: /en/getting-started/overview#start-here
     linkText: Installation Options
   - title: S3 Client Compatibility
     details: Create S3 credentials and connect AWS CLI, rclone, or MinIO Client.
@@ -41,6 +41,6 @@ features:
     linkText: Troubleshooting
   - title: Replica Repair
     details: "Coming soon: replica repair for provider outages."
-    link: /en/concepts/filecoin-storage-flow#replica-repair-vision
-    linkText: Storage Vision
+    link: /en/concepts/filecoin-storage-flow#planned-replica-repair
+    linkText: Feature Details
 ---

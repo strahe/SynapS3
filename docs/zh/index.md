@@ -14,14 +14,14 @@ hero:
       link: /zh/getting-started/overview
     - theme: alt
       text: 安装方式
-      link: /zh/getting-started/quick-start
+      link: /zh/getting-started/overview#从哪里开始
     - theme: alt
       text: S3 客户端
       link: /zh/getting-started/s3-clients
 features:
   - title: 自部署网关
     details: 使用 Docker 或源码构建，在自己的环境中运行 SynapS3。
-    link: /zh/getting-started/quick-start
+    link: /zh/getting-started/overview#从哪里开始
     linkText: 安装方式
   - title: S3 客户端兼容
     details: 创建 S3 凭据，连接 AWS CLI、rclone 或 MinIO Client。
@@ -41,6 +41,6 @@ features:
     linkText: 故障排查
   - title: 副本修复
     details: 即将支持：存储提供方不可用时的副本修复。
-    link: /zh/concepts/filecoin-storage-flow#副本修复愿景
-    linkText: 存储愿景
+    link: /zh/concepts/filecoin-storage-flow#计划支持的副本修复
+    linkText: 功能说明
 ---
