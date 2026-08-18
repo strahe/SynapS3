@@ -101,12 +101,11 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 			InCache:         true,
 			State:           reuse.State,
 		}
-		createdState = version.State
-
 		objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
 		if err != nil {
 			return fmt.Errorf("creating object version: %w", err)
 		}
+		createdState = version.State
 		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.State)
 	}); err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
@@ -510,10 +509,16 @@ func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model
 			switch {
 			case errors.Is(err, repository.ErrNotFound):
 				return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
+			case errors.Is(err, repository.ErrPermanentDeleteStorageBusy):
+				return nil, s3err.APIError{
+					Code:           "InvalidRequest",
+					Description:    "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later.",
+					HTTPStatusCode: http.StatusBadRequest,
+				}
 			case errors.Is(err, repository.ErrConflict):
 				return nil, s3err.APIError{
 					Code:           "InvalidRequest",
-					Description:    "Permanent delete is only supported for stable data versions with no active work.",
+					Description:    "This data version is not eligible for deletion.",
 					HTTPStatusCode: http.StatusBadRequest,
 				}
 			default:
@@ -748,8 +753,6 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 			InCache:         true,
 			State:           reuse.State,
 		}
-		createdState = version.State
-
 		if input.Restore == nil {
 			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
 		} else {
@@ -763,6 +766,7 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 		if err != nil {
 			return fmt.Errorf("creating copy destination version: %w", err)
 		}
+		createdState = version.State
 		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.State)
 	}); err != nil {
 		b.deleteVersionCacheBestEffort(ctx, input.DestinationBucket.Name, cacheKey, "orphaned version cache file after copy tx failure")

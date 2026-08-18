@@ -318,12 +318,11 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 			InCache:           true,
 			State:             reuse.State,
 		}
-		createdState = version.State
-
 		objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
 		if err != nil {
 			return fmt.Errorf("creating assembled object version: %w", err)
 		}
+		createdState = version.State
 		if err := b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.State); err != nil {
 			return err
 		}

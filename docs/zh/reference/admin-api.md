@@ -133,6 +133,14 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
 
+### 永久删除对象版本
+
+`POST /api/v1/buckets/{name}/objects/permanent-delete` 接受 `key` 和 `version_id`。`POST /api/v1/buckets/{name}/objects/deleted/permanent-delete` 接受 `key` 和 `delete_marker_version_id`。
+
+如果将被删除的任一版本仍有存储工作在进行，或已提交的 Filecoin 交易仍在等待确认，两个端点会立即返回 `409 Conflict`。请检查相关任务后重试。对于其他条件均符合永久删除要求的数据版本，已停止且尚未提交交易的存储工作不会阻止删除。所选版本或已删除对象不再符合永久删除条件时，同样返回 `409 Conflict`；无效请求返回 `400 Bad Request`，存储桶、对象或版本不存在时返回 `404 Not Found`。
+
+删除成功后，仅由已删除版本使用的远程存储会排入后台清理；仍被其他版本共享的存储会保留。
+
 ### 恢复对象版本
 
 对象存在版本历史时，`GET /api/v1/buckets/{name}/objects/versions` 的每一页都会返回 `current_version_id`。确认恢复时把该值传回服务端：

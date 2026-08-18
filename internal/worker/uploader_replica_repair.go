@@ -115,32 +115,31 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 		u.handleTaskFailure(ctx, task, logger, "parse replica repair task", err)
 		return
 	}
-	binding, err := u.repos.Uploads.GetDataSetBindingByID(ctx, payload.dataSetID)
+	if task == nil || task.ClaimedAt == nil {
+		return
+	}
+	item, err := u.repos.Uploads.AcquireReplicaRepairItem(ctx, repository.AcquireReplicaRepairItemInput{
+		TaskID:              task.ID,
+		TaskClaimedAt:       *task.ClaimedAt,
+		StorageDataSetID:    payload.dataSetID,
+		StorageUploadCopyID: payload.copyID,
+		BucketID:            task.RefID,
+	})
 	if err != nil {
-		u.handleTaskFailure(ctx, task, logger, "load replica repair data set", err)
+		switch {
+		case errors.Is(err, repository.ErrReplicaRepairItemCancelled):
+			u.advanceReplicaRepairTask(ctx, task, payload.dataSetID, logger)
+		case errors.Is(err, repository.ErrTaskClaimLost):
+			return
+		default:
+			u.handleTaskFailure(ctx, task, logger, "acquire replica repair item", err)
+		}
 		return
 	}
-	if binding == nil {
-		u.advanceReplicaRepairTask(ctx, task, payload.dataSetID, logger)
-		return
-	}
-	if task.RefType != "bucket" || task.RefID != binding.BucketID {
-		u.handleTaskFailure(ctx, task, logger, "validate replica repair task", errors.New("task bucket identity does not match its data set"))
-		return
-	}
-	copyRow, err := u.repos.Uploads.GetUploadCopyByID(ctx, payload.copyID)
-	if err != nil {
-		u.handleTaskFailure(ctx, task, logger, "load replica repair copy", err)
-		return
-	}
-	if copyRow == nil || copyRow.StorageDataSetID == nil || *copyRow.StorageDataSetID != binding.ID || copyRow.Status == model.StorageUploadCopyStatusFailed {
-		u.advanceReplicaRepairTask(ctx, task, binding.ID, logger)
-		return
-	}
-	if copyRow.CopyIndex != binding.CopyIndex {
-		u.handleTaskFailure(ctx, task, logger, "validate replica repair copy", errors.New("copy slot does not match its data set"))
-		return
-	}
+	binding := &item.DataSet
+	copyRow := &item.Copy
+	upload := &item.Upload
+	version := &item.Version
 	if !copyCommitted(copyRow) {
 		ordinaryTaskRunning, err := u.repos.Tasks.HasEarlierRunningUploadCopyTask(ctx, task, copyRow.UploadID, copyRow.CopyIndex)
 		if err != nil {
@@ -169,18 +168,6 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 		return
 	default:
 		u.handleTaskFailure(ctx, task, logger, "validate replica repair data set", fmt.Errorf("data set status %s cannot be recovered in place", binding.Status))
-		return
-	}
-	upload, err := u.repos.Uploads.GetByID(ctx, copyRow.UploadID)
-	if err != nil || upload == nil {
-		if err == nil {
-			err = fmt.Errorf("storage upload %d not found", copyRow.UploadID)
-		}
-		u.handleTaskFailure(ctx, task, logger, "load replica repair upload", err)
-		return
-	}
-	if upload.BucketID != binding.BucketID {
-		u.handleTaskFailure(ctx, task, logger, "validate replica repair upload", errors.New("upload bucket does not match its data set"))
 		return
 	}
 	bucket, err := u.repos.Buckets.GetByID(ctx, upload.BucketID)
@@ -235,7 +222,7 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 				binding.Status = model.StorageDataSetStatusReady
 			}
 		}
-		if err := u.finishReplicaRepairItem(ctx, task, upload, binding.ID, logger); err != nil {
+		if err := u.finishReplicaRepairItem(ctx, task, upload, version, binding.ID, logger); err != nil {
 			u.handleTaskFailure(ctx, task, logger, "finalize committed replica repair", err)
 		}
 		return
@@ -245,7 +232,7 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 		u.handleReplicaRepairDataSetFailure(ctx, task, binding, logger, "restore replica context", err)
 		return
 	}
-	if err := u.repairReplicaCopy(ctx, task, upload, bucket, binding, copyRow, storageCtx, logger); err != nil {
+	if err := u.repairReplicaCopy(ctx, task, upload, version, bucket, binding, copyRow, storageCtx, logger); err != nil {
 		u.handleReplicaRepairDataSetFailure(ctx, task, binding, logger, "repair replica copy", err)
 	}
 }
@@ -254,6 +241,7 @@ func (u *Uploader) repairReplicaCopy(
 	ctx context.Context,
 	task *model.Task,
 	upload *model.StorageUpload,
+	version *model.ObjectVersion,
 	bucket *model.Bucket,
 	binding *model.StorageDataSet,
 	copyRow *model.StorageUploadCopy,
@@ -291,10 +279,6 @@ func (u *Uploader) repairReplicaCopy(
 				return err
 			}
 		} else {
-			version, err := u.repos.Objects.GetVersionByID(ctx, upload.SourceVersionID)
-			if err != nil {
-				return err
-			}
 			if version == nil {
 				u.waitForReplicaRepairSource(ctx, task, logger)
 				return nil
@@ -422,13 +406,14 @@ func (u *Uploader) repairReplicaCopy(
 			binding.Status = model.StorageDataSetStatusReady
 		}
 	}
-	return u.finishReplicaRepairItem(ctx, task, upload, binding.ID, logger)
+	return u.finishReplicaRepairItem(ctx, task, upload, version, binding.ID, logger)
 }
 
 func (u *Uploader) finishReplicaRepairItem(
 	ctx context.Context,
 	task *model.Task,
 	upload *model.StorageUpload,
+	version *model.ObjectVersion,
 	dataSetID int64,
 	logger *slog.Logger,
 ) error {
@@ -440,12 +425,8 @@ func (u *Uploader) finishReplicaRepairItem(
 	}); err != nil {
 		return err
 	}
-	version, err := u.repos.Objects.GetVersionByID(ctx, upload.SourceVersionID)
-	if err != nil {
-		return err
-	}
 	if version == nil {
-		return fmt.Errorf("load source version %s: %w", upload.SourceVersionID, repository.ErrNotFound)
+		return fmt.Errorf("load live version for storage upload %d: %w", upload.ID, repository.ErrNotFound)
 	}
 	ref := repository.ObjectVersionRef{ObjectID: version.ObjectID, VersionID: version.VersionID}
 	_, needsPreparation, err := u.scheduleRemainingPeerCopies(ctx, ref, upload.BucketID, upload.ID, task.MaxRetries)

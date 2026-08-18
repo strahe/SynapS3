@@ -2279,6 +2279,41 @@ func TestDeleteObject_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.
 	}
 }
 
+func TestDeleteObject_DataVersionPermanentDeleteReportsActiveStorageWork(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-active-storage-work-bucket")
+	putOut := putTestObjectOutput(t, tb, "delete-active-storage-work-bucket", "file.txt", "data")
+	version, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%#v err=%v", version, err)
+	}
+	if err := tb.repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState(uploading): %v", err)
+	}
+	stage := "prepare_upload"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: version.ObjectID, RefVersionID: version.VersionID,
+		IdempotencyKey: "upload:" + version.VersionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := tb.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Tasks.Create: %v", err)
+	}
+
+	_, err = tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    aws.String("delete-active-storage-work-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: aws.String(putOut.VersionID),
+	})
+	apiErr, ok := err.(s3err.APIError)
+	if !ok {
+		t.Fatalf("DeleteObject error = %T %v, want s3 API error", err, err)
+	}
+	if apiErr.Code != "InvalidRequest" || apiErr.Description != "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later." {
+		t.Fatalf("DeleteObject API error = %#v, want actionable storage-work conflict", apiErr)
+	}
+}
+
 func TestDeleteObject_DataVersionPermanentDeleteRemovesCurrentVisibleVersion(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
@@ -2566,6 +2601,56 @@ func TestDeleteObjects_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing
 	}
 	if len(versionsOut.Versions) != 0 || len(versionsOut.DeleteMarkers) != 1 || *versionsOut.DeleteMarkers[0].VersionId != *marker.VersionId {
 		t.Fatalf("versions=%#v markers=%#v, want only marker %s", versionsOut.Versions, versionsOut.DeleteMarkers, *marker.VersionId)
+	}
+}
+
+func TestDeleteObjects_DataVersionReportsActiveStorageWorkPerEntry(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-active-storage-work-bucket")
+	putOut := putTestObjectOutput(t, tb, "delete-objects-active-storage-work-bucket", "file.txt", "data")
+	version, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%#v err=%v", version, err)
+	}
+	if err := tb.repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState(uploading): %v", err)
+	}
+	stage := "prepare_upload"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: version.ObjectID, RefVersionID: version.VersionID,
+		IdempotencyKey: "upload:" + version.VersionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := tb.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Tasks.Create: %v", err)
+	}
+
+	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-active-storage-work-bucket"),
+		Delete: &types.Delete{Objects: []types.ObjectIdentifier{
+			{Key: aws.String("file.txt"), VersionId: aws.String(putOut.VersionID)},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects(active storage work): %v", err)
+	}
+	if len(out.Deleted) != 0 || len(out.Error) != 1 {
+		t.Fatalf("DeleteObjects(active storage work) = %#v, want one entry error", out)
+	}
+	entryErr := out.Error[0]
+	if entryErr.Key == nil || *entryErr.Key != "file.txt" || entryErr.VersionId == nil || *entryErr.VersionId != putOut.VersionID {
+		t.Fatalf("entry identity = key:%v version:%v, want file.txt/%s", entryErr.Key, entryErr.VersionId, putOut.VersionID)
+	}
+	if entryErr.Code == nil || *entryErr.Code != "InvalidRequest" {
+		t.Fatalf("entry code = %v, want InvalidRequest", entryErr.Code)
+	}
+	wantMessage := "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later."
+	if entryErr.Message == nil || *entryErr.Message != wantMessage {
+		t.Fatalf("entry message = %v, want %q", entryErr.Message, wantMessage)
+	}
+	got, err := tb.repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("version after rejected DeleteObjects = %#v err=%v, want retained", got, err)
 	}
 }
 

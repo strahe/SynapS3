@@ -2883,6 +2883,211 @@ func TestUploader_ReplicaRepairUsesRetainedCacheWhenNoRemoteCopyIsReadable(t *te
 	}
 }
 
+func TestUploader_ReplicaRepairUsesSharedVersionAfterSourceDelete(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedStoredUploadWithPendingExtraCopy(t, env)
+
+	followerVersionID := model.NewVersionID()
+	followerCacheKey := ".versions/" + followerVersionID
+	info, err := env.cache.Put(ctx, fixture.bucket.Name, followerCacheKey, bytes.NewReader([]byte("hello world")))
+	if err != nil {
+		t.Fatalf("cache follower: %v", err)
+	}
+	follower := &model.ObjectVersion{
+		VersionID: followerVersionID, BucketID: fixture.bucket.ID, Key: "follower.txt",
+		Size: info.Size, ETag: info.ETag, Checksum: info.Checksum, ContentType: "text/plain", CacheKey: followerCacheKey,
+	}
+	if _, err := env.repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
+	}
+	if err := env.repos.Objects.UpdateVersionState(ctx, follower.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark follower uploading: %v", err)
+	}
+	if _, err := env.repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+		UploadID: fixture.upload.ID, BucketID: fixture.bucket.ID, ContentSize: follower.Size,
+		Checksum: follower.Checksum, VersionID: follower.VersionID,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForVersion(follower): %v", err)
+	}
+	if _, _, err := env.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.NewFinalizeUploadInput(fixture.upload.ID, false, 0)); err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet(follower): %v", err)
+	}
+
+	task := seedReplicaRepairTaskWithStatus(t, env, fixture, model.TaskStatusExhausted, "shared-source-delete")
+	if _, err := env.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.sourceKey, VersionID: fixture.sourceVersionID,
+	}); err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently(source): %v", err)
+	}
+	if err := env.repos.Tasks.RetryExhausted(ctx, task.ID); err != nil {
+		t.Fatalf("RetryExhausted: %v", err)
+	}
+
+	peerBinding, err := env.repos.Uploads.GetDataSetBindingByID(ctx, fixture.peer.ID)
+	if err != nil || peerBinding == nil || peerBinding.DataSetID == nil {
+		t.Fatalf("GetDataSetBindingByID(peer): binding=%#v err=%v", peerBinding, err)
+	}
+	peerDataSetID := peerBinding.DataSetID.SDK()
+	peerCtx := newFakeUploadContext(peerBinding.ProviderID.SDK(), peerDataSetID, sdktypes.NewBigInt(302), testCID(t))
+	peerCtx.boundDataSet = &peerDataSetID
+	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		if !createContextDataSetIDEqual(opts, peerDataSetID) {
+			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		}
+		return peerCtx, nil
+	}
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default())
+	gotTask := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
+		t.Fatalf("repair task after source delete = %#v, want completed without retry", gotTask)
+	}
+	copyRow, err := env.repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageUploadCopyStatusCommitted {
+		t.Fatalf("repair copy after source delete = %#v err=%v, want committed", copyRow, err)
+	}
+	gotFollower, err := env.repos.Objects.GetVersionByID(ctx, follower.VersionID)
+	if err != nil || gotFollower == nil || gotFollower.State != model.ObjectStateStored {
+		t.Fatalf("surviving shared version = %#v err=%v, want stored", gotFollower, err)
+	}
+}
+
+func TestUploader_ReplicaRepairDoesNotReachStorageAfterPermanentDeleteWins(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedStoredUploadWithPendingExtraCopy(t, env)
+	task := seedReplicaRepairTaskWithStatus(t, env, fixture, model.TaskStatusExhausted, "delete-wins")
+	if _, err := env.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.sourceKey, VersionID: fixture.sourceVersionID,
+	}); err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+	}
+	if err := env.repos.Tasks.RetryExhausted(ctx, task.ID); err != nil {
+		t.Fatalf("RetryExhausted: %v", err)
+	}
+	var createContextCalls atomic.Int32
+	var createContextsCalls atomic.Int32
+	env.storage.CreateContextFunc = func(_ context.Context, _ *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		createContextCalls.Add(1)
+		return nil, errors.New("deleted repair must not create a storage context")
+	}
+	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		createContextsCalls.Add(1)
+		return nil, errors.New("deleted repair must not select storage providers")
+	}
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default())
+	gotTask := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
+		t.Fatalf("cancelled repair task = %#v, want completed without retry", gotTask)
+	}
+	if createContextCalls.Load() != 0 || createContextsCalls.Load() != 0 {
+		t.Fatalf("storage context calls after delete = exact:%d selection:%d, want zero", createContextCalls.Load(), createContextsCalls.Load())
+	}
+	copyRow, err := env.repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageUploadCopyStatusFailed {
+		t.Fatalf("cancelled repair copy = %#v err=%v, want failed", copyRow, err)
+	}
+}
+
+type storedUploadWithPendingExtraCopyFixture struct {
+	bucket          *model.Bucket
+	sourceKey       string
+	sourceVersionID string
+	upload          *model.StorageUpload
+	peer            *model.StorageDataSet
+	repairCopy      *model.StorageUploadCopy
+}
+
+func seedStoredUploadWithPendingExtraCopy(t *testing.T, env *testWorkerEnv) storedUploadWithPendingExtraCopyFixture {
+	t.Helper()
+	bucket, _, sourceVersionID := seedCachedObject(t, env)
+	ctx := context.Background()
+	source, err := env.repos.Objects.GetVersionByID(ctx, sourceVersionID)
+	if err != nil || source == nil {
+		t.Fatalf("GetVersionByID(source): version=%#v err=%v", source, err)
+	}
+	if err := env.repos.Objects.UpdateVersionState(ctx, sourceVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("mark source uploading: %v", err)
+	}
+	upload, err := env.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID: bucket.ID, SourceVersionID: sourceVersionID, ContentSize: source.Size, Checksum: source.Checksum, RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	ingress, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding(ingress): %v", err)
+	}
+	peer, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding(peer): %v", err)
+	}
+	for _, input := range []repository.MarkDataSetReadyInput{
+		{ID: ingress.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")},
+		{ID: peer.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002")},
+	} {
+		if err := env.repos.Uploads.MarkDataSetReady(ctx, input); err != nil {
+			t.Fatalf("MarkDataSetReady(%d): %v", input.ID, err)
+		}
+	}
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: ingress.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: ingress.ProviderID},
+		{StorageDataSetID: peer.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: peer.ProviderID},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := env.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID: upload.ID, CopyIndex: 0, PieceCID: testCID(t).String(), PieceID: onChainIDPtr(t, "301"), RetrievalURL: "https://ingress.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted(ingress): %v", err)
+	}
+	if _, err := env.repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		UploadID: upload.ID, BucketID: bucket.ID, ContentSize: source.Size, Checksum: source.Checksum,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForContent: %v", err)
+	}
+	if _, _, err := env.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.NewFinalizeUploadInput(upload.ID, false, 0)); err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet: %v", err)
+	}
+	if err := env.repos.Uploads.MarkDataSetUnavailable(ctx, peer.ID, "temporary outage"); err != nil {
+		t.Fatalf("MarkDataSetUnavailable(peer): %v", err)
+	}
+	repairCopy, err := env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 1)
+	if err != nil || repairCopy == nil {
+		t.Fatalf("GetUploadCopy(repair): copy=%#v err=%v", repairCopy, err)
+	}
+	return storedUploadWithPendingExtraCopyFixture{
+		bucket: bucket, sourceKey: source.Key, sourceVersionID: sourceVersionID,
+		upload: upload, peer: peer, repairCopy: repairCopy,
+	}
+}
+
+func seedReplicaRepairTaskWithStatus(
+	t *testing.T,
+	env *testWorkerEnv,
+	fixture storedUploadWithPendingExtraCopyFixture,
+	status model.TaskStatus,
+	suffix string,
+) *model.Task {
+	t.Helper()
+	stage := "repair_replica"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.bucket.ID,
+		RefVersionID: fixture.sourceVersionID, IdempotencyKey: "upload:repair-data-set:" + suffix,
+		Payload: map[string]interface{}{"storage_data_set_id": fixture.peer.ID, "storage_upload_copy_id": fixture.repairCopy.ID},
+		Status:  status, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := env.repos.Tasks.Create(context.Background(), task); err != nil {
+		t.Fatalf("Create replica repair task: %v", err)
+	}
+	return task
+}
+
 func TestUploader_PeerTransientFailureKeepsCopyRetryable(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	bucket, objID, versionID := seedCachedObject(t, env)

@@ -133,6 +133,14 @@ Treat these endpoints as change-window operations. They can change data, credent
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
 
+### Permanently Delete Object Versions
+
+`POST /api/v1/buckets/{name}/objects/permanent-delete` accepts `key` and `version_id`. `POST /api/v1/buckets/{name}/objects/deleted/permanent-delete` accepts `key` and `delete_marker_version_id`.
+
+Both endpoints fail immediately with `409 Conflict` while storage work for a version is active or a submitted Filecoin transaction is awaiting confirmation. Check the related tasks, then try again. For an otherwise eligible data version, stopped storage work that has not submitted a transaction does not block deletion. A selected version or deleted object that is no longer eligible for permanent deletion also returns `409 Conflict`; invalid requests return `400 Bad Request`, and missing buckets, objects, or versions return `404 Not Found`.
+
+After a successful delete, remote storage used only by the removed versions is queued for background cleanup. Storage shared with remaining versions is kept.
+
 ### Restore an Object Version
 
 `GET /api/v1/buckets/{name}/objects/versions` includes `current_version_id` on every page when the object has version history. Pass that value when confirming a restore:

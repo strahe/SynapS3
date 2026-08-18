@@ -373,6 +373,34 @@ type MarkUploadCopyCommittedInput struct {
 	CommitTransactionID string
 }
 
+// AcquireReplicaRepairItemInput identifies the exact repair work already
+// parsed and claimed by the upload worker.
+type AcquireReplicaRepairItemInput struct {
+	TaskID              int64
+	TaskClaimedAt       time.Time
+	StorageDataSetID    int64
+	StorageUploadCopyID int64
+	BucketID            int64
+}
+
+// AcquireUploadTaskInput identifies one claimed ordinary upload task and its
+// optional existing storage upload.
+type AcquireUploadTaskInput struct {
+	TaskID        int64
+	TaskClaimedAt time.Time
+	UploadID      int64
+	VersionID     string
+}
+
+// ReplicaRepairItem is the consistent database snapshot authorized for one
+// replica repair attempt.
+type ReplicaRepairItem struct {
+	DataSet model.StorageDataSet
+	Copy    model.StorageUploadCopy
+	Upload  model.StorageUpload
+	Version model.ObjectVersion
+}
+
 type BindReadableUploadInput struct {
 	UploadID    int64
 	BucketID    int64
@@ -440,6 +468,8 @@ type StorageUploadRepository interface {
 	CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error)
 	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageUploadCopy, error)
+	AcquireUploadTask(ctx context.Context, input AcquireUploadTaskInput) error
+	AcquireReplicaRepairItem(ctx context.Context, input AcquireReplicaRepairItemInput) (*ReplicaRepairItem, error)
 	NextIncompleteCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
 	NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
 	ListUnavailableDataSetsWithIncompleteCopies(ctx context.Context, afterID int64, limit int) ([]model.StorageDataSet, error)

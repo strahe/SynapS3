@@ -3,8 +3,11 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"maps"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
@@ -168,9 +171,6 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 		return result, fmt.Errorf("permanently deleting object version: %w", ErrInvalidInput)
 	}
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		if err := lockCurrentObjectIfExists(ctx, db, input.BucketID, input.Key); err != nil {
-			return err
-		}
 		version, err := selectVersionByBucketKeyAndID(ctx, db, input.BucketID, input.Key, input.VersionID)
 		if err != nil {
 			return err
@@ -178,10 +178,44 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 		if version == nil {
 			return ErrNotFound
 		}
-		if version.IsDeleteMarker || !objectVersionPermanentDeleteStateAllowed(version.State) {
+		preliminaryUploads, err := authoritativeStorageUploadsForVersions(ctx, db, []*model.ObjectVersion{version})
+		if err != nil {
+			return err
+		}
+		lockedUploads, err := lockStorageUploadsByID(ctx, db, sortedStorageUploadIDs(preliminaryUploads))
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return ErrPermanentDeleteStorageBusy
+			}
+			return err
+		}
+		if err := lockCurrentObjectIfExists(ctx, db, input.BucketID, input.Key); err != nil {
+			return err
+		}
+		if err := lockObjectVersionsByID(ctx, db, []string{input.VersionID}); err != nil {
+			return err
+		}
+		version, err = selectVersionByBucketKeyAndID(ctx, db, input.BucketID, input.Key, input.VersionID)
+		if err != nil {
+			return err
+		}
+		if version == nil {
+			return ErrNotFound
+		}
+		if version.IsDeleteMarker {
 			return ErrConflict
 		}
-		if err := ensureObjectVersionHasNoActiveWork(ctx, db, version); err != nil {
+		if err := objectVersionPermanentDeleteStateError(version.State); err != nil {
+			return err
+		}
+		currentUploads, err := authoritativeStorageUploadsForVersions(ctx, db, []*model.ObjectVersion{version})
+		if err != nil {
+			return err
+		}
+		if !sameStorageUploadIDs(preliminaryUploads, currentUploads) {
+			return ErrPermanentDeleteStorageBusy
+		}
+		if err := prepareObjectVersionsForPermanentDelete(ctx, db, []*model.ObjectVersion{version}, lockedUploads); err != nil {
 			return err
 		}
 		wasCurrent := version.IsCurrent
@@ -253,9 +287,6 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 	result.DeleteMarkerVersionID = input.DeleteMarkerVersionID
 
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		if err := lockCurrentObjectIfExists(ctx, db, input.BucketID, input.Key); err != nil {
-			return err
-		}
 		current, err := selectCurrentVersionByBucketAndKey(ctx, db, input.BucketID, input.Key)
 		if err != nil {
 			return err
@@ -274,6 +305,65 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 		if len(versions) == 0 {
 			return ErrNotFound
 		}
+		versionIDs := make([]string, 0, len(versions))
+		for i := range versions {
+			versionIDs = append(versionIDs, versions[i].VersionID)
+		}
+		preliminaryDataVersions := dataObjectVersionPointers(versions)
+		preliminaryUploads, err := authoritativeStorageUploadsForVersions(ctx, db, preliminaryDataVersions)
+		if err != nil {
+			return err
+		}
+		lockedUploads, err := lockStorageUploadsByID(ctx, db, sortedStorageUploadIDs(preliminaryUploads))
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return ErrPermanentDeleteStorageBusy
+			}
+			return err
+		}
+		if err := lockCurrentObjectIfExists(ctx, db, input.BucketID, input.Key); err != nil {
+			return err
+		}
+		if err := lockObjectVersionsByID(ctx, db, versionIDs); err != nil {
+			return err
+		}
+		current, err = selectCurrentVersionByBucketAndKey(ctx, db, input.BucketID, input.Key)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return ErrNotFound
+		}
+		if !current.IsDeleteMarker || current.VersionID != input.DeleteMarkerVersionID {
+			return ErrConflict
+		}
+		versions, err = selectVersionsByObjectNewestFirst(ctx, db, current.ObjectID)
+		if err != nil {
+			return err
+		}
+		if !sameObjectVersionIDs(versions, versionIDs) {
+			return ErrConflict
+		}
+		dataVersions := make([]*model.ObjectVersion, 0, len(versions))
+		for i := range versions {
+			if versions[i].IsDeleteMarker {
+				continue
+			}
+			if err := objectVersionPermanentDeleteStateError(versions[i].State); err != nil {
+				return err
+			}
+			dataVersions = append(dataVersions, &versions[i])
+		}
+		currentUploads, err := authoritativeStorageUploadsForVersions(ctx, db, dataVersions)
+		if err != nil {
+			return err
+		}
+		if !sameStorageUploadIDs(preliminaryUploads, currentUploads) {
+			return ErrPermanentDeleteStorageBusy
+		}
+		if err := prepareObjectVersionsForPermanentDelete(ctx, db, dataVersions, lockedUploads); err != nil {
+			return err
+		}
 
 		now := time.Now()
 		deletions := make([]model.ObjectDeletion, 0, len(versions))
@@ -283,12 +373,6 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 			if version.IsDeleteMarker {
 				result.DeleteMarkersDeleted++
 				continue
-			}
-			if !objectVersionPermanentDeleteStateAllowed(version.State) {
-				return ErrConflict
-			}
-			if err := ensureObjectVersionHasNoActiveWork(ctx, db, &version); err != nil {
-				return err
 			}
 			deletions = append(deletions, model.ObjectDeletion{
 				BucketID:           version.BucketID,
@@ -832,6 +916,9 @@ func executeVersionCacheAccessUpdate(
 
 func (r *BunObjectRepo) SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if _, err := lockStorageUploadForObjectState(ctx, db, storageUploadID, to); err != nil {
+			return fmt.Errorf("locking storage upload for version transition: %w", err)
+		}
 		now := time.Now()
 		query := `UPDATE object_versions
 			SET storage_upload_id = ?, state = ?, updated_at = ?
@@ -1114,74 +1201,268 @@ func usableCopyExistsSQL(uploadIDExpr string) string {
 	return "EXISTS (SELECT 1 FROM storage_upload_copies AS storage_copy JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id WHERE storage_copy.upload_id = " + uploadIDExpr + " AND storage_copy.status = 'committed' AND storage_copy.storage_data_set_id IS NOT NULL AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> '' AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> '' AND storage_data_set.status IN ('ready', 'draining') AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> '' AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> '')"
 }
 
-func objectVersionPermanentDeleteStateAllowed(state model.ObjectState) bool {
+func objectVersionPermanentDeleteStateError(state model.ObjectState) error {
 	switch state {
-	case model.ObjectStateCached, model.ObjectStateStored, model.ObjectStateCacheEvicted, model.ObjectStateFailed:
+	case model.ObjectStateCached,
+		model.ObjectStateUploading,
+		model.ObjectStateCommitting,
+		model.ObjectStateReplicating,
+		model.ObjectStateStored,
+		model.ObjectStateCacheEvicted,
+		model.ObjectStateFailed:
+		return nil
+	default:
+		return ErrConflict
+	}
+}
+
+func prepareObjectVersionsForPermanentDelete(
+	ctx context.Context,
+	db bun.IDB,
+	versions []*model.ObjectVersion,
+	uploadsByID map[int64]*model.StorageUpload,
+) error {
+	if len(versions) == 0 {
+		return nil
+	}
+
+	deletingVersionIDs := make([]string, 0, len(versions))
+	bucketIDs := make(map[int64]struct{})
+	for _, version := range versions {
+		if version == nil || version.VersionID == "" {
+			return fmt.Errorf("preparing permanent delete storage work: %w", ErrInvalidInput)
+		}
+		deletingVersionIDs = append(deletingVersionIDs, version.VersionID)
+		bucketIDs[version.BucketID] = struct{}{}
+	}
+	sort.Strings(deletingVersionIDs)
+
+	uploadIDs := sortedStorageUploadIDs(uploadsByID)
+	var copies []model.StorageUploadCopy
+	if len(uploadIDs) > 0 {
+		if err := db.NewSelect().
+			Model(&copies).
+			Where("upload_id IN (?)", bun.List(uploadIDs)).
+			OrderExpr("id ASC").
+			Scan(ctx); err != nil {
+			return fmt.Errorf("loading storage copies for permanent delete: %w", err)
+		}
+	}
+	for i := range copies {
+		res, err := db.NewUpdate().
+			Model((*model.StorageUploadCopy)(nil)).
+			Set("updated_at = updated_at").
+			Where("id = ?", copies[i].ID).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("locking storage copy for permanent delete: %w", err)
+		}
+		rows, _ := res.RowsAffected()
+		if rows == 0 {
+			return fmt.Errorf("locking storage copy %d for permanent delete: %w", copies[i].ID, ErrConflict)
+		}
+	}
+
+	relatedVersionIDs := append([]string(nil), deletingVersionIDs...)
+	for _, upload := range uploadsByID {
+		relatedVersionIDs = appendUniqueString(relatedVersionIDs, upload.SourceVersionID)
+	}
+	var boundVersionIDs []string
+	if len(uploadIDs) > 0 {
+		if err := db.NewSelect().
+			Model((*model.ObjectVersion)(nil)).
+			Column("version_id").
+			Where("storage_upload_id IN (?)", bun.List(uploadIDs)).
+			Scan(ctx, &boundVersionIDs); err != nil {
+			return fmt.Errorf("loading storage upload references for permanent delete: %w", err)
+		}
+	}
+	for _, versionID := range boundVersionIDs {
+		relatedVersionIDs = appendUniqueString(relatedVersionIDs, versionID)
+	}
+	sort.Strings(relatedVersionIDs)
+
+	bucketIDList := make([]int64, 0, len(bucketIDs))
+	for bucketID := range bucketIDs {
+		bucketIDList = append(bucketIDList, bucketID)
+	}
+	sort.Slice(bucketIDList, func(i, j int) bool { return bucketIDList[i] < bucketIDList[j] })
+	var taskIDs []int64
+	if err := db.NewSelect().
+		Model((*model.Task)(nil)).
+		Column("id").
+		Where("type = ?", model.TaskTypeUpload).
+		Where(`(
+			(ref_type = ? AND ref_version_id IN (?))
+			OR (ref_type = ? AND ref_id IN (?) AND ref_version_id IN (?))
+		)`, "object", bun.List(deletingVersionIDs), "bucket", bun.List(bucketIDList), bun.List(relatedVersionIDs)).
+		OrderExpr("id ASC").
+		Scan(ctx, &taskIDs); err != nil {
+		return fmt.Errorf("loading storage tasks for permanent delete: %w", err)
+	}
+	for _, taskID := range taskIDs {
+		if _, err := db.NewUpdate().
+			Model((*model.Task)(nil)).
+			Set("status = status").
+			Where("id = ?", taskID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("locking storage task for permanent delete: %w", err)
+		}
+	}
+	if len(taskIDs) > 0 {
+		activeTasks, err := db.NewSelect().
+			Model((*model.Task)(nil)).
+			Where("id IN (?)", bun.List(taskIDs)).
+			Where("status IN (?)", bun.List(activeTaskStatuses())).
+			Count(ctx)
+		if err != nil {
+			return fmt.Errorf("rechecking active storage tasks for permanent delete: %w", err)
+		}
+		if activeTasks > 0 {
+			return ErrPermanentDeleteStorageBusy
+		}
+	}
+	if len(uploadIDs) == 0 {
+		return nil
+	}
+
+	copiesByUploadID := make(map[int64][]model.StorageUploadCopy)
+	for _, copyRow := range copies {
+		copiesByUploadID[copyRow.UploadID] = append(copiesByUploadID[copyRow.UploadID], copyRow)
+	}
+	for _, uploadID := range uploadIDs {
+		upload := uploadsByID[uploadID]
+		liveVersion, err := selectLiveObjectVersionForStorageUpload(ctx, db, upload, deletingVersionIDs)
+		if err != nil {
+			return err
+		}
+		if liveVersion != nil {
+			continue
+		}
+		for _, copyRow := range copiesByUploadID[uploadID] {
+			if copyRow.Status != model.StorageUploadCopyStatusCommitted &&
+				copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != "" {
+				return ErrPermanentDeleteStorageBusy
+			}
+			if !storageUploadCopyCanBeCancelledForPermanentDelete(copyRow) {
+				continue
+			}
+			res, err := db.NewUpdate().
+				Model((*model.StorageUploadCopy)(nil)).
+				Set("status = ?", model.StorageUploadCopyStatusFailed).
+				Set("last_error = ?", "cancelled because the last object version was permanently deleted").
+				Set("updated_at = ?", time.Now()).
+				Where("id = ?", copyRow.ID).
+				Where("status IN (?)", bun.List([]model.StorageUploadCopyStatus{
+					model.StorageUploadCopyStatusPending,
+					model.StorageUploadCopyStatusPieceReady,
+					model.StorageUploadCopyStatusCommitting,
+				})).
+				Where("commit_transaction_id IS NULL OR commit_transaction_id = ''").
+				Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("cancelling storage copy for permanent delete: %w", err)
+			}
+			rows, _ := res.RowsAffected()
+			if rows == 0 {
+				return fmt.Errorf("cancelling storage copy %d for permanent delete: %w", copyRow.ID, ErrPermanentDeleteStorageBusy)
+			}
+		}
+		if _, err := db.NewUpdate().
+			Model((*model.StorageUpload)(nil)).
+			Set("status = ?", model.StorageUploadStatusSuperseded).
+			Set("error_message = ?", "superseded because the last object version was permanently deleted").
+			Set("updated_at = ?", time.Now()).
+			Where("id = ?", uploadID).
+			Where("status <> ?", model.StorageUploadStatusSuperseded).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("closing storage upload for permanent delete: %w", err)
+		}
+	}
+	return nil
+}
+
+func authoritativeStorageUploadsForVersions(
+	ctx context.Context,
+	db bun.IDB,
+	versions []*model.ObjectVersion,
+) (map[int64]*model.StorageUpload, error) {
+	uploadsByID := make(map[int64]*model.StorageUpload)
+	for _, version := range versions {
+		if version == nil || version.VersionID == "" {
+			return nil, fmt.Errorf("loading permanent delete storage uploads: %w", ErrInvalidInput)
+		}
+		upload, err := authoritativeStorageUploadForVersion(ctx, db, version)
+		if err != nil {
+			return nil, err
+		}
+		if upload == nil {
+			continue
+		}
+		uploadID := upload.ID
+		version.StorageUploadID = &uploadID
+		uploadsByID[upload.ID] = upload
+	}
+	return uploadsByID, nil
+}
+
+func dataObjectVersionPointers(versions []model.ObjectVersion) []*model.ObjectVersion {
+	dataVersions := make([]*model.ObjectVersion, 0, len(versions))
+	for i := range versions {
+		if !versions[i].IsDeleteMarker {
+			dataVersions = append(dataVersions, &versions[i])
+		}
+	}
+	return dataVersions
+}
+
+func sameObjectVersionIDs(versions []model.ObjectVersion, expectedIDs []string) bool {
+	if len(versions) != len(expectedIDs) {
+		return false
+	}
+	actualIDs := make([]string, 0, len(versions))
+	for i := range versions {
+		actualIDs = append(actualIDs, versions[i].VersionID)
+	}
+	expected := append([]string(nil), expectedIDs...)
+	sort.Strings(actualIDs)
+	sort.Strings(expected)
+	return slices.Equal(actualIDs, expected)
+}
+
+func authoritativeStorageUploadForVersion(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (*model.StorageUpload, error) {
+	upload := new(model.StorageUpload)
+	q := db.NewSelect().Model(upload)
+	if version.StorageUploadID != nil && *version.StorageUploadID > 0 {
+		q = q.Where("id = ?", *version.StorageUploadID)
+	} else {
+		q = q.Where("source_version_id = ?", version.VersionID).OrderExpr("id DESC").Limit(1)
+	}
+	if err := q.Scan(ctx); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("loading storage upload for permanent delete: %w", err)
+	}
+	return upload, nil
+}
+
+func sortedStorageUploadIDs(uploadsByID map[int64]*model.StorageUpload) []int64 {
+	ids := make([]int64, 0, len(uploadsByID))
+	for id := range uploadsByID {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func storageUploadCopyCanBeCancelledForPermanentDelete(copyRow model.StorageUploadCopy) bool {
+	switch copyRow.Status {
+	case model.StorageUploadCopyStatusPending, model.StorageUploadCopyStatusPieceReady, model.StorageUploadCopyStatusCommitting:
 		return true
 	default:
 		return false
 	}
-}
-
-func ensureObjectVersionHasNoActiveWork(ctx context.Context, db bun.IDB, version *model.ObjectVersion) error {
-	if version == nil {
-		return ErrNotFound
-	}
-	versionID := version.VersionID
-	uploadCount, err := db.NewSelect().
-		Model((*model.StorageUpload)(nil)).
-		Where("source_version_id = ? AND status IN (?)", versionID, bun.List(activeUploadStatuses())).
-		Count(ctx)
-	if err != nil {
-		return fmt.Errorf("checking active upload for permanent delete: %w", err)
-	}
-	if uploadCount > 0 {
-		return ErrConflict
-	}
-	storageUploadID := int64(0)
-	if version.StorageUploadID != nil {
-		storageUploadID = *version.StorageUploadID
-	}
-	taskCount, err := db.NewSelect().
-		Model((*model.Task)(nil)).
-		Where(`(
-			(ref_type = ? AND ref_version_id = ?)
-			OR (
-				type = ?
-				AND ref_version_id IN (
-					SELECT repair_upload.source_version_id
-					FROM storage_uploads AS repair_upload
-					WHERE repair_upload.source_version_id = ? OR repair_upload.id = ?
-				)
-			)
-		)`, "object", versionID, model.TaskTypeUpload, versionID, storageUploadID).
-		Where("status IN (?)", bun.List(activeTaskStatuses())).
-		Count(ctx)
-	if err != nil {
-		return fmt.Errorf("checking active task for permanent delete: %w", err)
-	}
-	if taskCount > 0 {
-		return ErrConflict
-	}
-	repairCount, err := db.NewSelect().
-		Model((*model.StorageUploadCopy)(nil)).
-		Join("JOIN storage_uploads AS repair_upload ON repair_upload.id = storage_upload_copy.upload_id").
-		Join("JOIN storage_data_sets AS repair_data_set ON repair_data_set.id = storage_upload_copy.storage_data_set_id").
-		Where("(repair_upload.source_version_id = ? OR repair_upload.id = ?)", versionID, storageUploadID).
-		Where("storage_upload_copy.status IN (?)", bun.List([]model.StorageUploadCopyStatus{
-			model.StorageUploadCopyStatusPending,
-			model.StorageUploadCopyStatusPieceReady,
-			model.StorageUploadCopyStatusCommitting,
-		})).
-		Where("repair_data_set.status = ?", model.StorageDataSetStatusUnavailable).
-		Count(ctx)
-	if err != nil {
-		return fmt.Errorf("checking in-place replica repair for permanent delete: %w", err)
-	}
-	if repairCount > 0 {
-		return ErrConflict
-	}
-	return nil
 }
 
 const defaultStorageCleanupMaxRetries = 5
@@ -1255,13 +1536,8 @@ func createStorageCleanupTaskForDeletedVersions(ctx context.Context, db bun.IDB,
 			return nil, fmt.Errorf("setting storage cleanup task max retries: %w", err)
 		}
 	}
-	for i := range copies {
-		copies[i].TaskID = task.ID
-		copies[i].CreatedAt = now
-		copies[i].UpdatedAt = now
-	}
-	if _, err := db.NewInsert().Model(&copies).Exec(ctx); err != nil {
-		return nil, fmt.Errorf("creating storage cleanup copy snapshots: %w", err)
+	if _, err := syncStorageCleanupCopySnapshots(ctx, db, task.ID, uploadID, copies); err != nil {
+		return nil, err
 	}
 	return &task.ID, nil
 }
@@ -1269,6 +1545,13 @@ func createStorageCleanupTaskForDeletedVersions(ctx context.Context, db bun.IDB,
 func reuseStorageCleanupTask(ctx context.Context, db bun.IDB, task *model.Task, uploadID int64, deletedVersionIDs []string, maxRetries *int) (*int64, error) {
 	if task == nil {
 		return nil, fmt.Errorf("reusing storage cleanup task: %w", ErrInvalidInput)
+	}
+	copies, err := storageCleanupCopySnapshots(ctx, db, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := syncStorageCleanupCopySnapshots(ctx, db, task.ID, uploadID, copies); err != nil {
+		return nil, err
 	}
 	if task.Status != model.TaskStatusCompleted {
 		if taskStatusIsActive(task.Status) {
@@ -1315,6 +1598,36 @@ func reuseStorageCleanupTask(ctx context.Context, db bun.IDB, task *model.Task, 
 		return nil, fmt.Errorf("requeueing retained storage cleanup task %d: %w", task.ID, ErrConflict)
 	}
 	return &task.ID, nil
+}
+
+func syncStorageCleanupCopySnapshots(
+	ctx context.Context,
+	db bun.IDB,
+	taskID int64,
+	uploadID int64,
+	copies []model.StorageCleanupCopy,
+) (int, error) {
+	if taskID <= 0 || uploadID <= 0 {
+		return 0, fmt.Errorf("syncing storage cleanup copy snapshots: %w", ErrInvalidInput)
+	}
+	if len(copies) == 0 {
+		return 0, nil
+	}
+	now := time.Now()
+	for i := range copies {
+		copies[i].TaskID = taskID
+		copies[i].CreatedAt = now
+		copies[i].UpdatedAt = now
+	}
+	res, err := db.NewInsert().
+		Model(&copies).
+		On("CONFLICT (task_id, copy_index) DO NOTHING").
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("syncing storage cleanup copy snapshots: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	return int(rows), nil
 }
 
 func updateStorageCleanupTaskPayload(ctx context.Context, db bun.IDB, task *model.Task, uploadID int64, deletedVersionIDs []string) error {
@@ -1437,6 +1750,9 @@ func storageCleanupCopySnapshots(ctx context.Context, db bun.IDB, uploadID int64
 
 func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (ObjectVersionWriteResult, error) {
 	normalizeObjectVersion(version)
+	if err := prepareNewObjectVersionStorageReference(ctx, db, version); err != nil {
+		return ObjectVersionWriteResult{}, fmt.Errorf("preparing object version storage reference: %w", err)
+	}
 	if err := lockCurrentObjectIfExists(ctx, db, version.BucketID, version.Key); err != nil {
 		return ObjectVersionWriteResult{}, err
 	}
@@ -1468,6 +1784,10 @@ func createVersionAndSetCurrentIfChanged(ctx context.Context, db bun.IDB, versio
 }
 
 func createVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (int64, error) {
+	normalizeObjectVersion(version)
+	if err := prepareNewObjectVersionStorageReference(ctx, db, version); err != nil {
+		return 0, fmt.Errorf("preparing object version storage reference: %w", err)
+	}
 	if err := lockCurrentObjectIfExists(ctx, db, version.BucketID, version.Key); err != nil {
 		return 0, err
 	}
@@ -1485,6 +1805,9 @@ func createVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.
 
 func createRestoredVersionAndSetCurrent(ctx context.Context, db bun.IDB, version *model.ObjectVersion, sourceVersionID, expectedCurrentVersionID string) (int64, error) {
 	normalizeObjectVersion(version)
+	if err := prepareNewObjectVersionStorageReference(ctx, db, version); err != nil {
+		return 0, fmt.Errorf("preparing restored version storage reference: %w", err)
+	}
 	if err := lockCurrentObjectIfExists(ctx, db, version.BucketID, version.Key); err != nil {
 		return 0, err
 	}
@@ -1955,6 +2278,31 @@ func lockCurrentObjectIfExists(ctx context.Context, db bun.IDB, bucketID int64, 
 		Where("bucket_id = ? AND key = ?", bucketID, key).
 		Exec(ctx); err != nil {
 		return fmt.Errorf("locking current object: %w", err)
+	}
+	return nil
+}
+
+func lockObjectVersionsByID(ctx context.Context, db bun.IDB, versionIDs []string) error {
+	ids := append([]string(nil), versionIDs...)
+	sort.Strings(ids)
+	previous := ""
+	for _, versionID := range ids {
+		if versionID == "" || versionID == previous {
+			continue
+		}
+		previous = versionID
+		res, err := db.NewUpdate().
+			Model((*model.ObjectVersion)(nil)).
+			Set("updated_at = updated_at").
+			Where("version_id = ?", versionID).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("locking object version for permanent delete: %w", err)
+		}
+		rows, _ := res.RowsAffected()
+		if rows == 0 {
+			return ErrNotFound
+		}
 	}
 	return nil
 }
