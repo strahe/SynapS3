@@ -181,7 +181,7 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 		if version.IsDeleteMarker || !objectVersionPermanentDeleteStateAllowed(version.State) {
 			return ErrConflict
 		}
-		if err := ensureObjectVersionHasNoActiveWork(ctx, db, version.VersionID); err != nil {
+		if err := ensureObjectVersionHasNoActiveWork(ctx, db, version); err != nil {
 			return err
 		}
 		wasCurrent := version.IsCurrent
@@ -287,7 +287,7 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 			if !objectVersionPermanentDeleteStateAllowed(version.State) {
 				return ErrConflict
 			}
-			if err := ensureObjectVersionHasNoActiveWork(ctx, db, version.VersionID); err != nil {
+			if err := ensureObjectVersionHasNoActiveWork(ctx, db, &version); err != nil {
 				return err
 			}
 			deletions = append(deletions, model.ObjectDeletion{
@@ -1123,7 +1123,11 @@ func objectVersionPermanentDeleteStateAllowed(state model.ObjectState) bool {
 	}
 }
 
-func ensureObjectVersionHasNoActiveWork(ctx context.Context, db bun.IDB, versionID string) error {
+func ensureObjectVersionHasNoActiveWork(ctx context.Context, db bun.IDB, version *model.ObjectVersion) error {
+	if version == nil {
+		return ErrNotFound
+	}
+	versionID := version.VersionID
 	uploadCount, err := db.NewSelect().
 		Model((*model.StorageUpload)(nil)).
 		Where("source_version_id = ? AND status IN (?)", versionID, bun.List(activeUploadStatuses())).
@@ -1134,14 +1138,47 @@ func ensureObjectVersionHasNoActiveWork(ctx context.Context, db bun.IDB, version
 	if uploadCount > 0 {
 		return ErrConflict
 	}
+	storageUploadID := int64(0)
+	if version.StorageUploadID != nil {
+		storageUploadID = *version.StorageUploadID
+	}
 	taskCount, err := db.NewSelect().
 		Model((*model.Task)(nil)).
-		Where("ref_type = ? AND ref_version_id = ? AND status IN (?)", "object", versionID, bun.List(activeTaskStatuses())).
+		Where(`(
+			(ref_type = ? AND ref_version_id = ?)
+			OR (
+				type = ?
+				AND ref_version_id IN (
+					SELECT repair_upload.source_version_id
+					FROM storage_uploads AS repair_upload
+					WHERE repair_upload.source_version_id = ? OR repair_upload.id = ?
+				)
+			)
+		)`, "object", versionID, model.TaskTypeUpload, versionID, storageUploadID).
+		Where("status IN (?)", bun.List(activeTaskStatuses())).
 		Count(ctx)
 	if err != nil {
 		return fmt.Errorf("checking active task for permanent delete: %w", err)
 	}
 	if taskCount > 0 {
+		return ErrConflict
+	}
+	repairCount, err := db.NewSelect().
+		Model((*model.StorageUploadCopy)(nil)).
+		Join("JOIN storage_uploads AS repair_upload ON repair_upload.id = storage_upload_copy.upload_id").
+		Join("JOIN storage_data_sets AS repair_data_set ON repair_data_set.id = storage_upload_copy.storage_data_set_id").
+		Where("(repair_upload.source_version_id = ? OR repair_upload.id = ?)", versionID, storageUploadID).
+		Where("storage_upload_copy.status IN (?)", bun.List([]model.StorageUploadCopyStatus{
+			model.StorageUploadCopyStatusPending,
+			model.StorageUploadCopyStatusPieceReady,
+			model.StorageUploadCopyStatusCommitting,
+		})).
+		Where("repair_data_set.status = ?", model.StorageDataSetStatusUnavailable).
+		Count(ctx)
+	if err != nil {
+		return fmt.Errorf("checking in-place replica repair for permanent delete: %w", err)
+	}
+	if repairCount > 0 {
 		return ErrConflict
 	}
 	return nil

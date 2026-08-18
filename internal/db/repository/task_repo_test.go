@@ -1397,3 +1397,159 @@ func TestTaskRepo_CompleteByRefClearsWaitingFields(t *testing.T) {
 		t.Fatalf("completed task diagnostics = wait:%v message:%v error:%v, want cleared", got.WaitReason, got.StatusMessage, got.LastError)
 	}
 }
+
+func TestTaskRepo_RecurringTaskReusesOneRowAcrossRepairItems(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	stage := "repair_replica"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "bucket",
+		RefID:          1,
+		RefVersionID:   "01J000000000000000REPAIR01",
+		IdempotencyKey: "upload:repair-data-set:41",
+		Payload:        map[string]interface{}{"storage_data_set_id": int64(41), "storage_upload_copy_id": int64(101)},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	created, err := repos.Tasks.EnsureRecurring(ctx, task)
+	if err != nil || !created || task.ID == 0 {
+		t.Fatalf("EnsureRecurring create: created=%t task=%#v err=%v", created, task, err)
+	}
+	duplicate := *task
+	duplicate.ID = 0
+	duplicate.Payload = map[string]interface{}{"storage_data_set_id": int64(41), "storage_upload_copy_id": int64(102)}
+	created, err = repos.Tasks.EnsureRecurring(ctx, &duplicate)
+	if err != nil || created {
+		t.Fatalf("EnsureRecurring active duplicate: created=%t err=%v", created, err)
+	}
+
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != task.ID {
+		t.Fatalf("ClaimReady: task=%#v err=%v", claimed, err)
+	}
+	nextPayload := map[string]interface{}{"storage_data_set_id": int64(41), "storage_upload_copy_id": int64(102)}
+	nextVersionID := "01J000000000000000REPAIR02"
+	if err := repos.Tasks.ContinueRunning(ctx, claimed, nextVersionID, nextPayload); err != nil {
+		t.Fatalf("ContinueRunning: %v", err)
+	}
+	continued, err := repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || continued.Status != model.TaskStatusQueued || continued.RetryCount != 0 || continued.RefVersionID != nextVersionID || testTaskPayloadInt64(continued.Payload, "storage_upload_copy_id") != 102 {
+		t.Fatalf("continued task = %#v err=%v", continued, err)
+	}
+
+	claimed, err = repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimReady continued: task=%#v err=%v", claimed, err)
+	}
+	if err := repos.Tasks.Complete(ctx, claimed); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	reactivated := *task
+	reactivated.ID = 0
+	reactivated.Payload = map[string]interface{}{"storage_data_set_id": int64(41), "storage_upload_copy_id": int64(103)}
+	created, err = repos.Tasks.EnsureRecurring(ctx, &reactivated)
+	if err != nil || !created {
+		t.Fatalf("EnsureRecurring completed task: created=%t err=%v", created, err)
+	}
+	got, err := repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || got.Status != model.TaskStatusQueued || testTaskPayloadInt64(got.Payload, "storage_upload_copy_id") != 103 {
+		t.Fatalf("reactivated task = %#v err=%v", got, err)
+	}
+}
+
+func TestTaskRepo_HasEarlierRunningUploadCopyTaskMatchesConcreteCopy(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	stage := "ingress_store"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          1,
+		RefVersionID:   "01J000000000000000RUNNING1",
+		IdempotencyKey: "upload:running-copy",
+		Payload:        map[string]interface{}{"upload_id": int64(41), "copy_index": 2},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimReady: task=%#v err=%v", claimed, err)
+	}
+
+	repairStage := "repair_replica"
+	repairTask := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &repairStage,
+		RefType:        "bucket",
+		RefID:          1,
+		RefVersionID:   "01J000000000000000RUNNING1",
+		IdempotencyKey: "upload:repair-data-set:1",
+		Payload:        map[string]interface{}{"storage_data_set_id": int64(1), "storage_upload_copy_id": int64(1)},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, repairTask); err != nil {
+		t.Fatalf("Create repair: %v", err)
+	}
+	claimedRepair, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimedRepair == nil || claimedRepair.ID != repairTask.ID {
+		t.Fatalf("ClaimReady repair: task=%#v err=%v", claimedRepair, err)
+	}
+
+	earlier, err := repos.Tasks.HasEarlierRunningUploadCopyTask(ctx, claimedRepair, 41, 2)
+	if err != nil || !earlier {
+		t.Fatalf("HasEarlierRunningUploadCopyTask matching copy = %t, %v; want true", earlier, err)
+	}
+	earlier, err = repos.Tasks.HasEarlierRunningUploadCopyTask(ctx, claimedRepair, 41, 1)
+	if err != nil || earlier {
+		t.Fatalf("HasEarlierRunningUploadCopyTask different copy = %t, %v; want false", earlier, err)
+	}
+}
+
+func testTaskPayloadInt64(payload map[string]interface{}, key string) int64 {
+	switch value := payload[key].(type) {
+	case int64:
+		return value
+	case float64:
+		return int64(value)
+	default:
+		return 0
+	}
+}
+
+func TestTaskRepo_RecurringTaskDoesNotReviveExhaustedWork(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	stage := "repair_replica"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: 1,
+		IdempotencyKey: "upload:repair-data-set:42", Status: model.TaskStatusExhausted,
+		MaxRetries: 5, RetryCount: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create exhausted task: %v", err)
+	}
+	retry := *task
+	retry.ID = 0
+	retry.Status = model.TaskStatusQueued
+	created, err := repos.Tasks.EnsureRecurring(ctx, &retry)
+	if err != nil || created {
+		t.Fatalf("EnsureRecurring exhausted task: created=%t err=%v", created, err)
+	}
+	got, err := repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || got.Status != model.TaskStatusExhausted || got.RetryCount != 5 {
+		t.Fatalf("exhausted task = %#v err=%v", got, err)
+	}
+}

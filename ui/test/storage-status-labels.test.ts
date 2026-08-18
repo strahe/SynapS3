@@ -38,6 +38,7 @@ test('task labels use product-facing task and operation names', () => {
   assert.equal(taskTypeLabel('storage_cleanup'), 'Replica Cleanup')
   assert.equal(taskOperationOptionLabel('ensure_dataset'), 'Prepare replica target')
   assert.equal(taskOperationOptionLabel('peer_pull'), 'Sync peer replica')
+  assert.equal(taskOperationOptionLabel('repair_replica'), 'Resume replica upload')
   assert.equal(taskOperationLabel({ type: 'evict_cache' }), 'Evict local cache')
   assert.equal(taskOperationLabel({ type: 'storage_cleanup' }), 'Delete remote replicas')
   assert.equal(taskOperationLabel({ type: 'upload', stage: '' }), 'Upload object')

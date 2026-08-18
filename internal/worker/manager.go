@@ -12,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/state"
 )
 
 // Worker defines a background processing unit.
@@ -29,6 +30,7 @@ type Manager struct {
 	repos            *repository.Repositories
 	workers          []Worker
 	logger           *slog.Logger
+	stateMachine     *state.Machine
 	evictionPolicy   cache.EvictionPolicy
 	uploadMaxRetries int
 	evictMaxRetries  int
@@ -54,6 +56,7 @@ func NewManager(repos *repository.Repositories, logger *slog.Logger, evictionPol
 		repos:            repos,
 		workers:          workers,
 		logger:           logger,
+		stateMachine:     state.NewObjectStateMachine(),
 		evictionPolicy:   evictionPolicy,
 		uploadMaxRetries: defaultUploadMaxRetries,
 		evictMaxRetries:  defaultEvictMaxRetries,
@@ -117,6 +120,7 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 	// Reconcile unfinished upload work.
 	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUpload, "upload")
 	m.reconcileStagedUploads(ctx)
+	m.reconcileUnavailableDataSets(ctx)
 
 	// Log exhausted task count for operator awareness
 	exhaustedTasks, err := m.repos.Tasks.ListExhausted(ctx, 100)
@@ -124,6 +128,27 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Error("failed to check exhausted tasks", "error", err)
 	} else if len(exhaustedTasks) > 0 {
 		m.logger.Warn("exhausted tasks found on startup, review via GET /admin/exhausted-tasks", "count", len(exhaustedTasks))
+	}
+}
+
+func (m *Manager) reconcileUnavailableDataSets(ctx context.Context) {
+	afterID := int64(0)
+	for {
+		bindings, err := m.repos.Uploads.ListUnavailableDataSetsWithIncompleteCopies(ctx, afterID, reconcileBatchSize)
+		if err != nil {
+			m.logger.Error("failed to list unavailable data sets for recovery", "error", err)
+			return
+		}
+		for i := range bindings {
+			binding := &bindings[i]
+			if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+				m.logger.Error("failed to ensure unavailable data set repair", "dataSetID", binding.ID, "error", err)
+			}
+			afterID = binding.ID
+		}
+		if len(bindings) < reconcileBatchSize {
+			return
+		}
 	}
 }
 
@@ -240,7 +265,7 @@ func (m *Manager) reconcileOrphanStagedVersion(ctx context.Context, version mode
 	case model.ObjectStateUploading:
 		m.enqueueRecoveredUploadStage(ctx, version, 0, recoveryStagePrepare, 0, "")
 	case model.ObjectStateCommitting:
-		if err := m.repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCommitting, model.ObjectStateUploading); err != nil {
+		if err := state.TransitionState(ctx, m.stateMachine, m.repos.Objects, version.VersionID, model.ObjectStateCommitting, model.ObjectStateUploading); err != nil {
 			m.logger.Error("failed to reset orphan committing version", "versionID", version.VersionID, "error", err)
 			return
 		}
@@ -288,13 +313,30 @@ func (m *Manager) reconcileIngressUpload(ctx context.Context, version model.Obje
 		return
 	}
 	var ingress *model.StorageUploadCopy
+	var committedIngress *model.StorageUploadCopy
 	for i := range copies {
-		if copies[i].TransferMethod == model.StorageCopyTransferMethodIngress && !copyCommitted(&copies[i]) {
-			ingress = &copies[i]
-			break
+		if copies[i].TransferMethod != model.StorageCopyTransferMethodIngress {
+			continue
 		}
+		if copyCommitted(&copies[i]) {
+			committedIngress = &copies[i]
+			continue
+		}
+		ingress = &copies[i]
+		break
 	}
 	if ingress == nil {
+		if committedIngress != nil {
+			binding, err := m.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, version.BucketID, committedIngress.CopyIndex)
+			if err != nil {
+				m.logger.Error("failed to load committed ingress dataset binding for reconciliation", "uploadID", upload.ID, "copyIndex", committedIngress.CopyIndex, "error", err)
+				return
+			}
+			if binding != nil && (dataSetBindingUnavailable(binding) || dataSetBindingWriteBlocked(binding)) {
+				m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageIngressCommit, committedIngress.CopyIndex, committedIngress.TransferMethod)
+				return
+			}
+		}
 		m.reconcileReplicatingUpload(ctx, version, upload)
 		return
 	}
@@ -303,7 +345,32 @@ func (m *Manager) reconcileIngressUpload(ctx context.Context, version model.Obje
 		m.logger.Error("failed to load ingress dataset binding for reconciliation", "uploadID", upload.ID, "copyIndex", ingress.CopyIndex, "error", err)
 		return
 	}
-	if binding == nil || binding.Status != model.StorageDataSetStatusReady {
+	if binding == nil {
+		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageEnsureDataSet, ingress.CopyIndex, ingress.TransferMethod)
+		return
+	}
+	if binding.Status == model.StorageDataSetStatusUnavailable {
+		if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+			m.logger.Error("failed to ensure recovered ingress repair", "dataSetID", binding.ID, "error", err)
+		}
+	}
+	if copyCommitSubmitted(ingress) && (dataSetBindingUnavailable(binding) || dataSetBindingWriteBlocked(binding)) {
+		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageIngressCommit, ingress.CopyIndex, ingress.TransferMethod)
+		return
+	}
+	if dataSetBindingUnavailable(binding) || dataSetBindingWriteBlocked(binding) {
+		reassigned, reassignErr := reassignIngressCopyAndSchedule(ctx, m.repos, m.stateMachine, &version, upload.ID, ingress.CopyIndex, m.uploadMaxRetries, nil)
+		if reassignErr != nil {
+			m.logger.Error("failed to reassign recovered ingress copy", "uploadID", upload.ID, "copyIndex", ingress.CopyIndex, "error", reassignErr)
+			return
+		}
+		if reassigned != nil {
+			return
+		}
+		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageEnsureDataSet, ingress.CopyIndex, ingress.TransferMethod)
+		return
+	}
+	if !uploadCanUseDataSetBinding(upload.ID, binding) {
 		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, recoveryStageEnsureDataSet, ingress.CopyIndex, ingress.TransferMethod)
 		return
 	}
@@ -357,9 +424,10 @@ func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.
 	if finalized {
 		return
 	}
-	recoverablePeerCount := 0
+	assignedSlots := make(map[int]struct{}, len(copies))
 	for i := range copies {
 		copyRow := &copies[i]
+		assignedSlots[copyRow.CopyIndex] = struct{}{}
 		if copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull || copyCommitted(copyRow) || copyRow.Status == model.StorageUploadCopyStatusFailed {
 			continue
 		}
@@ -369,10 +437,15 @@ func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.
 			m.logger.Error("failed to load peer dataset binding for reconciliation", "uploadID", upload.ID, "copyIndex", copyRow.CopyIndex, "error", err)
 			continue
 		}
-		if !dataSetBindingCanEnsureWrite(binding) {
+		if binding != nil && binding.Status == model.StorageDataSetStatusUnavailable {
+			if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+				m.logger.Error("failed to ensure recovered peer repair", "dataSetID", binding.ID, "error", err)
+			}
 			continue
 		}
-		recoverablePeerCount++
+		if !uploadCanUseDataSetBinding(upload.ID, binding) {
+			continue
+		}
 		if binding != nil && binding.Status == model.StorageDataSetStatusReady {
 			stage = recoveryStagePeerPull
 			if copyHasPiece(copyRow) {
@@ -381,7 +454,7 @@ func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.
 		}
 		m.enqueueRecoveredUploadStage(ctx, version, upload.ID, stage, copyRow.CopyIndex, copyRow.TransferMethod)
 	}
-	if upload.RequestedCopies > len(readableCopies)+recoverablePeerCount && len(readableCopies) > 0 {
+	if upload.RequestedCopies > len(assignedSlots) && len(readableCopies) > 0 {
 		m.enqueueRecoveredUploadRepair(ctx, version, upload.ID)
 	}
 }

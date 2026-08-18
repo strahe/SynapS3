@@ -324,6 +324,68 @@ func TestManager_RecoverOnStartup_BindsCommittedIngressBeforeSingleCopyFinalize(
 	}
 }
 
+func TestManager_RecoverOnStartup_RequeuesCommittedIngressOnUnavailableDataSet(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, db, "mgr-unavailable-committed-ingress")
+	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-unavailable-committed-ingress", model.ObjectStateCached)
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("uploading: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+		t.Fatalf("committing: %v", err)
+	}
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID: bucket.ID, SourceVersionID: versionID, ContentSize: version.Size, Checksum: version.Checksum, RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzaceunavailablecommitted", PieceID: onChainIDPtr(t, "301"), RetrievalURL: "https://ingress.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetUnavailable(ctx, binding.ID, "provider unavailable after commit"); err != nil {
+		t.Fatalf("MarkDataSetUnavailable: %v", err)
+	}
+
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
+	mgr.Start(ctx)
+
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ingress_commit", string(model.TaskStatusQueued), 10, 0)
+	if err != nil || total != 1 {
+		t.Fatalf("ingress commit tasks = %#v total=%d err=%v, want one recovery task", tasks, total, err)
+	}
+	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || taskPayloadInt64ForTest(tasks[0].Payload, "copy_index") != 0 {
+		t.Fatalf("ingress commit task = %#v, want exact committed copy", tasks[0])
+	}
+	got, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || got == nil || got.State != model.ObjectStateCommitting {
+		t.Fatalf("version before provider proof = %#v err=%v, want committing", got, err)
+	}
+}
+
 func TestManager_RecoverOnStartup_MakesExpiredPrimaryCommitTaskClaimable(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -485,13 +547,13 @@ func TestManager_RecoverOnStartup_ReenqueuesReplicatingSecondaryStage(t *testing
 	}
 }
 
-func TestManager_RecoverOnStartup_QueuesRepairForUnavailablePeerDeficit(t *testing.T) {
+func TestManager_RecoverOnStartup_QueuesSingletonRepairIndependentOfObjectState(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-peer-unavailable-recover")
-	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-peer-unavailable", model.ObjectStateCached)
+	_, versionID := seedManagerVersion(t, repos, bucket, "recover-peer-unavailable", model.ObjectStateCached)
 	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("uploading: %v", err)
 	}
@@ -552,8 +614,23 @@ func TestManager_RecoverOnStartup_QueuesRepairForUnavailablePeerDeficit(t *testi
 	if err := repos.Uploads.MarkDataSetUnavailable(ctx, peer.ID, "provider dataset retired"); err != nil {
 		t.Fatalf("MarkDataSetUnavailable peer: %v", err)
 	}
+	secondUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID: bucket.ID, SourceVersionID: "01J000000000000000WAITING2", ContentSize: version.Size, Checksum: "second-waiting-copy", RequestedCopies: 2,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt second: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, secondUpload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: peer.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings second: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateReplicating, model.ObjectStateStored); err != nil {
+		t.Fatalf("mark stored while peer remains incomplete: %v", err)
+	}
 
-	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(9, 4)
+	mgr := worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone).WithTaskMaxRetries(0, 4)
+	mgr.Start(ctx)
 	mgr.Start(ctx)
 
 	ensureTasks, ensureTotal, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "ensure_dataset", string(model.TaskStatusQueued), 10, 0)
@@ -563,25 +640,34 @@ func TestManager_RecoverOnStartup_QueuesRepairForUnavailablePeerDeficit(t *testi
 	if ensureTotal != 0 || len(ensureTasks) != 0 {
 		t.Fatalf("ensure_dataset tasks total=%d tasks=%#v, want no recovery for unavailable peer", ensureTotal, ensureTasks)
 	}
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "prepare_upload", string(model.TaskStatusQueued), 10, 0)
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeUpload), "repair_replica", string(model.TaskStatusQueued), 10, 0)
 	if err != nil {
-		t.Fatalf("List repair prepare tasks: %v", err)
+		t.Fatalf("List repair replica tasks: %v", err)
 	}
 	if total != 1 || len(tasks) != 1 {
-		t.Fatalf("prepare_upload tasks total=%d tasks=%#v, want one repair task", total, tasks)
+		t.Fatalf("repair_replica tasks total=%d tasks=%#v, want one in-place repair task after repeated recovery", total, tasks)
 	}
-	if tasks[0].RefID != objID || tasks[0].RefVersionID != versionID || taskPayloadInt64ForTest(tasks[0].Payload, "upload_id") != upload.ID {
-		t.Fatalf("repair task = %#v, want upload repair task for upload %d", tasks[0], upload.ID)
+	if tasks[0].MaxRetries != 0 {
+		t.Fatalf("repair task MaxRetries = %d, want configured zero", tasks[0].MaxRetries)
+	}
+	peerCopy, err := repos.Uploads.GetUploadCopy(ctx, upload.ID, 1)
+	if err != nil || peerCopy == nil {
+		t.Fatalf("GetUploadCopy peer: copy=%v err=%v", peerCopy, err)
+	}
+	if tasks[0].RefType != "bucket" || tasks[0].RefID != bucket.ID || tasks[0].RefVersionID != versionID ||
+		taskPayloadInt64ForTest(tasks[0].Payload, "storage_data_set_id") != peer.ID ||
+		taskPayloadInt64ForTest(tasks[0].Payload, "storage_upload_copy_id") != peerCopy.ID {
+		t.Fatalf("repair task = %#v, want data set %d copy %d", tasks[0], peer.ID, peerCopy.ID)
 	}
 }
 
-func TestManager_RecoverOnStartup_QueuesRepairForFailedPeerDeficitWithRecoverablePeer(t *testing.T) {
+func TestManager_RecoverOnStartup_DoesNotReplaceAssignedFailedPeer(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
 	bucket := testutil.SeedBucket(t, db, "mgr-peer-deficit-with-pending-recover")
-	objID, versionID := seedManagerVersion(t, repos, bucket, "recover-peer-deficit-pending", model.ObjectStateCached)
+	_, versionID := seedManagerVersion(t, repos, bucket, "recover-peer-deficit-pending", model.ObjectStateCached)
 	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
 		t.Fatalf("uploading: %v", err)
 	}
@@ -665,11 +751,8 @@ func TestManager_RecoverOnStartup_QueuesRepairForFailedPeerDeficitWithRecoverabl
 	if err != nil {
 		t.Fatalf("List repair prepare tasks: %v", err)
 	}
-	if repairTotal != 1 || len(repairTasks) != 1 {
-		t.Fatalf("prepare_upload tasks total=%d tasks=%#v, want repair for remaining deficit", repairTotal, repairTasks)
-	}
-	if repairTasks[0].RefID != objID || repairTasks[0].RefVersionID != versionID || taskPayloadInt64ForTest(repairTasks[0].Payload, "upload_id") != upload.ID {
-		t.Fatalf("repair task = %#v, want upload repair task for upload %d", repairTasks[0], upload.ID)
+	if repairTotal != 0 || len(repairTasks) != 0 {
+		t.Fatalf("prepare_upload tasks total=%d tasks=%#v, want no replacement for an assigned failed slot", repairTotal, repairTasks)
 	}
 }
 

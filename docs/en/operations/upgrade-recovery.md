@@ -55,6 +55,7 @@ Receive write -> save object -> record metadata -> return success -> continue ba
 
 | Scenario | Recovery |
 | --- | --- |
+| Established provider is temporarily unavailable during initial storage | Restore the original provider. Other assigned writable copies continue, while the unfinished copy waits without consuming retries and resumes automatically. SynapS3 does not select a replacement provider. |
 | Background storage task cannot reach a provider | Restore connectivity, then retry exhausted storage tasks. |
 | RPC node down | Restore RPC connectivity, then retry exhausted tasks. |
 | Private provider URL blocked | Keep blocked by default; enable `filecoin.allow_private_networks` only for trusted private deployments. |

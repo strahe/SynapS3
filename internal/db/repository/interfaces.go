@@ -339,21 +339,31 @@ type UploadCopyBindingInput struct {
 }
 
 type MarkUploadCopyPieceReadyInput struct {
-	UploadID     int64
-	CopyIndex    int
-	PieceCID     string
-	PieceID      *types.OnChainID
-	RetrievalURL string
+	StorageUploadCopyID int64
+	UploadID            int64
+	CopyIndex           int
+	PieceCID            string
+	PieceID             *types.OnChainID
+	RetrievalURL        string
 }
 
 type MarkUploadCopyCommittingInput struct {
+	StorageUploadCopyID int64
 	UploadID            int64
 	CopyIndex           int
 	CommitExtraDataHex  string
 	CommitTransactionID string
 }
 
+type ResetRejectedUploadCopyCommitInput struct {
+	UploadID            int64
+	CopyIndex           int
+	CommitTransactionID string
+	LastError           string
+}
+
 type MarkUploadCopyCommittedInput struct {
+	StorageUploadCopyID int64
 	UploadID            int64
 	CopyIndex           int
 	PieceCID            string
@@ -422,14 +432,21 @@ type StorageUploadRepository interface {
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
+	RecoverDataSet(ctx context.Context, input MarkDataSetReadyInput) (bool, error)
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
 	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error
 	MarkDataSetUnavailable(ctx context.Context, id int64, lastError string) error
-	DiscardFailedDataSetCandidate(ctx context.Context, uploadID int64, copyIndex int, storageDataSetID int64) error
+	DiscardFailedDataSetCandidate(ctx context.Context, uploadID int64, copyIndex int, storageDataSetID int64) (bool, error)
 	CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error)
+	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageUploadCopy, error)
+	NextIncompleteCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
+	NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
+	ListUnavailableDataSetsWithIncompleteCopies(ctx context.Context, afterID int64, limit int) ([]model.StorageDataSet, error)
+	ReassignIngressCopy(ctx context.Context, uploadID int64, unavailableCopyIndex int) (*model.StorageUploadCopy, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
 	MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error
+	ResetRejectedUploadCopyCommit(ctx context.Context, input ResetRejectedUploadCopyCommitInput) error
 	MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error
 	MarkUploadCopyFailed(ctx context.Context, uploadID int64, copyIndex int, lastError string) error
 	BindReadableUploadForContent(ctx context.Context, input BindReadableUploadInput) ([]ObjectVersionRef, error)
@@ -453,7 +470,14 @@ type BucketACLSnapshot struct {
 // TaskRepository defines persistence operations for Task entities.
 type TaskRepository interface {
 	Create(ctx context.Context, task *model.Task) error
+	// EnsureRecurring creates a singleton coordinator task or reactivates its
+	// completed row with the supplied payload. Active, failed, exhausted, and
+	// cancelled rows are left unchanged.
+	EnsureRecurring(ctx context.Context, task *model.Task) (bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
+	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*model.Task, error)
+	HasActiveByIdempotencyKey(ctx context.Context, idempotencyKey string) (bool, error)
+	HasEarlierRunningUploadCopyTask(ctx context.Context, claimedTask *model.Task, uploadID int64, copyIndex int) (bool, error)
 
 	// ClaimReady atomically claims one ready task of the given type by
 	// transitioning it to running and setting a lease. Returns nil if no task is available.
@@ -471,6 +495,12 @@ type TaskRepository interface {
 	ScheduleRetryRunning(ctx context.Context, task *model.Task, lastError string, backoff time.Duration) (model.TaskStatus, error)
 	// WaitRunning records a non-error wait and releases the running task until scheduled_at.
 	WaitRunning(ctx context.Context, task *model.Task, reason model.TaskWaitReason, message string, delay time.Duration) error
+	// LockRunningClaim locks the same running task claim for a cross-repository
+	// transaction that must decide whether to continue or complete it.
+	LockRunningClaim(ctx context.Context, task *model.Task) error
+	// ContinueRunning completes one successful coordinator item by replacing
+	// its version reference and payload, then returning the same task row to the queue tail.
+	ContinueRunning(ctx context.Context, task *model.Task, refVersionID string, payload map[string]interface{}) error
 	// ReleaseRunning releases the same running task claim back to queued without recording an error.
 	ReleaseRunning(ctx context.Context, task *model.Task) error
 	// CancelRunning marks the same running task claim as cancelled.
