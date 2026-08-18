@@ -697,64 +697,162 @@ func (r *BunStorageUploadRepo) MarkDataSetReady(ctx context.Context, input MarkD
 	})
 }
 
+func (r *BunStorageUploadRepo) RecoverDataSet(ctx context.Context, input MarkDataSetReadyInput) (bool, error) {
+	if input.ID <= 0 || input.DataSetID.IsZero() {
+		return false, fmt.Errorf("recovering storage data set: %w", ErrInvalidInput)
+	}
+	now := time.Now()
+	res, err := r.db.NewUpdate().
+		Model((*model.StorageDataSet)(nil)).
+		Set("status = ?", model.StorageDataSetStatusReady).
+		Set("client_data_set_id = COALESCE(?, client_data_set_id)", input.ClientDataSetID).
+		Set("last_used_upload_id = COALESCE(?, last_used_upload_id)", nullableInt64(input.UploadID)).
+		Set("last_error = NULL").
+		Set("updated_at = ?", now).
+		Where("id = ?", input.ID).
+		Where("data_set_id = ?", input.DataSetID).
+		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
+			model.StorageDataSetStatusUnavailable,
+			model.StorageDataSetStatusReady,
+		})).
+		Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("recovering storage data set: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows > 0 {
+		return true, nil
+	}
+	count, err := r.db.NewSelect().
+		Model((*model.StorageDataSet)(nil)).
+		Where("id = ?", input.ID).
+		Count(ctx)
+	if err != nil {
+		return false, fmt.Errorf("checking storage data set recovery: %w", err)
+	}
+	if count == 0 {
+		return false, fmt.Errorf("recovering storage data set %d: %w", input.ID, ErrNotFound)
+	}
+	return false, nil
+}
+
 func (r *BunStorageUploadRepo) MarkDataSetDraining(ctx context.Context, id int64, lastError string) error {
-	_, err := r.db.NewUpdate().
+	res, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = ?", model.StorageDataSetStatusDraining).
 		Set("last_error = ?", lastError).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ?", id).
+		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
+			model.StorageDataSetStatusReady,
+			model.StorageDataSetStatusUnavailable,
+			model.StorageDataSetStatusDraining,
+		})).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage data set draining: %w", err)
 	}
-	return nil
+	return requireDataSetStatusUpdate(ctx, r.db, id, res, "marking storage data set draining")
 }
 
 func (r *BunStorageUploadRepo) MarkDataSetFailed(ctx context.Context, id int64, lastError string) error {
-	_, err := r.db.NewUpdate().
+	res, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = ?", model.StorageDataSetStatusFailed).
 		Set("last_error = ?", lastError).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ?", id).
+		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
+			model.StorageDataSetStatusPending,
+			model.StorageDataSetStatusCreating,
+			model.StorageDataSetStatusFailed,
+		})).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage data set failed: %w", err)
 	}
-	return nil
+	return requireDataSetStatusUpdate(ctx, r.db, id, res, "marking storage data set failed")
 }
 
 func (r *BunStorageUploadRepo) MarkDataSetUnavailable(ctx context.Context, id int64, lastError string) error {
-	_, err := r.db.NewUpdate().
+	res, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = ?", model.StorageDataSetStatusUnavailable).
 		Set("last_error = ?", lastError).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ?", id).
+		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
+			model.StorageDataSetStatusReady,
+			model.StorageDataSetStatusUnavailable,
+		})).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage data set unavailable: %w", err)
 	}
-	return nil
+	return requireDataSetStatusUpdate(ctx, r.db, id, res, "marking storage data set unavailable")
 }
 
-func (r *BunStorageUploadRepo) DiscardFailedDataSetCandidate(ctx context.Context, uploadID int64, copyIndex int, storageDataSetID int64) error {
-	if uploadID <= 0 || copyIndex < 0 || storageDataSetID <= 0 {
-		return fmt.Errorf("invalid failed storage data set candidate: %w", ErrInvalidInput)
+func requireDataSetStatusUpdate(ctx context.Context, db bun.IDB, id int64, result sql.Result, operation string) error {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s: reading affected rows: %w", operation, err)
 	}
-	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+	if rows > 0 {
+		return nil
+	}
+	count, err := db.NewSelect().
+		Model((*model.StorageDataSet)(nil)).
+		Where("id = ?", id).
+		Count(ctx)
+	if err != nil {
+		return fmt.Errorf("%s: checking data set: %w", operation, err)
+	}
+	if count == 0 {
+		return fmt.Errorf("%s: %w", operation, ErrNotFound)
+	}
+	return fmt.Errorf("%s: data set state changed: %w", operation, ErrConflict)
+}
+
+func (r *BunStorageUploadRepo) DiscardFailedDataSetCandidate(ctx context.Context, uploadID int64, copyIndex int, storageDataSetID int64) (bool, error) {
+	if uploadID <= 0 || copyIndex < 0 || storageDataSetID <= 0 {
+		return false, fmt.Errorf("invalid failed storage data set candidate: %w", ErrInvalidInput)
+	}
+	discarded := false
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
 		candidates, err := db.NewSelect().
 			Model((*model.StorageDataSet)(nil)).
 			Where("id = ?", storageDataSetID).
 			Where("created_by_upload_id = ?", uploadID).
 			Where("status = ?", model.StorageDataSetStatusFailed).
 			Where("(data_set_id IS NULL OR data_set_id = '')").
+			Where("(client_data_set_id IS NULL OR client_data_set_id = '')").
+			Where("(create_transaction_id IS NULL OR create_transaction_id = '')").
+			Where("(create_status_url IS NULL OR create_status_url = '')").
 			Count(ctx)
 		if err != nil {
 			return fmt.Errorf("checking failed storage data set candidate: %w", err)
 		}
 		if candidates == 0 {
+			return nil
+		}
+		refs, err := db.NewSelect().
+			Model((*model.StorageUploadCopy)(nil)).
+			Where("storage_data_set_id = ?", storageDataSetID).
+			Count(ctx)
+		if err != nil {
+			return fmt.Errorf("checking failed storage data set candidate references: %w", err)
+		}
+		currentRefs, err := db.NewSelect().
+			Model((*model.StorageUploadCopy)(nil)).
+			Where("upload_id = ?", uploadID).
+			Where("copy_index = ?", copyIndex).
+			Where("storage_data_set_id = ?", storageDataSetID).
+			Where("status = ?", model.StorageUploadCopyStatusFailed).
+			Count(ctx)
+		if err != nil {
+			return fmt.Errorf("checking failed storage upload copy candidate: %w", err)
+		}
+		if refs != 1 || currentRefs != 1 {
 			return nil
 		}
 		if _, err := db.NewDelete().
@@ -766,27 +864,27 @@ func (r *BunStorageUploadRepo) DiscardFailedDataSetCandidate(ctx context.Context
 			Exec(ctx); err != nil {
 			return fmt.Errorf("deleting failed storage upload copy candidate: %w", err)
 		}
-		refs, err := db.NewSelect().
-			Model((*model.StorageUploadCopy)(nil)).
-			Where("storage_data_set_id = ?", storageDataSetID).
-			Count(ctx)
-		if err != nil {
-			return fmt.Errorf("checking failed storage data set candidate references: %w", err)
-		}
-		if refs > 0 {
-			return nil
-		}
-		if _, err := db.NewDelete().
+		res, err := db.NewDelete().
 			Model((*model.StorageDataSet)(nil)).
 			Where("id = ?", storageDataSetID).
 			Where("created_by_upload_id = ?", uploadID).
 			Where("status = ?", model.StorageDataSetStatusFailed).
 			Where("(data_set_id IS NULL OR data_set_id = '')").
-			Exec(ctx); err != nil {
+			Where("(client_data_set_id IS NULL OR client_data_set_id = '')").
+			Where("(create_transaction_id IS NULL OR create_transaction_id = '')").
+			Where("(create_status_url IS NULL OR create_status_url = '')").
+			Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("deleting failed storage data set candidate: %w", err)
 		}
+		rows, _ := res.RowsAffected()
+		if rows != 1 {
+			return fmt.Errorf("deleting failed storage data set candidate: %w", ErrConflict)
+		}
+		discarded = true
 		return nil
 	})
+	return discarded, err
 }
 
 func (r *BunStorageUploadRepo) CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error {
@@ -835,10 +933,194 @@ func (r *BunStorageUploadRepo) GetUploadCopy(ctx context.Context, uploadID int64
 	return copyRow, nil
 }
 
+func (r *BunStorageUploadRepo) GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageUploadCopy, error) {
+	copyRow := new(model.StorageUploadCopy)
+	err := r.db.NewSelect().Model(copyRow).Where("id = ?", id).Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting storage upload copy by id: %w", err)
+	}
+	return copyRow, nil
+}
+
+func (r *BunStorageUploadRepo) NextIncompleteCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error) {
+	copyRow := new(model.StorageUploadCopy)
+	err := r.db.NewSelect().
+		Model(copyRow).
+		Join("JOIN storage_uploads AS storage_upload ON storage_upload.id = storage_upload_copy.upload_id").
+		Where("storage_upload_copy.storage_data_set_id = ?", storageDataSetID).
+		Where("storage_upload_copy.status IN (?)", bun.List([]model.StorageUploadCopyStatus{
+			model.StorageUploadCopyStatusPending,
+			model.StorageUploadCopyStatusPieceReady,
+			model.StorageUploadCopyStatusCommitting,
+		})).
+		Where(`EXISTS (
+			SELECT 1 FROM object_versions AS repair_version
+			WHERE repair_version.version_id = storage_upload.source_version_id
+			   OR repair_version.storage_upload_id = storage_upload.id
+		)`).
+		OrderExpr("storage_upload_copy.id ASC").
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting next incomplete data set copy: %w", err)
+	}
+	return copyRow, nil
+}
+
+func (r *BunStorageUploadRepo) NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error) {
+	copyRow := new(model.StorageUploadCopy)
+	query := fmt.Sprintf(`SELECT storage_copy.*
+		FROM storage_upload_copies AS storage_copy
+		JOIN storage_uploads AS storage_upload ON storage_upload.id = storage_copy.upload_id
+		WHERE storage_copy.storage_data_set_id = ?
+		  AND storage_copy.status = ?
+		  AND storage_upload.status IN (?, ?, ?)
+		  AND storage_upload.requested_copies > 0
+		  AND EXISTS (
+			SELECT 1 FROM object_versions AS pending_version
+			WHERE pending_version.storage_upload_id = storage_upload.id
+			  AND pending_version.state = ?
+		  )
+		  AND (
+			SELECT COUNT(*)
+			FROM storage_upload_copies AS readable_copy
+			JOIN storage_data_sets AS readable_data_set ON readable_data_set.id = readable_copy.storage_data_set_id
+			WHERE readable_copy.upload_id = storage_upload.id
+			  AND readable_copy.status = ?
+			  AND readable_copy.storage_data_set_id IS NOT NULL
+			  AND readable_copy.provider_id IS NOT NULL AND readable_copy.provider_id <> ''
+			  AND readable_data_set.data_set_id IS NOT NULL AND readable_data_set.data_set_id <> ''
+			  AND (readable_data_set.status IN (%s) OR readable_data_set.id = ?)
+			  AND readable_copy.piece_id IS NOT NULL AND readable_copy.piece_id <> ''
+			  AND readable_copy.retrieval_url IS NOT NULL AND readable_copy.retrieval_url <> ''
+		  ) >= storage_upload.requested_copies
+		ORDER BY storage_copy.id ASC
+		LIMIT 1`, storageHealthReadyDataSetStatusListSQL())
+	err := r.db.NewRaw(
+		query,
+		storageDataSetID,
+		model.StorageUploadCopyStatusCommitted,
+		model.StorageUploadStatusRunning,
+		model.StorageUploadStatusIngressReady,
+		model.StorageUploadStatusReadable,
+		model.ObjectStateReplicating,
+		model.StorageUploadCopyStatusCommitted,
+		storageDataSetID,
+	).Scan(ctx, copyRow)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting next finalizable data set copy: %w", err)
+	}
+	return copyRow, nil
+}
+
+func (r *BunStorageUploadRepo) ListUnavailableDataSetsWithIncompleteCopies(ctx context.Context, afterID int64, limit int) ([]model.StorageDataSet, error) {
+	var bindings []model.StorageDataSet
+	q := r.db.NewSelect().
+		Model(&bindings).
+		Where("status = ?", model.StorageDataSetStatusUnavailable).
+		Where("id > ?", afterID).
+		Where(`EXISTS (
+			SELECT 1 FROM storage_upload_copies AS storage_copy
+			JOIN storage_uploads AS storage_upload ON storage_upload.id = storage_copy.upload_id
+			WHERE storage_copy.storage_data_set_id = storage_data_set.id
+			  AND storage_copy.status IN (?, ?, ?)
+			  AND EXISTS (
+				SELECT 1 FROM object_versions AS repair_version
+				WHERE repair_version.version_id = storage_upload.source_version_id
+				   OR repair_version.storage_upload_id = storage_upload.id
+			  )
+		)`,
+			model.StorageUploadCopyStatusPending,
+			model.StorageUploadCopyStatusPieceReady,
+			model.StorageUploadCopyStatusCommitting,
+		).
+		OrderExpr("id ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing unavailable data sets with incomplete copies: %w", err)
+	}
+	return bindings, nil
+}
+
+func (r *BunStorageUploadRepo) ReassignIngressCopy(ctx context.Context, uploadID int64, unavailableCopyIndex int) (*model.StorageUploadCopy, error) {
+	var selected *model.StorageUploadCopy
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		candidate := new(model.StorageUploadCopy)
+		err := db.NewSelect().
+			Model(candidate).
+			Join("JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_upload_copy.storage_data_set_id").
+			Where("storage_upload_copy.upload_id = ?", uploadID).
+			Where("storage_upload_copy.copy_index <> ?", unavailableCopyIndex).
+			Where("storage_upload_copy.status = ?", model.StorageUploadCopyStatusPending).
+			Where("storage_upload_copy.transfer_method = ?", model.StorageCopyTransferMethodPeerPull).
+			Where("storage_data_set.status = ?", model.StorageDataSetStatusReady).
+			OrderExpr("storage_upload_copy.copy_index ASC").
+			Limit(1).
+			Scan(ctx)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("selecting alternate ingress copy: %w", err)
+		}
+		res, err := db.NewUpdate().
+			Model((*model.StorageUploadCopy)(nil)).
+			Set("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).
+			Where("upload_id = ? AND copy_index = ?", uploadID, unavailableCopyIndex).
+			Where("transfer_method = ?", model.StorageCopyTransferMethodIngress).
+			Where("status <> ?", model.StorageUploadCopyStatusCommitted).
+			Where("NOT (status = ? AND commit_transaction_id IS NOT NULL AND commit_transaction_id <> '')", model.StorageUploadCopyStatusCommitting).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("releasing unavailable ingress copy: %w", err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("releasing unavailable ingress copy: reading affected rows: %w", err)
+		}
+		if rows != 1 {
+			return fmt.Errorf("releasing unavailable ingress copy: %w", ErrConflict)
+		}
+		res, err = db.NewUpdate().
+			Model((*model.StorageUploadCopy)(nil)).
+			Set("transfer_method = ?", model.StorageCopyTransferMethodIngress).
+			Set("updated_at = ?", time.Now()).
+			Where("id = ?", candidate.ID).
+			Where("status = ?", model.StorageUploadCopyStatusPending).
+			Where("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("assigning alternate ingress copy: %w", err)
+		}
+		rows, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("assigning alternate ingress copy: reading affected rows: %w", err)
+		}
+		if rows != 1 {
+			return fmt.Errorf("assigning alternate ingress copy: %w", ErrConflict)
+		}
+		candidate.TransferMethod = model.StorageCopyTransferMethodIngress
+		selected = candidate
+		return nil
+	})
+	return selected, err
+}
+
 func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		now := time.Now()
-		res, err := db.NewUpdate().
+		q := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusPieceReady).
 			Set("piece_id = COALESCE(?, piece_id)", input.PieceID).
@@ -846,8 +1128,11 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
 			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
-			Where("status <> ?", model.StorageUploadCopyStatusCommitted).
-			Exec(ctx)
+			Where("status <> ?", model.StorageUploadCopyStatusCommitted)
+		if input.StorageUploadCopyID > 0 {
+			q = q.Where("id = ?", input.StorageUploadCopyID)
+		}
+		res, err := q.Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("marking storage upload copy piece ready: %w", err)
 		}
@@ -863,23 +1148,63 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 			if err := updateUploadIngressReady(ctx, db, input.UploadID, input.PieceCID, now); err != nil {
 				return err
 			}
+		} else {
+			if _, err := db.NewUpdate().
+				Model((*model.StorageUpload)(nil)).
+				Set("piece_cid = COALESCE(?, piece_cid)", nullableString(input.PieceCID)).
+				Set("updated_at = ?", now).
+				Where("id = ?", input.UploadID).
+				Exec(ctx); err != nil {
+				return fmt.Errorf("recording storage upload piece CID: %w", err)
+			}
 		}
 		return nil
 	})
 }
 
 func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error {
-	_, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*model.StorageUploadCopy)(nil)).
 		Set("status = CASE WHEN ? IS NOT NULL THEN ? ELSE status END", nullableString(input.CommitTransactionID), model.StorageUploadCopyStatusCommitting).
 		Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
 		Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
 		Set("last_error = NULL").
 		Set("updated_at = ?", time.Now()).
-		Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
-		Exec(ctx)
+		Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex)
+	if input.StorageUploadCopyID > 0 {
+		q = q.Where("id = ?", input.StorageUploadCopyID)
+	}
+	_, err := q.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage upload copy committing: %w", err)
+	}
+	return nil
+}
+
+func (r *BunStorageUploadRepo) ResetRejectedUploadCopyCommit(ctx context.Context, input ResetRejectedUploadCopyCommitInput) error {
+	if input.UploadID <= 0 || input.CopyIndex < 0 || input.CommitTransactionID == "" {
+		return fmt.Errorf("resetting rejected storage upload commit: %w", ErrInvalidInput)
+	}
+	res, err := r.db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("status = ?", model.StorageUploadCopyStatusPieceReady).
+		Set("commit_extra_data_hex = NULL").
+		Set("commit_transaction_id = NULL").
+		Set("last_error = ?", input.LastError).
+		Set("updated_at = ?", time.Now()).
+		Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
+		Where("status = ?", model.StorageUploadCopyStatusCommitting).
+		Where("commit_transaction_id = ?", input.CommitTransactionID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("resetting rejected storage upload commit: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("resetting rejected storage upload commit: reading affected rows: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("resetting rejected storage upload commit: %w", ErrConflict)
 	}
 	return nil
 }
@@ -894,7 +1219,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 		if err != nil {
 			return err
 		}
-		res, err := db.NewUpdate().
+		q := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusCommitted).
 			Set("piece_id = COALESCE(?, piece_id)", input.PieceID).
@@ -904,8 +1229,11 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
-			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
-			Exec(ctx)
+			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex)
+		if input.StorageUploadCopyID > 0 {
+			q = q.Where("id = ?", input.StorageUploadCopyID)
+		}
+		res, err := q.Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("marking storage upload copy committed: %w", err)
 		}
@@ -930,19 +1258,39 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadI
 			Set("updated_at = ?", now).
 			Where("upload_id = ? AND copy_index = ?", uploadID, copyIndex).
 			Where("status <> ?", model.StorageUploadCopyStatusCommitted).
+			Where("NOT (status = ? AND commit_transaction_id IS NOT NULL AND commit_transaction_id <> '')", model.StorageUploadCopyStatusCommitting).
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("marking storage upload copy failed: %w", err)
 		}
-		rows, _ := res.RowsAffected()
+		rows, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return fmt.Errorf("marking storage upload copy failed: reading affected rows: %w", rowsErr)
+		}
 		if rows == 0 {
+			submittedCount, countErr := db.NewSelect().
+				Model((*model.StorageUploadCopy)(nil)).
+				Where("upload_id = ? AND copy_index = ?", uploadID, copyIndex).
+				Where("status = ?", model.StorageUploadCopyStatusCommitting).
+				Where("commit_transaction_id IS NOT NULL AND commit_transaction_id <> ''").
+				Count(ctx)
+			if countErr != nil {
+				return fmt.Errorf("checking submitted storage commit before failure: %w", countErr)
+			}
+			if submittedCount > 0 {
+				return fmt.Errorf("marking storage upload copy failed: submitted commit is still recoverable: %w", ErrConflict)
+			}
 			return nil
 		}
 		readableCount, err := countReadableCommittedCopies(ctx, db, uploadID)
 		if err != nil {
 			return err
 		}
-		if readableCount == 0 {
+		submittedCount, err := countSubmittedCommitCopies(ctx, db, uploadID)
+		if err != nil {
+			return err
+		}
+		if readableCount == 0 && submittedCount == 0 {
 			_, err = db.NewUpdate().
 				Model((*model.StorageUpload)(nil)).
 				Set("status = ?", model.StorageUploadStatusFailed).
@@ -954,7 +1302,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadI
 			if err != nil {
 				return fmt.Errorf("marking storage upload failed: %w", err)
 			}
-		} else {
+		} else if readableCount > 0 {
 			_, err = db.NewUpdate().
 				Model((*model.StorageUpload)(nil)).
 				Set("status = ?", model.StorageUploadStatusReadable).
@@ -971,6 +1319,19 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadI
 		}
 		return nil
 	})
+}
+
+func countSubmittedCommitCopies(ctx context.Context, db bun.IDB, uploadID int64) (int, error) {
+	count, err := db.NewSelect().
+		Model((*model.StorageUploadCopy)(nil)).
+		Where("upload_id = ?", uploadID).
+		Where("status = ?", model.StorageUploadCopyStatusCommitting).
+		Where("commit_transaction_id IS NOT NULL AND commit_transaction_id <> ''").
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting submitted storage commits: %w", err)
+	}
+	return count, nil
 }
 
 func (r *BunStorageUploadRepo) BindReadableUploadForContent(ctx context.Context, input BindReadableUploadInput) ([]ObjectVersionRef, error) {
@@ -996,7 +1357,7 @@ func (r *BunStorageUploadRepo) BindReadableUploadForContent(ctx context.Context,
 			SET storage_upload_id = ?, state = ?, failed_at_state = NULL, last_error = NULL, updated_at = ?
 			WHERE bucket_id = ? AND size = ? AND checksum = ?
 			  AND (
-				(version_id = ? AND state IN (?, ?))
+				(version_id = ? AND state IN (?, ?, ?))
 				OR (
 					state = ?
 					AND NOT EXISTS (
@@ -1018,7 +1379,7 @@ func (r *BunStorageUploadRepo) BindReadableUploadForContent(ctx context.Context,
 		err := db.NewRaw(query,
 			input.UploadID, model.ObjectStateReplicating, now,
 			input.BucketID, input.ContentSize, input.Checksum,
-			upload.SourceVersionID, model.ObjectStateCommitting, model.ObjectStateFailed,
+			upload.SourceVersionID, model.ObjectStateUploading, model.ObjectStateCommitting, model.ObjectStateFailed,
 			model.ObjectStateUploading,
 			input.UploadID,
 			model.TaskTypeUpload, bun.List(activeTaskStatuses()),

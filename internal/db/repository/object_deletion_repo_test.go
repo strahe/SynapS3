@@ -88,6 +88,112 @@ func TestObjectRepo_DeleteObjectVersionPermanentlyRemovesVersionAndQueuesStorage
 	}
 }
 
+func TestObjectRepo_DeleteObjectVersionPermanentlyWaitsForUnavailableReplicaRepair(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "permanent-delete-repair-bucket")
+	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000DEL0R", 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID: bucket.ID, SourceVersionID: version.VersionID, ContentSize: version.Size, Checksum: version.Checksum, RequestedCopies: 2,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding primary: %v", err)
+	}
+	repair, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding repair: %v", err)
+	}
+	for _, input := range []repository.MarkDataSetReadyInput{
+		{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")},
+		{ID: repair.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002")},
+	} {
+		if err := repos.Uploads.MarkDataSetReady(ctx, input); err != nil {
+			t.Fatalf("MarkDataSetReady(%d): %v", input.ID, err)
+		}
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
+		{StorageDataSetID: repair.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
+	}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	pieceCID := "bafk2bzacepermanentrepair"
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID: upload.ID, CopyIndex: 0, PieceCID: pieceCID, PieceID: onChainIDPtr(t, "3001"), RetrievalURL: "https://primary.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted primary: %v", err)
+	}
+	mustExec(t, db, `UPDATE storage_uploads SET status = ? WHERE id = ?`, model.StorageUploadStatusComplete, upload.ID)
+	if err := repos.Objects.SetVersionStorageUploadAndTransition(ctx, version.VersionID, upload.ID, model.ObjectStateCached, model.ObjectStateStored); err != nil {
+		t.Fatalf("SetVersionStorageUploadAndTransition: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetUnavailable(ctx, repair.ID, "temporary outage"); err != nil {
+		t.Fatalf("MarkDataSetUnavailable: %v", err)
+	}
+
+	_, err = repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
+	})
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("DeleteObjectVersionPermanently during repair error = %v, want ErrConflict", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID: upload.ID, CopyIndex: 1, PieceCID: pieceCID, PieceID: onChainIDPtr(t, "3002"), RetrievalURL: "https://repair.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted repair: %v", err)
+	}
+	stage := "repair_replica"
+	repairTask := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: bucket.ID, RefVersionID: version.VersionID,
+		IdempotencyKey: "upload:repair-data-set:permanent-delete", Status: model.TaskStatusQueued,
+		MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, repairTask); err != nil {
+		t.Fatalf("Create repair task: %v", err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != repairTask.ID {
+		t.Fatalf("ClaimReady repair task: task=%#v err=%v", claimed, err)
+	}
+	_, err = repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
+	})
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("DeleteObjectVersionPermanently before repair finalization error = %v, want ErrConflict", err)
+	}
+	if err := repos.Tasks.Complete(ctx, claimed); err != nil {
+		t.Fatalf("Complete repair task: %v", err)
+	}
+	result, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently after repair: %v", err)
+	}
+	if result.StorageCleanupTaskID == nil {
+		t.Fatal("expected storage cleanup task after repair")
+	}
+	var cleanupCopies int
+	if err := db.NewRaw(`SELECT COUNT(*) FROM storage_cleanup_copies WHERE task_id = ?`, *result.StorageCleanupTaskID).Scan(ctx, &cleanupCopies); err != nil {
+		t.Fatalf("count storage cleanup copies: %v", err)
+	}
+	if cleanupCopies != 2 {
+		t.Fatalf("storage cleanup copies = %d, want both committed replicas", cleanupCopies)
+	}
+}
+
 func TestObjectRepo_DeleteObjectVersionPermanentlyUsesConfiguredStorageCleanupMaxRetries(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

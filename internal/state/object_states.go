@@ -10,6 +10,8 @@ func NewObjectStateMachine() *Machine {
 		// Happy path
 		Transition{From: string(model.ObjectStateCached), To: string(model.ObjectStateUploading)},
 		Transition{From: string(model.ObjectStateUploading), To: string(model.ObjectStateCommitting)},
+		// An assigned peer can commit before the original ingress copy resumes.
+		Transition{From: string(model.ObjectStateUploading), To: string(model.ObjectStateReplicating)},
 		Transition{From: string(model.ObjectStateCommitting), To: string(model.ObjectStateReplicating)},
 		Transition{From: string(model.ObjectStateReplicating), To: string(model.ObjectStateStored)},
 		Transition{From: string(model.ObjectStateStored), To: string(model.ObjectStateCacheEvicted)},
@@ -20,6 +22,8 @@ func NewObjectStateMachine() *Machine {
 
 		// Retry
 		Transition{From: string(model.ObjectStateFailed), To: string(model.ObjectStateUploading)},
+		// Recovery can reassign an ingress attempt that reached committing without a piece.
+		Transition{From: string(model.ObjectStateCommitting), To: string(model.ObjectStateUploading)},
 	)
 	return m
 }

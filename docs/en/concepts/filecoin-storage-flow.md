@@ -50,7 +50,9 @@ Retry after restoring RPC connectivity, storage provider reachability, wallet fu
 
 ## Provider Health
 
-Health checks record storage provider and local data set status. The dashboard uses those results to show copies that are `unavailable`, `degraded`, or `unknown`. These results are observational; recovery from provider unavailability is part of the planned replica repair feature below.
+Health checks record storage provider and local data set status. The dashboard uses those results to show copies that are `unavailable`, `degraded`, or `unknown`.
+
+If an established provider becomes temporarily unavailable while the initial copies are still being stored, SynapS3 keeps using the other assigned writable copies. The unfinished copy waits without consuming retries and resumes automatically when the original provider becomes reachable again. SynapS3 does not automatically select a replacement provider. Repairing copies that became unavailable after storage completed remains part of the planned replica repair feature below.
 
 ## What Users See
 

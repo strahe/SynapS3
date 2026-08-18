@@ -4307,21 +4307,6 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	if err != nil || peerBinding == nil {
 		t.Fatalf("GetDataSetBindingByCopyIndex peer: binding=%v err=%v", peerBinding, err)
 	}
-	if _, err := srv.db.NewUpdate().
-		Model((*model.StorageDataSet)(nil)).
-		Set("status = ?", model.StorageDataSetStatusDraining).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", peerBinding.ID).
-		Exec(ctx); err != nil {
-		t.Fatalf("mark peer dataset draining: %v", err)
-	}
-	drainingDetail, statusCode := getProvenance("provenance-bucket", versionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("draining status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if drainingDetail.SuccessCopies != 2 {
-		t.Fatalf("draining provenance = %#v, want draining dataset counted as readable", drainingDetail)
-	}
 	if err := repos.Uploads.MarkDataSetUnavailable(ctx, peerBinding.ID, "provider dataset retired"); err != nil {
 		t.Fatalf("MarkDataSetUnavailable peer: %v", err)
 	}
@@ -4331,6 +4316,16 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	}
 	if unavailableDetail.SuccessCopies != 1 {
 		t.Fatalf("unavailable provenance = %#v, want unavailable dataset excluded from readable copies", unavailableDetail)
+	}
+	if err := repos.Uploads.MarkDataSetDraining(ctx, peerBinding.ID, "provider service ended"); err != nil {
+		t.Fatalf("MarkDataSetDraining peer: %v", err)
+	}
+	drainingDetail, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("draining status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if drainingDetail.SuccessCopies != 2 {
+		t.Fatalf("draining provenance = %#v, want draining dataset counted as readable", drainingDetail)
 	}
 	if !reflect.DeepEqual(identityResolver.requests[0], []string{"101", "202", "303"}) {
 		t.Fatalf("provider identity request = %#v, want one provenance snapshot request", identityResolver.requests)

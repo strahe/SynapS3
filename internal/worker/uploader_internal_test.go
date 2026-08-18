@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,45 +14,85 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
 
-func TestGetSubmittedCommitStatusTimesOutWhenProviderStalls(t *testing.T) {
-	originalTimeout := submittedCommitRequestTimeout
-	submittedCommitRequestTimeout = 25 * time.Millisecond
-	t.Cleanup(func() { submittedCommitRequestTimeout = originalTimeout })
+const submittedCommitTestTxHash = "0x7890abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456"
 
+func testSubmittedCommitChecker(timeout time.Duration) *synapse.PDPStatusChecker {
+	return synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
+		Timeout:              timeout,
+		AllowPrivateNetworks: true,
+	})
+}
+
+func TestWaitForSubmittedCommitClassifiesProviderTimeout(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-release
 	}))
 	defer srv.Close()
 
+	dataSetID := onChainID(t, "1001")
+	u := &Uploader{statusChecker: testSubmittedCommitChecker(25 * time.Millisecond)}
 	started := time.Now()
-	_, err := getSubmittedCommitStatus(context.Background(), srv.URL)
+	_, err := u.waitForSubmittedCommit(context.Background(), submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, submittedCommitTestTxHash, 1)
 	close(release)
 	if err == nil {
-		t.Fatal("getSubmittedCommitStatus returned nil error for a stalled provider")
+		t.Fatal("waitForSubmittedCommit returned nil error for a stalled provider")
+	}
+	if !synapse.IsProviderUnavailable(err) {
+		t.Fatalf("waitForSubmittedCommit error = %T %v, want ProviderUnavailableError", err, err)
 	}
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("getSubmittedCommitStatus elapsed = %s, want bounded timeout", elapsed)
+		t.Fatalf("waitForSubmittedCommit elapsed = %s, want bounded timeout", elapsed)
+	}
+}
+
+func TestWaitForSubmittedCommitPreservesCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dataSetID := onChainID(t, "1001")
+	u := &Uploader{statusChecker: testSubmittedCommitChecker(time.Second)}
+	_, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: "https://provider.example"}, &model.StorageDataSet{DataSetID: &dataSetID}, submittedCommitTestTxHash, 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForSubmittedCommit error = %T %v, want context canceled", err, err)
+	}
+	if synapse.IsProviderUnavailable(err) {
+		t.Fatalf("waitForSubmittedCommit error = %T %v, caller cancellation must not mark provider unavailable", err, err)
+	}
+}
+
+func TestWaitForSubmittedCommitClassifiesProviderUnavailable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	dataSetID := onChainID(t, "1001")
+	u := &Uploader{statusChecker: testSubmittedCommitChecker(time.Second)}
+	_, err := u.waitForSubmittedCommit(context.Background(), submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, submittedCommitTestTxHash, 1)
+	if !synapse.IsProviderUnavailable(err) {
+		t.Fatalf("waitForSubmittedCommit error = %T %v, want ProviderUnavailableError", err, err)
 	}
 }
 
 func TestWaitForSubmittedCommitRejectsConfirmedWithoutPieces(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"txHash":"0xcommit","txStatus":"confirmed","dataSetId":1001,"piecesAdded":false}`))
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"piecesAdded":false}`, submittedCommitTestTxHash)
 	}))
 	defer srv.Close()
 
 	dataSetID := onChainID(t, "1001")
-	u := &Uploader{}
+	u := &Uploader{statusChecker: testSubmittedCommitChecker(time.Second)}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	_, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, "0xcommit", 1)
+	_, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, submittedCommitTestTxHash, 1)
 	if !errors.Is(err, errCommitRejected) {
 		t.Fatalf("waitForSubmittedCommit error = %v, want errCommitRejected", err)
 	}
@@ -62,19 +104,63 @@ func TestWaitForSubmittedCommitHasGlobalTimeout(t *testing.T) {
 	t.Cleanup(func() { submittedCommitMaxWait = originalMaxWait })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"txHash":"0xcommit","txStatus":"pending","dataSetId":1001,"piecesAdded":false}`))
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"pending","dataSetId":1001,"pieceCount":1,"piecesAdded":false}`, submittedCommitTestTxHash)
 	}))
 	defer srv.Close()
 
 	dataSetID := onChainID(t, "1001")
-	u := &Uploader{}
+	u := &Uploader{statusChecker: testSubmittedCommitChecker(time.Second)}
 	started := time.Now()
-	_, err := u.waitForSubmittedCommit(context.Background(), submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, "0xcommit", 1)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waitForSubmittedCommit error = %v, want deadline exceeded", err)
+	_, err := u.waitForSubmittedCommit(context.Background(), submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, submittedCommitTestTxHash, 1)
+	if !errors.Is(err, errSubmittedCommitPending) {
+		t.Fatalf("waitForSubmittedCommit error = %v, want submitted commit pending", err)
+	}
+	if synapse.IsProviderUnavailable(err) {
+		t.Fatalf("waitForSubmittedCommit error = %T %v, pending commit must not mark provider unavailable", err, err)
 	}
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("waitForSubmittedCommit elapsed = %s, want bounded timeout", elapsed)
+	}
+}
+
+func TestPendingSubmittedCommitWaitsWithoutRetry(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	stage := uploadStageIngressCommit
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          1,
+		RefVersionID:   "01J0000000000000000COMMIT",
+		IdempotencyKey: "upload:pending-commit",
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     1,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimReady: task=%#v err=%v", claimed, err)
+	}
+
+	u := &Uploader{repos: repos}
+	if !u.waitForPendingSubmittedCommit(ctx, claimed, slog.Default(), fmt.Errorf("poll commit: %w", errSubmittedCommitPending)) {
+		t.Fatal("waitForPendingSubmittedCommit did not handle the pending commit")
+	}
+	got, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != model.TaskStatusWaiting || got.RetryCount != 0 {
+		t.Fatalf("pending commit task = %#v, want waiting without retry", got)
+	}
+	if got.WaitReason == nil || *got.WaitReason != model.TaskWaitReasonDependency || got.StatusMessage == nil || *got.StatusMessage != "Waiting for storage confirmation" {
+		t.Fatalf("pending commit task = %#v, want storage confirmation dependency", got)
 	}
 }
 
@@ -82,21 +168,35 @@ func TestWaitForSubmittedCommitParsesBigIntStringIDsAndZeroPieceID(t *testing.T)
 	dataSetID := "18446744073709551616"
 	pieceID := "18446744073709551617"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"txHash":"0xcommit","txStatus":"confirmed","dataSetId":"` + dataSetID + `","piecesAdded":true,"confirmedPieceIds":["0","` + pieceID + `"]}`))
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":%q,"pieceCount":2,"piecesAdded":true,"confirmedPieceIds":["0",%q]}`, submittedCommitTestTxHash, dataSetID, pieceID)
 	}))
 	defer srv.Close()
 
 	bindingDataSetID := onChainID(t, dataSetID)
-	u := &Uploader{}
+	u := &Uploader{statusChecker: testSubmittedCommitChecker(time.Second)}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	result, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &bindingDataSetID}, "0xcommit", 2)
+	result, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &bindingDataSetID}, submittedCommitTestTxHash, 2)
 	if err != nil {
 		t.Fatalf("waitForSubmittedCommit: %v", err)
 	}
 	if result.DataSetID.String() != dataSetID || len(result.PieceIDs) != 2 || result.PieceIDs[0].String() != "0" || result.PieceIDs[1].String() != pieceID {
 		t.Fatalf("commit result = %#v, want big data set and piece IDs", result)
+	}
+}
+
+func TestWaitForSubmittedCommitRejectsTransactionMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"piecesAdded":true,"confirmedPieceIds":[2001]}`, "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+	}))
+	defer srv.Close()
+
+	dataSetID := onChainID(t, "1001")
+	u := &Uploader{statusChecker: testSubmittedCommitChecker(time.Second)}
+	_, err := u.waitForSubmittedCommit(t.Context(), submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, submittedCommitTestTxHash, 1)
+	if err == nil || synapse.IsProviderUnavailable(err) {
+		t.Fatalf("waitForSubmittedCommit error = %T %v, want ordinary identity mismatch", err, err)
 	}
 }
 

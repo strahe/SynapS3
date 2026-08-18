@@ -10,6 +10,7 @@ export const taskStageOptions = [
   'ingress_commit',
   'peer_pull',
   'peer_commit',
+  'repair_replica',
 ] as const
 
 export type TaskStageOption = (typeof taskStageOptions)[number]
@@ -21,6 +22,7 @@ const taskStageLabels: Record<Exclude<TaskStageOption, 'all'> | '', string> = {
   ingress_commit: 'Register source replica on-chain',
   peer_pull: 'Sync peer replica',
   peer_commit: 'Register peer replica on-chain',
+  repair_replica: 'Resume replica upload',
   '': 'Upload',
 }
 

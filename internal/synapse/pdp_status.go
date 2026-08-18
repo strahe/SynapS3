@@ -115,25 +115,39 @@ func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input
 }
 
 func (c *PDPStatusChecker) CheckAddPiecesStatus(ctx context.Context, input AddPiecesStatusInput) PDPStatusResult {
+	result, err := c.GetAddPiecesStatus(ctx, input)
+	if err == nil {
+		return result
+	}
+	state := result.State
+	if state == "" {
+		state = PDPStatusUnavailable
+	}
+	return result.withError(state, err.Error())
+}
+
+// GetAddPiecesStatus performs one validated status request while preserving
+// the underlying error for operational callers that must classify retries.
+func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiecesStatusInput) (PDPStatusResult, error) {
 	statusURL := input.StatusURL
 	if statusURL == "" {
 		var err error
 		statusURL, err = buildAddPiecesStatusURL(input.ServiceURL, input.DataSetID, input.TransactionID)
 		if err != nil {
-			return PDPStatusResult{}.withError(PDPStatusUnavailable, err.Error())
+			return PDPStatusResult{}, err
 		}
 	}
 	result := PDPStatusResult{StatusURL: statusURL}
 	if input.ExpectedPieceCount <= 0 {
-		return result.withError(PDPStatusUnavailable, "missing expected piece count")
+		return result, errors.New("missing expected piece count")
 	}
 	client, err := c.clientForStatusURL(statusURL)
 	if err != nil {
-		return result.withError(PDPStatusUnavailable, err.Error())
+		return result, err
 	}
 	status, err := client.GetAddPiecesStatus(ctx, statusURL)
 	if err != nil {
-		return result.withError(PDPStatusUnavailable, err.Error())
+		return result, err
 	}
 	result.TxStatus = status.TxStatus
 	result.DataSetID = status.DataSetID.String()
@@ -143,10 +157,11 @@ func (c *PDPStatusChecker) CheckAddPiecesStatus(ctx context.Context, input AddPi
 		result.ConfirmedPieceIDs = append(result.ConfirmedPieceIDs, id.String())
 	}
 	if err := validateAddPiecesStatusIdentity(input, result, status.TxHash.Hex()); err != nil {
-		return result.withError(PDPStatusMismatch, err.Error())
+		result.State = PDPStatusMismatch
+		return result, err
 	}
 	result.State = classifyAddPiecesStatus(status.TxStatus, status.PiecesAdded, status.PieceCount, input.ExpectedPieceCount, len(result.ConfirmedPieceIDs))
-	return result
+	return result, nil
 }
 
 func (c *PDPStatusChecker) clientForStatusURL(statusURL string) (*pdp.Client, error) {

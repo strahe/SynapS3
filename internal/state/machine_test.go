@@ -13,6 +13,7 @@ func TestObjectStateMachine_HappyPath(t *testing.T) {
 	transitions := []struct{ from, to model.ObjectState }{
 		{model.ObjectStateCached, model.ObjectStateUploading},
 		{model.ObjectStateUploading, model.ObjectStateCommitting},
+		{model.ObjectStateUploading, model.ObjectStateReplicating},
 		{model.ObjectStateCommitting, model.ObjectStateReplicating},
 		{model.ObjectStateReplicating, model.ObjectStateStored},
 		{model.ObjectStateStored, model.ObjectStateCacheEvicted},
@@ -79,12 +80,19 @@ func TestObjectStateMachine_RetryFromFailed(t *testing.T) {
 	}
 }
 
+func TestObjectStateMachine_ResumeReassignedIngress(t *testing.T) {
+	m := NewObjectStateMachine()
+
+	if err := m.Validate(string(model.ObjectStateCommitting), string(model.ObjectStateUploading)); err != nil {
+		t.Fatalf("committing→uploading: unexpected error: %v", err)
+	}
+}
+
 func TestObjectStateMachine_InvalidTransitions(t *testing.T) {
 	m := NewObjectStateMachine()
 
 	invalid := []struct{ from, to model.ObjectState }{
 		{model.ObjectStateCached, model.ObjectStateStored},          // must go through uploading
-		{model.ObjectStateUploading, model.ObjectStateReplicating},  // primary Store is not enough
 		{model.ObjectStateCommitting, model.ObjectStateStored},      // secondary commits still pending
 		{model.ObjectStateCached, model.ObjectStateCacheEvicted},    // can't evict from cached
 		{model.ObjectStateCacheEvicted, model.ObjectStateCached},    // can't revive
@@ -127,8 +135,8 @@ func TestObjectStateMachine_NextStates(t *testing.T) {
 		expected []string
 	}{
 		{model.ObjectStateCached, []string{"uploading"}},
-		{model.ObjectStateUploading, []string{"committing", "failed"}},
-		{model.ObjectStateCommitting, []string{"failed", "replicating"}},
+		{model.ObjectStateUploading, []string{"committing", "failed", "replicating"}},
+		{model.ObjectStateCommitting, []string{"failed", "replicating", "uploading"}},
 		{model.ObjectStateReplicating, []string{"stored"}},
 		{model.ObjectStateStored, []string{"cache_evicted"}},
 		{model.ObjectStateFailed, []string{"uploading"}},

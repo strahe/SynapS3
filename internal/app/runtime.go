@@ -157,6 +157,10 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, evictionPolicy,
 			cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
 			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
+			worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
+				Timeout:              15 * time.Second,
+				AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+			})),
 			worker.WithEventPublisher(events)),
 		worker.NewEvictor(repos, localCache, cacheGate, accessTracker, stateMachine,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger,
