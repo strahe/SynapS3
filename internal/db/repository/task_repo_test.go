@@ -431,6 +431,9 @@ func TestTaskRepo_Complete(t *testing.T) {
 	if task.ClaimedAt != nil || task.LeaseUntil != nil || task.StartedAt != nil {
 		t.Fatalf("completed task lease fields = claimed:%v lease:%v started:%v, want cleared", task.ClaimedAt, task.LeaseUntil, task.StartedAt)
 	}
+	if task.StatusMessage != nil {
+		t.Fatalf("completed task status_message = %q, want nil", *task.StatusMessage)
+	}
 }
 
 func TestTaskRepo_CompleteWithMessage(t *testing.T) {
@@ -545,6 +548,117 @@ func TestTaskRepo_FailRunning(t *testing.T) {
 	err := repos.Tasks.FailRunning(ctx, queued, "should fail")
 	if err == nil {
 		t.Fatal("expected error failing queued task")
+	}
+}
+
+func TestTaskRepo_CancelRunning(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUpload)
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimReady: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	if err := repos.Tasks.CancelRunning(ctx, claimed, "cancelled by user"); err != nil {
+		t.Fatalf("CancelRunning: %v", err)
+	}
+
+	task, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if task.Status != model.TaskStatusCancelled {
+		t.Errorf("expected cancelled, got %s", task.Status)
+	}
+	if task.LastError != nil {
+		t.Errorf("expected last_error to be cleared, got %q", *task.LastError)
+	}
+	if task.StatusMessage == nil || *task.StatusMessage != "cancelled by user" {
+		t.Errorf("expected status_message %q, got %v", "cancelled by user", task.StatusMessage)
+	}
+	if task.CompletedAt == nil {
+		t.Error("expected completed_at to be set")
+	}
+	if task.ClaimedAt != nil || task.LeaseUntil != nil || task.StartedAt != nil {
+		t.Fatalf("cancelled task lease fields = claimed:%v lease:%v started:%v, want cleared", task.ClaimedAt, task.LeaseUntil, task.StartedAt)
+	}
+
+	queued := seedTask(t, repos, model.TaskTypeUpload)
+	now := time.Now()
+	leaseUntil := now.Add(5 * time.Minute)
+	mustExec(t, db, `UPDATE tasks SET claimed_at = ?, lease_until = ?, started_at = ? WHERE id = ?`, now, leaseUntil, now, queued.ID)
+	queued.ClaimedAt = &now
+	queued.LeaseUntil = &leaseUntil
+	queued.StartedAt = &now
+	if err := repos.Tasks.CancelRunning(ctx, queued, "should fail"); err == nil {
+		t.Fatal("expected error cancelling queued task")
+	}
+}
+
+func TestTaskRepo_CancelRunningWithoutMessage(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUpload)
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimReady: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	if err := repos.Tasks.CancelRunning(ctx, claimed, ""); err != nil {
+		t.Fatalf("CancelRunning: %v", err)
+	}
+
+	task, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if task.Status != model.TaskStatusCancelled {
+		t.Errorf("expected cancelled, got %s", task.Status)
+	}
+	if task.StatusMessage != nil {
+		t.Errorf("expected status_message nil, got %q", *task.StatusMessage)
+	}
+}
+
+func TestTaskRepo_CancelRunningRejectsStaleClaim(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	seedTask(t, repos, model.TaskTypeUpload)
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimReady: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("setup: could not claim task")
+	}
+
+	if err := repos.Tasks.ReleaseRunning(ctx, claimed); err != nil {
+		t.Fatalf("ReleaseRunning: %v", err)
+	}
+
+	if err := repos.Tasks.CancelRunning(ctx, claimed, "cancel"); err == nil {
+		t.Fatal("expected error cancelling stale claim")
+	}
+
+	task, err := repos.Tasks.GetByID(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if task.Status != model.TaskStatusQueued {
+		t.Fatalf("status after stale cancel = %s, want queued", task.Status)
 	}
 }
 

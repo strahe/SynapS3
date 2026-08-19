@@ -80,7 +80,7 @@ synaps3 admin-auth reset-password --config /var/lib/synaps3/config.toml
 
 ## 安全标头
 
-Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 和 `Referrer-Policy: strict-origin-when-cross-origin`。默认内容策略让仪表盘资源保持同源。
+Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 和 `Referrer-Policy: strict-origin-when-cross-origin`。默认内容策略让仪表盘资源保持同源。`/api/`、`/admin/`、`/metrics` 和 `/healthz` 还会发送 `Cache-Control: no-store`。仪表盘页面资源不受该标头影响。
 
 ## 高风险操作
 

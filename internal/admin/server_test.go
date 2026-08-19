@@ -416,4 +416,33 @@ func TestWithSecurityHeaders(t *testing.T) {
 	if got := res.Header.Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") || !strings.Contains(got, "connect-src 'self'") {
 		t.Errorf("Content-Security-Policy = %q, want self-only baseline", got)
 	}
+	if got := res.Header.Get("Cache-Control"); got != "" {
+		t.Errorf("Cache-Control = %q, want empty for dashboard assets", got)
+	}
+}
+
+func TestWithSecurityHeadersSensitivePaths(t *testing.T) {
+	handler := withSecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for _, path := range []string{
+		"/api/v1/auth/session",
+		"/admin/exhausted-tasks",
+		"/metrics",
+		"/healthz",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			res := rec.Result()
+			defer func() { _ = res.Body.Close() }()
+
+			if got := res.Header.Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q, want no-store", got)
+			}
+		})
+	}
 }
