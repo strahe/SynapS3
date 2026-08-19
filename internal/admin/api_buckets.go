@@ -1197,6 +1197,8 @@ func (s *Server) handleAPIPermanentDeleteBucketObject(w http.ResponseWriter, r *
 		switch {
 		case errors.Is(err, repository.ErrNotFound):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "object version not found"})
+		case errors.Is(err, repository.ErrPermanentDeleteStorageBusy):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "Storage work for this version is still in progress or awaiting Filecoin confirmation. Check the related task, then try again."})
 		case errors.Is(err, repository.ErrConflict):
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "object version cannot be permanently deleted"})
 		default:
@@ -1255,6 +1257,8 @@ func (s *Server) handleAPIPermanentDeleteDeletedBucketObject(w http.ResponseWrit
 		switch {
 		case errors.Is(err, repository.ErrNotFound):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "deleted object not found"})
+		case errors.Is(err, repository.ErrPermanentDeleteStorageBusy):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "Storage work for one or more versions is still in progress or awaiting Filecoin confirmation. Check the related tasks, then try again."})
 		case errors.Is(err, repository.ErrConflict):
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "deleted object cannot be permanently deleted"})
 		default:

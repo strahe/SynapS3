@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -945,6 +946,193 @@ func (r *BunStorageUploadRepo) GetUploadCopyByID(ctx context.Context, id int64) 
 	return copyRow, nil
 }
 
+func (r *BunStorageUploadRepo) AcquireUploadTask(ctx context.Context, input AcquireUploadTaskInput) error {
+	if input.TaskID <= 0 || input.TaskClaimedAt.IsZero() || input.UploadID < 0 || input.VersionID == "" {
+		return fmt.Errorf("acquiring upload task: %w", ErrInvalidInput)
+	}
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		var upload *model.StorageUpload
+		if input.UploadID > 0 {
+			uploads, err := lockStorageUploadsByID(ctx, db, []int64{input.UploadID})
+			if err != nil {
+				if errors.Is(err, ErrNotFound) {
+					return ErrUploadTaskCancelled
+				}
+				return fmt.Errorf("locking upload task storage upload: %w", err)
+			}
+			upload = uploads[input.UploadID]
+			if upload == nil || upload.Status == model.StorageUploadStatusSuperseded {
+				return ErrUploadTaskCancelled
+			}
+		}
+
+		version := new(model.ObjectVersion)
+		err := db.NewRaw(`UPDATE object_versions
+			SET updated_at = updated_at
+			WHERE version_id = ?
+			RETURNING *`, input.VersionID).Scan(ctx, version)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return ErrUploadTaskCancelled
+			}
+			return fmt.Errorf("locking upload task object version: %w", err)
+		}
+		if version.IsDeleteMarker {
+			return ErrUploadTaskCancelled
+		}
+		if upload != nil && (version.BucketID != upload.BucketID || !objectVersionReferencesStorageUpload(version, upload)) {
+			return ErrUploadTaskCancelled
+		}
+
+		now := time.Now()
+		task := new(model.Task)
+		err = db.NewRaw(`UPDATE tasks
+			SET status = status
+			WHERE id = ?
+			  AND status = ?
+			  AND claimed_at = ?
+			  AND lease_until IS NOT NULL
+			  AND lease_until > ?
+			RETURNING *`, input.TaskID, model.TaskStatusRunning, input.TaskClaimedAt, now).Scan(ctx, task)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return ErrTaskClaimLost
+			}
+			return fmt.Errorf("locking upload task claim: %w", err)
+		}
+		if task.Type != model.TaskTypeUpload || task.RefType != "object" || task.RefID != version.ObjectID || task.RefVersionID != version.VersionID {
+			return fmt.Errorf("upload task identity mismatch: %w", ErrConflict)
+		}
+		return nil
+	})
+}
+
+func (r *BunStorageUploadRepo) AcquireReplicaRepairItem(ctx context.Context, input AcquireReplicaRepairItemInput) (*ReplicaRepairItem, error) {
+	if input.TaskID <= 0 || input.TaskClaimedAt.IsZero() || input.StorageDataSetID <= 0 || input.StorageUploadCopyID <= 0 || input.BucketID <= 0 {
+		return nil, fmt.Errorf("acquiring replica repair item: %w", ErrInvalidInput)
+	}
+
+	var item ReplicaRepairItem
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		copyRow := new(model.StorageUploadCopy)
+		err := db.NewRaw(`UPDATE storage_upload_copies
+			SET updated_at = updated_at
+			WHERE id = ?
+			RETURNING *`, input.StorageUploadCopyID).Scan(ctx, copyRow)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return ErrReplicaRepairItemCancelled
+			}
+			return fmt.Errorf("locking replica repair copy: %w", err)
+		}
+
+		now := time.Now()
+		task := new(model.Task)
+		err = db.NewRaw(`UPDATE tasks
+			SET status = status
+			WHERE id = ?
+			  AND status = ?
+			  AND claimed_at = ?
+			  AND lease_until IS NOT NULL
+			  AND lease_until > ?
+			RETURNING *`, input.TaskID, model.TaskStatusRunning, input.TaskClaimedAt, now).Scan(ctx, task)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return ErrTaskClaimLost
+			}
+			return fmt.Errorf("locking replica repair task claim: %w", err)
+		}
+
+		if copyRow.Status == model.StorageUploadCopyStatusFailed {
+			return ErrReplicaRepairItemCancelled
+		}
+		if copyRow.StorageDataSetID == nil || *copyRow.StorageDataSetID != input.StorageDataSetID {
+			return fmt.Errorf("replica repair copy data set mismatch: %w", ErrConflict)
+		}
+
+		dataSet := new(model.StorageDataSet)
+		if err := db.NewSelect().Model(dataSet).Where("id = ?", input.StorageDataSetID).Scan(ctx); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrReplicaRepairItemCancelled
+			}
+			return fmt.Errorf("loading replica repair data set: %w", err)
+		}
+		upload := new(model.StorageUpload)
+		if err := db.NewSelect().Model(upload).Where("id = ?", copyRow.UploadID).Scan(ctx); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrReplicaRepairItemCancelled
+			}
+			return fmt.Errorf("loading replica repair upload: %w", err)
+		}
+		if dataSet.BucketID != input.BucketID || upload.BucketID != input.BucketID || task.Type != model.TaskTypeUpload || task.RefType != "bucket" || task.RefID != input.BucketID {
+			return fmt.Errorf("replica repair bucket identity mismatch: %w", ErrConflict)
+		}
+		if copyRow.CopyIndex != dataSet.CopyIndex {
+			return fmt.Errorf("replica repair copy slot mismatch: %w", ErrConflict)
+		}
+		if copyRow.ProviderID == nil || !copyRow.ProviderID.Equal(dataSet.ProviderID) {
+			return fmt.Errorf("replica repair copy provider mismatch: %w", ErrConflict)
+		}
+
+		version, err := selectLiveObjectVersionForStorageUpload(ctx, db, upload, nil)
+		if err != nil {
+			return err
+		}
+		if version == nil {
+			return ErrReplicaRepairItemCancelled
+		}
+		if version.BucketID != input.BucketID {
+			return fmt.Errorf("replica repair object version bucket mismatch: %w", ErrConflict)
+		}
+
+		item = ReplicaRepairItem{
+			DataSet: *dataSet,
+			Copy:    *copyRow,
+			Upload:  *upload,
+			Version: *version,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("acquiring replica repair item: %w", err)
+	}
+	return &item, nil
+}
+
+func selectLiveObjectVersionForStorageUpload(
+	ctx context.Context,
+	db bun.IDB,
+	upload *model.StorageUpload,
+	excludedVersionIDs []string,
+) (*model.ObjectVersion, error) {
+	if upload == nil || upload.ID <= 0 {
+		return nil, fmt.Errorf("selecting live storage upload version: %w", ErrInvalidInput)
+	}
+	version := new(model.ObjectVersion)
+	q := db.NewSelect().
+		Model(version).
+		Where("is_delete_marker = ?", false).
+		Where(objectVersionReferencesStorageUploadIDSQL, upload.ID, upload.SourceVersionID)
+	if len(excludedVersionIDs) > 0 {
+		q = q.Where("version_id NOT IN (?)", bun.List(excludedVersionIDs))
+	}
+	err := q.
+		OrderExpr("in_cache DESC").
+		OrderExpr("CASE WHEN version_id = ? THEN 0 ELSE 1 END ASC", upload.SourceVersionID).
+		OrderExpr("is_current DESC").
+		OrderExpr("created_at DESC").
+		OrderExpr("version_id DESC").
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting live storage upload version: %w", err)
+	}
+	return version, nil
+}
+
 func (r *BunStorageUploadRepo) NextIncompleteCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error) {
 	copyRow := new(model.StorageUploadCopy)
 	err := r.db.NewSelect().
@@ -958,9 +1146,9 @@ func (r *BunStorageUploadRepo) NextIncompleteCopyForDataSet(ctx context.Context,
 		})).
 		Where(`EXISTS (
 			SELECT 1 FROM object_versions AS repair_version
-			WHERE repair_version.version_id = storage_upload.source_version_id
-			   OR repair_version.storage_upload_id = storage_upload.id
-		)`).
+			WHERE repair_version.is_delete_marker = ?
+			  AND `+objectVersionReferencesStorageUploadSQL("repair_version", "storage_upload")+`
+		)`, false).
 		OrderExpr("storage_upload_copy.id ASC").
 		Limit(1).
 		Scan(ctx)
@@ -1035,13 +1223,14 @@ func (r *BunStorageUploadRepo) ListUnavailableDataSetsWithIncompleteCopies(ctx c
 			  AND storage_copy.status IN (?, ?, ?)
 			  AND EXISTS (
 				SELECT 1 FROM object_versions AS repair_version
-				WHERE repair_version.version_id = storage_upload.source_version_id
-				   OR repair_version.storage_upload_id = storage_upload.id
+				WHERE repair_version.is_delete_marker = ?
+				  AND `+objectVersionReferencesStorageUploadSQL("repair_version", "storage_upload")+`
 			  )
 		)`,
 			model.StorageUploadCopyStatusPending,
 			model.StorageUploadCopyStatusPieceReady,
 			model.StorageUploadCopyStatusCommitting,
+			false,
 		).
 		OrderExpr("id ASC")
 	if limit > 0 {
@@ -1119,6 +1308,9 @@ func (r *BunStorageUploadRepo) ReassignIngressCopy(ctx context.Context, uploadID
 
 func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
+			return fmt.Errorf("locking storage upload for piece-ready copy: %w", err)
+		}
 		now := time.Now()
 		q := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
@@ -1130,7 +1322,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
 			Where("status <> ?", model.StorageUploadCopyStatusCommitted)
 		if input.StorageUploadCopyID > 0 {
-			q = q.Where("id = ?", input.StorageUploadCopyID)
+			q = q.
+				Where("id = ?", input.StorageUploadCopyID).
+				Where("status <> ?", model.StorageUploadCopyStatusFailed).
+				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
 		}
 		res, err := q.Exec(ctx)
 		if err != nil {
@@ -1138,6 +1333,9 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
+			if input.StorageUploadCopyID > 0 {
+				return fmt.Errorf("marking storage upload copy piece ready: %w", ErrConflict)
+			}
 			return nil
 		}
 		transferMethod, err := uploadCopyTransferMethod(ctx, db, input.UploadID, input.CopyIndex)
@@ -1163,22 +1361,36 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 }
 
 func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error {
-	q := r.db.NewUpdate().
-		Model((*model.StorageUploadCopy)(nil)).
-		Set("status = CASE WHEN ? IS NOT NULL THEN ? ELSE status END", nullableString(input.CommitTransactionID), model.StorageUploadCopyStatusCommitting).
-		Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
-		Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
-		Set("last_error = NULL").
-		Set("updated_at = ?", time.Now()).
-		Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex)
-	if input.StorageUploadCopyID > 0 {
-		q = q.Where("id = ?", input.StorageUploadCopyID)
-	}
-	_, err := q.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("marking storage upload copy committing: %w", err)
-	}
-	return nil
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
+			return fmt.Errorf("locking storage upload for committing copy: %w", err)
+		}
+		q := db.NewUpdate().
+			Model((*model.StorageUploadCopy)(nil)).
+			Set("status = CASE WHEN ? IS NOT NULL THEN ? ELSE status END", nullableString(input.CommitTransactionID), model.StorageUploadCopyStatusCommitting).
+			Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
+			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
+			Set("last_error = NULL").
+			Set("updated_at = ?", time.Now()).
+			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex)
+		if input.StorageUploadCopyID > 0 {
+			q = q.
+				Where("id = ?", input.StorageUploadCopyID).
+				Where("status <> ?", model.StorageUploadCopyStatusFailed).
+				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
+		}
+		res, err := q.Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("marking storage upload copy committing: %w", err)
+		}
+		if input.StorageUploadCopyID > 0 {
+			rows, _ := res.RowsAffected()
+			if rows == 0 {
+				return fmt.Errorf("marking storage upload copy committing: %w", ErrConflict)
+			}
+		}
+		return nil
+	})
 }
 
 func (r *BunStorageUploadRepo) ResetRejectedUploadCopyCommit(ctx context.Context, input ResetRejectedUploadCopyCommitInput) error {
@@ -1214,6 +1426,9 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 		return fmt.Errorf("marking storage upload copy committed: %w", ErrInvalidInput)
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
+			return fmt.Errorf("locking storage upload for committed copy: %w", err)
+		}
 		now := time.Now()
 		isNewDataSet, err := uploadCopyDataSetCreatedByUpload(ctx, db, input.UploadID, input.CopyIndex)
 		if err != nil {
@@ -1231,7 +1446,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 			Set("updated_at = ?", now).
 			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex)
 		if input.StorageUploadCopyID > 0 {
-			q = q.Where("id = ?", input.StorageUploadCopyID)
+			q = q.
+				Where("id = ?", input.StorageUploadCopyID).
+				Where("status <> ?", model.StorageUploadCopyStatusFailed).
+				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
 		}
 		res, err := q.Exec(ctx)
 		if err != nil {
@@ -1239,6 +1457,9 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
+			if input.StorageUploadCopyID > 0 {
+				return fmt.Errorf("marking storage upload copy committed: %w", ErrConflict)
+			}
 			return fmt.Errorf("marking storage upload copy committed: %w", ErrNotFound)
 		}
 		if err := updateUploadReadable(ctx, db, input.UploadID, input.PieceCID, now); err != nil {
@@ -1248,8 +1469,22 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 	})
 }
 
+func liveObjectVersionExistsForUploadSQL() string {
+	return `EXISTS (
+		SELECT 1
+		FROM storage_uploads AS guarded_upload
+		JOIN object_versions AS live_version
+		  ON ` + objectVersionReferencesStorageUploadSQL("live_version", "guarded_upload") + `
+		WHERE guarded_upload.id = ?
+		  AND live_version.is_delete_marker = ?
+	)`
+}
+
 func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadID int64, copyIndex int, lastError string) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if err := lockStorageUploadForCopyMutation(ctx, db, uploadID); err != nil {
+			return fmt.Errorf("locking storage upload for failed copy: %w", err)
+		}
 		now := time.Now()
 		res, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
@@ -1337,15 +1572,9 @@ func countSubmittedCommitCopies(ctx context.Context, db bun.IDB, uploadID int64)
 func (r *BunStorageUploadRepo) BindReadableUploadForContent(ctx context.Context, input BindReadableUploadInput) ([]ObjectVersionRef, error) {
 	var refs []ObjectVersionRef
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		upload := new(model.StorageUpload)
-		if err := db.NewSelect().Model(upload).Where("id = ?", input.UploadID).Scan(ctx); err != nil {
-			if err == sql.ErrNoRows {
-				return ErrNotFound
-			}
-			return fmt.Errorf("selecting storage upload for readable bind: %w", err)
-		}
-		if err := requireReadableCommittedCopy(ctx, db, input.UploadID); err != nil {
-			return err
+		upload, err := lockStorageUploadForObjectState(ctx, db, input.UploadID, model.ObjectStateReplicating)
+		if err != nil {
+			return fmt.Errorf("locking storage upload for readable bind: %w", err)
 		}
 		now := time.Now()
 		if err := updateUploadReadable(ctx, db, input.UploadID, derefString(upload.PieceCID), now); err != nil {
@@ -1376,7 +1605,7 @@ func (r *BunStorageUploadRepo) BindReadableUploadForContent(ctx context.Context,
 				)
 			  )
 			RETURNING object_id, version_id`
-		err := db.NewRaw(query,
+		err = db.NewRaw(query,
 			input.UploadID, model.ObjectStateReplicating, now,
 			input.BucketID, input.ContentSize, input.Checksum,
 			upload.SourceVersionID, model.ObjectStateUploading, model.ObjectStateCommitting, model.ObjectStateFailed,
@@ -1395,15 +1624,9 @@ func (r *BunStorageUploadRepo) BindReadableUploadForContent(ctx context.Context,
 func (r *BunStorageUploadRepo) BindReadableUploadForVersion(ctx context.Context, input BindReadableUploadForVersionInput) ([]ObjectVersionRef, error) {
 	var refs []ObjectVersionRef
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		upload := new(model.StorageUpload)
-		if err := db.NewSelect().Model(upload).Where("id = ?", input.UploadID).Scan(ctx); err != nil {
-			if err == sql.ErrNoRows {
-				return ErrNotFound
-			}
-			return fmt.Errorf("selecting storage upload for version readable bind: %w", err)
-		}
-		if err := requireReadableCommittedCopy(ctx, db, input.UploadID); err != nil {
-			return err
+		upload, err := lockStorageUploadForObjectState(ctx, db, input.UploadID, model.ObjectStateReplicating)
+		if err != nil {
+			return fmt.Errorf("locking storage upload for version readable bind: %w", err)
 		}
 		now := time.Now()
 		if err := updateUploadReadable(ctx, db, input.UploadID, derefString(upload.PieceCID), now); err != nil {
@@ -1419,7 +1642,7 @@ func (r *BunStorageUploadRepo) BindReadableUploadForVersion(ctx context.Context,
 				  AND active_upload.status IN ('running', 'ingress_ready', 'readable')
 			  )
 			RETURNING object_id, version_id`
-		err := db.NewRaw(query,
+		err = db.NewRaw(query,
 			input.UploadID, model.ObjectStateReplicating, now,
 			input.VersionID, input.BucketID, input.ContentSize, input.Checksum, model.ObjectStateUploading,
 			input.UploadID,
@@ -1441,12 +1664,13 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 	var refs []ObjectVersionRef
 	finalized := false
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		upload := new(model.StorageUpload)
-		if err := db.NewSelect().Model(upload).Where("id = ?", input.UploadID).Scan(ctx); err != nil {
-			if err == sql.ErrNoRows {
-				return ErrNotFound
-			}
-			return fmt.Errorf("selecting storage upload for finalization: %w", err)
+		locked, err := lockStorageUploadsByID(ctx, db, []int64{input.UploadID})
+		if err != nil {
+			return fmt.Errorf("locking storage upload for finalization: %w", err)
+		}
+		upload := locked[input.UploadID]
+		if upload == nil || upload.Status == model.StorageUploadStatusRejected || upload.Status == model.StorageUploadStatusSuperseded {
+			return fmt.Errorf("storage upload %d cannot be finalized: %w", input.UploadID, ErrConflict)
 		}
 		readable, err := countReadableCommittedCopies(ctx, db, input.UploadID)
 		if err != nil {

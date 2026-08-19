@@ -42,8 +42,8 @@ SynapS3 mainly supports path-style S3 access for writing bucket and object data 
 | Object | `PutObject` | Supported | Stores an object through the cache-first write model. |
 | Object | `GetObject` | Supported | Reads from cache or committed remote storage. |
 | Object | `HeadObject` | Supported | Reads object metadata. |
-| Object | `DeleteObject` | Supported | Creates a delete marker, or deletes a specific `versionId`. |
-| Object | `DeleteObjects` | Supported | Creates delete markers, or deletes specific `versionId` entries. |
+| Object | `DeleteObject` | Supported | Creates a delete marker without `versionId`; with `versionId`, deletes an eligible data version or delete marker. |
+| Object | `DeleteObjects` | Supported | Applies the same version-aware deletion rules to each entry and reports entry-specific failures. |
 | Object | `CopyObject` | Supported | Source object must be readable from cache or committed remote storage. |
 | Object | `ListObjects` | Supported | Marker pagination. |
 | Object | `ListObjectsV2` | Supported | Continuation-token pagination. |
@@ -59,7 +59,7 @@ SynapS3 mainly supports path-style S3 access for writing bucket and object data 
 
 ## Versioning Behavior
 
-Buckets behave as versioning-enabled. A normal object delete creates a delete marker. A delete request with `versionId` deletes that specific version. Version listing returns object versions and delete markers.
+Buckets behave as versioning-enabled. A delete without `versionId` creates a delete marker. A delete with `versionId` either deletes that data version or delete marker, or returns an error; the gateway does not keep the request and run it later. Deleting a delete marker is not blocked by Filecoin storage. A data-version delete returns `400 InvalidRequest`, or an entry-specific `InvalidRequest` from `DeleteObjects`, while storage work is active or a submitted Filecoin transaction is awaiting confirmation. For an otherwise eligible data version, stopped storage work that has not submitted a transaction does not block deletion. After a data version is deleted, unreferenced remote storage is queued for background cleanup; storage shared with another version is preserved. Version listing returns object versions and delete markers.
 
 ## What Is Intentionally Out of Scope
 

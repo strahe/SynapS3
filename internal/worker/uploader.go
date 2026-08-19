@@ -439,6 +439,26 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
+	if task.ClaimedAt == nil {
+		return
+	}
+	uploadID, _ := taskUploadID(task)
+	err = u.repos.Uploads.AcquireUploadTask(ctx, repository.AcquireUploadTaskInput{
+		TaskID:        task.ID,
+		TaskClaimedAt: *task.ClaimedAt,
+		UploadID:      uploadID,
+		VersionID:     version.VersionID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, repository.ErrUploadTaskCancelled):
+			completeWorkerTask(ctx, u.repos, task, "uploader", logger)
+		case errors.Is(err, repository.ErrTaskClaimLost):
+		default:
+			u.handleTaskFailure(ctx, task, logger, "acquire upload task", err)
+		}
+		return
+	}
 
 	bucket, err := u.repos.Buckets.GetByID(ctx, version.BucketID)
 	if err != nil || bucket == nil {
@@ -584,7 +604,7 @@ func taskClaimPrecedes(first, second *model.Task) bool {
 }
 
 func (u *Uploader) prepareStagedUpload(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, logger *slog.Logger) {
-	if uploadID, ok := repairUploadID(task); ok {
+	if uploadID, ok := taskUploadID(task); ok {
 		u.prepareReadableUploadRepair(ctx, task, version, bucket, uploadID, logger)
 		return
 	}
@@ -713,7 +733,7 @@ func (u *Uploader) uploadCopyInputs(ctx context.Context, uploadID int64, binding
 	return inputs, nil
 }
 
-func repairUploadID(task *model.Task) (int64, bool) {
+func taskUploadID(task *model.Task) (int64, bool) {
 	if task == nil || task.Payload == nil {
 		return 0, false
 	}
@@ -1998,18 +2018,27 @@ func reassignIngressCopyAndSchedule(
 	}
 	var reassigned *model.StorageUploadCopy
 	err := repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		if runningTask != nil {
-			if err := txRepos.Tasks.LockRunningClaim(ctx, runningTask); err != nil {
-				return err
+		wasCommitting := version.State == model.ObjectStateCommitting
+		if wasCommitting {
+			if err := state.TransitionState(ctx, stateMachine, txRepos.Objects, version.VersionID, model.ObjectStateCommitting, model.ObjectStateUploading); err != nil {
+				return fmt.Errorf("lock committing version before ingress reassignment: %w", err)
 			}
 		}
 		selected, err := txRepos.Uploads.ReassignIngressCopy(ctx, uploadID, unavailableCopyIndex)
-		if err != nil || selected == nil {
+		if err != nil {
 			return err
 		}
-		if version.State == model.ObjectStateCommitting && !copyHasPiece(selected) {
-			if err := state.TransitionState(ctx, stateMachine, txRepos.Objects, version.VersionID, model.ObjectStateCommitting, model.ObjectStateUploading); err != nil {
-				return fmt.Errorf("resume upload on reassigned ingress: %w", err)
+		if wasCommitting && (selected == nil || copyHasPiece(selected)) {
+			if err := state.TransitionState(ctx, stateMachine, txRepos.Objects, version.VersionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
+				return fmt.Errorf("preserve committing state after ingress reassignment: %w", err)
+			}
+		}
+		if selected == nil {
+			return nil
+		}
+		if runningTask != nil {
+			if err := txRepos.Tasks.LockRunningClaim(ctx, runningTask); err != nil {
+				return err
 			}
 		}
 		ref := repository.ObjectVersionRef{ObjectID: version.ObjectID, VersionID: version.VersionID}

@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
 )
 
 func TestObjectRepo_DeleteObjectVersionPermanentlyRemovesVersionAndQueuesStorageCleanup(t *testing.T) {
@@ -88,11 +90,693 @@ func TestObjectRepo_DeleteObjectVersionPermanentlyRemovesVersionAndQueuesStorage
 	}
 }
 
-func TestObjectRepo_DeleteObjectVersionPermanentlyWaitsForUnavailableReplicaRepair(t *testing.T) {
+func TestObjectRepo_DeleteObjectVersionPermanentlyAllowsStoppedInProgressState(t *testing.T) {
+	tests := []struct {
+		name  string
+		state model.ObjectState
+	}{
+		{name: "uploading", state: model.ObjectStateUploading},
+		{name: "committing", state: model.ObjectStateCommitting},
+		{name: "replicating", state: model.ObjectStateReplicating},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			bucket := seedBucket(t, db, "permanent-delete-"+tt.name)
+			version := newObjectVersion(bucket.ID, "file.txt", model.NewVersionID(), 10)
+			if tt.state != model.ObjectStateReplicating {
+				version.State = tt.state
+			}
+			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+				t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+			}
+			if tt.state == model.ObjectStateReplicating {
+				uploadID := acceptTestStorageUploadForVersion(t, repos, bucket.ID, version, "bafk2bzacepermanentbusy")
+				if err := repos.Objects.SetVersionStorageUploadAndTransition(ctx, version.VersionID, uploadID, model.ObjectStateCached, model.ObjectStateReplicating); err != nil {
+					t.Fatalf("SetVersionStorageUploadAndTransition: %v", err)
+				}
+			}
+
+			_, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+				BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
+			})
+			if err != nil {
+				t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+			}
+			got, loadErr := repos.Objects.GetVersionByID(ctx, version.VersionID)
+			if loadErr != nil || got != nil {
+				t.Fatalf("version after permanent delete = %#v err=%v, want removed", got, loadErr)
+			}
+		})
+	}
+}
+
+func TestObjectRepo_DeleteObjectVersionPermanentlyCoordinatesReplicaRepairTaskStates(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     model.TaskStatus
+		wantBusy   bool
+		createTask bool
+	}{
+		{name: "queued", status: model.TaskStatusQueued, wantBusy: true, createTask: true},
+		{name: "scheduled", status: model.TaskStatusScheduled, wantBusy: true, createTask: true},
+		{name: "waiting", status: model.TaskStatusWaiting, wantBusy: true, createTask: true},
+		{name: "running", status: model.TaskStatusRunning, wantBusy: true, createTask: true},
+		{name: "exhausted", status: model.TaskStatusExhausted, createTask: true},
+		{name: "failed", status: model.TaskStatusFailed, createTask: true},
+		{name: "cancelled", status: model.TaskStatusCancelled, createTask: true},
+		{name: "completed", status: model.TaskStatusCompleted, createTask: true},
+		{name: "no task"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			fixture := seedPermanentDeleteRepairFixture(t, db, repos, "repair-task-"+strings.ReplaceAll(tt.name, " ", "-"))
+			var taskID int64
+			if tt.createTask {
+				stage := "repair_replica"
+				task := &model.Task{
+					Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.bucket.ID,
+					RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:repair-data-set:permanent-delete",
+					Payload: map[string]interface{}{"storage_data_set_id": fixture.repair.ID, "storage_upload_copy_id": fixture.repairCopy.ID},
+					Status:  tt.status, MaxRetries: 5, ScheduledAt: time.Now(),
+				}
+				if err := repos.Tasks.Create(ctx, task); err != nil {
+					t.Fatalf("Create repair task: %v", err)
+				}
+				taskID = task.ID
+			}
+
+			result, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+				BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+			})
+			if tt.wantBusy {
+				if !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) || !errors.Is(err, repository.ErrConflict) {
+					t.Fatalf("DeleteObjectVersionPermanently error = %v, want storage-work conflict", err)
+				}
+				gotVersion, loadErr := repos.Objects.GetVersionByID(ctx, fixture.version.VersionID)
+				if loadErr != nil || gotVersion == nil {
+					t.Fatalf("version after rejected delete = %#v err=%v, want retained", gotVersion, loadErr)
+				}
+				got, loadErr := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+				if loadErr != nil || got == nil || got.Status != model.StorageUploadCopyStatusPending {
+					t.Fatalf("repair copy after rejected delete = %#v err=%v, want pending", got, loadErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+			}
+			if result.StorageCleanupTaskID == nil {
+				t.Fatal("expected cleanup task for committed replica")
+			}
+			got, loadErr := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+			if loadErr != nil || got == nil || got.Status != model.StorageUploadCopyStatusFailed {
+				t.Fatalf("repair copy after accepted delete = %#v err=%v, want failed", got, loadErr)
+			}
+			gotUpload, loadErr := repos.Uploads.GetByID(ctx, fixture.upload.ID)
+			if loadErr != nil || gotUpload == nil || gotUpload.Status != model.StorageUploadStatusSuperseded {
+				t.Fatalf("upload after last-reference delete = %#v err=%v, want superseded", gotUpload, loadErr)
+			}
+			if taskID > 0 {
+				gotTask, taskErr := repos.Tasks.GetByID(ctx, taskID)
+				if taskErr != nil || gotTask == nil || gotTask.Status != tt.status {
+					t.Fatalf("repair coordinator after accepted delete = %#v err=%v, want preserved %s", gotTask, taskErr, tt.status)
+				}
+			}
+		})
+	}
+}
+
+func TestObjectRepo_DeleteObjectVersionPermanentlyKeepsSubmittedRepairCommit(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := seedBucket(t, db, "permanent-delete-repair-bucket")
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "submitted-repair")
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID: fixture.upload.ID, CopyIndex: fixture.repairCopy.CopyIndex, PieceCID: "bafk2bzacepermanentrepair", RetrievalURL: "https://repair.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
+		UploadID: fixture.upload.ID, CopyIndex: fixture.repairCopy.CopyIndex, CommitTransactionID: "0xsubmitted",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitting: %v", err)
+	}
+
+	_, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	})
+	if !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+		t.Fatalf("DeleteObjectVersionPermanently error = %v, want submitted storage-work conflict", err)
+	}
+	got, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || got == nil || got.Status != model.StorageUploadCopyStatusCommitting || got.CommitTransactionID == nil {
+		t.Fatalf("submitted repair copy = %#v err=%v, want retained committing copy", got, err)
+	}
+}
+
+func TestObjectRepo_DeleteObjectVersionPermanentlyPreservesSharedRepairUntilLastReference(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "shared-repair")
+	follower := newObjectVersion(fixture.bucket.ID, "follower.txt", "01J000000000000000000DEL0S", fixture.version.Size)
+	follower.Checksum = fixture.version.Checksum
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
+	}
+	bindPermanentDeleteFollower(t, repos, fixture.upload.ID, follower)
+
+	first, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	})
+	if err != nil || first.StorageCleanupTaskID == nil {
+		t.Fatalf("DeleteObjectVersionPermanently(source): result=%#v err=%v", first, err)
+	}
+	copyAfterSourceDelete, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyAfterSourceDelete == nil || copyAfterSourceDelete.Status != model.StorageUploadCopyStatusPending {
+		t.Fatalf("shared repair copy after source delete = %#v err=%v, want pending", copyAfterSourceDelete, err)
+	}
+	if got, err := repos.Objects.GetVersionByID(ctx, follower.VersionID); err != nil || got == nil {
+		t.Fatalf("shared follower after source delete = %#v err=%v", got, err)
+	}
+
+	second, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: follower.Key, VersionID: follower.VersionID,
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently(last reference): %v", err)
+	}
+	if second.StorageCleanupTaskID == nil || *second.StorageCleanupTaskID != *first.StorageCleanupTaskID {
+		t.Fatalf("cleanup task IDs = first:%v second:%v, want reused task", first.StorageCleanupTaskID, second.StorageCleanupTaskID)
+	}
+	copyAfterLastDelete, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyAfterLastDelete == nil || copyAfterLastDelete.Status != model.StorageUploadCopyStatusFailed {
+		t.Fatalf("repair copy after last reference delete = %#v err=%v, want failed", copyAfterLastDelete, err)
+	}
+}
+
+func TestObjectRepo_CreateVersionDoesNotAttachSupersededUploadAfterPermanentDelete(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "permanent-delete-stale-reuse")
+	source := newObjectVersion(bucket.ID, "source.txt", model.NewVersionID(), 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(source): %v", err)
+	}
+	uploadID := acceptTestStorageUploadForVersion(t, repos, bucket.ID, source, "bafk2bzacestalereuse")
+	if err := repos.Objects.SetVersionStorageUploadAndTransition(ctx, source.VersionID, uploadID, model.ObjectStateCached, model.ObjectStateStored); err != nil {
+		t.Fatalf("SetVersionStorageUploadAndTransition(source): %v", err)
+	}
+
+	staleUploadID := uploadID
+	follower := newObjectVersion(bucket.ID, "follower.txt", model.NewVersionID(), source.Size)
+	follower.Checksum = source.Checksum
+	follower.StorageUploadID = &staleUploadID
+	follower.State = model.ObjectStateStored
+	if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: bucket.ID, Key: source.Key, VersionID: source.VersionID,
+	}); err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently(source): %v", err)
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(stale follower): %v", err)
+	}
+
+	got, err := repos.Objects.GetVersionByID(ctx, follower.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("GetVersionByID(follower): version=%#v err=%v", got, err)
+	}
+	if got.StorageUploadID != nil || got.State != model.ObjectStateCached {
+		t.Fatalf("follower storage reference = upload:%#v state:%s, want cached without superseded upload", got.StorageUploadID, got.State)
+	}
+	upload, err := repos.Uploads.GetByID(ctx, uploadID)
+	if err != nil || upload == nil || upload.Status != model.StorageUploadStatusSuperseded {
+		t.Fatalf("deleted source upload = %#v err=%v, want superseded", upload, err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, follower.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState follower cached to uploading: %v", err)
+	}
+	if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+		UploadID: uploadID, BucketID: bucket.ID, ContentSize: follower.Size, Checksum: follower.Checksum, VersionID: follower.VersionID,
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("BindReadableUploadForVersion error = %v, want superseded upload conflict", err)
+	}
+	if _, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet error = %v, want superseded upload conflict", err)
+	}
+	if err := repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
+		UploadID: uploadID, CopyIndex: 0, CommitTransactionID: "0xlate",
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("MarkUploadCopyCommitting error = %v, want superseded upload conflict", err)
+	}
+}
+
+func TestStorageCleanupRepo_SourceVersionIsAnObjectReferenceBeforeBinding(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "storage-cleanup-source-reference")
+	version := newObjectVersion(bucket.ID, "source.txt", model.NewVersionID(), 10)
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID: bucket.ID, SourceVersionID: version.VersionID, ContentSize: version.Size, Checksum: version.Checksum, RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+
+	hasReferences, err := repos.StorageCleanup.UploadHasObjectReferences(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("UploadHasObjectReferences: %v", err)
+	}
+	if !hasReferences {
+		t.Fatal("UploadHasObjectReferences = false, want unbound source version to keep upload referenced")
+	}
+	if err := repos.StorageCleanup.DeleteUploadProvenanceIfUnreferenced(ctx, upload.ID); err != nil {
+		t.Fatalf("DeleteUploadProvenanceIfUnreferenced(referenced): %v", err)
+	}
+	if retained, err := repos.Uploads.GetByID(ctx, upload.ID); err != nil || retained == nil {
+		t.Fatalf("referenced upload after provenance cleanup = %#v err=%v, want retained", retained, err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.StorageUpload)(nil)).
+		Set("status = ?", model.StorageUploadStatusFailed).
+		Where("id = ?", upload.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("retire first upload fixture: %v", err)
+	}
+	currentUploadID := acceptTestStorageUploadForVersion(t, repos, bucket.ID, version, "bafk2bzacecurrentsource")
+	if err := repos.Objects.SetVersionStorageUploadAndTransition(ctx, version.VersionID, currentUploadID, model.ObjectStateCached, model.ObjectStateStored); err != nil {
+		t.Fatalf("SetVersionStorageUploadAndTransition(current): %v", err)
+	}
+	hasReferences, err = repos.StorageCleanup.UploadHasObjectReferences(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("UploadHasObjectReferences(old): %v", err)
+	}
+	if hasReferences {
+		t.Fatal("UploadHasObjectReferences(old) = true, want rebound source to release historical upload")
+	}
+	if err := repos.StorageCleanup.DeleteUploadProvenanceIfUnreferenced(ctx, upload.ID); err != nil {
+		t.Fatalf("DeleteUploadProvenanceIfUnreferenced(unreferenced): %v", err)
+	}
+	if removed, err := repos.Uploads.GetByID(ctx, upload.ID); err != nil || removed != nil {
+		t.Fatalf("unreferenced upload after provenance cleanup = %#v err=%v, want removed", removed, err)
+	}
+}
+
+func TestTaskRepo_RetryCannotReattachSupersededUpload(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "retry-superseded-upload")
+	stage := "peer_pull"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: fixture.version.ObjectID,
+		RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:retry-superseded-upload",
+		Payload: map[string]interface{}{"upload_id": fixture.upload.ID}, Status: model.TaskStatusExhausted,
+		MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create exhausted upload task: %v", err)
+	}
+	if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	}); err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+	}
+	if err := repos.Tasks.RetryExhausted(ctx, task.ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("RetryExhausted error = %v, want superseded upload conflict", err)
+	}
+	got, err := repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || got == nil || got.Status != model.TaskStatusExhausted {
+		t.Fatalf("task after rejected retry = %#v err=%v, want exhausted", got, err)
+	}
+}
+
+func TestStorageUploadRepo_AcquireUploadTaskProtectsRunningWorkAndRejectsDeletedWork(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "ordinary-upload-execution")
+	stage := "peer_pull"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: fixture.version.ObjectID,
+		RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:ordinary-execution-owner",
+		Payload: map[string]interface{}{"upload_id": fixture.upload.ID, "copy_index": fixture.repairCopy.CopyIndex},
+		Status:  model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create ordinary upload task: %v", err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil || claimed.ClaimedAt == nil {
+		t.Fatalf("ClaimReady(ordinary): task=%#v err=%v", claimed, err)
+	}
+	if err := repos.Uploads.AcquireUploadTask(ctx, repository.AcquireUploadTaskInput{
+		TaskID: claimed.ID, TaskClaimedAt: *claimed.ClaimedAt, UploadID: fixture.upload.ID, VersionID: fixture.version.VersionID,
+	}); err != nil {
+		t.Fatalf("AcquireUploadTask: %v", err)
+	}
+	if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	}); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+		t.Fatalf("DeleteObjectVersionPermanently while ordinary task owns execution = %v, want storage busy", err)
+	}
+	if err := repos.Tasks.Complete(ctx, claimed); err != nil {
+		t.Fatalf("Complete ordinary upload task: %v", err)
+	}
+	if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	}); err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently after task stopped: %v", err)
+	}
+
+	late := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: fixture.version.ObjectID,
+		RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:ordinary-execution-late",
+		Payload: map[string]interface{}{"upload_id": fixture.upload.ID, "copy_index": fixture.repairCopy.CopyIndex},
+		Status:  model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, late); err != nil {
+		t.Fatalf("Create late ordinary upload task: %v", err)
+	}
+	lateClaim, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || lateClaim == nil || lateClaim.ClaimedAt == nil {
+		t.Fatalf("ClaimReady(late ordinary): task=%#v err=%v", lateClaim, err)
+	}
+	if err := repos.Uploads.AcquireUploadTask(ctx, repository.AcquireUploadTaskInput{
+		TaskID: lateClaim.ID, TaskClaimedAt: *lateClaim.ClaimedAt, UploadID: fixture.upload.ID, VersionID: fixture.version.VersionID,
+	}); !errors.Is(err, repository.ErrUploadTaskCancelled) {
+		t.Fatalf("AcquireUploadTask after permanent delete = %v, want cancelled", err)
+	}
+}
+
+func TestObjectRepo_DeleteObjectVersionPermanentlyKeepsSharedVersionsWhileRepairIsRunning(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "shared-running-repair")
+	follower := newObjectVersion(fixture.bucket.ID, "follower.txt", "01J000000000000000000DEL0X", fixture.version.Size)
+	follower.Checksum = fixture.version.Checksum
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
+	}
+	bindPermanentDeleteFollower(t, repos, fixture.upload.ID, follower)
+	stage := "repair_replica"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.bucket.ID,
+		RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:repair-data-set:shared-running-repair",
+		Payload: map[string]interface{}{"storage_data_set_id": fixture.repair.ID, "storage_upload_copy_id": fixture.repairCopy.ID},
+		Status:  model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create repair task: %v", err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != task.ID || claimed.Status != model.TaskStatusRunning || claimed.ClaimedAt == nil {
+		t.Fatalf("ClaimReady: task=%#v err=%v", claimed, err)
+	}
+
+	for _, version := range []*model.ObjectVersion{fixture.version, follower} {
+		_, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+			BucketID: fixture.bucket.ID, Key: version.Key, VersionID: version.VersionID,
+		})
+		if !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+			t.Fatalf("DeleteObjectVersionPermanently(%s) error = %v, want storage-work conflict", version.VersionID, err)
+		}
+	}
+	for _, versionID := range []string{fixture.version.VersionID, follower.VersionID} {
+		got, loadErr := repos.Objects.GetVersionByID(ctx, versionID)
+		if loadErr != nil || got == nil {
+			t.Fatalf("shared version %s after rejected delete = %#v err=%v, want retained", versionID, got, loadErr)
+		}
+	}
+	copyRow, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageUploadCopyStatusPending {
+		t.Fatalf("repair copy after rejected shared deletes = %#v err=%v, want pending", copyRow, err)
+	}
+}
+
+func TestObjectRepo_DeleteObjectVersionPermanentlyAddsLateCommittedCleanupSnapshot(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "late-cleanup-snapshot")
+	follower := newObjectVersion(fixture.bucket.ID, "follower.txt", "01J000000000000000000DEL0T", fixture.version.Size)
+	follower.Checksum = fixture.version.Checksum
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
+	}
+	bindPermanentDeleteFollower(t, repos, fixture.upload.ID, follower)
+
+	first, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	})
+	if err != nil || first.StorageCleanupTaskID == nil {
+		t.Fatalf("DeleteObjectVersionPermanently(source): result=%#v err=%v", first, err)
+	}
+	cleanupCopies, err := repos.StorageCleanup.ListCopiesForTask(ctx, *first.StorageCleanupTaskID)
+	if err != nil || len(cleanupCopies) != 1 || cleanupCopies[0].CopyIndex != 0 {
+		t.Fatalf("initial cleanup copies = %#v err=%v, want committed copy 0", cleanupCopies, err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeStorageCleanup, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != *first.StorageCleanupTaskID {
+		t.Fatalf("ClaimReady(cleanup): task=%#v err=%v", claimed, err)
+	}
+	if err := repos.StorageCleanup.MarkCopyRemoved(ctx, cleanupCopies[0].ID); err != nil {
+		t.Fatalf("MarkCopyRemoved: %v", err)
+	}
+	if err := repos.Tasks.Complete(ctx, claimed); err != nil {
+		t.Fatalf("Complete(cleanup): %v", err)
+	}
+
+	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		StorageUploadCopyID: fixture.repairCopy.ID,
+		UploadID:            fixture.upload.ID,
+		CopyIndex:           fixture.repairCopy.CopyIndex,
+		PieceCID:            "bafk2bzacepermanentrepair",
+		PieceID:             onChainIDPtr(t, "3002"),
+		RetrievalURL:        "https://repair.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted(repair): %v", err)
+	}
+	second, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: follower.Key, VersionID: follower.VersionID,
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently(last reference): %v", err)
+	}
+	if second.StorageCleanupTaskID == nil || *second.StorageCleanupTaskID != *first.StorageCleanupTaskID {
+		t.Fatalf("cleanup task IDs = first:%v second:%v, want reused task", first.StorageCleanupTaskID, second.StorageCleanupTaskID)
+	}
+	cleanupTask, err := repos.Tasks.GetByID(ctx, *first.StorageCleanupTaskID)
+	if err != nil || cleanupTask == nil || cleanupTask.Status != model.TaskStatusQueued {
+		t.Fatalf("cleanup task after late snapshot = %#v err=%v, want requeued", cleanupTask, err)
+	}
+	cleanupCopies, err = repos.StorageCleanup.ListCopiesForTask(ctx, *first.StorageCleanupTaskID)
+	if err != nil || len(cleanupCopies) != 2 {
+		t.Fatalf("cleanup copies after late commit = %#v err=%v, want two snapshots", cleanupCopies, err)
+	}
+	if cleanupCopies[0].Status != model.StorageCleanupCopyStatusRemoved || cleanupCopies[1].CopyIndex != 1 || cleanupCopies[1].Status != model.StorageCleanupCopyStatusPending {
+		t.Fatalf("cleanup copy states after late commit = %#v, want removed copy 0 and pending copy 1", cleanupCopies)
+	}
+}
+
+func TestStorageUploadRepo_ExactRepairWritesCannotRevivePermanentlyDeletedCopy(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "exact-write-guard")
+	if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	}); err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "piece ready",
+			run: func() error {
+				return repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+					StorageUploadCopyID: fixture.repairCopy.ID, UploadID: fixture.upload.ID,
+					CopyIndex: fixture.repairCopy.CopyIndex, PieceCID: "bafk2bzacepermanentrepair", RetrievalURL: "https://repair.example/piece",
+				})
+			},
+		},
+		{
+			name: "committing",
+			run: func() error {
+				return repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
+					StorageUploadCopyID: fixture.repairCopy.ID, UploadID: fixture.upload.ID, CopyIndex: fixture.repairCopy.CopyIndex,
+				})
+			},
+		},
+		{
+			name: "committed",
+			run: func() error {
+				return repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+					StorageUploadCopyID: fixture.repairCopy.ID, UploadID: fixture.upload.ID, CopyIndex: fixture.repairCopy.CopyIndex,
+					PieceCID: "bafk2bzacepermanentrepair", PieceID: onChainIDPtr(t, "3002"), RetrievalURL: "https://repair.example/piece",
+				})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.run(); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("exact repair write error = %v, want ErrConflict", err)
+			}
+		})
+	}
+	copyRow, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageUploadCopyStatusFailed {
+		t.Fatalf("repair copy after rejected writes = %#v err=%v, want failed", copyRow, err)
+	}
+}
+
+func TestStorageUploadRepo_AcquireReplicaRepairItemUsesSharedSurvivor(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "acquire-shared-survivor")
+	follower := newObjectVersion(fixture.bucket.ID, "follower.txt", "01J000000000000000000DEL0U", fixture.version.Size)
+	follower.Checksum = fixture.version.Checksum
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
+	}
+	bindPermanentDeleteFollower(t, repos, fixture.upload.ID, follower)
+	stage := "repair_replica"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.bucket.ID,
+		RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:repair-data-set:acquire-shared-survivor",
+		Payload: map[string]interface{}{"storage_data_set_id": fixture.repair.ID, "storage_upload_copy_id": fixture.repairCopy.ID},
+		Status:  model.TaskStatusExhausted, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create repair task: %v", err)
+	}
+	if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	}); err != nil {
+		t.Fatalf("DeleteObjectVersionPermanently(source): %v", err)
+	}
+	if err := repos.Tasks.RetryExhausted(ctx, task.ID); err != nil {
+		t.Fatalf("RetryExhausted: %v", err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != task.ID || claimed.ClaimedAt == nil {
+		t.Fatalf("ClaimReady(repair): task=%#v err=%v", claimed, err)
+	}
+	item, err := repos.Uploads.AcquireReplicaRepairItem(ctx, repository.AcquireReplicaRepairItemInput{
+		TaskID: claimed.ID, TaskClaimedAt: *claimed.ClaimedAt, StorageDataSetID: fixture.repair.ID,
+		StorageUploadCopyID: fixture.repairCopy.ID, BucketID: fixture.bucket.ID,
+	})
+	if err != nil {
+		t.Fatalf("AcquireReplicaRepairItem: %v", err)
+	}
+	if item.Version.VersionID != follower.VersionID || item.Copy.ID != fixture.repairCopy.ID || item.Upload.ID != fixture.upload.ID {
+		t.Fatalf("acquired repair item = %#v, want surviving version %s and exact copy/upload", item, follower.VersionID)
+	}
+	if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: follower.Key, VersionID: follower.VersionID,
+	}); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+		t.Fatalf("DeleteObjectVersionPermanently while repair owns item error = %v, want storage-work conflict", err)
+	}
+}
+
+func TestStorageUploadRepo_AcquireReplicaRepairItemRejectsDeletedWorkAndLostClaim(t *testing.T) {
+	t.Run("deleted work", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+		fixture := seedPermanentDeleteRepairFixture(t, db, repos, "acquire-deleted-work")
+		stage := "repair_replica"
+		task := &model.Task{
+			Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.bucket.ID,
+			RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:repair-data-set:acquire-deleted-work",
+			Payload: map[string]interface{}{"storage_data_set_id": fixture.repair.ID, "storage_upload_copy_id": fixture.repairCopy.ID},
+			Status:  model.TaskStatusExhausted, MaxRetries: 5, ScheduledAt: time.Now(),
+		}
+		if err := repos.Tasks.Create(ctx, task); err != nil {
+			t.Fatalf("Create repair task: %v", err)
+		}
+		if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+			BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+		}); err != nil {
+			t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+		}
+		if err := repos.Tasks.RetryExhausted(ctx, task.ID); err != nil {
+			t.Fatalf("RetryExhausted: %v", err)
+		}
+		claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+		if err != nil || claimed == nil || claimed.ClaimedAt == nil {
+			t.Fatalf("ClaimReady: task=%#v err=%v", claimed, err)
+		}
+		_, err = repos.Uploads.AcquireReplicaRepairItem(ctx, repository.AcquireReplicaRepairItemInput{
+			TaskID: claimed.ID, TaskClaimedAt: *claimed.ClaimedAt, StorageDataSetID: fixture.repair.ID,
+			StorageUploadCopyID: fixture.repairCopy.ID, BucketID: fixture.bucket.ID,
+		})
+		if !errors.Is(err, repository.ErrReplicaRepairItemCancelled) {
+			t.Fatalf("AcquireReplicaRepairItem error = %v, want cancelled item", err)
+		}
+	})
+
+	t.Run("lost claim", func(t *testing.T) {
+		db := testDB(t)
+		repos := repository.NewRepositories(db)
+		ctx := context.Background()
+		fixture := seedPermanentDeleteRepairFixture(t, db, repos, "acquire-lost-claim")
+		stage := "repair_replica"
+		task := &model.Task{
+			Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.bucket.ID,
+			RefVersionID: fixture.version.VersionID, IdempotencyKey: "upload:repair-data-set:acquire-lost-claim",
+			Payload: map[string]interface{}{"storage_data_set_id": fixture.repair.ID, "storage_upload_copy_id": fixture.repairCopy.ID},
+			Status:  model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+		}
+		if err := repos.Tasks.Create(ctx, task); err != nil {
+			t.Fatalf("Create repair task: %v", err)
+		}
+		claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+		if err != nil || claimed == nil || claimed.ClaimedAt == nil {
+			t.Fatalf("ClaimReady: task=%#v err=%v", claimed, err)
+		}
+		if err := repos.Tasks.Complete(ctx, claimed); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		_, err = repos.Uploads.AcquireReplicaRepairItem(ctx, repository.AcquireReplicaRepairItemInput{
+			TaskID: claimed.ID, TaskClaimedAt: *claimed.ClaimedAt, StorageDataSetID: fixture.repair.ID,
+			StorageUploadCopyID: fixture.repairCopy.ID, BucketID: fixture.bucket.ID,
+		})
+		if !errors.Is(err, repository.ErrTaskClaimLost) {
+			t.Fatalf("AcquireReplicaRepairItem error = %v, want lost claim", err)
+		}
+	})
+}
+
+type permanentDeleteRepairFixture struct {
+	bucket     *model.Bucket
+	version    *model.ObjectVersion
+	upload     *model.StorageUpload
+	repair     *model.StorageDataSet
+	repairCopy *model.StorageUploadCopy
+}
+
+func seedPermanentDeleteRepairFixture(t *testing.T, db *bun.DB, repos *repository.Repositories, suffix string) permanentDeleteRepairFixture {
+	t.Helper()
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "permanent-delete-"+suffix)
 	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000DEL0R", 10)
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
@@ -102,6 +786,9 @@ func TestObjectRepo_DeleteObjectVersionPermanentlyWaitsForUnavailableReplicaRepa
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState cached to uploading: %v", err)
 	}
 	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID,
@@ -129,68 +816,40 @@ func TestObjectRepo_DeleteObjectVersionPermanentlyWaitsForUnavailableReplicaRepa
 	}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
-	pieceCID := "bafk2bzacepermanentrepair"
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID: upload.ID, CopyIndex: 0, PieceCID: pieceCID, PieceID: onChainIDPtr(t, "3001"), RetrievalURL: "https://primary.example/piece",
+		UploadID: upload.ID, CopyIndex: 0, PieceCID: "bafk2bzacepermanentrepair", PieceID: onChainIDPtr(t, "3001"), RetrievalURL: "https://primary.example/piece",
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyCommitted primary: %v", err)
 	}
-	mustExec(t, db, `UPDATE storage_uploads SET status = ? WHERE id = ?`, model.StorageUploadStatusComplete, upload.ID)
-	if err := repos.Objects.SetVersionStorageUploadAndTransition(ctx, version.VersionID, upload.ID, model.ObjectStateCached, model.ObjectStateStored); err != nil {
-		t.Fatalf("SetVersionStorageUploadAndTransition: %v", err)
+	bindReadableUploadForContent(t, repos, upload.ID, bucket.ID, version.Size, version.Checksum)
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || gotVersion == nil || gotVersion.State != model.ObjectStateReplicating || gotVersion.StorageUploadID == nil || *gotVersion.StorageUploadID != upload.ID {
+		t.Fatalf("source after first readable replica = %#v err=%v, want replicating on upload %d", gotVersion, err, upload.ID)
 	}
 	if err := repos.Uploads.MarkDataSetUnavailable(ctx, repair.ID, "temporary outage"); err != nil {
 		t.Fatalf("MarkDataSetUnavailable: %v", err)
 	}
+	repairCopy, err := repos.Uploads.GetUploadCopy(ctx, upload.ID, 1)
+	if err != nil || repairCopy == nil {
+		t.Fatalf("GetUploadCopy(repair): copy=%#v err=%v", repairCopy, err)
+	}
+	return permanentDeleteRepairFixture{bucket: bucket, version: version, upload: upload, repair: repair, repairCopy: repairCopy}
+}
 
-	_, err = repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
-		BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
-	})
-	if !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("DeleteObjectVersionPermanently during repair error = %v, want ErrConflict", err)
+func bindPermanentDeleteFollower(t *testing.T, repos *repository.Repositories, uploadID int64, version *model.ObjectVersion) {
+	t.Helper()
+	ctx := context.Background()
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
+		t.Fatalf("UpdateVersionState follower cached to uploading: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID: upload.ID, CopyIndex: 1, PieceCID: pieceCID, PieceID: onChainIDPtr(t, "3002"), RetrievalURL: "https://repair.example/piece",
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitted repair: %v", err)
-	}
-	stage := "repair_replica"
-	repairTask := &model.Task{
-		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: bucket.ID, RefVersionID: version.VersionID,
-		IdempotencyKey: "upload:repair-data-set:permanent-delete", Status: model.TaskStatusQueued,
-		MaxRetries: 5, ScheduledAt: time.Now(),
-	}
-	if err := repos.Tasks.Create(ctx, repairTask); err != nil {
-		t.Fatalf("Create repair task: %v", err)
-	}
-	claimed, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
-	if err != nil || claimed == nil || claimed.ID != repairTask.ID {
-		t.Fatalf("ClaimReady repair task: task=%#v err=%v", claimed, err)
-	}
-	_, err = repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
-		BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
-	})
-	if !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("DeleteObjectVersionPermanently before repair finalization error = %v, want ErrConflict", err)
-	}
-	if err := repos.Tasks.Complete(ctx, claimed); err != nil {
-		t.Fatalf("Complete repair task: %v", err)
-	}
-	result, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
-		BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
+	refs, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+		UploadID: uploadID, BucketID: version.BucketID, ContentSize: version.Size, Checksum: version.Checksum, VersionID: version.VersionID,
 	})
 	if err != nil {
-		t.Fatalf("DeleteObjectVersionPermanently after repair: %v", err)
+		t.Fatalf("BindReadableUploadForVersion(follower): %v", err)
 	}
-	if result.StorageCleanupTaskID == nil {
-		t.Fatal("expected storage cleanup task after repair")
-	}
-	var cleanupCopies int
-	if err := db.NewRaw(`SELECT COUNT(*) FROM storage_cleanup_copies WHERE task_id = ?`, *result.StorageCleanupTaskID).Scan(ctx, &cleanupCopies); err != nil {
-		t.Fatalf("count storage cleanup copies: %v", err)
-	}
-	if cleanupCopies != 2 {
-		t.Fatalf("storage cleanup copies = %d, want both committed replicas", cleanupCopies)
+	if len(refs) != 1 || refs[0].VersionID != version.VersionID {
+		t.Fatalf("BindReadableUploadForVersion refs = %#v, want follower %s", refs, version.VersionID)
 	}
 }
 
@@ -749,6 +1408,68 @@ func TestObjectRepo_DeleteDeletedObjectPermanentlyRemovesAllVersionsAndQueuesSto
 	}
 	if task.RefID != uploadID || task.Type != model.TaskTypeStorageCleanup {
 		t.Fatalf("cleanup task = type:%s refID:%d, want storage cleanup for upload %d", task.Type, task.RefID, uploadID)
+	}
+}
+
+func TestObjectRepo_DeleteDeletedObjectPermanentlyReportsActiveStorageWork(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "deleted-object-active-storage-work")
+	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000DEL0V", 10)
+	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	stage := "prepare_upload"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: objectID, RefVersionID: version.VersionID,
+		IdempotencyKey: "upload:" + version.VersionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create upload task: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, version.Key, "01J000000000000000000DEL0W")
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	_, err = repos.Objects.DeleteDeletedObjectPermanently(ctx, repository.DeleteDeletedObjectInput{
+		BucketID: bucket.ID, Key: version.Key, DeleteMarkerVersionID: marker.VersionID,
+	})
+	if !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+		t.Fatalf("DeleteDeletedObjectPermanently error = %v, want storage-work conflict", err)
+	}
+	if got, loadErr := repos.Objects.GetVersionByID(ctx, version.VersionID); loadErr != nil || got == nil {
+		t.Fatalf("data version after rejected delete = %#v err=%v", got, loadErr)
+	}
+	if got, loadErr := repos.Objects.GetVersionByID(ctx, marker.VersionID); loadErr != nil || got == nil {
+		t.Fatalf("delete marker after rejected delete = %#v err=%v", got, loadErr)
+	}
+}
+
+func TestObjectRepo_DeleteDeletedObjectPermanentlyCancelsStoppedReplicaRepair(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "deleted-object-stopped-repair")
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, fixture.bucket.ID, fixture.version.Key, model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	if _, err := repos.Objects.DeleteDeletedObjectPermanently(ctx, repository.DeleteDeletedObjectInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, DeleteMarkerVersionID: marker.VersionID,
+	}); err != nil {
+		t.Fatalf("DeleteDeletedObjectPermanently: %v", err)
+	}
+	copyRow, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageUploadCopyStatusFailed {
+		t.Fatalf("repair copy after deleted-object cleanup = %#v err=%v, want failed", copyRow, err)
+	}
+	upload, err := repos.Uploads.GetByID(ctx, fixture.upload.ID)
+	if err != nil || upload == nil || upload.Status != model.StorageUploadStatusSuperseded {
+		t.Fatalf("upload after deleted-object cleanup = %#v err=%v, want superseded", upload, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,6 +19,22 @@ var ErrInvalidInput = errors.New("invalid input")
 
 // ErrConflict is returned when a compare-and-restore operation sees stale state.
 var ErrConflict = errors.New("conflict")
+
+// ErrPermanentDeleteStorageBusy reports that a permanent delete cannot yet
+// cancel storage work without risking a remote write. It remains compatible
+// with ErrConflict for existing callers.
+var ErrPermanentDeleteStorageBusy = fmt.Errorf("permanent delete blocked by storage work: %w", ErrConflict)
+
+// ErrReplicaRepairItemCancelled reports that the exact repair copy no longer
+// has work the claimed coordinator may execute.
+var ErrReplicaRepairItemCancelled = errors.New("replica repair item cancelled")
+
+// ErrUploadTaskCancelled reports that an ordinary upload task no longer has
+// live storage work it may execute.
+var ErrUploadTaskCancelled = errors.New("upload task cancelled")
+
+// ErrTaskClaimLost reports that a worker no longer owns the running task claim.
+var ErrTaskClaimLost = errors.New("task claim lost")
 
 // ErrAlreadyCurrent is returned when a restore would not change the current object representation.
 var ErrAlreadyCurrent = errors.New("already current")

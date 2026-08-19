@@ -3389,6 +3389,50 @@ func TestAPIBucketDeletedObjectPermanentDeleteRemovesDeletedObject(t *testing.T)
 	}
 }
 
+func TestAPIBucketDeletedObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "trash-permanent-delete-busy-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	objectID, versionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", "", model.ObjectStateUploading)
+	stage := "prepare_upload"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: objectID, RefVersionID: versionID,
+		IdempotencyKey: "upload:" + versionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Tasks.Create: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-busy-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	want := "Storage work for one or more versions is still in progress or awaiting Filecoin confirmation. Check the related tasks, then try again."
+	if body["error"] != want {
+		t.Fatalf("error = %q, want %q", body["error"], want)
+	}
+	for _, id := range []string{versionID, marker.VersionID} {
+		got, loadErr := repos.Objects.GetVersionByID(ctx, id)
+		if loadErr != nil || got == nil {
+			t.Fatalf("version %s after rejected delete = %#v err=%v, want retained", id, got, loadErr)
+		}
+	}
+}
+
 func TestAPIBucketDeletedObjectPermanentDeleteCompletesCacheCleanupWhenRequestIsCanceled(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
@@ -3587,6 +3631,40 @@ func TestAPIBucketObjectPermanentDeleteRemovesVersion(t *testing.T) {
 	}
 	if !gotOldVersion.IsCurrent {
 		t.Fatalf("old version is_current = false, want true after current version permanent delete")
+	}
+}
+
+func TestAPIBucketObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "version-permanent-delete-busy-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	objectID, versionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", "", model.ObjectStateCached)
+	stage := "prepare_upload"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: objectID, RefVersionID: versionID,
+		IdempotencyKey: "upload:" + versionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Tasks.Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/version-permanent-delete-busy-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", versionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	want := "Storage work for this version is still in progress or awaiting Filecoin confirmation. Check the related task, then try again."
+	if body["error"] != want {
+		t.Fatalf("error = %q, want %q", body["error"], want)
 	}
 }
 

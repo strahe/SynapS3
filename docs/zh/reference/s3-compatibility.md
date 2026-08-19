@@ -42,8 +42,8 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 | 对象 | `PutObject` | 支持 | 按缓存优先的写入模型存储对象。 |
 | 对象 | `GetObject` | 支持 | 从缓存或已提交的远端存储读取。 |
 | 对象 | `HeadObject` | 支持 | 读取对象元数据。 |
-| 对象 | `DeleteObject` | 支持 | 创建 delete marker，或删除指定 `versionId`。 |
-| 对象 | `DeleteObjects` | 支持 | 创建 delete markers，或删除指定 `versionId` 条目。 |
+| 对象 | `DeleteObject` | 支持 | 不带 `versionId` 时创建 delete marker；带 `versionId` 时删除符合条件的数据版本或 delete marker。 |
+| 对象 | `DeleteObjects` | 支持 | 对每个条目应用相同的版本删除规则，并分别返回失败结果。 |
 | 对象 | `CopyObject` | 支持 | 源对象必须可从缓存或已提交的远端存储读取。 |
 | 对象 | `ListObjects` | 支持 | Marker 分页。 |
 | 对象 | `ListObjectsV2` | 支持 | Continuation-token 分页。 |
@@ -59,7 +59,7 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 
 ## 版本控制行为
 
-存储桶按 versioning-enabled 处理。普通对象删除会创建 delete marker。带 `versionId` 的删除会删除指定版本。Version listing 会返回对象版本和 delete markers。
+存储桶按 versioning-enabled 处理。不带 `versionId` 的删除会创建 delete marker。带 `versionId` 的请求要么删除对应的数据版本或 delete marker，要么返回错误；系统不会保留请求并在之后自动执行。删除 delete marker 不受 Filecoin 存储进度阻塞。当存储工作仍在进行，或已提交的 Filecoin 交易仍在等待确认时，删除数据版本会收到 `400 InvalidRequest`，`DeleteObjects` 则为对应条目返回 `InvalidRequest`。对于其他条件均符合永久删除要求的数据版本，已停止且尚未提交交易的存储工作不会阻止删除。数据版本删除后，不再被任何版本引用的远端存储会进入后台清理；其他版本仍在使用的共享存储会保留。Version listing 会返回对象版本和 delete markers。
 
 ## 有意不支持
 

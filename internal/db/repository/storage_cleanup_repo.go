@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -68,14 +69,24 @@ func (r *BunStorageCleanupRepo) MarkCopyUnsupported(ctx context.Context, id int6
 }
 
 func (r *BunStorageCleanupRepo) UploadHasObjectReferences(ctx context.Context, uploadID int64) (bool, error) {
-	count, err := r.db.NewSelect().
-		Model((*model.ObjectVersion)(nil)).
-		Where("storage_upload_id = ? AND is_delete_marker = ?", uploadID, false).
-		Count(ctx)
+	return uploadHasObjectReferences(ctx, r.db, uploadID)
+}
+
+func uploadHasObjectReferences(ctx context.Context, db bun.IDB, uploadID int64) (bool, error) {
+	var row struct {
+		Count int `bun:"count"`
+	}
+	err := db.NewRaw(`SELECT COUNT(DISTINCT object_version.version_id) AS count
+		FROM storage_uploads AS storage_upload
+		JOIN object_versions AS object_version
+		  ON `+objectVersionReferencesStorageUploadSQL("object_version", "storage_upload")+`
+		WHERE storage_upload.id = ?
+		  AND object_version.is_delete_marker = ?`, uploadID, false).
+		Scan(ctx, &row)
 	if err != nil {
 		return false, fmt.Errorf("checking storage cleanup object references: %w", err)
 	}
-	return count > 0, nil
+	return row.Count > 0, nil
 }
 
 func (r *BunStorageCleanupRepo) TaskHasObjectReferences(ctx context.Context, taskID int64, uploadID int64) (bool, error) {
@@ -97,7 +108,9 @@ func (r *BunStorageCleanupRepo) TaskHasObjectReferences(ctx context.Context, tas
 			)
 		 )
 		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-		JOIN object_versions AS object_version ON object_version.storage_upload_id = storage_copy.upload_id
+		JOIN storage_uploads AS referenced_upload ON referenced_upload.id = storage_copy.upload_id
+		JOIN object_versions AS object_version
+		  ON `+objectVersionReferencesStorageUploadSQL("object_version", "referenced_upload")+`
 		WHERE cleanup_copy.task_id = ?
 		  AND object_version.is_delete_marker = FALSE
 		  AND (
@@ -144,20 +157,40 @@ func (r *BunStorageCleanupRepo) TaskHasObjectReferences(ctx context.Context, tas
 }
 
 func (r *BunStorageCleanupRepo) DeleteUploadProvenanceIfUnreferenced(ctx context.Context, uploadID int64) error {
-	hasRefs, err := r.UploadHasObjectReferences(ctx, uploadID)
-	if err != nil {
-		return err
+	if uploadID <= 0 {
+		return fmt.Errorf("deleting unreferenced storage upload provenance: %w", ErrInvalidInput)
 	}
-	if hasRefs {
+	return r.runMaybeTx(ctx, func(db bun.IDB) error {
+		if _, err := lockStorageUploadsByID(ctx, db, []int64{uploadID}); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return fmt.Errorf("locking storage upload before deleting provenance: %w", err)
+		}
+		hasRefs, err := uploadHasObjectReferences(ctx, db, uploadID)
+		if err != nil {
+			return err
+		}
+		if hasRefs {
+			return nil
+		}
+		if _, err := db.NewDelete().
+			Model((*model.StorageUpload)(nil)).
+			Where("id = ?", uploadID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("deleting unreferenced storage upload provenance: %w", err)
+		}
 		return nil
+	})
+}
+
+func (r *BunStorageCleanupRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {
+	if db, ok := r.db.(*bun.DB); ok {
+		return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+			return fn(tx)
+		})
 	}
-	if _, err := r.db.NewDelete().
-		Model((*model.StorageUpload)(nil)).
-		Where("id = ?", uploadID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("deleting unreferenced storage upload provenance: %w", err)
-	}
-	return nil
+	return fn(r.db)
 }
 
 func storageCleanupCopyUpdateResult(res sql.Result, err error, op string) error {

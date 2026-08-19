@@ -701,6 +701,15 @@ func resetFailedObjectForTaskRetry(ctx context.Context, db bun.IDB, task *model.
 	}
 
 	target := retryObjectState(task)
+	uploadID := int64(0)
+	if target == model.ObjectStateReplicating {
+		uploadID = taskPayloadInt64(task.Payload, "upload_id")
+		if uploadID > 0 {
+			if _, err := lockStorageUploadForObjectState(ctx, db, uploadID, target); err != nil {
+				return fmt.Errorf("locking storage upload for task retry: %w", err)
+			}
+		}
+	}
 	q := db.NewUpdate().
 		Model((*model.ObjectVersion)(nil)).
 		Set("state = ?", target).
@@ -708,10 +717,8 @@ func resetFailedObjectForTaskRetry(ctx context.Context, db bun.IDB, task *model.
 		Set("last_error = NULL").
 		Set("updated_at = ?", now).
 		Where("version_id = ? AND state = ?", task.RefVersionID, model.ObjectStateFailed)
-	if target == model.ObjectStateReplicating {
-		if uploadID := taskPayloadInt64(task.Payload, "upload_id"); uploadID > 0 {
-			q = q.Set("storage_upload_id = ?", uploadID)
-		}
+	if uploadID > 0 {
+		q = q.Set("storage_upload_id = ?", uploadID)
 	}
 	if _, err := q.Exec(ctx); err != nil {
 		return fmt.Errorf("resetting failed object for task retry: %w", err)

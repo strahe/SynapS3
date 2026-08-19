@@ -44,8 +44,8 @@ Writes commit to local cache and metadata before returning success. Reads use lo
 | Object | `PutObject` | ✅ | Stores an object |
 | Object | `GetObject` | ✅ | Reads an object |
 | Object | `HeadObject` | ✅ | Reads object metadata |
-| Object | `DeleteObject` | ✅ | Creates a delete marker, or deletes a specific `versionId` |
-| Object | `DeleteObjects` | ✅ | Creates delete markers, or deletes specific `versionId` entries |
+| Object | `DeleteObject` | ✅ | Creates a delete marker without `versionId`; with `versionId`, deletes an eligible data version or delete marker |
+| Object | `DeleteObjects` | ✅ | Applies the same deletion rules per entry and reports entry-specific failures |
 | Object | `CopyObject` | ✅ | Source object must be readable from cache or committed Filecoin storage |
 | Object | `ListObjects` | ✅ | Marker pagination |
 | Object | `ListObjectsV2` | ✅ | Continuation-token pagination |
