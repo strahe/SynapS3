@@ -3,13 +3,74 @@ package repository_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
 )
+
+type walletCreateBarrierHook struct {
+	participants  int
+	release       chan struct{}
+	mu            sync.Mutex
+	selected      int
+	failedInserts int
+}
+
+func newWalletCreateBarrierHook(participants int) *walletCreateBarrierHook {
+	return &walletCreateBarrierHook{
+		participants: participants,
+		release:      make(chan struct{}),
+	}
+}
+
+func (h *walletCreateBarrierHook) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *walletCreateBarrierHook) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+	if !strings.Contains(event.Query, "wallet_operations") {
+		return
+	}
+	if event.Operation() == "INSERT" {
+		if event.Err != nil {
+			h.mu.Lock()
+			h.failedInserts++
+			h.mu.Unlock()
+		}
+		return
+	}
+	if event.Operation() != "SELECT" {
+		return
+	}
+
+	h.mu.Lock()
+	if h.selected >= h.participants {
+		h.mu.Unlock()
+		return
+	}
+	h.selected++
+	if h.selected == h.participants {
+		close(h.release)
+	}
+	release := h.release
+	h.mu.Unlock()
+
+	select {
+	case <-release:
+	case <-ctx.Done():
+	}
+}
+
+func (h *walletCreateBarrierHook) failedInsertCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.failedInserts
+}
 
 func TestWalletOperationRepo_CreateOrGetIsIdempotentByTypeAndClientRequestID(t *testing.T) {
 	db := testDB(t)
@@ -114,9 +175,13 @@ func TestWalletOperationRepo_CreateOrGetRejectsSameRequestWithDifferentAmount(t 
 func TestWalletOperationRepo_CreateOrGetConcurrentSameAmount(t *testing.T) {
 	db := concurrentTestDB(t)
 	repos := repository.NewRepositories(db)
-	ctx := context.Background()
 
 	const workers = 8
+	barrier := newWalletCreateBarrierHook(workers)
+	db.AddQueryHook(barrier)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	ops := make([]*model.WalletOperation, workers)
@@ -162,6 +227,9 @@ func TestWalletOperationRepo_CreateOrGetConcurrentSameAmount(t *testing.T) {
 	if createdCount != 1 {
 		t.Fatalf("created count = %d, want 1", createdCount)
 	}
+	if got := barrier.failedInsertCount(); got != workers-1 {
+		t.Fatalf("failed insert count = %d, want %d unique-conflict retries", got, workers-1)
+	}
 
 	got, err := repos.WalletOperations.GetByID(ctx, id)
 	if err != nil {
@@ -175,9 +243,13 @@ func TestWalletOperationRepo_CreateOrGetConcurrentSameAmount(t *testing.T) {
 func TestWalletOperationRepo_CreateOrGetConcurrentAmountConflict(t *testing.T) {
 	db := concurrentTestDB(t)
 	repos := repository.NewRepositories(db)
-	ctx := context.Background()
 
 	const workers = 8
+	barrier := newWalletCreateBarrierHook(workers)
+	db.AddQueryHook(barrier)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	ops := make([]*model.WalletOperation, workers)
@@ -229,11 +301,14 @@ func TestWalletOperationRepo_CreateOrGetConcurrentAmountConflict(t *testing.T) {
 			t.Fatalf("worker %d amount = %q, want %q", i, ops[i].Amount, successAmount)
 		}
 	}
-	if successCount == 0 {
-		t.Fatal("expected at least one successful CreateOrGet")
+	if successCount != workers/2 {
+		t.Fatalf("success count = %d, want %d", successCount, workers/2)
 	}
-	if conflictCount == 0 {
-		t.Fatal("expected at least one ErrWalletOperationConflict")
+	if conflictCount != workers/2 {
+		t.Fatalf("conflict count = %d, want %d", conflictCount, workers/2)
+	}
+	if got := barrier.failedInsertCount(); got != workers-1 {
+		t.Fatalf("failed insert count = %d, want %d unique-conflict retries", got, workers-1)
 	}
 
 	got, err := repos.WalletOperations.GetByID(ctx, successID)

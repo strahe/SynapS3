@@ -134,7 +134,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("content-type", "text/event-stream")
-	w.Header().Set("cache-control", "no-cache")
+	w.Header().Set("cache-control", "no-cache, no-store")
 	w.Header().Set("connection", "keep-alive")
 
 	flusher, ok := w.(http.Flusher)

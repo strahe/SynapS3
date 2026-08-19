@@ -416,6 +416,7 @@ func TestTaskRepo_Complete(t *testing.T) {
 	if claimed == nil {
 		t.Fatal("setup: could not claim task")
 	}
+	mustExec(t, db, `UPDATE tasks SET status_message = ? WHERE id = ?`, "stale status", claimed.ID)
 
 	if err := repos.Tasks.Complete(ctx, claimed); err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -564,6 +565,7 @@ func TestTaskRepo_CancelRunning(t *testing.T) {
 	if claimed == nil {
 		t.Fatal("setup: could not claim task")
 	}
+	mustExec(t, db, `UPDATE tasks SET last_error = ? WHERE id = ?`, "stale error", claimed.ID)
 
 	if err := repos.Tasks.CancelRunning(ctx, claimed, "cancelled by user"); err != nil {
 		t.Fatalf("CancelRunning: %v", err)
@@ -614,6 +616,7 @@ func TestTaskRepo_CancelRunningWithoutMessage(t *testing.T) {
 	if claimed == nil {
 		t.Fatal("setup: could not claim task")
 	}
+	mustExec(t, db, `UPDATE tasks SET status_message = ? WHERE id = ?`, "stale status", claimed.ID)
 
 	if err := repos.Tasks.CancelRunning(ctx, claimed, ""); err != nil {
 		t.Fatalf("CancelRunning: %v", err)
