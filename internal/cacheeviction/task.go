@@ -9,13 +9,25 @@ import (
 )
 
 const (
-	StageLRU         = "lru"
-	StageAfterUpload = "after_upload"
+	StageLRU                       = "lru"
+	StageAfterUpload               = "after_upload"
+	StageReconcileBucketDurability = "reconcile_bucket_durability"
 
-	lruAccessedAtPayloadKey  = "cache_accessed_at"
-	lruTaskKeyPrefix         = "evict_cache:lru:"
-	afterUploadTaskKeyPrefix = "evict_cache:"
+	lruAccessedAtPayloadKey       = "cache_accessed_at"
+	deleteAuthorizedPayloadKey    = "delete_authorized"
+	lruTaskKeyPrefix              = "evict_cache:lru:"
+	afterUploadTaskKeyPrefix      = "evict_cache:"
+	bucketDurabilityTaskKeyPrefix = "evict_cache:bucket_durability:"
 )
+
+// ErrDurabilityThreshold means the current Bucket policy does not authorize deletion.
+var ErrDurabilityThreshold = errors.New("minimum durable copies not met")
+
+// ErrNoLongerEligible means a planned cache entry no longer matches the deletion contract.
+var ErrNoLongerEligible = errors.New("cache entry is no longer eligible")
+
+// ErrAccessChanged means an LRU candidate was accessed after it was planned.
+var ErrAccessChanged = errors.New("cache access snapshot changed")
 
 // Candidate is the persisted snapshot needed to plan one LRU eviction.
 type Candidate struct {
@@ -28,6 +40,13 @@ type Candidate struct {
 // LRUTaskPayload is the typed boundary for an LRU task's persisted payload.
 type LRUTaskPayload struct {
 	AccessedAt time.Time
+}
+
+// AuthorizedDeletion is the persisted decision needed to remove one cache
+// entry outside the database transaction that approved it.
+type AuthorizedDeletion struct {
+	Version    model.ObjectVersion
+	BucketName string
 }
 
 // NormalizeAccessTime matches the timestamp precision supported by both
@@ -72,6 +91,21 @@ func NewAfterUploadTask(objectID int64, versionID string, maxRetries int, schedu
 	}
 }
 
+// NewBucketDurabilityTask builds the singleton reconciliation task for one bucket.
+func NewBucketDurabilityTask(bucketID int64, maxRetries int, scheduledAt time.Time) *model.Task {
+	stage := StageReconcileBucketDurability
+	return &model.Task{
+		Type:           model.TaskTypeEvictCache,
+		Stage:          &stage,
+		RefType:        "bucket",
+		RefID:          bucketID,
+		IdempotencyKey: fmt.Sprintf("%s%d", bucketDurabilityTaskKeyPrefix, bucketID),
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     maxRetries,
+		ScheduledAt:    scheduledAt,
+	}
+}
+
 // ParseLRUTaskPayload validates and decodes the persisted LRU access snapshot.
 func ParseLRUTaskPayload(task *model.Task) (LRUTaskPayload, error) {
 	if task == nil {
@@ -90,6 +124,33 @@ func ParseLRUTaskPayload(task *model.Task) (LRUTaskPayload, error) {
 		return LRUTaskPayload{}, fmt.Errorf("parsing LRU eviction task cache_accessed_at: %w", err)
 	}
 	return LRUTaskPayload{AccessedAt: NormalizeAccessTime(accessedAt)}, nil
+}
+
+// DeleteAuthorized reports whether the task has crossed the durable deletion
+// authorization boundary.
+func DeleteAuthorized(task *model.Task) (bool, error) {
+	if task == nil || task.Payload == nil {
+		return false, nil
+	}
+	raw, ok := task.Payload[deleteAuthorizedPayloadKey]
+	if !ok {
+		return false, nil
+	}
+	authorized, ok := raw.(bool)
+	if !ok {
+		return false, fmt.Errorf("cache eviction task delete_authorized has type %T, want bool", raw)
+	}
+	return authorized, nil
+}
+
+// WithDeleteAuthorization copies payload before recording an authorization.
+func WithDeleteAuthorization(payload map[string]any) map[string]any {
+	out := make(map[string]any, len(payload)+1)
+	for key, value := range payload {
+		out[key] = value
+	}
+	out[deleteAuthorizedPayloadKey] = true
+	return out
 }
 
 func (p LRUTaskPayload) taskPayload() map[string]any {

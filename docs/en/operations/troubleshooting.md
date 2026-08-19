@@ -109,10 +109,10 @@ Recovery options:
 - Confirm the host has free disk space, then increase `cache.max_size_gb` if capacity allows.
 - Restore storage provider connectivity and background task progress so queued uploads can complete and cache eviction can run.
 - Use the default `lru` policy for capacity-based cleanup. Lower the high watermark to leave more write headroom, and keep `0 <= low < high <= 100`.
-- Use `after_upload` only when each version should be removed on the next Evictor poll after all target remote copies commit.
+- Use `after_upload` only when each version should be removed on the next Evictor poll after its bucket's minimum durable copies commit.
 - Use `none` when automatic removal must be disabled.
 
-LRU cannot remove multipart staging data, versions that are not remotely durable, or versions without a readable committed remote copy. A write does not synchronously run eviction, so `507 Insufficient Storage` can continue until the Evictor catches up or safe candidates become available.
+LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. A write does not synchronously run eviction, so `507 Insufficient Storage` can continue until the Evictor catches up or safe candidates become available.
 
 Failed LRU deletion tasks remain visible as exhausted work and become eligible again after a one-hour cooldown. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` to retry sooner.
 

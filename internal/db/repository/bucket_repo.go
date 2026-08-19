@@ -133,21 +133,87 @@ func (r *BunBucketRepo) SetOwnerAndACL(ctx context.Context, name string, ownerAc
 	return nil
 }
 
-func (r *BunBucketRepo) SetDefaultCopies(ctx context.Context, name string, copies *int) error {
-	res, err := r.db.NewUpdate().
-		Model((*model.Bucket)(nil)).
-		Set("default_copies = ?", copies).
-		Set("updated_at = ?", time.Now().UTC()).
-		Where("name = ?", name).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("setting bucket default copies: %w", err)
+func (r *BunBucketRepo) UpdateCopyPolicy(ctx context.Context, input UpdateBucketCopyPolicyInput) (*model.Bucket, error) {
+	bucket, err := lockBucketByName(ctx, r.db, input.Name)
+	if err != nil || bucket == nil {
+		return bucket, err
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
+
+	update := r.db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("updated_at = ?", time.Now().UTC()).
+		Where("id = ?", bucket.ID)
+	if input.SetDefaultCopies {
+		bucket.DefaultCopies = input.DefaultCopies
+		update = update.Set("default_copies = ?", input.DefaultCopies)
+	}
+	if input.SetMinimumDurableCopies {
+		bucket.MinimumDurableCopies = input.MinimumDurableCopies
+		update = update.Set("minimum_durable_copies = ?", input.MinimumDurableCopies)
+	}
+	if _, err := update.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("updating bucket copy policy: %w", err)
+	}
+	return bucket, nil
+}
+
+func (r *BunBucketRepo) SetDefaultCopies(ctx context.Context, name string, copies *int) error {
+	bucket, err := r.UpdateCopyPolicy(ctx, UpdateBucketCopyPolicyInput{
+		Name:             name,
+		SetDefaultCopies: true,
+		DefaultCopies:    copies,
+	})
+	if err != nil {
+		return err
+	}
+	if bucket == nil {
 		return fmt.Errorf("setting bucket default copies: bucket %q not found", name)
 	}
 	return nil
+}
+
+func lockBucketByName(ctx context.Context, db bun.IDB, name string) (*model.Bucket, error) {
+	lockResult, err := db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("updated_at = updated_at").
+		Where("name = ?", name).
+		Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("locking bucket copy policy: %w", err)
+	}
+	rows, _ := lockResult.RowsAffected()
+	if rows == 0 {
+		return nil, nil
+	}
+
+	bucket := new(model.Bucket)
+	if err := db.NewSelect().
+		Model(bucket).
+		Where("name = ?", name).
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("locking bucket copy policy: %w", err)
+	}
+	return bucket, nil
+}
+
+func lockBucketByID(ctx context.Context, db bun.IDB, id int64) (*model.Bucket, error) {
+	lockResult, err := db.NewUpdate().
+		Model((*model.Bucket)(nil)).
+		Set("updated_at = updated_at").
+		Where("id = ?", id).
+		Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("locking bucket %d: %w", id, err)
+	}
+	rows, _ := lockResult.RowsAffected()
+	if rows == 0 {
+		return nil, nil
+	}
+	bucket := new(model.Bucket)
+	if err := db.NewSelect().Model(bucket).Where("id = ?", id).Scan(ctx); err != nil {
+		return nil, fmt.Errorf("loading locked bucket %d: %w", id, err)
+	}
+	return bucket, nil
 }
 
 func (r *BunBucketRepo) CountByOwner(ctx context.Context, ownerAccessKey string) (int, error) {

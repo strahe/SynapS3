@@ -114,7 +114,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `POST` | `/api/v1/buckets` | Create a bucket. |
 | `GET` | `/api/v1/buckets/{name}` | Read bucket detail. |
 | `PUT` | `/api/v1/buckets/{name}/owner` | Update bucket owner. |
-| `PUT` | `/api/v1/buckets/{name}/copy-policy` | Update default copy policy. |
+| `PUT` | `/api/v1/buckets/{name}/copy-policy` | Update target replicas and/or the cache-release threshold. |
 | `DELETE` | `/api/v1/buckets/{name}` | Not supported. Returns `501 Not Implemented`. |
 | `GET` | `/api/v1/buckets/{name}/objects` | List objects. |
 | `DELETE` | `/api/v1/buckets/{name}/objects` | Create an object delete marker. |
@@ -132,6 +132,17 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | List versions affected by storage health issues. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
+
+### Bucket Copy Policy
+
+`POST /api/v1/buckets` accepts optional `default_copies` and `minimum_durable_copies` fields. Bucket list, detail, create, and policy-update responses include:
+
+- `minimum_durable_copies`: the explicit bucket value, or `null` for strict per-upload behavior;
+- `effective_minimum_durable_copies`: the current display value after clamping the bucket minimum to the current target.
+
+`PUT /api/v1/buckets/{name}/copy-policy` accepts `default_copies` and `minimum_durable_copies` independently. An omitted field is unchanged. `default_copies: null` inherits the current runtime target for new uploads. `minimum_durable_copies: null` requires every replica frozen for each upload before releasing its cache. An explicit minimum must be between `1` and `8` and cannot exceed the target produced by the same request. An empty request or an invalid final combination returns `400 Bad Request`.
+
+Target changes affect new uploads. Minimum changes also re-evaluate retained cache for current uploads. Increasing the minimum cannot restore cache that has already been deleted.
 
 ### Permanently Delete Object Versions
 
@@ -221,6 +232,8 @@ The restore streams synchronously for up to one hour and requires enough cache c
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | Delete an S3 user. |
 
 Cache settings expose `eviction_policy`, `lru_high_watermark_percent`, and `lru_low_watermark_percent` under `cache`. Valid policies are `lru`, `after_upload`, and `none`. Watermarks must satisfy `0 <= low < high <= 100` and only affect `lru`.
+
+When the full runtime is available, `GET /api/v1/settings` also returns `runtime_filecoin_default_copies`. This is the value used by the current process. `config.filecoin.default_copies` remains the saved value that takes effect after the next restart.
 
 After saving settings, restart SynapS3, check `/healthz`, and read settings again to confirm the effective values.
 

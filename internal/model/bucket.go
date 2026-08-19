@@ -26,14 +26,15 @@ func (s BucketStatus) IsWritable() bool { return true }
 type Bucket struct {
 	bun.BaseModel `bun:"table:buckets"`
 
-	ID             int64        `bun:",pk,autoincrement"`
-	Name           string       `bun:",unique,notnull"`
-	ACL            []byte       `bun:",nullzero"`
-	OwnerAccessKey *string      `bun:",nullzero"`
-	DefaultCopies  *int         `bun:",nullzero"`
-	Status         BucketStatus `bun:",notnull,default:'active'"`
-	CreatedAt      time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt      time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
+	ID                   int64        `bun:",pk,autoincrement"`
+	Name                 string       `bun:",unique,notnull"`
+	ACL                  []byte       `bun:",nullzero"`
+	OwnerAccessKey       *string      `bun:",nullzero"`
+	DefaultCopies        *int         `bun:",nullzero"`
+	MinimumDurableCopies *int         `bun:",nullzero"`
+	Status               BucketStatus `bun:",notnull,default:'active'"`
+	CreatedAt            time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt            time.Time    `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Owner *S3Account `bun:"rel:belongs-to,join:owner_access_key=access_key,on_update:cascade,on_delete:restrict"`
 }

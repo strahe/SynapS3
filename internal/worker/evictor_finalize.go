@@ -2,7 +2,9 @@ package worker
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
 )
 
@@ -26,13 +28,37 @@ type evictionDecision struct {
 func (e *Evictor) deleteCacheEntry(
 	ctx context.Context,
 	task *model.Task,
-	bucketName string,
-	version *model.ObjectVersion,
+	deletion *cacheeviction.AuthorizedDeletion,
 ) *evictionDecision {
-	if err := e.cache.Delete(ctx, bucketName, version.CacheKey); err != nil {
-		return retryEviction(err, "deleting cache entry")
+	if deletion == nil {
+		return failEviction("cache deletion was not authorized", "cache eviction has no authorized target")
 	}
-	return e.recordCacheEntryDeleted(ctx, task, version)
+	if deletion.Version.InCache {
+		if err := e.cache.Delete(ctx, deletion.BucketName, deletion.Version.CacheKey); err != nil {
+			return retryEviction(err, "deleting cache entry")
+		}
+	}
+	return e.recordCacheEntryDeleted(ctx, task, &deletion.Version)
+}
+
+func (e *Evictor) deleteCoordinatorCacheEntry(
+	ctx context.Context,
+	task *model.Task,
+	deletion *cacheeviction.AuthorizedDeletion,
+) error {
+	if deletion == nil {
+		return cacheeviction.ErrNoLongerEligible
+	}
+	if deletion.Version.InCache {
+		if err := e.cache.Delete(ctx, deletion.BucketName, deletion.Version.CacheKey); err != nil {
+			return err
+		}
+	}
+	e.cacheAccessTracker.Forget(deletion.Version.VersionID)
+	if err := e.repos.CacheEvictions.RecordAuthorizedDeletion(ctx, task); err != nil {
+		return fmt.Errorf("recording cache eviction state: %w", err)
+	}
+	return nil
 }
 
 func (e *Evictor) recordCacheEntryDeleted(
@@ -41,20 +67,10 @@ func (e *Evictor) recordCacheEntryDeleted(
 	version *model.ObjectVersion,
 ) *evictionDecision {
 	e.cacheAccessTracker.Forget(version.VersionID)
-	if err := e.recordDeletedCacheState(ctx, task, version); err != nil {
+	if err := e.repos.CacheEvictions.RecordAuthorizedDeletion(ctx, task); err != nil {
 		return retryEviction(err, "recording cache eviction state")
 	}
 	return completeEviction()
-}
-
-func (e *Evictor) hasReadableRemoteCopy(
-	ctx context.Context,
-	version *model.ObjectVersion,
-) (bool, error) {
-	if version.StorageUploadID == nil {
-		return false, nil
-	}
-	return e.repos.Uploads.HasReadableCommittedCopy(ctx, *version.StorageUploadID)
 }
 
 func (e *Evictor) applyEvictionDecision(

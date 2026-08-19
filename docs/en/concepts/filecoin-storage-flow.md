@@ -31,7 +31,7 @@ flowchart TD
 | `uploading` | A background task is preparing remote storage or uploading bytes. |
 | `committing` | The provider has a piece ready and the commit step is in progress. |
 | `replicating` | At least one readable copy exists while target copies are still being completed. |
-| `stored` | Target remote copy policy is satisfied and metadata is available. |
+| `stored` | The bucket's minimum durable copies are readable and committed; remaining target copies may still be syncing. |
 | `failed` | The active lifecycle step failed and may be retried. |
 | `cache_evicted` | Local cache has been removed after remote durability. |
 
@@ -54,12 +54,18 @@ Health checks record storage provider and local data set status. The dashboard u
 
 If an established provider becomes temporarily unavailable while the initial copies are still being stored, SynapS3 keeps using the other assigned writable copies. The unfinished copy waits without consuming retries and resumes automatically when the original provider becomes reachable again. SynapS3 does not automatically select a replacement provider. Repairing copies that became unavailable after storage completed remains part of the planned replica repair feature below.
 
+## Target and Minimum Replicas
+
+The target replica count is frozen when an upload starts. By default, cache release remains strict: every target replica must be readable and committed. A bucket can instead set a lower minimum durable replica count. Once that minimum is met, the version becomes stored and its cache follows the configured eviction policy, while the upload continues filling its original replica slots until the target is reached.
+
+Changing the target affects new uploads. Changing the minimum also re-evaluates retained cache for current uploads. Increasing the minimum does not move versions that are already stored back to an earlier state and cannot restore cache that has already been deleted.
+
 ## What Users See
 
 - S3 upload can succeed before Filecoin storage finishes.
 - Dashboard task and topology views show storage progress.
 - Reads prefer local cache. If remote metadata exists, SynapS3 can retrieve the object from the provider.
-- Cache eviction is an operational optimization, not the write acceptance point. `after_upload` removes a version after storage completes, `lru` waits for capacity pressure, and `none` retains it.
+- Cache eviction is an operational optimization, not the write acceptance point. `after_upload` removes a version after its minimum durable replicas are ready, `lru` waits for capacity pressure, and `none` retains it.
 
 ## Planned Replica Repair
 

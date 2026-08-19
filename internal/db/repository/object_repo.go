@@ -583,7 +583,10 @@ func (r *BunObjectRepo) FindReusableStoredVersion(ctx context.Context, bucketID 
 	err := q.Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
 		Where("object_version.is_delete_marker = ?", false).
 		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
-		Where("storage_upload.status = ?", model.StorageUploadStatusComplete).
+		Where("storage_upload.status IN (?)", bun.List([]model.StorageUploadStatus{
+			model.StorageUploadStatusReadable,
+			model.StorageUploadStatusComplete,
+		})).
 		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
 		OrderExpr("object_version.created_at DESC").
 		OrderExpr("object_version.version_id DESC").
@@ -916,19 +919,23 @@ func executeVersionCacheAccessUpdate(
 
 func (r *BunObjectRepo) SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		if _, err := lockStorageUploadForObjectState(ctx, db, storageUploadID, to); err != nil {
+		upload, err := lockStorageUploadForObjectState(ctx, db, storageUploadID, to)
+		if err != nil {
 			return fmt.Errorf("locking storage upload for version transition: %w", err)
 		}
+		if to == model.ObjectStateStored || to == model.ObjectStateCacheEvicted {
+			if err := requireCurrentMinimumDurableCopies(ctx, db, upload); err != nil {
+				return fmt.Errorf("checking storage upload durability for version transition: %w", err)
+			}
+		}
 		now := time.Now()
-		query := `UPDATE object_versions
-			SET storage_upload_id = ?, state = ?, updated_at = ?
-			WHERE version_id = ? AND state = ?
-			  AND EXISTS (
-				SELECT 1 FROM storage_uploads
-				WHERE id = ? AND status = ?
-			  )
-			  AND ` + usableCopyExistsSQL("?")
-		res, err := db.NewRaw(query, storageUploadID, to, now, versionID, from, storageUploadID, model.StorageUploadStatusComplete, storageUploadID).Exec(ctx)
+		res, err := db.NewUpdate().
+			Model((*model.ObjectVersion)(nil)).
+			Set("storage_upload_id = ?", storageUploadID).
+			Set("state = ?", to).
+			Set("updated_at = ?", now).
+			Where("version_id = ? AND state = ?", versionID, from).
+			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("setting version storage upload and transitioning state: %w", err)
 		}

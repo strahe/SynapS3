@@ -239,7 +239,7 @@ func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
 				}
 				continue
 			}
-			if current.StatusMessage != nil && strings.Contains(*current.StatusMessage, "waiting for all copies") {
+			if current.StatusMessage != nil && strings.Contains(*current.StatusMessage, "enough durable replicas") {
 				gotTask = current
 			}
 		}
@@ -256,7 +256,7 @@ func TestEvictor_ReplicatingVersionDefersEvictionAndKeepsCache(t *testing.T) {
 	if gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonDependency {
 		t.Fatalf("task wait_reason = %v, want dependency", gotTask.WaitReason)
 	}
-	if gotTask.StatusMessage == nil || !strings.Contains(*gotTask.StatusMessage, "waiting for all copies") {
+	if gotTask.StatusMessage == nil || !strings.Contains(*gotTask.StatusMessage, "enough durable replicas") {
 		t.Fatalf("task status_message = %v, want waiting-for-copies reason", gotTask.StatusMessage)
 	}
 	if !gotTask.ScheduledAt.After(originalScheduledAt) {

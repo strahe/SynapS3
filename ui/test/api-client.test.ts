@@ -174,6 +174,63 @@ test('admin write mutations send csrf header', async () => {
   assert.equal(calls[4]?.headers.get('X-SynapS3-Settings-Write'), null)
 })
 
+test('bucket policy mutations serialize target and cache-release thresholds independently', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; body: unknown }> = []
+  globalThis.fetch = (async (input, init) => {
+    calls.push({
+      url: String(input),
+      body: JSON.parse(init?.body?.toString() ?? '{}') as unknown,
+    })
+    return new Response(
+      JSON.stringify({
+        id: 1,
+        name: 'bucket-a',
+        owner_access_key: 'owner-a',
+        default_copies: 3,
+        effective_copies: 3,
+        minimum_durable_copies: 2,
+        effective_minimum_durable_copies: 2,
+        status: 'active',
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    )
+  }) as typeof fetch
+
+  try {
+    await api.createBucket({
+      name: 'bucket-a',
+      owner_access_key: 'owner-a',
+      default_copies: 3,
+      minimum_durable_copies: 2,
+    })
+    await api.updateBucketCopyPolicy('bucket-a', { minimum_durable_copies: null })
+    await api.updateBucketCopyPolicy('bucket-a', { default_copies: 4 })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.deepEqual(calls, [
+    {
+      url: '/api/v1/buckets',
+      body: {
+        name: 'bucket-a',
+        owner_access_key: 'owner-a',
+        default_copies: 3,
+        minimum_durable_copies: 2,
+      },
+    },
+    {
+      url: '/api/v1/buckets/bucket-a/copy-policy',
+      body: { minimum_durable_copies: null },
+    },
+    {
+      url: '/api/v1/buckets/bucket-a/copy-policy',
+      body: { default_copies: 4 },
+    },
+  ])
+})
+
 test('401 responses notify auth invalidation and clear csrf token', async () => {
   const originalFetch = globalThis.fetch
   let invalidations = 0

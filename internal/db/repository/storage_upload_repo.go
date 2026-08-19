@@ -1242,6 +1242,58 @@ func (r *BunStorageUploadRepo) ListUnavailableDataSetsWithIncompleteCopies(ctx c
 	return bindings, nil
 }
 
+func (r *BunStorageUploadRepo) ListIncompleteReadableUploads(
+	ctx context.Context,
+	afterID int64,
+	limit int,
+) ([]IncompleteReadableUpload, error) {
+	var uploads []model.StorageUpload
+	q := r.db.NewSelect().
+		Model(&uploads).
+		Where("status = ?", model.StorageUploadStatusReadable).
+		Where("id > ?", afterID).
+		Where(`EXISTS (
+			SELECT 1 FROM object_versions AS live_version
+			WHERE live_version.is_delete_marker = ?
+			  AND live_version.state IN (?, ?)
+			  AND `+objectVersionReferencesStorageUploadSQL("live_version", "storage_upload")+`
+		)`, false, model.ObjectStateStored, model.ObjectStateCacheEvicted).
+		OrderExpr("id ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Scan(ctx); err != nil {
+		return nil, fmt.Errorf("listing incomplete readable storage uploads: %w", err)
+	}
+
+	items := make([]IncompleteReadableUpload, 0, len(uploads))
+	for i := range uploads {
+		version := new(model.ObjectVersion)
+		err := r.db.NewSelect().
+			Model(version).
+			Where("is_delete_marker = ?", false).
+			Where("state IN (?, ?)", model.ObjectStateStored, model.ObjectStateCacheEvicted).
+			Where(objectVersionReferencesStorageUploadIDSQL, uploads[i].ID, uploads[i].SourceVersionID).
+			OrderExpr("in_cache DESC").
+			OrderExpr("is_current DESC").
+			OrderExpr("created_at DESC").
+			OrderExpr("version_id DESC").
+			Limit(1).
+			Scan(ctx)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil, fmt.Errorf("selecting durable version for incomplete readable upload %d: %w", uploads[i].ID, err)
+		}
+		items = append(items, IncompleteReadableUpload{
+			Upload:  uploads[i],
+			Version: *version,
+		})
+	}
+	return items, nil
+}
+
 func (r *BunStorageUploadRepo) ReassignIngressCopy(ctx context.Context, uploadID int64, unavailableCopyIndex int) (*model.StorageUploadCopy, error) {
 	var selected *model.StorageUploadCopy
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
@@ -1664,6 +1716,24 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 	var refs []ObjectVersionRef
 	finalized := false
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		var bucketID int64
+		if err := db.NewSelect().
+			Model((*model.StorageUpload)(nil)).
+			Column("bucket_id").
+			Where("id = ?", input.UploadID).
+			Scan(ctx, &bucketID); err != nil {
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("loading storage upload %d: %w", input.UploadID, ErrNotFound)
+			}
+			return fmt.Errorf("loading storage upload bucket: %w", err)
+		}
+		bucket, err := lockBucketByID(ctx, db, bucketID)
+		if err != nil {
+			return err
+		}
+		if bucket == nil {
+			return fmt.Errorf("storage upload %d bucket not found: %w", input.UploadID, ErrNotFound)
+		}
 		locked, err := lockStorageUploadsByID(ctx, db, []int64{input.UploadID})
 		if err != nil {
 			return fmt.Errorf("locking storage upload for finalization: %w", err)
@@ -1676,21 +1746,11 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 		if err != nil {
 			return err
 		}
-		if upload.RequestedCopies <= 0 || readable < upload.RequestedCopies {
+		minimum := minimumDurableCopiesForUpload(bucket, upload.RequestedCopies)
+		if minimum <= 0 || readable < minimum {
 			return nil
 		}
 		now := time.Now()
-		_, err = db.NewUpdate().
-			Model((*model.StorageUpload)(nil)).
-			Set("status = ?", model.StorageUploadStatusComplete).
-			Set("accepted_at = COALESCE(accepted_at, ?)", now).
-			Set("accept_error = NULL").
-			Set("updated_at = ?", now).
-			Where("id = ?", input.UploadID).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("marking storage upload complete: %w", err)
-		}
 		err = db.NewRaw(`UPDATE object_versions
 			SET state = ?, updated_at = ?
 			WHERE storage_upload_id = ? AND state = ?
@@ -1698,12 +1758,9 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 			model.ObjectStateStored, now, input.UploadID, model.ObjectStateReplicating,
 		).Scan(ctx, &refs)
 		if err != nil && err != sql.ErrNoRows {
-			return fmt.Errorf("finalizing object versions for upload: %w", err)
+			return fmt.Errorf("marking durable object versions stored: %w", err)
 		}
 		for _, ref := range refs {
-			if err := completeUploadTasksForVersion(ctx, db, ref.VersionID, now, unclaimedTaskStatuses()); err != nil {
-				return err
-			}
 			if input.EnqueueAfterUploadEviction {
 				evictions := &BunCacheEvictionRepo{db: db}
 				if _, err := evictions.EnsureAfterUploadTask(
@@ -1720,10 +1777,59 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 				}
 			}
 		}
+		if upload.RequestedCopies <= 0 || readable < upload.RequestedCopies {
+			return nil
+		}
+		_, err = db.NewUpdate().
+			Model((*model.StorageUpload)(nil)).
+			Set("status = ?", model.StorageUploadStatusComplete).
+			Set("accepted_at = COALESCE(accepted_at, ?)", now).
+			Set("accept_error = NULL").
+			Set("updated_at = ?", now).
+			Where("id = ?", input.UploadID).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("marking storage upload complete: %w", err)
+		}
+		if err := completeUploadTasksForUpload(ctx, db, input.UploadID, now, unclaimedTaskStatuses()); err != nil {
+			return err
+		}
 		finalized = true
 		return nil
 	})
 	return finalized, refs, err
+}
+
+func minimumDurableCopiesForUpload(bucket *model.Bucket, requestedCopies int) int {
+	if requestedCopies <= 0 {
+		return 0
+	}
+	if bucket == nil || bucket.MinimumDurableCopies == nil || *bucket.MinimumDurableCopies >= requestedCopies {
+		return requestedCopies
+	}
+	return *bucket.MinimumDurableCopies
+}
+
+func requireCurrentMinimumDurableCopies(ctx context.Context, db bun.IDB, upload *model.StorageUpload) error {
+	if upload == nil {
+		return fmt.Errorf("storage upload is required: %w", ErrInvalidInput)
+	}
+	bucket := new(model.Bucket)
+	if err := db.NewSelect().Model(bucket).Where("id = ?", upload.BucketID).Scan(ctx); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("storage upload bucket not found: %w", ErrNotFound)
+		}
+		return fmt.Errorf("loading storage upload bucket durability policy: %w", err)
+	}
+	minimum := minimumDurableCopiesForUpload(bucket, upload.RequestedCopies)
+	readable, err := countReadableCommittedCopies(ctx, db, upload.ID)
+	if err != nil {
+		return err
+	}
+	if minimum <= 0 || readable < minimum {
+		return fmt.Errorf("storage upload %d has %d of %d required durable copies: %w", upload.ID, readable, minimum, ErrConflict)
+	}
+	return nil
 }
 
 func (r *BunStorageUploadRepo) FindActiveUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error) {
@@ -2070,6 +2176,30 @@ func completeUploadTasksForVersion(ctx context.Context, db bun.IDB, versionID st
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("completing upload tasks for bound version: %w", err)
+	}
+	return nil
+}
+
+func completeUploadTasksForUpload(ctx context.Context, db bun.IDB, uploadID int64, now time.Time, statuses []model.TaskStatus) error {
+	if uploadID <= 0 || len(statuses) == 0 {
+		return fmt.Errorf("completing upload tasks for storage upload: %w", ErrInvalidInput)
+	}
+	_, err := db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusCompleted).
+		Set("completed_at = ?", now).
+		Set("last_error = NULL").
+		Set("wait_reason = NULL").
+		Set("status_message = NULL").
+		Set("claimed_at = NULL").
+		Set("lease_until = NULL").
+		Set("started_at = NULL").
+		Where("ref_type = ? AND type = ?", "object", model.TaskTypeUpload).
+		Where("status IN (?)", bun.List(statuses)).
+		Where("ref_version_id IN (SELECT version_id FROM object_versions WHERE storage_upload_id = ?)", uploadID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("completing upload tasks for storage upload: %w", err)
 	}
 	return nil
 }

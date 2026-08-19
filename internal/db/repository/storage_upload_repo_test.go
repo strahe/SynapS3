@@ -1673,6 +1673,125 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 	}
 }
 
+func TestStorageUploadRepo_MinimumDurabilityStoresBeforeTargetAndKeepsRepairWork(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "minimum-durability-finalize-bucket")
+	minimum := 2
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimum,
+	}); err != nil {
+		t.Fatalf("UpdateCopyPolicy: %v", err)
+	}
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000MIN02", 10)
+	version.Checksum = "minimum-durability-checksum"
+	objectID, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	if err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 3)
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "1001", "2001", "https://one.example/piece")
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 1, "202", "2002", "2002", "https://two.example/piece")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
+
+	stage := "peer_pull"
+	repairTask := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          objectID,
+		RefVersionID:   version.VersionID,
+		IdempotencyKey: "upload:minimum-durability-third-copy",
+		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 2},
+		Status:         model.TaskStatusQueued,
+		MaxRetries:     5,
+		ScheduledAt:    time.Now(),
+	}
+	if err := repos.Tasks.Create(ctx, repairTask); err != nil {
+		t.Fatalf("Create repair task: %v", err)
+	}
+
+	done, refs, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet minimum: %v", err)
+	}
+	if done || len(refs) != 1 || refs[0].VersionID != version.VersionID {
+		t.Fatalf("minimum finalize = done:%v refs:%#v, want stored without upload completion", done, refs)
+	}
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || gotVersion == nil || gotVersion.State != model.ObjectStateStored {
+		t.Fatalf("version after minimum = %#v err=%v, want stored", gotVersion, err)
+	}
+	gotUpload, err := repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || gotUpload == nil || gotUpload.Status != model.StorageUploadStatusReadable {
+		t.Fatalf("upload after minimum = %#v err=%v, want readable", gotUpload, err)
+	}
+	gotTask, err := repos.Tasks.GetByID(ctx, repairTask.ID)
+	if err != nil || gotTask == nil || gotTask.Status != model.TaskStatusQueued {
+		t.Fatalf("repair task after minimum = %#v err=%v, want queued", gotTask, err)
+	}
+
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 2, "303", "3003", "2003", "https://three.example/piece")
+	done, refs, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet target: %v", err)
+	}
+	if !done || len(refs) != 0 {
+		t.Fatalf("target finalize = done:%v refs:%#v, want complete without another state transition", done, refs)
+	}
+	gotUpload, err = repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || gotUpload == nil || gotUpload.Status != model.StorageUploadStatusComplete {
+		t.Fatalf("upload after target = %#v err=%v, want complete", gotUpload, err)
+	}
+	gotTask, err = repos.Tasks.GetByID(ctx, repairTask.ID)
+	if err != nil || gotTask == nil || gotTask.Status != model.TaskStatusCompleted {
+		t.Fatalf("repair task after target = %#v err=%v, want completed", gotTask, err)
+	}
+}
+
+func TestStorageUploadRepo_ListIncompleteReadableUploadsIncludesCommittedUnavailableSlot(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "minimum-durability-recovery-bucket")
+	minimum := 1
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimum,
+	}); err != nil {
+		t.Fatalf("UpdateCopyPolicy: %v", err)
+	}
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000MIN03", 10)
+	version.Checksum = "minimum-durability-recovery-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 2)
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "1001", "2001", "https://one.example/piece")
+	unavailable := commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 1, "202", "2002", "2002", "https://two.example/piece")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
+	if err := repos.Uploads.MarkDataSetUnavailable(ctx, unavailable.ID, "temporary outage"); err != nil {
+		t.Fatalf("MarkDataSetUnavailable: %v", err)
+	}
+	if complete, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil || complete {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet = complete:%t err:%v, want durable before target", complete, err)
+	}
+
+	items, err := repos.Uploads.ListIncompleteReadableUploads(ctx, 0, 100)
+	if err != nil {
+		t.Fatalf("ListIncompleteReadableUploads: %v", err)
+	}
+	if len(items) != 1 || items[0].Upload.ID != upload.ID || items[0].Version.VersionID != version.VersionID {
+		t.Fatalf("incomplete readable uploads = %#v, want upload %d version %s", items, upload.ID, version.VersionID)
+	}
+}
+
 func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

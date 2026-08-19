@@ -189,6 +189,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithSettings(opts.Settings).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).
 		WithObservability(observabilityService).
+		WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithS3IAM(iamService, rootAccount.Access)
 	if opts.ProviderIdentity != nil {

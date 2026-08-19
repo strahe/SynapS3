@@ -121,7 +121,7 @@ The login page uses a browser-session cookie by default. Selecting **Keep me sig
 Cache eviction policies have these user-visible results:
 
 - `lru`: when cache usage reaches the high watermark, SynapS3 removes the least recently accessed remotely safe entries until usage reaches the low watermark.
-- `after_upload`: after all target remote copies commit, SynapS3 queues that version for removal at the next Evictor poll. A later remote read can restore the cache, and that restored entry is not immediately removed again.
+- `after_upload`: after a version meets its bucket's minimum durable copies, SynapS3 queues it for removal at the next Evictor poll. A later remote read can restore the cache, and that restored entry is not immediately removed again.
 - `none`: SynapS3 does not automatically remove local cache data.
 
 The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain saved but have no effect under `after_upload` or `none`.

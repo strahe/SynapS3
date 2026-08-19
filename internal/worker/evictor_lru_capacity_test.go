@@ -17,23 +17,19 @@ import (
 	"github.com/strahe/synaps3/internal/worker"
 )
 
-type blockingVersionStateRepo struct {
-	repository.ObjectRepository
+type blockingDeletionRecordRepo struct {
+	repository.CacheEvictionRepository
 	versionID string
 	entered   chan struct{}
 	release   <-chan struct{}
 	once      sync.Once
 }
 
-func (r *blockingVersionStateRepo) UpdateVersionState(
+func (r *blockingDeletionRecordRepo) RecordAuthorizedDeletion(
 	ctx context.Context,
-	versionID string,
-	from model.ObjectState,
-	to model.ObjectState,
+	task *model.Task,
 ) error {
-	if versionID == r.versionID &&
-		from == model.ObjectStateStored &&
-		to == model.ObjectStateCacheEvicted {
+	if task.RefVersionID == r.versionID {
 		r.once.Do(func() { close(r.entered) })
 		select {
 		case <-r.release:
@@ -41,7 +37,7 @@ func (r *blockingVersionStateRepo) UpdateVersionState(
 			return ctx.Err()
 		}
 	}
-	return r.ObjectRepository.UpdateVersionState(ctx, versionID, from, to)
+	return r.CacheEvictionRepository.RecordAuthorizedDeletion(ctx, task)
 }
 
 func TestEvictor_LRUCapacityReservationEndsAtPhysicalDelete(t *testing.T) {
@@ -89,11 +85,11 @@ func TestEvictor_LRUCapacityReservationEndsAtPhysicalDelete(t *testing.T) {
 	stateUpdateEntered := make(chan struct{})
 	releaseStateUpdate := make(chan struct{})
 	var releaseStateOnce sync.Once
-	env.repos.Objects = &blockingVersionStateRepo{
-		ObjectRepository: env.repos.Objects,
-		versionID:        firstVersionID,
-		entered:          stateUpdateEntered,
-		release:          releaseStateUpdate,
+	env.repos.CacheEvictions = &blockingDeletionRecordRepo{
+		CacheEvictionRepository: env.repos.CacheEvictions,
+		versionID:               firstVersionID,
+		entered:                 stateUpdateEntered,
+		release:                 releaseStateUpdate,
 	}
 
 	heldSecond, err := env.cacheGate.Open(

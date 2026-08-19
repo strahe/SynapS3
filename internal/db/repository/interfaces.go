@@ -29,7 +29,9 @@ type BucketRepository interface {
 	SetACL(ctx context.Context, name string, acl []byte) error
 	// SetOwnerAndACL stores both the authoritative owner and compatible ACL.
 	SetOwnerAndACL(ctx context.Context, name string, ownerAccessKey *string, acl []byte) error
-	// SetDefaultCopies stores the bucket copy policy override. Nil means inherit.
+	// UpdateCopyPolicy locks and updates the independently optional bucket policy fields.
+	UpdateCopyPolicy(ctx context.Context, input UpdateBucketCopyPolicyInput) (*model.Bucket, error)
+	// SetDefaultCopies stores the bucket target override. Nil means inherit.
 	SetDefaultCopies(ctx context.Context, name string, copies *int) error
 	// CountByOwner returns bucket count for the authoritative owner access key.
 	CountByOwner(ctx context.Context, ownerAccessKey string) (int, error)
@@ -39,6 +41,15 @@ type BucketRepository interface {
 	HardDelete(ctx context.Context, id int64) error
 	// CountStorageDataSets returns provider-scoped data set count.
 	CountStorageDataSets(ctx context.Context) (int, error)
+}
+
+// UpdateBucketCopyPolicyInput distinguishes omitted fields from explicit nulls.
+type UpdateBucketCopyPolicyInput struct {
+	Name                    string
+	SetDefaultCopies        bool
+	DefaultCopies           *int
+	SetMinimumDurableCopies bool
+	MinimumDurableCopies    *int
 }
 
 // S3AccountRepository defines persistence operations for S3 IAM accounts.
@@ -401,6 +412,13 @@ type ReplicaRepairItem struct {
 	Version model.ObjectVersion
 }
 
+// IncompleteReadableUpload identifies one durable upload that still needs
+// work to reach its frozen target copy count.
+type IncompleteReadableUpload struct {
+	Upload  model.StorageUpload
+	Version model.ObjectVersion
+}
+
 type BindReadableUploadInput struct {
 	UploadID    int64
 	BucketID    int64
@@ -473,6 +491,7 @@ type StorageUploadRepository interface {
 	NextIncompleteCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
 	NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
 	ListUnavailableDataSetsWithIncompleteCopies(ctx context.Context, afterID int64, limit int) ([]model.StorageDataSet, error)
+	ListIncompleteReadableUploads(ctx context.Context, afterID int64, limit int) ([]IncompleteReadableUpload, error)
 	ReassignIngressCopy(ctx context.Context, uploadID int64, unavailableCopyIndex int) (*model.StorageUploadCopy, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
 	MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error

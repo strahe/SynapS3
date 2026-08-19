@@ -218,11 +218,11 @@ func TestEvictor_LRUChecksRemoteSafetyAfterWaitingForOpenBody(t *testing.T) {
 		t.Fatalf("RecordVersionCacheAccess: %v", err)
 	}
 	task := seedLRUEvictionTask(t, env, objectID, versionID, plannedAt)
-	checks := &observableReadableCheckRepo{
-		StorageUploadRepository: env.repos.Uploads,
+	checks := &observableDeletionAuthorizationRepo{
+		CacheEvictionRepository: env.repos.CacheEvictions,
 		started:                 make(chan struct{}),
 	}
-	env.repos.Uploads = checks
+	env.repos.CacheEvictions = checks
 
 	opened, err := env.cacheGate.Open(
 		versionID,

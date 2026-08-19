@@ -742,6 +742,212 @@ func TestUploader_CompletesRetryWhenObjectIsAlreadyStored(t *testing.T) {
 	}
 }
 
+func TestUploader_DurableIncompleteUploadKeepsRepairingOriginalReplica(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cacheState model.ObjectState
+		inCache    bool
+	}{
+		{name: "stored with retained cache", cacheState: model.ObjectStateStored, inCache: true},
+		{name: "cache evicted", cacheState: model.ObjectStateCacheEvicted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestWorkerEnv(t)
+			ctx := context.Background()
+			fixture := seedReadableUploadWithPendingPeer(t, env)
+			bucket, err := env.repos.Buckets.GetByID(ctx, fixture.upload.BucketID)
+			if err != nil || bucket == nil {
+				t.Fatalf("GetByID bucket: bucket=%#v err=%v", bucket, err)
+			}
+			minimum := 1
+			if _, err := env.repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+				Name:                    bucket.Name,
+				SetMinimumDurableCopies: true,
+				MinimumDurableCopies:    &minimum,
+			}); err != nil {
+				t.Fatalf("UpdateCopyPolicy: %v", err)
+			}
+			if complete, _, err := env.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: fixture.upload.ID}); err != nil || complete {
+				t.Fatalf("FinalizeUploadIfTargetCopiesMet = complete:%t err:%v, want durable before target", complete, err)
+			}
+			if tc.cacheState == model.ObjectStateCacheEvicted {
+				if err := env.repos.Objects.UpdateVersionState(ctx, fixture.versionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+					t.Fatalf("mark cache evicted: %v", err)
+				}
+				if err := env.repos.Objects.SetVersionCachePresence(ctx, fixture.versionID, false); err != nil {
+					t.Fatalf("clear cache presence: %v", err)
+				}
+			}
+			if err := env.repos.Uploads.MarkDataSetUnavailable(ctx, fixture.peer.ID, "temporary outage"); err != nil {
+				t.Fatalf("MarkDataSetUnavailable: %v", err)
+			}
+
+			var createContextsCalls atomic.Int32
+			env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+				createContextsCalls.Add(1)
+				return nil, errors.New("durable repair must not select a replacement provider")
+			}
+			stage := "prepare_upload"
+			task := &model.Task{
+				Type:           model.TaskTypeUpload,
+				Stage:          &stage,
+				RefType:        "object",
+				RefID:          fixture.objID,
+				RefVersionID:   fixture.versionID,
+				IdempotencyKey: fmt.Sprintf("upload:%s:prepare_upload:%d:durable", fixture.versionID, fixture.upload.ID),
+				Payload:        map[string]interface{}{"upload_id": fixture.upload.ID},
+				Status:         model.TaskStatusQueued,
+				MaxRetries:     5,
+				ScheduledAt:    time.Now(),
+			}
+			if err := env.repos.Tasks.Create(ctx, task); err != nil {
+				t.Fatalf("Create durable repair task: %v", err)
+			}
+
+			uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
+			gotTask := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+			if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
+				t.Fatalf("durable repair task = %#v, want completed without retry", gotTask)
+			}
+			if createContextsCalls.Load() != 0 {
+				t.Fatalf("CreateContexts calls = %d, want 0", createContextsCalls.Load())
+			}
+			peerCopy, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, fixture.peer.CopyIndex)
+			if err != nil || peerCopy == nil {
+				t.Fatalf("GetUploadCopy peer: copy=%#v err=%v", peerCopy, err)
+			}
+			repairTasks, total, err := env.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "repair_replica", "", 10, 0)
+			if err != nil || total != 1 || len(repairTasks) != 1 ||
+				taskPayloadInt64ForTest(repairTasks[0].Payload, "storage_data_set_id") != fixture.peer.ID ||
+				taskPayloadInt64ForTest(repairTasks[0].Payload, "storage_upload_copy_id") != peerCopy.ID {
+				t.Fatalf("repair tasks = %#v total=%d err=%v, want original data set %d copy %d", repairTasks, total, err, fixture.peer.ID, peerCopy.ID)
+			}
+			version, err := env.repos.Objects.GetVersionByID(ctx, fixture.versionID)
+			if err != nil || version == nil || version.State != tc.cacheState || version.InCache != tc.inCache {
+				t.Fatalf("durable version after repair handoff = %#v err=%v", version, err)
+			}
+		})
+	}
+}
+
+func TestUploader_DurableEnsureTaskDoesNotReassignIngress(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadableUploadWithPendingPeer(t, env)
+	bucket, err := env.repos.Buckets.GetByID(ctx, fixture.upload.BucketID)
+	if err != nil || bucket == nil {
+		t.Fatalf("GetByID bucket: bucket=%#v err=%v", bucket, err)
+	}
+	if _, err := env.db.NewUpdate().
+		Model((*model.StorageUpload)(nil)).
+		Set("requested_copies = ?", 3).
+		Where("id = ?", fixture.upload.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("raise frozen target for fixture: %v", err)
+	}
+	if _, err := env.db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("status = ?", model.StorageUploadCopyStatusPending).
+		Where("upload_id = ? AND copy_index = ?", fixture.upload.ID, fixture.ingress.CopyIndex).
+		Exec(ctx); err != nil {
+		t.Fatalf("make ingress copy pending: %v", err)
+	}
+	if err := env.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		UploadID:     fixture.upload.ID,
+		CopyIndex:    fixture.peer.CopyIndex,
+		PieceCID:     testCID(t).String(),
+		PieceID:      onChainIDPtr(t, "302"),
+		RetrievalURL: "https://peer.example/piece",
+	}); err != nil {
+		t.Fatalf("commit peer copy: %v", err)
+	}
+	spare, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        onChainID(t, "303"),
+		CopyIndex:         2,
+		CreatedByUploadID: fixture.upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("create spare binding: %v", err)
+	}
+	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID:        spare.ID,
+		UploadID:  fixture.upload.ID,
+		DataSetID: onChainID(t, "3003"),
+	}); err != nil {
+		t.Fatalf("mark spare binding ready: %v", err)
+	}
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, fixture.upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: spare.ID,
+		CopyIndex:        spare.CopyIndex,
+		TransferMethod:   model.StorageCopyTransferMethodPeerPull,
+		ProviderID:       spare.ProviderID,
+	}}); err != nil {
+		t.Fatalf("create spare copy: %v", err)
+	}
+	minimum := 1
+	if _, err := env.repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimum,
+	}); err != nil {
+		t.Fatalf("set minimum: %v", err)
+	}
+	if complete, _, err := env.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: fixture.upload.ID}); err != nil || complete {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet = complete:%t err:%v, want durable before target", complete, err)
+	}
+	if err := env.repos.Uploads.MarkDataSetUnavailable(ctx, fixture.ingress.ID, "temporary outage"); err != nil {
+		t.Fatalf("mark ingress unavailable: %v", err)
+	}
+
+	stage := "ensure_dataset"
+	task := &model.Task{
+		Type:           model.TaskTypeUpload,
+		Stage:          &stage,
+		RefType:        "object",
+		RefID:          fixture.objID,
+		RefVersionID:   fixture.versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:ensure_dataset:%d:0:durable", fixture.versionID, fixture.upload.ID),
+		Payload: map[string]interface{}{
+			"upload_id":       fixture.upload.ID,
+			"copy_index":      fixture.ingress.CopyIndex,
+			"transfer_method": string(model.StorageCopyTransferMethodIngress),
+		},
+		Status:      model.TaskStatusQueued,
+		MaxRetries:  5,
+		ScheduledAt: time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("create stale ensure task: %v", err)
+	}
+	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+		return nil, errors.New("durable ensure task must not choose a provider")
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 3, 1, 10*time.Millisecond, slog.Default())
+	gotTask := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
+		t.Fatalf("stale ensure task = %#v, want completed without retry", gotTask)
+	}
+	spareCopy, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, spare.CopyIndex)
+	if err != nil || spareCopy == nil {
+		t.Fatalf("GetUploadCopy spare: copy=%#v err=%v", spareCopy, err)
+	}
+	if spareCopy.TransferMethod != model.StorageCopyTransferMethodPeerPull {
+		t.Fatalf("spare transfer method = %s, want peer pull", spareCopy.TransferMethod)
+	}
+	ingressCopy, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, fixture.ingress.CopyIndex)
+	if err != nil || ingressCopy == nil {
+		t.Fatalf("GetUploadCopy ingress: copy=%#v err=%v", ingressCopy, err)
+	}
+	repairTasks, total, err := env.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "repair_replica", "", 10, 0)
+	if err != nil || total != 1 || len(repairTasks) != 1 ||
+		taskPayloadInt64ForTest(repairTasks[0].Payload, "storage_data_set_id") != fixture.ingress.ID ||
+		taskPayloadInt64ForTest(repairTasks[0].Payload, "storage_upload_copy_id") != ingressCopy.ID {
+		t.Fatalf("repair tasks = %#v total=%d err=%v, want original ingress data set %d copy %d", repairTasks, total, err, fixture.ingress.ID, ingressCopy.ID)
+	}
+}
+
 func TestUploader_ClaimsLaterPendingTaskWhileAnotherUploadRuns(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, firstObjID, firstVersionID := seedCachedObject(t, env)
@@ -3202,6 +3408,7 @@ type readableUploadWithPendingPeerFixture struct {
 	objID     int64
 	versionID string
 	upload    *model.StorageUpload
+	ingress   *model.StorageDataSet
 	peer      *model.StorageDataSet
 }
 
@@ -3271,6 +3478,7 @@ func seedReadableUploadWithPendingPeer(t *testing.T, env *testWorkerEnv) readabl
 		objID:     objID,
 		versionID: versionID,
 		upload:    upload,
+		ingress:   ingress,
 		peer:      peer,
 	}
 }

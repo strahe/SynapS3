@@ -120,6 +120,7 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 	// Reconcile unfinished upload work.
 	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUpload, "upload")
 	m.reconcileStagedUploads(ctx)
+	m.reconcileIncompleteReadableUploads(ctx)
 	m.reconcileUnavailableDataSets(ctx)
 
 	// Log exhausted task count for operator awareness
@@ -128,6 +129,25 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Error("failed to check exhausted tasks", "error", err)
 	} else if len(exhaustedTasks) > 0 {
 		m.logger.Warn("exhausted tasks found on startup, review via GET /admin/exhausted-tasks", "count", len(exhaustedTasks))
+	}
+}
+
+func (m *Manager) reconcileIncompleteReadableUploads(ctx context.Context) {
+	afterID := int64(0)
+	for {
+		items, err := m.repos.Uploads.ListIncompleteReadableUploads(ctx, afterID, reconcileBatchSize)
+		if err != nil {
+			m.logger.Error("failed to list incomplete readable uploads for recovery", "error", err)
+			return
+		}
+		for i := range items {
+			item := &items[i]
+			m.enqueueRecoveredUploadRepair(ctx, item.Version, item.Upload.ID)
+			afterID = item.Upload.ID
+		}
+		if len(items) < reconcileBatchSize {
+			return
+		}
 	}
 }
 
@@ -506,7 +526,7 @@ func (m *Manager) enqueueRecoveredUploadRepair(ctx context.Context, version mode
 		MaxRetries:     m.uploadMaxRetries,
 		ScheduledAt:    time.Now(),
 	}
-	if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+	if _, err := m.repos.Tasks.EnsureRecurring(ctx, task); err != nil {
 		m.logger.Error("failed to enqueue recovered upload repair", "uploadID", uploadID, "versionID", version.VersionID, "error", err)
 	}
 }

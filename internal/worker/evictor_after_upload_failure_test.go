@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheeviction"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
 )
@@ -54,21 +56,6 @@ func TestEvictor_Preconditions(t *testing.T) {
 			},
 			wantLastError: "not stored",
 		},
-		{
-			name: "NoReadableCopies",
-			setup: func(ctx context.Context, t *testing.T, env *testWorkerEnv) *model.Task {
-				_, objID, versionID := seedStoredObject(t, env)
-				version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
-				if err != nil || version == nil || version.StorageUploadID == nil {
-					t.Fatalf("stored version upload: version=%v err=%v", version, err)
-				}
-				if _, err := env.db.NewDelete().Model((*model.StorageUploadCopy)(nil)).Where("upload_id = ?", *version.StorageUploadID).Exec(ctx); err != nil {
-					t.Fatalf("remove readable copies: %v", err)
-				}
-				return seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
-			},
-			wantLastError: "no readable upload copies",
-		},
 	}
 
 	for _, tt := range tests {
@@ -96,6 +83,44 @@ func TestEvictor_Preconditions(t *testing.T) {
 				t.Errorf("expected last error to contain %q, got %v", tt.wantLastError, got.LastError)
 			}
 		})
+	}
+}
+
+func TestEvictor_AfterUploadWaitsWhenMinimumIsNoLongerMet(t *testing.T) {
+	var deleteCalls atomic.Int64
+	mc := &testutil.MockCache{DeleteFunc: func(context.Context, string, string) error {
+		deleteCalls.Add(1)
+		return nil
+	}}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	ctx := context.Background()
+	_, objID, versionID := seedStoredObject(t, env)
+	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil || version.StorageUploadID == nil {
+		t.Fatalf("stored version upload: version=%v err=%v", version, err)
+	}
+	if _, err := env.db.NewDelete().Model((*model.StorageUploadCopy)(nil)).Where("upload_id = ?", *version.StorageUploadID).Exec(ctx); err != nil {
+		t.Fatalf("remove readable copies: %v", err)
+	}
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+	evictor := newAfterUploadEvictor(env, 1, 10*time.Millisecond)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = evictor.Run(runCtx)
+		close(done)
+	}()
+	waitForTaskStatus(t, env, task.ID, model.TaskStatusWaiting, 3*time.Second)
+	cancel()
+	waitForSignal(t, done, time.Second, "after-upload durability wait shutdown")
+
+	got, err := env.repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || got == nil || got.RetryCount != 0 || got.WaitReason == nil || *got.WaitReason != model.TaskWaitReasonDependency {
+		t.Fatalf("waiting task = %#v err=%v", got, err)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("cache delete calls = %d, want 0", deleteCalls.Load())
 	}
 }
 
@@ -153,4 +178,64 @@ func TestEvictor_CacheDeleteFailureLeavesObjectUnchangedAndKeepsTaskRecoverable(
 			}
 		})
 	}
+}
+
+func TestEvictor_DeletionAuthorizationSurvivesStateWriteFailure(t *testing.T) {
+	var deleteCalls atomic.Int64
+	mc := &testutil.MockCache{DeleteFunc: func(context.Context, string, string) error {
+		deleteCalls.Add(1)
+		return nil
+	}}
+	env := newTestWorkerEnvWithMockCache(t, mc)
+	ctx := context.Background()
+	_, objID, versionID := seedStoredObject(t, env)
+	task := seedTask(t, env, model.TaskTypeEvictCache, objID, versionID, 5, 0)
+	records := &failFirstDeletionRecordRepo{CacheEvictionRepository: env.repos.CacheEvictions}
+	env.repos.CacheEvictions = records
+	evictor := newAfterUploadEvictor(env, 1, 10*time.Millisecond)
+
+	runWorkerUntilTaskRetryCount(t, env, evictor, task.ID, 1, 5*time.Second)
+	interrupted, err := env.repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || interrupted == nil {
+		t.Fatalf("GetByID after interrupted record: task=%#v err=%v", interrupted, err)
+	}
+	authorized, err := cacheeviction.DeleteAuthorized(interrupted)
+	if err != nil || !authorized || interrupted.RefVersionID != versionID {
+		t.Fatalf("interrupted authorization = task:%#v authorized:%t err:%v", interrupted, authorized, err)
+	}
+	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil || version.State != model.ObjectStateStored || !version.InCache {
+		t.Fatalf("version before state convergence = %#v err=%v", version, err)
+	}
+	if _, err := env.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-time.Second)).
+		Where("id = ?", task.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("make authorized retry ready: %v", err)
+	}
+
+	completed := runWorkerUntilTask(t, env, evictor, task.ID, 5*time.Second)
+	if completed.Status != model.TaskStatusCompleted || completed.RetryCount != 1 {
+		t.Fatalf("completed authorized retry = %#v", completed)
+	}
+	version, err = env.repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil || version.State != model.ObjectStateCacheEvicted || version.InCache {
+		t.Fatalf("version after state convergence = %#v err=%v", version, err)
+	}
+	if deleteCalls.Load() != 2 || records.calls.Load() != 2 {
+		t.Fatalf("recovery calls = delete:%d record:%d, want 2/2", deleteCalls.Load(), records.calls.Load())
+	}
+}
+
+type failFirstDeletionRecordRepo struct {
+	repository.CacheEvictionRepository
+	calls atomic.Int64
+}
+
+func (r *failFirstDeletionRecordRepo) RecordAuthorizedDeletion(ctx context.Context, task *model.Task) error {
+	if r.calls.Add(1) == 1 {
+		return errors.New("injected state write failure")
+	}
+	return r.CacheEvictionRepository.RecordAuthorizedDeletion(ctx, task)
 }

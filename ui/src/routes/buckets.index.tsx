@@ -24,8 +24,18 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/c
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { useBuckets, useCreateBucket, useS3Users, useUpdateBucketOwner } from '@/hooks/queries'
-import { bucketCopyPolicyLabel, copyPolicyOptions, inheritedCopyPolicyValue } from '@/lib/bucket-copy-policy'
+import { useBuckets, useCreateBucket, useS3Users, useSettings, useUpdateBucketOwner } from '@/hooks/queries'
+import {
+  bucketCopyPolicyLabel,
+  clampMinimumDurableCopiesValue,
+  copyPolicyOptions,
+  inheritedCopyPolicyValue,
+  minimumDurableCopiesOptionLabel,
+  minimumDurableCopiesOptions,
+  minimumDurableCopiesWarning,
+  selectedTargetCopies,
+  strictMinimumDurableCopiesValue,
+} from '@/lib/bucket-copy-policy'
 import {
   bucketStorageHealthLabel,
   bucketStorageHealthStatusTone,
@@ -43,15 +53,21 @@ function CreateBucketDialog() {
   const [bucketName, setBucketName] = useState('')
   const [ownerAccessKey, setOwnerAccessKey] = useState('')
   const [copyPolicy, setCopyPolicy] = useState(inheritedCopyPolicyValue)
+  const [minimumDurableCopies, setMinimumDurableCopies] = useState(strictMinimumDurableCopiesValue)
   const [error, setError] = useState<string | null>(null)
   const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
+  const { data: settings } = useSettings()
   const createBucket = useCreateBucket()
   const navigate = useNavigate()
+  const runtimeDefaultCopies = settings?.runtime_filecoin_default_copies
+  const targetCopies = selectedTargetCopies(copyPolicy, runtimeDefaultCopies)
+  const minimumOptions = minimumDurableCopiesOptions(targetCopies)
 
   const reset = () => {
     setBucketName('')
     setOwnerAccessKey('')
     setCopyPolicy(inheritedCopyPolicyValue)
+    setMinimumDurableCopies(strictMinimumDurableCopiesValue)
     setError(null)
     createBucket.reset()
   }
@@ -75,8 +91,9 @@ function CreateBucketDialog() {
 
     setError(null)
     const defaultCopies = copyPolicy === inheritedCopyPolicyValue ? null : Number(copyPolicy)
+    const minimumCopies = minimumDurableCopies === strictMinimumDurableCopiesValue ? null : Number(minimumDurableCopies)
     createBucket.mutate(
-      { name, ownerAccessKey, defaultCopies },
+      { name, ownerAccessKey, defaultCopies, minimumDurableCopies: minimumCopies },
       {
         onSuccess: (bucket) => {
           setOpen(false)
@@ -93,6 +110,11 @@ function CreateBucketDialog() {
   const bucketNameError = error === 'Bucket name is required' ? error : null
   const ownerError = error === 'Bucket owner is required' ? error : null
   const formError = error && !bucketNameError && !ownerError ? error : null
+  const handleCopyPolicyChange = (next: string) => {
+    const nextTarget = selectedTargetCopies(next, runtimeDefaultCopies)
+    setCopyPolicy(next)
+    setMinimumDurableCopies((current) => clampMinimumDurableCopiesValue(current, nextTarget))
+  }
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -140,13 +162,17 @@ function CreateBucketDialog() {
             </Field>
             <Field>
               <FieldLabel htmlFor="bucket-copies">Replicas</FieldLabel>
-              <Select value={copyPolicy} onValueChange={setCopyPolicy} disabled={createBucket.isPending}>
+              <Select value={copyPolicy} onValueChange={handleCopyPolicyChange} disabled={createBucket.isPending}>
                 <SelectTrigger id="bucket-copies" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value={inheritedCopyPolicyValue}>Inherit global default</SelectItem>
+                    <SelectItem value={inheritedCopyPolicyValue}>
+                      {runtimeDefaultCopies == null
+                        ? 'Inherit current runtime default'
+                        : `Inherit current runtime default (${minimumDurableCopiesOptionLabel(runtimeDefaultCopies)})`}
+                    </SelectItem>
                     {copyPolicyOptions.map((copies) => (
                       <SelectItem key={copies} value={copies.toString()}>
                         {copies} {copies === 1 ? 'copy' : 'copies'}
@@ -155,8 +181,39 @@ function CreateBucketDialog() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              {copyPolicy === inheritedCopyPolicyValue && runtimeDefaultCopies == null && (
+                <FieldDescription>
+                  The current runtime default is unavailable. Choose a replica count to configure an explicit
+                  cache-release threshold.
+                </FieldDescription>
+              )}
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="bucket-minimum-durable-copies">Release cache after</FieldLabel>
+              <Select
+                value={minimumDurableCopies}
+                onValueChange={setMinimumDurableCopies}
+                disabled={createBucket.isPending}
+              >
+                <SelectTrigger id="bucket-minimum-durable-copies" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value={strictMinimumDurableCopiesValue}>All replicas (strict)</SelectItem>
+                    {minimumOptions.map((copies) => (
+                      <SelectItem key={copies} value={copies.toString()}>
+                        {minimumDurableCopiesOptionLabel(copies)}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
             </Field>
           </FieldGroup>
+          <Alert>
+            <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
+          </Alert>
           {formError && (
             <Alert variant="destructive">
               <AlertDescription>{formError}</AlertDescription>

@@ -114,7 +114,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `POST` | `/api/v1/buckets` | 创建存储桶。 |
 | `GET` | `/api/v1/buckets/{name}` | 读取存储桶详情。 |
 | `PUT` | `/api/v1/buckets/{name}/owner` | 更新存储桶 owner。 |
-| `PUT` | `/api/v1/buckets/{name}/copy-policy` | 更新默认 copy policy。 |
+| `PUT` | `/api/v1/buckets/{name}/copy-policy` | 更新目标副本数和/或缓存释放门槛。 |
 | `DELETE` | `/api/v1/buckets/{name}` | 不支持，返回 `501 Not Implemented`。 |
 | `GET` | `/api/v1/buckets/{name}/objects` | 列出对象。 |
 | `DELETE` | `/api/v1/buckets/{name}/objects` | 创建对象 delete marker。 |
@@ -132,6 +132,17 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | 列出受存储健康问题影响的版本。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
+
+### 存储桶副本策略
+
+`POST /api/v1/buckets` 接受可选的 `default_copies` 和 `minimum_durable_copies` 字段。存储桶列表、详情、创建和策略更新响应包含：
+
+- `minimum_durable_copies`：存储桶显式设置的值；`null` 表示按每次上传采用严格策略；
+- `effective_minimum_durable_copies`：将当前存储桶门槛限制在当前目标副本数以内后，用于展示的值。
+
+`PUT /api/v1/buckets/{name}/copy-policy` 可以独立接收 `default_copies` 和 `minimum_durable_copies`。字段缺省时保持不变。`default_copies: null` 表示新上传继承当前运行时目标副本数。`minimum_durable_copies: null` 表示必须完成单次上传冻结的所有副本后才能释放缓存。显式门槛必须在 `1` 到 `8` 之间，且不能超过同一请求产生的最终目标副本数。空请求或无效的最终组合返回 `400 Bad Request`。
+
+目标副本数变更只影响新上传。最低耐久副本数变更还会重新评估当前上传仍保留的缓存。提高门槛无法恢复已经删除的缓存。
 
 ### 永久删除对象版本
 
@@ -221,6 +232,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | 删除 S3 用户。 |
 
 缓存设置在 `cache` 下提供 `eviction_policy`、`lru_high_watermark_percent` 和 `lru_low_watermark_percent`。有效策略为 `lru`、`after_upload` 和 `none`。水位必须满足 `0 <= low < high <= 100`，且只在 `lru` 策略下生效。
+
+完整运行时可用时，`GET /api/v1/settings` 还会返回 `runtime_filecoin_default_copies`，表示当前进程实际使用的值。`config.filecoin.default_copies` 仍表示已保存、下次重启后生效的值。
 
 保存设置后，重启 SynapS3，检查 `/healthz`，再读取设置以确认实际生效值。
 

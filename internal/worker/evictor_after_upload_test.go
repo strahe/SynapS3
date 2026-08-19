@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -102,21 +103,22 @@ func TestEvictor_HappyPath(t *testing.T) {
 	}
 }
 
-type observableReadableCheckRepo struct {
-	repository.StorageUploadRepository
+type observableDeletionAuthorizationRepo struct {
+	repository.CacheEvictionRepository
 
 	calls   atomic.Int64
 	started chan struct{}
 }
 
-func (r *observableReadableCheckRepo) HasReadableCommittedCopy(
+func (r *observableDeletionAuthorizationRepo) AuthorizeDeletion(
 	ctx context.Context,
-	uploadID int64,
-) (bool, error) {
+	task *model.Task,
+	expectedAccess *time.Time,
+) (*cacheeviction.AuthorizedDeletion, error) {
 	if r.calls.Add(1) == 1 {
 		close(r.started)
 	}
-	return r.StorageUploadRepository.HasReadableCommittedCopy(ctx, uploadID)
+	return r.CacheEvictionRepository.AuthorizeDeletion(ctx, task, expectedAccess)
 }
 
 func TestEvictor_ChecksRemoteSafetyAfterWaitingForOpenBody(t *testing.T) {
@@ -140,11 +142,11 @@ func TestEvictor_ChecksRemoteSafetyAfterWaitingForOpenBody(t *testing.T) {
 	}
 	dataSetID := *copies[0].StorageDataSetID
 
-	checks := &observableReadableCheckRepo{
-		StorageUploadRepository: env.repos.Uploads,
+	checks := &observableDeletionAuthorizationRepo{
+		CacheEvictionRepository: env.repos.CacheEvictions,
 		started:                 make(chan struct{}),
 	}
-	env.repos.Uploads = checks
+	env.repos.CacheEvictions = checks
 	opened, err := env.cacheGate.Open(
 		versionID,
 		func() (io.ReadCloser, *cache.ObjectInfo, error) {
@@ -186,7 +188,7 @@ func TestEvictor_ChecksRemoteSafetyAfterWaitingForOpenBody(t *testing.T) {
 		t.Fatalf("close cache body: %v", err)
 	}
 	waitForSignal(t, checks.started, time.Second, "final remote-safety check")
-	waitForTaskStatus(t, env, task.ID, model.TaskStatusFailed, 3*time.Second)
+	waitForTaskStatus(t, env, task.ID, model.TaskStatusWaiting, 3*time.Second)
 
 	if deleteCalls.Load() != 0 {
 		t.Fatalf("cache Delete calls after remote safety changed = %d, want 0", deleteCalls.Load())
