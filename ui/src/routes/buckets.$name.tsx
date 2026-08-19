@@ -122,12 +122,14 @@ import {
   clampMinimumDurableCopiesValue,
   copyPolicyOptions,
   inheritedCopyPolicyValue,
+  minimumDurableCopiesChoiceNote,
   minimumDurableCopiesLabel,
   minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
   minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
   selectedTargetCopies,
+  showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
 } from '@/lib/bucket-copy-policy'
 import { type BucketRouteSearch, normalizeBucketRouteSearch } from '@/lib/bucket-route-search'
@@ -2344,11 +2346,14 @@ function BucketDetailsSettings({
                 </SelectGroup>
               </SelectContent>
             </Select>
+            <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
           </Field>
         </FieldGroup>
-        <Alert className="mt-3">
-          <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
-        </Alert>
+        {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (
+          <Alert className="mt-3">
+            <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
+          </Alert>
+        )}
         <div className="mt-3 flex justify-end">
           <Button
             variant="outline"

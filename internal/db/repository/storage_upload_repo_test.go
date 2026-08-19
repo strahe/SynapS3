@@ -1753,6 +1753,96 @@ func TestStorageUploadRepo_MinimumDurabilityStoresBeforeTargetAndKeepsRepairWork
 	}
 }
 
+func TestStorageUploadRepo_MinimumDurabilityEnqueuesAfterUploadBeforeTarget(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "minimum-durability-after-upload-bucket")
+	minimum := 2
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimum,
+	}); err != nil {
+		t.Fatalf("UpdateCopyPolicy: %v", err)
+	}
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000MINAU", 10)
+	version.Checksum = "minimum-durability-after-upload"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 3)
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "1001", "2001", "https://one.example/piece")
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 1, "202", "2002", "2002", "https://two.example/piece")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
+
+	maxEvictionRetries := 7
+	done, refs, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		repository.NewFinalizeUploadInput(upload.ID, true, maxEvictionRetries),
+	)
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet minimum: %v", err)
+	}
+	if done || len(refs) != 1 || refs[0].VersionID != version.VersionID {
+		t.Fatalf("minimum finalize = done:%v refs:%#v, want stored without upload completion", done, refs)
+	}
+	gotUpload, err := repos.Uploads.GetByID(ctx, upload.ID)
+	if err != nil || gotUpload == nil || gotUpload.Status != model.StorageUploadStatusReadable {
+		t.Fatalf("upload after minimum = %#v err=%v, want readable", gotUpload, err)
+	}
+	evictionTasks, total, err := repos.Tasks.List(
+		ctx,
+		string(model.TaskTypeEvictCache),
+		cacheeviction.StageAfterUpload,
+		"",
+		10,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("List after-upload eviction tasks: %v", err)
+	}
+	if total != 1 || len(evictionTasks) != 1 {
+		t.Fatalf("after-upload eviction tasks after minimum total=%d tasks=%#v, want one", total, evictionTasks)
+	}
+	if evictionTasks[0].RefVersionID != version.VersionID || evictionTasks[0].MaxRetries != maxEvictionRetries {
+		t.Fatalf(
+			"after-upload eviction task = version:%s retries:%d, want version:%s retries:%d",
+			evictionTasks[0].RefVersionID,
+			evictionTasks[0].MaxRetries,
+			version.VersionID,
+			maxEvictionRetries,
+		)
+	}
+
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 2, "303", "3003", "2003", "https://three.example/piece")
+	done, refs, err = repos.Uploads.FinalizeUploadIfTargetCopiesMet(
+		ctx,
+		repository.NewFinalizeUploadInput(upload.ID, true, maxEvictionRetries),
+	)
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet target: %v", err)
+	}
+	if !done || len(refs) != 0 {
+		t.Fatalf("target finalize = done:%v refs:%#v, want complete without another state transition", done, refs)
+	}
+	evictionTasks, total, err = repos.Tasks.List(
+		ctx,
+		string(model.TaskTypeEvictCache),
+		cacheeviction.StageAfterUpload,
+		"",
+		10,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("List after-upload eviction tasks after target: %v", err)
+	}
+	if total != 1 || len(evictionTasks) != 1 || evictionTasks[0].RefVersionID != version.VersionID {
+		t.Fatalf("after-upload eviction tasks after target total=%d tasks=%#v, want the same task", total, evictionTasks)
+	}
+}
+
 func TestStorageUploadRepo_ListIncompleteReadableUploadsIncludesCommittedUnavailableSlot(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

@@ -29,7 +29,11 @@ export function bucketCopyPolicySavedMessage() {
 }
 
 export function bucketCopyPolicyEffectNote() {
-  return 'Target replicas apply to new uploads. Cache release applies to retained cache for current and future uploads.'
+  return 'Target replicas apply to new uploads. After the selected replica count is ready, the object is treated as stored and remaining replicas keep syncing. Cache can then be removed only if eviction is enabled.'
+}
+
+export function minimumDurableCopiesChoiceNote() {
+  return 'Choose All replicas to follow later target changes. A number stays fixed.'
 }
 
 export function minimumDurableCopiesValue(bucket: Pick<BucketItem, 'minimum_durable_copies' | 'effective_copies'>) {
@@ -66,7 +70,13 @@ export function clampMinimumDurableCopiesValue(value: string, targetCopies: numb
 }
 
 export function minimumDurableCopiesWarning() {
-  return 'Lowering this value can release local cache before every target replica is ready. Raising it cannot restore cache that has already been deleted.'
+  return 'Cache may be removed before every target replica is ready, depending on cache eviction settings. Raising this later cannot restore cache that has already been deleted.'
+}
+
+export function showsMinimumDurableCopiesWarning(value: string, targetCopies: number | null) {
+  if (value === strictMinimumDurableCopiesValue) return false
+  const copies = Number(value)
+  return Number.isInteger(copies) && targetCopies != null && copies < targetCopies
 }
 
 function copyCountLabel(copies: number) {

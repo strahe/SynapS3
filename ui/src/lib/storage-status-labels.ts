@@ -175,6 +175,9 @@ export function objectStateLabel(
   uploadStatus?: ObjectUploadStatus,
   progressPercent: number | null = null
 ) {
+  if (uploadStatus === 'readable' && (state === 'stored' || state === 'cache_evicted')) {
+    return 'Available, syncing remaining replicas'
+  }
   if (uploadStatus) return uploadStatusLabel(uploadStatus, progressPercent)
   switch (state) {
     case 'cached':

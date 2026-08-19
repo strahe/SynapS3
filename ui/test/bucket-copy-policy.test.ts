@@ -6,11 +6,13 @@ import {
   bucketCopyPolicyInheritOptionLabel,
   bucketCopyPolicySavedMessage,
   clampMinimumDurableCopiesValue,
+  minimumDurableCopiesChoiceNote,
   minimumDurableCopiesLabel,
   minimumDurableCopiesOptions,
   minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
   selectedTargetCopies,
+  showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
 } from '../src/lib/bucket-copy-policy.ts'
 
@@ -18,12 +20,19 @@ test('bucket copy policy text explains save result and future upload scope', () 
   assert.equal(bucketCopyPolicySavedMessage(), 'Replica policy saved.')
   assert.equal(
     bucketCopyPolicyEffectNote(),
-    'Target replicas apply to new uploads. Cache release applies to retained cache for current and future uploads.'
+    'Target replicas apply to new uploads. After the selected replica count is ready, the object is treated as stored and remaining replicas keep syncing. Cache can then be removed only if eviction is enabled.'
+  )
+  assert.equal(
+    minimumDurableCopiesChoiceNote(),
+    'Choose All replicas to follow later target changes. A number stays fixed.'
   )
   assert.equal(
     minimumDurableCopiesWarning(),
-    'Lowering this value can release local cache before every target replica is ready. Raising it cannot restore cache that has already been deleted.'
+    'Cache may be removed before every target replica is ready, depending on cache eviction settings. Raising this later cannot restore cache that has already been deleted.'
   )
+  assert.equal(showsMinimumDurableCopiesWarning(strictMinimumDurableCopiesValue, 3), false)
+  assert.equal(showsMinimumDurableCopiesWarning('3', 3), false)
+  assert.equal(showsMinimumDurableCopiesWarning('2', 3), true)
 })
 
 test('minimum durable copy choices follow the selected runtime or explicit target', () => {
@@ -77,6 +86,15 @@ test('minimum durable copy labels distinguish strict and explicit policies', () 
       effective_minimum_durable_copies: 3,
     }),
     'All replicas (strict)'
+  )
+  assert.equal(
+    minimumDurableCopiesLabel({
+      default_copies: 3,
+      effective_copies: 3,
+      minimum_durable_copies: 3,
+      effective_minimum_durable_copies: 3,
+    }),
+    '3 of 3 replicas'
   )
   assert.equal(
     minimumDurableCopiesLabel({

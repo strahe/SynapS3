@@ -30,7 +30,7 @@ flowchart TD
 | `cached` | Object is durable locally and queued for upload. |
 | `uploading` | A background task is preparing remote storage or uploading bytes. |
 | `committing` | The provider has a piece ready and the commit step is in progress. |
-| `replicating` | At least one readable copy exists while target copies are still being completed. |
+| `replicating` | At least one readable committed copy exists, but the bucket's minimum durable copies are not yet met. |
 | `stored` | The bucket's minimum durable copies are readable and committed; remaining target copies may still be syncing. |
 | `failed` | The active lifecycle step failed and may be retried. |
 | `cache_evicted` | Local cache has been removed after remote durability. |
@@ -56,7 +56,7 @@ If an established provider becomes temporarily unavailable while the initial cop
 
 ## Target and Minimum Replicas
 
-The target replica count is frozen when an upload starts. By default, cache release remains strict: every target replica must be readable and committed. A bucket can instead set a lower minimum durable replica count. Once that minimum is met, the version becomes stored and its cache follows the configured eviction policy, while the upload continues filling its original replica slots until the target is reached.
+The target replica count is frozen when an upload starts. By default, Release cache after is All replicas (strict): every target replica frozen for that upload must be readable and committed. A bucket can instead set an explicit count from 1 through the current target. An explicit count stays fixed if the target later changes; All replicas follows each upload's frozen target. Once that threshold is met, the version becomes stored and its cache follows the configured eviction policy, while the upload continues filling its original replica slots until the target is reached. The dashboard keeps showing replica sync progress until every frozen target replica is done.
 
 Changing the target affects new uploads. Changing the minimum also re-evaluates retained cache for current uploads. Increasing the minimum does not move versions that are already stored back to an earlier state and cannot restore cache that has already been deleted.
 

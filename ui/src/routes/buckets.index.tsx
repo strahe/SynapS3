@@ -26,14 +26,18 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBuckets, useCreateBucket, useS3Users, useSettings, useUpdateBucketOwner } from '@/hooks/queries'
 import {
+  bucketCopyPolicyEffectNote,
   bucketCopyPolicyLabel,
   clampMinimumDurableCopiesValue,
   copyPolicyOptions,
   inheritedCopyPolicyValue,
+  minimumDurableCopiesChoiceNote,
+  minimumDurableCopiesLabel,
   minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
   minimumDurableCopiesWarning,
   selectedTargetCopies,
+  showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
 } from '@/lib/bucket-copy-policy'
 import {
@@ -171,7 +175,7 @@ function CreateBucketDialog() {
                     <SelectItem value={inheritedCopyPolicyValue}>
                       {runtimeDefaultCopies == null
                         ? 'Inherit current runtime default'
-                        : `Inherit current runtime default (${minimumDurableCopiesOptionLabel(runtimeDefaultCopies)})`}
+                        : `Inherit current runtime default (${runtimeDefaultCopies} ${runtimeDefaultCopies === 1 ? 'copy' : 'copies'})`}
                     </SelectItem>
                     {copyPolicyOptions.map((copies) => (
                       <SelectItem key={copies} value={copies.toString()}>
@@ -209,11 +213,15 @@ function CreateBucketDialog() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
             </Field>
           </FieldGroup>
-          <Alert>
-            <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
-          </Alert>
+          <p className="text-xs text-muted-foreground">{bucketCopyPolicyEffectNote()}</p>
+          {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (
+            <Alert>
+              <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
+            </Alert>
+          )}
           {formError && (
             <Alert variant="destructive">
               <AlertDescription>{formError}</AlertDescription>
@@ -440,7 +448,10 @@ function BucketsPage() {
                   <TableCell className="px-4">
                     <OwnerCell ownerAccessKey={bucket.owner_access_key} />
                   </TableCell>
-                  <TableCell className="px-4">{bucketCopyPolicyLabel(bucket)}</TableCell>
+                  <TableCell className="px-4">
+                    <div>{bucketCopyPolicyLabel(bucket)}</div>
+                    <div className="text-xs text-muted-foreground">{minimumDurableCopiesLabel(bucket)}</div>
+                  </TableCell>
                   <TableCell className="px-4">
                     <BucketStorageHealthCell bucket={bucket} />
                   </TableCell>

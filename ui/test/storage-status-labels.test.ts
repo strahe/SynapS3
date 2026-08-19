@@ -29,6 +29,9 @@ test('object upload labels describe Filecoin lifecycle in user-facing terms', ()
 
 test('object state labels prefer active upload lifecycle when present', () => {
   assert.equal(objectStateLabel('uploading', 'uploading', 'running', 56), 'Uploading to Filecoin 56%')
+  assert.equal(objectStateLabel('replicating', 'syncing', 'readable'), 'Available, syncing replicas')
+  assert.equal(objectStateLabel('stored', 'syncing', 'readable'), 'Available, syncing remaining replicas')
+  assert.equal(objectStateLabel('cache_evicted', 'syncing', 'readable'), 'Available, syncing remaining replicas')
   assert.equal(objectStateLabel('stored', 'success'), 'Stored')
 })
 

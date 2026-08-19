@@ -42,7 +42,7 @@ Repeated reads of the same version coalesce access-time updates to at most one d
 | `after_upload` | Queue each version for removal after its bucket's minimum durable copies commit. |
 | `none` | Do not create or run automatic cache eviction work. |
 
-Each bucket defaults to strict cache release, so the minimum equals the target replicas frozen for each upload. An operator can lower the minimum for a bucket to release retained cache while the original replica slots continue syncing. The minimum is clamped to each upload's target. Raising it affects cache that still exists; it cannot recreate cache that has already been deleted.
+Each bucket defaults to strict cache release, so the minimum equals the target replicas frozen for each upload. An operator can set an explicit count from 1 through the current target; that number stays fixed if the target later changes. Lowering the threshold makes retained cache eligible for removal while original replica slots continue syncing. Actual removal still follows `after_upload`, `lru`, or `none`. The minimum is clamped to each upload's target. Raising it affects cache that still exists; it cannot recreate cache that has already been deleted.
 
 Only versions that currently meet their minimum and have a readable committed remote copy are eligible. Eviction checks the current minimum again before authorizing deletion and waits for active reads of the same version to close. Because cleanup is asynchronous, writes can still return `507 Insufficient Storage` when cleanup cannot keep pace or no safe candidate exists.
 
