@@ -115,7 +115,7 @@ func TestAdminEventsHandlerStreamsProviderIdentityEvent(t *testing.T) {
 	srv := &Server{events: newAdminEventHub(), logger: testLogger()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/events", srv.handleAPIEvents)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(withSecurityHeaders(srv.withAdminAuth(mux)))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/api/v1/events")
@@ -128,6 +128,9 @@ func TestAdminEventsHandlerStreamsProviderIdentityEvent(t *testing.T) {
 	}
 	if got := resp.Header.Get("content-type"); !strings.HasPrefix(got, "text/event-stream") {
 		t.Fatalf("content-type = %q, want text/event-stream", got)
+	}
+	if got := resp.Header.Get("cache-control"); got != "no-cache, no-store" {
+		t.Fatalf("cache-control = %q, want no-cache, no-store", got)
 	}
 
 	reader := bufio.NewReader(resp.Body)

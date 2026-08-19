@@ -3,12 +3,74 @@ package repository_test
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
 )
+
+type walletCreateBarrierHook struct {
+	participants  int
+	release       chan struct{}
+	mu            sync.Mutex
+	selected      int
+	failedInserts int
+}
+
+func newWalletCreateBarrierHook(participants int) *walletCreateBarrierHook {
+	return &walletCreateBarrierHook{
+		participants: participants,
+		release:      make(chan struct{}),
+	}
+}
+
+func (h *walletCreateBarrierHook) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *walletCreateBarrierHook) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+	if !strings.Contains(event.Query, "wallet_operations") {
+		return
+	}
+	if event.Operation() == "INSERT" {
+		if event.Err != nil {
+			h.mu.Lock()
+			h.failedInserts++
+			h.mu.Unlock()
+		}
+		return
+	}
+	if event.Operation() != "SELECT" {
+		return
+	}
+
+	h.mu.Lock()
+	if h.selected >= h.participants {
+		h.mu.Unlock()
+		return
+	}
+	h.selected++
+	if h.selected == h.participants {
+		close(h.release)
+	}
+	release := h.release
+	h.mu.Unlock()
+
+	select {
+	case <-release:
+	case <-ctx.Done():
+	}
+}
+
+func (h *walletCreateBarrierHook) failedInsertCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.failedInserts
+}
 
 func TestWalletOperationRepo_CreateOrGetIsIdempotentByTypeAndClientRequestID(t *testing.T) {
 	db := testDB(t)
@@ -107,6 +169,154 @@ func TestWalletOperationRepo_CreateOrGetRejectsSameRequestWithDifferentAmount(t 
 		Amount:          "101",
 	}); err == nil {
 		t.Fatal("CreateOrGet with different amount error = nil, want conflict")
+	}
+}
+
+func TestWalletOperationRepo_CreateOrGetConcurrentSameAmount(t *testing.T) {
+	db := concurrentTestDB(t)
+	repos := repository.NewRepositories(db)
+
+	const workers = 8
+	barrier := newWalletCreateBarrierHook(workers)
+	db.AddQueryHook(barrier)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	ops := make([]*model.WalletOperation, workers)
+	created := make([]bool, workers)
+	errs := make([]error, workers)
+
+	wg.Add(workers)
+	for i := range workers {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			op, wasCreated, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+				Type:            model.WalletOperationTypeFund,
+				ClientRequestID: "concurrent-request",
+				Amount:          "100",
+			})
+			ops[i] = op
+			created[i] = wasCreated
+			errs[i] = err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var createdCount int
+	var id int64
+	for i := range workers {
+		if errs[i] != nil {
+			t.Fatalf("worker %d: %v", i, errs[i])
+		}
+		if ops[i] == nil {
+			t.Fatalf("worker %d returned nil operation", i)
+		}
+		if created[i] {
+			createdCount++
+		}
+		if id == 0 {
+			id = ops[i].ID
+		} else if ops[i].ID != id {
+			t.Fatalf("worker %d ID = %d, want %d", i, ops[i].ID, id)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created count = %d, want 1", createdCount)
+	}
+	if got := barrier.failedInsertCount(); got != workers-1 {
+		t.Fatalf("failed insert count = %d, want %d unique-conflict retries", got, workers-1)
+	}
+
+	got, err := repos.WalletOperations.GetByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.ID != id || got.Amount != "100" {
+		t.Fatalf("stored operation = %#v, want id %d amount 100", got, id)
+	}
+}
+
+func TestWalletOperationRepo_CreateOrGetConcurrentAmountConflict(t *testing.T) {
+	db := concurrentTestDB(t)
+	repos := repository.NewRepositories(db)
+
+	const workers = 8
+	barrier := newWalletCreateBarrierHook(workers)
+	db.AddQueryHook(barrier)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	ops := make([]*model.WalletOperation, workers)
+	errs := make([]error, workers)
+
+	wg.Add(workers)
+	for i := range workers {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			amount := "100"
+			if i%2 == 1 {
+				amount = "200"
+			}
+			op, _, err := repos.WalletOperations.CreateOrGet(ctx, repository.CreateWalletOperationInput{
+				Type:            model.WalletOperationTypeFund,
+				ClientRequestID: "concurrent-conflict",
+				Amount:          amount,
+			})
+			ops[i] = op
+			errs[i] = err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var successID int64
+	var successAmount string
+	var successCount int
+	var conflictCount int
+	for i := range workers {
+		if errors.Is(errs[i], repository.ErrWalletOperationConflict) {
+			conflictCount++
+			continue
+		}
+		if errs[i] != nil {
+			t.Fatalf("worker %d: unexpected error %v", i, errs[i])
+		}
+		if ops[i] == nil {
+			t.Fatalf("worker %d returned nil operation", i)
+		}
+		successCount++
+		if successID == 0 {
+			successID = ops[i].ID
+			successAmount = ops[i].Amount
+		} else if ops[i].ID != successID {
+			t.Fatalf("worker %d ID = %d, want %d", i, ops[i].ID, successID)
+		} else if ops[i].Amount != successAmount {
+			t.Fatalf("worker %d amount = %q, want %q", i, ops[i].Amount, successAmount)
+		}
+	}
+	if successCount != workers/2 {
+		t.Fatalf("success count = %d, want %d", successCount, workers/2)
+	}
+	if conflictCount != workers/2 {
+		t.Fatalf("conflict count = %d, want %d", conflictCount, workers/2)
+	}
+	if got := barrier.failedInsertCount(); got != workers-1 {
+		t.Fatalf("failed insert count = %d, want %d unique-conflict retries", got, workers-1)
+	}
+
+	got, err := repos.WalletOperations.GetByID(ctx, successID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.Amount != successAmount {
+		t.Fatalf("stored operation = %#v, want amount %q", got, successAmount)
 	}
 }
 

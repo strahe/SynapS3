@@ -3,6 +3,7 @@ package repository_test
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"testing"
 
 	"github.com/strahe/synaps3/internal/db/migrations"
@@ -24,6 +25,31 @@ func testDB(t *testing.T) *bun.DB {
 		t.Fatalf("opening test db: %v", err)
 	}
 	sqldb.SetMaxOpenConns(1)
+
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("running migrations: %v", err)
+	}
+
+	return db
+}
+
+// concurrentTestDB creates a file-backed SQLite DB that allows overlapping connections.
+func concurrentTestDB(t *testing.T) *bun.DB {
+	t.Helper()
+
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "repo.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("opening concurrent test db: %v", err)
+	}
+	sqldb.SetMaxOpenConns(8)
 
 	db := bun.NewDB(sqldb, sqlitedialect.New())
 	t.Cleanup(func() { _ = db.Close() })

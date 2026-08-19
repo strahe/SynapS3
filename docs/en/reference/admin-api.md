@@ -80,7 +80,7 @@ After logout or a `401` API response, the dashboard returns to the login page.
 
 ## Security Headers
 
-Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. The default content policy keeps dashboard resources on the same origin.
+Admin responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin`. The default content policy keeps dashboard resources on the same origin. `/api/`, `/admin/`, `/metrics`, and `/healthz` also send `Cache-Control: no-store`. Dashboard page assets do not.
 
 ## High-Risk Operations
 
