@@ -11,6 +11,7 @@ import {
   minimumDurableCopiesOptions,
   minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
+  persistMinimumDurableCopies,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
@@ -20,11 +21,11 @@ test('bucket copy policy text explains save result and future upload scope', () 
   assert.equal(bucketCopyPolicySavedMessage(), 'Replica policy saved.')
   assert.equal(
     bucketCopyPolicyEffectNote(),
-    'Target replicas apply to new uploads. After the selected replica count is ready, the object is treated as stored and remaining replicas keep syncing. Cache can then be removed only if eviction is enabled.'
+    'New uploads use the Replicas target. Cache can be removed after the Release cache after count is ready, if eviction is enabled. Remaining target replicas keep syncing.'
   )
   assert.equal(
     minimumDurableCopiesChoiceNote(),
-    'Choose All replicas to follow later target changes. A number stays fixed.'
+    'All replicas waits for every target replica of that upload. A number stays fixed if the target changes later.'
   )
   assert.equal(
     minimumDurableCopiesWarning(),
@@ -41,8 +42,9 @@ test('minimum durable copy choices follow the selected runtime or explicit targe
   assert.equal(selectedTargetCopies('4', 3), 4)
   assert.deepEqual(minimumDurableCopiesOptions(3), [1, 2, 3])
   assert.deepEqual(minimumDurableCopiesOptions(null), [])
-  assert.equal(clampMinimumDurableCopiesValue('3', 2), strictMinimumDurableCopiesValue)
+  assert.equal(clampMinimumDurableCopiesValue('3', 2), '2')
   assert.equal(clampMinimumDurableCopiesValue('2', 3), '2')
+  assert.equal(clampMinimumDurableCopiesValue(strictMinimumDurableCopiesValue, 2), strictMinimumDurableCopiesValue)
 })
 
 test('inherited target labels use the current runtime rather than the saved next-start value', () => {
@@ -74,10 +76,7 @@ test('minimum durable copy labels distinguish strict and explicit policies', () 
     minimumDurableCopiesValue({ minimum_durable_copies: null, effective_copies: 3 }),
     strictMinimumDurableCopiesValue
   )
-  assert.equal(
-    minimumDurableCopiesValue({ minimum_durable_copies: 5, effective_copies: 2 }),
-    strictMinimumDurableCopiesValue
-  )
+  assert.equal(minimumDurableCopiesValue({ minimum_durable_copies: 5, effective_copies: 2 }), '2')
   assert.equal(
     minimumDurableCopiesLabel({
       default_copies: null,
@@ -105,4 +104,22 @@ test('minimum durable copy labels distinguish strict and explicit policies', () 
     }),
     '2 of 3 replicas'
   )
+  assert.equal(
+    minimumDurableCopiesLabel({
+      default_copies: null,
+      effective_copies: 2,
+      minimum_durable_copies: 5,
+      effective_minimum_durable_copies: 2,
+    }),
+    '2 of 2 replicas'
+  )
+})
+
+test('persisted minimum keeps an explicit count instead of clearing to all replicas', () => {
+  assert.equal(persistMinimumDurableCopies(strictMinimumDurableCopiesValue, null, 3), undefined)
+  assert.equal(persistMinimumDurableCopies(strictMinimumDurableCopiesValue, 2, 3), null)
+  assert.equal(persistMinimumDurableCopies('2', 2, 3), undefined)
+  assert.equal(persistMinimumDurableCopies('2', 5, 2), 2)
+  assert.equal(persistMinimumDurableCopies('5', 5, 8), undefined)
+  assert.equal(persistMinimumDurableCopies('1', 2, 3), 1)
 })

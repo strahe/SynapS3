@@ -128,6 +128,7 @@ import {
   minimumDurableCopiesOptions,
   minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
+  persistMinimumDurableCopies,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
@@ -2214,18 +2215,24 @@ function BucketDetailsSettings({
     if (bucket.name) setCopyPolicyNotice(null)
   }, [bucket.name])
 
+  const nextMinimumDurableCopies = persistMinimumDurableCopies(
+    minimumDurableCopies,
+    bucket.minimum_durable_copies,
+    targetCopies
+  )
   const copyPolicyChanged =
-    (copyPolicy !== currentCopyPolicy || minimumDurableCopies !== currentMinimumDurableCopies) &&
+    (copyPolicy !== currentCopyPolicy ||
+      minimumDurableCopies !== currentMinimumDurableCopies ||
+      nextMinimumDurableCopies !== undefined) &&
     copyPolicyNotice == null
   const handleCopyPolicyChange = (next: string) => {
     const nextTarget = selectedTargetCopies(next, inheritedTargetCopies)
     setCopyPolicy(next)
     setMinimumDurableCopies((current) => {
       if (
-        current === strictMinimumDurableCopiesValue &&
         bucket.minimum_durable_copies != null &&
-        bucket.minimum_durable_copies > bucket.effective_copies &&
         nextTarget != null &&
+        bucket.minimum_durable_copies > bucket.effective_copies &&
         bucket.minimum_durable_copies <= nextTarget
       ) {
         return bucket.minimum_durable_copies.toString()
@@ -2243,11 +2250,6 @@ function BucketDetailsSettings({
   const saveCopyPolicy = () => {
     setCopyPolicyError(null)
     setCopyPolicyNotice(null)
-    const clearMinimumForTarget =
-      copyPolicy !== currentCopyPolicy &&
-      minimumDurableCopies === strictMinimumDurableCopiesValue &&
-      bucket.minimum_durable_copies != null &&
-      (targetCopies == null || bucket.minimum_durable_copies > targetCopies)
     updateCopyPolicy.mutate(
       {
         name: bucket.name,
@@ -2257,12 +2259,7 @@ function BucketDetailsSettings({
             : copyPolicy === inheritedCopyPolicyValue
               ? null
               : Number(copyPolicy),
-        minimumDurableCopies:
-          minimumDurableCopies === currentMinimumDurableCopies && !clearMinimumForTarget
-            ? undefined
-            : minimumDurableCopies === strictMinimumDurableCopiesValue
-              ? null
-              : Number(minimumDurableCopies),
+        minimumDurableCopies: nextMinimumDurableCopies,
       },
       {
         onSuccess: (savedBucket) => {

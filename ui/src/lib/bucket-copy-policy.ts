@@ -29,17 +29,16 @@ export function bucketCopyPolicySavedMessage() {
 }
 
 export function bucketCopyPolicyEffectNote() {
-  return 'Target replicas apply to new uploads. After the selected replica count is ready, the object is treated as stored and remaining replicas keep syncing. Cache can then be removed only if eviction is enabled.'
+  return 'New uploads use the Replicas target. Cache can be removed after the Release cache after count is ready, if eviction is enabled. Remaining target replicas keep syncing.'
 }
 
 export function minimumDurableCopiesChoiceNote() {
-  return 'Choose All replicas to follow later target changes. A number stays fixed.'
+  return 'All replicas waits for every target replica of that upload. A number stays fixed if the target changes later.'
 }
 
 export function minimumDurableCopiesValue(bucket: Pick<BucketItem, 'minimum_durable_copies' | 'effective_copies'>) {
-  if (bucket.minimum_durable_copies == null || bucket.minimum_durable_copies > bucket.effective_copies) {
-    return strictMinimumDurableCopiesValue
-  }
+  if (bucket.minimum_durable_copies == null) return strictMinimumDurableCopiesValue
+  if (bucket.minimum_durable_copies > bucket.effective_copies) return bucket.effective_copies.toString()
   return bucket.minimum_durable_copies.toString()
 }
 
@@ -65,8 +64,28 @@ export function minimumDurableCopiesOptions(targetCopies: number | null) {
 
 export function clampMinimumDurableCopiesValue(value: string, targetCopies: number | null) {
   if (value === strictMinimumDurableCopiesValue) return value
-  if (targetCopies == null || Number(value) > targetCopies) return strictMinimumDurableCopiesValue
+  if (targetCopies == null) return strictMinimumDurableCopiesValue
+  const copies = Number(value)
+  if (!Number.isInteger(copies) || copies < 1) return strictMinimumDurableCopiesValue
+  if (copies > targetCopies) return targetCopies.toString()
   return value
+}
+
+export function persistMinimumDurableCopies(
+  selected: string,
+  storedMinimum: number | null,
+  targetCopies: number | null
+): number | null | undefined {
+  if (selected === strictMinimumDurableCopiesValue) {
+    return storedMinimum == null ? undefined : null
+  }
+  const selectedNumber = Number(selected)
+  if (!Number.isInteger(selectedNumber) || selectedNumber < 1 || selectedNumber > 8) {
+    return undefined
+  }
+  const next = targetCopies != null && selectedNumber > targetCopies ? targetCopies : selectedNumber
+  if (storedMinimum === next) return undefined
+  return next
 }
 
 export function minimumDurableCopiesWarning() {
