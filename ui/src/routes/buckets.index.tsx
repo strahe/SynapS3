@@ -26,7 +26,6 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useBuckets, useCreateBucket, useS3Users, useSettings, useUpdateBucketOwner } from '@/hooks/queries'
 import {
-  bucketCopyPolicyEffectNote,
   bucketCopyPolicyLabel,
   clampMinimumDurableCopiesValue,
   copyPolicyOptions,
@@ -213,10 +212,11 @@ function CreateBucketDialog() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
+              {minimumDurableCopies === strictMinimumDurableCopiesValue && (
+                <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
+              )}
             </Field>
           </FieldGroup>
-          <p className="text-xs text-muted-foreground">{bucketCopyPolicyEffectNote()}</p>
           {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (
             <Alert>
               <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>

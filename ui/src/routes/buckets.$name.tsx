@@ -114,7 +114,6 @@ import {
   useUpdateBucketOwner,
 } from '@/hooks/queries'
 import {
-  bucketCopyPolicyEffectNote,
   bucketCopyPolicyInheritOptionLabel,
   bucketCopyPolicyLabel,
   bucketCopyPolicySavedMessage,
@@ -2297,10 +2296,6 @@ function BucketDetailsSettings({
       </section>
       <section className="rounded-md border border-border p-4">
         <h3 className="text-sm font-medium">Replica policy</h3>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Target: {bucketCopyPolicyLabel(bucket)} · Release cache: {minimumDurableCopiesLabel(bucket)}
-        </p>
-        <p className="mt-1 text-xs text-muted-foreground">{bucketCopyPolicyEffectNote()}</p>
         <FieldGroup className="mt-3">
           <Field>
             <FieldLabel htmlFor={`bucket-copies-${bucket.id}`}>Replicas</FieldLabel>
@@ -2343,7 +2338,9 @@ function BucketDetailsSettings({
                 </SelectGroup>
               </SelectContent>
             </Select>
-            <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
+            {minimumDurableCopies === strictMinimumDurableCopiesValue && (
+              <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
+            )}
           </Field>
         </FieldGroup>
         {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (

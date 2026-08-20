@@ -60,35 +60,36 @@ func parseReplicaRepairPayload(task *model.Task) (replicaRepairPayload, error) {
 }
 
 func (u *Uploader) ensureReplicaRepairTask(ctx context.Context, binding *model.StorageDataSet, maxRetries int) error {
-	return ensureReplicaRepairTask(ctx, u.repos, binding, maxRetries)
+	_, err := ensureReplicaRepairTask(ctx, u.repos, binding, maxRetries)
+	return err
 }
 
-func ensureReplicaRepairTask(ctx context.Context, repos *repository.Repositories, binding *model.StorageDataSet, maxRetries int) error {
+func ensureReplicaRepairTask(ctx context.Context, repos *repository.Repositories, binding *model.StorageDataSet, maxRetries int) (bool, error) {
 	if binding == nil || binding.ID <= 0 || !dataSetBindingEstablished(binding) {
-		return nil
+		return false, nil
 	}
 	if binding.Status != model.StorageDataSetStatusUnavailable && binding.Status != model.StorageDataSetStatusReady {
-		return nil
+		return false, nil
 	}
 	copyRow, err := repos.Uploads.NextFinalizableCopyForDataSet(ctx, binding.ID)
 	if err != nil {
-		return fmt.Errorf("select replica finalization copy for data set %d: %w", binding.ID, err)
+		return false, fmt.Errorf("select replica finalization copy for data set %d: %w", binding.ID, err)
 	}
 	if copyRow == nil {
 		copyRow, err = repos.Uploads.NextIncompleteCopyForDataSet(ctx, binding.ID)
 		if err != nil {
-			return fmt.Errorf("select replica repair copy for data set %d: %w", binding.ID, err)
+			return false, fmt.Errorf("select replica repair copy for data set %d: %w", binding.ID, err)
 		}
 	}
 	if copyRow == nil {
-		return nil
+		return false, nil
 	}
 	upload, err := repos.Uploads.GetByID(ctx, copyRow.UploadID)
 	if err != nil {
-		return fmt.Errorf("load replica repair upload %d: %w", copyRow.UploadID, err)
+		return false, fmt.Errorf("load replica repair upload %d: %w", copyRow.UploadID, err)
 	}
 	if upload == nil || upload.SourceVersionID == "" {
-		return fmt.Errorf("load replica repair upload %d: %w", copyRow.UploadID, repository.ErrNotFound)
+		return false, fmt.Errorf("load replica repair upload %d: %w", copyRow.UploadID, repository.ErrNotFound)
 	}
 	stage := uploadStageRepairReplica
 	task := &model.Task{
@@ -104,9 +105,9 @@ func ensureReplicaRepairTask(ctx context.Context, repos *repository.Repositories
 		ScheduledAt:    time.Now(),
 	}
 	if _, err := repos.Tasks.EnsureRecurring(ctx, task); err != nil {
-		return fmt.Errorf("ensure replica repair task for data set %d: %w", binding.ID, err)
+		return false, fmt.Errorf("ensure replica repair task for data set %d: %w", binding.ID, err)
 	}
-	return nil
+	return true, nil
 }
 
 func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Task, logger *slog.Logger) {

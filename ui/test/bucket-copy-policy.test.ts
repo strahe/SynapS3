@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  bucketCopyPolicyEffectNote,
   bucketCopyPolicyInheritOptionLabel,
   bucketCopyPolicySavedMessage,
   clampMinimumDurableCopiesValue,
@@ -19,17 +18,10 @@ import {
 
 test('bucket copy policy text explains save result and future upload scope', () => {
   assert.equal(bucketCopyPolicySavedMessage(), 'Replica policy saved.')
-  assert.equal(
-    bucketCopyPolicyEffectNote(),
-    'New uploads use the Replicas target. Cache can be removed after the Release cache after count is ready, if eviction is enabled. Remaining target replicas keep syncing.'
-  )
-  assert.equal(
-    minimumDurableCopiesChoiceNote(),
-    'All replicas waits for every target replica of that upload. A number stays fixed if the target changes later.'
-  )
+  assert.equal(minimumDurableCopiesChoiceNote(), 'Waits for every target replica of that upload.')
   assert.equal(
     minimumDurableCopiesWarning(),
-    'Cache may be removed before every target replica is ready, depending on cache eviction settings. Raising this later cannot restore cache that has already been deleted.'
+    'Cache may be removed before every target replica is ready. Raising this later cannot restore deleted cache.'
   )
   assert.equal(showsMinimumDurableCopiesWarning(strictMinimumDurableCopiesValue, 3), false)
   assert.equal(showsMinimumDurableCopiesWarning('3', 3), false)

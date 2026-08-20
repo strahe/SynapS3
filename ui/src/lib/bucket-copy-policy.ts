@@ -28,12 +28,8 @@ export function bucketCopyPolicySavedMessage() {
   return 'Replica policy saved.'
 }
 
-export function bucketCopyPolicyEffectNote() {
-  return 'New uploads use the Replicas target. Cache can be removed after the Release cache after count is ready, if eviction is enabled. Remaining target replicas keep syncing.'
-}
-
 export function minimumDurableCopiesChoiceNote() {
-  return 'All replicas waits for every target replica of that upload. A number stays fixed if the target changes later.'
+  return 'Waits for every target replica of that upload.'
 }
 
 export function minimumDurableCopiesValue(bucket: Pick<BucketItem, 'minimum_durable_copies' | 'effective_copies'>) {
@@ -89,7 +85,7 @@ export function persistMinimumDurableCopies(
 }
 
 export function minimumDurableCopiesWarning() {
-  return 'Cache may be removed before every target replica is ready, depending on cache eviction settings. Raising this later cannot restore cache that has already been deleted.'
+  return 'Cache may be removed before every target replica is ready. Raising this later cannot restore deleted cache.'
 }
 
 export function showsMinimumDurableCopiesWarning(value: string, targetCopies: number | null) {

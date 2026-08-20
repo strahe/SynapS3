@@ -161,7 +161,7 @@ func (m *Manager) reconcileUnavailableDataSets(ctx context.Context) {
 		}
 		for i := range bindings {
 			binding := &bindings[i]
-			if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+			if _, err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
 				m.logger.Error("failed to ensure unavailable data set repair", "dataSetID", binding.ID, "error", err)
 			}
 			afterID = binding.ID
@@ -370,7 +370,7 @@ func (m *Manager) reconcileIngressUpload(ctx context.Context, version model.Obje
 		return
 	}
 	if binding.Status == model.StorageDataSetStatusUnavailable {
-		if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+		if _, err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
 			m.logger.Error("failed to ensure recovered ingress repair", "dataSetID", binding.ID, "error", err)
 		}
 	}
@@ -458,7 +458,7 @@ func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.
 			continue
 		}
 		if binding != nil && binding.Status == model.StorageDataSetStatusUnavailable {
-			if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+			if _, err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
 				m.logger.Error("failed to ensure recovered peer repair", "dataSetID", binding.ID, "error", err)
 			}
 			continue
