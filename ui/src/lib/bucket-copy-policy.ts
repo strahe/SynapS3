@@ -24,12 +24,20 @@ export function bucketCopyPolicyInheritOptionLabel(bucket: BucketCopyPolicy, run
   return `Inherit current runtime default (${copyCountLabel(copies)})`
 }
 
+export function replicaTargetChoiceNote() {
+  return 'Applies to new uploads. Existing objects keep the replica target they started with.'
+}
+
 export function bucketCopyPolicySavedMessage() {
-  return 'Replica policy saved.'
+  return 'Saved. New uploads use this replica target. Cache can be released after the selected count.'
 }
 
 export function minimumDurableCopiesChoiceNote() {
-  return 'Waits for every target replica of that upload.'
+  return 'Keeps cache until every replica of that upload is stored, including later Replicas increases.'
+}
+
+export function minimumDurableCopiesFixedCountNote() {
+  return 'Keeps this count if Replicas later increases.'
 }
 
 export function minimumDurableCopiesValue(bucket: Pick<BucketItem, 'minimum_durable_copies' | 'effective_copies'>) {
@@ -43,8 +51,12 @@ export function minimumDurableCopiesLabel(bucket: BucketCopyPolicy) {
   return `${bucket.effective_minimum_durable_copies} of ${bucket.effective_copies} ${bucket.effective_copies === 1 ? 'replica' : 'replicas'}`
 }
 
-export function minimumDurableCopiesOptionLabel(copies: number) {
-  return `${copies} ${copies === 1 ? 'replica' : 'replicas'}`
+export function minimumDurableCopiesOptionLabel(copies: number, targetCopies?: number | null) {
+  const count = `${copies} ${copies === 1 ? 'replica' : 'replicas'}`
+  if (targetCopies != null && copies === targetCopies) {
+    return `${count} (fixed count)`
+  }
+  return count
 }
 
 export function selectedTargetCopies(copyPolicy: string, runtimeDefaultCopies?: number) {

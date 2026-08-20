@@ -6,19 +6,36 @@ import {
   bucketCopyPolicySavedMessage,
   clampMinimumDurableCopiesValue,
   minimumDurableCopiesChoiceNote,
+  minimumDurableCopiesFixedCountNote,
   minimumDurableCopiesLabel,
+  minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
   minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
   persistMinimumDurableCopies,
+  replicaTargetChoiceNote,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
 } from '../src/lib/bucket-copy-policy.ts'
 
 test('bucket copy policy text explains save result and future upload scope', () => {
-  assert.equal(bucketCopyPolicySavedMessage(), 'Replica policy saved.')
-  assert.equal(minimumDurableCopiesChoiceNote(), 'Waits for every target replica of that upload.')
+  assert.equal(
+    replicaTargetChoiceNote(),
+    'Applies to new uploads. Existing objects keep the replica target they started with.'
+  )
+  assert.equal(
+    bucketCopyPolicySavedMessage(),
+    'Saved. New uploads use this replica target. Cache can be released after the selected count.'
+  )
+  assert.equal(
+    minimumDurableCopiesChoiceNote(),
+    'Keeps cache until every replica of that upload is stored, including later Replicas increases.'
+  )
+  assert.equal(minimumDurableCopiesFixedCountNote(), 'Keeps this count if Replicas later increases.')
+  assert.equal(minimumDurableCopiesOptionLabel(3), '3 replicas')
+  assert.equal(minimumDurableCopiesOptionLabel(3, 3), '3 replicas (fixed count)')
+  assert.equal(minimumDurableCopiesOptionLabel(2, 3), '2 replicas')
   assert.equal(
     minimumDurableCopiesWarning(),
     'Cache may be removed before every target replica is ready. Raising this later cannot restore deleted cache.'

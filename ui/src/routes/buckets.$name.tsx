@@ -122,12 +122,14 @@ import {
   copyPolicyOptions,
   inheritedCopyPolicyValue,
   minimumDurableCopiesChoiceNote,
+  minimumDurableCopiesFixedCountNote,
   minimumDurableCopiesLabel,
   minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
   minimumDurableCopiesValue,
   minimumDurableCopiesWarning,
   persistMinimumDurableCopies,
+  replicaTargetChoiceNote,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
@@ -2316,6 +2318,7 @@ function BucketDetailsSettings({
                 </SelectGroup>
               </SelectContent>
             </Select>
+            <FieldDescription>{replicaTargetChoiceNote()}</FieldDescription>
           </Field>
           <Field>
             <FieldLabel htmlFor={`bucket-minimum-durable-copies-${bucket.id}`}>Release cache after</FieldLabel>
@@ -2332,14 +2335,16 @@ function BucketDetailsSettings({
                   <SelectItem value={strictMinimumDurableCopiesValue}>All replicas (strict)</SelectItem>
                   {minimumOptions.map((copies) => (
                     <SelectItem key={copies} value={copies.toString()}>
-                      {minimumDurableCopiesOptionLabel(copies)}
+                      {minimumDurableCopiesOptionLabel(copies, targetCopies)}
                     </SelectItem>
                   ))}
                 </SelectGroup>
               </SelectContent>
             </Select>
-            {minimumDurableCopies === strictMinimumDurableCopiesValue && (
+            {minimumDurableCopies === strictMinimumDurableCopiesValue ? (
               <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
+            ) : (
+              <FieldDescription>{minimumDurableCopiesFixedCountNote()}</FieldDescription>
             )}
           </Field>
         </FieldGroup>

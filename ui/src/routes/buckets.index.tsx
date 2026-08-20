@@ -31,10 +31,12 @@ import {
   copyPolicyOptions,
   inheritedCopyPolicyValue,
   minimumDurableCopiesChoiceNote,
+  minimumDurableCopiesFixedCountNote,
   minimumDurableCopiesLabel,
   minimumDurableCopiesOptionLabel,
   minimumDurableCopiesOptions,
   minimumDurableCopiesWarning,
+  replicaTargetChoiceNote,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
   strictMinimumDurableCopiesValue,
@@ -184,11 +186,13 @@ function CreateBucketDialog() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              {copyPolicy === inheritedCopyPolicyValue && runtimeDefaultCopies == null && (
+              {copyPolicy === inheritedCopyPolicyValue && runtimeDefaultCopies == null ? (
                 <FieldDescription>
                   The current runtime default is unavailable. Choose a replica count to configure an explicit
                   cache-release threshold.
                 </FieldDescription>
+              ) : (
+                <FieldDescription>{replicaTargetChoiceNote()}</FieldDescription>
               )}
             </Field>
             <Field>
@@ -206,14 +210,16 @@ function CreateBucketDialog() {
                     <SelectItem value={strictMinimumDurableCopiesValue}>All replicas (strict)</SelectItem>
                     {minimumOptions.map((copies) => (
                       <SelectItem key={copies} value={copies.toString()}>
-                        {minimumDurableCopiesOptionLabel(copies)}
+                        {minimumDurableCopiesOptionLabel(copies, targetCopies)}
                       </SelectItem>
                     ))}
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              {minimumDurableCopies === strictMinimumDurableCopiesValue && (
+              {minimumDurableCopies === strictMinimumDurableCopiesValue ? (
                 <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
+              ) : (
+                <FieldDescription>{minimumDurableCopiesFixedCountNote()}</FieldDescription>
               )}
             </Field>
           </FieldGroup>
