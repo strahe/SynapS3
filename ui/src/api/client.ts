@@ -194,6 +194,8 @@ export interface BucketItem {
   owner_access_key: string | null
   default_copies: number | null
   effective_copies: number
+  minimum_durable_copies: number | null
+  effective_minimum_durable_copies: number
   status: string
   object_count: number
   total_size_bytes: number
@@ -296,6 +298,8 @@ export interface BucketMutationResponse {
   owner_access_key: string | null
   default_copies: number | null
   effective_copies: number
+  minimum_durable_copies: number | null
+  effective_minimum_durable_copies: number
   status: string
 }
 
@@ -852,6 +856,7 @@ export interface SettingsData {
   config_path: string
   writable: boolean
   runtime_available?: boolean
+  runtime_filecoin_default_copies?: number
   restart_required: boolean
   s3_users: SettingsS3UsersStatus
   config: SettingsEditableConfig
@@ -1044,7 +1049,12 @@ export const api = {
   getOverview: () => fetchJSON<OverviewData>('/overview'),
   getBuckets: () => fetchJSON<BucketItem[]>('/buckets'),
   getBucket: (name: string) => fetchJSON<BucketDetail>(`/buckets/${encodeURIComponent(name)}`),
-  createBucket: (payload: { name: string; owner_access_key: string; default_copies?: number | null }) =>
+  createBucket: (payload: {
+    name: string
+    owner_access_key: string
+    default_copies?: number | null
+    minimum_durable_copies?: number | null
+  }) =>
     fetchJSON<BucketMutationResponse>('/buckets', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -1054,10 +1064,13 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ owner_access_key: ownerAccessKey }),
     }),
-  updateBucketCopyPolicy: (name: string, defaultCopies: number | null) =>
+  updateBucketCopyPolicy: (
+    name: string,
+    policy: { default_copies?: number | null; minimum_durable_copies?: number | null }
+  ) =>
     fetchJSON<BucketMutationResponse>(`/buckets/${encodeURIComponent(name)}/copy-policy`, {
       method: 'PUT',
-      body: JSON.stringify({ default_copies: defaultCopies }),
+      body: JSON.stringify(policy),
     }),
   getBucketObjects: (name: string, params: { prefix?: string; delimiter?: string; after?: string; limit?: number }) => {
     const sp = new URLSearchParams()

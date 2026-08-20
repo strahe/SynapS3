@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -203,6 +202,9 @@ func (e *Evictor) processTask(ctx context.Context, task *model.Task) {
 		decision = e.processLRUEviction(ctx, task)
 	case cacheeviction.StageAfterUpload:
 		decision = e.processAfterUploadEviction(ctx, task)
+	case cacheeviction.StageReconcileBucketDurability:
+		e.processBucketDurabilityReconciliation(ctx, task)
+		return
 	default:
 		decision = cancelEviction("Cache eviction task uses an unsupported stage")
 	}
@@ -268,7 +270,7 @@ func (e *Evictor) deferReplicatingEviction(ctx context.Context, task *model.Task
 		ctx,
 		task,
 		model.TaskWaitReasonDependency,
-		"waiting for all copies to commit",
+		"Waiting for enough durable replicas to release the cache",
 		replicatingEvictDeferDelay,
 	); err != nil {
 		logger.Error("failed to defer replicating cache eviction", "error", err)
@@ -277,40 +279,7 @@ func (e *Evictor) deferReplicatingEviction(ctx context.Context, task *model.Task
 		return
 	}
 	admin.WorkerTasksProcessed.WithLabelValues("evictor", "success").Inc()
-	logger.Info("cache eviction deferred until replication completes")
-}
-
-func (e *Evictor) recordDeletedCacheState(
-	ctx context.Context,
-	task *model.Task,
-	version *model.ObjectVersion,
-) error {
-	switch version.State {
-	case model.ObjectStateStored:
-		if err := state.TransitionState(
-			ctx,
-			e.stateMachine,
-			e.repos.Objects,
-			task.RefVersionID,
-			model.ObjectStateStored,
-			model.ObjectStateCacheEvicted,
-		); err != nil {
-			if latest, latestErr := e.repos.Objects.GetVersionByID(ctx, task.RefVersionID); latestErr == nil &&
-				latest != nil &&
-				latest.State == model.ObjectStateCacheEvicted &&
-				!latest.InCache {
-				return nil
-			}
-			return err
-		}
-	case model.ObjectStateCacheEvicted:
-		if err := e.repos.Objects.SetVersionCachePresence(ctx, task.RefVersionID, false); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("object is no longer eligible for cache eviction: state %s", version.State)
-	}
-	return nil
+	logger.Info("cache eviction deferred until durability policy is satisfied")
 }
 
 func (e *Evictor) completeTask(ctx context.Context, task *model.Task, logger *slog.Logger, message string) {

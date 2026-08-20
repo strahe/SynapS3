@@ -469,15 +469,85 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 	}
 	defer u.publishUploadStateChanged(task, version, bucket)
 
-	if version.State == model.ObjectStateStored || version.State == model.ObjectStateCacheEvicted {
-		if !completeWorkerTask(ctx, u.repos, task, "uploader", logger) {
-			return
-		}
-		logger.Info("upload task already satisfied", "state", version.State)
+	if durableObjectState(version.State) {
+		u.processDurableUploadTask(ctx, task, version, bucket, logger)
 		return
 	}
 
 	u.processStagedTask(ctx, task, version, bucket, uploadTaskStage(task), logger)
+}
+
+func durableObjectState(state model.ObjectState) bool {
+	return state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted
+}
+
+func (u *Uploader) processDurableUploadTask(
+	ctx context.Context,
+	task *model.Task,
+	version *model.ObjectVersion,
+	bucket *model.Bucket,
+	logger *slog.Logger,
+) {
+	uploadID, ok := taskUploadID(task)
+	if !ok && version.StorageUploadID != nil {
+		uploadID = *version.StorageUploadID
+		ok = uploadID > 0
+	}
+	if !ok {
+		completeWorkerTask(ctx, u.repos, task, "uploader", logger)
+		return
+	}
+	upload, err := u.repos.Uploads.GetByID(ctx, uploadID)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "load durable upload", err)
+		return
+	}
+	if upload == nil || upload.Status == model.StorageUploadStatusComplete {
+		completeWorkerTask(ctx, u.repos, task, "uploader", logger)
+		return
+	}
+
+	stage := uploadTaskStage(task)
+	if stage == uploadStagePrepare {
+		u.prepareReadableUploadRepair(ctx, task, version, bucket, uploadID, logger)
+		return
+	}
+	uploadID, copyIndex, err := uploadStageIDs(task, true)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "parse durable upload task payload", err)
+		return
+	}
+	binding, err := u.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, copyIndex)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "load durable upload data set", err)
+		return
+	}
+	if binding == nil {
+		u.prepareReadableUploadRepair(ctx, task, version, bucket, uploadID, logger)
+		return
+	}
+	if binding.Status == model.StorageDataSetStatusFailed && !dataSetBindingEstablished(binding) {
+		u.prepareReadableUploadRepair(ctx, task, version, bucket, uploadID, logger)
+		return
+	}
+	if binding.Status == model.StorageDataSetStatusPending || binding.Status == model.StorageDataSetStatusCreating {
+		u.ensureUploadDataSet(ctx, task, version, bucket, uploadID, copyIndex, logger)
+		return
+	}
+	if binding.Status == model.StorageDataSetStatusReady {
+		u.processStagedTask(ctx, task, version, bucket, stage, logger)
+		return
+	}
+	queued, err := ensureReplicaRepairTask(ctx, u.repos, binding, task.MaxRetries)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "handoff durable upload repair", err)
+		return
+	}
+	if !queued {
+		u.waitForStorageDependency(ctx, task, logger, "Waiting for in-place replica recovery")
+		return
+	}
+	completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 }
 
 func (u *Uploader) publishUploadStateChanged(task *model.Task, version *model.ObjectVersion, bucket *model.Bucket) {
@@ -742,7 +812,8 @@ func taskUploadID(task *model.Task) (int64, bool) {
 }
 
 func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, logger *slog.Logger) {
-	if version.State != model.ObjectStateReplicating || version.StorageUploadID == nil || *version.StorageUploadID != uploadID {
+	if (version.State != model.ObjectStateReplicating && !durableObjectState(version.State)) ||
+		version.StorageUploadID == nil || *version.StorageUploadID != uploadID {
 		u.handleTaskFailure(ctx, task, logger, "prepare upload repair", fmt.Errorf("object state %s is not repairable for upload %d", version.State, uploadID))
 		return
 	}
@@ -763,8 +834,8 @@ func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.
 		u.handleTaskFailure(ctx, task, logger, "list readable repair copies", err)
 		return
 	}
-	if len(readableCopies) == 0 {
-		u.handleTaskFailure(ctx, task, logger, "prepare upload repair", errors.New("readable source copy not found"))
+	if len(readableCopies) == 0 && !version.InCache {
+		u.waitForStorageDependency(ctx, task, logger, "Waiting for a readable replica or retained cache data")
 		return
 	}
 	finalized, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
@@ -927,22 +998,39 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 	targetCopies = boundedTargetCopies(targetCopies)
 	selected := make([]model.StorageDataSet, 0, targetCopies)
 	excluded := make([]sdktypes.BigInt, 0, len(bindings))
-	for _, binding := range bindings {
+	inFlight := 0
+	for i := range bindings {
+		binding := bindings[i]
 		existing[binding.CopyIndex] = binding
 		excluded = append(excluded, binding.ProviderID.SDK())
-	}
-	missingIndexes := make([]int, 0, targetCopies)
-	for copyIndex := range targetCopies {
-		if binding, ok := existing[copyIndex]; ok {
-			selected = append(selected, binding)
-		} else {
-			missingIndexes = append(missingIndexes, copyIndex)
+		if dataSetBindingCanOccupyUploadSlot(uploadID, &binding) {
+			if len(selected) < targetCopies {
+				selected = append(selected, binding)
+			}
+			continue
+		}
+		if dataSetBindingInFlightForOtherUpload(uploadID, &binding) {
+			inFlight++
 		}
 	}
-	if len(missingIndexes) == 0 {
+	if len(selected) >= targetCopies {
 		plan := newBucketBindingPlan(selected, uploadID)
 		plan.complete = true
 		return plan, nil
+	}
+	if inFlight > 0 {
+		return newBucketBindingPlan(selected, uploadID), nil
+	}
+	need := targetCopies - len(selected)
+	missingIndexes := make([]int, 0, need)
+	for copyIndex := 0; len(missingIndexes) < need && copyIndex < model.StorageCopiesMax; copyIndex++ {
+		if _, occupied := existing[copyIndex]; occupied {
+			continue
+		}
+		missingIndexes = append(missingIndexes, copyIndex)
+	}
+	if len(missingIndexes) == 0 {
+		return newBucketBindingPlan(selected, uploadID), nil
 	}
 	contexts, err := u.storage.CreateContexts(ctx, &storage.CreateContextsOptions{
 		Copies:             len(missingIndexes),
@@ -1923,6 +2011,18 @@ func (u *Uploader) finishPeerCopy(ctx context.Context, task *model.Task, version
 	if !u.repairReadableBinding(ctx, task, version, uploadID, logger, "repair readable binding") {
 		return
 	}
+	ref := repository.ObjectVersionRef{ObjectID: version.ObjectID, VersionID: version.VersionID}
+	_, needsPreparation, err := u.scheduleRemainingPeerCopies(ctx, ref, version.BucketID, uploadID, task.MaxRetries)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "schedule remaining upload copies", err)
+		return
+	}
+	if needsPreparation {
+		if err := u.enqueueRepairUploadForVersion(ctx, ref, task.MaxRetries, uploadID); err != nil {
+			u.handleTaskFailure(ctx, task, logger, "schedule upload preparation", err)
+			return
+		}
+	}
 	if _, _, err := u.repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, u.finalizeUploadInput(uploadID)); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "finalize upload", err)
 		return
@@ -2739,6 +2839,34 @@ func uploadCanUseDataSetBinding(uploadID int64, binding *model.StorageDataSet) b
 	return binding.CreatedByUploadID != nil &&
 		*binding.CreatedByUploadID == uploadID &&
 		dataSetBindingCanEnsureWrite(binding)
+}
+
+func dataSetBindingCanOccupyUploadSlot(uploadID int64, binding *model.StorageDataSet) bool {
+	if binding == nil {
+		return false
+	}
+	switch binding.Status {
+	case model.StorageDataSetStatusReady:
+		return true
+	case model.StorageDataSetStatusUnavailable:
+		return dataSetBindingEstablished(binding)
+	case model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating, model.StorageDataSetStatusFailed:
+		return uploadCanUseDataSetBinding(uploadID, binding)
+	default:
+		return false
+	}
+}
+
+func dataSetBindingInFlightForOtherUpload(uploadID int64, binding *model.StorageDataSet) bool {
+	if binding == nil || dataSetBindingCanOccupyUploadSlot(uploadID, binding) {
+		return false
+	}
+	switch binding.Status {
+	case model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating:
+		return true
+	default:
+		return false
+	}
 }
 
 func uploadTracksDataSetBinding(uploadID int64, binding *model.StorageDataSet) bool {

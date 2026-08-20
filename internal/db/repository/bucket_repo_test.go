@@ -69,7 +69,7 @@ func TestBucketRepo_GetByID(t *testing.T) {
 	}
 }
 
-func TestBucketRepo_SetDefaultCopies(t *testing.T) {
+func TestBucketRepo_UpdateCopyPolicy(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -80,37 +80,62 @@ func TestBucketRepo_SetDefaultCopies(t *testing.T) {
 	}
 
 	copies := 4
-	if err := repos.Buckets.SetDefaultCopies(ctx, bucket.Name, &copies); err != nil {
-		t.Fatalf("SetDefaultCopies set: %v", err)
+	minimum := 2
+	updated, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetDefaultCopies:        true,
+		DefaultCopies:           &copies,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimum,
+	})
+	if err != nil {
+		t.Fatalf("UpdateCopyPolicy set: %v", err)
+	}
+	if updated == nil || updated.DefaultCopies == nil || *updated.DefaultCopies != copies ||
+		updated.MinimumDurableCopies == nil || *updated.MinimumDurableCopies != minimum {
+		t.Fatalf("UpdateCopyPolicy result = %#v, want target/minimum %d/%d", updated, copies, minimum)
 	}
 	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
 	if err != nil {
 		t.Fatalf("GetByName after set: %v", err)
 	}
-	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies {
-		t.Fatalf("DefaultCopies after set = %#v, want %d", got, copies)
+	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies ||
+		got.MinimumDurableCopies == nil || *got.MinimumDurableCopies != minimum {
+		t.Fatalf("copy policy after set = %#v, want target/minimum %d/%d", got, copies, minimum)
 	}
 
-	if err := repos.Buckets.SetDefaultCopies(ctx, bucket.Name, nil); err != nil {
-		t.Fatalf("SetDefaultCopies clear: %v", err)
+	updated, err = repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateCopyPolicy clear minimum: %v", err)
+	}
+	if updated == nil || updated.DefaultCopies == nil || *updated.DefaultCopies != copies || updated.MinimumDurableCopies != nil {
+		t.Fatalf("UpdateCopyPolicy clear result = %#v, want target %d and strict minimum", updated, copies)
 	}
 	got, err = repos.Buckets.GetByName(ctx, bucket.Name)
 	if err != nil {
 		t.Fatalf("GetByName after clear: %v", err)
 	}
-	if got == nil || got.DefaultCopies != nil {
-		t.Fatalf("DefaultCopies after clear = %#v, want nil", got)
+	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies || got.MinimumDurableCopies != nil {
+		t.Fatalf("copy policy after minimum clear = %#v, want target %d and strict minimum", got, copies)
 	}
 }
 
-func TestBucketRepo_SetDefaultCopiesMissingBucket(t *testing.T) {
+func TestBucketRepo_UpdateCopyPolicyMissingBucket(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
 	copies := 3
-	if err := repos.Buckets.SetDefaultCopies(ctx, "missing-copies-policy", &copies); err == nil {
-		t.Fatal("SetDefaultCopies missing bucket succeeded, want error")
+	updated, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:             "missing-copies-policy",
+		SetDefaultCopies: true,
+		DefaultCopies:    &copies,
+	})
+	if err != nil || updated != nil {
+		t.Fatalf("UpdateCopyPolicy missing bucket = %#v, %v; want nil, nil", updated, err)
 	}
 }
 

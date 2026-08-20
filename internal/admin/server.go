@@ -60,6 +60,7 @@ type Server struct {
 	s3IAM                    auth.IAMService
 	s3RootAccess             string
 	filecoinDefaultCopies    int
+	evictMaxRetries          int
 	storageCleanupMaxRetries int
 	setupOnly                bool
 	logger                   *slog.Logger
@@ -105,6 +106,7 @@ func New(
 		taskDiagnosticChecker:    synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{}),
 		events:                   newAdminEventHub(),
 		filecoinDefaultCopies:    boundedBucketCopies(filecoinDefaultCopies),
+		evictMaxRetries:          5,
 		storageCleanupMaxRetries: 5,
 		logger:                   logger,
 		startedAt:                time.Now(),
@@ -207,6 +209,12 @@ func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 // WithStorageCleanupMaxRetries configures max retries for storage cleanup tasks created by admin actions.
 func (s *Server) WithStorageCleanupMaxRetries(maxRetries int) *Server {
 	s.storageCleanupMaxRetries = maxRetries
+	return s
+}
+
+// WithEvictMaxRetries configures max retries for eviction tasks created by admin actions.
+func (s *Server) WithEvictMaxRetries(maxRetries int) *Server {
+	s.evictMaxRetries = maxRetries
 	return s
 }
 

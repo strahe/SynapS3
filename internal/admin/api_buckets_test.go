@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -734,7 +735,7 @@ func (r *recordingObjectListRepo) list(prefix string, include func(string) bool,
 func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 2, "owner-access")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"admin-create-bucket","owner_access_key":"owner-access","default_copies":4}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(`{"name":"admin-create-bucket","owner_access_key":"owner-access","default_copies":4,"minimum_durable_copies":2}`))
 	req.Header.Set("Content-Type", "application/json")
 	setBucketWriteHeaders(req)
 	rr := httptest.NewRecorder()
@@ -766,12 +767,17 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if bucket.DefaultCopies == nil || *bucket.DefaultCopies != 4 {
 		t.Fatalf("bucket default_copies = %v, want 4", bucket.DefaultCopies)
 	}
+	if bucket.MinimumDurableCopies == nil || *bucket.MinimumDurableCopies != 2 {
+		t.Fatalf("bucket minimum_durable_copies = %v, want 2", bucket.MinimumDurableCopies)
+	}
 
 	var body struct {
 		Name            string  `json:"name"`
 		OwnerAccessKey  *string `json:"owner_access_key"`
 		DefaultCopies   *int    `json:"default_copies"`
 		EffectiveCopies int     `json:"effective_copies"`
+		MinimumCopies   *int    `json:"minimum_durable_copies"`
+		EffectiveMin    int     `json:"effective_minimum_durable_copies"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode response: %v", err)
@@ -781,6 +787,9 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	}
 	if body.DefaultCopies == nil || *body.DefaultCopies != 4 || body.EffectiveCopies != 4 {
 		t.Fatalf("copy policy response = default:%v effective:%d, want 4/4", body.DefaultCopies, body.EffectiveCopies)
+	}
+	if body.MinimumCopies == nil || *body.MinimumCopies != 2 || body.EffectiveMin != 2 {
+		t.Fatalf("minimum copy policy response = minimum:%v effective:%d, want 2/2", body.MinimumCopies, body.EffectiveMin)
 	}
 }
 
@@ -874,6 +883,30 @@ func TestHandleAPIBuckets_CreateBucketRejectsMalformedStrictJSON(t *testing.T) {
 				t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestHandleAPIBuckets_CreateBucketRejectsMinimumAboveTarget(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 3, "owner-access")
+	for _, body := range []string{
+		`{"name":"invalid-explicit-minimum","owner_access_key":"owner-access","default_copies":2,"minimum_durable_copies":3}`,
+		`{"name":"invalid-inherited-minimum","owner_access_key":"owner-access","minimum_durable_copies":4}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		setBucketWriteHeaders(req)
+		rr := httptest.NewRecorder()
+		srv.handleAPICreateBucket(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d body=%s, want bad request", rr.Code, rr.Body.String())
+		}
+	}
+	buckets, err := repos.Buckets.List(context.Background())
+	if err != nil {
+		t.Fatalf("Buckets.List: %v", err)
+	}
+	if len(buckets) != 0 {
+		t.Fatalf("invalid requests created buckets: %#v", buckets)
 	}
 }
 
@@ -2563,6 +2596,119 @@ func TestAPIBucketCopyPolicy_UpdateAndClear(t *testing.T) {
 	}
 }
 
+func TestAPIBucketCopyPolicy_IndependentFieldsValidateFinalPolicyAndUseOneCoordinator(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "independent-copy-policy-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	update := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/independent-copy-policy-bucket/copy-policy", strings.NewReader(body))
+		req.SetPathValue("name", bucket.Name)
+		req.Header.Set("Content-Type", "application/json")
+		setBucketWriteHeaders(req)
+		rr := httptest.NewRecorder()
+		srv.handleAPIUpdateBucketCopyPolicy(rr, req)
+		return rr
+	}
+	assertStored := func(wantTarget, wantMinimum *int) {
+		t.Helper()
+		got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+		if err != nil || got == nil {
+			t.Fatalf("GetByName: bucket=%#v err=%v", got, err)
+		}
+		if !reflect.DeepEqual(got.DefaultCopies, wantTarget) || !reflect.DeepEqual(got.MinimumDurableCopies, wantMinimum) {
+			t.Fatalf("stored policy = target:%v minimum:%v, want target:%v minimum:%v", got.DefaultCopies, got.MinimumDurableCopies, wantTarget, wantMinimum)
+		}
+	}
+
+	targetFour, minimumTwo := 4, 2
+	if rr := update(`{"default_copies":4,"minimum_durable_copies":2}`); rr.Code != http.StatusOK {
+		t.Fatalf("joint update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(&targetFour, &minimumTwo)
+
+	minimumThree := 3
+	if rr := update(`{"minimum_durable_copies":3}`); rr.Code != http.StatusOK {
+		t.Fatalf("minimum-only update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(&targetFour, &minimumThree)
+
+	targetThree := 3
+	if rr := update(`{"default_copies":3}`); rr.Code != http.StatusOK {
+		t.Fatalf("target-only update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(&targetThree, &minimumThree)
+
+	if rr := update(`{"default_copies":2}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid target reduction status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(&targetThree, &minimumThree)
+
+	if rr := update(`{"minimum_durable_copies":null}`); rr.Code != http.StatusOK {
+		t.Fatalf("clear minimum status = %d body=%s", rr.Code, rr.Body.String())
+	} else {
+		var response struct {
+			Minimum     *int `json:"minimum_durable_copies"`
+			Effective   int  `json:"effective_minimum_durable_copies"`
+			Target      *int `json:"default_copies"`
+			TargetValue int  `json:"effective_copies"`
+		}
+		if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+			t.Fatalf("Decode clear minimum response: %v", err)
+		}
+		if response.Minimum != nil || response.Effective != 3 || response.Target == nil || *response.Target != 3 || response.TargetValue != 3 {
+			t.Fatalf("clear minimum response = %#v, want strict 3/3", response)
+		}
+	}
+	assertStored(&targetThree, nil)
+
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeEvictCache), cacheeviction.StageReconcileBucketDurability, "", 10, 0)
+	if err != nil {
+		t.Fatalf("List coordinator tasks: %v", err)
+	}
+	if total != 1 || len(tasks) != 1 || tasks[0].RefType != "bucket" || tasks[0].RefID != bucket.ID {
+		t.Fatalf("coordinator tasks total=%d tasks=%#v, want one bucket task", total, tasks)
+	}
+}
+
+func TestAPIBucketCopyPolicy_EffectiveMinimumClampsWithoutRewritingStoredValue(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 2)
+	minimum := 5
+	bucket := &model.Bucket{
+		Name:                 "clamped-copy-policy-bucket",
+		MinimumDurableCopies: &minimum,
+		Status:               model.BucketStatusActive,
+	}
+	if err := repos.Buckets.Create(context.Background(), bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/clamped-copy-policy-bucket", nil)
+	req.SetPathValue("name", bucket.Name)
+	rr := httptest.NewRecorder()
+	srv.handleAPIGetBucket(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Minimum   *int `json:"minimum_durable_copies"`
+		Effective int  `json:"effective_minimum_durable_copies"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode response: %v", err)
+	}
+	if response.Minimum == nil || *response.Minimum != 5 || response.Effective != 2 {
+		t.Fatalf("minimum response = stored:%v effective:%d, want 5 clamped to 2", response.Minimum, response.Effective)
+	}
+	stored, err := repos.Buckets.GetByName(context.Background(), bucket.Name)
+	if err != nil || stored == nil || stored.MinimumDurableCopies == nil || *stored.MinimumDurableCopies != 5 {
+		t.Fatalf("stored bucket after GET = %#v err=%v, want unchanged minimum 5", stored, err)
+	}
+}
+
 func TestAPIBucketCopyPolicy_RejectsInvalidPayloads(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
@@ -2581,6 +2727,9 @@ func TestAPIBucketCopyPolicy_RejectsInvalidPayloads(t *testing.T) {
 		{name: "fractional copies", body: `{"default_copies":3.5}`},
 		{name: "zero copies", body: `{"default_copies":0}`},
 		{name: "too many copies", body: `{"default_copies":9}`},
+		{name: "zero minimum", body: `{"minimum_durable_copies":0}`},
+		{name: "too many minimum", body: `{"minimum_durable_copies":9}`},
+		{name: "minimum exceeds target", body: `{"default_copies":2,"minimum_durable_copies":3}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/invalid-copy-policy-bucket/copy-policy", strings.NewReader(tc.body))

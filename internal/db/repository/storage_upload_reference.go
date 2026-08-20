@@ -58,6 +58,22 @@ func lockStorageUploadForObjectState(
 	uploadID int64,
 	state model.ObjectState,
 ) (*model.StorageUpload, error) {
+	var bucketID int64
+	if err := db.NewSelect().
+		Model((*model.StorageUpload)(nil)).
+		Column("bucket_id").
+		Where("id = ?", uploadID).
+		Scan(ctx, &bucketID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("loading storage upload %d: %w", uploadID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("loading storage upload %d bucket: %w", uploadID, err)
+	}
+	if bucket, err := lockBucketByID(ctx, db, bucketID); err != nil {
+		return nil, err
+	} else if bucket == nil {
+		return nil, fmt.Errorf("locking storage upload %d bucket: %w", uploadID, ErrNotFound)
+	}
 	uploads, err := lockStorageUploadsByID(ctx, db, []int64{uploadID})
 	if err != nil {
 		return nil, err
@@ -87,7 +103,7 @@ func lockStorageUploadForCopyMutation(ctx context.Context, db bun.IDB, uploadID 
 func storageUploadSupportsObjectState(status model.StorageUploadStatus, state model.ObjectState) bool {
 	switch state {
 	case model.ObjectStateStored, model.ObjectStateCacheEvicted:
-		return status == model.StorageUploadStatusComplete
+		return status == model.StorageUploadStatusReadable || status == model.StorageUploadStatusComplete
 	case model.ObjectStateReplicating:
 		return status != model.StorageUploadStatusRejected && status != model.StorageUploadStatusSuperseded
 	default:
@@ -99,7 +115,10 @@ func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, ve
 	if version == nil || version.StorageUploadID == nil || *version.StorageUploadID <= 0 {
 		return nil
 	}
-	_, err := lockStorageUploadForObjectState(ctx, db, *version.StorageUploadID, version.State)
+	upload, err := lockStorageUploadForObjectState(ctx, db, *version.StorageUploadID, version.State)
+	if err == nil && (version.State == model.ObjectStateStored || version.State == model.ObjectStateCacheEvicted) {
+		err = requireCurrentMinimumDurableCopies(ctx, db, upload)
+	}
 	if err == nil {
 		return nil
 	}

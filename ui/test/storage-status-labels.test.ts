@@ -29,6 +29,9 @@ test('object upload labels describe Filecoin lifecycle in user-facing terms', ()
 
 test('object state labels prefer active upload lifecycle when present', () => {
   assert.equal(objectStateLabel('uploading', 'uploading', 'running', 56), 'Uploading to Filecoin 56%')
+  assert.equal(objectStateLabel('replicating', 'syncing', 'readable'), 'Available, syncing replicas')
+  assert.equal(objectStateLabel('stored', 'syncing', 'readable'), 'Available, syncing remaining replicas')
+  assert.equal(objectStateLabel('cache_evicted', 'syncing', 'readable'), 'Available, syncing remaining replicas')
   assert.equal(objectStateLabel('stored', 'success'), 'Stored')
 })
 
@@ -39,6 +42,7 @@ test('task labels use product-facing task and operation names', () => {
   assert.equal(taskOperationOptionLabel('ensure_dataset'), 'Prepare replica target')
   assert.equal(taskOperationOptionLabel('peer_pull'), 'Sync peer replica')
   assert.equal(taskOperationOptionLabel('repair_replica'), 'Resume replica upload')
+  assert.equal(taskOperationLabel({ type: 'evict_cache', stage: 'reconcile_bucket_durability' }), 'Apply cache policy')
   assert.equal(taskOperationLabel({ type: 'evict_cache' }), 'Evict local cache')
   assert.equal(taskOperationLabel({ type: 'storage_cleanup' }), 'Delete remote replicas')
   assert.equal(taskOperationLabel({ type: 'upload', stage: '' }), 'Upload object')

@@ -139,13 +139,23 @@ func TestSettingsGETReportsRuntimeObservability(t *testing.T) {
 	}
 
 	runtimeSrv := &Server{
-		addr:     "127.0.0.1:9090",
-		settings: setupSrv.settings,
-		logger:   testLogger(),
+		addr:                  "127.0.0.1:9090",
+		settings:              setupSrv.settings,
+		filecoinDefaultCopies: 4,
+		logger:                testLogger(),
 	}
 	runtimeResp := getSettingsResponse(t, runtimeSrv)
 	if !runtimeResp.RuntimeAvailable {
 		t.Fatalf("runtime runtime_available = false, want true")
+	}
+	if setupResp.RuntimeFilecoinDefaultCopies != nil {
+		t.Fatalf("setup runtime copies = %v, want unavailable", setupResp.RuntimeFilecoinDefaultCopies)
+	}
+	if runtimeResp.RuntimeFilecoinDefaultCopies == nil || *runtimeResp.RuntimeFilecoinDefaultCopies != 4 {
+		t.Fatalf("runtime copies = %v, want current process value 4", runtimeResp.RuntimeFilecoinDefaultCopies)
+	}
+	if runtimeResp.Config.Filecoin.DefaultCopies == 4 {
+		t.Fatal("saved next-start value unexpectedly matches injected runtime value; test no longer proves the distinction")
 	}
 }
 

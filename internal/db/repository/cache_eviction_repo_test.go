@@ -2,13 +2,225 @@ package repository_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/uptrace/bun"
 )
+
+func TestCacheEvictionRepo_DurabilityAuthorizationUsesCommitOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		raiseBeforePromote bool
+		wantAuthorized     bool
+	}{
+		{name: "policy_raise_first_blocks_deletion", raiseBeforePromote: true},
+		{name: "authorization_first_survives_policy_raise", wantAuthorized: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			bucket, version, upload := seedMinimumDurabilityCandidate(t, repos, db, tc.name)
+
+			if _, err := repos.CacheEvictions.EnsureBucketDurabilityReconciliation(ctx, bucket.ID, 4); err != nil {
+				t.Fatalf("EnsureBucketDurabilityReconciliation: %v", err)
+			}
+			task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
+			if err != nil || task == nil {
+				t.Fatalf("ClaimReady: task=%#v err=%v", task, err)
+			}
+			candidate, err := repos.CacheEvictions.NextBucketDurabilityCandidate(ctx, bucket.ID)
+			if err != nil || candidate == nil || candidate.VersionID != version.VersionID {
+				t.Fatalf("NextBucketDurabilityCandidate: candidate=%#v err=%v", candidate, err)
+			}
+
+			minimumThree := 3
+			if tc.raiseBeforePromote {
+				if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+					Name:                    bucket.Name,
+					SetMinimumDurableCopies: true,
+					MinimumDurableCopies:    &minimumThree,
+				}); err != nil {
+					t.Fatalf("raise minimum before authorization: %v", err)
+				}
+			}
+
+			deletion, err := repos.CacheEvictions.PromoteBucketDurabilityCandidate(ctx, task, version.VersionID, true)
+			if !tc.wantAuthorized {
+				if !errors.Is(err, cacheeviction.ErrDurabilityThreshold) || deletion != nil {
+					t.Fatalf("promotion after policy raise = deletion:%#v err:%v, want durability threshold", deletion, err)
+				}
+				got, getErr := repos.Objects.GetVersionByID(ctx, version.VersionID)
+				if getErr != nil || got == nil || got.State != model.ObjectStateReplicating || !got.InCache {
+					t.Fatalf("blocked candidate = %#v err=%v, want replicating in cache", got, getErr)
+				}
+				return
+			}
+			if err != nil || deletion == nil {
+				t.Fatalf("PromoteBucketDurabilityCandidate: deletion=%#v err=%v", deletion, err)
+			}
+			authorized, err := cacheeviction.DeleteAuthorized(task)
+			if err != nil || !authorized || task.RefVersionID != version.VersionID {
+				t.Fatalf("task authorization = %t ref=%q err=%v", authorized, task.RefVersionID, err)
+			}
+			if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+				Name:                    bucket.Name,
+				SetMinimumDurableCopies: true,
+				MinimumDurableCopies:    &minimumThree,
+			}); err != nil {
+				t.Fatalf("raise minimum after authorization: %v", err)
+			}
+			if err := repos.CacheEvictions.RecordAuthorizedDeletion(ctx, task); err != nil {
+				t.Fatalf("RecordAuthorizedDeletion: %v", err)
+			}
+			got, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+			if err != nil || got == nil || got.State != model.ObjectStateCacheEvicted || got.InCache {
+				t.Fatalf("authorized candidate = %#v err=%v, want cache evicted", got, err)
+			}
+			if task.RefVersionID != "" {
+				t.Fatalf("coordinator ref after deletion = %q, want cleared", task.RefVersionID)
+			}
+			completed, err := repos.CacheEvictions.CompleteBucketDurabilityReconciliation(ctx, task)
+			if err != nil || !completed {
+				t.Fatalf("CompleteBucketDurabilityReconciliation = %t err=%v", completed, err)
+			}
+			gotUpload, err := repos.Uploads.GetByID(ctx, upload.ID)
+			if err != nil || gotUpload == nil || gotUpload.Status != model.StorageUploadStatusReadable {
+				t.Fatalf("upload after cache deletion = %#v err=%v, want readable for repair", gotUpload, err)
+			}
+		})
+	}
+}
+
+func TestCacheEvictionRepo_RequeuesTerminalCoordinatorWithoutLosingAuthorization(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket, version, _ := seedMinimumDurabilityCandidate(t, repos, db, "preserve-authorization")
+	if _, err := repos.CacheEvictions.EnsureBucketDurabilityReconciliation(ctx, bucket.ID, 4); err != nil {
+		t.Fatalf("EnsureBucketDurabilityReconciliation: %v", err)
+	}
+	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
+	if err != nil || task == nil {
+		t.Fatalf("ClaimReady: task=%#v err=%v", task, err)
+	}
+	if _, err := repos.CacheEvictions.PromoteBucketDurabilityCandidate(ctx, task, version.VersionID, true); err != nil {
+		t.Fatalf("PromoteBucketDurabilityCandidate: %v", err)
+	}
+	if err := repos.Tasks.FailRunning(ctx, task, "injected cache failure"); err != nil {
+		t.Fatalf("FailRunning: %v", err)
+	}
+	activated, err := repos.CacheEvictions.EnsureBucketDurabilityReconciliation(ctx, bucket.ID, 7)
+	if err != nil || !activated {
+		t.Fatalf("requeue terminal coordinator = %t err=%v", activated, err)
+	}
+	got, err := repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID: task=%#v err=%v", got, err)
+	}
+	authorized, err := cacheeviction.DeleteAuthorized(got)
+	if err != nil || !authorized || got.RefVersionID != version.VersionID || got.Status != model.TaskStatusQueued || got.MaxRetries != 7 {
+		t.Fatalf("requeued coordinator = %#v authorized=%t err=%v", got, authorized, err)
+	}
+}
+
+func TestCacheEvictionRepo_BucketDurabilityCoordinatorPreservesZeroRetries(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "durability-zero-retries")
+
+	created, err := repos.CacheEvictions.EnsureBucketDurabilityReconciliation(ctx, bucket.ID, 0)
+	if err != nil || !created {
+		t.Fatalf("EnsureBucketDurabilityReconciliation = %t err=%v", created, err)
+	}
+	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeEvictCache), cacheeviction.StageReconcileBucketDurability, "", 10, 0)
+	if err != nil || total != 1 || len(tasks) != 1 {
+		t.Fatalf("coordinator tasks total=%d tasks=%#v err=%v", total, tasks, err)
+	}
+	if tasks[0].MaxRetries != 0 {
+		t.Fatalf("coordinator max retries = %d, want 0", tasks[0].MaxRetries)
+	}
+}
+
+func TestCacheEvictionRepo_ClearsCoordinatorAuthorizationWhenVersionWasDeleted(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket, version, _ := seedMinimumDurabilityCandidate(t, repos, db, "deleted-authorized-version")
+	if _, err := repos.CacheEvictions.EnsureBucketDurabilityReconciliation(ctx, bucket.ID, 4); err != nil {
+		t.Fatalf("EnsureBucketDurabilityReconciliation: %v", err)
+	}
+	task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
+	if err != nil || task == nil {
+		t.Fatalf("ClaimReady: task=%#v err=%v", task, err)
+	}
+	if _, err := repos.CacheEvictions.PromoteBucketDurabilityCandidate(ctx, task, version.VersionID, true); err != nil {
+		t.Fatalf("PromoteBucketDurabilityCandidate: %v", err)
+	}
+	if _, err := db.NewDelete().Model((*model.ObjectVersion)(nil)).Where("version_id = ?", version.VersionID).Exec(ctx); err != nil {
+		t.Fatalf("delete authorized version: %v", err)
+	}
+	if err := repos.CacheEvictions.RecordAuthorizedDeletion(ctx, task); err != nil {
+		t.Fatalf("RecordAuthorizedDeletion missing version: %v", err)
+	}
+	if task.RefVersionID != "" || task.Payload != nil {
+		t.Fatalf("cleared coordinator authorization = ref:%q payload:%#v", task.RefVersionID, task.Payload)
+	}
+	completed, err := repos.CacheEvictions.CompleteBucketDurabilityReconciliation(ctx, task)
+	if err != nil || !completed {
+		t.Fatalf("CompleteBucketDurabilityReconciliation = %t err=%v", completed, err)
+	}
+}
+
+func TestCacheEvictionRepo_LRUCandidateRequiresCurrentMinimumDurability(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket, version, upload := seedMinimumDurabilityCandidate(t, repos, db, "lru-minimum")
+
+	if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateReplicating, model.ObjectStateStored); err != nil {
+		t.Fatalf("mark stored: %v", err)
+	}
+	if err := repos.Objects.RecordVersionCacheCommit(ctx, version.VersionID, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("RecordVersionCacheCommit: %v", err)
+	}
+	if _, err := db.NewDelete().
+		Model((*model.StorageUploadCopy)(nil)).
+		Where("upload_id = ? AND copy_index = ?", upload.ID, 1).
+		Exec(ctx); err != nil {
+		t.Fatalf("remove second readable copy: %v", err)
+	}
+
+	candidates, err := repos.CacheEvictions.ListLRUCandidates(ctx, time.Now().Add(-time.Hour), 10)
+	if err != nil {
+		t.Fatalf("ListLRUCandidates below minimum: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("candidates below minimum = %#v, want none", candidates)
+	}
+
+	minimumOne := 1
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimumOne,
+	}); err != nil {
+		t.Fatalf("lower minimum: %v", err)
+	}
+	candidates, err = repos.CacheEvictions.ListLRUCandidates(ctx, time.Now().Add(-time.Hour), 10)
+	if err != nil {
+		t.Fatalf("ListLRUCandidates at minimum: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].VersionID != version.VersionID {
+		t.Fatalf("candidates at minimum = %#v, want %s", candidates, version.VersionID)
+	}
+}
 
 func TestCacheEvictionRepo_EnsureAfterUploadOnlyRequeuesCancelledTask(t *testing.T) {
 	db := testDB(t)
@@ -185,6 +397,7 @@ func TestCacheEvictionRepo_CancelActiveTasksExceptPreservesMatchingStageAndTermi
 	ctx := context.Background()
 	lruStage := cacheeviction.StageLRU
 	afterUploadStage := cacheeviction.StageAfterUpload
+	reconcileStage := cacheeviction.StageReconcileBucketDurability
 	tasks := []*model.Task{
 		{
 			Type:           model.TaskTypeEvictCache,
@@ -217,6 +430,23 @@ func TestCacheEvictionRepo_CancelActiveTasksExceptPreservesMatchingStageAndTermi
 			IdempotencyKey: "cancel-stage-terminal",
 			Status:         model.TaskStatusFailed,
 		},
+		{
+			Type:           model.TaskTypeEvictCache,
+			Stage:          &reconcileStage,
+			RefType:        "bucket",
+			RefID:          9,
+			IdempotencyKey: "cancel-stage-durability-coordinator",
+			Status:         model.TaskStatusQueued,
+		},
+		{
+			Type:           model.TaskTypeEvictCache,
+			Stage:          &afterUploadStage,
+			RefType:        "object",
+			RefVersionID:   "01J0000000000000000000CS05",
+			IdempotencyKey: "cancel-stage-authorized-after-upload",
+			Payload:        cacheeviction.WithDeleteAuthorization(nil),
+			Status:         model.TaskStatusQueued,
+		},
 	}
 	for _, task := range tasks {
 		if err := repos.Tasks.Create(ctx, task); err != nil {
@@ -236,6 +466,8 @@ func TestCacheEvictionRepo_CancelActiveTasksExceptPreservesMatchingStageAndTermi
 		model.TaskStatusCancelled,
 		model.TaskStatusCancelled,
 		model.TaskStatusFailed,
+		model.TaskStatusQueued,
+		model.TaskStatusQueued,
 	}
 	for index, task := range tasks {
 		got, err := repos.Tasks.GetByID(ctx, task.ID)
@@ -246,6 +478,35 @@ func TestCacheEvictionRepo_CancelActiveTasksExceptPreservesMatchingStageAndTermi
 			t.Fatalf("task %s status = %s, want %s", task.IdempotencyKey, got.Status, wantStatuses[index])
 		}
 	}
+}
+
+func seedMinimumDurabilityCandidate(
+	t *testing.T,
+	repos *repository.Repositories,
+	db *bun.DB,
+	suffix string,
+) (*model.Bucket, *model.ObjectVersion, *model.StorageUpload) {
+	t.Helper()
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "durability-candidate-"+suffix)
+	minimum := 2
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimum,
+	}); err != nil {
+		t.Fatalf("UpdateCopyPolicy: %v", err)
+	}
+	version := newObjectVersion(bucket.ID, "candidate.txt", model.NewVersionID(), 10)
+	version.Checksum = "durability-candidate-" + suffix
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 3)
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "1001", "2001", "https://one.example/piece")
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 1, "202", "2002", "2002", "https://two.example/piece")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
+	return bucket, version, upload
 }
 
 func TestCacheEvictionRepo_ListLRUCandidatesOrdersSafeCurrentAndHistoricalVersions(t *testing.T) {

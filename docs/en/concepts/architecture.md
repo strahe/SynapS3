@@ -36,7 +36,7 @@ The key boundary is between the S3 response and Filecoin upload. When a write is
 
 - Confirmed S3 writes must survive async upload failures.
 - Object visibility and object storage progress are tracked separately.
-- Cache eviction only happens after the configured remote-copy policy is satisfied.
+- Cache eviction only happens after the bucket's cache-release threshold is met. By default that threshold is each upload's frozen replica target.
 - SynapS3 uses a single-node design and does not assume distributed coordination.
 
 ## What This Means for Operators

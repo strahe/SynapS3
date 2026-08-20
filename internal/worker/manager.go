@@ -120,6 +120,7 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 	// Reconcile unfinished upload work.
 	m.reconcileTasks(ctx, model.ObjectStateCached, model.TaskTypeUpload, "upload")
 	m.reconcileStagedUploads(ctx)
+	m.reconcileIncompleteReadableUploads(ctx)
 	m.reconcileUnavailableDataSets(ctx)
 
 	// Log exhausted task count for operator awareness
@@ -128,6 +129,25 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Error("failed to check exhausted tasks", "error", err)
 	} else if len(exhaustedTasks) > 0 {
 		m.logger.Warn("exhausted tasks found on startup, review via GET /admin/exhausted-tasks", "count", len(exhaustedTasks))
+	}
+}
+
+func (m *Manager) reconcileIncompleteReadableUploads(ctx context.Context) {
+	afterID := int64(0)
+	for {
+		items, err := m.repos.Uploads.ListIncompleteReadableUploads(ctx, afterID, reconcileBatchSize)
+		if err != nil {
+			m.logger.Error("failed to list incomplete readable uploads for recovery", "error", err)
+			return
+		}
+		for i := range items {
+			item := &items[i]
+			m.enqueueRecoveredUploadRepair(ctx, item.Version, item.Upload.ID)
+			afterID = item.Upload.ID
+		}
+		if len(items) < reconcileBatchSize {
+			return
+		}
 	}
 }
 
@@ -141,7 +161,7 @@ func (m *Manager) reconcileUnavailableDataSets(ctx context.Context) {
 		}
 		for i := range bindings {
 			binding := &bindings[i]
-			if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+			if _, err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
 				m.logger.Error("failed to ensure unavailable data set repair", "dataSetID", binding.ID, "error", err)
 			}
 			afterID = binding.ID
@@ -350,7 +370,7 @@ func (m *Manager) reconcileIngressUpload(ctx context.Context, version model.Obje
 		return
 	}
 	if binding.Status == model.StorageDataSetStatusUnavailable {
-		if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+		if _, err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
 			m.logger.Error("failed to ensure recovered ingress repair", "dataSetID", binding.ID, "error", err)
 		}
 	}
@@ -438,7 +458,7 @@ func (m *Manager) reconcileReplicatingUpload(ctx context.Context, version model.
 			continue
 		}
 		if binding != nil && binding.Status == model.StorageDataSetStatusUnavailable {
-			if err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
+			if _, err := ensureReplicaRepairTask(ctx, m.repos, binding, m.uploadMaxRetries); err != nil {
 				m.logger.Error("failed to ensure recovered peer repair", "dataSetID", binding.ID, "error", err)
 			}
 			continue
@@ -506,7 +526,7 @@ func (m *Manager) enqueueRecoveredUploadRepair(ctx context.Context, version mode
 		MaxRetries:     m.uploadMaxRetries,
 		ScheduledAt:    time.Now(),
 	}
-	if err := m.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+	if _, err := m.repos.Tasks.EnsureRecurring(ctx, task); err != nil {
 		m.logger.Error("failed to enqueue recovered upload repair", "uploadID", uploadID, "versionID", version.VersionID, "error", err)
 	}
 }

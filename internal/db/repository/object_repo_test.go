@@ -800,6 +800,65 @@ func TestObjectRepo_SetVersionStorageUploadAndTransitionUsesNewUpload(t *testing
 	}
 }
 
+func TestObjectRepo_NewStoredReferenceRechecksCurrentMinimumDurability(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "reuse-current-minimum-bucket")
+	minimumOne := 1
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimumOne,
+	}); err != nil {
+		t.Fatalf("set minimum one: %v", err)
+	}
+
+	source := newObjectVersion(bucket.ID, "source.txt", model.NewVersionID(), 10)
+	source.Checksum = "reuse-current-minimum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, source.VersionID, source.Size, source.Checksum, 2)
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "1001", "2001", "https://one.example/piece")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, source)
+	if complete, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil || complete {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet = complete:%t err:%v, want stored before target", complete, err)
+	}
+	reusable, err := repos.Objects.FindReusableStoredVersion(ctx, bucket.ID, source.Size, source.Checksum)
+	if err != nil {
+		t.Fatalf("FindReusableStoredVersion before raising minimum: %v", err)
+	}
+	if reusable == nil || reusable.VersionID != source.VersionID {
+		t.Fatalf("reusable readable upload version = %#v, want %s", reusable, source.VersionID)
+	}
+
+	minimumTwo := 2
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:                    bucket.Name,
+		SetMinimumDurableCopies: true,
+		MinimumDurableCopies:    &minimumTwo,
+	}); err != nil {
+		t.Fatalf("raise minimum: %v", err)
+	}
+	follower := newObjectVersion(bucket.ID, "follower.txt", model.NewVersionID(), source.Size)
+	follower.Checksum = source.Checksum
+	follower.State = model.ObjectStateStored
+	follower.InCache = true
+	follower.StorageUploadID = &upload.ID
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, follower); err != nil {
+		t.Fatalf("create follower: %v", err)
+	}
+
+	got, err := repos.Objects.GetVersionByID(ctx, follower.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("get follower: version=%#v err=%v", got, err)
+	}
+	if got.State != model.ObjectStateCached || got.StorageUploadID != nil || !got.InCache {
+		t.Fatalf("follower below current minimum = %#v, want retained cache without reused upload", got)
+	}
+}
+
 func TestObjectRepo_FindReusableActiveUploadVersionRequiresActiveTask(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

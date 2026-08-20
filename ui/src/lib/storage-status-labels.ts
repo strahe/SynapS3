@@ -11,6 +11,7 @@ export const taskStageOptions = [
   'peer_pull',
   'peer_commit',
   'repair_replica',
+  'reconcile_bucket_durability',
 ] as const
 
 export type TaskStageOption = (typeof taskStageOptions)[number]
@@ -23,6 +24,7 @@ const taskStageLabels: Record<Exclude<TaskStageOption, 'all'> | '', string> = {
   peer_pull: 'Sync peer replica',
   peer_commit: 'Register peer replica on-chain',
   repair_replica: 'Resume replica upload',
+  reconcile_bucket_durability: 'Apply cache policy',
   '': 'Upload',
 }
 
@@ -173,6 +175,9 @@ export function objectStateLabel(
   uploadStatus?: ObjectUploadStatus,
   progressPercent: number | null = null
 ) {
+  if (uploadStatus === 'readable' && (state === 'stored' || state === 'cache_evicted')) {
+    return 'Available, syncing remaining replicas'
+  }
   if (uploadStatus) return uploadStatusLabel(uploadStatus, progressPercent)
   switch (state) {
     case 'cached':

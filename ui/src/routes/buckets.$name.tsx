@@ -109,17 +109,30 @@ import {
   useRestoreBucketObject,
   useRestoreBucketObjectVersion,
   useS3Users,
+  useSettings,
   useUpdateBucketCopyPolicy,
   useUpdateBucketOwner,
 } from '@/hooks/queries'
 import {
-  bucketCopyPolicyEffectNote,
   bucketCopyPolicyInheritOptionLabel,
   bucketCopyPolicyLabel,
   bucketCopyPolicySavedMessage,
   bucketCopyPolicyValue,
+  clampMinimumDurableCopiesValue,
   copyPolicyOptions,
   inheritedCopyPolicyValue,
+  minimumDurableCopiesChoiceNote,
+  minimumDurableCopiesFixedCountNote,
+  minimumDurableCopiesLabel,
+  minimumDurableCopiesOptionLabel,
+  minimumDurableCopiesOptions,
+  minimumDurableCopiesValue,
+  minimumDurableCopiesWarning,
+  persistMinimumDurableCopies,
+  replicaTargetChoiceNote,
+  selectedTargetCopies,
+  showsMinimumDurableCopiesWarning,
+  strictMinimumDurableCopiesValue,
 } from '@/lib/bucket-copy-policy'
 import { type BucketRouteSearch, normalizeBucketRouteSearch } from '@/lib/bucket-route-search'
 import {
@@ -1836,6 +1849,7 @@ function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<type
       <BucketDetailField label="Objects" value={formatObjectCount(bucket.object_count)} />
       <BucketDetailField label="Total size" value={formatBytes(bucket.total_size_bytes)} />
       <BucketDetailField label="Replicas" value={bucketCopyPolicyLabel(bucket)} />
+      <BucketDetailField label="Release cache after" value={minimumDurableCopiesLabel(bucket)} />
       <BucketDetailField label="Versioning" value={bucket.versioning_status} />
       <BucketDetailField
         label="Owner"
@@ -2179,23 +2193,58 @@ function BucketDetailsSettings({
   onChangeOwner: () => void
 }) {
   const updateCopyPolicy = useUpdateBucketCopyPolicy()
+  const { data: settings } = useSettings()
   const currentCopyPolicy = bucketCopyPolicyValue(bucket)
+  const currentMinimumDurableCopies = minimumDurableCopiesValue(bucket)
   const [copyPolicy, setCopyPolicy] = useState(currentCopyPolicy)
+  const [minimumDurableCopies, setMinimumDurableCopies] = useState(currentMinimumDurableCopies)
   const [copyPolicyError, setCopyPolicyError] = useState<string | null>(null)
   const [copyPolicyNotice, setCopyPolicyNotice] = useState<string | null>(null)
+  const runtimeDefaultCopies = settings?.runtime_filecoin_default_copies
+  const inheritedTargetCopies =
+    currentCopyPolicy === inheritedCopyPolicyValue ? bucket.effective_copies : runtimeDefaultCopies
+  const targetCopies = selectedTargetCopies(copyPolicy, inheritedTargetCopies)
+  const minimumOptions = minimumDurableCopiesOptions(targetCopies)
 
   useEffect(() => {
     setCopyPolicy(currentCopyPolicy)
+    setMinimumDurableCopies(currentMinimumDurableCopies)
     setCopyPolicyError(null)
-  }, [currentCopyPolicy])
+  }, [currentCopyPolicy, currentMinimumDurableCopies])
 
   useEffect(() => {
     if (bucket.name) setCopyPolicyNotice(null)
   }, [bucket.name])
 
-  const copyPolicyChanged = copyPolicy !== currentCopyPolicy && copyPolicyNotice == null
+  const nextMinimumDurableCopies = persistMinimumDurableCopies(
+    minimumDurableCopies,
+    bucket.minimum_durable_copies,
+    targetCopies
+  )
+  const copyPolicyChanged =
+    (copyPolicy !== currentCopyPolicy ||
+      minimumDurableCopies !== currentMinimumDurableCopies ||
+      nextMinimumDurableCopies !== undefined) &&
+    copyPolicyNotice == null
   const handleCopyPolicyChange = (next: string) => {
+    const nextTarget = selectedTargetCopies(next, inheritedTargetCopies)
     setCopyPolicy(next)
+    setMinimumDurableCopies((current) => {
+      if (
+        bucket.minimum_durable_copies != null &&
+        nextTarget != null &&
+        bucket.minimum_durable_copies > bucket.effective_copies &&
+        bucket.minimum_durable_copies <= nextTarget
+      ) {
+        return bucket.minimum_durable_copies.toString()
+      }
+      return clampMinimumDurableCopiesValue(current, nextTarget)
+    })
+    setCopyPolicyError(null)
+    setCopyPolicyNotice(null)
+  }
+  const handleMinimumDurableCopiesChange = (next: string) => {
+    setMinimumDurableCopies(next)
     setCopyPolicyError(null)
     setCopyPolicyNotice(null)
   }
@@ -2205,11 +2254,18 @@ function BucketDetailsSettings({
     updateCopyPolicy.mutate(
       {
         name: bucket.name,
-        defaultCopies: copyPolicy === inheritedCopyPolicyValue ? null : Number(copyPolicy),
+        defaultCopies:
+          copyPolicy === currentCopyPolicy
+            ? undefined
+            : copyPolicy === inheritedCopyPolicyValue
+              ? null
+              : Number(copyPolicy),
+        minimumDurableCopies: nextMinimumDurableCopies,
       },
       {
         onSuccess: (savedBucket) => {
           setCopyPolicy(bucketCopyPolicyValue(savedBucket))
+          setMinimumDurableCopies(minimumDurableCopiesValue(savedBucket))
           setCopyPolicyNotice(bucketCopyPolicySavedMessage())
         },
         onError: (mutationError) => {
@@ -2241,25 +2297,63 @@ function BucketDetailsSettings({
         </Button>
       </section>
       <section className="rounded-md border border-border p-4">
-        <h3 className="text-sm font-medium">Replicas</h3>
-        <p className="mt-1 text-sm text-muted-foreground">{bucketCopyPolicyLabel(bucket)}</p>
-        <p className="mt-1 text-xs text-muted-foreground">{bucketCopyPolicyEffectNote()}</p>
-        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
-          <Select value={copyPolicy} onValueChange={handleCopyPolicyChange} disabled={updateCopyPolicy.isPending}>
-            <SelectTrigger className="w-full sm:w-56">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                <SelectItem value={inheritedCopyPolicyValue}>{bucketCopyPolicyInheritOptionLabel(bucket)}</SelectItem>
-                {copyPolicyOptions.map((copies) => (
-                  <SelectItem key={copies} value={copies.toString()}>
-                    {copies} {copies === 1 ? 'copy' : 'copies'}
+        <h3 className="text-sm font-medium">Replica policy</h3>
+        <FieldGroup className="mt-3">
+          <Field>
+            <FieldLabel htmlFor={`bucket-copies-${bucket.id}`}>Replicas</FieldLabel>
+            <Select value={copyPolicy} onValueChange={handleCopyPolicyChange} disabled={updateCopyPolicy.isPending}>
+              <SelectTrigger id={`bucket-copies-${bucket.id}`} className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value={inheritedCopyPolicyValue}>
+                    {bucketCopyPolicyInheritOptionLabel(bucket, runtimeDefaultCopies)}
                   </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
+                  {copyPolicyOptions.map((copies) => (
+                    <SelectItem key={copies} value={copies.toString()}>
+                      {copies} {copies === 1 ? 'copy' : 'copies'}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <FieldDescription>{replicaTargetChoiceNote()}</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor={`bucket-minimum-durable-copies-${bucket.id}`}>Release cache after</FieldLabel>
+            <Select
+              value={minimumDurableCopies}
+              onValueChange={handleMinimumDurableCopiesChange}
+              disabled={updateCopyPolicy.isPending}
+            >
+              <SelectTrigger id={`bucket-minimum-durable-copies-${bucket.id}`} className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value={strictMinimumDurableCopiesValue}>All replicas (strict)</SelectItem>
+                  {minimumOptions.map((copies) => (
+                    <SelectItem key={copies} value={copies.toString()}>
+                      {minimumDurableCopiesOptionLabel(copies, targetCopies)}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            {minimumDurableCopies === strictMinimumDurableCopiesValue ? (
+              <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
+            ) : (
+              <FieldDescription>{minimumDurableCopiesFixedCountNote()}</FieldDescription>
+            )}
+          </Field>
+        </FieldGroup>
+        {showsMinimumDurableCopiesWarning(minimumDurableCopies, targetCopies) && (
+          <Alert className="mt-3">
+            <AlertDescription>{minimumDurableCopiesWarning()}</AlertDescription>
+          </Alert>
+        )}
+        <div className="mt-3 flex justify-end">
           <Button
             variant="outline"
             size="sm"

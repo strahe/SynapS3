@@ -39,10 +39,12 @@ Repeated reads of the same version coalesce access-time updates to at most one d
 | Policy | Behavior |
 | --- | --- |
 | `lru` | At the high capacity watermark, queue the least recently accessed remotely safe versions until planned usage reaches the low watermark. |
-| `after_upload` | Queue each version for removal after all target remote copies commit. |
+| `after_upload` | Queue each version for removal after its bucket's minimum durable copies commit. |
 | `none` | Do not create or run automatic cache eviction work. |
 
-Only versions with a readable committed remote copy are eligible. Eviction waits for active reads of the same version to close. Because cleanup is asynchronous, writes can still return `507 Insufficient Storage` when cleanup cannot keep pace or no safe candidate exists.
+Each bucket defaults to strict cache release, so the minimum equals the target replicas frozen for each upload. In the dashboard, set this on the bucket under Settings → Replica policy. An operator can set an explicit count from 1 through the current target. That count stays if Replicas later increases. Lowering Replicas below the stored count is rejected until Release cache after is also lowered. Lowering the threshold makes retained cache eligible for removal while remaining replicas continue syncing. Actual removal still follows `after_upload`, `lru`, or `none`. The minimum is clamped to each upload's target. Raising it affects cache that still exists; it cannot recreate cache that has already been deleted.
+
+Only versions that currently meet their minimum and have a readable committed remote copy are eligible. Eviction checks the current minimum again before authorizing deletion and waits for active reads of the same version to close. Because cleanup is asynchronous, writes can still return `507 Insufficient Storage` when cleanup cannot keep pace or no safe candidate exists.
 
 ## Multipart Uploads
 

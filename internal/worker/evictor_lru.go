@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheeviction"
+	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 )
 
@@ -14,6 +16,25 @@ func (e *Evictor) processLRUEviction(
 	ctx context.Context,
 	task *model.Task,
 ) *evictionDecision {
+	authorized, err := cacheeviction.DeleteAuthorized(task)
+	if err != nil {
+		return cancelEviction("LRU cache deletion authorization is invalid")
+	}
+	if authorized {
+		var decision *evictionDecision
+		e.cacheGate.GuardDeletion(task.RefVersionID, func() {
+			deletion, authorizeErr := e.repos.CacheEvictions.AuthorizeDeletion(ctx, task, nil)
+			switch {
+			case authorizeErr == nil:
+				decision = e.deleteCacheEntry(ctx, task, deletion)
+			case errors.Is(authorizeErr, repository.ErrNotFound), errors.Is(authorizeErr, cacheeviction.ErrNoLongerEligible):
+				decision = cancelEviction("Authorized cache entry no longer exists")
+			default:
+				decision = retryEviction(authorizeErr, "resuming authorized LRU cache eviction")
+			}
+		})
+		return decision
+	}
 	if e.policy != cache.EvictionPolicyLRU {
 		return cancelEviction("Cache eviction policy no longer uses LRU")
 	}
@@ -76,31 +97,29 @@ func (e *Evictor) finalizeLRUEviction(
 		return cancelEviction("Object was accessed after this LRU eviction was planned")
 	}
 
-	bucket, err := e.repos.Buckets.GetByID(ctx, version.BucketID)
-	if err != nil {
-		return retryEviction(err, "loading object bucket for LRU cache eviction")
-	}
-	if bucket == nil {
-		return cancelEviction("Object bucket no longer exists")
-	}
-
-	readable, err := e.hasReadableRemoteCopy(ctx, version)
-	if err != nil {
-		return retryEviction(err, "checking readable remote copies before LRU cache eviction")
-	}
-	if !readable {
-		return cancelEviction("Object no longer has a readable committed remote copy")
-	}
-
 	if !e.reserveLRUDeletion(version.Size) {
 		return cancelEviction("LRU cache usage already reached the low watermark")
 	}
-	err = e.cache.Delete(ctx, bucket.Name, version.CacheKey)
+	deletion, err := e.repos.CacheEvictions.AuthorizeDeletion(ctx, task, &accessSnapshot)
+	if err != nil {
+		e.finishLRUDeletion(version.Size, false)
+		switch {
+		case errors.Is(err, cacheeviction.ErrDurabilityThreshold),
+			errors.Is(err, cacheeviction.ErrNoLongerEligible),
+			errors.Is(err, cacheeviction.ErrAccessChanged):
+			return cancelEviction("Object is no longer eligible for LRU cache eviction")
+		default:
+			return retryEviction(err, "authorizing LRU cache eviction")
+		}
+	}
+	if deletion.Version.InCache {
+		err = e.cache.Delete(ctx, deletion.BucketName, deletion.Version.CacheKey)
+	}
 	e.finishLRUDeletion(version.Size, err == nil)
 	if err != nil {
 		return retryEviction(err, "deleting cache entry")
 	}
-	return e.recordCacheEntryDeleted(ctx, task, version)
+	return e.recordCacheEntryDeleted(ctx, task, &deletion.Version)
 }
 
 func effectiveLRUAccessTime(version *model.ObjectVersion) time.Time {

@@ -326,19 +326,20 @@ func cloneConfig(cfg *config.Config) *config.Config {
 }
 
 type settingsResponse struct {
-	Mode             string                          `json:"mode"`
-	ConfigPath       string                          `json:"config_path"`
-	Writable         bool                            `json:"writable"`
-	RuntimeAvailable bool                            `json:"runtime_available"`
-	RestartRequired  bool                            `json:"restart_required"`
-	S3Users          settingsS3UsersStatus           `json:"s3_users"`
-	Config           settingsEditableConfig          `json:"config"`
-	Manual           settingsManualConfig            `json:"manual"`
-	Secrets          settingsSecretStatus            `json:"secrets"`
-	Metadata         map[string]config.FieldMetadata `json:"metadata"`
-	Defaults         settingsDefaults                `json:"defaults"`
-	EnvManaged       map[string]string               `json:"env_managed"`
-	ValidationErrors []config.FieldError             `json:"validation_errors,omitempty"`
+	Mode                         string                          `json:"mode"`
+	ConfigPath                   string                          `json:"config_path"`
+	Writable                     bool                            `json:"writable"`
+	RuntimeAvailable             bool                            `json:"runtime_available"`
+	RuntimeFilecoinDefaultCopies *int                            `json:"runtime_filecoin_default_copies,omitempty"`
+	RestartRequired              bool                            `json:"restart_required"`
+	S3Users                      settingsS3UsersStatus           `json:"s3_users"`
+	Config                       settingsEditableConfig          `json:"config"`
+	Manual                       settingsManualConfig            `json:"manual"`
+	Secrets                      settingsSecretStatus            `json:"secrets"`
+	Metadata                     map[string]config.FieldMetadata `json:"metadata"`
+	Defaults                     settingsDefaults                `json:"defaults"`
+	EnvManaged                   map[string]string               `json:"env_managed"`
+	ValidationErrors             []config.FieldError             `json:"validation_errors,omitempty"`
 }
 
 type settingsDefaults struct {
@@ -776,6 +777,10 @@ func (s *Server) readSettingsUpdateRequest(w http.ResponseWriter, r *http.Reques
 func (s *Server) decorateSettingsResponse(resp settingsResponse) settingsResponse {
 	resp.S3Users = s.s3UsersStatus()
 	resp.RuntimeAvailable = !s.setupOnly
+	if resp.RuntimeAvailable {
+		copies := s.filecoinDefaultCopies
+		resp.RuntimeFilecoinDefaultCopies = &copies
+	}
 	return resp
 }
 
