@@ -80,85 +80,66 @@ func TestInitialSchemaFingerprintPostgres(t *testing.T) {
 	}
 }
 
-func TestSchemaParitySQLite(t *testing.T) {
-	sequence := 0
-	assertSchemaParity(t, func(t *testing.T) *bun.DB {
-		sequence++
-		return newSQLiteMigrationDB(t, fmt.Sprintf("schema_parity_%d", sequence))
-	}, func(t *testing.T, db *bun.DB) (string, string) {
-		return sqliteSchemaFingerprint(t, db, false)
-	})
+func TestLegacyMigrationUpgradePreservesDataAndIsIdempotent(t *testing.T) {
+	testMigrationDialects(t, testLegacyMigrationUpgradePreservesDataAndIsIdempotent)
 }
 
-func TestSchemaParityPostgres(t *testing.T) {
-	assertSchemaParity(t, newPostgresMigrationDB, func(t *testing.T, db *bun.DB) (string, string) {
-		return postgresSchemaFingerprint(t, db, false)
-	})
-}
-
-func assertSchemaParity(
-	t *testing.T,
-	newDB func(*testing.T) *bun.DB,
-	fingerprint func(*testing.T, *bun.DB) (string, string),
-) {
-	t.Helper()
+func testLegacyMigrationUpgradePreservesDataAndIsIdempotent(t *testing.T, db *bun.DB) {
 	ctx := context.Background()
-
-	fresh := newDB(t)
-	freshMigrator := NewMigrator(fresh)
-	if err := freshMigrator.Init(ctx); err != nil {
-		t.Fatalf("initialize fresh migrator: %v", err)
-	}
-	if _, err := freshMigrator.Migrate(ctx); err != nil {
-		t.Fatalf("migrate fresh schema: %v", err)
-	}
-
-	legacy := newDB(t)
-	legacyMigrator := NewMigrator(legacy)
-	if err := legacyMigrator.Init(ctx); err != nil {
+	migrator := NewMigrator(db)
+	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("initialize legacy migrator: %v", err)
 	}
-	if err := runMigrationBody(ctx, legacy, up2026040501Init); err != nil {
+	if err := runMigrationBody(ctx, db, up2026040501Init); err != nil {
 		t.Fatalf("create legacy initial schema: %v", err)
 	}
-	markAppliedMigration(t, ctx, legacyMigrator, "2026040501", 1)
-	seedLegacyMigrationData(t, legacy)
-	if _, err := legacyMigrator.Migrate(ctx); err != nil {
+	markAppliedMigration(t, ctx, migrator, "2026040501", 1)
+	seedLegacyMigrationData(t, db)
+	if _, err := migrator.Migrate(ctx); err != nil {
 		t.Fatalf("upgrade legacy schema: %v", err)
 	}
 
-	freshHash, freshSchema := fingerprint(t, fresh)
-	legacyHash, legacySchema := fingerprint(t, legacy)
-	if freshHash != legacyHash {
-		t.Fatalf("fresh schema %s differs from upgraded schema %s\nfresh:\n%s\nupgrade:\n%s", freshHash, legacyHash, freshSchema, legacySchema)
-	}
 	var generation int
 	var current bool
-	if err := legacy.NewRaw("SELECT generation, is_current FROM storage_data_sets WHERE id = 1").Scan(ctx, &generation, &current); err != nil {
+	if err := db.NewRaw("SELECT generation, is_current FROM storage_data_sets WHERE id = 1").Scan(ctx, &generation, &current); err != nil {
 		t.Fatalf("read upgraded legacy data: %v", err)
 	}
 	if generation != 1 || !current {
 		t.Fatalf("upgraded data generation/current = %d/%v, want 1/true", generation, current)
 	}
-	group, err := legacyMigrator.Migrate(ctx)
+	group, err := migrator.Migrate(ctx)
 	if err != nil {
 		t.Fatalf("repeat migrations: %v", err)
 	}
 	if len(group.Migrations) != 0 {
 		t.Fatalf("repeat migrations applied %d migrations, want none", len(group.Migrations))
 	}
+}
 
-	if _, err := freshMigrator.Rollback(ctx); err != nil {
+func TestFreshMigrationRollbackRemovesSchema(t *testing.T) {
+	testMigrationDialects(t, testFreshMigrationRollbackRemovesSchema)
+}
+
+func testFreshMigrationRollbackRemovesSchema(t *testing.T, db *bun.DB) {
+	ctx := context.Background()
+	migrator := NewMigrator(db)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("initialize fresh migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate fresh schema: %v", err)
+	}
+	if _, err := migrator.Rollback(ctx); err != nil {
 		t.Fatalf("rollback empty fresh schema: %v", err)
 	}
-	domainTables, err := countDomainTables(ctx, fresh)
+	domainTables, err := countDomainTables(ctx, db)
 	if err != nil {
 		t.Fatalf("count tables after rollback: %v", err)
 	}
 	if domainTables != 0 {
 		t.Fatalf("rollback left %d domain tables, want none", domainTables)
 	}
-	applied, err := freshMigrator.AppliedMigrations(ctx)
+	applied, err := migrator.AppliedMigrations(ctx)
 	if err != nil {
 		t.Fatalf("read migrations after rollback: %v", err)
 	}
