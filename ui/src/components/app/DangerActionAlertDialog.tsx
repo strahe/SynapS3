@@ -23,6 +23,7 @@ export interface DangerActionAlertDialogProps {
   confirmLabel: string
   onConfirm: () => void
   pending?: boolean
+  confirmDisabled?: boolean
   error?: string | null
   typedTarget?: string
   typedTargetLabel?: string
@@ -38,6 +39,7 @@ export function DangerActionAlertDialog({
   confirmLabel,
   onConfirm,
   pending = false,
+  confirmDisabled = false,
   error,
   typedTarget,
   typedTargetLabel = 'Type to confirm',
@@ -50,7 +52,7 @@ export function DangerActionAlertDialog({
   const needsTypedConfirmation = typedTarget !== undefined
   const typedConfirmationValid =
     !needsTypedConfirmation || (typedTarget.length > 0 && confirmationMatches(confirmInput, typedTarget))
-  const canConfirm = !pending && typedConfirmationValid
+  const canConfirm = !pending && !confirmDisabled && typedConfirmationValid
 
   useEffect(() => {
     if (!open) setConfirmInput('')

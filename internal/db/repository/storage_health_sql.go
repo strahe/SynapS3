@@ -59,17 +59,39 @@ func storageHealthSQLLiteralList(values ...string) string {
 	return strings.Join(out, ", ")
 }
 
-func storageHealthSQLLiteral(value string) string {
-	switch value {
-	case string(model.StorageDataSetStatusReady),
+// Enum values share spellings across domains, so the allowlist is a set rather
+// than a switch.
+var storageHealthSQLLiterals = func() map[string]struct{} {
+	values := []string{
+		string(model.StorageDataSetStatusPending),
+		string(model.StorageDataSetStatusCreating),
+		string(model.StorageDataSetStatusReady),
+		string(model.StorageDataSetStatusFailed),
+		string(model.StorageDataSetStatusUnavailable),
 		string(model.StorageDataSetStatusDraining),
+		string(model.StorageDataSetStatusRetired),
+		string(model.StorageUploadCopyStatusPending),
+		string(model.StorageUploadCopyStatusPieceReady),
+		string(model.StorageUploadCopyStatusCommitting),
 		string(model.StorageUploadCopyStatusCommitted),
+		string(model.StorageUploadCopyStatusFailed),
 		string(observability.StatusAvailable),
 		string(observability.StatusDegraded),
 		string(observability.StatusUnavailable),
-		string(observability.StatusUnknown):
-		return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-	default:
+		string(observability.StatusUnknown),
+	}
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}()
+
+// Only enum values that already exist as domain constants may be inlined into
+// raw SQL. The panic guards against interpolating caller-supplied text.
+func storageHealthSQLLiteral(value string) string {
+	if _, ok := storageHealthSQLLiterals[value]; !ok {
 		panic("unsupported storage health SQL literal")
 	}
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }

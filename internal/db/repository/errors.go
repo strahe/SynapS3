@@ -36,6 +36,11 @@ var ErrUploadTaskCancelled = errors.New("upload task cancelled")
 // ErrTaskClaimLost reports that a worker no longer owns the running task claim.
 var ErrTaskClaimLost = errors.New("task claim lost")
 
+// ErrReplacementRetryUnsupported means the task belongs to an operator-approved
+// provider replacement, which resumes only through its own retry action so the
+// replacement record and the task never disagree. It wraps ErrConflict.
+var ErrReplacementRetryUnsupported = fmt.Errorf("provider replacement work cannot be retried from the task queue: %w", ErrConflict)
+
 // ErrAlreadyCurrent is returned when a restore would not change the current object representation.
 var ErrAlreadyCurrent = errors.New("already current")
 

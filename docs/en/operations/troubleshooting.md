@@ -132,6 +132,8 @@ Retry only after RPC connectivity, storage provider availability, wallet funds, 
 synaps3 admin task retry 42
 ```
 
+Provider replacement work is the exception: do not retry it from Tasks. Finished or stopped replacement tasks provide **Open Data Sets**, which opens the affected bucket directly at **Details** → **Storage** → **Data Sets**. Use **Retry replacement** only when that action is shown. If the selected provider already stores this bucket, choose a different provider instead.
+
 ## Provider or RPC Issues
 
 Check provider health and Filecoin readiness in the dashboard, or inspect the Admin API:

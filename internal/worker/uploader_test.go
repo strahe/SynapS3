@@ -3133,7 +3133,7 @@ func TestUploader_SubmittedPeerMismatchedStatusRemainsRecoverableAfterExhaustion
 	if err != nil || !copyCommitSubmittedForTest(copyRow) || *copyRow.CommitTransactionID != fakeSubmittedCommitTxHash {
 		t.Fatalf("peer copy after mismatched status = %#v err=%v, want recoverable submitted commit", copyRow, err)
 	}
-	if err := env.repos.Uploads.MarkUploadCopyFailed(ctx, fixture.upload.ID, 1, "late generic failure"); !errors.Is(err, repository.ErrConflict) {
+	if err := env.repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: fixture.upload.ID, CopyIndex: 1, LastError: "late generic failure"}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("MarkUploadCopyFailed submitted peer error = %v, want conflict", err)
 	}
 	version, err := env.repos.Objects.GetVersionByID(ctx, fixture.versionID)
@@ -4592,7 +4592,7 @@ func TestUploader_RepairPreparePreservesAssignedPeerSlots(t *testing.T) {
 			name: "failed copy",
 			mark: func(ctx context.Context, t *testing.T, env *testWorkerEnv, fixture readableUploadWithPendingPeerFixture) {
 				t.Helper()
-				if err := env.repos.Uploads.MarkUploadCopyFailed(ctx, fixture.upload.ID, 1, "peer pull: provider failed"); err != nil {
+				if err := env.repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: fixture.upload.ID, CopyIndex: 1, LastError: "peer pull: provider failed"}); err != nil {
 					t.Fatalf("MarkUploadCopyFailed: %v", err)
 				}
 			},
@@ -5021,7 +5021,7 @@ func TestUploader_EvidenceFreeDataSetCandidateIsNotSharedAcrossUploads(t *testin
 	if err := env.repos.Uploads.MarkDataSetFailed(ctx, candidate.ID, "creation rejected"); err != nil {
 		t.Fatalf("MarkDataSetFailed(candidate): %v", err)
 	}
-	if err := env.repos.Uploads.MarkUploadCopyFailed(ctx, firstUpload.ID, 0, "creation rejected"); err != nil {
+	if err := env.repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: firstUpload.ID, CopyIndex: 0, LastError: "creation rejected"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed(first): %v", err)
 	}
 	discarded, err := env.repos.Uploads.DiscardFailedDataSetCandidate(ctx, firstUpload.ID, 0, candidate.ID)

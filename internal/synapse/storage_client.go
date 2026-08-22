@@ -13,11 +13,12 @@ import (
 // SynapS3's testable staged storage interface. It exists because Go does not
 // allow []*storage.Context to satisfy []UploadContext directly.
 type StorageServiceAdapter struct {
-	service *storage.Service
+	service    *storage.Service
+	terminator storageServiceTerminator
 }
 
 func AdaptStorageService(service *storage.Service) *StorageServiceAdapter {
-	return &StorageServiceAdapter{service: service}
+	return &StorageServiceAdapter{service: service, terminator: service}
 }
 
 func (s *StorageServiceAdapter) Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {

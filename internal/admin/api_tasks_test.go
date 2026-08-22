@@ -73,6 +73,35 @@ func TestAPIListExhaustedUsesTaskListDTO(t *testing.T) {
 	}
 }
 
+func TestAPIListTasksIncludesBucketNameForBucketReferences(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := testutil.SeedBucket(t, db, "replacement-task-bucket")
+	stage := "retire_abandoned_target"
+	task := &model.Task{
+		Type: model.TaskTypeStorageCleanup, Stage: &stage, RefType: "bucket", RefID: bucket.ID,
+		IdempotencyKey: "replacement-task-bucket-ref", Status: model.TaskStatusCompleted,
+		ScheduledAt: time.Now(), CompletedAt: func() *time.Time { now := time.Now(); return &now }(),
+	}
+	if err := repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	srv := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
+	rr := httptest.NewRecorder()
+	srv.handleAPITasks(rr, httptest.NewRequest(http.MethodGet, "/api/v1/tasks", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var body taskListResponse
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Tasks) != 1 || body.Tasks[0].BucketName != bucket.Name {
+		t.Fatalf("tasks = %#v, want bucket name %q", body.Tasks, bucket.Name)
+	}
+}
+
 func TestAPIRetryExhaustedHTTPStatuses(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -649,7 +678,7 @@ func TestAPITaskRefDetailNonObject(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200", status)
 	}
-	if body.RefType != "bucket" || body.RefID != bucket.ID || body.Object != nil {
+	if body.RefType != "bucket" || body.RefID != bucket.ID || body.BucketName != bucket.Name || body.Object != nil {
 		t.Fatalf("ref detail = %#v, want bucket ref without object", body)
 	}
 }

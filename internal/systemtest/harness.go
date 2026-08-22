@@ -159,6 +159,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 		Filecoin: app.FilecoinServices{
 			Storage: filecoin, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
 			Readiness: filecoin, Observability: filecoin,
+			Terminator: filecoin, Epochs: filecoin,
 		},
 		S3Addresses: []string{socketPath}, ShutdownTimeout: 5 * time.Second,
 	})

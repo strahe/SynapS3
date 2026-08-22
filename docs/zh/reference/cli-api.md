@@ -97,6 +97,8 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 
 列出后台任务时支持 `--type`、`--stage`、`--status`、`--limit` 和 `--offset`。`--stage` 必须与 `--type` 一起使用。
 
+`synaps3 admin task retry` 不会重试提供方替换工作。请在已完成或已停止的替换任务上使用 **Open Data Sets**，或打开存储桶并前往 **Details** → **Storage** → **Data Sets**。如果所选提供方已经存储该桶，请改选其他提供方，而不是重试。
+
 缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
 
 ## 设置安全

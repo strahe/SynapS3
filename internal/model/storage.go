@@ -95,6 +95,10 @@ type StorageUpload struct {
 }
 
 // StorageDataSet records the bucket ownership of a provider-scoped data set.
+// CopyIndex names the logical replica slot, which can own several physical
+// generations while a provider replacement is in flight. IsCurrent selects the
+// generation that accepts new writes; replaced generations stay readable until
+// they are verifiably retired.
 type StorageDataSet struct {
 	bun.BaseModel `bun:"table:storage_data_sets"`
 
@@ -102,6 +106,8 @@ type StorageDataSet struct {
 	BucketID            int64                `bun:",notnull"`
 	ProviderID          types.OnChainID      `bun:"type:text,notnull"`
 	CopyIndex           int                  `bun:",notnull"`
+	Generation          int                  `bun:",notnull"`
+	IsCurrent           bool                 `bun:",notnull"`
 	DataSetID           *types.OnChainID     `bun:"type:text"`
 	ClientDataSetID     *types.OnChainID     `bun:"type:text"`
 	Status              StorageDataSetStatus `bun:",notnull,default:'pending'"`

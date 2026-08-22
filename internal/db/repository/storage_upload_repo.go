@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 )
@@ -231,6 +232,22 @@ func (r *BunStorageUploadRepo) ListCopies(ctx context.Context, uploadID int64) (
 	return copies, nil
 }
 
+// CountCurrentGenerationCopySlots counts logical replica slots, not physical
+// generation rows. An unbound copy belongs to its slot until it is assigned.
+func (r *BunStorageUploadRepo) CountCurrentGenerationCopySlots(ctx context.Context, uploadID int64) (int, error) {
+	if uploadID <= 0 {
+		return 0, fmt.Errorf("counting current upload copy slots: %w", ErrInvalidInput)
+	}
+	var count int
+	query := fmt.Sprintf(`SELECT COUNT(DISTINCT storage_copy.copy_index)
+		FROM storage_upload_copies AS storage_copy
+		WHERE storage_copy.upload_id = ? AND %s`, currentGenerationCopySQL("storage_copy"))
+	if err := r.db.NewRaw(query, uploadID).Scan(ctx, &count); err != nil {
+		return 0, fmt.Errorf("counting current upload copy slots: %w", err)
+	}
+	return count, nil
+}
+
 func shouldRetryUploadFailureAppend(err error) bool {
 	return isUniqueViolation(err) || isSQLiteBusy(err)
 }
@@ -275,16 +292,10 @@ func (r *BunStorageUploadRepo) ListReadableCommittedCopies(ctx context.Context, 
 		JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
 		WHERE storage_copy.upload_id = ?
 		  AND storage_upload.piece_cid IS NOT NULL AND storage_upload.piece_cid <> ''
-		  AND storage_copy.status = ?
-		  AND storage_copy.storage_data_set_id IS NOT NULL
-		  AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> ''
-		  AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> ''
-		  AND storage_data_set.status IN (%s)
-		  AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> ''
-		  AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> ''`,
-		storageHealthReadyDataSetStatusListSQL(),
+		  AND %s`,
+		readableCommittedCopyPredicateSQL("storage_copy", "storage_data_set"),
 	)
-	args := []interface{}{uploadID, model.StorageUploadCopyStatusCommitted}
+	args := []interface{}{uploadID}
 	query += " ORDER BY storage_copy.copy_index ASC"
 	if err := r.db.NewRaw(query, args...).Scan(ctx, &copies); err != nil {
 		if err == sql.ErrNoRows {
@@ -296,7 +307,7 @@ func (r *BunStorageUploadRepo) ListReadableCommittedCopies(ctx context.Context, 
 }
 
 func (r *BunStorageUploadRepo) HasReadableCommittedCopy(ctx context.Context, uploadID int64) (bool, error) {
-	count, err := countReadableCommittedCopies(ctx, r.db, uploadID)
+	count, err := countReadableReplicaSlots(ctx, r.db, uploadID)
 	if err != nil {
 		return false, err
 	}
@@ -550,12 +561,14 @@ func (r *BunStorageUploadRepo) listBucketStorageHealthReasonCodes(ctx context.Co
 	return out, nil
 }
 
+// ListDataSetBindings returns every generation, including retired ones, because
+// callers need the full provider history as well as the current write targets.
 func (r *BunStorageUploadRepo) ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error) {
 	var bindings []model.StorageDataSet
 	if err := r.db.NewSelect().
 		Model(&bindings).
 		Where("bucket_id = ?", bucketID).
-		OrderExpr("copy_index ASC").
+		OrderExpr("copy_index ASC, generation ASC").
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing storage data set bindings: %w", err)
 	}
@@ -569,6 +582,8 @@ func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketI
 			storage_data_set.bucket_id,
 			bucket.name AS bucket_name,
 			storage_data_set.copy_index,
+			storage_data_set.generation,
+			storage_data_set.is_current,
 			storage_data_set.provider_id,
 			storage_data_set.data_set_id,
 			storage_data_set.client_data_set_id,
@@ -619,7 +634,7 @@ func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketI
 			GROUP BY storage_copy.storage_data_set_id
 		) AS version_stats ON version_stats.storage_data_set_id = storage_data_set.id
 		WHERE (? = 0 OR storage_data_set.bucket_id = ?)
-		ORDER BY bucket.name ASC, storage_data_set.copy_index ASC`,
+		ORDER BY bucket.name ASC, storage_data_set.copy_index ASC, storage_data_set.generation ASC`,
 		storageHealthReadyDataSetStatusListSQL(),
 		storageHealthCommittedCopyStatusSQL(),
 		storageHealthCommittedCopyStatusSQL(),
@@ -630,11 +645,13 @@ func (r *BunStorageUploadRepo) ListDataSetSummaries(ctx context.Context, bucketI
 	return summaries, nil
 }
 
+// GetDataSetBindingByCopyIndex returns the generation that currently owns the
+// slot. Historical generations stay readable but never receive new writes.
 func (r *BunStorageUploadRepo) GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error) {
 	binding := new(model.StorageDataSet)
 	err := r.db.NewSelect().
 		Model(binding).
-		Where("bucket_id = ? AND copy_index = ?", bucketID, copyIndex).
+		Where("bucket_id = ? AND copy_index = ? AND is_current", bucketID, copyIndex).
 		Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -698,6 +715,11 @@ func (r *BunStorageUploadRepo) MarkDataSetReady(ctx context.Context, input MarkD
 	})
 }
 
+// RecoverDataSet restores a quarantined binding once storage confirms it is
+// usable again. A generation an operator is actively replacing is never
+// revived, because bringing it back would fight the approved migration.
+// Terminally failed or attention-holding replacements do not block recovery, so
+// a slot whose replacement gave up can still repair in place.
 func (r *BunStorageUploadRepo) RecoverDataSet(ctx context.Context, input MarkDataSetReadyInput) (bool, error) {
 	if input.ID <= 0 || input.DataSetID.IsZero() {
 		return false, fmt.Errorf("recovering storage data set: %w", ErrInvalidInput)
@@ -716,6 +738,15 @@ func (r *BunStorageUploadRepo) RecoverDataSet(ctx context.Context, input MarkDat
 			model.StorageDataSetStatusUnavailable,
 			model.StorageDataSetStatusReady,
 		})).
+		Where(`NOT EXISTS (
+			SELECT 1 FROM storage_replacements AS blocking_replacement
+			WHERE blocking_replacement.source_data_set_id = storage_data_set.id
+			  AND blocking_replacement.status IN (?, ?, ?, ?)
+		)`,
+			storagereplacement.StatusPreparingTarget,
+			storagereplacement.StatusMigrating,
+			storagereplacement.StatusWaiting,
+			storagereplacement.StatusRetiring).
 		Exec(ctx)
 	if err != nil {
 		return false, fmt.Errorf("recovering storage data set: %w", err)
@@ -908,9 +939,11 @@ func (r *BunStorageUploadRepo) CreateUploadCopiesForBindings(ctx context.Context
 				StorageDataSetID: &input.StorageDataSetID,
 				IsNewDataSet:     isNewDataSet,
 			}
+			// Copies are unique per concrete data set so one upload can hold both
+			// generations of a slot while a replacement migrates.
 			if _, err := db.NewInsert().
 				Model(copyRow).
-				On("CONFLICT (upload_id, copy_index) DO NOTHING").
+				On("CONFLICT (upload_id, storage_data_set_id) WHERE storage_data_set_id IS NOT NULL DO NOTHING").
 				Exec(ctx); err != nil {
 				return fmt.Errorf("creating storage upload copy row: %w", err)
 			}
@@ -919,17 +952,43 @@ func (r *BunStorageUploadRepo) CreateUploadCopiesForBindings(ctx context.Context
 	})
 }
 
+// GetUploadCopy resolves a slot to the copy on its current generation, so a
+// task that carries only (upload, slot) can never address a replaced or a
+// not-yet-activated generation. A bound copy wins over an unbound one.
 func (r *BunStorageUploadRepo) GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error) {
 	copyRow := new(model.StorageUploadCopy)
 	err := r.db.NewSelect().
 		Model(copyRow).
-		Where("upload_id = ? AND copy_index = ?", uploadID, copyIndex).
+		Where("storage_upload_copy.upload_id = ? AND storage_upload_copy.copy_index = ?", uploadID, copyIndex).
+		Where(currentGenerationCopySQL("storage_upload_copy")).
+		OrderExpr("(storage_upload_copy.storage_data_set_id IS NULL) ASC").
+		Limit(1).
 		Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("selecting storage upload copy: %w", err)
+	}
+	return copyRow, nil
+}
+
+// GetUploadCopyForDataSet addresses one concrete generation, which is how
+// replacement work targets the new provider while the old one still exists.
+func (r *BunStorageUploadRepo) GetUploadCopyForDataSet(ctx context.Context, uploadID, storageDataSetID int64) (*model.StorageUploadCopy, error) {
+	if uploadID <= 0 || storageDataSetID <= 0 {
+		return nil, fmt.Errorf("selecting storage upload copy for data set: %w", ErrInvalidInput)
+	}
+	copyRow := new(model.StorageUploadCopy)
+	err := r.db.NewSelect().
+		Model(copyRow).
+		Where("upload_id = ? AND storage_data_set_id = ?", uploadID, storageDataSetID).
+		Scan(ctx)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("selecting storage upload copy for data set: %w", err)
 	}
 	return copyRow, nil
 }
@@ -1176,20 +1235,19 @@ func (r *BunStorageUploadRepo) NextFinalizableCopyForDataSet(ctx context.Context
 			  AND pending_version.state = ?
 		  )
 		  AND (
-			SELECT COUNT(*)
+			SELECT COUNT(DISTINCT readable_data_set.copy_index)
 			FROM storage_upload_copies AS readable_copy
 			JOIN storage_data_sets AS readable_data_set ON readable_data_set.id = readable_copy.storage_data_set_id
 			WHERE readable_copy.upload_id = storage_upload.id
-			  AND readable_copy.status = ?
-			  AND readable_copy.storage_data_set_id IS NOT NULL
-			  AND readable_copy.provider_id IS NOT NULL AND readable_copy.provider_id <> ''
-			  AND readable_data_set.data_set_id IS NOT NULL AND readable_data_set.data_set_id <> ''
-			  AND (readable_data_set.status IN (%s) OR readable_data_set.id = ?)
-			  AND readable_copy.piece_id IS NOT NULL AND readable_copy.piece_id <> ''
-			  AND readable_copy.retrieval_url IS NOT NULL AND readable_copy.retrieval_url <> ''
+			  AND %s
 		  ) >= storage_upload.requested_copies
 		ORDER BY storage_copy.id ASC
-		LIMIT 1`, storageHealthReadyDataSetStatusListSQL())
+		LIMIT 1`, readableCommittedCopyPredicateWithDataSetStatusSQL(
+		"readable_copy",
+		"readable_data_set",
+		fmt.Sprintf("(readable_data_set.status IN (%s) OR readable_data_set.id = ?)",
+			storageHealthReadyDataSetStatusListSQL()),
+	))
 	err := r.db.NewRaw(
 		query,
 		storageDataSetID,
@@ -1198,7 +1256,6 @@ func (r *BunStorageUploadRepo) NextFinalizableCopyForDataSet(ctx context.Context
 		model.StorageUploadStatusIngressReady,
 		model.StorageUploadStatusReadable,
 		model.ObjectStateReplicating,
-		model.StorageUploadCopyStatusCommitted,
 		storageDataSetID,
 	).Scan(ctx, copyRow)
 	if err != nil {
@@ -1306,6 +1363,7 @@ func (r *BunStorageUploadRepo) ReassignIngressCopy(ctx context.Context, uploadID
 			Where("storage_upload_copy.status = ?", model.StorageUploadCopyStatusPending).
 			Where("storage_upload_copy.transfer_method = ?", model.StorageCopyTransferMethodPeerPull).
 			Where("storage_data_set.status = ?", model.StorageDataSetStatusReady).
+			Where("storage_data_set.is_current").
 			OrderExpr("storage_upload_copy.copy_index ASC").
 			Limit(1).
 			Scan(ctx)
@@ -1315,10 +1373,14 @@ func (r *BunStorageUploadRepo) ReassignIngressCopy(ctx context.Context, uploadID
 		if err != nil {
 			return fmt.Errorf("selecting alternate ingress copy: %w", err)
 		}
+		unavailableCopyID, err := resolveSlotCopyID(ctx, db, uploadID, unavailableCopyIndex)
+		if err != nil {
+			return err
+		}
 		res, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).
-			Where("upload_id = ? AND copy_index = ?", uploadID, unavailableCopyIndex).
+			Where("id = ?", unavailableCopyID).
 			Where("transfer_method = ?", model.StorageCopyTransferMethodIngress).
 			Where("status <> ?", model.StorageUploadCopyStatusCommitted).
 			Where("NOT (status = ? AND commit_transaction_id IS NOT NULL AND commit_transaction_id <> '')", model.StorageUploadCopyStatusCommitting).
@@ -1363,6 +1425,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 		if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
 			return fmt.Errorf("locking storage upload for piece-ready copy: %w", err)
 		}
+		copyID, err := slotCopyTarget(ctx, db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
+		if err != nil {
+			return err
+		}
 		now := time.Now()
 		q := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
@@ -1371,11 +1437,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 			Set("retrieval_url = COALESCE(?, retrieval_url)", nullableString(input.RetrievalURL)).
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
-			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
+			Where("id = ?", copyID).
 			Where("status <> ?", model.StorageUploadCopyStatusCommitted)
-		if input.StorageUploadCopyID > 0 {
+		if input.RequireEligibleCopy {
 			q = q.
-				Where("id = ?", input.StorageUploadCopyID).
 				Where("status <> ?", model.StorageUploadCopyStatusFailed).
 				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
 		}
@@ -1385,7 +1450,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			if input.StorageUploadCopyID > 0 {
+			if input.RequireEligibleCopy {
 				return fmt.Errorf("marking storage upload copy piece ready: %w", ErrConflict)
 			}
 			return nil
@@ -1417,6 +1482,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, inp
 		if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
 			return fmt.Errorf("locking storage upload for committing copy: %w", err)
 		}
+		copyID, err := slotCopyTarget(ctx, db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
+		if err != nil {
+			return err
+		}
 		q := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = CASE WHEN ? IS NOT NULL THEN ? ELSE status END", nullableString(input.CommitTransactionID), model.StorageUploadCopyStatusCommitting).
@@ -1424,10 +1493,9 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, inp
 			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
 			Set("last_error = NULL").
 			Set("updated_at = ?", time.Now()).
-			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex)
-		if input.StorageUploadCopyID > 0 {
+			Where("id = ?", copyID)
+		if input.RequireEligibleCopy {
 			q = q.
-				Where("id = ?", input.StorageUploadCopyID).
 				Where("status <> ?", model.StorageUploadCopyStatusFailed).
 				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
 		}
@@ -1435,7 +1503,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, inp
 		if err != nil {
 			return fmt.Errorf("marking storage upload copy committing: %w", err)
 		}
-		if input.StorageUploadCopyID > 0 {
+		if input.RequireEligibleCopy {
 			rows, _ := res.RowsAffected()
 			if rows == 0 {
 				return fmt.Errorf("marking storage upload copy committing: %w", ErrConflict)
@@ -1449,6 +1517,10 @@ func (r *BunStorageUploadRepo) ResetRejectedUploadCopyCommit(ctx context.Context
 	if input.UploadID <= 0 || input.CopyIndex < 0 || input.CommitTransactionID == "" {
 		return fmt.Errorf("resetting rejected storage upload commit: %w", ErrInvalidInput)
 	}
+	copyID, err := slotCopyTarget(ctx, r.db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
+	if err != nil {
+		return err
+	}
 	res, err := r.db.NewUpdate().
 		Model((*model.StorageUploadCopy)(nil)).
 		Set("status = ?", model.StorageUploadCopyStatusPieceReady).
@@ -1456,7 +1528,7 @@ func (r *BunStorageUploadRepo) ResetRejectedUploadCopyCommit(ctx context.Context
 		Set("commit_transaction_id = NULL").
 		Set("last_error = ?", input.LastError).
 		Set("updated_at = ?", time.Now()).
-		Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex).
+		Where("id = ?", copyID).
 		Where("status = ?", model.StorageUploadCopyStatusCommitting).
 		Where("commit_transaction_id = ?", input.CommitTransactionID).
 		Exec(ctx)
@@ -1486,6 +1558,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 		if err != nil {
 			return err
 		}
+		copyID, err := slotCopyTarget(ctx, db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
+		if err != nil {
+			return err
+		}
 		q := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusCommitted).
@@ -1496,10 +1572,9 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
-			Where("upload_id = ? AND copy_index = ?", input.UploadID, input.CopyIndex)
-		if input.StorageUploadCopyID > 0 {
+			Where("id = ?", copyID)
+		if input.RequireEligibleCopy {
 			q = q.
-				Where("id = ?", input.StorageUploadCopyID).
 				Where("status <> ?", model.StorageUploadCopyStatusFailed).
 				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
 		}
@@ -1509,7 +1584,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			if input.StorageUploadCopyID > 0 {
+			if input.RequireEligibleCopy {
 				return fmt.Errorf("marking storage upload copy committed: %w", ErrConflict)
 			}
 			return fmt.Errorf("marking storage upload copy committed: %w", ErrNotFound)
@@ -1532,10 +1607,15 @@ func liveObjectVersionExistsForUploadSQL() string {
 	)`
 }
 
-func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadID int64, copyIndex int, lastError string) error {
+func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, input MarkUploadCopyFailedInput) error {
+	uploadID, copyIndex, lastError := input.UploadID, input.CopyIndex, input.LastError
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		if err := lockStorageUploadForCopyMutation(ctx, db, uploadID); err != nil {
 			return fmt.Errorf("locking storage upload for failed copy: %w", err)
+		}
+		copyID, err := slotCopyTarget(ctx, db, input.StorageUploadCopyID, uploadID, copyIndex)
+		if err != nil {
+			return err
 		}
 		now := time.Now()
 		res, err := db.NewUpdate().
@@ -1543,7 +1623,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadI
 			Set("status = ?", model.StorageUploadCopyStatusFailed).
 			Set("last_error = ?", lastError).
 			Set("updated_at = ?", now).
-			Where("upload_id = ? AND copy_index = ?", uploadID, copyIndex).
+			Where("id = ?", copyID).
 			Where("status <> ?", model.StorageUploadCopyStatusCommitted).
 			Where("NOT (status = ? AND commit_transaction_id IS NOT NULL AND commit_transaction_id <> '')", model.StorageUploadCopyStatusCommitting).
 			Exec(ctx)
@@ -1557,7 +1637,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadI
 		if rows == 0 {
 			submittedCount, countErr := db.NewSelect().
 				Model((*model.StorageUploadCopy)(nil)).
-				Where("upload_id = ? AND copy_index = ?", uploadID, copyIndex).
+				Where("id = ?", copyID).
 				Where("status = ?", model.StorageUploadCopyStatusCommitting).
 				Where("commit_transaction_id IS NOT NULL AND commit_transaction_id <> ''").
 				Count(ctx)
@@ -1569,7 +1649,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, uploadI
 			}
 			return nil
 		}
-		readableCount, err := countReadableCommittedCopies(ctx, db, uploadID)
+		readableCount, err := countReadableReplicaSlots(ctx, db, uploadID)
 		if err != nil {
 			return err
 		}
@@ -1742,7 +1822,7 @@ func (r *BunStorageUploadRepo) FinalizeUploadIfTargetCopiesMet(ctx context.Conte
 		if upload == nil || upload.Status == model.StorageUploadStatusRejected || upload.Status == model.StorageUploadStatusSuperseded {
 			return fmt.Errorf("storage upload %d cannot be finalized: %w", input.UploadID, ErrConflict)
 		}
-		readable, err := countReadableCommittedCopies(ctx, db, input.UploadID)
+		readable, err := countReadableReplicaSlots(ctx, db, input.UploadID)
 		if err != nil {
 			return err
 		}
@@ -1822,7 +1902,7 @@ func requireCurrentMinimumDurableCopies(ctx context.Context, db bun.IDB, upload 
 		return fmt.Errorf("loading storage upload bucket durability policy: %w", err)
 	}
 	minimum := minimumDurableCopiesForUpload(bucket, upload.RequestedCopies)
-	readable, err := countReadableCommittedCopies(ctx, db, upload.ID)
+	readable, err := countReadableReplicaSlots(ctx, db, upload.ID)
 	if err != nil {
 		return err
 	}
@@ -1892,12 +1972,7 @@ func (r *BunStorageUploadRepo) SetAcceptError(ctx context.Context, uploadID int6
 }
 
 func (r *BunStorageUploadRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {
-	if db, ok := r.db.(*bun.DB); ok {
-		return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-			return fn(tx)
-		})
-	}
-	return fn(r.db)
+	return runMaybeTx(ctx, r.db, fn)
 }
 
 func (r *BunStorageUploadRepo) findActiveUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error) {
@@ -1918,14 +1993,30 @@ func (r *BunStorageUploadRepo) findActiveUploadBySourceVersion(ctx context.Conte
 	return upload, nil
 }
 
+// Generations are numbered per replica slot and never reused, so a retired
+// generation stays distinguishable from the one that replaced it.
+func nextDataSetGeneration(ctx context.Context, db bun.IDB, bucketID int64, copyIndex int) (int, error) {
+	var generation int
+	err := db.NewRaw(
+		`SELECT COALESCE(MAX(generation), 0) + 1 FROM storage_data_sets WHERE bucket_id = ? AND copy_index = ?`,
+		bucketID, copyIndex,
+	).Scan(ctx, &generation)
+	if err != nil {
+		return 0, fmt.Errorf("selecting next storage data set generation: %w", err)
+	}
+	return generation, nil
+}
+
 func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBindingInput) (*model.StorageDataSet, error) {
 	if input.BucketID == 0 || input.ProviderID.IsZero() || input.CopyIndex < 0 {
 		return nil, fmt.Errorf("invalid storage data set binding input: %w", ErrInvalidInput)
 	}
+	// Only live generations reserve a provider or a slot; a retired generation
+	// leaves both free so an operator can reuse a provider they used before.
 	existingByProvider := new(model.StorageDataSet)
 	err := db.NewSelect().
 		Model(existingByProvider).
-		Where("bucket_id = ? AND provider_id = ?", input.BucketID, input.ProviderID).
+		Where("bucket_id = ? AND provider_id = ? AND is_current", input.BucketID, input.ProviderID).
 		Scan(ctx)
 	if err == nil {
 		if existingByProvider.CopyIndex != input.CopyIndex {
@@ -1939,7 +2030,7 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 	existingByIndex := new(model.StorageDataSet)
 	err = db.NewSelect().
 		Model(existingByIndex).
-		Where("bucket_id = ? AND copy_index = ?", input.BucketID, input.CopyIndex).
+		Where("bucket_id = ? AND copy_index = ? AND is_current", input.BucketID, input.CopyIndex).
 		Scan(ctx)
 	if err == nil {
 		return nil, fmt.Errorf("copy_index %d already bound to provider %s: %w", input.CopyIndex, existingByIndex.ProviderID, ErrAlreadyExists)
@@ -1947,11 +2038,17 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 	if err != sql.ErrNoRows {
 		return nil, fmt.Errorf("selecting storage data set by copy index: %w", err)
 	}
+	generation, err := nextDataSetGeneration(ctx, db, input.BucketID, input.CopyIndex)
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	binding := &model.StorageDataSet{
 		BucketID:          input.BucketID,
 		ProviderID:        input.ProviderID,
 		CopyIndex:         input.CopyIndex,
+		Generation:        generation,
+		IsCurrent:         true,
 		Status:            model.StorageDataSetStatusPending,
 		CreatedByUploadID: nullableInt64(input.CreatedByUploadID),
 		LastUsedUploadID:  nullableInt64(input.CreatedByUploadID),
@@ -1970,7 +2067,7 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 		existing := new(model.StorageDataSet)
 		selectErr := db.NewSelect().
 			Model(existing).
-			Where("bucket_id = ? AND provider_id = ?", input.BucketID, input.ProviderID).
+			Where("bucket_id = ? AND provider_id = ? AND is_current", input.BucketID, input.ProviderID).
 			Scan(ctx)
 		if selectErr == nil && existing.CopyIndex == input.CopyIndex {
 			return existing, nil
@@ -2023,33 +2120,25 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, uploadID int64,
 	return fmt.Errorf("provider data set already bound to another bucket: %w", ErrAlreadyExists)
 }
 
-func countReadableCommittedCopies(ctx context.Context, db bun.IDB, uploadID int64) (int, error) {
+// The result counts logical replica slots, so several data set generations of
+// one slot never inflate an upload's durability.
+func countReadableReplicaSlots(ctx context.Context, db bun.IDB, uploadID int64) (int, error) {
 	var row struct {
 		Count int `bun:"count"`
 	}
-	err := db.NewRaw(fmt.Sprintf(`SELECT COUNT(*) AS count
-		FROM storage_upload_copies AS storage_copy
-		JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-		WHERE storage_copy.upload_id = ?
-		  AND storage_copy.status = ?
-		  AND storage_copy.storage_data_set_id IS NOT NULL
-		  AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> ''
-		  AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> ''
-		  AND storage_data_set.status IN (%s)
-		  AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> ''
-		  AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> ''`,
-		storageHealthReadyDataSetStatusListSQL(),
+	err := db.NewRaw(fmt.Sprintf(`SELECT %s AS count`,
+		distinctReadableSlotCountSQL("storage_copy", "storage_data_set", "?"),
 	),
-		uploadID, model.StorageUploadCopyStatusCommitted,
+		uploadID,
 	).Scan(ctx, &row)
 	if err != nil {
-		return 0, fmt.Errorf("counting readable storage upload copies: %w", err)
+		return 0, fmt.Errorf("counting readable replica slots: %w", err)
 	}
 	return row.Count, nil
 }
 
 func requireReadableCommittedCopy(ctx context.Context, db bun.IDB, uploadID int64) error {
-	count, err := countReadableCommittedCopies(ctx, db, uploadID)
+	count, err := countReadableReplicaSlots(ctx, db, uploadID)
 	if err != nil {
 		return err
 	}
@@ -2059,6 +2148,43 @@ func requireReadableCommittedCopy(ctx context.Context, db bun.IDB, uploadID int6
 	return nil
 }
 
+// Addressing a copy by slot alone became ambiguous once a slot can own several
+// generations, so every write resolves to one concrete row first. Returning
+// zero means the slot has no copy yet; an ambiguous slot is a conflict rather
+// than a silent multi-row update.
+// slotCopyTarget picks the concrete copy a mutation must touch. Zero means the
+// slot has no copy, which every caller already handles as "no rows updated".
+func slotCopyTarget(ctx context.Context, db bun.IDB, copyID, uploadID int64, copyIndex int) (int64, error) {
+	if copyID > 0 {
+		return copyID, nil
+	}
+	return resolveSlotCopyID(ctx, db, uploadID, copyIndex)
+}
+
+func resolveSlotCopyID(ctx context.Context, db bun.IDB, uploadID int64, copyIndex int) (int64, error) {
+	var ids []int64
+	err := db.NewSelect().
+		Model((*model.StorageUploadCopy)(nil)).
+		Column("id").
+		Where("storage_upload_copy.upload_id = ? AND storage_upload_copy.copy_index = ?", uploadID, copyIndex).
+		Where(currentGenerationCopySQL("storage_upload_copy")).
+		Scan(ctx, &ids)
+	if err != nil {
+		return 0, fmt.Errorf("resolving storage upload copy for slot: %w", err)
+	}
+	switch len(ids) {
+	case 0:
+		return 0, nil
+	case 1:
+		return ids[0], nil
+	default:
+		return 0, fmt.Errorf(
+			"storage upload %d replica slot %d matches %d copies: %w",
+			uploadID, copyIndex, len(ids), ErrConflict,
+		)
+	}
+}
+
 func uploadCopyTransferMethod(ctx context.Context, db bun.IDB, uploadID int64, copyIndex int) (model.StorageCopyTransferMethod, error) {
 	var row struct {
 		TransferMethod model.StorageCopyTransferMethod `bun:"transfer_method"`
@@ -2066,7 +2192,10 @@ func uploadCopyTransferMethod(ctx context.Context, db bun.IDB, uploadID int64, c
 	err := db.NewSelect().
 		Model((*model.StorageUploadCopy)(nil)).
 		Column("transfer_method").
-		Where("upload_id = ? AND copy_index = ?", uploadID, copyIndex).
+		Where("storage_upload_copy.upload_id = ? AND storage_upload_copy.copy_index = ?", uploadID, copyIndex).
+		Where(currentGenerationCopySQL("storage_upload_copy")).
+		OrderExpr("(storage_upload_copy.storage_data_set_id IS NULL) ASC").
+		Limit(1).
 		Scan(ctx, &row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -2081,13 +2210,16 @@ func uploadCopyDataSetCreatedByUpload(ctx context.Context, db bun.IDB, uploadID 
 	var row struct {
 		IsNewDataSet bool `bun:"is_new_data_set"`
 	}
-	err := db.NewRaw(`SELECT CASE
+	err := db.NewRaw(fmt.Sprintf(`SELECT CASE
 			WHEN storage_data_set.created_by_upload_id = storage_copy.upload_id THEN TRUE
 			ELSE FALSE
 		END AS is_new_data_set
 		FROM storage_upload_copies AS storage_copy
 		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-		WHERE storage_copy.upload_id = ? AND storage_copy.copy_index = ?`,
+		WHERE storage_copy.upload_id = ? AND storage_copy.copy_index = ?
+		  AND %s
+		ORDER BY (storage_copy.storage_data_set_id IS NULL) ASC
+		LIMIT 1`, currentGenerationCopySQL("storage_copy")),
 		uploadID, copyIndex,
 	).Scan(ctx, &row)
 	if err != nil {

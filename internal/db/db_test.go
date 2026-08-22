@@ -221,18 +221,27 @@ func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
 	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (2, 'bucket-b')`)
 	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, piece_cid, requested_copies) VALUES (1, 1, 'v1', 10, 'sum-1', 'complete', 'bafk2bzacefake', 2)`)
 	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (2, 2, 'v2', 10, 'sum-2', 'running', 3)`)
-	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (1, 1, '101', 0, '1001', 'ready', 1, 1)`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (2, '101', 0, '1001', 'ready', 2, 2)`); err == nil {
+	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (1, 1, '101', 0, 1, TRUE, '1001', 'ready', 1, 1)`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (2, '101', 0, 1, TRUE, '1001', 'ready', 2, 2)`); err == nil {
 		t.Fatal("expected provider/data_set reuse across buckets to fail")
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, status, created_by_upload_id, last_used_upload_id) VALUES (1, '202', 0, 'pending', 1, 1)`); err == nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, status, created_by_upload_id, last_used_upload_id) VALUES (1, '202', 0, 1, TRUE, 'pending', 1, 1)`); err == nil {
 		t.Fatal("expected duplicate bucket/copy_index binding to fail")
 	}
 
-	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, status, created_by_upload_id, last_used_upload_id) VALUES (2, 1, '202', 1, 'pending', 1, 1)`)
+	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, status, created_by_upload_id, last_used_upload_id) VALUES (2, 1, '202', 1, 1, TRUE, 'pending', 1, 1)`)
 	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, piece_id, transfer_method, status, retrieval_url, storage_data_set_id) VALUES (1, 0, '101', '2001', 'ingress', 'committed', 'https://provider.example/piece', 1)`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_copies (upload_id, copy_index, transfer_method) VALUES (1, 0, 'peer_pull')`); err == nil {
-		t.Fatal("expected duplicate copy_index for upload to fail")
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, transfer_method, storage_data_set_id) VALUES (1, 0, '101', 'peer_pull', 1)`); err == nil {
+		t.Fatal("expected duplicate copy for one data set to fail")
+	}
+	// A replica slot holds both generations while a provider replacement migrates.
+	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, status, created_by_upload_id, last_used_upload_id) VALUES (3, 1, '303', 0, 2, FALSE, 'pending', 1, 1)`)
+	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, transfer_method, storage_data_set_id) VALUES (1, 0, '303', 'peer_pull', 3)`)
+	// Unbound copies still cannot duplicate a slot, which distinct NULL data set
+	// ids would otherwise allow.
+	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, transfer_method) VALUES (1, 3, 'peer_pull')`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_copies (upload_id, copy_index, transfer_method) VALUES (1, 3, 'peer_pull')`); err == nil {
+		t.Fatal("expected duplicate unbound copy for one slot to fail")
 	}
 	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, transfer_method, storage_data_set_id) VALUES (1, 1, '202', 'peer_pull', 2)`)
 	if _, err := db.ExecContext(ctx, `UPDATE storage_upload_copies SET status = 'committed' WHERE upload_id = 1 AND copy_index = 1`); err == nil {

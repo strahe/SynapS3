@@ -20,6 +20,7 @@ type taskListItem struct {
 	CopyIndex     *int                    `json:"copy_index,omitempty"`
 	RefType       string                  `json:"ref_type"`
 	RefID         int64                   `json:"ref_id"`
+	BucketName    string                  `json:"bucket_name,omitempty"`
 	RefVersionID  string                  `json:"ref_version_id"`
 	Status        string                  `json:"status"`
 	Progress      *uploadProgressResponse `json:"progress,omitempty"`
@@ -44,6 +45,7 @@ type taskRefDetailResponse struct {
 	RefType        string                       `json:"ref_type"`
 	RefID          int64                        `json:"ref_id"`
 	RefVersionID   string                       `json:"ref_version_id"`
+	BucketName     string                       `json:"bucket_name,omitempty"`
 	Object         *taskRefObjectDetail         `json:"object"`
 	StorageCleanup *taskRefStorageCleanupDetail `json:"storage_cleanup,omitempty"`
 }
@@ -121,10 +123,30 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	progressByTaskID := s.taskUploadProgresses(ctx, tasks)
+	bucketIDs := make([]int64, 0)
+	seenBucketIDs := make(map[int64]struct{})
+	for i := range tasks {
+		if tasks[i].RefType == "bucket" && tasks[i].RefID > 0 {
+			if _, ok := seenBucketIDs[tasks[i].RefID]; !ok {
+				seenBucketIDs[tasks[i].RefID] = struct{}{}
+				bucketIDs = append(bucketIDs, tasks[i].RefID)
+			}
+		}
+	}
+	bucketNames, err := s.repos.Buckets.GetNamesByIDs(ctx, bucketIDs)
+	if err != nil {
+		s.logger.Error("api: failed to load task bucket names", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 
 	items := make([]taskListItem, 0, len(tasks))
 	for i := range tasks {
-		items = append(items, taskListItemFromModel(&tasks[i], progressByTaskID[tasks[i].ID]))
+		item := taskListItemFromModel(&tasks[i], progressByTaskID[tasks[i].ID])
+		if tasks[i].RefType == "bucket" {
+			item.BucketName = bucketNames[tasks[i].RefID]
+		}
+		items = append(items, item)
 	}
 
 	writeJSON(w, http.StatusOK, taskListResponse{
@@ -324,6 +346,17 @@ func (s *Server) handleAPITaskRefDetail(w http.ResponseWriter, r *http.Request) 
 		RefType:      task.RefType,
 		RefID:        task.RefID,
 		RefVersionID: task.RefVersionID,
+	}
+	if task.RefType == "bucket" {
+		bucket, bucketErr := s.repos.Buckets.GetByID(ctx, task.RefID)
+		if bucketErr != nil {
+			s.logger.Error("api: failed to load task bucket ref", "error", bucketErr, "taskID", id)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			return
+		}
+		if bucket != nil {
+			resp.BucketName = bucket.Name
+		}
 	}
 	if task.RefType == "storage_upload" && task.Type == model.TaskTypeStorageCleanup {
 		copies, err := s.repos.StorageCleanup.ListCopiesForTask(ctx, task.ID)

@@ -43,6 +43,27 @@ type StorageClient interface {
 	CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (CleanupContext, error)
 }
 
+// ServiceTerminator is the destructive service-lifecycle boundary. It is used
+// only after replacement cleanup authorization and the retirement safety gate
+// have both passed.
+type ServiceTerminator interface {
+	TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, error)
+}
+
+// TerminationResult records what the chain agreed to. EndEpoch is the epoch at
+// which the service actually stops, which is why retirement waits for the chain
+// to reach it rather than trusting the call returning.
+type TerminationResult struct {
+	TxHash   string
+	EndEpoch int64
+}
+
+// ChainEpochReader observes the chain head. Replacement uses it to decide when
+// a terminated service has genuinely ended.
+type ChainEpochReader interface {
+	CurrentEpoch(ctx context.Context) (int64, error)
+}
+
 // WalletQuerier provides on-chain wallet state for the admin dashboard.
 type WalletQuerier interface {
 	GetWalletInfo(ctx context.Context) (*WalletInfo, error)

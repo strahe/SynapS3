@@ -1,0 +1,264 @@
+package migrations
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
+)
+
+func init() {
+	Migrations.MustRegister(up2026082101StorageDataSetGenerations, down2026082101StorageDataSetGenerations)
+}
+
+// A replica slot may now own several data set generations so an operator can
+// replace a provider while the previous generation stays readable. Both
+// directions run in one transaction because bun marks a migration applied
+// before it executes; a half-applied schema would otherwise be recorded as
+// complete.
+func up2026082101StorageDataSetGenerations(ctx context.Context, db *bun.DB) error {
+	return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		if err := assertStorageGenerationPreconditions2026082101(ctx, tx); err != nil {
+			return err
+		}
+		pg := db.Dialect().Name() == dialect.PG
+
+		isCurrentColumn := "INTEGER NOT NULL DEFAULT 1"
+		if pg {
+			isCurrentColumn = "BOOLEAN NOT NULL DEFAULT TRUE"
+		}
+		// Neither column carries a CHECK: SQLite cannot add one later and a
+		// column-level CHECK blocks DROP COLUMN on rollback. The partial unique
+		// indexes below enforce the invariants on both dialects instead.
+		//
+		// The initial migration builds storage_data_sets from the runtime model,
+		// so a database created after this change already has both columns while
+		// an upgraded one does not.
+		var statements []string
+		for column, definition := range map[string]string{
+			"is_current": isCurrentColumn,
+			"generation": "INTEGER NOT NULL DEFAULT 1",
+		} {
+			exists, err := storageDataSetColumnExists2026082101(ctx, tx, pg, column)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				statements = append(statements, fmt.Sprintf("ALTER TABLE storage_data_sets ADD COLUMN %s %s", column, definition))
+			}
+		}
+
+		statements = append(statements,
+			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_index",
+			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_provider",
+			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_index",
+
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_current
+				ON storage_data_sets (bucket_id, copy_index) WHERE is_current`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_generation
+				ON storage_data_sets (bucket_id, copy_index, generation)`,
+			// A historical generation never blocks reusing its provider; only a
+			// live slot does.
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_provider_current
+				ON storage_data_sets (bucket_id, provider_id) WHERE is_current`,
+
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_data_set
+				ON storage_upload_copies (upload_id, storage_data_set_id) WHERE storage_data_set_id IS NOT NULL`,
+			// NULLs compare distinct in unique indexes on both dialects, so the
+			// index above would let unbound duplicates accumulate per slot.
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_slot_unbound
+				ON storage_upload_copies (upload_id, copy_index) WHERE storage_data_set_id IS NULL`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_slot
+				ON storage_upload_copies (upload_id, copy_index)`,
+
+			storageReplacementsTableSQL2026082101(pg),
+			storageReplacementItemsTableSQL2026082101(pg),
+
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_replacements_active_source
+				ON storage_replacements (source_data_set_id) WHERE status NOT IN ('completed', 'superseded')`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_replacements_bucket_slot
+				ON storage_replacements (bucket_id, copy_index, id)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_replacements_bucket_request
+				ON storage_replacements (bucket_id, client_request_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_next
+				ON storage_replacement_items (replacement_id, status, id)`,
+		)
+		for _, query := range statements {
+			if _, err := tx.ExecContext(ctx, query); err != nil {
+				return fmt.Errorf("adding storage data set generations: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+// Rollback only succeeds while every slot still owns a single generation. Once
+// a replacement has produced a second generation the original unique indexes
+// cannot be restored, and refusing is the correct outcome.
+func down2026082101StorageDataSetGenerations(ctx context.Context, db *bun.DB) error {
+	return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		statements := []string{
+			"DROP TABLE IF EXISTS storage_replacement_items",
+			"DROP TABLE IF EXISTS storage_replacements",
+
+			// SQLite refuses to drop a column named by an index or by a partial
+			// index predicate, so the indexes go first.
+			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_slot",
+			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_slot_unbound",
+			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_data_set",
+			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_provider_current",
+			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_generation",
+			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_current",
+
+			"ALTER TABLE storage_data_sets DROP COLUMN generation",
+			"ALTER TABLE storage_data_sets DROP COLUMN is_current",
+
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_index
+				ON storage_data_sets (bucket_id, copy_index)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_provider
+				ON storage_data_sets (bucket_id, provider_id)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_index
+				ON storage_upload_copies (upload_id, copy_index)`,
+		}
+		for _, query := range statements {
+			if _, err := tx.ExecContext(ctx, query); err != nil {
+				return fmt.Errorf("removing storage data set generations: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func storageDataSetColumnExists2026082101(ctx context.Context, tx bun.Tx, pg bool, column string) (bool, error) {
+	query := `SELECT COUNT(*) FROM pragma_table_info('storage_data_sets') WHERE name = ?`
+	if pg {
+		query = `SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = 'storage_data_sets'
+			  AND column_name = ?`
+	}
+	var count int
+	if err := tx.NewRaw(query, column).Scan(ctx, &count); err != nil {
+		return false, fmt.Errorf("checking storage_data_sets.%s: %w", column, err)
+	}
+	return count > 0, nil
+}
+
+// The new unique indexes would fail mid-migration on a database that violated
+// an invariant the old schema never enforced. Reporting the offending rows up
+// front keeps the failure actionable.
+func assertStorageGenerationPreconditions2026082101(ctx context.Context, tx bun.Tx) error {
+	checks := []struct {
+		description string
+		query       string
+	}{
+		{
+			description: "storage upload copies sharing one data set",
+			query: `SELECT COUNT(*) FROM (
+				SELECT upload_id, storage_data_set_id FROM storage_upload_copies
+				WHERE storage_data_set_id IS NOT NULL
+				GROUP BY upload_id, storage_data_set_id HAVING COUNT(*) > 1
+			) AS duplicates`,
+		},
+		{
+			description: "unbound storage upload copies sharing one replica slot",
+			query: `SELECT COUNT(*) FROM (
+				SELECT upload_id, copy_index FROM storage_upload_copies
+				WHERE storage_data_set_id IS NULL
+				GROUP BY upload_id, copy_index HAVING COUNT(*) > 1
+			) AS duplicates`,
+		},
+		{
+			description: "storage data sets sharing one replica slot",
+			query: `SELECT COUNT(*) FROM (
+				SELECT bucket_id, copy_index FROM storage_data_sets
+				GROUP BY bucket_id, copy_index HAVING COUNT(*) > 1
+			) AS duplicates`,
+		},
+	}
+	for _, check := range checks {
+		var count int
+		if err := tx.NewRaw(check.query).Scan(ctx, &count); err != nil {
+			return fmt.Errorf("checking %s: %w", check.description, err)
+		}
+		if count > 0 {
+			return fmt.Errorf("cannot add storage data set generations: found %d %s", count, check.description)
+		}
+	}
+	return nil
+}
+
+func storageReplacementsTableSQL2026082101(pg bool) string {
+	identity := "id INTEGER PRIMARY KEY AUTOINCREMENT"
+	reference := "INTEGER"
+	timestamp := "TIMESTAMP"
+	boolean := "INTEGER NOT NULL DEFAULT 0"
+	if pg {
+		identity = "id BIGSERIAL PRIMARY KEY"
+		reference = "BIGINT"
+		timestamp = "TIMESTAMPTZ"
+		boolean = "BOOLEAN NOT NULL DEFAULT FALSE"
+	}
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS storage_replacements (
+		%[1]s,
+		bucket_id %[2]s NOT NULL REFERENCES buckets (id) ON UPDATE CASCADE ON DELETE RESTRICT,
+		copy_index INTEGER NOT NULL,
+		source_data_set_id %[2]s NOT NULL REFERENCES storage_data_sets (id) ON UPDATE CASCADE ON DELETE RESTRICT,
+		target_data_set_id %[2]s NOT NULL REFERENCES storage_data_sets (id) ON UPDATE CASCADE ON DELETE RESTRICT,
+		selection_mode TEXT NOT NULL,
+		requested_provider_id TEXT,
+		client_request_id TEXT NOT NULL,
+		status TEXT NOT NULL,
+		wait_reason TEXT,
+		failure_reason TEXT,
+		last_error TEXT,
+		items_total INTEGER NOT NULL DEFAULT 0,
+		items_copied INTEGER NOT NULL DEFAULT 0,
+		seed_cursor_upload_id %[2]s NOT NULL DEFAULT 0,
+		seeding_complete %[4]s,
+		termination_tx_hash TEXT,
+		termination_epoch %[2]s,
+		termination_observed_at %[3]s,
+		abandoned_termination_tx_hash TEXT,
+		abandoned_termination_epoch %[2]s,
+		abandoned_termination_observed_at %[3]s,
+		superseded_by_id %[2]s REFERENCES storage_replacements (id) ON UPDATE CASCADE ON DELETE SET NULL,
+		confirmed_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		created_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		CONSTRAINT chk_storage_replacements_copy_index CHECK (copy_index >= 0),
+		CONSTRAINT chk_storage_replacements_selection_mode CHECK (selection_mode IN ('automatic', 'manual')),
+		CONSTRAINT chk_storage_replacements_status CHECK (status IN ('preparing_target', 'migrating', 'waiting', 'retiring', 'cleanup_attention', 'failed', 'completed', 'superseded')),
+		CONSTRAINT chk_storage_replacements_wait_reason CHECK (wait_reason IS NULL OR wait_reason IN ('readable_source', 'target', 'target_creating', 'target_writable', 'funding', 'provider', 'termination_epoch', 'source_writes', 'coverage')),
+		CONSTRAINT chk_storage_replacements_failure_reason CHECK (failure_reason IS NULL OR failure_reason IN ('target_in_use')),
+		CONSTRAINT chk_storage_replacements_client_request_id CHECK (length(client_request_id) BETWEEN 1 AND 128),
+		CONSTRAINT chk_storage_replacements_distinct_data_sets CHECK (source_data_set_id <> target_data_set_id),
+		CONSTRAINT chk_storage_replacements_items CHECK (items_total >= 0 AND items_copied >= 0 AND items_copied <= items_total)
+	)`, identity, reference, timestamp, boolean)
+}
+
+func storageReplacementItemsTableSQL2026082101(pg bool) string {
+	identity := "id INTEGER PRIMARY KEY AUTOINCREMENT"
+	reference := "INTEGER"
+	timestamp := "TIMESTAMP"
+	if pg {
+		identity = "id BIGSERIAL PRIMARY KEY"
+		reference = "BIGINT"
+		timestamp = "TIMESTAMPTZ"
+	}
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS storage_replacement_items (
+		%[1]s,
+		replacement_id %[2]s NOT NULL REFERENCES storage_replacements (id) ON UPDATE CASCADE ON DELETE CASCADE,
+		upload_id %[2]s NOT NULL REFERENCES storage_uploads (id) ON UPDATE CASCADE ON DELETE RESTRICT,
+		target_copy_id %[2]s REFERENCES storage_upload_copies (id) ON UPDATE CASCADE ON DELETE SET NULL,
+		status TEXT NOT NULL,
+		attempts INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT,
+		created_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		CONSTRAINT chk_storage_replacement_items_status CHECK (status IN ('pending', 'running', 'waiting_source', 'copied', 'cancelled')),
+		CONSTRAINT chk_storage_replacement_items_attempts CHECK (attempts >= 0),
+		CONSTRAINT uq_storage_replacement_items_upload UNIQUE (replacement_id, upload_id)
+	)`, identity, reference, timestamp)
+}

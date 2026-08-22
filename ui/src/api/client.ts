@@ -208,6 +208,10 @@ export interface StorageDataSetSummary {
   bucket_id: number
   bucket_name?: string
   copy_index: number
+  generation: number
+  is_current: boolean
+  /** Only the generation that receives writes can be replaced. */
+  replaceable: boolean
   provider_id: string
   provider_identity?: ProviderIdentity
   data_set_id?: string
@@ -290,6 +294,48 @@ export interface BucketDetail extends BucketItem {
   versioning_status: string
   versioning_enforced: boolean
   data_sets: StorageDataSetSummary[]
+  /** Full replacement history for this bucket, newest first. */
+  replacements: ProviderReplacement[]
+}
+
+export type ProviderReplacementStatus =
+  | 'preparing_target'
+  | 'migrating'
+  | 'waiting'
+  | 'retiring'
+  | 'cleanup_attention'
+  | 'failed'
+  | 'completed'
+  | 'superseded'
+
+export interface ProviderReplacementDataSet {
+  id: number
+  generation: number
+  is_current: boolean
+  status: string
+  provider_id: string
+  data_set_id: string | null
+  provider_identity?: ProviderIdentity
+}
+
+export interface ProviderReplacement {
+  id: number
+  bucket_name: string
+  copy_index: number
+  status: ProviderReplacementStatus
+  wait_reason?: string
+  wait_message?: string
+  failure_reason?: 'target_in_use'
+  selection_mode: 'automatic' | 'manual'
+  source: ProviderReplacementDataSet
+  target: ProviderReplacementDataSet
+  /** Progress counts unique stored content, not object versions. */
+  items_total: number
+  items_copied: number
+  last_error: string | null
+  termination_epoch: number | null
+  created_at: string
+  updated_at: string
 }
 
 export interface BucketMutationResponse {
@@ -496,6 +542,15 @@ export interface ObjectStatusDetail {
 
 export type ObjectUploadCopyStatus = 'pending' | 'piece_ready' | 'committing' | 'committed' | 'failed'
 
+/** One provider offered for a replacement, with why it cannot be chosen. */
+export interface ReplacementProviderCandidate {
+  provider_id: string
+  eligible: boolean
+  ineligible_reason?: string
+  previously_used: boolean
+  provider_identity?: ProviderIdentity
+}
+
 export interface ProviderIdentity {
   registry_provider_id: string
   name?: string
@@ -554,6 +609,7 @@ export interface TaskItem {
   copy_index?: number
   ref_type: string
   ref_id: number
+  bucket_name?: string
   ref_version_id: string
   status: string
   progress?: UploadTransferProgress
@@ -751,6 +807,7 @@ export interface TaskRefDetail {
   ref_type: string
   ref_id: number
   ref_version_id: string
+  bucket_name?: string
   object: TaskRefObjectDetail | null
   storage_cleanup?: TaskStorageCleanupDetail
 }
@@ -1072,6 +1129,21 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(policy),
     }),
+  startProviderReplacement: (
+    name: string,
+    dataSetID: number,
+    request: { mode: 'automatic' | 'manual'; provider_id?: string; client_request_id: string }
+  ) =>
+    fetchJSON<ProviderReplacement>(`/buckets/${encodeURIComponent(name)}/data-sets/${dataSetID}/replacement`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }),
+  retryProviderReplacement: (replacementID: number) =>
+    fetchJSON<ProviderReplacement>(`/storage-replacements/${replacementID}/retry`, { method: 'POST' }),
+  getReplacementProviders: (name: string, dataSetID: number) =>
+    fetchJSON<{ providers: ReplacementProviderCandidate[] }>(
+      `/buckets/${encodeURIComponent(name)}/data-sets/${dataSetID}/replacement/providers`
+    ),
   getBucketObjects: (name: string, params: { prefix?: string; delimiter?: string; after?: string; limit?: number }) => {
     const sp = new URLSearchParams()
     if (params.prefix) sp.set('prefix', params.prefix)

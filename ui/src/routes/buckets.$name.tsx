@@ -13,6 +13,7 @@ import {
   Loader2,
   MoreHorizontal,
   RefreshCw,
+  Repeat2,
   RotateCcw,
   Trash2,
   TriangleAlert,
@@ -40,6 +41,7 @@ import {
   type ObjectUploadStatus,
   type ObjectVersionItem,
   objectVersionAlreadyCurrentCode,
+  type ProviderReplacement,
   type StorageDataSetSummary,
   type StorageHealthStatus,
   type UploadTransferProgress,
@@ -53,6 +55,7 @@ import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
+import { ProviderSelect } from '@/components/app/ProviderSelect'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
@@ -106,10 +109,13 @@ import {
   usePermanentDeleteBucketObjectVersion,
   usePermanentDeleteDeletedBucketObject,
   useRefreshDataSetStorageHealth,
+  useReplacementProviderCandidates,
   useRestoreBucketObject,
   useRestoreBucketObjectVersion,
+  useRetryProviderReplacement,
   useS3Users,
   useSettings,
+  useStartProviderReplacement,
   useUpdateBucketCopyPolicy,
   useUpdateBucketOwner,
 } from '@/hooks/queries'
@@ -155,6 +161,19 @@ import {
   copyHealthSummaryTitle,
 } from '@/lib/copy-health'
 import { dataSetStorageHealthDetailParts, dataSetStorageHealthRefreshErrorMessage } from '@/lib/data-set-storage-health'
+import {
+  activeReplacements,
+  dataSetGenerationLabel,
+  dataSetGenerationTone,
+  dataSetReplaceable,
+  replacementConfirmationSummary,
+  replacementErrorMessage,
+  replacementNextStep,
+  replacementProgressLabel,
+  replacementRetryable,
+  replacementStatusLabel,
+  replacementStatusTone,
+} from '@/lib/provider-replacement'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
@@ -1182,6 +1201,22 @@ function ObjectBrowserPage() {
   )
   const qc = useQueryClient()
 
+  useEffect(() => {
+    if (search.details === 'storage') setDetailsOpen(true)
+  }, [search.details])
+
+  const handleDetailsOpenChange = (open: boolean) => {
+    setDetailsOpen(open)
+    if (!open && search.details === 'storage') {
+      navigate({
+        to: '/buckets/$name',
+        params: { name },
+        search: { ...search, details: undefined },
+        replace: true,
+      })
+    }
+  }
+
   const pathCrumbs = bucketPrefixCrumbs(prefix)
 
   const navigateToPrefix = (newPrefix: string) => {
@@ -1446,7 +1481,8 @@ function ObjectBrowserPage() {
           <BucketDetailsSheet
             bucket={bucket.data}
             open={detailsOpen}
-            onOpenChange={setDetailsOpen}
+            onOpenChange={handleDetailsOpenChange}
+            focusStorage={search.details === 'storage'}
             onChangeOwner={openChangeOwner}
             onReviewStorageRisk={() => navigateToStorageRisk()}
             onReviewStorageDataSetRisk={navigateToStorageRiskDataSet}
@@ -1769,6 +1805,7 @@ function BucketDetailsSheet({
   onChangeOwner,
   onReviewStorageRisk,
   onReviewStorageDataSetRisk,
+  focusStorage,
 }: {
   bucket: NonNullable<ReturnType<typeof useBucket>['data']>
   open: boolean
@@ -1776,9 +1813,19 @@ function BucketDetailsSheet({
   onChangeOwner: () => void
   onReviewStorageRisk: () => void
   onReviewStorageDataSetRisk: (dataSetID: number) => void
+  focusStorage: boolean
 }) {
   const [storageHealthError, setStorageHealthError] = useState<string | null>(null)
+  // Replacement diagnostics are not replica-health diagnostics; sharing one
+  // dialog labelled them as the wrong kind of fault.
+  const [replacementError, setReplacementError] = useState<string | null>(null)
+  const [replacementTarget, setReplacementTarget] = useState<StorageDataSetSummary | null>(null)
   const titleRef = useRef<HTMLHeadingElement>(null)
+  const storageRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (open && focusStorage) storageRef.current?.scrollIntoView({ block: 'start' })
+  }, [focusStorage, open])
 
   return (
     <>
@@ -1811,13 +1858,22 @@ function BucketDetailsSheet({
                 onOpenLastError={setStorageHealthError}
                 onReviewVersions={onReviewStorageRisk}
               />
-              <BucketDetailsSection title="Storage">
-                <BucketStorageDataSets
-                  bucketName={bucket.name}
-                  dataSets={bucket.data_sets ?? []}
-                  onReviewStorageRisk={onReviewStorageDataSetRisk}
-                />
-              </BucketDetailsSection>
+              <div ref={storageRef}>
+                <BucketDetailsSection title="Storage">
+                  <ProviderReplacementProgress
+                    bucketName={bucket.name}
+                    replacements={bucket.replacements ?? []}
+                    onOpenLastError={setReplacementError}
+                  />
+                  <BucketStorageDataSets
+                    bucketName={bucket.name}
+                    dataSets={bucket.data_sets ?? []}
+                    replacements={bucket.replacements ?? []}
+                    onReviewStorageRisk={onReviewStorageDataSetRisk}
+                    onReplaceProvider={setReplacementTarget}
+                  />
+                </BucketDetailsSection>
+              </div>
               <BucketDetailsSection title="Settings">
                 <BucketDetailsSettings bucket={bucket} onChangeOwner={onChangeOwner} />
               </BucketDetailsSection>
@@ -1830,7 +1886,244 @@ function BucketDetailsSheet({
         text={storageHealthError}
         onClose={() => setStorageHealthError(null)}
       />
+      <DetailTextDialog
+        title="Provider Replacement Diagnostics"
+        text={replacementError}
+        onClose={() => setReplacementError(null)}
+      />
+      <ReplaceProviderDialog
+        bucketName={bucket.name}
+        dataSet={replacementTarget}
+        onClose={() => setReplacementTarget(null)}
+      />
     </>
+  )
+}
+
+function ReplaceProviderDialog({
+  bucketName,
+  dataSet,
+  onClose,
+}: {
+  bucketName: string
+  dataSet: StorageDataSetSummary | null
+  onClose: () => void
+}) {
+  const startReplacement = useStartProviderReplacement()
+  const [mode, setMode] = useState<'automatic' | 'manual'>('automatic')
+  const [providerID, setProviderID] = useState('')
+  const [clientRequestID, setClientRequestID] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const dataSetID = dataSet?.id
+  // The registry is only worth reading while the operator is actually choosing.
+  const candidates = useReplacementProviderCandidates(
+    bucketName,
+    dataSet?.id ?? null,
+    Boolean(dataSet) && mode === 'manual'
+  )
+
+  useEffect(() => {
+    if (dataSetID !== undefined) {
+      setMode('automatic')
+      setProviderID('')
+      setError(null)
+      setClientRequestID(crypto.randomUUID())
+    }
+  }, [dataSetID])
+
+  if (!dataSet) return null
+
+  const namedProvider = dataSet.provider_identity?.name?.trim()
+  const providerLabel = namedProvider || (dataSet.provider_id ? `Registry ${dataSet.provider_id}` : '—')
+  const canChooseProvider =
+    mode === 'automatic' || (!candidates.isLoading && !candidates.isError && providerID.trim().length > 0)
+
+  const submit = () => {
+    if (!canChooseProvider || startReplacement.isPending) return
+    const requestID = clientRequestID || crypto.randomUUID()
+    if (!clientRequestID) setClientRequestID(requestID)
+    setError(null)
+    startReplacement.mutate(
+      { bucket: bucketName, dataSetID: dataSet.id, mode, providerID: providerID.trim(), clientRequestID: requestID },
+      {
+        onSuccess: () => onClose(),
+        onError: (mutationError) => setError(replacementErrorMessage(mutationError)),
+      }
+    )
+  }
+
+  return (
+    <DangerActionAlertDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose()
+      }}
+      title="Replace provider"
+      description="This starts paying a new provider, and new uploads go there. The old provider is ended after existing objects are readable on the new one."
+      confirmLabel="Replace provider"
+      typedTarget="replace"
+      pending={startReplacement.isPending}
+      confirmDisabled={!canChooseProvider}
+      error={error}
+      contentClassName="data-[size=default]:max-w-lg data-[size=default]:sm:max-w-lg"
+      onConfirm={submit}
+    >
+      <ReviewDetails
+        rows={[
+          { id: 'replica', label: 'Replica', value: replicaLabel(dataSet.copy_index), monospace: false },
+          {
+            id: 'provider',
+            label: 'Current provider',
+            value: dataSet.provider_id,
+            displayValue: providerLabel,
+            copyable: true,
+            monospace: !namedProvider,
+          },
+          { id: 'scope', label: 'Data to copy', value: replacementConfirmationSummary(dataSet), monospace: false },
+        ]}
+      />
+      <Alert>
+        <AlertDescription>
+          Existing objects copy from another replica or from cache. If an object has neither, the old provider stays.
+        </AlertDescription>
+      </Alert>
+      <FieldGroup>
+        <Field data-disabled={startReplacement.isPending}>
+          <FieldLabel htmlFor="replacement-mode">New provider</FieldLabel>
+          <Select
+            value={mode}
+            onValueChange={(value) => {
+              setMode(value as 'automatic' | 'manual')
+              setProviderID('')
+              setClientRequestID(crypto.randomUUID())
+            }}
+            disabled={startReplacement.isPending}
+          >
+            <SelectTrigger id="replacement-mode" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="automatic">Choose automatically</SelectItem>
+                <SelectItem value="manual">Choose a provider</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          {mode === 'automatic' && <FieldDescription>Picks a provider this bucket has never used.</FieldDescription>}
+        </Field>
+        {mode === 'manual' && (
+          <Field data-disabled={startReplacement.isPending}>
+            <FieldLabel htmlFor="replacement-provider">Provider</FieldLabel>
+            {candidates.isError ? (
+              <FieldDescription>Provider choices couldn’t be loaded. Try again.</FieldDescription>
+            ) : (
+              <ProviderSelect
+                id="replacement-provider"
+                candidates={candidates.data?.providers ?? []}
+                value={providerID}
+                onChange={(value) => {
+                  setProviderID(value)
+                  setClientRequestID(crypto.randomUUID())
+                }}
+                disabled={startReplacement.isPending || candidates.isLoading}
+              />
+            )}
+          </Field>
+        )}
+      </FieldGroup>
+    </DangerActionAlertDialog>
+  )
+}
+
+/**
+ * ProviderReplacementProgress shows the replacement that still needs something,
+ * including a retry the operator owns. A failed retry request is reported here
+ * rather than disappearing.
+ */
+function ProviderReplacementProgress({
+  bucketName,
+  replacements,
+  onOpenLastError,
+}: {
+  bucketName: string
+  replacements: ProviderReplacement[]
+  onOpenLastError: (text: string) => void
+}) {
+  const active = activeReplacements(replacements)
+  if (active.length === 0) return null
+  return (
+    <div className="flex flex-col gap-3">
+      {active.map((replacement) => (
+        <ProviderReplacementProgressCard
+          key={replacement.id}
+          bucketName={bucketName}
+          replacement={replacement}
+          onOpenLastError={onOpenLastError}
+        />
+      ))}
+    </div>
+  )
+}
+
+function ProviderReplacementProgressCard({
+  bucketName,
+  replacement,
+  onOpenLastError,
+}: {
+  bucketName: string
+  replacement: ProviderReplacement
+  onOpenLastError: (text: string) => void
+}) {
+  const retryReplacement = useRetryProviderReplacement()
+  const [retryError, setRetryError] = useState<string | null>(null)
+  const nextStep = replacementNextStep(replacement)
+
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-medium">
+          Replacing {replicaLabel(replacement.copy_index)} · {replacement.source.provider_id} →{' '}
+          {replacement.target.provider_id}
+        </span>
+        <StatusBadge tone={replacementStatusTone(replacement.status)}>
+          {replacementStatusLabel(replacement.status)}
+        </StatusBadge>
+      </div>
+      <div className="text-sm text-muted-foreground">{replacementProgressLabel(replacement)}</div>
+      {nextStep && <div className="text-sm text-muted-foreground">{nextStep}</div>}
+      {replacement.last_error && (
+        <BucketDetailAction
+          label="Error details"
+          value="View"
+          onClick={() => onOpenLastError(replacement.last_error ?? '')}
+        />
+      )}
+      {retryError && (
+        <Alert variant="destructive">
+          <AlertDescription>{retryError}</AlertDescription>
+        </Alert>
+      )}
+      {replacementRetryable(replacement) && (
+        <div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={retryReplacement.isPending}
+            onClick={() => {
+              setRetryError(null)
+              retryReplacement.mutate(
+                { bucket: bucketName, replacementID: replacement.id },
+                { onError: (error) => setRetryError(replacementErrorMessage(error)) }
+              )
+            }}
+          >
+            {retryReplacement.isPending && <Loader2 data-icon="inline-start" className="animate-spin" />}
+            Retry replacement
+          </Button>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -1970,11 +2263,15 @@ function BucketDetailAction({ label, value, onClick }: { label: string; value: s
 function BucketStorageDataSets({
   bucketName,
   dataSets,
+  replacements,
   onReviewStorageRisk,
+  onReplaceProvider,
 }: {
   bucketName: string
   dataSets: StorageDataSetSummary[]
+  replacements: ProviderReplacement[]
   onReviewStorageRisk: (dataSetID: number) => void
+  onReplaceProvider: (dataSet: StorageDataSetSummary) => void
 }) {
   const refreshStorageHealth = useRefreshDataSetStorageHealth()
   const [refreshError, setRefreshError] = useState<string | null>(null)
@@ -2057,8 +2354,17 @@ function BucketStorageDataSets({
 
               return (
                 <TableRow key={dataSet.id}>
-                  <TableCell className="overflow-hidden px-3 font-mono text-xs">
-                    <span className="block max-w-full truncate">{replicaLabel(dataSet.copy_index)}</span>
+                  <TableCell className="overflow-hidden px-3">
+                    <span className="block max-w-full truncate font-mono text-xs">
+                      {replicaLabel(dataSet.copy_index)}
+                    </span>
+                    <StatusBadge
+                      tone={dataSetGenerationTone(dataSet)}
+                      className="mt-1 max-w-full truncate"
+                      title={dataSetGenerationLabel(dataSet)}
+                    >
+                      {dataSetGenerationLabel(dataSet)}
+                    </StatusBadge>
                   </TableCell>
                   <TableCell className="overflow-hidden px-3">
                     <ProviderIdentityCell providerID={dataSet.provider_id} identity={dataSet.provider_identity} />
@@ -2093,22 +2399,40 @@ function BucketStorageDataSets({
                     {formatNumber(dataSet.referenced_version_count)}
                   </TableCell>
                   <TableCell className="px-2 text-right">
-                    {dataSetNeedsStorageRiskReview(dataSet) && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={`Review affected versions for ${replicaLabel(dataSet.copy_index)}`}
-                            onClick={() => onReviewStorageRisk(dataSet.id)}
-                          >
-                            <TriangleAlert />
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent>Affected versions</TooltipContent>
-                      </Tooltip>
-                    )}
+                    <div className="flex items-center justify-end gap-1">
+                      {dataSetNeedsStorageRiskReview(dataSet) && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={`Review affected versions for ${replicaLabel(dataSet.copy_index)}`}
+                              onClick={() => onReviewStorageRisk(dataSet.id)}
+                            >
+                              <TriangleAlert />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Affected versions</TooltipContent>
+                        </Tooltip>
+                      )}
+                      {dataSetReplaceable(dataSet, replacements) && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={`Replace provider for ${replicaLabel(dataSet.copy_index)}`}
+                              onClick={() => onReplaceProvider(dataSet)}
+                            >
+                              <Repeat2 />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Replace provider</TooltipContent>
+                        </Tooltip>
+                      )}
+                    </div>
                   </TableCell>
                 </TableRow>
               )

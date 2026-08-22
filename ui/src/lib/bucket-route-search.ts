@@ -10,6 +10,7 @@ export type BucketRouteSearch = {
   risk_created_at_marker?: string
   risk_stale_before?: string
   view?: 'objects' | 'deleted' | 'storage-risk'
+  details?: 'storage'
 }
 
 export function normalizeBucketRouteSearch(search: Record<string, unknown>): BucketRouteSearch {
@@ -25,6 +26,7 @@ export function normalizeBucketRouteSearch(search: Record<string, unknown>): Buc
     risk_created_at_marker: normalizeSearchString(search.risk_created_at_marker),
     risk_stale_before: normalizeSearchString(search.risk_stale_before),
     view: search.view === 'deleted' || search.view === 'storage-risk' ? search.view : undefined,
+    details: search.details === 'storage' ? 'storage' : undefined,
   }
 }
 

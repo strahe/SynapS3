@@ -22,6 +22,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
@@ -62,9 +63,13 @@ type Server struct {
 	filecoinDefaultCopies    int
 	evictMaxRetries          int
 	storageCleanupMaxRetries int
-	setupOnly                bool
-	logger                   *slog.Logger
-	startedAt                time.Time
+	uploadMaxRetries         int
+	// replacementSelector resolves an automatic replacement provider. Nil means
+	// only an explicit Provider ID can be confirmed.
+	replacementSelector providerReplacementSelector
+	setupOnly           bool
+	logger              *slog.Logger
+	startedAt           time.Time
 
 	// Track previously seen label sets to zero stale entries on refresh.
 	prevTaskLabels   map[[2]string]struct{}
@@ -108,6 +113,7 @@ func New(
 		filecoinDefaultCopies:    boundedBucketCopies(filecoinDefaultCopies),
 		evictMaxRetries:          5,
 		storageCleanupMaxRetries: 5,
+		uploadMaxRetries:         5,
 		logger:                   logger,
 		startedAt:                time.Now(),
 	}
@@ -206,6 +212,14 @@ func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	return s
 }
 
+// WithUploadMaxRetries sets the retry budget replacement coordinators inherit.
+func (s *Server) WithUploadMaxRetries(maxRetries int) *Server {
+	if maxRetries > 0 {
+		s.uploadMaxRetries = maxRetries
+	}
+	return s
+}
+
 // WithStorageCleanupMaxRetries configures max retries for storage cleanup tasks created by admin actions.
 func (s *Server) WithStorageCleanupMaxRetries(maxRetries int) *Server {
 	s.storageCleanupMaxRetries = maxRetries
@@ -257,6 +271,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/buckets/{name}", s.handleAPIGetBucket)
 		mux.HandleFunc("PUT /api/v1/buckets/{name}/owner", s.handleAPIUpdateBucketOwner)
 		mux.HandleFunc("PUT /api/v1/buckets/{name}/copy-policy", s.handleAPIUpdateBucketCopyPolicy)
+		mux.HandleFunc("POST /api/v1/buckets/{name}/data-sets/{id}/replacement", s.handleAPIStartDataSetReplacement)
+		mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", s.handleAPIListDataSetReplacementProviders)
+		mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", s.handleAPIRetryStorageReplacement)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", s.handleAPIDeleteBucketObject)
@@ -463,7 +480,12 @@ func (s *Server) handleRetryExhausted(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.repos.Tasks.RetryExhausted(r.Context(), id); err != nil {
 		s.logger.Error("failed to retry exhausted task", "taskID", id, "error", err)
-		if errors.Is(err, repository.ErrNotFound) {
+		if errors.Is(err, repository.ErrReplacementRetryUnsupported) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "Retry this replacement from the bucket Details page, under Storage → Data Sets.",
+				"code":  storagereplacement.CodeTaskRetryUnsupported,
+			})
+		} else if errors.Is(err, repository.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found or not in exhausted state"})
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})

@@ -13,6 +13,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/state"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 )
 
 // Worker defines a background processing unit.
@@ -122,6 +123,7 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 	m.reconcileStagedUploads(ctx)
 	m.reconcileIncompleteReadableUploads(ctx)
 	m.reconcileUnavailableDataSets(ctx)
+	m.reconcileProviderReplacements(ctx)
 
 	// Log exhausted task count for operator awareness
 	exhaustedTasks, err := m.repos.Tasks.ListExhausted(ctx, 100)
@@ -169,6 +171,70 @@ func (m *Manager) reconcileUnavailableDataSets(ctx context.Context) {
 		if len(bindings) < reconcileBatchSize {
 			return
 		}
+	}
+}
+
+// reconcileProviderReplacements re-issues the coordinator for every replacement
+// that still has work. Both coordinator keys are idempotent singletons, so this
+// is safe to run on every boot, and it also picks up an abandoned target left by
+// a superseded confirmation.
+func (m *Manager) reconcileProviderReplacements(ctx context.Context) {
+	afterID := int64(0)
+	for {
+		rows, err := m.repos.Replacements.ListActive(ctx, afterID, reconcileBatchSize)
+		if err != nil {
+			m.logger.Error("failed to list active provider replacements for recovery", "error", err)
+			break
+		}
+		for i := range rows {
+			row := &rows[i]
+			m.enqueueReplacementCoordinator(ctx, row)
+			afterID = row.ID
+		}
+		if len(rows) < reconcileBatchSize {
+			break
+		}
+	}
+
+	afterID = 0
+	for {
+		rows, err := m.repos.Replacements.ListSupersededCleanupCandidates(ctx, afterID, reconcileBatchSize)
+		if err != nil {
+			m.logger.Error("failed to list superseded provider replacements for cleanup", "error", err)
+			return
+		}
+		for i := range rows {
+			row := &rows[i]
+			// A superseded replacement's leftover is its unused target, not its
+			// source; the source still belongs to whoever took over the slot.
+			task := storagereplacement.NewAbandonedTargetTask(row.ID, row.BucketID, m.uploadMaxRetries, time.Now())
+			// Leftover paid services have no Data Sets retry: the replacement is
+			// superseded. Revive a coordinator that failed or exhausted so an
+			// unused target does not stay reserved across restarts.
+			if _, err := m.repos.Tasks.ResumeCoordinator(ctx, task); err != nil {
+				m.logger.Error("failed to ensure superseded replacement cleanup", "replacementID", row.ID, "error", err)
+			}
+			afterID = row.ID
+		}
+		if len(rows) < reconcileBatchSize {
+			return
+		}
+	}
+}
+
+// A replacement resumes through whichever coordinator owns its current phase.
+func (m *Manager) enqueueReplacementCoordinator(ctx context.Context, row *storagereplacement.Replacement) {
+	var task *model.Task
+	// A recorded termination epoch means the old service has already been asked
+	// to end, so this replacement is past migration even if a wait moved it out
+	// of the retiring status.
+	if row.Status == storagereplacement.StatusRetiring || row.TerminationEpoch != nil {
+		task = storagereplacement.NewRetireTask(row.ID, row.BucketID, m.uploadMaxRetries, time.Now())
+	} else {
+		task = storagereplacement.NewMigrateTask(row.ID, row.BucketID, "", m.uploadMaxRetries, time.Now())
+	}
+	if _, err := m.repos.Tasks.EnsureRecurring(ctx, task); err != nil {
+		m.logger.Error("failed to ensure provider replacement coordinator", "replacementID", row.ID, "error", err)
 	}
 }
 

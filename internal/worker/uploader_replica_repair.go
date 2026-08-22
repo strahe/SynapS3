@@ -71,6 +71,16 @@ func ensureReplicaRepairTask(ctx context.Context, repos *repository.Repositories
 	if binding.Status != model.StorageDataSetStatusUnavailable && binding.Status != model.StorageDataSetStatusReady {
 		return false, nil
 	}
+	// An approved replacement already owns this generation's remaining work.
+	// Repairing it in place would fight the migration, so recovery stands down
+	// until the replacement finishes or terminally fails.
+	replacing, err := repos.Replacements.HasInProgressForDataSet(ctx, binding.ID)
+	if err != nil {
+		return false, fmt.Errorf("check provider replacement for data set %d: %w", binding.ID, err)
+	}
+	if replacing {
+		return false, nil
+	}
 	copyRow, err := repos.Uploads.NextFinalizableCopyForDataSet(ctx, binding.ID)
 	if err != nil {
 		return false, fmt.Errorf("select replica finalization copy for data set %d: %w", binding.ID, err)
@@ -265,7 +275,7 @@ func (u *Uploader) repairReplicaCopy(
 			}
 			pieceCIDString = sourceCopy.PieceCID
 			pieces := []storage.PieceInput{{PieceCID: pieceCID}}
-			extraData, encodedExtra, err := u.extraDataForCopy(ctx, storageCtx, upload.ID, copyRow.CopyIndex, pieces)
+			extraData, encodedExtra, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
 			if err != nil {
 				return err
 			}
@@ -313,8 +323,7 @@ func (u *Uploader) repairReplicaCopy(
 			_, extraHex, err = u.extraDataForCopy(
 				ctx,
 				storageCtx,
-				upload.ID,
-				copyRow.CopyIndex,
+				copyRow,
 				[]storage.PieceInput{{PieceCID: pieceCID}},
 			)
 			if err != nil {
@@ -323,6 +332,7 @@ func (u *Uploader) repairReplicaCopy(
 		}
 		if err := u.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
 			StorageUploadCopyID: copyRow.ID,
+			RequireEligibleCopy: true,
 			UploadID:            upload.ID,
 			CopyIndex:           copyRow.CopyIndex,
 			PieceCID:            pieceCIDString,
@@ -332,6 +342,7 @@ func (u *Uploader) repairReplicaCopy(
 		}
 		if err := u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
 			StorageUploadCopyID: copyRow.ID,
+			RequireEligibleCopy: true,
 			UploadID:            upload.ID,
 			CopyIndex:           copyRow.CopyIndex,
 			CommitExtraDataHex:  extraHex,
@@ -362,6 +373,7 @@ func (u *Uploader) repairReplicaCopy(
 	pieceID := idtypes.OnChainIDFromSDK(result.PieceIDs[0])
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
 		StorageUploadCopyID: copyRow.ID,
+		RequireEligibleCopy: true,
 		UploadID:            upload.ID,
 		CopyIndex:           copyRow.CopyIndex,
 		PieceCID:            pieceCIDString,
@@ -462,13 +474,13 @@ func (u *Uploader) commitReplicaRepairCopy(
 		transactionID := *copyRow.CommitTransactionID
 		result, err := u.waitForSubmittedCommit(ctx, storageCtx, binding, transactionID, len(pieces))
 		if errors.Is(err, errCommitRejected) {
-			if resetErr := u.resetRejectedSubmittedCommit(ctx, upload.ID, copyRow.CopyIndex, transactionID, err); resetErr != nil {
+			if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, upload.ID, copyRow.CopyIndex, transactionID, err); resetErr != nil {
 				return nil, fmt.Errorf("reset rejected replica repair commit: %w", resetErr)
 			}
 		}
 		return result, err
 	}
-	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, upload.ID, copyRow.CopyIndex, pieces)
+	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +493,7 @@ func (u *Uploader) commitReplicaRepairCopy(
 			submittedTx = txHash
 			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
 				StorageUploadCopyID: copyRow.ID,
+				RequireEligibleCopy: true,
 				UploadID:            upload.ID,
 				CopyIndex:           copyRow.CopyIndex,
 				CommitExtraDataHex:  extraHex,
@@ -492,7 +505,7 @@ func (u *Uploader) commitReplicaRepairCopy(
 		return nil, fmt.Errorf("save replica repair commit submission: %w", submitErr)
 	}
 	if errors.Is(err, errCommitRejected) && submittedTx != "" {
-		if resetErr := u.resetRejectedSubmittedCommit(ctx, upload.ID, copyRow.CopyIndex, submittedTx, err); resetErr != nil {
+		if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, upload.ID, copyRow.CopyIndex, submittedTx, err); resetErr != nil {
 			return nil, fmt.Errorf("reset rejected replica repair commit: %w", resetErr)
 		}
 	}

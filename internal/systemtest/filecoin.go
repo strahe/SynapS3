@@ -51,15 +51,31 @@ type MemoryFilecoin struct {
 	pieces          map[string]*memoryPiece
 	nextDataSet     map[string]uint64
 	nextPiece       uint64
+	// terminated records the epoch at which each data set's service ends, and
+	// epoch is the observed chain head. Tests advance the head to prove that
+	// retirement waits for the chain rather than for the call returning.
+	terminated map[string]int64
+	epoch      int64
+	// terminationDelay is how far ahead of the chain head a terminated service
+	// ends. Zero means the end of term is already reached.
+	terminationDelay int64
 }
 
-// NewMemoryFilecoin creates three deterministic active storage providers.
+// MemoryFilecoinProviders is how many providers the fake offers. One more than
+// a bucket's default replica count, so an approved replacement always has an
+// unused provider to move to.
+const MemoryFilecoinProviders = 4
+
+// NewMemoryFilecoin creates deterministic active storage providers.
 func NewMemoryFilecoin() *MemoryFilecoin {
 	return &MemoryFilecoin{
+		// The fourth provider is never used by a fresh bucket, so an approved
+		// replacement always has somewhere to move to.
 		providers: []sdktypes.BigInt{
 			sdktypes.NewBigInt(101),
 			sdktypes.NewBigInt(102),
 			sdktypes.NewBigInt(103),
+			sdktypes.NewBigInt(104),
 		},
 		dataSets:        make(map[string]*memoryDataSet),
 		pendingDataSets: make(map[string]sdktypes.BigInt),
@@ -67,6 +83,8 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 		pieces:          make(map[string]*memoryPiece),
 		nextDataSet:     make(map[string]uint64),
 		nextPiece:       1,
+		terminated:      make(map[string]int64),
+		epoch:           1000,
 	}
 }
 
@@ -458,6 +476,51 @@ func copyBigIntPtr(value sdktypes.BigInt) *sdktypes.BigInt {
 }
 
 // GetWalletInfo returns a complete, funded wallet snapshot.
+// TerminateService ends a data set's service. The fake reports an end of term
+// the chain has already reached, because a system test exercises the operator
+// flow rather than chain timing; use terminationDelay to make retirement wait.
+func (m *MemoryFilecoin) TerminateService(_ context.Context, dataSetID sdktypes.BigInt) (*synapse.TerminationResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := dataSetID.String()
+	endEpoch, ok := m.terminated[key]
+	if !ok {
+		endEpoch = m.epoch + m.terminationDelay
+		m.terminated[key] = endEpoch
+	}
+	return &synapse.TerminationResult{TxHash: "0xterminate" + key, EndEpoch: endEpoch}, nil
+}
+
+// SetTerminationDelay controls how many epochs pass between termination and the
+// end of term, so a test can decide whether retirement has to wait.
+func (m *MemoryFilecoin) SetTerminationDelay(epochs int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.terminationDelay = epochs
+}
+
+func (m *MemoryFilecoin) CurrentEpoch(context.Context) (int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.epoch, nil
+}
+
+// AdvanceEpoch moves the observed chain head forward.
+func (m *MemoryFilecoin) AdvanceEpoch(delta int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.epoch += delta
+}
+
+// TerminationEpoch reports the recorded end of term, or false when the service
+// was never terminated.
+func (m *MemoryFilecoin) TerminationEpoch(dataSetID string) (int64, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	epoch, ok := m.terminated[dataSetID]
+	return epoch, ok
+}
+
 func (m *MemoryFilecoin) GetWalletInfo(context.Context) (*synapse.WalletInfo, error) {
 	nonce := uint64(1)
 	return &synapse.WalletInfo{

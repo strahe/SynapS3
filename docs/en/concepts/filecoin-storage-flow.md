@@ -52,13 +52,23 @@ Retry after restoring RPC connectivity, storage provider reachability, wallet fu
 
 Health checks record storage provider and local data set status. The dashboard uses those results to show copies that are `unavailable`, `degraded`, or `unknown`.
 
-If an established provider becomes temporarily unavailable while the initial copies are still being stored, SynapS3 keeps using the other assigned writable copies. The unfinished copy waits without consuming retries and resumes automatically when the original provider becomes reachable again. SynapS3 does not automatically select a replacement provider. Repairing copies that became unavailable after storage completed remains part of the planned replica repair feature below.
+If an established provider becomes temporarily unavailable while the initial copies are still being stored, SynapS3 keeps using the other assigned writable copies. The unfinished copy waits without consuming retries and resumes automatically when the original provider becomes reachable again. SynapS3 does not automatically select a replacement provider; see [Replace a Storage Provider](#replace-a-storage-provider) for the operator-approved path. Repairing copies that became unavailable after storage completed remains part of the planned replica repair feature below.
 
 ## Target and Minimum Replicas
 
 The target replica count is frozen when an upload starts. By default, **Release cache after** is **All replicas (strict)**: every target replica frozen for that upload must be readable and committed. A bucket can instead set an explicit count from 1 through the current target. An explicit count stays if Replicas later increases; lowering Replicas below that count is rejected until Release cache after is also lowered. **All replicas (strict)** follows each upload's frozen target. Once that threshold is met, the version becomes stored and its cache follows the configured eviction policy, while remaining replicas continue until the upload's target is reached. The dashboard keeps showing replica sync progress until every frozen target replica is done.
 
 Changing the target affects new uploads. Changing the minimum also re-evaluates retained cache for current uploads. Increasing the minimum does not move versions that are already stored back to an earlier state and cannot restore cache that has already been deleted.
+
+## Replace a Storage Provider
+
+When a provider becomes permanently unavailable, or you plan to move away from one, open the bucket in the dashboard, choose **Details**, then **Storage** → **Data Sets**, and replace the provider. This is always an explicit decision: SynapS3 never swaps a provider on its own, because doing so creates a new paid service and changes where your data lives.
+
+One confirmation covers the whole move. SynapS3 creates the new storage service, switches new uploads to it once it is ready, copies existing data across, and only then shuts down the old provider. Objects copy from another replica or from local cache. An object with neither cannot be copied, and the old provider is not shut down. Data that can still be read from the old provider stays readable until every retained version is readable on the new one.
+
+While replacements run, the replica shows every move that still needs progress or operator attention, including parallel moves on other replicas. Progress is counted in stored items, since content shared by several versions is copied once. Once copying is finished, the dashboard separates content that was transferred from content that was deleted before it needed to move.
+
+Some steps wait rather than fail. The dashboard distinguishes creating the new service, waiting for it to become writable, an unreachable provider, wallet funds, and missing readable content. Most waits resume on their own. If an object has no other replica and no local cache, replacement stays waiting until one is available. Retry from the same Data Sets list when work has run out of attempts, or when shutting down the old provider needs a payment settled first. A target already in use cannot be retried; choose another provider.
 
 ## What Users See
 

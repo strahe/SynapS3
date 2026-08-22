@@ -11,6 +11,7 @@ export const taskStageOptions = [
   'peer_pull',
   'peer_commit',
   'repair_replica',
+  'replace_provider',
   'reconcile_bucket_durability',
 ] as const
 
@@ -24,8 +25,20 @@ const taskStageLabels: Record<Exclude<TaskStageOption, 'all'> | '', string> = {
   peer_pull: 'Sync peer replica',
   peer_commit: 'Register peer replica on-chain',
   repair_replica: 'Resume replica upload',
+  replace_provider: 'Replace provider',
   reconcile_bucket_durability: 'Apply cache policy',
   '': 'Upload',
+}
+
+// The retirement stages run on the storage cleanup worker, so they are labelled
+// but never offered in the Upload stage filter, which would return nothing.
+const replacementCleanupStageLabels: Record<string, string> = {
+  retire_data_set: 'Retire replaced provider',
+  retire_abandoned_target: 'Retire unused provider',
+}
+
+export function replacementCleanupStageLabel(stage?: string | null) {
+  return stage ? replacementCleanupStageLabels[stage] : undefined
 }
 
 export function taskTypeLabel(type?: string) {
@@ -106,6 +119,10 @@ export function storageCleanupCopyStatusTone(status?: string): StatusTone {
 }
 
 function taskOperationBaseLabel(type: string | undefined, stage: string) {
+  // Retiring a replaced provider ends a paid service; it is not the ordinary
+  // replica deletion the storage_cleanup type otherwise means.
+  const replacementLabel = replacementCleanupStageLabel(stage)
+  if (replacementLabel) return replacementLabel
   const stageLabel = taskStageLabels[stage as keyof typeof taskStageLabels]
   if (stageLabel && stage !== '') return stageLabel
   switch (type) {
