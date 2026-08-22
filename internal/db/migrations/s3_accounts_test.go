@@ -3,11 +3,11 @@ package migrations
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/migrate"
 
 	_ "modernc.org/sqlite"
 )
@@ -21,7 +21,7 @@ func TestS3AccountsMigrationCreatesAccountAndOwnerSchema(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, Migrations)
+	migrator := NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestMigrationCreatesStorageUploadSourceVersionIndex(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, Migrations)
+	migrator := NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestBucketDefaultCopiesMigrationAddsNullableBoundedColumn(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, Migrations)
+	migrator := NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestWalletApproveMigrationUpdatesSQLiteConstraints(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, Migrations)
+	migrator := NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}
@@ -171,6 +171,28 @@ func TestWalletApproveMigrationUpdatesSQLiteConstraints(t *testing.T) {
 
 	if _, err := migrator.Rollback(ctx); err == nil {
 		t.Fatal("rollback with approve operation succeeded, want refusal")
+	}
+}
+
+func TestWalletApproveMigrationReportsMissingPostgresConstraint(t *testing.T) {
+	db := newPostgresMigrationDB(t)
+	ctx := context.Background()
+	if err := runMigrationBody(ctx, db, up2026040501Init); err != nil {
+		t.Fatalf("create initial schema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE wallet_operations DROP CONSTRAINT chk_wallet_operations_type"); err != nil {
+		t.Fatalf("drop wallet operation type constraint: %v", err)
+	}
+
+	err := up2026062201WalletApprove(ctx, db)
+	if err == nil {
+		t.Fatal("migration accepted a missing wallet operation constraint")
+	}
+	if !strings.Contains(err.Error(), "partial schema state") {
+		t.Fatalf("migration error = %v, want partial schema diagnosis", err)
+	}
+	if strings.Contains(err.Error(), "no rows") {
+		t.Fatalf("migration error leaked missing-row detail: %v", err)
 	}
 }
 

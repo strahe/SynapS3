@@ -62,6 +62,14 @@ func TestStorageDataSetGenerationsMigrationPreservesExistingSlots(t *testing.T) 
 	if !sqliteIndexExists(t, db, "idx_storage_replacements_bucket_request") {
 		t.Fatal("bucket-scoped replacement idempotency index missing")
 	}
+	for _, index := range []string{
+		"idx_storage_uploads_bucket_id",
+		"idx_storage_replacement_items_upload_id",
+	} {
+		if !sqliteIndexExists(t, db, index) {
+			t.Fatalf("persistent query index %s missing", index)
+		}
+	}
 }
 
 func TestStorageDataSetGenerationsMigrationEnforcesSlotInvariants(t *testing.T) {
@@ -171,6 +179,23 @@ func TestStorageDataSetGenerationsMigrationRejectsIncompatibleData(t *testing.T)
 	}
 }
 
+func TestStorageDataSetGenerationsMigrationRejectsPartialSchema(t *testing.T) {
+	ctx := context.Background()
+	db := newGenerationsTestDB(t, "generations_partial_schema")
+	mustExecMigrationTest(t, db, "ALTER TABLE storage_data_sets ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+
+	err := up2026082101StorageDataSetGenerations(ctx, db)
+	if err == nil {
+		t.Fatal("migration accepted a partial schema")
+	}
+	if !strings.Contains(err.Error(), "partial schema state") {
+		t.Fatalf("partial schema error = %v", err)
+	}
+	if sqliteColumnExists(t, db, "storage_data_sets", "is_current") {
+		t.Fatal("partial schema failure continued applying DDL")
+	}
+}
+
 func TestStorageDataSetGenerationsMigrationDown(t *testing.T) {
 	ctx := context.Background()
 	db := newGenerationsTestDB(t, "generations_down")
@@ -198,25 +223,70 @@ func TestStorageDataSetGenerationsMigrationDown(t *testing.T) {
 	if sqliteTableExists(t, db, "storage_replacements") {
 		t.Fatal("storage_replacements survived rollback")
 	}
+	if sqliteIndexExists(t, db, "idx_storage_uploads_bucket_id") {
+		t.Fatal("idx_storage_uploads_bucket_id survived rollback")
+	}
 }
 
-// Rolling back is only meaningful while every slot still owns one generation.
-func TestStorageDataSetGenerationsMigrationDownRefusesMultipleGenerations(t *testing.T) {
-	ctx := context.Background()
-	db := newGenerationsTestDB(t, "generations_down_dirty")
-	seedLegacyDataSet(t, db, 1, 1, 0, "101")
-	if err := up2026082101StorageDataSetGenerations(ctx, db); err != nil {
-		t.Fatalf("up migration: %v", err)
+func TestStorageDataSetGenerationsMigrationDownDiagnosesConflicts(t *testing.T) {
+	tests := []struct {
+		name  string
+		want  string
+		setup func(*testing.T, *bun.DB)
+	}{
+		{
+			name: "bucket copy index",
+			want: "duplicate (bucket_id, copy_index)",
+			setup: func(t *testing.T, db *bun.DB) {
+				if err := insertDataSet(db, 2, 1, 0, "202", false, 2); err != nil {
+					t.Fatalf("seed second generation: %v", err)
+				}
+			},
+		},
+		{
+			name: "bucket provider",
+			want: "duplicate (bucket_id, provider_id)",
+			setup: func(t *testing.T, db *bun.DB) {
+				if err := insertDataSet(db, 2, 1, 1, "101", false, 1); err != nil {
+					t.Fatalf("seed reused provider: %v", err)
+				}
+			},
+		},
+		{
+			name: "upload copy index",
+			want: "duplicate (upload_id, copy_index)",
+			setup: func(t *testing.T, db *bun.DB) {
+				if err := insertDataSet(db, 2, 1, 1, "202", true, 1); err != nil {
+					t.Fatalf("seed second data set: %v", err)
+				}
+				mustExecMigrationTest(t, db, "INSERT INTO storage_uploads (id, bucket_id) VALUES (1, 1)")
+				mustExecMigrationTest(t, db, `INSERT INTO storage_upload_copies
+					(id, upload_id, copy_index, storage_data_set_id)
+				 VALUES (1, 1, 0, 1), (2, 1, 0, 2)`)
+			},
+		},
 	}
-	if err := insertDataSet(db, 2, 1, 0, "202", false, 2); err != nil {
-		t.Fatalf("seed historical generation: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := newGenerationsTestDB(t, "generations_down_"+strings.ReplaceAll(tt.name, " ", "_"))
+			seedLegacyDataSet(t, db, 1, 1, 0, "101")
+			if err := up2026082101StorageDataSetGenerations(ctx, db); err != nil {
+				t.Fatalf("up migration: %v", err)
+			}
+			tt.setup(t, db)
 
-	if err := down2026082101StorageDataSetGenerations(ctx, db); err == nil {
-		t.Fatal("rollback accepted two generations for one slot, want failure")
-	}
-	if !sqliteColumnExists(t, db, "storage_data_sets", "generation") {
-		t.Fatal("failed rollback dropped generation, want a rolled back transaction")
+			err := down2026082101StorageDataSetGenerations(ctx, db)
+			if err == nil {
+				t.Fatal("rollback accepted incompatible data, want failure")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("rollback error = %v, want %q", err, tt.want)
+			}
+			if !sqliteColumnExists(t, db, "storage_data_sets", "generation") {
+				t.Fatal("failed rollback dropped generation")
+			}
+		})
 	}
 }
 

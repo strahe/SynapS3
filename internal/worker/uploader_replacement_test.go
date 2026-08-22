@@ -20,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
+	"github.com/uptrace/bun"
 )
 
 type replacementEnv struct {
@@ -827,8 +828,88 @@ func TestUploader_OnlyParkedItemsPutTheCoordinatorIntoAWait(t *testing.T) {
 	if settled.RetryCount != 0 {
 		t.Fatalf("retry count = %d, want waiting to leave the budget untouched", settled.RetryCount)
 	}
+	if settled.Status != model.TaskStatusWaiting {
+		t.Fatalf("task status = %s, want waiting", settled.Status)
+	}
 	if settled.ScheduledAt.Before(time.Now()) {
 		t.Fatal("the coordinator was re-queued immediately instead of waiting for the source")
+	}
+}
+
+type cancelReplacementWaitHook struct {
+	cancel context.CancelFunc
+	fired  atomic.Bool
+}
+
+func (h *cancelReplacementWaitHook) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *cancelReplacementWaitHook) AfterQuery(_ context.Context, event *bun.QueryEvent) {
+	query := strings.ToLower(event.Query)
+	if event.Err != nil || event.Operation() != "UPDATE" ||
+		!strings.Contains(query, "storage_replacements") ||
+		!strings.Contains(query, "wait_reason") || !strings.Contains(query, "waiting") {
+		return
+	}
+	if h.fired.CompareAndSwap(false, true) {
+		h.cancel()
+	}
+}
+
+func TestUploader_ReplacementWaitCancellationRollsBackBothStates(t *testing.T) {
+	fixture := seedReplacementEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	replacement := fixture.authorize(t, "202")
+	if err := fixture.env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID:        replacement.TargetDataSetID,
+		DataSetID: onChainID(t, "2002"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+
+	if _, err := fixture.env.db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("status = ?", model.StorageUploadCopyStatusPending).
+		Where("upload_id = ? AND storage_data_set_id = ?", fixture.upload.ID, fixture.source.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("put the source copy back in flight: %v", err)
+	}
+
+	task := fixture.coordinatorTask(t, replacement.ID)
+	hook := &cancelReplacementWaitHook{cancel: cancel}
+	fixture.env.db.AddQueryHook(hook)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = fixture.newUploader().Run(ctx)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("uploader did not reach the replacement wait before the timeout")
+	}
+	if !hook.fired.Load() {
+		t.Fatal("replacement wait cancellation hook did not run")
+	}
+
+	row, err := fixture.env.repos.Replacements.GetByID(context.Background(), replacement.ID)
+	if err != nil || row == nil {
+		t.Fatalf("GetByID replacement = %#v err=%v", row, err)
+	}
+	if row.Status == storagereplacement.StatusWaiting || row.WaitReason != nil {
+		t.Fatalf("replacement = %#v, want the cancelled wait rolled back", row)
+	}
+	settled, err := fixture.env.repos.Tasks.GetByID(context.Background(), task.ID)
+	if err != nil || settled == nil {
+		t.Fatalf("GetByID task = %#v err=%v", settled, err)
+	}
+	if settled.Status == model.TaskStatusWaiting || settled.WaitReason != nil {
+		t.Fatalf("task = %#v, want the cancelled wait rolled back", settled)
 	}
 }
 

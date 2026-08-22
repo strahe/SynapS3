@@ -109,12 +109,7 @@ func (r *BunStorageReplacementRepo) scanMigrationCandidates(
 	limit int,
 ) (eligible []int64, cursor int64, scanned int, err error) {
 	var candidates []int64
-	if err := r.db.NewSelect().
-		Model((*model.StorageUpload)(nil)).
-		Column("id").
-		Where("bucket_id = ? AND id > ?", row.BucketID, row.SeedCursorUploadID).
-		OrderExpr("id ASC").
-		Limit(limit).
+	if err := r.db.NewRaw(storageUploadMigrationWindowSQL(), row.BucketID, row.SeedCursorUploadID, limit).
 		Scan(ctx, &candidates); err != nil {
 		return nil, 0, 0, fmt.Errorf("scanning replacement migration candidates: %w", err)
 	}
@@ -148,6 +143,13 @@ func (r *BunStorageReplacementRepo) scanMigrationCandidates(
 		return nil, 0, 0, fmt.Errorf("selecting replacement migration items: %w", err)
 	}
 	return eligible, cursor, len(candidates), nil
+}
+
+func storageUploadMigrationWindowSQL() string {
+	return `SELECT id FROM storage_uploads
+		WHERE bucket_id = ? AND id > ?
+		ORDER BY id ASC
+		LIMIT ?`
 }
 
 func markSeedingComplete(ctx context.Context, db bun.IDB, replacementID, cursor int64) error {

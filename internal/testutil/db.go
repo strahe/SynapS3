@@ -15,7 +15,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/migrate"
 
 	_ "modernc.org/sqlite"
 )
@@ -55,7 +54,7 @@ func newTestSQLiteDB(t *testing.T, dsn string) *bun.DB {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	migrator := migrations.NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}

@@ -14,7 +14,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/migrate"
 )
 
 func newObjectVersion(bucketID int64, key, versionID string, size int64) *model.ObjectVersion {
@@ -254,7 +253,7 @@ func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinn
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	migrator := migrations.NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}
@@ -443,7 +442,7 @@ func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	migrator := migrations.NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}
@@ -512,7 +511,7 @@ func TestObjectRepo_CreateVersionAndSetCurrentIfChanged_ConcurrentIdenticalWrite
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	migrator := migrations.NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("init migrator: %v", err)
 	}

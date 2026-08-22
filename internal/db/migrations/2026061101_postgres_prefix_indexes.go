@@ -9,10 +9,13 @@ import (
 )
 
 func init() {
-	Migrations.MustRegister(up2026061101PostgresPrefixIndexes, down2026061101PostgresPrefixIndexes)
+	Migrations.MustRegister(
+		transactionalMigration(up2026061101PostgresPrefixIndexes),
+		transactionalMigration(down2026061101PostgresPrefixIndexes),
+	)
 }
 
-func up2026061101PostgresPrefixIndexes(ctx context.Context, db *bun.DB) error {
+func up2026061101PostgresPrefixIndexes(ctx context.Context, db bun.IDB) error {
 	if db.Dialect().Name() != dialect.PG {
 		return nil
 	}
@@ -41,7 +44,7 @@ func up2026061101PostgresPrefixIndexes(ctx context.Context, db *bun.DB) error {
 	return nil
 }
 
-func down2026061101PostgresPrefixIndexes(ctx context.Context, db *bun.DB) error {
+func down2026061101PostgresPrefixIndexes(ctx context.Context, db bun.IDB) error {
 	if db.Dialect().Name() != dialect.PG {
 		return nil
 	}

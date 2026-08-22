@@ -16,7 +16,6 @@ import (
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/migrate"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
@@ -60,7 +59,7 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 
 // RunMigrations initialises the Bun migrator and applies all pending migrations.
 func RunMigrations(ctx context.Context, db *bun.DB) error {
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	migrator := migrations.NewMigrator(db)
 
 	if err := migrator.Init(ctx); err != nil {
 		return fmt.Errorf("initializing migrator: %w", err)

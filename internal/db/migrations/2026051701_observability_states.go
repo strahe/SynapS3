@@ -9,7 +9,10 @@ import (
 )
 
 func init() {
-	Migrations.MustRegister(up2026051701ObservabilityStates, down2026051701ObservabilityStates)
+	Migrations.MustRegister(
+		transactionalMigration(up2026051701ObservabilityStates),
+		transactionalMigration(down2026051701ObservabilityStates),
+	)
 }
 
 type observabilityProviderState2026051701 struct {
@@ -59,7 +62,7 @@ type observabilityCollectionState2026051701 struct {
 	UpdatedAt      time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp"`
 }
 
-func up2026051701ObservabilityStates(ctx context.Context, db *bun.DB) error {
+func up2026051701ObservabilityStates(ctx context.Context, db bun.IDB) error {
 	if _, err := db.NewCreateTable().
 		Model((*observabilityCollectionState2026051701)(nil)).
 		IfNotExists().
@@ -114,7 +117,7 @@ func up2026051701ObservabilityStates(ctx context.Context, db *bun.DB) error {
 	return nil
 }
 
-func down2026051701ObservabilityStates(ctx context.Context, db *bun.DB) error {
+func down2026051701ObservabilityStates(ctx context.Context, db bun.IDB) error {
 	if _, err := db.NewDropTable().
 		Model((*observabilityDataSetState2026051701)(nil)).
 		IfExists().

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/strahe/synaps3/internal/config"
 	appdb "github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/migrations"
@@ -17,7 +19,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/migrate"
 )
 
 type replacementLockContextKey struct{}
@@ -388,31 +389,44 @@ func seedPostgresReplacement(t *testing.T, db *bun.DB, name string) *postgresRep
 
 func newPostgresReplacementDB(t *testing.T, ctx context.Context, dsn string) *bun.DB {
 	t.Helper()
-	db, err := appdb.New(config.DatabaseConfig{
-		Driver: "postgres", DSN: dsn, MaxOpenConns: 4, MaxIdleConns: 2,
+	adminDB, err := appdb.New(config.DatabaseConfig{
+		Driver: "postgres", DSN: dsn, MaxOpenConns: 1, MaxIdleConns: 1,
 	})
 	if err != nil {
 		t.Fatalf("opening postgres test db: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
 
 	schema := fmt.Sprintf("synaps3_replacement_%d", time.Now().UnixNano())
 	quoted := `"` + schema + `"`
-	if _, err := db.ExecContext(ctx, "CREATE SCHEMA "+quoted); err != nil {
+	if _, err := adminDB.ExecContext(ctx, "CREATE SCHEMA "+quoted); err != nil {
+		_ = adminDB.Close()
 		t.Fatalf("creating schema: %v", err)
 	}
 	t.Cleanup(func() {
 		dropCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if _, err := db.ExecContext(dropCtx, "DROP SCHEMA "+quoted+" CASCADE"); err != nil {
+		if _, err := adminDB.ExecContext(dropCtx, "DROP SCHEMA "+quoted+" CASCADE"); err != nil {
 			t.Logf("dropping schema %s: %v", schema, err)
 		}
+		_ = adminDB.Close()
 	})
-	if _, err := db.ExecContext(ctx, "SET search_path TO "+quoted); err != nil {
-		t.Fatalf("setting search_path: %v", err)
-	}
 
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
+	pgConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parsing postgres test DSN: %v", err)
+	}
+	pgConfig.RuntimeParams["search_path"] = schema
+	registeredDSN := stdlib.RegisterConnConfig(pgConfig)
+	t.Cleanup(func() { stdlib.UnregisterConnConfig(registeredDSN) })
+	db, err := appdb.New(config.DatabaseConfig{
+		Driver: "postgres", DSN: registeredDSN, MaxOpenConns: 4, MaxIdleConns: 2,
+	})
+	if err != nil {
+		t.Fatalf("opening schema-scoped postgres test db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	migrator := migrations.NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		t.Fatalf("migrator init: %v", err)
 	}
