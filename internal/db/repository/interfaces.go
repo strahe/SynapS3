@@ -6,6 +6,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
 )
@@ -15,6 +16,7 @@ type BucketRepository interface {
 	Create(ctx context.Context, bucket *model.Bucket) error
 	GetByName(ctx context.Context, name string) (*model.Bucket, error)
 	GetByID(ctx context.Context, id int64) (*model.Bucket, error)
+	GetNamesByIDs(ctx context.Context, ids []int64) (map[int64]string, error)
 	ListActive(ctx context.Context) ([]model.Bucket, error)
 	// List returns all buckets regardless of status.
 	List(ctx context.Context) ([]model.Bucket, error)
@@ -226,6 +228,8 @@ type StorageDataSetSummary struct {
 	BucketID           int64                      `bun:"bucket_id"`
 	BucketName         string                     `bun:"bucket_name"`
 	CopyIndex          int                        `bun:"copy_index"`
+	Generation         int                        `bun:"generation"`
+	IsCurrent          bool                       `bun:"is_current"`
 	ProviderID         types.OnChainID            `bun:"provider_id"`
 	DataSetID          *types.OnChainID           `bun:"data_set_id"`
 	ClientDataSetID    *types.OnChainID           `bun:"client_data_set_id"`
@@ -349,8 +353,17 @@ type UploadCopyBindingInput struct {
 	ProviderID       types.OnChainID
 }
 
+// StorageUploadCopyID names the exact copy row to write. A task that was
+// queued before the current data set generation took over must still land on
+// the generation it actually stored to, so addressing is separate from the
+// eligibility guards below.
+//
+// RequireEligibleCopy makes the write refuse a failed copy, a deleted object,
+// or a copy that no longer matches, instead of reporting no rows. Coordinators
+// that own one specific copy set it; ordinary upload stages stay idempotent.
 type MarkUploadCopyPieceReadyInput struct {
 	StorageUploadCopyID int64
+	RequireEligibleCopy bool
 	UploadID            int64
 	CopyIndex           int
 	PieceCID            string
@@ -360,13 +373,30 @@ type MarkUploadCopyPieceReadyInput struct {
 
 type MarkUploadCopyCommittingInput struct {
 	StorageUploadCopyID int64
+	RequireEligibleCopy bool
 	UploadID            int64
 	CopyIndex           int
 	CommitExtraDataHex  string
 	CommitTransactionID string
 }
 
+// MarkUploadCopyFailedInput names the copy that failed. Without the id the
+// failure resolves through the replica slot, which after an activation is a
+// different generation than the one the write was bound to: the failure would
+// either land on the replacement's copy or update nothing at all, leaving the
+// original stuck mid-transfer and holding retirement open.
+type MarkUploadCopyFailedInput struct {
+	StorageUploadCopyID int64
+	UploadID            int64
+	CopyIndex           int
+	LastError           string
+}
+
 type ResetRejectedUploadCopyCommitInput struct {
+	// StorageUploadCopyID names the exact copy whose commit was rejected. Without
+	// it the reset resolves through the replica slot, which after an activation
+	// points at a different generation than the one that submitted the commit.
+	StorageUploadCopyID int64
 	UploadID            int64
 	CopyIndex           int
 	CommitTransactionID string
@@ -375,6 +405,7 @@ type ResetRejectedUploadCopyCommitInput struct {
 
 type MarkUploadCopyCommittedInput struct {
 	StorageUploadCopyID int64
+	RequireEligibleCopy bool
 	UploadID            int64
 	CopyIndex           int
 	PieceCID            string
@@ -467,6 +498,7 @@ type StorageUploadRepository interface {
 	GetUploadProvenance(ctx context.Context, uploadID int64) (*StorageUploadProvenance, error)
 	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
 	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
+	CountCurrentGenerationCopySlots(ctx context.Context, uploadID int64) (int, error)
 	ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
 	HasReadableCommittedCopy(ctx context.Context, uploadID int64) (bool, error)
 	ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error)
@@ -486,6 +518,8 @@ type StorageUploadRepository interface {
 	CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error
 	GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error)
 	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageUploadCopy, error)
+	// GetUploadCopyForDataSet addresses one concrete data set generation.
+	GetUploadCopyForDataSet(ctx context.Context, uploadID, storageDataSetID int64) (*model.StorageUploadCopy, error)
 	AcquireUploadTask(ctx context.Context, input AcquireUploadTaskInput) error
 	AcquireReplicaRepairItem(ctx context.Context, input AcquireReplicaRepairItemInput) (*ReplicaRepairItem, error)
 	NextIncompleteCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
@@ -497,7 +531,7 @@ type StorageUploadRepository interface {
 	MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error
 	ResetRejectedUploadCopyCommit(ctx context.Context, input ResetRejectedUploadCopyCommitInput) error
 	MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error
-	MarkUploadCopyFailed(ctx context.Context, uploadID int64, copyIndex int, lastError string) error
+	MarkUploadCopyFailed(ctx context.Context, input MarkUploadCopyFailedInput) error
 	BindReadableUploadForContent(ctx context.Context, input BindReadableUploadInput) ([]ObjectVersionRef, error)
 	BindReadableUploadForVersion(ctx context.Context, input BindReadableUploadForVersionInput) ([]ObjectVersionRef, error)
 	FinalizeUploadIfTargetCopiesMet(ctx context.Context, input FinalizeUploadInput) (bool, []ObjectVersionRef, error)
@@ -516,6 +550,130 @@ type BucketACLSnapshot struct {
 	ACL    []byte             `bun:"acl"`
 }
 
+// StorageReplacementRepository owns operator-approved provider replacement:
+// its state machine, the bounded migration cursor, and the retirement safety
+// gate. Every state change is a compare-and-set so a superseded or stale caller
+// is refused rather than silently applied.
+type StorageReplacementRepository interface {
+	// Authorize records one confirmed replacement, creates the target data set
+	// generation, supersedes any earlier replacement of the same source, and
+	// queues the migration coordinator, all in one transaction.
+	Authorize(ctx context.Context, input AuthorizeReplacementInput) (*storagereplacement.Replacement, bool, error)
+	// Retry resumes failed or cleanup-attention work on the same approved
+	// target. Choosing a different provider requires a new authorization.
+	Retry(ctx context.Context, input RetryReplacementInput) (*storagereplacement.Replacement, error)
+
+	GetByID(ctx context.Context, id int64) (*storagereplacement.Replacement, error)
+	GetByClientRequestID(ctx context.Context, bucketID int64, clientRequestID string) (*storagereplacement.Replacement, error)
+	ListForBucket(ctx context.Context, bucketID int64, limit int) ([]storagereplacement.Replacement, error)
+	GetActiveForDataSet(ctx context.Context, dataSetID int64) (*storagereplacement.Replacement, error)
+	// HeldItemCopyID reports the target copy the coordinator is writing right
+	// now, or zero when it holds no item.
+	HeldItemCopyID(ctx context.Context, replacementID int64) (int64, error)
+	// HasInProgressForDataSet reports whether recovery must leave this data set
+	// alone. Terminally failed work does not count, so a stuck slot can still
+	// repair in place.
+	HasInProgressForDataSet(ctx context.Context, dataSetID int64) (bool, error)
+	ListActive(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error)
+	ListSupersededCleanupCandidates(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error)
+
+	// Activate makes the target the write target and marks the source draining
+	// in one transaction. It touches a fixed number of rows regardless of how
+	// much history the bucket holds.
+	Activate(ctx context.Context, replacementID int64) error
+	// SeedMigrationBatch inserts one bounded batch of migration work and
+	// advances the cursor. done reports that the whole history has been scanned.
+	SeedMigrationBatch(ctx context.Context, replacementID int64, limit int) (inserted int, done bool, err error)
+	NextExecutableItem(ctx context.Context, replacementID int64) (*storagereplacement.Item, error)
+	// AcquireItem re-derives a consistent snapshot and revalidates the worker
+	// claim. No provider call may start before it returns.
+	AcquireItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error)
+	AttachTargetCopy(ctx context.Context, input AttachReplacementTargetCopyInput) (*model.StorageUploadCopy, error)
+	MarkItemCopied(ctx context.Context, itemID int64) error
+	MarkItemWaitingSource(ctx context.Context, itemID int64, lastError string) error
+
+	MarkMigrating(ctx context.Context, replacementID int64) error
+	MarkWaiting(ctx context.Context, replacementID int64, reason storagereplacement.WaitReason) error
+	MarkFailed(ctx context.Context, replacementID int64, reason *storagereplacement.FailureReason, lastError string) error
+	MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error
+	BeginRetirement(ctx context.Context, replacementID int64) error
+	RecordTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
+	RecordAbandonedTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
+	CompleteAbandonedTargetTermination(ctx context.Context, replacementID int64, observedAt time.Time) error
+	// EvaluateRetirementGate reports every blocker by name so the API and UI can
+	// explain why a source is still held.
+	EvaluateRetirementGate(ctx context.Context, replacementID int64, observedEpoch *int64) (RetirementGate, error)
+	// CompleteRetirement re-runs the whole gate inside its own transaction and
+	// refuses premature completion even when called outside the worker.
+	CompleteRetirement(ctx context.Context, replacementID int64, observedEpoch int64) error
+
+	// CountAbandonedTargetSoleCopies and RetireAbandonedTarget clean up a target
+	// a later confirmation replaced. They retire the opposite generation from
+	// CompleteRetirement and never change the replacement record.
+	CountAbandonedTargetSoleCopies(ctx context.Context, targetDataSetID int64) (int, error)
+	RetireAbandonedTarget(ctx context.Context, replacementID int64) error
+}
+
+// AuthorizeReplacementInput is one operator confirmation.
+type AuthorizeReplacementInput struct {
+	BucketID         int64
+	SourceDataSetID  int64
+	SelectionMode    storagereplacement.SelectionMode
+	TargetProviderID types.OnChainID
+	ClientRequestID  string
+	MaxRetries       int
+}
+
+type RetryReplacementInput struct {
+	ReplacementID int64
+	MaxRetries    int
+}
+
+type AcquireReplacementItemInput struct {
+	ReplacementID int64
+	ItemID        int64
+	TaskID        int64
+	TaskClaimedAt time.Time
+}
+
+// ReplacementItemSnapshot is the consistent view one migration item needs.
+type ReplacementItemSnapshot struct {
+	Replacement storagereplacement.Replacement
+	Item        storagereplacement.Item
+	Source      model.StorageDataSet
+	Target      model.StorageDataSet
+	Upload      model.StorageUpload
+	Version     model.ObjectVersion
+}
+
+type AttachReplacementTargetCopyInput struct {
+	ReplacementID int64
+	ItemID        int64
+	UploadID      int64
+}
+
+type RecordTerminationEpochInput struct {
+	ReplacementID int64
+	TxHash        string
+	Epoch         int64
+}
+
+// RetirementGate reports each safety predicate separately so a recoverable
+// block can wait while a structural one raises operator attention.
+type RetirementGate struct {
+	CoverageGaps     int
+	SourceWrites     int
+	WaitingItems     int
+	SlotOwned        bool
+	EpochReached     bool
+	TerminationEpoch *int64
+	// Blockers names the failing predicates in evaluation order.
+	Blockers []string
+}
+
+// Passed reports whether every predicate is satisfied.
+func (g RetirementGate) Passed() bool { return len(g.Blockers) == 0 }
+
 // TaskRepository defines persistence operations for Task entities.
 type TaskRepository interface {
 	Create(ctx context.Context, task *model.Task) error
@@ -523,6 +681,9 @@ type TaskRepository interface {
 	// completed row with the supplied payload. Active, failed, exhausted, and
 	// cancelled rows are left unchanged.
 	EnsureRecurring(ctx context.Context, task *model.Task) (bool, error)
+	// ResumeCoordinator revives a singleton coordinator on an operator's
+	// request, including one that exhausted its retries or failed.
+	ResumeCoordinator(ctx context.Context, task *model.Task) (bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
 	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*model.Task, error)
 	HasActiveByIdempotencyKey(ctx context.Context, idempotencyKey string) (bool, error)

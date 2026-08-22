@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
 
@@ -174,6 +176,45 @@ func (r *BunStorageCleanupRepo) DeleteUploadProvenanceIfUnreferenced(ctx context
 		if hasRefs {
 			return nil
 		}
+		// Replacement items retain upload provenance while they are executable.
+		// Settle and remove them explicitly so the RESTRICT foreign key remains a
+		// guard against bypassing the replacement progress transaction.
+		var items []storagereplacement.Item
+		if err := db.NewRaw(
+			`UPDATE storage_replacement_items SET updated_at = updated_at WHERE upload_id = ? RETURNING *`,
+			uploadID,
+		).Scan(ctx, &items); err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("locking replacement items before deleting provenance: %w", err)
+		}
+		lockedReplacements := make(map[int64]struct{}, len(items))
+		replacementIDs := make([]int64, 0, len(items))
+		for i := range items {
+			if _, ok := lockedReplacements[items[i].ReplacementID]; ok {
+				continue
+			}
+			lockedReplacements[items[i].ReplacementID] = struct{}{}
+			replacementIDs = append(replacementIDs, items[i].ReplacementID)
+		}
+		slices.Sort(replacementIDs)
+		for _, replacementID := range replacementIDs {
+			if _, err := lockReplacementByID(ctx, db, replacementID); err != nil {
+				return err
+			}
+		}
+		for i := range items {
+			item := &items[i]
+			if err := settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled); err != nil {
+				return err
+			}
+		}
+		if len(items) > 0 {
+			if _, err := db.NewDelete().
+				Model((*storagereplacement.Item)(nil)).
+				Where("upload_id = ?", uploadID).
+				Exec(ctx); err != nil {
+				return fmt.Errorf("deleting settled replacement items: %w", err)
+			}
+		}
 		if _, err := db.NewDelete().
 			Model((*model.StorageUpload)(nil)).
 			Where("id = ?", uploadID).
@@ -185,12 +226,7 @@ func (r *BunStorageCleanupRepo) DeleteUploadProvenanceIfUnreferenced(ctx context
 }
 
 func (r *BunStorageCleanupRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {
-	if db, ok := r.db.(*bun.DB); ok {
-		return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-			return fn(tx)
-		})
-	}
-	return fn(r.db)
+	return runMaybeTx(ctx, r.db, fn)
 }
 
 func storageCleanupCopyUpdateResult(res sql.Result, err error, op string) error {

@@ -319,6 +319,10 @@ func runServe(ctx context.Context, src config.Source) error {
 			Receipts:      walletReceiptClient,
 			Readiness:     filecoinReadiness,
 			Observability: observabilityChecker,
+			Terminator:    storageClient,
+			// The epoch comes from the same node that reports wallet receipts,
+			// so replacement adds no new RPC connection.
+			Epochs: synapse.NewChainEpochReader(walletReceiptClient),
 		},
 		ProviderIdentity: admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger),
 		Logger:           logger,

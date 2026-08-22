@@ -53,6 +53,10 @@ type FilecoinServices struct {
 	Receipts      worker.WalletReceiptChecker
 	Readiness     ReadinessProbe
 	Observability observability.RefreshChecker
+	// Terminator ends a replaced storage service. Epochs observes the chain so
+	// the gateway can tell an accepted termination from a completed one.
+	Terminator synapse.ServiceTerminator
+	Epochs     synapse.ChainEpochReader
 }
 
 // RuntimeOptions configures the application composition root. Database,
@@ -172,7 +176,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 				cfg.Worker.Evictor.MaxRetries,
 			)),
 		worker.NewStorageCleanupWorker(repos, opts.Filecoin.Storage,
-			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger),
+			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger, worker.WithServiceTermination(opts.Filecoin.Terminator, opts.Filecoin.Epochs)),
 		worker.NewWalletOperationRunner(repos, opts.Filecoin.Wallet, opts.Filecoin.Receipts, 5*time.Second, logger,
 			worker.WithWalletOperationEventPublisher(events)),
 	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
@@ -191,9 +195,15 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithObservability(observabilityService).
 		WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
+		WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries).
 		WithS3IAM(iamService, rootAccount.Access)
 	if opts.ProviderIdentity != nil {
 		adminServer.WithProviderIdentityResolver(opts.ProviderIdentity)
+	}
+	if observabilityService != nil {
+		// Replacement offers the same providers the storage topology reports,
+		// which is the same service that reports them.
+		adminServer.WithProviderReplacement(admin.NewStorageProviderSelector(observabilityService))
 	}
 	if err := adminServer.WithTrustedProxies(cfg.Admin.TrustedProxies); err != nil {
 		return nil, fmt.Errorf("initializing admin trusted proxies: %w", err)
@@ -247,6 +257,8 @@ func validateOptions(opts RuntimeOptions) error {
 		{name: "filecoin receipts", value: opts.Filecoin.Receipts},
 		{name: "filecoin readiness", value: opts.Filecoin.Readiness},
 		{name: "filecoin observability", value: opts.Filecoin.Observability},
+		{name: "filecoin service terminator", value: opts.Filecoin.Terminator},
+		{name: "filecoin chain epochs", value: opts.Filecoin.Epochs},
 	}
 	for _, dependency := range dependencies {
 		if isNil(dependency.value) {

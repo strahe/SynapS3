@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 )
@@ -48,6 +50,25 @@ func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
 }
 
 func (r *BunTaskRepo) EnsureRecurring(ctx context.Context, task *model.Task) (bool, error) {
+	// Automatic recurrence never revives work that gave up. Exhausted and failed
+	// coordinators wait for an operator, who resumes them through ResumeCoordinator.
+	return r.ensureRecurringTask(ctx, task, model.TaskStatusCompleted)
+}
+
+// ResumeCoordinator restarts a singleton coordinator on an operator's request.
+// It differs from EnsureRecurring in exactly one way: it also revives a task
+// that exhausted its retries or failed outright, which is the state the
+// dedicated replacement retry exists to recover from. Without it the retry
+// would move the replacement back into a working status with nothing queued to
+// do the work, and the record would never leave it.
+func (r *BunTaskRepo) ResumeCoordinator(ctx context.Context, task *model.Task) (bool, error) {
+	if task != nil && !storagereplacement.IsCoordinatorTask(task.Type, task.Stage) {
+		return false, fmt.Errorf("resuming a task that is not a coordinator: %w", ErrInvalidInput)
+	}
+	return r.ensureRecurringTask(ctx, task, model.TaskStatusCompleted, model.TaskStatusExhausted, model.TaskStatusFailed)
+}
+
+func (r *BunTaskRepo) ensureRecurringTask(ctx context.Context, task *model.Task, revivable ...model.TaskStatus) (bool, error) {
 	if task == nil || task.IdempotencyKey == "" || task.Type == "" || task.RefType == "" {
 		return false, fmt.Errorf("recurring task identity is required: %w", ErrInvalidInput)
 	}
@@ -85,7 +106,7 @@ func (r *BunTaskRepo) EnsureRecurring(ctx context.Context, task *model.Task) (bo
 		if err != nil {
 			return fmt.Errorf("loading recurring task: %w", err)
 		}
-		if existing.Status != model.TaskStatusCompleted {
+		if !slices.Contains(revivable, existing.Status) {
 			return nil
 		}
 		now := time.Now()
@@ -107,7 +128,7 @@ func (r *BunTaskRepo) EnsureRecurring(ctx context.Context, task *model.Task) (bo
 			Set("lease_until = NULL").
 			Set("started_at = NULL").
 			Set("completed_at = NULL").
-			Where("id = ? AND status = ?", existing.ID, model.TaskStatusCompleted).
+			Where("id = ? AND status = ?", existing.ID, existing.Status).
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("reactivating recurring task: %w", err)
@@ -480,8 +501,13 @@ func (r *BunTaskRepo) LockRunningClaim(ctx context.Context, claimedTask *model.T
 }
 
 func (r *BunTaskRepo) ContinueRunning(ctx context.Context, claimedTask *model.Task, refVersionID string, payload map[string]interface{}) error {
-	if refVersionID == "" || payload == nil {
-		return fmt.Errorf("continuation version and payload are required: %w", ErrInvalidInput)
+	if payload == nil {
+		return fmt.Errorf("continuation payload is required: %w", ErrInvalidInput)
+	}
+	// An object coordinator must keep naming the version it is working on. A
+	// bucket-scoped coordinator legitimately has none between items.
+	if refVersionID == "" && claimedTask != nil && claimedTask.RefType == "object" {
+		return fmt.Errorf("continuation version is required: %w", ErrInvalidInput)
 	}
 	taskID, claimedAt, err := runningTaskClaim(claimedTask)
 	if err != nil {
@@ -490,7 +516,7 @@ func (r *BunTaskRepo) ContinueRunning(ctx context.Context, claimedTask *model.Ta
 	now := time.Now()
 	res, err := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
-		Set("ref_version_id = ?", refVersionID).
+		Set("ref_version_id = COALESCE(NULLIF(?, ''), ref_version_id)", refVersionID).
 		Set("payload = ?", payload).
 		Set("status = ?", model.TaskStatusQueued).
 		Set("retry_count = 0").
@@ -663,6 +689,12 @@ func (r *BunTaskRepo) RetryExhausted(ctx context.Context, taskID int64) error {
 				return fmt.Errorf("retrying exhausted task %d: %w", taskID, ErrNotFound)
 			}
 			return fmt.Errorf("loading exhausted task: %w", err)
+		}
+
+		// Replacement work carries state the generic queue knows nothing about,
+		// so it must resume through the dedicated replacement action instead.
+		if storagereplacement.IsCoordinatorTask(task.Type, task.Stage) {
+			return ErrReplacementRetryUnsupported
 		}
 
 		now := time.Now()

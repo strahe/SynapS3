@@ -14,9 +14,11 @@ import (
 
 // Compile-time interface checks.
 var (
-	_ synapse.StorageClient = (*MockStorageClient)(nil)
-	_ synapse.WalletQuerier = (*MockWalletQuerier)(nil)
-	_ cache.Cache           = (*MockCache)(nil)
+	_ synapse.StorageClient     = (*MockStorageClient)(nil)
+	_ synapse.WalletQuerier     = (*MockWalletQuerier)(nil)
+	_ synapse.ServiceTerminator = (*MockServiceTerminator)(nil)
+	_ synapse.ChainEpochReader  = (*MockChainEpochReader)(nil)
+	_ cache.Cache               = (*MockCache)(nil)
 )
 
 // MockStorageClient is a configurable test double for synapse.StorageClient.
@@ -262,4 +264,31 @@ func (m *MockCache) DeleteUpload(ctx context.Context, uploadID string) error {
 		return m.DeleteUploadFunc(ctx, uploadID)
 	}
 	return nil
+}
+
+// MockServiceTerminator is a configurable test double for
+// synapse.ServiceTerminator.
+type MockServiceTerminator struct {
+	TerminateServiceFunc func(ctx context.Context, dataSetID sdktypes.BigInt) (*synapse.TerminationResult, error)
+}
+
+func (m *MockServiceTerminator) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*synapse.TerminationResult, error) {
+	if m.TerminateServiceFunc != nil {
+		return m.TerminateServiceFunc(ctx, dataSetID)
+	}
+	return nil, errors.New("MockServiceTerminator.TerminateService not configured")
+}
+
+// MockChainEpochReader is a configurable test double for
+// synapse.ChainEpochReader. An unconfigured reader reports epoch zero, which
+// keeps a retirement gate waiting rather than letting it pass by accident.
+type MockChainEpochReader struct {
+	CurrentEpochFunc func(ctx context.Context) (int64, error)
+}
+
+func (m *MockChainEpochReader) CurrentEpoch(ctx context.Context) (int64, error) {
+	if m.CurrentEpochFunc != nil {
+		return m.CurrentEpochFunc(ctx)
+	}
+	return 0, nil
 }

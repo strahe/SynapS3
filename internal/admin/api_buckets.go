@@ -91,6 +91,8 @@ type bucketDetailResponse struct {
 	VersioningStatus              string                             `json:"versioning_status"`
 	VersioningEnforced            bool                               `json:"versioning_enforced"`
 	DataSets                      []storageDataSetSummaryResponse    `json:"data_sets"`
+	// Replacements is the bucket's full history, newest first.
+	Replacements []providerReplacementResponse `json:"replacements"`
 }
 
 type storageDataSetSummaryResponse struct {
@@ -98,6 +100,9 @@ type storageDataSetSummaryResponse struct {
 	BucketID           int64                     `json:"bucket_id"`
 	BucketName         string                    `json:"bucket_name,omitempty"`
 	CopyIndex          int                       `json:"copy_index"`
+	Generation         int                       `json:"generation"`
+	IsCurrent          bool                      `json:"is_current"`
+	Replaceable        bool                      `json:"replaceable"`
 	ProviderID         string                    `json:"provider_id"`
 	ProviderIdentity   *providerIdentityResponse `json:"provider_identity,omitempty"`
 	DataSetID          *string                   `json:"data_set_id,omitempty"`
@@ -379,6 +384,7 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		VersioningStatus:              "Enabled",
 		VersioningEnforced:            true,
 		DataSets:                      dataSets,
+		Replacements:                  s.bucketReplacementResponses(ctx, bucket.Name, bucket.ID),
 	})
 }
 
@@ -613,10 +619,15 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			storageHealth = dataSetStorageHealthQueryFailureInfo()
 		}
 		out = append(out, storageDataSetSummaryResponse{
-			ID:                 summary.ID,
-			BucketID:           summary.BucketID,
-			BucketName:         summary.BucketName,
-			CopyIndex:          summary.CopyIndex,
+			ID:         summary.ID,
+			BucketID:   summary.BucketID,
+			BucketName: summary.BucketName,
+			CopyIndex:  summary.CopyIndex,
+			Generation: summary.Generation,
+			IsCurrent:  summary.IsCurrent,
+			// Only the generation that receives writes can be replaced;
+			// replacing a historical one would move nothing.
+			Replaceable:        summary.IsCurrent && summary.Status != model.StorageDataSetStatusRetired,
 			ProviderID:         summary.ProviderID.String(),
 			ProviderIdentity:   providerIdentityFromSnapshot(identities, summary.ProviderID),
 			DataSetID:          onChainIDStringPtr(summary.DataSetID),

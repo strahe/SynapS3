@@ -22,6 +22,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/state"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/pdp"
@@ -78,6 +79,8 @@ const (
 	uploadStagePeerPull      = "peer_pull"
 	uploadStagePeerCommit    = "peer_commit"
 	uploadStageRepairReplica = "repair_replica"
+	// Provider replacement advances through the same queue as ordinary uploads.
+	uploadStageReplaceProvider = storagereplacement.StageMigrate
 )
 
 // UploaderOption configures uploader behavior.
@@ -427,8 +430,14 @@ func (u *Uploader) processTask(ctx context.Context, task *model.Task) {
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}
-	if uploadTaskStage(task) == uploadStageRepairReplica {
+	switch uploadTaskStage(task) {
+	case uploadStageRepairReplica:
 		u.processReplicaRepairTask(ctx, task, logger)
+		return
+	case uploadStageReplaceProvider:
+		// The coordinator tracks a bucket slot rather than one object version,
+		// so it is dispatched before any version lookup.
+		u.processReplacementTask(ctx, task, logger)
 		return
 	}
 
@@ -591,6 +600,9 @@ func (u *Uploader) processStagedTask(ctx context.Context, task *model.Task, vers
 		if u.deferToReplicaRepair(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
 			return
 		}
+		if u.deferToReplacement(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
+			return
+		}
 		u.ingressStore(ctx, task, version, bucket, uploadID, copyIndex, logger)
 	case uploadStageIngressCommit:
 		uploadID, copyIndex, err := uploadStageIDs(task, true)
@@ -599,6 +611,9 @@ func (u *Uploader) processStagedTask(ctx context.Context, task *model.Task, vers
 			return
 		}
 		if u.deferToReplicaRepair(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
+			return
+		}
+		if u.deferToReplacement(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
 			return
 		}
 		u.ingressCommit(ctx, task, version, bucket, uploadID, copyIndex, logger)
@@ -611,6 +626,9 @@ func (u *Uploader) processStagedTask(ctx context.Context, task *model.Task, vers
 		if u.deferToReplicaRepair(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
 			return
 		}
+		if u.deferToReplacement(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
+			return
+		}
 		u.peerPull(ctx, task, version, bucket, uploadID, copyIndex, logger)
 	case uploadStagePeerCommit:
 		uploadID, copyIndex, err := uploadStageIDs(task, true)
@@ -619,6 +637,9 @@ func (u *Uploader) processStagedTask(ctx context.Context, task *model.Task, vers
 			return
 		}
 		if u.deferToReplicaRepair(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
+			return
+		}
+		if u.deferToReplacement(ctx, task, bucket.ID, uploadID, copyIndex, logger) {
 			return
 		}
 		u.peerCommit(ctx, task, version, bucket, uploadID, copyIndex, logger)
@@ -644,16 +665,22 @@ func (u *Uploader) deferToReplicaRepair(ctx context.Context, task *model.Task, b
 	if repairTask == nil || repairTask.Status != model.TaskStatusRunning {
 		return false
 	}
-	copyRow, err := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
-	if err != nil || copyRow == nil {
-		if err == nil {
-			err = fmt.Errorf("upload copy %d not found", copyIndex)
+	// A task queued before copy ids were recorded still resolves through its
+	// replica slot, which now names the current generation.
+	claimedCopyID := uploadStageCopyID(task)
+	if claimedCopyID == 0 {
+		copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
+		if err != nil || copyRow == nil {
+			if err == nil {
+				err = fmt.Errorf("upload copy %d not found", copyIndex)
+			}
+			u.handleTaskFailure(ctx, task, logger, "load upload copy for replica repair coordination", err)
+			return true
 		}
-		u.handleTaskFailure(ctx, task, logger, "load upload copy for replica repair coordination", err)
-		return true
+		claimedCopyID = copyRow.ID
 	}
 	repairCopyID, err := payloadInt64(repairTask.Payload, replicaRepairCopyIDKey)
-	if err == nil && repairCopyID != copyRow.ID {
+	if err == nil && repairCopyID != claimedCopyID {
 		return false
 	}
 	if !taskClaimPrecedes(repairTask, task) {
@@ -711,6 +738,11 @@ func (u *Uploader) prepareStagedUpload(ctx context.Context, task *model.Task, ve
 		u.handleTaskFailure(ctx, task, logger, "ensure provider bindings", planErr)
 		return
 	}
+	plan, err = u.preserveInFlightUploadBindings(ctx, upload.ID, plan)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "preserve in-flight provider bindings", err)
+		return
+	}
 	copyInputs, err := u.uploadCopyInputs(ctx, upload.ID, plan.bindings)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "plan upload copy rows", err)
@@ -746,7 +778,7 @@ func (u *Uploader) prepareStagedUpload(ctx context.Context, task *model.Task, ve
 		u.waitForStorageDependency(ctx, task, logger, "Waiting for an assigned storage provider to recover")
 		return
 	}
-	if err := u.enqueueUploadStage(ctx, task, uploadStageEnsureDataSet, upload.ID, ingress.CopyIndex, model.StorageCopyTransferMethodIngress); err != nil {
+	if err := u.enqueueUploadStageForCopy(ctx, task, uploadStageEnsureDataSet, upload.ID, ingress.CopyIndex, model.StorageCopyTransferMethodIngress, ingress.ID); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "enqueue ingress dataset task", err)
 		return
 	}
@@ -759,9 +791,15 @@ func (u *Uploader) uploadCopyInputs(ctx context.Context, uploadID int64, binding
 		return nil, err
 	}
 	existingByIndex := make(map[int]model.StorageUploadCopy, len(existingCopies))
+	// A slot can hold a copy per generation during a replacement, so the copy
+	// that matches a binding is found by data set rather than by slot.
+	existingByDataSet := make(map[int64]model.StorageUploadCopy, len(existingCopies))
 	ingressCopyIndex := -1
 	for _, copyRow := range existingCopies {
 		existingByIndex[copyRow.CopyIndex] = copyRow
+		if copyRow.StorageDataSetID != nil {
+			existingByDataSet[*copyRow.StorageDataSetID] = copyRow
+		}
 		if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
 			ingressCopyIndex = copyRow.CopyIndex
 		}
@@ -784,12 +822,16 @@ func (u *Uploader) uploadCopyInputs(ctx context.Context, uploadID int64, binding
 	}
 	inputs := make([]repository.UploadCopyBindingInput, 0, len(bindings))
 	for _, binding := range bindings {
-		if _, exists := existingByIndex[binding.CopyIndex]; !exists && !uploadTracksDataSetBinding(uploadID, &binding) {
+		existingCopy, hasCopy := existingByDataSet[binding.ID]
+		if !hasCopy {
+			existingCopy, hasCopy = existingByIndex[binding.CopyIndex]
+		}
+		if !hasCopy && !uploadTracksDataSetBinding(uploadID, &binding) {
 			continue
 		}
 		transferMethod := model.StorageCopyTransferMethodPeerPull
-		if existing, ok := existingByIndex[binding.CopyIndex]; ok {
-			transferMethod = existing.TransferMethod
+		if hasCopy {
+			transferMethod = existingCopy.TransferMethod
 		} else if binding.CopyIndex == ingressCopyIndex {
 			transferMethod = model.StorageCopyTransferMethodIngress
 		}
@@ -855,6 +897,11 @@ func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.
 		u.handleTaskFailure(ctx, task, logger, "ensure repair provider bindings", planErr)
 		return
 	}
+	plan, err = u.preserveInFlightUploadBindings(ctx, uploadID, plan)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "preserve in-flight repair bindings", err)
+		return
+	}
 	inputs, err := u.uploadCopyInputs(ctx, uploadID, plan.bindings)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "plan repair upload copy rows", err)
@@ -906,7 +953,7 @@ func (u *Uploader) prepareReadableUploadRepair(ctx context.Context, task *model.
 		binding := plan.byCopyIndex[copyRow.CopyIndex]
 		switch {
 		case fundedBindings[copyRow.CopyIndex] != nil && uploadCanUseDataSetBinding(uploadID, binding):
-			if err := u.enqueueUploadStage(ctx, task, uploadStageEnsureDataSet, uploadID, copyRow.CopyIndex, model.StorageCopyTransferMethodPeerPull); err != nil {
+			if err := u.enqueueUploadStageForCopy(ctx, task, uploadStageEnsureDataSet, uploadID, copyRow.CopyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
 				u.handleTaskFailure(ctx, task, logger, "enqueue existing repair copy", err)
 				return
 			}
@@ -957,6 +1004,79 @@ func newBucketBindingPlan(bindings []model.StorageDataSet, uploadID int64) bucke
 	return plan
 }
 
+// preserveInFlightUploadBindings keeps unfinished copy rows on the generation
+// they were created for. A provider replacement may have moved the slot to a
+// new current generation while funding or task enqueueing was waiting.
+func (u *Uploader) preserveInFlightUploadBindings(
+	ctx context.Context,
+	uploadID int64,
+	plan bucketBindingPlan,
+) (bucketBindingPlan, error) {
+	copies, err := u.repos.Uploads.ListCopies(ctx, uploadID)
+	if err != nil {
+		return bucketBindingPlan{}, err
+	}
+	chosen := make(map[int]model.StorageUploadCopy)
+	for i := range copies {
+		copyRow := copies[i]
+		if copyRow.StorageDataSetID == nil || copyRow.Status == model.StorageUploadCopyStatusFailed || copyCommitted(&copyRow) {
+			continue
+		}
+		previous, ok := chosen[copyRow.CopyIndex]
+		if !ok || (copyRow.TransferMethod == model.StorageCopyTransferMethodIngress && previous.TransferMethod != model.StorageCopyTransferMethodIngress) ||
+			(copyRow.TransferMethod == previous.TransferMethod && copyRow.ID < previous.ID) {
+			chosen[copyRow.CopyIndex] = copyRow
+		}
+	}
+	if len(chosen) == 0 {
+		return plan, nil
+	}
+	authoritative := make(map[int]model.StorageDataSet, len(chosen))
+	for copyIndex, copyRow := range chosen {
+		binding, err := u.repos.Uploads.GetDataSetBindingByID(ctx, *copyRow.StorageDataSetID)
+		if err != nil {
+			return bucketBindingPlan{}, err
+		}
+		if binding == nil || binding.CopyIndex != copyIndex ||
+			(binding.Status != model.StorageDataSetStatusReady && binding.Status != model.StorageDataSetStatusDraining) {
+			continue
+		}
+		authoritative[copyIndex] = *binding
+	}
+	if len(authoritative) == 0 {
+		return plan, nil
+	}
+	bindings := make([]model.StorageDataSet, 0, len(plan.bindings)+len(authoritative))
+	seen := make(map[int]struct{}, len(plan.bindings)+len(authoritative))
+	for i := range plan.bindings {
+		binding := plan.bindings[i]
+		if inFlight, ok := authoritative[binding.CopyIndex]; ok {
+			binding = inFlight
+		}
+		if _, ok := seen[binding.CopyIndex]; ok {
+			continue
+		}
+		seen[binding.CopyIndex] = struct{}{}
+		bindings = append(bindings, binding)
+	}
+	for copyIndex, binding := range authoritative {
+		if _, ok := seen[copyIndex]; ok {
+			continue
+		}
+		bindings = append(bindings, binding)
+	}
+	out := newBucketBindingPlan(bindings, uploadID)
+	out.complete = plan.complete
+	out.deferredContext = plan.deferredContext
+	for i := range out.bindings {
+		binding := &out.bindings[i]
+		if binding.Status == model.StorageDataSetStatusDraining {
+			out.writable = append(out.writable, *binding)
+		}
+	}
+	return out, nil
+}
+
 func (u *Uploader) ensureWritableIngressCopy(ctx context.Context, uploadID int64, fundedBindings map[int]*model.StorageDataSet) (*model.StorageUploadCopy, error) {
 	copies, err := u.repos.Uploads.ListCopies(ctx, uploadID)
 	if err != nil {
@@ -1001,8 +1121,14 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 	inFlight := 0
 	for i := range bindings {
 		binding := bindings[i]
-		existing[binding.CopyIndex] = binding
+		// Automatic selection excludes every provider this bucket has ever used,
+		// including retired generations, so a replacement never lands back on a
+		// provider the operator already moved away from.
 		excluded = append(excluded, binding.ProviderID.SDK())
+		if !binding.IsCurrent {
+			continue
+		}
+		existing[binding.CopyIndex] = binding
 		if dataSetBindingCanOccupyUploadSlot(uploadID, &binding) {
 			if len(selected) < targetCopies {
 				selected = append(selected, binding)
@@ -1107,7 +1233,7 @@ func (u *Uploader) ensureUploadFundingReady(
 			storageCtx synapse.UploadContext
 			err        error
 		)
-		if binding.Status == model.StorageDataSetStatusReady && binding.DataSetID != nil && !binding.DataSetID.IsZero() {
+		if binding.DataSetID != nil && !binding.DataSetID.IsZero() {
 			storageCtx, err = u.contextForReadyBinding(ctx, binding, bucket.Name)
 		} else {
 			storageCtx, err = u.contextForBindingProvider(ctx, binding, bucket.Name)
@@ -1217,7 +1343,7 @@ func uploadFundingWaitMessage(costs *storage.MultiContextCosts) string {
 }
 
 func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, logger *slog.Logger) {
-	copyRow, err := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+	copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 	if err != nil || copyRow == nil {
 		if err == nil {
 			err = fmt.Errorf("upload copy %d not found", copyIndex)
@@ -1343,7 +1469,7 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
 		nextStage = uploadStageIngressStore
 	}
-	if err := u.enqueueUploadStage(ctx, task, nextStage, uploadID, copyIndex, copyRow.TransferMethod); err != nil {
+	if err := u.enqueueUploadStageForCopy(ctx, task, nextStage, uploadID, copyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "enqueue next upload stage", err)
 		return
 	}
@@ -1351,7 +1477,7 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 }
 
 func (u *Uploader) ingressStore(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, logger *slog.Logger) {
-	binding, storageCtx, err := u.readyContextForCopy(ctx, bucket, copyIndex)
+	binding, storageCtx, err := u.readyContextForCopy(ctx, task, bucket, uploadID, copyIndex)
 	if err != nil {
 		u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "ingress context", err)
 		return
@@ -1360,7 +1486,7 @@ func (u *Uploader) ingressStore(ctx context.Context, task *model.Task, version *
 		u.handleTaskFailure(ctx, task, logger, "ingress context", errors.New("ingress dataset binding not found"))
 		return
 	}
-	copyRow, err := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+	copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "load ingress copy", err)
 		return
@@ -1372,7 +1498,7 @@ func (u *Uploader) ingressStore(ctx context.Context, task *model.Task, version *
 				return
 			}
 		}
-		if err := u.enqueueUploadStage(ctx, task, uploadStageIngressCommit, uploadID, copyIndex, model.StorageCopyTransferMethodIngress); err != nil {
+		if err := u.enqueueUploadStageForCopy(ctx, task, uploadStageIngressCommit, uploadID, copyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
 			u.handleTaskFailure(ctx, task, logger, "enqueue ingress commit", err)
 			return
 		}
@@ -1403,10 +1529,11 @@ func (u *Uploader) ingressStore(ctx context.Context, task *model.Task, version *
 	progress.Flush(version.Size, true)
 	pieceCID := result.PieceCID.String()
 	if err := u.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
-		UploadID:     uploadID,
-		CopyIndex:    copyIndex,
-		PieceCID:     pieceCID,
-		RetrievalURL: storageCtx.PieceURL(result.PieceCID),
+		StorageUploadCopyID: uploadStageCopyID(task),
+		UploadID:            uploadID,
+		CopyIndex:           copyIndex,
+		PieceCID:            pieceCID,
+		RetrievalURL:        storageCtx.PieceURL(result.PieceCID),
 	}); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "mark ingress piece ready", err)
 		return
@@ -1417,7 +1544,7 @@ func (u *Uploader) ingressStore(ctx context.Context, task *model.Task, version *
 			return
 		}
 	}
-	if err := u.enqueueUploadStage(ctx, task, uploadStageIngressCommit, uploadID, copyIndex, model.StorageCopyTransferMethodIngress); err != nil {
+	if err := u.enqueueUploadStageForCopy(ctx, task, uploadStageIngressCommit, uploadID, copyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "enqueue ingress commit", err)
 		return
 	}
@@ -1425,7 +1552,7 @@ func (u *Uploader) ingressStore(ctx context.Context, task *model.Task, version *
 }
 
 func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, logger *slog.Logger) {
-	copyRow, err := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+	copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "load ingress copy", err)
 		return
@@ -1434,7 +1561,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 		u.finishCommittedIngress(ctx, task, version, bucket, uploadID, copyRow, logger)
 		return
 	}
-	binding, storageCtx, err := u.readyContextForCopy(ctx, bucket, copyIndex)
+	binding, storageCtx, err := u.readyContextForCopy(ctx, task, bucket, uploadID, copyIndex)
 	if err != nil {
 		u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "ingress commit context", err)
 		return
@@ -1460,7 +1587,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 				return
 			}
 			if errors.Is(err, errCommitRejected) {
-				if resetErr := u.resetRejectedSubmittedCommit(ctx, uploadID, copyIndex, *copyRow.CommitTransactionID, err); resetErr != nil {
+				if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, uploadID, copyIndex, *copyRow.CommitTransactionID, err); resetErr != nil {
 					u.handleTaskFailure(ctx, task, logger, "reset rejected ingress commit", resetErr)
 					return
 				}
@@ -1475,6 +1602,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 			pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 		}
 		if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+			StorageUploadCopyID: uploadStageCopyID(task),
 			UploadID:            uploadID,
 			CopyIndex:           copyIndex,
 			PieceCID:            *upload.PieceCID,
@@ -1489,7 +1617,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 		u.finishReadable(ctx, task, version, uploadID, logger)
 		return
 	}
-	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, uploadID, copyIndex, pieces)
+	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
 	if err != nil {
 		u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress presign", err)
 		return
@@ -1502,6 +1630,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 		OnSubmitted: func(txHash string) {
 			submittedTx = txHash
 			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
+				StorageUploadCopyID: uploadStageCopyID(task),
 				UploadID:            uploadID,
 				CopyIndex:           copyIndex,
 				CommitExtraDataHex:  extraHex,
@@ -1526,6 +1655,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 		pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 	}
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		StorageUploadCopyID: uploadStageCopyID(task),
 		UploadID:            uploadID,
 		CopyIndex:           copyIndex,
 		PieceCID:            *upload.PieceCID,
@@ -1702,18 +1832,28 @@ func (u *Uploader) scheduleRemainingPeerCopies(
 	if upload == nil {
 		return nil, false, fmt.Errorf("storage upload %d not found", uploadID)
 	}
-	needsPreparation := len(copies) < boundedTargetCopies(upload.RequestedCopies)
+	currentSlots, err := u.repos.Uploads.CountCurrentGenerationCopySlots(ctx, uploadID)
+	if err != nil {
+		return nil, false, err
+	}
+	needsPreparation := currentSlots < boundedTargetCopies(upload.RequestedCopies)
 	for _, copyRow := range copies {
 		if copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull || copyCommitted(&copyRow) || copyRow.Status == model.StorageUploadCopyStatusFailed {
 			continue
 		}
-		binding, err := u.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucketID, copyRow.CopyIndex)
+		var binding *model.StorageDataSet
+		if copyRow.StorageDataSetID != nil {
+			binding, err = u.repos.Uploads.GetDataSetBindingByID(ctx, *copyRow.StorageDataSetID)
+		} else {
+			binding, err = u.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucketID, copyRow.CopyIndex)
+		}
 		if err != nil {
 			return nil, false, err
 		}
 		switch {
-		case binding != nil && binding.Status == model.StorageDataSetStatusReady:
-			if err := u.enqueueUploadStageForVersion(ctx, ref, maxRetries, uploadStageEnsureDataSet, uploadID, copyRow.CopyIndex, copyRow.TransferMethod); err != nil {
+		case binding != nil && (binding.Status == model.StorageDataSetStatusReady ||
+			(copyRow.StorageDataSetID != nil && binding.Status == model.StorageDataSetStatusDraining)):
+			if err := u.enqueueUploadStageForVersionCopy(ctx, ref, maxRetries, uploadStageEnsureDataSet, uploadID, copyRow.CopyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
 				return nil, false, err
 			}
 		case binding != nil && binding.Status == model.StorageDataSetStatusUnavailable:
@@ -1742,12 +1882,12 @@ func (u *Uploader) repairReadableBinding(ctx context.Context, task *model.Task, 
 }
 
 func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, logger *slog.Logger) {
-	binding, storageCtx, err := u.readyContextForCopy(ctx, bucket, copyIndex)
+	binding, storageCtx, err := u.readyContextForCopy(ctx, task, bucket, uploadID, copyIndex)
 	if err != nil {
 		u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "peer pull context", err)
 		return
 	}
-	copyRow, err := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+	copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "load peer copy", err)
 		return
@@ -1757,7 +1897,7 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 		return
 	}
 	if copyHasPiece(copyRow) {
-		if err := u.enqueueUploadStage(ctx, task, uploadStagePeerCommit, uploadID, copyIndex, model.StorageCopyTransferMethodPeerPull); err != nil {
+		if err := u.enqueueUploadStageForCopy(ctx, task, uploadStagePeerCommit, uploadID, copyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
 			u.handleTaskFailure(ctx, task, logger, "enqueue peer commit", err)
 			return
 		}
@@ -1784,7 +1924,7 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 		}
 		pieceCIDString = sourceCopy.PieceCID
 		pieces := []storage.PieceInput{{PieceCID: pieceCID}}
-		extraData, encodedExtra, err := u.extraDataForCopy(ctx, storageCtx, uploadID, copyIndex, pieces)
+		extraData, encodedExtra, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
 		if err != nil {
 			u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer presign", err)
 			return
@@ -1831,30 +1971,32 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 		}
 		pieceCID = result.PieceCID
 		pieceCIDString = pieceCID.String()
-		_, extraHex, err = u.extraDataForCopy(ctx, storageCtx, uploadID, copyIndex, []storage.PieceInput{{PieceCID: pieceCID}})
+		_, extraHex, err = u.extraDataForCopy(ctx, storageCtx, copyRow, []storage.PieceInput{{PieceCID: pieceCID}})
 		if err != nil {
 			u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer presign", err)
 			return
 		}
 	}
 	if err := u.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
-		UploadID:     uploadID,
-		CopyIndex:    copyIndex,
-		PieceCID:     pieceCIDString,
-		RetrievalURL: storageCtx.PieceURL(pieceCID),
+		StorageUploadCopyID: uploadStageCopyID(task),
+		UploadID:            uploadID,
+		CopyIndex:           copyIndex,
+		PieceCID:            pieceCIDString,
+		RetrievalURL:        storageCtx.PieceURL(pieceCID),
 	}); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "mark peer piece ready", err)
 		return
 	}
 	if err := u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID:           uploadID,
-		CopyIndex:          copyIndex,
-		CommitExtraDataHex: extraHex,
+		StorageUploadCopyID: uploadStageCopyID(task),
+		UploadID:            uploadID,
+		CopyIndex:           copyIndex,
+		CommitExtraDataHex:  extraHex,
 	}); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "save peer extra data", err)
 		return
 	}
-	if err := u.enqueueUploadStage(ctx, task, uploadStagePeerCommit, uploadID, copyIndex, model.StorageCopyTransferMethodPeerPull); err != nil {
+	if err := u.enqueueUploadStageForCopy(ctx, task, uploadStagePeerCommit, uploadID, copyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "enqueue peer commit", err)
 		return
 	}
@@ -1862,12 +2004,12 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 }
 
 func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, logger *slog.Logger) {
-	binding, storageCtx, err := u.readyContextForCopy(ctx, bucket, copyIndex)
+	binding, storageCtx, err := u.readyContextForCopy(ctx, task, bucket, uploadID, copyIndex)
 	if err != nil {
 		u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "peer commit context", err)
 		return
 	}
-	copyRow, err := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+	copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "load peer copy", err)
 		return
@@ -1911,7 +2053,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 				return
 			}
 			if errors.Is(err, errCommitRejected) {
-				if resetErr := u.resetRejectedSubmittedCommit(ctx, uploadID, copyIndex, *copyRow.CommitTransactionID, err); resetErr != nil {
+				if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, uploadID, copyIndex, *copyRow.CommitTransactionID, err); resetErr != nil {
 					u.handleTaskFailure(ctx, task, logger, "reset rejected peer commit", resetErr)
 					return
 				}
@@ -1930,6 +2072,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 			pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 		}
 		if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+			StorageUploadCopyID: uploadStageCopyID(task),
 			UploadID:            uploadID,
 			CopyIndex:           copyIndex,
 			PieceCID:            pieceCIDString,
@@ -1944,7 +2087,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		u.finishPeerCopy(ctx, task, version, uploadID, logger)
 		return
 	}
-	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, uploadID, copyIndex, pieces)
+	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
 	if err != nil {
 		u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer presign", err)
 		return
@@ -1957,6 +2100,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		OnSubmitted: func(txHash string) {
 			submittedTx = txHash
 			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
+				StorageUploadCopyID: uploadStageCopyID(task),
 				UploadID:            uploadID,
 				CopyIndex:           copyIndex,
 				CommitExtraDataHex:  extraHex,
@@ -1971,7 +2115,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 				return
 			}
 			if errors.Is(err, errCommitRejected) {
-				if resetErr := u.resetRejectedSubmittedCommit(ctx, uploadID, copyIndex, submittedTx, err); resetErr != nil {
+				if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, uploadID, copyIndex, submittedTx, err); resetErr != nil {
 					u.handleTaskFailure(ctx, task, logger, "reset rejected peer commit", resetErr)
 					return
 				}
@@ -1993,6 +2137,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
 	}
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		StorageUploadCopyID: uploadStageCopyID(task),
 		UploadID:            uploadID,
 		CopyIndex:           copyIndex,
 		PieceCID:            pieceCIDString,
@@ -2030,32 +2175,73 @@ func (u *Uploader) finishPeerCopy(ctx context.Context, task *model.Task, version
 	completeWorkerTask(ctx, u.repos, task, "uploader", logger)
 }
 
-func (u *Uploader) enqueueUploadStage(ctx context.Context, parent *model.Task, stage string, uploadID int64, copyIndex int, transferMethod model.StorageCopyTransferMethod) error {
+func (u *Uploader) enqueueUploadStageForCopy(
+	ctx context.Context,
+	parent *model.Task,
+	stage string,
+	uploadID int64,
+	copyIndex int,
+	transferMethod model.StorageCopyTransferMethod,
+	copyID int64,
+) error {
+	if parent == nil || copyID <= 0 {
+		return fmt.Errorf("enqueueing concrete upload copy: %w", repository.ErrInvalidInput)
+	}
 	ref := repository.ObjectVersionRef{ObjectID: parent.RefID, VersionID: parent.RefVersionID}
-	return u.enqueueUploadStageForVersion(ctx, ref, parent.MaxRetries, stage, uploadID, copyIndex, transferMethod)
+	return u.enqueueUploadStageForVersionCopy(ctx, ref, parent.MaxRetries, stage, uploadID, copyIndex, transferMethod, copyID)
 }
 
-func (u *Uploader) enqueueUploadStageForVersion(ctx context.Context, ref repository.ObjectVersionRef, maxRetries int, stage string, uploadID int64, copyIndex int, transferMethod model.StorageCopyTransferMethod) error {
-	return enqueueUploadStageForVersion(ctx, u.repos, ref, maxRetries, stage, uploadID, copyIndex, transferMethod)
-}
-
-func enqueueUploadStageForVersion(ctx context.Context, repos *repository.Repositories, ref repository.ObjectVersionRef, maxRetries int, stage string, uploadID int64, copyIndex int, transferMethod model.StorageCopyTransferMethod) error {
-	task := newUploadStageTask(ref, maxRetries, stage, uploadID, copyIndex, transferMethod)
-	if err := repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
+func (u *Uploader) enqueueUploadStageForVersionCopy(
+	ctx context.Context,
+	ref repository.ObjectVersionRef,
+	maxRetries int,
+	stage string,
+	uploadID int64,
+	copyIndex int,
+	transferMethod model.StorageCopyTransferMethod,
+	copyID int64,
+) error {
+	if copyID <= 0 {
+		return fmt.Errorf("enqueueing concrete upload copy: %w", repository.ErrInvalidInput)
+	}
+	task := newUploadStageTask(ref, maxRetries, stage, uploadID, copyIndex, transferMethod, copyID)
+	if err := u.repos.Tasks.Create(ctx, task); err != nil && !errors.Is(err, repository.ErrAlreadyExists) {
 		return err
 	}
 	return nil
 }
 
-func newUploadStageTask(ref repository.ObjectVersionRef, maxRetries int, stage string, uploadID int64, copyIndex int, transferMethod model.StorageCopyTransferMethod) *model.Task {
+// Recording the concrete copy lets the replacement safety gate tell a write
+// bound for the retiring generation from one bound for its replacement. A task
+// queued before this existed simply carries no copy id.
+func stageTaskCopyID(ctx context.Context, repos *repository.Repositories, uploadID int64, copyIndex int, transferMethod model.StorageCopyTransferMethod) (int64, error) {
+	if transferMethod == "" {
+		return 0, nil
+	}
+	copyRow, err := repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+	if err != nil {
+		return 0, err
+	}
+	if copyRow == nil {
+		return 0, nil
+	}
+	return copyRow.ID, nil
+}
+
+func newUploadStageTask(ref repository.ObjectVersionRef, maxRetries int, stage string, uploadID int64, copyIndex int, transferMethod model.StorageCopyTransferMethod, copyID int64) *model.Task {
 	payload := map[string]interface{}{
 		"upload_id": uploadID,
 	}
+	// The key stays keyed by slot so tasks queued before copy ids existed keep
+	// their identity.
 	key := fmt.Sprintf("upload:%s:%s:%d", ref.VersionID, stage, uploadID)
 	if transferMethod != "" {
 		payload["copy_index"] = copyIndex
 		payload["transfer_method"] = string(transferMethod)
 		key = fmt.Sprintf("%s:%d", key, copyIndex)
+		if copyID > 0 {
+			payload[replicaRepairCopyIDKey] = copyID
+		}
 	}
 	return &model.Task{
 		Type:           model.TaskTypeUpload,
@@ -2072,7 +2258,11 @@ func newUploadStageTask(ref repository.ObjectVersionRef, maxRetries int, stage s
 }
 
 func ensureIngressHandoffTask(ctx context.Context, repos *repository.Repositories, ref repository.ObjectVersionRef, maxRetries int, uploadID int64, copyIndex int) error {
-	task := newUploadStageTask(ref, maxRetries, uploadStageEnsureDataSet, uploadID, copyIndex, model.StorageCopyTransferMethodIngress)
+	copyID, err := stageTaskCopyID(ctx, repos, uploadID, copyIndex, model.StorageCopyTransferMethodIngress)
+	if err != nil {
+		return err
+	}
+	task := newUploadStageTask(ref, maxRetries, uploadStageEnsureDataSet, uploadID, copyIndex, model.StorageCopyTransferMethodIngress, copyID)
 	created, err := repos.Tasks.EnsureRecurring(ctx, task)
 	if err != nil || created {
 		return err
@@ -2189,6 +2379,59 @@ func uploadStageIDs(task *model.Task, needsCopyIndex bool) (int64, int, error) {
 	return uploadID, copyIndex, nil
 }
 
+// taskUploadCopy loads the copy a staged task is bound to. When the task records
+// a concrete copy it wins over the replica slot, so reads and writes stay on the
+// same generation after a replacement activates.
+func (u *Uploader) taskUploadCopy(ctx context.Context, task *model.Task, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error) {
+	if copyID := uploadStageCopyID(task); copyID > 0 {
+		copyRow, err := u.repos.Uploads.GetUploadCopyByID(ctx, copyID)
+		if err != nil {
+			return nil, err
+		}
+		if copyRow == nil {
+			return nil, fmt.Errorf("storage upload copy %d: %w", copyID, repository.ErrNotFound)
+		}
+		transferMethod, _ := task.Payload["transfer_method"].(string)
+		if copyRow.UploadID != uploadID || copyRow.CopyIndex != copyIndex ||
+			(transferMethod != "" && string(copyRow.TransferMethod) != transferMethod) {
+			return nil, fmt.Errorf("storage upload copy %d does not match task payload: %w", copyID, repository.ErrConflict)
+		}
+		return copyRow, nil
+	}
+	return u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+}
+
+// taskCopyDataSet resolves the data set a task's copy is bound to. Tasks queued
+// before copy ids existed, and copies not yet bound to a data set, fall back to
+// the slot's current generation, which is where they belong.
+func (u *Uploader) taskCopyDataSet(ctx context.Context, task *model.Task, bucketID, uploadID int64, copyIndex int) (*model.StorageDataSet, error) {
+	copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
+	if err != nil {
+		return nil, err
+	}
+	if copyRow != nil && copyRow.StorageDataSetID != nil && *copyRow.StorageDataSetID > 0 {
+		return u.repos.Uploads.GetDataSetBindingByID(ctx, *copyRow.StorageDataSetID)
+	}
+	return u.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucketID, copyIndex)
+}
+
+// uploadStageCopyID reports the concrete copy a staged task targets. Tasks
+// queued before copy ids were recorded return zero and stay resolvable through
+// their replica slot.
+func uploadStageCopyID(task *model.Task) int64 {
+	if task == nil || task.Payload == nil {
+		return 0
+	}
+	if _, ok := task.Payload[replicaRepairCopyIDKey]; !ok {
+		return 0
+	}
+	copyID, err := payloadInt64(task.Payload, replicaRepairCopyIDKey)
+	if err != nil || copyID < 0 {
+		return 0
+	}
+	return copyID
+}
+
 func payloadInt64(payload map[string]interface{}, key string) (int64, error) {
 	raw, ok := payload[key]
 	if !ok {
@@ -2211,7 +2454,7 @@ func payloadInt64(payload map[string]interface{}, key string) (int64, error) {
 }
 
 func (u *Uploader) markDataSetStageFailed(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, binding *model.StorageDataSet, logger *slog.Logger, stage string, err error) {
-	copyRow, copyErr := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+	copyRow, copyErr := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 	if copyErr != nil {
 		u.handleTaskFailure(ctx, task, logger, "load failed upload copy", copyErr)
 		return
@@ -2284,7 +2527,12 @@ func (u *Uploader) markPeerFailed(ctx context.Context, task *model.Task, uploadI
 	if status == model.TaskStatusExhausted {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), terminalFailureCleanupTimeout)
 		defer cancel()
-		if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, uploadID, copyIndex, fmt.Sprintf("%s: %v", stage, err)); markErr != nil {
+		if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, repository.MarkUploadCopyFailedInput{
+			StorageUploadCopyID: uploadStageCopyID(task),
+			UploadID:            uploadID,
+			CopyIndex:           copyIndex,
+			LastError:           fmt.Sprintf("%s: %v", stage, err),
+		}); markErr != nil {
 			logger.Warn("failed to mark peer upload copy failed", "uploadID", uploadID, "copyIndex", copyIndex, "error", markErr)
 		}
 		discarded := false
@@ -2315,7 +2563,7 @@ func (u *Uploader) handlePeerDataSetFailure(ctx context.Context, task *model.Tas
 		}
 	}
 	if dataSetFailureEnded(err, binding) || dataSetFailureUnavailable(err, binding) {
-		copyRow, loadErr := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+		copyRow, loadErr := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 		if loadErr != nil || copyRow == nil {
 			if loadErr == nil {
 				loadErr = errors.New("peer upload copy not found")
@@ -2445,7 +2693,12 @@ func (u *Uploader) handleDataSetCreationFailure(
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), terminalFailureCleanupTimeout)
 	defer cancel()
-	if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, uploadID, copyRow.CopyIndex, fmt.Sprintf("%s: %v", stage, err)); markErr != nil {
+	if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, repository.MarkUploadCopyFailedInput{
+		StorageUploadCopyID: copyRow.ID,
+		UploadID:            uploadID,
+		CopyIndex:           copyRow.CopyIndex,
+		LastError:           fmt.Sprintf("%s: %v", stage, err),
+	}); markErr != nil {
 		logger.Warn("failed to mark rejected data set copy failed", "uploadID", uploadID, "copyIndex", copyRow.CopyIndex, "error", markErr)
 	}
 	discarded, discardErr := u.repos.Uploads.DiscardFailedDataSetCandidate(cleanupCtx, uploadID, copyRow.CopyIndex, binding.ID)
@@ -2472,7 +2725,7 @@ func (u *Uploader) handleDataSetCreationFailure(
 		if reassignErr != nil {
 			logger.Warn("failed to reassign ingress after data set rejection", "uploadID", uploadID, "copyIndex", copyRow.CopyIndex, "error", reassignErr)
 		} else if reassigned != nil {
-			if enqueueErr := u.enqueueUploadStage(cleanupCtx, task, uploadStageEnsureDataSet, uploadID, reassigned.CopyIndex, model.StorageCopyTransferMethodIngress); enqueueErr != nil {
+			if enqueueErr := u.enqueueUploadStageForCopy(cleanupCtx, task, uploadStageEnsureDataSet, uploadID, reassigned.CopyIndex, reassigned.TransferMethod, reassigned.ID); enqueueErr != nil {
 				logger.Warn("failed to enqueue ingress after data set rejection", "uploadID", uploadID, "copyIndex", reassigned.CopyIndex, "error", enqueueErr)
 			}
 		}
@@ -2590,15 +2843,24 @@ func (u *Uploader) markDataSetStatus(ctx context.Context, binding *model.Storage
 	return latest, nil
 }
 
-func (u *Uploader) readyContextForCopy(ctx context.Context, bucket *model.Bucket, copyIndex int) (*model.StorageDataSet, synapse.UploadContext, error) {
-	binding, err := u.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, copyIndex)
+// readyContextForCopy opens the provider context for the data set this task's
+// copy is actually bound to, not for whichever generation currently owns the
+// slot. A provider replacement can take the slot while an upload is mid-flight;
+// resolving by slot would then store the piece on the new provider while the
+// copy row being updated still belongs to the old one.
+func (u *Uploader) readyContextForCopy(ctx context.Context, task *model.Task, bucket *model.Bucket, uploadID int64, copyIndex int) (*model.StorageDataSet, synapse.UploadContext, error) {
+	binding, err := u.taskCopyDataSet(ctx, task, bucket.ID, uploadID, copyIndex)
 	if err != nil {
 		return nil, nil, err
 	}
 	if binding == nil {
 		return nil, nil, nil
 	}
-	if binding.Status != model.StorageDataSetStatusReady || binding.DataSetID == nil || binding.DataSetID.IsZero() {
+	concrete := uploadStageCopyID(task) > 0
+	usableStatus := binding.Status == model.StorageDataSetStatusReady ||
+		concrete && binding.Status == model.StorageDataSetStatusDraining
+	if !usableStatus ||
+		binding.DataSetID == nil || binding.DataSetID.IsZero() {
 		return binding, nil, fmt.Errorf("dataset binding %d is not ready", binding.ID)
 	}
 	storageCtx, err := u.contextForReadyBinding(ctx, binding, bucket.Name)
@@ -2644,11 +2906,10 @@ func (u *Uploader) contextForReadyBinding(ctx context.Context, binding *model.St
 	return storageCtx, nil
 }
 
-func (u *Uploader) extraDataForCopy(ctx context.Context, storageCtx synapse.UploadContext, uploadID int64, copyIndex int, pieces []storage.PieceInput) ([]byte, string, error) {
-	copyRow, err := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
-	if err != nil {
-		return nil, "", err
-	}
+// extraDataForCopy takes the concrete copy rather than a replica slot: the
+// cached presign blob belongs to one generation, and resolving it by slot would
+// hand back the replacement's blob after an activation.
+func (u *Uploader) extraDataForCopy(ctx context.Context, storageCtx synapse.UploadContext, copyRow *model.StorageUploadCopy, pieces []storage.PieceInput) ([]byte, string, error) {
 	if copyRow != nil && copyRow.CommitExtraDataHex != nil && *copyRow.CommitExtraDataHex != "" {
 		extraData, err := hex.DecodeString(*copyRow.CommitExtraDataHex)
 		return extraData, strings.ToLower(*copyRow.CommitExtraDataHex), err
@@ -2739,12 +3000,14 @@ func (u *Uploader) waitForPendingSubmittedCommit(ctx context.Context, task *mode
 
 func (u *Uploader) resetRejectedSubmittedCommit(
 	ctx context.Context,
+	copyID int64,
 	uploadID int64,
 	copyIndex int,
 	transactionID string,
 	commitErr error,
 ) error {
 	return u.repos.Uploads.ResetRejectedUploadCopyCommit(ctx, repository.ResetRejectedUploadCopyCommitInput{
+		StorageUploadCopyID: copyID,
 		UploadID:            uploadID,
 		CopyIndex:           copyIndex,
 		CommitTransactionID: transactionID,
@@ -2942,7 +3205,12 @@ func (u *Uploader) handleIngressFailure(ctx context.Context, task *model.Task, v
 		if status == model.TaskStatusExhausted && !currentSubmitted {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), terminalFailureCleanupTimeout)
 			defer cancel()
-			if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, uploadID, copyIndex, fmt.Sprintf("%s: %v", stage, err)); markErr != nil {
+			if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, repository.MarkUploadCopyFailedInput{
+				StorageUploadCopyID: uploadStageCopyID(task),
+				UploadID:            uploadID,
+				CopyIndex:           copyIndex,
+				LastError:           fmt.Sprintf("%s: %v", stage, err),
+			}); markErr != nil {
 				logger.Warn("failed to mark alternate ingress upload copy failed", "uploadID", uploadID, "copyIndex", copyIndex, "error", markErr)
 			}
 		}
@@ -2953,7 +3221,12 @@ func (u *Uploader) handleIngressFailure(ctx context.Context, task *model.Task, v
 	if status == model.TaskStatusExhausted {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), terminalFailureCleanupTimeout)
 		defer cancel()
-		if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, uploadID, copyIndex, fmt.Sprintf("%s: %v", stage, err)); markErr != nil {
+		if markErr := u.repos.Uploads.MarkUploadCopyFailed(cleanupCtx, repository.MarkUploadCopyFailedInput{
+			StorageUploadCopyID: uploadStageCopyID(task),
+			UploadID:            uploadID,
+			CopyIndex:           copyIndex,
+			LastError:           fmt.Sprintf("%s: %v", stage, err),
+		}); markErr != nil {
 			logger.Warn("failed to mark ingress upload copy failed", "uploadID", uploadID, "copyIndex", copyIndex, "error", markErr)
 		}
 	}
@@ -2970,7 +3243,7 @@ func (u *Uploader) handleIngressDataSetFailure(ctx context.Context, task *model.
 		}
 	}
 	if dataSetFailureEnded(err, binding) || dataSetFailureUnavailable(err, binding) {
-		copyRow, loadErr := u.repos.Uploads.GetUploadCopy(ctx, uploadID, copyIndex)
+		copyRow, loadErr := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 		if loadErr != nil || copyRow == nil {
 			if loadErr == nil {
 				loadErr = errors.New("ingress upload copy not found")

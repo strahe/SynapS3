@@ -1,6 +1,15 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { createFileRoute } from '@tanstack/react-router'
-import { ChevronDown, ListTodo, Loader2, RefreshCw, RotateCcw, Stethoscope, TriangleAlert } from 'lucide-react'
+import { createFileRoute, Link } from '@tanstack/react-router'
+import {
+  ChevronDown,
+  ExternalLink,
+  ListTodo,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Stethoscope,
+  TriangleAlert,
+} from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
 import { api, type TaskDiagnostic, type TaskItem, type TaskStorageCleanupDetail } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
@@ -27,7 +36,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTaskRefDetail, useTasks } from '@/hooks/queries'
+import { taskHasDataSetsRecovery, taskRetryableFromQueue } from '@/lib/provider-replacement'
 import {
+  replacementCleanupStageLabel,
   storageCleanupCopyStatusLabel,
   storageCleanupCopyStatusTone,
   storageCleanupStatusLabel,
@@ -116,7 +127,16 @@ function taskDetailTitle(task: TaskItem) {
 function TaskRefCell({ task }: { task: TaskItem }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const detail = useTaskRefDetail(task.id, detailsOpen)
-  const refLabel = task.type === 'storage_cleanup' ? 'Deleted object' : `${task.ref_type}:${task.ref_id}`
+  // Replacement cleanup ends a storage service; calling it a deleted object
+  // would send the operator looking in the wrong place.
+  const replacementCleanup = replacementCleanupStageLabel(task.stage)
+  const refLabel = replacementCleanup
+    ? task.bucket_name
+      ? `${replacementCleanup} · ${task.bucket_name}`
+      : replacementCleanup
+    : task.type === 'storage_cleanup'
+      ? 'Deleted object'
+      : `${task.ref_type}:${task.ref_id}`
 
   return (
     <Popover open={detailsOpen} onOpenChange={setDetailsOpen}>
@@ -148,6 +168,14 @@ function TaskRefPopoverContent({ detail, enabled }: { detail: ReturnType<typeof 
     return <span>{enabled ? 'Loading details' : ''}</span>
   }
   if (!detail.data.object && !detail.data.storage_cleanup) {
+    if (detail.data.bucket_name) {
+      return (
+        <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 text-xs">
+          <span className="text-muted-foreground">Bucket</span>
+          <span className="font-medium">{detail.data.bucket_name}</span>
+        </div>
+      )
+    }
     return <span>Details unavailable</span>
   }
 
@@ -324,8 +352,9 @@ function TaskActionsCell({
   onOpenDiagnostic: (task: TaskItem) => void
 }) {
   const showDiagnostic = task.type === 'upload'
-  const showRetry = task.status === 'exhausted'
-  if (!showDiagnostic && !showRetry) return <span className="text-muted-foreground">—</span>
+  const showRetry = task.status === 'exhausted' && taskRetryableFromQueue(task)
+  const showDataSets = taskHasDataSetsRecovery(task)
+  if (!showDiagnostic && !showRetry && !showDataSets) return <span className="text-muted-foreground">—</span>
 
   return (
     <div className="flex items-center gap-1">
@@ -360,6 +389,23 @@ function TaskActionsCell({
             </Button>
           </TooltipTrigger>
           <TooltipContent>Retry</TooltipContent>
+        </Tooltip>
+      )}
+      {showDataSets && task.bucket_name && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button asChild type="button" variant="outline" size="icon-xs">
+              <Link
+                to="/buckets/$name"
+                params={{ name: task.bucket_name }}
+                search={{ details: 'storage' }}
+                aria-label="Open Data Sets"
+              >
+                <ExternalLink data-icon="inline-start" />
+              </Link>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Open Data Sets</TooltipContent>
         </Tooltip>
       )}
     </div>

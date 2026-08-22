@@ -163,6 +163,63 @@ export function useUpdateBucketCopyPolicy() {
   })
 }
 
+/**
+ * The provider chooser, loaded only while the operator is actually choosing.
+ * It reaches the registry, so it is not worth fetching for a dialog that is
+ * closed or set to pick automatically.
+ */
+export function useReplacementProviderCandidates(bucket: string, dataSetID: number | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['replacement-providers', bucket, dataSetID],
+    queryFn: () => api.getReplacementProviders(bucket, dataSetID as number),
+    enabled: enabled && dataSetID !== null,
+    staleTime: 30_000,
+  })
+}
+
+export function useStartProviderReplacement() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({
+      bucket,
+      dataSetID,
+      mode,
+      providerID,
+      clientRequestID,
+    }: {
+      bucket: string
+      dataSetID: number
+      mode: 'automatic' | 'manual'
+      providerID?: string
+      clientRequestID: string
+    }) =>
+      api.startProviderReplacement(bucket, dataSetID, {
+        mode,
+        client_request_id: clientRequestID,
+        ...(mode === 'manual' && providerID ? { provider_id: providerID } : {}),
+      }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['bucket', variables.bucket] })
+      qc.invalidateQueries({ queryKey: ['buckets'] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+}
+
+export function useRetryProviderReplacement() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ replacementID }: { bucket: string; replacementID: number }) =>
+      api.retryProviderReplacement(replacementID),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['bucket', variables.bucket] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+}
+
 export function useDeleteBucketObject() {
   const qc = useQueryClient()
 

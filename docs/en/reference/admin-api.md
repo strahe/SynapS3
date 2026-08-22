@@ -93,6 +93,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
 | Tasks and storage health | task retry, diagnostic refresh, storage provider and data set refresh | Requeues work or refreshes operational status. |
+| Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends the old service. |
 
 ## Health and Metrics
 
@@ -130,6 +131,9 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `POST` | `/api/v1/buckets/{name}/objects/permanent-delete` | Permanently delete an object version. |
 | `POST` | `/api/v1/buckets/{name}/objects/deleted/permanent-delete` | Permanently delete a deleted object version. |
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | List versions affected by storage health issues. |
+| `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | List the providers this replica can move to, and why the others cannot take it. |
+| `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Authorize replacing the storage provider behind a replica. |
+| `POST` | `/api/v1/storage-replacements/{id}/retry` | Resume a failed or attention-holding provider replacement. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
 
@@ -189,6 +193,68 @@ A missing or permanently deleted source returns `404 Not Found`; insufficient ca
 
 The restore streams synchronously for up to one hour and requires enough cache capacity for the new destination version.
 
+### Replace a Storage Provider
+
+`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` is the only way to replace the storage provider behind a replica. One confirmation authorizes all of it: a new paid storage service, moving new uploads to it, copying existing data across, and ending the old service once every retained version is readable on the new provider. Objects copy from another replica or from local cache. An object with neither cannot be copied, and the old provider is not shut down.
+
+Choose the new provider automatically:
+
+```json
+{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
+```
+
+Automatic selection excludes every provider the bucket has ever used, including retired ones. Or name the provider yourself:
+
+```json
+{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
+```
+
+A named provider must appear in the complete available, active, PDP-capable provider inventory. It may be one the bucket used before, provided that earlier service has already been retired. The provider being replaced, and any provider still holding a live generation of this bucket, are rejected.
+
+`client_request_id` is required after trimming and must contain 1–128 characters. The first successful request returns `201 Created`. Replaying the same bucket, source, mode, and manual provider with the same ID returns the original record and `200 OK`, even after the replica has switched. Reusing the ID with different parameters returns `409 Conflict` with `replacement_idempotency_conflict`. An automatic replay is resolved before reading the provider inventory, so a later inventory change cannot choose a different provider.
+
+Confirming again for the same replica supersedes the earlier request and returns `201 Created`; it is not a conflict. The unused provider from the earlier request is shut down. `replacement_active` means something else: the replica is the target of another unfinished replacement, which has to be resolved first.
+
+Only the replica that currently receives writes can be replaced; a historical generation is reported with `"replaceable": false` in `GET /api/v1/buckets/{name}`.
+
+A successful first confirmation returns `201 Created` with the replacement record; an exact replay returns `200 OK`. `GET /api/v1/buckets/{name}` returns the bucket's recent replacements in `replacements`, newest first, up to the 50 most recent.
+
+Replacement moves through these states:
+
+| Status | Meaning |
+| --- | --- |
+| `preparing_target` | The new service is being created. Writes still go to the current provider. |
+| `migrating` | The new provider receives new uploads while existing data is copied across. |
+| `waiting` | Paused. `wait_reason` and `wait_message` distinguish service creation (`target_creating`), writable confirmation (`target_writable`), an unreachable provider (`target`), funding, source availability, and safe retirement waits. Most waits resume without action. |
+| `retiring` | Everything is copied and the old service is being ended. |
+| `cleanup_attention` | Ending the old service needs an operator decision, such as settling payment debt. |
+| `failed` | Work ran out of attempts and needs to be retried. |
+| `completed` | The old service is ended and the replica now lives on the new provider. |
+| `superseded` | A later confirmation replaced this request. |
+
+`last_error` is set only for `failed` and `cleanup_attention`, and is cleared by a retry. Waiting never sets it, because waiting is not a failure. A failed response may also include `failure_reason`. `target_in_use` is permanent for that approved target: choose a different provider; the retry endpoint returns a conflict.
+
+`items_total` and `items_copied` count unique stored content, not object versions: content shared by many versions is copied once. Content deleted while migration is in progress is no longer needed and is not counted as copied. After copying finishes, the response reports how much content was copied and how much no longer needed to move; `items_copied/items_total` is not a completion percentage. The confirmation dialog instead counts referenced versions and total size.
+
+`POST /api/v1/storage-replacements/{id}/retry` resumes a `failed` or `cleanup_attention` replacement on the same approved provider.
+
+Choosing a different provider requires a new confirmation, and is only available while the retiring provider still holds the replica. Once the new provider has taken the replica over, each generation holds data the other does not, so confirming again on either one is refused (`replacement_source_not_current` on the old, `replacement_active` on the new) and the approved copy has to be finished with retry.
+
+Conflicts return `409 Conflict` with a stable code:
+
+```json
+{
+  "error": "that provider already stores a replica of this bucket",
+  "code": "replacement_target_in_use"
+}
+```
+
+The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_source_not_current`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, and `replacement_idempotency_conflict`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; a currently unavailable manual target returns `400` with `replacement_target_unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; an unavailable storage service returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
+
+`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists every provider currently reported available with `eligible`, an `ineligible_reason` of `current_source` or `already_serves_bucket`, and `previously_used` for a provider this bucket has used and fully retired. Providers that cannot take the replica are listed rather than omitted, so an operator can see why one they expected is unavailable. It is the same inventory the storage topology reports under the `Available` filter, so a provider listed there is offered here and an unreachable one is offered in neither. Eligibility is the same rule the confirmation enforces. Automatic selection is stricter still: it never returns to a provider this bucket has used, which a manual choice may.
+
+Confirmation only checks what SynapS3 has recorded. A provider that still runs a storage service for this bucket on chain is detected when the replacement prepares its target: the replacement stops at `failed` with the provider and data set named, and the operator confirms again on a different provider. The replica has not moved at that point, so nothing is at risk. A provider whose earlier service for this bucket was retired normally can be chosen again.
+
 ## Tasks
 
 | Method | Path | Purpose |
@@ -201,6 +267,8 @@ The restore streams synchronously for up to one hour and requires enough cache c
 | `POST` | `/api/v1/tasks/{id}/retry` | Retry an exhausted task. |
 | `GET` | `/admin/exhausted-tasks` | List exhausted tasks. Supports `limit` up to `1000`. |
 | `POST` | `/admin/exhausted-tasks/{id}/retry` | Retry an exhausted task (legacy path). |
+
+Replacement and retirement task responses that refer to a bucket include `bucket_name` in list and reference-detail responses. Retrying replacement work from the task queue returns `409 Conflict` with `"code": "replacement_task_retry_unsupported"`. When a replacement task has completed or stopped, use **Open Data Sets**, or open the bucket and go to Details → Storage → Data Sets. A `target_in_use` failure has no Retry action because it requires a different provider.
 
 ## Wallet and Filecoin
 

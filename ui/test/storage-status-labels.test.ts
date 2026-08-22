@@ -89,3 +89,14 @@ test('replica cleanup copy status tones expose each cleanup state', () => {
   assert.equal(storageCleanupCopyStatusTone('failed'), 'danger')
   assert.equal(storageCleanupCopyStatusTone('unsupported'), 'danger')
 })
+
+// Retiring a replaced provider ends a paid service. Reading "Delete remote
+// replicas" there suggests the object data is being removed.
+test('retiring a provider is not labelled as replica deletion', () => {
+  assert.equal(taskOperationLabel({ type: 'storage_cleanup', stage: 'retire_data_set' }), 'Retire replaced provider')
+  assert.equal(
+    taskOperationLabel({ type: 'storage_cleanup', stage: 'retire_abandoned_target' }),
+    'Retire unused provider'
+  )
+  assert.equal(taskOperationLabel({ type: 'storage_cleanup', stage: '' }), 'Delete remote replicas')
+})

@@ -144,7 +144,10 @@ func TestSystemGoldenPath(t *testing.T) {
 		if err != nil {
 			return providerRaw + "\n" + dataSetRaw, false, err
 		}
-		return providerRaw + "\n" + dataSetRaw, providers.Summary.Available == 3 && dataSets.Summary.Available == 3, nil
+		// Every configured provider is observed; the bucket's three replicas
+		// account for the data sets.
+		return providerRaw + "\n" + dataSetRaw,
+			providers.Summary.Available == systemtest.MemoryFilecoinProviders && dataSets.Summary.Available == 3, nil
 	})
 
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

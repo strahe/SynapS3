@@ -97,6 +97,9 @@ func newBucketAPIMux(srv *Server) *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/versions/restore", srv.handleAPIRestoreObjectVersion)
 	mux.HandleFunc("GET /api/v1/buckets/{name}/objects/download", srv.handleAPIDownloadObject)
 	mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", srv.handleAPIUploadObject)
+	mux.HandleFunc("POST /api/v1/buckets/{name}/data-sets/{id}/replacement", srv.handleAPIStartDataSetReplacement)
+	mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", srv.handleAPIListDataSetReplacementProviders)
+	mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", srv.handleAPIRetryStorageReplacement)
 	return mux
 }
 
@@ -565,7 +568,7 @@ func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versio
 	}); err != nil {
 		t.Fatalf("bind primary committed upload: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 1, "secondary pull: timeout"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 1, LastError: "secondary pull: timeout"}); err != nil {
 		t.Fatalf("mark secondary failed: %v", err)
 	}
 	return upload
@@ -654,7 +657,7 @@ func markAdminFailedUpload(t *testing.T, repos *repository.Repositories, version
 	}}); err != nil {
 		t.Fatalf("create failed upload copy: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, message); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 0, LastError: message}); err != nil {
 		t.Fatalf("mark failed upload copy: %v", err)
 	}
 	return upload

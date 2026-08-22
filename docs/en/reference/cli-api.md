@@ -97,6 +97,8 @@ Admin global flags must appear after `admin` and before the subcommand:
 
 Task listing supports `--type`, `--stage`, `--status`, `--limit`, and `--offset`. `--stage` requires `--type`.
 
+`synaps3 admin task retry` does not retry provider replacement work. Use **Open Data Sets** from a finished or stopped replacement task, or open the bucket and go to **Details** → **Storage** → **Data Sets**. If the selected provider already stores this bucket, choose a different provider instead of retrying.
+
 Cache eviction policy accepts `lru`, `after_upload`, or `none`. LRU watermarks must satisfy `0 <= low < high <= 100`; these settings are retained but inactive under the other policies.
 
 ## Settings Safety

@@ -1501,7 +1501,7 @@ func TestStorageUploadRepo_FinalizeUploadIfTargetCopiesMetMovesReplicatingToStor
 		t.Fatalf("partial state = %s, want replicating", got.State)
 	}
 
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 1, "peer pull: dataset unavailable"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 1, LastError: "peer pull: dataset unavailable"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed peer: %v", err)
 	}
 	replacement, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: bucket.ID, ProviderID: onChainID(t, "303"), CopyIndex: 2, CreatedByUploadID: upload.ID})
@@ -1913,7 +1913,7 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
 
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, "ingress store: provider rejected piece"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 0, LastError: "ingress store: provider rejected piece"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed: %v", err)
 	}
 	got, err := repos.Uploads.GetByID(ctx, upload.ID)
@@ -1943,7 +1943,7 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 		t.Fatalf("upload status after store retry = %s, want ingress_ready", got.Status)
 	}
 
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 0, "ingress commit: provider rejected piece"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 0, LastError: "ingress commit: provider rejected piece"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed after store retry: %v", err)
 	}
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
@@ -2174,7 +2174,7 @@ func TestStorageUploadRepo_CommittedCopyIgnoresStaleStatusUpdates(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady stale: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 1, "secondary pull: stale failure"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 1, LastError: "secondary pull: stale failure"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed stale: %v", err)
 	}
 
@@ -2311,14 +2311,14 @@ func TestStorageUploadRepo_UnavailableDataSetRecoveryUsesIncompleteCopies(t *tes
 	if err != nil || firstCopy == nil || firstCopy.UploadID != firstUpload.ID {
 		t.Fatalf("first incomplete copy = %#v err=%v", firstCopy, err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, firstUpload.ID, firstCopy.CopyIndex, "skip completed repair item"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: firstUpload.ID, CopyIndex: firstCopy.CopyIndex, LastError: "skip completed repair item"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed: %v", err)
 	}
 	secondCopy, err := repos.Uploads.NextIncompleteCopyForDataSet(ctx, binding.ID)
 	if err != nil || secondCopy == nil || secondCopy.UploadID != secondUpload.ID {
 		t.Fatalf("second incomplete copy = %#v err=%v", secondCopy, err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, secondUpload.ID, secondCopy.CopyIndex, "skip second repair item"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: secondUpload.ID, CopyIndex: secondCopy.CopyIndex, LastError: "skip second repair item"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed second: %v", err)
 	}
 	next, err := repos.Uploads.NextIncompleteCopyForDataSet(ctx, binding.ID)
@@ -2506,7 +2506,7 @@ func TestStorageUploadRepo_DiscardFailedCandidateIsAtomicWithSharedReferences(t 
 	if err := repos.Uploads.MarkDataSetFailed(ctx, binding.ID, "creation rejected"); err != nil {
 		t.Fatalf("MarkDataSetFailed: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, first.ID, 0, "creation rejected"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: first.ID, CopyIndex: 0, LastError: "creation rejected"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed: %v", err)
 	}
 	discarded, err := repos.Uploads.DiscardFailedDataSetCandidate(ctx, first.ID, 0, binding.ID)
@@ -2720,4 +2720,206 @@ func affectedVersionByID(versions []repository.BucketStorageHealthAffectedVersio
 
 func strPtr(v string) *string {
 	return &v
+}
+
+// A provider replacement gives one replica slot two data set generations that
+// can both hold a committed copy. Counting them as two replicas would release
+// cache while only one provider actually holds the data.
+func TestStorageUploadRepo_DurabilityCountsDistinctSlotsAcrossGenerations(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "generation-durability-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000GEN01", 10)
+	version.Checksum = "generation-durability-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 3)
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 0, "101", "1001", "2001", "https://one.example/piece")
+	commitStorageHealthCopy(t, repos, bucket.ID, upload.ID, 1, "202", "2002", "2002", "https://two.example/piece")
+	bindStorageHealthVersion(t, repos, bucket.ID, upload.ID, version)
+
+	source, err := repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
+	if err != nil || source == nil {
+		t.Fatalf("GetDataSetBindingByCopyIndex = %#v err=%v", source, err)
+	}
+	// Stand in for an activated replacement until the replacement repository
+	// owns this transition.
+	mustExec(t, db, `UPDATE storage_data_sets SET is_current = FALSE, status = ? WHERE id = ?`,
+		model.StorageDataSetStatusDraining, source.ID)
+	mustExec(t, db, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_at, updated_at)
+		VALUES (?, '909', 0, 2, TRUE, '9009', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		bucket.ID, model.StorageDataSetStatusReady)
+	target, err := repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
+	if err != nil || target == nil || target.ID == source.ID || target.Generation != 2 {
+		t.Fatalf("current binding after activation = %#v err=%v, want the second generation", target, err)
+	}
+	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, piece_id, transfer_method, status, retrieval_url, storage_data_set_id, created_at, updated_at)
+		VALUES (?, 0, '909', '9001', ?, ?, 'https://three.example/piece', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		upload.ID, model.StorageCopyTransferMethodPeerPull, model.StorageUploadCopyStatusCommitted, target.ID)
+
+	// All three physical copies stay retrievable, including the retiring one.
+	copies, err := repos.Uploads.ListReadableCommittedCopies(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("ListReadableCommittedCopies: %v", err)
+	}
+	if len(copies) != 3 {
+		t.Fatalf("readable copies = %d, want 3 physical copies", len(copies))
+	}
+
+	// Durability still sees two slots, so the third requested copy is owed.
+	done, refs, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID})
+	if err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet: %v", err)
+	}
+	if done {
+		t.Fatalf("two generations of one slot satisfied a 3-copy target, want them counted as one replica (refs=%#v)", refs)
+	}
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || gotVersion == nil || gotVersion.State == model.ObjectStateStored {
+		t.Fatalf("version after activation = %#v err=%v, want it to stay short of the durability threshold", gotVersion, err)
+	}
+}
+
+// A staged task records the copy it stored to. If the slot's current generation
+// changes before the task runs, the write must still land on the generation
+// that actually holds the piece rather than on its replacement.
+func TestStorageUploadRepo_CopyWritesFollowTheRecordedCopyNotTheCurrentGeneration(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "generation-addressing-bucket")
+
+	version := newObjectVersion(bucket.ID, "file.txt", "01J000000000000000000ADR01", 10)
+	version.Checksum = "generation-addressing-checksum"
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+	}
+	upload := startCopyHealthUpload(t, repos, bucket.ID, version.VersionID, version.Size, version.Checksum, 1)
+	source := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 0, "101")
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID:        source.ID,
+		UploadID:  upload.ID,
+		DataSetID: onChainID(t, "1001"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: source.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       onChainID(t, "101"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	sourceCopy, err := repos.Uploads.GetUploadCopyForDataSet(ctx, upload.ID, source.ID)
+	if err != nil || sourceCopy == nil {
+		t.Fatalf("GetUploadCopyForDataSet source = %#v err=%v", sourceCopy, err)
+	}
+
+	// Stand in for an activated replacement that also staged its own copy.
+	mustExec(t, db, `UPDATE storage_data_sets SET is_current = FALSE, status = ? WHERE id = ?`,
+		model.StorageDataSetStatusDraining, source.ID)
+	mustExec(t, db, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_at, updated_at)
+		VALUES (?, '909', 0, 2, TRUE, '9009', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		bucket.ID, model.StorageDataSetStatusReady)
+	target, err := repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
+	if err != nil || target == nil || target.ID == source.ID {
+		t.Fatalf("current binding after activation = %#v err=%v, want the new generation", target, err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: target.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodPeerPull,
+		ProviderID:       onChainID(t, "909"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings target: %v", err)
+	}
+	targetCopy, err := repos.Uploads.GetUploadCopyForDataSet(ctx, upload.ID, target.ID)
+	if err != nil || targetCopy == nil {
+		t.Fatalf("GetUploadCopyForDataSet target = %#v err=%v", targetCopy, err)
+	}
+
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		StorageUploadCopyID: sourceCopy.ID,
+		UploadID:            upload.ID,
+		CopyIndex:           0,
+		PieceCID:            "bafk2bzacegeneration",
+		PieceID:             onChainIDPtr(t, "2001"),
+		RetrievalURL:        "https://source.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+
+	gotSource, err := repos.Uploads.GetUploadCopyByID(ctx, sourceCopy.ID)
+	if err != nil || gotSource == nil || gotSource.Status != model.StorageUploadCopyStatusPieceReady {
+		t.Fatalf("recorded copy = %#v err=%v, want piece_ready on the generation that stored it", gotSource, err)
+	}
+	gotTarget, err := repos.Uploads.GetUploadCopyByID(ctx, targetCopy.ID)
+	if err != nil || gotTarget == nil || gotTarget.Status != model.StorageUploadCopyStatusPending {
+		t.Fatalf("replacement copy = %#v err=%v, want it untouched", gotTarget, err)
+	}
+
+	// A task queued before copy ids existed still resolves through its slot,
+	// which names the current generation.
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     upload.ID,
+		CopyIndex:    0,
+		PieceCID:     "bafk2bzacegeneration",
+		PieceID:      onChainIDPtr(t, "9001"),
+		RetrievalURL: "https://target.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady legacy: %v", err)
+	}
+	gotTarget, err = repos.Uploads.GetUploadCopyByID(ctx, targetCopy.ID)
+	if err != nil || gotTarget == nil || gotTarget.Status != model.StorageUploadCopyStatusPieceReady {
+		t.Fatalf("legacy addressed copy = %#v err=%v, want the current generation", gotTarget, err)
+	}
+}
+
+func TestStorageUploadRepo_CountCurrentGenerationCopySlotsIgnoresHistoricalCopies(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "current-generation-copy-count")
+	upload := startCopyHealthUpload(t, repos, bucket.ID, model.NewVersionID(), 10, "generation-count", 2)
+	source := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 0, "101")
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: source.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady source: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: source.ID, CopyIndex: 0,
+		TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings source: %v", err)
+	}
+
+	mustExec(t, db, `UPDATE storage_data_sets SET is_current = FALSE, status = ? WHERE id = ?`,
+		model.StorageDataSetStatusDraining, source.ID)
+	mustExec(t, db, `INSERT INTO storage_data_sets
+		(bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_at, updated_at)
+		VALUES (?, '202', 0, 2, TRUE, '2002', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		bucket.ID, model.StorageDataSetStatusReady)
+	target, err := repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
+	if err != nil || target == nil || target.ID == source.ID {
+		t.Fatalf("current target = %#v err=%v", target, err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: target.ID, CopyIndex: 0,
+		TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202"),
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings target: %v", err)
+	}
+
+	count, err := repos.Uploads.CountCurrentGenerationCopySlots(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("CountCurrentGenerationCopySlots: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("current logical slots = %d, want one occupied slot and one missing slot", count)
+	}
 }

@@ -12,12 +12,17 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synapse-go/storage"
 )
 
 type StorageCleanupWorker struct {
-	repos        *repository.Repositories
+	repos *repository.Repositories
+	// terminator and epochs are only used by provider replacement retirement,
+	// which is the sole destructive service-lifecycle path.
+	terminator   synapse.ServiceTerminator
+	epochs       synapse.ChainEpochReader
 	storage      synapse.StorageClient
 	concurrency  int
 	pollInterval time.Duration
@@ -33,8 +38,20 @@ const (
 
 var errStorageCleanupCopyUnsupported = errors.New("storage cleanup copy unsupported")
 
-func NewStorageCleanupWorker(repos *repository.Repositories, storageClient synapse.StorageClient, concurrency int, pollInterval time.Duration, logger *slog.Logger) *StorageCleanupWorker {
-	return &StorageCleanupWorker{
+// StorageCleanupOption configures optional cleanup dependencies.
+type StorageCleanupOption func(*StorageCleanupWorker)
+
+// WithServiceTermination enables provider replacement retirement. Without it
+// the worker still removes pieces but refuses to end any service.
+func WithServiceTermination(terminator synapse.ServiceTerminator, epochs synapse.ChainEpochReader) StorageCleanupOption {
+	return func(w *StorageCleanupWorker) {
+		w.terminator = terminator
+		w.epochs = epochs
+	}
+}
+
+func NewStorageCleanupWorker(repos *repository.Repositories, storageClient synapse.StorageClient, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...StorageCleanupOption) *StorageCleanupWorker {
+	w := &StorageCleanupWorker{
 		repos:           repos,
 		storage:         storageClient,
 		concurrency:     concurrency,
@@ -43,6 +60,10 @@ func NewStorageCleanupWorker(repos *repository.Repositories, storageClient synap
 		logger:          logger,
 		livenessTracker: newLivenessTracker(pollInterval),
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
 }
 
 func (w *StorageCleanupWorker) Name() string { return "storage_cleanup" }
@@ -121,6 +142,14 @@ func (w *StorageCleanupWorker) processTask(ctx context.Context, task *model.Task
 	defer func() {
 		admin.WorkerTaskDuration.WithLabelValues("storage_cleanup").Observe(time.Since(start).Seconds())
 	}()
+
+	if task.Stage != nil {
+		switch *task.Stage {
+		case storagereplacement.StageRetire, storagereplacement.StageRetireAbandonedTarget:
+			w.processReplacementRetirementTask(ctx, task)
+			return
+		}
+	}
 
 	logger := w.logger.With("taskID", task.ID, "uploadID", task.RefID)
 	hasRefs, err := w.repos.StorageCleanup.UploadHasObjectReferences(ctx, task.RefID)

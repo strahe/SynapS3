@@ -230,7 +230,7 @@ func (r *BunStorageUploadRepo) listBucketStorageHealthReadableAlternativeCounts(
 	}
 	query := fmt.Sprintf(`SELECT
 			object_version.version_id,
-			COUNT(*) AS readable_alternative_count
+			COUNT(DISTINCT readable_data_set.copy_index) AS readable_alternative_count
 		FROM object_versions AS object_version
 		JOIN storage_upload_copies AS readable_copy ON readable_copy.upload_id = object_version.storage_upload_id
 		JOIN storage_uploads AS readable_upload
@@ -311,19 +311,13 @@ func validateBucketStorageHealthAffectedVersionMarkers(input BucketStorageHealth
 }
 
 // This records locally known readable committed copies; it is not a data-safety guarantee.
+// The single placeholder binds the observation freshness cutoff.
 func readableCommittedStorageCopySQL() string {
 	return fmt.Sprintf(`readable_upload.piece_cid IS NOT NULL AND readable_upload.piece_cid <> ''
-		  AND readable_copy.status = %s
-		  AND readable_copy.storage_data_set_id IS NOT NULL
-		  AND readable_copy.provider_id IS NOT NULL AND readable_copy.provider_id <> ''
-		  AND readable_data_set.data_set_id IS NOT NULL AND readable_data_set.data_set_id <> ''
-		  AND readable_data_set.status IN (%s)
+		  AND %s
 		  AND readable_observation.status = %s
-		  AND readable_observation.last_checked_at >= ?
-		  AND readable_copy.piece_id IS NOT NULL AND readable_copy.piece_id <> ''
-		  AND readable_copy.retrieval_url IS NOT NULL AND readable_copy.retrieval_url <> ''`,
-		storageHealthCommittedCopyStatusSQL(),
-		storageHealthReadyDataSetStatusListSQL(),
+		  AND readable_observation.last_checked_at >= ?`,
+		readableCommittedCopyPredicateSQL("readable_copy", "readable_data_set"),
 		storageHealthAvailableObservationStatusSQL(),
 	)
 }

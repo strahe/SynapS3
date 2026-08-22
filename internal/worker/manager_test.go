@@ -733,7 +733,7 @@ func TestManager_RecoverOnStartup_DoesNotReplaceAssignedFailedPeer(t *testing.T)
 	}); err != nil {
 		t.Fatalf("BindReadableUploadForContent: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, upload.ID, 2, "peer pull: provider failed"); err != nil {
+	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 2, LastError: "peer pull: provider failed"}); err != nil {
 		t.Fatalf("MarkUploadCopyFailed: %v", err)
 	}
 

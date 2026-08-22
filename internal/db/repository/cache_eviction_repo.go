@@ -730,7 +730,7 @@ func requireMinimumDurability(
 		return cacheeviction.ErrDurabilityThreshold
 	}
 	minimum := minimumDurableCopiesForUpload(bucket, upload.RequestedCopies)
-	readable, err := countReadableCommittedCopies(ctx, db, upload.ID)
+	readable, err := countReadableReplicaSlots(ctx, db, upload.ID)
 	if err != nil {
 		return err
 	}
@@ -802,28 +802,17 @@ func nextBucketDurabilityCandidate(
 	return version, nil
 }
 
+// Keep this threshold aligned with minimumDurableCopiesForUpload; both compare
+// readable replica slots, not physical data set generations, against the
+// bucket's effective minimum.
 func minimumDurabilityMetSQL(uploadAlias, bucketAlias string) string {
-	return fmt.Sprintf(`(
-		SELECT COUNT(*)
-		FROM storage_upload_copies AS durable_copy
-		JOIN storage_data_sets AS durable_data_set ON durable_data_set.id = durable_copy.storage_data_set_id
-		WHERE durable_copy.upload_id = %s.id
-		  AND durable_copy.status = '%s'
-		  AND durable_copy.storage_data_set_id IS NOT NULL
-		  AND durable_copy.provider_id IS NOT NULL AND durable_copy.provider_id <> ''
-		  AND durable_data_set.data_set_id IS NOT NULL AND durable_data_set.data_set_id <> ''
-		  AND durable_data_set.status IN (%s)
-		  AND durable_copy.piece_id IS NOT NULL AND durable_copy.piece_id <> ''
-		  AND durable_copy.retrieval_url IS NOT NULL AND durable_copy.retrieval_url <> ''
-	) >= CASE
+	return fmt.Sprintf(`%s >= CASE
 		WHEN %s.minimum_durable_copies IS NULL
 		  OR %s.minimum_durable_copies >= %s.requested_copies
 		THEN %s.requested_copies
 		ELSE %s.minimum_durable_copies
 	END`,
-		uploadAlias,
-		model.StorageUploadCopyStatusCommitted,
-		storageHealthReadyDataSetStatusListSQL(),
+		distinctReadableSlotCountSQL("durable_copy", "durable_data_set", uploadAlias+".id"),
 		bucketAlias,
 		bucketAlias,
 		uploadAlias,
@@ -857,10 +846,5 @@ func cacheDeletionAuthorizedSQL(dialectName dialect.Name) string {
 }
 
 func (r *BunCacheEvictionRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {
-	if db, ok := r.db.(*bun.DB); ok {
-		return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-			return fn(tx)
-		})
-	}
-	return fn(r.db)
+	return runMaybeTx(ctx, r.db, fn)
 }

@@ -58,6 +58,25 @@ func (r *BunBucketRepo) GetByID(ctx context.Context, id int64) (*model.Bucket, e
 	return bucket, nil
 }
 
+func (r *BunBucketRepo) GetNamesByIDs(ctx context.Context, ids []int64) (map[int64]string, error) {
+	out := make(map[int64]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var buckets []model.Bucket
+	if err := r.db.NewSelect().
+		Model(&buckets).
+		Column("id", "name").
+		Where("id IN (?)", bun.List(ids)).
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("selecting bucket names: %w", err)
+	}
+	for i := range buckets {
+		out[buckets[i].ID] = buckets[i].Name
+	}
+	return out, nil
+}
+
 func (r *BunBucketRepo) ListActive(ctx context.Context) ([]model.Bucket, error) {
 	var buckets []model.Bucket
 	err := r.db.NewSelect().
