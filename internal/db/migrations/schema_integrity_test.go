@@ -95,8 +95,14 @@ func testLegacyMigrationUpgradePreservesDataAndIsIdempotent(t *testing.T, db *bu
 	}
 	markAppliedMigration(t, ctx, migrator, "2026040501", 1)
 	seedLegacyMigrationData(t, db)
+	walletBefore := readLegacyWalletRow(t, db)
 	if _, err := migrator.Migrate(ctx); err != nil {
 		t.Fatalf("upgrade legacy schema: %v", err)
+	}
+
+	// 2026062201 rebuilds wallet_operations on SQLite by copying rows.
+	if walletAfter := readLegacyWalletRow(t, db); walletAfter != walletBefore {
+		t.Fatalf("wallet row changed across the upgrade:\n before=%s\n after =%s", walletBefore, walletAfter)
 	}
 
 	var generation int
@@ -177,12 +183,53 @@ func seedLegacyMigrationData(t *testing.T, db *bun.DB) {
 		`INSERT INTO storage_data_sets
 			(id, bucket_id, provider_id, copy_index, status)
 		 VALUES (1, 1, '101', 0, 'ready')`,
+		`INSERT INTO wallet_operations
+			(id, type, client_request_id, amount, status, tx_hash, last_error,
+			 lease_until, started_at, submitted_at, completed_at, created_at, updated_at)
+		 VALUES (1, 'fund', 'legacy-fund', '1234', 'confirmed', '0xfeed', 'boom',
+			 '2026-01-01 01:00:00', '2026-01-02 02:00:00', '2026-01-03 03:00:00',
+			 '2026-01-04 04:00:00', '2026-01-05 05:00:00', '2026-01-06 06:00:00')`,
 	}
 	for _, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("seed legacy migration data: %v", err)
 		}
 	}
+}
+
+func readLegacyWalletRow(t *testing.T, db *bun.DB) string {
+	t.Helper()
+	var (
+		opType, requestID, amount, status string
+		txHash, lastError                 *string
+		lease, started, submitted, done   *time.Time
+		created, updated                  time.Time
+	)
+	if err := db.NewRaw(`SELECT type, client_request_id, amount, status, tx_hash, last_error,
+		lease_until, started_at, submitted_at, completed_at, created_at, updated_at
+		FROM wallet_operations WHERE id = 1`).
+		Scan(context.Background(), &opType, &requestID, &amount, &status, &txHash, &lastError,
+			&lease, &started, &submitted, &done, &created, &updated); err != nil {
+		t.Fatalf("read wallet row: %v", err)
+	}
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
+		opType, requestID, amount, status, derefString(txHash), derefString(lastError),
+		formatTime(lease), formatTime(started), formatTime(submitted), formatTime(done),
+		formatTime(&created), formatTime(&updated))
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return "<nil>"
+	}
+	return *v
+}
+
+func formatTime(v *time.Time) string {
+	if v == nil {
+		return "<nil>"
+	}
+	return v.UTC().Format(time.RFC3339Nano)
 }
 
 func countDomainTables(ctx context.Context, db *bun.DB) (int, error) {

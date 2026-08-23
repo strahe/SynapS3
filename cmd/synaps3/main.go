@@ -159,6 +159,12 @@ func migrateCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "migrate",
 		Usage: "run database migrations and exit",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "force-unlock",
+				Usage: "release a migration lock left by a killed run, then exit; only use it when no migration is in progress",
+			},
+		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Len() > 0 {
 				return fmt.Errorf("unexpected argument %q, migrate takes no positional arguments", cmd.Args().First())
@@ -166,6 +172,9 @@ func migrateCommand() *cli.Command {
 			src, err := configSourceFromCommand(cmd)
 			if err != nil {
 				return err
+			}
+			if cmd.Bool("force-unlock") {
+				return runForceUnlock(ctx, src)
 			}
 			return runMigrate(ctx, src)
 		},
@@ -238,6 +247,20 @@ func runMigrate(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("running migrations: %w", err)
 	}
 	slog.Info("migrations completed successfully")
+	return nil
+}
+
+func runForceUnlock(ctx context.Context, src config.Source) error {
+	_, database, err := loadConfigAndDB(ctx, src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = database.Close() }()
+
+	if err := db.ForceUnlockMigrations(ctx, database); err != nil {
+		return err
+	}
+	slog.Info("migration lock released")
 	return nil
 }
 

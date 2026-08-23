@@ -69,7 +69,8 @@ func RunMigrations(ctx context.Context, db *bun.DB) (retErr error) {
 		return fmt.Errorf("initializing migrator: %w", err)
 	}
 	if err := migrator.Lock(ctx); err != nil {
-		return fmt.Errorf("locking migrator: %w", err)
+		return fmt.Errorf("locking migrator: %w; if no migration is running, "+
+			"clear a lock left by a killed run with `synaps3 migrate --force-unlock`", err)
 	}
 	defer func() {
 		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrationUnlockTimeout)
@@ -90,6 +91,18 @@ func RunMigrations(ctx context.Context, db *bun.DB) (retErr error) {
 		slog.Info("no new migrations to apply")
 	}
 
+	return nil
+}
+
+// ForceUnlockMigrations releases a migration lock left by a killed run.
+func ForceUnlockMigrations(ctx context.Context, db *bun.DB) error {
+	migrator := migrations.NewMigrator(db)
+	if err := migrator.Init(ctx); err != nil {
+		return fmt.Errorf("initializing migrator: %w", err)
+	}
+	if err := migrator.Unlock(ctx); err != nil {
+		return fmt.Errorf("releasing migration lock: %w", err)
+	}
 	return nil
 }
 
