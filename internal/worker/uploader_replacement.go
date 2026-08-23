@@ -715,11 +715,19 @@ func (u *Uploader) waitForReplacementDependency(
 	logger *slog.Logger,
 	message string,
 ) {
-	if err := u.repos.Replacements.MarkWaiting(ctx, replacement.ID, reason); err != nil {
-		logger.Warn("failed to record replacement wait reason",
-			"replacementID", replacement.ID, "reason", reason, "error", err)
+	err := u.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		if err := txRepos.Replacements.MarkWaiting(ctx, replacement.ID, reason); err != nil {
+			return err
+		}
+		return txRepos.Tasks.WaitRunning(ctx, task, model.TaskWaitReasonDependency, message, uploadDependencyWaitDelay)
+	})
+	if err != nil {
+		logger.Error("failed to wait for replacement dependency",
+			"replacementID", replacement.ID, "taskID", task.ID, "reason", reason, "error", err)
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		return
 	}
-	u.waitForStorageDependency(ctx, task, logger, message)
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
 }
 
 // handleReplacementProviderFailure keeps a recoverable provider problem in

@@ -181,7 +181,7 @@ func (r *BunStorageCleanupRepo) DeleteUploadProvenanceIfUnreferenced(ctx context
 		// guard against bypassing the replacement progress transaction.
 		var items []storagereplacement.Item
 		if err := db.NewRaw(
-			`UPDATE storage_replacement_items SET updated_at = updated_at WHERE upload_id = ? RETURNING *`,
+			lockReplacementItemsByUploadSQL(),
 			uploadID,
 		).Scan(ctx, &items); err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("locking replacement items before deleting provenance: %w", err)
@@ -223,6 +223,13 @@ func (r *BunStorageCleanupRepo) DeleteUploadProvenanceIfUnreferenced(ctx context
 		}
 		return nil
 	})
+}
+
+func lockReplacementItemsByUploadSQL() string {
+	return `UPDATE storage_replacement_items
+		SET updated_at = updated_at
+		WHERE upload_id = ?
+		RETURNING *`
 }
 
 func (r *BunStorageCleanupRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {

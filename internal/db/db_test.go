@@ -14,10 +14,112 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/config"
+	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 )
+
+type migrationLockBarrier struct {
+	locked  chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *migrationLockBarrier) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *migrationLockBarrier) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+	if event.Err != nil || event.Operation() != "INSERT" || !strings.Contains(event.Query, "bun_migration_locks") {
+		return
+	}
+	h.once.Do(func() {
+		close(h.locked)
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+		}
+	})
+}
+
+func TestForceUnlockMigrationsClearsALockLeftByAKilledRun(t *testing.T) {
+	cfg := config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.Join(t.TempDir(), "force-unlock.db"),
+		MaxOpenConns: 2,
+		MaxIdleConns: 2,
+	}
+	db, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+
+	if err := RunMigrations(ctx, db); err != nil {
+		t.Fatalf("RunMigrations() error = %v", err)
+	}
+	// A killed run never reaches its deferred unlock.
+	if err := migrations.NewMigrator(db).Lock(ctx); err != nil {
+		t.Fatalf("acquiring the leaked lock: %v", err)
+	}
+	err = RunMigrations(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "--force-unlock") {
+		t.Fatalf("RunMigrations() error = %v, want the stale-lock remediation", err)
+	}
+
+	if err := ForceUnlockMigrations(ctx, db); err != nil {
+		t.Fatalf("ForceUnlockMigrations() error = %v", err)
+	}
+	if err := RunMigrations(ctx, db); err != nil {
+		t.Fatalf("RunMigrations() after force unlock = %v, want success", err)
+	}
+}
+
+func TestRunMigrationsSerializesConcurrentRunnersAndUnlocksAfterCancellation(t *testing.T) {
+	cfg := config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.Join(t.TempDir(), "migration-lock.db") + "?_pragma=journal_mode(WAL)",
+		MaxOpenConns: 2,
+		MaxIdleConns: 2,
+	}
+	db, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	barrier := &migrationLockBarrier{locked: make(chan struct{}), release: make(chan struct{})}
+	db.AddQueryHook(barrier)
+	ctx, cancel := context.WithCancel(context.Background())
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- RunMigrations(ctx, db)
+	}()
+
+	select {
+	case <-barrier.locked:
+	case <-time.After(5 * time.Second):
+		cancel()
+		close(barrier.release)
+		t.Fatal("first migration runner did not acquire the lock")
+	}
+	if err := RunMigrations(context.Background(), db); err == nil || !strings.Contains(err.Error(), "already locked") {
+		cancel()
+		close(barrier.release)
+		t.Fatalf("concurrent RunMigrations() error = %v, want migration lock conflict", err)
+	}
+
+	cancel()
+	close(barrier.release)
+	if err := <-firstResult; err == nil {
+		t.Fatal("cancelled RunMigrations() succeeded")
+	}
+	if err := RunMigrations(context.Background(), db); err != nil {
+		t.Fatalf("RunMigrations() after cancelled owner = %v, want released lock", err)
+	}
+}
 
 func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	t.Parallel()

@@ -5,13 +5,26 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 )
 
 func init() {
-	Migrations.MustRegister(up2026040501Init, down2026040501Init)
+	Migrations.MustRegister(
+		transactionalMigration(up2026040501Init),
+		transactionalMigration(down2026040501Init),
+	)
+}
+
+type s3Account2026040501 struct {
+	bun.BaseModel `bun:"table:s3_accounts"`
+
+	AccessKey string    `bun:",pk"`
+	SecretKey string    `bun:",notnull"`
+	Role      string    `bun:",notnull"`
+	IsRoot    bool      `bun:",notnull,default:false"`
+	CreatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
 type bucket2026040501 struct {
@@ -24,6 +37,16 @@ type bucket2026040501 struct {
 	Status         string    `bun:",notnull,default:'active'"`
 	CreatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 	UpdatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type object2026040501 struct {
+	bun.BaseModel `bun:"table:objects"`
+
+	ID        int64     `bun:",pk,autoincrement"`
+	BucketID  int64     `bun:",notnull"`
+	Key       string    `bun:",notnull"`
+	CreatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
 type objectVersion2026040501 struct {
@@ -53,6 +76,73 @@ type objectVersion2026040501 struct {
 	UpdatedAt       time.Time         `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
+type objectDeletion2026040501 struct {
+	bun.BaseModel `bun:"table:object_deletions"`
+
+	ID                 int64      `bun:",pk,autoincrement"`
+	BucketID           int64      `bun:",notnull"`
+	ObjectID           int64      `bun:",notnull"`
+	Key                string     `bun:",notnull"`
+	VersionID          string     `bun:",unique,notnull"`
+	CacheKey           string     `bun:",notnull"`
+	StorageUploadID    *int64     `bun:",nullzero"`
+	Size               int64      `bun:",notnull"`
+	Checksum           string     `bun:",notnull"`
+	CacheCleanupStatus string     `bun:",notnull,default:'pending'"`
+	CacheError         *string    `bun:",nullzero"`
+	CacheCleanedAt     *time.Time `bun:",nullzero"`
+	CreatedAt          time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt          time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	DeletedAt          time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type task2026040501 struct {
+	bun.BaseModel `bun:"table:tasks"`
+
+	ID             int64          `bun:",pk,autoincrement"`
+	Type           string         `bun:",notnull"`
+	Stage          *string        `bun:",nullzero"`
+	RefType        string         `bun:",notnull"`
+	RefID          int64          `bun:",notnull"`
+	RefVersionID   string         `bun:",notnull"`
+	IdempotencyKey string         `bun:",unique,notnull"`
+	Payload        map[string]any `bun:"type:jsonb"`
+	Status         string         `bun:",notnull,default:'queued'"`
+	RetryCount     int            `bun:",notnull,default:0"`
+	MaxRetries     int            `bun:",notnull,default:5"`
+	LastError      *string        `bun:",nullzero"`
+	StatusMessage  *string        `bun:",nullzero"`
+	WaitReason     *string        `bun:",nullzero"`
+	ScheduledAt    time.Time      `bun:",nullzero,notnull,default:current_timestamp"`
+	ClaimedAt      *time.Time     `bun:",nullzero"`
+	LeaseUntil     *time.Time     `bun:",nullzero"`
+	StartedAt      *time.Time     `bun:",nullzero"`
+	CompletedAt    *time.Time     `bun:",nullzero"`
+}
+
+type storageCleanupCopy2026040501 struct {
+	bun.BaseModel `bun:"table:storage_cleanup_copies"`
+
+	ID               int64      `bun:",pk,autoincrement"`
+	TaskID           int64      `bun:",notnull"`
+	UploadID         int64      `bun:",notnull"`
+	CopyIndex        int        `bun:",notnull"`
+	ProviderID       *string    `bun:"type:text"`
+	StorageDataSetID *int64     `bun:",nullzero"`
+	DataSetID        *string    `bun:"type:text"`
+	ClientDataSetID  *string    `bun:"type:text"`
+	PieceID          *string    `bun:"type:text"`
+	PieceCID         string     `bun:",notnull"`
+	RetrievalURL     *string    `bun:",nullzero"`
+	Status           string     `bun:",notnull,default:'pending'"`
+	DeleteTxHash     *string    `bun:",nullzero"`
+	LastError        *string    `bun:",nullzero"`
+	ScheduledAt      *time.Time `bun:",nullzero"`
+	RemovedAt        *time.Time `bun:",nullzero"`
+	CreatedAt        time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt        time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
 type multipartUpload2026040501 struct {
 	bun.BaseModel `bun:"table:multipart_uploads"`
 
@@ -78,12 +168,107 @@ type multipartPart2026040501 struct {
 	CreatedAt  time.Time `bun:",nullzero,notnull,default:current_timestamp"`
 }
 
+type walletOperation2026040501 struct {
+	bun.BaseModel `bun:"table:wallet_operations"`
+
+	ID              int64      `bun:",pk,autoincrement"`
+	Type            string     `bun:",notnull"`
+	ClientRequestID string     `bun:",notnull"`
+	Amount          string     `bun:",notnull"`
+	Status          string     `bun:",notnull,default:'pending'"`
+	TxHash          *string    `bun:",nullzero"`
+	LastError       *string    `bun:",nullzero"`
+	LeaseUntil      *time.Time `bun:",nullzero"`
+	StartedAt       *time.Time `bun:",nullzero"`
+	SubmittedAt     *time.Time `bun:",nullzero"`
+	CompletedAt     *time.Time `bun:",nullzero"`
+	CreatedAt       time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt       time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type storageUpload2026040501 struct {
+	bun.BaseModel `bun:"table:storage_uploads"`
+
+	ID                      int64      `bun:",pk,autoincrement"`
+	BucketID                int64      `bun:",notnull"`
+	SourceTaskID            *int64     `bun:",nullzero"`
+	SourceVersionID         string     `bun:",nullzero"`
+	ContentSize             int64      `bun:",notnull"`
+	Checksum                string     `bun:",notnull"`
+	Status                  string     `bun:",notnull,default:'running'"`
+	PieceCID                *string    `bun:",nullzero"`
+	RequestedCopies         int        `bun:",notnull"`
+	IngressBytesTransferred int64      `bun:",notnull,default:0"`
+	IngressStoreAttempt     int        `bun:",notnull,default:0"`
+	ProgressUpdatedAt       *time.Time `bun:",nullzero"`
+	RawResultJSON           []byte     `bun:"type:jsonb,nullzero"`
+	ErrorMessage            *string    `bun:",nullzero"`
+	AcceptError             *string    `bun:",nullzero"`
+	AcceptedAt              *time.Time `bun:",nullzero"`
+	CreatedAt               time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt               time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type storageDataSet2026040501 struct {
+	bun.BaseModel `bun:"table:storage_data_sets"`
+
+	ID                  int64     `bun:",pk,autoincrement"`
+	BucketID            int64     `bun:",notnull"`
+	ProviderID          string    `bun:"type:text,notnull"`
+	CopyIndex           int       `bun:",notnull"`
+	DataSetID           *string   `bun:"type:text"`
+	ClientDataSetID     *string   `bun:"type:text"`
+	Status              string    `bun:",notnull,default:'pending'"`
+	CreateTransactionID *string   `bun:",nullzero"`
+	CreateStatusURL     *string   `bun:",nullzero"`
+	CreatedByUploadID   *int64    `bun:",nullzero"`
+	LastUsedUploadID    *int64    `bun:",nullzero"`
+	LastError           *string   `bun:",nullzero"`
+	CreatedAt           time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt           time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type storageUploadCopy2026040501 struct {
+	bun.BaseModel `bun:"table:storage_upload_copies"`
+
+	ID                  int64     `bun:",pk,autoincrement"`
+	UploadID            int64     `bun:",notnull"`
+	CopyIndex           int       `bun:",notnull"`
+	ProviderID          *string   `bun:"type:text"`
+	DataSetID           *string   `bun:"type:text,scanonly"`
+	PieceID             *string   `bun:"type:text"`
+	TransferMethod      string    `bun:",notnull"`
+	Status              string    `bun:",notnull,default:'pending'"`
+	RetrievalURL        *string   `bun:",nullzero"`
+	IsNewDataSet        bool      `bun:",notnull,default:false"`
+	StorageDataSetID    *int64    `bun:",nullzero"`
+	CommitExtraDataHex  *string   `bun:",nullzero"`
+	CommitTransactionID *string   `bun:",nullzero"`
+	LastError           *string   `bun:",nullzero"`
+	CreatedAt           time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt           time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+type storageUploadFailure2026040501 struct {
+	bun.BaseModel `bun:"table:storage_upload_failures"`
+
+	ID             int64     `bun:",pk,autoincrement"`
+	UploadID       int64     `bun:",notnull"`
+	AttemptIndex   int       `bun:",notnull"`
+	ProviderID     *string   `bun:"type:text"`
+	TransferMethod string    `bun:",notnull"`
+	Stage          *string   `bun:",nullzero"`
+	ErrorMessage   *string   `bun:",nullzero"`
+	Explicit       bool      `bun:",notnull,default:false"`
+	CreatedAt      time.Time `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
 // up2026040501Init is the frozen development-preview baseline schema.
 // Follow-up schema changes must be added as separate migrations.
-func up2026040501Init(ctx context.Context, db *bun.DB) error {
+func up2026040501Init(ctx context.Context, db bun.IDB) error {
 	// IAM and bucket ownership tables come first because buckets reference S3 accounts.
 	if _, err := db.NewCreateTable().
-		Model((*model.S3Account)(nil)).
+		Model((*s3Account2026040501)(nil)).
 		IfNotExists().
 		ColumnExpr("CONSTRAINT chk_s3_accounts_role CHECK (role IN ('admin', 'user', 'userplus'))").
 		Exec(ctx); err != nil {
@@ -101,7 +286,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 
 	// Objects are stable key identities; all mutable version data lives in object_versions.
 	if _, err := db.NewCreateTable().
-		Model((*model.Object)(nil)).
+		Model((*object2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
 		Exec(ctx); err != nil {
@@ -109,7 +294,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateIndex().
-		Model((*model.Object)(nil)).
+		Model((*object2026040501)(nil)).
 		Index("idx_objects_bucket_key").
 		Column("bucket_id", "key").
 		Unique().
@@ -118,7 +303,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating unique index on objects bucket/key: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.Object)(nil)).
+		Model((*object2026040501)(nil)).
 		Index("idx_objects_id_bucket_key").
 		Column("id", "bucket_id", "key").
 		Unique().
@@ -209,7 +394,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateTable().
-		Model((*model.ObjectDeletion)(nil)).
+		Model((*objectDeletion2026040501)(nil)).
 		IfNotExists().
 		ColumnExpr("CONSTRAINT chk_object_deletions_size CHECK (size >= 0)").
 		ColumnExpr("CONSTRAINT chk_object_deletions_cache_status CHECK (cache_cleanup_status IN ('pending', 'deleted', 'skipped', 'failed'))").
@@ -217,7 +402,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating object_deletions table: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectDeletion)(nil)).
+		Model((*objectDeletion2026040501)(nil)).
 		Index("idx_object_deletions_bucket_key_created").
 		Column("bucket_id", "key", "created_at").
 		IfNotExists().
@@ -225,7 +410,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating object deletion bucket key index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectDeletion)(nil)).
+		Model((*objectDeletion2026040501)(nil)).
 		Index("idx_object_deletions_storage_upload").
 		Column("storage_upload_id").
 		IfNotExists().
@@ -233,7 +418,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating object deletion storage upload index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.ObjectDeletion)(nil)).
+		Model((*objectDeletion2026040501)(nil)).
 		Index("idx_object_deletions_bucket_created").
 		ColumnExpr("bucket_id, created_at DESC, id DESC").
 		IfNotExists().
@@ -243,7 +428,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 
 	// Tasks are queue/audit records with polymorphic references, so no FK is declared here.
 	if _, err := db.NewCreateTable().
-		Model((*model.Task)(nil)).
+		Model((*task2026040501)(nil)).
 		IfNotExists().
 		ColumnExpr(`CONSTRAINT chk_tasks_type CHECK ("type" IN ('upload', 'evict_cache', 'storage_cleanup'))`).
 		ColumnExpr("CONSTRAINT chk_tasks_status CHECK (status IN ('queued', 'scheduled', 'running', 'waiting', 'completed', 'failed', 'exhausted', 'cancelled'))").
@@ -257,7 +442,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateIndex().
-		Model((*model.Task)(nil)).
+		Model((*task2026040501)(nil)).
 		Index("idx_tasks_type_status_scheduled").
 		Column("type", "status", "scheduled_at").
 		IfNotExists().
@@ -265,7 +450,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating task polling index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.Task)(nil)).
+		Model((*task2026040501)(nil)).
 		Index("idx_tasks_type_ready_scheduled").
 		Column("type", "scheduled_at", "id").
 		Where("status IN ('queued', 'scheduled', 'waiting')").
@@ -274,7 +459,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating ready task polling index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.Task)(nil)).
+		Model((*task2026040501)(nil)).
 		Index("idx_tasks_type_stage_status_scheduled").
 		Column("type", "stage", "status", "scheduled_at").
 		IfNotExists().
@@ -282,7 +467,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating task stage index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.Task)(nil)).
+		Model((*task2026040501)(nil)).
 		Index("idx_tasks_lease_until").
 		Column("lease_until").
 		IfNotExists().
@@ -290,7 +475,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating task lease index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.Task)(nil)).
+		Model((*task2026040501)(nil)).
 		Index("idx_tasks_ref_status").
 		Column("ref_type", "ref_id", "status").
 		IfNotExists().
@@ -298,7 +483,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating task ref status index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.Task)(nil)).
+		Model((*task2026040501)(nil)).
 		Index("idx_tasks_ref_version_type_status").
 		Column("ref_type", "ref_version_id", "type", "status").
 		IfNotExists().
@@ -306,7 +491,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating task ref version index: %w", err)
 	}
 	if _, err := db.NewCreateTable().
-		Model((*model.StorageCleanupCopy)(nil)).
+		Model((*storageCleanupCopy2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(task_id) REFERENCES tasks(id) ON UPDATE CASCADE ON DELETE CASCADE").
 		ColumnExpr("CONSTRAINT chk_storage_cleanup_copies_copy_index CHECK (copy_index >= 0)").
@@ -315,7 +500,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage_cleanup_copies table: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageCleanupCopy)(nil)).
+		Model((*storageCleanupCopy2026040501)(nil)).
 		Index("idx_storage_cleanup_copies_task_copy").
 		Column("task_id", "copy_index").
 		Unique().
@@ -324,7 +509,7 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage cleanup copy task index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageCleanupCopy)(nil)).
+		Model((*storageCleanupCopy2026040501)(nil)).
 		Index("idx_storage_cleanup_copies_upload_status").
 		Column("upload_id", "status").
 		IfNotExists().
@@ -385,22 +570,22 @@ func up2026040501Init(ctx context.Context, db *bun.DB) error {
 }
 
 // down2026040501Init drops the baseline schema in reverse dependency order.
-func down2026040501Init(ctx context.Context, db *bun.DB) error {
+func down2026040501Init(ctx context.Context, db bun.IDB) error {
 	for _, m := range []interface{}{
-		(*model.MultipartPart)(nil),
-		(*model.MultipartUpload)(nil),
-		(*model.WalletOperation)(nil),
-		(*model.StorageCleanupCopy)(nil),
-		(*model.Task)(nil),
-		(*model.ObjectDeletion)(nil),
-		(*model.StorageUploadFailure)(nil),
-		(*model.StorageUploadCopy)(nil),
-		(*model.ObjectVersion)(nil),
-		(*model.StorageDataSet)(nil),
-		(*model.StorageUpload)(nil),
-		(*model.Object)(nil),
-		(*model.Bucket)(nil),
-		(*model.S3Account)(nil),
+		(*multipartPart2026040501)(nil),
+		(*multipartUpload2026040501)(nil),
+		(*walletOperation2026040501)(nil),
+		(*storageCleanupCopy2026040501)(nil),
+		(*task2026040501)(nil),
+		(*objectDeletion2026040501)(nil),
+		(*storageUploadFailure2026040501)(nil),
+		(*storageUploadCopy2026040501)(nil),
+		(*objectVersion2026040501)(nil),
+		(*storageDataSet2026040501)(nil),
+		(*storageUpload2026040501)(nil),
+		(*object2026040501)(nil),
+		(*bucket2026040501)(nil),
+		(*s3Account2026040501)(nil),
 	} {
 		if _, err := db.NewDropTable().Model(m).IfExists().Exec(ctx); err != nil {
 			return fmt.Errorf("dropping table %T: %w", m, err)
@@ -409,9 +594,9 @@ func down2026040501Init(ctx context.Context, db *bun.DB) error {
 	return nil
 }
 
-func createWalletOperationTables(ctx context.Context, db *bun.DB) error {
+func createWalletOperationTables(ctx context.Context, db bun.IDB) error {
 	if _, err := db.NewCreateTable().
-		Model((*model.WalletOperation)(nil)).
+		Model((*walletOperation2026040501)(nil)).
 		IfNotExists().
 		ColumnExpr(`CONSTRAINT chk_wallet_operations_type CHECK ("type" IN ('fund', 'withdraw'))`).
 		ColumnExpr("CONSTRAINT chk_wallet_operations_status CHECK (status IN ('pending', 'running', 'submitted', 'confirmed', 'failed', 'unknown'))").
@@ -420,7 +605,7 @@ func createWalletOperationTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating wallet_operations table: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.WalletOperation)(nil)).
+		Model((*walletOperation2026040501)(nil)).
 		Index("idx_wallet_operations_request").
 		Column("type", "client_request_id").
 		Unique().
@@ -429,7 +614,7 @@ func createWalletOperationTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating wallet operation request index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.WalletOperation)(nil)).
+		Model((*walletOperation2026040501)(nil)).
 		Index("idx_wallet_operations_status_created").
 		Column("status", "created_at", "id").
 		IfNotExists().
@@ -439,16 +624,16 @@ func createWalletOperationTables(ctx context.Context, db *bun.DB) error {
 	return nil
 }
 
-func walletOperationAmountCheck(db *bun.DB) string {
+func walletOperationAmountCheck(db bun.IDB) string {
 	if db.Dialect().Name() == dialect.PG {
 		return `amount ~ '^[1-9][0-9]*$'`
 	}
 	return `amount GLOB '[1-9]*' AND amount NOT GLOB '*[^0-9]*'`
 }
 
-func createS3AccountIndexes(ctx context.Context, db *bun.DB) error {
+func createS3AccountIndexes(ctx context.Context, db bun.IDB) error {
 	if _, err := db.NewCreateIndex().
-		Model((*model.S3Account)(nil)).
+		Model((*s3Account2026040501)(nil)).
 		Index("idx_s3_accounts_is_root").
 		Column("is_root").
 		IfNotExists().
@@ -457,7 +642,7 @@ func createS3AccountIndexes(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateIndex().
-		Model((*model.S3Account)(nil)).
+		Model((*s3Account2026040501)(nil)).
 		Index("idx_s3_accounts_single_root").
 		Column("is_root").
 		Where(boolTrueWhere(db, "is_root")).
@@ -469,7 +654,7 @@ func createS3AccountIndexes(ctx context.Context, db *bun.DB) error {
 	return nil
 }
 
-func createBucketIndexes(ctx context.Context, db *bun.DB) error {
+func createBucketIndexes(ctx context.Context, db bun.IDB) error {
 	if _, err := db.NewCreateIndex().
 		Model((*bucket2026040501)(nil)).
 		Index("idx_buckets_owner_access_key").
@@ -481,9 +666,9 @@ func createBucketIndexes(ctx context.Context, db *bun.DB) error {
 	return nil
 }
 
-func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
+func createStorageProvenanceTables(ctx context.Context, db bun.IDB) error {
 	if _, err := db.NewCreateTable().
-		Model((*model.StorageUpload)(nil)).
+		Model((*storageUpload2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
 		ColumnExpr("CONSTRAINT chk_storage_uploads_status CHECK (status IN ('running', 'ingress_ready', 'readable', 'complete', 'failed', 'rejected', 'superseded'))").
@@ -495,7 +680,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage_uploads table: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUpload)(nil)).
+		Model((*storageUpload2026040501)(nil)).
 		Index("idx_storage_uploads_task_version_status").
 		Column("source_task_id", "source_version_id", "status", "accepted_at").
 		IfNotExists().
@@ -503,7 +688,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage upload task/version index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUpload)(nil)).
+		Model((*storageUpload2026040501)(nil)).
 		Index("idx_storage_uploads_source_version_id").
 		Column("source_version_id", "id").
 		Where("source_version_id <> ''").
@@ -512,7 +697,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage upload source version index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUpload)(nil)).
+		Model((*storageUpload2026040501)(nil)).
 		Index("idx_storage_uploads_content_status").
 		Column("bucket_id", "content_size", "checksum", "status", "accepted_at").
 		IfNotExists().
@@ -520,7 +705,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage upload content index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUpload)(nil)).
+		Model((*storageUpload2026040501)(nil)).
 		Index("idx_storage_uploads_active_source_version").
 		Column("source_version_id").
 		Where("source_version_id <> '' AND status IN ('running', 'ingress_ready', 'readable')").
@@ -531,7 +716,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateTable().
-		Model((*model.StorageDataSet)(nil)).
+		Model((*storageDataSet2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(bucket_id) REFERENCES buckets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
 		ForeignKey("(created_by_upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE SET NULL").
@@ -542,7 +727,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage_data_sets table: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageDataSet)(nil)).
+		Model((*storageDataSet2026040501)(nil)).
 		Index("idx_storage_data_sets_provider_data_set").
 		Column("provider_id", "data_set_id").
 		Where("data_set_id IS NOT NULL AND data_set_id <> ''").
@@ -552,7 +737,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage data set provider unique index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageDataSet)(nil)).
+		Model((*storageDataSet2026040501)(nil)).
 		Index("idx_storage_data_sets_bucket_provider").
 		Column("bucket_id", "provider_id").
 		Unique().
@@ -561,7 +746,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage data set bucket provider index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageDataSet)(nil)).
+		Model((*storageDataSet2026040501)(nil)).
 		Index("idx_storage_data_sets_bucket_copy_index").
 		Column("bucket_id", "copy_index").
 		Unique().
@@ -571,7 +756,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateTable().
-		Model((*model.StorageUploadCopy)(nil)).
+		Model((*storageUploadCopy2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE CASCADE").
 		ForeignKey("(storage_data_set_id) REFERENCES storage_data_sets(id) ON UPDATE CASCADE ON DELETE RESTRICT").
@@ -583,7 +768,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage_upload_copies table: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUploadCopy)(nil)).
+		Model((*storageUploadCopy2026040501)(nil)).
 		Index("idx_storage_upload_copies_upload_index").
 		Column("upload_id", "copy_index").
 		Unique().
@@ -592,7 +777,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage upload copy unique index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUploadCopy)(nil)).
+		Model((*storageUploadCopy2026040501)(nil)).
 		Index("idx_storage_upload_copies_upload_transfer_method_index").
 		Column("upload_id", "transfer_method", "copy_index").
 		IfNotExists().
@@ -600,7 +785,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage upload copy transfer method index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUploadCopy)(nil)).
+		Model((*storageUploadCopy2026040501)(nil)).
 		Index("idx_storage_upload_copies_status_data_set_upload").
 		Column("status", "storage_data_set_id", "upload_id").
 		IfNotExists().
@@ -608,7 +793,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage upload copy dataset summary index: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUploadCopy)(nil)).
+		Model((*storageUploadCopy2026040501)(nil)).
 		Index("idx_storage_upload_copies_status_piece_identity_upload").
 		Column("status", "provider_id", "piece_id", "upload_id").
 		IfNotExists().
@@ -617,7 +802,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 	}
 
 	if _, err := db.NewCreateTable().
-		Model((*model.StorageUploadFailure)(nil)).
+		Model((*storageUploadFailure2026040501)(nil)).
 		IfNotExists().
 		ForeignKey("(upload_id) REFERENCES storage_uploads(id) ON UPDATE CASCADE ON DELETE CASCADE").
 		ColumnExpr("CONSTRAINT chk_storage_upload_failures_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull'))").
@@ -625,7 +810,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 		return fmt.Errorf("creating storage_upload_failures table: %w", err)
 	}
 	if _, err := db.NewCreateIndex().
-		Model((*model.StorageUploadFailure)(nil)).
+		Model((*storageUploadFailure2026040501)(nil)).
 		Index("idx_storage_upload_failures_upload_attempt").
 		Column("upload_id", "attempt_index").
 		Unique().
@@ -637,7 +822,7 @@ func createStorageProvenanceTables(ctx context.Context, db *bun.DB) error {
 }
 
 // boolTrueWhere emits portable partial-index predicates for PostgreSQL and SQLite.
-func boolTrueWhere(db *bun.DB, column string) string {
+func boolTrueWhere(db bun.IDB, column string) string {
 	if db.Dialect().Name() == dialect.PG {
 		return column + " IS TRUE"
 	}

@@ -9,146 +9,134 @@ import (
 )
 
 func init() {
-	Migrations.MustRegister(up2026082101StorageDataSetGenerations, down2026082101StorageDataSetGenerations)
+	Migrations.MustRegister(
+		transactionalMigration(up2026082101StorageDataSetGenerations),
+		transactionalMigration(down2026082101StorageDataSetGenerations),
+	)
 }
 
 // A replica slot may now own several data set generations so an operator can
-// replace a provider while the previous generation stays readable. Both
-// directions run in one transaction because bun marks a migration applied
-// before it executes; a half-applied schema would otherwise be recorded as
-// complete.
-func up2026082101StorageDataSetGenerations(ctx context.Context, db *bun.DB) error {
-	return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		if err := assertStorageGenerationPreconditions2026082101(ctx, tx); err != nil {
-			return err
+// replace a provider while the previous generation stays readable.
+func up2026082101StorageDataSetGenerations(ctx context.Context, db bun.IDB) error {
+	done, err := storageDataSetGenerationsReached2026082101(ctx, db, true)
+	if done {
+		return nil
+	}
+	if err != nil {
+		if dataErr := assertStorageGenerationPreconditions2026082101(ctx, db); dataErr != nil {
+			return dataErr
 		}
-		pg := db.Dialect().Name() == dialect.PG
+		return err
+	}
+	if err := assertStorageGenerationPreconditions2026082101(ctx, db); err != nil {
+		return err
+	}
+	pg := db.Dialect().Name() == dialect.PG
 
-		isCurrentColumn := "INTEGER NOT NULL DEFAULT 1"
-		if pg {
-			isCurrentColumn = "BOOLEAN NOT NULL DEFAULT TRUE"
-		}
-		// Neither column carries a CHECK: SQLite cannot add one later and a
-		// column-level CHECK blocks DROP COLUMN on rollback. The partial unique
-		// indexes below enforce the invariants on both dialects instead.
-		//
-		// The initial migration builds storage_data_sets from the runtime model,
-		// so a database created after this change already has both columns while
-		// an upgraded one does not.
-		var statements []string
-		for column, definition := range map[string]string{
-			"is_current": isCurrentColumn,
-			"generation": "INTEGER NOT NULL DEFAULT 1",
-		} {
-			exists, err := storageDataSetColumnExists2026082101(ctx, tx, pg, column)
-			if err != nil {
-				return err
-			}
-			if !exists {
-				statements = append(statements, fmt.Sprintf("ALTER TABLE storage_data_sets ADD COLUMN %s %s", column, definition))
-			}
-		}
+	isCurrentColumn := "INTEGER NOT NULL DEFAULT 1"
+	if pg {
+		isCurrentColumn = "BOOLEAN NOT NULL DEFAULT TRUE"
+	}
+	// Neither column carries a CHECK: SQLite cannot add one later and a
+	// column-level CHECK blocks DROP COLUMN on rollback. The partial unique
+	// indexes below enforce the invariants on both dialects instead.
+	statements := []string{
+		"ALTER TABLE storage_data_sets ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
+		"ALTER TABLE storage_data_sets ADD COLUMN is_current " + isCurrentColumn,
+		"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_index",
+		"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_provider",
+		"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_index",
 
-		statements = append(statements,
-			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_index",
-			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_provider",
-			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_index",
-
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_current
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_current
 				ON storage_data_sets (bucket_id, copy_index) WHERE is_current`,
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_generation
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_generation
 				ON storage_data_sets (bucket_id, copy_index, generation)`,
-			// A historical generation never blocks reusing its provider; only a
-			// live slot does.
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_provider_current
+		// A historical generation never blocks reusing its provider; only a
+		// live slot does.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_provider_current
 				ON storage_data_sets (bucket_id, provider_id) WHERE is_current`,
 
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_data_set
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_data_set
 				ON storage_upload_copies (upload_id, storage_data_set_id) WHERE storage_data_set_id IS NOT NULL`,
-			// NULLs compare distinct in unique indexes on both dialects, so the
-			// index above would let unbound duplicates accumulate per slot.
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_slot_unbound
+		// NULLs compare distinct in unique indexes on both dialects, so the
+		// index above would let unbound duplicates accumulate per slot.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_slot_unbound
 				ON storage_upload_copies (upload_id, copy_index) WHERE storage_data_set_id IS NULL`,
-			`CREATE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_slot
+		`CREATE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_slot
 				ON storage_upload_copies (upload_id, copy_index)`,
+		`CREATE INDEX IF NOT EXISTS idx_storage_uploads_bucket_id
+				ON storage_uploads (bucket_id, id)`,
 
-			storageReplacementsTableSQL2026082101(pg),
-			storageReplacementItemsTableSQL2026082101(pg),
+		storageReplacementsTableSQL2026082101(pg),
+		storageReplacementItemsTableSQL2026082101(pg),
 
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_replacements_active_source
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_replacements_active_source
 				ON storage_replacements (source_data_set_id) WHERE status NOT IN ('completed', 'superseded')`,
-			`CREATE INDEX IF NOT EXISTS idx_storage_replacements_bucket_slot
+		`CREATE INDEX IF NOT EXISTS idx_storage_replacements_bucket_slot
 				ON storage_replacements (bucket_id, copy_index, id)`,
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_replacements_bucket_request
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_replacements_bucket_request
 				ON storage_replacements (bucket_id, client_request_id)`,
-			`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_next
+		`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_next
 				ON storage_replacement_items (replacement_id, status, id)`,
-		)
-		for _, query := range statements {
-			if _, err := tx.ExecContext(ctx, query); err != nil {
-				return fmt.Errorf("adding storage data set generations: %w", err)
-			}
+		`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_upload_id
+				ON storage_replacement_items (upload_id)`,
+	}
+	for _, query := range statements {
+		if _, err := db.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("adding storage data set generations: %w", err)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // Rollback only succeeds while every slot still owns a single generation. Once
 // a replacement has produced a second generation the original unique indexes
 // cannot be restored, and refusing is the correct outcome.
-func down2026082101StorageDataSetGenerations(ctx context.Context, db *bun.DB) error {
-	return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		statements := []string{
-			"DROP TABLE IF EXISTS storage_replacement_items",
-			"DROP TABLE IF EXISTS storage_replacements",
+func down2026082101StorageDataSetGenerations(ctx context.Context, db bun.IDB) error {
+	done, err := storageDataSetGenerationsReached2026082101(ctx, db, false)
+	if err != nil || done {
+		return err
+	}
+	if err := assertStorageGenerationRollbackPreconditions2026082101(ctx, db); err != nil {
+		return err
+	}
+	statements := []string{
+		"DROP INDEX IF EXISTS idx_storage_replacement_items_upload_id",
+		"DROP INDEX IF EXISTS idx_storage_uploads_bucket_id",
+		"DROP TABLE IF EXISTS storage_replacement_items",
+		"DROP TABLE IF EXISTS storage_replacements",
 
-			// SQLite refuses to drop a column named by an index or by a partial
-			// index predicate, so the indexes go first.
-			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_slot",
-			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_slot_unbound",
-			"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_data_set",
-			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_provider_current",
-			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_generation",
-			"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_current",
+		// SQLite refuses to drop a column named by an index or by a partial
+		// index predicate, so the indexes go first.
+		"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_slot",
+		"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_slot_unbound",
+		"DROP INDEX IF EXISTS idx_storage_upload_copies_upload_data_set",
+		"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_provider_current",
+		"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_generation",
+		"DROP INDEX IF EXISTS idx_storage_data_sets_bucket_copy_current",
 
-			"ALTER TABLE storage_data_sets DROP COLUMN generation",
-			"ALTER TABLE storage_data_sets DROP COLUMN is_current",
+		"ALTER TABLE storage_data_sets DROP COLUMN generation",
+		"ALTER TABLE storage_data_sets DROP COLUMN is_current",
 
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_index
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_copy_index
 				ON storage_data_sets (bucket_id, copy_index)`,
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_provider
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_data_sets_bucket_provider
 				ON storage_data_sets (bucket_id, provider_id)`,
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_index
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_upload_copies_upload_index
 				ON storage_upload_copies (upload_id, copy_index)`,
-		}
-		for _, query := range statements {
-			if _, err := tx.ExecContext(ctx, query); err != nil {
-				return fmt.Errorf("removing storage data set generations: %w", err)
-			}
-		}
-		return nil
-	})
-}
-
-func storageDataSetColumnExists2026082101(ctx context.Context, tx bun.Tx, pg bool, column string) (bool, error) {
-	query := `SELECT COUNT(*) FROM pragma_table_info('storage_data_sets') WHERE name = ?`
-	if pg {
-		query = `SELECT COUNT(*) FROM information_schema.columns
-			WHERE table_schema = current_schema()
-			  AND table_name = 'storage_data_sets'
-			  AND column_name = ?`
 	}
-	var count int
-	if err := tx.NewRaw(query, column).Scan(ctx, &count); err != nil {
-		return false, fmt.Errorf("checking storage_data_sets.%s: %w", column, err)
+	for _, query := range statements {
+		if _, err := db.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("removing storage data set generations: %w", err)
+		}
 	}
-	return count > 0, nil
+	return nil
 }
 
 // The new unique indexes would fail mid-migration on a database that violated
 // an invariant the old schema never enforced. Reporting the offending rows up
 // front keeps the failure actionable.
-func assertStorageGenerationPreconditions2026082101(ctx context.Context, tx bun.Tx) error {
+func assertStorageGenerationPreconditions2026082101(ctx context.Context, db bun.IDB) error {
 	checks := []struct {
 		description string
 		query       string
@@ -179,7 +167,7 @@ func assertStorageGenerationPreconditions2026082101(ctx context.Context, tx bun.
 	}
 	for _, check := range checks {
 		var count int
-		if err := tx.NewRaw(check.query).Scan(ctx, &count); err != nil {
+		if err := db.NewRaw(check.query).Scan(ctx, &count); err != nil {
 			return fmt.Errorf("checking %s: %w", check.description, err)
 		}
 		if count > 0 {
@@ -187,6 +175,130 @@ func assertStorageGenerationPreconditions2026082101(ctx context.Context, tx bun.
 		}
 	}
 	return nil
+}
+
+func assertStorageGenerationRollbackPreconditions2026082101(ctx context.Context, db bun.IDB) error {
+	checks := []struct {
+		description string
+		query       string
+	}{
+		{
+			description: "duplicate (bucket_id, copy_index) groups in storage_data_sets",
+			query: `SELECT COUNT(*) FROM (
+				SELECT bucket_id, copy_index FROM storage_data_sets
+				GROUP BY bucket_id, copy_index HAVING COUNT(*) > 1
+			) AS duplicates`,
+		},
+		{
+			description: "duplicate (bucket_id, provider_id) groups in storage_data_sets",
+			query: `SELECT COUNT(*) FROM (
+				SELECT bucket_id, provider_id FROM storage_data_sets
+				GROUP BY bucket_id, provider_id HAVING COUNT(*) > 1
+			) AS duplicates`,
+		},
+		{
+			description: "duplicate (upload_id, copy_index) groups in storage_upload_copies",
+			query: `SELECT COUNT(*) FROM (
+				SELECT upload_id, copy_index FROM storage_upload_copies
+				GROUP BY upload_id, copy_index HAVING COUNT(*) > 1
+			) AS duplicates`,
+		},
+	}
+	for _, check := range checks {
+		var count int
+		if err := db.NewRaw(check.query).Scan(ctx, &count); err != nil {
+			return fmt.Errorf("checking %s: %w", check.description, err)
+		}
+		if count > 0 {
+			return fmt.Errorf("cannot remove storage data set generations: found %d %s", count, check.description)
+		}
+	}
+	return nil
+}
+
+func storageDataSetGenerationsReached2026082101(
+	ctx context.Context,
+	db bun.IDB,
+	wantMigrated bool,
+) (bool, error) {
+	generation, err := columnExists(ctx, db, "storage_data_sets", "generation")
+	if err != nil {
+		return false, fmt.Errorf("checking storage_data_sets.generation: %w", err)
+	}
+	isCurrent, err := columnExists(ctx, db, "storage_data_sets", "is_current")
+	if err != nil {
+		return false, fmt.Errorf("checking storage_data_sets.is_current: %w", err)
+	}
+	legacyIndexes := []string{
+		"idx_storage_data_sets_bucket_copy_index",
+		"idx_storage_data_sets_bucket_provider",
+		"idx_storage_upload_copies_upload_index",
+	}
+	migratedIndexes := []string{
+		"idx_storage_data_sets_bucket_copy_current",
+		"idx_storage_data_sets_bucket_copy_generation",
+		"idx_storage_data_sets_bucket_provider_current",
+		"idx_storage_upload_copies_upload_data_set",
+		"idx_storage_upload_copies_upload_slot_unbound",
+		"idx_storage_upload_copies_upload_slot",
+		"idx_storage_uploads_bucket_id",
+		"idx_storage_replacements_active_source",
+		"idx_storage_replacements_bucket_slot",
+		"idx_storage_replacements_bucket_request",
+		"idx_storage_replacement_items_next",
+		"idx_storage_replacement_items_upload_id",
+	}
+	legacyIndexCount, err := existingIndexes2026082101(ctx, db, legacyIndexes)
+	if err != nil {
+		return false, err
+	}
+	migratedIndexCount, err := existingIndexes2026082101(ctx, db, migratedIndexes)
+	if err != nil {
+		return false, err
+	}
+	replacementTables := 0
+	for _, table := range []string{"storage_replacements", "storage_replacement_items"} {
+		exists, err := tableExists(ctx, db, table)
+		if err != nil {
+			return false, fmt.Errorf("checking %s: %w", table, err)
+		}
+		if exists {
+			replacementTables++
+		}
+	}
+
+	legacy := !generation && !isCurrent && legacyIndexCount == len(legacyIndexes) && migratedIndexCount == 0 && replacementTables == 0
+	migrated := generation && isCurrent && legacyIndexCount == 0 && migratedIndexCount == len(migratedIndexes) && replacementTables == 2
+	if (wantMigrated && migrated) || (!wantMigrated && legacy) {
+		return true, nil
+	}
+	if (wantMigrated && legacy) || (!wantMigrated && migrated) {
+		return false, nil
+	}
+	return false, fmt.Errorf(
+		"2026082101_storage_data_set_generations has partial schema state: generation=%t, is_current=%t, legacy_indexes=%d/%d, migrated_indexes=%d/%d, replacement_tables=%d/2",
+		generation,
+		isCurrent,
+		legacyIndexCount,
+		len(legacyIndexes),
+		migratedIndexCount,
+		len(migratedIndexes),
+		replacementTables,
+	)
+}
+
+func existingIndexes2026082101(ctx context.Context, db bun.IDB, names []string) (int, error) {
+	count := 0
+	for _, name := range names {
+		exists, err := indexExists(ctx, db, name)
+		if err != nil {
+			return 0, fmt.Errorf("checking %s: %w", name, err)
+		}
+		if exists {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func storageReplacementsTableSQL2026082101(pg bool) string {

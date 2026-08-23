@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -10,17 +11,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/migrate"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
+
+const migrationUnlockTimeout = 5 * time.Second
 
 // New creates a Bun database connection based on the provided configuration.
 func New(cfg config.DatabaseConfig) (*bun.DB, error) {
@@ -59,12 +62,23 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 }
 
 // RunMigrations initialises the Bun migrator and applies all pending migrations.
-func RunMigrations(ctx context.Context, db *bun.DB) error {
-	migrator := migrate.NewMigrator(db, migrations.Migrations)
+func RunMigrations(ctx context.Context, db *bun.DB) (retErr error) {
+	migrator := migrations.NewMigrator(db)
 
 	if err := migrator.Init(ctx); err != nil {
 		return fmt.Errorf("initializing migrator: %w", err)
 	}
+	if err := migrator.Lock(ctx); err != nil {
+		return fmt.Errorf("locking migrator: %w; if no migration is running, "+
+			"clear a lock left by a killed run with `synaps3 migrate --force-unlock`", err)
+	}
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrationUnlockTimeout)
+		defer cancel()
+		if err := migrator.Unlock(unlockCtx); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("unlocking migrator: %w", err))
+		}
+	}()
 
 	group, err := migrator.Migrate(ctx)
 	if err != nil {
@@ -77,6 +91,18 @@ func RunMigrations(ctx context.Context, db *bun.DB) error {
 		slog.Info("no new migrations to apply")
 	}
 
+	return nil
+}
+
+// ForceUnlockMigrations releases a migration lock left by a killed run.
+func ForceUnlockMigrations(ctx context.Context, db *bun.DB) error {
+	migrator := migrations.NewMigrator(db)
+	if err := migrator.Init(ctx); err != nil {
+		return fmt.Errorf("initializing migrator: %w", err)
+	}
+	if err := migrator.Unlock(ctx); err != nil {
+		return fmt.Errorf("releasing migration lock: %w", err)
+	}
 	return nil
 }
 
