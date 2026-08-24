@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,29 +10,30 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
 
 type taskListItem struct {
-	ID            int64                   `json:"id"`
-	Type          string                  `json:"type"`
-	Stage         *string                 `json:"stage,omitempty"`
-	UploadID      *int64                  `json:"upload_id,omitempty"`
-	CopyIndex     *int                    `json:"copy_index,omitempty"`
-	RefType       string                  `json:"ref_type"`
-	RefID         int64                   `json:"ref_id"`
-	BucketName    string                  `json:"bucket_name,omitempty"`
-	RefVersionID  string                  `json:"ref_version_id"`
-	Status        string                  `json:"status"`
-	Progress      *uploadProgressResponse `json:"progress,omitempty"`
-	RetryCount    int                     `json:"retry_count"`
-	MaxRetries    int                     `json:"max_retries"`
-	LastError     *string                 `json:"last_error,omitempty"`
-	StatusMessage *string                 `json:"status_message,omitempty"`
-	WaitReason    *string                 `json:"wait_reason,omitempty"`
-	ScheduledAt   string                  `json:"scheduled_at"`
-	ClaimedAt     *string                 `json:"claimed_at,omitempty"`
-	CompletedAt   *string                 `json:"completed_at,omitempty"`
+	ID            int64                 `json:"id"`
+	Type          string                `json:"type"`
+	Stage         *string               `json:"stage,omitempty"`
+	UploadID      *int64                `json:"upload_id,omitempty"`
+	CopyIndex     *int                  `json:"copy_index,omitempty"`
+	RefType       string                `json:"ref_type"`
+	RefID         int64                 `json:"ref_id"`
+	BucketName    string                `json:"bucket_name,omitempty"`
+	RefVersionID  string                `json:"ref_version_id"`
+	Status        string                `json:"status"`
+	Progress      *taskProgressResponse `json:"progress,omitempty"`
+	RetryCount    int                   `json:"retry_count"`
+	MaxRetries    int                   `json:"max_retries"`
+	LastError     *string               `json:"last_error,omitempty"`
+	StatusMessage *string               `json:"status_message,omitempty"`
+	WaitReason    *string               `json:"wait_reason,omitempty"`
+	ScheduledAt   string                `json:"scheduled_at"`
+	ClaimedAt     *string               `json:"claimed_at,omitempty"`
+	CompletedAt   *string               `json:"completed_at,omitempty"`
 }
 
 type taskListResponse struct {
@@ -122,7 +124,7 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	progressByTaskID := s.taskUploadProgresses(ctx, tasks)
+	progressByTaskID := s.taskProgresses(ctx, tasks)
 	bucketIDs := make([]int64, 0)
 	seenBucketIDs := make(map[int64]struct{})
 	for i := range tasks {
@@ -157,7 +159,7 @@ func (s *Server) handleAPITasks(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func taskListItemFromModel(t *model.Task, progress *uploadProgressResponse) taskListItem {
+func taskListItemFromModel(t *model.Task, progress *taskProgressResponse) taskListItem {
 	item := taskListItem{
 		ID:            t.ID,
 		Type:          string(t.Type),
@@ -242,8 +244,110 @@ func taskPayloadInt64(payload map[string]interface{}, key string) *int64 {
 	return nil
 }
 
-func (s *Server) taskUploadProgresses(ctx context.Context, tasks []model.Task) map[int64]*uploadProgressResponse {
-	progressByTaskID := make(map[int64]*uploadProgressResponse)
+type taskProgressResponse struct {
+	Scope string `json:"scope"`
+
+	Attempt       int    `json:"attempt,omitempty"`
+	UploadedBytes int64  `json:"uploaded_bytes,omitempty"`
+	TotalBytes    int64  `json:"total_bytes,omitempty"`
+	Done          bool   `json:"done,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
+
+	Phase               string  `json:"phase,omitempty"`
+	SeedingComplete     bool    `json:"seeding_complete,omitempty"`
+	ItemsTotal          int     `json:"items_total,omitempty"`
+	ItemsProcessed      int     `json:"items_processed,omitempty"`
+	ItemsCopied         int     `json:"items_copied,omitempty"`
+	ItemsNoLongerNeeded int     `json:"items_no_longer_needed,omitempty"`
+	ItemsPending        int     `json:"items_pending,omitempty"`
+	ItemsActive         int     `json:"items_active,omitempty"`
+	ItemsRetrying       int     `json:"items_retrying,omitempty"`
+	ItemsWaitingSource  int     `json:"items_waiting_source,omitempty"`
+	ItemsFailed         int     `json:"items_failed,omitempty"`
+	Percent             *int    `json:"percent,omitempty"`
+	NextRetryAt         *string `json:"next_retry_at,omitempty"`
+}
+
+func (p taskProgressResponse) MarshalJSON() ([]byte, error) {
+	if p.Scope == "provider_replacement" {
+		return json.Marshal(struct {
+			Scope               string  `json:"scope"`
+			Phase               string  `json:"phase"`
+			SeedingComplete     bool    `json:"seeding_complete"`
+			ItemsTotal          int     `json:"items_total"`
+			ItemsProcessed      int     `json:"items_processed"`
+			ItemsCopied         int     `json:"items_copied"`
+			ItemsNoLongerNeeded int     `json:"items_no_longer_needed"`
+			ItemsPending        int     `json:"items_pending"`
+			ItemsActive         int     `json:"items_active"`
+			ItemsRetrying       int     `json:"items_retrying"`
+			ItemsWaitingSource  int     `json:"items_waiting_source"`
+			ItemsFailed         int     `json:"items_failed"`
+			Percent             *int    `json:"percent,omitempty"`
+			NextRetryAt         *string `json:"next_retry_at,omitempty"`
+		}{
+			Scope: p.Scope, Phase: p.Phase, SeedingComplete: p.SeedingComplete,
+			ItemsTotal: p.ItemsTotal, ItemsProcessed: p.ItemsProcessed,
+			ItemsCopied: p.ItemsCopied, ItemsNoLongerNeeded: p.ItemsNoLongerNeeded,
+			ItemsPending: p.ItemsPending, ItemsActive: p.ItemsActive,
+			ItemsRetrying: p.ItemsRetrying, ItemsWaitingSource: p.ItemsWaitingSource,
+			ItemsFailed: p.ItemsFailed, Percent: p.Percent, NextRetryAt: p.NextRetryAt,
+		})
+	}
+	return json.Marshal(struct {
+		Scope         string `json:"scope"`
+		Attempt       int    `json:"attempt"`
+		UploadedBytes int64  `json:"uploaded_bytes"`
+		TotalBytes    int64  `json:"total_bytes"`
+		Percent       *int   `json:"percent,omitempty"`
+		Done          bool   `json:"done"`
+		UpdatedAt     string `json:"updated_at"`
+	}{
+		Scope: p.Scope, Attempt: p.Attempt, UploadedBytes: p.UploadedBytes,
+		TotalBytes: p.TotalBytes, Percent: p.Percent, Done: p.Done, UpdatedAt: p.UpdatedAt,
+	})
+}
+
+func taskProgressFromUpload(progress *uploadProgressResponse) *taskProgressResponse {
+	if progress == nil {
+		return nil
+	}
+	return &taskProgressResponse{
+		Scope:         progress.Scope,
+		Attempt:       progress.Attempt,
+		UploadedBytes: progress.UploadedBytes,
+		TotalBytes:    progress.TotalBytes,
+		Percent:       progress.Percent,
+		Done:          progress.Done,
+		UpdatedAt:     progress.UpdatedAt,
+	}
+}
+
+func taskProgressFromReplacement(progress storagereplacement.ProgressSnapshot) *taskProgressResponse {
+	response := &taskProgressResponse{
+		Scope:               "provider_replacement",
+		Phase:               string(progress.Phase),
+		SeedingComplete:     progress.SeedingComplete,
+		ItemsTotal:          progress.ItemsTotal,
+		ItemsProcessed:      progress.ItemsProcessed,
+		ItemsCopied:         progress.ItemsCopied,
+		ItemsNoLongerNeeded: progress.ItemsNoLongerNeeded,
+		ItemsPending:        progress.ItemsPending,
+		ItemsActive:         progress.ItemsActive,
+		ItemsRetrying:       progress.ItemsRetrying,
+		ItemsWaitingSource:  progress.ItemsWaitingSource,
+		ItemsFailed:         progress.ItemsFailed,
+		Percent:             progress.Percent,
+	}
+	if progress.NextRetryAt != nil {
+		value := progress.NextRetryAt.Format(time.RFC3339)
+		response.NextRetryAt = &value
+	}
+	return response
+}
+
+func (s *Server) taskProgresses(ctx context.Context, tasks []model.Task) map[int64]*taskProgressResponse {
+	progressByTaskID := make(map[int64]*taskProgressResponse)
 	if s == nil || s.repos == nil || s.repos.Uploads == nil || len(tasks) == 0 {
 		return progressByTaskID
 	}
@@ -252,8 +356,17 @@ func (s *Server) taskUploadProgresses(ctx context.Context, tasks []model.Task) m
 	taskVersionIDs := make(map[int64]string)
 	uploadIDSet := make(map[int64]struct{})
 	versionIDSet := make(map[string]struct{})
+	replacementTaskIDs := make(map[int64]int64)
+	replacementIDSet := make(map[int64]struct{})
 	for i := range tasks {
 		task := &tasks[i]
+		if task.Stage != nil && (*task.Stage == storagereplacement.StageMigrate || *task.Stage == storagereplacement.StageRetire) {
+			if replacementID := taskPayloadInt64(task.Payload, "replacement_id"); replacementID != nil {
+				replacementTaskIDs[task.ID] = *replacementID
+				replacementIDSet[*replacementID] = struct{}{}
+			}
+			continue
+		}
 		if !taskWantsUploadProgress(task) {
 			continue
 		}
@@ -303,14 +416,30 @@ func (s *Server) taskUploadProgresses(ctx context.Context, tasks []model.Task) m
 		if !ok {
 			continue
 		}
-		progressByTaskID[taskID] = uploadProgressResponseFromUpload(&upload)
+		progressByTaskID[taskID] = taskProgressFromUpload(uploadProgressResponseFromUpload(&upload))
 	}
 	for taskID, versionID := range taskVersionIDs {
 		upload, ok := uploadsByVersionID[versionID]
 		if !ok {
 			continue
 		}
-		progressByTaskID[taskID] = uploadProgressResponseFromUpload(&upload)
+		progressByTaskID[taskID] = taskProgressFromUpload(uploadProgressResponseFromUpload(&upload))
+	}
+	if len(replacementIDSet) > 0 {
+		replacementIDs := make([]int64, 0, len(replacementIDSet))
+		for replacementID := range replacementIDSet {
+			replacementIDs = append(replacementIDs, replacementID)
+		}
+		progresses, err := s.repos.Replacements.ReplacementProgresses(ctx, replacementIDs)
+		if err != nil {
+			s.logger.Warn("api: failed to load task replacement progress", "error", err)
+		} else {
+			for taskID, replacementID := range replacementTaskIDs {
+				if progress, ok := progresses[replacementID]; ok {
+					progressByTaskID[taskID] = taskProgressFromReplacement(progress)
+				}
+			}
+		}
 	}
 	return progressByTaskID
 }

@@ -54,9 +54,17 @@ func TestStorageDataSetGenerationsMigrationPreservesExistingSlots(t *testing.T) 
 	for _, column := range []string{
 		"client_request_id", "failure_reason", "abandoned_termination_tx_hash",
 		"abandoned_termination_epoch", "abandoned_termination_observed_at",
+		"state_version", "last_dispatched_at",
 	} {
 		if !sqliteColumnExists(t, db, "storage_replacements", column) {
 			t.Fatalf("storage_replacements.%s column missing", column)
+		}
+	}
+	for _, column := range []string{
+		"scheduled_at", "retry_count", "max_retries", "claimed_at", "lease_until",
+	} {
+		if !sqliteColumnExists(t, db, "storage_replacement_items", column) {
+			t.Fatalf("storage_replacement_items.%s column missing", column)
 		}
 	}
 	if !sqliteIndexExists(t, db, "idx_storage_replacements_bucket_request") {
@@ -64,11 +72,18 @@ func TestStorageDataSetGenerationsMigrationPreservesExistingSlots(t *testing.T) 
 	}
 	for _, index := range []string{
 		"idx_storage_uploads_bucket_id",
+		"idx_storage_replacement_items_due",
+		"idx_storage_replacement_items_lease",
+		"idx_storage_replacement_items_state",
 		"idx_storage_replacement_items_upload_id",
+		"idx_storage_replacements_dispatch",
 	} {
 		if !sqliteIndexExists(t, db, index) {
 			t.Fatalf("persistent query index %s missing", index)
 		}
+	}
+	if sqliteIndexExists(t, db, "idx_storage_replacement_items_next") {
+		t.Fatal("obsolete replacement item index should not be created")
 	}
 }
 
@@ -153,6 +168,38 @@ func TestStorageDataSetGenerationsMigrationLimitsActiveReplacements(t *testing.T
 	}
 	if err := insertReplacement(db, 3, 1, 1, "preparing_target"); err == nil {
 		t.Fatal("replacement onto itself was accepted, want check violation")
+	}
+}
+
+func TestStorageDataSetGenerationsMigrationEnforcesReplacementQueueState(t *testing.T) {
+	ctx := context.Background()
+	db := newGenerationsTestDB(t, "generations_replacement_queue_constraints")
+	seedLegacyDataSet(t, db, 1, 1, 0, "101")
+	if err := up2026082101StorageDataSetGenerations(ctx, db); err != nil {
+		t.Fatalf("up migration: %v", err)
+	}
+	mustExecMigrationTest(t, db, "UPDATE storage_data_sets SET is_current = 0 WHERE id = 1")
+	if err := insertDataSet(db, 2, 1, 0, "202", true, 2); err != nil {
+		t.Fatalf("insert target: %v", err)
+	}
+	if err := insertReplacement(db, 1, 1, 2, "migrating"); err != nil {
+		t.Fatalf("insert replacement: %v", err)
+	}
+	mustExecMigrationTest(t, db, "INSERT INTO storage_uploads (id, bucket_id) VALUES (1, 1), (2, 1), (3, 1)")
+
+	mustExecMigrationTest(t, db, `INSERT INTO storage_replacement_items
+		(replacement_id, upload_id, status, max_retries) VALUES (1, 1, 'retrying', 5)`)
+	mustExecMigrationTest(t, db, `INSERT INTO storage_replacement_items
+		(replacement_id, upload_id, status, max_retries) VALUES (1, 2, 'failed', 5)`)
+	if _, err := db.Exec(`INSERT INTO storage_replacement_items
+		(replacement_id, upload_id, status, max_retries) VALUES (1, 3, 'unknown', 5)`); err == nil {
+		t.Fatal("unknown item status accepted")
+	}
+	if _, err := db.Exec(`UPDATE storage_replacement_items SET claimed_at = CURRENT_TIMESTAMP WHERE upload_id = 1`); err == nil {
+		t.Fatal("half-populated item claim accepted")
+	}
+	if _, err := db.Exec(`UPDATE storage_replacement_items SET status = 'running' WHERE upload_id = 1`); err == nil {
+		t.Fatal("running item without a lease accepted")
 	}
 }
 

@@ -511,6 +511,9 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", "73")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
 	t.Setenv("SYNAPS3_WORKER_UPLOAD_MAX_RETRIES", "8")
+	t.Setenv("SYNAPS3_WORKER_PROVIDER_REPLACEMENT_CONCURRENCY", "7")
+	t.Setenv("SYNAPS3_WORKER_PROVIDER_REPLACEMENT_POLL_INTERVAL", "11s")
+	t.Setenv("SYNAPS3_WORKER_PROVIDER_REPLACEMENT_MAX_RETRIES", "9")
 	t.Setenv("SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL", "2m")
 	t.Setenv("SYNAPS3_WORKER_EVICTOR_MAX_RETRIES", "6")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
@@ -546,6 +549,11 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	}
 	if cfg.Worker.Upload.PollInterval != 9*time.Second || cfg.Worker.Upload.MaxRetries != 8 {
 		t.Fatalf("upload worker = %#v, want env values", cfg.Worker.Upload)
+	}
+	if cfg.Worker.ProviderReplacement.Concurrency != 7 ||
+		cfg.Worker.ProviderReplacement.PollInterval != 11*time.Second ||
+		cfg.Worker.ProviderReplacement.MaxRetries != 9 {
+		t.Fatalf("provider replacement worker = %#v, want independent env values", cfg.Worker.ProviderReplacement)
 	}
 	if cfg.Worker.Evictor.PollInterval != 2*time.Minute || cfg.Worker.Evictor.MaxRetries != 6 {
 		t.Fatalf("evictor worker = %#v, want env values", cfg.Worker.Evictor)

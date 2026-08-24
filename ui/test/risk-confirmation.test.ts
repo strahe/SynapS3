@@ -29,6 +29,9 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'worker.upload.concurrency': meta('Upload Concurrency'),
   'worker.upload.max_retries': meta('Upload Max Retries'),
   'worker.upload.poll_interval': meta('Upload Poll Interval'),
+  'worker.provider_replacement.concurrency': meta('Provider Replacement Concurrency'),
+  'worker.provider_replacement.max_retries': meta('Provider Replacement Max Retries'),
+  'worker.provider_replacement.poll_interval': meta('Provider Replacement Poll Interval'),
   'worker.evictor.concurrency': meta('Evictor Concurrency'),
   'worker.evictor.max_retries': meta('Evictor Max Retries'),
   'worker.evictor.poll_interval': meta('Evictor Poll Interval'),
@@ -72,6 +75,11 @@ function baseConfig(): SettingsEditableConfig {
     },
     worker: {
       upload: {
+        concurrency: 4,
+        poll_interval: '5s',
+        max_retries: 5,
+      },
+      provider_replacement: {
         concurrency: 4,
         poll_interval: '5s',
         max_retries: 5,
@@ -161,6 +169,9 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.worker.upload.concurrency = 8
   next.worker.upload.max_retries = 7
   next.worker.upload.poll_interval = '1s'
+  next.worker.provider_replacement.concurrency = 6
+  next.worker.provider_replacement.max_retries = 8
+  next.worker.provider_replacement.poll_interval = '2s'
   next.worker.evictor.concurrency = 3
   next.worker.evictor.max_retries = 4
   next.worker.evictor.poll_interval = '30s'
@@ -193,6 +204,9 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['worker.upload.concurrency', 'Upload Concurrency', '4', '8', 'medium'],
       ['worker.upload.poll_interval', 'Upload Poll Interval', '5s', '1s', 'medium'],
       ['worker.upload.max_retries', 'Upload Max Retries', '5', '7', 'medium'],
+      ['worker.provider_replacement.concurrency', 'Provider Replacement Concurrency', '4', '6', 'medium'],
+      ['worker.provider_replacement.poll_interval', 'Provider Replacement Poll Interval', '5s', '2s', 'medium'],
+      ['worker.provider_replacement.max_retries', 'Provider Replacement Max Retries', '5', '8', 'medium'],
       ['worker.evictor.concurrency', 'Evictor Concurrency', '2', '3', 'medium'],
       ['worker.evictor.poll_interval', 'Evictor Poll Interval', '1m', '30s', 'medium'],
       ['worker.evictor.max_retries', 'Evictor Max Retries', '3', '4', 'medium'],

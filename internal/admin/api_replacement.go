@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,10 +54,11 @@ type providerReplacementResponse struct {
 	Source replacementDataSetResponse `json:"source"`
 	Target replacementDataSetResponse `json:"target"`
 
-	ItemsTotal       int     `json:"items_total"`
-	ItemsCopied      int     `json:"items_copied"`
-	LastError        *string `json:"last_error"`
-	TerminationEpoch *int64  `json:"termination_epoch"`
+	ItemsTotal       int                   `json:"items_total"`
+	ItemsCopied      int                   `json:"items_copied"`
+	Progress         *taskProgressResponse `json:"progress,omitempty"`
+	LastError        *string               `json:"last_error"`
+	TerminationEpoch *int64                `json:"termination_epoch"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -264,8 +266,9 @@ func (s *Server) handleAPIRetryStorageReplacement(w http.ResponseWriter, r *http
 	}
 	ctx := r.Context()
 	row, err := s.repos.Replacements.Retry(ctx, repository.RetryReplacementInput{
-		ReplacementID: id,
-		MaxRetries:    s.uploadMaxRetries,
+		ReplacementID:  id,
+		MaxRetries:     s.uploadMaxRetries,
+		ItemMaxRetries: s.providerReplacementMaxRetries,
 	})
 	if err != nil {
 		s.writeReplacementError(w, err, "")
@@ -354,6 +357,23 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 }
 
 func (s *Server) providerReplacementResponse(ctx context.Context, bucketName string, row *storagereplacement.Replacement) (providerReplacementResponse, error) {
+	progresses, err := s.repos.Replacements.ReplacementProgresses(ctx, []int64{row.ID})
+	if err != nil {
+		return providerReplacementResponse{}, err
+	}
+	progress, ok := progresses[row.ID]
+	if !ok {
+		return providerReplacementResponse{}, fmt.Errorf("provider replacement %d progress: %w", row.ID, repository.ErrNotFound)
+	}
+	return s.providerReplacementResponseWithProgress(ctx, bucketName, row, progress)
+}
+
+func (s *Server) providerReplacementResponseWithProgress(
+	ctx context.Context,
+	bucketName string,
+	row *storagereplacement.Replacement,
+	progress storagereplacement.ProgressSnapshot,
+) (providerReplacementResponse, error) {
 	source, err := s.repos.Uploads.GetDataSetBindingByID(ctx, row.SourceDataSetID)
 	if err != nil {
 		return providerReplacementResponse{}, err
@@ -373,6 +393,7 @@ func (s *Server) providerReplacementResponse(ctx context.Context, bucketName str
 		Target:           replacementDataSetView(target, identities),
 		ItemsTotal:       row.ItemsTotal,
 		ItemsCopied:      row.ItemsCopied,
+		Progress:         taskProgressFromReplacement(progress),
 		LastError:        row.LastError,
 		TerminationEpoch: row.TerminationEpoch,
 		CreatedAt:        row.CreatedAt,
@@ -425,9 +446,22 @@ func (s *Server) bucketReplacementResponses(ctx context.Context, bucketName stri
 		s.logger.Error("api: failed to list provider replacements", "error", err, "bucketID", bucketID)
 		return nil
 	}
+	replacementIDs := make([]int64, 0, len(rows))
+	for i := range rows {
+		replacementIDs = append(replacementIDs, rows[i].ID)
+	}
+	progresses, err := s.repos.Replacements.ReplacementProgresses(ctx, replacementIDs)
+	if err != nil {
+		s.logger.Error("api: failed to load provider replacement progress", "error", err, "bucketID", bucketID)
+		return nil
+	}
 	out := make([]providerReplacementResponse, 0, len(rows))
 	for i := range rows {
-		response, err := s.providerReplacementResponse(ctx, bucketName, &rows[i])
+		progress, ok := progresses[rows[i].ID]
+		if !ok {
+			continue
+		}
+		response, err := s.providerReplacementResponseWithProgress(ctx, bucketName, &rows[i], progress)
 		if err != nil {
 			s.logger.Error("api: failed to build replacement response", "error", err, "replacementID", rows[i].ID)
 			continue

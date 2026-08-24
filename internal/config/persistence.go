@@ -293,6 +293,14 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			},
 		},
 		{
+			Name: "worker.provider_replacement",
+			Fields: []initFieldDescriptor{
+				{Field: "worker.provider_replacement.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.ProviderReplacement.Concurrency), Enabled: saveMode},
+				{Field: "worker.provider_replacement.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.ProviderReplacement.PollInterval.String()), Enabled: saveMode},
+				{Field: "worker.provider_replacement.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.ProviderReplacement.MaxRetries), Enabled: saveMode},
+			},
+		},
+		{
 			Name: "worker.evictor",
 			Fields: []initFieldDescriptor{
 				{Field: "worker.evictor.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.Evictor.Concurrency), Enabled: saveMode},

@@ -166,7 +166,9 @@ func TestItemStatusBlocksRetirementWhileExecutable(t *testing.T) {
 	cases := map[ItemStatus]bool{
 		ItemStatusPending:       true,
 		ItemStatusRunning:       true,
+		ItemStatusRetrying:      true,
 		ItemStatusWaitingSource: true,
+		ItemStatusFailed:        true,
 		ItemStatusCopied:        false,
 		ItemStatusCancelled:     false,
 	}

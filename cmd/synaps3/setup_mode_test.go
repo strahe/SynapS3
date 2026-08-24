@@ -38,6 +38,9 @@ func TestShouldStartSetupModeAllowsEditableConfigErrors(t *testing.T) {
 	cfg.Cache.MaxSizeGB = 0
 	cfg.Worker.Upload.PollInterval = 0
 	cfg.Worker.Upload.MaxRetries = -1
+	cfg.Worker.ProviderReplacement.Concurrency = 0
+	cfg.Worker.ProviderReplacement.PollInterval = 0
+	cfg.Worker.ProviderReplacement.MaxRetries = -1
 	cfg.Logging.Level = "verbose"
 	cfg.Logging.S3Access.Level = "verbose"
 

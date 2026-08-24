@@ -157,15 +157,21 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 
 	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
+	uploader := worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, evictionPolicy,
+		cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
+		worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
+		worker.WithProviderReplacementMaxRetries(cfg.Worker.ProviderReplacement.MaxRetries),
+		worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
+			Timeout:              15 * time.Second,
+			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+		})),
+		worker.WithEventPublisher(events))
 	manager := worker.NewManager(repos, logger, evictionPolicy,
-		worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, evictionPolicy,
-			cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
-			worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
-			worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
-				Timeout:              15 * time.Second,
-				AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-			})),
-			worker.WithEventPublisher(events)),
+		uploader,
+		worker.NewProviderReplacementWorker(repos, uploader,
+			cfg.Worker.ProviderReplacement.Concurrency,
+			cfg.Worker.ProviderReplacement.PollInterval,
+			logger),
 		worker.NewEvictor(repos, localCache, cacheGate, accessTracker, stateMachine,
 			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger,
 			worker.WithCacheEvictionPolicy(
@@ -179,7 +185,11 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger, worker.WithServiceTermination(opts.Filecoin.Terminator, opts.Filecoin.Epochs)),
 		worker.NewWalletOperationRunner(repos, opts.Filecoin.Wallet, opts.Filecoin.Receipts, 5*time.Second, logger,
 			worker.WithWalletOperationEventPublisher(events)),
-	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries)
+	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries).
+		WithProviderReplacementRecovery(
+			cfg.Worker.ProviderReplacement.MaxRetries,
+			cfg.Worker.ProviderReplacement.PollInterval,
+		)
 
 	adminServer := admin.New(cfg.Admin.Addr, opts.Database, localCache, cacheGate, accessTracker, maxCacheBytes, repos, manager,
 		opts.Filecoin.WalletQuery, cfg.Filecoin.DefaultCopies, logger).
@@ -196,6 +206,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries).
 		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
 		WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries).
+		WithProviderReplacementMaxRetries(cfg.Worker.ProviderReplacement.MaxRetries).
 		WithS3IAM(iamService, rootAccount.Access)
 	if opts.ProviderIdentity != nil {
 		adminServer.WithProviderIdentityResolver(opts.ProviderIdentity)

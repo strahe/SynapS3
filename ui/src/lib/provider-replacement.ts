@@ -88,32 +88,6 @@ export function dataSetReplaceable(dataSet: StorageDataSetSummary, replacements:
 }
 
 /**
- * Progress is measured in unique stored content, which is what actually gets
- * copied. Many object versions can share one item.
- */
-export function replacementProgressLabel(replacement: ProviderReplacement) {
-  if (replacement.status === 'preparing_target') {
-    return 'Creating the new storage service'
-  }
-  if (replacement.items_total === 0) {
-    if (replacement.status === 'retiring' || replacement.status === 'cleanup_attention') {
-      return 'Stored content migration is complete'
-    }
-    return 'Preparing the list of stored items'
-  }
-  if (
-    replacement.status === 'retiring' ||
-    replacement.status === 'cleanup_attention' ||
-    replacement.status === 'completed'
-  ) {
-    const noLongerNeeded = Math.max(0, replacement.items_total - replacement.items_copied)
-    const suffix = noLongerNeeded > 0 ? `; ${formatNumber(noLongerNeeded)} no longer needed` : ''
-    return `Stored content migration is complete · ${formatNumber(replacement.items_copied)} copied${suffix}`
-  }
-  return `Migrated ${formatNumber(replacement.items_copied)} of ${formatNumber(replacement.items_total)} stored items`
-}
-
-/**
  * A confirmation counts referenced versions and total size, which is what the
  * operator is authorizing storage for.
  */

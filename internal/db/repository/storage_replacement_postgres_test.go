@@ -32,6 +32,33 @@ type replacementBucketLockBarrier struct {
 	attemptOnce sync.Once
 }
 
+type replacementItemClaimBarrier struct {
+	winner     string
+	locked     chan struct{}
+	release    chan struct{}
+	lockedOnce sync.Once
+}
+
+func (h *replacementItemClaimBarrier) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h *replacementItemClaimBarrier) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+	if !replacementItemClaimQuery(event.Query) || ctx.Value(replacementLockContextKey{}) != h.winner {
+		return
+	}
+	h.lockedOnce.Do(func() {
+		close(h.locked)
+		<-h.release
+	})
+}
+
+func replacementItemClaimQuery(query string) bool {
+	query = strings.ToLower(query)
+	return strings.Contains(query, "from storage_replacements as replacement") &&
+		strings.Contains(query, "for update of replacement skip locked")
+}
+
 func (h *replacementBucketLockBarrier) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
 	if replacementBucketLockQuery(event.Query) && ctx.Value(replacementLockContextKey{}) != h.winner {
 		h.attemptOnce.Do(func() { close(h.competitor) })
@@ -164,6 +191,113 @@ func TestPostgresStorageReplacementSchemaParity(t *testing.T) {
 		CreatedAt:      time.Now(), UpdatedAt: time.Now(),
 	}).Exec(ctx); err == nil {
 		t.Fatal("PostgreSQL accepted a duplicate unbound copy for one slot")
+	}
+
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: row.TargetDataSetID, DataSetID: onChainID(t, "2002"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady target: %v", err)
+	}
+	if err := repos.Replacements.Activate(ctx, row.ID); err != nil {
+		t.Fatalf("Activate replacement: %v", err)
+	}
+	maxRetries := 5
+	if _, err := db.NewInsert().Model(&storagereplacement.Item{
+		ReplacementID: row.ID, UploadID: upload.ID, Status: storagereplacement.ItemStatusPending,
+		MaxRetries: &maxRetries, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}).Exec(ctx); err != nil {
+		t.Fatalf("seed replacement item: %v", err)
+	}
+	claimed, err := repos.Replacements.ClaimReadyReplacementItem(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ClaimedAt == nil || claimed.LeaseUntil == nil {
+		t.Fatalf("PostgreSQL durable item claim = %#v err=%v", claimed, err)
+	}
+	stale := storagereplacement.ClaimToken{ItemID: claimed.ID, ClaimedAt: claimed.ClaimedAt.Add(-time.Second)}
+	if err := repos.Replacements.RenewReplacementItemLease(ctx, stale, time.Minute); !errors.Is(err, repository.ErrItemClaimLost) {
+		t.Fatalf("PostgreSQL stale item renewal = %v, want ErrItemClaimLost", err)
+	}
+}
+
+func TestPostgresConcurrentItemClaimsReserveReplacementFairnessSlot(t *testing.T) {
+	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
+	}
+	ctx := context.Background()
+	db := newPostgresReplacementDB(t, ctx, dsn)
+	first := seedPostgresReplacement(t, db, "pg-claim-fairness-first")
+	second := seedPostgresReplacement(t, db, "pg-claim-fairness-second")
+	for _, fixture := range []*postgresReplacementFixture{first, second} {
+		if err := fixture.repos.Replacements.Activate(ctx, fixture.row.ID); err != nil {
+			t.Fatalf("activate replacement %d: %v", fixture.row.ID, err)
+		}
+	}
+
+	maxRetries := 5
+	seedItem := func(fixture *postgresReplacementFixture, versionID string) {
+		t.Helper()
+		upload := &model.StorageUpload{
+			BucketID: fixture.bucket.ID, SourceVersionID: versionID,
+			ContentSize: 1, Checksum: versionID, Status: model.StorageUploadStatusRunning, RequestedCopies: 1,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}
+		if _, err := db.NewInsert().Model(upload).Exec(ctx); err != nil {
+			t.Fatalf("seed upload: %v", err)
+		}
+		if _, err := db.NewInsert().Model(&storagereplacement.Item{
+			ReplacementID: fixture.row.ID, UploadID: upload.ID,
+			Status: storagereplacement.ItemStatusPending, ScheduledAt: time.Now().Add(-time.Second),
+			MaxRetries: &maxRetries, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}).Exec(ctx); err != nil {
+			t.Fatalf("seed replacement item: %v", err)
+		}
+	}
+	seedItem(first, "pg-fairness-first-a")
+	seedItem(first, "pg-fairness-first-b")
+	seedItem(second, "pg-fairness-second-a")
+
+	barrier := &replacementItemClaimBarrier{
+		winner: "first-claim", locked: make(chan struct{}), release: make(chan struct{}),
+	}
+	db.AddQueryHook(barrier)
+	type claimResult struct {
+		item *storagereplacement.Item
+		err  error
+	}
+	firstResult := make(chan claimResult, 1)
+	go func() {
+		claimCtx := context.WithValue(ctx, replacementLockContextKey{}, barrier.winner)
+		item, err := first.repos.Replacements.ClaimReadyReplacementItem(claimCtx, time.Minute)
+		firstResult <- claimResult{item: item, err: err}
+	}()
+	waitReplacementSignal(t, barrier.locked, "first replacement item claim")
+	released := false
+	defer func() {
+		if !released {
+			close(barrier.release)
+		}
+	}()
+
+	secondCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	concurrent, err := second.repos.Replacements.ClaimReadyReplacementItem(secondCtx, time.Minute)
+	if err != nil || concurrent == nil {
+		t.Fatalf("concurrent item claim = %#v err=%v", concurrent, err)
+	}
+	close(barrier.release)
+	released = true
+	var initial claimResult
+	select {
+	case initial = <-firstResult:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for initial replacement item claim")
+	}
+	if initial.err != nil || initial.item == nil {
+		t.Fatalf("initial item claim = %#v err=%v", initial.item, initial.err)
+	}
+	if initial.item.ReplacementID != first.row.ID || concurrent.ReplacementID != second.row.ID {
+		t.Fatalf("concurrent claims used replacements %d and %d, want %d then %d",
+			initial.item.ReplacementID, concurrent.ReplacementID, first.row.ID, second.row.ID)
 	}
 }
 

@@ -72,6 +72,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `database` | SQLite 或 PostgreSQL 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
 | `worker.upload` | 后台 Filecoin 存储并发、轮询和重试。 |
+| `worker.provider_replacement` | 存储提供方替换传输的并发、轮询与复制重试。 |
 | `worker.evictor` | 本地缓存淘汰任务。 |
 | `worker.storage_cleanup` | 远端副本清理任务。 |
 | `logging` | 运行时日志等级、格式和 S3 access log。 |
@@ -96,11 +97,16 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `cache.lru_low_watermark_percent` | `80` |
 | `worker.upload.concurrency` | `4` |
 | `worker.upload.max_retries` | `5` |
+| `worker.provider_replacement.concurrency` | `4` |
+| `worker.provider_replacement.poll_interval` | `5s` |
+| `worker.provider_replacement.max_retries` | `5` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
+
+`worker.provider_replacement` 配置不会影响普通上传。修改 `worker.provider_replacement.max_retries` 后，新发现的替换内容和通过 **Retry replacement** 重试的内容会使用新值；已经进行中的内容保留原有上限。修改存储提供方替换的并发、轮询或重试配置后必须重启 SynapS3。
 
 ## Admin 会话时长
 

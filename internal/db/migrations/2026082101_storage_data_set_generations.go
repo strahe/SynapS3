@@ -76,10 +76,18 @@ func up2026082101StorageDataSetGenerations(ctx context.Context, db bun.IDB) erro
 				ON storage_replacements (bucket_id, copy_index, id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_replacements_bucket_request
 				ON storage_replacements (bucket_id, client_request_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_next
+		`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_due
+				ON storage_replacement_items (replacement_id, scheduled_at, id)
+				WHERE status IN ('pending', 'retrying', 'waiting_source') AND claimed_at IS NULL AND max_retries IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_lease
+				ON storage_replacement_items (replacement_id, lease_until, id)
+				WHERE status = 'running' AND max_retries IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_state
 				ON storage_replacement_items (replacement_id, status, id)`,
 		`CREATE INDEX IF NOT EXISTS idx_storage_replacement_items_upload_id
 				ON storage_replacement_items (upload_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_storage_replacements_dispatch
+				ON storage_replacements (last_dispatched_at, id) WHERE status = 'migrating'`,
 	}
 	for _, query := range statements {
 		if _, err := db.ExecContext(ctx, query); err != nil {
@@ -101,6 +109,10 @@ func down2026082101StorageDataSetGenerations(ctx context.Context, db bun.IDB) er
 		return err
 	}
 	statements := []string{
+		"DROP INDEX IF EXISTS idx_storage_replacements_dispatch",
+		"DROP INDEX IF EXISTS idx_storage_replacement_items_lease",
+		"DROP INDEX IF EXISTS idx_storage_replacement_items_due",
+		"DROP INDEX IF EXISTS idx_storage_replacement_items_state",
 		"DROP INDEX IF EXISTS idx_storage_replacement_items_upload_id",
 		"DROP INDEX IF EXISTS idx_storage_uploads_bucket_id",
 		"DROP TABLE IF EXISTS storage_replacement_items",
@@ -245,8 +257,11 @@ func storageDataSetGenerationsReached2026082101(
 		"idx_storage_replacements_active_source",
 		"idx_storage_replacements_bucket_slot",
 		"idx_storage_replacements_bucket_request",
-		"idx_storage_replacement_items_next",
+		"idx_storage_replacement_items_due",
+		"idx_storage_replacement_items_lease",
+		"idx_storage_replacement_items_state",
 		"idx_storage_replacement_items_upload_id",
+		"idx_storage_replacements_dispatch",
 	}
 	legacyIndexCount, err := existingIndexes2026082101(ctx, db, legacyIndexes)
 	if err != nil {
@@ -266,9 +281,31 @@ func storageDataSetGenerationsReached2026082101(
 			replacementTables++
 		}
 	}
+	replacementColumns := []struct {
+		table  string
+		column string
+	}{
+		{"storage_replacements", "state_version"},
+		{"storage_replacements", "last_dispatched_at"},
+		{"storage_replacement_items", "scheduled_at"},
+		{"storage_replacement_items", "retry_count"},
+		{"storage_replacement_items", "max_retries"},
+		{"storage_replacement_items", "claimed_at"},
+		{"storage_replacement_items", "lease_until"},
+	}
+	replacementColumnCount := 0
+	for _, item := range replacementColumns {
+		exists, err := columnExists(ctx, db, item.table, item.column)
+		if err != nil {
+			return false, fmt.Errorf("checking %s.%s: %w", item.table, item.column, err)
+		}
+		if exists {
+			replacementColumnCount++
+		}
+	}
 
-	legacy := !generation && !isCurrent && legacyIndexCount == len(legacyIndexes) && migratedIndexCount == 0 && replacementTables == 0
-	migrated := generation && isCurrent && legacyIndexCount == 0 && migratedIndexCount == len(migratedIndexes) && replacementTables == 2
+	legacy := !generation && !isCurrent && legacyIndexCount == len(legacyIndexes) && migratedIndexCount == 0 && replacementTables == 0 && replacementColumnCount == 0
+	migrated := generation && isCurrent && legacyIndexCount == 0 && migratedIndexCount == len(migratedIndexes) && replacementTables == 2 && replacementColumnCount == len(replacementColumns)
 	if (wantMigrated && migrated) || (!wantMigrated && legacy) {
 		return true, nil
 	}
@@ -276,7 +313,7 @@ func storageDataSetGenerationsReached2026082101(
 		return false, nil
 	}
 	return false, fmt.Errorf(
-		"2026082101_storage_data_set_generations has partial schema state: generation=%t, is_current=%t, legacy_indexes=%d/%d, migrated_indexes=%d/%d, replacement_tables=%d/2",
+		"2026082101_storage_data_set_generations has partial schema state: generation=%t, is_current=%t, legacy_indexes=%d/%d, migrated_indexes=%d/%d, replacement_tables=%d/2, replacement_columns=%d/%d",
 		generation,
 		isCurrent,
 		legacyIndexCount,
@@ -284,6 +321,8 @@ func storageDataSetGenerationsReached2026082101(
 		migratedIndexCount,
 		len(migratedIndexes),
 		replacementTables,
+		replacementColumnCount,
+		len(replacementColumns),
 	)
 }
 
@@ -329,6 +368,8 @@ func storageReplacementsTableSQL2026082101(pg bool) string {
 		items_copied INTEGER NOT NULL DEFAULT 0,
 		seed_cursor_upload_id %[2]s NOT NULL DEFAULT 0,
 		seeding_complete %[4]s,
+		state_version %[2]s NOT NULL DEFAULT 1,
+		last_dispatched_at %[3]s,
 		termination_tx_hash TEXT,
 		termination_epoch %[2]s,
 		termination_observed_at %[3]s,
@@ -366,11 +407,21 @@ func storageReplacementItemsTableSQL2026082101(pg bool) string {
 		target_copy_id %[2]s REFERENCES storage_upload_copies (id) ON UPDATE CASCADE ON DELETE SET NULL,
 		status TEXT NOT NULL,
 		attempts INTEGER NOT NULL DEFAULT 0,
+		scheduled_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		max_retries INTEGER,
+		claimed_at %[3]s,
+		lease_until %[3]s,
 		last_error TEXT,
 		created_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at %[3]s NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		CONSTRAINT chk_storage_replacement_items_status CHECK (status IN ('pending', 'running', 'waiting_source', 'copied', 'cancelled')),
+		CONSTRAINT chk_storage_replacement_items_status CHECK (status IN ('pending', 'running', 'retrying', 'waiting_source', 'copied', 'cancelled', 'failed')),
 		CONSTRAINT chk_storage_replacement_items_attempts CHECK (attempts >= 0),
+		CONSTRAINT chk_storage_replacement_items_retry CHECK (retry_count >= 0 AND (max_retries IS NULL OR max_retries >= 0)),
+		CONSTRAINT chk_storage_replacement_items_claim CHECK (
+			(status = 'running' AND claimed_at IS NOT NULL AND lease_until IS NOT NULL)
+			OR (status <> 'running' AND claimed_at IS NULL AND lease_until IS NULL)
+		),
 		CONSTRAINT uq_storage_replacement_items_upload UNIQUE (replacement_id, upload_id)
 	)`, identity, reference, timestamp)
 }

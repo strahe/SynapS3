@@ -2,8 +2,10 @@ package worker_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +19,42 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
 )
+
+type flakyReplacementRecoveryRepo struct {
+	repository.StorageReplacementRepository
+	initializeCalls  atomic.Int32
+	releaseCalls     atomic.Int32
+	retryAllowed     <-chan struct{}
+	recoveryComplete chan<- struct{}
+}
+
+func (r *flakyReplacementRecoveryRepo) InitializeReplacementItemRetryBudgets(
+	ctx context.Context,
+	maxRetries int,
+) (int, error) {
+	if r.initializeCalls.Add(1) == 1 {
+		return 0, errors.New("injected retry budget recovery failure")
+	}
+	if r.retryAllowed != nil {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-r.retryAllowed:
+		}
+	}
+	return r.StorageReplacementRepository.InitializeReplacementItemRetryBudgets(ctx, maxRetries)
+}
+
+func (r *flakyReplacementRecoveryRepo) ReleaseExpiredItemLeases(ctx context.Context) (int, error) {
+	if r.releaseCalls.Add(1) == 1 {
+		return 0, errors.New("injected item lease recovery failure")
+	}
+	count, err := r.StorageReplacementRepository.ReleaseExpiredItemLeases(ctx)
+	if err == nil && r.recoveryComplete != nil {
+		close(r.recoveryComplete)
+	}
+	return count, err
+}
 
 func TestManager_RecoverOnStartup_ReleasesExpiredLeases(t *testing.T) {
 	db := testutil.NewTestDB(t)
@@ -106,6 +144,64 @@ func TestManager_RecoverOnStartup_PreservesActiveLeases(t *testing.T) {
 	}
 	if got.LeaseUntil == nil || !got.LeaseUntil.After(now) {
 		t.Fatalf("lease_until = %v, want active lease after %s", got.LeaseUntil, now)
+	}
+}
+
+func TestManager_RetriesProviderReplacementRecoveryWithoutBlockingWorkers(t *testing.T) {
+	repos := testutil.NewTestRepos(t)
+	retryAllowed := make(chan struct{})
+	recoveryComplete := make(chan struct{})
+	flaky := &flakyReplacementRecoveryRepo{
+		StorageReplacementRepository: repos.Replacements,
+		retryAllowed:                 retryAllowed,
+		recoveryComplete:             recoveryComplete,
+	}
+	repos.Replacements = flaky
+	var workerRuns atomic.Int32
+	workerStarted := make(chan struct{})
+	managed := &stubWorker{
+		name: "independent-of-recovery",
+		run: func(ctx context.Context) error {
+			workerRuns.Add(1)
+			close(workerStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		worker.NewManager(repos, slog.Default(), cache.EvictionPolicyNone, managed).
+			WithProviderReplacementRecovery(5, time.Millisecond).
+			Start(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-workerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start while provider replacement recovery was retrying")
+	}
+	close(retryAllowed)
+	select {
+	case <-recoveryComplete:
+	case <-time.After(time.Second):
+		t.Fatal("provider replacement recovery did not complete after retry")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not stop after cancellation")
+	}
+
+	if flaky.initializeCalls.Load() != 2 || flaky.releaseCalls.Load() != 2 {
+		t.Fatalf("recovery calls = initialize:%d release:%d, want two attempts each",
+			flaky.initializeCalls.Load(), flaky.releaseCalls.Load())
+	}
+	if workerRuns.Load() != 1 {
+		t.Fatalf("worker runs = %d, want one", workerRuns.Load())
 	}
 }
 

@@ -181,6 +181,24 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_WORKER_UPLOAD_MAX_RETRIES",
 		Editable:    true,
 	},
+	"worker.provider_replacement.concurrency": {
+		Label:       "Provider Replacement Concurrency",
+		Description: "Number of provider replacement transfers that may run concurrently. Restart required.",
+		Env:         "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_CONCURRENCY",
+		Editable:    true,
+	},
+	"worker.provider_replacement.poll_interval": {
+		Label:       "Provider Replacement Poll Interval",
+		Description: "Interval between checks for provider replacement work. Restart required.",
+		Env:         "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_POLL_INTERVAL",
+		Editable:    true,
+	},
+	"worker.provider_replacement.max_retries": {
+		Label:       "Provider Replacement Max Retries",
+		Description: "Maximum retry attempts for each provider replacement copy. Restart required.",
+		Env:         "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_MAX_RETRIES",
+		Editable:    true,
+	},
 	"worker.evictor.concurrency": {
 		Label:       "Evictor Concurrency",
 		Description: "Number of cache eviction jobs that may run concurrently.",

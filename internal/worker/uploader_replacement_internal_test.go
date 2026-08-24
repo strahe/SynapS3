@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
@@ -11,6 +12,117 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/types"
 )
+
+type replacementGateUploadRepo struct {
+	repository.StorageUploadRepository
+	copyRow *model.StorageUploadCopy
+	target  *model.StorageDataSet
+}
+
+func (r *replacementGateUploadRepo) GetUploadCopyByID(context.Context, int64) (*model.StorageUploadCopy, error) {
+	return r.copyRow, nil
+}
+
+func (r *replacementGateUploadRepo) GetDataSetBindingByID(context.Context, int64) (*model.StorageDataSet, error) {
+	return r.target, nil
+}
+
+type replacementGateReplacementRepo struct {
+	repository.StorageReplacementRepository
+	replacement *storagereplacement.Replacement
+	claim       *storagereplacement.ClaimToken
+}
+
+func (r *replacementGateReplacementRepo) GetActiveForDataSet(context.Context, int64) (*storagereplacement.Replacement, error) {
+	return r.replacement, nil
+}
+
+func (r *replacementGateReplacementRepo) RunningReplacementItemClaimForUpload(
+	context.Context,
+	int64,
+	int64,
+) (*storagereplacement.ClaimToken, error) {
+	return r.claim, nil
+}
+
+type replacementGateTaskRepo struct {
+	repository.TaskRepository
+	waits int
+}
+
+func (r *replacementGateTaskRepo) WaitRunning(
+	context.Context,
+	*model.Task,
+	model.TaskWaitReason,
+	string,
+	time.Duration,
+) error {
+	r.waits++
+	return nil
+}
+
+func TestOrdinaryUploadDefersToReplacementClaimBeforeTargetCopyAttach(t *testing.T) {
+	claimedAt := time.Now()
+	taskClaimedAt := claimedAt.Add(time.Millisecond)
+	leaseUntil := taskClaimedAt.Add(time.Minute)
+	targetID := int64(42)
+	copyRow := &model.StorageUploadCopy{
+		ID:               11,
+		UploadID:         22,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		StorageDataSetID: &targetID,
+	}
+	uploads := &replacementGateUploadRepo{
+		copyRow: copyRow,
+		target:  &model.StorageDataSet{ID: targetID},
+	}
+	replacements := &replacementGateReplacementRepo{
+		replacement: &storagereplacement.Replacement{ID: 33, TargetDataSetID: targetID},
+		claim:       &storagereplacement.ClaimToken{ItemID: 44, ClaimedAt: claimedAt},
+	}
+	tasks := new(replacementGateTaskRepo)
+	u := &Uploader{repos: &repository.Repositories{
+		Uploads:      uploads,
+		Replacements: replacements,
+		Tasks:        tasks,
+	}}
+	task := newUploadStageTask(
+		repository.ObjectVersionRef{ObjectID: 1, VersionID: "version"},
+		5,
+		uploadStageIngressStore,
+		copyRow.UploadID,
+		copyRow.CopyIndex,
+		copyRow.TransferMethod,
+		copyRow.ID,
+	)
+	task.Status = model.TaskStatusRunning
+	task.ClaimedAt = &taskClaimedAt
+	task.LeaseUntil = &leaseUntil
+
+	if !u.deferToReplacement(context.Background(), task, 1, copyRow.UploadID, copyRow.CopyIndex, slog.Default()) {
+		t.Fatal("ordinary upload did not defer to the earlier replacement claim")
+	}
+	if tasks.waits != 1 {
+		t.Fatalf("dependency waits = %d, want 1", tasks.waits)
+	}
+
+	replacements.claim.ClaimedAt = taskClaimedAt
+	if u.deferToReplacement(context.Background(), task, 1, copyRow.UploadID, copyRow.CopyIndex, slog.Default()) {
+		t.Fatal("ordinary upload deferred on an exact claim timestamp tie")
+	}
+	if tasks.waits != 1 {
+		t.Fatalf("dependency waits after exact tie = %d, want 1", tasks.waits)
+	}
+
+	uploads.target = &model.StorageDataSet{ID: targetID - 1}
+	if u.deferToReplacement(context.Background(), task, 1, copyRow.UploadID, copyRow.CopyIndex, slog.Default()) {
+		t.Fatal("ordinary upload deferred while writing the replacement source generation")
+	}
+	if tasks.waits != 1 {
+		t.Fatalf("dependency waits after source write = %d, want 1", tasks.waits)
+	}
+}
 
 // In-place recovery and an approved replacement both want to finish the same
 // generation's work. The replacement wins while it is running, otherwise the

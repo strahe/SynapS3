@@ -236,6 +236,8 @@ Replacement moves through these states:
 
 `items_total` and `items_copied` count unique stored content, not object versions: content shared by many versions is copied once. Content deleted while migration is in progress is no longer needed and is not counted as copied. After copying finishes, the response reports how much content was copied and how much no longer needed to move; `items_copied/items_total` is not a completion percentage. The confirmation dialog instead counts referenced versions and total size.
 
+Each replacement also includes a nested `progress` object. During discovery, `seeding_complete` is `false`, `items_total` is only the number discovered so far, and `percent` is omitted. Once discovery finishes, `items_total` is final and `percent` is `items_processed / items_total`, where `items_processed = items_copied + items_no_longer_needed`. This lets a completed replacement reach 100% even when content was deleted before it needed copying. `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, and `items_failed` report the current work counts; `next_retry_at` is present when a retry is scheduled for the future. `phase` is `prepare`, `migrate`, `retire`, or `none`.
+
 `POST /api/v1/storage-replacements/{id}/retry` resumes a `failed` or `cleanup_attention` replacement on the same approved provider.
 
 Choosing a different provider requires a new confirmation, and is only available while the retiring provider still holds the replica. Once the new provider has taken the replica over, each generation holds data the other does not, so confirming again on either one is refused (`replacement_source_not_current` on the old, `replacement_active` on the new) and the approved copy has to be finished with retry.
@@ -269,6 +271,8 @@ Confirmation only checks what SynapS3 has recorded. A provider that still runs a
 | `POST` | `/admin/exhausted-tasks/{id}/retry` | Retry an exhausted task (legacy path). |
 
 Replacement and retirement task responses that refer to a bucket include `bucket_name` in list and reference-detail responses. Retrying replacement work from the task queue returns `409 Conflict` with `"code": "replacement_task_retry_unsupported"`. When a replacement task has completed or stopped, use **Open Data Sets**, or open the bucket and go to Details → Storage → Data Sets. A `target_in_use` failure has no Retry action because it requires a different provider.
+
+Task list `progress` is a scope-discriminated object. With `scope: "ingress_store"`, it contains `attempt`, `uploaded_bytes`, `total_bytes`, optional `percent`, `done`, and `updated_at`. With `scope: "provider_replacement"`, it contains the same replacement progress returned by the bucket response. Clients must branch on `scope`.
 
 ## Wallet and Filecoin
 
