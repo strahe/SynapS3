@@ -92,8 +92,11 @@ type ItemStatus string
 const (
 	// ItemStatusPending is seeded work not yet attempted.
 	ItemStatusPending ItemStatus = "pending"
-	// ItemStatusRunning is the one item currently held by the coordinator.
+	// ItemStatusRunning is an item leased by a replacement worker.
 	ItemStatusRunning ItemStatus = "running"
+	// ItemStatusRetrying is temporarily failed work waiting for its persisted
+	// retry schedule. It remains retirement-blocking.
+	ItemStatusRetrying ItemStatus = "retrying"
 	// ItemStatusWaitingSource means no readable copy and no cached content is
 	// available yet. The coordinator moves on and revisits it later.
 	ItemStatusWaitingSource ItemStatus = "waiting_source"
@@ -101,23 +104,38 @@ const (
 	ItemStatusCopied ItemStatus = "copied"
 	// ItemStatusCancelled means the content no longer needs migrating.
 	ItemStatusCancelled ItemStatus = "cancelled"
+	// ItemStatusFailed exhausted its item-level retry budget. Other items may
+	// continue, but the source cannot retire until an operator retries it.
+	ItemStatusFailed ItemStatus = "failed"
 )
 
-// Executable reports whether the coordinator may pick this item up.
+// Executable reports whether an item is still active or recoverable.
 func (s ItemStatus) Executable() bool {
-	return s == ItemStatusPending || s == ItemStatusRunning || s == ItemStatusWaitingSource
+	switch s {
+	case ItemStatusPending, ItemStatusRunning, ItemStatusRetrying, ItemStatusWaitingSource:
+		return true
+	default:
+		return false
+	}
 }
 
 // Blocking reports whether the item prevents the source from being retired.
 func (s ItemStatus) Blocking() bool {
-	return s.Executable()
+	switch s {
+	case ItemStatusPending, ItemStatusRunning, ItemStatusRetrying,
+		ItemStatusWaitingSource, ItemStatusFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 // Valid reports whether the value is a known item status.
 func (s ItemStatus) Valid() bool {
 	switch s {
-	case ItemStatusPending, ItemStatusRunning, ItemStatusWaitingSource,
-		ItemStatusCopied, ItemStatusCancelled:
+	case ItemStatusPending, ItemStatusRunning, ItemStatusRetrying,
+		ItemStatusWaitingSource, ItemStatusCopied, ItemStatusCancelled,
+		ItemStatusFailed:
 		return true
 	default:
 		return false

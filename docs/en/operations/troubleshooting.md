@@ -132,7 +132,7 @@ Retry only after RPC connectivity, storage provider availability, wallet funds, 
 synaps3 admin task retry 42
 ```
 
-Provider replacement work is the exception: do not retry it from Tasks. Finished or stopped replacement tasks provide **Open Data Sets**, which opens the affected bucket directly at **Details** → **Storage** → **Data Sets**. Use **Retry replacement** only when that action is shown. If the selected provider already stores this bucket, choose a different provider instead.
+Provider replacement work is the exception: do not retry it from Tasks. Copy retries and waits for readable content resume automatically, including after a restart. Finished or stopped replacement tasks provide **Open Data Sets**, which opens the affected bucket directly at **Details** → **Storage** → **Data Sets**. Use **Retry replacement** only when that action is shown. It retries content that needs attention with the current `worker.provider_replacement.max_retries` setting and keeps completed work. If the selected provider already stores this bucket, choose a different provider instead.
 
 ## Provider or RPC Issues
 

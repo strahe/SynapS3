@@ -45,11 +45,18 @@ export function buildSettingsPayload(
     payload.cache.lru_low_watermark_percent = form.cache.lru_low_watermark_percent
 
   const upload: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['upload']> = {}
+  const providerReplacement: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['provider_replacement']> = {}
   const evictor: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['evictor']> = {}
   const storageCleanup: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['storage_cleanup']> = {}
   if (include('worker.upload.concurrency')) upload.concurrency = form.worker.upload.concurrency
   if (include('worker.upload.poll_interval')) upload.poll_interval = form.worker.upload.poll_interval
   if (include('worker.upload.max_retries')) upload.max_retries = form.worker.upload.max_retries
+  if (include('worker.provider_replacement.concurrency'))
+    providerReplacement.concurrency = form.worker.provider_replacement.concurrency
+  if (include('worker.provider_replacement.poll_interval'))
+    providerReplacement.poll_interval = form.worker.provider_replacement.poll_interval
+  if (include('worker.provider_replacement.max_retries'))
+    providerReplacement.max_retries = form.worker.provider_replacement.max_retries
   if (include('worker.evictor.concurrency')) evictor.concurrency = form.worker.evictor.concurrency
   if (include('worker.evictor.poll_interval')) evictor.poll_interval = form.worker.evictor.poll_interval
   if (include('worker.evictor.max_retries')) evictor.max_retries = form.worker.evictor.max_retries
@@ -59,7 +66,7 @@ export function buildSettingsPayload(
     storageCleanup.poll_interval = form.worker.storage_cleanup.poll_interval
   if (include('worker.storage_cleanup.max_retries'))
     storageCleanup.max_retries = form.worker.storage_cleanup.max_retries
-  payload.worker = { upload, evictor, storage_cleanup: storageCleanup }
+  payload.worker = { upload, provider_replacement: providerReplacement, evictor, storage_cleanup: storageCleanup }
 
   payload.logging = {}
   if (include('logging.level')) payload.logging.level = form.logging.level

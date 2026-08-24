@@ -35,6 +35,11 @@ type Replacement struct {
 	// no single transaction scales with retained bucket history.
 	SeedCursorUploadID int64 `bun:",notnull,default:0"`
 	SeedingComplete    bool  `bun:",notnull,default:false"`
+	// StateVersion fences item-worker pause requests from a later coordinator
+	// recovery. LastDispatchedAt is the durable fairness cursor used by the
+	// global item queue.
+	StateVersion     int64      `bun:",notnull,default:1"`
+	LastDispatchedAt *time.Time `bun:",nullzero"`
 	// TerminationEpoch is recorded before the old service is treated as
 	// terminated, so a crash between termination and observation re-reads it
 	// instead of terminating twice.
@@ -66,7 +71,54 @@ type Item struct {
 	TargetCopyID *int64     `bun:",nullzero"`
 	Status       ItemStatus `bun:",notnull"`
 	Attempts     int        `bun:",notnull,default:0"`
-	LastError    *string    `bun:",nullzero"`
-	CreatedAt    time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt    time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	ScheduledAt  time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	RetryCount   int        `bun:",notnull,default:0"`
+	// MaxRetries is nullable only for rows created before the durable item
+	// queue migration. Startup recovery initializes it exactly once.
+	MaxRetries *int       `bun:",nullzero"`
+	ClaimedAt  *time.Time `bun:",nullzero"`
+	LeaseUntil *time.Time `bun:",nullzero"`
+	LastError  *string    `bun:",nullzero"`
+	CreatedAt  time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt  time.Time  `bun:",nullzero,notnull,default:current_timestamp"`
+}
+
+// ClaimToken fences lifecycle updates made by one item worker lease.
+type ClaimToken struct {
+	ItemID    int64
+	ClaimedAt time.Time
+}
+
+// ProgressSnapshot is the UI-neutral aggregate for one replacement. Total is
+// provisional until SeedingComplete is true.
+type ProgressSnapshot struct {
+	ReplacementID       int64
+	Phase               Phase
+	SeedingComplete     bool
+	ItemsTotal          int
+	ItemsProcessed      int
+	ItemsCopied         int
+	ItemsNoLongerNeeded int
+	ItemsPending        int
+	ItemsActive         int
+	ItemsRetrying       int
+	ItemsWaitingSource  int
+	ItemsFailed         int
+	Percent             *int
+	NextRetryAt         *time.Time
+}
+
+// ExecutionSnapshot is the bounded coordinator view of one replacement. It
+// intentionally reports presence rather than item counts; full aggregates are
+// reserved for operator-facing progress reads.
+type ExecutionSnapshot struct {
+	ReplacementID    int64 `bun:"replacement_id"`
+	SeedingComplete  bool  `bun:"seeding_complete"`
+	ItemsTotal       int   `bun:"items_total"`
+	ItemsCopied      int   `bun:"items_copied"`
+	HasPending       bool  `bun:"has_pending"`
+	HasActive        bool  `bun:"has_active"`
+	HasRetrying      bool  `bun:"has_retrying"`
+	HasWaitingSource bool  `bun:"has_waiting_source"`
+	HasFailed        bool  `bun:"has_failed"`
 }

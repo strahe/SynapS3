@@ -148,6 +148,7 @@ export function collectSettingsRiskChanges(
   )
 
   addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'upload')
+  addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'provider_replacement')
   addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'evictor')
 
   return changes
@@ -159,7 +160,7 @@ function addWorkerRiskChanges(
   next: SettingsEditableConfig,
   envManaged: Record<string, string>,
   metadata: Record<string, SettingsFieldMetadata>,
-  pool: 'upload' | 'evictor'
+  pool: 'upload' | 'provider_replacement' | 'evictor'
 ) {
   const prefix = `worker.${pool}`
   const initialPool = initial.worker[pool]

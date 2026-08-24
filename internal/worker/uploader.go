@@ -50,20 +50,21 @@ var submittedCommitMaxWait = 5 * time.Minute
 // Uploader claims upload tasks, persists upload provenance, and accepts complete
 // uploads for object versions.
 type Uploader struct {
-	repos           *repository.Repositories
-	cache           cache.Cache
-	storage         synapse.StorageClient
-	statusChecker   *synapse.PDPStatusChecker
-	wallet          synapse.WalletQuerier // optional; nil skips balance pre-check
-	stateMachine    *state.Machine
-	evictionPolicy  cache.EvictionPolicy
-	evictMaxRetries int
-	targetCopies    int
-	eventPublisher  admin.EventPublisher
-	concurrency     int
-	pollInterval    time.Duration
-	leaseTTL        time.Duration
-	logger          *slog.Logger
+	repos                 *repository.Repositories
+	cache                 cache.Cache
+	storage               synapse.StorageClient
+	statusChecker         *synapse.PDPStatusChecker
+	wallet                synapse.WalletQuerier // optional; nil skips balance pre-check
+	stateMachine          *state.Machine
+	evictionPolicy        cache.EvictionPolicy
+	evictMaxRetries       int
+	targetCopies          int
+	eventPublisher        admin.EventPublisher
+	replacementMaxRetries int
+	concurrency           int
+	pollInterval          time.Duration
+	leaseTTL              time.Duration
+	logger                *slog.Logger
 	*livenessTracker
 }
 
@@ -72,14 +73,13 @@ const (
 	uploadPollJitterDivisor = 5
 	uploadProgressTimeout   = 2 * time.Second
 
-	uploadStagePrepare       = "prepare_upload"
-	uploadStageEnsureDataSet = "ensure_dataset"
-	uploadStageIngressStore  = "ingress_store"
-	uploadStageIngressCommit = "ingress_commit"
-	uploadStagePeerPull      = "peer_pull"
-	uploadStagePeerCommit    = "peer_commit"
-	uploadStageRepairReplica = "repair_replica"
-	// Provider replacement advances through the same queue as ordinary uploads.
+	uploadStagePrepare         = "prepare_upload"
+	uploadStageEnsureDataSet   = "ensure_dataset"
+	uploadStageIngressStore    = "ingress_store"
+	uploadStageIngressCommit   = "ingress_commit"
+	uploadStagePeerPull        = "peer_pull"
+	uploadStagePeerCommit      = "peer_commit"
+	uploadStageRepairReplica   = "repair_replica"
 	uploadStageReplaceProvider = storagereplacement.StageMigrate
 )
 
@@ -108,6 +108,18 @@ func WithPDPStatusChecker(checker *synapse.PDPStatusChecker) UploaderOption {
 	}
 }
 
+// WithProviderReplacementMaxRetries sets the provider replacement retry limit.
+func WithProviderReplacementMaxRetries(maxRetries int) UploaderOption {
+	return func(u *Uploader) {
+		u.replacementMaxRetries = maxRetries
+	}
+}
+
+// providerEvidenceContext lets monotonic evidence writes outlive lease cancellation.
+func providerEvidenceContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), taskLeaseOperationTimeout)
+}
+
 func boundedTargetCopies(copies int) int {
 	return model.ClampStorageCopies(copies)
 }
@@ -115,20 +127,21 @@ func boundedTargetCopies(copies int) int {
 // NewUploader creates a new upload worker.
 func NewUploader(repos *repository.Repositories, c cache.Cache, sc synapse.StorageClient, wallet synapse.WalletQuerier, sm *state.Machine, evictionPolicy cache.EvictionPolicy, targetCopies int, concurrency int, pollInterval time.Duration, logger *slog.Logger, opts ...UploaderOption) *Uploader {
 	u := &Uploader{
-		repos:           repos,
-		cache:           c,
-		storage:         sc,
-		statusChecker:   synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{Timeout: submittedCommitRequestTimeout}),
-		wallet:          wallet,
-		stateMachine:    sm,
-		evictionPolicy:  evictionPolicy,
-		evictMaxRetries: defaultEvictMaxRetries,
-		targetCopies:    boundedTargetCopies(targetCopies),
-		concurrency:     concurrency,
-		pollInterval:    pollInterval,
-		leaseTTL:        10 * time.Minute,
-		logger:          logger,
-		livenessTracker: newLivenessTracker(pollInterval),
+		repos:                 repos,
+		cache:                 c,
+		storage:               sc,
+		statusChecker:         synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{Timeout: submittedCommitRequestTimeout}),
+		wallet:                wallet,
+		stateMachine:          sm,
+		evictionPolicy:        evictionPolicy,
+		evictMaxRetries:       defaultEvictMaxRetries,
+		targetCopies:          boundedTargetCopies(targetCopies),
+		replacementMaxRetries: defaultUploadMaxRetries,
+		concurrency:           concurrency,
+		pollInterval:          pollInterval,
+		leaseTTL:              10 * time.Minute,
+		logger:                logger,
+		livenessTracker:       newLivenessTracker(pollInterval),
 	}
 	for _, opt := range opts {
 		opt(u)

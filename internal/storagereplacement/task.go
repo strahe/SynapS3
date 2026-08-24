@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	// StageMigrate advances replacement migration through the Upload worker.
+	// StageMigrate advances the replacement control plane through the uploader;
+	// item transfers run on the dedicated replacement worker.
 	StageMigrate = "replace_provider"
 	// StageRetire runs the retirement safety gate through the storage cleanup
 	// worker.
@@ -20,16 +21,13 @@ const (
 	StageRetireAbandonedTarget = "retire_abandoned_target"
 
 	replacementIDPayloadKey = "replacement_id"
-	itemIDPayloadKey        = "item_id"
-	copyIDPayloadKey        = "storage_upload_copy_id"
-
-	migrateTaskKeyPrefix = "upload:storage-replacement:"
-	retireTaskKeyPrefix  = "storage_cleanup:storage-replacement:"
+	migrateTaskKeyPrefix    = "upload:storage-replacement:"
+	retireTaskKeyPrefix     = "storage_cleanup:storage-replacement:"
 )
 
 // MigrateTaskKey identifies the single migration coordinator for one
-// replacement. Exactly one such task exists, which is what limits a
-// replacement to one executable item at a time.
+// replacement. Item concurrency is owned by the durable replacement queue,
+// not by this control-plane task.
 func MigrateTaskKey(replacementID int64) string {
 	return fmt.Sprintf("%s%d:migrate", migrateTaskKeyPrefix, replacementID)
 }
@@ -48,9 +46,8 @@ func AbandonedTargetTaskKey(replacementID int64) string {
 }
 
 // NewMigrateTask builds the singleton migration coordinator for one
-// replacement. Exactly one exists per replacement, which is what keeps a
-// replacement to one executable item and lets ordinary uploads interleave
-// through the normal queue order.
+// replacement. It prepares the target, seeds durable items, observes their
+// bounded execution state, and hands completed migration to retirement.
 func NewMigrateTask(replacementID, bucketID int64, versionID string, maxRetries int, scheduledAt time.Time) *model.Task {
 	stage := StageMigrate
 	return &model.Task{
@@ -60,7 +57,7 @@ func NewMigrateTask(replacementID, bucketID int64, versionID string, maxRetries 
 		RefID:          bucketID,
 		RefVersionID:   versionID,
 		IdempotencyKey: MigrateTaskKey(replacementID),
-		Payload:        NewMigratePayload(replacementID, 0, 0),
+		Payload:        NewMigratePayload(replacementID),
 		Status:         model.TaskStatusQueued,
 		MaxRetries:     maxRetries,
 		ScheduledAt:    scheduledAt,
@@ -85,27 +82,15 @@ func NewRetireTask(replacementID, bucketID int64, maxRetries int, scheduledAt ti
 	}
 }
 
-// MigratePayload is the persisted state of the migration coordinator. It holds
-// identifiers only; every claim re-derives the rest from the database so a
-// restart cannot act on a stale snapshot.
+// MigratePayload is the persisted state of the migration coordinator. The
+// durable item queue owns all transfer state.
 type MigratePayload struct {
 	ReplacementID int64
-	// ItemID is zero when no item is currently assigned.
-	ItemID int64
-	// CopyID is zero until the target copy row exists.
-	CopyID int64
 }
 
 // NewMigratePayload builds the coordinator payload.
-func NewMigratePayload(replacementID, itemID, copyID int64) map[string]any {
-	payload := map[string]any{replacementIDPayloadKey: replacementID}
-	if itemID > 0 {
-		payload[itemIDPayloadKey] = itemID
-	}
-	if copyID > 0 {
-		payload[copyIDPayloadKey] = copyID
-	}
-	return payload
+func NewMigratePayload(replacementID int64) map[string]any {
+	return map[string]any{replacementIDPayloadKey: replacementID}
 }
 
 // ParseMigratePayload decodes a migration coordinator payload. These tasks only
@@ -122,15 +107,7 @@ func ParseMigratePayload(task *model.Task) (MigratePayload, error) {
 	if replacementID <= 0 {
 		return MigratePayload{}, fmt.Errorf("replacement migration task %s must be positive", replacementIDPayloadKey)
 	}
-	itemID, err := optionalPayloadInt64(task.Payload, itemIDPayloadKey)
-	if err != nil {
-		return MigratePayload{}, err
-	}
-	copyID, err := optionalPayloadInt64(task.Payload, copyIDPayloadKey)
-	if err != nil {
-		return MigratePayload{}, err
-	}
-	return MigratePayload{ReplacementID: replacementID, ItemID: itemID, CopyID: copyID}, nil
+	return MigratePayload{ReplacementID: replacementID}, nil
 }
 
 // NewRetirePayload builds the retirement coordinator payload.
@@ -188,16 +165,6 @@ func IsCoordinatorTask(taskType model.TaskType, stage *string) bool {
 	default:
 		return false
 	}
-}
-
-func optionalPayloadInt64(payload map[string]any, key string) (int64, error) {
-	if payload == nil {
-		return 0, nil
-	}
-	if _, ok := payload[key]; !ok {
-		return 0, nil
-	}
-	return payloadInt64(payload, key)
 }
 
 // Payload values survive a JSON round trip through the task table, so an

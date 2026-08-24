@@ -332,10 +332,28 @@ export interface ProviderReplacement {
   /** Progress counts unique stored content, not object versions. */
   items_total: number
   items_copied: number
+  progress: ProviderReplacementProgress
   last_error: string | null
   termination_epoch: number | null
   created_at: string
   updated_at: string
+}
+
+export interface ProviderReplacementProgress {
+  scope: 'provider_replacement'
+  phase: 'prepare' | 'migrate' | 'retire' | 'none'
+  seeding_complete: boolean
+  items_total: number
+  items_processed: number
+  items_copied: number
+  items_no_longer_needed: number
+  items_pending: number
+  items_active: number
+  items_retrying: number
+  items_waiting_source: number
+  items_failed: number
+  percent?: number
+  next_retry_at?: string
 }
 
 export interface BucketMutationResponse {
@@ -374,6 +392,8 @@ export interface UploadTransferProgress {
   done: boolean
   updated_at: string
 }
+
+export type TaskProgress = UploadTransferProgress | ProviderReplacementProgress
 
 export interface ObjectItem {
   id: number
@@ -612,7 +632,7 @@ export interface TaskItem {
   bucket_name?: string
   ref_version_id: string
   status: string
-  progress?: UploadTransferProgress
+  progress?: TaskProgress
   retry_count: number
   max_retries: number
   last_error?: string
@@ -997,6 +1017,7 @@ export interface SettingsCacheConfig {
 
 export interface SettingsWorkerConfig {
   upload: SettingsWorkerPoolConfig
+  provider_replacement: SettingsWorkerPoolConfig
   evictor: SettingsWorkerPoolConfig
   storage_cleanup: SettingsWorkerPoolConfig
 }
@@ -1073,6 +1094,7 @@ export type SettingsUpdatePayload = Partial<{
   cache: Partial<SettingsCacheConfig>
   worker: Partial<{
     upload: Partial<SettingsWorkerPoolConfig>
+    provider_replacement: Partial<SettingsWorkerPoolConfig>
     evictor: Partial<SettingsWorkerPoolConfig>
     storage_cleanup: Partial<SettingsWorkerPoolConfig>
   }>

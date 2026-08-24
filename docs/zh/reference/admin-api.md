@@ -93,7 +93,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
 | 后台任务和存储健康 | 任务重试、诊断刷新、存储提供方和数据集刷新 | 重新入队任务，或刷新运维状态。 |
-| 提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
+| 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
 
 ## 健康检查和指标
 
@@ -131,9 +131,9 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `POST` | `/api/v1/buckets/{name}/objects/permanent-delete` | 永久删除对象版本。 |
 | `POST` | `/api/v1/buckets/{name}/objects/deleted/permanent-delete` | 永久删除已删除对象版本。 |
 | `GET` | `/api/v1/buckets/{name}/storage-health/affected-versions` | 列出受存储健康问题影响的版本。 |
-| `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 列出该副本可以迁往的提供方，以及其余提供方不能接管的原因。 |
+| `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 列出该副本可以迁往的存储提供方，以及其他存储提供方不能接管的原因。 |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 授权替换某个副本背后的存储提供方。 |
-| `POST` | `/api/v1/storage-replacements/{id}/retry` | 恢复处于 `failed` 或 `cleanup_attention` 的提供方替换。 |
+| `POST` | `/api/v1/storage-replacements/{id}/retry` | 恢复处于 `failed` 或 `cleanup_attention` 的存储提供方替换。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
 
@@ -195,25 +195,25 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 替换存储提供方
 
-`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` 是替换某个副本背后存储提供方的唯一入口。一次确认即授权全部动作：新建付费存储服务、把新上传切换过去、复制已有数据，并在每个保留版本都能从新提供方读取之后关闭旧提供方。对象从其他副本或本地缓存复制。两者都没有的对象无法复制，旧提供方也不会被关闭。
+`POST /api/v1/buckets/{name}/data-sets/{id}/replacement` 是替换某个副本背后存储提供方的唯一入口。一次确认即授权全部动作：新建付费存储服务、把新上传切换过去、复制已有数据，并在每个保留版本都能从新存储提供方读取之后关闭旧存储提供方。对象从其他副本或本地缓存复制。两者都没有的对象无法复制，旧存储提供方也不会被关闭。
 
-自动选择新的提供方：
+自动选择新的存储提供方：
 
 ```json
 { "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
 ```
 
-自动选择会排除该存储桶用过的所有提供方，包括已退休的。也可以指定提供方：
+自动选择会排除该存储桶用过的所有存储提供方，包括已退休的。也可以指定存储提供方：
 
 ```json
 { "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
 ```
 
-指定的提供方必须出现在完整的可用、活跃且支持 PDP 的提供方清单中。它可以是该存储桶以前用过的，前提是那次服务已经退休。正在被替换的提供方，以及任何仍持有该存储桶活跃代的提供方，都会被拒绝。
+指定的存储提供方必须出现在完整的可用、活跃且支持 PDP 的存储提供方清单中。它可以是该存储桶以前用过的，前提是那次服务已经退休。正在被替换的存储提供方，以及任何仍持有该存储桶活跃代的存储提供方，都会被拒绝。
 
-`client_request_id` 为必填项，trim 后长度必须为 1–128 个字符。首次成功返回 `201 Created`。同一存储桶、来源、模式和手动提供方使用同一个 ID 精确重放时，会返回原记录和 `200 OK`，即使副本已经切换也一样。同一个 ID 携带不同参数会返回 `409 Conflict` 和 `replacement_idempotency_conflict`。自动模式的重放会在读取提供方清单前命中原记录，因此清单后续变化不会改选提供方。
+`client_request_id` 为必填项，trim 后长度必须为 1–128 个字符。首次成功返回 `201 Created`。同一存储桶、来源、模式和手动存储提供方使用同一个 ID 精确重放时，会返回原记录和 `200 OK`，即使副本已经切换也一样。同一个 ID 携带不同参数会返回 `409 Conflict` 和 `replacement_idempotency_conflict`。自动模式的重放会在读取存储提供方清单前命中原记录，因此清单后续变化不会改选存储提供方。
 
-对同一副本再次确认会取代先前的请求并返回 `201 Created`，不是冲突。先前请求里尚未使用的提供方会被关闭。`replacement_active` 表示的是另一件事：该副本是另一次未完成替换的目标，必须先处理那一次。
+对同一副本再次确认会取代先前的请求并返回 `201 Created`，不是冲突。先前请求里尚未使用的存储提供方会被关闭。`replacement_active` 表示的是另一件事：该副本是另一次未完成替换的目标，必须先处理那一次。
 
 只有当前接收写入的副本可以被替换；历史代在 `GET /api/v1/buckets/{name}` 中返回 `"replaceable": false`。
 
@@ -223,22 +223,24 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 | 状态 | 含义 |
 | --- | --- |
-| `preparing_target` | 正在创建新服务。写入仍然发往当前提供方。 |
-| `migrating` | 新提供方开始接收新上传，同时复制已有数据。 |
-| `waiting` | 已暂停。`wait_reason` 与 `wait_message` 会区分服务创建（`target_creating`）、可写确认（`target_writable`）、提供方不可达（`target`）、资金、来源可用性和安全退休等待。多数等待无需操作即可继续。 |
+| `preparing_target` | 正在创建新服务。写入仍然发往当前存储提供方。 |
+| `migrating` | 新存储提供方开始接收新上传，同时复制已有数据。 |
+| `waiting` | 已暂停。`wait_reason` 与 `wait_message` 会区分服务创建（`target_creating`）、可写确认（`target_writable`）、存储提供方不可达（`target`）、资金、来源可用性和安全退休等待。多数等待无需操作即可继续。 |
 | `retiring` | 数据已复制完毕，正在终止旧服务。 |
 | `cleanup_attention` | 终止旧服务需要运营者决定，例如结清欠费。 |
 | `failed` | 重试次数用尽，需要重新发起。 |
-| `completed` | 旧服务已终止，该副本已落在新提供方上。 |
+| `completed` | 旧服务已终止，该副本已落在新存储提供方上。 |
 | `superseded` | 更晚的一次确认取代了本次请求。 |
 
-`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 对当前已批准目标是永久失败：需要改选提供方，重试接口会返回冲突。
+`last_error` 只在 `failed` 和 `cleanup_attention` 时设置，重试会清空它。等待状态从不设置它，因为等待不是失败。失败响应还可能包含 `failure_reason`。`target_in_use` 对当前已批准目标是永久失败：需要改选存储提供方，重试接口会返回冲突。
 
 `items_total` 与 `items_copied` 统计的是唯一的已存储内容，而不是对象版本：被多个版本共享的内容只复制一次。迁移期间删除的内容已不再需要，不会算作已复制。复制结束后，响应会分别说明已复制的内容，以及已无需迁移的内容；`items_copied/items_total` 不是完成百分比。确认页统计的是引用版本数和数据量。
 
-`POST /api/v1/storage-replacements/{id}/retry` 在同一个已批准的提供方上恢复 `failed` 或 `cleanup_attention` 的替换。
+每条替换记录还包含嵌套的 `progress` 对象。发现内容期间，`seeding_complete` 为 `false`，`items_total` 只是当前已发现数量，并且省略 `percent`。发现完成后，`items_total` 才是最终总数，`percent` 按 `items_processed / items_total` 计算，其中 `items_processed = items_copied + items_no_longer_needed`。因此，即使部分内容在复制前已删除，完成状态仍会达到 100%。`items_pending`、`items_active`、`items_retrying`、`items_waiting_source` 与 `items_failed` 返回当前工作数量；存在未来的重试时返回 `next_retry_at`。`phase` 取 `prepare`、`migrate`、`retire` 或 `none`。
 
-更换提供方需要重新确认，且仅在旧提供方仍持有该副本时可用。新提供方接管副本之后，两代各自持有对方没有的数据，因此对任意一代再次确认都会被拒绝（旧代返回 `replacement_source_not_current`，新代返回 `replacement_active`），此时只能用重试完成已批准的复制。
+`POST /api/v1/storage-replacements/{id}/retry` 在同一个已批准的存储提供方上恢复 `failed` 或 `cleanup_attention` 的替换。
+
+更换存储提供方需要重新确认，且仅在旧存储提供方仍持有该副本时可用。新存储提供方接管副本之后，两代各自持有对方没有的数据，因此对任意一代再次确认都会被拒绝（旧代返回 `replacement_source_not_current`，新代返回 `replacement_active`），此时只能用重试完成已批准的复制。
 
 冲突返回 `409 Conflict` 并附带稳定的 code：
 
@@ -249,11 +251,11 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_source_not_current`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
+这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_source_not_current`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
 
-`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出当前探测为可用的提供方，附带 `eligible`、取值为 `current_source` 或 `already_serves_bucket` 的 `ineligible_reason`，以及标记该存储桶用过并已完全退休的 `previously_used`。不能接管该副本的提供方会照常列出而不是省略，便于运营者看清预期中的提供方为何不可用。这份清单与存储拓扑页在 `Available` 过滤下读取的是同一份：在那里可用的提供方这里会提供，探测不通的两边都不会出现。可选性判定与确认阶段完全一致。自动选择更严格：它绝不会回到该存储桶用过的提供方，而手动选择可以。
+`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出当前探测为可用的存储提供方，附带 `eligible`、取值为 `current_source` 或 `already_serves_bucket` 的 `ineligible_reason`，以及标记该存储桶用过并已完全退休的 `previously_used`。不能接管该副本的存储提供方会照常列出而不是省略，便于运营者看清预期中的存储提供方为何不可用。这份清单与存储拓扑页在 `Available` 过滤下读取的是同一份：在那里可用的存储提供方这里会提供，探测不通的两边都不会出现。可选性判定与确认阶段完全一致。自动选择更严格：它绝不会回到该存储桶用过的存储提供方，而手动选择可以。
 
-确认阶段只能检查 SynapS3 已记录的信息。如果某提供方在链上仍为该存储桶运行着存储服务，会在替换准备目标时被发现：替换停在 `failed`，并写明提供方与数据集，运营者改选另一个提供方重新确认即可。此时副本尚未迁移，没有任何风险。此前已正常退休的提供方可以再次选择。
+确认阶段只能检查 SynapS3 已记录的信息。如果某个存储提供方在链上仍为该存储桶运行着存储服务，会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移，没有任何风险。此前已正常退休的存储提供方可以再次选择。
 
 ## 任务
 
@@ -268,7 +270,9 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/admin/exhausted-tasks` | 列出 exhausted 任务。支持最大为 `1000` 的 `limit`。 |
 | `POST` | `/admin/exhausted-tasks/{id}/retry` | 重试 exhausted 任务（遗留路径）。 |
 
-引用存储桶的替换和退休任务会在列表与引用详情响应中包含 `bucket_name`。从任务队列重试提供方替换工作会返回 `409 Conflict` 和 `"code": "replacement_task_retry_unsupported"`。替换任务完成或停止后，可以使用 **Open Data Sets**，或打开存储桶并前往 Details → Storage → Data Sets。`target_in_use` 失败不会显示 Retry，因为它需要改选提供方。
+引用存储桶的替换和退休任务会在列表与引用详情响应中包含 `bucket_name`。从任务队列重试存储提供方替换工作会返回 `409 Conflict` 和 `"code": "replacement_task_retry_unsupported"`。替换任务完成或停止后，可以使用 **Open Data Sets**，或打开存储桶并前往 Details → Storage → Data Sets。`target_in_use` 失败不会显示 Retry，因为它需要改选存储提供方。
+
+任务列表中的 `progress` 是按 `scope` 区分的联合对象。`scope: "ingress_store"` 返回 `attempt`、`uploaded_bytes`、`total_bytes`、可选 `percent`、`done` 与 `updated_at`。`scope: "provider_replacement"` 返回与存储桶响应相同的替换进度。客户端必须先按 `scope` 分支。
 
 ## 钱包和 Filecoin
 

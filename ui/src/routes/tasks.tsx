@@ -17,6 +17,7 @@ import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialo
 import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
+import { ProviderReplacementProgress } from '@/components/app/ProviderReplacementProgress'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressBar } from '@/components/app/UploadProgress'
@@ -322,6 +323,23 @@ function TaskDetailsCell({
   task: TaskItem
   onOpenDetail: (dialog: TaskDetailDialogState) => void
 }) {
+  if (task.progress?.scope === 'provider_replacement') {
+    return (
+      <div className="flex min-w-0 items-center gap-2">
+        <ProviderReplacementProgress progress={task.progress} statusMessage={task.status_message} compact />
+        {task.last_error && (
+          <Button
+            type="button"
+            variant="link"
+            onClick={() => onOpenDetail({ title: 'Error Details', text: task.last_error ?? '' })}
+            className="h-auto shrink-0 p-0 text-[11px] font-normal text-muted-foreground hover:text-foreground"
+          >
+            Error details
+          </Button>
+        )}
+      </div>
+    )
+  }
   const detailText = taskDetailText(task)
   if (!detailText) {
     return <span className="text-muted-foreground">—</span>
@@ -436,7 +454,7 @@ function TaskCommonCells({
       <TableCell className="whitespace-nowrap px-3 py-2 text-right">
         {task.retry_count}/{task.max_retries}
       </TableCell>
-      <TableCell className="max-w-xs whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
+      <TableCell className="max-w-sm whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
         <TaskDetailsCell task={task} onOpenDetail={onOpenDetail} />
       </TableCell>
       <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">{timeAgo(task.scheduled_at)}</TableCell>
@@ -521,7 +539,9 @@ function UploadTasksTable({ tasks, retryPending, onRetry, onOpenDiagnostic, onOp
                 <TableCell className="whitespace-nowrap px-3 py-2">
                   <div className="flex items-center gap-3">
                     <span className="text-sm">{taskOperationLabel(task)}</span>
-                    {taskHasByteTransfer(task) && task.progress && <UploadProgressBar progress={task.progress} />}
+                    {taskHasByteTransfer(task) && task.progress?.scope === 'ingress_store' && (
+                      <UploadProgressBar progress={task.progress} />
+                    )}
                   </div>
                 </TableCell>
                 <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">

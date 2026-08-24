@@ -19,7 +19,6 @@ import {
   replacementConfirmationSummary,
   replacementErrorMessage,
   replacementNextStep,
-  replacementProgressLabel,
   replacementRetryable,
   replacementStatusLabel,
   replacementStatusTone,
@@ -59,6 +58,21 @@ function replacement(overrides: Partial<ProviderReplacement> = {}): ProviderRepl
     target: { id: 2, generation: 2, is_current: true, status: 'ready', provider_id: '202', data_set_id: '2002' },
     items_total: 10,
     items_copied: 3,
+    progress: {
+      scope: 'provider_replacement',
+      phase: 'migrate',
+      seeding_complete: true,
+      items_total: 10,
+      items_processed: 3,
+      items_copied: 3,
+      items_no_longer_needed: 0,
+      items_pending: 7,
+      items_active: 0,
+      items_retrying: 0,
+      items_waiting_source: 0,
+      items_failed: 0,
+      percent: 30,
+    },
     last_error: null,
     termination_epoch: null,
     created_at: '2026-08-01T00:00:00Z',
@@ -80,19 +94,8 @@ test('a historical generation is never offered for replacement', () => {
   assert.equal(dataSetReplaceable(dataSet({ is_current: false, replaceable: false }), []), false)
 })
 
-// Confirmation counts versions; progress counts stored content. Mixing the two
-// would tell the operator the wrong thing about what is being copied.
-test('confirmation and progress use their own units', () => {
+test('confirmation uses referenced versions and bytes', () => {
   assert.equal(replacementConfirmationSummary(dataSet()), '12 versions · 1 MB')
-  assert.equal(replacementProgressLabel(replacement()), 'Migrated 3 of 10 stored items')
-  assert.equal(
-    replacementProgressLabel(replacement({ status: 'preparing_target', items_total: 0, items_copied: 0 })),
-    'Creating the new storage service'
-  )
-  assert.equal(
-    replacementProgressLabel(replacement({ items_total: 0, items_copied: 0 })),
-    'Preparing the list of stored items'
-  )
 })
 
 test('only operator-owned states are retryable', () => {
@@ -130,13 +133,6 @@ test('every replacement that still needs something is surfaced', () => {
       replacement({ id: 8, status: 'cleanup_attention' }),
     ]).map((row) => row.id),
     [7, 8]
-  )
-})
-
-test('terminal migration progress separates copied content from content no longer needed', () => {
-  assert.equal(
-    replacementProgressLabel(replacement({ status: 'retiring', items_total: 10, items_copied: 8 })),
-    'Stored content migration is complete · 8 copied; 2 no longer needed'
   )
 })
 

@@ -145,6 +145,9 @@ func TestAPIStartDataSetReplacementManualMode(t *testing.T) {
 	if body.ItemsTotal != 0 || body.ItemsCopied != 0 {
 		t.Fatalf("progress = %d/%d, want no migration work yet", body.ItemsCopied, body.ItemsTotal)
 	}
+	if body.Progress == nil || body.Progress.Scope != "provider_replacement" || body.Progress.SeedingComplete || body.Progress.Percent != nil {
+		t.Fatalf("structured progress = %#v, want indeterminate provider replacement progress", body.Progress)
+	}
 }
 
 // Automatic selection must exclude every provider the bucket has ever used.
@@ -373,7 +376,7 @@ func TestRetryExhaustedRejectsReplacementCoordinator(t *testing.T) {
 		RefType:        "bucket",
 		RefID:          1,
 		IdempotencyKey: storagereplacement.MigrateTaskKey(42),
-		Payload:        storagereplacement.NewMigratePayload(42, 0, 0),
+		Payload:        storagereplacement.NewMigratePayload(42),
 		Status:         model.TaskStatusQueued,
 		MaxRetries:     1,
 	}

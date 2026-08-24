@@ -132,7 +132,7 @@ synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task retry 42
 ```
 
-提供方替换工作是例外：不要从 Tasks 重试。已完成或已停止的替换任务会提供 **Open Data Sets**，直接打开受影响存储桶的 **Details** → **Storage** → **Data Sets**。仅在页面显示 **Retry replacement** 时使用它；如果所选提供方已经存储该桶，请改选其他提供方。
+存储提供方替换工作是例外：不要从 Tasks 重试。复制重试和等待可读内容会自动继续，重启后也一样。已完成或已停止的替换任务会提供 **Open Data Sets**，直接打开受影响存储桶的 **Details** → **Storage** → **Data Sets**。仅在页面显示 **Retry replacement** 时使用它；需要处理的内容会按当前 `worker.provider_replacement.max_retries` 设置重试，已经完成的内容会保留。如果所选存储提供方已经存储该桶，请改选其他存储提供方。
 
 ## 存储提供方或 RPC 问题
 

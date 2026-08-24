@@ -39,6 +39,9 @@ description: 使用 SYNAPS3 环境变量覆盖配置，并理解适用场景。
 | `SYNAPS3_WORKER_UPLOAD_CONCURRENCY` | `worker.upload.concurrency` |
 | `SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL` | `worker.upload.poll_interval` |
 | `SYNAPS3_WORKER_UPLOAD_MAX_RETRIES` | `worker.upload.max_retries` |
+| `SYNAPS3_WORKER_PROVIDER_REPLACEMENT_CONCURRENCY` | `worker.provider_replacement.concurrency` |
+| `SYNAPS3_WORKER_PROVIDER_REPLACEMENT_POLL_INTERVAL` | `worker.provider_replacement.poll_interval` |
+| `SYNAPS3_WORKER_PROVIDER_REPLACEMENT_MAX_RETRIES` | `worker.provider_replacement.max_retries` |
 | `SYNAPS3_WORKER_EVICTOR_CONCURRENCY` | `worker.evictor.concurrency` |
 | `SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL` | `worker.evictor.poll_interval` |
 | `SYNAPS3_WORKER_EVICTOR_MAX_RETRIES` | `worker.evictor.max_retries` |

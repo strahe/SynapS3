@@ -115,6 +115,7 @@ export function applyUploadProgressUpdate(queryClient: QueryClient, payload: Upl
         (typeof payload.upload_id === 'number' && task.upload_id === payload.upload_id) ||
         task.ref_version_id === payload.version_id
       if (!matches) return task
+      if (task.progress?.scope === 'provider_replacement') return task
       const next = mergeProgress(task.progress, progress)
       if (next === task.progress) return task
       changed = true

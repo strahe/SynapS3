@@ -10,34 +10,21 @@ import (
 )
 
 func TestMigratePayloadRoundTrip(t *testing.T) {
-	task := &model.Task{Payload: NewMigratePayload(7, 42, 99)}
+	task := &model.Task{Payload: NewMigratePayload(7)}
 	got, err := ParseMigratePayload(task)
 	if err != nil {
 		t.Fatalf("ParseMigratePayload: %v", err)
 	}
-	want := MigratePayload{ReplacementID: 7, ItemID: 42, CopyID: 99}
+	want := MigratePayload{ReplacementID: 7}
 	if got != want {
 		t.Fatalf("payload = %+v, want %+v", got, want)
-	}
-}
-
-// Between items the coordinator holds no item and no copy, and must still be
-// decodable.
-func TestMigratePayloadWithoutAssignedItem(t *testing.T) {
-	task := &model.Task{Payload: NewMigratePayload(7, 0, 0)}
-	got, err := ParseMigratePayload(task)
-	if err != nil {
-		t.Fatalf("ParseMigratePayload: %v", err)
-	}
-	if got.ItemID != 0 || got.CopyID != 0 {
-		t.Fatalf("payload = %+v, want zero item and copy", got)
 	}
 }
 
 // Payloads survive a JSON round trip through the task table, so integers come
 // back as float64 or json.Number depending on the driver.
 func TestMigratePayloadSurvivesJSONRoundTrip(t *testing.T) {
-	encoded, err := json.Marshal(NewMigratePayload(7, 42, 99))
+	encoded, err := json.Marshal(NewMigratePayload(7))
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
@@ -54,8 +41,8 @@ func TestMigratePayloadSurvivesJSONRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseMigratePayload(useNumber=%v): %v", useNumber, err)
 		}
-		if got.ReplacementID != 7 || got.ItemID != 42 || got.CopyID != 99 {
-			t.Fatalf("payload = %+v, want 7/42/99", got)
+		if got.ReplacementID != 7 {
+			t.Fatalf("payload = %+v, want replacement 7", got)
 		}
 	}
 }

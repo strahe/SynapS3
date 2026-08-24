@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
@@ -456,6 +458,48 @@ func TestAPITasksIncludesPrimaryTransferProgress(t *testing.T) {
 	progress := body.Tasks[0].Progress
 	if progress.Scope != "ingress_store" || progress.Attempt != progressUpload.IngressStoreAttempt || progress.UploadedBytes != 5 || progress.TotalBytes != 20 || progress.Percent == nil || *progress.Percent != 25 || progress.Done {
 		t.Fatalf("progress = %#v, want 5/20 primary transfer progress", progress)
+	}
+}
+
+func TestAPITasksIncludesProviderReplacementProgress(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+	start := fixture.start(t, `{"mode":"manual","provider_id":"202"}`)
+	if start.Code != http.StatusCreated {
+		t.Fatalf("start replacement status=%d body=%s", start.Code, start.Body.String())
+	}
+	replacement := decodeReplacement(t, start)
+	if err := fixture.srv.repos.Tasks.Create(context.Background(), storagereplacement.NewRetireTask(
+		replacement.ID, fixture.bucket.ID, 5, time.Now(),
+	)); err != nil {
+		t.Fatalf("create retirement task: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/tasks", fixture.srv.handleAPITasks)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tasks status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, field := range []string{
+		`"seeding_complete":false`, `"items_total":0`, `"items_processed":0`,
+		`"items_waiting_source":0`, `"items_failed":0`,
+	} {
+		if !strings.Contains(rec.Body.String(), field) {
+			t.Fatalf("tasks body missing %s: %s", field, rec.Body.String())
+		}
+	}
+	var body taskListResponse
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(body.Tasks) != 2 {
+		t.Fatalf("tasks = %#v, want migration and retirement coordinators", body.Tasks)
+	}
+	for i := range body.Tasks {
+		if body.Tasks[i].Progress == nil || body.Tasks[i].Progress.Scope != "provider_replacement" {
+			t.Fatalf("task %d progress = %#v, want provider replacement progress", body.Tasks[i].ID, body.Tasks[i].Progress)
+		}
 	}
 }
 

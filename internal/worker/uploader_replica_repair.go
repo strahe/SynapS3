@@ -491,7 +491,8 @@ func (u *Uploader) commitReplicaRepairCopy(
 		ExtraData: extraData,
 		OnSubmitted: func(txHash string) {
 			submittedTx = txHash
-			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
+			evidenceCtx, evidenceCancel := providerEvidenceContext(ctx)
+			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(evidenceCtx, repository.MarkUploadCopyCommittingInput{
 				StorageUploadCopyID: copyRow.ID,
 				RequireEligibleCopy: true,
 				UploadID:            upload.ID,
@@ -499,6 +500,7 @@ func (u *Uploader) commitReplicaRepairCopy(
 				CommitExtraDataHex:  extraHex,
 				CommitTransactionID: txHash,
 			})
+			evidenceCancel()
 		},
 	})
 	if submittedTx != "" && submitErr != nil {

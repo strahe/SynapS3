@@ -28,18 +28,21 @@ type Worker interface {
 
 // Manager coordinates the lifecycle of all background workers.
 type Manager struct {
-	repos            *repository.Repositories
-	workers          []Worker
-	logger           *slog.Logger
-	stateMachine     *state.Machine
-	evictionPolicy   cache.EvictionPolicy
-	uploadMaxRetries int
-	evictMaxRetries  int
+	repos                         *repository.Repositories
+	workers                       []Worker
+	logger                        *slog.Logger
+	stateMachine                  *state.Machine
+	evictionPolicy                cache.EvictionPolicy
+	uploadMaxRetries              int
+	evictMaxRetries               int
+	providerReplacementMaxRetries int
+	providerReplacementRecovery   time.Duration
 }
 
 const (
-	defaultUploadMaxRetries = 5
-	reconcileBatchSize      = 100
+	defaultUploadMaxRetries                = 5
+	defaultProviderReplacementRecoveryWait = 5 * time.Second
+	reconcileBatchSize                     = 100
 )
 
 const (
@@ -54,14 +57,25 @@ const (
 // NewManager creates a new worker manager.
 func NewManager(repos *repository.Repositories, logger *slog.Logger, evictionPolicy cache.EvictionPolicy, workers ...Worker) *Manager {
 	return &Manager{
-		repos:            repos,
-		workers:          workers,
-		logger:           logger,
-		stateMachine:     state.NewObjectStateMachine(),
-		evictionPolicy:   evictionPolicy,
-		uploadMaxRetries: defaultUploadMaxRetries,
-		evictMaxRetries:  defaultEvictMaxRetries,
+		repos:                         repos,
+		workers:                       workers,
+		logger:                        logger,
+		stateMachine:                  state.NewObjectStateMachine(),
+		evictionPolicy:                evictionPolicy,
+		uploadMaxRetries:              defaultUploadMaxRetries,
+		evictMaxRetries:               defaultEvictMaxRetries,
+		providerReplacementMaxRetries: defaultUploadMaxRetries,
+		providerReplacementRecovery:   defaultProviderReplacementRecoveryWait,
 	}
+}
+
+// WithProviderReplacementRecovery configures provider replacement startup recovery.
+func (m *Manager) WithProviderReplacementRecovery(maxRetries int, retryInterval time.Duration) *Manager {
+	m.providerReplacementMaxRetries = maxRetries
+	if retryInterval > 0 {
+		m.providerReplacementRecovery = retryInterval
+	}
+	return m
 }
 
 // WithTaskMaxRetries configures max retries for tasks recreated during startup reconciliation.
@@ -72,11 +86,17 @@ func (m *Manager) WithTaskMaxRetries(uploadMaxRetries, evictMaxRetries int) *Man
 }
 
 // Start launches all registered workers and blocks until ctx is cancelled.
-// It performs startup recovery before launching workers.
 func (m *Manager) Start(ctx context.Context) {
-	m.recoverOnStartup(ctx)
+	if !m.recoverOnStartup(ctx) {
+		return
+	}
 
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		m.recoverProviderReplacementQueue(ctx)
+	}()
 
 	for _, w := range m.workers {
 		wg.Add(1)
@@ -96,14 +116,13 @@ func (m *Manager) Start(ctx context.Context) {
 
 // recoverOnStartup releases expired task leases and resets objects stuck
 // in intermediate states from a previous crash.
-func (m *Manager) recoverOnStartup(ctx context.Context) {
+func (m *Manager) recoverOnStartup(ctx context.Context) bool {
 	released, err := m.repos.Tasks.ReleaseExpiredLeases(ctx)
 	if err != nil {
 		m.logger.Error("failed to release expired task leases", "error", err)
 	} else if released > 0 {
 		m.logger.Info("released expired task leases", "count", released)
 	}
-
 	keepStage := ""
 	switch m.evictionPolicy {
 	case cache.EvictionPolicyLRU:
@@ -131,6 +150,35 @@ func (m *Manager) recoverOnStartup(ctx context.Context) {
 		m.logger.Error("failed to check exhausted tasks", "error", err)
 	} else if len(exhaustedTasks) > 0 {
 		m.logger.Warn("exhausted tasks found on startup, review via GET /admin/exhausted-tasks", "count", len(exhaustedTasks))
+	}
+	return ctx.Err() == nil
+}
+
+func (m *Manager) recoverProviderReplacementQueue(ctx context.Context) bool {
+	for {
+		itemBudgets, budgetErr := m.repos.Replacements.InitializeReplacementItemRetryBudgets(
+			ctx, m.providerReplacementMaxRetries,
+		)
+		if budgetErr != nil {
+			m.logger.Error("failed to initialize provider replacement item retry budgets", "error", budgetErr)
+		} else if itemBudgets > 0 {
+			m.logger.Info("initialized provider replacement item retry budgets", "count", itemBudgets)
+		}
+
+		releasedItems, leaseErr := m.repos.Replacements.ReleaseExpiredItemLeases(ctx)
+		if leaseErr != nil {
+			m.logger.Error("failed to release expired provider replacement item leases", "error", leaseErr)
+		} else if releasedItems > 0 {
+			m.logger.Info("released expired provider replacement item leases", "count", releasedItems)
+		}
+		if budgetErr == nil && leaseErr == nil {
+			return true
+		}
+		m.logger.Warn("provider replacement startup recovery will retry",
+			"after", m.providerReplacementRecovery)
+		if !sleepUntilNextWorkerPoll(ctx, m.providerReplacementRecovery) {
+			return false
+		}
 	}
 }
 

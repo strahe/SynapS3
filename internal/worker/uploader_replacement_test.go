@@ -140,16 +140,22 @@ func (r *replacementEnv) runUploaderUntil(t *testing.T, cond func() bool, timeou
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := make(chan struct{})
 	uploader := r.newUploader()
+	replacementWorker := r.newProviderReplacementWorker(uploader)
+	done := make(chan struct{}, 2)
 	go func() {
-		defer close(done)
 		_ = uploader.Run(ctx)
+		done <- struct{}{}
+	}()
+	go func() {
+		_ = replacementWorker.Run(ctx)
+		done <- struct{}{}
 	}()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cond() {
 			cancel()
+			<-done
 			<-done
 			return
 		}
@@ -157,12 +163,36 @@ func (r *replacementEnv) runUploaderUntil(t *testing.T, cond func() bool, timeou
 	}
 	cancel()
 	<-done
+	<-done
 	t.Fatal("uploader did not reach the expected state before the timeout")
 }
 
 func (r *replacementEnv) newUploader() *worker.Uploader {
 	return worker.NewUploader(r.env.repos, r.env.cache, r.env.storage, nil, r.env.sm,
-		cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default())
+		cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default(),
+		worker.WithProviderReplacementMaxRetries(5))
+}
+
+func (r *replacementEnv) newProviderReplacementWorker(uploader *worker.Uploader) *worker.ProviderReplacementWorker {
+	return worker.NewProviderReplacementWorker(r.env.repos, uploader, 4, 10*time.Millisecond, slog.Default())
+}
+
+func (r *replacementEnv) runReplacementUntilTask(t *testing.T, taskID int64, timeout time.Duration) *model.Task {
+	t.Helper()
+	var final *model.Task
+	r.runUploaderUntil(t, func() bool {
+		task, err := r.env.repos.Tasks.GetByID(context.Background(), taskID)
+		if err != nil || task == nil {
+			return false
+		}
+		if task.Status == model.TaskStatusQueued || task.Status == model.TaskStatusScheduled ||
+			task.Status == model.TaskStatusWaiting || task.Status == model.TaskStatusRunning {
+			return false
+		}
+		final = task
+		return true
+	}, timeout)
+	return final
 }
 
 // The whole approved flow: prepare the new service, switch the slot, copy the
@@ -173,7 +203,7 @@ func TestUploader_ReplacementPreparesActivatesAndMigrates(t *testing.T) {
 	row := fixture.authorize(t, "202")
 	task := fixture.coordinatorTask(t, row.ID)
 
-	final := runWorkerUntilTask(t, fixture.env, fixture.newUploader(), task.ID, 20*time.Second)
+	final := fixture.runReplacementUntilTask(t, task.ID, 20*time.Second)
 	if final == nil || final.Status != model.TaskStatusCompleted {
 		t.Fatalf("coordinator task = %#v, want completed", final)
 	}
@@ -250,9 +280,11 @@ func TestUploader_ReplacementWaitsWhenNoSourceIsReadable(t *testing.T) {
 	if got.LastError != nil {
 		t.Fatalf("last_error = %v, want waiting to record no failure", *got.LastError)
 	}
-	items, err := fixture.env.repos.Replacements.NextExecutableItem(ctx, row.ID)
-	if err != nil || items == nil || items.Status != storagereplacement.ItemStatusWaitingSource {
-		t.Fatalf("parked item = %#v err=%v, want waiting_source", items, err)
+	var item storagereplacement.Item
+	if err := fixture.env.db.NewSelect().Model(&item).
+		Where("replacement_id = ?", row.ID).
+		Scan(ctx); err != nil || item.Status != storagereplacement.ItemStatusWaitingSource {
+		t.Fatalf("parked item = %#v err=%v, want waiting_source", item, err)
 	}
 }
 
@@ -338,7 +370,7 @@ func seedRetirementFixture(t *testing.T) *retirementFixture {
 	base := seedReplacementEnv(t)
 	row := base.authorize(t, "202")
 	migrate := base.coordinatorTask(t, row.ID)
-	if final := runWorkerUntilTask(t, base.env, base.newUploader(), migrate.ID, 20*time.Second); final == nil ||
+	if final := base.runReplacementUntilTask(t, migrate.ID, 20*time.Second); final == nil ||
 		final.Status != model.TaskStatusCompleted {
 		t.Fatalf("migration coordinator = %#v, want completed", final)
 	}
@@ -857,7 +889,7 @@ func (h *cancelReplacementWaitHook) AfterQuery(_ context.Context, event *bun.Que
 	}
 }
 
-func TestUploader_ReplacementWaitCancellationRollsBackBothStates(t *testing.T) {
+func TestUploader_ReplacementWaitCancellationDoesNotPartiallyPauseLifecycle(t *testing.T) {
 	fixture := seedReplacementEnv(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -880,16 +912,24 @@ func TestUploader_ReplacementWaitCancellationRollsBackBothStates(t *testing.T) {
 	task := fixture.coordinatorTask(t, replacement.ID)
 	hook := &cancelReplacementWaitHook{cancel: cancel}
 	fixture.env.db.AddQueryHook(hook)
-	done := make(chan struct{})
+	uploader := fixture.newUploader()
+	replacementWorker := fixture.newProviderReplacementWorker(uploader)
+	done := make(chan struct{}, 2)
 	go func() {
-		defer close(done)
-		_ = fixture.newUploader().Run(ctx)
+		_ = uploader.Run(ctx)
+		done <- struct{}{}
+	}()
+	go func() {
+		_ = replacementWorker.Run(ctx)
+		done <- struct{}{}
 	}()
 
 	select {
 	case <-done:
+		<-done
 	case <-time.After(20 * time.Second):
 		cancel()
+		<-done
 		<-done
 		t.Fatal("uploader did not reach the replacement wait before the timeout")
 	}
@@ -908,8 +948,10 @@ func TestUploader_ReplacementWaitCancellationRollsBackBothStates(t *testing.T) {
 	if err != nil || settled == nil {
 		t.Fatalf("GetByID task = %#v err=%v", settled, err)
 	}
-	if settled.Status == model.TaskStatusWaiting || settled.WaitReason != nil {
-		t.Fatalf("task = %#v, want the cancelled wait rolled back", settled)
+	terminal := settled.Status == model.TaskStatusCompleted || settled.Status == model.TaskStatusFailed ||
+		settled.Status == model.TaskStatusExhausted || settled.Status == model.TaskStatusCancelled
+	if settled.RetryCount != 0 || terminal {
+		t.Fatalf("task = %#v, want an active coordinator with retry budget untouched", settled)
 	}
 }
 

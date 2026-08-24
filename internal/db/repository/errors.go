@@ -36,6 +36,10 @@ var ErrUploadTaskCancelled = errors.New("upload task cancelled")
 // ErrTaskClaimLost reports that a worker no longer owns the running task claim.
 var ErrTaskClaimLost = errors.New("task claim lost")
 
+// ErrItemClaimLost reports that a provider replacement worker no longer owns
+// the item lease identified by its fencing token.
+var ErrItemClaimLost = errors.New("replacement item claim lost")
+
 // ErrReplacementRetryUnsupported means the task belongs to an operator-approved
 // provider replacement, which resumes only through its own retry action so the
 // replacement record and the task never disagree. It wraps ErrConflict.

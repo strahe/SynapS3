@@ -14,7 +14,9 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/strahe/synaps3/internal/config"
 	synaps3db "github.com/strahe/synaps3/internal/db"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 	_ "modernc.org/sqlite"
 )
@@ -65,6 +67,47 @@ func TestRetirementCoverageProductionSQLUsesIndexes(t *testing.T) {
 			plan := sqliteProductionQueryPlan(t, sqldb, tt.query, tt.args...)
 			if !strings.Contains(plan, tt.index) {
 				t.Fatalf("production query plan =\n%s\nwant %s", plan, tt.index)
+			}
+		})
+	}
+
+	readyPlan := sqliteProductionQueryPlan(t, sqldb, readyReplacementSelectionSQL(dialect.SQLite),
+		storagereplacement.StatusMigrating,
+		storagereplacement.StatusWaiting,
+		storagereplacement.WaitReasonReadableSource,
+		time.Now(),
+		time.Now(),
+	)
+	for _, index := range []string{"idx_storage_replacement_items_due", "idx_storage_replacement_items_lease"} {
+		if !strings.Contains(readyPlan, index) {
+			t.Fatalf("ready replacement plan =\n%s\nwant %s", readyPlan, index)
+		}
+	}
+
+	candidateTests := []struct {
+		name  string
+		query string
+		args  []any
+		index string
+	}{
+		{
+			name:  "due replacement item",
+			query: readyReplacementDueItemSQL(),
+			args:  []any{int64(1), time.Now()},
+			index: "idx_storage_replacement_items_due",
+		},
+		{
+			name:  "expired replacement item",
+			query: readyReplacementExpiredItemSQL(),
+			args:  []any{int64(1), time.Now()},
+			index: "idx_storage_replacement_items_lease",
+		},
+	}
+	for _, tt := range candidateTests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := sqliteProductionQueryPlan(t, sqldb, tt.query, tt.args...)
+			if !strings.Contains(plan, tt.index) || strings.Contains(plan, "USE TEMP B-TREE") {
+				t.Fatalf("replacement item candidate plan =\n%s\nwant %s without a temp sort", plan, tt.index)
 			}
 		})
 	}

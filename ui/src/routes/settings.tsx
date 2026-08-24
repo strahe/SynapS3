@@ -101,6 +101,9 @@ const tabFields = {
     'worker.upload.concurrency',
     'worker.upload.poll_interval',
     'worker.upload.max_retries',
+    'worker.provider_replacement.concurrency',
+    'worker.provider_replacement.poll_interval',
+    'worker.provider_replacement.max_retries',
     'worker.evictor.concurrency',
     'worker.evictor.poll_interval',
     'worker.evictor.max_retries',
@@ -583,6 +586,14 @@ function SettingsPage() {
               onChange={(value) => setForm({ ...form, worker: { ...form.worker, upload: value } })}
             />
             <WorkerSection
+              title="Provider Replacement Worker"
+              prefix="worker.provider_replacement"
+              value={form.worker.provider_replacement}
+              data={data}
+              errors={fieldErrors}
+              onChange={(value) => setForm({ ...form, worker: { ...form.worker, provider_replacement: value } })}
+            />
+            <WorkerSection
               title="Evictor Worker"
               prefix="worker.evictor"
               value={form.worker.evictor}
@@ -933,7 +944,7 @@ function WorkerSection({
   onChange,
 }: {
   title: string
-  prefix: 'worker.upload' | 'worker.evictor' | 'worker.storage_cleanup'
+  prefix: 'worker.upload' | 'worker.provider_replacement' | 'worker.evictor' | 'worker.storage_cleanup'
   value: SettingsEditableConfig['worker']['upload']
   data: SettingsData
   errors: Record<string, string>

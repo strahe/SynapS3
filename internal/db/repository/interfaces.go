@@ -567,9 +567,6 @@ type StorageReplacementRepository interface {
 	GetByClientRequestID(ctx context.Context, bucketID int64, clientRequestID string) (*storagereplacement.Replacement, error)
 	ListForBucket(ctx context.Context, bucketID int64, limit int) ([]storagereplacement.Replacement, error)
 	GetActiveForDataSet(ctx context.Context, dataSetID int64) (*storagereplacement.Replacement, error)
-	// HeldItemCopyID reports the target copy the coordinator is writing right
-	// now, or zero when it holds no item.
-	HeldItemCopyID(ctx context.Context, replacementID int64) (int64, error)
 	// HasInProgressForDataSet reports whether recovery must leave this data set
 	// alone. Terminally failed work does not count, so a stuck slot can still
 	// repair in place.
@@ -581,20 +578,34 @@ type StorageReplacementRepository interface {
 	// in one transaction. It touches a fixed number of rows regardless of how
 	// much history the bucket holds.
 	Activate(ctx context.Context, replacementID int64) error
-	// SeedMigrationBatch inserts one bounded batch of migration work and
-	// advances the cursor. done reports that the whole history has been scanned.
-	SeedMigrationBatch(ctx context.Context, replacementID int64, limit int) (inserted int, done bool, err error)
-	NextExecutableItem(ctx context.Context, replacementID int64) (*storagereplacement.Item, error)
+	// SeedMigrationBatchWithBudget inserts one bounded batch of migration work,
+	// snapshots its retry budget, and advances the cursor.
+	SeedMigrationBatchWithBudget(ctx context.Context, replacementID int64, limit, maxRetries int) (inserted int, done bool, err error)
+	InitializeReplacementItemRetryBudgets(ctx context.Context, maxRetries int) (int, error)
+	ReleaseExpiredItemLeases(ctx context.Context) (int, error)
+	ClaimReadyReplacementItem(ctx context.Context, leaseTTL time.Duration) (*storagereplacement.Item, error)
+	RenewReplacementItemLease(ctx context.Context, token storagereplacement.ClaimToken, leaseTTL time.Duration) error
+	ReleaseReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
+	CompleteReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
+	WaitReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextCheck time.Time, lastError string) error
+	DeferReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextAttempt time.Time) error
+	RetryReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextAttempt time.Time, lastError string) (storagereplacement.ItemStatus, error)
+	PauseMigration(ctx context.Context, replacementID, expectedStateVersion int64, reason storagereplacement.WaitReason) error
+	ReplacementExecution(ctx context.Context, replacementID int64) (storagereplacement.ExecutionSnapshot, error)
+	ReplacementProgresses(ctx context.Context, replacementIDs []int64) (map[int64]storagereplacement.ProgressSnapshot, error)
+	RunningReplacementItemClaimForUpload(ctx context.Context, replacementID, uploadID int64) (*storagereplacement.ClaimToken, error)
 	// AcquireItem re-derives a consistent snapshot and revalidates the worker
 	// claim. No provider call may start before it returns.
 	AcquireItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error)
 	AttachTargetCopy(ctx context.Context, input AttachReplacementTargetCopyInput) (*model.StorageUploadCopy, error)
-	MarkItemCopied(ctx context.Context, itemID int64) error
-	MarkItemWaitingSource(ctx context.Context, itemID int64, lastError string) error
 
 	MarkMigrating(ctx context.Context, replacementID int64) error
 	MarkWaiting(ctx context.Context, replacementID int64, reason storagereplacement.WaitReason) error
 	MarkFailed(ctx context.Context, replacementID int64, reason *storagereplacement.FailureReason, lastError string) error
+	// FailCoordinator fails a replacement and its running coordinator atomically.
+	FailCoordinator(ctx context.Context, input ReplacementCoordinatorFailureInput) error
+	// ScheduleCoordinatorRetry updates the replacement and coordinator atomically.
+	ScheduleCoordinatorRetry(ctx context.Context, input ReplacementCoordinatorRetryInput) (model.TaskStatus, error)
 	MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error
 	BeginRetirement(ctx context.Context, replacementID int64) error
 	RecordTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
@@ -625,15 +636,29 @@ type AuthorizeReplacementInput struct {
 }
 
 type RetryReplacementInput struct {
+	ReplacementID  int64
+	MaxRetries     int
+	ItemMaxRetries int
+}
+
+type ReplacementCoordinatorFailureInput struct {
 	ReplacementID int64
-	MaxRetries    int
+	Task          *model.Task
+	FailureReason *storagereplacement.FailureReason
+	LastError     string
+}
+
+type ReplacementCoordinatorRetryInput struct {
+	ReplacementID int64
+	Task          *model.Task
+	LastError     string
+	Backoff       time.Duration
 }
 
 type AcquireReplacementItemInput struct {
 	ReplacementID int64
 	ItemID        int64
-	TaskID        int64
-	TaskClaimedAt time.Time
+	ItemClaimedAt time.Time
 }
 
 // ReplacementItemSnapshot is the consistent view one migration item needs.
@@ -650,6 +675,7 @@ type AttachReplacementTargetCopyInput struct {
 	ReplacementID int64
 	ItemID        int64
 	UploadID      int64
+	ItemClaimedAt time.Time
 }
 
 type RecordTerminationEpochInput struct {
@@ -688,6 +714,7 @@ type TaskRepository interface {
 	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*model.Task, error)
 	HasActiveByIdempotencyKey(ctx context.Context, idempotencyKey string) (bool, error)
 	HasEarlierRunningUploadCopyTask(ctx context.Context, claimedTask *model.Task, uploadID int64, copyIndex int) (bool, error)
+	HasEarlierRunningUploadCopyClaim(ctx context.Context, claimedAt time.Time, uploadID int64, copyIndex int) (bool, error)
 
 	// ClaimReady atomically claims one ready task of the given type by
 	// transitioning it to running and setting a lease. Returns nil if no task is available.

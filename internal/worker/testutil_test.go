@@ -73,11 +73,17 @@ func newTestWorkerEnvWithMockCache(t *testing.T, mc *testutil.MockCache) *testWo
 type stubWorker struct {
 	name      string
 	isHealthy bool
+	run       func(context.Context) error
 }
 
-func (s *stubWorker) Name() string                { return s.name }
-func (s *stubWorker) Run(_ context.Context) error { return nil }
-func (s *stubWorker) Healthy() bool               { return s.isHealthy }
+func (s *stubWorker) Name() string { return s.name }
+func (s *stubWorker) Run(ctx context.Context) error {
+	if s.run != nil {
+		return s.run(ctx)
+	}
+	return nil
+}
+func (s *stubWorker) Healthy() bool { return s.isHealthy }
 
 func taskPayloadInt64ForTest(payload map[string]interface{}, key string) int64 {
 	raw, ok := payload[key]

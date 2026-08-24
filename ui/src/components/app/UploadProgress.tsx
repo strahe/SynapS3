@@ -42,7 +42,14 @@ export function UploadProgressBar({ progress }: { progress?: UploadTransferProgr
 
   return (
     <div className="inline-flex w-32 shrink-0 items-center gap-2" title={`${percent}% uploaded`}>
-      <Progress value={percent} className="min-w-0 flex-1 [&_[data-slot=progress-indicator]]:bg-status-info" />
+      <Progress
+        value={percent}
+        aria-label="Upload progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+        className="min-w-0 flex-1 [&_[data-slot=progress-indicator]]:bg-status-info"
+      />
       <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted-foreground">{percent}%</span>
     </div>
   )

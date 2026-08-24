@@ -72,6 +72,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `database` | SQLite or PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
 | `worker.upload` | Background Filecoin storage concurrency, polling, and retries. |
+| `worker.provider_replacement` | Provider-replacement transfer concurrency, polling, and copy retries. |
 | `worker.evictor` | Local cache eviction tasks. |
 | `worker.storage_cleanup` | Remote copy cleanup tasks. |
 | `logging` | Runtime log level, format, and S3 access logs. |
@@ -96,11 +97,16 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `cache.lru_low_watermark_percent` | `80` |
 | `worker.upload.concurrency` | `4` |
 | `worker.upload.max_retries` | `5` |
+| `worker.provider_replacement.concurrency` | `4` |
+| `worker.provider_replacement.poll_interval` | `5s` |
+| `worker.provider_replacement.max_retries` | `5` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
+
+`worker.provider_replacement` settings do not affect ordinary uploads. Changing `worker.provider_replacement.max_retries` applies to replacement work discovered afterward and content retried with **Retry replacement**; work already in progress keeps its current limit. Changes to provider replacement concurrency, polling, or retries require a SynapS3 restart.
 
 ## Admin Session Lifetime
 

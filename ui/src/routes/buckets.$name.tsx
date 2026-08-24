@@ -55,6 +55,7 @@ import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
+import { ProviderReplacementProgress as ReplacementProgressView } from '@/components/app/ProviderReplacementProgress'
 import { ProviderSelect } from '@/components/app/ProviderSelect'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
@@ -169,7 +170,6 @@ import {
   replacementConfirmationSummary,
   replacementErrorMessage,
   replacementNextStep,
-  replacementProgressLabel,
   replacementRetryable,
   replacementStatusLabel,
   replacementStatusTone,
@@ -1762,7 +1762,14 @@ function UploadDialogProgress({ item }: { item: UploadDialogItem }) {
   const percent = item.status === 'success' ? 100 : item.percent
   return (
     <div className="inline-flex w-36 shrink-0 items-center gap-2" title={`${percent}% uploaded`}>
-      <Progress value={percent} className="min-w-0 flex-1" />
+      <Progress
+        value={percent}
+        aria-label="Upload progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+        className="min-w-0 flex-1"
+      />
       <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted-foreground">{percent}%</span>
     </div>
   )
@@ -2089,7 +2096,7 @@ function ProviderReplacementProgressCard({
           {replacementStatusLabel(replacement.status)}
         </StatusBadge>
       </div>
-      <div className="text-sm text-muted-foreground">{replacementProgressLabel(replacement)}</div>
+      <ReplacementProgressView progress={replacement.progress} />
       {nextStep && <div className="text-sm text-muted-foreground">{nextStep}</div>}
       {replacement.last_error && (
         <BucketDetailAction

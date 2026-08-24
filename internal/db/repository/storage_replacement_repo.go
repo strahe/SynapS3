@@ -259,7 +259,7 @@ func linkSupersededReplacements(ctx context.Context, db bun.IDB, ids []int64, su
 // data rather than remembered, so a retry always restarts at the stage the
 // replacement actually reached.
 func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplacementInput) (*storagereplacement.Replacement, error) {
-	if input.ReplacementID <= 0 {
+	if input.ReplacementID <= 0 || input.MaxRetries < 0 || input.ItemMaxRetries < 0 {
 		return nil, fmt.Errorf("retrying provider replacement: %w", ErrInvalidInput)
 	}
 	var resumed *storagereplacement.Replacement
@@ -306,6 +306,19 @@ func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplac
 			next = storagereplacement.StatusMigrating
 		}
 		now := time.Now()
+		if _, err := db.NewUpdate().Model((*storagereplacement.Item)(nil)).
+			Set("status = ?", storagereplacement.ItemStatusPending).
+			Set("retry_count = 0").
+			Set("max_retries = ?", input.ItemMaxRetries).
+			Set("scheduled_at = ?", now).
+			Set("last_error = NULL").
+			Set("claimed_at = NULL").
+			Set("lease_until = NULL").
+			Set("updated_at = ?", now).
+			Where("replacement_id = ? AND status = ?", row.ID, storagereplacement.ItemStatusFailed).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("resetting failed replacement items: %w", err)
+		}
 		if err := transitionReplacement(ctx, db, row.ID, []storagereplacement.Status{row.Status}, next, func(q *bun.UpdateQuery) *bun.UpdateQuery {
 			return q.Set("last_error = NULL").Set("wait_reason = NULL").Set("failure_reason = NULL")
 		}, now); err != nil {
@@ -444,6 +457,62 @@ func (r *BunStorageReplacementRepo) MarkFailed(
 				Set("wait_reason = NULL").
 				Set("failure_reason = ?", reason)
 		})
+}
+
+func (r *BunStorageReplacementRepo) FailCoordinator(
+	ctx context.Context,
+	input ReplacementCoordinatorFailureInput,
+) error {
+	if input.ReplacementID <= 0 || input.Task == nil ||
+		(input.FailureReason != nil && !input.FailureReason.Valid()) {
+		return fmt.Errorf("failing provider replacement coordinator: %w", ErrInvalidInput)
+	}
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		replacements := &BunStorageReplacementRepo{db: db}
+		if err := replacements.MarkFailed(ctx, input.ReplacementID, input.FailureReason, input.LastError); err != nil {
+			return err
+		}
+		if err := (&BunTaskRepo{db: db}).FailRunning(ctx, input.Task, input.LastError); err != nil {
+			return fmt.Errorf("stopping provider replacement coordinator: %w", err)
+		}
+		return nil
+	})
+}
+
+func (r *BunStorageReplacementRepo) ScheduleCoordinatorRetry(
+	ctx context.Context,
+	input ReplacementCoordinatorRetryInput,
+) (model.TaskStatus, error) {
+	if input.ReplacementID <= 0 || input.Task == nil {
+		return "", fmt.Errorf("scheduling provider replacement coordinator retry: %w", ErrInvalidInput)
+	}
+	var taskStatus model.TaskStatus
+	err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		replacement, err := lockReplacementByID(ctx, db, input.ReplacementID)
+		if err != nil {
+			return err
+		}
+		taskStatus, err = (&BunTaskRepo{db: db}).ScheduleRetryRunning(ctx, input.Task, input.LastError, input.Backoff)
+		if err != nil || taskStatus != model.TaskStatusExhausted {
+			return err
+		}
+
+		next, changed := storagereplacement.OnTaskExhausted(replacement.Status)
+		if !changed {
+			return nil
+		}
+		replacementError := input.LastError + " (max retries reached)"
+		return transitionReplacement(ctx, db, replacement.ID, []storagereplacement.Status{replacement.Status}, next,
+			func(q *bun.UpdateQuery) *bun.UpdateQuery {
+				return q.Set("last_error = ?", replacementError).
+					Set("wait_reason = NULL").
+					Set("failure_reason = NULL")
+			}, time.Now())
+	})
+	if err != nil {
+		return "", err
+	}
+	return taskStatus, nil
 }
 
 // MarkCleanupAttention is committed in the same transaction that stops the
@@ -694,6 +763,7 @@ func transitionReplacement(
 	q := db.NewUpdate().
 		Model((*storagereplacement.Replacement)(nil)).
 		Set("status = ?", to).
+		Set("state_version = state_version + 1").
 		Set("updated_at = ?", now).
 		Where("id = ?", replacementID).
 		Where("status IN (?)", bun.List(allowed))

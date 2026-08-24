@@ -30,6 +30,7 @@ function baseConfig(): SettingsEditableConfig {
     },
     worker: {
       upload: { concurrency: 4, poll_interval: '5s', max_retries: 5 },
+      provider_replacement: { concurrency: 4, poll_interval: '5s', max_retries: 5 },
       evictor: { concurrency: 2, poll_interval: '1m0s', max_retries: 3 },
       storage_cleanup: { concurrency: 2, poll_interval: '1m0s', max_retries: 5 },
     },
@@ -123,4 +124,19 @@ test('settings payload omits env-managed LRU watermarks', () => {
 
   assert.equal(payload.cache?.lru_high_watermark_percent, undefined)
   assert.equal(payload.cache?.lru_low_watermark_percent, undefined)
+})
+
+test('settings payload keeps provider replacement worker independent from uploads', () => {
+  const initial = baseConfig()
+  const form = baseConfig()
+  form.worker.provider_replacement = { concurrency: 7, poll_interval: '11s', max_retries: 9 }
+
+  const payload = buildSettingsPayload(form, initial, {})
+
+  assert.deepEqual(payload.worker?.provider_replacement, {
+    concurrency: 7,
+    poll_interval: '11s',
+    max_retries: 9,
+  })
+  assert.deepEqual(payload.worker?.upload, { concurrency: 4, poll_interval: '5s', max_retries: 5 })
 })

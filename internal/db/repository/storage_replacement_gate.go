@@ -87,10 +87,12 @@ func evaluateRetirementGate(ctx context.Context, db bun.IDB, replacementID int64
 	waiting, err := db.NewSelect().
 		Model((*storagereplacement.Item)(nil)).
 		Where("replacement_id = ?", row.ID).
-		Where("status IN (?, ?, ?)",
+		Where("status IN (?, ?, ?, ?, ?)",
 			storagereplacement.ItemStatusPending,
 			storagereplacement.ItemStatusRunning,
-			storagereplacement.ItemStatusWaitingSource).
+			storagereplacement.ItemStatusRetrying,
+			storagereplacement.ItemStatusWaitingSource,
+			storagereplacement.ItemStatusFailed).
 		Count(ctx)
 	if err != nil {
 		return gate, fmt.Errorf("counting outstanding replacement items: %w", err)

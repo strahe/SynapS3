@@ -2837,7 +2837,7 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID.String(),
-		RetrievalURL: "https://primary.example/piece",
+		RetrievalURL: fmt.Sprintf("https://provider-101.example/piece/%s", pieceCID.String()),
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
@@ -2992,7 +2992,7 @@ func TestUploader_RejectedSubmittedIngressCommitIsResubmitted(t *testing.T) {
 		UploadID:     upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID.String(),
-		RetrievalURL: "https://primary.example/piece",
+		RetrievalURL: fmt.Sprintf("https://provider-101.example/piece/%s", pieceCID.String()),
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
@@ -3081,7 +3081,7 @@ func TestUploader_SubmittedPeerMismatchedStatusRemainsRecoverableAfterExhaustion
 		UploadID:     fixture.upload.ID,
 		CopyIndex:    1,
 		PieceCID:     pieceCID.String(),
-		RetrievalURL: "https://peer.example/piece",
+		RetrievalURL: fmt.Sprintf("https://provider-202.example/piece/%s", pieceCID.String()),
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
@@ -3339,7 +3339,7 @@ func TestUploader_ReplicaRepairResubmitsRejectedCommit(t *testing.T) {
 		UploadID:     fixture.upload.ID,
 		CopyIndex:    1,
 		PieceCID:     pieceCID.String(),
-		RetrievalURL: "https://peer.example/piece",
+		RetrievalURL: fmt.Sprintf("https://provider-202.example/piece/%s", pieceCID.String()),
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}

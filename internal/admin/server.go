@@ -36,34 +36,35 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr                     string
-	db                       *bun.DB
-	cache                    cache.Cache
-	objectReader             *objectreader.Reader
-	objectStorage            synapse.StorageClient
-	cacheGate                *cacheaccess.Gate
-	cacheAccessTracker       *cacheaccess.Tracker
-	objectUploader           objectUploader
-	objectVersionRestorer    objectVersionRestorer
-	cacheMaxBytes            int64
-	repos                    *repository.Repositories
-	bucketLifecycle          *bucketlifecycle.Service
-	workerHealth             WorkerHealthChecker
-	wallet                   synapse.WalletQuerier
-	filecoinReadiness        filecoinReadinessProbe
-	observability            *observability.Service
-	taskDiagnosticChecker    taskDiagnosticStatusChecker
-	providerIdentity         providerIdentityLookup
-	events                   *EventHub
-	settings                 *SettingsService
-	auth                     *authService
-	trustedProxies           []netip.Prefix
-	s3IAM                    auth.IAMService
-	s3RootAccess             string
-	filecoinDefaultCopies    int
-	evictMaxRetries          int
-	storageCleanupMaxRetries int
-	uploadMaxRetries         int
+	addr                          string
+	db                            *bun.DB
+	cache                         cache.Cache
+	objectReader                  *objectreader.Reader
+	objectStorage                 synapse.StorageClient
+	cacheGate                     *cacheaccess.Gate
+	cacheAccessTracker            *cacheaccess.Tracker
+	objectUploader                objectUploader
+	objectVersionRestorer         objectVersionRestorer
+	cacheMaxBytes                 int64
+	repos                         *repository.Repositories
+	bucketLifecycle               *bucketlifecycle.Service
+	workerHealth                  WorkerHealthChecker
+	wallet                        synapse.WalletQuerier
+	filecoinReadiness             filecoinReadinessProbe
+	observability                 *observability.Service
+	taskDiagnosticChecker         taskDiagnosticStatusChecker
+	providerIdentity              providerIdentityLookup
+	events                        *EventHub
+	settings                      *SettingsService
+	auth                          *authService
+	trustedProxies                []netip.Prefix
+	s3IAM                         auth.IAMService
+	s3RootAccess                  string
+	filecoinDefaultCopies         int
+	evictMaxRetries               int
+	storageCleanupMaxRetries      int
+	uploadMaxRetries              int
+	providerReplacementMaxRetries int
 	// replacementSelector resolves an automatic replacement provider. Nil means
 	// only an explicit Provider ID can be confirmed.
 	replacementSelector providerReplacementSelector
@@ -97,25 +98,26 @@ func New(
 		panic("admin server requires a cache access tracker")
 	}
 	s := &Server{
-		addr:                     addr,
-		db:                       db,
-		cache:                    c,
-		cacheGate:                cacheGate,
-		cacheAccessTracker:       cacheAccessTracker,
-		objectReader:             objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
-		cacheMaxBytes:            cacheMaxBytes,
-		repos:                    repos,
-		bucketLifecycle:          bucketlifecycle.New(repos, c, logger),
-		workerHealth:             wh,
-		wallet:                   newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
-		taskDiagnosticChecker:    synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{}),
-		events:                   newAdminEventHub(),
-		filecoinDefaultCopies:    boundedBucketCopies(filecoinDefaultCopies),
-		evictMaxRetries:          5,
-		storageCleanupMaxRetries: 5,
-		uploadMaxRetries:         5,
-		logger:                   logger,
-		startedAt:                time.Now(),
+		addr:                          addr,
+		db:                            db,
+		cache:                         c,
+		cacheGate:                     cacheGate,
+		cacheAccessTracker:            cacheAccessTracker,
+		objectReader:                  objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
+		cacheMaxBytes:                 cacheMaxBytes,
+		repos:                         repos,
+		bucketLifecycle:               bucketlifecycle.New(repos, c, logger),
+		workerHealth:                  wh,
+		wallet:                        newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
+		taskDiagnosticChecker:         synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{}),
+		events:                        newAdminEventHub(),
+		filecoinDefaultCopies:         boundedBucketCopies(filecoinDefaultCopies),
+		evictMaxRetries:               5,
+		storageCleanupMaxRetries:      5,
+		uploadMaxRetries:              5,
+		providerReplacementMaxRetries: 5,
+		logger:                        logger,
+		startedAt:                     time.Now(),
 	}
 	s.watchWalletOperationEvents()
 	return s
@@ -216,6 +218,14 @@ func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 func (s *Server) WithUploadMaxRetries(maxRetries int) *Server {
 	if maxRetries > 0 {
 		s.uploadMaxRetries = maxRetries
+	}
+	return s
+}
+
+// WithProviderReplacementMaxRetries sets the provider replacement retry limit.
+func (s *Server) WithProviderReplacementMaxRetries(maxRetries int) *Server {
+	if maxRetries >= 0 {
+		s.providerReplacementMaxRetries = maxRetries
 	}
 	return s
 }

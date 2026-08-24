@@ -1948,7 +1948,7 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
 		UploadID:     upload.ID,
 		CopyIndex:    0,
-		PieceCID:     "piece-after-commit-retry",
+		PieceCID:     "piece-after-store-retry",
 		PieceID:      onChainIDPtr(t, "2001"),
 		RetrievalURL: "https://provider.example/retry",
 	}); err != nil {

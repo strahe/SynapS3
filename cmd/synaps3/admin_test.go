@@ -581,6 +581,7 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 			"100.00 GiB",
 			"cache.lru_high_watermark_percent",
 			"cache.lru_low_watermark_percent",
+			"worker.provider_replacement.concurrency",
 			"Logging",
 		} {
 			if !strings.Contains(out, want) {
@@ -724,6 +725,11 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 				if cache["lru_low_watermark_percent"] != float64(70) {
 					t.Fatalf("cache.lru_low_watermark_percent = %#v, want 70", cache["lru_low_watermark_percent"])
 				}
+				worker := body["worker"].(map[string]any)
+				providerReplacement := worker["provider_replacement"].(map[string]any)
+				if providerReplacement["poll_interval"] != "9s" {
+					t.Fatalf("worker.provider_replacement.poll_interval = %#v, want 9s", providerReplacement["poll_interval"])
+				}
 				filecoin := body["filecoin"].(map[string]any)
 				if filecoin["with_cdn"] != true {
 					t.Fatalf("filecoin.with_cdn = %#v, want true", filecoin["with_cdn"])
@@ -749,7 +755,8 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 		out, err := runAdminCommand(t, []string{
 			"synaps3", "admin", "--admin-url", ts.URL,
 			"settings", "set", "cache.max_size_gb=8", "cache.lru_high_watermark_percent=85",
-			"cache.lru_low_watermark_percent=70", "filecoin.with_cdn=true", "logging.level=debug",
+			"cache.lru_low_watermark_percent=70", "worker.provider_replacement.poll_interval=9s",
+			"filecoin.with_cdn=true", "logging.level=debug",
 			"logging.s3_access.enabled=false", "logging.s3_access.level=debug",
 		})
 		if err != nil {
@@ -995,8 +1002,10 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 				"lru_low_watermark_percent":  80,
 			},
 			"worker": map[string]any{
-				"upload":  map[string]any{"concurrency": 4, "poll_interval": "5s", "max_retries": 5},
-				"evictor": map[string]any{"concurrency": 2, "poll_interval": "1m0s", "max_retries": 3},
+				"upload":               map[string]any{"concurrency": 4, "poll_interval": "5s", "max_retries": 5},
+				"provider_replacement": map[string]any{"concurrency": 4, "poll_interval": "5s", "max_retries": 5},
+				"evictor":              map[string]any{"concurrency": 2, "poll_interval": "1m0s", "max_retries": 3},
+				"storage_cleanup":      map[string]any{"concurrency": 2, "poll_interval": "1m0s", "max_retries": 5},
 			},
 			"logging": map[string]any{
 				"level":     "info",
