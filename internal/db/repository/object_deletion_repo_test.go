@@ -13,6 +13,102 @@ import (
 	"github.com/uptrace/bun"
 )
 
+func TestObjectRepo_UpdateObjectDeletionCacheCleanup(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "deletion-cache-cleanup-bucket")
+
+	deleteVersion := func(t *testing.T, key, versionID string) {
+		t.Helper()
+		version := newObjectVersion(bucket.ID, key, versionID, 100)
+		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+			t.Fatalf("CreateVersionAndSetCurrent: %v", err)
+		}
+		if _, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+			BucketID:  bucket.ID,
+			Key:       key,
+			VersionID: versionID,
+		}); err != nil {
+			t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+		}
+	}
+
+	t.Run("deleted", func(t *testing.T) {
+		const versionID = "01J000000000000000CACHE01"
+		deleteVersion(t, "deleted.txt", versionID)
+
+		if err := repos.Objects.UpdateObjectDeletionCacheCleanup(ctx, versionID, model.CacheCleanupStatusDeleted, ""); err != nil {
+			t.Fatalf("UpdateObjectDeletionCacheCleanup: %v", err)
+		}
+
+		var deletion model.ObjectDeletion
+		if err := db.NewSelect().Model(&deletion).Where("version_id = ?", versionID).Scan(ctx); err != nil {
+			t.Fatalf("select deletion: %v", err)
+		}
+		if deletion.CacheCleanupStatus != model.CacheCleanupStatusDeleted {
+			t.Errorf("CacheCleanupStatus = %q, want %q", deletion.CacheCleanupStatus, model.CacheCleanupStatusDeleted)
+		}
+		if deletion.CacheError != nil {
+			t.Errorf("CacheError = %q, want nil", *deletion.CacheError)
+		}
+		if deletion.CacheCleanedAt == nil {
+			t.Error("CacheCleanedAt is nil")
+		}
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		const (
+			versionID  = "01J000000000000000CACHE02"
+			cacheError = "disk I/O error"
+		)
+		deleteVersion(t, "failed.txt", versionID)
+
+		if err := repos.Objects.UpdateObjectDeletionCacheCleanup(ctx, versionID, model.CacheCleanupStatusFailed, cacheError); err != nil {
+			t.Fatalf("UpdateObjectDeletionCacheCleanup: %v", err)
+		}
+
+		var deletion model.ObjectDeletion
+		if err := db.NewSelect().Model(&deletion).Where("version_id = ?", versionID).Scan(ctx); err != nil {
+			t.Fatalf("select deletion: %v", err)
+		}
+		if deletion.CacheCleanupStatus != model.CacheCleanupStatusFailed {
+			t.Errorf("CacheCleanupStatus = %q, want %q", deletion.CacheCleanupStatus, model.CacheCleanupStatusFailed)
+		}
+		if deletion.CacheError == nil || *deletion.CacheError != cacheError {
+			t.Errorf("CacheError = %v, want %q", deletion.CacheError, cacheError)
+		}
+		if deletion.CacheCleanedAt == nil {
+			t.Error("CacheCleanedAt is nil")
+		}
+	})
+
+	t.Run("invalid input", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			versionID string
+			status    model.CacheCleanupStatus
+		}{
+			{name: "empty version ID", status: model.CacheCleanupStatusDeleted},
+			{name: "empty status", versionID: "01J000000000000000CACHE03"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := repos.Objects.UpdateObjectDeletionCacheCleanup(ctx, tc.versionID, tc.status, "")
+				if !errors.Is(err, repository.ErrInvalidInput) {
+					t.Fatalf("UpdateObjectDeletionCacheCleanup error = %v, want ErrInvalidInput", err)
+				}
+			})
+		}
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		err := repos.Objects.UpdateObjectDeletionCacheCleanup(ctx, "01J000000000000000MISSING", model.CacheCleanupStatusDeleted, "")
+		if !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("UpdateObjectDeletionCacheCleanup error = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 func TestObjectRepo_DeleteObjectVersionPermanentlyRemovesVersionAndQueuesStorageCleanup(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

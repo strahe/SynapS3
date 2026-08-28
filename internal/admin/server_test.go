@@ -427,10 +427,18 @@ func TestWithSecurityHeadersSensitivePaths(t *testing.T) {
 	}))
 
 	for _, path := range []string{
+		"/api/",
+		"//api/",
 		"/api/v1/auth/session",
+		"//api/v1/auth/session",
+		"/admin/",
+		"//admin/",
 		"/admin/exhausted-tasks",
+		"//admin/exhausted-tasks",
 		"/metrics",
+		"//metrics",
 		"/healthz",
+		"//healthz",
 	} {
 		t.Run(path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, path, nil)

@@ -50,6 +50,37 @@ func TestBucketRepo_GetByName_NotFound(t *testing.T) {
 	}
 }
 
+func TestBucketRepo_GetNamesByIDs(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	names, err := repos.Buckets.GetNamesByIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("GetNamesByIDs empty: %v", err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("GetNamesByIDs empty = %v, want empty map", names)
+	}
+
+	first := &model.Bucket{Name: "names-first", Status: model.BucketStatusActive}
+	second := &model.Bucket{Name: "names-second", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, first); err != nil {
+		t.Fatalf("Create first: %v", err)
+	}
+	if err := repos.Buckets.Create(ctx, second); err != nil {
+		t.Fatalf("Create second: %v", err)
+	}
+
+	names, err = repos.Buckets.GetNamesByIDs(ctx, []int64{first.ID, second.ID, 999})
+	if err != nil {
+		t.Fatalf("GetNamesByIDs: %v", err)
+	}
+	if len(names) != 2 || names[first.ID] != first.Name || names[second.ID] != second.Name {
+		t.Fatalf("GetNamesByIDs = %v, want {%d: %q, %d: %q}", names, first.ID, first.Name, second.ID, second.Name)
+	}
+}
+
 func TestBucketRepo_GetByID(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -120,6 +151,33 @@ func TestBucketRepo_UpdateCopyPolicy(t *testing.T) {
 	}
 	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies || got.MinimumDurableCopies != nil {
 		t.Fatalf("copy policy after minimum clear = %#v, want target %d and strict minimum", got, copies)
+	}
+}
+
+func TestBucketRepo_SetDefaultCopies(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "set-default-copies", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	copies := 5
+	if err := repos.Buckets.SetDefaultCopies(ctx, bucket.Name, &copies); err != nil {
+		t.Fatalf("SetDefaultCopies: %v", err)
+	}
+	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies {
+		t.Fatalf("DefaultCopies = %#v, want %d", got, copies)
+	}
+
+	if err := repos.Buckets.SetDefaultCopies(ctx, "missing-bucket", &copies); err == nil {
+		t.Fatal("SetDefaultCopies missing bucket succeeded")
 	}
 }
 

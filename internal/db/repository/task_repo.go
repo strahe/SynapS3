@@ -211,18 +211,18 @@ func (r *BunTaskRepo) HasEarlierRunningUploadCopyTask(ctx context.Context, claim
 		return false, err
 	}
 	uploadIDExpr, copyIndexExpr := runningUploadCopyTaskPayloadExpressions(r.db.Dialect().Name())
-	count, err := r.db.NewSelect().
+	exists, err := r.db.NewSelect().
 		Model((*model.Task)(nil)).
 		Where("type = ?", model.TaskTypeUpload).
 		Where("status = ?", model.TaskStatusRunning).
 		Where(uploadIDExpr+" = ?", uploadID).
 		Where(copyIndexExpr+" = ?", copyIndex).
 		Where("(claimed_at < ? OR (claimed_at = ? AND id < ?))", claimedAt, claimedAt, taskID).
-		Count(ctx)
+		Exists(ctx)
 	if err != nil {
 		return false, fmt.Errorf("checking earlier running upload copy task: %w", err)
 	}
-	return count > 0, nil
+	return exists, nil
 }
 
 // HasEarlierRunningUploadCopyClaim checks upload precedence for a replacement item.
@@ -236,18 +236,18 @@ func (r *BunTaskRepo) HasEarlierRunningUploadCopyClaim(
 		return false, fmt.Errorf("checking earlier upload copy claim: %w", ErrInvalidInput)
 	}
 	uploadIDExpr, copyIndexExpr := runningUploadCopyTaskPayloadExpressions(r.db.Dialect().Name())
-	count, err := r.db.NewSelect().
+	exists, err := r.db.NewSelect().
 		Model((*model.Task)(nil)).
 		Where("type = ?", model.TaskTypeUpload).
 		Where("status = ?", model.TaskStatusRunning).
 		Where(uploadIDExpr+" = ?", uploadID).
 		Where(copyIndexExpr+" = ?", copyIndex).
 		Where("claimed_at <= ?", claimedAt).
-		Count(ctx)
+		Exists(ctx)
 	if err != nil {
 		return false, fmt.Errorf("checking earlier upload copy claim: %w", err)
 	}
-	return count > 0, nil
+	return exists, nil
 }
 
 func runningUploadCopyTaskPayloadExpressions(dialectName dialect.Name) (string, string) {
