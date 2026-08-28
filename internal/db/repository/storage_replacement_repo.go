@@ -669,7 +669,7 @@ func (r *BunStorageReplacementRepo) GetActiveForDataSet(ctx context.Context, dat
 // attention states so a generation whose replacement gave up can still recover
 // and repair in place.
 func (r *BunStorageReplacementRepo) HasInProgressForDataSet(ctx context.Context, dataSetID int64) (bool, error) {
-	count, err := r.db.NewSelect().
+	exists, err := r.db.NewSelect().
 		Model((*storagereplacement.Replacement)(nil)).
 		Where("source_data_set_id = ? OR target_data_set_id = ?", dataSetID, dataSetID).
 		Where("status IN (?, ?, ?, ?)",
@@ -677,11 +677,11 @@ func (r *BunStorageReplacementRepo) HasInProgressForDataSet(ctx context.Context,
 			storagereplacement.StatusMigrating,
 			storagereplacement.StatusWaiting,
 			storagereplacement.StatusRetiring).
-		Count(ctx)
+		Exists(ctx)
 	if err != nil {
 		return false, fmt.Errorf("checking in-progress provider replacement: %w", err)
 	}
-	return count > 0, nil
+	return exists, nil
 }
 
 func (r *BunStorageReplacementRepo) ListActive(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error) {

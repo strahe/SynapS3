@@ -1317,15 +1317,15 @@ func prepareObjectVersionsForPermanentDelete(
 		}
 	}
 	if len(taskIDs) > 0 {
-		activeTasks, err := db.NewSelect().
+		activeTasksExist, err := db.NewSelect().
 			Model((*model.Task)(nil)).
 			Where("id IN (?)", bun.List(taskIDs)).
 			Where("status IN (?)", bun.List(activeTaskStatuses())).
-			Count(ctx)
+			Exists(ctx)
 		if err != nil {
 			return fmt.Errorf("rechecking active storage tasks for permanent delete: %w", err)
 		}
-		if activeTasks > 0 {
+		if activeTasksExist {
 			return ErrPermanentDeleteStorageBusy
 		}
 	}
@@ -1569,14 +1569,14 @@ func reuseStorageCleanupTask(ctx context.Context, db bun.IDB, task *model.Task, 
 		return &task.ID, nil
 	}
 
-	remainingCopies, err := db.NewSelect().
+	remainingCopiesExist, err := db.NewSelect().
 		Model((*model.StorageCleanupCopy)(nil)).
 		Where("task_id = ? AND status <> ?", task.ID, model.StorageCleanupCopyStatusRemoved).
-		Count(ctx)
+		Exists(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("checking retained storage cleanup copies: %w", err)
 	}
-	if remainingCopies == 0 {
+	if !remainingCopiesExist {
 		return &task.ID, nil
 	}
 

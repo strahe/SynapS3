@@ -382,7 +382,10 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'")
-		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/admin/") || r.URL.Path == "/metrics" || r.URL.Path == "/healthz" {
+		cleanPath := canonicalAdminAuthPath(r.URL.Path)
+		if cleanPath == "/api" || strings.HasPrefix(cleanPath, "/api/") ||
+			cleanPath == "/admin" || strings.HasPrefix(cleanPath, "/admin/") ||
+			cleanPath == "/metrics" || cleanPath == "/healthz" {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
