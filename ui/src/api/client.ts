@@ -169,6 +169,7 @@ export interface ObservabilityDataSetFacts {
   client_data_set_id?: string
   local_status: string
   active_piece_count?: number
+  has_active_pieces?: boolean
 }
 
 export interface ObservabilityDataSetObservation {
@@ -236,6 +237,7 @@ export interface DataSetStorageHealthInfo {
   status: StorageHealthStatus
   reason_codes: string[] | null
   active_piece_count?: number
+  has_active_pieces?: boolean
   last_checked_at?: string
   last_error?: string
   stale: boolean

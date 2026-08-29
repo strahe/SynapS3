@@ -124,6 +124,7 @@ type dataSetStorageHealthInfo struct {
 	Status           string                     `json:"status"`
 	ReasonCodes      []observability.ReasonCode `json:"reason_codes"`
 	ActivePieceCount *int64                     `json:"active_piece_count,omitempty"`
+	HasActivePieces  *bool                      `json:"has_active_pieces,omitempty"`
 	LastCheckedAt    string                     `json:"last_checked_at,omitempty"`
 	LastError        *string                    `json:"last_error,omitempty"`
 	Stale            bool                       `json:"stale"`
@@ -676,6 +677,7 @@ func (s *Server) dataSetStorageHealthInfo(observation observability.DataSetObser
 		Status:           string(observation.Signal.Status),
 		ReasonCodes:      reasonCodes,
 		ActivePieceCount: observation.Facts.ActivePieceCount,
+		HasActivePieces:  observation.Facts.HasActivePieces,
 		LastCheckedAt:    lastCheckedAt,
 		LastError:        observation.Signal.LastError,
 		Stale:            observation.Signal.Freshness.Stale,

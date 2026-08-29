@@ -153,7 +153,8 @@ func sameDataSetMetadata(left, right map[string]string) bool {
 		return false
 	}
 	for key, value := range right {
-		if left[key] != value {
+		got, ok := left[key]
+		if !ok || got != value {
 			return false
 		}
 	}

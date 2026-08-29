@@ -1170,12 +1170,14 @@ func TestAPIBucketDetail_DataSetStorageHealthQueryFailureReturnsUnknownPlacehold
 
 func TestDataSetStorageHealthInfoEncodesEmptyReasonCodesArray(t *testing.T) {
 	checkedAt := time.Date(2026, 5, 24, 12, 0, 0, 123456789, time.UTC)
+	hasActivePieces := true
 	srv := (&Server{logger: testLogger()}).
 		WithObservability(observability.NewService(observability.ServiceOptions{RefreshInterval: time.Hour}))
 
 	info := srv.dataSetStorageHealthInfo(observability.DataSetObservation{
 		Facts: observability.DataSetFacts{
-			LocalDataSetID: 1,
+			LocalDataSetID:  1,
+			HasActivePieces: &hasActivePieces,
 		},
 		Signal: observability.Signal{
 			Status:      observability.StatusAvailable,
@@ -1195,6 +1197,9 @@ func TestDataSetStorageHealthInfoEncodesEmptyReasonCodesArray(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"reason_codes":[]`) {
 		t.Fatalf("storage health reason_codes should be an empty array: %s", body)
+	}
+	if !strings.Contains(string(body), `"has_active_pieces":true`) {
+		t.Fatalf("storage health should include active piece presence: %s", body)
 	}
 }
 

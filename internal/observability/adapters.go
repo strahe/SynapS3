@@ -55,13 +55,21 @@ func (s *StorageDataSetScanner) ScanWalletDataSets(ctx context.Context) ([]Chain
 		if dataSet == nil || dataSet.DataSetInfo == nil {
 			continue
 		}
+		hasActivePieces := dataSet.HasActivePieces
+		var activePieceCount *int64
+		if dataSet.IsLive && !hasActivePieces {
+			zero := int64(0)
+			activePieceCount = &zero
+		}
 		out = append(out, ChainDataSet{
-			DataSetID:       idtypes.OnChainIDFromSDK(dataSet.DataSetID),
-			ClientDataSetID: onChainIDPtrFromSDK(dataSet.ClientDataSetID),
-			ProviderID:      idtypes.OnChainIDFromSDK(dataSet.ProviderID),
-			IsLive:          dataSet.IsLive,
-			IsManaged:       dataSet.IsManaged,
-			Metadata:        dataSet.Metadata,
+			DataSetID:        idtypes.OnChainIDFromSDK(dataSet.DataSetID),
+			ClientDataSetID:  onChainIDPtrFromSDK(dataSet.ClientDataSetID),
+			ProviderID:       idtypes.OnChainIDFromSDK(dataSet.ProviderID),
+			IsLive:           dataSet.IsLive,
+			IsManaged:        dataSet.IsManaged,
+			ActivePieceCount: activePieceCount,
+			HasActivePieces:  &hasActivePieces,
+			Metadata:         dataSet.Metadata,
 		})
 	}
 	return out, nil

@@ -98,6 +98,24 @@ func TestWaitForSubmittedCommitRejectsConfirmedWithoutPieces(t *testing.T) {
 	}
 }
 
+func TestWaitForSubmittedCommitRejectsSDKTerminalStatuses(t *testing.T) {
+	for _, txStatus := range []string{"failed", "reorged"} {
+		t.Run(txStatus, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":%q,"dataSetId":1001,"pieceCount":0,"addMessageOk":false,"piecesAdded":false}`, submittedCommitTestTxHash, txStatus)
+			}))
+			defer srv.Close()
+
+			dataSetID := onChainID(t, "1001")
+			u := &Uploader{statusChecker: testSubmittedCommitChecker(time.Second)}
+			_, err := u.waitForSubmittedCommit(t.Context(), submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &dataSetID}, submittedCommitTestTxHash, 1)
+			if !errors.Is(err, errCommitRejected) {
+				t.Fatalf("waitForSubmittedCommit error = %v, want errCommitRejected", err)
+			}
+		})
+	}
+}
+
 func TestWaitForSubmittedCommitHasGlobalTimeout(t *testing.T) {
 	originalMaxWait := submittedCommitMaxWait
 	submittedCommitMaxWait = 40 * time.Millisecond

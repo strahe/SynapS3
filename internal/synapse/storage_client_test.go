@@ -94,6 +94,42 @@ func TestStorageServiceAdapterFindMatchingDataSetUsesExactMetadataAndStablePrefe
 	}
 }
 
+func TestStorageServiceAdapterFindMatchingDataSetRequiresEmptyMetadataKey(t *testing.T) {
+	t.Parallel()
+
+	payer := common.HexToAddress("0x1001")
+	providerID := sdktypes.NewBigInt(202)
+	finder := &staticDataSetFinder{dataSets: []*storage.DataSetDetails{
+		dataSetDetails(10, 1010, 202, true, true, true, 0, map[string]string{
+			"source": dataSetSource,
+			"bucket": "photos",
+			"extra":  "",
+		}),
+		dataSetDetails(20, 1020, 202, true, true, true, 0, map[string]string{
+			"source":  dataSetSource,
+			"bucket":  "photos",
+			"withCDN": "",
+		}),
+	}}
+	service, err := storage.New(storage.Options{DataSetFinder: finder, PayerAddress: payer})
+	if err != nil {
+		t.Fatalf("storage.New: %v", err)
+	}
+
+	ref, err := AdaptStorageService(service).FindMatchingDataSet(
+		t.Context(),
+		providerID,
+		map[string]string{"bucket": "photos"},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("FindMatchingDataSet: %v", err)
+	}
+	if ref == nil || ref.DataSetID().String() != "20" {
+		t.Fatalf("matching ref = %#v, want data set 20 with an explicit withCDN key", ref)
+	}
+}
+
 func TestStorageServiceAdapterPrepareUploadReturnsCostsWithoutFunding(t *testing.T) {
 	t.Parallel()
 

@@ -553,6 +553,9 @@ func chainEvidence(dataSet ChainDataSet) map[string]any {
 	if dataSet.ActivePieceCount != nil {
 		evidence["active_piece_count"] = *dataSet.ActivePieceCount
 	}
+	if dataSet.HasActivePieces != nil {
+		evidence["has_active_pieces"] = *dataSet.HasActivePieces
+	}
 	return evidence
 }
 

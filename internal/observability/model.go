@@ -104,6 +104,7 @@ type ChainDataSet struct {
 	IsLive           bool
 	IsManaged        bool
 	ActivePieceCount *int64
+	HasActivePieces  *bool
 	Metadata         map[string]string
 }
 
@@ -197,6 +198,7 @@ type DataSetFacts struct {
 	ClientDataSetID  *types.OnChainID           `json:"client_data_set_id,omitempty"`
 	LocalStatus      model.StorageDataSetStatus `json:"local_status"`
 	ActivePieceCount *int64                     `json:"active_piece_count,omitempty"`
+	HasActivePieces  *bool                      `json:"has_active_pieces,omitempty"`
 }
 
 type CopyFacts struct {

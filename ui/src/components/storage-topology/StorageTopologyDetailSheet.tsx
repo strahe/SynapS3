@@ -11,6 +11,7 @@ import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { activePiecesValue } from '@/lib/data-set-storage-health'
 import { replicaLabel } from '@/lib/storage-status-labels'
 import {
   dataSetDisplayLabel,
@@ -249,10 +250,7 @@ function DataSetDetailContent({
           value={dataSet.facts.local_status}
           badgeTone={localStatusTone(dataSet.facts.local_status)}
         />
-        <DetailRow
-          label="Active pieces"
-          value={dataSet.facts.active_piece_count === undefined ? '—' : formatNumber(dataSet.facts.active_piece_count)}
-        />
+        <DetailRow label="Active pieces" value={activePiecesValue(dataSet.facts)} />
       </DetailBlock>
       <SignalDetailBlock signal={dataSet.signal} />
     </>

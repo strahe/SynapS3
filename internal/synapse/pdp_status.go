@@ -119,6 +119,10 @@ func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input
 	if err := validateDataSetCreationStatusIdentity(input, result, status.CreateMessageHash.Hex()); err != nil {
 		return result.withError(PDPStatusMismatch, err.Error())
 	}
+	if errors.Is(err, pdp.ErrTxRejected) {
+		result.State = PDPStatusRejected
+		return result
+	}
 	result.State = classifyCreationStatus(status.TxStatus, status.DataSetCreated)
 	return result
 }
@@ -178,6 +182,10 @@ func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiec
 	if err := validateAddPiecesStatusIdentity(input, result, status.TxHash.Hex()); err != nil {
 		result.State = PDPStatusMismatch
 		return result, err
+	}
+	if errors.Is(err, pdp.ErrTxRejected) {
+		result.State = PDPStatusRejected
+		return result, nil
 	}
 	result.State = classifyAddPiecesStatus(status.TxStatus, status.PiecesAdded, status.PieceCount, input.ExpectedPieceCount, len(result.ConfirmedPieceIDs))
 	return result, nil

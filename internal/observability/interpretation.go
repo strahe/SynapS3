@@ -104,9 +104,20 @@ func DataSetObservationFromState(state DataSetState, interval time.Duration, now
 			ClientDataSetID:  state.ClientDataSetID,
 			LocalStatus:      state.LocalStatus,
 			ActivePieceCount: state.ActivePieceCount,
+			HasActivePieces:  dataSetHasActivePieces(state),
 		},
 		Signal: BuildSignal(state.Status, state.ReasonCodes, state.LastError, checkedAt, interval, now),
 	}
+}
+
+func dataSetHasActivePieces(state DataSetState) *bool {
+	if value, ok := state.Evidence["has_active_pieces"].(bool); ok {
+		return new(value)
+	}
+	if state.ActivePieceCount != nil {
+		return new(*state.ActivePieceCount > 0)
+	}
+	return nil
 }
 
 func CopyHealthFromFacts(facts CopyFacts, dataSetObservation *DataSetObservation, interval time.Duration, now time.Time) Signal {
