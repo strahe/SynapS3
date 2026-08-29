@@ -179,9 +179,18 @@ func (u *Uploader) createReplacementDataSet(
 		//
 		// A creation this replacement did submit is resumed by the creating
 		// branch below, which resolves the recorded transaction instead.
-		if dataSetID := storageCtx.DataSetID(); dataSetID != nil {
+		matchingRef, err := u.storage.FindMatchingDataSet(
+			ctx,
+			target.ProviderID.SDK(),
+			map[string]string{"bucket": bucket.Name},
+			storageCtx.CDNEnabled(),
+		)
+		if err != nil {
+			return false, err
+		}
+		if matchingRef != nil {
 			return false, fmt.Errorf("provider %s already runs data set %s for this bucket: %w",
-				target.ProviderID.String(), idtypes.OnChainIDFromSDK(*dataSetID).String(),
+				target.ProviderID.String(), idtypes.OnChainIDFromSDK(matchingRef.DataSetID()).String(),
 				storagereplacement.ErrTargetInUse)
 		}
 		var submitted storage.CreateDataSetSubmission
@@ -203,16 +212,21 @@ func (u *Uploader) createReplacementDataSet(
 		if err != nil {
 			return false, err
 		}
+		dataSetID, clientDataSetID, err := dataSetResultIDsForBinding(target, result)
+		if err != nil {
+			return false, err
+		}
 		return true, u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 			ID:              target.ID,
-			DataSetID:       idtypes.OnChainIDFromSDK(result.DataSetID),
-			ClientDataSetID: onChainIDPtrFromSDK(result.ClientDataSetID),
+			DataSetID:       dataSetID,
+			ClientDataSetID: &clientDataSetID,
 		})
 	case model.StorageDataSetStatusCreating:
 		if target.CreateTransactionID == nil || target.CreateStatusURL == nil || target.ClientDataSetID == nil {
 			return false, errDataSetCreationIncomplete
 		}
 		result, err := storageCtx.WaitForDataSetCreated(ctx, storage.CreateDataSetSubmission{
+			ProviderID:      target.ProviderID.SDK(),
 			TransactionID:   *target.CreateTransactionID,
 			StatusURL:       *target.CreateStatusURL,
 			ClientDataSetID: sdkBigIntPtr(target.ClientDataSetID),
@@ -220,10 +234,14 @@ func (u *Uploader) createReplacementDataSet(
 		if err != nil {
 			return false, err
 		}
+		dataSetID, clientDataSetID, err := dataSetResultIDsForBinding(target, result)
+		if err != nil {
+			return false, err
+		}
 		return true, u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 			ID:              target.ID,
-			DataSetID:       idtypes.OnChainIDFromSDK(result.DataSetID),
-			ClientDataSetID: onChainIDPtrFromSDK(result.ClientDataSetID),
+			DataSetID:       dataSetID,
+			ClientDataSetID: &clientDataSetID,
 		})
 	default:
 		return false, fmt.Errorf("replacement %d target status %s cannot be prepared", replacement.ID, target.Status)
@@ -248,7 +266,7 @@ func (u *Uploader) migrateReplacementItem(
 			u.handleReplacementTaskFailure(ctx, task, replacement.ID, logger, "load replacement bucket", err)
 			return
 		}
-		if _, err := u.contextForReadyBinding(ctx, target, bucket.Name); err != nil {
+		if _, err := u.contextForReadyBinding(ctx, target); err != nil {
 			u.handleReplacementProviderFailure(ctx, task, replacement, logger, "check replacement target", err)
 			return
 		}
@@ -356,7 +374,7 @@ func (u *Uploader) ensureReplacementFundingReady(
 		u.handleReplacementProviderFailure(ctx, task, replacement, logger, "open replacement funding context", err)
 		return false
 	}
-	costs, err := u.storage.PrepareUpload(ctx, uint64(objectlimits.MinFOCUploadSize), []synapse.UploadContext{storageCtx})
+	costs, err := u.storage.PrepareUpload(ctx, uint64(objectlimits.MinFOCUploadSize), []synapse.StorageTarget{storageCtx})
 	if err != nil {
 		u.handleReplacementProviderFailure(ctx, task, replacement, logger, "prepare replacement funding", err)
 		return false

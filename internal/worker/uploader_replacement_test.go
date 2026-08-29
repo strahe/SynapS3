@@ -84,14 +84,14 @@ func seedReplacementEnv(t *testing.T) *replacementEnv {
 
 	sourceCtx := readyFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	targetCtx := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3002), testCID(t))
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		switch {
 		case createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)):
 			return sourceCtx, nil
 		case createContextDataSetIDEqual(opts, sdktypes.NewBigInt(2002)), createContextProviderIDEqual(opts, sdktypes.NewBigInt(202)):
 			return targetCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 	return &replacementEnv{
 		env: env, bucket: bucket, upload: upload, versionID: versionID,
@@ -295,7 +295,7 @@ func TestUploader_ReplacementWaitsForFundingBeforeCreatingTheService(t *testing.
 	task := fixture.coordinatorTask(t, row.ID)
 	var createCalls atomic.Int32
 	fixture.targetCtx.createCalls = &createCalls
-	fixture.env.storage.PrepareUploadFunc = func(context.Context, uint64, []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+	fixture.env.storage.PrepareUploadFunc = func(context.Context, uint64, []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 		return &storage.MultiContextCosts{Ready: false}, nil
 	}
 
@@ -956,12 +956,8 @@ func TestUploader_ReplacementWaitCancellationDoesNotPartiallyPauseLifecycle(t *t
 }
 
 // A replacement has to open its own paid service. If the chosen provider still
-// runs a live service for this bucket, the SDK hands back a context already
-// bound to it -- and attaching there would leave the replacement paying for,
-// and later retiring, a service it does not own.
-//
-// The fixture's target context is deliberately unbound, so this branch was
-// never reached by any existing test.
+// runs a live service for this bucket, adopting it would leave the replacement
+// paying for, and later retiring, a service it does not own.
 func TestUploader_ReplacementNeverAttachesToAnExistingService(t *testing.T) {
 	fixture := seedReplacementEnv(t)
 	ctx := context.Background()
@@ -972,9 +968,19 @@ func TestUploader_ReplacementNeverAttachesToAnExistingService(t *testing.T) {
 	existing := readyFakeUploadContext(
 		sdktypes.NewBigInt(202), sdktypes.NewBigInt(9002), sdktypes.NewBigInt(3002), testCID(t))
 	existing.createCalls = &createCalls
-	fixture.env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	existingRef, ok := existing.DataSetRef()
+	if !ok {
+		t.Fatal("existing target has no data set reference")
+	}
+	fixture.env.storage.FindMatchingDataSetFunc = func(_ context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error) {
+		if !providerID.Equal(sdktypes.NewBigInt(202)) || metadata["bucket"] != fixture.bucket.Name || withCDN {
+			t.Fatalf("FindMatchingDataSet inputs = provider:%s metadata:%v withCDN:%t", providerID.String(), metadata, withCDN)
+		}
+		return &existingRef, nil
+	}
+	fixture.env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(202)) {
-			return existing, nil
+			return fixture.targetCtx, nil
 		}
 		return fixture.sourceCtx, nil
 	}
@@ -1047,7 +1053,7 @@ func TestUploader_ReplacementResumesItsOwnSubmittedCreation(t *testing.T) {
 	// The service this replacement created is now visible to the resolver.
 	bound := readyFakeUploadContext(
 		sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3002), testCID(t))
-	fixture.env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	fixture.env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(202)) ||
 			createContextDataSetIDEqual(opts, sdktypes.NewBigInt(2002)) {
 			return bound, nil

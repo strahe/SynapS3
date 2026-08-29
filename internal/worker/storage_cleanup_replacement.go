@@ -12,7 +12,6 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
-	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/storage"
 )
 
@@ -488,8 +487,7 @@ func (w *StorageCleanupWorker) resolveAbandonedTargetCreation(
 			errors.New("storage client is not configured"))
 		return
 	}
-	storageCtx, err := w.storage.CreateContext(ctx, &storage.CreateContextOptions{
-		ProviderID:      sdkBigIntPtr(&target.ProviderID),
+	storageCtx, err := w.storage.OpenProviderTarget(ctx, target.ProviderID.SDK(), storage.NewProviderContextOptions{
 		DataSetMetadata: map[string]string{"bucket": bucket.Name},
 	})
 	if err != nil || storageCtx == nil {
@@ -500,6 +498,7 @@ func (w *StorageCleanupWorker) resolveAbandonedTargetCreation(
 		return
 	}
 	result, err := storageCtx.WaitForDataSetCreated(ctx, storage.CreateDataSetSubmission{
+		ProviderID:      target.ProviderID.SDK(),
 		TransactionID:   *target.CreateTransactionID,
 		StatusURL:       *target.CreateStatusURL,
 		ClientDataSetID: sdkBigIntPtr(target.ClientDataSetID),
@@ -508,10 +507,15 @@ func (w *StorageCleanupWorker) resolveAbandonedTargetCreation(
 		w.retryAbandonedTargetObservation(ctx, task, replacement, target, logger, "resolve abandoned target creation", err)
 		return
 	}
+	dataSetID, clientDataSetID, err := dataSetResultIDsForBinding(target, result)
+	if err != nil {
+		w.retryAbandonedTargetObservation(ctx, task, replacement, target, logger, "validate abandoned target creation", err)
+		return
+	}
 	if err := w.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:              target.ID,
-		DataSetID:       idtypes.OnChainIDFromSDK(result.DataSetID),
-		ClientDataSetID: onChainIDPtrFromSDK(result.ClientDataSetID),
+		DataSetID:       dataSetID,
+		ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		// The chain service exists. Releasing the local row would orphan it, and
 		// exhausting the task would leave no resume path, so wait and persist again.

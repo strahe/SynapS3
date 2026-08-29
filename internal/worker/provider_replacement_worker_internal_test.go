@@ -138,7 +138,7 @@ func TestReplacementTargetContextRegistrySharesActiveContextAndRefreshesAfterRel
 
 	registry := newReplacementTargetContextRegistry()
 	var creates atomic.Int32
-	create := func() (synapse.UploadContext, error) {
+	create := func() (synapse.DataSetTarget, error) {
 		creates.Add(1)
 		return nil, nil
 	}
@@ -175,7 +175,7 @@ func TestReplacementTargetContextRegistrySerializesCommitsForSameTarget(t *testi
 	t.Parallel()
 
 	registry := newReplacementTargetContextRegistry()
-	create := func() (synapse.UploadContext, error) { return nil, nil }
+	create := func() (synapse.DataSetTarget, error) { return nil, nil }
 	first, err := registry.acquire(context.Background(), 42, create)
 	if err != nil {
 		t.Fatalf("acquire first handle: %v", err)
@@ -230,7 +230,7 @@ func TestReplacementTargetContextRegistryAllowsDifferentTargetsToCommit(t *testi
 	t.Parallel()
 
 	registry := newReplacementTargetContextRegistry()
-	create := func() (synapse.UploadContext, error) { return nil, nil }
+	create := func() (synapse.DataSetTarget, error) { return nil, nil }
 	first, err := registry.acquire(context.Background(), 42, create)
 	if err != nil {
 		t.Fatalf("acquire first handle: %v", err)

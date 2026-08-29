@@ -380,8 +380,8 @@ func (e *ReplacementTransferExecutor) Execute(ctx context.Context, item *storage
 	if bucket == nil {
 		return expectedStateVersion, fmt.Errorf("bucket %d: %w", snapshot.Replacement.BucketID, repository.ErrNotFound)
 	}
-	handle, err := e.registry.acquire(ctx, snapshot.Target.ID, func() (synapse.UploadContext, error) {
-		return e.support.contextForReadyBinding(ctx, &snapshot.Target, bucket.Name)
+	handle, err := e.registry.acquire(ctx, snapshot.Target.ID, func() (synapse.DataSetTarget, error) {
+		return e.support.contextForReadyBinding(ctx, &snapshot.Target)
 	})
 	if err != nil {
 		return expectedStateVersion, err
@@ -504,7 +504,7 @@ func (e *ReplacementTransferExecutor) copy(
 
 func (e *ReplacementTransferExecutor) pull(
 	ctx context.Context,
-	storageCtx synapse.UploadContext,
+	storageCtx synapse.DataSetTarget,
 	copyRow *model.StorageUploadCopy,
 	sources []repository.ReadableStorageCopy,
 ) (*pulledReplacementPiece, error) {
@@ -539,7 +539,7 @@ func (e *ReplacementTransferExecutor) pull(
 
 func (e *ReplacementTransferExecutor) storeFromCache(
 	ctx context.Context,
-	storageCtx synapse.UploadContext,
+	storageCtx synapse.DataSetTarget,
 	bucket *model.Bucket,
 	version *model.ObjectVersion,
 ) (bool, cid.Cid, error) {
@@ -601,7 +601,7 @@ type replacementTargetContextRegistry struct {
 
 type replacementTargetContextEntry struct {
 	ready      chan struct{}
-	storageCtx synapse.UploadContext
+	storageCtx synapse.DataSetTarget
 	err        error
 	refs       int
 	commitGate chan struct{}
@@ -611,7 +611,7 @@ type replacementTargetContextHandle struct {
 	registry   *replacementTargetContextRegistry
 	targetID   int64
 	entry      *replacementTargetContextEntry
-	storageCtx synapse.UploadContext
+	storageCtx synapse.DataSetTarget
 	once       sync.Once
 }
 
@@ -622,7 +622,7 @@ func newReplacementTargetContextRegistry() *replacementTargetContextRegistry {
 func (r *replacementTargetContextRegistry) acquire(
 	ctx context.Context,
 	targetID int64,
-	create func() (synapse.UploadContext, error),
+	create func() (synapse.DataSetTarget, error),
 ) (*replacementTargetContextHandle, error) {
 	r.mu.Lock()
 	entry, exists := r.entries[targetID]

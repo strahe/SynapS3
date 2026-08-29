@@ -8,88 +8,79 @@ import (
 	"testing"
 
 	"github.com/strahe/synapse-go/pdp"
+	"github.com/strahe/synapse-go/spregistry"
 	"github.com/strahe/synapse-go/storage"
-	"github.com/strahe/synapse-go/types"
 )
 
-func TestNormalizeCreateContextsError(t *testing.T) {
+func TestNormalizeSelectUploadTargetsError(t *testing.T) {
 	t.Parallel()
 
-	known := errors.New("storage.Service.CreateContexts: storage.ServiceResolver.ResolveUploadContexts: no remaining providers")
-	if got := normalizeCreateContextsError(known); !IsNoProviderCandidates(got) {
-		t.Fatalf("known error = %T %v, want NoProviderCandidatesError", got, got)
+	for _, selectionErr := range []error{
+		storage.ErrInsufficientUploadContexts,
+		storage.ErrNoHealthyProviders,
+		storage.ErrNoEndorsedProvider,
+		storage.ErrEndorsementsNotConfigured,
+	} {
+		t.Run(selectionErr.Error(), func(t *testing.T) {
+			t.Parallel()
+			got := normalizeSelectUploadTargetsError(fmt.Errorf("select targets: %w", selectionErr))
+			if !IsNoProviderCandidates(got) {
+				t.Fatalf("error = %T %v, want NoProviderCandidatesError", got, got)
+			}
+		})
 	}
 
-	nearMiss := errors.New("storage.Service.CreateContexts: no remaining providers")
-	if got := normalizeCreateContextsError(nearMiss); IsNoProviderCandidates(got) {
-		t.Fatalf("near-miss error = %T %v, must remain unclassified", got, got)
-	}
-
-	typed := fmt.Errorf("provider selection: %w", storage.ErrNoHealthyProviders)
-	if got := normalizeCreateContextsError(typed); !IsNoProviderCandidates(got) {
-		t.Fatalf("typed health error = %T %v, want NoProviderCandidatesError", got, got)
+	legacyText := errors.New("storage.Service.CreateContexts: storage.ServiceResolver.ResolveUploadContexts: no remaining providers")
+	if got := normalizeSelectUploadTargetsError(legacyText); IsNoProviderCandidates(got) {
+		t.Fatalf("legacy string = %T %v, must remain unclassified", got, got)
 	}
 }
 
-func TestNormalizeCreateContextErrorMatchesRequestedDataSet(t *testing.T) {
+func TestNormalizeOpenDataSetTargetErrorUsesTypedLifecycleError(t *testing.T) {
 	t.Parallel()
 
-	dataSetID := types.NewBigInt(23054)
-	opts := &storage.CreateContextOptions{DataSetID: &dataSetID}
-	known := errors.New("storage.Service.CreateContext: storage.ServiceResolver.ResolveUploadContexts: data set 23054 does not exist")
-	if got := normalizeCreateContextError(known, opts); !IsDataSetServiceEnded(got) {
-		t.Fatalf("known error = %T %v, want DataSetServiceEndedError", got, got)
+	got := normalizeOpenDataSetTargetError(context.Background(), fmt.Errorf("open data set: %w", storage.ErrDataSetUnavailable))
+	if !IsDataSetServiceEnded(got) {
+		t.Fatalf("error = %T %v, want DataSetServiceEndedError", got, got)
 	}
-
-	other := types.NewBigInt(23055)
-	if got := normalizeCreateContextError(known, &storage.CreateContextOptions{DataSetID: &other}); IsDataSetServiceEnded(got) {
-		t.Fatalf("mismatched data set error = %T %v, must remain unclassified", got, got)
+	if !errors.Is(got, storage.ErrDataSetUnavailable) {
+		t.Fatalf("error = %T %v, want wrapped ErrDataSetUnavailable", got, got)
 	}
 }
 
-func TestNormalizeCreateContextErrorMatchesRequestedProvider(t *testing.T) {
+func TestNormalizeOpenTargetErrorsUseTypedProviderNotFound(t *testing.T) {
 	t.Parallel()
 
-	providerID := types.NewBigInt(303)
-	dataSetID := types.NewBigInt(23054)
-	opts := &storage.CreateContextOptions{ProviderID: &providerID, DataSetID: &dataSetID}
-	known := errors.New("storage.Service.CreateContext: storage.ServiceResolver.ResolveUploadContexts: provider 303 for data set 23054 not found")
-	if got := normalizeCreateContextError(known, opts); !IsProviderUnavailable(got) {
-		t.Fatalf("known error = %T %v, want ProviderUnavailableError", got, got)
-	}
-
-	otherProvider := types.NewBigInt(304)
-	if got := normalizeCreateContextError(known, &storage.CreateContextOptions{ProviderID: &otherProvider, DataSetID: &dataSetID}); IsProviderUnavailable(got) {
-		t.Fatalf("mismatched provider error = %T %v, must remain unclassified", got, got)
+	for name, normalize := range map[string]func(context.Context, error) error{
+		"provider": normalizeOpenProviderTargetError,
+		"data set": normalizeOpenDataSetTargetError,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := normalize(context.Background(), fmt.Errorf("open target: %w", spregistry.ErrNotFound))
+			if !IsProviderUnavailable(got) {
+				t.Fatalf("error = %T %v, want ProviderUnavailableError", got, got)
+			}
+		})
 	}
 }
 
-func TestNormalizeCreateContextErrorTreatsAssignedDataSetAsUnavailable(t *testing.T) {
+func TestNormalizeOpenDataSetTargetErrorPreservesInvalidArgument(t *testing.T) {
 	t.Parallel()
 
-	known := errors.New("storage.Service.CreateContext: storage.ServiceResolver.ResolveUploadContexts: no remaining providers")
-	dataSetID := types.NewBigInt(23054)
-	assigned := normalizeCreateContextError(known, &storage.CreateContextOptions{DataSetID: &dataSetID})
-	if !IsProviderUnavailable(assigned) || IsNoProviderCandidates(assigned) {
-		t.Fatalf("assigned data set error = %T %v, want only ProviderUnavailableError", assigned, assigned)
-	}
-	automatic := normalizeCreateContextError(known, &storage.CreateContextOptions{})
-	if !IsNoProviderCandidates(automatic) {
-		t.Fatalf("automatic selection error = %T %v, want NoProviderCandidatesError", automatic, automatic)
-	}
-	typed := normalizeCreateContextError(storage.ErrNoHealthyProviders, &storage.CreateContextOptions{DataSetID: &dataSetID})
-	if !IsProviderUnavailable(typed) || IsNoProviderCandidates(typed) {
-		t.Fatalf("assigned typed health error = %T %v, want only ProviderUnavailableError", typed, typed)
+	invalid := fmt.Errorf("provider mismatch: %w", storage.ErrInvalidArgument)
+	got := normalizeOpenDataSetTargetError(context.Background(), invalid)
+	if !errors.Is(got, storage.ErrInvalidArgument) || IsProviderUnavailable(got) || IsDataSetServiceEnded(got) {
+		t.Fatalf("error = %T %v, want ordinary ErrInvalidArgument", got, got)
 	}
 }
 
-func TestProviderAvailabilityClassificationRequiresOperationContext(t *testing.T) {
+func TestKnownTargetNetworkErrorsAreProviderUnavailable(t *testing.T) {
 	t.Parallel()
 
 	rpcFailure := &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}
-	dataSetID := types.NewBigInt(23054)
-	if got := normalizeCreateContextError(rpcFailure, &storage.CreateContextOptions{DataSetID: &dataSetID}); IsProviderUnavailable(got) {
-		t.Fatalf("CreateContext RPC error = %T %v, must remain an ordinary retryable error", got, got)
+	if got := normalizeOpenDataSetTargetError(context.Background(), rpcFailure); !IsProviderUnavailable(got) {
+		t.Fatalf("open data set RPC error = %T %v, want ProviderUnavailableError", got, got)
 	}
 	if got := NormalizeProviderOperationError(context.Background(), rpcFailure); !IsProviderUnavailable(got) {
 		t.Fatalf("provider endpoint error = %T %v, want ProviderUnavailableError", got, got)

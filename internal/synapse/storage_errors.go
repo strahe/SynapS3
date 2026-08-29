@@ -3,7 +3,6 @@ package synapse
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 
@@ -90,16 +89,13 @@ func providerOperationUnavailable(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-	var httpErr *pdp.HTTPError
-	if errors.As(err, &httpErr) {
+	if httpErr, ok := errors.AsType[*pdp.HTTPError](err); ok {
 		return providerHTTPStatusUnavailable(httpErr.StatusCode)
 	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return true
 	}
-	var operationErr *net.OpError
-	if errors.As(err, &operationErr) {
+	if _, ok := errors.AsType[*net.OpError](err); ok {
 		return true
 	}
 	var networkErr net.Error
@@ -117,20 +113,18 @@ func IsDataSetServiceEnded(err error) bool {
 	if err == nil {
 		return false
 	}
-	var ended *DataSetServiceEndedError
-	if errors.As(err, &ended) {
+	if _, ok := errors.AsType[*DataSetServiceEndedError](err); ok {
 		return true
 	}
 	var notLive *warmstorage.DataSetNotLiveError
-	return errors.As(err, &notLive) || errors.Is(err, warmstorage.ErrNotFound)
+	return errors.As(err, &notLive) || errors.Is(err, warmstorage.ErrNotFound) || errors.Is(err, storage.ErrDataSetUnavailable)
 }
 
 func normalizeDataSetLifecycleError(err error) error {
 	if err == nil || IsNoProviderCandidates(err) {
 		return err
 	}
-	var ended *DataSetServiceEndedError
-	if errors.As(err, &ended) {
+	if _, ok := errors.AsType[*DataSetServiceEndedError](err); ok {
 		return err
 	}
 	if IsDataSetServiceEnded(err) {
@@ -152,8 +146,7 @@ func NormalizeProviderOperationError(ctx context.Context, err error) error {
 	if IsNoProviderCandidates(err) || IsDataSetServiceEnded(err) {
 		return err
 	}
-	var unavailable *ProviderUnavailableError
-	if errors.As(err, &unavailable) {
+	if _, ok := errors.AsType[*ProviderUnavailableError](err); ok {
 		return err
 	}
 	if providerOperationUnavailable(err) {
@@ -174,61 +167,39 @@ func normalizeResolutionOperationError(err error) error {
 	return err
 }
 
-func normalizeCreateContextsError(err error) error {
+func normalizeSelectUploadTargetsError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, storage.ErrNoHealthyProviders) {
+	if errors.Is(err, storage.ErrInsufficientUploadContexts) ||
+		errors.Is(err, storage.ErrNoHealthyProviders) ||
+		errors.Is(err, storage.ErrNoEndorsedProvider) ||
+		errors.Is(err, storage.ErrEndorsementsNotConfigured) {
 		return &NoProviderCandidatesError{Cause: err}
-	}
-	switch err.Error() {
-	case "storage.Service.CreateContexts: storage.ServiceResolver.ResolveUploadContexts: no approved providers",
-		"storage.Service.CreateContexts: storage.ServiceResolver.ResolveUploadContexts: no remaining providers":
-		return &NoProviderCandidatesError{Cause: err}
-	default:
-		return normalizeResolutionOperationError(err)
-	}
-}
-
-func normalizeCreateContextError(err error, opts *storage.CreateContextOptions) error {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, storage.ErrNoHealthyProviders) {
-		if opts != nil && opts.DataSetID != nil {
-			return &ProviderUnavailableError{Cause: err}
-		}
-		return &NoProviderCandidatesError{Cause: err}
-	}
-	switch err.Error() {
-	case "storage.Service.CreateContext: storage.ServiceResolver.ResolveUploadContexts: no approved providers",
-		"storage.Service.CreateContext: storage.ServiceResolver.ResolveUploadContexts: no remaining providers":
-		if opts != nil && opts.DataSetID != nil {
-			return &ProviderUnavailableError{Cause: err}
-		}
-		return &NoProviderCandidatesError{Cause: err}
-	}
-	if opts != nil && opts.DataSetID != nil {
-		missing := fmt.Sprintf(
-			"storage.Service.CreateContext: storage.ServiceResolver.ResolveUploadContexts: data set %s does not exist",
-			opts.DataSetID.String(),
-		)
-		if err.Error() == missing {
-			return &DataSetServiceEndedError{Cause: err}
-		}
-	}
-	if opts != nil && opts.ProviderID != nil && opts.DataSetID != nil {
-		missing := fmt.Sprintf(
-			"storage.Service.CreateContext: storage.ServiceResolver.ResolveUploadContexts: provider %s for data set %s not found",
-			opts.ProviderID.String(),
-			opts.DataSetID.String(),
-		)
-		if err.Error() == missing {
-			return &ProviderUnavailableError{Cause: err}
-		}
-	}
-	if opts != nil && opts.ProviderID != nil && errors.Is(err, spregistry.ErrNotFound) {
-		return &ProviderUnavailableError{Cause: err}
 	}
 	return normalizeResolutionOperationError(err)
+}
+
+func normalizeOpenProviderTargetError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, spregistry.ErrNotFound) {
+		return &ProviderUnavailableError{Cause: err}
+	}
+	return NormalizeProviderOperationError(ctx, err)
+}
+
+func normalizeOpenDataSetTargetError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	err = normalizeDataSetLifecycleError(err)
+	if IsDataSetServiceEnded(err) {
+		return err
+	}
+	if errors.Is(err, spregistry.ErrNotFound) {
+		return &ProviderUnavailableError{Cause: err}
+	}
+	return NormalizeProviderOperationError(ctx, err)
 }

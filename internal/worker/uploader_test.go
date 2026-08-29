@@ -44,11 +44,11 @@ func testCID(t *testing.T) cid.Cid {
 	return cid.NewCidV1(cid.Raw, mh)
 }
 
-func createContextProviderIDEqual(opts *storage.CreateContextOptions, want sdktypes.BigInt) bool {
+func createContextProviderIDEqual(opts *testutil.OpenTargetOptions, want sdktypes.BigInt) bool {
 	return opts.ProviderID != nil && opts.ProviderID.Equal(want)
 }
 
-func createContextDataSetIDEqual(opts *storage.CreateContextOptions, want sdktypes.BigInt) bool {
+func createContextDataSetIDEqual(opts *testutil.OpenTargetOptions, want sdktypes.BigInt) bool {
 	return opts.DataSetID != nil && opts.DataSetID.Equal(want)
 }
 
@@ -462,15 +462,17 @@ func seedDeadUnestablishedBinding(t *testing.T, env *testWorkerEnv, bucketID, up
 
 func (f *fakeUploadContext) ProviderID() sdktypes.BigInt { return f.providerID.Copy() }
 
-func (f *fakeUploadContext) DataSetID() *sdktypes.BigInt {
+func (f *fakeUploadContext) DataSetRef() (storage.DataSetRef, bool) {
 	f.dataSetMu.RLock()
 	defer f.dataSetMu.RUnlock()
 	if f.boundDataSet == nil {
-		return nil
+		return storage.DataSetRef{}, false
 	}
-	id := f.boundDataSet.Copy()
-	return &id
+	ref, err := storage.NewDataSetRef(f.providerID, *f.boundDataSet, f.clientDataID)
+	return ref, err == nil
 }
+
+func (f *fakeUploadContext) ClientDataSetID() sdktypes.BigInt { return f.clientDataID.Copy() }
 
 func (f *fakeUploadContext) GetProviderInfo() storage.Provider {
 	return storage.Provider{
@@ -479,7 +481,7 @@ func (f *fakeUploadContext) GetProviderInfo() storage.Provider {
 	}
 }
 
-func (f *fakeUploadContext) WithCDN() bool { return false }
+func (f *fakeUploadContext) CDNEnabled() bool { return false }
 
 func (f *fakeUploadContext) PieceURL(piece cid.Cid) string {
 	return fmt.Sprintf("https://provider-%s.example/piece/%s", f.providerID.String(), piece.String())
@@ -497,6 +499,7 @@ func (f *fakeUploadContext) CreateDataSet(_ context.Context, opts *storage.Creat
 		f.createCalls.Add(1)
 	}
 	submission := storage.CreateDataSetSubmission{
+		ProviderID:      f.providerID.Copy(),
 		TransactionID:   fmt.Sprintf("0xcreate%s", f.dataSetID.String()),
 		StatusURL:       fmt.Sprintf("https://provider-%s.example/status/create", f.providerID.String()),
 		ClientDataSetID: sdkBigIntTestPtr(f.clientDataID),
@@ -507,14 +510,13 @@ func (f *fakeUploadContext) CreateDataSet(_ context.Context, opts *storage.Creat
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
-	createdDataSetID := f.dataSetID.Copy()
-	f.dataSetMu.Lock()
-	f.boundDataSet = &createdDataSetID
-	f.dataSetMu.Unlock()
+	ref, err := storage.NewDataSetRef(f.providerID, f.dataSetID, f.clientDataID)
+	if err != nil {
+		return nil, err
+	}
 	return &storage.CreateDataSetResult{
-		TransactionID:   submission.TransactionID,
-		DataSetID:       f.dataSetID.Copy(),
-		ClientDataSetID: f.clientDataID.Copy(),
+		TransactionID: submission.TransactionID,
+		DataSet:       ref,
 	}, nil
 }
 
@@ -525,14 +527,19 @@ func (f *fakeUploadContext) WaitForDataSetCreated(_ context.Context, submission 
 	if f.waitErr != nil {
 		return nil, f.waitErr
 	}
-	createdDataSetID := f.dataSetID.Copy()
-	f.dataSetMu.Lock()
-	f.boundDataSet = &createdDataSetID
-	f.dataSetMu.Unlock()
+	if !submission.ProviderID.Equal(f.providerID) {
+		return nil, fmt.Errorf("submission provider %s does not match target provider %s", submission.ProviderID.String(), f.providerID.String())
+	}
+	if submission.ClientDataSetID == nil {
+		return nil, errors.New("submission is missing client data set ID")
+	}
+	ref, err := storage.NewDataSetRef(f.providerID, f.dataSetID, *submission.ClientDataSetID)
+	if err != nil {
+		return nil, err
+	}
 	return &storage.CreateDataSetResult{
-		TransactionID:   submission.TransactionID,
-		DataSetID:       f.dataSetID.Copy(),
-		ClientDataSetID: submission.ClientDataSetID.Copy(),
+		TransactionID: submission.TransactionID,
+		DataSet:       ref,
 	}, nil
 }
 
@@ -586,9 +593,13 @@ func (f *fakeUploadContext) Commit(_ context.Context, req storage.CommitRequest)
 	if f.commitErr != nil {
 		return nil, f.commitErr
 	}
+	ref, err := storage.NewDataSetRef(f.providerID, f.dataSetID, f.clientDataID)
+	if err != nil {
+		return nil, err
+	}
 	return &storage.CommitResult{
 		TransactionID: fakeSubmittedCommitTxHash,
-		DataSetID:     f.dataSetID.Copy(),
+		DataSet:       ref,
 		PieceIDs:      []sdktypes.BigInt{f.pieceID.Copy()},
 	}, nil
 }
@@ -598,9 +609,9 @@ func sdkBigIntTestPtr(id sdktypes.BigInt) *sdktypes.BigInt {
 	return &cp
 }
 
-func newFakeUploadContexts(t *testing.T, copies int, base uint64) []synapse.UploadContext {
+func newFakeUploadContexts(t *testing.T, copies int, base uint64) []synapse.StorageTarget {
 	t.Helper()
-	contexts := make([]synapse.UploadContext, 0, copies)
+	contexts := make([]synapse.StorageTarget, 0, copies)
 	for i := 0; i < copies; i++ {
 		offset := base + uint64(i)
 		contexts = append(contexts, newFakeUploadContext(
@@ -675,11 +686,11 @@ func seedReadyPrimaryStoreTask(t *testing.T, env *testWorkerEnv) (*model.Storage
 	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	dataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &dataSetID
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 	return upload, task, primaryCtx
 }
@@ -693,9 +704,9 @@ func TestUploader_WaitsPollIntervalBeforeInitialClaim(t *testing.T) {
 	var closeStarted sync.Once
 	pollInterval := 100 * time.Millisecond
 
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		closeStarted.Do(func() { close(uploadStarted) })
-		contexts := make([]synapse.UploadContext, 0, opts.Copies)
+		contexts := make([]synapse.StorageTarget, 0, opts.Copies)
 		for i := 0; i < opts.Copies; i++ {
 			contexts = append(contexts, newFakeUploadContext(
 				sdktypes.NewBigInt(uint64(100+i)),
@@ -777,7 +788,7 @@ func TestUploader_CompletesRetryWhenObjectIsAlreadyStored(t *testing.T) {
 	}
 
 	var storageCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		storageCalls.Add(1)
 		return nil, errors.New("storage must not be called for a stored object")
 	}
@@ -835,9 +846,9 @@ func TestUploader_DurableIncompleteUploadKeepsRepairingOriginalReplica(t *testin
 				t.Fatalf("MarkDataSetUnavailable: %v", err)
 			}
 
-			var createContextsCalls atomic.Int32
-			env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-				createContextsCalls.Add(1)
+			var selectTargetsCalls atomic.Int32
+			env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+				selectTargetsCalls.Add(1)
 				return nil, errors.New("durable repair must not select a replacement provider")
 			}
 			stage := "prepare_upload"
@@ -862,8 +873,8 @@ func TestUploader_DurableIncompleteUploadKeepsRepairingOriginalReplica(t *testin
 			if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
 				t.Fatalf("durable repair task = %#v, want completed without retry", gotTask)
 			}
-			if createContextsCalls.Load() != 0 {
-				t.Fatalf("CreateContexts calls = %d, want 0", createContextsCalls.Load())
+			if selectTargetsCalls.Load() != 0 {
+				t.Fatalf("SelectUploadTargets calls = %d, want 0", selectTargetsCalls.Load())
 			}
 			peerCopy, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, fixture.peer.CopyIndex)
 			if err != nil || peerCopy == nil {
@@ -973,7 +984,7 @@ func TestUploader_DurableEnsureTaskDoesNotReassignIngress(t *testing.T) {
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("create stale ensure task: %v", err)
 	}
-	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		return nil, errors.New("durable ensure task must not choose a provider")
 	}
 
@@ -1234,20 +1245,20 @@ func TestUploader_ThreeReplicasWithMinimumTwoDurableCopiesCompletesAllCopies(t *
 		c3.dataSetID.String(): c3,
 	}
 
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		if opts.Copies != 3 {
-			t.Fatalf("CreateContexts copies = %d, want 3", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 3", opts.Copies)
 		}
-		return []synapse.UploadContext{c1, c2, c3}, nil
+		return []synapse.StorageTarget{c1, c2, c3}, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if opts.ProviderID != nil {
 			return contextsByProvider[opts.ProviderID.String()], nil
 		}
 		if opts.DataSetID != nil {
 			return contextsByDataSet[opts.DataSetID.String()], nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyNone, 3, 2, 10*time.Millisecond, slog.Default())
@@ -1341,18 +1352,18 @@ func TestUploader_UsesReadySpareWhenLowerIndexSlotIsDead(t *testing.T) {
 		c1.providerID.String(): c1,
 		c3.providerID.String(): c3,
 	}
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("dead lower-index slot must not force a new provider")
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if opts.ProviderID != nil {
 			if ctx := contextsByProvider[opts.ProviderID.String()]; ctx != nil {
 				return ctx, nil
 			}
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyNone, 3, 2, 10*time.Millisecond, slog.Default())
@@ -1384,8 +1395,8 @@ func TestUploader_UsesReadySpareWhenLowerIndexSlotIsDead(t *testing.T) {
 	if upload.Status != model.StorageUploadStatusComplete {
 		t.Fatalf("upload status = %s, want %s", upload.Status, model.StorageUploadStatusComplete)
 	}
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want 0", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want 0", got)
 	}
 	copies, err := env.repos.Uploads.ListCopies(ctx, upload.ID)
 	if err != nil {
@@ -1445,17 +1456,17 @@ func TestUploader_RepairPrepareFillsTargetFromReadySpareWhenAssignedSlotIsDead(t
 	seedDeadUnestablishedBinding(t, env, bucket.ID, fixture.upload.ID, 2, "303")
 	spare := seedReadyBinding(t, env, bucket.ID, fixture.upload.ID, 3, "404", "4004")
 
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("ready spare must be used before selecting a new provider")
 	}
 	spareCtx := readyFakeUploadContext(sdktypes.NewBigInt(404), sdktypes.NewBigInt(4004), sdktypes.NewBigInt(5001), testCID(t))
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, spareCtx.providerID) || createContextDataSetIDEqual(opts, spareCtx.dataSetID) {
 			return spareCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	stage := "prepare_upload"
@@ -1480,8 +1491,8 @@ func TestUploader_RepairPrepareFillsTargetFromReadySpareWhenAssignedSlotIsDead(t
 	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
 		t.Fatalf("repair task = %#v, want completed without retry", gotTask)
 	}
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want 0", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want 0", got)
 	}
 	copies, err := env.repos.Uploads.ListCopies(ctx, fixture.upload.ID)
 	if err != nil {
@@ -1597,14 +1608,14 @@ func TestUploader_FinishPeerCopySchedulesRemainingPeerCopy(t *testing.T) {
 	peerDataSetID := sdktypes.NewBigInt(2002)
 	secondaryCtx := newFakeUploadContext(fixture.peer.ProviderID.SDK(), peerDataSetID, sdktypes.NewBigInt(3001), pieceCID)
 	secondaryCtx.boundDataSet = &peerDataSetID
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if opts.ProviderID != nil && opts.ProviderID.String() == fixture.peer.ProviderID.String() {
 			return secondaryCtx, nil
 		}
 		if opts.DataSetID != nil && opts.DataSetID.String() == "2002" {
 			return secondaryCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyNone, 3, 1, 10*time.Millisecond, slog.Default())
@@ -1636,7 +1647,7 @@ func TestUploader_ClaimsLaterPendingTaskWhileAnotherUploadRuns(t *testing.T) {
 	var releaseOnce sync.Once
 	var uploadCalls atomic.Int32
 
-	env.storage.CreateContextsFunc = func(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		call := uploadCalls.Add(1)
 		if call == 1 {
 			close(firstUploadEntered)
@@ -1646,7 +1657,7 @@ func TestUploader_ClaimsLaterPendingTaskWhileAnotherUploadRuns(t *testing.T) {
 				return nil, ctx.Err()
 			}
 		}
-		contexts := make([]synapse.UploadContext, 0, opts.Copies)
+		contexts := make([]synapse.StorageTarget, 0, opts.Copies)
 		for i := 0; i < opts.Copies; i++ {
 			offset := uint64(call*100 + int32(i))
 			contexts = append(contexts, newFakeUploadContext(
@@ -1698,14 +1709,14 @@ func TestUploader_HealthyWhileUploadTaskIsActive(t *testing.T) {
 	var releaseOnce sync.Once
 	pollInterval := 20 * time.Millisecond
 
-	env.storage.CreateContextsFunc = func(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		close(uploadEntered)
 		select {
 		case <-releaseUpload:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		contexts := make([]synapse.UploadContext, 0, opts.Copies)
+		contexts := make([]synapse.StorageTarget, 0, opts.Copies)
 		for i := 0; i < opts.Copies; i++ {
 			contexts = append(contexts, newFakeUploadContext(
 				sdktypes.NewBigInt(uint64(100+i)),
@@ -1808,20 +1819,20 @@ func TestUploader_StagedPrimaryCommitKeepsCacheUntilAllCopiesCommitted(t *testin
 		secondary.dataSetID.String(): secondary,
 	}
 
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		if opts.Copies != 2 {
-			t.Fatalf("CreateContexts copies = %d, want 2", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 2", opts.Copies)
 		}
-		return []synapse.UploadContext{primary, secondary}, nil
+		return []synapse.StorageTarget{primary, secondary}, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if opts.ProviderID != nil {
 			return contextsByProvider[opts.ProviderID.String()], nil
 		}
 		if opts.DataSetID != nil {
 			return contextsByDataSet[opts.DataSetID.String()], nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
@@ -1905,13 +1916,13 @@ func TestUploader_EmptyPayloadStartsStagedPrepare(t *testing.T) {
 		legacyUploadCalled.Store(true)
 		return nil, errors.New("legacy upload should not be called")
 	}
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		if opts.Copies != 3 {
-			t.Fatalf("CreateContexts copies = %d, want 3", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 3", opts.Copies)
 		}
-		return []synapse.UploadContext{
+		return []synapse.StorageTarget{
 			newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t)),
 			newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), testCID(t)),
 			newFakeUploadContext(sdktypes.NewBigInt(303), sdktypes.NewBigInt(3003), sdktypes.NewBigInt(4001), testCID(t)),
@@ -1964,11 +1975,11 @@ func TestUploader_StagedPrepareUsesConfiguredCopyCount(t *testing.T) {
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
 
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		if opts.Copies != 4 {
-			t.Fatalf("CreateContexts copies = %d, want 4", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 4", opts.Copies)
 		}
-		return []synapse.UploadContext{
+		return []synapse.StorageTarget{
 			newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t)),
 			newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), testCID(t)),
 			newFakeUploadContext(sdktypes.NewBigInt(303), sdktypes.NewBigInt(3003), sdktypes.NewBigInt(4001), testCID(t)),
@@ -2006,11 +2017,11 @@ func TestUploader_StagedPrepareUsesBucketCopyOverride(t *testing.T) {
 		t.Fatalf("SetDefaultCopies: %v", err)
 	}
 
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		if opts.Copies != 4 {
-			t.Fatalf("CreateContexts copies = %d, want 4", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 4", opts.Copies)
 		}
-		contexts := make([]synapse.UploadContext, 0, opts.Copies)
+		contexts := make([]synapse.StorageTarget, 0, opts.Copies)
 		for i := 0; i < opts.Copies; i++ {
 			contexts = append(contexts, newFakeUploadContext(
 				sdktypes.NewBigInt(uint64(100+i)),
@@ -2102,18 +2113,18 @@ func TestUploader_StagedPrepareReusesExistingUploadRequestedCopies(t *testing.T)
 	if err := env.repos.Buckets.SetDefaultCopies(ctx, bucket.Name, &newBucketCopies); err != nil {
 		t.Fatalf("SetDefaultCopies after upload: %v", err)
 	}
-	var createContextsCopies []int
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCopies = append(createContextsCopies, opts.Copies)
+	var selectTargetsCopies []int
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCopies = append(selectTargetsCopies, opts.Copies)
 		return newFakeUploadContexts(t, opts.Copies, 10000), nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if opts.DataSetID != nil {
 			if uploadCtx := contextsByDataSet[opts.DataSetID.String()]; uploadCtx != nil {
 				return uploadCtx, nil
 			}
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	stage := "prepare_upload"
@@ -2134,8 +2145,8 @@ func TestUploader_StagedPrepareReusesExistingUploadRequestedCopies(t *testing.T)
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 100*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, retryTask.ID, 5*time.Second)
 
-	if len(createContextsCopies) != 0 {
-		t.Fatalf("CreateContexts copies after retry = %v, want none", createContextsCopies)
+	if len(selectTargetsCopies) != 0 {
+		t.Fatalf("SelectUploadTargets copies after retry = %v, want none", selectTargetsCopies)
 	}
 	copies, err := env.repos.Uploads.ListCopies(ctx, upload.ID)
 	if err != nil {
@@ -2151,11 +2162,11 @@ func TestUploader_StagedPrepareCapsConfiguredCopyCount(t *testing.T) {
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
 
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		if opts.Copies != 8 {
-			t.Fatalf("CreateContexts copies = %d, want 8", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 8", opts.Copies)
 		}
-		contexts := make([]synapse.UploadContext, 0, opts.Copies)
+		contexts := make([]synapse.StorageTarget, 0, opts.Copies)
 		for i := 0; i < opts.Copies; i++ {
 			contexts = append(contexts, newFakeUploadContext(
 				sdktypes.NewBigInt(uint64(100+i)),
@@ -2187,7 +2198,7 @@ func TestUploader_StagedPrepareCapsConfiguredCopyCount(t *testing.T) {
 	}
 }
 
-func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
+func TestUploader_EnsureDatasetAdoptsMatchingDataSet(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	bucket, objID, versionID := seedCachedObject(t, env)
 	ctx := context.Background()
@@ -2244,23 +2255,29 @@ func TestUploader_EnsureDatasetUsesExistingResolvedDataset(t *testing.T) {
 	var createCalls atomic.Int32
 	existingID := sdktypes.NewBigInt(13236)
 	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), existingID, sdktypes.NewBigInt(2001), testCID(t))
-	providerCtx.boundDataSet = &existingID
 	providerCtx.createCalls = &createCalls
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
-		if createContextDataSetIDEqual(opts, existingID) {
-			return providerCtx, nil
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
+	}
+	env.storage.FindMatchingDataSetFunc = func(_ context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error) {
+		if !providerID.Equal(sdktypes.NewBigInt(101)) || metadata["bucket"] != bucket.Name || withCDN {
+			return nil, fmt.Errorf("unexpected matching data set request: provider=%s metadata=%v withCDN=%t", providerID.String(), metadata, withCDN)
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		ref, err := storage.NewDataSetRef(providerID, existingID, providerCtx.clientDataID)
+		if err != nil {
+			return nil, err
+		}
+		return &ref, nil
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
 	if got := createCalls.Load(); got != 0 {
-		t.Fatalf("CreateDataSet calls = %d, want 0 when provider context already resolves a dataset", got)
+		t.Fatalf("CreateDataSet calls = %d, want 0 when a matching data set exists", got)
 	}
 	gotBinding, err := env.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 0)
 	if err != nil || gotBinding == nil {
@@ -2322,11 +2339,11 @@ func TestUploader_EnsureDatasetContextTimeoutKeepsBindingPendingForRetry(t *test
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("create ensure task: %v", err)
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return nil, context.DeadlineExceeded
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
@@ -2406,14 +2423,14 @@ func TestUploader_EnsureDatasetSubmittedProviderUnavailableWaitsWithoutRetry(t *
 	providerCtx.createCalls = &createCalls
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.createErr = &synapse.ProviderUnavailableError{Cause: context.DeadlineExceeded}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
 		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return providerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
@@ -2519,11 +2536,11 @@ func TestUploader_EnsureDatasetCreatingProviderUnavailableWaitsWithoutRetry(t *t
 	providerCtx.createCalls = &createCalls
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.waitErr = &synapse.ProviderUnavailableError{Cause: context.DeadlineExceeded}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
@@ -2615,11 +2632,11 @@ func TestUploader_EnsureDatasetCreatingRejectedMarksBindingFailed(t *testing.T) 
 	providerCtx.createCalls = &createCalls
 	providerCtx.waitCalls = &waitCalls
 	providerCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
@@ -2727,11 +2744,11 @@ func TestUploader_EnsureDatasetCreationRejectionPreservesEstablishedEvidence(t *
 
 	providerCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	providerCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) {
 			return providerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
@@ -2860,12 +2877,13 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
 	primaryDataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &primaryDataSetID
+	primaryCtx.clientDataID = sdktypes.NewBigInt(9001)
 	primaryCtx.commitErr = errors.New("commit status poll timeout")
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(
@@ -2905,7 +2923,7 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 			t.Fatalf("commit status path = %q, want submitted transaction status path", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"piecesAdded":true,"confirmedPieceIds":[2001]}`, fakeSubmittedCommitTxHash)
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[2001]}`, fakeSubmittedCommitTxHash)
 	}))
 	defer statusServer.Close()
 	primaryCtx.serviceURL = statusServer.URL
@@ -3031,12 +3049,13 @@ func TestUploader_RejectedSubmittedIngressCommitIsResubmitted(t *testing.T) {
 	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
 	primaryDataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &primaryDataSetID
+	primaryCtx.clientDataID = sdktypes.NewBigInt(9001)
 	primaryCtx.serviceURL = statusServer.URL
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, primaryDataSetID) {
 			return primaryCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(
@@ -3106,18 +3125,18 @@ func TestUploader_SubmittedPeerMismatchedStatusRemainsRecoverableAfterExhaustion
 
 	statusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":9999,"pieceCount":1,"piecesAdded":true,"confirmedPieceIds":[302]}`, fakeSubmittedCommitTxHash)
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":9999,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[302]}`, fakeSubmittedCommitTxHash)
 	}))
 	defer statusServer.Close()
 	peerCtx := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(302), pieceCID)
 	peerDataSetID := sdktypes.NewBigInt(2002)
 	peerCtx.boundDataSet = &peerDataSetID
 	peerCtx.serviceURL = statusServer.URL
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, peerDataSetID) {
 			return peerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(
@@ -3159,23 +3178,23 @@ func TestUploader_UnavailablePeerKeepsObjectReadableAndWaitsForInPlaceRepair(t *
 		ingress.dataSetID.String(): ingress,
 		peer.dataSetID.String():    peer,
 	}
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		if opts.Copies == 2 {
-			return []synapse.UploadContext{ingress, peer}, nil
+			return []synapse.StorageTarget{ingress, peer}, nil
 		}
-		t.Fatalf("unexpected CreateContexts copies = %d; established slots must not be replaced", opts.Copies)
+		t.Fatalf("unexpected SelectUploadTargets copies = %d; established slots must not be replaced", opts.Copies)
 		return nil, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if opts.ProviderID != nil {
 			return contextsByProvider[opts.ProviderID.String()], nil
 		}
 		if opts.DataSetID != nil {
 			return contextsByDataSet[opts.DataSetID.String()], nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
@@ -3274,8 +3293,8 @@ doneWaiting:
 	if err != nil || recoveredBinding == nil || recoveredBinding.Status != model.StorageDataSetStatusReady {
 		t.Fatalf("recovered binding = %#v err=%v, want ready", recoveredBinding, err)
 	}
-	if got := createContextsCalls.Load(); got != 1 {
-		t.Fatalf("CreateContexts calls = %d, want only initial slot provisioning", got)
+	if got := selectTargetsCalls.Load(); got != 1 {
+		t.Fatalf("SelectUploadTargets calls = %d, want only initial slot provisioning", got)
 	}
 }
 
@@ -3294,11 +3313,11 @@ func TestUploader_ReplicaRepairDoesNotRecoverDataSetBeforeStorageOperationSuccee
 	dataSetID := sdktypes.NewBigInt(2002)
 	peerCtx.boundDataSet = &dataSetID
 	peerCtx.pullErr = errors.New("unexpected pull response")
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, dataSetID) {
 			return peerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 	stage := "repair_replica"
 	task := &model.Task{
@@ -3377,11 +3396,11 @@ func TestUploader_ReplicaRepairResubmitsRejectedCommit(t *testing.T) {
 	peerDataSetID := sdktypes.NewBigInt(2002)
 	peerCtx.boundDataSet = &peerDataSetID
 	peerCtx.serviceURL = statusServer.URL
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, peerDataSetID) {
 			return peerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(
@@ -3460,10 +3479,10 @@ func TestUploader_ReplicaRepairResumesAfterCopyCommitBeforeDataSetRecovery(t *te
 	boundDataSetID := peerBinding.DataSetID.SDK()
 	peerCtx.boundDataSet = &boundDataSetID
 	var contextCalls atomic.Int32
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		contextCalls.Add(1)
 		if !createContextDataSetIDEqual(opts, boundDataSetID) {
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		return peerCtx, nil
 	}
@@ -3525,11 +3544,11 @@ func TestUploader_DataSetRecoveryFinalizesOtherCommittedUploads(t *testing.T) {
 	peerDataSetID := sdktypes.NewBigInt(2002)
 	peerCtx := newFakeUploadContext(sdktypes.NewBigInt(202), peerDataSetID, sdktypes.NewBigInt(302), testCID(t))
 	peerCtx.boundDataSet = &peerDataSetID
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, peerDataSetID) {
 			return peerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
@@ -3578,9 +3597,9 @@ func TestUploader_ReplicaRepairFinalizesCommittedCopyWhenDataSetStartsDraining(t
 	peerCtx := newFakeUploadContext(peerBinding.ProviderID.SDK(), peerBinding.DataSetID.SDK(), sdktypes.NewBigInt(302), testCID(t))
 	boundDataSetID := peerBinding.DataSetID.SDK()
 	peerCtx.boundDataSet = &boundDataSetID
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if !createContextDataSetIDEqual(opts, boundDataSetID) {
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		return peerCtx, nil
 	}
@@ -3641,7 +3660,7 @@ func TestUploader_CommittedReplicaRepairWaitsForLiveProviderEvidence(t *testing.
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
 		t.Fatalf("Create repair task: %v", err)
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, _ *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, _ *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		return nil, &synapse.ProviderUnavailableError{Cause: context.DeadlineExceeded}
 	}
 
@@ -3723,16 +3742,16 @@ func TestUploader_ReplicaRepairUsesRetainedCacheWhenNoRemoteCopyIsReadable(t *te
 	dataSetID := sdktypes.NewBigInt(1001)
 	repairedCtx.boundDataSet = &dataSetID
 	var createContextCalls atomic.Int32
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	var selectTargetsCalls atomic.Int32
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		createContextCalls.Add(1)
 		if !createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) || !createContextDataSetIDEqual(opts, dataSetID) {
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		return repairedCtx, nil
 	}
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("replica repair must not select a new provider")
 	}
 
@@ -3744,8 +3763,8 @@ func TestUploader_ReplicaRepairUsesRetainedCacheWhenNoRemoteCopyIsReadable(t *te
 	if got := createContextCalls.Load(); got != 1 {
 		t.Fatalf("CreateContext calls = %d, want one exact original context", got)
 	}
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want no provider selection", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want no provider selection", got)
 	}
 	if got := repairedCtx.storeCalls.Load(); got != 1 {
 		t.Fatalf("Store calls = %d, want one retained-cache upload", got)
@@ -3815,9 +3834,9 @@ func TestUploader_ReplicaRepairUsesSharedVersionAfterSourceDelete(t *testing.T) 
 	peerDataSetID := peerBinding.DataSetID.SDK()
 	peerCtx := newFakeUploadContext(peerBinding.ProviderID.SDK(), peerDataSetID, sdktypes.NewBigInt(302), testCID(t))
 	peerCtx.boundDataSet = &peerDataSetID
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if !createContextDataSetIDEqual(opts, peerDataSetID) {
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		return peerCtx, nil
 	}
@@ -3850,13 +3869,13 @@ func TestUploader_ReplicaRepairDoesNotReachStorageAfterPermanentDeleteWins(t *te
 		t.Fatalf("RetryExhausted: %v", err)
 	}
 	var createContextCalls atomic.Int32
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextFunc = func(_ context.Context, _ *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	var selectTargetsCalls atomic.Int32
+	env.storage.OpenTargetFunc = func(_ context.Context, _ *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		createContextCalls.Add(1)
 		return nil, errors.New("deleted repair must not create a storage context")
 	}
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("deleted repair must not select storage providers")
 	}
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default())
@@ -3864,8 +3883,8 @@ func TestUploader_ReplicaRepairDoesNotReachStorageAfterPermanentDeleteWins(t *te
 	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
 		t.Fatalf("cancelled repair task = %#v, want completed without retry", gotTask)
 	}
-	if createContextCalls.Load() != 0 || createContextsCalls.Load() != 0 {
-		t.Fatalf("storage context calls after delete = exact:%d selection:%d, want zero", createContextCalls.Load(), createContextsCalls.Load())
+	if createContextCalls.Load() != 0 || selectTargetsCalls.Load() != 0 {
+		t.Fatalf("storage context calls after delete = exact:%d selection:%d, want zero", createContextCalls.Load(), selectTargetsCalls.Load())
 	}
 	copyRow, err := env.repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
 	if err != nil || copyRow == nil || copyRow.Status != model.StorageUploadCopyStatusFailed {
@@ -4039,11 +4058,11 @@ func TestUploader_PeerTransientFailureKeepsCopyRetryable(t *testing.T) {
 	peerDataSetID := sdktypes.NewBigInt(2002)
 	peerCtx.boundDataSet = &peerDataSetID
 	peerCtx.pullErr = errors.New("temporary provider pull failed")
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(2002)) {
 			return peerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	stage := "peer_pull"
@@ -4251,14 +4270,14 @@ func TestUploader_PeerUsesRetainedCacheWhenReadableProviderBecomesUnavailable(t 
 	peerCtx := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3002), pieceCID)
 	peerDataSetID := sdktypes.NewBigInt(2002)
 	peerCtx.boundDataSet = &peerDataSetID
-	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		return nil, errors.New("existing replica slots must not select another provider")
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, sdktypes.NewBigInt(202)) && createContextDataSetIDEqual(opts, sdktypes.NewBigInt(2002)) {
 			return peerCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 	stage := "peer_pull"
 	task := &model.Task{
@@ -4324,9 +4343,9 @@ func TestUploader_QueuedPeerStageHandsUnavailableDataSetToInPlaceRepair(t *testi
 		t.Fatalf("MarkDataSetUnavailable peer: %v", err)
 	}
 
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("established slots must not select another provider")
 	}
 
@@ -4364,8 +4383,8 @@ func TestUploader_QueuedPeerStageHandsUnavailableDataSetToInPlaceRepair(t *testi
 	if len(copies) != 2 || copies[1].CopyIndex != 1 || copies[1].Status != model.StorageUploadCopyStatusPending || copies[1].StorageDataSetID == nil || *copies[1].StorageDataSetID != fixture.peer.ID {
 		t.Fatalf("copies after unavailable peer ensure = %#v, want original pending peer copy", copies)
 	}
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want no provider replacement", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want no provider replacement", got)
 	}
 	repairTasks, total, err := env.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "repair_replica", "", 10, 0)
 	if err != nil {
@@ -4390,9 +4409,9 @@ func TestUploader_ReplicaRepairWaitsForRunningPeerOperation(t *testing.T) {
 	peerCtx.boundDataSet = &dataSetID
 	peerCtx.pullEntered = make(chan struct{})
 	peerCtx.releasePull = make(chan struct{})
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if !createContextDataSetIDEqual(opts, dataSetID) {
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		return peerCtx, nil
 	}
@@ -4511,7 +4530,7 @@ func TestUploader_PeerOperationDefersWhileRecoveredDataSetHasActiveRepair(t *tes
 		t.Fatalf("Create peer task: %v", err)
 	}
 	var createContextCalls atomic.Int32
-	env.storage.CreateContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(context.Context, *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		createContextCalls.Add(1)
 		return nil, errors.New("ordinary peer operation must defer to active repair")
 	}
@@ -4566,7 +4585,7 @@ func TestUploader_IngressOperationDefersWhileDataSetHasActiveRepair(t *testing.T
 		t.Fatalf("release ingress task claim: %v", err)
 	}
 	var createContextCalls atomic.Int32
-	env.storage.CreateContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(context.Context, *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		createContextCalls.Add(1)
 		return nil, errors.New("ordinary ingress operation must defer to active repair")
 	}
@@ -4616,9 +4635,9 @@ func TestUploader_RepairPreparePreservesAssignedPeerSlots(t *testing.T) {
 			fixture := seedReadableUploadWithPendingPeer(t, env)
 			tc.mark(ctx, t, env, fixture)
 
-			var createContextsCalls atomic.Int32
-			env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-				createContextsCalls.Add(1)
+			var selectTargetsCalls atomic.Int32
+			env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+				selectTargetsCalls.Add(1)
 				return nil, errors.New("assigned slots must not select another provider")
 			}
 
@@ -4656,8 +4675,8 @@ func TestUploader_RepairPreparePreservesAssignedPeerSlots(t *testing.T) {
 			if len(copies) != 2 || copies[1].CopyIndex != 1 {
 				t.Fatalf("copies after repair prepare = %#v, want original assigned slots only", copies)
 			}
-			if got := createContextsCalls.Load(); got != 0 {
-				t.Fatalf("CreateContexts calls = %d, want no provider replacement", got)
+			if got := selectTargetsCalls.Load(); got != 0 {
+				t.Fatalf("SelectUploadTargets calls = %d, want no provider replacement", got)
 			}
 			repairTasks, total, err := env.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "repair_replica", "", 10, 0)
 			if err != nil {
@@ -4715,15 +4734,15 @@ func TestUploader_FailedNewPeerDataSetWithServiceEvidenceIsNotReselected(t *test
 
 	failedCtx := newFakeUploadContext(sdktypes.NewBigInt(303), sdktypes.NewBigInt(3003), sdktypes.NewBigInt(4001), testCID(t))
 	failedCtx.waitErr = fmt.Errorf("wait rejected: %w", pdp.ErrTxRejected)
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, failedCtx.providerID) {
 			return failedCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("service evidence must prevent provider reselection")
 	}
 
@@ -4754,8 +4773,8 @@ func TestUploader_FailedNewPeerDataSetWithServiceEvidenceIsNotReselected(t *test
 	if repairTotal != 0 || len(repairTasks) != 0 {
 		t.Fatalf("repair tasks = %#v, want no automatic provider replacement", repairTasks)
 	}
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want 0", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want 0", got)
 	}
 	retained, err := env.repos.Uploads.GetDataSetBindingByCopyIndex(ctx, fixture.upload.BucketID, 2)
 	if err != nil || retained == nil {
@@ -4804,19 +4823,19 @@ func TestUploader_RepairReusesAuthorizedBindingWithoutUploadCopy(t *testing.T) {
 	}
 
 	replacement := newFakeUploadContext(sdktypes.NewBigInt(404), sdktypes.NewBigInt(4004), sdktypes.NewBigInt(5001), testCID(t))
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
-		return []synapse.UploadContext{replacement}, nil
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
+		return []synapse.StorageTarget{replacement}, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, replacement.providerID) {
 			return replacement, nil
 		}
 		if createContextDataSetIDEqual(opts, replacement.dataSetID) {
 			return replacement, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	stage := "prepare_upload"
@@ -4839,8 +4858,8 @@ func TestUploader_RepairReusesAuthorizedBindingWithoutUploadCopy(t *testing.T) {
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want 0 when an authorized slot binding exists", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want 0 when an authorized slot binding exists", got)
 	}
 	copies, err := env.repos.Uploads.ListCopies(ctx, fixture.upload.ID)
 	if err != nil {
@@ -4895,11 +4914,11 @@ func TestUploader_FailedCandidateWithoutServiceEvidenceCanBeReselected(t *testin
 	failedCtx := newFakeUploadContext(sdktypes.NewBigInt(303), sdktypes.NewBigInt(3003), sdktypes.NewBigInt(4001), testCID(t))
 	failedCtx.skipCreateSubmission = true
 	failedCtx.createErr = fmt.Errorf("create rejected: %w", pdp.ErrTxRejected)
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, failedCtx.providerID) {
 			return failedCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	stage := "ensure_dataset"
@@ -4994,16 +5013,16 @@ func TestUploader_EvidenceFreeDataSetCandidateIsNotSharedAcrossUploads(t *testin
 		t.Fatalf("CreateVersionAndSetCurrent(second): %v", err)
 	}
 	prepareTask := seedStagedUploadTask(t, env, secondObjectID, secondVersionID, 5)
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("occupied slot must wait for its creating upload")
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTaskStatus(t, env, uploader, prepareTask.ID, model.TaskStatusWaiting, 5*time.Second)
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls while candidate owns slot = %d, want 0", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls while candidate owns slot = %d, want 0", got)
 	}
 	secondUpload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(ctx, secondVersionID)
 	if err != nil || secondUpload == nil {
@@ -5030,18 +5049,18 @@ func TestUploader_EvidenceFreeDataSetCandidateIsNotSharedAcrossUploads(t *testin
 	}
 
 	replacement := newFakeUploadContext(sdktypes.NewBigInt(404), sdktypes.NewBigInt(4004), sdktypes.NewBigInt(5004), testCID(t))
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		if opts.Copies != 1 {
-			t.Fatalf("CreateContexts copies = %d, want 1", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 1", opts.Copies)
 		}
-		return []synapse.UploadContext{replacement}, nil
+		return []synapse.StorageTarget{replacement}, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, replacement.providerID) {
 			return replacement, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 	if _, err := env.db.NewUpdate().Model((*model.Task)(nil)).
 		Set("scheduled_at = ?", time.Now().Add(-time.Second)).
@@ -5050,8 +5069,8 @@ func TestUploader_EvidenceFreeDataSetCandidateIsNotSharedAcrossUploads(t *testin
 		t.Fatalf("reschedule second prepare: %v", err)
 	}
 	runWorkerUntilTask(t, env, uploader, prepareTask.ID, 5*time.Second)
-	if got := createContextsCalls.Load(); got != 1 {
-		t.Fatalf("CreateContexts calls after safe discard = %d, want 1", got)
+	if got := selectTargetsCalls.Load(); got != 1 {
+		t.Fatalf("SelectUploadTargets calls after safe discard = %d, want 1", got)
 	}
 	secondCopies, err = env.repos.Uploads.ListCopies(ctx, secondUpload.ID)
 	if err != nil || len(secondCopies) != 1 || secondCopies[0].ProviderID == nil || secondCopies[0].ProviderID.String() != "404" {
@@ -5187,11 +5206,11 @@ func TestUploader_StagedPrimaryStoreCacheMissMarksCacheLocationAbsent(t *testing
 	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), testCID(t))
 	dataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &dataSetID
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default())
@@ -5285,13 +5304,13 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		if err := env.repos.Tasks.Create(ctx, fixture.task); err != nil {
 			t.Fatalf("create ingress store task: %v", err)
 		}
-		env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 			for _, storageCtx := range fixture.contexts {
 				if createContextDataSetIDEqual(opts, storageCtx.dataSetID) || createContextProviderIDEqual(opts, storageCtx.providerID) {
 					return storageCtx, nil
 				}
 			}
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		return fixture
 	}
@@ -5299,9 +5318,9 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 	t.Run("temporary outage reassigns ingress without replacing provider", func(t *testing.T) {
 		fixture := seed(t, 2, 2)
 		fixture.contexts[0].storeErr = &synapse.ProviderUnavailableError{Cause: errors.New("provider unavailable")}
-		var createContextsCalls atomic.Int32
-		fixture.env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-			createContextsCalls.Add(1)
+		var selectTargetsCalls atomic.Int32
+		fixture.env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+			selectTargetsCalls.Add(1)
 			return nil, errors.New("existing slots must not be replaced")
 		}
 		uploader := worker.NewUploader(fixture.env.repos, fixture.env.cache, fixture.env.storage, nil, fixture.env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
@@ -5327,8 +5346,8 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		if err != nil || total != 1 || taskPayloadInt64ForTest(ensureTasks[0].Payload, "copy_index") != 1 {
 			t.Fatalf("ensure tasks = %#v total=%d err=%v, want reassigned slot 1", ensureTasks, total, err)
 		}
-		if got := createContextsCalls.Load(); got != 0 {
-			t.Fatalf("CreateContexts calls = %d, want no topology change", got)
+		if got := selectTargetsCalls.Load(); got != 0 {
+			t.Fatalf("SelectUploadTargets calls = %d, want no topology change", got)
 		}
 	})
 
@@ -5355,9 +5374,9 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 			t.Fatalf("prepare committed ingress task: %v", err)
 		}
 		providerAvailable := atomic.Bool{}
-		fixture.env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		fixture.env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 			if !createContextDataSetIDEqual(opts, fixture.contexts[0].dataSetID) {
-				return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+				return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 			}
 			if !providerAvailable.Load() {
 				return nil, &synapse.ProviderUnavailableError{Cause: context.DeadlineExceeded}
@@ -5493,7 +5512,7 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 			t.Fatalf("mark committing: %v", err)
 		}
 		var changed atomic.Bool
-		fixture.env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		fixture.env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 			if createContextDataSetIDEqual(opts, fixture.contexts[0].dataSetID) {
 				if changed.CompareAndSwap(false, true) {
 					if err := fixture.env.repos.Objects.UpdateVersionState(ctx, fixture.versionID, model.ObjectStateCommitting, model.ObjectStateUploading); err != nil {
@@ -5507,7 +5526,7 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 					return storageCtx, nil
 				}
 			}
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		uploader := worker.NewUploader(fixture.env.repos, fixture.env.cache, fixture.env.storage, nil, fixture.env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
 		runWorkerUntilTaskRetryCount(t, fixture.env, uploader, fixture.task.ID, 1, 5*time.Second)
@@ -5572,9 +5591,9 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		fixture := seed(t, 2, 1)
 		ctx := context.Background()
 		fixture.contexts[0].storeErr = &synapse.ProviderUnavailableError{Cause: errors.New("provider unavailable")}
-		var createContextsCalls atomic.Int32
-		fixture.env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-			createContextsCalls.Add(1)
+		var selectTargetsCalls atomic.Int32
+		fixture.env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+			selectTargetsCalls.Add(1)
 			return nil, errors.New("existing slots must not be replaced")
 		}
 		uploader := worker.NewUploader(fixture.env.repos, fixture.env.cache, fixture.env.storage, nil, fixture.env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
@@ -5622,8 +5641,8 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		if ensureTasks[0].RefType != "object" || ensureTasks[0].RefID != fixture.objectID || ensureTasks[0].RefVersionID != fixture.versionID || taskPayloadInt64ForTest(ensureTasks[0].Payload, "copy_index") != 1 {
 			t.Fatalf("peer ensure task = %#v, want exact source object and pending slot", ensureTasks[0])
 		}
-		if got := createContextsCalls.Load(); got != 0 {
-			t.Fatalf("CreateContexts calls = %d, want no topology change", got)
+		if got := selectTargetsCalls.Load(); got != 0 {
+			t.Fatalf("SelectUploadTargets calls = %d, want no topology change", got)
 		}
 	})
 
@@ -5645,7 +5664,7 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 	t.Run("concurrent lifecycle change converges without retry", func(t *testing.T) {
 		fixture := seed(t, 1, 1)
 		var changed atomic.Bool
-		fixture.env.storage.CreateContextFunc = func(_ context.Context, _ *storage.CreateContextOptions) (synapse.UploadContext, error) {
+		fixture.env.storage.OpenTargetFunc = func(_ context.Context, _ *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 			if changed.CompareAndSwap(false, true) {
 				if err := fixture.env.repos.Uploads.MarkDataSetDraining(context.Background(), fixture.bindings[0].ID, "service ended concurrently"); err != nil {
 					t.Fatalf("MarkDataSetDraining: %v", err)
@@ -5693,15 +5712,15 @@ func TestUploader_UnestablishedCandidateOutageWaitsWithoutReplicaRepair(t *testi
 		sdktypes.NewBigInt(2001),
 		testCID(t),
 	)
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		if opts.Copies != 1 {
-			t.Fatalf("CreateContexts copies = %d, want one authorized slot", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want one authorized slot", opts.Copies)
 		}
-		return []synapse.UploadContext{candidate}, nil
+		return []synapse.StorageTarget{candidate}, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if !createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)) || opts.DataSetID != nil {
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 		return nil, &synapse.ProviderUnavailableError{Cause: errors.New("candidate provider unavailable")}
 	}
@@ -5735,7 +5754,7 @@ func TestUploader_SPUploadFailure_Retry(t *testing.T) {
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
 
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		return nil, errors.New("SP unavailable")
 	}
 
@@ -5768,7 +5787,7 @@ func TestUploader_SPUploadFailure_MaxRetries(t *testing.T) {
 	}
 	task.RetryCount = 4
 
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		return nil, errors.New("SP permanent failure")
 	}
 
@@ -5814,7 +5833,7 @@ func TestUploader_AllAssignedProvidersUnavailableWaitsWithoutRetry(t *testing.T)
 		bindings = append(bindings, binding)
 	}
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
-	var createContextsCalls atomic.Int32
+	var selectTargetsCalls atomic.Int32
 	var providerRecovered atomic.Bool
 	recoveredContext := newFakeUploadContext(
 		sdktypes.NewBigInt(101),
@@ -5824,11 +5843,11 @@ func TestUploader_AllAssignedProvidersUnavailableWaitsWithoutRetry(t *testing.T)
 	)
 	recoveredDataSetID := sdktypes.NewBigInt(1001)
 	recoveredContext.boundDataSet = &recoveredDataSetID
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("assigned slots must not select replacement providers")
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if providerRecovered.Load() && createContextDataSetIDEqual(opts, recoveredDataSetID) {
 			return recoveredContext, nil
 		}
@@ -5841,8 +5860,8 @@ func TestUploader_AllAssignedProvidersUnavailableWaitsWithoutRetry(t *testing.T)
 	if err != nil || gotTask.RetryCount != 0 || gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonDependency {
 		t.Fatalf("waiting task = %#v err=%v", gotTask, err)
 	}
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want no topology change", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want no topology change", got)
 	}
 	upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(ctx, versionID)
 	if err != nil || upload == nil {
@@ -5916,8 +5935,8 @@ func TestUploader_AllAssignedProvidersUnavailableWaitsWithoutRetry(t *testing.T)
 	if gotPrepare.Status != model.TaskStatusCompleted || gotPrepare.RetryCount != 0 {
 		t.Fatalf("resumed prepare task = %#v, want completed without retry", gotPrepare)
 	}
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls after recovery = %d, want no topology change", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls after recovery = %d, want no topology change", got)
 	}
 }
 
@@ -5948,22 +5967,22 @@ func TestUploader_PrepareSkipsUnavailableAssignedContextAndReassignsIngress(t *t
 	healthyCtx := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(3001), testCID(t))
 	dataSetID := sdktypes.NewBigInt(2002)
 	healthyCtx.boundDataSet = &dataSetID
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		return nil, errors.New("assigned slots must not select replacement providers")
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		switch {
 		case createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)):
 			return nil, &synapse.ProviderUnavailableError{Cause: errors.New("provider 101 unavailable")}
 		case createContextDataSetIDEqual(opts, dataSetID):
 			return healthyCtx, nil
 		default:
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 	}
-	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 		if len(contexts) != 1 || !contexts[0].ProviderID().Equal(sdktypes.NewBigInt(202)) {
 			t.Fatalf("funding contexts = %#v, want only provider 202", contexts)
 		}
@@ -5972,8 +5991,8 @@ func TestUploader_PrepareSkipsUnavailableAssignedContextAndReassignsIngress(t *t
 
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
-	if got := createContextsCalls.Load(); got != 0 {
-		t.Fatalf("CreateContexts calls = %d, want no topology change", got)
+	if got := selectTargetsCalls.Load(); got != 0 {
+		t.Fatalf("SelectUploadTargets calls = %d, want no topology change", got)
 	}
 	failedBinding, err := env.repos.Uploads.GetDataSetBindingByID(ctx, bindings[0].ID)
 	if err != nil || failedBinding == nil || failedBinding.Status != model.StorageDataSetStatusUnavailable {
@@ -6001,7 +6020,7 @@ func TestUploader_NewSlotProviderExhaustionWaitsWithoutRetry(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		return nil, &synapse.NoProviderCandidatesError{Cause: errors.New("no remaining providers")}
 	}
 	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm, cache.EvictionPolicyAfterUpload, 3, 1, 10*time.Millisecond, slog.Default())
@@ -6047,23 +6066,23 @@ func TestUploader_NewSlotProviderExhaustionUsesExistingReadySlots(t *testing.T) 
 		readyContexts[ids[1]] = storageCtx
 	}
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
-	var createContextsCalls atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalls.Add(1)
+	var selectTargetsCalls atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalls.Add(1)
 		if opts.Copies != 1 {
-			t.Fatalf("CreateContexts copies = %d, want one missing slot", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want one missing slot", opts.Copies)
 		}
 		return nil, &synapse.NoProviderCandidatesError{Cause: errors.New("no remaining providers")}
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if opts.DataSetID != nil {
 			if storageCtx := readyContexts[opts.DataSetID.String()]; storageCtx != nil {
 				return storageCtx, nil
 			}
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
-	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 		if len(contexts) != 2 {
 			t.Fatalf("PrepareUpload contexts = %d, want two existing ready slots", len(contexts))
 		}
@@ -6075,8 +6094,8 @@ func TestUploader_NewSlotProviderExhaustionUsesExistingReadySlots(t *testing.T) 
 	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
 		t.Fatalf("prepare task = %#v, want existing slots to continue without retry", gotTask)
 	}
-	if got := createContextsCalls.Load(); got != 1 {
-		t.Fatalf("CreateContexts calls = %d, want one bounded attempt for the missing slot", got)
+	if got := selectTargetsCalls.Load(); got != 1 {
+		t.Fatalf("SelectUploadTargets calls = %d, want one bounded attempt for the missing slot", got)
 	}
 	upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(ctx, versionID)
 	if err != nil || upload == nil {
@@ -6160,10 +6179,10 @@ func TestUploader_FundingSkipsUnavailableCandidateAndUsesReadySlot(t *testing.T)
 	var candidateRecovered atomic.Bool
 	var candidateCreateCalls atomic.Int32
 	candidateCtx.createCalls = &candidateCreateCalls
-	env.storage.CreateContextsFunc = func(context.Context, *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(context.Context, storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		return nil, errors.New("all requested slots are already assigned")
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		switch {
 		case createContextProviderIDEqual(opts, sdktypes.NewBigInt(101)):
 			if candidateRecovered.Load() {
@@ -6173,11 +6192,11 @@ func TestUploader_FundingSkipsUnavailableCandidateAndUsesReadySlot(t *testing.T)
 		case createContextDataSetIDEqual(opts, readyDataSetID):
 			return readyCtx, nil
 		default:
-			return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+			return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 		}
 	}
 	var prepareCalls atomic.Int32
-	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 		call := prepareCalls.Add(1)
 		wantProvider := sdktypes.NewBigInt(202)
 		if call > 1 {
@@ -6255,20 +6274,20 @@ func TestUploader_EvictTaskIdempotency(t *testing.T) {
 
 	pieceCID := testCID(t)
 	ingress := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		if opts.Copies != 1 {
-			t.Fatalf("CreateContexts copies = %d, want 1", opts.Copies)
+			t.Fatalf("SelectUploadTargets copies = %d, want 1", opts.Copies)
 		}
-		return []synapse.UploadContext{ingress}, nil
+		return []synapse.StorageTarget{ingress}, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextProviderIDEqual(opts, ingress.providerID) {
 			return ingress, nil
 		}
 		if createContextDataSetIDEqual(opts, ingress.dataSetID) {
 			return ingress, nil
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
 
 	// Pre-create conflicting evict_cache task to trigger idempotency collision
@@ -6316,12 +6335,12 @@ func TestUploader_UploadFundingWaitsWithoutRetry(t *testing.T) {
 	_, objID, versionID := seedCachedObject(t, env)
 	task := seedStagedUploadTask(t, env, objID, versionID, 5)
 
-	var createContextsCalled atomic.Int32
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalled.Add(1)
+	var selectTargetsCalled atomic.Int32
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalled.Add(1)
 		return newFakeUploadContexts(t, opts.Copies, 0), nil
 	}
-	env.storage.PrepareUploadFunc = func(_ context.Context, dataSize uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+	env.storage.PrepareUploadFunc = func(_ context.Context, dataSize uint64, contexts []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 		if dataSize == 0 {
 			t.Fatal("PrepareUpload data size must be positive")
 		}
@@ -6355,8 +6374,8 @@ func TestUploader_UploadFundingWaitsWithoutRetry(t *testing.T) {
 		}
 		t.Fatalf("status_message = %q, want deposit and approval guidance", message)
 	}
-	if createContextsCalled.Load() != 1 {
-		t.Fatalf("CreateContexts calls = %d, want 1", createContextsCalled.Load())
+	if selectTargetsCalled.Load() != 1 {
+		t.Fatalf("SelectUploadTargets calls = %d, want 1", selectTargetsCalled.Load())
 	}
 	upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(context.Background(), versionID)
 	if err != nil || upload == nil {
@@ -6383,25 +6402,25 @@ func TestUploader_UploadFundingRetryReusesBindings(t *testing.T) {
 	ctx := context.Background()
 
 	var (
-		createContextsCalled atomic.Int32
-		prepareCalled        atomic.Int32
-		uploadContexts       []synapse.UploadContext
+		selectTargetsCalled atomic.Int32
+		prepareCalled       atomic.Int32
+		uploadContexts      []synapse.StorageTarget
 	)
-	env.storage.CreateContextsFunc = func(_ context.Context, _ *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-		createContextsCalled.Add(1)
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, _ storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+		selectTargetsCalled.Add(1)
 		uploadContexts = newFakeUploadContexts(t, config.DefaultFilecoinCopies, 0)
 		return uploadContexts, nil
 	}
-	env.storage.CreateContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		for _, uploadCtx := range uploadContexts {
 			fakeCtx := uploadCtx.(*fakeUploadContext)
 			if createContextProviderIDEqual(opts, fakeCtx.providerID) || createContextDataSetIDEqual(opts, fakeCtx.dataSetID) {
 				return fakeCtx, nil
 			}
 		}
-		return nil, fmt.Errorf("unexpected CreateContext opts: %#v", opts)
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
 	}
-	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+	env.storage.PrepareUploadFunc = func(_ context.Context, _ uint64, contexts []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 		if len(contexts) != config.DefaultFilecoinCopies {
 			t.Fatalf("PrepareUpload contexts = %d, want %d", len(contexts), config.DefaultFilecoinCopies)
 		}
@@ -6430,8 +6449,8 @@ func TestUploader_UploadFundingRetryReusesBindings(t *testing.T) {
 	if got.Status != model.TaskStatusCompleted {
 		t.Fatalf("expected retried task completed, got %s", got.Status)
 	}
-	if createContextsCalled.Load() != 1 {
-		t.Fatalf("CreateContexts calls = %d, want 1", createContextsCalled.Load())
+	if selectTargetsCalled.Load() != 1 {
+		t.Fatalf("SelectUploadTargets calls = %d, want 1", selectTargetsCalled.Load())
 	}
 	if prepareCalled.Load() != 2 {
 		t.Fatalf("PrepareUpload calls = %d, want 2", prepareCalled.Load())
@@ -6468,7 +6487,7 @@ func TestUploader_PrepareFundingDoesNotQueryWallet(t *testing.T) {
 			return nil, errors.New("wallet should not be queried during upload funding preparation")
 		},
 	}
-	env.storage.CreateContextsFunc = func(_ context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+	env.storage.SelectUploadTargetsFunc = func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 		return newFakeUploadContexts(t, opts.Copies, 0), nil
 	}
 

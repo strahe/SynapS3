@@ -284,8 +284,9 @@ func (w *StorageCleanupWorker) processCopy(ctx context.Context, copy model.Stora
 		}
 		return false, fmt.Errorf("%w: %v", errStorageCleanupCopyUnsupported, err)
 	}
-	cleanupCtx, err := w.storage.CreateCleanupContext(ctx, &storage.CreateContextOptions{
-		DataSetID: sdkBigIntPtr(copy.DataSetID),
+	providerID := copy.ProviderID.SDK()
+	cleanupCtx, err := w.storage.OpenCleanupContext(ctx, copy.DataSetID.SDK(), storage.NewDataSetContextOptions{
+		ProviderID: &providerID,
 	})
 	if err != nil {
 		return false, err

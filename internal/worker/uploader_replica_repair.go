@@ -191,7 +191,7 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 	}
 	if alreadyCommitted {
 		if binding.Status == model.StorageDataSetStatusUnavailable {
-			if _, err := u.contextForReadyBinding(ctx, binding, bucket.Name); err != nil {
+			if _, err := u.contextForReadyBinding(ctx, binding); err != nil {
 				u.handleReplicaRepairDataSetFailure(ctx, task, binding, logger, "verify committed replica context", err)
 				return
 			}
@@ -238,7 +238,7 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 		}
 		return
 	}
-	storageCtx, err := u.contextForReadyBinding(ctx, binding, bucket.Name)
+	storageCtx, err := u.contextForReadyBinding(ctx, binding)
 	if err != nil {
 		u.handleReplicaRepairDataSetFailure(ctx, task, binding, logger, "restore replica context", err)
 		return
@@ -256,7 +256,7 @@ func (u *Uploader) repairReplicaCopy(
 	bucket *model.Bucket,
 	binding *model.StorageDataSet,
 	copyRow *model.StorageUploadCopy,
-	storageCtx synapse.UploadContext,
+	storageCtx synapse.DataSetTarget,
 	logger *slog.Logger,
 ) error {
 	readableCopies, err := u.repos.Uploads.ListReadableCommittedCopies(ctx, upload.ID)
@@ -467,7 +467,7 @@ func (u *Uploader) commitReplicaRepairCopy(
 	upload *model.StorageUpload,
 	binding *model.StorageDataSet,
 	copyRow *model.StorageUploadCopy,
-	storageCtx synapse.UploadContext,
+	storageCtx synapse.DataSetTarget,
 	pieces []storage.PieceInput,
 ) (*storage.CommitResult, error) {
 	if copyCommitSubmitted(copyRow) {

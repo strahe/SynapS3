@@ -99,13 +99,22 @@ func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input
 		return result.withError(PDPStatusUnavailable, err.Error())
 	}
 	status, err := client.GetDataSetCreationStatus(ctx, statusURL)
-	if err != nil {
+	if status == nil {
+		if err == nil {
+			err = errors.New("empty data set creation status")
+		}
 		return result.withError(PDPStatusUnavailable, err.Error())
 	}
 	result.TxStatus = status.TxStatus
 	result.DataSetCreated = status.DataSetCreated
 	if status.DataSetID != nil {
 		result.DataSetID = status.DataSetID.String()
+	}
+	if errors.Is(err, pdp.ErrInvalidStatus) {
+		return result.withError(PDPStatusMismatch, err.Error())
+	}
+	if err != nil && !errors.Is(err, pdp.ErrTxRejected) {
+		return result.withError(PDPStatusUnavailable, err.Error())
 	}
 	if err := validateDataSetCreationStatusIdentity(input, result, status.CreateMessageHash.Hex()); err != nil {
 		return result.withError(PDPStatusMismatch, err.Error())
@@ -146,7 +155,10 @@ func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiec
 		return result, err
 	}
 	status, err := client.GetAddPiecesStatus(ctx, statusURL)
-	if err != nil {
+	if status == nil {
+		if err == nil {
+			err = errors.New("empty add-pieces status")
+		}
 		return result, err
 	}
 	result.TxStatus = status.TxStatus
@@ -155,6 +167,13 @@ func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiec
 	result.PiecesAdded = status.PiecesAdded
 	for _, id := range status.ConfirmedPieceIDs {
 		result.ConfirmedPieceIDs = append(result.ConfirmedPieceIDs, id.String())
+	}
+	if errors.Is(err, pdp.ErrInvalidStatus) {
+		result.State = PDPStatusMismatch
+		return result, err
+	}
+	if err != nil && !errors.Is(err, pdp.ErrTxRejected) {
+		return result, err
 	}
 	if err := validateAddPiecesStatusIdentity(input, result, status.TxHash.Hex()); err != nil {
 		result.State = PDPStatusMismatch

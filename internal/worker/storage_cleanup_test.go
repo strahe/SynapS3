@@ -73,14 +73,11 @@ func TestStorageCleanupWorkerMarksMissingPieceRemoved(t *testing.T) {
 	}
 
 	var requestedDataSet string
-	env.storage.CreateCleanupContextFunc = func(_ context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error) {
-		if opts.ProviderID != nil {
-			t.Fatalf("ProviderID = %s, want none when deleting from a known dataset", opts.ProviderID)
+	env.storage.OpenCleanupContextFunc = func(_ context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+		if opts.ProviderID == nil || opts.ProviderID.String() != "101" {
+			t.Fatalf("ProviderID = %v, want 101", opts.ProviderID)
 		}
-		if opts.DataSetID == nil {
-			t.Fatal("DataSetID is nil, want one dataset")
-		}
-		requestedDataSet = opts.DataSetID.String()
+		requestedDataSet = dataSetID.String()
 		return fakeCleanupContext{
 			pieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
 				return &storage.PieceStatus{Exists: false}, nil
@@ -155,7 +152,7 @@ func TestStorageCleanupWorkerContinuesAfterUnsupportedCopy(t *testing.T) {
 	if _, err := env.db.NewInsert().Model(removable).Exec(ctx); err != nil {
 		t.Fatalf("insert removable cleanup copy: %v", err)
 	}
-	env.storage.CreateCleanupContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.CleanupContext, error) {
+	env.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
 		return fakeCleanupContext{
 			pieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
 				return &storage.PieceStatus{Exists: false}, nil
@@ -230,7 +227,7 @@ func TestStorageCleanupWorkerWaitsWhenUnsupportedTaskStillHasScheduledDeletion(t
 	if _, err := env.db.NewInsert().Model(scheduled).Exec(ctx); err != nil {
 		t.Fatalf("insert scheduled cleanup copy: %v", err)
 	}
-	env.storage.CreateCleanupContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.CleanupContext, error) {
+	env.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
 		return fakeCleanupContext{
 			pieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
 				return &storage.PieceStatus{Exists: true}, nil
@@ -297,7 +294,7 @@ func TestStorageCleanupWorkerSchedulesDeletionByPieceID(t *testing.T) {
 	}
 
 	var deletedPieceID string
-	env.storage.CreateCleanupContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.CleanupContext, error) {
+	env.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
 		return fakeCleanupContext{
 			pieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
 				return &storage.PieceStatus{Exists: true}, nil
@@ -397,7 +394,7 @@ func TestStorageCleanupWorkerWaitsWhenObjectUsesUpload(t *testing.T) {
 	}
 
 	var cleanupContextCalls atomic.Int32
-	env.storage.CreateCleanupContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.CleanupContext, error) {
+	env.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
 		cleanupContextCalls.Add(1)
 		return fakeCleanupContext{}, nil
 	}
@@ -500,7 +497,7 @@ func TestStorageCleanupWorkerWaitsWhenActiveUploadUsesSamePiece(t *testing.T) {
 	seedStorageCleanupWorkerCommittedCopy(t, env, bucket.ID, activeUpload.ID, pieceCID, "101", "1001", "2001")
 
 	var cleanupContextCalls atomic.Int32
-	env.storage.CreateCleanupContextFunc = func(context.Context, *storage.CreateContextOptions) (synapse.CleanupContext, error) {
+	env.storage.OpenCleanupContextFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
 		cleanupContextCalls.Add(1)
 		return fakeCleanupContext{}, nil
 	}

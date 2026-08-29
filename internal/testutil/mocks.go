@@ -23,12 +23,24 @@ var (
 
 // MockStorageClient is a configurable test double for synapse.StorageClient.
 type MockStorageClient struct {
-	UploadFunc               func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
-	DownloadFunc             func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
-	PrepareUploadFunc        func(ctx context.Context, dataSize uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error)
-	CreateContextsFunc       func(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error)
-	CreateContextFunc        func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error)
-	CreateCleanupContextFunc func(ctx context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error)
+	UploadFunc              func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
+	DownloadFunc            func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
+	PrepareUploadFunc       func(ctx context.Context, dataSize uint64, targets []synapse.StorageTarget) (*storage.MultiContextCosts, error)
+	SelectUploadTargetsFunc func(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error)
+	OpenProviderTargetFunc  func(ctx context.Context, providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) (synapse.ProviderTarget, error)
+	OpenDataSetTargetFunc   func(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.DataSetTarget, error)
+	OpenTargetFunc          func(ctx context.Context, opts *OpenTargetOptions) (synapse.StorageTarget, error)
+	FindMatchingDataSetFunc func(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error)
+	OpenCleanupContextFunc  func(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.CleanupContext, error)
+}
+
+// OpenTargetOptions lets worker tests configure one callback for both
+// immutable provider and data-set target opens.
+type OpenTargetOptions struct {
+	ProviderID      *sdktypes.BigInt
+	DataSetID       *sdktypes.BigInt
+	DataSetMetadata map[string]string
+	WithCDN         *bool
 }
 
 func (m *MockStorageClient) Upload(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error) {
@@ -45,120 +57,215 @@ func (m *MockStorageClient) Download(ctx context.Context, pieceCID cid.Cid, opts
 	return nil, errors.New("MockStorageClient.Download not configured")
 }
 
-func (m *MockStorageClient) PrepareUpload(ctx context.Context, dataSize uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+func (m *MockStorageClient) PrepareUpload(ctx context.Context, dataSize uint64, targets []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 	if m.PrepareUploadFunc != nil {
-		return m.PrepareUploadFunc(ctx, dataSize, contexts)
+		return m.PrepareUploadFunc(ctx, dataSize, targets)
 	}
 	return &storage.MultiContextCosts{Ready: true}, nil
 }
 
-func (m *MockStorageClient) CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
-	if m.CreateContextsFunc != nil {
-		return m.CreateContextsFunc(ctx, opts)
+func (m *MockStorageClient) SelectUploadTargets(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+	if m.SelectUploadTargetsFunc != nil {
+		return m.SelectUploadTargetsFunc(ctx, opts)
 	}
-	return nil, errors.New("MockStorageClient.CreateContexts not configured")
+	return nil, errors.New("MockStorageClient.SelectUploadTargets not configured")
 }
 
-func (m *MockStorageClient) CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
-	if m.CreateContextFunc != nil {
-		return m.CreateContextFunc(ctx, opts)
+func (m *MockStorageClient) OpenProviderTarget(ctx context.Context, providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+	if m.OpenProviderTargetFunc != nil {
+		return m.OpenProviderTargetFunc(ctx, providerID, opts)
 	}
-	return NewMockUploadContext(opts), nil
-}
-
-func (m *MockStorageClient) CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error) {
-	if m.CreateCleanupContextFunc != nil {
-		return m.CreateCleanupContextFunc(ctx, opts)
-	}
-	if m.CreateContextFunc != nil {
-		ctx, err := m.CreateContextFunc(ctx, opts)
+	if m.OpenTargetFunc != nil {
+		target, err := m.OpenTargetFunc(ctx, &OpenTargetOptions{
+			ProviderID:      copySDKBigIntPtr(&providerID),
+			DataSetMetadata: opts.DataSetMetadata,
+			WithCDN:         opts.WithCDN,
+		})
 		if err != nil {
 			return nil, err
 		}
-		cleanupCtx, ok := ctx.(synapse.CleanupContext)
+		providerTarget, ok := target.(synapse.ProviderTarget)
 		if !ok {
-			return nil, errors.New("MockStorageClient.CreateContext did not return CleanupContext")
+			return nil, errors.New("MockStorageClient.OpenTargetFunc did not return ProviderTarget")
+		}
+		return providerTarget, nil
+	}
+	return NewMockProviderTarget(providerID, opts), nil
+}
+
+func (m *MockStorageClient) OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+	if m.OpenDataSetTargetFunc != nil {
+		return m.OpenDataSetTargetFunc(ctx, dataSetID, opts)
+	}
+	if m.OpenTargetFunc != nil {
+		target, err := m.OpenTargetFunc(ctx, &OpenTargetOptions{
+			ProviderID: opts.ProviderID,
+			DataSetID:  copySDKBigIntPtr(&dataSetID),
+			WithCDN:    opts.WithCDN,
+		})
+		if err != nil {
+			return nil, err
+		}
+		dataSetTarget, ok := target.(synapse.DataSetTarget)
+		if !ok {
+			return nil, errors.New("MockStorageClient.OpenTargetFunc did not return DataSetTarget")
+		}
+		if _, bound := dataSetTarget.DataSetRef(); !bound {
+			clientDataSetID := dataSetID.Copy()
+			if source, ok := target.(interface{ ClientDataSetID() sdktypes.BigInt }); ok {
+				clientDataSetID = source.ClientDataSetID()
+			}
+			ref, refErr := storage.NewDataSetRef(target.ProviderID(), dataSetID, clientDataSetID)
+			if refErr != nil {
+				return nil, refErr
+			}
+			return dataSetTargetWithRef{DataSetTarget: dataSetTarget, ref: ref}, nil
+		}
+		return dataSetTarget, nil
+	}
+	providerID := sdktypes.BigInt{}
+	if opts.ProviderID != nil {
+		providerID = opts.ProviderID.Copy()
+	}
+	return NewMockDataSetTarget(providerID, dataSetID, opts.WithCDN), nil
+}
+
+type dataSetTargetWithRef struct {
+	synapse.DataSetTarget
+	ref storage.DataSetRef
+}
+
+func (c dataSetTargetWithRef) DataSetRef() (storage.DataSetRef, bool) { return c.ref, true }
+
+func (m *MockStorageClient) FindMatchingDataSet(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error) {
+	if m.FindMatchingDataSetFunc != nil {
+		return m.FindMatchingDataSetFunc(ctx, providerID, metadata, withCDN)
+	}
+	return nil, nil
+}
+
+func (m *MockStorageClient) OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+	if m.OpenCleanupContextFunc != nil {
+		return m.OpenCleanupContextFunc(ctx, dataSetID, opts)
+	}
+	if m.OpenDataSetTargetFunc != nil {
+		dataSetCtx, err := m.OpenDataSetTargetFunc(ctx, dataSetID, opts)
+		if err != nil {
+			return nil, err
+		}
+		cleanupCtx, ok := dataSetCtx.(synapse.CleanupContext)
+		if !ok {
+			return nil, errors.New("MockStorageClient.OpenDataSetTarget did not return CleanupContext")
 		}
 		return cleanupCtx, nil
 	}
-	return nil, errors.New("MockStorageClient.CreateCleanupContext not configured")
+	if m.OpenTargetFunc != nil {
+		target, err := m.OpenTargetFunc(ctx, &OpenTargetOptions{
+			ProviderID: opts.ProviderID,
+			DataSetID:  copySDKBigIntPtr(&dataSetID),
+			WithCDN:    opts.WithCDN,
+		})
+		if err != nil {
+			return nil, err
+		}
+		cleanupCtx, ok := target.(synapse.CleanupContext)
+		if !ok {
+			return nil, errors.New("MockStorageClient.OpenTargetFunc did not return CleanupContext")
+		}
+		return cleanupCtx, nil
+	}
+	return nil, errors.New("MockStorageClient.OpenCleanupContext not configured")
 }
 
-// MockUploadContext is a minimal UploadContext for tests that only need
+// MockStorageTarget is a minimal immutable storage target for tests that only need
 // provider metadata for upload preparation.
-type MockUploadContext struct {
-	ProviderIDValue sdktypes.BigInt
-	DataSetIDValue  *sdktypes.BigInt
-	ServiceURLValue string
-	WithCDNValue    bool
+type MockStorageTarget struct {
+	ProviderIDValue      sdktypes.BigInt
+	DataSetIDValue       *sdktypes.BigInt
+	ClientDataSetIDValue sdktypes.BigInt
+	ServiceURLValue      string
+	WithCDNValue         bool
 }
 
-func NewMockUploadContext(opts *storage.CreateContextOptions) *MockUploadContext {
-	ctx := &MockUploadContext{ServiceURLValue: "https://provider.example"}
-	if opts != nil {
-		if opts.ProviderID != nil {
-			ctx.ProviderIDValue = opts.ProviderID.Copy()
-		}
-		if opts.DataSetID != nil {
-			id := opts.DataSetID.Copy()
-			ctx.DataSetIDValue = &id
-		}
-		if opts.WithCDN != nil {
-			ctx.WithCDNValue = *opts.WithCDN
-		}
+func NewMockProviderTarget(providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) *MockStorageTarget {
+	ctx := &MockStorageTarget{ProviderIDValue: providerID.Copy(), ServiceURLValue: "https://provider.example"}
+	if opts.WithCDN != nil {
+		ctx.WithCDNValue = *opts.WithCDN
 	}
 	return ctx
 }
 
-func (m *MockUploadContext) ProviderID() sdktypes.BigInt { return m.ProviderIDValue.Copy() }
-
-func (m *MockUploadContext) DataSetID() *sdktypes.BigInt {
-	if m.DataSetIDValue == nil {
-		return nil
+func NewMockDataSetTarget(providerID, dataSetID sdktypes.BigInt, withCDN *bool) *MockStorageTarget {
+	ctx := &MockStorageTarget{
+		ProviderIDValue: providerID.Copy(),
+		DataSetIDValue:  copySDKBigIntPtr(&dataSetID),
+		ServiceURLValue: "https://provider.example",
 	}
-	id := m.DataSetIDValue.Copy()
-	return &id
+	if withCDN != nil {
+		ctx.WithCDNValue = *withCDN
+	}
+	return ctx
 }
 
-func (m *MockUploadContext) GetProviderInfo() storage.Provider {
+func (m *MockStorageTarget) ProviderID() sdktypes.BigInt { return m.ProviderIDValue.Copy() }
+
+func (m *MockStorageTarget) DataSetRef() (storage.DataSetRef, bool) {
+	if m.DataSetIDValue == nil {
+		return storage.DataSetRef{}, false
+	}
+	ref, err := storage.NewDataSetRef(m.ProviderIDValue, *m.DataSetIDValue, m.ClientDataSetIDValue)
+	return ref, err == nil
+}
+
+func (m *MockStorageTarget) ClientDataSetID() sdktypes.BigInt { return m.ClientDataSetIDValue.Copy() }
+
+func (m *MockStorageTarget) GetProviderInfo() storage.Provider {
 	return storage.Provider{ID: m.ProviderID(), ServiceURL: m.ServiceURL()}
 }
 
-func (m *MockUploadContext) WithCDN() bool { return m.WithCDNValue }
+func (m *MockStorageTarget) CDNEnabled() bool { return m.WithCDNValue }
 
-func (m *MockUploadContext) PieceURL(piece cid.Cid) string {
+func (m *MockStorageTarget) PieceURL(piece cid.Cid) string {
 	return m.ServiceURL() + "/piece/" + piece.String()
 }
 
-func (m *MockUploadContext) ServiceURL() string {
+func (m *MockStorageTarget) ServiceURL() string {
 	if m.ServiceURLValue != "" {
 		return m.ServiceURLValue
 	}
 	return "https://provider.example"
 }
 
-func (m *MockUploadContext) CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
-	return nil, errors.New("MockUploadContext.CreateDataSet not configured")
+func (m *MockStorageTarget) CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+	return nil, errors.New("MockStorageTarget.CreateDataSet not configured")
 }
 
-func (m *MockUploadContext) WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
-	return nil, errors.New("MockUploadContext.WaitForDataSetCreated not configured")
+func (m *MockStorageTarget) WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+	return nil, errors.New("MockStorageTarget.WaitForDataSetCreated not configured")
 }
 
-func (m *MockUploadContext) Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
-	return nil, errors.New("MockUploadContext.Store not configured")
+func (m *MockStorageTarget) Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+	return nil, errors.New("MockStorageTarget.Store not configured")
 }
 
-func (m *MockUploadContext) PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error) {
-	return nil, errors.New("MockUploadContext.PresignForCommit not configured")
+func (m *MockStorageTarget) PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error) {
+	return nil, errors.New("MockStorageTarget.PresignForCommit not configured")
 }
 
-func (m *MockUploadContext) Pull(context.Context, storage.PullRequest) (*storage.PullResult, error) {
-	return nil, errors.New("MockUploadContext.Pull not configured")
+func (m *MockStorageTarget) Pull(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+	return nil, errors.New("MockStorageTarget.Pull not configured")
 }
 
-func (m *MockUploadContext) Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error) {
-	return nil, errors.New("MockUploadContext.Commit not configured")
+func (m *MockStorageTarget) Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error) {
+	return nil, errors.New("MockStorageTarget.Commit not configured")
+}
+
+func copySDKBigIntPtr(value *sdktypes.BigInt) *sdktypes.BigInt {
+	if value == nil {
+		return nil
+	}
+	copy := value.Copy()
+	return &copy
 }
 
 // MockWalletQuerier is a configurable test double for synapse.WalletQuerier.

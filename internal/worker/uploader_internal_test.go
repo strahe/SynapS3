@@ -164,11 +164,135 @@ func TestPendingSubmittedCommitWaitsWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestEnsureBucketProviderBindingsPersistsPartialSelectionBeforeWaiting(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "partial-selection-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create bucket: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J0000000000000PARTIAL01",
+		ContentSize:     1024,
+		Checksum:        "partial-selection-checksum",
+		RequestedCopies: 3,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	providerTarget := testutil.NewMockProviderTarget(sdktypes.NewBigInt(101), storage.NewProviderContextOptions{})
+	dataSetTarget := testutil.NewMockDataSetTarget(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), nil)
+	dataSetTarget.ClientDataSetIDValue = sdktypes.NewBigInt(9002)
+	client := &testutil.MockStorageClient{
+		SelectUploadTargetsFunc: func(_ context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
+			if opts.Copies != 3 {
+				t.Fatalf("selection copies = %d, want 3", opts.Copies)
+			}
+			return []synapse.StorageTarget{providerTarget, dataSetTarget}, &synapse.NoProviderCandidatesError{
+				Cause: &storage.InsufficientUploadContextsError{Requested: 3, Available: 2},
+			}
+		},
+	}
+	uploader := &Uploader{repos: repos, storage: client}
+
+	plan, err := uploader.ensureBucketProviderBindings(ctx, bucket, upload.ID, 3)
+	if !synapse.IsNoProviderCandidates(err) || plan.complete || len(plan.bindings) != 2 {
+		t.Fatalf("plan = %#v, error = %T %v; want two persisted partial bindings", plan, err, err)
+	}
+	pending := plan.byCopyIndex[0]
+	ready := plan.byCopyIndex[1]
+	if pending == nil || pending.ProviderID.String() != "101" || pending.Status != model.StorageDataSetStatusPending {
+		t.Fatalf("provider binding = %#v, want pending provider 101", pending)
+	}
+	if ready == nil || ready.ProviderID.String() != "202" || ready.Status != model.StorageDataSetStatusReady ||
+		ready.DataSetID == nil || ready.DataSetID.String() != "2002" ||
+		ready.ClientDataSetID == nil || ready.ClientDataSetID.String() != "9002" {
+		t.Fatalf("data set binding = %#v, want complete ready identity", ready)
+	}
+}
+
+func TestContextForReadyBindingBackfillsClientDataSetIDAndRejectsConflict(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "ready-binding-backfill-bucket", Status: model.BucketStatusActive}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create bucket: %v", err)
+	}
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J00000000000BACKFILL01",
+		ContentSize:     1024,
+		Checksum:        "ready-binding-backfill-checksum",
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        onChainID(t, "101"),
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	dataSetID := onChainID(t, "1001")
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: binding.ID, UploadID: upload.ID, DataSetID: dataSetID,
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	binding, err = repos.Uploads.GetDataSetBindingByID(ctx, binding.ID)
+	if err != nil || binding == nil {
+		t.Fatalf("GetDataSetBindingByID: binding=%#v err=%v", binding, err)
+	}
+	target := testutil.NewMockDataSetTarget(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), nil)
+	target.ClientDataSetIDValue = sdktypes.NewBigInt(9001)
+	client := &testutil.MockStorageClient{
+		OpenDataSetTargetFunc: func(_ context.Context, gotDataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+			if !gotDataSetID.Equal(sdktypes.NewBigInt(1001)) || opts.ProviderID == nil || !opts.ProviderID.Equal(sdktypes.NewBigInt(101)) {
+				t.Fatalf("OpenDataSetTarget inputs = dataSet:%s provider:%v", gotDataSetID.String(), opts.ProviderID)
+			}
+			return target, nil
+		},
+	}
+	uploader := &Uploader{repos: repos, storage: client}
+
+	if _, err := uploader.contextForReadyBinding(ctx, binding); err != nil {
+		t.Fatalf("contextForReadyBinding: %v", err)
+	}
+	if binding.ClientDataSetID == nil || binding.ClientDataSetID.String() != "9001" {
+		t.Fatalf("in-memory client data set ID = %v, want 9001", binding.ClientDataSetID)
+	}
+	stored, err := repos.Uploads.GetDataSetBindingByID(ctx, binding.ID)
+	if err != nil || stored == nil || stored.ClientDataSetID == nil || stored.ClientDataSetID.String() != "9001" {
+		t.Fatalf("stored binding = %#v err=%v, want client data set ID 9001", stored, err)
+	}
+
+	target.ClientDataSetIDValue = sdktypes.NewBigInt(9002)
+	if _, err := uploader.contextForReadyBinding(ctx, binding); err == nil {
+		t.Fatal("contextForReadyBinding accepted a conflicting client data set ID")
+	}
+}
+
+func TestDataSetResultIDsForBindingRejectsMissingResult(t *testing.T) {
+	t.Parallel()
+
+	binding := &model.StorageDataSet{ProviderID: onChainID(t, "101")}
+	if _, _, err := dataSetResultIDsForBinding(binding, nil); err == nil {
+		t.Fatal("dataSetResultIDsForBinding accepted a missing creation result")
+	}
+}
+
 func TestWaitForSubmittedCommitParsesBigIntStringIDsAndZeroPieceID(t *testing.T) {
 	dataSetID := "18446744073709551616"
 	pieceID := "18446744073709551617"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":%q,"pieceCount":2,"piecesAdded":true,"confirmedPieceIds":["0",%q]}`, submittedCommitTestTxHash, dataSetID, pieceID)
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":%q,"pieceCount":2,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":["0",%q]}`, submittedCommitTestTxHash, dataSetID, pieceID)
 	}))
 	defer srv.Close()
 
@@ -177,18 +301,18 @@ func TestWaitForSubmittedCommitParsesBigIntStringIDsAndZeroPieceID(t *testing.T)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	result, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: srv.URL}, &model.StorageDataSet{DataSetID: &bindingDataSetID}, submittedCommitTestTxHash, 2)
+	result, err := u.waitForSubmittedCommit(ctx, submittedCommitTestContext{serviceURL: srv.URL, dataSetID: bindingDataSetID.SDK()}, &model.StorageDataSet{DataSetID: &bindingDataSetID}, submittedCommitTestTxHash, 2)
 	if err != nil {
 		t.Fatalf("waitForSubmittedCommit: %v", err)
 	}
-	if result.DataSetID.String() != dataSetID || len(result.PieceIDs) != 2 || result.PieceIDs[0].String() != "0" || result.PieceIDs[1].String() != pieceID {
+	if result.DataSet.DataSetID().String() != dataSetID || len(result.PieceIDs) != 2 || result.PieceIDs[0].String() != "0" || result.PieceIDs[1].String() != pieceID {
 		t.Fatalf("commit result = %#v, want big data set and piece IDs", result)
 	}
 }
 
 func TestWaitForSubmittedCommitRejectsTransactionMismatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"piecesAdded":true,"confirmedPieceIds":[2001]}`, "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[2001]}`, "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
 	}))
 	defer srv.Close()
 
@@ -330,17 +454,25 @@ func TestUploadProgressReporterCoalescesThrottledProgress(t *testing.T) {
 
 type submittedCommitTestContext struct {
 	serviceURL string
+	dataSetID  sdktypes.BigInt
 }
 
-func (c submittedCommitTestContext) ProviderID() sdktypes.BigInt { return sdktypes.NewBigInt(0) }
+func (c submittedCommitTestContext) ProviderID() sdktypes.BigInt { return sdktypes.NewBigInt(1) }
 
-func (c submittedCommitTestContext) DataSetID() *sdktypes.BigInt { return nil }
+func (c submittedCommitTestContext) DataSetRef() (storage.DataSetRef, bool) {
+	dataSetID := c.dataSetID
+	if dataSetID.IsZero() {
+		dataSetID = sdktypes.NewBigInt(1001)
+	}
+	ref, err := storage.NewDataSetRef(c.ProviderID(), dataSetID, sdktypes.BigInt{})
+	return ref, err == nil
+}
 
 func (c submittedCommitTestContext) GetProviderInfo() storage.Provider {
 	return storage.Provider{ID: c.ProviderID(), ServiceURL: c.ServiceURL()}
 }
 
-func (c submittedCommitTestContext) WithCDN() bool { return false }
+func (c submittedCommitTestContext) CDNEnabled() bool { return false }
 
 func (c submittedCommitTestContext) PieceURL(cid.Cid) string { return "" }
 
