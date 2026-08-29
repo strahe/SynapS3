@@ -346,6 +346,12 @@ type MarkDataSetReadyInput struct {
 	ClientDataSetID *types.OnChainID
 }
 
+type BackfillClientDataSetIDInput struct {
+	ID              int64
+	DataSetID       types.OnChainID
+	ClientDataSetID types.OnChainID
+}
+
 type UploadCopyBindingInput struct {
 	StorageDataSetID int64
 	CopyIndex        int
@@ -510,6 +516,7 @@ type StorageUploadRepository interface {
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
+	BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error
 	RecoverDataSet(ctx context.Context, input MarkDataSetReadyInput) (bool, error)
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
 	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error

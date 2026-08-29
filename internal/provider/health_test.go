@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -17,9 +18,11 @@ func TestCheckHealth_HTTPStatus(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
+		body       string
 		want       string
 	}{
-		{name: "ok", statusCode: http.StatusOK, want: "reachable"},
+		{name: "ok", statusCode: http.StatusOK, body: "curio-pdp", want: "reachable"},
+		{name: "wrong service identity", statusCode: http.StatusOK, body: "not-pdp", want: "unreachable"},
 		{name: "4xx response", statusCode: http.StatusMethodNotAllowed, want: "unreachable"},
 		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, want: "unreachable"},
 	}
@@ -34,6 +37,7 @@ func TestCheckHealth_HTTPStatus(t *testing.T) {
 					t.Errorf("path = %q, want /pdp/ping", r.URL.Path)
 				}
 				w.WriteHeader(tt.statusCode)
+				_, _ = io.WriteString(w, tt.body)
 			}))
 			defer srv.Close()
 
@@ -108,6 +112,7 @@ func TestHealthCheckerUsesProvidedClient(t *testing.T) {
 func TestCheckHealthBatch(t *testing.T) {
 	reachableSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "curio-pdp")
 	}))
 	defer reachableSrv.Close()
 
@@ -148,7 +153,7 @@ func (r *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
 	r.path = req.URL.Path
 	return &http.Response{
 		StatusCode: http.StatusOK,
-		Body:       http.NoBody,
+		Body:       io.NopCloser(strings.NewReader("curio-pdp")),
 		Request:    req,
 	}, nil
 }

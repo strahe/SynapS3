@@ -11,16 +11,28 @@ import (
 	sdktypes "github.com/strahe/synapse-go/types"
 )
 
-// UploadContext abstracts one provider-scoped SDK storage context.
-type UploadContext interface {
+// StorageTarget abstracts the immutable identity shared by provider and data
+// set targets returned by synapse-go.
+type StorageTarget interface {
 	ProviderID() sdktypes.BigInt
-	DataSetID() *sdktypes.BigInt
+	DataSetRef() (storage.DataSetRef, bool)
 	GetProviderInfo() storage.Provider
-	WithCDN() bool
+	CDNEnabled() bool
 	PieceURL(cid.Cid) string
 	ServiceURL() string
+}
+
+// ProviderTarget is an unbound provider used to create or resume creation of
+// a data set. Creating a data set does not mutate the target into a bound one.
+type ProviderTarget interface {
+	StorageTarget
 	CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
 	WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
+}
+
+// DataSetTarget is an immutable existing data set used for piece operations.
+type DataSetTarget interface {
+	StorageTarget
 	Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
 	PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error)
 	Pull(context.Context, storage.PullRequest) (*storage.PullResult, error)
@@ -37,10 +49,12 @@ type CleanupContext interface {
 // staged provider operations.
 type StorageClient interface {
 	Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
-	PrepareUpload(ctx context.Context, dataSize uint64, contexts []UploadContext) (*storage.MultiContextCosts, error)
-	CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]UploadContext, error)
-	CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (UploadContext, error)
-	CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (CleanupContext, error)
+	PrepareUpload(ctx context.Context, dataSize uint64, targets []StorageTarget) (*storage.MultiContextCosts, error)
+	SelectUploadTargets(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]StorageTarget, error)
+	OpenProviderTarget(ctx context.Context, providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) (ProviderTarget, error)
+	OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (DataSetTarget, error)
+	FindMatchingDataSet(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error)
+	OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (CleanupContext, error)
 }
 
 // ServiceTerminator is the destructive service-lifecycle boundary. It is used

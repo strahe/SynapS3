@@ -2,7 +2,6 @@ package observability
 
 import (
 	"context"
-	"math/big"
 
 	"github.com/strahe/synaps3/internal/provider"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -39,7 +38,7 @@ type StorageDataSetScanner struct {
 }
 
 type dataSetFinder interface {
-	FindDataSets(context.Context, *storage.FindDataSetsOptions) ([]*storage.DataSetInfo, error)
+	FindDataSets(context.Context, *storage.FindDataSetsOptions) ([]*storage.DataSetDetails, error)
 }
 
 func NewStorageDataSetScanner(storage dataSetFinder) *StorageDataSetScanner {
@@ -56,13 +55,20 @@ func (s *StorageDataSetScanner) ScanWalletDataSets(ctx context.Context) ([]Chain
 		if dataSet == nil || dataSet.DataSetInfo == nil {
 			continue
 		}
+		hasActivePieces := dataSet.HasActivePieces
+		var activePieceCount *int64
+		if dataSet.IsLive && !hasActivePieces {
+			zero := int64(0)
+			activePieceCount = &zero
+		}
 		out = append(out, ChainDataSet{
 			DataSetID:        idtypes.OnChainIDFromSDK(dataSet.DataSetID),
 			ClientDataSetID:  onChainIDPtrFromSDK(dataSet.ClientDataSetID),
 			ProviderID:       idtypes.OnChainIDFromSDK(dataSet.ProviderID),
 			IsLive:           dataSet.IsLive,
 			IsManaged:        dataSet.IsManaged,
-			ActivePieceCount: activePieceCountInt64(dataSet.ActivePieceCount),
+			ActivePieceCount: activePieceCount,
+			HasActivePieces:  &hasActivePieces,
 			Metadata:         dataSet.Metadata,
 		})
 	}
@@ -92,13 +98,5 @@ func onChainIDPtrFromSDK(id sdktypes.BigInt) *idtypes.OnChainID {
 		return nil
 	}
 	out := idtypes.OnChainIDFromSDK(id)
-	return &out
-}
-
-func activePieceCountInt64(value *big.Int) *int64 {
-	if value == nil || !value.IsInt64() {
-		return nil
-	}
-	out := value.Int64()
 	return &out
 }

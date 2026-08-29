@@ -11,21 +11,38 @@ import (
 	"testing"
 
 	"github.com/ipfs/go-cid"
+	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synapse-go/storage"
+	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	filecoin := NewMemoryFilecoin()
-	contexts, err := filecoin.CreateContexts(ctx, &storage.CreateContextsOptions{Copies: 3})
+	targets, err := filecoin.SelectUploadTargets(ctx, storage.SelectUploadContextsOptions{Copies: 3})
 	if err != nil {
-		t.Fatalf("CreateContexts: %v", err)
+		t.Fatalf("SelectUploadTargets: %v", err)
 	}
-	for _, uploadContext := range contexts {
-		if _, err := uploadContext.CreateDataSet(ctx, nil); err != nil {
-			t.Fatalf("CreateDataSet provider %s: %v", uploadContext.ProviderID().String(), err)
+	contexts := make([]synapse.DataSetTarget, 0, len(targets))
+	for _, target := range targets {
+		providerTarget, ok := target.(synapse.ProviderTarget)
+		if !ok {
+			t.Fatalf("selected target %T is not a ProviderTarget", target)
 		}
+		created, err := providerTarget.CreateDataSet(ctx, nil)
+		if err != nil {
+			t.Fatalf("CreateDataSet provider %s: %v", providerTarget.ProviderID().String(), err)
+		}
+		if _, bound := providerTarget.DataSetRef(); bound {
+			t.Fatal("ProviderTarget became bound after CreateDataSet")
+		}
+		providerID := created.DataSet.ProviderID()
+		dataSetTarget, err := filecoin.OpenDataSetTarget(ctx, created.DataSet.DataSetID(), storage.NewDataSetContextOptions{ProviderID: &providerID})
+		if err != nil {
+			t.Fatalf("OpenDataSetTarget: %v", err)
+		}
+		contexts = append(contexts, dataSetTarget)
 	}
 
 	content := bytes.Repeat([]byte("synaps3-system-test"), 128)
@@ -48,15 +65,13 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 	for _, uploadContext := range contexts[1:] {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, pullErr := uploadContext.Pull(ctx, storage.PullRequest{
 				Pieces: []cid.Cid{stored.PieceCID},
 				From:   contexts[0].PieceURL,
 			})
 			errCh <- pullErr
-		}()
+		})
 	}
 	wg.Wait()
 	close(errCh)
@@ -89,16 +104,48 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	}
 }
 
+func TestMemoryFilecoinFindMatchingDataSetRequiresExactMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	filecoin := NewMemoryFilecoin()
+	providerID := sdktypes.NewBigInt(101)
+	target, err := filecoin.OpenProviderTarget(ctx, providerID, storage.NewProviderContextOptions{
+		DataSetMetadata: map[string]string{"bucket": "bucket-a", "original": ""},
+	})
+	if err != nil {
+		t.Fatalf("OpenProviderTarget: %v", err)
+	}
+	if _, err := target.CreateDataSet(ctx, nil); err != nil {
+		t.Fatalf("CreateDataSet: %v", err)
+	}
+
+	matched, err := filecoin.FindMatchingDataSet(
+		ctx,
+		providerID,
+		map[string]string{"bucket": "bucket-a", "different": ""},
+		false,
+	)
+	if err != nil {
+		t.Fatalf("FindMatchingDataSet: %v", err)
+	}
+	if matched != nil {
+		t.Fatalf("FindMatchingDataSet returned data set %s for different metadata", matched.DataSetID().String())
+	}
+}
+
 func TestMemoryFilecoinRejectsInvalidSequenceAndCancellation(t *testing.T) {
 	t.Parallel()
 	filecoin := NewMemoryFilecoin()
 	ctx := context.Background()
-	contexts, err := filecoin.CreateContexts(ctx, &storage.CreateContextsOptions{Copies: 1})
+	targets, err := filecoin.SelectUploadTargets(ctx, storage.SelectUploadContextsOptions{Copies: 1})
 	if err != nil {
-		t.Fatalf("CreateContexts: %v", err)
+		t.Fatalf("SelectUploadTargets: %v", err)
 	}
-	if _, err := contexts[0].Store(ctx, bytes.NewReader([]byte("out-of-order")), nil); !errors.Is(err, errInvalidFilecoinSequence) {
-		t.Fatalf("Store before CreateDataSet error = %v, want invalid sequence", err)
+	if _, bound := targets[0].DataSetRef(); bound {
+		t.Fatal("new provider target unexpectedly has a data set")
+	}
+	if _, err := filecoin.OpenDataSetTarget(ctx, sdktypes.NewBigInt(999999), storage.NewDataSetContextOptions{}); err == nil {
+		t.Fatal("OpenDataSetTarget unknown data set succeeded")
 	}
 	unknown := cid.MustParse("bafkreibm6jg3ux5qumh4jxcq3xjgbpfs2jsl2w7jtjsq3btqfnhtzgdrmq")
 	if _, err := filecoin.Download(ctx, unknown, nil); err == nil {
@@ -106,7 +153,7 @@ func TestMemoryFilecoinRejectsInvalidSequenceAndCancellation(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := filecoin.CreateContexts(cancelled, &storage.CreateContextsOptions{Copies: 1}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("CreateContexts cancelled error = %v, want context.Canceled", err)
+	if _, err := filecoin.SelectUploadTargets(cancelled, storage.SelectUploadContextsOptions{Copies: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SelectUploadTargets cancelled error = %v, want context.Canceled", err)
 	}
 }

@@ -1171,49 +1171,55 @@ func (u *Uploader) ensureBucketProviderBindings(ctx context.Context, bucket *mod
 	if len(missingIndexes) == 0 {
 		return newBucketBindingPlan(selected, uploadID), nil
 	}
-	contexts, err := u.storage.CreateContexts(ctx, &storage.CreateContextsOptions{
+	targets, selectErr := u.storage.SelectUploadTargets(ctx, storage.SelectUploadContextsOptions{
 		Copies:             len(missingIndexes),
 		ExcludeProviderIDs: excluded,
 		DataSetMetadata:    map[string]string{"bucket": bucket.Name},
 	})
-	if err != nil {
-		return newBucketBindingPlan(selected, uploadID), err
-	}
-	for i, storageCtx := range contexts {
+	for i, target := range targets {
 		if i >= len(missingIndexes) {
 			break
 		}
-		if storageCtx == nil {
-			return newBucketBindingPlan(selected, uploadID), errors.New("storage context resolver returned a nil context")
+		if target == nil {
+			return newBucketBindingPlan(selected, uploadID), errors.New("storage target selector returned a nil target")
 		}
 		copyIndex := missingIndexes[i]
 		binding, err := u.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 			BucketID:          bucket.ID,
-			ProviderID:        idtypes.OnChainIDFromSDK(storageCtx.ProviderID()),
+			ProviderID:        idtypes.OnChainIDFromSDK(target.ProviderID()),
 			CopyIndex:         copyIndex,
 			CreatedByUploadID: uploadID,
 		})
 		if err != nil {
 			return newBucketBindingPlan(selected, uploadID), err
 		}
-		if dataSetID := storageCtx.DataSetID(); dataSetID != nil {
+		if ref, bound := target.DataSetRef(); bound {
+			dataSetID, clientDataSetID, err := dataSetRefIDsForBinding(binding, ref)
+			if err != nil {
+				return newBucketBindingPlan(selected, uploadID), err
+			}
 			if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID:        binding.ID,
-				UploadID:  uploadID,
-				DataSetID: idtypes.OnChainIDFromSDK(*dataSetID),
+				ID:              binding.ID,
+				UploadID:        uploadID,
+				DataSetID:       dataSetID,
+				ClientDataSetID: &clientDataSetID,
 			}); err != nil {
 				return newBucketBindingPlan(selected, uploadID), err
 			}
 			binding.Status = model.StorageDataSetStatusReady
-			binding.DataSetID = onChainIDPtrFromSDK(*dataSetID)
+			binding.DataSetID = &dataSetID
+			binding.ClientDataSetID = &clientDataSetID
 		}
 		selected = append(selected, *binding)
 		existing[copyIndex] = *binding
 	}
 	sort.Slice(selected, func(i, j int) bool { return selected[i].CopyIndex < selected[j].CopyIndex })
-	if len(contexts) != len(missingIndexes) {
+	if selectErr != nil {
+		return newBucketBindingPlan(selected, uploadID), selectErr
+	}
+	if len(targets) != len(missingIndexes) {
 		return newBucketBindingPlan(selected, uploadID), &synapse.NoProviderCandidatesError{
-			Cause: fmt.Errorf("CreateContexts returned %d contexts, want %d", len(contexts), len(missingIndexes)),
+			Cause: fmt.Errorf("SelectUploadTargets returned %d targets, want %d", len(targets), len(missingIndexes)),
 		}
 	}
 	plan := newBucketBindingPlan(selected, uploadID)
@@ -1234,7 +1240,7 @@ func (u *Uploader) ensureUploadFundingReady(
 		u.handleTaskFailure(ctx, task, logger, "prepare upload funding contexts", errors.New("missing bucket binding plan"))
 		return nil, false
 	}
-	contexts := make([]synapse.UploadContext, 0, len(plan.writable))
+	targets := make([]synapse.StorageTarget, 0, len(plan.writable))
 	fundedBindings := make(map[int]*model.StorageDataSet, len(plan.writable))
 	for i := range plan.writable {
 		binding := plan.byID[plan.writable[i].ID]
@@ -1243,16 +1249,16 @@ func (u *Uploader) ensureUploadFundingReady(
 			return nil, false
 		}
 		var (
-			storageCtx synapse.UploadContext
-			err        error
+			storageTarget synapse.StorageTarget
+			err           error
 		)
 		if binding.DataSetID != nil && !binding.DataSetID.IsZero() {
-			storageCtx, err = u.contextForReadyBinding(ctx, binding, bucket.Name)
+			storageTarget, err = u.contextForReadyBinding(ctx, binding)
 		} else {
-			storageCtx, err = u.contextForBindingProvider(ctx, binding, bucket.Name)
+			storageTarget, err = u.contextForBindingProvider(ctx, binding, bucket.Name)
 		}
 		if err == nil {
-			contexts = append(contexts, storageCtx)
+			targets = append(targets, storageTarget)
 			fundedBindings[binding.CopyIndex] = binding
 			continue
 		}
@@ -1306,7 +1312,7 @@ func (u *Uploader) ensureUploadFundingReady(
 			return nil, false
 		}
 	}
-	if len(contexts) == 0 {
+	if len(targets) == 0 {
 		u.waitForStorageDependency(ctx, task, logger, "Waiting for an assigned storage provider to recover")
 		return nil, false
 	}
@@ -1314,7 +1320,7 @@ func (u *Uploader) ensureUploadFundingReady(
 	if contentSize > int64(dataSize) {
 		dataSize = uint64(contentSize)
 	}
-	costs, err := u.storage.PrepareUpload(ctx, dataSize, contexts)
+	costs, err := u.storage.PrepareUpload(ctx, dataSize, targets)
 	if err != nil {
 		if synapse.IsProviderUnavailable(err) || synapse.IsNoProviderCandidates(err) {
 			u.waitForStorageDependency(ctx, task, logger, "Waiting for storage providers to become available")
@@ -1381,26 +1387,42 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 		return
 	}
 	if binding.Status != model.StorageDataSetStatusReady {
-		storageCtx, err := u.contextForBindingProvider(ctx, binding, bucket.Name)
+		providerTarget, err := u.contextForBindingProvider(ctx, binding, bucket.Name)
 		if err != nil {
 			u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "create dataset context", err)
 			return
 		}
-		if dataSetID := storageCtx.DataSetID(); dataSetID != nil {
-			if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID:        binding.ID,
-				UploadID:  uploadID,
-				DataSetID: idtypes.OnChainIDFromSDK(*dataSetID),
-			}); err != nil {
-				u.handleTaskFailure(ctx, task, logger, "mark existing dataset ready", err)
+		switch binding.Status {
+		case model.StorageDataSetStatusPending, model.StorageDataSetStatusFailed:
+			matchingRef, err := u.storage.FindMatchingDataSet(
+				ctx,
+				binding.ProviderID.SDK(),
+				map[string]string{"bucket": bucket.Name},
+				providerTarget.CDNEnabled(),
+			)
+			if err != nil {
+				u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "find existing dataset", err)
 				return
 			}
-		} else {
-			switch binding.Status {
-			case model.StorageDataSetStatusPending, model.StorageDataSetStatusFailed:
+			if matchingRef != nil {
+				dataSetID, clientDataSetID, err := dataSetRefIDsForBinding(binding, *matchingRef)
+				if err != nil {
+					u.handleTaskFailure(ctx, task, logger, "validate existing dataset", err)
+					return
+				}
+				if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+					ID:              binding.ID,
+					UploadID:        uploadID,
+					DataSetID:       dataSetID,
+					ClientDataSetID: &clientDataSetID,
+				}); err != nil {
+					u.handleTaskFailure(ctx, task, logger, "mark existing dataset ready", err)
+					return
+				}
+			} else {
 				var submitted storage.CreateDataSetSubmission
 				var submitErr error
-				result, err := storageCtx.CreateDataSet(ctx, &storage.CreateDataSetOptions{
+				result, err := providerTarget.CreateDataSet(ctx, &storage.CreateDataSetOptions{
 					OnSubmitted: func(sub storage.CreateDataSetSubmission) {
 						submitted = sub
 						submitErr = u.repos.Uploads.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
@@ -1431,51 +1453,62 @@ func (u *Uploader) ensureUploadDataSet(ctx context.Context, task *model.Task, ve
 				if submitted.TransactionID != "" {
 					binding.CreateTransactionID = &submitted.TransactionID
 				}
-				if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-					ID:              binding.ID,
-					UploadID:        uploadID,
-					DataSetID:       idtypes.OnChainIDFromSDK(result.DataSetID),
-					ClientDataSetID: onChainIDPtrFromSDK(result.ClientDataSetID),
-				}); err != nil {
-					u.handleTaskFailure(ctx, task, logger, "mark dataset ready", err)
-					return
-				}
-			case model.StorageDataSetStatusCreating:
-				if binding.CreateTransactionID == nil || binding.CreateStatusURL == nil || binding.ClientDataSetID == nil {
-					u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "wait dataset", errDataSetCreationIncomplete)
-					return
-				}
-				clientDataSetID := sdkBigIntPtr(binding.ClientDataSetID)
-				result, err := storageCtx.WaitForDataSetCreated(ctx, storage.CreateDataSetSubmission{
-					TransactionID:   *binding.CreateTransactionID,
-					StatusURL:       *binding.CreateStatusURL,
-					ClientDataSetID: clientDataSetID,
-				})
-				if err != nil {
-					if errors.Is(err, pdp.ErrTxRejected) {
-						u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "wait dataset", err)
-						return
-					}
-					if synapse.IsProviderUnavailable(err) {
-						u.waitForStorageDependency(ctx, task, logger, "Waiting for storage service creation")
-						return
-					}
-					u.handleTaskFailure(ctx, task, logger, "wait dataset", err)
+				dataSetID, clientDataSetID, refErr := dataSetResultIDsForBinding(binding, result)
+				if refErr != nil {
+					u.handleTaskFailure(ctx, task, logger, "validate created dataset", refErr)
 					return
 				}
 				if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 					ID:              binding.ID,
 					UploadID:        uploadID,
-					DataSetID:       idtypes.OnChainIDFromSDK(result.DataSetID),
-					ClientDataSetID: onChainIDPtrFromSDK(result.ClientDataSetID),
+					DataSetID:       dataSetID,
+					ClientDataSetID: &clientDataSetID,
 				}); err != nil {
 					u.handleTaskFailure(ctx, task, logger, "mark dataset ready", err)
 					return
 				}
-			default:
-				u.handleTaskFailure(ctx, task, logger, "ensure dataset", fmt.Errorf("dataset binding status %s cannot be ensured", binding.Status))
+			}
+		case model.StorageDataSetStatusCreating:
+			if binding.CreateTransactionID == nil || binding.CreateStatusURL == nil || binding.ClientDataSetID == nil {
+				u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "wait dataset", errDataSetCreationIncomplete)
 				return
 			}
+			clientDataSetIDSDK := sdkBigIntPtr(binding.ClientDataSetID)
+			result, err := providerTarget.WaitForDataSetCreated(ctx, storage.CreateDataSetSubmission{
+				ProviderID:      binding.ProviderID.SDK(),
+				TransactionID:   *binding.CreateTransactionID,
+				StatusURL:       *binding.CreateStatusURL,
+				ClientDataSetID: clientDataSetIDSDK,
+			})
+			if err != nil {
+				if errors.Is(err, pdp.ErrTxRejected) {
+					u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "wait dataset", err)
+					return
+				}
+				if synapse.IsProviderUnavailable(err) {
+					u.waitForStorageDependency(ctx, task, logger, "Waiting for storage service creation")
+					return
+				}
+				u.handleTaskFailure(ctx, task, logger, "wait dataset", err)
+				return
+			}
+			dataSetID, clientDataSetID, refErr := dataSetResultIDsForBinding(binding, result)
+			if refErr != nil {
+				u.handleTaskFailure(ctx, task, logger, "validate recovered dataset", refErr)
+				return
+			}
+			if err := u.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+				ID:              binding.ID,
+				UploadID:        uploadID,
+				DataSetID:       dataSetID,
+				ClientDataSetID: &clientDataSetID,
+			}); err != nil {
+				u.handleTaskFailure(ctx, task, logger, "mark dataset ready", err)
+				return
+			}
+		default:
+			u.handleTaskFailure(ctx, task, logger, "ensure dataset", fmt.Errorf("dataset binding status %s cannot be ensured", binding.Status))
+			return
 		}
 	}
 	nextStage := uploadStagePeerPull
@@ -1721,7 +1754,7 @@ func (u *Uploader) finishCommittedIngress(ctx context.Context, task *model.Task,
 		u.handleTaskFailure(ctx, task, logger, "recover committed ingress data set", errors.New("established data set has no data set ID"))
 		return
 	}
-	if _, err := u.contextForReadyBinding(ctx, binding, bucket.Name); err != nil {
+	if _, err := u.contextForReadyBinding(ctx, binding); err != nil {
 		u.handleCommittedIngressDataSetFailure(ctx, task, binding, logger, err)
 		return
 	}
@@ -2861,7 +2894,7 @@ func (u *Uploader) markDataSetStatus(ctx context.Context, binding *model.Storage
 // slot. A provider replacement can take the slot while an upload is mid-flight;
 // resolving by slot would then store the piece on the new provider while the
 // copy row being updated still belongs to the old one.
-func (u *Uploader) readyContextForCopy(ctx context.Context, task *model.Task, bucket *model.Bucket, uploadID int64, copyIndex int) (*model.StorageDataSet, synapse.UploadContext, error) {
+func (u *Uploader) readyContextForCopy(ctx context.Context, task *model.Task, bucket *model.Bucket, uploadID int64, copyIndex int) (*model.StorageDataSet, synapse.DataSetTarget, error) {
 	binding, err := u.taskCopyDataSet(ctx, task, bucket.ID, uploadID, copyIndex)
 	if err != nil {
 		return nil, nil, err
@@ -2876,16 +2909,15 @@ func (u *Uploader) readyContextForCopy(ctx context.Context, task *model.Task, bu
 		binding.DataSetID == nil || binding.DataSetID.IsZero() {
 		return binding, nil, fmt.Errorf("dataset binding %d is not ready", binding.ID)
 	}
-	storageCtx, err := u.contextForReadyBinding(ctx, binding, bucket.Name)
+	storageCtx, err := u.contextForReadyBinding(ctx, binding)
 	if err != nil {
 		return binding, nil, err
 	}
 	return binding, storageCtx, nil
 }
 
-func (u *Uploader) contextForBindingProvider(ctx context.Context, binding *model.StorageDataSet, bucketName string) (synapse.UploadContext, error) {
-	storageCtx, err := u.storage.CreateContext(ctx, &storage.CreateContextOptions{
-		ProviderID:      sdkBigIntPtr(&binding.ProviderID),
+func (u *Uploader) contextForBindingProvider(ctx context.Context, binding *model.StorageDataSet, bucketName string) (synapse.ProviderTarget, error) {
+	storageCtx, err := u.storage.OpenProviderTarget(ctx, binding.ProviderID.SDK(), storage.NewProviderContextOptions{
 		DataSetMetadata: map[string]string{"bucket": bucketName},
 	})
 	if err != nil {
@@ -2897,11 +2929,13 @@ func (u *Uploader) contextForBindingProvider(ctx context.Context, binding *model
 	return storageCtx, nil
 }
 
-func (u *Uploader) contextForReadyBinding(ctx context.Context, binding *model.StorageDataSet, bucketName string) (synapse.UploadContext, error) {
-	storageCtx, err := u.storage.CreateContext(ctx, &storage.CreateContextOptions{
-		ProviderID:      sdkBigIntPtr(&binding.ProviderID),
-		DataSetID:       sdkBigIntPtr(binding.DataSetID),
-		DataSetMetadata: map[string]string{"bucket": bucketName},
+func (u *Uploader) contextForReadyBinding(ctx context.Context, binding *model.StorageDataSet) (synapse.DataSetTarget, error) {
+	if binding == nil || binding.DataSetID == nil || binding.DataSetID.IsZero() {
+		return nil, errors.New("storage data set binding is not ready")
+	}
+	providerID := binding.ProviderID.SDK()
+	storageCtx, err := u.storage.OpenDataSetTarget(ctx, binding.DataSetID.SDK(), storage.NewDataSetContextOptions{
+		ProviderID: &providerID,
 	})
 	if err != nil {
 		return nil, err
@@ -2912,17 +2946,59 @@ func (u *Uploader) contextForReadyBinding(ctx context.Context, binding *model.St
 	if got := idtypes.OnChainIDFromSDK(storageCtx.ProviderID()); !got.Equal(binding.ProviderID) {
 		return nil, fmt.Errorf("dataset %s resolved provider %s, want %s", binding.DataSetID, got.String(), binding.ProviderID.String())
 	}
-	resolvedDataSetID := storageCtx.DataSetID()
-	if resolvedDataSetID == nil || !idtypes.OnChainIDFromSDK(*resolvedDataSetID).Equal(*binding.DataSetID) {
+	ref, bound := storageCtx.DataSetRef()
+	if !bound {
 		return nil, fmt.Errorf("storage context did not resolve requested data set %s", binding.DataSetID.String())
 	}
+	resolvedDataSetID, resolvedClientDataSetID, err := dataSetRefIDsForBinding(binding, ref)
+	if err != nil {
+		return nil, err
+	}
+	if !resolvedDataSetID.Equal(*binding.DataSetID) {
+		return nil, fmt.Errorf("storage context resolved data set %s, want %s", resolvedDataSetID.String(), binding.DataSetID.String())
+	}
+	if binding.ClientDataSetID == nil {
+		if err := u.repos.Uploads.BackfillClientDataSetID(ctx, repository.BackfillClientDataSetIDInput{
+			ID:              binding.ID,
+			DataSetID:       resolvedDataSetID,
+			ClientDataSetID: resolvedClientDataSetID,
+		}); err != nil {
+			return nil, err
+		}
+		binding.ClientDataSetID = &resolvedClientDataSetID
+	} else if !binding.ClientDataSetID.Equal(resolvedClientDataSetID) {
+		return nil, fmt.Errorf("dataset %s resolved client data set ID %s, want %s",
+			binding.DataSetID.String(), resolvedClientDataSetID.String(), binding.ClientDataSetID.String())
+	}
 	return storageCtx, nil
+}
+
+func dataSetRefIDsForBinding(binding *model.StorageDataSet, ref storage.DataSetRef) (idtypes.OnChainID, idtypes.OnChainID, error) {
+	if binding == nil {
+		return idtypes.OnChainID{}, idtypes.OnChainID{}, errors.New("storage data set binding is missing")
+	}
+	providerID := idtypes.OnChainIDFromSDK(ref.ProviderID())
+	if !providerID.Equal(binding.ProviderID) {
+		return idtypes.OnChainID{}, idtypes.OnChainID{}, fmt.Errorf("dataset resolved provider %s, want %s", providerID.String(), binding.ProviderID.String())
+	}
+	dataSetID := idtypes.OnChainIDFromSDK(ref.DataSetID())
+	if dataSetID.IsZero() {
+		return idtypes.OnChainID{}, idtypes.OnChainID{}, errors.New("dataset resolved a zero data set ID")
+	}
+	return dataSetID, idtypes.OnChainIDFromSDK(ref.ClientDataSetID()), nil
+}
+
+func dataSetResultIDsForBinding(binding *model.StorageDataSet, result *storage.CreateDataSetResult) (idtypes.OnChainID, idtypes.OnChainID, error) {
+	if result == nil {
+		return idtypes.OnChainID{}, idtypes.OnChainID{}, errors.New("storage provider returned no data set creation result")
+	}
+	return dataSetRefIDsForBinding(binding, result.DataSet)
 }
 
 // extraDataForCopy takes the concrete copy rather than a replica slot: the
 // cached presign blob belongs to one generation, and resolving it by slot would
 // hand back the replacement's blob after an activation.
-func (u *Uploader) extraDataForCopy(ctx context.Context, storageCtx synapse.UploadContext, copyRow *model.StorageUploadCopy, pieces []storage.PieceInput) ([]byte, string, error) {
+func (u *Uploader) extraDataForCopy(ctx context.Context, storageCtx synapse.DataSetTarget, copyRow *model.StorageUploadCopy, pieces []storage.PieceInput) ([]byte, string, error) {
 	if copyRow != nil && copyRow.CommitExtraDataHex != nil && *copyRow.CommitExtraDataHex != "" {
 		extraData, err := hex.DecodeString(*copyRow.CommitExtraDataHex)
 		return extraData, strings.ToLower(*copyRow.CommitExtraDataHex), err
@@ -2934,7 +3010,7 @@ func (u *Uploader) extraDataForCopy(ctx context.Context, storageCtx synapse.Uplo
 	return extraData, strings.ToLower(hex.EncodeToString(extraData)), nil
 }
 
-func (u *Uploader) waitForSubmittedCommit(ctx context.Context, storageCtx synapse.UploadContext, binding *model.StorageDataSet, txHash string, pieceCount int) (*storage.CommitResult, error) {
+func (u *Uploader) waitForSubmittedCommit(ctx context.Context, storageCtx synapse.DataSetTarget, binding *model.StorageDataSet, txHash string, pieceCount int) (*storage.CommitResult, error) {
 	if binding == nil || binding.DataSetID == nil || binding.DataSetID.IsZero() {
 		return nil, errors.New("commit dataset binding is not ready")
 	}
@@ -2974,9 +3050,13 @@ func (u *Uploader) waitForSubmittedCommit(ctx context.Context, storageCtx synaps
 				}
 				pieceIDs = append(pieceIDs, pieceID.SDK())
 			}
+			ref, bound := storageCtx.DataSetRef()
+			if !bound {
+				return nil, errors.New("commit target is not bound to a data set")
+			}
 			return &storage.CommitResult{
 				TransactionID: txHash,
-				DataSetID:     binding.DataSetID.SDK(),
+				DataSet:       ref,
 				PieceIDs:      pieceIDs,
 				IsNewDataSet:  false,
 			}, nil

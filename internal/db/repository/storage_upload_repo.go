@@ -715,6 +715,50 @@ func (r *BunStorageUploadRepo) MarkDataSetReady(ctx context.Context, input MarkD
 	})
 }
 
+func (r *BunStorageUploadRepo) BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error {
+	if input.ID <= 0 || input.DataSetID.IsZero() {
+		return fmt.Errorf("backfilling storage client data set ID: %w", ErrInvalidInput)
+	}
+	res, err := r.db.NewUpdate().
+		Model((*model.StorageDataSet)(nil)).
+		Set("client_data_set_id = ?", input.ClientDataSetID).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", input.ID).
+		Where("data_set_id = ?", input.DataSetID).
+		Where("client_data_set_id IS NULL").
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("backfilling storage client data set ID: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking storage client data set ID backfill: %w", err)
+	}
+	if rows > 0 {
+		return nil
+	}
+	var current struct {
+		DataSetID       *types.OnChainID `bun:"data_set_id"`
+		ClientDataSetID *types.OnChainID `bun:"client_data_set_id"`
+	}
+	err = r.db.NewSelect().
+		Table("storage_data_sets").
+		Column("data_set_id", "client_data_set_id").
+		Where("id = ?", input.ID).
+		Scan(ctx, &current)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("backfilling storage client data set ID: %w", ErrNotFound)
+		}
+		return fmt.Errorf("checking storage client data set ID: %w", err)
+	}
+	if current.DataSetID == nil || !current.DataSetID.Equal(input.DataSetID) ||
+		current.ClientDataSetID == nil || !current.ClientDataSetID.Equal(input.ClientDataSetID) {
+		return fmt.Errorf("backfilling storage client data set ID: %w", ErrConflict)
+	}
+	return nil
+}
+
 // RecoverDataSet restores a quarantined binding once storage confirms it is
 // usable again. A generation an operator is actively replacing is never
 // revived, because bringing it back would fight the approved migration.

@@ -203,6 +203,68 @@ func TestStorageUploadRepo_OnChainIDsRoundTripLargeValuesAndZeroPieceID(t *testi
 	}
 }
 
+func TestStorageUploadRepo_BackfillClientDataSetIDPreservesLifecycleAndRejectsConflicts(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	bucket := seedBucket(t, db, "client-data-set-id-backfill-bucket")
+	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+		BucketID:        bucket.ID,
+		SourceVersionID: "01J000000000000000BACKFILL",
+		ContentSize:     10,
+		Checksum:        "checksum-client-data-set-id-backfill",
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:          bucket.ID,
+		ProviderID:        onChainID(t, "101"),
+		CopyIndex:         0,
+		CreatedByUploadID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	dataSetID := onChainID(t, "1001")
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: binding.ID, UploadID: upload.ID, DataSetID: dataSetID,
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetDraining(ctx, binding.ID, "replacement in progress"); err != nil {
+		t.Fatalf("MarkDataSetDraining: %v", err)
+	}
+
+	clientDataSetID := onChainID(t, "9001")
+	input := repository.BackfillClientDataSetIDInput{
+		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: clientDataSetID,
+	}
+	if err := repos.Uploads.BackfillClientDataSetID(ctx, input); err != nil {
+		t.Fatalf("BackfillClientDataSetID: %v", err)
+	}
+	if err := repos.Uploads.BackfillClientDataSetID(ctx, input); err != nil {
+		t.Fatalf("BackfillClientDataSetID idempotent call: %v", err)
+	}
+	got, err := repos.Uploads.GetDataSetBindingByID(ctx, binding.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetDataSetBindingByID: binding=%#v err=%v", got, err)
+	}
+	if got.Status != model.StorageDataSetStatusDraining || got.LastError == nil || *got.LastError != "replacement in progress" {
+		t.Fatalf("binding lifecycle = status:%s error:%v, want unchanged draining state", got.Status, got.LastError)
+	}
+	if got.ClientDataSetID == nil || !got.ClientDataSetID.Equal(clientDataSetID) {
+		t.Fatalf("client data set ID = %v, want %s", got.ClientDataSetID, clientDataSetID.String())
+	}
+
+	conflict := input
+	conflict.ClientDataSetID = onChainID(t, "9002")
+	if err := repos.Uploads.BackfillClientDataSetID(ctx, conflict); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("conflicting BackfillClientDataSetID error = %v, want ErrConflict", err)
+	}
+}
+
 func TestStorageUploadRepo_PrimaryStoreProgressTracksAttemptsAndClamps(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

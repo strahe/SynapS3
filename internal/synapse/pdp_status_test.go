@@ -100,6 +100,12 @@ func TestPDPStatusCheckerClassifiesAddPiecesIdentityMismatch(t *testing.T) {
 			transactionID: testAddPiecesTxHash,
 		},
 		{
+			name:          "rejected transaction mismatch",
+			response:      `{"txHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","txStatus":"failed","dataSetId":1001,"pieceCount":0,"addMessageOk":false,"piecesAdded":false}`,
+			dataSetID:     "1001",
+			transactionID: testAddPiecesTxHash,
+		},
+		{
 			name:          "missing data set id",
 			response:      fmt.Sprintf(`{"txHash":%q,"txStatus":"confirmed","pieceCount":1,"addMessageOk":true,"piecesAdded":true}`, testAddPiecesTxHash),
 			dataSetID:     "1001",
@@ -129,20 +135,67 @@ func TestPDPStatusCheckerClassifiesAddPiecesIdentityMismatch(t *testing.T) {
 	}
 }
 
-func TestPDPStatusCheckerClassifiesRejectedStatus(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"createMessageHash":%q,"service":"svc","txStatus":"rejected","dataSetCreated":false,"ok":false}`, testCreateDataSetTxHash)
-	}))
-	defer server.Close()
+func TestPDPStatusCheckerClassifiesSDKRejectedCreationStatuses(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "rejected", response: fmt.Sprintf(`{"createMessageHash":%q,"service":"svc","txStatus":"rejected","dataSetCreated":false,"ok":false}`, testCreateDataSetTxHash)},
+		{name: "failed", response: fmt.Sprintf(`{"createMessageHash":%q,"service":"svc","txStatus":"failed","dataSetCreated":false,"ok":false}`, testCreateDataSetTxHash)},
+		{name: "reorged", response: fmt.Sprintf(`{"createMessageHash":%q,"service":"svc","txStatus":"reorged","dataSetCreated":true,"ok":true,"dataSetId":42}`, testCreateDataSetTxHash)},
+		{name: "confirmed rejected", response: fmt.Sprintf(`{"createMessageHash":%q,"service":"svc","txStatus":"confirmed","dataSetCreated":false,"ok":false}`, testCreateDataSetTxHash)},
+	}
 
-	checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
-	got := checker.CheckDataSetCreationStatus(t.Context(), DataSetCreationStatusInput{
-		StatusURL:     server.URL + "/pdp/data-sets/created/0xabc",
-		TransactionID: testCreateDataSetTxHash,
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, tt.response)
+			}))
+			defer server.Close()
 
-	if got.State != PDPStatusRejected || got.TxStatus != "rejected" {
-		t.Fatalf("status = %#v, want rejected", got)
+			checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
+			got := checker.CheckDataSetCreationStatus(t.Context(), DataSetCreationStatusInput{
+				StatusURL:     server.URL + "/pdp/data-sets/created/0xabc",
+				TransactionID: testCreateDataSetTxHash,
+			})
+
+			if got.State != PDPStatusRejected || got.Error != "" {
+				t.Fatalf("status = %#v, want rejected without checker error", got)
+			}
+		})
+	}
+}
+
+func TestPDPStatusCheckerClassifiesSDKRejectedAddPiecesStatuses(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "rejected", response: fmt.Sprintf(`{"txHash":%q,"txStatus":"rejected","dataSetId":1001,"pieceCount":0,"addMessageOk":false,"piecesAdded":false}`, testAddPiecesTxHash)},
+		{name: "failed", response: fmt.Sprintf(`{"txHash":%q,"txStatus":"failed","dataSetId":1001,"pieceCount":0,"addMessageOk":false,"piecesAdded":false}`, testAddPiecesTxHash)},
+		{name: "reorged", response: fmt.Sprintf(`{"txHash":%q,"txStatus":"reorged","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[2001]}`, testAddPiecesTxHash)},
+		{name: "confirmed rejected", response: fmt.Sprintf(`{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":0,"addMessageOk":false,"piecesAdded":false}`, testAddPiecesTxHash)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, tt.response)
+			}))
+			defer server.Close()
+
+			checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
+			got := checker.CheckAddPiecesStatus(t.Context(), AddPiecesStatusInput{
+				ServiceURL:         server.URL,
+				DataSetID:          "1001",
+				TransactionID:      testAddPiecesTxHash,
+				ExpectedPieceCount: 1,
+			})
+
+			if got.State != PDPStatusRejected || got.Error != "" {
+				t.Fatalf("status = %#v, want rejected without checker error", got)
+			}
+		})
 	}
 }
 

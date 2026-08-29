@@ -34,6 +34,25 @@ func TestBuildFreshnessClassifiesNoStateFreshAndStale(t *testing.T) {
 	}
 }
 
+func TestDataSetObservationUsesPresenceEvidenceAndLegacyCount(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+
+	fromEvidence := DataSetObservationFromState(DataSetState{
+		Evidence: map[string]any{"has_active_pieces": true},
+	}, time.Minute, now)
+	if fromEvidence.Facts.HasActivePieces == nil || !*fromEvidence.Facts.HasActivePieces {
+		t.Fatalf("presence from evidence = %v, want true", fromEvidence.Facts.HasActivePieces)
+	}
+
+	legacyCount := int64(0)
+	fromLegacyCount := DataSetObservationFromState(DataSetState{
+		ActivePieceCount: &legacyCount,
+	}, time.Minute, now)
+	if fromLegacyCount.Facts.HasActivePieces == nil || *fromLegacyCount.Facts.HasActivePieces {
+		t.Fatalf("presence from legacy count = %v, want false", fromLegacyCount.Facts.HasActivePieces)
+	}
+}
+
 func TestBuildSignalMapsStatusAndStale(t *testing.T) {
 	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
 	freshCheckedAt := now

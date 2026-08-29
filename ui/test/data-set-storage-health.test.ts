@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import type { StorageDataSetSummary } from '../src/api/client.ts'
 import {
+  activePiecesValue,
   dataSetStorageHealthDetailParts,
   dataSetStorageHealthRefreshErrorMessage,
 } from '../src/lib/data-set-storage-health.ts'
@@ -39,6 +40,28 @@ test('data set storage health details hide ready local state', () => {
       })
     ),
     ['18 pieces', 'just now']
+  )
+})
+
+test('active piece labels use exact counts when known and presence otherwise', () => {
+  assert.equal(activePiecesValue({ active_piece_count: 18, has_active_pieces: false }), '18')
+  assert.equal(activePiecesValue({ has_active_pieces: true }), 'Yes')
+  assert.equal(activePiecesValue({ has_active_pieces: false }), 'No')
+  assert.equal(activePiecesValue({}), '—')
+
+  assert.deepEqual(
+    dataSetStorageHealthDetailParts(
+      dataSet({
+        storage_health: {
+          status: 'available',
+          reason_codes: [],
+          has_active_pieces: true,
+          last_checked_at: '9999-01-01T00:00:00Z',
+          stale: false,
+        },
+      })
+    ),
+    ['Contains active pieces', 'just now']
   )
 })
 

@@ -9,6 +9,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { activePiecesValue } from '@/lib/data-set-storage-health'
 import { replicaLabel } from '@/lib/storage-status-labels'
 import {
   dataSetChainIDValue,
@@ -20,7 +21,6 @@ import {
   providerPDPFactBadge,
   type StorageTopologyProviderRow,
 } from '@/lib/storage-topology'
-import { formatNumber } from '@/lib/utils'
 
 export function ProvidersTableCard({
   rows,
@@ -182,9 +182,7 @@ export function DataSetsTableCard({
                     </StatusBadge>
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2 text-right">
-                    {dataSet.facts.active_piece_count === undefined
-                      ? '—'
-                      : formatNumber(dataSet.facts.active_piece_count)}
+                    {activePiecesValue(dataSet.facts)}
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                     {freshnessLabel(dataSet.signal.freshness)}

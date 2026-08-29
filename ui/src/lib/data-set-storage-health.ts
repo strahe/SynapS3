@@ -1,6 +1,31 @@
 import type { StorageDataSetSummary } from '../api/client'
 import { formatNumber, timeAgo } from './utils.ts'
 
+interface ActivePieceFacts {
+  active_piece_count?: number
+  has_active_pieces?: boolean
+}
+
+export function activePiecesValue(facts: ActivePieceFacts) {
+  if (facts.active_piece_count !== undefined) {
+    return formatNumber(facts.active_piece_count)
+  }
+  if (facts.has_active_pieces !== undefined) {
+    return facts.has_active_pieces ? 'Yes' : 'No'
+  }
+  return '—'
+}
+
+function activePiecesDetail(facts: ActivePieceFacts) {
+  if (facts.active_piece_count !== undefined) {
+    return `${formatNumber(facts.active_piece_count)} pieces`
+  }
+  if (facts.has_active_pieces !== undefined) {
+    return facts.has_active_pieces ? 'Contains active pieces' : 'No active pieces'
+  }
+  return null
+}
+
 export function dataSetStorageHealthDetailParts(dataSet: Pick<StorageDataSetSummary, 'status' | 'storage_health'>) {
   const localState = dataSet.status === 'ready' ? null : `local state: ${dataSet.status}`
   const storageHealth = dataSet.storage_health
@@ -9,8 +34,7 @@ export function dataSetStorageHealthDetailParts(dataSet: Pick<StorageDataSetSumm
   }
 
   const reasons = (storageHealth.reason_codes ?? []).map(storageHealthReasonLabel).join(', ')
-  const activePieces =
-    storageHealth.active_piece_count === undefined ? null : `${formatNumber(storageHealth.active_piece_count)} pieces`
+  const activePieces = activePiecesDetail(storageHealth)
   const lastError =
     (storageHealth.status === 'unknown' || storageHealth.status === 'unavailable') && storageHealth.last_error
       ? `last error: ${storageHealth.last_error}`

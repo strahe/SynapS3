@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"slices"
 	"sync"
@@ -31,6 +32,8 @@ type memoryDataSet struct {
 	id       sdktypes.BigInt
 	clientID sdktypes.BigInt
 	provider sdktypes.BigInt
+	metadata map[string]string
+	withCDN  bool
 	pieces   map[string]sdktypes.BigInt
 }
 
@@ -88,21 +91,21 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 	}
 }
 
-func (m *MemoryFilecoin) PrepareUpload(ctx context.Context, _ uint64, contexts []synapse.UploadContext) (*storage.MultiContextCosts, error) {
+func (m *MemoryFilecoin) PrepareUpload(ctx context.Context, _ uint64, targets []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(contexts) == 0 {
+	if len(targets) == 0 {
 		return nil, fmt.Errorf("%w: upload has no contexts", errInvalidFilecoinSequence)
 	}
 	return &storage.MultiContextCosts{DepositNeeded: new(big.Int), Ready: true}, nil
 }
 
-func (m *MemoryFilecoin) CreateContexts(ctx context.Context, opts *storage.CreateContextsOptions) ([]synapse.UploadContext, error) {
+func (m *MemoryFilecoin) SelectUploadTargets(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if opts == nil || opts.Copies <= 0 {
+	if opts.Copies <= 0 {
 		return nil, fmt.Errorf("memory filecoin: positive copy count is required")
 	}
 	excluded := make(map[string]struct{}, len(opts.ExcludeProviderIDs))
@@ -122,47 +125,61 @@ func (m *MemoryFilecoin) CreateContexts(ctx context.Context, opts *storage.Creat
 	if len(selected) != opts.Copies {
 		return nil, fmt.Errorf("memory filecoin: requested %d copies, only %d providers available", opts.Copies, len(selected))
 	}
-	contexts := make([]synapse.UploadContext, 0, len(selected))
+	targets := make([]synapse.StorageTarget, 0, len(selected))
 	for _, providerID := range selected {
-		contexts = append(contexts, m.newContext(providerID, nil, optionBool(opts.WithCDN)))
+		ref, err := m.FindMatchingDataSet(ctx, providerID, opts.DataSetMetadata, optionBool(opts.WithCDN))
+		if err != nil {
+			return nil, err
+		}
+		if ref != nil {
+			targets = append(targets, m.newDataSetTarget(*ref, optionBool(opts.WithCDN)))
+		} else {
+			targets = append(targets, m.newProviderTarget(providerID, opts.DataSetMetadata, optionBool(opts.WithCDN)))
+		}
 	}
-	return contexts, nil
+	return targets, nil
 }
 
-func (m *MemoryFilecoin) CreateContext(ctx context.Context, opts *storage.CreateContextOptions) (synapse.UploadContext, error) {
+func (m *MemoryFilecoin) OpenProviderTarget(ctx context.Context, providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
-	}
-	if opts == nil || (opts.ProviderID == nil && opts.DataSetID == nil) {
-		return nil, errors.New("memory filecoin: provider or dataset ID is required")
-	}
-	var providerID sdktypes.BigInt
-	if opts.DataSetID != nil {
-		m.mu.RLock()
-		dataSet := m.dataSets[opts.DataSetID.String()]
-		m.mu.RUnlock()
-		if dataSet == nil {
-			return nil, fmt.Errorf("memory filecoin: unknown dataset %s", opts.DataSetID.String())
-		}
-		providerID = dataSet.provider.Copy()
-		if opts.ProviderID != nil && !dataSet.provider.Equal(*opts.ProviderID) {
-			return nil, fmt.Errorf("memory filecoin: dataset %s belongs to provider %s, not %s", opts.DataSetID.String(), dataSet.provider.String(), opts.ProviderID.String())
-		}
-	} else {
-		providerID = opts.ProviderID.Copy()
 	}
 	if !m.hasProvider(providerID) {
 		return nil, fmt.Errorf("memory filecoin: unknown provider %s", providerID.String())
 	}
-	return m.newContext(providerID, opts.DataSetID, optionBool(opts.WithCDN)), nil
+	return m.newProviderTarget(providerID, opts.DataSetMetadata, optionBool(opts.WithCDN)), nil
 }
 
-func (m *MemoryFilecoin) CreateCleanupContext(ctx context.Context, opts *storage.CreateContextOptions) (synapse.CleanupContext, error) {
-	uploadContext, err := m.CreateContext(ctx, opts)
+func (m *MemoryFilecoin) OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	dataSet := m.dataSets[dataSetID.String()]
+	m.mu.RUnlock()
+	if dataSet == nil {
+		return nil, fmt.Errorf("memory filecoin: unknown dataset %s", dataSetID.String())
+	}
+	if opts.ProviderID != nil && !dataSet.provider.Equal(*opts.ProviderID) {
+		return nil, fmt.Errorf("memory filecoin: dataset %s belongs to provider %s, not %s", dataSetID.String(), dataSet.provider.String(), opts.ProviderID.String())
+	}
+	ref, err := storage.NewDataSetRef(dataSet.provider, dataSet.id, dataSet.clientID)
 	if err != nil {
 		return nil, err
 	}
-	return uploadContext.(*memoryUploadContext), nil
+	withCDN := dataSet.withCDN
+	if opts.WithCDN != nil {
+		withCDN = *opts.WithCDN
+	}
+	return m.newDataSetTarget(ref, withCDN), nil
+}
+
+func (m *MemoryFilecoin) OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+	target, err := m.OpenDataSetTarget(ctx, dataSetID, opts)
+	if err != nil {
+		return nil, err
+	}
+	return target.(*memoryDataSetTarget), nil
 }
 
 func (m *MemoryFilecoin) Download(ctx context.Context, pieceCID cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -188,63 +205,122 @@ func (m *MemoryFilecoin) hasProvider(id sdktypes.BigInt) bool {
 	return slices.ContainsFunc(m.providers, func(provider sdktypes.BigInt) bool { return provider.Equal(id) })
 }
 
-func (m *MemoryFilecoin) newContext(providerID sdktypes.BigInt, dataSetID *sdktypes.BigInt, withCDN bool) *memoryUploadContext {
-	var copiedDataSetID *sdktypes.BigInt
-	if dataSetID != nil {
-		id := dataSetID.Copy()
-		copiedDataSetID = &id
+func (m *MemoryFilecoin) FindMatchingDataSet(
+	ctx context.Context,
+	providerID sdktypes.BigInt,
+	metadata map[string]string,
+	withCDN bool,
+) (*storage.DataSetRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return &memoryUploadContext{
-		filecoin:  m,
-		provider:  providerID.Copy(),
-		dataSetID: copiedDataSetID,
-		withCDN:   withCDN,
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	wantedMetadata := canonicalMemoryDataSetMetadata(metadata, withCDN)
+	var best *memoryDataSet
+	for _, dataSet := range m.dataSets {
+		if !dataSet.provider.Equal(providerID) || dataSet.withCDN != withCDN ||
+			!maps.Equal(dataSet.metadata, wantedMetadata) {
+			continue
+		}
+		if _, terminated := m.terminated[dataSet.id.String()]; terminated {
+			continue
+		}
+		if best == nil ||
+			(len(dataSet.pieces) > 0 && len(best.pieces) == 0) ||
+			((len(dataSet.pieces) > 0) == (len(best.pieces) > 0) && dataSet.id.Cmp(best.id) < 0) {
+			best = dataSet
+		}
+	}
+	if best == nil {
+		return nil, nil
+	}
+	ref, err := storage.NewDataSetRef(best.provider, best.id, best.clientID)
+	if err != nil {
+		return nil, err
+	}
+	return &ref, nil
+}
+
+func cloneMemoryMetadata(metadata map[string]string) map[string]string {
+	out := make(map[string]string, len(metadata))
+	maps.Copy(out, metadata)
+	return out
+}
+
+func canonicalMemoryDataSetMetadata(metadata map[string]string, withCDN bool) map[string]string {
+	out := cloneMemoryMetadata(metadata)
+	out["source"] = "synaps3"
+	if withCDN {
+		out["withCDN"] = ""
+	} else {
+		delete(out, "withCDN")
+	}
+	return out
+}
+
+func (m *MemoryFilecoin) newProviderTarget(providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) *memoryProviderTarget {
+	return &memoryProviderTarget{
+		memoryTarget: memoryTarget{filecoin: m, provider: providerID.Copy(), withCDN: withCDN},
+		metadata:     canonicalMemoryDataSetMetadata(metadata, withCDN),
+	}
+}
+
+func (m *MemoryFilecoin) newDataSetTarget(ref storage.DataSetRef, withCDN bool) *memoryDataSetTarget {
+	return &memoryDataSetTarget{
+		memoryTarget: memoryTarget{filecoin: m, provider: ref.ProviderID(), withCDN: withCDN},
+		ref:          ref,
 	}
 }
 
 func optionBool(value *bool) bool { return value != nil && *value }
 
-type memoryUploadContext struct {
+type memoryTarget struct {
 	filecoin *MemoryFilecoin
 	provider sdktypes.BigInt
 	withCDN  bool
-
-	mu        sync.RWMutex
-	dataSetID *sdktypes.BigInt
 }
 
-func (c *memoryUploadContext) ProviderID() sdktypes.BigInt { return c.provider.Copy() }
+func (c *memoryTarget) ProviderID() sdktypes.BigInt { return c.provider.Copy() }
 
-func (c *memoryUploadContext) DataSetID() *sdktypes.BigInt {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.dataSetID == nil {
-		return nil
-	}
-	id := c.dataSetID.Copy()
-	return &id
-}
-
-func (c *memoryUploadContext) GetProviderInfo() storage.Provider {
+func (c *memoryTarget) GetProviderInfo() storage.Provider {
 	return storage.Provider{ID: c.ProviderID(), ServiceURL: c.ServiceURL()}
 }
 
-func (c *memoryUploadContext) WithCDN() bool { return c.withCDN }
+func (c *memoryTarget) CDNEnabled() bool { return c.withCDN }
 
-func (c *memoryUploadContext) ServiceURL() string {
+func (c *memoryTarget) ServiceURL() string {
 	return fmt.Sprintf("https://provider-%s.system.invalid", c.provider.String())
 }
 
-func (c *memoryUploadContext) PieceURL(pieceCID cid.Cid) string {
+func (c *memoryTarget) PieceURL(pieceCID cid.Cid) string {
 	return c.ServiceURL() + "/piece/" + pieceCID.String()
 }
 
-func (c *memoryUploadContext) CreateDataSet(ctx context.Context, opts *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+type memoryProviderTarget struct {
+	memoryTarget
+	metadata map[string]string
+}
+
+func (c *memoryProviderTarget) DataSetRef() (storage.DataSetRef, bool) {
+	return storage.DataSetRef{}, false
+}
+
+type memoryDataSetTarget struct {
+	memoryTarget
+	ref storage.DataSetRef
+}
+
+func (c *memoryDataSetTarget) DataSetRef() (storage.DataSetRef, bool) { return c.ref, true }
+
+func (c *memoryDataSetTarget) DataSetID() *sdktypes.BigInt {
+	id := c.ref.DataSetID()
+	return &id
+}
+
+func (c *memoryProviderTarget) CreateDataSet(ctx context.Context, opts *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
-	}
-	if c.DataSetID() != nil {
-		return nil, fmt.Errorf("%w: dataset already exists", errInvalidFilecoinSequence)
 	}
 	m := c.filecoin
 	m.mu.Lock()
@@ -260,26 +336,39 @@ func (c *memoryUploadContext) CreateDataSet(ctx context.Context, opts *storage.C
 	clientID := sdktypes.NewBigInt(clientIDValue + 500000)
 	txID := "create-" + id.String()
 	m.submissions[txID] = id.Copy()
-	dataSet := &memoryDataSet{id: id.Copy(), clientID: clientID.Copy(), provider: c.provider.Copy(), pieces: make(map[string]sdktypes.BigInt)}
+	dataSet := &memoryDataSet{
+		id: id.Copy(), clientID: clientID.Copy(), provider: c.provider.Copy(),
+		metadata: cloneMemoryMetadata(c.metadata), withCDN: c.withCDN,
+		pieces: make(map[string]sdktypes.BigInt),
+	}
 	m.dataSets[id.String()] = dataSet
 	delete(m.pendingDataSets, providerKey)
 	m.mu.Unlock()
 
-	c.mu.Lock()
-	c.dataSetID = copyBigIntPtr(id)
-	c.mu.Unlock()
 	submission := storage.CreateDataSetSubmission{
-		TransactionID: txID, StatusURL: c.ServiceURL() + "/status/" + txID, ClientDataSetID: copyBigIntPtr(clientID),
+		ProviderID: c.provider.Copy(), TransactionID: txID,
+		StatusURL: c.ServiceURL() + "/status/" + txID, ClientDataSetID: copyBigIntPtr(clientID),
 	}
 	if opts != nil && opts.OnSubmitted != nil {
 		opts.OnSubmitted(submission)
 	}
-	return &storage.CreateDataSetResult{TransactionID: txID, DataSetID: id.Copy(), ClientDataSetID: clientID.Copy()}, nil
+	ref, err := storage.NewDataSetRef(c.provider, id, clientID)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.CreateDataSetResult{TransactionID: txID, DataSet: ref}, nil
 }
 
-func (c *memoryUploadContext) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+func (c *memoryProviderTarget) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !submission.ProviderID.Equal(c.provider) {
+		return nil, fmt.Errorf("%w: submission provider %s does not match target provider %s",
+			errInvalidFilecoinSequence, submission.ProviderID.String(), c.provider.String())
+	}
+	if submission.ClientDataSetID == nil {
+		return nil, fmt.Errorf("%w: submission is missing client data set ID", errInvalidFilecoinSequence)
 	}
 	c.filecoin.mu.RLock()
 	id, ok := c.filecoin.submissions[submission.TransactionID]
@@ -288,13 +377,14 @@ func (c *memoryUploadContext) WaitForDataSetCreated(ctx context.Context, submiss
 	if !ok || dataSet == nil || !dataSet.provider.Equal(c.provider) {
 		return nil, fmt.Errorf("%w: unknown dataset submission %q", errInvalidFilecoinSequence, submission.TransactionID)
 	}
-	c.mu.Lock()
-	c.dataSetID = copyBigIntPtr(id)
-	c.mu.Unlock()
-	return &storage.CreateDataSetResult{TransactionID: submission.TransactionID, DataSetID: id.Copy(), ClientDataSetID: dataSet.clientID.Copy()}, nil
+	ref, err := storage.NewDataSetRef(c.provider, id, dataSet.clientID)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.CreateDataSetResult{TransactionID: submission.TransactionID, DataSet: ref}, nil
 }
 
-func (c *memoryUploadContext) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
+func (c *memoryDataSetTarget) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -334,7 +424,7 @@ func (c *memoryUploadContext) Store(ctx context.Context, reader io.Reader, opts 
 	return &storage.StoreResult{PieceCID: pieceCID, Size: int64(len(content))}, nil
 }
 
-func (c *memoryUploadContext) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {
+func (c *memoryDataSetTarget) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -353,7 +443,7 @@ func (c *memoryUploadContext) PresignForCommit(ctx context.Context, pieces []sto
 	return []byte("commit-" + c.provider.String()), nil
 }
 
-func (c *memoryUploadContext) Pull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+func (c *memoryDataSetTarget) Pull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -381,7 +471,7 @@ func (c *memoryUploadContext) Pull(ctx context.Context, request storage.PullRequ
 	return &storage.PullResult{Status: storage.PullStatusComplete, Pieces: results}, nil
 }
 
-func (c *memoryUploadContext) Commit(ctx context.Context, request storage.CommitRequest) (*storage.CommitResult, error) {
+func (c *memoryDataSetTarget) Commit(ctx context.Context, request storage.CommitRequest) (*storage.CommitResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -420,10 +510,10 @@ func (c *memoryUploadContext) Commit(ctx context.Context, request storage.Commit
 	if request.OnSubmitted != nil {
 		request.OnSubmitted(txID)
 	}
-	return &storage.CommitResult{TransactionID: txID, DataSetID: dataSetID.Copy(), PieceIDs: pieceIDs}, nil
+	return &storage.CommitResult{TransactionID: txID, DataSet: c.ref, PieceIDs: pieceIDs}, nil
 }
 
-func (c *memoryUploadContext) DeletePieceByID(ctx context.Context, pieceID sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+func (c *memoryDataSetTarget) DeletePieceByID(ctx context.Context, pieceID sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -449,7 +539,7 @@ func (c *memoryUploadContext) DeletePieceByID(ctx context.Context, pieceID sdkty
 	return nil, fmt.Errorf("memory filecoin: unknown piece ID %s", pieceID.String())
 }
 
-func (c *memoryUploadContext) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
+func (c *memoryDataSetTarget) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -635,6 +725,7 @@ var (
 	_ synapse.WalletQuerier        = (*MemoryFilecoin)(nil)
 	_ synapse.WalletOperator       = (*MemoryFilecoin)(nil)
 	_ observability.RefreshChecker = (*MemoryFilecoin)(nil)
-	_ synapse.UploadContext        = (*memoryUploadContext)(nil)
-	_ synapse.CleanupContext       = (*memoryUploadContext)(nil)
+	_ synapse.ProviderTarget       = (*memoryProviderTarget)(nil)
+	_ synapse.DataSetTarget        = (*memoryDataSetTarget)(nil)
+	_ synapse.CleanupContext       = (*memoryDataSetTarget)(nil)
 )

@@ -41,6 +41,14 @@ func TestCheckProvidersMergesLocalAndRegistrySources(t *testing.T) {
 	assertProviderState(t, byProvider["202"], StatusAvailable, nil)
 }
 
+func TestChainEvidenceRecordsActivePiecePresence(t *testing.T) {
+	hasActivePieces := true
+	evidence := chainEvidence(ChainDataSet{HasActivePieces: &hasActivePieces})
+	if evidence["has_active_pieces"] != true {
+		t.Fatalf("has_active_pieces evidence = %#v, want true", evidence["has_active_pieces"])
+	}
+}
+
 func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
 	checker := NewChecker(CheckerOptions{
 		ProviderSource: fakeProviderSource{
