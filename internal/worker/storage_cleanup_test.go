@@ -107,7 +107,7 @@ func TestStorageCleanupWorkerMarksMissingPieceRemoved(t *testing.T) {
 	}
 }
 
-func TestStorageCleanupWorkerContinuesAfterUnsupportedCopy(t *testing.T) {
+func TestStorageCleanupWorkerMarksZeroProviderUnsupportedAndContinues(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	ctx := context.Background()
 	pieceCID := testCID(t).String()
@@ -120,7 +120,7 @@ func TestStorageCleanupWorkerContinuesAfterUnsupportedCopy(t *testing.T) {
 		Status:         model.TaskStatusQueued,
 		MaxRetries:     3,
 		ScheduledAt:    time.Now(),
-		Payload: map[string]interface{}{
+		Payload: map[string]any{
 			"storage_upload_id": uploadID,
 			"piece_cid":         pieceCID,
 		},
@@ -129,11 +129,15 @@ func TestStorageCleanupWorkerContinuesAfterUnsupportedCopy(t *testing.T) {
 		t.Fatalf("Create cleanup task: %v", err)
 	}
 	unsupported := &model.StorageCleanupCopy{
-		TaskID:    task.ID,
-		UploadID:  uploadID,
-		CopyIndex: 0,
-		PieceCID:  pieceCID,
-		Status:    model.StorageCleanupCopyStatusPending,
+		TaskID:          task.ID,
+		UploadID:        uploadID,
+		CopyIndex:       0,
+		ProviderID:      onChainIDPtr(t, "0"),
+		DataSetID:       onChainIDPtr(t, "1001"),
+		ClientDataSetID: onChainIDPtr(t, "5001"),
+		PieceID:         onChainIDPtr(t, "2001"),
+		PieceCID:        pieceCID,
+		Status:          model.StorageCleanupCopyStatusPending,
 	}
 	removable := &model.StorageCleanupCopy{
 		TaskID:          task.ID,

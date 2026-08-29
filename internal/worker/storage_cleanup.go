@@ -269,7 +269,8 @@ func (w *StorageCleanupWorker) waitForReferences(ctx context.Context, task *mode
 }
 
 func (w *StorageCleanupWorker) processCopy(ctx context.Context, copy model.StorageCleanupCopy) (bool, error) {
-	if copy.DataSetID == nil || copy.ClientDataSetID == nil || copy.PieceID == nil || copy.ProviderID == nil || copy.PieceCID == "" {
+	if copy.DataSetID == nil || copy.ClientDataSetID == nil || copy.PieceID == nil ||
+		copy.ProviderID == nil || copy.ProviderID.IsZero() || copy.PieceCID == "" {
 		msg := "Storage provider details are incomplete for this version"
 		if err := w.repos.StorageCleanup.MarkCopyUnsupported(ctx, copy.ID, msg); err != nil {
 			return false, err

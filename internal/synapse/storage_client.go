@@ -123,7 +123,7 @@ func (s *StorageServiceAdapter) FindMatchingDataSet(
 	for _, dataSet := range dataSets {
 		if dataSet == nil || dataSet.DataSetInfo == nil || dataSet.DataSetID.IsZero() ||
 			!dataSet.ProviderID.Equal(providerID) || dataSet.PDPEndEpoch != 0 ||
-			!dataSet.IsLive || !dataSet.IsManaged || !sameDataSetMetadata(dataSet.Metadata, wanted) {
+			!dataSet.IsLive || !dataSet.IsManaged || !maps.Equal(dataSet.Metadata, wanted) {
 			continue
 		}
 		if best == nil ||
@@ -146,19 +146,6 @@ func cloneDataSetMetadata(metadata map[string]string) map[string]string {
 	out := make(map[string]string, len(metadata)+2)
 	maps.Copy(out, metadata)
 	return out
-}
-
-func sameDataSetMetadata(left, right map[string]string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for key, value := range right {
-		got, ok := left[key]
-		if !ok || got != value {
-			return false
-		}
-	}
-	return true
 }
 
 func wrapStorageTarget(storageCtx storage.StorageContext) (StorageTarget, error) {

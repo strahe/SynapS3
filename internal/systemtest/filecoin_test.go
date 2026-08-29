@@ -104,6 +104,35 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	}
 }
 
+func TestMemoryFilecoinFindMatchingDataSetRequiresExactMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	filecoin := NewMemoryFilecoin()
+	providerID := sdktypes.NewBigInt(101)
+	target, err := filecoin.OpenProviderTarget(ctx, providerID, storage.NewProviderContextOptions{
+		DataSetMetadata: map[string]string{"bucket": "bucket-a", "original": ""},
+	})
+	if err != nil {
+		t.Fatalf("OpenProviderTarget: %v", err)
+	}
+	if _, err := target.CreateDataSet(ctx, nil); err != nil {
+		t.Fatalf("CreateDataSet: %v", err)
+	}
+
+	matched, err := filecoin.FindMatchingDataSet(
+		ctx,
+		providerID,
+		map[string]string{"bucket": "bucket-a", "different": ""},
+		false,
+	)
+	if err != nil {
+		t.Fatalf("FindMatchingDataSet: %v", err)
+	}
+	if matched != nil {
+		t.Fatalf("FindMatchingDataSet returned data set %s for different metadata", matched.DataSetID().String())
+	}
+}
+
 func TestMemoryFilecoinRejectsInvalidSequenceAndCancellation(t *testing.T) {
 	t.Parallel()
 	filecoin := NewMemoryFilecoin()

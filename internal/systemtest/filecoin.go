@@ -220,7 +220,7 @@ func (m *MemoryFilecoin) FindMatchingDataSet(
 	var best *memoryDataSet
 	for _, dataSet := range m.dataSets {
 		if !dataSet.provider.Equal(providerID) || dataSet.withCDN != withCDN ||
-			!sameMemoryMetadata(dataSet.metadata, wantedMetadata) {
+			!maps.Equal(dataSet.metadata, wantedMetadata) {
 			continue
 		}
 		if _, terminated := m.terminated[dataSet.id.String()]; terminated {
@@ -240,18 +240,6 @@ func (m *MemoryFilecoin) FindMatchingDataSet(
 		return nil, err
 	}
 	return &ref, nil
-}
-
-func sameMemoryMetadata(left, right map[string]string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for key, value := range right {
-		if left[key] != value {
-			return false
-		}
-	}
-	return true
 }
 
 func cloneMemoryMetadata(metadata map[string]string) map[string]string {
