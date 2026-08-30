@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -84,6 +83,26 @@ func (a *Advancer) AdvanceUnavailable(
 		CopyIndex:           copyRow.CopyIndex,
 		StorageDataSetID:    binding.ID,
 	}, attemptID, AttentionDataSetUnavailable, true)
+}
+
+// ReleaseTerminalReservation releases an unattempted reservation whose owner
+// is terminal without requiring a provider context.
+func (a *Advancer) ReleaseTerminalReservation(
+	ctx context.Context,
+	copyRow model.StorageUploadCopy,
+	binding model.StorageDataSet,
+) (AdvanceResult, error) {
+	if a == nil || a.Store == nil || copyRow.ID <= 0 || copyRow.UploadID <= 0 || copyRow.CopyIndex < 0 ||
+		copyRow.StorageDataSetID == nil || *copyRow.StorageDataSetID != binding.ID ||
+		copyRow.CommitAttemptID == nil || *copyRow.CommitAttemptID == "" || copyRow.CommitAttemptedAt != nil {
+		return AdvanceResult{}, errors.New("invalid terminal storage commit reservation")
+	}
+	return a.release(ctx, CopyIdentity{
+		StorageUploadCopyID: copyRow.ID,
+		UploadID:            copyRow.UploadID,
+		CopyIndex:           copyRow.CopyIndex,
+		StorageDataSetID:    binding.ID,
+	}, copyRow, ReleaseOwnerTerminal, true, true, false)
 }
 
 func (a *Advancer) Advance(ctx context.Context, input AdvanceInput) (AdvanceResult, error) {
@@ -165,6 +184,10 @@ func (a *Advancer) submitReserved(
 		Now:          a.now(),
 	})
 	if err != nil {
+		_, releaseErr := a.release(ctx, identity, copyRow, ReleaseBeforeSubmitCanceled, false, false, false)
+		if releaseErr != nil {
+			return AdvanceResult{}, errors.Join(err, fmt.Errorf("releasing unattempted storage commit reservation: %w", releaseErr))
+		}
 		return AdvanceResult{}, err
 	}
 	if !attempt.Entered {
@@ -202,20 +225,23 @@ func (a *Advancer) submitReserved(
 	})
 	if submitErr != nil {
 		if errors.Is(submitErr, storage.ErrDataSetUnavailable) || synapse.IsDataSetServiceEnded(submitErr) {
-			return a.attention(ctx, identity, attemptID, AttentionDataSetUnavailable, false)
+			return a.release(ctx, identity, attempt.Copy, ReleaseDataSetUnavailable, true, true, true)
+		}
+		if context.Cause(ctx) != nil {
+			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 		}
 		if callbackObserved.Load() {
 			if evidenceErr := callbackEvidenceErr.Load(); evidenceErr != nil {
 				return AdvanceResult{State: AdvancePending, AttemptID: attemptID},
-					fmt.Errorf("recording storage commit callback evidence: %w", evidenceErr.err)
+					errors.Join(submitErr, fmt.Errorf("recording storage commit callback evidence: %w", evidenceErr.err))
+			}
+			if synapse.IsProviderUnavailable(submitErr) {
+				return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
 			}
 			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 		}
-		if definitelyNotSubmitted(submitErr) {
-			if resetErr := a.reset(ctx, identity, attemptID, submitErr); resetErr != nil {
-				return AdvanceResult{}, resetErr
-			}
-			return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID}, nil
+		if synapse.IsProviderUnavailable(submitErr) {
+			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
 		}
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 	}
@@ -256,22 +282,28 @@ func (a *Advancer) observe(
 ) (AdvanceResult, error) {
 	identity := copyIdentity(input, false)
 	attemptID := *copyRow.CommitAttemptID
+	if context.Cause(ctx) != nil {
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+	}
 	if copyRow.CommitSubmissionJSON != nil && *copyRow.CommitSubmissionJSON != "" {
 		submission, err := DecodeSubmission(*copyRow.CommitSubmissionJSON)
 		if err != nil {
-			return a.attention(ctx, identity, attemptID, AttentionInvalidSubmission, false)
+			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionInvalidSubmission, false)
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, a.requestTimeout())
 		status, err := input.Target.GetCommitStatus(requestCtx, submission)
 		cancel()
 		if err != nil {
+			if context.Cause(ctx) != nil {
+				return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+			}
 			if errors.Is(err, storage.ErrDataSetUnavailable) || synapse.IsDataSetServiceEnded(err) {
 				return a.pendingOrAttentionWithCode(
 					ctx, identity, copyRow, attemptID, AttentionDataSetUnavailable,
 				)
 			}
 			if errors.Is(err, storage.ErrInvalidArgument) {
-				return a.attention(ctx, identity, attemptID, AttentionSubmissionMismatch, false)
+				return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 			}
 			return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
 		}
@@ -282,10 +314,8 @@ func (a *Advancer) observe(
 	}
 	if copyRow.CommitAttentionAt != nil {
 		code := AttentionAttemptOnlyAmbiguous
-		if copyRow.CommitAttentionCode != nil {
-			if parsed, err := ParseAttentionCode(*copyRow.CommitAttentionCode); err == nil {
-				code = parsed
-			}
+		if copyRow.CommitAttentionCode != nil && *copyRow.CommitAttentionCode != "" {
+			code = AttentionCode(*copyRow.CommitAttentionCode)
 		}
 		return AdvanceResult{
 			State:         AdvanceNeedsAttention,
@@ -297,13 +327,13 @@ func (a *Advancer) observe(
 	pieceStatus, err := input.Target.PieceStatus(requestCtx, input.Pieces[0].PieceCID)
 	cancel()
 	if err != nil && (errors.Is(err, storage.ErrDataSetUnavailable) || synapse.IsDataSetServiceEnded(err)) {
-		return a.attention(ctx, identity, attemptID, AttentionDataSetUnavailable, false)
+		return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionDataSetUnavailable, false)
 	}
 	code := AttentionAttemptOnlyAmbiguous
 	if err == nil && pieceStatus != nil && pieceStatus.Exists {
 		code = AttentionUnattributedPiece
 	}
-	return a.attention(ctx, identity, attemptID, code, false)
+	return a.attentionForCopy(ctx, identity, copyRow, attemptID, code, false)
 }
 
 func (a *Advancer) observeTransaction(
@@ -325,8 +355,11 @@ func (a *Advancer) observeTransaction(
 		ExpectedPieceCount: len(input.Pieces),
 	})
 	if err != nil {
+		if context.Cause(ctx) != nil {
+			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+		}
 		if result.State == synapse.PDPStatusMismatch {
-			return a.attention(ctx, identity, attemptID, AttentionSubmissionMismatch, false)
+			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 		}
 		return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
 	}
@@ -338,21 +371,22 @@ func (a *Advancer) observeTransaction(
 		for _, raw := range result.ConfirmedPieceIDs {
 			pieceID, err := idtypes.ParseOnChainID("confirmed piece ID", raw)
 			if err != nil {
-				return a.attention(ctx, identity, attemptID, AttentionSubmissionMismatch, false)
+				return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 			}
 			pieceIDs = append(pieceIDs, pieceID.SDK())
 		}
 		ref, bound := input.Target.DataSetRef()
 		if !bound {
-			return a.attention(ctx, identity, attemptID, AttentionSubmissionMismatch, false)
+			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 		}
 		return AdvanceResult{
 			State:     AdvanceConfirmed,
 			AttemptID: attemptID,
 			Confirmation: &storage.CommitResult{
-				TransactionID: transactionID,
-				DataSet:       ref,
-				PieceIDs:      pieceIDs,
+				TransactionID:          transactionID,
+				ConfirmedTransactionID: result.ConfirmedTransactionID,
+				DataSet:                ref,
+				PieceIDs:               pieceIDs,
 			},
 		}, nil
 	case synapse.PDPStatusRejected:
@@ -361,7 +395,7 @@ func (a *Advancer) observeTransaction(
 		}
 		return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID}, nil
 	case synapse.PDPStatusMismatch:
-		return a.attention(ctx, identity, attemptID, AttentionSubmissionMismatch, false)
+		return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 	default:
 		return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
 	}
@@ -382,7 +416,7 @@ func (a *Advancer) classifySDKStatus(
 		return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
 	case storage.CommitStateConfirmed:
 		if status.DataSet == nil {
-			return a.attention(ctx, identity, attemptID, AttentionSubmissionMismatch, false)
+			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 		}
 		return AdvanceResult{
 			State:     AdvanceConfirmed,
@@ -400,7 +434,7 @@ func (a *Advancer) classifySDKStatus(
 		}
 		return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID}, nil
 	default:
-		return a.attention(ctx, identity, attemptID, AttentionSubmissionMismatch, false)
+		return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 	}
 }
 
@@ -423,9 +457,23 @@ func (a *Advancer) pendingOrAttentionWithCode(
 	code AttentionCode,
 ) (AdvanceResult, error) {
 	if copyRow.CommitAttentionAt != nil || a.now().Sub(*copyRow.CommitAttemptedAt) >= a.attentionAfter() {
-		return a.attention(ctx, identity, attemptID, code, true)
+		return a.attentionForCopy(ctx, identity, copyRow, attemptID, code, true)
 	}
 	return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+}
+
+func (a *Advancer) attentionForCopy(
+	ctx context.Context,
+	identity CopyIdentity,
+	copyRow model.StorageUploadCopy,
+	attemptID string,
+	code AttentionCode,
+	keepObserving bool,
+) (AdvanceResult, error) {
+	if copyRow.CommitAttentionCode != nil && *copyRow.CommitAttentionCode != "" {
+		code = AttentionCode(*copyRow.CommitAttentionCode)
+	}
+	return a.attention(ctx, identity, attemptID, code, keepObserving)
 }
 
 func (a *Advancer) attention(
@@ -435,6 +483,9 @@ func (a *Advancer) attention(
 	code AttentionCode,
 	keepObserving bool,
 ) (AdvanceResult, error) {
+	if context.Cause(ctx) != nil {
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+	}
 	evidenceCtx, cancel := evidenceContext(ctx)
 	err := a.Store.MarkCommitAttention(evidenceCtx, AttentionInput{
 		Copy:      identity,
@@ -547,23 +598,6 @@ func decodeCommitExtraData(value *string) ([]byte, error) {
 		return nil, fmt.Errorf("decoding storage commit extra data: %w", err)
 	}
 	return extraData, nil
-}
-
-func definitelyNotSubmitted(err error) bool {
-	if errors.Is(err, storage.ErrInvalidArgument) {
-		return true
-	}
-	var httpErr *pdp.HTTPError
-	if !errors.As(err, &httpErr) {
-		return false
-	}
-	if httpErr.StatusCode == http.StatusNotImplemented {
-		return true
-	}
-	return httpErr.StatusCode >= http.StatusBadRequest &&
-		httpErr.StatusCode < http.StatusInternalServerError &&
-		httpErr.StatusCode != http.StatusRequestTimeout &&
-		httpErr.StatusCode != http.StatusConflict
 }
 
 func evidenceContext(parent context.Context) (context.Context, context.CancelFunc) {

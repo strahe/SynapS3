@@ -230,7 +230,7 @@ func (r *BunStorageUploadRepo) MarkCommitAttention(ctx context.Context, input st
 		now := commitInputTime(input.Now)
 		res, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
-			Set("commit_attention_code = ?", string(input.Code)).
+			Set("commit_attention_code = COALESCE(commit_attention_code, ?)", string(input.Code)).
 			Set("commit_attention_at = COALESCE(commit_attention_at, ?)", now).
 			Set("updated_at = ?", now).
 			Where("id = ?", copyID).
@@ -416,7 +416,7 @@ func (r *BunStorageUploadRepo) ListCommitAttention(ctx context.Context, limit in
 	for _, row := range rows {
 		code, err := storagecommit.ParseAttentionCode(row.Code)
 		if err != nil {
-			return nil, fmt.Errorf("listing storage confirmation attention for copy %d: %w", row.CopyID, err)
+			code = storagecommit.AttentionCode(row.Code)
 		}
 		out = append(out, storagecommit.AttentionRecord{
 			CopyID: row.CopyID, UploadID: row.UploadID, CopyIndex: row.CopyIndex,
@@ -484,13 +484,14 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
+		var recovered int64
 		copyIDExpr := taskPayloadCopyIDSQL(db.Dialect().Name())
 		uploadIDExpr, copyIndexExpr := runningUploadCopyTaskPayloadExpressions(db.Dialect().Name())
 		copyTaskMatch := fmt.Sprintf(
 			"(%[1]s = ? OR ((%[1]s IS NULL OR %[1]s = 0) AND %[2]s = ? AND %[3]s = ?))",
 			copyIDExpr("task"), uploadIDExpr, copyIndexExpr,
 		)
-		if _, err := db.NewUpdate().
+		res, err = db.NewUpdate().
 			Model((*model.Task)(nil)).
 			Set("status = ?", model.TaskStatusScheduled).
 			Set("scheduled_at = ?", now).
@@ -501,10 +502,13 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 			Where("type = ?", model.TaskTypeUpload).
 			Where("status IN (?, ?, ?)", model.TaskStatusQueued, model.TaskStatusScheduled, model.TaskStatusWaiting).
 			Where(copyTaskMatch, copyID, copyRow.UploadID, copyRow.CopyIndex).
-			Exec(ctx); err != nil {
+			Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("waking storage confirmation task: %w", err)
 		}
-		if _, err := db.NewUpdate().
+		rows, _ := res.RowsAffected()
+		recovered += rows
+		res, err = db.NewUpdate().
 			Model((*storagereplacement.Item)(nil)).
 			Set("status = ?", storagereplacement.ItemStatusCancelled).
 			Set("scheduled_at = ?", now).
@@ -517,10 +521,13 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 				WHERE owner_replacement.id = storage_replacement_item.replacement_id
 				  AND owner_replacement.status IN (?, ?)
 			)`, storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
-			Exec(ctx); err != nil {
+			Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("settling terminal replacement confirmation item: %w", err)
 		}
-		if _, err := db.NewUpdate().
+		rows, _ = res.RowsAffected()
+		recovered += rows
+		res, err = db.NewUpdate().
 			Model((*storagereplacement.Item)(nil)).
 			Set("status = ?", storagereplacement.ItemStatusFailed).
 			Set("scheduled_at = ?", now).
@@ -533,10 +540,13 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 				WHERE owner_replacement.id = storage_replacement_item.replacement_id
 				  AND owner_replacement.status IN (?, ?)
 			)`, storagereplacement.StatusFailed, storagereplacement.StatusCleanupAttention).
-			Exec(ctx); err != nil {
+			Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("holding failed replacement confirmation item: %w", err)
 		}
-		if _, err := db.NewUpdate().
+		rows, _ = res.RowsAffected()
+		recovered += rows
+		res, err = db.NewUpdate().
 			Model((*storagereplacement.Item)(nil)).
 			Set("status = ?", storagereplacement.ItemStatusPending).
 			Set("scheduled_at = ?", now).
@@ -550,8 +560,14 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 				  AND owner_replacement.status IN (?, ?, ?, ?)
 			)`, storagereplacement.StatusPreparingTarget, storagereplacement.StatusMigrating,
 				storagereplacement.StatusWaiting, storagereplacement.StatusRetiring).
-			Exec(ctx); err != nil {
+			Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("waking replacement confirmation item: %w", err)
+		}
+		rows, _ = res.RowsAffected()
+		recovered += rows
+		if recovered == 0 {
+			return fmt.Errorf("releasing storage confirmation attention without recoverable work: %w", ErrConflict)
 		}
 		return nil
 	})

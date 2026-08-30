@@ -360,11 +360,17 @@ func (u *Uploader) repairReplicaCopy(
 	}
 	pieces := []storage.PieceInput{{PieceCID: pieceCID}}
 	advance, err := u.commitReplicaRepairCopy(ctx, upload, binding, copyRow, storageCtx, pieces, false)
-	if err != nil {
+	if err != nil && advance.State == storagecommit.AdvancePending && synapse.IsProviderUnavailable(err) {
 		return err
 	}
 	if u.waitForCommitAdvance(ctx, task, logger, advance) {
+		if err != nil {
+			logger.Warn("storage commit evidence remains fenced", "stage", "replica repair commit", "error", err)
+		}
 		return nil
+	}
+	if err != nil {
+		return err
 	}
 	switch {
 	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:

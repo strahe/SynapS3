@@ -168,6 +168,16 @@ func TestStorageCommitAttemptFenceBlocksAutomaticFailure(t *testing.T) {
 	if !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("MarkUploadCopyFailed error = %v, want conflict", err)
 	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(t.Context(), repository.MarkUploadCopyPieceReadyInput{
+		StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: "bafkqaaa", RetrievalURL: "https://provider.example/late",
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("late MarkUploadCopyPieceReady error = %v, want conflict", err)
+	}
+	persisted, err := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+	if err != nil || persisted.Status != model.StorageUploadCopyStatusCommitting {
+		t.Fatalf("copy after late piece-ready = %#v err=%v, want committing", persisted, err)
+	}
 	if err := repos.Uploads.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
 		Copy: identity, AttemptID: "attempt-fenced",
 	}); !errors.Is(err, repository.ErrConflict) {
@@ -198,12 +208,17 @@ func TestStorageCommitAttentionRequiresAcknowledgedFencedRelease(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("mark attention: %v", err)
 	}
+	if err := repos.Uploads.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
+		Copy: identity, AttemptID: "attention-attempt", Code: storagecommit.AttentionDataSetUnavailable,
+	}); err != nil {
+		t.Fatalf("repeat attention: %v", err)
+	}
 	stage := "peer_commit"
 	waitReason := model.TaskWaitReasonExternalConfirmation
 	legacyTask := &model.Task{
 		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: 1,
 		RefVersionID: "legacy-confirmation", IdempotencyKey: "legacy-confirmation-task",
-		Payload: map[string]interface{}{
+		Payload: map[string]any{
 			"upload_id": copyRow.UploadID, "copy_index": copyRow.CopyIndex,
 		},
 		Status: model.TaskStatusWaiting, WaitReason: &waitReason,
@@ -216,6 +231,16 @@ func TestStorageCommitAttentionRequiresAcknowledgedFencedRelease(t *testing.T) {
 	if err != nil || len(records) != 1 || records[0].CopyID != copyRow.ID ||
 		records[0].Code != storagecommit.AttentionAttemptOnlyAmbiguous {
 		t.Fatalf("attention records = %#v err=%v", records, err)
+	}
+	if _, err := db.NewUpdate().Model((*model.StorageUploadCopy)(nil)).
+		Set("commit_attention_code = ?", "future_attention_code").
+		Where("id = ?", copyRow.ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("set future attention code: %v", err)
+	}
+	records, err = repos.Uploads.ListCommitAttention(t.Context(), 10)
+	if err != nil || len(records) != 1 || records[0].Code != storagecommit.AttentionCode("future_attention_code") {
+		t.Fatalf("future attention records = %#v err=%v", records, err)
 	}
 	if err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
 		CopyID: copyRow.ID, ExpectedAttemptID: "attention-attempt",
@@ -248,6 +273,88 @@ func TestStorageCommitAttentionRequiresAcknowledgedFencedRelease(t *testing.T) {
 	}
 	if persistedTask.Status != model.TaskStatusScheduled || persistedTask.WaitReason != nil || persistedTask.ScheduledAt.After(time.Now().Add(time.Minute)) {
 		t.Fatalf("legacy confirmation task was not woken: %#v", persistedTask)
+	}
+}
+
+func TestStorageCommitAttentionReleaseRequiresRecoverableWork(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "commit-attention-orphan-bucket")
+	dataSet := seedCommitDataSet(t, db, bucket.ID)
+	copyRow := seedCommitCopies(t, db, bucket.ID, dataSet.ID, 1)[0]
+	identity := commitCopyIdentity(copyRow)
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "orphan-attention",
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "orphan-attention", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("mark attempted: %v", err)
+	}
+	if err := repos.Uploads.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
+		Copy: identity, AttemptID: "orphan-attention", Code: storagecommit.AttentionAttemptOnlyAmbiguous,
+	}); err != nil {
+		t.Fatalf("mark attention: %v", err)
+	}
+
+	err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
+		CopyID: copyRow.ID, ExpectedAttemptID: "orphan-attention", AcknowledgePossibleDuplicate: true,
+	})
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("orphan release error = %v, want conflict", err)
+	}
+	persisted, loadErr := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+	if loadErr != nil || persisted.CommitAttemptID == nil || persisted.CommitAttentionAt == nil {
+		t.Fatalf("orphan release did not roll back: copy=%#v err=%v", persisted, loadErr)
+	}
+}
+
+func TestStorageCommitSettlementUsesConcreteDrainingGenerationOrigin(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "commit-concrete-generation-bucket")
+	oldDataSet := seedCommitDataSet(t, db, bucket.ID)
+	copyRow := seedCommitCopies(t, db, bucket.ID, oldDataSet.ID, 1)[0]
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("is_current = ?", false).
+		Set("status = ?", model.StorageDataSetStatusDraining).
+		Set("created_by_upload_id = ?", copyRow.UploadID).
+		Where("id = ?", oldDataSet.ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("drain old data set: %v", err)
+	}
+	newDataSetID := onChainID(t, "1002")
+	newDataSet := &model.StorageDataSet{
+		BucketID: bucket.ID, ProviderID: oldDataSet.ProviderID, CopyIndex: oldDataSet.CopyIndex,
+		Generation: 2, IsCurrent: true, DataSetID: &newDataSetID, Status: model.StorageDataSetStatusReady,
+	}
+	if _, err := db.NewInsert().Model(newDataSet).Exec(t.Context()); err != nil {
+		t.Fatalf("insert current generation: %v", err)
+	}
+	identity := commitCopyIdentity(copyRow)
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "draining-settlement",
+	}); err != nil {
+		t.Fatalf("reserve draining copy: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "draining-settlement", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("mark draining copy attempted: %v", err)
+	}
+	pieceID := onChainID(t, "5001")
+	if err := repos.Uploads.MarkUploadCopyCommitted(t.Context(), repository.MarkUploadCopyCommittedInput{
+		StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: "bafkqaaa", PieceID: &pieceID, RetrievalURL: "https://old.example/piece",
+		CommitAttemptID: "draining-settlement",
+	}); err != nil {
+		t.Fatalf("settle draining copy: %v", err)
+	}
+	persisted, err := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+	if err != nil || !persisted.IsNewDataSet {
+		t.Fatalf("draining copy origin = %#v err=%v, want new-data-set provenance from concrete generation", persisted, err)
 	}
 }
 

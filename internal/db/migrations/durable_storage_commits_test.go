@@ -68,6 +68,28 @@ func TestDurableStorageCommitsMigrationRejectsLegacyCommittingRowsAtomically(t *
 	})
 }
 
+func TestDurableStorageCommitsMigrationRechecksLegacyRowsForCompleteSchema(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		createDurableStorageCommitLegacyTable(t, db)
+		if err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits); err != nil {
+			t.Fatalf("initial up migration: %v", err)
+		}
+		mustExecMigrationTest(t, db, "INSERT INTO storage_upload_copies (id, status) VALUES (1, 'committing')")
+
+		err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits)
+		if err == nil || !strings.Contains(err.Error(), "legacy committing copies") {
+			t.Fatalf("complete-schema recovery error = %v, want legacy committing refusal", err)
+		}
+		mustExecMigrationTest(t, db, "DELETE FROM storage_upload_copies")
+		mustExecMigrationTest(t, db, `INSERT INTO storage_upload_copies
+			(id, status, commit_attempt_id, commit_attempted_at)
+			VALUES (2, 'committing', 'durable-attempt', CURRENT_TIMESTAMP)`)
+		if err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits); err != nil {
+			t.Fatalf("complete-schema recovery rejected durable committing row: %v", err)
+		}
+	})
+}
+
 func TestDurableStorageCommitsMigrationRejectsPartialSchema(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
 		createDurableStorageCommitLegacyTable(t, db)

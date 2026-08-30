@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/strahe/synapse-go/pdp"
 )
 
@@ -77,15 +78,16 @@ type AddPiecesStatusInput struct {
 }
 
 type PDPStatusResult struct {
-	State             PDPStatusState
-	StatusURL         string
-	TxStatus          string
-	DataSetID         string
-	DataSetCreated    bool
-	PiecesAdded       bool
-	PieceCount        int
-	ConfirmedPieceIDs []string
-	Error             string
+	State                  PDPStatusState
+	StatusURL              string
+	TxStatus               string
+	DataSetID              string
+	DataSetCreated         bool
+	PiecesAdded            bool
+	PieceCount             int
+	ConfirmedPieceIDs      []string
+	ConfirmedTransactionID string
+	Error                  string
 }
 
 func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input DataSetCreationStatusInput) PDPStatusResult {
@@ -169,6 +171,9 @@ func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiec
 	result.DataSetID = status.DataSetID.String()
 	result.PieceCount = status.PieceCount
 	result.PiecesAdded = status.PiecesAdded
+	if status.ConfirmedTxHash != (common.Hash{}) {
+		result.ConfirmedTransactionID = status.ConfirmedTxHash.Hex()
+	}
 	for _, id := range status.ConfirmedPieceIDs {
 		result.ConfirmedPieceIDs = append(result.ConfirmedPieceIDs, id.String())
 	}
@@ -316,7 +321,10 @@ func classifyAddPiecesStatus(txStatus string, piecesAdded bool, pieceCount, expe
 		if pieceCount != expectedPieceCount {
 			return PDPStatusMismatch
 		}
-		if confirmedPieceIDCount != expectedPieceCount {
+		if confirmedPieceIDCount < expectedPieceCount {
+			return PDPStatusPending
+		}
+		if confirmedPieceIDCount > expectedPieceCount {
 			return PDPStatusMismatch
 		}
 		return PDPStatusConfirmed

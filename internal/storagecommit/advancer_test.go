@@ -133,7 +133,7 @@ func TestAdvancerPersistsFourSubmissionsBeforeConfirmationAndAdmitsFIFO(t *testi
 func TestAdvancerOwnerTerminalReleasesUnattemptedReservationWithoutSDK(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	binding, copies, _ := seedAdvancerCopies(t, db, 1)
 	identity := advancerCopyIdentity(copies[0])
 	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
 		Copy: identity, AttemptID: "owner-terminal-attempt",
@@ -141,16 +141,9 @@ func TestAdvancerOwnerTerminalReleasesUnattemptedReservationWithoutSDK(t *testin
 		t.Fatalf("reserve: %v", err)
 	}
 	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
-	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
-	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
-		t.Fatal("owner-terminal release entered the SDK")
-		return nil, nil
-	}
-
-	result, err := (&storagecommit.Advancer{Store: repos.Uploads}).Advance(t.Context(), storagecommit.AdvanceInput{
-		Copy: *copyRow, Binding: *binding, Target: target, OwnerTerminal: true,
-		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
-	})
+	result, err := (&storagecommit.Advancer{Store: repos.Uploads}).ReleaseTerminalReservation(
+		t.Context(), *copyRow, *binding,
+	)
 	if err != nil || result.State != storagecommit.AdvanceReleased || result.ReleaseReason != storagecommit.ReleaseOwnerTerminal {
 		t.Fatalf("advance = %#v err=%v", result, err)
 	}
@@ -226,7 +219,7 @@ func TestAdvancerDataSetUnavailableSeparatesReservationFromAttempt(t *testing.T)
 		}
 	})
 
-	t.Run("after SDK entry requires attention", func(t *testing.T) {
+	t.Run("SDK pre-submit rejection releases attempted fence", func(t *testing.T) {
 		db := testutil.NewTestDB(t)
 		repos := repository.NewRepositories(db)
 		binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
@@ -242,16 +235,92 @@ func TestAdvancerDataSetUnavailableSeparatesReservationFromAttempt(t *testing.T)
 			Copy: copies[0], Binding: *binding, Target: target,
 			Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
 		})
-		if err != nil || result.State != storagecommit.AdvanceNeedsAttention ||
-			result.AttentionCode != storagecommit.AttentionDataSetUnavailable || result.Continue {
+		if err != nil || result.State != storagecommit.AdvanceReleased ||
+			result.ReleaseReason != storagecommit.ReleaseDataSetUnavailable {
 			t.Fatalf("advance = %#v err=%v", result, err)
 		}
 		persisted := loadAdvancerCopy(t, repos, copies[0].ID)
-		if persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil ||
-			persisted.CommitAttentionAt == nil {
-			t.Fatalf("attempted unavailable commit was released: %#v", persisted)
+		if persisted.CommitAttemptID != nil || persisted.CommitAttemptedAt != nil ||
+			persisted.CommitAttentionAt != nil {
+			t.Fatalf("pre-submit rejection retained commit state: %#v", persisted)
 		}
 	})
+}
+
+func TestAdvancerAmbiguousSubmitErrorRetainsAttemptFence(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+		return []byte{0xab}, nil
+	}
+	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+		return nil, storage.ErrInvalidArgument
+	}
+
+	result, err := (&storagecommit.Advancer{Store: repos.Uploads}).Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: copies[0], Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvancePending {
+		t.Fatalf("advance = %#v err=%v, want fenced pending result", result, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.Status != model.StorageUploadCopyStatusCommitting ||
+		persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil {
+		t.Fatalf("ambiguous submit error lost attempt fence: %#v", persisted)
+	}
+}
+
+func TestAdvancerProviderUnavailableSubmitKeepsFenceAndSignalsDependency(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+		return []byte{0xab}, nil
+	}
+	providerErr := &synapse.ProviderUnavailableError{Cause: context.DeadlineExceeded}
+	target.SubmitCommitFunc = func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error) {
+		return nil, providerErr
+	}
+
+	result, err := (&storagecommit.Advancer{Store: repos.Uploads}).Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: copies[0], Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if !synapse.IsProviderUnavailable(err) || result.State != storagecommit.AdvancePending {
+		t.Fatalf("advance = %#v err=%v, want pending provider dependency", result, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil {
+		t.Fatalf("provider failure lost attempt fence: %#v", persisted)
+	}
+}
+
+func TestAdvancerReleasesReservationWhenMarkAttemptedFails(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+		return []byte{0xab}, nil
+	}
+	injected := errors.New("injected mark-attempted failure")
+	store := &failingMarkAttemptedStore{Store: repos.Uploads, err: injected}
+
+	result, err := (&storagecommit.Advancer{Store: store}).Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: copies[0], Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if !errors.Is(err, injected) || result.State != "" {
+		t.Fatalf("advance = %#v err=%v, want mark-attempted failure", result, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.CommitAttemptID != nil || persisted.CommitAttemptedAt != nil {
+		t.Fatalf("failed mark-attempted retained reservation: %#v", persisted)
+	}
 }
 
 func TestAdvancerSubmissionCallbackPreventsErrorBasedReset(t *testing.T) {
@@ -526,6 +595,7 @@ func TestAdvancerTxOnlyEvidenceConfirmsWithoutPieceStatus(t *testing.T) {
 		checkerCalls++
 		return synapse.PDPStatusResult{
 			State: synapse.PDPStatusConfirmed, ConfirmedPieceIDs: []string{"5001"},
+			ConfirmedTransactionID: "0xconfirmedtx",
 		}, nil
 	})
 	result, err := (&storagecommit.Advancer{Store: repos.Uploads, StatusChecker: checker}).Advance(
@@ -533,8 +603,45 @@ func TestAdvancerTxOnlyEvidenceConfirmsWithoutPieceStatus(t *testing.T) {
 			Copy: *copyRow, Binding: *binding, Target: target,
 			Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
 		})
-	if err != nil || result.State != storagecommit.AdvanceConfirmed || result.Confirmation == nil || checkerCalls != 1 {
+	if err != nil || result.State != storagecommit.AdvanceConfirmed || result.Confirmation == nil ||
+		result.Confirmation.ConfirmedTransactionID != "0xconfirmedtx" || checkerCalls != 1 {
 		t.Fatalf("advance = %#v err=%v checkerCalls=%d", result, err, checkerCalls)
+	}
+}
+
+func TestAdvancerCanceledObservationDoesNotWriteAttention(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	identity := advancerCopyIdentity(copies[0])
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "canceled-observation",
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "canceled-observation", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("mark attempted: %v", err)
+	}
+	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	ctx, cancel := context.WithCancel(t.Context())
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	target.PieceStatusFunc = func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
+		cancel()
+		return nil, context.Canceled
+	}
+
+	result, err := (&storagecommit.Advancer{Store: repos.Uploads}).Advance(ctx, storagecommit.AdvanceInput{
+		Copy: *copyRow, Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvancePending {
+		t.Fatalf("advance = %#v err=%v, want pending cancellation", result, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.CommitAttentionAt != nil || persisted.CommitAttentionCode != nil {
+		t.Fatalf("canceled observation wrote attention: %#v", persisted)
 	}
 }
 
@@ -543,6 +650,18 @@ type commitStatusCheckerFunc func(context.Context, synapse.AddPiecesStatusInput)
 type failingCommitEvidenceStore struct {
 	storagecommit.Store
 	err error
+}
+
+type failingMarkAttemptedStore struct {
+	storagecommit.Store
+	err error
+}
+
+func (s *failingMarkAttemptedStore) MarkCommitAttempted(
+	context.Context,
+	storagecommit.AttemptInput,
+) (storagecommit.AttemptResult, error) {
+	return storagecommit.AttemptResult{}, s.err
 }
 
 func (s *failingCommitEvidenceStore) RecordCommitTransaction(context.Context, storagecommit.EvidenceInput) error {

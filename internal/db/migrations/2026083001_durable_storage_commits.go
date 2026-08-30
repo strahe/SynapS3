@@ -38,6 +38,9 @@ func up2026083001DurableStorageCommits(ctx context.Context, db bun.IDB) error {
 	if err != nil {
 		return err
 	}
+	if err := assertDurableStorageCommitUpgradePreconditions2026083001(ctx, db); err != nil {
+		return err
+	}
 	if columns == len(durableStorageCommitColumns2026083001) && indexes == len(durableStorageCommitIndexes2026083001) {
 		return nil
 	}
@@ -50,9 +53,6 @@ func up2026083001DurableStorageCommits(ctx context.Context, db bun.IDB) error {
 			indexes,
 			len(durableStorageCommitIndexes2026083001),
 		)
-	}
-	if err := assertDurableStorageCommitUpgradePreconditions2026083001(ctx, db); err != nil {
-		return err
 	}
 	timestampType := "TIMESTAMP"
 	if db.Dialect().Name() == dialect.PG {
@@ -126,7 +126,15 @@ func down2026083001DurableStorageCommits(ctx context.Context, db bun.IDB) error 
 
 func assertDurableStorageCommitUpgradePreconditions2026083001(ctx context.Context, db bun.IDB) error {
 	var committing int
-	if err := db.NewRaw("SELECT COUNT(*) FROM storage_upload_copies WHERE status = 'committing'").Scan(ctx, &committing); err != nil {
+	query := "SELECT COUNT(*) FROM storage_upload_copies WHERE status = 'committing'"
+	attemptColumnExists, err := columnExists(ctx, db, "storage_upload_copies", "commit_attempt_id")
+	if err != nil {
+		return fmt.Errorf("checking durable attempt column before %s: %w", durableStorageCommitMigration2026083001, err)
+	}
+	if attemptColumnExists {
+		query += " AND (commit_attempt_id IS NULL OR commit_attempt_id = '')"
+	}
+	if err := db.NewRaw(query).Scan(ctx, &committing); err != nil {
 		return fmt.Errorf("checking existing committing copies before %s: %w", durableStorageCommitMigration2026083001, err)
 	}
 	if committing > 0 {

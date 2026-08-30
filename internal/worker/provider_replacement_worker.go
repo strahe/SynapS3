@@ -405,6 +405,19 @@ func (e *ReplacementTransferExecutor) Execute(ctx context.Context, item *storage
 	if copyCommitted(copyRow) {
 		return expectedStateVersion, e.finish(ctx, token, &snapshot.Upload)
 	}
+	if !snapshot.Replacement.Status.Active() && copyRow.CommitAttemptID != nil &&
+		*copyRow.CommitAttemptID != "" && copyRow.CommitAttemptedAt == nil {
+		advance, err := (&storagecommit.Advancer{Store: e.repos.Uploads}).ReleaseTerminalReservation(
+			ctx, *copyRow, snapshot.Target,
+		)
+		if err != nil {
+			return expectedStateVersion, err
+		}
+		if advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseOwnerTerminal {
+			return expectedStateVersion, errReplacementOwnerTerminal
+		}
+		return expectedStateVersion, errors.New("terminal replacement reservation returned an unexpected state")
+	}
 
 	bucket, err := e.repos.Buckets.GetByID(ctx, snapshot.Replacement.BucketID)
 	if err != nil {
@@ -516,13 +529,16 @@ func (e *ReplacementTransferExecutor) copy(
 	advance, err := e.support.commitReplicaRepairCopy(
 		ctx, upload, &snapshot.Target, copyRow, storageCtx, pieces, !snapshot.Replacement.Status.Active(),
 	)
-	if err != nil {
+	if err != nil && advance.State == storagecommit.AdvancePending && synapse.IsProviderUnavailable(err) {
 		return err
 	}
 	switch {
 	case advance.State == storagecommit.AdvanceWaitingCapacity,
 		advance.State == storagecommit.AdvanceSubmitted,
 		advance.State == storagecommit.AdvancePending:
+		if err != nil {
+			e.logger.Warn("storage commit evidence remains fenced", "stage", "provider replacement commit", "error", err)
+		}
 		return errReplacementCommitPending
 	case advance.State == storagecommit.AdvanceNeedsAttention && advance.Continue:
 		return errReplacementCommitObserving
@@ -536,6 +552,8 @@ func (e *ReplacementTransferExecutor) copy(
 		return errReplacementCommitPending
 	case advance.State == storagecommit.AdvanceRejected:
 		return errCommitRejected
+	case err != nil:
+		return err
 	case advance.State != storagecommit.AdvanceConfirmed || advance.Confirmation == nil || len(advance.Confirmation.PieceIDs) == 0:
 		return errors.New("replacement commit returned no piece ID")
 	}

@@ -874,7 +874,7 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                   {copy.attention_code && (
                     <div
                       className="mt-1 max-w-48 text-xs text-muted-foreground"
-                      title={`${copyAttentionLabel(copy.attention_code)}. Review the provider and transaction evidence before releasing this confirmation.${
+                      title={`${copyAttentionLabel(copy.attention_code)}. Run synaps3 admin storage-confirmation list to review the provider and transaction evidence, then release the current attempt from the CLI.${
                         copy.attention_at ? ` Detected ${copy.attention_at}.` : ''
                       }`}
                     >

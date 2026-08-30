@@ -1629,11 +1629,18 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 	}
 	pieces := []storage.PieceInput{{PieceCID: pieceCID}}
 	advance, err := u.advanceStorageCommit(ctx, binding, copyRow, storageCtx, pieces, false, false)
-	if err != nil {
-		u.handleTaskFailure(ctx, task, logger, "advance ingress commit", err)
+	if err != nil && advance.State == storagecommit.AdvancePending && synapse.IsProviderUnavailable(err) {
+		u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress commit", err)
 		return
 	}
 	if u.waitForCommitAdvance(ctx, task, logger, advance) {
+		if err != nil {
+			logger.Warn("storage commit evidence remains fenced", "stage", "ingress commit", "error", err)
+		}
+		return
+	}
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "advance ingress commit", err)
 		return
 	}
 	switch {
@@ -2041,11 +2048,18 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 	}
 	pieces := []storage.PieceInput{{PieceCID: pieceCID}}
 	advance, err := u.advanceStorageCommit(ctx, binding, copyRow, storageCtx, pieces, false, false)
-	if err != nil {
-		u.handleTaskFailure(ctx, task, logger, "advance peer commit", err)
+	if err != nil && advance.State == storagecommit.AdvancePending && synapse.IsProviderUnavailable(err) {
+		u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer commit", err)
 		return
 	}
 	if u.waitForCommitAdvance(ctx, task, logger, advance) {
+		if err != nil {
+			logger.Warn("storage commit evidence remains fenced", "stage", "peer commit", "error", err)
+		}
+		return
+	}
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, "advance peer commit", err)
 		return
 	}
 	switch {
@@ -2968,10 +2982,22 @@ func (u *Uploader) waitForCommitAdvance(
 			delay = storageCommitAttentionDelay
 			message = "Storage confirmation needs review"
 		}
+	case storagecommit.AdvanceReleased:
+		if result.ReleaseReason != storagecommit.ReleaseBeforeSubmitCanceled {
+			return false
+		}
+		delay = u.commitPollDelay()
+		message = "Waiting to retry storage submission"
 	default:
 		return false
 	}
-	if err := u.repos.Tasks.WaitRunning(ctx, task, model.TaskWaitReasonExternalConfirmation, message, delay); err != nil {
+	waitCtx := ctx
+	cancel := func() {}
+	if result.State == storagecommit.AdvanceReleased {
+		waitCtx, cancel = providerEvidenceContext(ctx)
+	}
+	defer cancel()
+	if err := u.repos.Tasks.WaitRunning(waitCtx, task, model.TaskWaitReasonExternalConfirmation, message, delay); err != nil {
 		logger.Error("failed to wait for storage confirmation", "error", err)
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return true

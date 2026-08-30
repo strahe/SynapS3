@@ -1493,7 +1493,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
 			Where("id = ?", copyID).
-			Where("status <> ?", model.StorageUploadCopyStatusCommitted)
+			Where("status NOT IN (?, ?)", model.StorageUploadCopyStatusCommitted, model.StorageUploadCopyStatusCommitting)
 		if input.PieceCID != "" {
 			q = q.Where(`EXISTS (
 				SELECT 1 FROM storage_uploads AS evidence_upload
@@ -1604,7 +1604,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 			}
 		}
 		now := time.Now()
-		isNewDataSet, err := uploadCopyDataSetCreatedByUpload(ctx, db, input.UploadID, input.CopyIndex)
+		isNewDataSet, err := uploadCopyDataSetCreatedByUpload(ctx, db, copyID)
 		if err != nil {
 			return err
 		}
@@ -2287,22 +2287,17 @@ func uploadCopyTransferMethod(ctx context.Context, db bun.IDB, uploadID int64, c
 	return row.TransferMethod, nil
 }
 
-func uploadCopyDataSetCreatedByUpload(ctx context.Context, db bun.IDB, uploadID int64, copyIndex int) (bool, error) {
+func uploadCopyDataSetCreatedByUpload(ctx context.Context, db bun.IDB, copyID int64) (bool, error) {
 	var row struct {
 		IsNewDataSet bool `bun:"is_new_data_set"`
 	}
-	err := db.NewRaw(fmt.Sprintf(`SELECT CASE
+	err := db.NewRaw(`SELECT CASE
 			WHEN storage_data_set.created_by_upload_id = storage_copy.upload_id THEN TRUE
 			ELSE FALSE
 		END AS is_new_data_set
 		FROM storage_upload_copies AS storage_copy
 		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-		WHERE storage_copy.upload_id = ? AND storage_copy.copy_index = ?
-		  AND %s
-		ORDER BY (storage_copy.storage_data_set_id IS NULL) ASC
-		LIMIT 1`, currentGenerationCopySQL("storage_copy")),
-		uploadID, copyIndex,
-	).Scan(ctx, &row)
+		WHERE storage_copy.id = ?`, copyID).Scan(ctx, &row)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return false, nil
