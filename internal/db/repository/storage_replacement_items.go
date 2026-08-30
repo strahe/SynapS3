@@ -229,13 +229,27 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 		if err != nil {
 			return err
 		}
+		confirmationRecovery := false
 		if !replacement.Status.Active() {
-			if replacement.Status.Terminal() {
+			if (replacement.Status == storagereplacement.StatusFailed || replacement.Status == storagereplacement.StatusSuperseded) &&
+				item.TargetCopyID != nil {
+				attempts, countErr := db.NewSelect().Model((*model.StorageUploadCopy)(nil)).
+					Where("id = ?", *item.TargetCopyID).
+					Where("commit_attempt_id IS NOT NULL AND commit_attempt_id <> ''").
+					Count(ctx)
+				if countErr != nil {
+					return fmt.Errorf("checking terminal replacement confirmation: %w", countErr)
+				}
+				confirmationRecovery = attempts == 1
+			}
+			if !confirmationRecovery && replacement.Status.Terminal() {
 				settled = true
 				return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
 			}
-			deferred = true
-			return releaseReplacementItemForRetry(ctx, db, item)
+			if !confirmationRecovery {
+				deferred = true
+				return releaseReplacementItemForRetry(ctx, db, item)
+			}
 		}
 		uploads := &BunStorageUploadRepo{db: db}
 		source, err := uploads.GetDataSetBindingByID(ctx, replacement.SourceDataSetID)
@@ -249,7 +263,7 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 		if source == nil || target == nil {
 			return fmt.Errorf("acquiring replacement item: data set: %w", ErrNotFound)
 		}
-		if !target.IsCurrent || target.CopyIndex != replacement.CopyIndex || source.CopyIndex != replacement.CopyIndex {
+		if (!confirmationRecovery && !target.IsCurrent) || target.CopyIndex != replacement.CopyIndex || source.CopyIndex != replacement.CopyIndex {
 			return fmt.Errorf("acquiring replacement item: replica slot changed: %w", ErrConflict)
 		}
 		upload, err := uploads.GetByID(ctx, item.UploadID)
@@ -264,10 +278,24 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 			return err
 		}
 		if version == nil {
+			if confirmationRecovery {
+				return fmt.Errorf("acquiring terminal replacement confirmation without a live owner: %w", ErrConflict)
+			}
 			// Nothing references this content any more, so the new provider does
 			// not need it.
 			settled = true
 			return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
+		}
+		if confirmationRecovery {
+			snapshot = &ReplacementItemSnapshot{
+				Replacement: *replacement,
+				Item:        *item,
+				Source:      *source,
+				Target:      *target,
+				Upload:      *upload,
+				Version:     *version,
+			}
+			return nil
 		}
 		owed, inFlight, err := sourceCopyState(ctx, db, upload.ID, source.ID)
 		if err != nil {

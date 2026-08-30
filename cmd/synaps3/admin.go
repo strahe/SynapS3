@@ -57,6 +57,7 @@ func adminCommand() *cli.Command {
 			adminS3UserCommand(),
 			adminSettingsCommand(),
 			adminTaskCommand(),
+			adminStorageConfirmationCommand(),
 		},
 	}
 }
@@ -448,6 +449,80 @@ func adminTaskCommand() *cli.Command {
 						return writeAdminJSON(cmd.Root().Writer, resp)
 					}
 					_, err = fmt.Fprintf(cmd.Root().Writer, "Task %s %s\n", taskID, resp["status"])
+					return err
+				},
+			},
+		},
+	}
+}
+
+func adminStorageConfirmationCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "storage-confirmation",
+		Usage: "inspect storage confirmations that need attention",
+		Commands: []*cli.Command{
+			{
+				Name:  "list",
+				Usage: "list storage confirmations that need attention",
+				Flags: []cli.Flag{
+					&cli.IntFlag{Name: "limit", Value: 100, Usage: "maximum confirmations to return"},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					limit := cmd.Int("limit")
+					if limit <= 0 || limit > 1000 {
+						return errors.New("--limit must be between 1 and 1000")
+					}
+					client, opts, err := newAdminClientFromCommand(ctx, cmd)
+					if err != nil {
+						return err
+					}
+					path := "/api/v1/storage-confirmations?" + url.Values{
+						"limit":  {strconv.Itoa(limit)},
+						"status": {"needs_attention"},
+					}.Encode()
+					var confirmations []adminStorageConfirmationAttention
+					if err := client.getJSON(ctx, path, &confirmations); err != nil {
+						return err
+					}
+					if opts.JSON {
+						return writeAdminJSON(cmd.Root().Writer, confirmations)
+					}
+					return writeAdminStorageConfirmationsTable(cmd.Root().Writer, confirmations)
+				},
+			},
+			{
+				Name:      "release",
+				Usage:     "release a storage confirmation for a possible duplicate submission",
+				ArgsUsage: "<copy-id>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "yes", Usage: "acknowledge that the provider may already have accepted the piece"},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					copyID, err := requireSingleArg(cmd, "copy id")
+					if err != nil {
+						return err
+					}
+					parsedID, err := strconv.ParseInt(copyID, 10, 64)
+					if err != nil || parsedID <= 0 {
+						return fmt.Errorf("invalid copy id %q", copyID)
+					}
+					if !cmd.Bool("yes") {
+						return errors.New("releasing a storage confirmation requires --yes")
+					}
+					client, opts, err := newAdminClientFromCommand(ctx, cmd)
+					if err != nil {
+						return err
+					}
+					var response adminStorageConfirmationRelease
+					path := "/api/v1/storage-confirmations/" + url.PathEscape(copyID) + "/release"
+					body := map[string]bool{"acknowledge_possible_duplicate": true}
+					if err := client.postJSON(ctx, path, body, &response, true); err != nil {
+						return err
+					}
+					if opts.JSON {
+						return writeAdminJSON(cmd.Root().Writer, response)
+					}
+					_, err = fmt.Fprintf(cmd.Root().Writer, "Storage confirmation released for copy %d\n", response.CopyID)
 					return err
 				},
 			},
@@ -888,6 +963,26 @@ type adminTaskStatusCount struct {
 	Type   string `json:"type"`
 	Status string `json:"status"`
 	Count  int64  `json:"count"`
+}
+
+type adminStorageConfirmationAttention struct {
+	CopyID        int64  `json:"copy_id"`
+	UploadID      int64  `json:"upload_id"`
+	CopyIndex     int    `json:"copy_index"`
+	DataSetRowID  int64  `json:"data_set_row_id"`
+	ProviderID    string `json:"provider_id"`
+	DataSetID     string `json:"data_set_id,omitempty"`
+	PieceCID      string `json:"piece_cid,omitempty"`
+	AttemptID     string `json:"attempt_id"`
+	TransactionID string `json:"transaction_id,omitempty"`
+	ReasonCode    string `json:"reason_code"`
+	AttemptedAt   string `json:"attempted_at"`
+	AttentionAt   string `json:"attention_at"`
+}
+
+type adminStorageConfirmationRelease struct {
+	CopyID int64  `json:"copy_id"`
+	Status string `json:"status"`
 }
 
 type adminSettingKind int
@@ -1373,6 +1468,31 @@ func writeAdminTaskStatsTable(w io.Writer, stats []adminTaskStatusCount) error {
 	_, _ = fmt.Fprintln(tw, "TYPE\tSTATUS\tCOUNT")
 	for _, stat := range stats {
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\n", stat.Type, stat.Status, stat.Count)
+	}
+	return tw.Flush()
+}
+
+func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStorageConfirmationAttention) error {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(tw, "COPY ID\tUPLOAD ID\tCOPY\tPROVIDER\tDATA SET\tATTEMPT\tTRANSACTION\tREASON\tATTENTION AT"); err != nil {
+		return err
+	}
+	for _, confirmation := range confirmations {
+		if _, err := fmt.Fprintf(
+			tw,
+			"%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			confirmation.CopyID,
+			confirmation.UploadID,
+			confirmation.CopyIndex,
+			confirmation.ProviderID,
+			confirmation.DataSetID,
+			confirmation.AttemptID,
+			confirmation.TransactionID,
+			confirmation.ReasonCode,
+			confirmation.AttentionAt,
+		); err != nil {
+			return err
+		}
 	}
 	return tw.Flush()
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/state"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -31,21 +32,19 @@ import (
 )
 
 const (
-	submittedCommitPollInterval   = 4 * time.Second
 	terminalFailureCleanupTimeout = 5 * time.Second
 	uploadFundingWaitDelay        = time.Minute
 	uploadDependencyWaitDelay     = time.Minute
+	storageCommitPollDelay        = 5 * time.Second
+	storageCommitAttentionDelay   = 24 * time.Hour
 )
 
 var (
 	errCommitRejected            = errors.New("commit transaction rejected")
-	errSubmittedCommitPending    = errors.New("submitted commit is still pending")
 	errDataSetCreationIncomplete = errors.New("data set creation submission is incomplete")
 )
 
-var submittedCommitRequestTimeout = 15 * time.Second
-
-var submittedCommitMaxWait = 5 * time.Minute
+var submittedCommitRequestTimeout = storagecommit.DefaultRequestTimeout
 
 // Uploader claims upload tasks, persists upload provenance, and accepts complete
 // uploads for object versions.
@@ -1626,89 +1625,40 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 		return
 	}
 	pieces := []storage.PieceInput{{PieceCID: pieceCID}}
-	if copyCommitSubmitted(copyRow) {
-		result, err := u.waitForSubmittedCommit(ctx, storageCtx, binding, *copyRow.CommitTransactionID, len(pieces))
-		if err != nil {
-			if u.waitForPendingSubmittedCommit(ctx, task, logger, err) {
-				return
-			}
-			if errors.Is(err, errCommitRejected) {
-				if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, uploadID, copyIndex, *copyRow.CommitTransactionID, err); resetErr != nil {
-					u.handleTaskFailure(ctx, task, logger, "reset rejected ingress commit", resetErr)
-					return
-				}
-				u.handleIngressFailure(ctx, task, version, uploadID, copyIndex, logger, "ingress commit", err)
-				return
-			}
-			u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress commit", err)
-			return
-		}
-		var pieceID *idtypes.OnChainID
-		if len(result.PieceIDs) > 0 {
-			pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
-		}
-		if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-			StorageUploadCopyID: uploadStageCopyID(task),
-			UploadID:            uploadID,
-			CopyIndex:           copyIndex,
-			PieceCID:            *upload.PieceCID,
-			PieceID:             pieceID,
-			RetrievalURL:        storageCtx.PieceURL(pieceCID),
-			CommitExtraDataHex:  derefString(copyRow.CommitExtraDataHex),
-			CommitTransactionID: result.TransactionID,
-		}); err != nil {
-			u.handleTaskFailure(ctx, task, logger, "mark ingress committed", err)
-			return
-		}
-		u.finishReadable(ctx, task, version, uploadID, logger)
-		return
-	}
-	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
+	advance, err := u.advanceStorageCommit(ctx, binding, copyRow, storageCtx, pieces, false, false)
 	if err != nil {
-		u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress presign", err)
+		u.handleTaskFailure(ctx, task, logger, "advance ingress commit", err)
 		return
 	}
-	var submittedTx string
-	var submitErr error
-	result, err := storageCtx.Commit(ctx, storage.CommitRequest{
-		Pieces:    pieces,
-		ExtraData: extraData,
-		OnSubmitted: func(txHash string) {
-			submittedTx = txHash
-			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-				StorageUploadCopyID: uploadStageCopyID(task),
-				UploadID:            uploadID,
-				CopyIndex:           copyIndex,
-				CommitExtraDataHex:  extraHex,
-				CommitTransactionID: txHash,
-			})
-		},
-	})
-	if err != nil {
-		if submittedTx != "" {
-			if submitErr != nil {
-				u.handleTaskFailure(ctx, task, logger, "save ingress commit submission", submitErr)
-				return
-			}
-			u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress commit", err)
-			return
-		}
-		u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress commit", err)
+	if u.waitForCommitAdvance(ctx, task, logger, advance) {
 		return
 	}
-	var pieceID *idtypes.OnChainID
-	if len(result.PieceIDs) > 0 {
-		pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
+	switch {
+	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
+		u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress commit", storage.ErrDataSetUnavailable)
+		return
+	case advance.State == storagecommit.AdvanceReleased:
+		return
+	case advance.State == storagecommit.AdvanceRejected:
+		u.handleIngressFailure(ctx, task, version, uploadID, copyIndex, logger, "ingress commit", errCommitRejected)
+		return
+	case advance.State != storagecommit.AdvanceConfirmed || advance.Confirmation == nil || len(advance.Confirmation.PieceIDs) == 0:
+		u.handleTaskFailure(ctx, task, logger, "advance ingress commit", errors.New("storage commit returned no confirmation"))
+		return
 	}
+	result := advance.Confirmation
+	pieceID := onChainIDPtrFromSDK(result.PieceIDs[0])
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		StorageUploadCopyID: uploadStageCopyID(task),
-		UploadID:            uploadID,
-		CopyIndex:           copyIndex,
-		PieceCID:            *upload.PieceCID,
-		PieceID:             pieceID,
-		RetrievalURL:        storageCtx.PieceURL(pieceCID),
-		CommitExtraDataHex:  extraHex,
-		CommitTransactionID: result.TransactionID,
+		StorageUploadCopyID:          copyRow.ID,
+		UploadID:                     uploadID,
+		CopyIndex:                    copyIndex,
+		PieceCID:                     *upload.PieceCID,
+		PieceID:                      pieceID,
+		RetrievalURL:                 storageCtx.PieceURL(pieceCID),
+		CommitExtraDataHex:           derefString(copyRow.CommitExtraDataHex),
+		CommitTransactionID:          result.TransactionID,
+		CommitAttemptID:              advance.AttemptID,
+		CommitConfirmedTransactionID: result.ConfirmedTransactionID,
 	}); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "mark ingress committed", err)
 		return
@@ -2029,17 +1979,9 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 		CopyIndex:           copyIndex,
 		PieceCID:            pieceCIDString,
 		RetrievalURL:        storageCtx.PieceURL(pieceCID),
-	}); err != nil {
-		u.handleTaskFailure(ctx, task, logger, "mark peer piece ready", err)
-		return
-	}
-	if err := u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		StorageUploadCopyID: uploadStageCopyID(task),
-		UploadID:            uploadID,
-		CopyIndex:           copyIndex,
 		CommitExtraDataHex:  extraHex,
 	}); err != nil {
-		u.handleTaskFailure(ctx, task, logger, "save peer extra data", err)
+		u.handleTaskFailure(ctx, task, logger, "mark peer piece ready", err)
 		return
 	}
 	if err := u.enqueueUploadStageForCopy(ctx, task, uploadStagePeerCommit, uploadID, copyIndex, copyRow.TransferMethod, copyRow.ID); err != nil {
@@ -2092,105 +2034,40 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		return
 	}
 	pieces := []storage.PieceInput{{PieceCID: pieceCID}}
-	if copyCommitSubmitted(copyRow) {
-		result, err := u.waitForSubmittedCommit(ctx, storageCtx, binding, *copyRow.CommitTransactionID, len(pieces))
-		if err != nil {
-			if u.waitForPendingSubmittedCommit(ctx, task, logger, err) {
-				return
-			}
-			if errors.Is(err, errCommitRejected) {
-				if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, uploadID, copyIndex, *copyRow.CommitTransactionID, err); resetErr != nil {
-					u.handleTaskFailure(ctx, task, logger, "reset rejected peer commit", resetErr)
-					return
-				}
-				u.handleTaskFailure(ctx, task, logger, "peer commit", err)
-				return
-			}
-			if dataSetFailureEnded(err, binding) || dataSetFailureUnavailable(err, binding) {
-				u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer commit", err)
-				return
-			}
-			u.handleTaskFailure(ctx, task, logger, "wait peer commit", err)
-			return
-		}
-		var pieceID *idtypes.OnChainID
-		if len(result.PieceIDs) > 0 {
-			pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
-		}
-		if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-			StorageUploadCopyID: uploadStageCopyID(task),
-			UploadID:            uploadID,
-			CopyIndex:           copyIndex,
-			PieceCID:            pieceCIDString,
-			PieceID:             pieceID,
-			RetrievalURL:        storageCtx.PieceURL(pieceCID),
-			CommitExtraDataHex:  derefString(copyRow.CommitExtraDataHex),
-			CommitTransactionID: result.TransactionID,
-		}); err != nil {
-			u.handleTaskFailure(ctx, task, logger, "mark peer committed", err)
-			return
-		}
-		u.finishPeerCopy(ctx, task, version, uploadID, logger)
-		return
-	}
-	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
+	advance, err := u.advanceStorageCommit(ctx, binding, copyRow, storageCtx, pieces, false, false)
 	if err != nil {
-		u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer presign", err)
+		u.handleTaskFailure(ctx, task, logger, "advance peer commit", err)
 		return
 	}
-	var submittedTx string
-	var submitErr error
-	result, err := storageCtx.Commit(ctx, storage.CommitRequest{
-		Pieces:    pieces,
-		ExtraData: extraData,
-		OnSubmitted: func(txHash string) {
-			submittedTx = txHash
-			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-				StorageUploadCopyID: uploadStageCopyID(task),
-				UploadID:            uploadID,
-				CopyIndex:           copyIndex,
-				CommitExtraDataHex:  extraHex,
-				CommitTransactionID: txHash,
-			})
-		},
-	})
-	if err != nil {
-		if submittedTx != "" {
-			if submitErr != nil {
-				u.handleTaskFailure(ctx, task, logger, "save peer commit submission", submitErr)
-				return
-			}
-			if errors.Is(err, errCommitRejected) {
-				if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, uploadID, copyIndex, submittedTx, err); resetErr != nil {
-					u.handleTaskFailure(ctx, task, logger, "reset rejected peer commit", resetErr)
-					return
-				}
-				u.handleTaskFailure(ctx, task, logger, "peer commit", err)
-				return
-			}
-			if dataSetFailureEnded(err, binding) || dataSetFailureUnavailable(err, binding) {
-				u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer commit", err)
-				return
-			}
-			u.handleTaskFailure(ctx, task, logger, "wait peer commit", err)
-			return
-		}
-		u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer commit", err)
+	if u.waitForCommitAdvance(ctx, task, logger, advance) {
 		return
 	}
-	var pieceID *idtypes.OnChainID
-	if len(result.PieceIDs) > 0 {
-		pieceID = onChainIDPtrFromSDK(result.PieceIDs[0])
+	switch {
+	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
+		u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer commit", storage.ErrDataSetUnavailable)
+		return
+	case advance.State == storagecommit.AdvanceReleased:
+		return
+	case advance.State == storagecommit.AdvanceRejected:
+		u.handleTaskFailure(ctx, task, logger, "peer commit", errCommitRejected)
+		return
+	case advance.State != storagecommit.AdvanceConfirmed || advance.Confirmation == nil || len(advance.Confirmation.PieceIDs) == 0:
+		u.handleTaskFailure(ctx, task, logger, "advance peer commit", errors.New("storage commit returned no confirmation"))
+		return
 	}
+	result := advance.Confirmation
+	pieceID := onChainIDPtrFromSDK(result.PieceIDs[0])
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		StorageUploadCopyID: uploadStageCopyID(task),
-		UploadID:            uploadID,
-		CopyIndex:           copyIndex,
-		PieceCID:            pieceCIDString,
-		PieceID:             pieceID,
-		RetrievalURL:        storageCtx.PieceURL(pieceCID),
-		CommitExtraDataHex:  extraHex,
-		CommitTransactionID: result.TransactionID,
+		StorageUploadCopyID:          copyRow.ID,
+		UploadID:                     uploadID,
+		CopyIndex:                    copyIndex,
+		PieceCID:                     pieceCIDString,
+		PieceID:                      pieceID,
+		RetrievalURL:                 storageCtx.PieceURL(pieceCID),
+		CommitExtraDataHex:           derefString(copyRow.CommitExtraDataHex),
+		CommitTransactionID:          result.TransactionID,
+		CommitAttemptID:              advance.AttemptID,
+		CommitConfirmedTransactionID: result.ConfirmedTransactionID,
 	}); err != nil {
 		u.handleTaskFailure(ctx, task, logger, "mark peer committed", err)
 		return
@@ -3010,102 +2887,75 @@ func (u *Uploader) extraDataForCopy(ctx context.Context, storageCtx synapse.Data
 	return extraData, strings.ToLower(hex.EncodeToString(extraData)), nil
 }
 
-func (u *Uploader) waitForSubmittedCommit(ctx context.Context, storageCtx synapse.DataSetTarget, binding *model.StorageDataSet, txHash string, pieceCount int) (*storage.CommitResult, error) {
-	if binding == nil || binding.DataSetID == nil || binding.DataSetID.IsZero() {
-		return nil, errors.New("commit dataset binding is not ready")
+func (u *Uploader) advanceStorageCommit(
+	ctx context.Context,
+	binding *model.StorageDataSet,
+	copyRow *model.StorageUploadCopy,
+	storageCtx synapse.DataSetTarget,
+	pieces []storage.PieceInput,
+	requireEligibleCopy bool,
+	ownerTerminal bool,
+) (storagecommit.AdvanceResult, error) {
+	if binding == nil || copyRow == nil {
+		return storagecommit.AdvanceResult{}, errors.New("storage commit binding or copy is missing")
 	}
-	if submittedCommitMaxWait > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeoutCause(
-			ctx,
-			submittedCommitMaxWait,
-			fmt.Errorf("%w: commit %s", errSubmittedCommitPending, txHash),
-		)
-		defer cancel()
+	advancer := storagecommit.Advancer{
+		Store:          u.repos.Uploads,
+		StatusChecker:  u.statusChecker,
+		RequestTimeout: submittedCommitRequestTimeout,
 	}
-	checker := u.statusChecker
-	if checker == nil {
-		checker = synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{Timeout: submittedCommitRequestTimeout})
-	}
-	for {
-		status, err := checker.GetAddPiecesStatus(ctx, synapse.AddPiecesStatusInput{
-			ServiceURL:         storageCtx.ServiceURL(),
-			DataSetID:          binding.DataSetID.String(),
-			TransactionID:      txHash,
-			ExpectedPieceCount: pieceCount,
-		})
-		if err != nil {
-			if cause := context.Cause(ctx); cause != nil {
-				return nil, cause
-			}
-			return nil, synapse.NormalizeProviderOperationError(ctx, err)
-		}
-		switch status.State {
-		case synapse.PDPStatusConfirmed:
-			pieceIDs := make([]sdktypes.BigInt, 0, len(status.ConfirmedPieceIDs))
-			for _, raw := range status.ConfirmedPieceIDs {
-				pieceID, err := idtypes.ParseOnChainID("confirmed piece ID", raw)
-				if err != nil {
-					return nil, err
-				}
-				pieceIDs = append(pieceIDs, pieceID.SDK())
-			}
-			ref, bound := storageCtx.DataSetRef()
-			if !bound {
-				return nil, errors.New("commit target is not bound to a data set")
-			}
-			return &storage.CommitResult{
-				TransactionID: txHash,
-				DataSet:       ref,
-				PieceIDs:      pieceIDs,
-				IsNewDataSet:  false,
-			}, nil
-		case synapse.PDPStatusRejected:
-			return nil, fmt.Errorf("%w: %s", errCommitRejected, txHash)
-		case synapse.PDPStatusMismatch:
-			if status.TxStatus == "confirmed" && !status.PiecesAdded {
-				return nil, fmt.Errorf("%w: commit %s confirmed without adding pieces", errCommitRejected, txHash)
-			}
-			return nil, fmt.Errorf("commit status did not match submission %s", txHash)
-		case synapse.PDPStatusUnavailable:
-			return nil, &synapse.ProviderUnavailableError{Cause: errors.New("commit status unavailable")}
-		case synapse.PDPStatusUnknown:
-			return nil, fmt.Errorf("commit status %q for %s", status.TxStatus, txHash)
-		case synapse.PDPStatusPending:
-		default:
-			return nil, fmt.Errorf("unexpected commit status state %q for %s", status.State, txHash)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, context.Cause(ctx)
-		case <-time.After(submittedCommitPollInterval):
-		}
-	}
+	return advancer.Advance(ctx, storagecommit.AdvanceInput{
+		Copy:                *copyRow,
+		Binding:             *binding,
+		Target:              storageCtx,
+		Pieces:              pieces,
+		RequireEligibleCopy: requireEligibleCopy,
+		OwnerTerminal:       ownerTerminal,
+	})
 }
 
-func (u *Uploader) waitForPendingSubmittedCommit(ctx context.Context, task *model.Task, logger *slog.Logger, err error) bool {
-	if !errors.Is(err, errSubmittedCommitPending) {
+func (u *Uploader) waitForCommitAdvance(
+	ctx context.Context,
+	task *model.Task,
+	logger *slog.Logger,
+	result storagecommit.AdvanceResult,
+) bool {
+	var (
+		delay   time.Duration
+		message string
+	)
+	switch result.State {
+	case storagecommit.AdvanceWaitingCapacity:
+		delay = u.commitPollDelay()
+		message = "Waiting to submit stored content"
+	case storagecommit.AdvanceSubmitted, storagecommit.AdvancePending:
+		delay = u.commitPollDelay()
+		message = "Waiting for storage confirmation"
+	case storagecommit.AdvanceNeedsAttention:
+		if result.Continue {
+			delay = u.commitPollDelay()
+			message = "Waiting for storage confirmation"
+		} else {
+			delay = storageCommitAttentionDelay
+			message = "Storage confirmation needs review"
+		}
+	default:
 		return false
 	}
-	u.waitForStorageDependency(ctx, task, logger, "Waiting for storage confirmation")
+	if err := u.repos.Tasks.WaitRunning(ctx, task, model.TaskWaitReasonExternalConfirmation, message, delay); err != nil {
+		logger.Error("failed to wait for storage confirmation", "error", err)
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		return true
+	}
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
 	return true
 }
 
-func (u *Uploader) resetRejectedSubmittedCommit(
-	ctx context.Context,
-	copyID int64,
-	uploadID int64,
-	copyIndex int,
-	transactionID string,
-	commitErr error,
-) error {
-	return u.repos.Uploads.ResetRejectedUploadCopyCommit(ctx, repository.ResetRejectedUploadCopyCommitInput{
-		StorageUploadCopyID: copyID,
-		UploadID:            uploadID,
-		CopyIndex:           copyIndex,
-		CommitTransactionID: transactionID,
-		LastError:           commitErr.Error(),
-	})
+func (u *Uploader) commitPollDelay() time.Duration {
+	if u != nil && u.pollInterval > 0 {
+		return u.pollInterval
+	}
+	return storageCommitPollDelay
 }
 
 func onChainIDPtrFromSDK(value sdktypes.BigInt) *idtypes.OnChainID {
@@ -3148,10 +2998,9 @@ func copyHasPiece(copyRow *model.StorageUploadCopy) bool {
 }
 
 func copyCommitSubmitted(copyRow *model.StorageUploadCopy) bool {
-	return copyRow != nil &&
-		copyRow.Status == model.StorageUploadCopyStatusCommitting &&
-		copyRow.CommitTransactionID != nil &&
-		*copyRow.CommitTransactionID != ""
+	return copyRow != nil && copyRow.Status == model.StorageUploadCopyStatusCommitting &&
+		copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" &&
+		copyRow.CommitAttemptedAt != nil
 }
 
 func copyCommitted(copyRow *model.StorageUploadCopy) bool {

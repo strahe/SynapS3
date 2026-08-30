@@ -465,9 +465,6 @@ func (u *Uploader) handleReplacementProviderFailure(
 	stage string,
 	err error,
 ) {
-	if u.waitForPendingSubmittedCommit(ctx, task, logger, err) {
-		return
-	}
 	switch {
 	case synapse.IsProviderUnavailable(err), synapse.IsNoProviderCandidates(err):
 		u.waitForReplacementDependency(ctx, task, replacement, storagereplacement.WaitReasonTarget, logger,

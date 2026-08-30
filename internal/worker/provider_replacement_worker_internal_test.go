@@ -171,7 +171,7 @@ func TestReplacementTargetContextRegistrySharesActiveContextAndRefreshesAfterRel
 	}
 }
 
-func TestReplacementTargetContextRegistrySerializesCommitsForSameTarget(t *testing.T) {
+func TestReplacementTargetContextRegistryDoesNotSerializeCommitsForSameTarget(t *testing.T) {
 	t.Parallel()
 
 	registry := newReplacementTargetContextRegistry()
@@ -209,8 +209,8 @@ func TestReplacementTargetContextRegistrySerializesCommitsForSameTarget(t *testi
 	}()
 	select {
 	case <-secondEntered:
-		t.Fatal("second commit entered while the same target gate was held")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("second commit remained blocked by the removed target gate")
 	}
 	close(releaseFirst)
 	if err := <-firstDone; err != nil {
@@ -224,6 +224,13 @@ func TestReplacementTargetContextRegistrySerializesCommitsForSameTarget(t *testi
 	if err := <-secondDone; err != nil {
 		t.Fatalf("second commit: %v", err)
 	}
+}
+
+func (h *replacementTargetContextHandle) commit(ctx context.Context, commit func() error) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return commit()
 }
 
 func TestReplacementTargetContextRegistryAllowsDifferentTargetsToCommit(t *testing.T) {

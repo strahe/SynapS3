@@ -83,6 +83,8 @@ synaps3 admin settings set cache.eviction_policy=lru cache.lru_high_watermark_pe
 synaps3 admin task stats
 synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task retry 42
+synaps3 admin storage-confirmation list
+synaps3 admin storage-confirmation release 42 --yes
 ```
 
 没有受保护的密码文件时，在无回显提示中输入 Admin 密码。不要把密码直接写入 shell history。创建 S3 用户和轮换 secret key 时只显示一次 secret key，请保存到权限为 `0600` 的客户端凭据文件。
@@ -99,6 +101,8 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 
 `synaps3 admin task retry` 不会重试存储提供方替换工作。请在已完成或已停止的替换任务上使用 **Open Data Sets**，或打开存储桶并前往 **Details** → **Storage** → **Data Sets**。如果所选存储提供方已经存储该桶，请改选其他存储提供方，而不是重试。
 
+`synaps3 admin storage-confirmation list` 会显示无法自动判定的提交 attempt。释放前应先核对存储提供方和 transaction 证据。`storage-confirmation release <copy-id> --yes` 表示确认存储提供方可能已经接受了该 piece，并允许正常恢复流程再次提交。
+
 缓存淘汰策略可设为 `lru`、`after_upload` 或 `none`。LRU 水位必须满足 `0 <= low < high <= 100`；其他策略会保留这些设置，但不使用它们。
 
 ## 设置安全
@@ -112,6 +116,7 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 synaps3 admin s3-user create --role admin --yes
 synaps3 admin s3-user update <access-key> --role admin --yes
 synaps3 admin s3-user delete <access-key> --yes
+synaps3 admin storage-confirmation release <copy-id> --yes
 ```
 
 保存设置后，重启 SynapS3，检查 `/healthz`，并运行 `synaps3 admin settings get` 确认实际生效值。

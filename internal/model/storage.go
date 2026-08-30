@@ -128,22 +128,29 @@ type StorageDataSet struct {
 type StorageUploadCopy struct {
 	bun.BaseModel `bun:"table:storage_upload_copies"`
 
-	ID                  int64                     `bun:",pk,autoincrement"`
-	UploadID            int64                     `bun:",notnull"`
-	CopyIndex           int                       `bun:",notnull"`
-	ProviderID          *types.OnChainID          `bun:"type:text"`
-	DataSetID           *types.OnChainID          `bun:"type:text,scanonly"`
-	PieceID             *types.OnChainID          `bun:"type:text"`
-	TransferMethod      StorageCopyTransferMethod `bun:",notnull"`
-	Status              StorageUploadCopyStatus   `bun:",notnull,default:'pending'"`
-	RetrievalURL        *string                   `bun:",nullzero"`
-	IsNewDataSet        bool                      `bun:",notnull,default:false"`
-	StorageDataSetID    *int64                    `bun:",nullzero"`
-	CommitExtraDataHex  *string                   `bun:",nullzero"`
-	CommitTransactionID *string                   `bun:",nullzero"`
-	LastError           *string                   `bun:",nullzero"`
-	CreatedAt           time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt           time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
+	ID                           int64                     `bun:",pk,autoincrement"`
+	UploadID                     int64                     `bun:",notnull"`
+	CopyIndex                    int                       `bun:",notnull"`
+	ProviderID                   *types.OnChainID          `bun:"type:text"`
+	DataSetID                    *types.OnChainID          `bun:"type:text,scanonly"`
+	PieceID                      *types.OnChainID          `bun:"type:text"`
+	TransferMethod               StorageCopyTransferMethod `bun:",notnull"`
+	Status                       StorageUploadCopyStatus   `bun:",notnull,default:'pending'"`
+	RetrievalURL                 *string                   `bun:",nullzero"`
+	IsNewDataSet                 bool                      `bun:",notnull,default:false"`
+	StorageDataSetID             *int64                    `bun:",nullzero"`
+	CommitExtraDataHex           *string                   `bun:",nullzero"`
+	CommitTransactionID          *string                   `bun:",nullzero"`
+	CommitReadyAt                *time.Time                `bun:",nullzero"`
+	CommitAttemptID              *string                   `bun:",nullzero"`
+	CommitAttemptedAt            *time.Time                `bun:",nullzero"`
+	CommitSubmissionJSON         *string                   `bun:",nullzero"`
+	CommitConfirmedTransactionID *string                   `bun:",nullzero"`
+	CommitAttentionCode          *string                   `bun:",nullzero"`
+	CommitAttentionAt            *time.Time                `bun:",nullzero"`
+	LastError                    *string                   `bun:",nullzero"`
+	CreatedAt                    time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
+	UpdatedAt                    time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
 
 	Upload     *StorageUpload  `bun:"rel:belongs-to,join:upload_id=id"`
 	StorageSet *StorageDataSet `bun:"rel:belongs-to,join:storage_data_set_id=id"`

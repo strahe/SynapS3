@@ -261,6 +261,7 @@ type taskProgressResponse struct {
 	ItemsNoLongerNeeded int     `json:"items_no_longer_needed,omitempty"`
 	ItemsPending        int     `json:"items_pending,omitempty"`
 	ItemsActive         int     `json:"items_active,omitempty"`
+	ItemsAttention      int     `json:"items_attention,omitempty"`
 	ItemsRetrying       int     `json:"items_retrying,omitempty"`
 	ItemsWaitingSource  int     `json:"items_waiting_source,omitempty"`
 	ItemsFailed         int     `json:"items_failed,omitempty"`
@@ -280,6 +281,7 @@ func (p taskProgressResponse) MarshalJSON() ([]byte, error) {
 			ItemsNoLongerNeeded int     `json:"items_no_longer_needed"`
 			ItemsPending        int     `json:"items_pending"`
 			ItemsActive         int     `json:"items_active"`
+			ItemsAttention      int     `json:"items_attention"`
 			ItemsRetrying       int     `json:"items_retrying"`
 			ItemsWaitingSource  int     `json:"items_waiting_source"`
 			ItemsFailed         int     `json:"items_failed"`
@@ -290,7 +292,8 @@ func (p taskProgressResponse) MarshalJSON() ([]byte, error) {
 			ItemsTotal: p.ItemsTotal, ItemsProcessed: p.ItemsProcessed,
 			ItemsCopied: p.ItemsCopied, ItemsNoLongerNeeded: p.ItemsNoLongerNeeded,
 			ItemsPending: p.ItemsPending, ItemsActive: p.ItemsActive,
-			ItemsRetrying: p.ItemsRetrying, ItemsWaitingSource: p.ItemsWaitingSource,
+			ItemsAttention: p.ItemsAttention,
+			ItemsRetrying:  p.ItemsRetrying, ItemsWaitingSource: p.ItemsWaitingSource,
 			ItemsFailed: p.ItemsFailed, Percent: p.Percent, NextRetryAt: p.NextRetryAt,
 		})
 	}
@@ -334,6 +337,7 @@ func taskProgressFromReplacement(progress storagereplacement.ProgressSnapshot) *
 		ItemsNoLongerNeeded: progress.ItemsNoLongerNeeded,
 		ItemsPending:        progress.ItemsPending,
 		ItemsActive:         progress.ItemsActive,
+		ItemsAttention:      progress.ItemsAttention,
 		ItemsRetrying:       progress.ItemsRetrying,
 		ItemsWaitingSource:  progress.ItemsWaitingSource,
 		ItemsFailed:         progress.ItemsFailed,

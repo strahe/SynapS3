@@ -69,7 +69,17 @@ func (r *BunStorageReplacementRepo) ClaimReadyReplacementItem(ctx context.Contex
 		if replacementID == 0 {
 			return nil
 		}
-		itemID, err := selectReadyReplacementItemID(ctx, db, replacementID, now)
+		var replacementStatus storagereplacement.Status
+		if err := db.NewSelect().
+			Model((*storagereplacement.Replacement)(nil)).
+			Column("status").
+			Where("id = ?", replacementID).
+			Scan(ctx, &replacementStatus); err != nil {
+			return fmt.Errorf("loading ready replacement status: %w", err)
+		}
+		confirmationOnly := replacementStatus == storagereplacement.StatusFailed ||
+			replacementStatus == storagereplacement.StatusSuperseded
+		itemID, err := selectReadyReplacementItemID(ctx, db, replacementID, now, confirmationOnly)
 		if err != nil {
 			return err
 		}
@@ -125,6 +135,10 @@ func selectReadyReplacementID(ctx context.Context, db bun.IDB, now time.Time) (i
 		storagereplacement.WaitReasonReadableSource,
 		now,
 		now,
+		storagereplacement.StatusFailed,
+		storagereplacement.StatusSuperseded,
+		now,
+		now,
 	).Scan(ctx, &id)
 	if err == sql.ErrNoRows {
 		return 0, nil
@@ -138,7 +152,7 @@ func selectReadyReplacementID(ctx context.Context, db bun.IDB, now time.Time) (i
 func readyReplacementSelectionSQL(dialectName dialect.Name) string {
 	query := `SELECT replacement.id
 		FROM storage_replacements AS replacement
-		WHERE (replacement.status = ? OR (replacement.status = ? AND replacement.wait_reason = ?))
+		WHERE (((replacement.status = ? OR (replacement.status = ? AND replacement.wait_reason = ?))
 		  AND (EXISTS (
 		         SELECT 1
 		         FROM storage_replacement_items AS due_item
@@ -154,7 +168,30 @@ func readyReplacementSelectionSQL(dialectName dialect.Name) string {
 		           AND expired_item.status = 'running'
 		           AND expired_item.lease_until <= ?
 		           AND expired_item.max_retries IS NOT NULL
-		       ))
+		       )))
+		  OR (replacement.status IN (?, ?)
+		      AND (EXISTS (
+		        SELECT 1
+		        FROM storage_replacement_items AS due_item
+		        JOIN storage_upload_copies AS due_copy ON due_copy.id = due_item.target_copy_id
+		        WHERE due_item.replacement_id = replacement.id
+		          AND due_item.status IN ('pending', 'retrying', 'waiting_source')
+		          AND due_item.scheduled_at <= ?
+		          AND due_item.claimed_at IS NULL
+		          AND due_item.max_retries IS NOT NULL
+		          AND due_copy.commit_attempt_id IS NOT NULL
+		          AND due_copy.commit_attempt_id <> ''
+		      ) OR EXISTS (
+		        SELECT 1
+		        FROM storage_replacement_items AS expired_item
+		        JOIN storage_upload_copies AS expired_copy ON expired_copy.id = expired_item.target_copy_id
+		        WHERE expired_item.replacement_id = replacement.id
+		          AND expired_item.status = 'running'
+		          AND expired_item.lease_until <= ?
+		          AND expired_item.max_retries IS NOT NULL
+		          AND expired_copy.commit_attempt_id IS NOT NULL
+		          AND expired_copy.commit_attempt_id <> ''
+		      ))))
 		ORDER BY CASE WHEN replacement.last_dispatched_at IS NULL THEN 0 ELSE 1 END,
 		         replacement.last_dispatched_at ASC,
 		         replacement.id ASC
@@ -178,15 +215,16 @@ func selectReadyReplacementItemID(
 	db bun.IDB,
 	replacementID int64,
 	now time.Time,
+	confirmationOnly bool,
 ) (int64, error) {
-	due, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementDueItemSQL(),
+	due, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementDueItemSQL(confirmationOnly),
 		replacementID,
 		now,
 	)
 	if err != nil {
 		return 0, err
 	}
-	expired, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementExpiredItemSQL(),
+	expired, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementExpiredItemSQL(confirmationOnly),
 		replacementID,
 		now,
 	)
@@ -205,26 +243,53 @@ func selectReadyReplacementItemID(
 	return expired.ID, nil
 }
 
-func readyReplacementDueItemSQL() string {
-	return `SELECT id, scheduled_at AS ready_at
-		FROM storage_replacement_items
-		WHERE replacement_id = ?
-		  AND status IN ('pending', 'retrying', 'waiting_source')
-		  AND scheduled_at <= ?
-		  AND claimed_at IS NULL
-		  AND max_retries IS NOT NULL
-		ORDER BY scheduled_at ASC, id ASC
+func readyReplacementDueItemSQL(confirmationOnly bool) string {
+	if confirmationOnly {
+		return `SELECT item.id, item.scheduled_at AS ready_at
+			FROM storage_replacement_items AS item
+			JOIN storage_upload_copies AS storage_copy ON storage_copy.id = item.target_copy_id
+			WHERE item.replacement_id = ?
+			  AND item.status IN ('pending', 'retrying', 'waiting_source')
+			  AND item.scheduled_at <= ?
+			  AND item.claimed_at IS NULL
+			  AND item.max_retries IS NOT NULL
+			  AND storage_copy.commit_attempt_id IS NOT NULL
+			  AND storage_copy.commit_attempt_id <> ''
+			ORDER BY item.scheduled_at ASC, item.id ASC
+			LIMIT 1`
+	}
+	return `SELECT item.id, item.scheduled_at AS ready_at
+		FROM storage_replacement_items AS item
+		WHERE item.replacement_id = ?
+		  AND item.status IN ('pending', 'retrying', 'waiting_source')
+		  AND item.scheduled_at <= ?
+		  AND item.claimed_at IS NULL
+		  AND item.max_retries IS NOT NULL
+		ORDER BY item.scheduled_at ASC, item.id ASC
 		LIMIT 1`
 }
 
-func readyReplacementExpiredItemSQL() string {
-	return `SELECT id, lease_until AS ready_at
-		FROM storage_replacement_items
-		WHERE replacement_id = ?
-		  AND status = 'running'
-		  AND lease_until <= ?
-		  AND max_retries IS NOT NULL
-		ORDER BY lease_until ASC, id ASC
+func readyReplacementExpiredItemSQL(confirmationOnly bool) string {
+	if confirmationOnly {
+		return `SELECT item.id, item.lease_until AS ready_at
+			FROM storage_replacement_items AS item
+			JOIN storage_upload_copies AS storage_copy ON storage_copy.id = item.target_copy_id
+			WHERE item.replacement_id = ?
+			  AND item.status = 'running'
+			  AND item.lease_until <= ?
+			  AND item.max_retries IS NOT NULL
+			  AND storage_copy.commit_attempt_id IS NOT NULL
+			  AND storage_copy.commit_attempt_id <> ''
+			ORDER BY item.lease_until ASC, item.id ASC
+			LIMIT 1`
+	}
+	return `SELECT item.id, item.lease_until AS ready_at
+		FROM storage_replacement_items AS item
+		WHERE item.replacement_id = ?
+		  AND item.status = 'running'
+		  AND item.lease_until <= ?
+		  AND item.max_retries IS NOT NULL
+		ORDER BY item.lease_until ASC, item.id ASC
 		LIMIT 1`
 }
 
@@ -288,6 +353,21 @@ func (r *BunStorageReplacementRepo) ReleaseReplacementItemClaim(ctx context.Cont
 		return ErrItemClaimLost
 	}
 	return nil
+}
+
+func (r *BunStorageReplacementRepo) CancelReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error {
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		item := new(storagereplacement.Item)
+		if err := db.NewSelect().Model(item).
+			Where("id = ? AND status = ? AND claimed_at = ?", token.ItemID, storagereplacement.ItemStatusRunning, token.ClaimedAt).
+			Scan(ctx); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrItemClaimLost
+			}
+			return fmt.Errorf("loading replacement item for cancellation: %w", err)
+		}
+		return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
+	})
 }
 
 func (r *BunStorageReplacementRepo) CompleteReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error {
@@ -520,6 +600,7 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		ItemsCopied        int                       `bun:"items_copied"`
 		ItemsPending       int                       `bun:"items_pending"`
 		ItemsActive        int                       `bun:"items_active"`
+		ItemsAttention     int                       `bun:"items_attention"`
 		ItemsRetrying      int                       `bun:"items_retrying"`
 		ItemsWaitingSource int                       `bun:"items_waiting_source"`
 		ItemsFailed        int                       `bun:"items_failed"`
@@ -533,15 +614,23 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		       replacement.seeding_complete,
 		       replacement.items_total,
 		       replacement.items_copied,
-		       COALESCE(SUM(CASE WHEN item.status = 'pending' THEN 1 ELSE 0 END), 0) AS items_pending,
-		       COALESCE(SUM(CASE WHEN item.status = 'running' THEN 1 ELSE 0 END), 0) AS items_active,
-		       COALESCE(SUM(CASE WHEN item.status = 'retrying' THEN 1 ELSE 0 END), 0) AS items_retrying,
-		       COALESCE(SUM(CASE WHEN item.status = 'waiting_source' THEN 1 ELSE 0 END), 0) AS items_waiting_source,
-		       COALESCE(SUM(CASE WHEN item.status = 'failed' THEN 1 ELSE 0 END), 0) AS items_failed,
-		       MIN(CASE WHEN item.status = 'retrying' AND item.scheduled_at > ? THEN item.scheduled_at END) AS next_retry_at
+		       COALESCE(SUM(CASE WHEN target_copy.commit_attention_at IS NULL AND item.status = 'pending'
+		         AND target_copy.commit_attempt_id IS NULL THEN 1 ELSE 0 END), 0) AS items_pending,
+		       COALESCE(SUM(CASE WHEN target_copy.commit_attention_at IS NULL
+		         AND (item.status = 'running' OR target_copy.commit_attempt_id IS NOT NULL) THEN 1 ELSE 0 END), 0) AS items_active,
+		       COALESCE(SUM(CASE WHEN target_copy.commit_attention_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS items_attention,
+		       COALESCE(SUM(CASE WHEN target_copy.commit_attention_at IS NULL AND item.status = 'retrying'
+		         AND target_copy.commit_attempt_id IS NULL THEN 1 ELSE 0 END), 0) AS items_retrying,
+		       COALESCE(SUM(CASE WHEN target_copy.commit_attention_at IS NULL AND item.status = 'waiting_source'
+		         AND target_copy.commit_attempt_id IS NULL THEN 1 ELSE 0 END), 0) AS items_waiting_source,
+		       COALESCE(SUM(CASE WHEN target_copy.commit_attention_at IS NULL AND item.status = 'failed'
+		         AND target_copy.commit_attempt_id IS NULL THEN 1 ELSE 0 END), 0) AS items_failed,
+		       MIN(CASE WHEN target_copy.commit_attention_at IS NULL AND target_copy.commit_attempt_id IS NULL
+		         AND item.status = 'retrying' AND item.scheduled_at > ? THEN item.scheduled_at END) AS next_retry_at
 		FROM storage_replacements AS replacement
 		JOIN storage_data_sets AS target ON target.id = replacement.target_data_set_id
 		LEFT JOIN storage_replacement_items AS item ON item.replacement_id = replacement.id
+		LEFT JOIN storage_upload_copies AS target_copy ON target_copy.id = item.target_copy_id
 		WHERE replacement.id IN (?)
 		GROUP BY replacement.id, replacement.status, target.is_current, replacement.seeding_complete,
 		         replacement.items_total, replacement.items_copied`
@@ -550,7 +639,7 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 	}
 	for i := range rows {
 		row := &rows[i]
-		outstanding := row.ItemsPending + row.ItemsActive + row.ItemsRetrying + row.ItemsWaitingSource + row.ItemsFailed
+		outstanding := row.ItemsPending + row.ItemsActive + row.ItemsAttention + row.ItemsRetrying + row.ItemsWaitingSource + row.ItemsFailed
 		noLongerNeeded := max(0, row.ItemsTotal-row.ItemsCopied-outstanding)
 		processed := row.ItemsCopied + noLongerNeeded
 		var percent *int
@@ -574,6 +663,7 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 			ItemsNoLongerNeeded: noLongerNeeded,
 			ItemsPending:        row.ItemsPending,
 			ItemsActive:         row.ItemsActive,
+			ItemsAttention:      row.ItemsAttention,
 			ItemsRetrying:       row.ItemsRetrying,
 			ItemsWaitingSource:  row.ItemsWaitingSource,
 			ItemsFailed:         row.ItemsFailed,

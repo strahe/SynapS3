@@ -134,6 +134,8 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | List the providers this replica can move to, and why the others cannot take it. |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Authorize replacing the storage provider behind a replica. |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | Resume a failed or attention-holding provider replacement. |
+| `GET` | `/api/v1/storage-confirmations` | List storage confirmations that need operator attention. |
+| `POST` | `/api/v1/storage-confirmations/{copy-id}/release` | Release an ambiguous confirmation after acknowledging possible duplicate storage. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
 
@@ -236,9 +238,15 @@ Replacement moves through these states:
 
 `items_total` and `items_copied` count unique stored content, not object versions: content shared by many versions is copied once. Content deleted while migration is in progress is no longer needed and is not counted as copied. After copying finishes, the response reports how much content was copied and how much no longer needed to move; `items_copied/items_total` is not a completion percentage. The confirmation dialog instead counts referenced versions and total size.
 
-Each replacement also includes a nested `progress` object. During discovery, `seeding_complete` is `false`, `items_total` is only the number discovered so far, and `percent` is omitted. Once discovery finishes, `items_total` is final and `percent` is `items_processed / items_total`, where `items_processed = items_copied + items_no_longer_needed`. This lets a completed replacement reach 100% even when content was deleted before it needed copying. `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, and `items_failed` report the current work counts; `next_retry_at` is present when a retry is scheduled for the future. `phase` is `prepare`, `migrate`, `retire`, or `none`.
+Each replacement also includes a nested `progress` object. During discovery, `seeding_complete` is `false`, `items_total` is only the number discovered so far, and `percent` is omitted. Once discovery finishes, `items_total` is final and `percent` is `items_processed / items_total`, where `items_processed = items_copied + items_no_longer_needed`. This lets a completed replacement reach 100% even when content was deleted before it needed copying. `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, `items_failed`, and `items_attention` report mutually exclusive current work counts. Confirmation work is included in `items_active`; work that needs an operator is included only in `items_attention`. Both counts remain outstanding work. `next_retry_at` is present when a retry is scheduled for the future. `phase` is `prepare`, `migrate`, `retire`, or `none`.
 
 `POST /api/v1/storage-replacements/{id}/retry` resumes a `failed` or `cleanup_attention` replacement on the same approved provider.
+
+### Storage confirmation attention
+
+Commit submission and confirmation are persisted separately. A process interruption after the provider may have accepted a piece but before a transaction identity was saved cannot be retried safely: an automatic retry could store the same piece twice. `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists these cases with the copy, data set, attempt, transaction when known, timestamps, and a stable `reason_code`.
+
+`POST /api/v1/storage-confirmations/{copy-id}/release` clears the fenced attempt so normal recovery can continue. The request must contain `{ "acknowledge_possible_duplicate": true }`. Release is irreversible from SynapS3's local evidence and may permit a duplicate submission, so inspect the provider and attempt details first. If confirmation succeeds before release, the attempt settles automatically and disappears from this list.
 
 Choosing a different provider requires a new confirmation, and is only available while the retiring provider still holds the replica. Once the new provider has taken the replica over, each generation holds data the other does not, so confirming again on either one is refused (`replacement_source_not_current` on the old, `replacement_active` on the new) and the approved copy has to be finished with retry.
 

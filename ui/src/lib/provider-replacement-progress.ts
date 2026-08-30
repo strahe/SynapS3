@@ -23,10 +23,15 @@ export function providerReplacementProgressView(
       ? `Discovering stored content · ${total} found · ${processed} processed`
       : `${processed} of ${total} processed${progress.percent === undefined ? '' : ` · ${percent}%`}`
   const parts: string[] = []
-  if (progress.items_active > 0) parts.push(`${progress.items_active} copying`)
+  if (progress.items_active > 0) parts.push(`${progress.items_active} in progress`)
+  if (progress.items_attention > 0) {
+    parts.push(
+      `${progress.items_attention} confirmation${progress.items_attention === 1 ? '' : 's'} need${progress.items_attention === 1 ? 's' : ''} attention`
+    )
+  }
   if (progress.items_retrying > 0) parts.push(`${progress.items_retrying} retrying`)
   if (progress.items_waiting_source > 0) parts.push(`${progress.items_waiting_source} waiting for source`)
-  if (progress.items_failed > 0) parts.push(`${progress.items_failed} need attention`)
+  if (progress.items_failed > 0) parts.push(`${progress.items_failed} failed`)
   if (parts.length === 0 && progress.items_pending > 0) parts.push(`${progress.items_pending} queued`)
   if (parts.length === 0 && progress.items_processed === progress.items_total) {
     parts.push(`${progress.items_copied} copied`)

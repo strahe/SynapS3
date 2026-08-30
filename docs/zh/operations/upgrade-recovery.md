@@ -19,6 +19,8 @@ synaps3 admin task list --status exhausted --limit 50
 
 预期结果：`/healthz` 返回 `ok`，并且所有 exhausted 任务在升级前都有明确处理方式。
 
+从使用阻塞式存储提交的旧版本升级前，先停止新的 S3 写入，但保持当前 SynapS3 进程运行，直到上传任务和存储提供方替换活动都已排空。旧的 `committing` copy 不包含可恢复的 submission handle，因此 durable commit 迁移在仍有这类记录时会拒绝启动。如果启动时报告这个条件，请让旧版本继续使用未改动的数据库；必要时恢复对应存储提供方，等待提交完成后再重试升级。不要通过删除或改写 copy 记录绕过检查。
+
 创建备份前，停止 S3 流量，并使用当前部署方式的服务管理器停止 SynapS3。
 
 - SQLite 部署：归档完整运行数据卷，并验证归档和校验和。
@@ -62,7 +64,7 @@ synaps3 admin task stats
 | 数据库空间不足 | 释放空间或扩容数据库。 |
 | 缓存磁盘空间不足 | 扩容磁盘、提高 `cache.max_size_gb`，或恢复上传和淘汰进度。 |
 | 存储提供方永久不可用，或需要计划性迁离 | 打开该存储桶，选择 **Details**，然后到 **Storage** → **Data Sets** 替换存储提供方。新存储提供方就绪后，新上传会切过去。已有对象从其他副本或本地缓存复制；两者都没有的对象无法复制，旧存储提供方也不会被关闭。所选目标已被占用时，请改选存储提供方，而不是重试。 |
-| 进程崩溃 | 重启服务，再检查健康状态和任务统计。未完成的存储提供方替换会从已保存的进度继续，包括计划中的重试和等待可读内容。如果进程在 SynapS3 记录存储提供方复制结果前停止，重启后可能重复发起该复制请求。对于已记录的服务关闭交易，SynapS3 会先检查交易状态，再决定是否再次提交。 |
+| 进程崩溃 | 重启服务，再检查健康状态和任务统计。已保存 handle 或 transaction 的存储提交会继续确认，不会重新提交。如果存储提供方可能已经接受 piece、但 SynapS3 尚未保存 transaction identity，该 attempt 会保持 fenced 并出现在 `synaps3 admin storage-confirmation list` 中，而不是自动重提。对于已记录的服务关闭交易，SynapS3 会先检查交易状态，再决定是否再次提交。 |
 
 副本完成存储后，如果存储提供方变为不可用，不一定会产生可重试任务。使用存储健康视图识别受影响副本；恢复目标副本数属于[计划支持的副本修复](../concepts/filecoin-storage-flow.md#计划支持的副本修复)。
 
@@ -82,6 +84,7 @@ synaps3 admin task stats
 synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task stats
 synaps3 admin task retry 42
+synaps3 admin storage-confirmation list
 synaps3 admin s3-user list
 synaps3 admin settings get
 ```

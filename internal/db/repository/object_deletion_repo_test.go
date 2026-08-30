@@ -10,6 +10,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/uptrace/bun"
 )
 
@@ -318,13 +319,13 @@ func TestObjectRepo_DeleteObjectVersionPermanentlyKeepsSubmittedRepairCommit(t *
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID: fixture.upload.ID, CopyIndex: fixture.repairCopy.CopyIndex, CommitTransactionID: "0xsubmitted",
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitting: %v", err)
+	copyRow, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopyByID: copy=%#v err=%v", copyRow, err)
 	}
+	seedRepositoryCommitAttempt(t, repos, *copyRow, "submitted-repair", "abcd", "0xsubmitted")
 
-	_, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+	_, err = repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
 		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
 	})
 	if !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
@@ -427,10 +428,19 @@ func TestObjectRepo_CreateVersionDoesNotAttachSupersededUploadAfterPermanentDele
 	if _, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: uploadID}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("FinalizeUploadIfTargetCopiesMet error = %v, want superseded upload conflict", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID: uploadID, CopyIndex: 0, CommitTransactionID: "0xlate",
-	}); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("MarkUploadCopyCommitting error = %v, want superseded upload conflict", err)
+	copyRow, err := repos.Uploads.GetUploadCopy(ctx, uploadID, 0)
+	if err != nil || copyRow == nil || copyRow.StorageDataSetID == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
+	}
+	_, err = repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: storagecommit.CopyIdentity{
+			StorageUploadCopyID: copyRow.ID, UploadID: uploadID, CopyIndex: 0,
+			StorageDataSetID: *copyRow.StorageDataSetID, RequireEligibleCopy: true,
+		},
+		AttemptID: "late-superseded-attempt",
+	})
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("ReserveCommitAttempt error = %v, want superseded upload conflict", err)
 	}
 }
 
@@ -712,11 +722,19 @@ func TestStorageUploadRepo_ExactRepairWritesCannotRevivePermanentlyDeletedCopy(t
 			},
 		},
 		{
-			name: "committing",
+			name: "commit reservation",
 			run: func() error {
-				return repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-					StorageUploadCopyID: fixture.repairCopy.ID, UploadID: fixture.upload.ID, CopyIndex: fixture.repairCopy.CopyIndex,
+				_, err := repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+					Copy: storagecommit.CopyIdentity{
+						StorageUploadCopyID: fixture.repairCopy.ID,
+						UploadID:            fixture.upload.ID,
+						CopyIndex:           fixture.repairCopy.CopyIndex,
+						StorageDataSetID:    *fixture.repairCopy.StorageDataSetID,
+						RequireEligibleCopy: true,
+					},
+					AttemptID: "late-reservation",
 				})
+				return err
 			},
 		},
 		{

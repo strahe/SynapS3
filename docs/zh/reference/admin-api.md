@@ -134,6 +134,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 列出该副本可以迁往的存储提供方，以及其他存储提供方不能接管的原因。 |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 授权替换某个副本背后的存储提供方。 |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | 恢复处于 `failed` 或 `cleanup_attention` 的存储提供方替换。 |
+| `GET` | `/api/v1/storage-confirmations` | 列出需要运营者处理的存储确认。 |
+| `POST` | `/api/v1/storage-confirmations/{copy-id}/release` | 确认可能产生重复存储后，释放一条无法判定的确认。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
 
@@ -236,9 +238,15 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 `items_total` 与 `items_copied` 统计的是唯一的已存储内容，而不是对象版本：被多个版本共享的内容只复制一次。迁移期间删除的内容已不再需要，不会算作已复制。复制结束后，响应会分别说明已复制的内容，以及已无需迁移的内容；`items_copied/items_total` 不是完成百分比。确认页统计的是引用版本数和数据量。
 
-每条替换记录还包含嵌套的 `progress` 对象。发现内容期间，`seeding_complete` 为 `false`，`items_total` 只是当前已发现数量，并且省略 `percent`。发现完成后，`items_total` 才是最终总数，`percent` 按 `items_processed / items_total` 计算，其中 `items_processed = items_copied + items_no_longer_needed`。因此，即使部分内容在复制前已删除，完成状态仍会达到 100%。`items_pending`、`items_active`、`items_retrying`、`items_waiting_source` 与 `items_failed` 返回当前工作数量；存在未来的重试时返回 `next_retry_at`。`phase` 取 `prepare`、`migrate`、`retire` 或 `none`。
+每条替换记录还包含嵌套的 `progress` 对象。发现内容期间，`seeding_complete` 为 `false`，`items_total` 只是当前已发现数量，并且省略 `percent`。发现完成后，`items_total` 才是最终总数，`percent` 按 `items_processed / items_total` 计算，其中 `items_processed = items_copied + items_no_longer_needed`。因此，即使部分内容在复制前已删除，完成状态仍会达到 100%。`items_pending`、`items_active`、`items_retrying`、`items_waiting_source`、`items_failed` 与 `items_attention` 返回互斥的当前工作数量。等待确认的工作只计入 `items_active`；需要运营者处理的工作只计入 `items_attention`，两者都属于尚未完成的工作。存在未来的重试时返回 `next_retry_at`。`phase` 取 `prepare`、`migrate`、`retire` 或 `none`。
 
 `POST /api/v1/storage-replacements/{id}/retry` 在同一个已批准的存储提供方上恢复 `failed` 或 `cleanup_attention` 的替换。
+
+### 存储确认处理
+
+提交与确认会分别持久化。若进程在存储提供方可能已经接受 piece、但 SynapS3 尚未保存 transaction identity 的窗口中断，自动重试可能重复存储同一个 piece，因此系统不会自动重提。`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出这些记录，包括 copy、data set、attempt、已知 transaction、时间和稳定的 `reason_code`。
+
+`POST /api/v1/storage-confirmations/{copy-id}/release` 会清除该 fenced attempt，让正常恢复继续。请求体必须包含 `{ "acknowledge_possible_duplicate": true }`。SynapS3 无法从本地证据撤销这项操作，释放后可能发生重复提交，因此应先核对存储提供方和 attempt 信息。若确认在人工释放前自行成功，该记录会自动结算并从清单消失。
 
 更换存储提供方需要重新确认，且仅在旧存储提供方仍持有该副本时可用。新存储提供方接管副本之后，两代各自持有对方没有的数据，因此对任意一代再次确认都会被拒绝（旧代返回 `replacement_source_not_current`，新代返回 `replacement_active`），此时只能用重试完成已批准的复制。
 

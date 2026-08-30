@@ -19,6 +19,8 @@ synaps3 admin task list --status exhausted --limit 50
 
 Expected result: health is `ok`, and every exhausted task has a clear handling decision before the process is replaced.
 
+Before upgrading from a release that used blocking storage commits, stop incoming S3 writes but leave the current SynapS3 process running until upload tasks and provider-replacement activity have drained. The durable-commit migration refuses to start while a legacy `committing` copy remains because the old row does not contain a resumable submission handle. If startup reports this condition, run the previous release against the unchanged database, restore the affected provider if necessary, and let that work finish before retrying the upgrade. Do not delete or rewrite the copy row to bypass the check.
+
 Stop S3 traffic and SynapS3 with the service manager used by your deployment before creating a backup.
 
 - SQLite deployments: archive the complete runtime data volume, then verify the archive and its checksum.
@@ -62,7 +64,7 @@ Receive write -> save object -> record metadata -> return success -> continue ba
 | Database full | Free space or scale the database. |
 | Cache disk full | Increase disk, raise `cache.max_size_gb`, or restore upload and eviction progress. |
 | Provider is permanently unavailable, or must be evacuated | Open the bucket, choose **Details**, then **Storage** → **Data Sets**, and replace the provider. New uploads move to the new provider once it is ready. Existing objects copy from another replica or from local cache; an object with neither cannot be copied, and the old provider is not shut down. If the selected target is already in use, choose another provider rather than retrying it. |
-| Process crash | Restart the service, then verify health and task statistics. Unfinished provider replacement work resumes from saved progress, including scheduled retries and waits for readable content. If the process stopped before SynapS3 recorded a provider copy result, restarting may repeat that copy request. Recorded service-shutdown transactions are checked before another shutdown is submitted. |
+| Process crash | Restart the service, then verify health and task statistics. Storage submissions with a saved handle or transaction resume confirmation without resubmitting. If the provider may have accepted a piece before SynapS3 saved a transaction identity, the attempt is fenced and appears in `synaps3 admin storage-confirmation list` instead of being repeated automatically. Recorded service-shutdown transactions are checked before another shutdown is submitted. |
 
 A provider becoming unavailable after a copy has already been stored does not necessarily create a retryable task. Use storage-health views to identify affected copies. Restoring the target copy count is part of [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
 
@@ -82,6 +84,7 @@ Useful commands:
 synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task stats
 synaps3 admin task retry 42
+synaps3 admin storage-confirmation list
 synaps3 admin s3-user list
 synaps3 admin settings get
 ```

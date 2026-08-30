@@ -83,6 +83,8 @@ synaps3 admin settings set cache.eviction_policy=lru cache.lru_high_watermark_pe
 synaps3 admin task stats
 synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task retry 42
+synaps3 admin storage-confirmation list
+synaps3 admin storage-confirmation release 42 --yes
 ```
 
 If no protected password file is available, enter the Admin password at the no-echo prompt. Do not place the password directly in shell history. S3 user creation and secret rotation show the secret only once; store it in a client credential file protected with `0600`.
@@ -99,6 +101,8 @@ Task listing supports `--type`, `--stage`, `--status`, `--limit`, and `--offset`
 
 `synaps3 admin task retry` does not retry provider replacement work. Use **Open Data Sets** from a finished or stopped replacement task, or open the bucket and go to **Details** → **Storage** → **Data Sets**. If the selected provider already stores this bucket, choose a different provider instead of retrying.
 
+`synaps3 admin storage-confirmation list` shows commit attempts that cannot be resolved automatically. Release one only after checking its provider and transaction evidence. `storage-confirmation release <copy-id> --yes` acknowledges that the provider may already have accepted the piece and permits normal recovery to submit again.
+
 Cache eviction policy accepts `lru`, `after_upload`, or `none`. LRU watermarks must satisfy `0 <= low < high <= 100`; these settings are retained but inactive under the other policies.
 
 ## Settings Safety
@@ -112,6 +116,7 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 synaps3 admin s3-user create --role admin --yes
 synaps3 admin s3-user update <access-key> --role admin --yes
 synaps3 admin s3-user delete <access-key> --yes
+synaps3 admin storage-confirmation release <copy-id> --yes
 ```
 
 After saving settings, restart SynapS3, check `/healthz`, and use `synaps3 admin settings get` to confirm the effective values.

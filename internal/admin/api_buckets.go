@@ -781,6 +781,8 @@ type objectProvenanceCopyResponse struct {
 	TransferMethod   string                    `json:"transfer_method"`
 	RetrievalURL     *string                   `json:"retrieval_url,omitempty"`
 	IsNewDataSet     bool                      `json:"is_new_data_set"`
+	AttentionCode    *string                   `json:"attention_code,omitempty"`
+	AttentionAt      *string                   `json:"attention_at,omitempty"`
 }
 
 type objectProvenanceFailureResponse struct {
@@ -1848,6 +1850,11 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		copyHealthByIndex[*fact.CopyIndex] = copyHealthInfoFromSignal(copyHealthSignalFromFact(fact, copyObservations, copyHealthFailed, copyHealthInterval, copyHealthNow))
 	}
 	for _, copyRow := range provenance.Copies {
+		var attentionAt *string
+		if copyRow.CommitAttentionAt != nil {
+			value := copyRow.CommitAttentionAt.Format(time.RFC3339)
+			attentionAt = &value
+		}
 		resp.Copies = append(resp.Copies, objectProvenanceCopyResponse{
 			CopyIndex:        copyRow.CopyIndex,
 			Status:           string(copyRow.Status),
@@ -1859,6 +1866,8 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			TransferMethod:   string(copyRow.TransferMethod),
 			RetrievalURL:     copyRow.RetrievalURL,
 			IsNewDataSet:     copyRow.IsNewDataSet,
+			AttentionCode:    copyRow.CommitAttentionCode,
+			AttentionAt:      attentionAt,
 		})
 	}
 	for _, failure := range provenance.Failures {

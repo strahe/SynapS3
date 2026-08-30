@@ -351,6 +351,7 @@ export interface ProviderReplacementProgress {
   items_no_longer_needed: number
   items_pending: number
   items_active: number
+  items_attention: number
   items_retrying: number
   items_waiting_source: number
   items_failed: number
