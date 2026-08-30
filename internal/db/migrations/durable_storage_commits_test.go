@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
@@ -25,6 +26,27 @@ func TestDurableStorageCommitsMigration(t *testing.T) {
 			exists, err := indexExists(t.Context(), db, index)
 			if err != nil || !exists {
 				t.Fatalf("index %s exists=%v err=%v", index, exists, err)
+			}
+		}
+		if db.Dialect().Name() == dialect.PG {
+			want := time.Date(2026, time.August, 30, 17, 45, 12, 123456000, time.FixedZone("UTC+08", 8*60*60))
+			if _, err := db.ExecContext(t.Context(), `INSERT INTO storage_upload_copies
+				(id, status, commit_ready_at, commit_attempted_at, commit_attention_at)
+				VALUES (?, 'piece_ready', ?, ?, ?)`, 1, want, want, want); err != nil {
+				t.Fatalf("insert PostgreSQL commit timestamps: %v", err)
+			}
+			var got struct {
+				ReadyAt     time.Time `bun:"commit_ready_at"`
+				AttemptedAt time.Time `bun:"commit_attempted_at"`
+				AttentionAt time.Time `bun:"commit_attention_at"`
+			}
+			if err := db.NewRaw(`SELECT commit_ready_at, commit_attempted_at, commit_attention_at
+				FROM storage_upload_copies WHERE id = ?`, 1).Scan(t.Context(), &got); err != nil {
+				t.Fatalf("scan PostgreSQL commit timestamps: %v", err)
+			}
+			if !got.ReadyAt.Equal(want) || !got.AttemptedAt.Equal(want) || !got.AttentionAt.Equal(want) {
+				t.Fatalf("PostgreSQL timestamp round trip = %s/%s/%s, want instant %s",
+					got.ReadyAt, got.AttemptedAt, got.AttentionAt, want)
 			}
 		}
 		if err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits); err != nil {

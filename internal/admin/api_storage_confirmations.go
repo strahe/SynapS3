@@ -26,7 +26,8 @@ type storageConfirmationAttentionResponse struct {
 }
 
 type releaseStorageConfirmationRequest struct {
-	AcknowledgePossibleDuplicate bool `json:"acknowledge_possible_duplicate"`
+	AcknowledgePossibleDuplicate bool   `json:"acknowledge_possible_duplicate"`
+	ExpectedAttemptID            string `json:"expected_attempt_id"`
 }
 
 func (s *Server) handleAPIListStorageConfirmations(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +79,7 @@ func (s *Server) handleAPIReleaseStorageConfirmation(w http.ResponseWriter, r *h
 		return
 	}
 	err = s.repos.Uploads.ReleaseCommitAttention(r.Context(), storagecommit.ManualReleaseInput{
-		CopyID: copyID, AcknowledgePossibleDuplicate: true,
+		CopyID: copyID, ExpectedAttemptID: req.ExpectedAttemptID, AcknowledgePossibleDuplicate: true,
 	})
 	switch {
 	case err == nil:

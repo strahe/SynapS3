@@ -789,9 +789,12 @@ func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t
 		name      string
 		status    storagereplacement.Status
 		attempted bool
+		confirm   bool
 	}{
 		{name: "failed reservation is released", status: storagereplacement.StatusFailed},
+		{name: "failed submission is recoverable", status: storagereplacement.StatusFailed, attempted: true},
 		{name: "superseded submission is confirmed", status: storagereplacement.StatusSuperseded, attempted: true},
+		{name: "superseded submission settles without live owner", status: storagereplacement.StatusSuperseded, attempted: true, confirm: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newReplacementFixture(t, "replacement-terminal-"+strings.ReplaceAll(tc.name, " ", "-"), "01J000000000000000ITEMQ23")
@@ -846,6 +849,7 @@ func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t
 				}); err != nil {
 					t.Fatalf("MarkCommitAttempted: %v", err)
 				}
+				mustExec(t, f.db, `DELETE FROM object_versions WHERE version_id = ?`, f.version.VersionID)
 			}
 			token := storagereplacement.ClaimToken{ItemID: item.ID, ClaimedAt: *item.ClaimedAt}
 			if err := f.repos.Replacements.ReleaseReplacementItemClaim(ctx, token); err != nil {
@@ -862,6 +866,50 @@ func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t
 			})
 			if err != nil || recovered == nil || recovered.Replacement.Status != tc.status {
 				t.Fatalf("terminal recovery snapshot = %#v err=%v", recovered, err)
+			}
+			if tc.confirm {
+				pieceID := onChainID(t, "7001")
+				if err := f.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+					StorageUploadCopyID: copyRow.ID, RequireEligibleCopy: true,
+					UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+					PieceCID: *snapshot.Upload.PieceCID, PieceID: &pieceID,
+					RetrievalURL: "https://target.example/piece", CommitAttemptID: "terminal-attempt",
+				}); err != nil {
+					t.Fatalf("MarkUploadCopyCommitted without live owner: %v", err)
+				}
+				return
+			}
+			if tc.attempted {
+				recoveryToken := storagereplacement.ClaimToken{ItemID: claimed.ID, ClaimedAt: *claimed.ClaimedAt}
+				if err := f.repos.Replacements.ReleaseReplacementItemClaim(ctx, recoveryToken); err != nil {
+					t.Fatalf("release recovery claim: %v", err)
+				}
+				if err := f.repos.Uploads.MarkCommitAttention(ctx, storagecommit.AttentionInput{
+					Copy: storagecommit.CopyIdentity{
+						StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID,
+						CopyIndex: copyRow.CopyIndex, StorageDataSetID: *copyRow.StorageDataSetID,
+					},
+					AttemptID: "terminal-attempt", Code: storagecommit.AttentionAttemptOnlyAmbiguous,
+				}); err != nil {
+					t.Fatalf("MarkCommitAttention without live owner: %v", err)
+				}
+				if err := f.repos.Uploads.ReleaseCommitAttention(ctx, storagecommit.ManualReleaseInput{
+					CopyID: copyRow.ID, ExpectedAttemptID: "terminal-attempt", AcknowledgePossibleDuplicate: true,
+				}); err != nil {
+					t.Fatalf("ReleaseCommitAttention: %v", err)
+				}
+				var releasedStatus storagereplacement.ItemStatus
+				if err := f.db.NewSelect().Model((*storagereplacement.Item)(nil)).
+					Column("status").Where("id = ?", item.ID).Scan(ctx, &releasedStatus); err != nil {
+					t.Fatalf("load released item: %v", err)
+				}
+				wantStatus := storagereplacement.ItemStatusFailed
+				if tc.status == storagereplacement.StatusSuperseded {
+					wantStatus = storagereplacement.ItemStatusCancelled
+				}
+				if releasedStatus != wantStatus {
+					t.Fatalf("released item status = %s, want %s", releasedStatus, wantStatus)
+				}
 			}
 		})
 	}
@@ -1477,6 +1525,76 @@ func TestStorageReplacementRepo_UnsatisfiableItemsSettleTerminally(t *testing.T)
 	}
 }
 
+func TestStorageReplacementRepo_CancelledCapacityWaitLeavesFIFO(t *testing.T) {
+	f := newReplacementFixture(t, "replacement-cancelled-fifo", "01J000000000000000000RPL30")
+	ctx := context.Background()
+	row := f.authorize(t, "202")
+	f.readyTarget(t, row, "2002")
+	if err := f.repos.Replacements.Activate(ctx, row.ID); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if _, _, err := f.repos.Replacements.SeedMigrationBatchWithBudget(ctx, row.ID, 10, 5); err != nil {
+		t.Fatalf("SeedMigrationBatch: %v", err)
+	}
+	item, err := f.repos.Replacements.ClaimReadyReplacementItem(ctx, time.Minute)
+	if err != nil || item == nil || item.ClaimedAt == nil {
+		t.Fatalf("claim = %#v err=%v", item, err)
+	}
+	snapshot, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
+		ReplacementID: row.ID, ItemID: item.ID, ItemClaimedAt: *item.ClaimedAt,
+	})
+	if err != nil || snapshot == nil {
+		t.Fatalf("AcquireItem: snapshot=%#v err=%v", snapshot, err)
+	}
+	copyRow, err := f.repos.Replacements.AttachTargetCopy(ctx, repository.AttachReplacementTargetCopyInput{
+		ReplacementID: row.ID, ItemID: item.ID, UploadID: snapshot.Upload.ID, ItemClaimedAt: *item.ClaimedAt,
+	})
+	if err != nil || copyRow == nil || snapshot.Upload.PieceCID == nil {
+		t.Fatalf("AttachTargetCopy: copy=%#v err=%v", copyRow, err)
+	}
+	if err := f.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		StorageUploadCopyID: copyRow.ID, RequireEligibleCopy: true,
+		UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: *snapshot.Upload.PieceCID, RetrievalURL: "https://target.example/piece", CommitExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	capacityCopies := seedCommitCopies(t, f.db, f.bucket.ID, row.TargetDataSetID, storagecommit.MaxActiveAttemptsPerDataSet)
+	for i := range capacityCopies {
+		if _, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+			Copy: commitCopyIdentity(capacityCopies[i]), AttemptID: fmt.Sprintf("fifo-capacity-%d", i),
+		}); err != nil {
+			t.Fatalf("reserve capacity %d: %v", i, err)
+		}
+	}
+	waiting, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: storagecommit.CopyIdentity{
+			StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+			StorageDataSetID: row.TargetDataSetID, RequireEligibleCopy: true,
+		},
+		AttemptID: "cancelled-fifo",
+	})
+	if err != nil || waiting.State != storagecommit.ReservationWaiting || waiting.Copy.CommitReadyAt == nil {
+		t.Fatalf("capacity wait = %#v err=%v", waiting, err)
+	}
+	if err := f.repos.Replacements.ReleaseReplacementItemClaim(ctx, storagereplacement.ClaimToken{
+		ItemID: item.ID, ClaimedAt: *item.ClaimedAt,
+	}); err != nil {
+		t.Fatalf("ReleaseReplacementItemClaim: %v", err)
+	}
+	item = claimSpecificReplacementItem(t, f, row.ID, item.ID)
+	mustExec(t, f.db, `DELETE FROM object_versions WHERE version_id = ?`, f.version.VersionID)
+	if _, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
+		ReplacementID: row.ID, ItemID: item.ID, ItemClaimedAt: *item.ClaimedAt,
+	}); !errors.Is(err, storagereplacement.ErrItemCancelled) {
+		t.Fatalf("AcquireItem after deletion = %v, want cancellation", err)
+	}
+	persisted, err := f.repos.Uploads.GetUploadCopyByID(ctx, copyRow.ID)
+	if err != nil || persisted == nil || persisted.CommitReadyAt != nil || persisted.CommitExtraDataHex != nil {
+		t.Fatalf("cancelled FIFO copy = %#v err=%v", persisted, err)
+	}
+}
+
 // A rejected attempt on the retiring generation must reset that generation,
 // not whichever one currently owns the slot.
 func TestStorageReplacementRepo_ResetCommitAttemptTargetsTheRecordedCopy(t *testing.T) {
@@ -1541,6 +1659,12 @@ func TestStorageReplacementRepo_AbandonedTargetRetiresWithoutTouchingTheSource(t
 	if sole != 0 {
 		t.Fatalf("sole copies = %d, want none on an unused target", sole)
 	}
+	reservedCopy := seedCommitCopies(t, f.db, f.bucket.ID, first.TargetDataSetID, 1)[0]
+	mustExec(t, f.db, `UPDATE storage_upload_copies SET commit_attempt_id = ? WHERE id = ?`, "abandoned-reservation", reservedCopy.ID)
+	if err := f.repos.Replacements.RetireAbandonedTarget(ctx, first.ID); !errors.Is(err, storagereplacement.ErrPrematureComplete) {
+		t.Fatalf("RetireAbandonedTarget with reservation = %v, want premature-complete", err)
+	}
+	mustExec(t, f.db, `UPDATE storage_upload_copies SET commit_attempt_id = NULL WHERE id = ?`, reservedCopy.ID)
 	if err := f.repos.Replacements.RetireAbandonedTarget(ctx, first.ID); err != nil {
 		t.Fatalf("RetireAbandonedTarget: %v", err)
 	}

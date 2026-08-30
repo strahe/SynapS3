@@ -1608,6 +1608,9 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 	}
 	binding, storageCtx, err := u.readyContextForCopy(ctx, task, bucket, uploadID, copyIndex)
 	if err != nil {
+		if binding != nil && u.handleUnavailableCommitContext(ctx, task, binding, copyRow, logger, "ingress commit context") {
+			return
+		}
 		u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "ingress commit context", err)
 		return
 	}
@@ -1992,11 +1995,6 @@ func (u *Uploader) peerPull(ctx context.Context, task *model.Task, version *mode
 }
 
 func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *model.ObjectVersion, bucket *model.Bucket, uploadID int64, copyIndex int, logger *slog.Logger) {
-	binding, storageCtx, err := u.readyContextForCopy(ctx, task, bucket, uploadID, copyIndex)
-	if err != nil {
-		u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "peer commit context", err)
-		return
-	}
 	copyRow, err := u.taskUploadCopy(ctx, task, uploadID, copyIndex)
 	if err != nil {
 		u.handleTaskFailure(ctx, task, logger, "load peer copy", err)
@@ -2004,6 +2002,14 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 	}
 	if copyCommitted(copyRow) {
 		u.finishPeerCopy(ctx, task, version, uploadID, logger)
+		return
+	}
+	binding, storageCtx, err := u.readyContextForCopy(ctx, task, bucket, uploadID, copyIndex)
+	if err != nil {
+		if binding != nil && u.handleUnavailableCommitContext(ctx, task, binding, copyRow, logger, "peer commit context") {
+			return
+		}
+		u.markDataSetStageFailed(ctx, task, version, bucket, uploadID, copyIndex, binding, logger, "peer commit context", err)
 		return
 	}
 	readableCopies, err := u.repos.Uploads.ListReadableCommittedCopies(ctx, uploadID)
@@ -2912,6 +2918,29 @@ func (u *Uploader) advanceStorageCommit(
 		RequireEligibleCopy: requireEligibleCopy,
 		OwnerTerminal:       ownerTerminal,
 	})
+}
+
+func (u *Uploader) handleUnavailableCommitContext(
+	ctx context.Context,
+	task *model.Task,
+	binding *model.StorageDataSet,
+	copyRow *model.StorageUploadCopy,
+	logger *slog.Logger,
+	stage string,
+) bool {
+	if !copyCommitSubmitted(copyRow) || binding == nil {
+		return false
+	}
+	advancer := storagecommit.Advancer{Store: u.repos.Uploads}
+	result, err := advancer.AdvanceUnavailable(ctx, *copyRow, *binding)
+	if err != nil {
+		u.handleTaskFailure(ctx, task, logger, stage, err)
+		return true
+	}
+	if !u.waitForCommitAdvance(ctx, task, logger, result) {
+		u.handleTaskFailure(ctx, task, logger, stage, errors.New("unavailable storage commit returned an unexpected state"))
+	}
+	return true
 }
 
 func (u *Uploader) waitForCommitAdvance(

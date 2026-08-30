@@ -417,6 +417,24 @@ func (e *ReplacementTransferExecutor) Execute(ctx context.Context, item *storage
 		return e.support.contextForReadyBinding(ctx, &snapshot.Target)
 	})
 	if err != nil {
+		if copyCommitSubmitted(copyRow) {
+			advance, advanceErr := (&storagecommit.Advancer{Store: e.repos.Uploads}).AdvanceUnavailable(
+				ctx, *copyRow, snapshot.Target,
+			)
+			if advanceErr != nil {
+				return expectedStateVersion, advanceErr
+			}
+			switch {
+			case advance.State == storagecommit.AdvancePending:
+				return expectedStateVersion, errReplacementCommitPending
+			case advance.State == storagecommit.AdvanceNeedsAttention && advance.Continue:
+				return expectedStateVersion, errReplacementCommitObserving
+			case advance.State == storagecommit.AdvanceNeedsAttention:
+				return expectedStateVersion, errReplacementCommitAttention
+			default:
+				return expectedStateVersion, errors.New("unavailable replacement commit returned an unexpected state")
+			}
+		}
 		return expectedStateVersion, err
 	}
 	defer handle.release()
@@ -474,6 +492,7 @@ func (e *ReplacementTransferExecutor) copy(
 			CopyIndex:           copyRow.CopyIndex,
 			PieceCID:            pieceCIDString,
 			RetrievalURL:        storageCtx.PieceURL(pieceCID),
+			CommitExtraDataHex:  extraHex,
 		})
 		evidenceCancel()
 		if err != nil {

@@ -973,11 +973,11 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 				}})
 			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/storage-confirmations/42/release":
 				sawRelease = true
-				var body map[string]bool
+				var body map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 					t.Fatalf("decode release body: %v", err)
 				}
-				if !body["acknowledge_possible_duplicate"] {
+				if body["acknowledge_possible_duplicate"] != true || body["expected_attempt_id"] != "attempt-1" {
 					t.Fatal("release acknowledgement was not sent")
 				}
 				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"copy_id": 42, "status": "released"})
@@ -995,7 +995,7 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 			!strings.Contains(out, "attempt-1") || !strings.Contains(out, "0xcommit") {
 			t.Fatalf("list output missing confirmation details:\n%s", out)
 		}
-		out, err = runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "release", "42", "--yes"})
+		out, err = runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "release", "42", "--attempt-id", "attempt-1", "--yes"})
 		if err != nil {
 			t.Fatalf("storage-confirmation release: %v\n%s", err, out)
 		}
@@ -1012,7 +1012,7 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
 		defer ts.Close()
 
-		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "release", "42"})
+		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "storage-confirmation", "release", "42", "--attempt-id", "attempt-1"})
 		if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 			t.Fatalf("error = %v, output=%s", err, out)
 		}

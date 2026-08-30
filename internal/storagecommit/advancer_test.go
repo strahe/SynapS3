@@ -2,6 +2,7 @@ package storagecommit_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -280,6 +281,45 @@ func TestAdvancerSubmissionCallbackPreventsErrorBasedReset(t *testing.T) {
 	}
 }
 
+func TestAdvancerSurfacesDurableSubmissionEvidenceFailure(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	target.ClientDataSetIDValue = sdktypes.NewBigInt(9001)
+	dataSetRef, ok := target.DataSetRef()
+	if !ok {
+		t.Fatal("mock target has no data set ref")
+	}
+	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+		return []byte{0xab}, nil
+	}
+	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+		request.OnSubmitted("0xevidence")
+		return &storage.CommitSubmission{
+			Kind: storage.CommitKindAddPieces, TransactionID: "0xevidence",
+			StatusURL:  "https://provider.example/status/evidence",
+			ProviderID: binding.ProviderID.SDK(), DataSet: &dataSetRef,
+			PieceCIDs: []cid.Cid{pieceCID},
+		}, nil
+	}
+	injected := errors.New("injected evidence write failure")
+	store := &failingCommitEvidenceStore{Store: repos.Uploads, err: injected}
+
+	result, err := (&storagecommit.Advancer{Store: store}).Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: copies[0], Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if !errors.Is(err, injected) || result.State != storagecommit.AdvancePending {
+		t.Fatalf("advance = %#v err=%v, want pending with evidence error", result, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil ||
+		persisted.CommitTransactionID != nil || persisted.CommitSubmissionJSON != nil {
+		t.Fatalf("failed evidence write lost attempt fence or invented evidence: %#v", persisted)
+	}
+}
+
 func TestAdvancerUnavailableConfirmationWaitsThenRecoversFromAttention(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -366,6 +406,45 @@ func TestAdvancerUnavailableConfirmationWaitsThenRecoversFromAttention(t *testin
 	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
 	if persisted.CommitAttentionCode != nil || persisted.CommitAttentionAt != nil || persisted.CommitAttemptID != nil {
 		t.Fatalf("confirmed settlement retained attention: %#v", persisted)
+	}
+}
+
+func TestAdvancerUnavailableContextMakesAttemptVisibleAfterThreshold(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, _ := seedAdvancerCopies(t, db, 1)
+	identity := advancerCopyIdentity(copies[0])
+	startedAt := time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC)
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "unavailable-context", Now: startedAt,
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "unavailable-context", ExtraDataHex: "abcd", Now: startedAt,
+	}); err != nil {
+		t.Fatalf("mark attempted: %v", err)
+	}
+	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	advancer := storagecommit.Advancer{
+		Store: repos.Uploads,
+		Now:   func() time.Time { return startedAt.Add(14 * time.Minute) },
+	}
+
+	result, err := advancer.AdvanceUnavailable(t.Context(), *copyRow, *binding)
+	if err != nil || result.State != storagecommit.AdvancePending {
+		t.Fatalf("pre-threshold unavailable advance = %#v err=%v", result, err)
+	}
+	advancer.Now = func() time.Time { return startedAt.Add(16 * time.Minute) }
+	result, err = advancer.AdvanceUnavailable(t.Context(), *copyRow, *binding)
+	if err != nil || result.State != storagecommit.AdvanceNeedsAttention || !result.Continue ||
+		result.AttentionCode != storagecommit.AttentionDataSetUnavailable {
+		t.Fatalf("post-threshold unavailable advance = %#v err=%v", result, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.CommitAttentionAt == nil || persisted.CommitAttentionCode == nil ||
+		*persisted.CommitAttentionCode != string(storagecommit.AttentionDataSetUnavailable) {
+		t.Fatalf("unavailable attempted commit is not operator-visible: %#v", persisted)
 	}
 }
 
@@ -460,6 +539,19 @@ func TestAdvancerTxOnlyEvidenceConfirmsWithoutPieceStatus(t *testing.T) {
 }
 
 type commitStatusCheckerFunc func(context.Context, synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error)
+
+type failingCommitEvidenceStore struct {
+	storagecommit.Store
+	err error
+}
+
+func (s *failingCommitEvidenceStore) RecordCommitTransaction(context.Context, storagecommit.EvidenceInput) error {
+	return s.err
+}
+
+func (s *failingCommitEvidenceStore) RecordCommitSubmission(context.Context, storagecommit.EvidenceInput) error {
+	return s.err
+}
 
 func (f commitStatusCheckerFunc) GetAddPiecesStatus(
 	ctx context.Context,

@@ -46,11 +46,52 @@ type AdvanceInput struct {
 	OwnerTerminal       bool
 }
 
+// AdvanceUnavailable records an attempted commit whose provider context could
+// not be reconstructed. It never submits or confirms provider work.
+func (a *Advancer) AdvanceUnavailable(
+	ctx context.Context,
+	copyRow model.StorageUploadCopy,
+	binding model.StorageDataSet,
+) (AdvanceResult, error) {
+	if a == nil || a.Store == nil || copyRow.ID <= 0 || copyRow.UploadID <= 0 || copyRow.CopyIndex < 0 ||
+		copyRow.StorageDataSetID == nil || *copyRow.StorageDataSetID != binding.ID ||
+		copyRow.CommitAttemptID == nil || *copyRow.CommitAttemptID == "" || copyRow.CommitAttemptedAt == nil {
+		return AdvanceResult{}, errors.New("invalid unavailable storage commit input")
+	}
+	attemptID := *copyRow.CommitAttemptID
+	if copyRow.CommitAttentionAt != nil {
+		code := AttentionDataSetUnavailable
+		if copyRow.CommitAttentionCode != nil {
+			parsed, err := ParseAttentionCode(*copyRow.CommitAttentionCode)
+			if err != nil {
+				return AdvanceResult{}, err
+			}
+			code = parsed
+		}
+		return AdvanceResult{
+			State:         AdvanceNeedsAttention,
+			AttemptID:     attemptID,
+			AttentionCode: code,
+			Continue:      code == AttentionDataSetUnavailable || code == AttentionConfirmationTimeout,
+		}, nil
+	}
+	if a.now().Sub(*copyRow.CommitAttemptedAt) < a.attentionAfter() {
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+	}
+	return a.attention(ctx, CopyIdentity{
+		StorageUploadCopyID: copyRow.ID,
+		UploadID:            copyRow.UploadID,
+		CopyIndex:           copyRow.CopyIndex,
+		StorageDataSetID:    binding.ID,
+	}, attemptID, AttentionDataSetUnavailable, true)
+}
+
 func (a *Advancer) Advance(ctx context.Context, input AdvanceInput) (AdvanceResult, error) {
 	if err := a.validateInput(input); err != nil {
 		return AdvanceResult{}, err
 	}
-	identity := copyIdentity(input)
+	identity := copyIdentity(input, false)
+	eligibleIdentity := copyIdentity(input, input.RequireEligibleCopy)
 	copyRow := input.Copy
 	if copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" {
 		if input.OwnerTerminal && copyRow.CommitAttemptedAt == nil {
@@ -80,7 +121,7 @@ func (a *Advancer) Advance(ctx context.Context, input AdvanceInput) (AdvanceResu
 		return AdvanceResult{}, err
 	}
 	reservation, err := a.Store.ReserveCommitAttempt(ctx, ReserveInput{
-		Copy:      identity,
+		Copy:      eligibleIdentity,
 		AttemptID: attemptID,
 		Now:       a.now(),
 	})
@@ -101,7 +142,8 @@ func (a *Advancer) submitReserved(
 	if copyRow.CommitAttemptID == nil || *copyRow.CommitAttemptID == "" {
 		return AdvanceResult{}, errors.New("reserved storage commit has no attempt token")
 	}
-	identity := copyIdentity(input)
+	identity := copyIdentity(input, false)
+	eligibleIdentity := copyIdentity(input, input.RequireEligibleCopy)
 	attemptID := *copyRow.CommitAttemptID
 	if err := context.Cause(ctx); err != nil {
 		return a.release(ctx, identity, copyRow, ReleaseBeforeSubmitCanceled, false, false, false)
@@ -117,7 +159,7 @@ func (a *Advancer) submitReserved(
 		return AdvanceResult{}, err
 	}
 	attempt, err := a.Store.MarkCommitAttempted(ctx, AttemptInput{
-		Copy:         identity,
+		Copy:         eligibleIdentity,
 		AttemptID:    attemptID,
 		ExtraDataHex: extraHex,
 		Now:          a.now(),
@@ -139,19 +181,23 @@ func (a *Advancer) submitReserved(
 		return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID}, nil
 	}
 	var callbackObserved atomic.Bool
+	var callbackEvidenceErr atomic.Pointer[commitEvidenceError]
 	submission, submitErr := input.Target.SubmitCommit(ctx, storage.CommitRequest{
 		Pieces:    input.Pieces,
 		ExtraData: extraData,
 		OnSubmitted: func(transactionID string) {
 			callbackObserved.Store(true)
 			evidenceCtx, cancel := evidenceContext(ctx)
-			_ = a.Store.RecordCommitTransaction(evidenceCtx, EvidenceInput{
+			err := a.Store.RecordCommitTransaction(evidenceCtx, EvidenceInput{
 				Copy:          identity,
 				AttemptID:     attemptID,
 				TransactionID: transactionID,
 				Now:           a.now(),
 			})
 			cancel()
+			if err != nil {
+				callbackEvidenceErr.Store(&commitEvidenceError{err: err})
+			}
 		},
 	})
 	if submitErr != nil {
@@ -159,6 +205,10 @@ func (a *Advancer) submitReserved(
 			return a.attention(ctx, identity, attemptID, AttentionDataSetUnavailable, false)
 		}
 		if callbackObserved.Load() {
+			if evidenceErr := callbackEvidenceErr.Load(); evidenceErr != nil {
+				return AdvanceResult{State: AdvancePending, AttemptID: attemptID},
+					fmt.Errorf("recording storage commit callback evidence: %w", evidenceErr.err)
+			}
 			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 		}
 		if definitelyNotSubmitted(submitErr) {
@@ -170,11 +220,15 @@ func (a *Advancer) submitReserved(
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 	}
 	if submission == nil {
+		if evidenceErr := callbackEvidenceErr.Load(); evidenceErr != nil {
+			return AdvanceResult{State: AdvancePending, AttemptID: attemptID},
+				fmt.Errorf("recording storage commit callback evidence: %w", evidenceErr.err)
+		}
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 	}
 	submissionJSON, err := EncodeSubmission(*submission)
 	if err != nil {
-		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, err
 	}
 	evidenceCtx, cancel := evidenceContext(ctx)
 	err = a.Store.RecordCommitSubmission(evidenceCtx, EvidenceInput{
@@ -186,9 +240,13 @@ func (a *Advancer) submitReserved(
 	})
 	cancel()
 	if err != nil {
-		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, err
 	}
 	return AdvanceResult{State: AdvanceSubmitted, AttemptID: attemptID}, nil
+}
+
+type commitEvidenceError struct {
+	err error
 }
 
 func (a *Advancer) observe(
@@ -196,7 +254,7 @@ func (a *Advancer) observe(
 	input AdvanceInput,
 	copyRow model.StorageUploadCopy,
 ) (AdvanceResult, error) {
-	identity := copyIdentity(input)
+	identity := copyIdentity(input, false)
 	attemptID := *copyRow.CommitAttemptID
 	if copyRow.CommitSubmissionJSON != nil && *copyRow.CommitSubmissionJSON != "" {
 		submission, err := DecodeSubmission(*copyRow.CommitSubmissionJSON)
@@ -253,7 +311,7 @@ func (a *Advancer) observeTransaction(
 	input AdvanceInput,
 	copyRow model.StorageUploadCopy,
 ) (AdvanceResult, error) {
-	identity := copyIdentity(input)
+	identity := copyIdentity(input, false)
 	attemptID := *copyRow.CommitAttemptID
 	transactionID := *copyRow.CommitTransactionID
 	checker := a.StatusChecker
@@ -470,13 +528,13 @@ func (a *Advancer) validateInput(input AdvanceInput) error {
 	return nil
 }
 
-func copyIdentity(input AdvanceInput) CopyIdentity {
+func copyIdentity(input AdvanceInput, requireEligibleCopy bool) CopyIdentity {
 	return CopyIdentity{
 		StorageUploadCopyID: input.Copy.ID,
 		UploadID:            input.Copy.UploadID,
 		CopyIndex:           input.Copy.CopyIndex,
 		StorageDataSetID:    input.Binding.ID,
-		RequireEligibleCopy: input.RequireEligibleCopy,
+		RequireEligibleCopy: requireEligibleCopy,
 	}
 }
 

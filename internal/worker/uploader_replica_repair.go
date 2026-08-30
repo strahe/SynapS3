@@ -241,6 +241,9 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 	}
 	storageCtx, err := u.contextForReadyBinding(ctx, binding)
 	if err != nil {
+		if u.handleUnavailableCommitContext(ctx, task, binding, copyRow, logger, "restore replica context") {
+			return
+		}
 		u.handleReplicaRepairDataSetFailure(ctx, task, binding, logger, "restore replica context", err)
 		return
 	}
@@ -338,6 +341,7 @@ func (u *Uploader) repairReplicaCopy(
 			CopyIndex:           copyRow.CopyIndex,
 			PieceCID:            pieceCIDString,
 			RetrievalURL:        storageCtx.PieceURL(pieceCID),
+			CommitExtraDataHex:  extraHex,
 		}); err != nil {
 			return err
 		}

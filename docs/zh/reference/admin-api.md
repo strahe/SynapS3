@@ -94,6 +94,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
 | 后台任务和存储健康 | 任务重试、诊断刷新、存储提供方和数据集刷新 | 重新入队任务，或刷新运维状态。 |
 | 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
+| 存储确认 | `POST /api/v1/storage-confirmations/{copy-id}/release` | 可能允许存储提供方再次存储同一个 piece。释放前必须核对当前 attempt。 |
 
 ## 健康检查和指标
 
@@ -242,12 +243,6 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 `POST /api/v1/storage-replacements/{id}/retry` 在同一个已批准的存储提供方上恢复 `failed` 或 `cleanup_attention` 的替换。
 
-### 存储确认处理
-
-提交与确认会分别持久化。若进程在存储提供方可能已经接受 piece、但 SynapS3 尚未保存 transaction identity 的窗口中断，自动重试可能重复存储同一个 piece，因此系统不会自动重提。`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出这些记录，包括 copy、data set、attempt、已知 transaction、时间和稳定的 `reason_code`。
-
-`POST /api/v1/storage-confirmations/{copy-id}/release` 会清除该 fenced attempt，让正常恢复继续。请求体必须包含 `{ "acknowledge_possible_duplicate": true }`。SynapS3 无法从本地证据撤销这项操作，释放后可能发生重复提交，因此应先核对存储提供方和 attempt 信息。若确认在人工释放前自行成功，该记录会自动结算并从清单消失。
-
 更换存储提供方需要重新确认，且仅在旧存储提供方仍持有该副本时可用。新存储提供方接管副本之后，两代各自持有对方没有的数据，因此对任意一代再次确认都会被拒绝（旧代返回 `replacement_source_not_current`，新代返回 `replacement_active`），此时只能用重试完成已批准的复制。
 
 冲突返回 `409 Conflict` 并附带稳定的 code：
@@ -264,6 +259,21 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出当前探测为可用的存储提供方，附带 `eligible`、取值为 `current_source` 或 `already_serves_bucket` 的 `ineligible_reason`，以及标记该存储桶用过并已完全退休的 `previously_used`。不能接管该副本的存储提供方会照常列出而不是省略，便于运营者看清预期中的存储提供方为何不可用。这份清单与存储拓扑页在 `Available` 过滤下读取的是同一份：在那里可用的存储提供方这里会提供，探测不通的两边都不会出现。可选性判定与确认阶段完全一致。自动选择更严格：它绝不会回到该存储桶用过的存储提供方，而手动选择可以。
 
 确认阶段只能检查 SynapS3 已记录的信息。如果某个存储提供方在链上仍为该存储桶运行着存储服务，会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移，没有任何风险。此前已正常退休的存储提供方可以再次选择。
+
+### 存储确认处理
+
+当 SynapS3 无法判定存储提供方是否已接受 piece 时，不会自动再次提交该 piece。`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出受影响的 copy、data set、attempt、已知 transaction、时间和稳定的 `reason_code`。
+
+`POST /api/v1/storage-confirmations/{copy-id}/release` 会让正常恢复继续，并可能产生重复提交。先核对清单中的当前记录，再同时发送该记录的 attempt ID 和明确的风险确认：
+
+```json
+{
+  "expected_attempt_id": "current-attempt-id",
+  "acknowledge_possible_duplicate": true
+}
+```
+
+如果核对后 attempt 已发生变化，API 返回 `409 Conflict`。如果确认在人工释放前自行成功，该记录会自动消失。
 
 ## 任务
 

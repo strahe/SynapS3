@@ -495,6 +495,7 @@ func adminStorageConfirmationCommand() *cli.Command {
 				Usage:     "release a storage confirmation for a possible duplicate submission",
 				ArgsUsage: "<copy-id>",
 				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "attempt-id", Usage: "attempt ID shown by storage-confirmation list", Required: true},
 					&cli.BoolFlag{Name: "yes", Usage: "acknowledge that the provider may already have accepted the piece"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -515,7 +516,10 @@ func adminStorageConfirmationCommand() *cli.Command {
 					}
 					var response adminStorageConfirmationRelease
 					path := "/api/v1/storage-confirmations/" + url.PathEscape(copyID) + "/release"
-					body := map[string]bool{"acknowledge_possible_duplicate": true}
+					body := map[string]any{
+						"acknowledge_possible_duplicate": true,
+						"expected_attempt_id":            strings.TrimSpace(cmd.String("attempt-id")),
+					}
 					if err := client.postJSON(ctx, path, body, &response, true); err != nil {
 						return err
 					}

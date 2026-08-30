@@ -56,13 +56,13 @@ func TestAPIStorageConfirmationsListAndRelease(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-confirmations/12/release", strings.NewReader(`{"acknowledge_possible_duplicate":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-confirmations/12/release", strings.NewReader(`{"acknowledge_possible_duplicate":true,"expected_attempt_id":"attempt-1"}`))
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("release status = %d body=%s", rec.Code, rec.Body.String())
 	}
-	if repo.releaseInput.CopyID != 12 || !repo.releaseInput.AcknowledgePossibleDuplicate {
+	if repo.releaseInput.CopyID != 12 || repo.releaseInput.ExpectedAttemptID != "attempt-1" || !repo.releaseInput.AcknowledgePossibleDuplicate {
 		t.Fatalf("release input = %#v", repo.releaseInput)
 	}
 }
@@ -81,5 +81,19 @@ func TestAPIStorageConfirmationReleaseRequiresAcknowledgement(t *testing.T) {
 	}
 	if repo.releaseInput.CopyID != 0 {
 		t.Fatalf("release was called: %#v", repo.releaseInput)
+	}
+}
+
+func TestAPIStorageConfirmationReleaseRejectsStaleAttempt(t *testing.T) {
+	repo := &storageConfirmationAPIRepo{releaseErr: repository.ErrConflict}
+	srv := &Server{repos: &repository.Repositories{Uploads: repo}, logger: testLogger()}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-confirmations/12/release", strings.NewReader(`{"acknowledge_possible_duplicate":true,"expected_attempt_id":"stale-attempt"}`))
+	req.SetPathValue("id", "12")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.handleAPIReleaseStorageConfirmation(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }

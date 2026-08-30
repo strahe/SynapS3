@@ -5519,8 +5519,8 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		runWorkerUntilTaskStatus(t, fixture.env, uploader, fixture.task.ID, model.TaskStatusWaiting, 5*time.Second)
 
 		gotTask, err := fixture.env.repos.Tasks.GetByID(ctx, fixture.task.ID)
-		if err != nil || gotTask.RetryCount != 0 || gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonDependency {
-			t.Fatalf("submitted ingress task = %#v err=%v, want dependency wait without retry", gotTask, err)
+		if err != nil || gotTask.RetryCount != 0 || gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonExternalConfirmation {
+			t.Fatalf("submitted ingress task = %#v err=%v, want confirmation wait without retry", gotTask, err)
 		}
 		copies, err := fixture.env.repos.Uploads.ListCopies(ctx, fixture.upload.ID)
 		if err != nil || len(copies) != 2 || copies[0].TransferMethod != model.StorageCopyTransferMethodIngress || copies[1].TransferMethod != model.StorageCopyTransferMethodPeerPull {

@@ -1587,7 +1587,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 				UploadID:            input.UploadID,
 				CopyIndex:           input.CopyIndex,
 				StorageDataSetID:    *initial.StorageDataSetID,
-				RequireEligibleCopy: input.RequireEligibleCopy,
+				RequireEligibleCopy: input.RequireEligibleCopy && input.CommitAttemptID == "",
 			})
 			if err != nil {
 				return err

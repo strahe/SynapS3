@@ -30,6 +30,10 @@ func TestStorageCommitReservationsEnforceCapacityAndFIFO(t *testing.T) {
 			t.Fatalf("reserve copy %d = %#v err=%v, want acquired", i, result, err)
 		}
 	}
+	active, err := repos.Uploads.CountActiveCommitAttemptsForDataSet(t.Context(), dataSet.ID)
+	if err != nil || active != storagecommit.MaxActiveAttemptsPerDataSet {
+		t.Fatalf("active reservations = %d err=%v, want %d", active, err, storagecommit.MaxActiveAttemptsPerDataSet)
+	}
 	fifth, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
 		Copy: commitCopyIdentity(copies[4]), AttemptID: "attempt-4", Now: base.Add(4 * time.Second),
 	})
@@ -47,6 +51,28 @@ func TestStorageCommitReservationsEnforceCapacityAndFIFO(t *testing.T) {
 	})
 	if err != nil || fifth.State != storagecommit.ReservationAcquired {
 		t.Fatalf("fifth reservation after release = %#v err=%v, want acquired", fifth, err)
+	}
+}
+
+func TestStorageCommitReservationAllowsBoundDrainingGeneration(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "commit-draining-generation-bucket")
+	dataSet := seedCommitDataSet(t, db, bucket.ID)
+	copyRow := seedCommitCopies(t, db, bucket.ID, dataSet.ID, 1)[0]
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("is_current = ?", false).
+		Set("status = ?", model.StorageDataSetStatusDraining).
+		Where("id = ?", dataSet.ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("drain data set: %v", err)
+	}
+
+	result, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: commitCopyIdentity(copyRow), AttemptID: "draining-attempt",
+	})
+	if err != nil || result.State != storagecommit.ReservationAcquired {
+		t.Fatalf("draining reservation = %#v err=%v, want acquired", result, err)
 	}
 }
 
@@ -172,18 +198,37 @@ func TestStorageCommitAttentionRequiresAcknowledgedFencedRelease(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("mark attention: %v", err)
 	}
+	stage := "peer_commit"
+	waitReason := model.TaskWaitReasonExternalConfirmation
+	legacyTask := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: 1,
+		RefVersionID: "legacy-confirmation", IdempotencyKey: "legacy-confirmation-task",
+		Payload: map[string]interface{}{
+			"upload_id": copyRow.UploadID, "copy_index": copyRow.CopyIndex,
+		},
+		Status: model.TaskStatusWaiting, WaitReason: &waitReason,
+		ScheduledAt: time.Now().Add(24 * time.Hour),
+	}
+	if _, err := db.NewInsert().Model(legacyTask).Exec(t.Context()); err != nil {
+		t.Fatalf("insert legacy confirmation task: %v", err)
+	}
 	records, err := repos.Uploads.ListCommitAttention(t.Context(), 10)
 	if err != nil || len(records) != 1 || records[0].CopyID != copyRow.ID ||
 		records[0].Code != storagecommit.AttentionAttemptOnlyAmbiguous {
 		t.Fatalf("attention records = %#v err=%v", records, err)
 	}
 	if err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
-		CopyID: copyRow.ID,
+		CopyID: copyRow.ID, ExpectedAttemptID: "attention-attempt",
 	}); !errors.Is(err, repository.ErrInvalidInput) {
 		t.Fatalf("unacknowledged release error = %v, want invalid input", err)
 	}
 	if err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
-		CopyID: copyRow.ID, AcknowledgePossibleDuplicate: true,
+		CopyID: copyRow.ID, ExpectedAttemptID: "stale-attempt", AcknowledgePossibleDuplicate: true,
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("stale attempt release error = %v, want conflict", err)
+	}
+	if err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
+		CopyID: copyRow.ID, ExpectedAttemptID: "attention-attempt", AcknowledgePossibleDuplicate: true,
 	}); err != nil {
 		t.Fatalf("acknowledged release: %v", err)
 	}
@@ -196,6 +241,13 @@ func TestStorageCommitAttentionRequiresAcknowledgedFencedRelease(t *testing.T) {
 		persisted.CommitSubmissionJSON != nil || persisted.CommitAttentionAt != nil ||
 		persisted.CommitAttentionCode != nil {
 		t.Fatalf("released copy = %#v", persisted)
+	}
+	persistedTask := new(model.Task)
+	if err := db.NewSelect().Model(persistedTask).Where("id = ?", legacyTask.ID).Scan(t.Context()); err != nil {
+		t.Fatalf("reload legacy confirmation task: %v", err)
+	}
+	if persistedTask.Status != model.TaskStatusScheduled || persistedTask.WaitReason != nil || persistedTask.ScheduledAt.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("legacy confirmation task was not woken: %#v", persistedTask)
 	}
 }
 

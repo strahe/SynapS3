@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 )
 
 const durableStorageCommitMigration2026083001 = "2026083001_durable_storage_commits"
@@ -53,14 +54,18 @@ func up2026083001DurableStorageCommits(ctx context.Context, db bun.IDB) error {
 	if err := assertDurableStorageCommitUpgradePreconditions2026083001(ctx, db); err != nil {
 		return err
 	}
+	timestampType := "TIMESTAMP"
+	if db.Dialect().Name() == dialect.PG {
+		timestampType = "TIMESTAMPTZ"
+	}
 	statements := []string{
-		"ALTER TABLE storage_upload_copies ADD COLUMN commit_ready_at TIMESTAMP",
+		"ALTER TABLE storage_upload_copies ADD COLUMN commit_ready_at " + timestampType,
 		"ALTER TABLE storage_upload_copies ADD COLUMN commit_attempt_id TEXT",
-		"ALTER TABLE storage_upload_copies ADD COLUMN commit_attempted_at TIMESTAMP",
+		"ALTER TABLE storage_upload_copies ADD COLUMN commit_attempted_at " + timestampType,
 		"ALTER TABLE storage_upload_copies ADD COLUMN commit_submission_json TEXT",
 		"ALTER TABLE storage_upload_copies ADD COLUMN commit_confirmed_transaction_id TEXT",
 		"ALTER TABLE storage_upload_copies ADD COLUMN commit_attention_code TEXT",
-		"ALTER TABLE storage_upload_copies ADD COLUMN commit_attention_at TIMESTAMP",
+		"ALTER TABLE storage_upload_copies ADD COLUMN commit_attention_at " + timestampType,
 		`CREATE INDEX idx_storage_upload_copies_commit_attempt_data_set
 			ON storage_upload_copies (storage_data_set_id, commit_attempt_id)
 			WHERE commit_attempt_id IS NOT NULL`,

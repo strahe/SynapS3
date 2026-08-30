@@ -58,8 +58,8 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("secondary PresignForCommit: %v", err)
 	}
-	if _, err := contexts[1].Commit(ctx, storage.CommitRequest{Pieces: []storage.PieceInput{piece}, ExtraData: extra}); !errors.Is(err, errInvalidFilecoinSequence) {
-		t.Fatalf("secondary Commit before Pull error = %v, want invalid sequence", err)
+	if _, err := contexts[1].SubmitCommit(ctx, storage.CommitRequest{Pieces: []storage.PieceInput{piece}, ExtraData: extra}); !errors.Is(err, errInvalidFilecoinSequence) {
+		t.Fatalf("secondary SubmitCommit before Pull error = %v, want invalid sequence", err)
 	}
 
 	var wg sync.WaitGroup
@@ -85,8 +85,13 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PresignForCommit provider %s: %v", uploadContext.ProviderID().String(), err)
 		}
-		if _, err := uploadContext.Commit(ctx, storage.CommitRequest{Pieces: []storage.PieceInput{piece}, ExtraData: extra}); err != nil {
-			t.Fatalf("Commit provider %s: %v", uploadContext.ProviderID().String(), err)
+		submission, err := uploadContext.SubmitCommit(ctx, storage.CommitRequest{Pieces: []storage.PieceInput{piece}, ExtraData: extra})
+		if err != nil {
+			t.Fatalf("SubmitCommit provider %s: %v", uploadContext.ProviderID().String(), err)
+		}
+		status, err := uploadContext.GetCommitStatus(ctx, *submission)
+		if err != nil || status == nil || status.State != storage.CommitStateConfirmed || len(status.PieceIDs) != 1 {
+			t.Fatalf("GetCommitStatus provider %s: status=%#v err=%v", uploadContext.ProviderID().String(), status, err)
 		}
 	}
 

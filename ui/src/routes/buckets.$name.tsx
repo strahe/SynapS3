@@ -870,7 +870,18 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 <TableCell className="px-3 font-mono text-xs">{replicaLabel(copy.copy_index)}</TableCell>
                 <TableCell className="px-3">{transferMethodLabel(copy.transfer_method)}</TableCell>
                 <TableCell className="px-3">
-                  <StatusBadge tone={copyStatusTone(copy.status)}>{copyStatusLabel(copy.status)}</StatusBadge>
+                  <StatusBadge tone={copyStatusTone(copy)}>{copyStatusLabel(copy)}</StatusBadge>
+                  {copy.attention_code && (
+                    <div
+                      className="mt-1 max-w-48 text-xs text-muted-foreground"
+                      title={`${copyAttentionLabel(copy.attention_code)}. Review the provider and transaction evidence before releasing this confirmation.${
+                        copy.attention_at ? ` Detected ${copy.attention_at}.` : ''
+                      }`}
+                    >
+                      {copyAttentionLabel(copy.attention_code)}
+                      {copy.attention_at ? ` · ${timeAgo(copy.attention_at)}` : ''}
+                    </div>
+                  )}
                 </TableCell>
                 <TableCell className="px-3">
                   <CopyHealthCell health={copy.health} />
@@ -1115,8 +1126,9 @@ function objectVisualStatus(status: ObjectStatus, uploadStatus?: ObjectUploadSta
   }
 }
 
-function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
-  switch (status) {
+function copyStatusTone(copy: ObjectProvenanceCopy): StatusTone {
+  if (copy.attention_code) return 'warning'
+  switch (copy.status) {
     case 'committed':
       return 'success'
     case 'failed':
@@ -1129,8 +1141,9 @@ function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
   }
 }
 
-function copyStatusLabel(status: ObjectProvenanceCopy['status']) {
-  switch (status) {
+function copyStatusLabel(copy: ObjectProvenanceCopy) {
+  if (copy.attention_code) return 'Needs review'
+  switch (copy.status) {
     case 'pending':
       return 'Waiting'
     case 'piece_ready':
@@ -1141,6 +1154,23 @@ function copyStatusLabel(status: ObjectProvenanceCopy['status']) {
       return 'Stored'
     case 'failed':
       return 'Failed'
+  }
+}
+
+function copyAttentionLabel(code: NonNullable<ObjectProvenanceCopy['attention_code']>) {
+  switch (code) {
+    case 'attempt_only_ambiguous':
+      return 'Submission result unknown'
+    case 'unattributed_piece':
+      return 'Piece ownership unknown'
+    case 'invalid_submission':
+      return 'Saved submission is invalid'
+    case 'submission_mismatch':
+      return 'Confirmation does not match'
+    case 'data_set_unavailable':
+      return 'Data set is unavailable'
+    case 'confirmation_timeout':
+      return 'Confirmation timed out'
   }
 }
 

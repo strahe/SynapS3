@@ -565,6 +565,14 @@ export interface ObjectStatusDetail {
 
 export type ObjectUploadCopyStatus = 'pending' | 'piece_ready' | 'committing' | 'committed' | 'failed'
 
+export type StorageCommitAttentionCode =
+  | 'attempt_only_ambiguous'
+  | 'unattributed_piece'
+  | 'invalid_submission'
+  | 'submission_mismatch'
+  | 'data_set_unavailable'
+  | 'confirmation_timeout'
+
 /** One provider offered for a replacement, with why it cannot be chosen. */
 export interface ReplacementProviderCandidate {
   provider_id: string
@@ -598,6 +606,8 @@ export interface ObjectProvenanceCopy {
   transfer_method: string
   retrieval_url?: string
   is_new_data_set: boolean
+  attention_code?: StorageCommitAttentionCode
+  attention_at?: string
 }
 
 export interface ObjectProvenanceFailure {

@@ -94,6 +94,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
 | Tasks and storage health | task retry, diagnostic refresh, storage provider and data set refresh | Requeues work or refreshes operational status. |
 | Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends the old service. |
+| Storage confirmation | `POST /api/v1/storage-confirmations/{copy-id}/release` | May permit the provider to store the same piece again. Verify the current attempt before releasing it. |
 
 ## Health and Metrics
 
@@ -242,12 +243,6 @@ Each replacement also includes a nested `progress` object. During discovery, `se
 
 `POST /api/v1/storage-replacements/{id}/retry` resumes a `failed` or `cleanup_attention` replacement on the same approved provider.
 
-### Storage confirmation attention
-
-Commit submission and confirmation are persisted separately. A process interruption after the provider may have accepted a piece but before a transaction identity was saved cannot be retried safely: an automatic retry could store the same piece twice. `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists these cases with the copy, data set, attempt, transaction when known, timestamps, and a stable `reason_code`.
-
-`POST /api/v1/storage-confirmations/{copy-id}/release` clears the fenced attempt so normal recovery can continue. The request must contain `{ "acknowledge_possible_duplicate": true }`. Release is irreversible from SynapS3's local evidence and may permit a duplicate submission, so inspect the provider and attempt details first. If confirmation succeeds before release, the attempt settles automatically and disappears from this list.
-
 Choosing a different provider requires a new confirmation, and is only available while the retiring provider still holds the replica. Once the new provider has taken the replica over, each generation holds data the other does not, so confirming again on either one is refused (`replacement_source_not_current` on the old, `replacement_active` on the new) and the approved copy has to be finished with retry.
 
 Conflicts return `409 Conflict` with a stable code:
@@ -264,6 +259,21 @@ The codes are `replacement_active`, `replacement_target_in_use`, `replacement_ta
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists every provider currently reported available with `eligible`, an `ineligible_reason` of `current_source` or `already_serves_bucket`, and `previously_used` for a provider this bucket has used and fully retired. Providers that cannot take the replica are listed rather than omitted, so an operator can see why one they expected is unavailable. It is the same inventory the storage topology reports under the `Available` filter, so a provider listed there is offered here and an unreachable one is offered in neither. Eligibility is the same rule the confirmation enforces. Automatic selection is stricter still: it never returns to a provider this bucket has used, which a manual choice may.
 
 Confirmation only checks what SynapS3 has recorded. A provider that still runs a storage service for this bucket on chain is detected when the replacement prepares its target: the replacement stops at `failed` with the provider and data set named, and the operator confirms again on a different provider. The replica has not moved at that point, so nothing is at risk. A provider whose earlier service for this bucket was retired normally can be chosen again.
+
+### Storage confirmation attention
+
+When SynapS3 cannot determine whether a provider accepted a piece, it does not submit that piece again automatically. `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists the affected copy, data set, attempt, known transaction, timestamps, and stable `reason_code`.
+
+`POST /api/v1/storage-confirmations/{copy-id}/release` lets normal recovery continue and may permit a duplicate submission. Inspect the current list entry first, then send both its attempt ID and the explicit risk acknowledgement:
+
+```json
+{
+  "expected_attempt_id": "current-attempt-id",
+  "acknowledge_possible_duplicate": true
+}
+```
+
+If the attempt changed after it was inspected, the API returns `409 Conflict`. If confirmation succeeds before release, the entry disappears automatically.
 
 ## Tasks
 
