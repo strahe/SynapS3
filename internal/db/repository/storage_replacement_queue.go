@@ -77,9 +77,9 @@ func (r *BunStorageReplacementRepo) ClaimReadyReplacementItem(ctx context.Contex
 			Scan(ctx, &replacementStatus); err != nil {
 			return fmt.Errorf("loading ready replacement status: %w", err)
 		}
-		confirmationOnly := replacementStatus == storagereplacement.StatusFailed ||
+		terminalOnly := replacementStatus == storagereplacement.StatusFailed ||
 			replacementStatus == storagereplacement.StatusSuperseded
-		itemID, err := selectReadyReplacementItemID(ctx, db, replacementID, now, confirmationOnly)
+		itemID, err := selectReadyReplacementItemID(ctx, db, replacementID, now, terminalOnly)
 		if err != nil {
 			return err
 		}
@@ -92,6 +92,13 @@ func (r *BunStorageReplacementRepo) ClaimReadyReplacementItem(ctx context.Contex
 			WHERE id = ?
 			  AND max_retries IS NOT NULL
 			  AND ((status IN (?, ?, ?) AND scheduled_at <= ? AND claimed_at IS NULL)
+			       OR (status = ? AND ? AND scheduled_at <= ? AND claimed_at IS NULL
+			           AND EXISTS (
+			             SELECT 1 FROM storage_upload_copies AS failed_copy
+			             WHERE failed_copy.id = storage_replacement_items.target_copy_id
+			               AND failed_copy.commit_attempt_id IS NOT NULL
+			               AND failed_copy.commit_attempt_id <> ''
+			           ))
 			       OR (status = ? AND lease_until <= ?))
 			RETURNING *`,
 			storagereplacement.ItemStatusRunning, now, now.Add(leaseTTL), now,
@@ -99,6 +106,9 @@ func (r *BunStorageReplacementRepo) ClaimReadyReplacementItem(ctx context.Contex
 			storagereplacement.ItemStatusPending,
 			storagereplacement.ItemStatusRetrying,
 			storagereplacement.ItemStatusWaitingSource,
+			now,
+			storagereplacement.ItemStatusFailed,
+			terminalOnly,
 			now,
 			storagereplacement.ItemStatusRunning,
 			now,
@@ -175,12 +185,18 @@ func readyReplacementSelectionSQL(dialectName dialect.Name) string {
 		        FROM storage_replacement_items AS due_item
 		        JOIN storage_upload_copies AS due_copy ON due_copy.id = due_item.target_copy_id
 		        WHERE due_item.replacement_id = replacement.id
-		          AND due_item.status IN ('pending', 'retrying', 'waiting_source')
+		          AND (due_item.status IN ('pending', 'retrying', 'waiting_source')
+		               OR (due_item.status = 'failed'
+		                   AND due_copy.commit_attempt_id IS NOT NULL
+		                   AND due_copy.commit_attempt_id <> ''))
 		          AND due_item.scheduled_at <= ?
 		          AND due_item.claimed_at IS NULL
 		          AND due_item.max_retries IS NOT NULL
-		          AND due_copy.commit_attempt_id IS NOT NULL
-		          AND due_copy.commit_attempt_id <> ''
+		          AND ((due_copy.commit_attempt_id IS NOT NULL AND due_copy.commit_attempt_id <> '')
+		               OR (due_copy.status = 'piece_ready'
+		                   AND due_copy.commit_ready_at IS NOT NULL
+		                   AND due_copy.commit_attempt_id IS NULL
+		                   AND due_copy.commit_attempted_at IS NULL))
 		      ) OR EXISTS (
 		        SELECT 1
 		        FROM storage_replacement_items AS expired_item
@@ -189,8 +205,11 @@ func readyReplacementSelectionSQL(dialectName dialect.Name) string {
 		          AND expired_item.status = 'running'
 		          AND expired_item.lease_until <= ?
 		          AND expired_item.max_retries IS NOT NULL
-		          AND expired_copy.commit_attempt_id IS NOT NULL
-		          AND expired_copy.commit_attempt_id <> ''
+		          AND ((expired_copy.commit_attempt_id IS NOT NULL AND expired_copy.commit_attempt_id <> '')
+		               OR (expired_copy.status = 'piece_ready'
+		                   AND expired_copy.commit_ready_at IS NOT NULL
+		                   AND expired_copy.commit_attempt_id IS NULL
+		                   AND expired_copy.commit_attempted_at IS NULL))
 		      ))))
 		ORDER BY CASE WHEN replacement.last_dispatched_at IS NULL THEN 0 ELSE 1 END,
 		         replacement.last_dispatched_at ASC,
@@ -215,16 +234,16 @@ func selectReadyReplacementItemID(
 	db bun.IDB,
 	replacementID int64,
 	now time.Time,
-	confirmationOnly bool,
+	terminalOnly bool,
 ) (int64, error) {
-	due, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementDueItemSQL(confirmationOnly),
+	due, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementDueItemSQL(terminalOnly),
 		replacementID,
 		now,
 	)
 	if err != nil {
 		return 0, err
 	}
-	expired, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementExpiredItemSQL(confirmationOnly),
+	expired, err := selectReadyReplacementItemCandidate(ctx, db, readyReplacementExpiredItemSQL(terminalOnly),
 		replacementID,
 		now,
 	)
@@ -243,18 +262,24 @@ func selectReadyReplacementItemID(
 	return expired.ID, nil
 }
 
-func readyReplacementDueItemSQL(confirmationOnly bool) string {
-	if confirmationOnly {
+func readyReplacementDueItemSQL(terminalOnly bool) string {
+	if terminalOnly {
 		return `SELECT item.id, item.scheduled_at AS ready_at
 			FROM storage_replacement_items AS item
 			JOIN storage_upload_copies AS storage_copy ON storage_copy.id = item.target_copy_id
 			WHERE item.replacement_id = ?
-			  AND item.status IN ('pending', 'retrying', 'waiting_source')
+			  AND (item.status IN ('pending', 'retrying', 'waiting_source')
+			       OR (item.status = 'failed'
+			           AND storage_copy.commit_attempt_id IS NOT NULL
+			           AND storage_copy.commit_attempt_id <> ''))
 			  AND item.scheduled_at <= ?
 			  AND item.claimed_at IS NULL
 			  AND item.max_retries IS NOT NULL
-			  AND storage_copy.commit_attempt_id IS NOT NULL
-			  AND storage_copy.commit_attempt_id <> ''
+			  AND ((storage_copy.commit_attempt_id IS NOT NULL AND storage_copy.commit_attempt_id <> '')
+			       OR (storage_copy.status = 'piece_ready'
+			           AND storage_copy.commit_ready_at IS NOT NULL
+			           AND storage_copy.commit_attempt_id IS NULL
+			           AND storage_copy.commit_attempted_at IS NULL))
 			ORDER BY item.scheduled_at ASC, item.id ASC
 			LIMIT 1`
 	}
@@ -269,8 +294,8 @@ func readyReplacementDueItemSQL(confirmationOnly bool) string {
 		LIMIT 1`
 }
 
-func readyReplacementExpiredItemSQL(confirmationOnly bool) string {
-	if confirmationOnly {
+func readyReplacementExpiredItemSQL(terminalOnly bool) string {
+	if terminalOnly {
 		return `SELECT item.id, item.lease_until AS ready_at
 			FROM storage_replacement_items AS item
 			JOIN storage_upload_copies AS storage_copy ON storage_copy.id = item.target_copy_id
@@ -278,8 +303,11 @@ func readyReplacementExpiredItemSQL(confirmationOnly bool) string {
 			  AND item.status = 'running'
 			  AND item.lease_until <= ?
 			  AND item.max_retries IS NOT NULL
-			  AND storage_copy.commit_attempt_id IS NOT NULL
-			  AND storage_copy.commit_attempt_id <> ''
+			  AND ((storage_copy.commit_attempt_id IS NOT NULL AND storage_copy.commit_attempt_id <> '')
+			       OR (storage_copy.status = 'piece_ready'
+			           AND storage_copy.commit_ready_at IS NOT NULL
+			           AND storage_copy.commit_attempt_id IS NULL
+			           AND storage_copy.commit_attempted_at IS NULL))
 			ORDER BY item.lease_until ASC, item.id ASC
 			LIMIT 1`
 	}
@@ -357,16 +385,20 @@ func (r *BunStorageReplacementRepo) ReleaseReplacementItemClaim(ctx context.Cont
 
 func (r *BunStorageReplacementRepo) CancelReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error {
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		now := time.Now()
 		item := new(storagereplacement.Item)
-		if err := db.NewSelect().Model(item).
-			Where("id = ? AND status = ? AND claimed_at = ?", token.ItemID, storagereplacement.ItemStatusRunning, token.ClaimedAt).
-			Scan(ctx); err != nil {
+		err := db.NewRaw(`UPDATE storage_replacement_items
+			SET status = ?, claimed_at = NULL, lease_until = NULL, updated_at = ?
+			WHERE id = ? AND status = ? AND claimed_at = ? AND lease_until > ?
+			RETURNING *`, storagereplacement.ItemStatusCancelled, now, token.ItemID,
+			storagereplacement.ItemStatusRunning, token.ClaimedAt, now).Scan(ctx, item)
+		if err != nil {
 			if err == sql.ErrNoRows {
 				return ErrItemClaimLost
 			}
-			return fmt.Errorf("loading replacement item for cancellation: %w", err)
+			return fmt.Errorf("cancelling replacement item claim: %w", err)
 		}
-		return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
+		return clearUnattemptedReplacementReservation(ctx, db, item.TargetCopyID, now)
 	})
 }
 
@@ -464,6 +496,9 @@ func (r *BunStorageReplacementRepo) RetryReplacementItemClaim(
 		}
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return ErrItemClaimLost
+		}
+		if status == storagereplacement.ItemStatusFailed {
+			return clearUnattemptedReplacementReservation(ctx, db, item.TargetCopyID, now)
 		}
 		return nil
 	})

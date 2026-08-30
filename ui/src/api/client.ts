@@ -606,7 +606,7 @@ export interface ObjectProvenanceCopy {
   transfer_method: string
   retrieval_url?: string
   is_new_data_set: boolean
-  attention_code?: StorageCommitAttentionCode
+  attention_code?: string
   attention_at?: string
 }
 

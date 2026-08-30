@@ -967,7 +967,7 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 				writeAdminTestJSON(t, w, http.StatusOK, []map[string]any{{
 					"copy_id": 42, "upload_id": 7, "copy_index": 1,
 					"data_set_row_id": 9, "provider_id": "provider-1", "data_set_id": "dataset-1",
-					"attempt_id": "attempt-1", "transaction_id": "0xcommit",
+					"piece_cid": "bafy-piece-1", "attempt_id": "attempt-1", "transaction_id": "0xcommit",
 					"reason_code":  "attempt_only_ambiguous",
 					"attempted_at": "2026-08-30T01:00:00Z", "attention_at": "2026-08-30T01:00:01Z",
 				}})
@@ -991,7 +991,9 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 		if err != nil {
 			t.Fatalf("storage-confirmation list: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "attempt_only_ambiguous") || !strings.Contains(out, "provider-1") ||
+		if !strings.Contains(out, "PIECE CID") || !strings.Contains(out, "ATTEMPTED AT") ||
+			!strings.Contains(out, "bafy-piece-1") || !strings.Contains(out, "2026-08-30T01:00:00Z") ||
+			!strings.Contains(out, "attempt_only_ambiguous") || !strings.Contains(out, "provider-1") ||
 			!strings.Contains(out, "attempt-1") || !strings.Contains(out, "0xcommit") {
 			t.Fatalf("list output missing confirmation details:\n%s", out)
 		}

@@ -299,7 +299,11 @@ func (w *StorageCleanupWorker) waitForReplacementRetirement(
 		logger.Warn("failed to record retirement wait reason", "reason", reason, "error", err)
 	}
 	logger.Debug("retirement gate is blocked", "blockers", gate.Blockers)
-	w.waitForReferences(ctx, task, logger, reason.Message())
+	message := reason.Message()
+	if gate.ActiveAttempts > 0 {
+		message = "Waiting for storage confirmations"
+	}
+	w.waitForReferences(ctx, task, logger, message)
 }
 
 // retirementWaitReason names the first blocker so the operator sees the reason
@@ -309,6 +313,8 @@ func retirementWaitReason(gate repository.RetirementGate) storagereplacement.Wai
 		return storagereplacement.WaitReasonCoverage
 	}
 	switch {
+	case gate.ActiveAttempts > 0:
+		return storagereplacement.WaitReasonProvider
 	case gate.WaitingItems > 0:
 		return storagereplacement.WaitReasonReadableSource
 	case gate.CoverageGaps > 0:

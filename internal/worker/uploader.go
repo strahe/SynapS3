@@ -1640,7 +1640,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 		return
 	}
 	if err != nil {
-		u.handleTaskFailure(ctx, task, logger, "advance ingress commit", err)
+		u.handleCommitTaskFailure(ctx, task, copyRow, logger, "advance ingress commit", err)
 		return
 	}
 	switch {
@@ -2059,7 +2059,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 		return
 	}
 	if err != nil {
-		u.handleTaskFailure(ctx, task, logger, "advance peer commit", err)
+		u.handleCommitTaskFailure(ctx, task, copyRow, logger, "advance peer commit", err)
 		return
 	}
 	switch {
@@ -3166,6 +3166,93 @@ func (u *Uploader) handleTaskFailure(ctx context.Context, task *model.Task, logg
 	scheduleTaskRetry(ctx, u.repos, task, "uploader", logger, err)
 	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 }
+
+func (u *Uploader) handleCommitTaskFailure(
+	ctx context.Context,
+	task *model.Task,
+	copyRow *model.StorageUploadCopy,
+	logger *slog.Logger,
+	stage string,
+	err error,
+) {
+	logger.Error(stage+" failed", "error", err)
+	if task == nil || task.RetryCount+1 < task.MaxRetries || copyRow == nil || copyRow.StorageDataSetID == nil {
+		scheduleTaskRetry(ctx, u.repos, task, "uploader", logger, err)
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		return
+	}
+
+	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalFailureCleanupTimeout)
+	defer cancel()
+	identity := storagecommit.CopyIdentity{
+		StorageUploadCopyID: copyRow.ID,
+		UploadID:            copyRow.UploadID,
+		CopyIndex:           copyRow.CopyIndex,
+		StorageDataSetID:    *copyRow.StorageDataSetID,
+	}
+	status := model.TaskStatus("")
+	retryErr := u.repos.WithTx(terminalCtx, func(txRepos *repository.Repositories) error {
+		fresh, loadErr := txRepos.Uploads.GetUploadCopyByID(terminalCtx, copyRow.ID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if fresh == nil || fresh.StorageDataSetID == nil || *fresh.StorageDataSetID != identity.StorageDataSetID {
+			return repository.ErrConflict
+		}
+		if fresh.CommitAttemptID != nil && *fresh.CommitAttemptID != "" {
+			if fresh.CommitAttemptedAt != nil {
+				return errCommitAttemptBecameActive
+			}
+			if releaseErr := txRepos.Uploads.ReleaseCommitAttempt(terminalCtx, storagecommit.ReleaseInput{
+				Copy:           identity,
+				AttemptID:      *fresh.CommitAttemptID,
+				ClearReadyAt:   true,
+				ClearExtraData: true,
+			}); releaseErr != nil {
+				return releaseErr
+			}
+		} else if releaseErr := txRepos.Uploads.ReleaseCommitReservation(terminalCtx, storagecommit.ReservationReleaseInput{
+			Copy:           identity,
+			ClearReadyAt:   true,
+			ClearExtraData: true,
+		}); releaseErr != nil {
+			return releaseErr
+		}
+		var scheduleErr error
+		status, scheduleErr = txRepos.Tasks.ScheduleRetryRunning(
+			terminalCtx, task, err.Error(), retryDelay(task.RetryCount),
+		)
+		if scheduleErr != nil {
+			return scheduleErr
+		}
+		if status != model.TaskStatusExhausted {
+			return errCommitRetryDidNotExhaust
+		}
+		return nil
+	})
+	if retryErr != nil {
+		fresh, loadErr := u.repos.Uploads.GetUploadCopyByID(terminalCtx, copyRow.ID)
+		if loadErr == nil && fresh != nil && fresh.CommitAttemptID != nil && *fresh.CommitAttemptID != "" &&
+			fresh.CommitAttemptedAt != nil {
+			logger.Warn("storage commit became externally observable before task exhaustion",
+				"stage", stage, "attemptID", *fresh.CommitAttemptID)
+			u.waitForCommitAdvance(terminalCtx, task, logger, storagecommit.AdvanceResult{
+				State: storagecommit.AdvancePending, AttemptID: *fresh.CommitAttemptID,
+			})
+			return
+		}
+		logger.Error("failed to exhaust commit task and release its reservation", "error", retryErr)
+		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+		return
+	}
+	admin.TasksExhaustedTotal.WithLabelValues("uploader", string(task.Type)).Inc()
+	admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
+}
+
+var (
+	errCommitAttemptBecameActive = errors.New("storage commit attempt became active")
+	errCommitRetryDidNotExhaust  = errors.New("storage commit retry did not exhaust")
+)
 
 func (u *Uploader) handleFailure(ctx context.Context, task *model.Task, version *model.ObjectVersion, logger *slog.Logger, stage string, err error) model.TaskStatus {
 	logger.Error(stage+" failed", "error", err)

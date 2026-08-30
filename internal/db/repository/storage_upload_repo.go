@@ -1521,18 +1521,46 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			if input.RequireEligibleCopy {
-				return fmt.Errorf("marking storage upload copy piece ready: %w", ErrConflict)
-			}
 			var status model.StorageUploadCopyStatus
 			if err := db.NewSelect().Model((*model.StorageUploadCopy)(nil)).
 				Column("status").Where("id = ?", copyID).Scan(ctx, &status); err != nil {
 				return fmt.Errorf("loading storage upload copy after piece evidence conflict: %w", err)
 			}
+			if status == model.StorageUploadCopyStatusCommitting {
+				compatible := db.NewSelect().
+					Model((*model.StorageUploadCopy)(nil)).
+					Where("id = ?", copyID).
+					Where("status = ?", model.StorageUploadCopyStatusCommitting).
+					Where("commit_attempt_id IS NOT NULL AND commit_attempt_id <> ''").
+					Where("commit_attempted_at IS NOT NULL")
+				if input.PieceCID != "" {
+					compatible = compatible.Where(`EXISTS (
+						SELECT 1 FROM storage_uploads AS evidence_upload
+						WHERE evidence_upload.id = ?
+						  AND evidence_upload.piece_cid = ?
+					)`, input.UploadID, input.PieceCID)
+				}
+				if input.PieceID != nil {
+					compatible = compatible.Where("piece_id = ?", input.PieceID)
+				}
+				if input.RetrievalURL != "" {
+					compatible = compatible.Where("retrieval_url = ?", input.RetrievalURL)
+				}
+				if input.CommitExtraDataHex != "" {
+					compatible = compatible.Where("commit_extra_data_hex = ?", input.CommitExtraDataHex)
+				}
+				count, err := compatible.Count(ctx)
+				if err != nil {
+					return fmt.Errorf("checking idempotent piece evidence for committing copy: %w", err)
+				}
+				if count == 1 {
+					return nil
+				}
+			}
 			// A late piece-ready result cannot regress a committed copy. Treat that
 			// stale observation as a harmless no-op; every other zero-row result is
 			// conflicting monotonic evidence and must stop before Commit.
-			if status == model.StorageUploadCopyStatusCommitted {
+			if status == model.StorageUploadCopyStatusCommitted && !input.RequireEligibleCopy {
 				return nil
 			}
 			return fmt.Errorf("marking storage upload copy piece ready: %w", ErrConflict)

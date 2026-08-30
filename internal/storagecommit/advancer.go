@@ -348,12 +348,14 @@ func (a *Advancer) observeTransaction(
 	if checker == nil {
 		checker = synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{Timeout: a.requestTimeout()})
 	}
-	result, err := checker.GetAddPiecesStatus(ctx, synapse.AddPiecesStatusInput{
+	requestCtx, cancel := context.WithTimeout(ctx, a.requestTimeout())
+	result, err := checker.GetAddPiecesStatus(requestCtx, synapse.AddPiecesStatusInput{
 		ServiceURL:         input.Target.ServiceURL(),
 		DataSetID:          input.Binding.DataSetID.String(),
 		TransactionID:      transactionID,
 		ExpectedPieceCount: len(input.Pieces),
 	})
+	cancel()
 	if err != nil {
 		if context.Cause(ctx) != nil {
 			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil

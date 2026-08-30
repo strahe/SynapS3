@@ -216,6 +216,22 @@ func TestPostgresStorageReplacementSchemaParity(t *testing.T) {
 	if err := repos.Replacements.RenewReplacementItemLease(ctx, stale, time.Minute); !errors.Is(err, repository.ErrItemClaimLost) {
 		t.Fatalf("PostgreSQL stale item renewal = %v, want ErrItemClaimLost", err)
 	}
+	if err := repos.Replacements.CancelReplacementItemClaim(ctx, stale); !errors.Is(err, repository.ErrItemClaimLost) {
+		t.Fatalf("PostgreSQL stale item cancellation = %v, want ErrItemClaimLost", err)
+	}
+	var preserved storagereplacement.Item
+	if err := db.NewSelect().Model(&preserved).Where("id = ?", claimed.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload PostgreSQL item claim: %v", err)
+	}
+	if preserved.Status != storagereplacement.ItemStatusRunning || preserved.ClaimedAt == nil ||
+		!preserved.ClaimedAt.Equal(*claimed.ClaimedAt) {
+		t.Fatalf("PostgreSQL stale cancellation changed the active claim: %#v", preserved)
+	}
+	if err := repos.Replacements.CancelReplacementItemClaim(ctx, storagereplacement.ClaimToken{
+		ItemID: claimed.ID, ClaimedAt: *claimed.ClaimedAt,
+	}); err != nil {
+		t.Fatalf("PostgreSQL current item cancellation: %v", err)
+	}
 }
 
 func TestPostgresConcurrentItemClaimsReserveReplacementFairnessSlot(t *testing.T) {

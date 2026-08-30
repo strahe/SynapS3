@@ -1478,19 +1478,21 @@ func writeAdminTaskStatsTable(w io.Writer, stats []adminTaskStatusCount) error {
 
 func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStorageConfirmationAttention) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "COPY ID\tUPLOAD ID\tCOPY\tPROVIDER\tDATA SET\tATTEMPT\tTRANSACTION\tREASON\tATTENTION AT"); err != nil {
+	if _, err := fmt.Fprintln(tw, "COPY ID\tUPLOAD ID\tCOPY\tPROVIDER\tDATA SET\tPIECE CID\tATTEMPT\tATTEMPTED AT\tTRANSACTION\tREASON\tATTENTION AT"); err != nil {
 		return err
 	}
 	for _, confirmation := range confirmations {
 		if _, err := fmt.Fprintf(
 			tw,
-			"%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			"%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			confirmation.CopyID,
 			confirmation.UploadID,
 			confirmation.CopyIndex,
 			confirmation.ProviderID,
 			confirmation.DataSetID,
+			confirmation.PieceCID,
 			confirmation.AttemptID,
+			confirmation.AttemptedAt,
 			confirmation.TransactionID,
 			confirmation.ReasonCode,
 			confirmation.AttentionAt,

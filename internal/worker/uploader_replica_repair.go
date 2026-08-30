@@ -370,7 +370,10 @@ func (u *Uploader) repairReplicaCopy(
 		return nil
 	}
 	if err != nil {
-		return err
+		// Commit failures own their task transition here so final exhaustion can
+		// clear an unsubmitted FIFO reservation in the same transaction.
+		u.handleCommitTaskFailure(ctx, task, copyRow, logger, "advance replica repair commit", err)
+		return nil
 	}
 	switch {
 	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:

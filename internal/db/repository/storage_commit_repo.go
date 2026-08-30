@@ -336,6 +336,7 @@ func (r *BunStorageUploadRepo) ReleaseCommitReservation(
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("updated_at = ?", commitInputTime(input.Now)).
 			Where("id = ?", copyID).
+			Where("status = ?", model.StorageUploadCopyStatusPieceReady).
 			Where("commit_attempt_id IS NULL").
 			Where("commit_attempted_at IS NULL")
 		if input.ClearReadyAt {
@@ -484,14 +485,13 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
-		var recovered int64
 		copyIDExpr := taskPayloadCopyIDSQL(db.Dialect().Name())
 		uploadIDExpr, copyIndexExpr := runningUploadCopyTaskPayloadExpressions(db.Dialect().Name())
 		copyTaskMatch := fmt.Sprintf(
 			"(%[1]s = ? OR ((%[1]s IS NULL OR %[1]s = 0) AND %[2]s = ? AND %[3]s = ?))",
 			copyIDExpr("task"), uploadIDExpr, copyIndexExpr,
 		)
-		res, err = db.NewUpdate().
+		_, err = db.NewUpdate().
 			Model((*model.Task)(nil)).
 			Set("status = ?", model.TaskStatusScheduled).
 			Set("scheduled_at = ?", now).
@@ -506,9 +506,7 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 		if err != nil {
 			return fmt.Errorf("waking storage confirmation task: %w", err)
 		}
-		rows, _ := res.RowsAffected()
-		recovered += rows
-		res, err = db.NewUpdate().
+		_, err = db.NewUpdate().
 			Model((*storagereplacement.Item)(nil)).
 			Set("status = ?", storagereplacement.ItemStatusCancelled).
 			Set("scheduled_at = ?", now).
@@ -525,9 +523,7 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 		if err != nil {
 			return fmt.Errorf("settling terminal replacement confirmation item: %w", err)
 		}
-		rows, _ = res.RowsAffected()
-		recovered += rows
-		res, err = db.NewUpdate().
+		_, err = db.NewUpdate().
 			Model((*storagereplacement.Item)(nil)).
 			Set("status = ?", storagereplacement.ItemStatusFailed).
 			Set("scheduled_at = ?", now).
@@ -544,9 +540,7 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 		if err != nil {
 			return fmt.Errorf("holding failed replacement confirmation item: %w", err)
 		}
-		rows, _ = res.RowsAffected()
-		recovered += rows
-		res, err = db.NewUpdate().
+		_, err = db.NewUpdate().
 			Model((*storagereplacement.Item)(nil)).
 			Set("status = ?", storagereplacement.ItemStatusPending).
 			Set("scheduled_at = ?", now).
@@ -563,11 +557,6 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("waking replacement confirmation item: %w", err)
-		}
-		rows, _ = res.RowsAffected()
-		recovered += rows
-		if recovered == 0 {
-			return fmt.Errorf("releasing storage confirmation attention without recoverable work: %w", ErrConflict)
 		}
 		return nil
 	})

@@ -76,6 +76,40 @@ func TestStorageCommitReservationAllowsBoundDrainingGeneration(t *testing.T) {
 	}
 }
 
+func TestStorageCommitReservationReleaseRejectsCommittedCopy(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "commit-release-committed-bucket")
+	dataSet := seedCommitDataSet(t, db, bucket.ID)
+	copyRow := seedCommitCopies(t, db, bucket.ID, dataSet.ID, 1)[0]
+	pieceID := onChainID(t, "2001")
+	if err := repos.Uploads.MarkUploadCopyCommitted(t.Context(), repository.MarkUploadCopyCommittedInput{
+		StorageUploadCopyID: copyRow.ID,
+		UploadID:            copyRow.UploadID,
+		CopyIndex:           copyRow.CopyIndex,
+		PieceCID:            "bafkqaaa",
+		PieceID:             &pieceID,
+		RetrievalURL:        "https://provider.example/piece",
+		CommitExtraDataHex:  "abcd",
+		CommitTransactionID: "0xcommitted",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+
+	err := repos.Uploads.ReleaseCommitReservation(t.Context(), storagecommit.ReservationReleaseInput{
+		Copy: commitCopyIdentity(copyRow), ClearReadyAt: true, ClearExtraData: true,
+	})
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("release committed reservation error = %v, want conflict", err)
+	}
+	persisted, err := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+	if err != nil || persisted == nil || persisted.Status != model.StorageUploadCopyStatusCommitted ||
+		persisted.CommitExtraDataHex == nil || *persisted.CommitExtraDataHex != "abcd" ||
+		persisted.CommitTransactionID == nil || *persisted.CommitTransactionID != "0xcommitted" {
+		t.Fatalf("committed evidence after reservation release = %#v err=%v", persisted, err)
+	}
+}
+
 func TestSQLiteConcurrentStorageCommitReservationsRespectCapacity(t *testing.T) {
 	assertConcurrentStorageCommitReservationsRespectCapacity(t, concurrentTestDB(t))
 }
@@ -149,6 +183,17 @@ func TestStorageCommitAttemptFenceBlocksAutomaticFailure(t *testing.T) {
 	dataSet := seedCommitDataSet(t, db, bucket.ID)
 	copyRow := seedCommitCopies(t, db, bucket.ID, dataSet.ID, 1)[0]
 	identity := commitCopyIdentity(copyRow)
+	readyEvidence := repository.MarkUploadCopyPieceReadyInput{
+		StorageUploadCopyID: copyRow.ID,
+		UploadID:            copyRow.UploadID,
+		CopyIndex:           copyRow.CopyIndex,
+		PieceCID:            "bafkqaaa",
+		RetrievalURL:        "https://provider.example/piece",
+		CommitExtraDataHex:  "abcd",
+	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(t.Context(), readyEvidence); err != nil {
+		t.Fatalf("seed piece evidence: %v", err)
+	}
 
 	reservation, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
 		Copy: identity, AttemptID: "attempt-fenced",
@@ -168,15 +213,19 @@ func TestStorageCommitAttemptFenceBlocksAutomaticFailure(t *testing.T) {
 	if !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("MarkUploadCopyFailed error = %v, want conflict", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyPieceReady(t.Context(), repository.MarkUploadCopyPieceReadyInput{
-		StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
-		PieceCID: "bafkqaaa", RetrievalURL: "https://provider.example/late",
-	}); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("late MarkUploadCopyPieceReady error = %v, want conflict", err)
+	if err := repos.Uploads.MarkUploadCopyPieceReady(t.Context(), readyEvidence); err != nil {
+		t.Fatalf("idempotent late MarkUploadCopyPieceReady: %v", err)
+	}
+	conflictingEvidence := readyEvidence
+	conflictingEvidence.RetrievalURL = "https://provider.example/different"
+	if err := repos.Uploads.MarkUploadCopyPieceReady(t.Context(), conflictingEvidence); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("conflicting late MarkUploadCopyPieceReady error = %v, want conflict", err)
 	}
 	persisted, err := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
-	if err != nil || persisted.Status != model.StorageUploadCopyStatusCommitting {
-		t.Fatalf("copy after late piece-ready = %#v err=%v, want committing", persisted, err)
+	if err != nil || persisted.Status != model.StorageUploadCopyStatusCommitting ||
+		persisted.CommitAttemptID == nil || *persisted.CommitAttemptID != "attempt-fenced" ||
+		persisted.CommitAttemptedAt == nil {
+		t.Fatalf("copy after late piece-ready = %#v err=%v, want unchanged attempted fence", persisted, err)
 	}
 	if err := repos.Uploads.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
 		Copy: identity, AttemptID: "attempt-fenced",
@@ -276,7 +325,7 @@ func TestStorageCommitAttentionRequiresAcknowledgedFencedRelease(t *testing.T) {
 	}
 }
 
-func TestStorageCommitAttentionReleaseRequiresRecoverableWork(t *testing.T) {
+func TestStorageCommitAttentionReleaseSucceedsWithoutRecoverableWork(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	bucket := seedBucket(t, db, "commit-attention-orphan-bucket")
@@ -299,15 +348,20 @@ func TestStorageCommitAttentionReleaseRequiresRecoverableWork(t *testing.T) {
 		t.Fatalf("mark attention: %v", err)
 	}
 
-	err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
+	if err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
 		CopyID: copyRow.ID, ExpectedAttemptID: "orphan-attention", AcknowledgePossibleDuplicate: true,
-	})
-	if !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("orphan release error = %v, want conflict", err)
+	}); err != nil {
+		t.Fatalf("orphan release: %v", err)
 	}
 	persisted, loadErr := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
-	if loadErr != nil || persisted.CommitAttemptID == nil || persisted.CommitAttentionAt == nil {
-		t.Fatalf("orphan release did not roll back: copy=%#v err=%v", persisted, loadErr)
+	if loadErr != nil || persisted.CommitAttemptID != nil || persisted.CommitAttentionAt != nil ||
+		persisted.Status != model.StorageUploadCopyStatusPieceReady {
+		t.Fatalf("orphan release did not clear the fence: copy=%#v err=%v", persisted, loadErr)
+	}
+	if err := repos.Uploads.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
+		CopyID: copyRow.ID, ExpectedAttemptID: "orphan-attention", AcknowledgePossibleDuplicate: true,
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("replayed orphan release error = %v, want conflict", err)
 	}
 }
 

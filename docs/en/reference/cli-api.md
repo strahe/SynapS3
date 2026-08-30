@@ -101,7 +101,7 @@ Task listing supports `--type`, `--stage`, `--status`, `--limit`, and `--offset`
 
 `synaps3 admin task retry` does not retry provider replacement work. Use **Open Data Sets** from a finished or stopped replacement task, or open the bucket and go to **Details** → **Storage** → **Data Sets**. If the selected provider already stores this bucket, choose a different provider instead of retrying.
 
-`synaps3 admin storage-confirmation list` shows storage confirmations that need review. After checking the provider, transaction, and current attempt, `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes` acknowledges that the provider may already have accepted the piece and permits normal recovery to submit again. A stale attempt ID is refused.
+`synaps3 admin storage-confirmation list` shows storage confirmations that need review. Verify the piece CID, provider, current attempt ID, attempted time, and any available transaction evidence before running `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes`; release only if you accept that the provider may already store the piece and resubmission may create duplicate paid storage. A stale attempt ID is refused.
 
 Cache eviction policy accepts `lru`, `after_upload`, or `none`. LRU watermarks must satisfy `0 <= low < high <= 100`; these settings are retained but inactive under the other policies.
 

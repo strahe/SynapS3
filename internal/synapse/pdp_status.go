@@ -321,10 +321,7 @@ func classifyAddPiecesStatus(txStatus string, piecesAdded bool, pieceCount, expe
 		if pieceCount != expectedPieceCount {
 			return PDPStatusMismatch
 		}
-		if confirmedPieceIDCount < expectedPieceCount {
-			return PDPStatusPending
-		}
-		if confirmedPieceIDCount > expectedPieceCount {
+		if confirmedPieceIDCount != expectedPieceCount {
 			return PDPStatusMismatch
 		}
 		return PDPStatusConfirmed

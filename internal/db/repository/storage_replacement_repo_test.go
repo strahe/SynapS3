@@ -513,6 +513,9 @@ func TestStorageReplacementRepo_ExpiredLeaseIsRecoveredAndFenced(t *testing.T) {
 	}
 	stale := storagereplacement.ClaimToken{ItemID: item.ID, ClaimedAt: *item.ClaimedAt}
 	mustExec(t, f.db, `UPDATE storage_replacement_items SET lease_until = ? WHERE id = ?`, time.Now().Add(-time.Second), item.ID)
+	if err := f.repos.Replacements.CancelReplacementItemClaim(ctx, stale); !errors.Is(err, repository.ErrItemClaimLost) {
+		t.Fatalf("expired cancellation error = %v, want ErrItemClaimLost", err)
+	}
 	if _, err := f.repos.Replacements.RetryReplacementItemClaim(
 		ctx, stale, time.Now(), "late retry",
 	); !errors.Is(err, repository.ErrItemClaimLost) {
@@ -525,6 +528,17 @@ func TestStorageReplacementRepo_ExpiredLeaseIsRecoveredAndFenced(t *testing.T) {
 	}
 	if reclaimed.ClaimedAt.Equal(stale.ClaimedAt) {
 		t.Fatal("reclaimed item reused the expired fencing token")
+	}
+	if err := f.repos.Replacements.CancelReplacementItemClaim(ctx, stale); !errors.Is(err, repository.ErrItemClaimLost) {
+		t.Fatalf("stale cancellation error = %v, want ErrItemClaimLost", err)
+	}
+	var stillClaimed storagereplacement.Item
+	if err := f.db.NewSelect().Model(&stillClaimed).Where("id = ?", reclaimed.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload reclaimed item: %v", err)
+	}
+	if stillClaimed.Status != storagereplacement.ItemStatusRunning || stillClaimed.ClaimedAt == nil ||
+		!stillClaimed.ClaimedAt.Equal(*reclaimed.ClaimedAt) {
+		t.Fatalf("stale cancellation changed the new claim: %#v", stillClaimed)
 	}
 	if err := f.repos.Replacements.CompleteReplacementItemClaim(ctx, stale); !errors.Is(err, repository.ErrItemClaimLost) {
 		t.Fatalf("stale completion error = %v, want ErrItemClaimLost", err)
@@ -786,12 +800,14 @@ func TestStorageReplacementRepo_ProgressBucketsCommitAttentionExclusively(t *tes
 
 func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		status    storagereplacement.Status
-		attempted bool
-		confirm   bool
+		name         string
+		status       storagereplacement.Status
+		capacityWait bool
+		attempted    bool
+		confirm      bool
 	}{
 		{name: "failed reservation is released", status: storagereplacement.StatusFailed},
+		{name: "failed ready-only reservation is released", status: storagereplacement.StatusFailed, capacityWait: true},
 		{name: "failed submission is recoverable", status: storagereplacement.StatusFailed, attempted: true},
 		{name: "superseded submission is confirmed", status: storagereplacement.StatusSuperseded, attempted: true},
 		{name: "superseded submission settles without live owner", status: storagereplacement.StatusSuperseded, attempted: true, confirm: true},
@@ -838,10 +854,24 @@ func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t
 				CopyIndex: copyRow.CopyIndex, StorageDataSetID: *copyRow.StorageDataSetID,
 				RequireEligibleCopy: true,
 			}
-			if _, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+			if tc.capacityWait {
+				capacityCopies := seedCommitCopies(t, f.db, f.bucket.ID, row.TargetDataSetID, storagecommit.MaxActiveAttemptsPerDataSet)
+				for i := range capacityCopies {
+					if _, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+						Copy: commitCopyIdentity(capacityCopies[i]), AttemptID: fmt.Sprintf("terminal-capacity-%d", i),
+					}); err != nil {
+						t.Fatalf("reserve terminal capacity %d: %v", i, err)
+					}
+				}
+			}
+			reservation, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
 				Copy: identity, AttemptID: "terminal-attempt",
-			}); err != nil {
+			})
+			if err != nil {
 				t.Fatalf("ReserveCommitAttempt: %v", err)
+			}
+			if tc.capacityWait && (reservation.State != storagecommit.ReservationWaiting || reservation.Copy.CommitAttemptID != nil) {
+				t.Fatalf("terminal capacity reservation = %#v, want ready-only wait", reservation)
 			}
 			if tc.attempted {
 				if _, err := f.repos.Uploads.MarkCommitAttempted(ctx, storagecommit.AttemptInput{
@@ -864,6 +894,16 @@ func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t
 			recovered, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
 				ReplacementID: row.ID, ItemID: claimed.ID, ItemClaimedAt: *claimed.ClaimedAt,
 			})
+			if tc.capacityWait {
+				if !errors.Is(err, storagereplacement.ErrItemCancelled) || recovered != nil {
+					t.Fatalf("terminal ready-only settlement = %#v err=%v, want cancellation", recovered, err)
+				}
+				persisted, loadErr := f.repos.Uploads.GetUploadCopyByID(ctx, copyRow.ID)
+				if loadErr != nil || persisted.CommitReadyAt != nil || persisted.CommitExtraDataHex != nil || persisted.CommitAttemptID != nil {
+					t.Fatalf("terminal ready-only copy = %#v err=%v, want cleared reservation", persisted, loadErr)
+				}
+				return
+			}
 			if err != nil || recovered == nil || recovered.Replacement.Status != tc.status {
 				t.Fatalf("terminal recovery snapshot = %#v err=%v", recovered, err)
 			}
@@ -912,6 +952,196 @@ func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t
 				}
 			}
 		})
+	}
+}
+
+func TestStorageReplacementRepo_FinalRetryClearsUnattemptedReservation(t *testing.T) {
+	f := newReplacementFixture(t, "replacement-final-retry-fifo", "01J000000000000000ITEMQ24")
+	ctx := context.Background()
+	row := f.authorize(t, "202")
+	f.readyTarget(t, row, "2002")
+	if err := f.repos.Replacements.Activate(ctx, row.ID); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if _, _, err := f.repos.Replacements.SeedMigrationBatchWithBudget(ctx, row.ID, 10, 0); err != nil {
+		t.Fatalf("SeedMigrationBatchWithBudget: %v", err)
+	}
+	item, err := f.repos.Replacements.ClaimReadyReplacementItem(ctx, time.Minute)
+	if err != nil || item == nil || item.ClaimedAt == nil {
+		t.Fatalf("claim = %#v err=%v", item, err)
+	}
+	snapshot, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
+		ReplacementID: row.ID, ItemID: item.ID, ItemClaimedAt: *item.ClaimedAt,
+	})
+	if err != nil || snapshot == nil || snapshot.Upload.PieceCID == nil {
+		t.Fatalf("AcquireItem = %#v err=%v", snapshot, err)
+	}
+	copyRow, err := f.repos.Replacements.AttachTargetCopy(ctx, repository.AttachReplacementTargetCopyInput{
+		ReplacementID: row.ID, ItemID: item.ID, UploadID: snapshot.Upload.ID, ItemClaimedAt: *item.ClaimedAt,
+	})
+	if err != nil || copyRow == nil {
+		t.Fatalf("AttachTargetCopy = %#v err=%v", copyRow, err)
+	}
+	if err := f.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		StorageUploadCopyID: copyRow.ID, RequireEligibleCopy: true,
+		UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: *snapshot.Upload.PieceCID, RetrievalURL: "https://target.example/piece", CommitExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	targetIdentity := storagecommit.CopyIdentity{
+		StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		StorageDataSetID: row.TargetDataSetID, RequireEligibleCopy: true,
+	}
+	targetReservation, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: targetIdentity, AttemptID: "target-unattempted",
+	})
+	if err != nil || targetReservation.State != storagecommit.ReservationAcquired ||
+		targetReservation.Copy.CommitAttemptID == nil || targetReservation.Copy.CommitAttemptedAt != nil {
+		t.Fatalf("target reservation = %#v err=%v, want unattempted token", targetReservation, err)
+	}
+	capacityCopies := seedCommitCopies(t, f.db, f.bucket.ID, row.TargetDataSetID, storagecommit.MaxActiveAttemptsPerDataSet-1)
+	for i := range capacityCopies {
+		if _, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+			Copy: commitCopyIdentity(capacityCopies[i]), AttemptID: fmt.Sprintf("retry-capacity-%d", i),
+		}); err != nil {
+			t.Fatalf("reserve capacity %d: %v", i, err)
+		}
+	}
+	follower := seedCommitCopies(t, f.db, f.bucket.ID, row.TargetDataSetID, 1)[0]
+	if followerReservation, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: commitCopyIdentity(follower), AttemptID: "follower-waiting",
+	}); err != nil || followerReservation.State != storagecommit.ReservationWaiting {
+		t.Fatalf("follower reservation = %#v err=%v, want waiting", followerReservation, err)
+	}
+	status, err := f.repos.Replacements.RetryReplacementItemClaim(ctx, storagereplacement.ClaimToken{
+		ItemID: item.ID, ClaimedAt: *item.ClaimedAt,
+	}, time.Now(), "presign failed")
+	if err != nil || status != storagereplacement.ItemStatusFailed {
+		t.Fatalf("final retry status=%s err=%v, want failed", status, err)
+	}
+	persisted, err := f.repos.Uploads.GetUploadCopyByID(ctx, copyRow.ID)
+	if err != nil || persisted.CommitReadyAt != nil || persisted.CommitExtraDataHex != nil || persisted.CommitAttemptID != nil {
+		t.Fatalf("failed target reservation = %#v err=%v, want cleared", persisted, err)
+	}
+	admitted, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: commitCopyIdentity(follower), AttemptID: "follower-admitted",
+	})
+	if err != nil || admitted.State != storagecommit.ReservationAcquired {
+		t.Fatalf("follower after terminal cleanup = %#v err=%v, want acquired", admitted, err)
+	}
+}
+
+func TestStorageReplacementRepo_FailedAttemptedItemRemainsConfirmable(t *testing.T) {
+	f := newReplacementFixture(t, "replacement-failed-attempt-confirmation", "01J000000000000000ITEMQ25")
+	ctx := context.Background()
+	row := f.authorize(t, "202")
+	f.readyTarget(t, row, "2002")
+	if err := f.repos.Replacements.Activate(ctx, row.ID); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if _, _, err := f.repos.Replacements.SeedMigrationBatchWithBudget(ctx, row.ID, 10, 0); err != nil {
+		t.Fatalf("SeedMigrationBatchWithBudget: %v", err)
+	}
+	item, err := f.repos.Replacements.ClaimReadyReplacementItem(ctx, time.Minute)
+	if err != nil || item == nil || item.ClaimedAt == nil {
+		t.Fatalf("claim = %#v err=%v", item, err)
+	}
+	snapshot, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
+		ReplacementID: row.ID, ItemID: item.ID, ItemClaimedAt: *item.ClaimedAt,
+	})
+	if err != nil || snapshot == nil || snapshot.Upload.PieceCID == nil {
+		t.Fatalf("AcquireItem = %#v err=%v", snapshot, err)
+	}
+	copyRow, err := f.repos.Replacements.AttachTargetCopy(ctx, repository.AttachReplacementTargetCopyInput{
+		ReplacementID: row.ID, ItemID: item.ID, UploadID: snapshot.Upload.ID, ItemClaimedAt: *item.ClaimedAt,
+	})
+	if err != nil || copyRow == nil {
+		t.Fatalf("AttachTargetCopy = %#v err=%v", copyRow, err)
+	}
+	const (
+		attemptID     = "failed-item-attempt"
+		transactionID = "0xfailed-item-attempt"
+	)
+	if err := f.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		StorageUploadCopyID: copyRow.ID, RequireEligibleCopy: true,
+		UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: *snapshot.Upload.PieceCID, RetrievalURL: "https://target.example/piece", CommitExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	identity := storagecommit.CopyIdentity{
+		StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		StorageDataSetID: row.TargetDataSetID, RequireEligibleCopy: true,
+	}
+	if _, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: identity, AttemptID: attemptID,
+	}); err != nil {
+		t.Fatalf("ReserveCommitAttempt: %v", err)
+	}
+	if _, err := f.repos.Uploads.MarkCommitAttempted(ctx, storagecommit.AttemptInput{
+		Copy: identity, AttemptID: attemptID, ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("MarkCommitAttempted: %v", err)
+	}
+	if err := f.repos.Uploads.RecordCommitTransaction(ctx, storagecommit.EvidenceInput{
+		Copy: identity, AttemptID: attemptID, TransactionID: transactionID,
+	}); err != nil {
+		t.Fatalf("RecordCommitTransaction: %v", err)
+	}
+	status, err := f.repos.Replacements.RetryReplacementItemClaim(ctx, storagereplacement.ClaimToken{
+		ItemID: item.ID, ClaimedAt: *item.ClaimedAt,
+	}, time.Now(), "settlement failed")
+	if err != nil || status != storagereplacement.ItemStatusFailed {
+		t.Fatalf("final retry status=%s err=%v, want failed", status, err)
+	}
+	persisted, err := f.repos.Uploads.GetUploadCopyByID(ctx, copyRow.ID)
+	if err != nil || persisted.CommitAttemptID == nil || *persisted.CommitAttemptID != attemptID ||
+		persisted.CommitAttemptedAt == nil {
+		t.Fatalf("attempted fence after item exhaustion = %#v err=%v", persisted, err)
+	}
+	if claimed, err := f.repos.Replacements.ClaimReadyReplacementItem(ctx, time.Minute); err != nil || claimed != nil {
+		t.Fatalf("active replacement claimed failed item = %#v err=%v", claimed, err)
+	}
+	if err := f.repos.Replacements.MarkFailed(ctx, row.ID, nil, "item retries exhausted"); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+	claimed, err := f.repos.Replacements.ClaimReadyReplacementItem(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != item.ID || claimed.ClaimedAt == nil {
+		t.Fatalf("terminal confirmation claim = %#v err=%v", claimed, err)
+	}
+	recovered, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
+		ReplacementID: row.ID, ItemID: claimed.ID, ItemClaimedAt: *claimed.ClaimedAt,
+	})
+	if err != nil || recovered == nil || recovered.Replacement.Status != storagereplacement.StatusFailed {
+		t.Fatalf("terminal confirmation snapshot = %#v err=%v", recovered, err)
+	}
+	pieceID := onChainID(t, "3002")
+	if err := f.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		StorageUploadCopyID: copyRow.ID, RequireEligibleCopy: true,
+		UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: *snapshot.Upload.PieceCID, PieceID: &pieceID,
+		RetrievalURL: "https://target.example/piece", CommitExtraDataHex: "abcd",
+		CommitTransactionID: transactionID, CommitAttemptID: attemptID,
+		CommitConfirmedTransactionID: transactionID,
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	if err := f.repos.Replacements.CompleteReplacementItemClaim(ctx, storagereplacement.ClaimToken{
+		ItemID: claimed.ID, ClaimedAt: *claimed.ClaimedAt,
+	}); err != nil {
+		t.Fatalf("CompleteReplacementItemClaim: %v", err)
+	}
+	persisted, err = f.repos.Uploads.GetUploadCopyByID(ctx, copyRow.ID)
+	if err != nil || persisted.Status != model.StorageUploadCopyStatusCommitted || persisted.CommitAttemptID != nil {
+		t.Fatalf("confirmed failed-item copy = %#v err=%v", persisted, err)
+	}
+	var completed storagereplacement.Item
+	if err := f.db.NewSelect().Model(&completed).Where("id = ?", item.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload completed item: %v", err)
+	}
+	if completed.Status != storagereplacement.ItemStatusCopied {
+		t.Fatalf("completed item status = %s, want copied", completed.Status)
 	}
 }
 
@@ -1525,7 +1755,7 @@ func TestStorageReplacementRepo_UnsatisfiableItemsSettleTerminally(t *testing.T)
 	}
 }
 
-func TestStorageReplacementRepo_CancelledCapacityWaitLeavesFIFO(t *testing.T) {
+func TestStorageReplacementRepo_CancelClaimOnlyClearsUnattemptedReservation(t *testing.T) {
 	f := newReplacementFixture(t, "replacement-cancelled-fifo", "01J000000000000000000RPL30")
 	ctx := context.Background()
 	row := f.authorize(t, "202")
@@ -1559,39 +1789,64 @@ func TestStorageReplacementRepo_CancelledCapacityWaitLeavesFIFO(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	capacityCopies := seedCommitCopies(t, f.db, f.bucket.ID, row.TargetDataSetID, storagecommit.MaxActiveAttemptsPerDataSet)
-	for i := range capacityCopies {
-		if _, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
-			Copy: commitCopyIdentity(capacityCopies[i]), AttemptID: fmt.Sprintf("fifo-capacity-%d", i),
-		}); err != nil {
-			t.Fatalf("reserve capacity %d: %v", i, err)
-		}
-	}
-	waiting, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+	reservation, err := f.repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
 		Copy: storagecommit.CopyIdentity{
 			StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID, CopyIndex: copyRow.CopyIndex,
 			StorageDataSetID: row.TargetDataSetID, RequireEligibleCopy: true,
 		},
 		AttemptID: "cancelled-fifo",
 	})
-	if err != nil || waiting.State != storagecommit.ReservationWaiting || waiting.Copy.CommitReadyAt == nil {
-		t.Fatalf("capacity wait = %#v err=%v", waiting, err)
+	if err != nil || reservation.State != storagecommit.ReservationAcquired || reservation.Copy.CommitAttemptID == nil ||
+		reservation.Copy.CommitAttemptedAt != nil {
+		t.Fatalf("unattempted reservation = %#v err=%v", reservation, err)
 	}
-	if err := f.repos.Replacements.ReleaseReplacementItemClaim(ctx, storagereplacement.ClaimToken{
+	if err := f.repos.Replacements.CancelReplacementItemClaim(ctx, storagereplacement.ClaimToken{
 		ItemID: item.ID, ClaimedAt: *item.ClaimedAt,
 	}); err != nil {
-		t.Fatalf("ReleaseReplacementItemClaim: %v", err)
+		t.Fatalf("CancelReplacementItemClaim: %v", err)
 	}
-	item = claimSpecificReplacementItem(t, f, row.ID, item.ID)
-	mustExec(t, f.db, `DELETE FROM object_versions WHERE version_id = ?`, f.version.VersionID)
-	if _, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
-		ReplacementID: row.ID, ItemID: item.ID, ItemClaimedAt: *item.ClaimedAt,
-	}); !errors.Is(err, storagereplacement.ErrItemCancelled) {
-		t.Fatalf("AcquireItem after deletion = %v, want cancellation", err)
+	var cancelled storagereplacement.Item
+	if err := f.db.NewSelect().Model(&cancelled).Where("id = ?", item.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload cancelled item: %v", err)
+	}
+	if cancelled.Status != storagereplacement.ItemStatusCancelled || cancelled.ClaimedAt != nil || cancelled.LeaseUntil != nil {
+		t.Fatalf("cancelled item = %#v", cancelled)
 	}
 	persisted, err := f.repos.Uploads.GetUploadCopyByID(ctx, copyRow.ID)
-	if err != nil || persisted == nil || persisted.CommitReadyAt != nil || persisted.CommitExtraDataHex != nil {
+	if err != nil || persisted == nil || persisted.CommitReadyAt != nil || persisted.CommitExtraDataHex != nil ||
+		persisted.CommitAttemptID != nil || persisted.CommitAttemptedAt != nil {
 		t.Fatalf("cancelled FIFO copy = %#v err=%v", persisted, err)
+	}
+
+	pieceID := onChainID(t, "3002")
+	if err := f.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		StorageUploadCopyID:          copyRow.ID,
+		UploadID:                     copyRow.UploadID,
+		CopyIndex:                    copyRow.CopyIndex,
+		PieceCID:                     *snapshot.Upload.PieceCID,
+		PieceID:                      &pieceID,
+		RetrievalURL:                 "https://target.example/piece",
+		CommitExtraDataHex:           "abcd",
+		CommitTransactionID:          "0xcommitted",
+		CommitConfirmedTransactionID: "0xcommitted",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	claimedAt := time.Now()
+	mustExec(t, f.db, `UPDATE storage_replacement_items
+		SET status = ?, claimed_at = ?, lease_until = ?, updated_at = ?
+		WHERE id = ?`, storagereplacement.ItemStatusRunning, claimedAt, claimedAt.Add(time.Minute), claimedAt, item.ID)
+	if err := f.repos.Replacements.CancelReplacementItemClaim(ctx, storagereplacement.ClaimToken{
+		ItemID: item.ID, ClaimedAt: claimedAt,
+	}); err != nil {
+		t.Fatalf("CancelReplacementItemClaim for committed copy: %v", err)
+	}
+	persisted, err = f.repos.Uploads.GetUploadCopyByID(ctx, copyRow.ID)
+	if err != nil || persisted == nil || persisted.Status != model.StorageUploadCopyStatusCommitted ||
+		persisted.CommitExtraDataHex == nil || *persisted.CommitExtraDataHex != "abcd" ||
+		persisted.CommitTransactionID == nil || *persisted.CommitTransactionID != "0xcommitted" ||
+		persisted.CommitConfirmedTransactionID == nil || *persisted.CommitConfirmedTransactionID != "0xcommitted" {
+		t.Fatalf("committed copy evidence after claim cancellation = %#v err=%v", persisted, err)
 	}
 }
 

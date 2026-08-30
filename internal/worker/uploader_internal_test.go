@@ -2,16 +2,208 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
+
+func seedCommitFailureCopy(
+	t *testing.T,
+	repos *repository.Repositories,
+	bucket *model.Bucket,
+	dataSet *model.StorageDataSet,
+	sourceVersionID string,
+) *model.StorageUploadCopy {
+	t.Helper()
+	upload, err := repos.Uploads.StartObjectUploadAttempt(t.Context(), repository.StartObjectUploadAttemptInput{
+		BucketID: bucket.ID, SourceVersionID: sourceVersionID, ContentSize: 1,
+		Checksum: "checksum-" + sourceVersionID, RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt: %v", err)
+	}
+	if err := repos.Uploads.CreateUploadCopiesForBindings(t.Context(), upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: dataSet.ID,
+		CopyIndex:        dataSet.CopyIndex,
+		TransferMethod:   model.StorageCopyTransferMethodPeerPull,
+		ProviderID:       dataSet.ProviderID,
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	copyRow, err := repos.Uploads.GetUploadCopyForDataSet(t.Context(), upload.ID, dataSet.ID)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopyForDataSet: copy=%#v err=%v", copyRow, err)
+	}
+	if err := repos.Uploads.MarkUploadCopyPieceReady(t.Context(), repository.MarkUploadCopyPieceReadyInput{
+		StorageUploadCopyID: copyRow.ID, UploadID: upload.ID, CopyIndex: copyRow.CopyIndex,
+		PieceCID: "bafkqaaa", RetrievalURL: "https://provider.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	copyRow, err = repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+	if err != nil {
+		t.Fatalf("reload copy: %v", err)
+	}
+	return copyRow
+}
+
+func seedCommitFailureFixture(
+	t *testing.T,
+	maxRetries int,
+) (*repository.Repositories, *model.StorageUploadCopy, *model.StorageDataSet, *model.Bucket, *model.Task) {
+	t.Helper()
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := testutil.SeedBucket(t, db, "commit-failure-"+model.NewVersionID())
+	owner, err := repos.Uploads.StartObjectUploadAttempt(t.Context(), repository.StartObjectUploadAttemptInput{
+		BucketID: bucket.ID, SourceVersionID: model.NewVersionID(), ContentSize: 1,
+		Checksum: "commit-failure-owner", RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartObjectUploadAttempt owner: %v", err)
+	}
+	dataSet, err := repos.Uploads.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "901"), CopyIndex: 0, CreatedByUploadID: owner.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Uploads.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+		ID: dataSet.ID, UploadID: owner.ID, DataSetID: onChainID(t, "9001"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
+	dataSet, err = repos.Uploads.GetDataSetBindingByID(t.Context(), dataSet.ID)
+	if err != nil || dataSet == nil {
+		t.Fatalf("GetDataSetBindingByID: dataSet=%#v err=%v", dataSet, err)
+	}
+	copyRow := seedCommitFailureCopy(t, repos, bucket, dataSet, model.NewVersionID())
+	identity := storagecommit.CopyIdentity{
+		StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID,
+		CopyIndex: copyRow.CopyIndex, StorageDataSetID: dataSet.ID,
+	}
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "commit-failure-reservation",
+	}); err != nil {
+		t.Fatalf("ReserveCommitAttempt: %v", err)
+	}
+	stage := uploadStagePeerCommit
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: bucket.ID,
+		RefVersionID: model.NewVersionID(), IdempotencyKey: "commit-failure-task-" + model.NewVersionID(),
+		Payload: map[string]interface{}{}, Status: model.TaskStatusQueued,
+		MaxRetries: maxRetries, ScheduledAt: time.Now(),
+	}
+	if err := repos.Tasks.Create(t.Context(), task); err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	claimed, err := repos.Tasks.ClaimReady(t.Context(), model.TaskTypeUpload, time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimReady: task=%#v err=%v", claimed, err)
+	}
+	return repos, copyRow, dataSet, bucket, claimed
+}
+
+func TestCommitTaskFailureReservationLifecycle(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("transient retry retains FIFO", func(t *testing.T) {
+		repos, copyRow, _, _, task := seedCommitFailureFixture(t, 2)
+		identity := storagecommit.CopyIdentity{
+			StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID,
+			CopyIndex: copyRow.CopyIndex, StorageDataSetID: *copyRow.StorageDataSetID,
+		}
+		if err := repos.Uploads.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
+			Copy: identity, AttemptID: "commit-failure-reservation",
+		}); err != nil {
+			t.Fatalf("seed ready-only reservation: %v", err)
+		}
+		(&Uploader{repos: repos}).handleCommitTaskFailure(t.Context(), task, copyRow, logger, "commit", errors.New("presign failed"))
+		persisted, err := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+		if err != nil || persisted.CommitReadyAt == nil || persisted.CommitAttemptID != nil {
+			t.Fatalf("transient copy = %#v err=%v, want retained FIFO", persisted, err)
+		}
+		gotTask, err := repos.Tasks.GetByID(t.Context(), task.ID)
+		if err != nil || gotTask.Status != model.TaskStatusScheduled || gotTask.RetryCount != 1 {
+			t.Fatalf("transient task = %#v err=%v", gotTask, err)
+		}
+	})
+
+	t.Run("terminal retry releases FIFO for successor", func(t *testing.T) {
+		repos, copyRow, dataSet, bucket, task := seedCommitFailureFixture(t, 1)
+		identity := storagecommit.CopyIdentity{
+			StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID,
+			CopyIndex: copyRow.CopyIndex, StorageDataSetID: *copyRow.StorageDataSetID,
+		}
+		if err := repos.Uploads.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
+			Copy: identity, AttemptID: "commit-failure-reservation",
+		}); err != nil {
+			t.Fatalf("seed ready-only reservation: %v", err)
+		}
+		follower := seedCommitFailureCopy(t, repos, bucket, dataSet, model.NewVersionID())
+		followerIdentity := storagecommit.CopyIdentity{
+			StorageUploadCopyID: follower.ID, UploadID: follower.UploadID,
+			CopyIndex: follower.CopyIndex, StorageDataSetID: *follower.StorageDataSetID,
+		}
+		waiting, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+			Copy: followerIdentity, AttemptID: "follower-waiting",
+		})
+		if err != nil || waiting.State != storagecommit.ReservationWaiting {
+			t.Fatalf("follower before cleanup = %#v err=%v, want waiting", waiting, err)
+		}
+		(&Uploader{repos: repos}).handleCommitTaskFailure(t.Context(), task, copyRow, logger, "commit", errors.New("presign failed"))
+		persisted, err := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+		if err != nil || persisted.CommitReadyAt != nil || persisted.CommitAttemptID != nil {
+			t.Fatalf("terminal copy = %#v err=%v, want cleared FIFO", persisted, err)
+		}
+		gotTask, err := repos.Tasks.GetByID(t.Context(), task.ID)
+		if err != nil || gotTask.Status != model.TaskStatusExhausted || gotTask.RetryCount != 1 {
+			t.Fatalf("terminal task = %#v err=%v", gotTask, err)
+		}
+		admitted, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+			Copy: followerIdentity, AttemptID: "follower-admitted",
+		})
+		if err != nil || admitted.State != storagecommit.ReservationAcquired {
+			t.Fatalf("follower after cleanup = %#v err=%v, want acquired", admitted, err)
+		}
+	})
+
+	t.Run("attempted fence parks without exhaustion", func(t *testing.T) {
+		repos, copyRow, _, _, task := seedCommitFailureFixture(t, 1)
+		identity := storagecommit.CopyIdentity{
+			StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID,
+			CopyIndex: copyRow.CopyIndex, StorageDataSetID: *copyRow.StorageDataSetID,
+		}
+		if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+			Copy: identity, AttemptID: "commit-failure-reservation", ExtraDataHex: "abcd",
+		}); err != nil {
+			t.Fatalf("MarkCommitAttempted: %v", err)
+		}
+		(&Uploader{repos: repos, pollInterval: time.Second}).handleCommitTaskFailure(
+			t.Context(), task, copyRow, logger, "commit", errors.New("persist evidence failed"),
+		)
+		persisted, err := repos.Uploads.GetUploadCopyByID(t.Context(), copyRow.ID)
+		if err != nil || persisted.CommitAttemptID == nil || *persisted.CommitAttemptID != "commit-failure-reservation" ||
+			persisted.CommitAttemptedAt == nil {
+			t.Fatalf("attempted copy = %#v err=%v, want preserved fence", persisted, err)
+		}
+		gotTask, err := repos.Tasks.GetByID(t.Context(), task.ID)
+		if err != nil || gotTask.Status != model.TaskStatusWaiting || gotTask.RetryCount != 0 ||
+			gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonExternalConfirmation {
+			t.Fatalf("attempted task = %#v err=%v, want confirmation wait", gotTask, err)
+		}
+	})
+}
 
 func TestEnsureBucketProviderBindingsPersistsPartialSelectionBeforeWaiting(t *testing.T) {
 	db := testutil.NewTestDB(t)

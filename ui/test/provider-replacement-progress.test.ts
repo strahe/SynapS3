@@ -58,6 +58,14 @@ test('confirmation attention stays distinct from failed replacement work', () =>
   assert.equal(view.activity, '2 confirmations need attention · 1 failed')
 })
 
+test('confirmation attention takes priority over the coordinator status message', () => {
+  const view = providerReplacementProgressView(
+    progress({ items_active: 4, items_attention: 1, items_retrying: 0, items_waiting_source: 0, items_failed: 0 }),
+    'Moving stored content'
+  )
+  assert.equal(view.activity, '1 confirmation needs attention · Moving stored content')
+})
+
 test('completed progress separates copied and no-longer-needed items at 100 percent', () => {
   const view = providerReplacementProgressView(
     progress({

@@ -609,6 +609,105 @@ func TestAdvancerTxOnlyEvidenceConfirmsWithoutPieceStatus(t *testing.T) {
 	}
 }
 
+func TestAdvancerTxOnlyMismatchNeedsAttention(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	identity := advancerCopyIdentity(copies[0])
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "tx-only-mismatch",
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "tx-only-mismatch", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("mark attempted: %v", err)
+	}
+	if err := repos.Uploads.RecordCommitTransaction(t.Context(), storagecommit.EvidenceInput{
+		Copy: identity, AttemptID: "tx-only-mismatch", TransactionID: "0xmismatch",
+	}); err != nil {
+		t.Fatalf("record transaction: %v", err)
+	}
+	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	checker := commitStatusCheckerFunc(func(context.Context, synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error) {
+		return synapse.PDPStatusResult{State: synapse.PDPStatusMismatch}, nil
+	})
+
+	result, err := (&storagecommit.Advancer{Store: repos.Uploads, StatusChecker: checker}).Advance(
+		t.Context(), storagecommit.AdvanceInput{
+			Copy: *copyRow, Binding: *binding, Target: target,
+			Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+		})
+	if err != nil || result.State != storagecommit.AdvanceNeedsAttention ||
+		result.AttentionCode != storagecommit.AttentionSubmissionMismatch {
+		t.Fatalf("advance = %#v err=%v, want submission mismatch attention", result, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.CommitAttentionCode == nil ||
+		*persisted.CommitAttentionCode != string(storagecommit.AttentionSubmissionMismatch) {
+		t.Fatalf("mismatch attention was not persisted: %#v", persisted)
+	}
+}
+
+func TestAdvancerTxOnlyRequestTimeoutRemainsPending(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	identity := advancerCopyIdentity(copies[0])
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "tx-only-timeout",
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "tx-only-timeout", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("mark attempted: %v", err)
+	}
+	if err := repos.Uploads.RecordCommitTransaction(t.Context(), storagecommit.EvidenceInput{
+		Copy: identity, AttemptID: "tx-only-timeout", TransactionID: "0xtimeout",
+	}); err != nil {
+		t.Fatalf("record transaction: %v", err)
+	}
+	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	const requestTimeout = 50 * time.Millisecond
+	var observedDeadline time.Time
+	checker := commitStatusCheckerFunc(func(ctx context.Context, _ synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error) {
+		var ok bool
+		observedDeadline, ok = ctx.Deadline()
+		if !ok {
+			t.Fatal("status checker context has no deadline")
+		}
+		<-ctx.Done()
+		return synapse.PDPStatusResult{}, ctx.Err()
+	})
+	parentCtx := t.Context()
+	startedAt := time.Now()
+	result, err := (&storagecommit.Advancer{
+		Store: repos.Uploads, StatusChecker: checker, RequestTimeout: requestTimeout,
+	}).Advance(parentCtx, storagecommit.AdvanceInput{
+		Copy: *copyRow, Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvancePending {
+		t.Fatalf("advance = %#v err=%v, want pending request timeout", result, err)
+	}
+	if context.Cause(parentCtx) != nil {
+		t.Fatalf("request timeout canceled parent context: %v", context.Cause(parentCtx))
+	}
+	deadlineAfter := observedDeadline.Sub(startedAt)
+	if deadlineAfter <= 0 || deadlineAfter > 2*requestTimeout {
+		t.Fatalf("checker deadline after %s, want finite deadline near %s", deadlineAfter, requestTimeout)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.CommitAttentionAt != nil || persisted.CommitAttentionCode != nil {
+		t.Fatalf("recent request timeout wrote attention: %#v", persisted)
+	}
+}
+
 func TestAdvancerCanceledObservationDoesNotWriteAttention(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)

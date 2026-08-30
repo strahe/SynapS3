@@ -176,6 +176,11 @@ import {
 } from '@/lib/provider-replacement'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
+import {
+  storageConfirmationAttentionView,
+  storageConfirmationListCommand,
+  storageConfirmationReleaseWarning,
+} from '@/lib/storage-confirmation-attention'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
 import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
@@ -872,15 +877,7 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 <TableCell className="px-3">
                   <StatusBadge tone={copyStatusTone(copy)}>{copyStatusLabel(copy)}</StatusBadge>
                   {copy.attention_code && (
-                    <div
-                      className="mt-1 max-w-48 text-xs text-muted-foreground"
-                      title={`${copyAttentionLabel(copy.attention_code)}. Run synaps3 admin storage-confirmation list to review the provider and transaction evidence, then release the current attempt from the CLI.${
-                        copy.attention_at ? ` Detected ${copy.attention_at}.` : ''
-                      }`}
-                    >
-                      {copyAttentionLabel(copy.attention_code)}
-                      {copy.attention_at ? ` · ${timeAgo(copy.attention_at)}` : ''}
-                    </div>
+                    <CopyAttentionDetails reasonCode={copy.attention_code} attentionAt={copy.attention_at} />
                   )}
                 </TableCell>
                 <TableCell className="px-3">
@@ -1157,21 +1154,30 @@ function copyStatusLabel(copy: ObjectProvenanceCopy) {
   }
 }
 
-function copyAttentionLabel(code: NonNullable<ObjectProvenanceCopy['attention_code']>) {
-  switch (code) {
-    case 'attempt_only_ambiguous':
-      return 'Submission result unknown'
-    case 'unattributed_piece':
-      return 'Piece ownership unknown'
-    case 'invalid_submission':
-      return 'Saved submission is invalid'
-    case 'submission_mismatch':
-      return 'Confirmation does not match'
-    case 'data_set_unavailable':
-      return 'Data set is unavailable'
-    case 'confirmation_timeout':
-      return 'Confirmation timed out'
-  }
+function CopyAttentionDetails({ reasonCode, attentionAt }: { reasonCode: string; attentionAt?: string }) {
+  const attention = storageConfirmationAttentionView(reasonCode)
+
+  return (
+    <details className="group mt-1 max-w-72 text-xs text-muted-foreground">
+      <summary className="cursor-pointer break-words text-status-warning marker:text-muted-foreground">
+        {attention.label}
+        {attentionAt ? ` · ${timeAgo(attentionAt)}` : ''}
+      </summary>
+      <div className="mt-2 space-y-2 rounded-md border border-border bg-muted/30 p-2 leading-relaxed">
+        <p>
+          Run <code className="break-all font-mono text-foreground">{storageConfirmationListCommand}</code> and review
+          the provider, piece, current attempt, and any transaction evidence.
+        </p>
+        <p>{storageConfirmationReleaseWarning}</p>
+        {!attention.known && (
+          <div className="space-y-1">
+            <div>Reason code</div>
+            <CopyableValue label="Confirmation reason code" value={attention.reasonCode} monospace maxLength={28} />
+          </div>
+        )}
+      </div>
+    </details>
+  )
 }
 
 function failureStageLabel(state?: string) {

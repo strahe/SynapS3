@@ -292,22 +292,34 @@ func TestPDPStatusCheckerClassifiesDataSetCreationIdentityMismatch(t *testing.T)
 	}
 }
 
-func TestPDPStatusCheckerWaitsForConfirmedPieceIDs(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[]}`, testAddPiecesTxHash)
-	}))
-	defer server.Close()
+func TestPDPStatusCheckerRejectsConfirmedPieceIDCountMismatch(t *testing.T) {
+	tests := []struct {
+		name              string
+		confirmedPieceIDs string
+	}{
+		{name: "missing", confirmedPieceIDs: `[]`},
+		{name: "excess", confirmedPieceIDs: `[2001,2002]`},
+	}
 
-	checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
-	got := checker.CheckAddPiecesStatus(t.Context(), AddPiecesStatusInput{
-		ServiceURL:         server.URL,
-		DataSetID:          "1001",
-		TransactionID:      testAddPiecesTxHash,
-		ExpectedPieceCount: 1,
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":%s}`, testAddPiecesTxHash, tt.confirmedPieceIDs)
+			}))
+			defer server.Close()
 
-	if got.State != PDPStatusPending {
-		t.Fatalf("status = %#v, want pending while confirmedPieceIDs are incomplete", got)
+			checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
+			got := checker.CheckAddPiecesStatus(t.Context(), AddPiecesStatusInput{
+				ServiceURL:         server.URL,
+				DataSetID:          "1001",
+				TransactionID:      testAddPiecesTxHash,
+				ExpectedPieceCount: 1,
+			})
+
+			if got.State != PDPStatusMismatch {
+				t.Fatalf("status = %#v, want mismatch for confirmed PieceID count", got)
+			}
+		})
 	}
 }
 

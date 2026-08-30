@@ -230,6 +230,7 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 			return err
 		}
 		confirmationRecovery := false
+		readyOnlyReservation := false
 		if item.TargetCopyID != nil {
 			attempts, countErr := db.NewSelect().Model((*model.StorageUploadCopy)(nil)).
 				Where("id = ?", *item.TargetCopyID).
@@ -239,11 +240,28 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 				return fmt.Errorf("checking replacement confirmation recovery: %w", countErr)
 			}
 			confirmationRecovery = attempts == 1
+			readyReservations, countErr := db.NewSelect().Model((*model.StorageUploadCopy)(nil)).
+				Where("id = ?", *item.TargetCopyID).
+				Where("status = ?", model.StorageUploadCopyStatusPieceReady).
+				Where("commit_ready_at IS NOT NULL").
+				Where("commit_attempt_id IS NULL").
+				Where("commit_attempted_at IS NULL").
+				Count(ctx)
+			if countErr != nil {
+				return fmt.Errorf("checking replacement ready-only reservation: %w", countErr)
+			}
+			readyOnlyReservation = readyReservations == 1
 		}
 		if !replacement.Status.Active() {
-			if !confirmationRecovery && replacement.Status.Terminal() {
-				settled = true
-				return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
+			if !confirmationRecovery {
+				switch {
+				case replacement.Status == storagereplacement.StatusFailed && readyOnlyReservation:
+					settled = true
+					return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusFailed)
+				case replacement.Status.Terminal():
+					settled = true
+					return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
+				}
 			}
 			if !confirmationRecovery {
 				deferred = true
@@ -408,20 +426,7 @@ func settleReplacementItem(ctx context.Context, db bun.IDB, item *storagereplace
 		return nil
 	}
 	if status != storagereplacement.ItemStatusCopied {
-		if item.TargetCopyID != nil {
-			if _, err := db.NewUpdate().
-				Model((*model.StorageUploadCopy)(nil)).
-				Set("commit_ready_at = NULL").
-				Set("commit_extra_data_hex = NULL").
-				Set("updated_at = ?", now).
-				Where("id = ?", *item.TargetCopyID).
-				Where("commit_attempt_id IS NULL").
-				Where("commit_attempted_at IS NULL").
-				Exec(ctx); err != nil {
-				return fmt.Errorf("clearing cancelled replacement commit reservation: %w", err)
-			}
-		}
-		return nil
+		return clearUnattemptedReplacementReservation(ctx, db, item.TargetCopyID, now)
 	}
 	if _, err := db.NewUpdate().
 		Model((*storagereplacement.Replacement)(nil)).
@@ -432,6 +437,36 @@ func settleReplacementItem(ctx context.Context, db bun.IDB, item *storagereplace
 		return fmt.Errorf("recording replacement progress: %w", err)
 	}
 	return resumeReadableSourceMigration(ctx, db, item.ReplacementID, now)
+}
+
+func clearUnattemptedReplacementReservation(
+	ctx context.Context,
+	db bun.IDB,
+	targetCopyID *int64,
+	now time.Time,
+) error {
+	if targetCopyID == nil {
+		return nil
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("commit_attempt_id = NULL").
+		Set("commit_attempted_at = NULL").
+		Set("commit_submission_json = NULL").
+		Set("commit_ready_at = NULL").
+		Set("commit_extra_data_hex = NULL").
+		Set("commit_transaction_id = NULL").
+		Set("commit_confirmed_transaction_id = NULL").
+		Set("commit_attention_code = NULL").
+		Set("commit_attention_at = NULL").
+		Set("updated_at = ?", now).
+		Where("id = ?", *targetCopyID).
+		Where("status = ?", model.StorageUploadCopyStatusPieceReady).
+		Where("commit_attempted_at IS NULL").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("clearing cancelled replacement commit reservation: %w", err)
+	}
+	return nil
 }
 
 // sourceCopyState answers two different questions that must not be collapsed:
