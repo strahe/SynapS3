@@ -94,6 +94,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
 | Tasks and storage health | task retry, diagnostic refresh, storage provider and data set refresh | Requeues work or refreshes operational status. |
 | Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends the old service. |
+| Storage confirmation | `POST /api/v1/storage-confirmations/{copy-id}/release` | May permit the provider to store the same piece again. Verify the current attempt before releasing it. |
 
 ## Health and Metrics
 
@@ -134,6 +135,8 @@ Treat these endpoints as change-window operations. They can change data, credent
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | List the providers this replica can move to, and why the others cannot take it. |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | Authorize replacing the storage provider behind a replica. |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | Resume a failed or attention-holding provider replacement. |
+| `GET` | `/api/v1/storage-confirmations` | List storage confirmations that need operator attention. |
+| `POST` | `/api/v1/storage-confirmations/{copy-id}/release` | Release an ambiguous confirmation after acknowledging possible duplicate storage. |
 
 For object upload, the HTTP `Content-Type` is the uploaded object's content type. It is not a JSON request marker.
 
@@ -236,7 +239,7 @@ Replacement moves through these states:
 
 `items_total` and `items_copied` count unique stored content, not object versions: content shared by many versions is copied once. Content deleted while migration is in progress is no longer needed and is not counted as copied. After copying finishes, the response reports how much content was copied and how much no longer needed to move; `items_copied/items_total` is not a completion percentage. The confirmation dialog instead counts referenced versions and total size.
 
-Each replacement also includes a nested `progress` object. During discovery, `seeding_complete` is `false`, `items_total` is only the number discovered so far, and `percent` is omitted. Once discovery finishes, `items_total` is final and `percent` is `items_processed / items_total`, where `items_processed = items_copied + items_no_longer_needed`. This lets a completed replacement reach 100% even when content was deleted before it needed copying. `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, and `items_failed` report the current work counts; `next_retry_at` is present when a retry is scheduled for the future. `phase` is `prepare`, `migrate`, `retire`, or `none`.
+Each replacement also includes a nested `progress` object. During discovery, `seeding_complete` is `false`, `items_total` is only the number discovered so far, and `percent` is omitted. Once discovery finishes, `items_total` is final and `percent` is `items_processed / items_total`, where `items_processed = items_copied + items_no_longer_needed`. This lets a completed replacement reach 100% even when content was deleted before it needed copying. `items_pending`, `items_active`, `items_retrying`, `items_waiting_source`, `items_failed`, and `items_attention` report mutually exclusive current work counts. Confirmation work is included in `items_active`; work that needs an operator is included only in `items_attention`. Both counts remain outstanding work. `next_retry_at` is present when a retry is scheduled for the future. `phase` is `prepare`, `migrate`, `retire`, or `none`.
 
 `POST /api/v1/storage-replacements/{id}/retry` resumes a `failed` or `cleanup_attention` replacement on the same approved provider.
 
@@ -256,6 +259,21 @@ The codes are `replacement_active`, `replacement_target_in_use`, `replacement_ta
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists every provider currently reported available with `eligible`, an `ineligible_reason` of `current_source` or `already_serves_bucket`, and `previously_used` for a provider this bucket has used and fully retired. Providers that cannot take the replica are listed rather than omitted, so an operator can see why one they expected is unavailable. It is the same inventory the storage topology reports under the `Available` filter, so a provider listed there is offered here and an unreachable one is offered in neither. Eligibility is the same rule the confirmation enforces. Automatic selection is stricter still: it never returns to a provider this bucket has used, which a manual choice may.
 
 Confirmation only checks what SynapS3 has recorded. A provider that still runs a storage service for this bucket on chain is detected when the replacement prepares its target: the replacement stops at `failed` with the provider and data set named, and the operator confirms again on a different provider. The replica has not moved at that point, so nothing is at risk. A provider whose earlier service for this bucket was retired normally can be chosen again.
+
+### Storage confirmation attention
+
+When SynapS3 cannot determine whether a provider accepted a piece, it does not submit that piece again automatically. `GET /api/v1/storage-confirmations?status=needs_attention&limit=100` lists the affected copy, data set, attempt, known transaction, timestamps, and stable `reason_code`.
+
+`POST /api/v1/storage-confirmations/{copy-id}/release` lets normal recovery continue and may permit a duplicate submission. Inspect the current list entry first, then send both its attempt ID and the explicit risk acknowledgement:
+
+```json
+{
+  "expected_attempt_id": "current-attempt-id",
+  "acknowledge_possible_duplicate": true
+}
+```
+
+If the attempt changed after it was inspected, the API returns `409 Conflict`. If confirmation succeeds before release, the entry disappears automatically.
 
 ## Tasks
 

@@ -17,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
@@ -2025,7 +2026,7 @@ func TestStorageUploadRepo_PrimaryCopyFailureMarksUploadFailed(t *testing.T) {
 	}
 }
 
-func TestStorageUploadRepo_ResetRejectedUploadCopyCommitUsesTransactionCAS(t *testing.T) {
+func TestStorageUploadRepo_ResetRejectedCommitUsesAttemptFence(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
@@ -2050,6 +2051,11 @@ func TestStorageUploadRepo_ResetRejectedUploadCopyCommitUsesTransactionCAS(t *te
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
+	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady: %v", err)
+	}
 	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
 		CopyIndex:        0,
@@ -2066,36 +2072,27 @@ func TestStorageUploadRepo_ResetRejectedUploadCopyCommitUsesTransactionCAS(t *te
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID:            upload.ID,
-		CopyIndex:           0,
-		CommitExtraDataHex:  "01",
-		CommitTransactionID: "0xrejected",
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitting: %v", err)
+	copyRow, err := repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
 	}
+	seedRepositoryCommitAttempt(t, repos, *copyRow, "rejected-attempt", "01", "0xrejected")
 
-	err = repos.Uploads.ResetRejectedUploadCopyCommit(ctx, repository.ResetRejectedUploadCopyCommitInput{
-		UploadID:            upload.ID,
-		CopyIndex:           0,
-		CommitTransactionID: "0xnewer",
-		LastError:           "rejected",
+	err = repos.Uploads.ResetCommitAttempt(ctx, storagecommit.ResetInput{
+		Copy: commitCopyIdentity(*copyRow), AttemptID: "newer-attempt", LastError: "rejected",
 	})
 	if !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("stale reset error = %v, want ErrConflict", err)
 	}
-	copyRow, err := repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+	copyRow, err = repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
 	if err != nil || copyRow.Status != model.StorageUploadCopyStatusCommitting || copyRow.CommitTransactionID == nil || *copyRow.CommitTransactionID != "0xrejected" {
 		t.Fatalf("copy after stale reset = %#v err=%v, want original submitted commit", copyRow, err)
 	}
 
-	if err := repos.Uploads.ResetRejectedUploadCopyCommit(ctx, repository.ResetRejectedUploadCopyCommitInput{
-		UploadID:            upload.ID,
-		CopyIndex:           0,
-		CommitTransactionID: "0xrejected",
-		LastError:           "commit transaction rejected",
+	if err := repos.Uploads.ResetCommitAttempt(ctx, storagecommit.ResetInput{
+		Copy: commitCopyIdentity(*copyRow), AttemptID: "rejected-attempt", LastError: "commit transaction rejected",
 	}); err != nil {
-		t.Fatalf("ResetRejectedUploadCopyCommit: %v", err)
+		t.Fatalf("ResetCommitAttempt: %v", err)
 	}
 	copyRow, err = repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
 	if err != nil || copyRow.Status != model.StorageUploadCopyStatusPieceReady || copyRow.CommitTransactionID != nil || copyRow.CommitExtraDataHex != nil {
@@ -2489,7 +2486,12 @@ func TestStorageUploadRepo_ReassignIngressUsesOnlyPendingReadyCopy(t *testing.T)
 				mustExec(t, db, `UPDATE storage_upload_copies SET status = ? WHERE upload_id = ? AND copy_index = 1`, tc.candidateStatus, upload.ID)
 			}
 			if tc.sourceSubmitted {
-				mustExec(t, db, `UPDATE storage_upload_copies SET status = ?, commit_transaction_id = ? WHERE upload_id = ? AND copy_index = 0`, model.StorageUploadCopyStatusCommitting, "0xsubmitted", upload.ID)
+				mustExec(t, db, `UPDATE storage_upload_copies SET status = ? WHERE upload_id = ? AND copy_index = 0`, model.StorageUploadCopyStatusPieceReady, upload.ID)
+				copyRow, loadErr := repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+				if loadErr != nil || copyRow == nil {
+					t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, loadErr)
+				}
+				seedRepositoryCommitAttempt(t, repos, *copyRow, "submitted-source", "abcd", "0xsubmitted")
 			}
 			if tc.rejectPromotion {
 				mustExec(t, db, `CREATE TRIGGER reject_ingress_promotion

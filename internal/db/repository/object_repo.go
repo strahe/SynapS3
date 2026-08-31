@@ -1347,8 +1347,7 @@ func prepareObjectVersionsForPermanentDelete(
 			continue
 		}
 		for _, copyRow := range copiesByUploadID[uploadID] {
-			if copyRow.Status != model.StorageUploadCopyStatusCommitted &&
-				copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != "" {
+			if storageUploadCopyHasAttemptedCommit(copyRow) {
 				return ErrPermanentDeleteStorageBusy
 			}
 			if !storageUploadCopyCanBeCancelledForPermanentDelete(copyRow) {
@@ -1357,6 +1356,15 @@ func prepareObjectVersionsForPermanentDelete(
 			res, err := db.NewUpdate().
 				Model((*model.StorageUploadCopy)(nil)).
 				Set("status = ?", model.StorageUploadCopyStatusFailed).
+				Set("commit_ready_at = NULL").
+				Set("commit_attempt_id = NULL").
+				Set("commit_attempted_at = NULL").
+				Set("commit_submission_json = NULL").
+				Set("commit_extra_data_hex = NULL").
+				Set("commit_transaction_id = NULL").
+				Set("commit_confirmed_transaction_id = NULL").
+				Set("commit_attention_code = NULL").
+				Set("commit_attention_at = NULL").
 				Set("last_error = ?", "cancelled because the last object version was permanently deleted").
 				Set("updated_at = ?", time.Now()).
 				Where("id = ?", copyRow.ID).
@@ -1365,7 +1373,7 @@ func prepareObjectVersionsForPermanentDelete(
 					model.StorageUploadCopyStatusPieceReady,
 					model.StorageUploadCopyStatusCommitting,
 				})).
-				Where("commit_transaction_id IS NULL OR commit_transaction_id = ''").
+				Where("NOT " + attemptedStorageCommitSQL("storage_upload_copy")).
 				Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("cancelling storage copy for permanent delete: %w", err)
@@ -1470,6 +1478,18 @@ func storageUploadCopyCanBeCancelledForPermanentDelete(copyRow model.StorageUplo
 	default:
 		return false
 	}
+}
+
+func storageUploadCopyHasAttemptedCommit(copyRow model.StorageUploadCopy) bool {
+	if copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" && copyRow.CommitAttemptedAt != nil {
+		return true
+	}
+	// A transaction id outside 'committed' records a submission whose outcome was
+	// never resolved, including rows older code left behind when it sent a
+	// submitted copy back to 'piece_ready'. Treat those as busy so a permanent
+	// delete cannot discard a piece the provider may still be paid to keep.
+	return copyRow.Status != model.StorageUploadCopyStatusCommitted &&
+		copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != ""
 }
 
 const defaultStorageCleanupMaxRetries = 5

@@ -12,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/storage"
@@ -240,6 +241,9 @@ func (u *Uploader) processReplicaRepairTask(ctx context.Context, task *model.Tas
 	}
 	storageCtx, err := u.contextForReadyBinding(ctx, binding)
 	if err != nil {
+		if u.handleUnavailableCommitContext(ctx, task, binding, copyRow, logger, "restore replica context") {
+			return
+		}
 		u.handleReplicaRepairDataSetFailure(ctx, task, binding, logger, "restore replica context", err)
 		return
 	}
@@ -337,14 +341,6 @@ func (u *Uploader) repairReplicaCopy(
 			CopyIndex:           copyRow.CopyIndex,
 			PieceCID:            pieceCIDString,
 			RetrievalURL:        storageCtx.PieceURL(pieceCID),
-		}); err != nil {
-			return err
-		}
-		if err := u.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-			StorageUploadCopyID: copyRow.ID,
-			RequireEligibleCopy: true,
-			UploadID:            upload.ID,
-			CopyIndex:           copyRow.CopyIndex,
 			CommitExtraDataHex:  extraHex,
 		}); err != nil {
 			return err
@@ -363,24 +359,46 @@ func (u *Uploader) repairReplicaCopy(
 		}
 	}
 	pieces := []storage.PieceInput{{PieceCID: pieceCID}}
-	result, err := u.commitReplicaRepairCopy(ctx, upload, binding, copyRow, storageCtx, pieces)
-	if err != nil {
+	advance, err := u.commitReplicaRepairCopy(ctx, upload, binding, copyRow, storageCtx, pieces, false)
+	if err != nil && advance.State == storagecommit.AdvancePending && synapse.IsProviderUnavailable(err) {
 		return err
 	}
-	if result == nil || len(result.PieceIDs) == 0 {
+	if u.waitForCommitAdvance(ctx, task, logger, advance) {
+		if err != nil {
+			logger.Warn("storage commit evidence remains fenced", "stage", "replica repair commit", "error", err)
+		}
+		return nil
+	}
+	if err != nil {
+		// Commit failures own their task transition here so final exhaustion can
+		// clear an unsubmitted FIFO reservation in the same transaction.
+		u.handleCommitTaskFailure(ctx, task, copyRow, logger, "advance replica repair commit", err)
+		return nil
+	}
+	switch {
+	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
+		return commitReleaseCause(advance)
+	case advance.State == storagecommit.AdvanceReleased:
+		return nil
+	case advance.State == storagecommit.AdvanceRejected:
+		return errCommitRejected
+	case advance.State != storagecommit.AdvanceConfirmed || advance.Confirmation == nil || len(advance.Confirmation.PieceIDs) == 0:
 		return errors.New("replica repair commit returned no piece ID")
 	}
+	result := advance.Confirmation
 	pieceID := idtypes.OnChainIDFromSDK(result.PieceIDs[0])
 	if err := u.repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		StorageUploadCopyID: copyRow.ID,
-		RequireEligibleCopy: true,
-		UploadID:            upload.ID,
-		CopyIndex:           copyRow.CopyIndex,
-		PieceCID:            pieceCIDString,
-		PieceID:             &pieceID,
-		RetrievalURL:        storageCtx.PieceURL(pieceCID),
-		CommitExtraDataHex:  derefString(copyRow.CommitExtraDataHex),
-		CommitTransactionID: result.TransactionID,
+		StorageUploadCopyID:          copyRow.ID,
+		RequireEligibleCopy:          true,
+		UploadID:                     upload.ID,
+		CopyIndex:                    copyRow.CopyIndex,
+		PieceCID:                     pieceCIDString,
+		PieceID:                      &pieceID,
+		RetrievalURL:                 storageCtx.PieceURL(pieceCID),
+		CommitExtraDataHex:           derefString(copyRow.CommitExtraDataHex),
+		CommitTransactionID:          result.TransactionID,
+		CommitAttemptID:              advance.AttemptID,
+		CommitConfirmedTransactionID: result.ConfirmedTransactionID,
 	}); err != nil {
 		return err
 	}
@@ -469,55 +487,15 @@ func (u *Uploader) commitReplicaRepairCopy(
 	copyRow *model.StorageUploadCopy,
 	storageCtx synapse.DataSetTarget,
 	pieces []storage.PieceInput,
-) (*storage.CommitResult, error) {
-	if copyCommitSubmitted(copyRow) {
-		transactionID := *copyRow.CommitTransactionID
-		result, err := u.waitForSubmittedCommit(ctx, storageCtx, binding, transactionID, len(pieces))
-		if errors.Is(err, errCommitRejected) {
-			if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, upload.ID, copyRow.CopyIndex, transactionID, err); resetErr != nil {
-				return nil, fmt.Errorf("reset rejected replica repair commit: %w", resetErr)
-			}
-		}
-		return result, err
+	ownerTerminal bool,
+) (storagecommit.AdvanceResult, error) {
+	if upload == nil || copyRow == nil || copyRow.UploadID != upload.ID {
+		return storagecommit.AdvanceResult{}, errors.New("replica repair commit identity mismatch")
 	}
-	extraData, extraHex, err := u.extraDataForCopy(ctx, storageCtx, copyRow, pieces)
-	if err != nil {
-		return nil, err
-	}
-	var submittedTx string
-	var submitErr error
-	result, err := storageCtx.Commit(ctx, storage.CommitRequest{
-		Pieces:    pieces,
-		ExtraData: extraData,
-		OnSubmitted: func(txHash string) {
-			submittedTx = txHash
-			evidenceCtx, evidenceCancel := providerEvidenceContext(ctx)
-			submitErr = u.repos.Uploads.MarkUploadCopyCommitting(evidenceCtx, repository.MarkUploadCopyCommittingInput{
-				StorageUploadCopyID: copyRow.ID,
-				RequireEligibleCopy: true,
-				UploadID:            upload.ID,
-				CopyIndex:           copyRow.CopyIndex,
-				CommitExtraDataHex:  extraHex,
-				CommitTransactionID: txHash,
-			})
-			evidenceCancel()
-		},
-	})
-	if submittedTx != "" && submitErr != nil {
-		return nil, fmt.Errorf("save replica repair commit submission: %w", submitErr)
-	}
-	if errors.Is(err, errCommitRejected) && submittedTx != "" {
-		if resetErr := u.resetRejectedSubmittedCommit(ctx, copyRow.ID, upload.ID, copyRow.CopyIndex, submittedTx, err); resetErr != nil {
-			return nil, fmt.Errorf("reset rejected replica repair commit: %w", resetErr)
-		}
-	}
-	return result, err
+	return u.advanceStorageCommit(ctx, binding, copyRow, storageCtx, pieces, true, ownerTerminal)
 }
 
 func (u *Uploader) handleReplicaRepairDataSetFailure(ctx context.Context, task *model.Task, binding *model.StorageDataSet, logger *slog.Logger, stage string, err error) {
-	if u.waitForPendingSubmittedCommit(ctx, task, logger, err) {
-		return
-	}
 	switch {
 	case dataSetWriteBlockedError(err), synapse.IsDataSetServiceEnded(err):
 		latest, markErr := u.markDataSetStatus(ctx, binding, model.StorageDataSetStatusDraining, err.Error())

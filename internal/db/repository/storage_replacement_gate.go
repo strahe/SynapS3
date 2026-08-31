@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -29,6 +30,7 @@ func taskPayloadCopyIDSQL(dialectName dialect.Name) func(alias string) string {
 const (
 	retirementBlockerCoverage      = "coverage"
 	retirementBlockerSourceWrites  = "source_writes"
+	retirementBlockerAttempts      = "confirmation_attempts"
 	retirementBlockerWaitingItems  = "waiting_items"
 	retirementBlockerSlotOwnership = "slot_ownership"
 	retirementBlockerEpoch         = "termination_epoch"
@@ -81,6 +83,14 @@ func evaluateRetirementGate(ctx context.Context, db bun.IDB, replacementID int64
 	gate.SourceWrites = writes
 	if writes > 0 {
 		gate.Blockers = append(gate.Blockers, retirementBlockerSourceWrites)
+	}
+	attempts, err := countReplacementActiveCommitAttempts(ctx, db, row.ID)
+	if err != nil {
+		return gate, err
+	}
+	gate.ActiveAttempts = attempts
+	if attempts > 0 {
+		gate.Blockers = append(gate.Blockers, retirementBlockerAttempts)
 	}
 
 	// G3: no migration item may still be owed.
@@ -276,6 +286,17 @@ func (r *BunStorageReplacementRepo) retireAbandonedTarget(
 		if err != nil {
 			return err
 		}
+		if err := lockReplacementDataSets(ctx, db, row.TargetDataSetID); err != nil {
+			return err
+		}
+		attempts, err := (&BunStorageUploadRepo{db: db}).CountActiveCommitAttemptsForDataSet(ctx, row.TargetDataSetID)
+		if err != nil {
+			return err
+		}
+		if attempts > 0 {
+			return fmt.Errorf("retiring abandoned target of replacement %d has %d active confirmation attempts: %w",
+				replacementID, attempts, storagereplacement.ErrPrematureComplete)
+		}
 		sole, err := (&BunStorageReplacementRepo{db: db}).CountAbandonedTargetSoleCopies(ctx, row.TargetDataSetID)
 		if err != nil {
 			return err
@@ -335,6 +356,9 @@ func (r *BunStorageReplacementRepo) CompleteRetirement(ctx context.Context, repl
 		if row.Status == storagereplacement.StatusCompleted {
 			return nil
 		}
+		if err := lockReplacementDataSets(ctx, db, row.SourceDataSetID, row.TargetDataSetID); err != nil {
+			return err
+		}
 		gate, err := evaluateRetirementGate(ctx, db, replacementID, &observedEpoch)
 		if err != nil {
 			return err
@@ -366,4 +390,39 @@ func (r *BunStorageReplacementRepo) CompleteRetirement(ctx context.Context, repl
 					Set("termination_observed_at = ?", now)
 			}, now)
 	})
+}
+
+func countReplacementActiveCommitAttempts(ctx context.Context, db bun.IDB, replacementID int64) (int, error) {
+	count, err := db.NewSelect().
+		Model((*model.StorageUploadCopy)(nil)).
+		Join("JOIN storage_replacement_items AS replacement_item ON replacement_item.target_copy_id = storage_upload_copy.id").
+		Where("replacement_item.replacement_id = ?", replacementID).
+		Where(attemptedStorageCommitSQL("storage_upload_copy")).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting replacement confirmation attempts: %w", err)
+	}
+	return count, nil
+}
+
+func lockReplacementDataSets(ctx context.Context, db bun.IDB, ids ...int64) error {
+	ids = append([]int64(nil), ids...)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for i, id := range ids {
+		if id <= 0 || (i > 0 && id == ids[i-1]) {
+			continue
+		}
+		res, err := db.NewUpdate().
+			Model((*model.StorageDataSet)(nil)).
+			Set("updated_at = updated_at").
+			Where("id = ?", id).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("locking replacement data set %d: %w", id, err)
+		}
+		if rows, _ := res.RowsAffected(); rows != 1 {
+			return fmt.Errorf("locking replacement data set %d: %w", id, ErrNotFound)
+		}
+	}
+	return nil
 }

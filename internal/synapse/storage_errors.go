@@ -120,6 +120,18 @@ func IsDataSetServiceEnded(err error) bool {
 	return errors.As(err, &notLive) || errors.Is(err, warmstorage.ErrNotFound) || errors.Is(err, storage.ErrDataSetUnavailable)
 }
 
+// IsDataSetWriteBlocked reports whether err means the data set can no longer
+// accept writes because its PDP payment ended. The SDK raises it while
+// validating the data set, before the provider is contacted, so a commit that
+// fails this way never reached the provider.
+func IsDataSetWriteBlocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := errors.AsType[*storage.DataSetPDPPaymentTerminatedError](err)
+	return ok
+}
+
 func normalizeDataSetLifecycleError(err error) error {
 	if err == nil || IsNoProviderCandidates(err) {
 		return err

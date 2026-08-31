@@ -12,6 +12,7 @@ import (
 const (
 	testCreateDataSetTxHash = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
 	testAddPiecesTxHash     = "0x7890abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456"
+	testConfirmedTxHash     = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 )
 
 func TestPDPStatusCheckerChecksDataSetCreationStatusOnce(t *testing.T) {
@@ -44,7 +45,7 @@ func TestPDPStatusCheckerChecksAddPiecesStatus(t *testing.T) {
 		if r.URL.Path != "/pdp/data-sets/1001/pieces/added/"+testAddPiecesTxHash {
 			t.Fatalf("path = %q, want add-pieces status path", r.URL.Path)
 		}
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[2001]}`, testAddPiecesTxHash)
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"confirmedTxHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[2001]}`, testAddPiecesTxHash, testConfirmedTxHash)
 	}))
 	defer server.Close()
 
@@ -56,7 +57,9 @@ func TestPDPStatusCheckerChecksAddPiecesStatus(t *testing.T) {
 		ExpectedPieceCount: 1,
 	})
 
-	if got.State != PDPStatusConfirmed || got.TxStatus != "confirmed" || !got.PiecesAdded || len(got.ConfirmedPieceIDs) != 1 || got.ConfirmedPieceIDs[0] != "2001" {
+	if got.State != PDPStatusConfirmed || got.TxStatus != "confirmed" || !got.PiecesAdded ||
+		len(got.ConfirmedPieceIDs) != 1 || got.ConfirmedPieceIDs[0] != "2001" ||
+		got.ConfirmedTransactionID != testConfirmedTxHash {
 		t.Fatalf("status = %#v, want confirmed add-pieces result", got)
 	}
 }
@@ -289,22 +292,34 @@ func TestPDPStatusCheckerClassifiesDataSetCreationIdentityMismatch(t *testing.T)
 	}
 }
 
-func TestPDPStatusCheckerClassifiesAddPiecesConfirmedPieceIDsMismatch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[]}`, testAddPiecesTxHash)
-	}))
-	defer server.Close()
+func TestPDPStatusCheckerRejectsConfirmedPieceIDCountMismatch(t *testing.T) {
+	tests := []struct {
+		name              string
+		confirmedPieceIDs string
+	}{
+		{name: "missing", confirmedPieceIDs: `[]`},
+		{name: "excess", confirmedPieceIDs: `[2001,2002]`},
+	}
 
-	checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
-	got := checker.CheckAddPiecesStatus(t.Context(), AddPiecesStatusInput{
-		ServiceURL:         server.URL,
-		DataSetID:          "1001",
-		TransactionID:      testAddPiecesTxHash,
-		ExpectedPieceCount: 1,
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":%s}`, testAddPiecesTxHash, tt.confirmedPieceIDs)
+			}))
+			defer server.Close()
 
-	if got.State != PDPStatusMismatch {
-		t.Fatalf("status = %#v, want mismatch for confirmedPieceIDs count", got)
+			checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
+			got := checker.CheckAddPiecesStatus(t.Context(), AddPiecesStatusInput{
+				ServiceURL:         server.URL,
+				DataSetID:          "1001",
+				TransactionID:      testAddPiecesTxHash,
+				ExpectedPieceCount: 1,
+			})
+
+			if got.State != PDPStatusMismatch {
+				t.Fatalf("status = %#v, want mismatch for confirmed PieceID count", got)
+			}
+		})
 	}
 }
 

@@ -471,7 +471,7 @@ func (c *memoryDataSetTarget) Pull(ctx context.Context, request storage.PullRequ
 	return &storage.PullResult{Status: storage.PullStatusComplete, Pieces: results}, nil
 }
 
-func (c *memoryDataSetTarget) Commit(ctx context.Context, request storage.CommitRequest) (*storage.CommitResult, error) {
+func (c *memoryDataSetTarget) SubmitCommit(ctx context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -510,7 +510,56 @@ func (c *memoryDataSetTarget) Commit(ctx context.Context, request storage.Commit
 	if request.OnSubmitted != nil {
 		request.OnSubmitted(txID)
 	}
-	return &storage.CommitResult{TransactionID: txID, DataSet: c.ref, PieceIDs: pieceIDs}, nil
+	return &storage.CommitSubmission{
+		Kind: storage.CommitKindAddPieces, TransactionID: txID,
+		StatusURL:  c.ServiceURL() + "/status/" + txID,
+		ProviderID: c.provider.Copy(), DataSet: &c.ref,
+		PieceCIDs: append([]cid.Cid(nil), pieceCIDs(request.Pieces)...),
+	}, nil
+}
+
+func (c *memoryDataSetTarget) GetCommitStatus(ctx context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dataSetID := c.DataSetID()
+	if dataSetID == nil || submission.Kind != storage.CommitKindAddPieces || submission.DataSet == nil ||
+		!submission.ProviderID.Equal(c.provider) || !submission.DataSet.DataSetID().Equal(*dataSetID) || len(submission.PieceCIDs) == 0 {
+		return nil, fmt.Errorf("%w: commit submission does not match target", errInvalidFilecoinSequence)
+	}
+	c.filecoin.mu.RLock()
+	defer c.filecoin.mu.RUnlock()
+	dataSet := c.filecoin.dataSets[dataSetID.String()]
+	if dataSet == nil || !dataSet.provider.Equal(c.provider) {
+		return nil, fmt.Errorf("%w: dataset %s is unavailable", errInvalidFilecoinSequence, dataSetID.String())
+	}
+	pieceIDs := make([]sdktypes.BigInt, 0, len(submission.PieceCIDs))
+	for _, pieceCID := range submission.PieceCIDs {
+		pieceID, ok := dataSet.pieces[pieceCID.String()]
+		if !ok {
+			return &storage.CommitStatus{
+				Kind: storage.CommitKindAddPieces, State: storage.CommitStatePending,
+				TransactionID: submission.TransactionID, DataSet: &c.ref,
+			}, nil
+		}
+		pieceIDs = append(pieceIDs, pieceID.Copy())
+	}
+	expectedTxID := fmt.Sprintf("commit-%s-%s", dataSetID.String(), pieceIDs[0].String())
+	if submission.TransactionID != expectedTxID {
+		return nil, fmt.Errorf("%w: unknown commit transaction %q", errInvalidFilecoinSequence, submission.TransactionID)
+	}
+	return &storage.CommitStatus{
+		Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed,
+		TransactionID: submission.TransactionID, DataSet: &c.ref, PieceIDs: pieceIDs,
+	}, nil
+}
+
+func pieceCIDs(pieces []storage.PieceInput) []cid.Cid {
+	out := make([]cid.Cid, len(pieces))
+	for i := range pieces {
+		out[i] = pieces[i].PieceCID
+	}
+	return out
 }
 
 func (c *memoryDataSetTarget) DeletePieceByID(ctx context.Context, pieceID sdktypes.BigInt) (*sdktypes.WriteResult, error) {

@@ -222,6 +222,17 @@ func (w *StorageCleanupWorker) retireAbandonedTarget(
 		w.waitForAbandonedTarget(ctx, task, logger, "Waiting for content on the abandoned provider to be copied elsewhere")
 		return
 	}
+	activeAttempts, err := w.repos.Uploads.CountActiveCommitAttemptsForDataSet(ctx, target.ID)
+	if err != nil {
+		logger.Warn("failed to check abandoned target confirmation attempts", "error", err)
+		w.waitForAbandonedTarget(ctx, task, logger, "Waiting to end the unused storage service")
+		return
+	}
+	if activeAttempts > 0 {
+		logger.Info("abandoned target still has active confirmation attempts", "count", activeAttempts)
+		w.waitForAbandonedTarget(ctx, task, logger, "Waiting for storage confirmations")
+		return
+	}
 
 	endEpoch := replacement.AbandonedTerminationEpoch
 	if endEpoch == nil {
@@ -289,7 +300,11 @@ func (w *StorageCleanupWorker) waitForReplacementRetirement(
 		logger.Warn("failed to record retirement wait reason", "reason", reason, "error", err)
 	}
 	logger.Debug("retirement gate is blocked", "blockers", gate.Blockers)
-	w.waitForReferences(ctx, task, logger, reason.Message())
+	message := reason.Message()
+	if gate.ActiveAttempts > 0 {
+		message = "Waiting for storage confirmations"
+	}
+	w.waitForReferences(ctx, task, logger, message)
 }
 
 // retirementWaitReason names the first blocker so the operator sees the reason
@@ -299,6 +314,8 @@ func retirementWaitReason(gate repository.RetirementGate) storagereplacement.Wai
 		return storagereplacement.WaitReasonCoverage
 	}
 	switch {
+	case gate.ActiveAttempts > 0:
+		return storagereplacement.WaitReasonProvider
 	case gate.WaitingItems > 0:
 		return storagereplacement.WaitReasonReadableSource
 	case gate.CoverageGaps > 0:

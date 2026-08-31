@@ -13,6 +13,7 @@ import (
 	"github.com/strahe/synaps3/internal/admin"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -29,6 +30,10 @@ const (
 var (
 	errReplacementSourceUnavailable = errors.New("replacement item has no readable source")
 	errReplacementUploadPrecedes    = errors.New("ordinary upload claim precedes replacement item")
+	errReplacementCommitPending     = errors.New("replacement storage confirmation is pending")
+	errReplacementCommitAttention   = errors.New("replacement storage confirmation needs review")
+	errReplacementCommitObserving   = errors.New("replacement storage confirmation remains under observation")
+	errReplacementOwnerTerminal     = errors.New("replacement owner is terminal")
 )
 
 type replacementMigrationPauser interface {
@@ -189,6 +194,34 @@ func (w *ProviderReplacementWorker) processItem(parent context.Context, item *st
 			w.logItemTransitionFailure(item, "yielding replacement item", transitionErr)
 			result = "failure"
 		}
+	case errors.Is(err, errReplacementCommitPending):
+		if transitionErr := w.repos.Replacements.DeferReplacementItemClaim(parent, token, time.Now().Add(w.commitPollDelay())); transitionErr != nil {
+			w.logItemTransitionFailure(item, "waiting for replacement storage confirmation", transitionErr)
+			result = "failure"
+		} else {
+			result = "confirmation_wait"
+		}
+	case errors.Is(err, errReplacementCommitObserving):
+		if transitionErr := w.repos.Replacements.DeferReplacementItemClaim(parent, token, time.Now().Add(commitObservationDelay(w.commitPollDelay()))); transitionErr != nil {
+			w.logItemTransitionFailure(item, "observing replacement storage confirmation", transitionErr)
+			result = "failure"
+		} else {
+			result = "confirmation_wait"
+		}
+	case errors.Is(err, errReplacementCommitAttention):
+		if transitionErr := w.repos.Replacements.DeferReplacementItemClaim(parent, token, time.Now().Add(storageCommitAttentionDelay)); transitionErr != nil {
+			w.logItemTransitionFailure(item, "parking replacement storage confirmation for review", transitionErr)
+			result = "failure"
+		} else {
+			result = "confirmation_attention"
+		}
+	case errors.Is(err, errReplacementOwnerTerminal):
+		if transitionErr := w.repos.Replacements.CancelReplacementItemClaim(parent, token); transitionErr != nil {
+			w.logItemTransitionFailure(item, "cancelling terminal replacement item", transitionErr)
+			result = "failure"
+		} else {
+			result = "cancelled"
+		}
 	case errors.Is(err, errReplacementSourceUnavailable):
 		if transitionErr := w.repos.Replacements.WaitReplacementItemClaim(
 			parent, token, time.Now().Add(replacementSourceRecheckDelay), safeReplacementItemError(err),
@@ -221,6 +254,13 @@ func (w *ProviderReplacementWorker) processItem(parent context.Context, item *st
 		}
 	}
 	admin.WorkerTasksProcessed.WithLabelValues(w.Name(), result).Inc()
+}
+
+func (w *ProviderReplacementWorker) commitPollDelay() time.Duration {
+	if w != nil && w.pollInterval > 0 {
+		return w.pollInterval
+	}
+	return storageCommitPollDelay
 }
 
 func pauseReplacementAtExecutionVersion(
@@ -372,6 +412,19 @@ func (e *ReplacementTransferExecutor) Execute(ctx context.Context, item *storage
 	if copyCommitted(copyRow) {
 		return expectedStateVersion, e.finish(ctx, token, &snapshot.Upload)
 	}
+	if !snapshot.Replacement.Status.Active() && copyRow.CommitAttemptID != nil &&
+		*copyRow.CommitAttemptID != "" && copyRow.CommitAttemptedAt == nil {
+		advance, err := (&storagecommit.Advancer{Store: e.repos.Uploads}).ReleaseTerminalReservation(
+			ctx, *copyRow, snapshot.Target,
+		)
+		if err != nil {
+			return expectedStateVersion, err
+		}
+		if advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseOwnerTerminal {
+			return expectedStateVersion, errReplacementOwnerTerminal
+		}
+		return expectedStateVersion, errors.New("terminal replacement reservation returned an unexpected state")
+	}
 
 	bucket, err := e.repos.Buckets.GetByID(ctx, snapshot.Replacement.BucketID)
 	if err != nil {
@@ -384,6 +437,24 @@ func (e *ReplacementTransferExecutor) Execute(ctx context.Context, item *storage
 		return e.support.contextForReadyBinding(ctx, &snapshot.Target)
 	})
 	if err != nil {
+		if copyCommitSubmitted(copyRow) {
+			advance, advanceErr := (&storagecommit.Advancer{Store: e.repos.Uploads}).AdvanceUnavailable(
+				ctx, *copyRow, snapshot.Target,
+			)
+			if advanceErr != nil {
+				return expectedStateVersion, advanceErr
+			}
+			switch {
+			case advance.State == storagecommit.AdvancePending:
+				return expectedStateVersion, errReplacementCommitPending
+			case advance.State == storagecommit.AdvanceNeedsAttention && advance.Continue:
+				return expectedStateVersion, errReplacementCommitObserving
+			case advance.State == storagecommit.AdvanceNeedsAttention:
+				return expectedStateVersion, errReplacementCommitAttention
+			default:
+				return expectedStateVersion, errors.New("unavailable replacement commit returned an unexpected state")
+			}
+		}
 		return expectedStateVersion, err
 	}
 	defer handle.release()
@@ -441,18 +512,10 @@ func (e *ReplacementTransferExecutor) copy(
 			CopyIndex:           copyRow.CopyIndex,
 			PieceCID:            pieceCIDString,
 			RetrievalURL:        storageCtx.PieceURL(pieceCID),
+			CommitExtraDataHex:  extraHex,
 		})
 		evidenceCancel()
 		if err != nil {
-			return err
-		}
-		if err := e.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-			StorageUploadCopyID: copyRow.ID,
-			RequireEligibleCopy: true,
-			UploadID:            upload.ID,
-			CopyIndex:           copyRow.CopyIndex,
-			CommitExtraDataHex:  extraHex,
-		}); err != nil {
 			return err
 		}
 		copyRow.Status = model.StorageUploadCopyStatusPieceReady
@@ -470,30 +533,52 @@ func (e *ReplacementTransferExecutor) copy(
 	}
 
 	pieces := []storage.PieceInput{{PieceCID: pieceCID}}
-	var result *storage.CommitResult
-	err := handle.commit(ctx, func() error {
-		var commitErr error
-		result, commitErr = e.support.commitReplicaRepairCopy(ctx, upload, &snapshot.Target, copyRow, storageCtx, pieces)
-		return commitErr
-	})
-	if err != nil {
+	advance, err := e.support.commitReplicaRepairCopy(
+		ctx, upload, &snapshot.Target, copyRow, storageCtx, pieces, !snapshot.Replacement.Status.Active(),
+	)
+	if err != nil && advance.State == storagecommit.AdvancePending && synapse.IsProviderUnavailable(err) {
 		return err
 	}
-	if result == nil || len(result.PieceIDs) == 0 {
+	switch {
+	case advance.State == storagecommit.AdvanceWaitingCapacity,
+		advance.State == storagecommit.AdvanceSubmitted,
+		advance.State == storagecommit.AdvancePending:
+		if err != nil {
+			e.logger.Warn("storage commit evidence remains fenced", "stage", "provider replacement commit", "error", err)
+		}
+		return errReplacementCommitPending
+	case advance.State == storagecommit.AdvanceNeedsAttention && advance.Continue:
+		return errReplacementCommitObserving
+	case advance.State == storagecommit.AdvanceNeedsAttention:
+		return errReplacementCommitAttention
+	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
+		return commitReleaseCause(advance)
+	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseOwnerTerminal:
+		return errReplacementOwnerTerminal
+	case advance.State == storagecommit.AdvanceReleased:
+		return errReplacementCommitPending
+	case advance.State == storagecommit.AdvanceRejected:
+		return errCommitRejected
+	case err != nil:
+		return err
+	case advance.State != storagecommit.AdvanceConfirmed || advance.Confirmation == nil || len(advance.Confirmation.PieceIDs) == 0:
 		return errors.New("replacement commit returned no piece ID")
 	}
+	result := advance.Confirmation
 	pieceID := idtypes.OnChainIDFromSDK(result.PieceIDs[0])
 	evidenceCtx, evidenceCancel := providerEvidenceContext(ctx)
 	err = e.repos.Uploads.MarkUploadCopyCommitted(evidenceCtx, repository.MarkUploadCopyCommittedInput{
-		StorageUploadCopyID: copyRow.ID,
-		RequireEligibleCopy: true,
-		UploadID:            upload.ID,
-		CopyIndex:           copyRow.CopyIndex,
-		PieceCID:            pieceCIDString,
-		PieceID:             &pieceID,
-		RetrievalURL:        storageCtx.PieceURL(pieceCID),
-		CommitExtraDataHex:  derefString(copyRow.CommitExtraDataHex),
-		CommitTransactionID: result.TransactionID,
+		StorageUploadCopyID:          copyRow.ID,
+		RequireEligibleCopy:          true,
+		UploadID:                     upload.ID,
+		CopyIndex:                    copyRow.CopyIndex,
+		PieceCID:                     pieceCIDString,
+		PieceID:                      &pieceID,
+		RetrievalURL:                 storageCtx.PieceURL(pieceCID),
+		CommitExtraDataHex:           derefString(copyRow.CommitExtraDataHex),
+		CommitTransactionID:          result.TransactionID,
+		CommitAttemptID:              advance.AttemptID,
+		CommitConfirmedTransactionID: result.ConfirmedTransactionID,
 	})
 	evidenceCancel()
 	if err != nil {
@@ -604,7 +689,6 @@ type replacementTargetContextEntry struct {
 	storageCtx synapse.DataSetTarget
 	err        error
 	refs       int
-	commitGate chan struct{}
 }
 
 type replacementTargetContextHandle struct {
@@ -628,10 +712,8 @@ func (r *replacementTargetContextRegistry) acquire(
 	entry, exists := r.entries[targetID]
 	if !exists {
 		entry = &replacementTargetContextEntry{
-			ready:      make(chan struct{}),
-			commitGate: make(chan struct{}, 1),
+			ready: make(chan struct{}),
 		}
-		entry.commitGate <- struct{}{}
 		r.entries[targetID] = entry
 	}
 	// Count creators and waiters before publishing the unlocked entry. A handle
@@ -683,17 +765,4 @@ func (h *replacementTargetContextHandle) release() {
 	h.once.Do(func() {
 		h.registry.release(h.targetID, h.entry)
 	})
-}
-
-func (h *replacementTargetContextHandle) commit(ctx context.Context, fn func() error) error {
-	if h == nil || h.entry == nil {
-		return errors.New("replacement target context is unavailable")
-	}
-	select {
-	case <-ctx.Done():
-		return context.Cause(ctx)
-	case <-h.entry.commitGate:
-	}
-	defer func() { h.entry.commitGate <- struct{}{} }()
-	return fn()
 }

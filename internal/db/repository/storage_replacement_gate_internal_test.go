@@ -77,6 +77,10 @@ func TestRetirementCoverageProductionSQLUsesIndexes(t *testing.T) {
 		storagereplacement.WaitReasonReadableSource,
 		time.Now(),
 		time.Now(),
+		storagereplacement.StatusFailed,
+		storagereplacement.StatusSuperseded,
+		time.Now(),
+		time.Now(),
 	)
 	for _, index := range []string{"idx_storage_replacement_items_due", "idx_storage_replacement_items_lease"} {
 		if !strings.Contains(readyPlan, index) {
@@ -92,13 +96,13 @@ func TestRetirementCoverageProductionSQLUsesIndexes(t *testing.T) {
 	}{
 		{
 			name:  "due replacement item",
-			query: readyReplacementDueItemSQL(),
+			query: readyReplacementDueItemSQL(false),
 			args:  []any{int64(1), time.Now()},
 			index: "idx_storage_replacement_items_due",
 		},
 		{
 			name:  "expired replacement item",
-			query: readyReplacementExpiredItemSQL(),
+			query: readyReplacementExpiredItemSQL(false),
 			args:  []any{int64(1), time.Now()},
 			index: "idx_storage_replacement_items_lease",
 		},

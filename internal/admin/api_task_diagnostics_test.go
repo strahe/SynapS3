@@ -13,6 +13,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
@@ -533,13 +534,28 @@ func seedTaskDiagnosticCommitTask(t *testing.T, db *bun.DB, repos *repository.Re
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID:            upload.ID,
-		CopyIndex:           0,
-		CommitExtraDataHex:  "0xextra",
-		CommitTransactionID: "0xcommit",
+	copyRow, err := repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+	if err != nil || copyRow == nil || copyRow.StorageDataSetID == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
+	}
+	identity := storagecommit.CopyIdentity{
+		StorageUploadCopyID: copyRow.ID, UploadID: upload.ID, CopyIndex: 0,
+		StorageDataSetID: *copyRow.StorageDataSetID,
+	}
+	if _, err := repos.Uploads.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "diagnostic-attempt",
 	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitting: %v", err)
+		t.Fatalf("ReserveCommitAttempt: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(ctx, storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "diagnostic-attempt", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("MarkCommitAttempted: %v", err)
+	}
+	if err := repos.Uploads.RecordCommitTransaction(ctx, storagecommit.EvidenceInput{
+		Copy: identity, AttemptID: "diagnostic-attempt", TransactionID: "0xcommit",
+	}); err != nil {
+		t.Fatalf("RecordCommitTransaction: %v", err)
 	}
 	stage := "ingress_commit"
 	task := &model.Task{

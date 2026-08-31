@@ -25,6 +25,7 @@ import (
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synaps3/internal/worker"
@@ -53,7 +54,45 @@ func createContextDataSetIDEqual(opts *testutil.OpenTargetOptions, want sdktypes
 }
 
 func copyCommitSubmittedForTest(copyRow *model.StorageUploadCopy) bool {
-	return copyRow != nil && copyRow.Status == model.StorageUploadCopyStatusCommitting && copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != ""
+	return copyRow != nil && copyRow.Status == model.StorageUploadCopyStatusCommitting &&
+		copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" &&
+		copyRow.CommitAttemptedAt != nil &&
+		copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != ""
+}
+
+func seedSubmittedCommitAttempt(
+	t *testing.T,
+	repos *repository.Repositories,
+	copyRow *model.StorageUploadCopy,
+	attemptID string,
+	extraDataHex string,
+	transactionID string,
+) {
+	t.Helper()
+	if copyRow == nil || copyRow.StorageDataSetID == nil {
+		t.Fatal("submitted commit fixture has no concrete copy binding")
+	}
+	identity := storagecommit.CopyIdentity{
+		StorageUploadCopyID: copyRow.ID,
+		UploadID:            copyRow.UploadID,
+		CopyIndex:           copyRow.CopyIndex,
+		StorageDataSetID:    *copyRow.StorageDataSetID,
+	}
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: attemptID,
+	}); err != nil {
+		t.Fatalf("ReserveCommitAttempt: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: attemptID, ExtraDataHex: extraDataHex,
+	}); err != nil {
+		t.Fatalf("MarkCommitAttempted: %v", err)
+	}
+	if err := repos.Uploads.RecordCommitTransaction(t.Context(), storagecommit.EvidenceInput{
+		Copy: identity, AttemptID: attemptID, TransactionID: transactionID,
+	}); err != nil {
+		t.Fatalf("RecordCommitTransaction: %v", err)
+	}
 }
 
 // seedCachedObject creates a bucket, writes a file into the filesystem cache,
@@ -602,6 +641,51 @@ func (f *fakeUploadContext) Commit(_ context.Context, req storage.CommitRequest)
 		DataSet:       ref,
 		PieceIDs:      []sdktypes.BigInt{f.pieceID.Copy()},
 	}, nil
+}
+
+func (f *fakeUploadContext) SubmitCommit(_ context.Context, req storage.CommitRequest) (*storage.CommitSubmission, error) {
+	f.commitCalls.Add(1)
+	f.commitMu.Lock()
+	f.commitExtras = append(f.commitExtras, append([]byte(nil), req.ExtraData...))
+	f.commitMu.Unlock()
+	if req.OnSubmitted != nil {
+		req.OnSubmitted(fakeSubmittedCommitTxHash)
+	}
+	if f.commitErr != nil {
+		return nil, f.commitErr
+	}
+	ref, err := storage.NewDataSetRef(f.providerID, f.dataSetID, f.clientDataID)
+	if err != nil {
+		return nil, err
+	}
+	pieceCIDs := make([]cid.Cid, 0, len(req.Pieces))
+	for _, piece := range req.Pieces {
+		pieceCIDs = append(pieceCIDs, piece.PieceCID)
+	}
+	return &storage.CommitSubmission{
+		Kind: storage.CommitKindAddPieces, TransactionID: fakeSubmittedCommitTxHash,
+		StatusURL: f.ServiceURL() + "/status/commit", ProviderID: f.providerID.Copy(),
+		DataSet: &ref, PieceCIDs: pieceCIDs,
+	}, nil
+}
+
+func (f *fakeUploadContext) GetCommitStatus(_ context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+	if f.commitErr != nil {
+		return nil, f.commitErr
+	}
+	ref, err := storage.NewDataSetRef(f.providerID, f.dataSetID, f.clientDataID)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.CommitStatus{
+		Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed,
+		TransactionID: submission.TransactionID, DataSet: &ref,
+		PieceIDs: []sdktypes.BigInt{f.pieceID.Copy()},
+	}, nil
+}
+
+func (f *fakeUploadContext) PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error) {
+	return &storage.PieceStatus{}, nil
 }
 
 func sdkBigIntTestPtr(id sdktypes.BigInt) *sdktypes.BigInt {
@@ -1570,13 +1654,6 @@ func TestUploader_FinishPeerCopySchedulesRemainingPeerCopy(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("mark piece ready: %v", err)
 	}
-	if err := env.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID:  fixture.upload.ID,
-		CopyIndex: fixture.peer.CopyIndex,
-	}); err != nil {
-		t.Fatalf("mark copy committing: %v", err)
-	}
-
 	// Make sure no task exists for Copy 2
 	copy2Task, _ := env.repos.Tasks.GetByIdempotencyKey(ctx, fmt.Sprintf("upload:%s:ensure_dataset:%d:2", fixture.versionID, fixture.upload.ID))
 	if copy2Task != nil {
@@ -2803,7 +2880,7 @@ func TestUploader_EnsureDatasetCreationRejectionPreservesEstablishedEvidence(t *
 	}
 }
 
-func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
+func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 	env := newTestWorkerEnv(t)
 	bucket, objID, versionID := seedCachedObject(t, env)
 	ctx := context.Background()
@@ -2879,6 +2956,22 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	primaryCtx.boundDataSet = &primaryDataSetID
 	primaryCtx.clientDataID = sdktypes.NewBigInt(9001)
 	primaryCtx.commitErr = errors.New("commit status poll timeout")
+	statusRequests := atomic.Int32{}
+	statusConfirmed := atomic.Bool{}
+	statusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		statusRequests.Add(1)
+		if r.URL.Path != "/pdp/data-sets/1001/pieces/added/"+fakeSubmittedCommitTxHash {
+			t.Fatalf("commit status path = %q, want submitted transaction status path", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if statusConfirmed.Load() {
+			_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[2001]}`, fakeSubmittedCommitTxHash)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"pending","dataSetId":1001,"pieceCount":1,"piecesAdded":false}`, fakeSubmittedCommitTxHash)
+	}))
+	defer statusServer.Close()
+	primaryCtx.serviceURL = statusServer.URL
 	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
 		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
 			return primaryCtx, nil
@@ -2891,10 +2984,10 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 		cache.EvictionPolicyAfterUpload, config.DefaultFilecoinCopies, 1, 50*time.Millisecond, slog.Default(),
 		worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{AllowPrivateNetworks: true})),
 	)
-	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
+	runWorkerUntilTaskStatus(t, env, uploader, task.ID, model.TaskStatusWaiting, 5*time.Second)
 	gotTask, err := env.repos.Tasks.GetByID(ctx, task.ID)
-	if err != nil || gotTask == nil || gotTask.Status != model.TaskStatusExhausted {
-		t.Fatalf("submitted commit task = %#v err=%v, want exhausted without failing content", gotTask, err)
+	if err != nil || gotTask == nil || gotTask.Status != model.TaskStatusWaiting || gotTask.RetryCount != 0 {
+		t.Fatalf("submitted commit task = %#v err=%v, want waiting without retry consumption", gotTask, err)
 	}
 
 	gotVersion, err := env.repos.Objects.GetVersionByID(ctx, versionID)
@@ -2916,19 +3009,12 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	}
 
 	primaryCtx.commitErr = nil
-	statusRequests := atomic.Int32{}
-	statusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		statusRequests.Add(1)
-		if r.URL.Path != "/pdp/data-sets/1001/pieces/added/"+fakeSubmittedCommitTxHash {
-			t.Fatalf("commit status path = %q, want submitted transaction status path", r.URL.Path)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"confirmed","dataSetId":1001,"pieceCount":1,"addMessageOk":true,"piecesAdded":true,"confirmedPieceIds":[2001]}`, fakeSubmittedCommitTxHash)
-	}))
-	defer statusServer.Close()
-	primaryCtx.serviceURL = statusServer.URL
-	if err := env.repos.Tasks.RetryExhausted(ctx, task.ID); err != nil {
-		t.Fatalf("RetryExhausted: %v", err)
+	statusConfirmed.Store(true)
+	if _, err := env.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-time.Second)).
+		Where("id = ?", task.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("reschedule pending commit task: %v", err)
 	}
 	runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
 
@@ -2941,8 +3027,8 @@ func TestUploader_PrimaryCommitSubmittedErrorDoesNotFailObject(t *testing.T) {
 	if primaryCtx.commitCalls.Load() != 1 {
 		t.Fatalf("commit calls = %d, want retry to wait on submitted transaction without resubmitting", primaryCtx.commitCalls.Load())
 	}
-	if statusRequests.Load() != 1 {
-		t.Fatalf("status requests = %d, want retry to poll submitted transaction once", statusRequests.Load())
+	if statusRequests.Load() < 1 {
+		t.Fatalf("status requests = %d, want submitted transaction observation", statusRequests.Load())
 	}
 	if len(commitExtras) != 1 || string(commitExtras[0]) != "extra-101" {
 		t.Fatalf("commit extras = %q, want only original commit payload", commitExtras)
@@ -3014,14 +3100,11 @@ func TestUploader_RejectedSubmittedIngressCommitIsResubmitted(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	if err := env.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID:            upload.ID,
-		CopyIndex:           0,
-		CommitExtraDataHex:  "01",
-		CommitTransactionID: fakeSubmittedCommitTxHash,
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitting: %v", err)
+	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
 	}
+	seedSubmittedCommitAttempt(t, env.repos, copyRow, "rejected-ingress", "01", fakeSubmittedCommitTxHash)
 	stage := "ingress_commit"
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
@@ -3064,7 +3147,7 @@ func TestUploader_RejectedSubmittedIngressCommitIsResubmitted(t *testing.T) {
 		worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{AllowPrivateNetworks: true})),
 	)
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
-	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+	copyRow, err = env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
 	if err != nil || copyRow.Status != model.StorageUploadCopyStatusPieceReady || copyRow.CommitTransactionID != nil || copyRow.CommitExtraDataHex != nil {
 		t.Fatalf("copy after rejected status = %#v err=%v, want resubmittable piece", copyRow, err)
 	}
@@ -3104,14 +3187,11 @@ func TestUploader_SubmittedPeerMismatchedStatusRemainsRecoverableAfterExhaustion
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	if err := env.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID:            fixture.upload.ID,
-		CopyIndex:           1,
-		CommitExtraDataHex:  "02",
-		CommitTransactionID: fakeSubmittedCommitTxHash,
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitting: %v", err)
+	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 1)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
 	}
+	seedSubmittedCommitAttempt(t, env.repos, copyRow, "mismatched-peer", "02", fakeSubmittedCommitTxHash)
 	stage := "peer_commit"
 	task := &model.Task{
 		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: fixture.objID, RefVersionID: fixture.versionID,
@@ -3144,13 +3224,15 @@ func TestUploader_SubmittedPeerMismatchedStatusRemainsRecoverableAfterExhaustion
 		cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default(),
 		worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{AllowPrivateNetworks: true})),
 	)
-	gotTask := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
-	if gotTask.Status != model.TaskStatusExhausted || gotTask.RetryCount != 1 {
-		t.Fatalf("peer commit task = %#v, want exhausted after one bounded attempt", gotTask)
+	runWorkerUntilTaskStatus(t, env, uploader, task.ID, model.TaskStatusWaiting, 5*time.Second)
+	gotTask, err := env.repos.Tasks.GetByID(ctx, task.ID)
+	if err != nil || gotTask.Status != model.TaskStatusWaiting || gotTask.RetryCount != 0 {
+		t.Fatalf("peer commit task = %#v err=%v, want attention wait without retry", gotTask, err)
 	}
-	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 1)
-	if err != nil || !copyCommitSubmittedForTest(copyRow) || *copyRow.CommitTransactionID != fakeSubmittedCommitTxHash {
-		t.Fatalf("peer copy after mismatched status = %#v err=%v, want recoverable submitted commit", copyRow, err)
+	copyRow, err = env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 1)
+	if err != nil || !copyCommitSubmittedForTest(copyRow) || *copyRow.CommitTransactionID != fakeSubmittedCommitTxHash ||
+		copyRow.CommitAttentionCode == nil || *copyRow.CommitAttentionCode != string(storagecommit.AttentionSubmissionMismatch) {
+		t.Fatalf("peer copy after mismatched status = %#v err=%v, want recoverable attention", copyRow, err)
 	}
 	if err := env.repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: fixture.upload.ID, CopyIndex: 1, LastError: "late generic failure"}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("MarkUploadCopyFailed submitted peer error = %v, want conflict", err)
@@ -3362,18 +3444,11 @@ func TestUploader_ReplicaRepairResubmitsRejectedCommit(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
-	if err := env.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-		UploadID:            fixture.upload.ID,
-		CopyIndex:           1,
-		CommitExtraDataHex:  "02",
-		CommitTransactionID: fakeSubmittedCommitTxHash,
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitting: %v", err)
-	}
 	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 1)
 	if err != nil || copyRow == nil {
 		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
 	}
+	seedSubmittedCommitAttempt(t, env.repos, copyRow, "rejected-repair", "02", fakeSubmittedCommitTxHash)
 	stage := "repair_replica"
 	task := &model.Task{
 		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.upload.BucketID,
@@ -3760,8 +3835,8 @@ func TestUploader_ReplicaRepairUsesRetainedCacheWhenNoRemoteCopyIsReadable(t *te
 	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
 		t.Fatalf("repair task = %#v, want completed without retry", gotTask)
 	}
-	if got := createContextCalls.Load(); got != 1 {
-		t.Fatalf("CreateContext calls = %d, want one exact original context", got)
+	if got := createContextCalls.Load(); got != 2 {
+		t.Fatalf("CreateContext calls = %d, want one submission run and one confirmation run on the original context", got)
 	}
 	if got := selectTargetsCalls.Load(); got != 0 {
 		t.Fatalf("SelectUploadTargets calls = %d, want no provider selection", got)
@@ -5424,11 +5499,11 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 		}
-		if err := fixture.env.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-			UploadID: fixture.upload.ID, CopyIndex: 0, CommitExtraDataHex: "01", CommitTransactionID: fakeSubmittedCommitTxHash,
-		}); err != nil {
-			t.Fatalf("MarkUploadCopyCommitting: %v", err)
+		copyRow, err := fixture.env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 0)
+		if err != nil || copyRow == nil {
+			t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
 		}
+		seedSubmittedCommitAttempt(t, fixture.env.repos, copyRow, "submitted-ingress", "01", fakeSubmittedCommitTxHash)
 		if err := fixture.env.repos.Uploads.MarkDataSetUnavailable(ctx, fixture.bindings[0].ID, "provider timeout after submit"); err != nil {
 			t.Fatalf("MarkDataSetUnavailable: %v", err)
 		}
@@ -5444,8 +5519,8 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		runWorkerUntilTaskStatus(t, fixture.env, uploader, fixture.task.ID, model.TaskStatusWaiting, 5*time.Second)
 
 		gotTask, err := fixture.env.repos.Tasks.GetByID(ctx, fixture.task.ID)
-		if err != nil || gotTask.RetryCount != 0 || gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonDependency {
-			t.Fatalf("submitted ingress task = %#v err=%v, want dependency wait without retry", gotTask, err)
+		if err != nil || gotTask.RetryCount != 0 || gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonExternalConfirmation {
+			t.Fatalf("submitted ingress task = %#v err=%v, want confirmation wait without retry", gotTask, err)
 		}
 		copies, err := fixture.env.repos.Uploads.ListCopies(ctx, fixture.upload.ID)
 		if err != nil || len(copies) != 2 || copies[0].TransferMethod != model.StorageCopyTransferMethodIngress || copies[1].TransferMethod != model.StorageCopyTransferMethodPeerPull {
@@ -5464,11 +5539,11 @@ func TestUploader_IngressProviderFailureClassification(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 		}
-		if err := fixture.env.repos.Uploads.MarkUploadCopyCommitting(ctx, repository.MarkUploadCopyCommittingInput{
-			UploadID: fixture.upload.ID, CopyIndex: 0, CommitExtraDataHex: "01", CommitTransactionID: fakeSubmittedCommitTxHash,
-		}); err != nil {
-			t.Fatalf("MarkUploadCopyCommitting: %v", err)
+		copyRow, err := fixture.env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 0)
+		if err != nil || copyRow == nil {
+			t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
 		}
+		seedSubmittedCommitAttempt(t, fixture.env.repos, copyRow, "preserved-ingress", "01", fakeSubmittedCommitTxHash)
 		if err := fixture.env.repos.Uploads.MarkDataSetUnavailable(ctx, fixture.bindings[0].ID, "legacy handoff state"); err != nil {
 			t.Fatalf("MarkDataSetUnavailable: %v", err)
 		}

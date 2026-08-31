@@ -94,6 +94,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
 | 后台任务和存储健康 | 任务重试、诊断刷新、存储提供方和数据集刷新 | 重新入队任务，或刷新运维状态。 |
 | 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
+| 存储确认 | `POST /api/v1/storage-confirmations/{copy-id}/release` | 可能允许存储提供方再次存储同一个 piece。释放前必须核对当前 attempt。 |
 
 ## 健康检查和指标
 
@@ -134,6 +135,8 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/buckets/{name}/data-sets/{id}/replacement/providers` | 列出该副本可以迁往的存储提供方，以及其他存储提供方不能接管的原因。 |
 | `POST` | `/api/v1/buckets/{name}/data-sets/{id}/replacement` | 授权替换某个副本背后的存储提供方。 |
 | `POST` | `/api/v1/storage-replacements/{id}/retry` | 恢复处于 `failed` 或 `cleanup_attention` 的存储提供方替换。 |
+| `GET` | `/api/v1/storage-confirmations` | 列出需要运营者处理的存储确认。 |
+| `POST` | `/api/v1/storage-confirmations/{copy-id}/release` | 确认可能产生重复存储后，释放一条无法判定的确认。 |
 
 对象上传时，HTTP `Content-Type` 表示上传对象的内容类型，不是 JSON 请求标记。
 
@@ -236,7 +239,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 `items_total` 与 `items_copied` 统计的是唯一的已存储内容，而不是对象版本：被多个版本共享的内容只复制一次。迁移期间删除的内容已不再需要，不会算作已复制。复制结束后，响应会分别说明已复制的内容，以及已无需迁移的内容；`items_copied/items_total` 不是完成百分比。确认页统计的是引用版本数和数据量。
 
-每条替换记录还包含嵌套的 `progress` 对象。发现内容期间，`seeding_complete` 为 `false`，`items_total` 只是当前已发现数量，并且省略 `percent`。发现完成后，`items_total` 才是最终总数，`percent` 按 `items_processed / items_total` 计算，其中 `items_processed = items_copied + items_no_longer_needed`。因此，即使部分内容在复制前已删除，完成状态仍会达到 100%。`items_pending`、`items_active`、`items_retrying`、`items_waiting_source` 与 `items_failed` 返回当前工作数量；存在未来的重试时返回 `next_retry_at`。`phase` 取 `prepare`、`migrate`、`retire` 或 `none`。
+每条替换记录还包含嵌套的 `progress` 对象。发现内容期间，`seeding_complete` 为 `false`，`items_total` 只是当前已发现数量，并且省略 `percent`。发现完成后，`items_total` 才是最终总数，`percent` 按 `items_processed / items_total` 计算，其中 `items_processed = items_copied + items_no_longer_needed`。因此，即使部分内容在复制前已删除，完成状态仍会达到 100%。`items_pending`、`items_active`、`items_retrying`、`items_waiting_source`、`items_failed` 与 `items_attention` 返回互斥的当前工作数量。等待确认的工作只计入 `items_active`；需要运营者处理的工作只计入 `items_attention`，两者都属于尚未完成的工作。存在未来的重试时返回 `next_retry_at`。`phase` 取 `prepare`、`migrate`、`retire` 或 `none`。
 
 `POST /api/v1/storage-replacements/{id}/retry` 在同一个已批准的存储提供方上恢复 `failed` 或 `cleanup_attention` 的替换。
 
@@ -256,6 +259,21 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出当前探测为可用的存储提供方，附带 `eligible`、取值为 `current_source` 或 `already_serves_bucket` 的 `ineligible_reason`，以及标记该存储桶用过并已完全退休的 `previously_used`。不能接管该副本的存储提供方会照常列出而不是省略，便于运营者看清预期中的存储提供方为何不可用。这份清单与存储拓扑页在 `Available` 过滤下读取的是同一份：在那里可用的存储提供方这里会提供，探测不通的两边都不会出现。可选性判定与确认阶段完全一致。自动选择更严格：它绝不会回到该存储桶用过的存储提供方，而手动选择可以。
 
 确认阶段只能检查 SynapS3 已记录的信息。如果某个存储提供方在链上仍为该存储桶运行着存储服务，会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移，没有任何风险。此前已正常退休的存储提供方可以再次选择。
+
+### 存储确认处理
+
+当 SynapS3 无法判定存储提供方是否已接受 piece 时，不会自动再次提交该 piece。`GET /api/v1/storage-confirmations?status=needs_attention&limit=100` 会列出受影响的 copy、data set、attempt、已知 transaction、时间和稳定的 `reason_code`。
+
+`POST /api/v1/storage-confirmations/{copy-id}/release` 会让正常恢复继续，并可能产生重复提交。先核对清单中的当前记录，再同时发送该记录的 attempt ID 和明确的风险确认：
+
+```json
+{
+  "expected_attempt_id": "current-attempt-id",
+  "acknowledge_possible_duplicate": true
+}
+```
+
+如果核对后 attempt 已发生变化，API 返回 `409 Conflict`。如果确认在人工释放前自行成功，该记录会自动消失。
 
 ## 任务
 

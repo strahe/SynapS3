@@ -101,6 +101,7 @@ type ProgressSnapshot struct {
 	ItemsNoLongerNeeded int
 	ItemsPending        int
 	ItemsActive         int
+	ItemsAttention      int
 	ItemsRetrying       int
 	ItemsWaitingSource  int
 	ItemsFailed         int

@@ -284,6 +284,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("POST /api/v1/buckets/{name}/data-sets/{id}/replacement", s.handleAPIStartDataSetReplacement)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers", s.handleAPIListDataSetReplacementProviders)
 		mux.HandleFunc("POST /api/v1/storage-replacements/{id}/retry", s.handleAPIRetryStorageReplacement)
+		mux.HandleFunc("GET /api/v1/storage-confirmations", s.handleAPIListStorageConfirmations)
+		mux.HandleFunc("POST /api/v1/storage-confirmations/{id}/release", s.handleAPIReleaseStorageConfirmation)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}", s.handleAPIDeleteBucket)
 		mux.HandleFunc("GET /api/v1/buckets/{name}/objects", s.handleAPIBucketObjects)
 		mux.HandleFunc("DELETE /api/v1/buckets/{name}/objects", s.handleAPIDeleteBucketObject)

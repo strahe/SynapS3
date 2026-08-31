@@ -185,6 +185,10 @@ type MockStorageTarget struct {
 	ClientDataSetIDValue sdktypes.BigInt
 	ServiceURLValue      string
 	WithCDNValue         bool
+	PresignForCommitFunc func(context.Context, []storage.PieceInput) ([]byte, error)
+	SubmitCommitFunc     func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
+	GetCommitStatusFunc  func(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
+	PieceStatusFunc      func(context.Context, cid.Cid) (*storage.PieceStatus, error)
 }
 
 func NewMockProviderTarget(providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) *MockStorageTarget {
@@ -248,7 +252,10 @@ func (m *MockStorageTarget) Store(context.Context, io.Reader, *storage.StoreOpti
 	return nil, errors.New("MockStorageTarget.Store not configured")
 }
 
-func (m *MockStorageTarget) PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error) {
+func (m *MockStorageTarget) PresignForCommit(ctx context.Context, pieces []storage.PieceInput) ([]byte, error) {
+	if m.PresignForCommitFunc != nil {
+		return m.PresignForCommitFunc(ctx, pieces)
+	}
 	return nil, errors.New("MockStorageTarget.PresignForCommit not configured")
 }
 
@@ -258,6 +265,27 @@ func (m *MockStorageTarget) Pull(context.Context, storage.PullRequest) (*storage
 
 func (m *MockStorageTarget) Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error) {
 	return nil, errors.New("MockStorageTarget.Commit not configured")
+}
+
+func (m *MockStorageTarget) SubmitCommit(ctx context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+	if m.SubmitCommitFunc != nil {
+		return m.SubmitCommitFunc(ctx, request)
+	}
+	return nil, errors.New("MockStorageTarget.SubmitCommit not configured")
+}
+
+func (m *MockStorageTarget) GetCommitStatus(ctx context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+	if m.GetCommitStatusFunc != nil {
+		return m.GetCommitStatusFunc(ctx, submission)
+	}
+	return nil, errors.New("MockStorageTarget.GetCommitStatus not configured")
+}
+
+func (m *MockStorageTarget) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
+	if m.PieceStatusFunc != nil {
+		return m.PieceStatusFunc(ctx, pieceCID)
+	}
+	return nil, errors.New("MockStorageTarget.PieceStatus not configured")
 }
 
 func copySDKBigIntPtr(value *sdktypes.BigInt) *sdktypes.BigInt {

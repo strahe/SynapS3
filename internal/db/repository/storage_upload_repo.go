@@ -9,6 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
@@ -1424,10 +1425,19 @@ func (r *BunStorageUploadRepo) ReassignIngressCopy(ctx context.Context, uploadID
 		res, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("transfer_method = ?", model.StorageCopyTransferMethodPeerPull).
+			Set("commit_ready_at = NULL").
+			Set("commit_attempt_id = NULL").
+			Set("commit_attempted_at = NULL").
+			Set("commit_submission_json = NULL").
+			Set("commit_extra_data_hex = NULL").
+			Set("commit_transaction_id = NULL").
+			Set("commit_confirmed_transaction_id = NULL").
+			Set("commit_attention_code = NULL").
+			Set("commit_attention_at = NULL").
 			Where("id = ?", unavailableCopyID).
 			Where("transfer_method = ?", model.StorageCopyTransferMethodIngress).
 			Where("status <> ?", model.StorageUploadCopyStatusCommitted).
-			Where("NOT (status = ? AND commit_transaction_id IS NOT NULL AND commit_transaction_id <> '')", model.StorageUploadCopyStatusCommitting).
+			Where("NOT " + attemptedStorageCommitSQL("storage_upload_copy")).
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("releasing unavailable ingress copy: %w", err)
@@ -1479,10 +1489,11 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 			Set("status = ?", model.StorageUploadCopyStatusPieceReady).
 			Set("piece_id = COALESCE(?, piece_id)", input.PieceID).
 			Set("retrieval_url = COALESCE(?, retrieval_url)", nullableString(input.RetrievalURL)).
+			Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
 			Where("id = ?", copyID).
-			Where("status <> ?", model.StorageUploadCopyStatusCommitted)
+			Where("status NOT IN (?, ?)", model.StorageUploadCopyStatusCommitted, model.StorageUploadCopyStatusCommitting)
 		if input.PieceCID != "" {
 			q = q.Where(`EXISTS (
 				SELECT 1 FROM storage_uploads AS evidence_upload
@@ -1496,6 +1507,9 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 		if input.RetrievalURL != "" {
 			q = q.Where("(retrieval_url IS NULL OR retrieval_url = '' OR retrieval_url = ?)", input.RetrievalURL)
 		}
+		if input.CommitExtraDataHex != "" {
+			q = q.Where("(commit_extra_data_hex IS NULL OR commit_extra_data_hex = '' OR commit_extra_data_hex = ?)", input.CommitExtraDataHex)
+		}
 		if input.RequireEligibleCopy {
 			q = q.
 				Where("status <> ?", model.StorageUploadCopyStatusFailed).
@@ -1507,18 +1521,46 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			if input.RequireEligibleCopy {
-				return fmt.Errorf("marking storage upload copy piece ready: %w", ErrConflict)
-			}
 			var status model.StorageUploadCopyStatus
 			if err := db.NewSelect().Model((*model.StorageUploadCopy)(nil)).
 				Column("status").Where("id = ?", copyID).Scan(ctx, &status); err != nil {
 				return fmt.Errorf("loading storage upload copy after piece evidence conflict: %w", err)
 			}
+			if status == model.StorageUploadCopyStatusCommitting {
+				compatible := db.NewSelect().
+					Model((*model.StorageUploadCopy)(nil)).
+					Where("id = ?", copyID).
+					Where("status = ?", model.StorageUploadCopyStatusCommitting).
+					Where("commit_attempt_id IS NOT NULL AND commit_attempt_id <> ''").
+					Where("commit_attempted_at IS NOT NULL")
+				if input.PieceCID != "" {
+					compatible = compatible.Where(`EXISTS (
+						SELECT 1 FROM storage_uploads AS evidence_upload
+						WHERE evidence_upload.id = ?
+						  AND evidence_upload.piece_cid = ?
+					)`, input.UploadID, input.PieceCID)
+				}
+				if input.PieceID != nil {
+					compatible = compatible.Where("piece_id = ?", input.PieceID)
+				}
+				if input.RetrievalURL != "" {
+					compatible = compatible.Where("retrieval_url = ?", input.RetrievalURL)
+				}
+				if input.CommitExtraDataHex != "" {
+					compatible = compatible.Where("commit_extra_data_hex = ?", input.CommitExtraDataHex)
+				}
+				count, err := compatible.Count(ctx)
+				if err != nil {
+					return fmt.Errorf("checking idempotent piece evidence for committing copy: %w", err)
+				}
+				if count == 1 {
+					return nil
+				}
+			}
 			// A late piece-ready result cannot regress a committed copy. Treat that
 			// stale observation as a harmless no-op; every other zero-row result is
 			// conflicting monotonic evidence and must stop before Commit.
-			if status == model.StorageUploadCopyStatusCommitted {
+			if status == model.StorageUploadCopyStatusCommitted && !input.RequireEligibleCopy {
 				return nil
 			}
 			return fmt.Errorf("marking storage upload copy piece ready: %w", ErrConflict)
@@ -1545,93 +1587,52 @@ func (r *BunStorageUploadRepo) MarkUploadCopyPieceReady(ctx context.Context, inp
 	})
 }
 
-func (r *BunStorageUploadRepo) MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error {
-	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
-			return fmt.Errorf("locking storage upload for committing copy: %w", err)
-		}
-		copyID, err := slotCopyTarget(ctx, db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
-		if err != nil {
-			return err
-		}
-		q := db.NewUpdate().
-			Model((*model.StorageUploadCopy)(nil)).
-			Set("status = CASE WHEN ? IS NOT NULL AND status <> ? THEN ? ELSE status END",
-				nullableString(input.CommitTransactionID), model.StorageUploadCopyStatusCommitted, model.StorageUploadCopyStatusCommitting).
-			Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
-			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
-			Set("last_error = NULL").
-			Set("updated_at = ?", time.Now()).
-			Where("id = ?", copyID)
-		if input.CommitExtraDataHex != "" {
-			q = q.Where("(commit_extra_data_hex IS NULL OR commit_extra_data_hex = '' OR commit_extra_data_hex = ?)", input.CommitExtraDataHex)
-		}
-		if input.CommitTransactionID != "" {
-			q = q.Where("(commit_transaction_id IS NULL OR commit_transaction_id = '' OR commit_transaction_id = ?)", input.CommitTransactionID)
-		}
-		if input.RequireEligibleCopy {
-			q = q.
-				Where("status <> ?", model.StorageUploadCopyStatusFailed).
-				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
-		}
-		res, err := q.Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("marking storage upload copy committing: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 && (input.RequireEligibleCopy || input.CommitExtraDataHex != "" || input.CommitTransactionID != "") {
-			return fmt.Errorf("marking storage upload copy committing: %w", ErrConflict)
-		}
-		return nil
-	})
-}
-
-func (r *BunStorageUploadRepo) ResetRejectedUploadCopyCommit(ctx context.Context, input ResetRejectedUploadCopyCommitInput) error {
-	if input.UploadID <= 0 || input.CopyIndex < 0 || input.CommitTransactionID == "" {
-		return fmt.Errorf("resetting rejected storage upload commit: %w", ErrInvalidInput)
-	}
-	copyID, err := slotCopyTarget(ctx, r.db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
-	if err != nil {
-		return err
-	}
-	res, err := r.db.NewUpdate().
-		Model((*model.StorageUploadCopy)(nil)).
-		Set("status = ?", model.StorageUploadCopyStatusPieceReady).
-		Set("commit_extra_data_hex = NULL").
-		Set("commit_transaction_id = NULL").
-		Set("last_error = ?", input.LastError).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", copyID).
-		Where("status = ?", model.StorageUploadCopyStatusCommitting).
-		Where("commit_transaction_id = ?", input.CommitTransactionID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("resetting rejected storage upload commit: %w", err)
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("resetting rejected storage upload commit: reading affected rows: %w", err)
-	}
-	if rows != 1 {
-		return fmt.Errorf("resetting rejected storage upload commit: %w", ErrConflict)
-	}
-	return nil
-}
-
 func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error {
-	if input.UploadID <= 0 || input.CopyIndex < 0 || input.PieceCID == "" || input.PieceID == nil || input.RetrievalURL == "" {
+	if input.UploadID <= 0 || input.CopyIndex < 0 || input.PieceCID == "" || input.PieceID == nil || input.RetrievalURL == "" ||
+		(input.CommitAttemptID != "" && input.StorageUploadCopyID <= 0) {
 		return fmt.Errorf("marking storage upload copy committed: %w", ErrInvalidInput)
 	}
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
-			return fmt.Errorf("locking storage upload for committed copy: %w", err)
+		var copyID int64
+		if input.CommitAttemptID != "" {
+			initial := new(model.StorageUploadCopy)
+			if err := db.NewSelect().
+				Model(initial).
+				Where("id = ?", input.StorageUploadCopyID).
+				Where("upload_id = ?", input.UploadID).
+				Where("copy_index = ?", input.CopyIndex).
+				Scan(ctx); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("loading storage commit copy: %w", ErrNotFound)
+				}
+				return fmt.Errorf("loading storage commit copy: %w", err)
+			}
+			if initial.StorageDataSetID == nil {
+				return fmt.Errorf("locking storage commit copy without data set: %w", ErrConflict)
+			}
+			lockedCopyID, _, err := lockCommitCopyFamily(ctx, db, storagecommit.CopyIdentity{
+				StorageUploadCopyID: input.StorageUploadCopyID,
+				UploadID:            input.UploadID,
+				CopyIndex:           input.CopyIndex,
+				StorageDataSetID:    *initial.StorageDataSetID,
+				RequireEligibleCopy: input.RequireEligibleCopy && input.CommitAttemptID == "",
+			})
+			if err != nil {
+				return err
+			}
+			copyID = lockedCopyID
+		} else {
+			if err := lockStorageUploadForCopyMutation(ctx, db, input.UploadID); err != nil {
+				return fmt.Errorf("locking storage upload for committed copy: %w", err)
+			}
+			var err error
+			copyID, err = slotCopyTarget(ctx, db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
+			if err != nil {
+				return err
+			}
 		}
 		now := time.Now()
-		isNewDataSet, err := uploadCopyDataSetCreatedByUpload(ctx, db, input.UploadID, input.CopyIndex)
-		if err != nil {
-			return err
-		}
-		copyID, err := slotCopyTarget(ctx, db, input.StorageUploadCopyID, input.UploadID, input.CopyIndex)
+		isNewDataSet, err := uploadCopyDataSetCreatedByUpload(ctx, db, copyID)
 		if err != nil {
 			return err
 		}
@@ -1643,6 +1644,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 			Set("is_new_data_set = ?", isNewDataSet).
 			Set("commit_extra_data_hex = COALESCE(?, commit_extra_data_hex)", nullableString(input.CommitExtraDataHex)).
 			Set("commit_transaction_id = COALESCE(?, commit_transaction_id)", nullableString(input.CommitTransactionID)).
+			Set("commit_confirmed_transaction_id = COALESCE(?, commit_confirmed_transaction_id)", nullableString(input.CommitConfirmedTransactionID)).
 			Set("last_error = NULL").
 			Set("updated_at = ?", now).
 			Where("id = ?", copyID)
@@ -1663,7 +1665,17 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 		if input.CommitTransactionID != "" {
 			q = q.Where("(commit_transaction_id IS NULL OR commit_transaction_id = '' OR commit_transaction_id = ?)", input.CommitTransactionID)
 		}
-		if input.RequireEligibleCopy {
+		if input.CommitAttemptID != "" {
+			q = q.
+				Set("commit_ready_at = NULL").
+				Set("commit_attempt_id = NULL").
+				Set("commit_attempted_at = NULL").
+				Set("commit_submission_json = NULL").
+				Set("commit_attention_code = NULL").
+				Set("commit_attention_at = NULL").
+				Where("commit_attempt_id = ?", input.CommitAttemptID)
+		}
+		if input.RequireEligibleCopy && input.CommitAttemptID == "" {
 			q = q.
 				Where("status <> ?", model.StorageUploadCopyStatusFailed).
 				Where(liveObjectVersionExistsForUploadSQL(), input.UploadID, false)
@@ -1711,11 +1723,20 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, input M
 		res, err := db.NewUpdate().
 			Model((*model.StorageUploadCopy)(nil)).
 			Set("status = ?", model.StorageUploadCopyStatusFailed).
+			Set("commit_ready_at = NULL").
+			Set("commit_attempt_id = NULL").
+			Set("commit_attempted_at = NULL").
+			Set("commit_submission_json = NULL").
+			Set("commit_extra_data_hex = NULL").
+			Set("commit_transaction_id = NULL").
+			Set("commit_confirmed_transaction_id = NULL").
+			Set("commit_attention_code = NULL").
+			Set("commit_attention_at = NULL").
 			Set("last_error = ?", lastError).
 			Set("updated_at = ?", now).
 			Where("id = ?", copyID).
 			Where("status <> ?", model.StorageUploadCopyStatusCommitted).
-			Where("NOT (status = ? AND commit_transaction_id IS NOT NULL AND commit_transaction_id <> '')", model.StorageUploadCopyStatusCommitting).
+			Where("NOT " + attemptedStorageCommitSQL("storage_upload_copy")).
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("marking storage upload copy failed: %w", err)
@@ -1728,8 +1749,7 @@ func (r *BunStorageUploadRepo) MarkUploadCopyFailed(ctx context.Context, input M
 			submittedCount, countErr := db.NewSelect().
 				Model((*model.StorageUploadCopy)(nil)).
 				Where("id = ?", copyID).
-				Where("status = ?", model.StorageUploadCopyStatusCommitting).
-				Where("commit_transaction_id IS NOT NULL AND commit_transaction_id <> ''").
+				Where(attemptedStorageCommitSQL("storage_upload_copy")).
 				Count(ctx)
 			if countErr != nil {
 				return fmt.Errorf("checking submitted storage commit before failure: %w", countErr)
@@ -1782,8 +1802,7 @@ func countSubmittedCommitCopies(ctx context.Context, db bun.IDB, uploadID int64)
 	count, err := db.NewSelect().
 		Model((*model.StorageUploadCopy)(nil)).
 		Where("upload_id = ?", uploadID).
-		Where("status = ?", model.StorageUploadCopyStatusCommitting).
-		Where("commit_transaction_id IS NOT NULL AND commit_transaction_id <> ''").
+		Where(attemptedStorageCommitSQL("storage_upload_copy")).
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("counting submitted storage commits: %w", err)
@@ -2296,22 +2315,17 @@ func uploadCopyTransferMethod(ctx context.Context, db bun.IDB, uploadID int64, c
 	return row.TransferMethod, nil
 }
 
-func uploadCopyDataSetCreatedByUpload(ctx context.Context, db bun.IDB, uploadID int64, copyIndex int) (bool, error) {
+func uploadCopyDataSetCreatedByUpload(ctx context.Context, db bun.IDB, copyID int64) (bool, error) {
 	var row struct {
 		IsNewDataSet bool `bun:"is_new_data_set"`
 	}
-	err := db.NewRaw(fmt.Sprintf(`SELECT CASE
+	err := db.NewRaw(`SELECT CASE
 			WHEN storage_data_set.created_by_upload_id = storage_copy.upload_id THEN TRUE
 			ELSE FALSE
 		END AS is_new_data_set
 		FROM storage_upload_copies AS storage_copy
 		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-		WHERE storage_copy.upload_id = ? AND storage_copy.copy_index = ?
-		  AND %s
-		ORDER BY (storage_copy.storage_data_set_id IS NULL) ASC
-		LIMIT 1`, currentGenerationCopySQL("storage_copy")),
-		uploadID, copyIndex,
-	).Scan(ctx, &row)
+		WHERE storage_copy.id = ?`, copyID).Scan(ctx, &row)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return false, nil

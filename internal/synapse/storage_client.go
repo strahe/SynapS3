@@ -236,8 +236,18 @@ func (c *dataSetTargetAdapter) Pull(ctx context.Context, request storage.PullReq
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 
-func (c *dataSetTargetAdapter) Commit(ctx context.Context, request storage.CommitRequest) (*storage.CommitResult, error) {
-	result, err := c.dataSet.Commit(ctx, request)
+func (c *dataSetTargetAdapter) SubmitCommit(ctx context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+	result, err := c.dataSet.SubmitCommit(ctx, request)
+	return result, NormalizeProviderOperationError(ctx, err)
+}
+
+func (c *dataSetTargetAdapter) GetCommitStatus(ctx context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+	result, err := c.dataSet.GetCommitStatus(ctx, submission)
+	return result, NormalizeProviderOperationError(ctx, err)
+}
+
+func (c *dataSetTargetAdapter) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
+	result, err := c.dataSet.PieceStatus(ctx, pieceCID)
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 

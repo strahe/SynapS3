@@ -6,6 +6,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
@@ -375,15 +376,7 @@ type MarkUploadCopyPieceReadyInput struct {
 	PieceCID            string
 	PieceID             *types.OnChainID
 	RetrievalURL        string
-}
-
-type MarkUploadCopyCommittingInput struct {
-	StorageUploadCopyID int64
-	RequireEligibleCopy bool
-	UploadID            int64
-	CopyIndex           int
 	CommitExtraDataHex  string
-	CommitTransactionID string
 }
 
 // MarkUploadCopyFailedInput names the copy that failed. Without the id the
@@ -398,27 +391,18 @@ type MarkUploadCopyFailedInput struct {
 	LastError           string
 }
 
-type ResetRejectedUploadCopyCommitInput struct {
-	// StorageUploadCopyID names the exact copy whose commit was rejected. Without
-	// it the reset resolves through the replica slot, which after an activation
-	// points at a different generation than the one that submitted the commit.
-	StorageUploadCopyID int64
-	UploadID            int64
-	CopyIndex           int
-	CommitTransactionID string
-	LastError           string
-}
-
 type MarkUploadCopyCommittedInput struct {
-	StorageUploadCopyID int64
-	RequireEligibleCopy bool
-	UploadID            int64
-	CopyIndex           int
-	PieceCID            string
-	PieceID             *types.OnChainID
-	RetrievalURL        string
-	CommitExtraDataHex  string
-	CommitTransactionID string
+	StorageUploadCopyID          int64
+	RequireEligibleCopy          bool
+	UploadID                     int64
+	CopyIndex                    int
+	PieceCID                     string
+	PieceID                      *types.OnChainID
+	RetrievalURL                 string
+	CommitExtraDataHex           string
+	CommitTransactionID          string
+	CommitAttemptID              string
+	CommitConfirmedTransactionID string
 }
 
 // AcquireReplicaRepairItemInput identifies the exact repair work already
@@ -535,8 +519,17 @@ type StorageUploadRepository interface {
 	ListIncompleteReadableUploads(ctx context.Context, afterID int64, limit int) ([]IncompleteReadableUpload, error)
 	ReassignIngressCopy(ctx context.Context, uploadID int64, unavailableCopyIndex int) (*model.StorageUploadCopy, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
-	MarkUploadCopyCommitting(ctx context.Context, input MarkUploadCopyCommittingInput) error
-	ResetRejectedUploadCopyCommit(ctx context.Context, input ResetRejectedUploadCopyCommitInput) error
+	ReserveCommitAttempt(ctx context.Context, input storagecommit.ReserveInput) (storagecommit.ReserveResult, error)
+	MarkCommitAttempted(ctx context.Context, input storagecommit.AttemptInput) (storagecommit.AttemptResult, error)
+	RecordCommitTransaction(ctx context.Context, input storagecommit.EvidenceInput) error
+	RecordCommitSubmission(ctx context.Context, input storagecommit.EvidenceInput) error
+	MarkCommitAttention(ctx context.Context, input storagecommit.AttentionInput) error
+	ResetCommitAttempt(ctx context.Context, input storagecommit.ResetInput) error
+	ReleaseCommitAttempt(ctx context.Context, input storagecommit.ReleaseInput) error
+	ReleaseCommitReservation(ctx context.Context, input storagecommit.ReservationReleaseInput) error
+	CountActiveCommitAttemptsForDataSet(ctx context.Context, storageDataSetID int64) (int, error)
+	ListCommitAttention(ctx context.Context, limit int) ([]storagecommit.AttentionRecord, error)
+	ReleaseCommitAttention(ctx context.Context, input storagecommit.ManualReleaseInput) error
 	MarkUploadCopyCommitted(ctx context.Context, input MarkUploadCopyCommittedInput) error
 	MarkUploadCopyFailed(ctx context.Context, input MarkUploadCopyFailedInput) error
 	BindReadableUploadForContent(ctx context.Context, input BindReadableUploadInput) ([]ObjectVersionRef, error)
@@ -593,6 +586,7 @@ type StorageReplacementRepository interface {
 	ClaimReadyReplacementItem(ctx context.Context, leaseTTL time.Duration) (*storagereplacement.Item, error)
 	RenewReplacementItemLease(ctx context.Context, token storagereplacement.ClaimToken, leaseTTL time.Duration) error
 	ReleaseReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
+	CancelReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
 	CompleteReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
 	WaitReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextCheck time.Time, lastError string) error
 	DeferReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextAttempt time.Time) error
@@ -696,6 +690,7 @@ type RecordTerminationEpochInput struct {
 type RetirementGate struct {
 	CoverageGaps     int
 	SourceWrites     int
+	ActiveAttempts   int
 	WaitingItems     int
 	SlotOwned        bool
 	EpochReached     bool

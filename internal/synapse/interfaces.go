@@ -36,7 +36,9 @@ type DataSetTarget interface {
 	Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
 	PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error)
 	Pull(context.Context, storage.PullRequest) (*storage.PullResult, error)
-	Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error)
+	SubmitCommit(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
+	GetCommitStatus(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
+	PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error)
 }
 
 // CleanupContext abstracts the SDK operations needed to remove PDP pieces.

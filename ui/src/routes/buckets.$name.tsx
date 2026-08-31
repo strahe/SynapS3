@@ -176,6 +176,11 @@ import {
 } from '@/lib/provider-replacement'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
+import {
+  storageConfirmationAttentionView,
+  storageConfirmationListCommand,
+  storageConfirmationReleaseWarning,
+} from '@/lib/storage-confirmation-attention'
 import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
 import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
@@ -870,7 +875,10 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
                 <TableCell className="px-3 font-mono text-xs">{replicaLabel(copy.copy_index)}</TableCell>
                 <TableCell className="px-3">{transferMethodLabel(copy.transfer_method)}</TableCell>
                 <TableCell className="px-3">
-                  <StatusBadge tone={copyStatusTone(copy.status)}>{copyStatusLabel(copy.status)}</StatusBadge>
+                  <StatusBadge tone={copyStatusTone(copy)}>{copyStatusLabel(copy)}</StatusBadge>
+                  {copy.attention_code && (
+                    <CopyAttentionDetails reasonCode={copy.attention_code} attentionAt={copy.attention_at} />
+                  )}
                 </TableCell>
                 <TableCell className="px-3">
                   <CopyHealthCell health={copy.health} />
@@ -1115,8 +1123,9 @@ function objectVisualStatus(status: ObjectStatus, uploadStatus?: ObjectUploadSta
   }
 }
 
-function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
-  switch (status) {
+function copyStatusTone(copy: ObjectProvenanceCopy): StatusTone {
+  if (copy.attention_code) return 'warning'
+  switch (copy.status) {
     case 'committed':
       return 'success'
     case 'failed':
@@ -1129,8 +1138,9 @@ function copyStatusTone(status: ObjectProvenanceCopy['status']): StatusTone {
   }
 }
 
-function copyStatusLabel(status: ObjectProvenanceCopy['status']) {
-  switch (status) {
+function copyStatusLabel(copy: ObjectProvenanceCopy) {
+  if (copy.attention_code) return 'Needs review'
+  switch (copy.status) {
     case 'pending':
       return 'Waiting'
     case 'piece_ready':
@@ -1142,6 +1152,32 @@ function copyStatusLabel(status: ObjectProvenanceCopy['status']) {
     case 'failed':
       return 'Failed'
   }
+}
+
+function CopyAttentionDetails({ reasonCode, attentionAt }: { reasonCode: string; attentionAt?: string }) {
+  const attention = storageConfirmationAttentionView(reasonCode)
+
+  return (
+    <details className="group mt-1 max-w-72 text-xs text-muted-foreground">
+      <summary className="cursor-pointer break-words text-status-warning marker:text-muted-foreground">
+        {attention.label}
+        {attentionAt ? ` · ${timeAgo(attentionAt)}` : ''}
+      </summary>
+      <div className="mt-2 space-y-2 rounded-md border border-border bg-muted/30 p-2 leading-relaxed">
+        <p>
+          Run <code className="break-all font-mono text-foreground">{storageConfirmationListCommand}</code> and review
+          the provider, piece, current attempt, and any transaction evidence.
+        </p>
+        <p>{storageConfirmationReleaseWarning}</p>
+        {!attention.known && (
+          <div className="space-y-1">
+            <div>Reason code</div>
+            <CopyableValue label="Confirmation reason code" value={attention.reasonCode} monospace maxLength={28} />
+          </div>
+        )}
+      </div>
+    </details>
+  )
 }
 
 function failureStageLabel(state?: string) {

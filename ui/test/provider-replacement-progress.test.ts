@@ -14,6 +14,7 @@ function progress(overrides: Partial<ProviderReplacementProgress> = {}): Provide
     items_no_longer_needed: 1,
     items_pending: 2,
     items_active: 1,
+    items_attention: 0,
     items_retrying: 1,
     items_waiting_source: 1,
     items_failed: 1,
@@ -47,7 +48,22 @@ test('determinate progress exposes active recovery states without raw errors', (
   assert.equal(view.indeterminate, false)
   assert.equal(view.value, 40)
   assert.equal(view.summary, '4 of 10 processed · 40%')
-  assert.equal(view.activity, '1 copying · 1 retrying · 1 waiting for source · 1 need attention')
+  assert.equal(view.activity, '1 in progress · 1 retrying · 1 waiting for source · 1 failed')
+})
+
+test('confirmation attention stays distinct from failed replacement work', () => {
+  const view = providerReplacementProgressView(
+    progress({ items_active: 0, items_attention: 2, items_retrying: 0, items_waiting_source: 0 })
+  )
+  assert.equal(view.activity, '2 confirmations need attention · 1 failed')
+})
+
+test('confirmation attention takes priority over the coordinator status message', () => {
+  const view = providerReplacementProgressView(
+    progress({ items_active: 4, items_attention: 1, items_retrying: 0, items_waiting_source: 0, items_failed: 0 }),
+    'Moving stored content'
+  )
+  assert.equal(view.activity, '1 confirmation needs attention · Moving stored content')
 })
 
 test('completed progress separates copied and no-longer-needed items at 100 percent', () => {
