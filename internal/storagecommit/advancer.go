@@ -140,7 +140,7 @@ func (a *Advancer) Advance(ctx context.Context, input AdvanceInput) (AdvanceResu
 		return AdvanceResult{}, err
 	}
 	if reservation.State == ReservationWaiting {
-		return AdvanceResult{State: AdvanceWaitingCapacity}, nil
+		return AdvanceResult{State: AdvanceWaitingCapacity, AttentionHeld: reservation.AttentionHeld}, nil
 	}
 	return a.submitReserved(ctx, input, reservation.Copy)
 }

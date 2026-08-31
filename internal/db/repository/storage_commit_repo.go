@@ -68,8 +68,16 @@ func (r *BunStorageUploadRepo) ReserveCommitAttempt(
 			return err
 		}
 		if active >= storagecommit.MaxActiveAttemptsPerDataSet {
+			// Say why capacity is gone. The count is diagnostic only, never an
+			// admission input, so it does not need to agree with the count above
+			// under a concurrent write.
+			held, err := countCommitAttentionAttemptsForDataSet(ctx, db, input.Copy.StorageDataSetID)
+			if err != nil {
+				return err
+			}
 			out.State = storagecommit.ReservationWaiting
 			out.Copy = *copyRow
+			out.AttentionHeld = held
 			return nil
 		}
 		var headID int64
@@ -372,6 +380,29 @@ func countActiveCommitAttemptsForDataSet(ctx context.Context, db bun.IDB, storag
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("counting active storage commit attempts: %w", err)
+	}
+	return count, nil
+}
+
+// countCommitAttentionAttemptsForDataSet counts the active attempts already
+// flagged for operator attention, which is what stops the data set's commit
+// queue from being able to move on its own.
+//
+// Every flagged attempt counts, whatever its code. Whether a given flag can
+// still settle without a person is not a property of the row: the same code is
+// written both as a terminal hold and as one the advancer keeps observing, and
+// which one it behaves as depends on the path that next reaches it. Classifying
+// by code would silently drop terminal holds, so this reports the flag and the
+// caller words its message to match.
+func countCommitAttentionAttemptsForDataSet(ctx context.Context, db bun.IDB, storageDataSetID int64) (int, error) {
+	count, err := db.NewSelect().
+		Model((*model.StorageUploadCopy)(nil)).
+		Where("storage_data_set_id = ?", storageDataSetID).
+		Where("commit_attempt_id IS NOT NULL AND commit_attempt_id <> ''").
+		Where("commit_attention_at IS NOT NULL").
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting storage commit attempts held for attention: %w", err)
 	}
 	return count, nil
 }

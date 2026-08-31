@@ -645,3 +645,104 @@ func seedCommitAttentionReplacement(
 		repos: repos, copyRow: copyRow, item: item, token: token, attemptID: attemptID,
 	}
 }
+
+func TestStorageCommitCapacityReportsSlotsHeldForAttention(t *testing.T) {
+	cases := []struct {
+		name              string
+		attention         storagecommit.AttentionCode
+		wantAttentionHeld int
+	}{
+		{
+			name:              "attention only an operator can clear holds the slot",
+			attention:         storagecommit.AttentionAttemptOnlyAmbiguous,
+			wantAttentionHeld: 4,
+		},
+		{
+			// data_set_unavailable is raised both as a terminal hold and as one
+			// the advancer keeps observing. Classifying by code drops the terminal
+			// ones, which is a silent under-count of the very case that strands a
+			// data set, so every flagged attempt counts.
+			name:              "data set unavailable attention holds the slot",
+			attention:         storagecommit.AttentionDataSetUnavailable,
+			wantAttentionHeld: 4,
+		},
+		{
+			name:              "confirmation timeout attention holds the slot",
+			attention:         storagecommit.AttentionConfirmationTimeout,
+			wantAttentionHeld: 4,
+		},
+		{
+			name:              "plain in-flight attempts are not flagged",
+			wantAttentionHeld: 0,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			bucket := seedBucket(t, db, "commit-review-capacity-bucket")
+			dataSet := seedCommitDataSet(t, db, bucket.ID)
+			copies := seedCommitCopies(t, db, bucket.ID, dataSet.ID, storagecommit.MaxActiveAttemptsPerDataSet+1)
+
+			for i := range storagecommit.MaxActiveAttemptsPerDataSet {
+				attemptID := fmt.Sprintf("review-attempt-%d", i)
+				seedRepositoryCommitAttempt(t, repos, copies[i], attemptID, "abcd", "")
+				if testCase.attention == "" {
+					continue
+				}
+				if err := repos.Uploads.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
+					Copy: commitCopyIdentity(copies[i]), AttemptID: attemptID, Code: testCase.attention,
+				}); err != nil {
+					t.Fatalf("MarkCommitAttention(%d): %v", i, err)
+				}
+			}
+
+			// Attention never frees the slot: those attempts may already have been
+			// accepted by the provider.
+			active, err := repos.Uploads.CountActiveCommitAttemptsForDataSet(t.Context(), dataSet.ID)
+			if err != nil || active != storagecommit.MaxActiveAttemptsPerDataSet {
+				t.Fatalf("active attempts = %d err=%v, want %d", active, err, storagecommit.MaxActiveAttemptsPerDataSet)
+			}
+
+			blocked, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+				Copy:      commitCopyIdentity(copies[storagecommit.MaxActiveAttemptsPerDataSet]),
+				AttemptID: "review-blocked-attempt",
+			})
+			if err != nil || blocked.State != storagecommit.ReservationWaiting {
+				t.Fatalf("blocked reservation = %#v err=%v, want waiting", blocked, err)
+			}
+			if blocked.AttentionHeld != testCase.wantAttentionHeld {
+				t.Fatalf("blocked reservation attention held = %d, want %d", blocked.AttentionHeld, testCase.wantAttentionHeld)
+			}
+		})
+	}
+}
+
+func TestStorageCommitQueuedReservationReportsNoAttentionHold(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "commit-review-queued-bucket")
+	dataSet := seedCommitDataSet(t, db, bucket.ID)
+	copies := seedCommitCopies(t, db, bucket.ID, dataSet.ID, 2)
+	base := time.Now().Add(-time.Minute)
+
+	// Give the head an earlier FIFO position without reserving it, so the second
+	// copy waits on order rather than on capacity.
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: commitCopyIdentity(copies[0]), AttemptID: "queued-head", Now: base,
+	}); err != nil {
+		t.Fatalf("reserve head: %v", err)
+	}
+	if err := repos.Uploads.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
+		Copy: commitCopyIdentity(copies[0]), AttemptID: "queued-head",
+	}); err != nil {
+		t.Fatalf("release head reservation: %v", err)
+	}
+
+	queued, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: commitCopyIdentity(copies[1]), AttemptID: "queued-follower", Now: base.Add(time.Second),
+	})
+	if err != nil || queued.State != storagecommit.ReservationWaiting || queued.AttentionHeld != 0 {
+		t.Fatalf("queued reservation = %#v err=%v, want waiting behind the FIFO head with no attention hold", queued, err)
+	}
+}
