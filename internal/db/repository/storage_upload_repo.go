@@ -1615,7 +1615,10 @@ func (r *BunStorageUploadRepo) MarkUploadCopyCommitted(ctx context.Context, inpu
 				UploadID:            input.UploadID,
 				CopyIndex:           input.CopyIndex,
 				StorageDataSetID:    *initial.StorageDataSetID,
-				RequireEligibleCopy: input.RequireEligibleCopy && input.CommitAttemptID == "",
+				// Settling an attempted commit deliberately skips the owner
+				// eligibility check: the piece already reached the provider, so a
+				// deleted owner must not stop the copy from being recorded.
+				RequireEligibleCopy: false,
 			})
 			if err != nil {
 				return err

@@ -516,3 +516,50 @@ func TestCommitReleaseCauseKeepsDataSetEndedClassification(t *testing.T) {
 		})
 	}
 }
+
+func TestCapacityWaitNamesAttentionHeldSlots(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cases := []struct {
+		name          string
+		attentionHeld int
+		wantMessage   string
+	}{
+		{
+			name:          "queued behind work that still moves",
+			attentionHeld: 0,
+			wantMessage:   "Waiting to submit stored content",
+		},
+		{
+			// The unflagged attempts are still working through, so the queue moves.
+			name:          "partial attention hold keeps the ordinary wording",
+			attentionHeld: storagecommit.MaxActiveAttemptsPerDataSet - 1,
+			wantMessage:   "Waiting to submit stored content",
+		},
+		{
+			name:          "every slot flagged for attention",
+			attentionHeld: storagecommit.MaxActiveAttemptsPerDataSet,
+			wantMessage:   "Waiting for storage confirmations that need attention",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			repos, _, _, _, task := seedCommitFailureFixture(t, 2)
+			handled := (&Uploader{repos: repos}).waitForCommitAdvance(t.Context(), task, logger, storagecommit.AdvanceResult{
+				State: storagecommit.AdvanceWaitingCapacity, AttentionHeld: testCase.attentionHeld,
+			})
+			if !handled {
+				t.Fatal("capacity wait was not handled")
+			}
+			gotTask, err := repos.Tasks.GetByID(t.Context(), task.ID)
+			if err != nil || gotTask == nil || gotTask.StatusMessage == nil {
+				t.Fatalf("task after capacity wait = %#v err=%v", gotTask, err)
+			}
+			if *gotTask.StatusMessage != testCase.wantMessage {
+				t.Fatalf("capacity wait message = %q, want %q", *gotTask.StatusMessage, testCase.wantMessage)
+			}
+			if gotTask.Status != model.TaskStatusWaiting || gotTask.RetryCount != 0 {
+				t.Fatalf("task after capacity wait = %#v, want waiting without retry", gotTask)
+			}
+		})
+	}
+}

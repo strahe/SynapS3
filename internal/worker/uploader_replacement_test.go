@@ -1081,3 +1081,35 @@ func TestUploader_ReplacementResumesItsOwnSubmittedCreation(t *testing.T) {
 		t.Fatalf("replacement failed on its own submitted service: %v", row.LastError)
 	}
 }
+
+// A migration whose target refuses writes must release its commit attempt and
+// pause on the target, the same failover the ordinary upload paths take.
+func TestUploader_ReplacementWriteBlockedTargetPausesOnTheTarget(t *testing.T) {
+	fixture := seedReplacementEnv(t)
+	ctx := context.Background()
+	row := fixture.authorize(t, "202")
+
+	fixture.targetCtx.submitPreflightErr = fmt.Errorf("storage.DataSetContext.SubmitCommit: %w",
+		&storage.DataSetPDPPaymentTerminatedError{DataSetID: sdktypes.NewBigInt(2002), PDPEndEpoch: 3778900})
+
+	fixture.runUploaderUntil(t, func() bool {
+		got, err := fixture.env.repos.Replacements.GetByID(ctx, row.ID)
+		return err == nil && got != nil && got.WaitReason != nil && *got.WaitReason == storagereplacement.WaitReasonTarget
+	}, 20*time.Second)
+
+	// The coordinator owns generation lifecycle here, so a refused target pauses
+	// the replacement instead of draining the generation it is migrating into.
+	// What the commit path owes is releasing its own attempt.
+	targetCopy, err := fixture.env.repos.Uploads.GetUploadCopyForDataSet(ctx, fixture.upload.ID, row.TargetDataSetID)
+	if err != nil || targetCopy == nil || targetCopy.Status != model.StorageUploadCopyStatusPieceReady ||
+		targetCopy.CommitAttemptID != nil || targetCopy.CommitReadyAt != nil ||
+		targetCopy.CommitExtraDataHex != nil || targetCopy.CommitTransactionID != nil {
+		t.Fatalf("target copy = %#v err=%v, want its commit attempt released", targetCopy, err)
+	}
+	var item storagereplacement.Item
+	if err := fixture.env.db.NewSelect().Model(&item).
+		Where("replacement_id = ?", row.ID).
+		Scan(ctx); err != nil || item.RetryCount != 0 {
+		t.Fatalf("paused item = %#v err=%v, want the retry budget untouched", item, err)
+	}
+}

@@ -2971,6 +2971,19 @@ func (u *Uploader) waitForCommitAdvance(
 	case storagecommit.AdvanceWaitingCapacity:
 		delay = u.commitPollDelay()
 		message = "Waiting to submit stored content"
+		// Once every slot is flagged for attention this queue cannot be relied on
+		// to move by itself, so point at the confirmations instead of letting it
+		// read like an ordinary queue. Partial holds keep the ordinary wording,
+		// because the unflagged attempts are still working through.
+		//
+		// This is the state that persists until someone acts on it, and the
+		// branch runs once per poll for every blocked task, so the log stays at
+		// debug. The wait message above is the durable, operator-visible record.
+		if result.AttentionHeld >= storagecommit.MaxActiveAttemptsPerDataSet {
+			message = "Waiting for storage confirmations that need attention"
+			logger.Debug("storage commit capacity is fully held by flagged confirmations",
+				"attentionHeld", result.AttentionHeld, "capacity", storagecommit.MaxActiveAttemptsPerDataSet)
+		}
 	case storagecommit.AdvanceSubmitted, storagecommit.AdvancePending:
 		delay = u.commitPollDelay()
 		message = "Waiting for storage confirmation"

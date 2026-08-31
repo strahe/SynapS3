@@ -33,6 +33,11 @@ type ReserveInput struct {
 type ReserveResult struct {
 	State ReservationState
 	Copy  model.StorageUploadCopy
+	// AttentionHeld counts the data set's active attempts already flagged for
+	// operator attention. It is set only when capacity turned the reservation
+	// away, so a waiting result with zero here is queued behind work that is
+	// still moving.
+	AttentionHeld int
 }
 
 type AttemptInput struct {

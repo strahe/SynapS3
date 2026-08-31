@@ -427,12 +427,18 @@ type fakeUploadContext struct {
 	storeProgress        []int64
 	storeCalls           atomic.Int32
 	commitErr            error
-	serviceURL           string
-	presignCalls         atomic.Int32
-	commitCalls          atomic.Int32
-	commitMu             sync.Mutex
-	commitExtras         [][]byte
-	pullCalls            atomic.Int32
+	// submitPreflightErr fails a commit the way the SDK does when it refuses the
+	// data set: contextCore.submitCommit validates writability before it presigns
+	// or adds pieces, so the provider is never contacted and no transaction is
+	// recorded. commitErr fails after the submission callback instead, which is
+	// the ambiguous shape.
+	submitPreflightErr error
+	serviceURL         string
+	presignCalls       atomic.Int32
+	commitCalls        atomic.Int32
+	commitMu           sync.Mutex
+	commitExtras       [][]byte
+	pullCalls          atomic.Int32
 }
 
 func newFakeUploadContext(providerID sdktypes.BigInt, dataSetID sdktypes.BigInt, pieceID sdktypes.BigInt, pieceCID cid.Cid) *fakeUploadContext {
@@ -621,29 +627,10 @@ func (f *fakeUploadContext) Pull(ctx context.Context, _ storage.PullRequest) (*s
 	return &storage.PullResult{Status: storage.PullStatusComplete}, nil
 }
 
-func (f *fakeUploadContext) Commit(_ context.Context, req storage.CommitRequest) (*storage.CommitResult, error) {
-	f.commitCalls.Add(1)
-	f.commitMu.Lock()
-	f.commitExtras = append(f.commitExtras, append([]byte(nil), req.ExtraData...))
-	f.commitMu.Unlock()
-	if req.OnSubmitted != nil {
-		req.OnSubmitted(fakeSubmittedCommitTxHash)
-	}
-	if f.commitErr != nil {
-		return nil, f.commitErr
-	}
-	ref, err := storage.NewDataSetRef(f.providerID, f.dataSetID, f.clientDataID)
-	if err != nil {
-		return nil, err
-	}
-	return &storage.CommitResult{
-		TransactionID: fakeSubmittedCommitTxHash,
-		DataSet:       ref,
-		PieceIDs:      []sdktypes.BigInt{f.pieceID.Copy()},
-	}, nil
-}
-
 func (f *fakeUploadContext) SubmitCommit(_ context.Context, req storage.CommitRequest) (*storage.CommitSubmission, error) {
+	if f.submitPreflightErr != nil {
+		return nil, f.submitPreflightErr
+	}
 	f.commitCalls.Add(1)
 	f.commitMu.Lock()
 	f.commitExtras = append(f.commitExtras, append([]byte(nil), req.ExtraData...))
@@ -2880,8 +2867,24 @@ func TestUploader_EnsureDatasetCreationRejectionPreservesEstablishedEvidence(t *
 	}
 }
 
-func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
-	env := newTestWorkerEnv(t)
+// ingressCommitFixture is a stored primary copy with its ingress_commit task
+// queued and its provider context wired, which is where the commit-path tests
+// start.
+type ingressCommitFixture struct {
+	env       *testWorkerEnv
+	bucket    *model.Bucket
+	objectID  int64
+	versionID string
+	upload    *model.StorageUpload
+	binding   *model.StorageDataSet
+	copyRow   *model.StorageUploadCopy
+	pieceCID  cid.Cid
+	task      *model.Task
+	primary   *fakeUploadContext
+}
+
+func seedReadyIngressCommitTask(t *testing.T, env *testWorkerEnv, requestedCopies, maxRetries int) ingressCommitFixture {
+	t.Helper()
 	bucket, objID, versionID := seedCachedObject(t, env)
 	ctx := context.Background()
 	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
@@ -2899,7 +2902,7 @@ func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 		SourceVersionID: versionID,
 		ContentSize:     version.Size,
 		Checksum:        version.Checksum,
-		RequestedCopies: 3,
+		RequestedCopies: requestedCopies,
 	})
 	if err != nil {
 		t.Fatalf("StartObjectUploadAttempt: %v", err)
@@ -2921,9 +2924,12 @@ func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
-	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
-	}); err != nil {
+	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: primary.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       onChainID(t, "101"),
+	}}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
 	pieceCID := testCID(t)
@@ -2935,6 +2941,10 @@ func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
 	}
+	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
+	}
 	stage := "ingress_commit"
 	task := &model.Task{
 		Type:           model.TaskTypeUpload,
@@ -2945,7 +2955,7 @@ func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 		IdempotencyKey: fmt.Sprintf("upload:%s:ingress_commit:%d", versionID, upload.ID),
 		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 0, "transfer_method": string(model.StorageCopyTransferMethodIngress)},
 		Status:         model.TaskStatusQueued,
-		MaxRetries:     1,
+		MaxRetries:     maxRetries,
 		ScheduledAt:    time.Now(),
 	}
 	if err := env.repos.Tasks.Create(ctx, task); err != nil {
@@ -2955,6 +2965,24 @@ func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 	primaryDataSetID := sdktypes.NewBigInt(1001)
 	primaryCtx.boundDataSet = &primaryDataSetID
 	primaryCtx.clientDataID = sdktypes.NewBigInt(9001)
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
+		if createContextDataSetIDEqual(opts, primaryDataSetID) {
+			return primaryCtx, nil
+		}
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
+	}
+	return ingressCommitFixture{
+		env: env, bucket: bucket, objectID: objID, versionID: versionID, upload: upload,
+		binding: primary, copyRow: copyRow, pieceCID: pieceCID, task: task, primary: primaryCtx,
+	}
+}
+
+func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadyIngressCommitTask(t, env, 3, 1)
+	upload, versionID, task := fixture.upload, fixture.versionID, fixture.task
+	primaryCtx := fixture.primary
 	primaryCtx.commitErr = errors.New("commit status poll timeout")
 	statusRequests := atomic.Int32{}
 	statusConfirmed := atomic.Bool{}
@@ -2972,12 +3000,6 @@ func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 	}))
 	defer statusServer.Close()
 	primaryCtx.serviceURL = statusServer.URL
-	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
-		if createContextDataSetIDEqual(opts, sdktypes.NewBigInt(1001)) {
-			return primaryCtx, nil
-		}
-		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
-	}
 
 	uploader := worker.NewUploader(
 		env.repos, env.cache, env.storage, nil, env.sm,
@@ -3044,83 +3066,11 @@ func TestUploader_PrimaryCommitPendingDoesNotConsumeRetryBudget(t *testing.T) {
 
 func TestUploader_RejectedSubmittedIngressCommitIsResubmitted(t *testing.T) {
 	env := newTestWorkerEnv(t)
-	bucket, objID, versionID := seedCachedObject(t, env)
 	ctx := context.Background()
-	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark uploading: %v", err)
-	}
-	if err := env.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
-		t.Fatalf("mark committing: %v", err)
-	}
-	version, err := env.repos.Objects.GetVersionByID(ctx, versionID)
-	if err != nil || version == nil {
-		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
-	}
-	upload, err := env.repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: versionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
-	primary, err := env.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          bucket.ID,
-		ProviderID:        onChainID(t, "101"),
-		CopyIndex:         0,
-		CreatedByUploadID: upload.ID,
-	})
-	if err != nil {
-		t.Fatalf("EnsureDataSetBinding: %v", err)
-	}
-	if err := env.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-		ID:              primary.ID,
-		UploadID:        upload.ID,
-		DataSetID:       onChainID(t, "1001"),
-		ClientDataSetID: onChainIDPtr(t, "9001"),
-	}); err != nil {
-		t.Fatalf("MarkDataSetReady: %v", err)
-	}
-	if err := env.repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
-		StorageDataSetID: primary.ID,
-		CopyIndex:        0,
-		TransferMethod:   model.StorageCopyTransferMethodIngress,
-		ProviderID:       onChainID(t, "101"),
-	}}); err != nil {
-		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
-	}
-	pieceCID := testCID(t)
-	if err := env.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
-		UploadID:     upload.ID,
-		CopyIndex:    0,
-		PieceCID:     pieceCID.String(),
-		RetrievalURL: fmt.Sprintf("https://provider-101.example/piece/%s", pieceCID.String()),
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
-	}
-	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
-	if err != nil || copyRow == nil {
-		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
-	}
+	fixture := seedReadyIngressCommitTask(t, env, 1, 2)
+	upload, versionID, task := fixture.upload, fixture.versionID, fixture.task
+	copyRow := fixture.copyRow
 	seedSubmittedCommitAttempt(t, env.repos, copyRow, "rejected-ingress", "01", fakeSubmittedCommitTxHash)
-	stage := "ingress_commit"
-	task := &model.Task{
-		Type:           model.TaskTypeUpload,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          objID,
-		RefVersionID:   versionID,
-		IdempotencyKey: fmt.Sprintf("upload:%s:ingress_commit:%d", versionID, upload.ID),
-		Payload:        map[string]interface{}{"upload_id": upload.ID, "copy_index": 0, "transfer_method": string(model.StorageCopyTransferMethodIngress)},
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     2,
-		ScheduledAt:    time.Now(),
-	}
-	if err := env.repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("Create task: %v", err)
-	}
 
 	statusRequests := atomic.Int32{}
 	statusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -3129,17 +3079,8 @@ func TestUploader_RejectedSubmittedIngressCommitIsResubmitted(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"txHash":%q,"txStatus":"rejected","dataSetId":1001,"pieceCount":1,"piecesAdded":false}`, fakeSubmittedCommitTxHash)
 	}))
 	defer statusServer.Close()
-	primaryCtx := newFakeUploadContext(sdktypes.NewBigInt(101), sdktypes.NewBigInt(1001), sdktypes.NewBigInt(2001), pieceCID)
-	primaryDataSetID := sdktypes.NewBigInt(1001)
-	primaryCtx.boundDataSet = &primaryDataSetID
-	primaryCtx.clientDataID = sdktypes.NewBigInt(9001)
+	primaryCtx := fixture.primary
 	primaryCtx.serviceURL = statusServer.URL
-	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
-		if createContextDataSetIDEqual(opts, primaryDataSetID) {
-			return primaryCtx, nil
-		}
-		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
-	}
 
 	uploader := worker.NewUploader(
 		env.repos, env.cache, env.storage, nil, env.sm,
@@ -3147,7 +3088,7 @@ func TestUploader_RejectedSubmittedIngressCommitIsResubmitted(t *testing.T) {
 		worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{AllowPrivateNetworks: true})),
 	)
 	runWorkerUntilTaskRetryCount(t, env, uploader, task.ID, 1, 5*time.Second)
-	copyRow, err = env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
+	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, upload.ID, 0)
 	if err != nil || copyRow.Status != model.StorageUploadCopyStatusPieceReady || copyRow.CommitTransactionID != nil || copyRow.CommitExtraDataHex != nil {
 		t.Fatalf("copy after rejected status = %#v err=%v, want resubmittable piece", copyRow, err)
 	}
@@ -6578,4 +6519,145 @@ func TestUploader_PrepareFundingDoesNotQueryWallet(t *testing.T) {
 	if upload, err := env.repos.Uploads.FindLatestUploadBySourceVersion(context.Background(), versionID); err != nil || upload == nil {
 		t.Fatalf("expected upload attempt, upload=%v err=%v", upload, err)
 	}
+}
+
+// writeBlockedCommitError is the SDK's refusal of a data set whose PDP payment
+// ended. The SDK raises it before contacting the provider, so the commit is
+// known not to have been submitted and the attempt can be released.
+func writeBlockedCommitError(dataSetID uint64) error {
+	return fmt.Errorf("storage.DataSetContext.SubmitCommit: %w", &storage.DataSetPDPPaymentTerminatedError{
+		DataSetID: sdktypes.NewBigInt(dataSetID), PDPEndEpoch: 3778900,
+	})
+}
+
+func assertCommitReleasedForFailover(t *testing.T, env *testWorkerEnv, bindingID, copyID int64) {
+	t.Helper()
+	ctx := context.Background()
+	binding, err := env.repos.Uploads.GetDataSetBindingByID(ctx, bindingID)
+	if err != nil || binding == nil || binding.Status != model.StorageDataSetStatusDraining {
+		t.Fatalf("binding after write-blocked commit = %#v err=%v, want draining", binding, err)
+	}
+	copyRow, err := env.repos.Uploads.GetUploadCopyByID(ctx, copyID)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageUploadCopyStatusPieceReady ||
+		copyRow.CommitAttemptID != nil || copyRow.CommitReadyAt != nil || copyRow.CommitExtraDataHex != nil ||
+		copyRow.CommitTransactionID != nil {
+		t.Fatalf("copy after write-blocked commit = %#v err=%v, want a released piece ready to move", copyRow, err)
+	}
+}
+
+func TestUploader_WriteBlockedIngressCommitDrainsDataSet(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadyIngressCommitTask(t, env, 1, 2)
+	fixture.primary.submitPreflightErr = writeBlockedCommitError(1001)
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm,
+		cache.EvictionPolicyAfterUpload, 1, 1, 10*time.Millisecond, slog.Default())
+	runWorkerUntilTaskStatus(t, env, uploader, fixture.task.ID, model.TaskStatusWaiting, 5*time.Second)
+
+	gotTask, err := env.repos.Tasks.GetByID(ctx, fixture.task.ID)
+	if err != nil || gotTask == nil || gotTask.RetryCount != 0 ||
+		gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonDependency {
+		t.Fatalf("ingress commit task = %#v err=%v, want dependency wait without retry", gotTask, err)
+	}
+	assertCommitReleasedForFailover(t, env, fixture.binding.ID, fixture.copyRow.ID)
+}
+
+func TestUploader_WriteBlockedPeerCommitDrainsDataSet(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadableUploadWithPendingPeer(t, env)
+	pieceCID := testCID(t)
+	if err := env.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     fixture.upload.ID,
+		CopyIndex:    1,
+		PieceCID:     pieceCID.String(),
+		RetrievalURL: fmt.Sprintf("https://provider-202.example/piece/%s", pieceCID.String()),
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 1)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
+	}
+	stage := "peer_commit"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: fixture.objID, RefVersionID: fixture.versionID,
+		IdempotencyKey: fmt.Sprintf("upload:%s:peer_commit:%d:1", fixture.versionID, fixture.upload.ID),
+		Payload:        map[string]interface{}{"upload_id": fixture.upload.ID, "copy_index": 1, "transfer_method": string(model.StorageCopyTransferMethodPeerPull)},
+		Status:         model.TaskStatusQueued, MaxRetries: 2, ScheduledAt: time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create peer commit task: %v", err)
+	}
+	peerCtx := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(302), pieceCID)
+	peerDataSetID := sdktypes.NewBigInt(2002)
+	peerCtx.boundDataSet = &peerDataSetID
+	peerCtx.submitPreflightErr = writeBlockedCommitError(2002)
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
+		if createContextDataSetIDEqual(opts, peerDataSetID) {
+			return peerCtx, nil
+		}
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm,
+		cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
+	// A peer copy on a write-blocked data set has nothing left to wait for: the
+	// replica is moved by the data set's own replacement, so the task completes
+	// rather than parking on the dependency the ingress path parks on.
+	gotTask := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
+		t.Fatalf("peer commit task = %#v, want completed without retry", gotTask)
+	}
+	assertCommitReleasedForFailover(t, env, fixture.peer.ID, copyRow.ID)
+}
+
+func TestUploader_WriteBlockedReplicaRepairCommitDrainsDataSet(t *testing.T) {
+	env := newTestWorkerEnv(t)
+	ctx := context.Background()
+	fixture := seedReadableUploadWithPendingPeer(t, env)
+	pieceCID := testCID(t)
+	if err := env.repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID:     fixture.upload.ID,
+		CopyIndex:    1,
+		PieceCID:     pieceCID.String(),
+		RetrievalURL: fmt.Sprintf("https://provider-202.example/piece/%s", pieceCID.String()),
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	copyRow, err := env.repos.Uploads.GetUploadCopy(ctx, fixture.upload.ID, 1)
+	if err != nil || copyRow == nil {
+		t.Fatalf("GetUploadCopy: copy=%#v err=%v", copyRow, err)
+	}
+	stage := "repair_replica"
+	task := &model.Task{
+		Type: model.TaskTypeUpload, Stage: &stage, RefType: "bucket", RefID: fixture.upload.BucketID,
+		RefVersionID: fixture.versionID, IdempotencyKey: fmt.Sprintf("upload:repair-data-set:%d", fixture.peer.ID),
+		Payload: map[string]interface{}{"storage_data_set_id": fixture.peer.ID, "storage_upload_copy_id": copyRow.ID},
+		Status:  model.TaskStatusQueued, MaxRetries: 2, ScheduledAt: time.Now(),
+	}
+	if err := env.repos.Tasks.Create(ctx, task); err != nil {
+		t.Fatalf("Create repair task: %v", err)
+	}
+	peerCtx := newFakeUploadContext(sdktypes.NewBigInt(202), sdktypes.NewBigInt(2002), sdktypes.NewBigInt(302), pieceCID)
+	peerDataSetID := sdktypes.NewBigInt(2002)
+	peerCtx.boundDataSet = &peerDataSetID
+	peerCtx.submitPreflightErr = writeBlockedCommitError(2002)
+	env.storage.OpenTargetFunc = func(_ context.Context, opts *testutil.OpenTargetOptions) (synapse.StorageTarget, error) {
+		if createContextDataSetIDEqual(opts, peerDataSetID) {
+			return peerCtx, nil
+		}
+		return nil, fmt.Errorf("unexpected OpenTarget opts: %#v", opts)
+	}
+
+	uploader := worker.NewUploader(env.repos, env.cache, env.storage, nil, env.sm,
+		cache.EvictionPolicyAfterUpload, 2, 1, 10*time.Millisecond, slog.Default())
+	// A draining data set has nothing left for in-place repair to do, so the task
+	// completes instead of waiting on the dependency the other paths wait on.
+	gotTask := runWorkerUntilTask(t, env, uploader, task.ID, 5*time.Second)
+	if gotTask.Status != model.TaskStatusCompleted || gotTask.RetryCount != 0 {
+		t.Fatalf("repair task = %#v, want completed without retry", gotTask)
+	}
+	assertCommitReleasedForFailover(t, env, fixture.peer.ID, copyRow.ID)
 }

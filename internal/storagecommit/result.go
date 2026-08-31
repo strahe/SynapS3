@@ -33,4 +33,8 @@ type AdvanceResult struct {
 	// why the data set failed instead of a generic sentinel. It is set only on
 	// ReleaseDataSetUnavailable and is nil everywhere else.
 	Cause error
+	// AttentionHeld carries the reservation's flagged-attempt count so the caller
+	// can say why capacity is unavailable. It is set only on
+	// AdvanceWaitingCapacity and is zero everywhere else.
+	AttentionHeld int
 }

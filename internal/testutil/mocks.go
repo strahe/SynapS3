@@ -263,10 +263,6 @@ func (m *MockStorageTarget) Pull(context.Context, storage.PullRequest) (*storage
 	return nil, errors.New("MockStorageTarget.Pull not configured")
 }
 
-func (m *MockStorageTarget) Commit(context.Context, storage.CommitRequest) (*storage.CommitResult, error) {
-	return nil, errors.New("MockStorageTarget.Commit not configured")
-}
-
 func (m *MockStorageTarget) SubmitCommit(ctx context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 	if m.SubmitCommitFunc != nil {
 		return m.SubmitCommitFunc(ctx, request)
