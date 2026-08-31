@@ -161,8 +161,8 @@ func (a *Advancer) submitReserved(
 	}
 	extraHex, err := a.commitExtraData(ctx, input.Target, copyRow, input.Pieces)
 	if err != nil {
-		if errors.Is(err, storage.ErrDataSetUnavailable) || synapse.IsDataSetServiceEnded(err) {
-			return a.release(ctx, identity, copyRow, ReleaseDataSetUnavailable, true, true, false)
+		if dataSetRefusesWrites(err) {
+			return a.releaseUnavailable(ctx, identity, copyRow, err, false)
 		}
 		if _, releaseErr := a.release(ctx, identity, copyRow, ReleaseBeforeSubmitCanceled, false, false, false); releaseErr != nil {
 			return AdvanceResult{}, releaseErr
@@ -216,8 +216,10 @@ func (a *Advancer) submitReserved(
 		},
 	})
 	if submitErr != nil {
-		if errors.Is(submitErr, storage.ErrDataSetUnavailable) || synapse.IsDataSetServiceEnded(submitErr) {
-			return a.release(ctx, identity, attempt.Copy, ReleaseDataSetUnavailable, true, true, true)
+		// A write-blocked data set is refused while the SDK validates it, before
+		// the provider is contacted, so the attempt is safe to release here.
+		if dataSetRefusesWrites(submitErr) {
+			return a.releaseUnavailable(ctx, identity, attempt.Copy, submitErr, true)
 		}
 		if context.Cause(ctx) != nil {
 			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
@@ -228,10 +230,10 @@ func (a *Advancer) submitReserved(
 					errors.Join(submitErr, fmt.Errorf("recording storage commit callback evidence: %w", evidenceErr.err))
 			}
 		}
-		if synapse.IsProviderUnavailable(submitErr) {
-			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
-		}
-		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+		// Every remaining submission failure is ambiguous, so the attempt fence
+		// stays and the next pass observes it. The error still travels back so the
+		// caller can record why, which parking alone would discard.
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
 	}
 	if submission == nil {
 		if evidenceErr := callbackEvidenceErr.Load(); evidenceErr != nil {
@@ -276,6 +278,12 @@ func (a *Advancer) observe(
 	if copyRow.CommitSubmissionJSON != nil && *copyRow.CommitSubmissionJSON != "" {
 		submission, err := DecodeSubmission(*copyRow.CommitSubmissionJSON)
 		if err != nil {
+			// A submission we can no longer read is still confirmable through its
+			// recorded transaction. That evidence names the exact transaction, so
+			// it is safer than asking an operator to release the attempt.
+			if copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != "" {
+				return a.observeTransaction(ctx, input, copyRow)
+			}
 			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionInvalidSubmission, false)
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, a.requestTimeout())
@@ -556,6 +564,32 @@ func (a *Advancer) release(
 		ReleaseReason: reason,
 		AttemptID:     *copyRow.CommitAttemptID,
 	}, nil
+}
+
+// releaseUnavailable releases the attempt and keeps the provider error so the
+// caller can record why the data set stopped accepting this commit.
+func (a *Advancer) releaseUnavailable(
+	ctx context.Context,
+	identity CopyIdentity,
+	copyRow model.StorageUploadCopy,
+	cause error,
+	knownNotSubmitted bool,
+) (AdvanceResult, error) {
+	result, err := a.release(ctx, identity, copyRow, ReleaseDataSetUnavailable, true, true, knownNotSubmitted)
+	if err != nil {
+		return result, err
+	}
+	result.Cause = cause
+	return result, nil
+}
+
+// dataSetRefusesWrites reports whether err means the data set will not accept
+// this commit, because its storage service ended or its PDP payment did. Both
+// are decided before the provider is contacted.
+func dataSetRefusesWrites(err error) bool {
+	return errors.Is(err, storage.ErrDataSetUnavailable) ||
+		synapse.IsDataSetServiceEnded(err) ||
+		synapse.IsDataSetWriteBlocked(err)
 }
 
 func (a *Advancer) commitExtraData(

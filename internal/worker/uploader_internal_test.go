@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -201,6 +202,35 @@ func TestCommitTaskFailureReservationLifecycle(t *testing.T) {
 		if err != nil || gotTask.Status != model.TaskStatusWaiting || gotTask.RetryCount != 0 ||
 			gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonExternalConfirmation {
 			t.Fatalf("attempted task = %#v err=%v, want confirmation wait", gotTask, err)
+		}
+	})
+
+	t.Run("settlement rollback parks instead of stranding the claim", func(t *testing.T) {
+		repos, copyRow, _, _, task := seedCommitFailureFixture(t, 1)
+		identity := storagecommit.CopyIdentity{
+			StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID,
+			CopyIndex: copyRow.CopyIndex, StorageDataSetID: *copyRow.StorageDataSetID,
+		}
+		if err := repos.Uploads.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
+			Copy: identity, AttemptID: "commit-failure-reservation",
+		}); err != nil {
+			t.Fatalf("seed ready-only reservation: %v", err)
+		}
+		// Failing the copy leaves nothing for the terminal settlement to release, so
+		// its transaction rolls back without the attempt ever becoming observable.
+		if err := repos.Uploads.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
+			StorageUploadCopyID: copyRow.ID, UploadID: copyRow.UploadID,
+			CopyIndex: copyRow.CopyIndex, LastError: "copy failed before settlement",
+		}); err != nil {
+			t.Fatalf("MarkUploadCopyFailed: %v", err)
+		}
+		(&Uploader{repos: repos, pollInterval: time.Second}).handleCommitTaskFailure(
+			t.Context(), task, copyRow, logger, "commit", errors.New("presign failed"),
+		)
+		gotTask, err := repos.Tasks.GetByID(t.Context(), task.ID)
+		if err != nil || gotTask.Status != model.TaskStatusWaiting ||
+			gotTask.WaitReason == nil || *gotTask.WaitReason != model.TaskWaitReasonExternalConfirmation {
+			t.Fatalf("rolled back task = %#v err=%v, want a parked task rather than a held claim", gotTask, err)
 		}
 	})
 }
@@ -455,4 +485,34 @@ func TestUploadProgressReporterCoalescesThrottledProgress(t *testing.T) {
 		t.Fatalf("GetByID final: %v", err)
 	}
 	t.Fatalf("ingress_bytes_transferred = %d, want coalesced latest progress 70", got.IngressBytesTransferred)
+}
+
+func TestCommitReleaseCauseKeepsDataSetEndedClassification(t *testing.T) {
+	// Both the uploader and the replacement worker decide between "draining" and
+	// "unavailable" from this error, so every cause a release can carry must still
+	// read as an ended data set.
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{name: "missing cause falls back to the sentinel"},
+		{name: "service ended", cause: storage.ErrDataSetUnavailable},
+		{name: "write blocked", cause: fmt.Errorf("submit commit: %w", &storage.DataSetPDPPaymentTerminatedError{
+			DataSetID: sdktypes.NewBigInt(1001), PDPEndEpoch: sdktypes.Epoch(42),
+		})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cause := commitReleaseCause(storagecommit.AdvanceResult{
+				State:         storagecommit.AdvanceReleased,
+				ReleaseReason: storagecommit.ReleaseDataSetUnavailable,
+				Cause:         tc.cause,
+			})
+			if cause == nil {
+				t.Fatal("release cause is nil, want an error the failure handlers can classify")
+			}
+			if !dataSetFailureEnded(cause, nil) {
+				t.Fatalf("release cause %v is not an ended data set, so it would be marked unavailable", cause)
+			}
+		})
+	}
 }

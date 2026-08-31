@@ -613,20 +613,25 @@ func seedCommitAttentionReplacement(
 		Status: storagereplacement.ItemStatusPending, ScheduledAt: now,
 		MaxRetries: &maxRetries, CreatedAt: now, UpdatedAt: now,
 	}
-	token := storagereplacement.ClaimToken{}
 	if claimed {
 		claimedAt := time.Now().Add(-time.Second)
 		leaseUntil := claimedAt.Add(time.Hour)
 		item.Status = storagereplacement.ItemStatusRunning
 		item.ClaimedAt = &claimedAt
 		item.LeaseUntil = &leaseUntil
-		token = storagereplacement.ClaimToken{ItemID: item.ID, ClaimedAt: claimedAt}
 	}
 	if _, err := db.NewInsert().Model(&item).Exec(t.Context()); err != nil {
 		t.Fatalf("insert replacement item: %v", err)
 	}
+	// Claim tokens must carry the persisted timestamp. Timestamps round trip with
+	// microsecond precision, so an in-memory time.Now() never matches the stored
+	// value on a platform whose wall clock exposes nanoseconds.
+	token := storagereplacement.ClaimToken{}
 	if claimed {
-		token.ItemID = item.ID
+		if err := db.NewSelect().Model(&item).Where("id = ?", item.ID).Scan(t.Context()); err != nil {
+			t.Fatalf("reload claimed replacement item: %v", err)
+		}
+		token = storagereplacement.ClaimToken{ItemID: item.ID, ClaimedAt: *item.ClaimedAt}
 	}
 	attemptID := name + "-attempt"
 	seedRepositoryCommitAttempt(t, repos, copyRow, attemptID, "abcd", "0x"+name)

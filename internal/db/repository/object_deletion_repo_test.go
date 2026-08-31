@@ -1766,3 +1766,37 @@ func payloadStringSlice(payload map[string]interface{}, key string) []string {
 	}
 	return nil
 }
+
+func TestObjectRepo_DeleteObjectVersionPermanentlyKeepsLegacyBareCommitTransaction(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+	fixture := seedPermanentDeleteRepairFixture(t, db, repos, "legacy-bare-transaction")
+	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		UploadID: fixture.upload.ID, CopyIndex: fixture.repairCopy.CopyIndex,
+		PieceCID: "bafk2bzacepermanentrepair", RetrievalURL: "https://repair.example/piece",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady: %v", err)
+	}
+	// Older code could send a submitted copy back to 'piece_ready' without clearing
+	// its transaction, leaving evidence the durable model never owned.
+	if _, err := db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("commit_transaction_id = ?", "0xlegacybare").
+		Where("id = ?", fixture.repairCopy.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("seed legacy bare transaction: %v", err)
+	}
+
+	_, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: fixture.bucket.ID, Key: fixture.version.Key, VersionID: fixture.version.VersionID,
+	})
+	if !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) {
+		t.Fatalf("DeleteObjectVersionPermanently error = %v, want legacy storage-work conflict", err)
+	}
+	got, err := repos.Uploads.GetUploadCopyByID(ctx, fixture.repairCopy.ID)
+	if err != nil || got == nil || got.Status != model.StorageUploadCopyStatusPieceReady ||
+		got.CommitTransactionID == nil || *got.CommitTransactionID != "0xlegacybare" {
+		t.Fatalf("legacy copy = %#v err=%v, want retained transaction evidence", got, err)
+	}
+}

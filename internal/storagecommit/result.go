@@ -29,4 +29,8 @@ type AdvanceResult struct {
 	Confirmation  *storage.CommitResult
 	AttentionCode AttentionCode
 	Continue      bool
+	// Cause carries the provider error behind a release so the caller can record
+	// why the data set failed instead of a generic sentinel. It is set only on
+	// ReleaseDataSetUnavailable and is nil everywhere else.
+	Cause error
 }

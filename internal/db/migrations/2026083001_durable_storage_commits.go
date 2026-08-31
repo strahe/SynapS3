@@ -124,17 +124,30 @@ func down2026083001DurableStorageCommits(ctx context.Context, db bun.IDB) error 
 	return nil
 }
 
+// strandedCommitTransactionFilter2026083001 matches copies that kept a commit
+// transaction after leaving 'committing'. Older code could send a submitted copy
+// back to 'piece_ready' without clearing its transaction, and from there on to
+// 'failed', leaving evidence of a submission whose outcome was never resolved.
+const strandedCommitTransactionFilter2026083001 = " FROM storage_upload_copies" +
+	" WHERE status NOT IN ('committed', 'committing')" +
+	" AND commit_transaction_id IS NOT NULL AND commit_transaction_id <> ''"
+
 func assertDurableStorageCommitUpgradePreconditions2026083001(ctx context.Context, db bun.IDB) error {
-	var committing int
-	query := "SELECT COUNT(*) FROM storage_upload_copies WHERE status = 'committing'"
 	attemptColumnExists, err := columnExists(ctx, db, "storage_upload_copies", "commit_attempt_id")
 	if err != nil {
 		return fmt.Errorf("checking durable attempt column before %s: %w", durableStorageCommitMigration2026083001, err)
 	}
+	// On a re-entrant run the durable columns already exist, so exclude copies the
+	// new model owns and judge only the rows the old code could have left behind.
+	legacyOnly := ""
 	if attemptColumnExists {
-		query += " AND (commit_attempt_id IS NULL OR commit_attempt_id = '')"
+		legacyOnly = " AND (commit_attempt_id IS NULL OR commit_attempt_id = '')"
 	}
-	if err := db.NewRaw(query).Scan(ctx, &committing); err != nil {
+
+	var committing int
+	if err := db.NewRaw(
+		"SELECT COUNT(*) FROM storage_upload_copies WHERE status = 'committing'"+legacyOnly,
+	).Scan(ctx, &committing); err != nil {
 		return fmt.Errorf("checking existing committing copies before %s: %w", durableStorageCommitMigration2026083001, err)
 	}
 	if committing > 0 {
@@ -142,6 +155,27 @@ func assertDurableStorageCommitUpgradePreconditions2026083001(ctx context.Contex
 			"cannot apply %s while %d legacy committing copies remain; drain storage commit work before upgrading",
 			durableStorageCommitMigration2026083001,
 			committing,
+		)
+	}
+
+	// The durable model cannot tell this evidence apart from a copy that never
+	// submitted anything, so a later permanent delete would discard a piece the
+	// provider may still be paid to keep. Refuse instead of guessing.
+	var stranded int
+	if err := db.NewRaw(
+		"SELECT COUNT(*)"+strandedCommitTransactionFilter2026083001+legacyOnly,
+	).Scan(ctx, &stranded); err != nil {
+		return fmt.Errorf("checking stranded commit transactions before %s: %w", durableStorageCommitMigration2026083001, err)
+	}
+	if stranded > 0 {
+		return fmt.Errorf(
+			"cannot apply %s while %d copies keep a commit transaction outside 'committed' and 'committing'; "+
+				"review them with [SELECT id, upload_id, copy_index, status, commit_transaction_id%s%s], "+
+				"resolve each transaction and clear commit_transaction_id, or reset the development database",
+			durableStorageCommitMigration2026083001,
+			stranded,
+			strandedCommitTransactionFilter2026083001,
+			legacyOnly,
 		)
 	}
 	return nil

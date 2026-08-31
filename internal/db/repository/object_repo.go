@@ -1484,7 +1484,11 @@ func storageUploadCopyHasAttemptedCommit(copyRow model.StorageUploadCopy) bool {
 	if copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" && copyRow.CommitAttemptedAt != nil {
 		return true
 	}
-	return copyRow.Status == model.StorageUploadCopyStatusCommitting &&
+	// A transaction id outside 'committed' records a submission whose outcome was
+	// never resolved, including rows older code left behind when it sent a
+	// submitted copy back to 'piece_ready'. Treat those as busy so a permanent
+	// delete cannot discard a piece the provider may still be paid to keep.
+	return copyRow.Status != model.StorageUploadCopyStatusCommitted &&
 		copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != ""
 }
 

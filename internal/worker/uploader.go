@@ -1646,7 +1646,7 @@ func (u *Uploader) ingressCommit(ctx context.Context, task *model.Task, version 
 	}
 	switch {
 	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
-		u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress commit", storage.ErrDataSetUnavailable)
+		u.handleIngressDataSetFailure(ctx, task, version, uploadID, copyIndex, binding.ID, logger, "ingress commit", commitReleaseCause(advance))
 		return
 	case advance.State == storagecommit.AdvanceReleased:
 		return
@@ -2065,7 +2065,7 @@ func (u *Uploader) peerCommit(ctx context.Context, task *model.Task, version *mo
 	}
 	switch {
 	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
-		u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer commit", storage.ErrDataSetUnavailable)
+		u.handlePeerDataSetFailure(ctx, task, bucket, uploadID, copyIndex, binding.ID, logger, "peer commit", commitReleaseCause(advance))
 		return
 	case advance.State == storagecommit.AdvanceReleased:
 		return
@@ -2723,8 +2723,7 @@ func (u *Uploader) enqueuePrepareUpload(ctx context.Context, parent *model.Task,
 }
 
 func dataSetWriteBlockedError(err error) bool {
-	var blocked *storage.DataSetPDPPaymentTerminatedError
-	return errors.As(err, &blocked)
+	return synapse.IsDataSetWriteBlocked(err)
 }
 
 func dataSetBindingWriteBlocked(binding *model.StorageDataSet) bool {
@@ -3018,6 +3017,16 @@ func commitObservationDelay(pollInterval time.Duration) time.Duration {
 	return max(pollInterval, storageCommitObservationDelay)
 }
 
+// commitReleaseCause names why a released commit gave up on its data set. The
+// advancer carries the provider error when it has one, which keeps the recorded
+// reason specific; the sentinel preserves the classification when it does not.
+func commitReleaseCause(result storagecommit.AdvanceResult) error {
+	if result.Cause != nil {
+		return result.Cause
+	}
+	return storage.ErrDataSetUnavailable
+}
+
 func onChainIDPtrFromSDK(value sdktypes.BigInt) *idtypes.OnChainID {
 	id := idtypes.OnChainIDFromSDK(value)
 	return &id
@@ -3247,6 +3256,16 @@ func (u *Uploader) handleCommitTaskFailure(
 			return
 		}
 		logger.Error("failed to exhaust commit task and release its reservation", "error", retryErr)
+		// The settlement rolled back, so this task still holds its claim. Park it
+		// briefly rather than leaving it running: ordinary task leases are only
+		// reclaimed when the process starts, so a task abandoned here stays stuck
+		// until the next restart.
+		if waitErr := u.repos.Tasks.WaitRunning(
+			terminalCtx, task, model.TaskWaitReasonExternalConfirmation,
+			"Waiting for storage confirmation", u.commitPollDelay(),
+		); waitErr != nil {
+			logger.Error("failed to park commit task after settlement rollback", "error", waitErr)
+		}
 		admin.WorkerTasksProcessed.WithLabelValues("uploader", "failure").Inc()
 		return
 	}

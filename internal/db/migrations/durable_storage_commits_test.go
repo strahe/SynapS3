@@ -169,3 +169,57 @@ func assertNoDurableStorageCommitDDL(t *testing.T, db *bun.DB) {
 		}
 	}
 }
+
+func TestDurableStorageCommitsMigrationRejectsStrandedCommitTransactions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  string
+	}{
+		{name: "piece ready", row: "(1, 'piece_ready', '0xstranded')"},
+		{name: "failed", row: "(1, 'failed', '0xstranded')"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+				createDurableStorageCommitLegacyTable(t, db)
+				mustExecMigrationTest(t, db,
+					"INSERT INTO storage_upload_copies (id, status, commit_transaction_id) VALUES "+tc.row)
+
+				err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits)
+				if err == nil || !strings.Contains(err.Error(), "keep a commit transaction outside") {
+					t.Fatalf("up migration error = %v, want stranded transaction refusal", err)
+				}
+				assertNoDurableStorageCommitDDL(t, db)
+			})
+		})
+	}
+}
+
+func TestDurableStorageCommitsMigrationAcceptsResolvedCommitTransactions(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		createDurableStorageCommitLegacyTable(t, db)
+		mustExecMigrationTest(t, db,
+			"INSERT INTO storage_upload_copies (id, status, commit_transaction_id) VALUES (1, 'committed', '0xdone')")
+
+		if err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits); err != nil {
+			t.Fatalf("up migration rejected a committed transaction: %v", err)
+		}
+	})
+}
+
+func TestDurableStorageCommitsMigrationIgnoresDurableTransactionsOnRecovery(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		createDurableStorageCommitLegacyTable(t, db)
+		if err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits); err != nil {
+			t.Fatalf("initial up migration: %v", err)
+		}
+		// The durable model owns this row, so a recovery run must judge it by the
+		// attempt token rather than treating its transaction as legacy evidence.
+		mustExecMigrationTest(t, db, `INSERT INTO storage_upload_copies
+			(id, status, commit_transaction_id, commit_attempt_id, commit_attempted_at)
+			VALUES (1, 'failed', '0xdurable', 'durable-attempt', CURRENT_TIMESTAMP)`)
+
+		if err := runMigrationBody(t.Context(), db, up2026083001DurableStorageCommits); err != nil {
+			t.Fatalf("recovery run rejected a durable commit transaction: %v", err)
+		}
+	})
+}

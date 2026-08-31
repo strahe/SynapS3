@@ -377,7 +377,7 @@ func (u *Uploader) repairReplicaCopy(
 	}
 	switch {
 	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
-		return storage.ErrDataSetUnavailable
+		return commitReleaseCause(advance)
 	case advance.State == storagecommit.AdvanceReleased:
 		return nil
 	case advance.State == storagecommit.AdvanceRejected:

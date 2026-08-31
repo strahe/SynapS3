@@ -552,7 +552,7 @@ func (e *ReplacementTransferExecutor) copy(
 	case advance.State == storagecommit.AdvanceNeedsAttention:
 		return errReplacementCommitAttention
 	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseDataSetUnavailable:
-		return storage.ErrDataSetUnavailable
+		return commitReleaseCause(advance)
 	case advance.State == storagecommit.AdvanceReleased && advance.ReleaseReason == storagecommit.ReleaseOwnerTerminal:
 		return errReplacementOwnerTerminal
 	case advance.State == storagecommit.AdvanceReleased:

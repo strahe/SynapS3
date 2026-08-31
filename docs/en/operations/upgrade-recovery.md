@@ -21,6 +21,8 @@ Expected result: health is `ok`, and every exhausted task has a clear handling d
 
 Before upgrading, stop incoming S3 writes but leave the current SynapS3 process running until uploads and provider replacements have finished. If the new version refuses to start because storage work is still in progress, run the previous version against the unchanged database, restore the affected provider if necessary, and let that work finish before retrying the upgrade. Do not alter the database to bypass this check.
 
+The upgrade is also refused when a stored copy still records a storage confirmation whose outcome was never resolved, which an interrupted earlier version could leave behind. The message reports how many copies are affected and includes the query that lists them, so you can confirm with the provider whether each piece was stored before clearing that record. A development environment can start from a fresh database instead.
+
 Stop S3 traffic and SynapS3 with the service manager used by your deployment before creating a backup.
 
 - SQLite deployments: archive the complete runtime data volume, then verify the archive and its checksum.
