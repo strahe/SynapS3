@@ -10,6 +10,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
 
@@ -39,6 +40,19 @@ func TestStorageCommitReservationsEnforceCapacityAndFIFO(t *testing.T) {
 	})
 	if err != nil || fifth.State != storagecommit.ReservationWaiting || fifth.Copy.CommitAttemptID != nil {
 		t.Fatalf("fifth reservation = %#v err=%v, want waiting without attempt", fifth, err)
+	}
+	if fifth.Copy.CommitReadyAt == nil {
+		t.Fatal("fifth reservation has no FIFO timestamp")
+	}
+	readyAt := *fifth.Copy.CommitReadyAt
+	updatedAt := fifth.Copy.UpdatedAt
+	fifth, err = repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: commitCopyIdentity(copies[4]), AttemptID: "attempt-4", Now: base.Add(time.Hour),
+	})
+	if err != nil || fifth.State != storagecommit.ReservationWaiting || fifth.Copy.CommitAttemptID != nil ||
+		fifth.Copy.CommitReadyAt == nil ||
+		!fifth.Copy.CommitReadyAt.Equal(readyAt) || !fifth.Copy.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("repeated fifth reservation = %#v err=%v, want unchanged FIFO row", fifth, err)
 	}
 
 	if err := repos.Uploads.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
@@ -365,6 +379,58 @@ func TestStorageCommitAttentionReleaseSucceedsWithoutRecoverableWork(t *testing.
 	}
 }
 
+func TestStorageCommitAttentionReleaseWaitsForReplacementClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		owner      storagereplacement.Status
+		wantStatus storagereplacement.ItemStatus
+	}{
+		{name: "failed", owner: storagereplacement.StatusFailed, wantStatus: storagereplacement.ItemStatusFailed},
+		{name: "superseded", owner: storagereplacement.StatusSuperseded, wantStatus: storagereplacement.ItemStatusCancelled},
+		{name: "active", owner: storagereplacement.StatusMigrating, wantStatus: storagereplacement.ItemStatusPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testDB(t)
+			fixture := seedCommitAttentionReplacement(t, db, "commit-release-claimed-"+tc.name, tc.owner, true)
+			input := storagecommit.ManualReleaseInput{
+				CopyID: fixture.copyRow.ID, ExpectedAttemptID: fixture.attemptID,
+				AcknowledgePossibleDuplicate: true,
+			}
+
+			if err := fixture.repos.Uploads.ReleaseCommitAttention(t.Context(), input); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("claimed release error = %v, want conflict", err)
+			}
+			persistedCopy, err := fixture.repos.Uploads.GetUploadCopyByID(t.Context(), fixture.copyRow.ID)
+			if err != nil || persistedCopy.CommitAttemptID == nil || *persistedCopy.CommitAttemptID != fixture.attemptID ||
+				persistedCopy.CommitAttemptedAt == nil || persistedCopy.CommitAttentionAt == nil {
+				t.Fatalf("copy after claimed release = %#v err=%v, want intact attention fence", persistedCopy, err)
+			}
+			persistedItem := new(storagereplacement.Item)
+			if err := db.NewSelect().Model(persistedItem).Where("id = ?", fixture.item.ID).Scan(t.Context()); err != nil {
+				t.Fatalf("load claimed item: %v", err)
+			}
+			if persistedItem.Status != storagereplacement.ItemStatusRunning || persistedItem.ClaimedAt == nil ||
+				!persistedItem.ClaimedAt.Equal(fixture.token.ClaimedAt) || persistedItem.LeaseUntil == nil {
+				t.Fatalf("item after claimed release = %#v, want unchanged claim", persistedItem)
+			}
+
+			if err := fixture.repos.Replacements.ReleaseReplacementItemClaim(t.Context(), fixture.token); err != nil {
+				t.Fatalf("release replacement claim: %v", err)
+			}
+			if err := fixture.repos.Uploads.ReleaseCommitAttention(t.Context(), input); err != nil {
+				t.Fatalf("release after claim yielded: %v", err)
+			}
+			persistedItem = new(storagereplacement.Item)
+			if err := db.NewSelect().Model(persistedItem).Where("id = ?", fixture.item.ID).Scan(t.Context()); err != nil {
+				t.Fatalf("load settled item: %v", err)
+			}
+			if persistedItem.Status != tc.wantStatus || persistedItem.ClaimedAt != nil || persistedItem.LeaseUntil != nil {
+				t.Fatalf("settled item = %#v, want status %s without claim", persistedItem, tc.wantStatus)
+			}
+		})
+	}
+}
+
 func TestStorageCommitSettlementUsesConcreteDrainingGenerationOrigin(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -484,5 +550,93 @@ func seedRepositoryCommitAttempt(
 		}); err != nil {
 			t.Fatalf("RecordCommitTransaction: %v", err)
 		}
+	}
+}
+
+type commitAttentionReplacementFixture struct {
+	repos     *repository.Repositories
+	copyRow   model.StorageUploadCopy
+	item      storagereplacement.Item
+	token     storagereplacement.ClaimToken
+	attemptID string
+}
+
+func seedCommitAttentionReplacement(
+	t *testing.T,
+	db *bun.DB,
+	name string,
+	ownerStatus storagereplacement.Status,
+	claimed bool,
+) commitAttentionReplacementFixture {
+	t.Helper()
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, name)
+	source := seedCommitDataSet(t, db, bucket.ID)
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("is_current = ?", false).
+		Set("status = ?", model.StorageDataSetStatusDraining).
+		Where("id = ?", source.ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("drain source data set: %v", err)
+	}
+	targetProviderID := onChainID(t, "202")
+	targetDataSetID := onChainID(t, "2002")
+	target := &model.StorageDataSet{
+		BucketID: bucket.ID, ProviderID: targetProviderID, CopyIndex: source.CopyIndex,
+		Generation: 2, IsCurrent: true, DataSetID: &targetDataSetID, Status: model.StorageDataSetStatusReady,
+	}
+	if _, err := db.NewInsert().Model(target).Exec(t.Context()); err != nil {
+		t.Fatalf("insert target data set: %v", err)
+	}
+	copyRow := seedCommitCopies(t, db, bucket.ID, target.ID, 1)[0]
+	if _, err := db.NewUpdate().Model((*model.StorageUploadCopy)(nil)).
+		Set("provider_id = ?", targetProviderID).
+		Where("id = ?", copyRow.ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("align target copy provider: %v", err)
+	}
+	copyRow.ProviderID = &targetProviderID
+	now := time.Now().Add(-time.Minute)
+	replacement := &storagereplacement.Replacement{
+		BucketID: bucket.ID, CopyIndex: source.CopyIndex,
+		SourceDataSetID: source.ID, TargetDataSetID: target.ID,
+		SelectionMode:   storagereplacement.SelectionModeManual,
+		ClientRequestID: name, Status: ownerStatus,
+		ItemsTotal: 1, ConfirmedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := db.NewInsert().Model(replacement).Exec(t.Context()); err != nil {
+		t.Fatalf("insert replacement: %v", err)
+	}
+	maxRetries := 5
+	item := storagereplacement.Item{
+		ReplacementID: replacement.ID, UploadID: copyRow.UploadID, TargetCopyID: &copyRow.ID,
+		Status: storagereplacement.ItemStatusPending, ScheduledAt: now,
+		MaxRetries: &maxRetries, CreatedAt: now, UpdatedAt: now,
+	}
+	token := storagereplacement.ClaimToken{}
+	if claimed {
+		claimedAt := time.Now().Add(-time.Second)
+		leaseUntil := claimedAt.Add(time.Hour)
+		item.Status = storagereplacement.ItemStatusRunning
+		item.ClaimedAt = &claimedAt
+		item.LeaseUntil = &leaseUntil
+		token = storagereplacement.ClaimToken{ItemID: item.ID, ClaimedAt: claimedAt}
+	}
+	if _, err := db.NewInsert().Model(&item).Exec(t.Context()); err != nil {
+		t.Fatalf("insert replacement item: %v", err)
+	}
+	if claimed {
+		token.ItemID = item.ID
+	}
+	attemptID := name + "-attempt"
+	seedRepositoryCommitAttempt(t, repos, copyRow, attemptID, "abcd", "0x"+name)
+	if err := repos.Uploads.MarkCommitAttention(t.Context(), storagecommit.AttentionInput{
+		Copy: commitCopyIdentity(copyRow), AttemptID: attemptID,
+		Code: storagecommit.AttentionAttemptOnlyAmbiguous,
+	}); err != nil {
+		t.Fatalf("mark commit attention: %v", err)
+	}
+	return commitAttentionReplacementFixture{
+		repos: repos, copyRow: copyRow, item: item, token: token, attemptID: attemptID,
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/uptrace/bun"
@@ -517,6 +518,173 @@ func TestAdvancerUnavailableContextMakesAttemptVisibleAfterThreshold(t *testing.
 	}
 }
 
+func TestAdvancerUnavailableContextPreservesCancellationAndUnknownAttention(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, _ := seedAdvancerCopies(t, db, 1)
+	identity := advancerCopyIdentity(copies[0])
+	startedAt := time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC)
+	if _, err := repos.Uploads.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "unavailable-canceled", Now: startedAt,
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := repos.Uploads.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "unavailable-canceled", ExtraDataHex: "abcd", Now: startedAt,
+	}); err != nil {
+		t.Fatalf("mark attempted: %v", err)
+	}
+	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	store := &attentionCountingStore{Store: repos.Uploads}
+	advancer := storagecommit.Advancer{
+		Store: store,
+		Now:   func() time.Time { return startedAt.Add(16 * time.Minute) },
+	}
+	canceledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result, err := advancer.AdvanceUnavailable(canceledCtx, *copyRow, *binding)
+	if err != nil || result.State != storagecommit.AdvancePending || store.calls != 0 {
+		t.Fatalf("canceled unavailable advance = %#v err=%v attentionWrites=%d", result, err, store.calls)
+	}
+
+	attentionAt := startedAt.Add(15 * time.Minute)
+	if _, err := db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("commit_attention_code = ?", "future_attention_code").
+		Set("commit_attention_at = ?", attentionAt).
+		Where("id = ?", copies[0].ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("set future attention: %v", err)
+	}
+	copyRow = loadAdvancerCopy(t, repos, copies[0].ID)
+	result, err = advancer.AdvanceUnavailable(t.Context(), *copyRow, *binding)
+	if err != nil || result.State != storagecommit.AdvanceNeedsAttention || result.Continue ||
+		result.AttentionCode != storagecommit.AttentionCode("future_attention_code") || store.calls != 0 {
+		t.Fatalf("future unavailable attention = %#v err=%v attentionWrites=%d", result, err, store.calls)
+	}
+}
+
+func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+	target.ClientDataSetIDValue = sdktypes.NewBigInt(9001)
+	dataSetRef, ok := target.DataSetRef()
+	if !ok {
+		t.Fatal("mock target has no data set ref")
+	}
+	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
+		return []byte{0xab}, nil
+	}
+	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
+		const tx = "0x0000000000000000000000000000000000000000000000000000000000000101"
+		request.OnSubmitted(tx)
+		return &storage.CommitSubmission{
+			Kind: storage.CommitKindAddPieces, TransactionID: tx,
+			StatusURL:  "https://provider.example/status/invalid",
+			ProviderID: binding.ProviderID.SDK(), DataSet: &dataSetRef,
+			PieceCIDs: []cid.Cid{pieceCID},
+		}, nil
+	}
+	mode := "invalid"
+	statusCalls := 0
+	target.GetCommitStatusFunc = func(_ context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+		statusCalls++
+		switch mode {
+		case "invalid":
+			return nil, fmt.Errorf("provider status identity: %w", pdp.ErrInvalidStatus)
+		case "pending":
+			return &storage.CommitStatus{State: storage.CommitStatePending, TransactionID: submission.TransactionID}, nil
+		case "confirmed":
+			return &storage.CommitStatus{
+				State: storage.CommitStateConfirmed, TransactionID: submission.TransactionID,
+				ConfirmedTransactionID: "0xconfirmed", DataSet: &dataSetRef,
+				PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(5001)},
+			}, nil
+		case "rejected":
+			return &storage.CommitStatus{State: storage.CommitStateRejected, TransactionID: submission.TransactionID}, nil
+		default:
+			t.Fatalf("unexpected status mode %q", mode)
+			return nil, nil
+		}
+	}
+	advancer := storagecommit.Advancer{Store: repos.Uploads}
+	result, err := advancer.Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: copies[0], Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvanceSubmitted {
+		t.Fatalf("submit = %#v err=%v", result, err)
+	}
+
+	store := &attentionCountingStore{Store: repos.Uploads}
+	advancer.Store = store
+	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	result, err = advancer.Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: *copyRow, Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvanceNeedsAttention || result.Continue ||
+		result.AttentionCode != storagecommit.AttentionSubmissionMismatch || store.calls != 1 {
+		t.Fatalf("invalid status advance = %#v err=%v attentionWrites=%d", result, err, store.calls)
+	}
+
+	mode = "pending"
+	copyRow = loadAdvancerCopy(t, repos, copies[0].ID)
+	result, err = advancer.Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: *copyRow, Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvanceNeedsAttention || result.Continue ||
+		result.AttentionCode != storagecommit.AttentionSubmissionMismatch || store.calls != 1 {
+		t.Fatalf("repeated attention advance = %#v err=%v attentionWrites=%d", result, err, store.calls)
+	}
+
+	if _, err := db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("commit_attention_code = ?", "future_attention_code").
+		Where("id = ?", copies[0].ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("set future attention: %v", err)
+	}
+	copyRow = loadAdvancerCopy(t, repos, copies[0].ID)
+	result, err = advancer.Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: *copyRow, Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvanceNeedsAttention || result.Continue ||
+		result.AttentionCode != storagecommit.AttentionCode("future_attention_code") || store.calls != 1 {
+		t.Fatalf("future attention advance = %#v err=%v attentionWrites=%d", result, err, store.calls)
+	}
+
+	mode = "confirmed"
+	copyRow = loadAdvancerCopy(t, repos, copies[0].ID)
+	result, err = advancer.Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: *copyRow, Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvanceConfirmed || result.Confirmation == nil ||
+		statusCalls != 4 || store.calls != 1 {
+		t.Fatalf("confirmed recovery = %#v err=%v statusCalls=%d attentionWrites=%d", result, err, statusCalls, store.calls)
+	}
+
+	mode = "rejected"
+	copyRow = loadAdvancerCopy(t, repos, copies[0].ID)
+	result, err = advancer.Advance(t.Context(), storagecommit.AdvanceInput{
+		Copy: *copyRow, Binding: *binding, Target: target,
+		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+	})
+	if err != nil || result.State != storagecommit.AdvanceRejected || statusCalls != 5 || store.calls != 1 {
+		t.Fatalf("rejected recovery = %#v err=%v statusCalls=%d attentionWrites=%d", result, err, statusCalls, store.calls)
+	}
+	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
+	if persisted.Status != model.StorageUploadCopyStatusPieceReady || persisted.CommitAttemptID != nil ||
+		persisted.CommitAttentionCode != nil || persisted.CommitAttentionAt != nil {
+		t.Fatalf("copy after rejected recovery = %#v, want reset piece-ready copy", persisted)
+	}
+}
+
 func TestAdvancerAttemptOnlyUsesPieceStatusAsDiagnosticEvidence(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -582,6 +750,14 @@ func TestAdvancerTxOnlyEvidenceConfirmsWithoutPieceStatus(t *testing.T) {
 		Copy: identity, AttemptID: "tx-only", TransactionID: "0xtxonly",
 	}); err != nil {
 		t.Fatalf("record transaction: %v", err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.StorageUploadCopy)(nil)).
+		Set("commit_attention_code = ?", "future_attention_code").
+		Set("commit_attention_at = ?", time.Now()).
+		Where("id = ?", copies[0].ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("set future tx-only attention: %v", err)
 	}
 	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
 	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
@@ -754,6 +930,16 @@ type failingCommitEvidenceStore struct {
 type failingMarkAttemptedStore struct {
 	storagecommit.Store
 	err error
+}
+
+type attentionCountingStore struct {
+	storagecommit.Store
+	calls int
+}
+
+func (s *attentionCountingStore) MarkCommitAttention(ctx context.Context, input storagecommit.AttentionInput) error {
+	s.calls++
+	return s.Store.MarkCommitAttention(ctx, input)
 }
 
 func (s *failingMarkAttemptedStore) MarkCommitAttempted(

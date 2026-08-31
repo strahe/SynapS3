@@ -58,21 +58,13 @@ func (a *Advancer) AdvanceUnavailable(
 		return AdvanceResult{}, errors.New("invalid unavailable storage commit input")
 	}
 	attemptID := *copyRow.CommitAttemptID
-	if copyRow.CommitAttentionAt != nil {
-		code := AttentionDataSetUnavailable
-		if copyRow.CommitAttentionCode != nil {
-			parsed, err := ParseAttentionCode(*copyRow.CommitAttentionCode)
-			if err != nil {
-				return AdvanceResult{}, err
-			}
-			code = parsed
-		}
-		return AdvanceResult{
-			State:         AdvanceNeedsAttention,
-			AttemptID:     attemptID,
-			AttentionCode: code,
-			Continue:      code == AttentionDataSetUnavailable || code == AttentionConfirmationTimeout,
-		}, nil
+	if context.Cause(ctx) != nil {
+		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
+	}
+	if result, ok := existingAttentionResult(
+		copyRow, attemptID, AttentionDataSetUnavailable, true,
+	); ok {
+		return result, nil
 	}
 	if a.now().Sub(*copyRow.CommitAttemptedAt) < a.attentionAfter() {
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
@@ -235,10 +227,6 @@ func (a *Advancer) submitReserved(
 				return AdvanceResult{State: AdvancePending, AttemptID: attemptID},
 					errors.Join(submitErr, fmt.Errorf("recording storage commit callback evidence: %w", evidenceErr.err))
 			}
-			if synapse.IsProviderUnavailable(submitErr) {
-				return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
-			}
-			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 		}
 		if synapse.IsProviderUnavailable(submitErr) {
 			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, submitErr
@@ -302,7 +290,7 @@ func (a *Advancer) observe(
 					ctx, identity, copyRow, attemptID, AttentionDataSetUnavailable,
 				)
 			}
-			if errors.Is(err, storage.ErrInvalidArgument) {
+			if errors.Is(err, storage.ErrInvalidArgument) || errors.Is(err, pdp.ErrInvalidStatus) {
 				return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
 			}
 			return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
@@ -312,16 +300,10 @@ func (a *Advancer) observe(
 	if copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != "" {
 		return a.observeTransaction(ctx, input, copyRow)
 	}
-	if copyRow.CommitAttentionAt != nil {
-		code := AttentionAttemptOnlyAmbiguous
-		if copyRow.CommitAttentionCode != nil && *copyRow.CommitAttentionCode != "" {
-			code = AttentionCode(*copyRow.CommitAttentionCode)
-		}
-		return AdvanceResult{
-			State:         AdvanceNeedsAttention,
-			AttemptID:     attemptID,
-			AttentionCode: code,
-		}, nil
+	if result, ok := existingAttentionResult(
+		copyRow, attemptID, AttentionAttemptOnlyAmbiguous, false,
+	); ok {
+		return result, nil
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, a.requestTimeout())
 	pieceStatus, err := input.Target.PieceStatus(requestCtx, input.Pieces[0].PieceCID)
@@ -472,10 +454,35 @@ func (a *Advancer) attentionForCopy(
 	code AttentionCode,
 	keepObserving bool,
 ) (AdvanceResult, error) {
+	if result, ok := existingAttentionResult(copyRow, attemptID, code, keepObserving); ok {
+		return result, nil
+	}
+	return a.attention(ctx, identity, attemptID, code, keepObserving)
+}
+
+func existingAttentionResult(
+	copyRow model.StorageUploadCopy,
+	attemptID string,
+	fallbackCode AttentionCode,
+	keepObserving bool,
+) (AdvanceResult, bool) {
+	if copyRow.CommitAttentionAt == nil {
+		return AdvanceResult{}, false
+	}
+	code := fallbackCode
 	if copyRow.CommitAttentionCode != nil && *copyRow.CommitAttentionCode != "" {
 		code = AttentionCode(*copyRow.CommitAttentionCode)
 	}
-	return a.attention(ctx, identity, attemptID, code, keepObserving)
+	return AdvanceResult{
+		State:         AdvanceNeedsAttention,
+		AttemptID:     attemptID,
+		AttentionCode: code,
+		Continue:      keepObserving && recoverableAttentionCode(code),
+	}, true
+}
+
+func recoverableAttentionCode(code AttentionCode) bool {
+	return code == AttentionDataSetUnavailable || code == AttentionConfirmationTimeout
 }
 
 func (a *Advancer) attention(
@@ -503,7 +510,7 @@ func (a *Advancer) attention(
 		State:         AdvanceNeedsAttention,
 		AttemptID:     attemptID,
 		AttentionCode: code,
-		Continue:      keepObserving,
+		Continue:      keepObserving && recoverableAttentionCode(code),
 	}, nil
 }
 

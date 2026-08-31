@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
@@ -119,22 +120,134 @@ func (r *BunStorageReplacementRepo) ClaimReadyReplacementItem(ctx context.Contex
 			}
 			return fmt.Errorf("claiming replacement item: %w", err)
 		}
-		if _, err := db.NewUpdate().
+		if terminalOnly {
+			settled, checkErr := settleClaimedTerminalReplacementItem(ctx, db, item, replacementStatus, now)
+			if checkErr != nil {
+				return checkErr
+			}
+			if settled {
+				return nil
+			}
+		}
+		dispatchUpdate := db.NewUpdate().
 			Model((*storagereplacement.Replacement)(nil)).
 			Set("last_dispatched_at = ?", now).
 			Set("updated_at = ?", now).
-			Where("id = ?", item.ReplacementID).
-			Where("status = ? OR (status = ? AND wait_reason = ?)",
+			Where("id = ?", item.ReplacementID)
+		if terminalOnly {
+			dispatchUpdate = dispatchUpdate.Where("status = ?", replacementStatus)
+		} else {
+			dispatchUpdate = dispatchUpdate.Where("status = ? OR (status = ? AND wait_reason = ?)",
 				storagereplacement.StatusMigrating,
 				storagereplacement.StatusWaiting,
-				storagereplacement.WaitReasonReadableSource).
-			Exec(ctx); err != nil {
+				storagereplacement.WaitReasonReadableSource)
+		}
+		if _, err := dispatchUpdate.Exec(ctx); err != nil {
 			return fmt.Errorf("recording replacement dispatch: %w", err)
 		}
 		claimed = item
 		return nil
 	})
 	return claimed, err
+}
+
+type replacementItemCommitWork uint8
+
+const (
+	replacementItemCommitWorkNone replacementItemCommitWork = iota
+	replacementItemCommitWorkDurable
+	replacementItemCommitWorkCommitted
+)
+
+func settleClaimedTerminalReplacementItem(
+	ctx context.Context,
+	db bun.IDB,
+	item *storagereplacement.Item,
+	replacementStatus storagereplacement.Status,
+	now time.Time,
+) (bool, error) {
+	commitWork, err := replacementItemCommitWorkState(ctx, db, item.TargetCopyID)
+	if err != nil {
+		return false, err
+	}
+	switch commitWork {
+	case replacementItemCommitWorkDurable:
+		return false, nil
+	case replacementItemCommitWorkCommitted:
+		if err := settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCopied); err != nil {
+			return false, fmt.Errorf("settling replacement item with a committed target copy: %w", err)
+		}
+		return true, nil
+	case replacementItemCommitWorkNone:
+		settledStatus := storagereplacement.ItemStatusCancelled
+		if replacementStatus == storagereplacement.StatusFailed {
+			settledStatus = storagereplacement.ItemStatusFailed
+		}
+		res, err := db.NewUpdate().
+			Model((*storagereplacement.Item)(nil)).
+			Set("status = ?", settledStatus).
+			Set("scheduled_at = ?", now).
+			Set("last_error = NULL").
+			Set("claimed_at = NULL").
+			Set("lease_until = NULL").
+			Set("updated_at = ?", now).
+			Where("id = ?", item.ID).
+			Where("status = ?", storagereplacement.ItemStatusRunning).
+			Where("claimed_at = ?", item.ClaimedAt).
+			Where("lease_until > ?", now).
+			Exec(ctx)
+		if err != nil {
+			return false, fmt.Errorf("settling replacement item without durable commit work: %w", err)
+		}
+		if rows, _ := res.RowsAffected(); rows != 1 {
+			return false, ErrItemClaimLost
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("settling replacement item with unknown commit work: %w", ErrConflict)
+	}
+}
+
+func replacementItemCommitWorkState(
+	ctx context.Context,
+	db bun.IDB,
+	targetCopyID *int64,
+) (replacementItemCommitWork, error) {
+	if targetCopyID == nil {
+		return replacementItemCommitWorkNone, nil
+	}
+	type commitWorkSnapshot struct {
+		Status            model.StorageUploadCopyStatus `bun:"status"`
+		CommitReadyAt     *time.Time                    `bun:"commit_ready_at"`
+		CommitAttemptID   *string                       `bun:"commit_attempt_id"`
+		CommitAttemptedAt *time.Time                    `bun:"commit_attempted_at"`
+		ReadableCommitted bool                          `bun:"readable_committed"`
+	}
+	snapshot := new(commitWorkSnapshot)
+	query := fmt.Sprintf(`SELECT target_copy.status,
+		       target_copy.commit_ready_at,
+		       target_copy.commit_attempt_id,
+		       target_copy.commit_attempted_at,
+		       COALESCE((%s), FALSE) AS readable_committed
+		FROM storage_upload_copies AS target_copy
+		LEFT JOIN storage_data_sets AS target_data_set ON target_data_set.id = target_copy.storage_data_set_id
+		WHERE target_copy.id = ?`, readableCommittedCopyPredicateSQL("target_copy", "target_data_set"))
+	err := db.NewRaw(query, *targetCopyID).Scan(ctx, snapshot)
+	if err == sql.ErrNoRows {
+		return replacementItemCommitWorkNone, nil
+	}
+	if err != nil {
+		return replacementItemCommitWorkNone, fmt.Errorf("checking replacement item durable commit work: %w", err)
+	}
+	if snapshot.ReadableCommitted {
+		return replacementItemCommitWorkCommitted, nil
+	}
+	if (snapshot.CommitAttemptID != nil && *snapshot.CommitAttemptID != "") ||
+		(snapshot.Status == model.StorageUploadCopyStatusPieceReady &&
+			snapshot.CommitReadyAt != nil && snapshot.CommitAttemptID == nil && snapshot.CommitAttemptedAt == nil) {
+		return replacementItemCommitWorkDurable, nil
+	}
+	return replacementItemCommitWorkNone, nil
 }
 
 func selectReadyReplacementID(ctx context.Context, db bun.IDB, now time.Time) (int64, error) {

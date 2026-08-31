@@ -252,21 +252,17 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 			}
 			readyOnlyReservation = readyReservations == 1
 		}
-		if !replacement.Status.Active() {
-			if !confirmationRecovery {
-				switch {
-				case replacement.Status == storagereplacement.StatusFailed && readyOnlyReservation:
-					settled = true
-					return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusFailed)
-				case replacement.Status.Terminal():
-					settled = true
-					return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
-				}
+		if !replacement.Status.Active() && !confirmationRecovery {
+			switch {
+			case replacement.Status == storagereplacement.StatusFailed && readyOnlyReservation:
+				settled = true
+				return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusFailed)
+			case replacement.Status.Terminal():
+				settled = true
+				return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled)
 			}
-			if !confirmationRecovery {
-				deferred = true
-				return releaseReplacementItemForRetry(ctx, db, item)
-			}
+			deferred = true
+			return releaseReplacementItemForRetry(ctx, db, item)
 		}
 		uploads := &BunStorageUploadRepo{db: db}
 		source, err := uploads.GetDataSetBindingByID(ctx, replacement.SourceDataSetID)

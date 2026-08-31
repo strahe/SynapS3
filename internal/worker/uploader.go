@@ -36,6 +36,7 @@ const (
 	uploadFundingWaitDelay        = time.Minute
 	uploadDependencyWaitDelay     = time.Minute
 	storageCommitPollDelay        = 5 * time.Second
+	storageCommitObservationDelay = time.Minute
 	storageCommitAttentionDelay   = 24 * time.Hour
 )
 
@@ -2976,7 +2977,7 @@ func (u *Uploader) waitForCommitAdvance(
 		message = "Waiting for storage confirmation"
 	case storagecommit.AdvanceNeedsAttention:
 		if result.Continue {
-			delay = u.commitPollDelay()
+			delay = commitObservationDelay(u.commitPollDelay())
 			message = "Waiting for storage confirmation"
 		} else {
 			delay = storageCommitAttentionDelay
@@ -3011,6 +3012,10 @@ func (u *Uploader) commitPollDelay() time.Duration {
 		return u.pollInterval
 	}
 	return storageCommitPollDelay
+}
+
+func commitObservationDelay(pollInterval time.Duration) time.Duration {
+	return max(pollInterval, storageCommitObservationDelay)
 }
 
 func onChainIDPtrFromSDK(value sdktypes.BigInt) *idtypes.OnChainID {

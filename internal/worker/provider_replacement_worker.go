@@ -194,9 +194,16 @@ func (w *ProviderReplacementWorker) processItem(parent context.Context, item *st
 			w.logItemTransitionFailure(item, "yielding replacement item", transitionErr)
 			result = "failure"
 		}
-	case errors.Is(err, errReplacementCommitPending), errors.Is(err, errReplacementCommitObserving):
+	case errors.Is(err, errReplacementCommitPending):
 		if transitionErr := w.repos.Replacements.DeferReplacementItemClaim(parent, token, time.Now().Add(w.commitPollDelay())); transitionErr != nil {
 			w.logItemTransitionFailure(item, "waiting for replacement storage confirmation", transitionErr)
+			result = "failure"
+		} else {
+			result = "confirmation_wait"
+		}
+	case errors.Is(err, errReplacementCommitObserving):
+		if transitionErr := w.repos.Replacements.DeferReplacementItemClaim(parent, token, time.Now().Add(commitObservationDelay(w.commitPollDelay()))); transitionErr != nil {
+			w.logItemTransitionFailure(item, "observing replacement storage confirmation", transitionErr)
 			result = "failure"
 		} else {
 			result = "confirmation_wait"

@@ -223,12 +223,13 @@ func (w *StorageCleanupWorker) retireAbandonedTarget(
 		return
 	}
 	activeAttempts, err := w.repos.Uploads.CountActiveCommitAttemptsForDataSet(ctx, target.ID)
-	if err != nil || activeAttempts > 0 {
-		if err != nil {
-			logger.Warn("failed to check abandoned target confirmation attempts", "error", err)
-		} else {
-			logger.Info("abandoned target still has active confirmation attempts", "count", activeAttempts)
-		}
+	if err != nil {
+		logger.Warn("failed to check abandoned target confirmation attempts", "error", err)
+		w.waitForAbandonedTarget(ctx, task, logger, "Waiting to end the unused storage service")
+		return
+	}
+	if activeAttempts > 0 {
+		logger.Info("abandoned target still has active confirmation attempts", "count", activeAttempts)
 		w.waitForAbandonedTarget(ctx, task, logger, "Waiting for storage confirmations")
 		return
 	}

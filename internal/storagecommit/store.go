@@ -72,7 +72,6 @@ type ResetInput struct {
 type ReleaseInput struct {
 	Copy              CopyIdentity
 	AttemptID         string
-	AllowAttempted    bool
 	KnownNotSubmitted bool
 	ClearReadyAt      bool
 	ClearExtraData    bool

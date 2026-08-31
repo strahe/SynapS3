@@ -885,11 +885,17 @@ func TestStorageReplacementRepo_TerminalReplacementClaimsOnlyDurableCommitWork(t
 			if err := f.repos.Replacements.ReleaseReplacementItemClaim(ctx, token); err != nil {
 				t.Fatalf("ReleaseReplacementItemClaim: %v", err)
 			}
-			mustExec(t, f.db, `UPDATE storage_replacements SET status = ?, wait_reason = NULL WHERE id = ?`, tc.status, row.ID)
+			oldDispatch := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+			mustExec(t, f.db, `UPDATE storage_replacements
+				SET status = ?, wait_reason = NULL, last_dispatched_at = ? WHERE id = ?`, tc.status, oldDispatch, row.ID)
 
 			claimed, err := f.repos.Replacements.ClaimReadyReplacementItem(ctx, time.Minute)
 			if err != nil || claimed == nil || claimed.ID != item.ID || claimed.ClaimedAt == nil {
 				t.Fatalf("terminal claim = %#v err=%v", claimed, err)
+			}
+			dispatched, err := f.repos.Replacements.GetByID(ctx, row.ID)
+			if err != nil || dispatched.LastDispatchedAt == nil || !dispatched.LastDispatchedAt.After(oldDispatch) {
+				t.Fatalf("terminal dispatch = %#v err=%v, want fairness timestamp after %s", dispatched, err, oldDispatch)
 			}
 			recovered, err := f.repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
 				ReplacementID: row.ID, ItemID: claimed.ID, ItemClaimedAt: *claimed.ClaimedAt,

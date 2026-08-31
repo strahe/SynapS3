@@ -39,30 +39,33 @@ func (r *BunStorageUploadRepo) ReserveCommitAttempt(
 		if copyRow.Status != model.StorageUploadCopyStatusPieceReady {
 			return fmt.Errorf("reserving storage commit attempt for copy %d in status %s: %w", copyID, copyRow.Status, ErrConflict)
 		}
-		if _, err := db.NewUpdate().
-			Model((*model.StorageUploadCopy)(nil)).
-			Set("commit_ready_at = COALESCE(commit_ready_at, ?)", now).
-			Set("updated_at = ?", now).
-			Where("id = ?", copyID).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("preparing storage commit attempt: %w", err)
-		}
-		copyRow, err = loadCommitCopy(ctx, db, copyID, input.Copy.StorageDataSetID)
-		if err != nil {
-			return err
+		if copyRow.CommitReadyAt == nil {
+			res, updateErr := db.NewUpdate().
+				Model((*model.StorageUploadCopy)(nil)).
+				Set("commit_ready_at = ?", now).
+				Set("updated_at = ?", now).
+				Where("id = ?", copyID).
+				Where("commit_ready_at IS NULL").
+				Exec(ctx)
+			if updateErr != nil {
+				return fmt.Errorf("preparing storage commit attempt: %w", updateErr)
+			}
+			if rows, _ := res.RowsAffected(); rows != 1 {
+				return fmt.Errorf("preparing storage commit attempt: %w", ErrConflict)
+			}
+			copyRow, err = loadCommitCopy(ctx, db, copyID, input.Copy.StorageDataSetID)
+			if err != nil {
+				return err
+			}
 		}
 		if copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" {
 			out.State = storagecommit.ReservationAcquired
 			out.Copy = *copyRow
 			return nil
 		}
-		active, err := db.NewSelect().
-			Model((*model.StorageUploadCopy)(nil)).
-			Where("storage_data_set_id = ?", input.Copy.StorageDataSetID).
-			Where("commit_attempt_id IS NOT NULL AND commit_attempt_id <> ''").
-			Count(ctx)
+		active, err := countActiveCommitAttemptsForDataSet(ctx, db, input.Copy.StorageDataSetID)
 		if err != nil {
-			return fmt.Errorf("counting active storage commit attempts: %w", err)
+			return err
 		}
 		if active >= storagecommit.MaxActiveAttemptsPerDataSet {
 			out.State = storagecommit.ReservationWaiting
@@ -308,8 +311,6 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttempt(ctx context.Context, input s
 			q = q.
 				Where("commit_transaction_id IS NULL").
 				Where("commit_submission_json IS NULL")
-		} else if input.AllowAttempted {
-			q = q.Where("commit_attention_at IS NOT NULL")
 		} else {
 			q = q.Where("commit_attempted_at IS NULL")
 		}
@@ -360,7 +361,11 @@ func (r *BunStorageUploadRepo) CountActiveCommitAttemptsForDataSet(ctx context.C
 	if storageDataSetID <= 0 {
 		return 0, fmt.Errorf("counting active storage commit attempts: %w", ErrInvalidInput)
 	}
-	count, err := r.db.NewSelect().
+	return countActiveCommitAttemptsForDataSet(ctx, r.db, storageDataSetID)
+}
+
+func countActiveCommitAttemptsForDataSet(ctx context.Context, db bun.IDB, storageDataSetID int64) (int, error) {
+	count, err := db.NewSelect().
 		Model((*model.StorageUploadCopy)(nil)).
 		Where("storage_data_set_id = ?", storageDataSetID).
 		Where("commit_attempt_id IS NOT NULL AND commit_attempt_id <> ''").
@@ -557,6 +562,18 @@ func (r *BunStorageUploadRepo) ReleaseCommitAttention(ctx context.Context, input
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("waking replacement confirmation item: %w", err)
+		}
+		claimedItems, err := db.NewSelect().
+			Model((*storagereplacement.Item)(nil)).
+			Where("target_copy_id = ?", copyID).
+			Where("status NOT IN (?, ?)", storagereplacement.ItemStatusCopied, storagereplacement.ItemStatusCancelled).
+			Where("claimed_at IS NOT NULL").
+			Count(ctx)
+		if err != nil {
+			return fmt.Errorf("checking claimed replacement confirmation item: %w", err)
+		}
+		if claimedItems > 0 {
+			return fmt.Errorf("releasing storage confirmation attention while replacement work is claimed: %w", ErrConflict)
 		}
 		return nil
 	})
