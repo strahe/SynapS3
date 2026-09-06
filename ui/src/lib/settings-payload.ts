@@ -44,29 +44,17 @@ export function buildSettingsPayload(
   if (include('cache.lru_low_watermark_percent'))
     payload.cache.lru_low_watermark_percent = form.cache.lru_low_watermark_percent
 
-  const upload: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['upload']> = {}
-  const providerReplacement: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['provider_replacement']> = {}
-  const evictor: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['evictor']> = {}
-  const storageCleanup: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['storage_cleanup']> = {}
-  if (include('worker.upload.concurrency')) upload.concurrency = form.worker.upload.concurrency
-  if (include('worker.upload.poll_interval')) upload.poll_interval = form.worker.upload.poll_interval
-  if (include('worker.upload.max_retries')) upload.max_retries = form.worker.upload.max_retries
-  if (include('worker.provider_replacement.concurrency'))
-    providerReplacement.concurrency = form.worker.provider_replacement.concurrency
-  if (include('worker.provider_replacement.poll_interval'))
-    providerReplacement.poll_interval = form.worker.provider_replacement.poll_interval
-  if (include('worker.provider_replacement.max_retries'))
-    providerReplacement.max_retries = form.worker.provider_replacement.max_retries
-  if (include('worker.evictor.concurrency')) evictor.concurrency = form.worker.evictor.concurrency
-  if (include('worker.evictor.poll_interval')) evictor.poll_interval = form.worker.evictor.poll_interval
-  if (include('worker.evictor.max_retries')) evictor.max_retries = form.worker.evictor.max_retries
-  if (include('worker.storage_cleanup.concurrency'))
-    storageCleanup.concurrency = form.worker.storage_cleanup.concurrency
-  if (include('worker.storage_cleanup.poll_interval'))
-    storageCleanup.poll_interval = form.worker.storage_cleanup.poll_interval
-  if (include('worker.storage_cleanup.max_retries'))
-    storageCleanup.max_retries = form.worker.storage_cleanup.max_retries
-  payload.worker = { upload, provider_replacement: providerReplacement, evictor, storage_cleanup: storageCleanup }
+  const tasks: NonNullable<NonNullable<SettingsUpdatePayload['worker']>['tasks']> = {}
+  if (include('worker.tasks.concurrency')) tasks.concurrency = form.worker.tasks.concurrency
+  if (include('worker.tasks.poll_interval')) tasks.poll_interval = form.worker.tasks.poll_interval
+  if (include('worker.tasks.lease_duration')) tasks.lease_duration = form.worker.tasks.lease_duration
+  if (include('worker.tasks.max_retries')) tasks.max_retries = form.worker.tasks.max_retries
+  if (include('worker.tasks.retention')) tasks.retention = form.worker.tasks.retention
+  if (include('worker.tasks.provider_mutation_concurrency'))
+    tasks.provider_mutation_concurrency = form.worker.tasks.provider_mutation_concurrency
+  if (include('worker.tasks.destructive_mutation_concurrency'))
+    tasks.destructive_mutation_concurrency = form.worker.tasks.destructive_mutation_concurrency
+  payload.worker = { tasks }
 
   payload.logging = {}
   if (include('logging.level')) payload.logging.level = form.logging.level

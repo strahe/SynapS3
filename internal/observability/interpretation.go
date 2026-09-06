@@ -122,13 +122,13 @@ func dataSetHasActivePieces(state DataSetState) *bool {
 
 func CopyHealthFromFacts(facts CopyFacts, dataSetObservation *DataSetObservation, interval time.Duration, now time.Time) Signal {
 	switch facts.Status {
-	case model.StorageUploadCopyStatusPending, model.StorageUploadCopyStatusPieceReady:
+	case model.StorageCopyStatusPending, model.StorageCopyStatusPieceReady:
 		return BuildSignal(StatusDegraded, []ReasonCode{ReasonCopyPending}, facts.LastError, nil, interval, now)
-	case model.StorageUploadCopyStatusCommitting:
+	case model.StorageCopyStatusCommitting:
 		return BuildSignal(StatusDegraded, []ReasonCode{ReasonCopyCommitting}, facts.LastError, nil, interval, now)
-	case model.StorageUploadCopyStatusFailed:
+	case model.StorageCopyStatusFailed:
 		return BuildSignal(StatusUnavailable, []ReasonCode{ReasonCopyFailed}, facts.LastError, nil, interval, now)
-	case model.StorageUploadCopyStatusCommitted:
+	case model.StorageCopyStatusCommitted:
 		return committedCopyHealthFromFacts(facts, dataSetObservation, interval, now)
 	default:
 		return BuildSignal(StatusUnknown, []ReasonCode{ReasonCopyObservationMissing}, facts.LastError, nil, interval, now)

@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/strahe/synaps3/internal/cache"
@@ -146,9 +145,7 @@ func TestMetrics_Endpoint(t *testing.T) {
 
 	// Increment metrics so we can verify their presence.
 	ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
-	WorkerTasksProcessed.WithLabelValues("uploader", "success").Inc()
-	WorkerTaskDuration.WithLabelValues("uploader").Observe(0.5)
-	WorkerTaskDuration.WithLabelValues("uploader").Observe(0.5)
+	TaskQueueDepth.WithLabelValues("upload_plan", "pending").Set(1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
@@ -178,7 +175,7 @@ func TestMetrics_Endpoint(t *testing.T) {
 		"synaps3_cache_used_bytes",
 		"synaps3_cache_hits_total",
 		"synaps3_cache_misses_total",
-		"synaps3_worker_tasks_processed_total",
+		"synaps3_task_queue_depth",
 	} {
 		if !strings.Contains(text, prefix) {
 			t.Errorf("metrics output missing %q", prefix)
@@ -326,36 +323,34 @@ func TestRefreshMetrics(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Seed a queued task.
-	task := &model.Task{
-		Type:           model.TaskTypeUpload,
-		RefType:        "object",
-		RefID:          1,
-		RefVersionID:   "01J000000000000000TASK001",
-		IdempotencyKey: "test-refresh-task",
-		Status:         model.TaskStatusQueued,
-		ScheduledAt:    time.Now(),
-	}
-	if err := repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("seeding task: %v", err)
-	}
+	// Seed one pending storage operation.
+	taskService := newAdminTestTaskService(t, repos)
+	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageStore, "test-refresh-task", model.TaskStatusPending)
 
 	// Seed an object.
-	bucket := &model.Bucket{Name: "metrics-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "metrics-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if _, err := db.NewInsert().Model(bucket).Exec(ctx); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
+	testutil.OpenBucketReplicaSlots(t, db, bucket.ID, bucket.DefaultCopies)
 	versionID := model.NewVersionID()
+	content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     1,
+		Checksum:        testutil.StorageChecksum("c"),
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("seeding content: %v", err)
+	}
 	version := &model.ObjectVersion{
 		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         "metrics.txt",
+		ContentID:   &content.ID,
 		Size:        1,
 		ETag:        "e",
-		Checksum:    "c",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/" + versionID,
-		State:       model.ObjectStateCached,
 	}
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
 		t.Fatalf("seeding object: %v", err)
@@ -433,8 +428,6 @@ func TestWithSecurityHeadersSensitivePaths(t *testing.T) {
 		"//api/v1/auth/session",
 		"/admin/",
 		"//admin/",
-		"/admin/exhausted-tasks",
-		"//admin/exhausted-tasks",
 		"/metrics",
 		"//metrics",
 		"/healthz",

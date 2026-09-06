@@ -160,7 +160,7 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 		body = r.streamAndRehydrate(
 			ctx,
 			bucketName,
-			version.CacheKey,
+			version.CacheKey(),
 			version.VersionID,
 			rc,
 		)
@@ -229,7 +229,7 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 		body = r.streamAndRehydrate(
 			ctx,
 			bucketName,
-			version.CacheKey,
+			version.CacheKey(),
 			version.VersionID,
 			rc,
 		)
@@ -252,10 +252,10 @@ func resultFromVersion(version *model.ObjectVersion, body io.ReadCloser, source 
 }
 
 func (r *Reader) downloadVersionFromProvider(ctx context.Context, key string, version *model.ObjectVersion) (io.ReadCloser, error) {
-	if version.StorageUploadID == nil || r.storage == nil {
+	if version.ContentID == nil || r.storage == nil {
 		return nil, ErrCacheMiss
 	}
-	copies, err := r.repos.Uploads.ListReadableCommittedCopies(ctx, *version.StorageUploadID)
+	copies, err := r.repos.Contents.ListReadableCommittedCopies(ctx, *version.ContentID)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +317,7 @@ func (r *Reader) streamAndRehydrate(
 				}
 				if persistedVersion == nil ||
 					persistedVersion.IsDeleteMarker ||
-					persistedVersion.CacheKey != cacheKey {
+					persistedVersion.CacheKey() != cacheKey {
 					skipRehydration = true
 					return nil
 				}
@@ -325,11 +325,13 @@ func (r *Reader) streamAndRehydrate(
 				if err != nil {
 					return err
 				}
-				persistErr = r.accessTracker.RecordCommit(
-					ctx,
-					versionID,
-					persistedVersion.CacheAccessedAt,
-				)
+				if persistedVersion.ContentID != nil {
+					persistErr = r.accessTracker.RecordCommit(
+						ctx,
+						*persistedVersion.ContentID,
+						persistedVersion.CacheAccessedAt,
+					)
+				}
 				return nil
 			},
 		)
@@ -376,17 +378,21 @@ func (r *Reader) openCached(
 	opened, err := r.cacheGate.Open(
 		version.VersionID,
 		func() (io.ReadCloser, *cache.ObjectInfo, error) {
-			return r.cache.Get(ctx, bucketName, version.CacheKey)
+			return r.cache.Get(ctx, bucketName, version.CacheKey())
 		},
 	)
 	if err != nil {
 		return nil, err
 	}
+	// Recency belongs to the bytes, so it is recorded against the content that
+	// backs this version rather than against the version itself.
 	var persistErr error
-	if version.InCache {
-		persistErr = r.accessTracker.RecordAccess(ctx, version.VersionID, version.CacheAccessedAt)
-	} else {
-		persistErr = r.accessTracker.RecordCommit(ctx, version.VersionID, version.CacheAccessedAt)
+	if version.ContentID != nil {
+		if version.InCache {
+			persistErr = r.accessTracker.RecordAccess(ctx, *version.ContentID, version.CacheAccessedAt)
+		} else {
+			persistErr = r.accessTracker.RecordCommit(ctx, *version.ContentID, version.CacheAccessedAt)
+		}
 	}
 	if persistErr != nil {
 		r.logger.Warn(

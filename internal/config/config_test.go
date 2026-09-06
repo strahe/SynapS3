@@ -196,7 +196,7 @@ func TestValidate_InvalidNetwork(t *testing.T) {
 
 func TestValidate_WorkerConcurrency_Zero(t *testing.T) {
 	cfg := validConfig()
-	cfg.Worker.Upload.Concurrency = 0
+	cfg.Worker.Tasks.Concurrency = 0
 
 	err := cfg.Validate()
 	if err == nil {
@@ -209,7 +209,7 @@ func TestValidate_WorkerConcurrency_Zero(t *testing.T) {
 
 func TestValidate_WorkerPollInterval_Zero(t *testing.T) {
 	cfg := validConfig()
-	cfg.Worker.Evictor.PollInterval = 0
+	cfg.Worker.Tasks.PollInterval = 0
 
 	err := cfg.Validate()
 	if err == nil {
@@ -275,9 +275,9 @@ func TestValidate_EditableSettingsFields(t *testing.T) {
 		},
 		{
 			name:  "worker max retries",
-			field: "worker.upload.max_retries",
+			field: "worker.tasks.max_retries",
 			mutate: func(cfg *Config) {
-				cfg.Worker.Upload.MaxRetries = -1
+				cfg.Worker.Tasks.MaxRetries = -1
 			},
 		},
 		{
@@ -420,11 +420,11 @@ func TestLoad_DefaultConfig(t *testing.T) {
 	if cfg.Cache.MaxSizeGB != def.Cache.MaxSizeGB {
 		t.Errorf("Cache.MaxSizeGB = %d, want %d", cfg.Cache.MaxSizeGB, def.Cache.MaxSizeGB)
 	}
-	if cfg.Worker.Upload.Concurrency != def.Worker.Upload.Concurrency {
-		t.Errorf("Worker.Upload.Concurrency = %d, want %d", cfg.Worker.Upload.Concurrency, def.Worker.Upload.Concurrency)
+	if cfg.Worker.Tasks.Concurrency != def.Worker.Tasks.Concurrency {
+		t.Errorf("Worker.Tasks.Concurrency = %d, want %d", cfg.Worker.Tasks.Concurrency, def.Worker.Tasks.Concurrency)
 	}
-	if cfg.Worker.Upload.PollInterval != def.Worker.Upload.PollInterval {
-		t.Errorf("Worker.Upload.PollInterval = %s, want %s", cfg.Worker.Upload.PollInterval, def.Worker.Upload.PollInterval)
+	if cfg.Worker.Tasks.PollInterval != def.Worker.Tasks.PollInterval {
+		t.Errorf("Worker.Tasks.PollInterval = %s, want %s", cfg.Worker.Tasks.PollInterval, def.Worker.Tasks.PollInterval)
 	}
 	if cfg.Filecoin.DefaultCopies != 3 {
 		t.Errorf("Filecoin.DefaultCopies = %d, want 3", cfg.Filecoin.DefaultCopies)
@@ -509,13 +509,13 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 	t.Setenv("SYNAPS3_CACHE_EVICTION_POLICY", "After_Upload")
 	t.Setenv("SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", "88")
 	t.Setenv("SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", "73")
-	t.Setenv("SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", "9s")
-	t.Setenv("SYNAPS3_WORKER_UPLOAD_MAX_RETRIES", "8")
-	t.Setenv("SYNAPS3_WORKER_PROVIDER_REPLACEMENT_CONCURRENCY", "7")
-	t.Setenv("SYNAPS3_WORKER_PROVIDER_REPLACEMENT_POLL_INTERVAL", "11s")
-	t.Setenv("SYNAPS3_WORKER_PROVIDER_REPLACEMENT_MAX_RETRIES", "9")
-	t.Setenv("SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL", "2m")
-	t.Setenv("SYNAPS3_WORKER_EVICTOR_MAX_RETRIES", "6")
+	t.Setenv("SYNAPS3_WORKER_TASKS_CONCURRENCY", "7")
+	t.Setenv("SYNAPS3_WORKER_TASKS_POLL_INTERVAL", "9s")
+	t.Setenv("SYNAPS3_WORKER_TASKS_LEASE_DURATION", "2m")
+	t.Setenv("SYNAPS3_WORKER_TASKS_MAX_RETRIES", "8")
+	t.Setenv("SYNAPS3_WORKER_TASKS_RETENTION", "96h")
+	t.Setenv("SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", "3")
+	t.Setenv("SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", "2")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_ENABLED", "false")
 	t.Setenv("SYNAPS3_LOGGING_S3_ACCESS_LEVEL", "debug")
 	t.Setenv("SYNAPS3_ADMIN_AUTH_PASSWORD_HASH", "$2a$10$7EqJtq98hPqEX7fNZaFWoOhi6r4aIvJrDWHtqK4V0GaQYe7TzTx6W")
@@ -547,16 +547,14 @@ func TestLoad_EnvOverrideUnderscoreFields(t *testing.T) {
 		cfg.Cache.LRULowWatermarkPercent != 73 {
 		t.Fatalf("cache config = %#v, want env values", cfg.Cache)
 	}
-	if cfg.Worker.Upload.PollInterval != 9*time.Second || cfg.Worker.Upload.MaxRetries != 8 {
-		t.Fatalf("upload worker = %#v, want env values", cfg.Worker.Upload)
-	}
-	if cfg.Worker.ProviderReplacement.Concurrency != 7 ||
-		cfg.Worker.ProviderReplacement.PollInterval != 11*time.Second ||
-		cfg.Worker.ProviderReplacement.MaxRetries != 9 {
-		t.Fatalf("provider replacement worker = %#v, want independent env values", cfg.Worker.ProviderReplacement)
-	}
-	if cfg.Worker.Evictor.PollInterval != 2*time.Minute || cfg.Worker.Evictor.MaxRetries != 6 {
-		t.Fatalf("evictor worker = %#v, want env values", cfg.Worker.Evictor)
+	if cfg.Worker.Tasks.Concurrency != 7 ||
+		cfg.Worker.Tasks.PollInterval != 9*time.Second ||
+		cfg.Worker.Tasks.LeaseDuration != 2*time.Minute ||
+		cfg.Worker.Tasks.MaxRetries != 8 ||
+		cfg.Worker.Tasks.Retention != 96*time.Hour ||
+		cfg.Worker.Tasks.ProviderMutationConcurrency != 3 ||
+		cfg.Worker.Tasks.DestructiveMutationConcurrency != 2 {
+		t.Fatalf("task worker = %#v, want env values", cfg.Worker.Tasks)
 	}
 	if cfg.Logging.S3Access.Enabled || cfg.Logging.S3Access.Level != "debug" {
 		t.Fatalf("s3 access logging = %#v, want disabled debug", cfg.Logging.S3Access)
@@ -853,7 +851,7 @@ func TestValidate_TLS_Disabled_NoCerts(t *testing.T) {
 
 func TestValidate_WorkerPollInterval_Negative(t *testing.T) {
 	cfg := validConfig()
-	cfg.Worker.Evictor.PollInterval = -1 * time.Second
+	cfg.Worker.Tasks.PollInterval = -1 * time.Second
 
 	err := cfg.Validate()
 	if err == nil {

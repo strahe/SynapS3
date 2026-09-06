@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"go/parser"
 	"go/token"
@@ -15,21 +16,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/migrate"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	initialSQLiteSchemaFingerprint   = "a76c972a38ca0fd958625a4e1a6ca69f69a7dc67ffe7abe0bb0bff06481044bb"
-	initialPostgresSchemaFingerprint = "91bc1d871d84e05ae3f995a10c14a21276fbe39eb12df4aed3aab9138a5ea964"
+	initialPortableSchemaFingerprint = "82c448b3d6eb4bc627cc6ae913091c21c8b440903dd09a85032a653515a80323"
 )
+
+func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
+	migrations := Migrations.Sorted()
+	if len(migrations) == 0 {
+		t.Fatal("migration registry is empty")
+	}
+	if migrations[0].Name != InitialSchemaName {
+		t.Fatalf("migration name = %q, want %q", migrations[0].Name, InitialSchemaName)
+	}
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i-1].Name >= migrations[i].Name {
+			t.Fatalf("migration names are not unique and ordered: %q then %q", migrations[i-1].Name, migrations[i].Name)
+		}
+	}
+}
 
 func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
 	files, err := filepath.Glob("*.go")
@@ -56,196 +69,390 @@ func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
 	}
 }
 
-func TestInitialSchemaFingerprintSQLite(t *testing.T) {
-	db := newSQLiteMigrationDB(t, "initial_schema_fingerprint")
-	ctx := context.Background()
-	if err := runMigrationBody(ctx, db, up2026040501Init); err != nil {
-		t.Fatalf("create initial schema: %v", err)
-	}
-	got, _ := sqliteSchemaFingerprint(t, db, false)
-	if got != initialSQLiteSchemaFingerprint {
-		t.Fatalf("initial SQLite schema fingerprint = %s, want %s", got, initialSQLiteSchemaFingerprint)
-	}
-}
-
 func TestInitialSchemaFingerprintPostgres(t *testing.T) {
 	db := newPostgresMigrationDB(t)
-	ctx := context.Background()
-	if err := runMigrationBody(ctx, db, up2026040501Init); err != nil {
+	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
 		t.Fatalf("create initial schema: %v", err)
 	}
-	got, _ := postgresSchemaFingerprint(t, db, false)
-	if got != initialPostgresSchemaFingerprint {
-		t.Fatalf("initial PostgreSQL schema fingerprint = %s, want %s", got, initialPostgresSchemaFingerprint)
+	got, schema := portableSchemaFingerprint(t, db)
+	sqliteDB := newSQLiteMigrationDB(t, "postgres_portable_schema_comparison")
+	if err := runMigrationBody(t.Context(), sqliteDB, up2026090101InitialSchema); err != nil {
+		t.Fatalf("create comparison SQLite schema: %v", err)
+	}
+	sqliteFingerprint, sqliteSchema := portableSchemaFingerprint(t, sqliteDB)
+	if got != sqliteFingerprint {
+		t.Fatalf(
+			"portable schema differs by dialect: PostgreSQL=%s SQLite=%s\n%s",
+			got,
+			sqliteFingerprint,
+			semanticSchemaDifference(sqliteSchema, schema),
+		)
+	}
+	if got != initialPortableSchemaFingerprint {
+		t.Fatalf("initial PostgreSQL portable schema fingerprint = %s, want %s\n%s", got, initialPortableSchemaFingerprint, schema)
 	}
 }
 
-func TestLegacyMigrationUpgradePreservesDataAndIsIdempotent(t *testing.T) {
-	testMigrationDialects(t, testLegacyMigrationUpgradePreservesDataAndIsIdempotent)
-}
-
-func testLegacyMigrationUpgradePreservesDataAndIsIdempotent(t *testing.T, db *bun.DB) {
-	ctx := context.Background()
-	migrator := NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("initialize legacy migrator: %v", err)
+func semanticSchemaDifference(want, got string) string {
+	wantLines := strings.Split(want, "\n")
+	gotLines := strings.Split(got, "\n")
+	wantSet := make(map[string]struct{}, len(wantLines))
+	gotSet := make(map[string]struct{}, len(gotLines))
+	for _, line := range wantLines {
+		wantSet[line] = struct{}{}
 	}
-	if err := runMigrationBody(ctx, db, up2026040501Init); err != nil {
-		t.Fatalf("create legacy initial schema: %v", err)
+	for _, line := range gotLines {
+		gotSet[line] = struct{}{}
 	}
-	markAppliedMigration(t, ctx, migrator, "2026040501", 1)
-	seedLegacyMigrationData(t, db)
-	walletBefore := readLegacyWalletRow(t, db)
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("upgrade legacy schema: %v", err)
-	}
-
-	// 2026062201 rebuilds wallet_operations on SQLite by copying rows.
-	if walletAfter := readLegacyWalletRow(t, db); walletAfter != walletBefore {
-		t.Fatalf("wallet row changed across the upgrade:\n before=%s\n after =%s", walletBefore, walletAfter)
-	}
-
-	var generation int
-	var current bool
-	if err := db.NewRaw("SELECT generation, is_current FROM storage_data_sets WHERE id = 1").Scan(ctx, &generation, &current); err != nil {
-		t.Fatalf("read upgraded legacy data: %v", err)
-	}
-	if generation != 1 || !current {
-		t.Fatalf("upgraded data generation/current = %d/%v, want 1/true", generation, current)
-	}
-	group, err := migrator.Migrate(ctx)
-	if err != nil {
-		t.Fatalf("repeat migrations: %v", err)
-	}
-	if len(group.Migrations) != 0 {
-		t.Fatalf("repeat migrations applied %d migrations, want none", len(group.Migrations))
-	}
-}
-
-func TestFreshMigrationRollbackRemovesSchema(t *testing.T) {
-	testMigrationDialects(t, testFreshMigrationRollbackRemovesSchema)
-}
-
-func testFreshMigrationRollbackRemovesSchema(t *testing.T, db *bun.DB) {
-	ctx := context.Background()
-	migrator := NewMigrator(db)
-	if err := migrator.Init(ctx); err != nil {
-		t.Fatalf("initialize fresh migrator: %v", err)
-	}
-	if _, err := migrator.Migrate(ctx); err != nil {
-		t.Fatalf("migrate fresh schema: %v", err)
-	}
-	if _, err := migrator.Rollback(ctx); err != nil {
-		t.Fatalf("rollback empty fresh schema: %v", err)
-	}
-	domainTables, err := countDomainTables(ctx, db)
-	if err != nil {
-		t.Fatalf("count tables after rollback: %v", err)
-	}
-	if domainTables != 0 {
-		t.Fatalf("rollback left %d domain tables, want none", domainTables)
-	}
-	applied, err := migrator.AppliedMigrations(ctx)
-	if err != nil {
-		t.Fatalf("read migrations after rollback: %v", err)
-	}
-	if len(applied) != 0 {
-		t.Fatalf("rollback left %d applied migrations, want none", len(applied))
-	}
-}
-
-func markAppliedMigration(t *testing.T, ctx context.Context, migrator interface {
-	MarkApplied(context.Context, *migrate.Migration) error
-}, name string, groupID int64,
-) {
-	t.Helper()
-	for _, migration := range Migrations.Sorted() {
-		if migration.Name != name {
-			continue
-		}
-		migration.GroupID = groupID
-		if err := migrator.MarkApplied(ctx, &migration); err != nil {
-			t.Fatalf("mark migration %s applied: %v", name, err)
-		}
-		return
-	}
-	t.Fatalf("migration %s not found", name)
-}
-
-func seedLegacyMigrationData(t *testing.T, db *bun.DB) {
-	t.Helper()
-	ctx := context.Background()
-	statements := []string{
-		`INSERT INTO buckets (id, name) VALUES (1, 'legacy-migration-bucket')`,
-		`INSERT INTO storage_uploads
-			(id, bucket_id, content_size, checksum, requested_copies)
-		 VALUES (1, 1, 1, 'checksum', 1)`,
-		`INSERT INTO storage_data_sets
-			(id, bucket_id, provider_id, copy_index, status)
-		 VALUES (1, 1, '101', 0, 'ready')`,
-		`INSERT INTO wallet_operations
-			(id, type, client_request_id, amount, status, tx_hash, last_error,
-			 lease_until, started_at, submitted_at, completed_at, created_at, updated_at)
-		 VALUES (1, 'fund', 'legacy-fund', '1234', 'confirmed', '0xfeed', 'boom',
-			 '2026-01-01 01:00:00', '2026-01-02 02:00:00', '2026-01-03 03:00:00',
-			 '2026-01-04 04:00:00', '2026-01-05 05:00:00', '2026-01-06 06:00:00')`,
-	}
-	for _, statement := range statements {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			t.Fatalf("seed legacy migration data: %v", err)
+	difference := make([]string, 0)
+	for _, line := range wantLines {
+		if _, ok := gotSet[line]; !ok {
+			difference = append(difference, "- "+line)
 		}
 	}
+	for _, line := range gotLines {
+		if _, ok := wantSet[line]; !ok {
+			difference = append(difference, "+ "+line)
+		}
+	}
+	return strings.Join(difference, "\n")
 }
 
-func readLegacyWalletRow(t *testing.T, db *bun.DB) string {
-	t.Helper()
-	var (
-		opType, requestID, amount, status string
-		txHash, lastError                 *string
-		lease, started, submitted, done   *time.Time
-		created, updated                  time.Time
-	)
-	if err := db.NewRaw(`SELECT type, client_request_id, amount, status, tx_hash, last_error,
-		lease_until, started_at, submitted_at, completed_at, created_at, updated_at
-		FROM wallet_operations WHERE id = 1`).
-		Scan(context.Background(), &opType, &requestID, &amount, &status, &txHash, &lastError,
-			&lease, &started, &submitted, &done, &created, &updated); err != nil {
-		t.Fatalf("read wallet row: %v", err)
+func TestInitialSchemaPortableFingerprintSQLite(t *testing.T) {
+	db := newSQLiteMigrationDB(t, "portable_schema_fingerprint")
+	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
+		t.Fatalf("create initial schema: %v", err)
 	}
-	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
-		opType, requestID, amount, status, derefString(txHash), derefString(lastError),
-		formatTime(lease), formatTime(started), formatTime(submitted), formatTime(done),
-		formatTime(&created), formatTime(&updated))
+	got, schema := portableSchemaFingerprint(t, db)
+	if got != initialPortableSchemaFingerprint {
+		t.Fatalf("initial SQLite portable schema fingerprint = %s, want %s\n%s", got, initialPortableSchemaFingerprint, schema)
+	}
 }
 
-func derefString(v *string) string {
-	if v == nil {
-		return "<nil>"
+func TestInitialSchemaContractSQLite(t *testing.T) {
+	db := newSQLiteMigrationDB(t, "initial_schema_contract")
+	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
+		t.Fatalf("create initial schema: %v", err)
 	}
-	return *v
+	for _, table := range []string{
+		"s3_accounts", "buckets", "bucket_replica_slots", "objects", "object_versions", "object_cache", "object_deletions",
+		"multipart_uploads", "multipart_parts", "storage_contents", "storage_data_sets",
+		"storage_copies", "storage_commit_attempts", "storage_replacements",
+		"storage_pull_attempts", "storage_replacement_items", "storage_cleanup_copies", "wallet_operations", "tasks",
+		"observability_collection_states", "observability_provider_states", "observability_data_set_states",
+		"task_payloads", "storage_data_set_terminations",
+	} {
+		if exists, err := tableExists(t.Context(), db, table); err != nil || !exists {
+			t.Errorf("table %s exists=%t err=%v", table, exists, err)
+		}
+	}
+	for _, column := range []struct{ table, name string }{
+		{"tasks", "claim_generation"},
+		{"task_payloads", "checkpoint_json"},
+		{"storage_data_set_terminations", "epoch"},
+		{"storage_copies", "active_task_id"},
+		{"storage_copies", "bucket_id"},
+		{"storage_copies", "content_size"},
+		{"storage_copies", "storage_data_set_id"},
+		{"storage_copies", "ingress_bytes_transferred"},
+		{"storage_commit_attempts", "attempt_id"},
+		{"storage_pull_attempts", "attempt_id"},
+		{"storage_pull_attempts", "source_piece_cid"},
+		{"storage_contents", "content_size"},
+		{"storage_data_sets", "ensure_task_id"},
+		{"storage_replacement_items", "target_data_set_id"},
+		{"storage_cleanup_copies", "bucket_id"},
+		{"object_versions", "content_id"},
+		{"object_cache", "cache_active_task_id"},
+		{"wallet_operations", "broadcast_attempted_at"},
+	} {
+		if exists, err := columnExists(t.Context(), db, column.table, column.name); err != nil || !exists {
+			t.Errorf("column %s.%s exists=%t err=%v", column.table, column.name, exists, err)
+		}
+	}
+	for _, index := range []string{
+		"idx_tasks_pending",
+		"idx_tasks_recovery",
+		"idx_tasks_gc",
+		"idx_storage_copies_commit_ready",
+		"idx_storage_commit_attempts_unresolved_copy",
+		"idx_storage_copies_ingress_content",
+		"idx_storage_data_sets_bucket_provider_active",
+		"idx_storage_replacements_active_bucket_slot",
+		"idx_wallet_operations_recent",
+	} {
+		if exists, err := indexExists(t.Context(), db, index); err != nil || !exists {
+			t.Errorf("index %s exists=%t err=%v", index, exists, err)
+		}
+	}
+	for _, index := range []string{
+		"idx_storage_data_sets_replica_slot",
+		"idx_storage_replacements_replica_slot",
+	} {
+		if exists, err := indexExists(t.Context(), db, index); err != nil || exists {
+			t.Errorf("removed index %s exists=%t err=%v", index, exists, err)
+		}
+	}
+	for _, column := range []struct{ table, name string }{
+		{"tasks", "stage"},
+		{"tasks", "category"},
+		{"tasks", "parent_task_id"},
+		{"tasks", "workflow_id"},
+		{"tasks", "priority"},
+		{"tasks", "lane"},
+		{"storage_replacement_items", "claimed_at"},
+		{"storage_replacement_items", "lease_until"},
+		{"storage_replacement_items", "scheduled_at"},
+		{"storage_replacement_items", "retry_count"},
+		{"storage_replacement_items", "task_id"},
+		{"storage_replacement_items", "target_copy_id"},
+		{"multipart_uploads", "id"},
+		{"storage_copies", "commit_attempt_id"},
+		{"storage_copies", "commit_attempted_at"},
+		{"storage_copies", "commit_transaction_id"},
+		{"storage_copies", "commit_submission_json"},
+		{"storage_copies", "commit_confirmed_transaction_id"},
+		{"storage_copies", "commit_attention_code"},
+		{"storage_copies", "commit_attention_at"},
+		{"storage_copies", "is_new_data_set"},
+		// Pull identity is a ledger row now, not five nullable copy columns.
+		{"storage_copies", "pull_request_id"},
+		{"storage_copies", "pull_source_provider_id"},
+		{"storage_copies", "pull_source_data_set_id"},
+		{"storage_copies", "pull_source_piece_id"},
+		{"storage_copies", "pull_source_retrieval_url"},
+		{"storage_pull_attempts", "request_id"},
+		// Pipeline position, cache residency and the content status column are
+		// derived or moved; reintroducing any of them re-creates a second
+		// authority for a fact the copies or object_cache already own.
+		{"object_versions", "is_current"},
+		{"object_versions", "state"},
+		{"object_versions", "failed_at_state"},
+		{"object_versions", "last_error"},
+		{"object_versions", "checksum"},
+		{"object_versions", "storage_upload_id"},
+		{"object_versions", "cache_key"},
+		{"object_versions", "in_cache"},
+		{"object_versions", "cache_accessed_at"},
+		{"object_versions", "cache_presence_generation"},
+		{"object_versions", "cache_operation_generation"},
+		{"object_versions", "cache_active_task_id"},
+		{"storage_contents", "status"},
+		{"storage_contents", "state"},
+		{"storage_contents", "disposition"},
+		{"storage_contents", "superseded_by_id"},
+		{"storage_contents", "committed_slots"},
+		{"storage_contents", "ingress_bytes_transferred"},
+		{"storage_contents", "created_from_version_id"},
+		{"observability_provider_states", "created_at"},
+		{"observability_provider_states", "updated_at"},
+		{"observability_data_set_states", "created_at"},
+		{"observability_data_set_states", "updated_at"},
+		{"object_deletions", "cache_cleanup_status"},
+		{"object_deletions", "cache_error"},
+		// The JSON a task carries and the terminations a replacement records
+		// are rows of their own; putting either back re-creates the write
+		// amplification and the repeated column group they were split out of.
+		{"tasks", "input_json"},
+		{"tasks", "checkpoint_json"},
+		{"storage_replacements", "termination_tx_hash"},
+		{"storage_replacements", "termination_epoch"},
+		{"storage_replacements", "termination_observed_at"},
+		{"storage_replacements", "abandoned_termination_tx_hash"},
+		{"storage_replacements", "abandoned_termination_epoch"},
+		{"storage_replacements", "abandoned_termination_observed_at"},
+		{"storage_replacements", "confirmed_at"},
+	} {
+		if exists, err := columnExists(t.Context(), db, column.table, column.name); err != nil || exists {
+			t.Errorf("removed column %s.%s exists=%t err=%v", column.table, column.name, exists, err)
+		}
+	}
 }
 
-func formatTime(v *time.Time) string {
-	if v == nil {
-		return "<nil>"
+func TestInitialSchemaTaskOwnerForeignKeysAreRestrictive(t *testing.T) {
+	db := newSQLiteMigrationDB(t, "task_owner_foreign_keys")
+	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
+		t.Fatalf("create initial schema: %v", err)
 	}
-	return v.UTC().Format(time.RFC3339Nano)
+	want := map[string]map[string]bool{
+		"buckets":              {"durability_task_id": false},
+		"object_cache":         {"cache_active_task_id": false},
+		"storage_contents":     {"cleanup_task_id": false},
+		"storage_data_sets":    {"ensure_task_id": false, "retirement_task_id": false},
+		"storage_copies":       {"active_task_id": false},
+		"storage_replacements": {"task_id": false},
+		"wallet_operations":    {"task_id": false},
+	}
+	for table, columns := range want {
+		rows, err := db.Query(`SELECT "from", "table", on_delete FROM pragma_foreign_key_list(?)`, table)
+		if err != nil {
+			t.Fatalf("query foreign keys for %s: %v", table, err)
+		}
+		for rows.Next() {
+			var from, target, onDelete string
+			if err := rows.Scan(&from, &target, &onDelete); err != nil {
+				_ = rows.Close()
+				t.Fatalf("scan foreign key for %s: %v", table, err)
+			}
+			if _, tracked := columns[from]; !tracked || target != "tasks" {
+				continue
+			}
+			if onDelete != "RESTRICT" {
+				_ = rows.Close()
+				t.Fatalf("%s.%s ON DELETE = %s, want RESTRICT", table, from, onDelete)
+			}
+			columns[from] = true
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close foreign keys for %s: %v", table, err)
+		}
+		for column, found := range columns {
+			if !found {
+				t.Errorf("missing task ownership foreign key %s.%s", table, column)
+			}
+		}
+	}
 }
 
-func countDomainTables(ctx context.Context, db *bun.DB) (int, error) {
-	query := `SELECT COUNT(*) FROM sqlite_schema
-		WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-		  AND name NOT IN ('bun_migrations', 'bun_migration_locks')`
-	if db.Dialect().Name() == dialect.PG {
-		query = `SELECT COUNT(*) FROM information_schema.tables
-			WHERE table_schema = current_schema()
-			  AND table_name NOT IN ('bun_migrations', 'bun_migration_locks')`
+func TestValidateTargetRejectsLegacyDatabaseWithoutModification(t *testing.T) {
+	db := newSQLiteMigrationDB(t, "legacy_rejection")
+	if _, err := db.Exec(`CREATE TABLE tasks (id INTEGER PRIMARY KEY, status TEXT)`); err != nil {
+		t.Fatalf("seed legacy table: %v", err)
 	}
-	var count int
-	if err := db.NewRaw(query).Scan(ctx, &count); err != nil {
-		return 0, err
+	if _, err := db.Exec(`INSERT INTO tasks (id, status) VALUES (7, 'running')`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
 	}
-	return count, nil
+	err := ValidateTarget(t.Context(), db)
+	if !errors.Is(err, ErrIncompatibleDatabase) {
+		t.Fatalf("ValidateTarget error = %v, want ErrIncompatibleDatabase", err)
+	}
+	var status string
+	if err := db.NewRaw(`SELECT status FROM tasks WHERE id = 7`).Scan(t.Context(), &status); err != nil {
+		t.Fatalf("read legacy row after rejection: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("legacy row status = %q, want unchanged", status)
+	}
+	if exists, err := tableExists(t.Context(), db, "bun_migrations"); err != nil || exists {
+		t.Fatalf("migration marker exists=%t err=%v after rejection", exists, err)
+	}
+}
+
+func TestValidateTargetAcceptsOnlyAppliedMigrationPrefixes(t *testing.T) {
+	registry := migrate.NewMigrations()
+	registry.Add(migrate.Migration{Name: InitialSchemaName})
+	registry.Add(migrate.Migration{Name: "2026090201"})
+	registry.Add(migrate.Migration{Name: "2026090301"})
+
+	tests := []struct {
+		name    string
+		applied []string
+		wantErr bool
+	}{
+		{name: "metadata only"},
+		{name: "baseline", applied: []string{InitialSchemaName}},
+		{name: "longer prefix", applied: []string{InitialSchemaName, "2026090201"}},
+		{name: "full registry", applied: []string{InitialSchemaName, "2026090201", "2026090301"}},
+		{name: "legacy marker", applied: []string{"2026040501"}, wantErr: true},
+		{name: "unknown marker", applied: []string{InitialSchemaName, "2026090250"}, wantErr: true},
+		{name: "duplicate marker", applied: []string{InitialSchemaName, InitialSchemaName}, wantErr: true},
+		{name: "out of order", applied: []string{"2026090201", InitialSchemaName}, wantErr: true},
+		{name: "gap", applied: []string{InitialSchemaName, "2026090301"}, wantErr: true},
+		{name: "longer than registry", applied: []string{InitialSchemaName, "2026090201", "2026090301", "2026090401"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := newSQLiteMigrationDB(t, "migration_prefix_"+strings.ReplaceAll(tt.name, " ", "_"))
+			if err := newMigrator(db, registry).Init(t.Context()); err != nil {
+				t.Fatalf("initialize migration metadata: %v", err)
+			}
+			for _, name := range tt.applied {
+				if _, err := db.Exec(`INSERT INTO bun_migrations (name, group_id) VALUES (?, 1)`, name); err != nil {
+					t.Fatalf("insert migration marker %q: %v", name, err)
+				}
+			}
+
+			err := validateTarget(t.Context(), db, registry)
+			if tt.wantErr {
+				if !errors.Is(err, ErrIncompatibleDatabase) {
+					t.Fatalf("validateTarget error = %v, want ErrIncompatibleDatabase", err)
+				}
+			} else if err != nil {
+				t.Fatalf("validateTarget error = %v", err)
+			}
+
+			var names []string
+			if err := db.NewRaw(`SELECT name FROM bun_migrations ORDER BY id`).Scan(t.Context(), &names); err != nil {
+				t.Fatalf("read migration markers: %v", err)
+			}
+			if !slices.Equal(names, tt.applied) {
+				t.Fatalf("migration markers after validation = %v, want unchanged %v", names, tt.applied)
+			}
+		})
+	}
+}
+
+func TestValidateTargetRejectsInvalidMigrationRegistry(t *testing.T) {
+	tests := []struct {
+		name     string
+		registry *migrate.Migrations
+	}{
+		{name: "empty", registry: migrate.NewMigrations()},
+		{name: "missing baseline", registry: migrationRegistryForTest("2026090201")},
+		{name: "duplicate", registry: migrationRegistryForTest(InitialSchemaName, InitialSchemaName)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := newSQLiteMigrationDB(t, "invalid_registry_"+strings.ReplaceAll(tt.name, " ", "_"))
+			if err := validateTarget(t.Context(), db, tt.registry); !errors.Is(err, ErrIncompatibleDatabase) {
+				t.Fatalf("validateTarget error = %v, want ErrIncompatibleDatabase", err)
+			}
+			if count, err := applicationTableCount(t.Context(), db); err != nil || count != 0 {
+				t.Fatalf("application table count after rejection = %d, err=%v", count, err)
+			}
+		})
+	}
+}
+
+func migrationRegistryForTest(names ...string) *migrate.Migrations {
+	registry := migrate.NewMigrations()
+	for _, name := range names {
+		registry.Add(migrate.Migration{Name: name})
+	}
+	return registry
+}
+
+func TestFreshBaselineIsIdempotentAndCannotRollback(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		if err := ValidateTarget(ctx, db); err != nil {
+			t.Fatalf("validate empty target: %v", err)
+		}
+		migrator := NewMigrator(db)
+		if err := migrator.Init(ctx); err != nil {
+			t.Fatalf("initialize migrator: %v", err)
+		}
+		first, err := migrator.Migrate(ctx)
+		if err != nil {
+			t.Fatalf("migrate fresh schema: %v", err)
+		}
+		if len(first.Migrations) != 1 || first.Migrations[0].Name != InitialSchemaName {
+			t.Fatalf("first migration group = %#v", first.Migrations)
+		}
+		second, err := migrator.Migrate(ctx)
+		if err != nil {
+			t.Fatalf("repeat migration: %v", err)
+		}
+		if len(second.Migrations) != 0 {
+			t.Fatalf("repeat migration applied %d migrations", len(second.Migrations))
+		}
+		if _, err := migrator.Rollback(ctx); err == nil {
+			t.Fatal("initial schema rollback succeeded")
+		}
+		if exists, err := tableExists(ctx, db, "tasks"); err != nil || !exists {
+			t.Fatalf("tasks table exists=%t err=%v after rejected rollback", exists, err)
+		}
+	})
 }
 
 func runMigrationBody(ctx context.Context, db *bun.DB, body migrationBody) error {
@@ -310,71 +517,4 @@ func quotePostgresName(name string) string {
 func normalizedFingerprint(lines []string) (string, string) {
 	payload := strings.Join(lines, "\n")
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(payload))), payload
-}
-
-func sqliteSchemaFingerprint(t *testing.T, db *bun.DB, includeMigrations bool) (string, string) {
-	t.Helper()
-	query := `SELECT type, name, tbl_name, COALESCE(sql, '')
-		FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'`
-	if !includeMigrations {
-		query += ` AND name NOT IN ('bun_migrations', 'bun_migration_locks')`
-	}
-	query += ` ORDER BY type, name`
-	rows, err := db.Query(query)
-	if err != nil {
-		t.Fatalf("query SQLite schema: %v", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var lines []string
-	for rows.Next() {
-		var kind, name, table, ddl string
-		if err := rows.Scan(&kind, &name, &table, &ddl); err != nil {
-			t.Fatalf("scan SQLite schema: %v", err)
-		}
-		lines = append(lines, strings.Join([]string{kind, name, table, strings.Join(strings.Fields(ddl), " ")}, "|"))
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate SQLite schema: %v", err)
-	}
-	return normalizedFingerprint(lines)
-}
-
-func postgresSchemaFingerprint(t *testing.T, db *bun.DB, includeMigrations bool) (string, string) {
-	t.Helper()
-	var lines []string
-	queries := []string{
-		`SELECT 'column|' || table_name || '|' || lpad(ordinal_position::text, 4, '0') || '|' ||
-			column_name || '|' || data_type || '|' || udt_name || '|' || is_nullable || '|' ||
-			coalesce(replace(column_default, current_schema() || '.', '<schema>.'), '')
-		 FROM information_schema.columns WHERE table_schema = current_schema()`,
-		`SELECT 'constraint|' || t.relname || '|' || c.conname || '|' || c.contype::text || '|' ||
-			pg_get_constraintdef(c.oid, true)
-		 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
-		 JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema()`,
-		`SELECT 'index|' || tablename || '|' || indexname || '|' ||
-			replace(indexdef, current_schema() || '.', '<schema>.')
-		 FROM pg_indexes WHERE schemaname = current_schema()`,
-	}
-	for _, query := range queries {
-		rows, err := db.Query(query)
-		if err != nil {
-			t.Fatalf("query PostgreSQL schema: %v", err)
-		}
-		for rows.Next() {
-			var line string
-			if err := rows.Scan(&line); err != nil {
-				_ = rows.Close()
-				t.Fatalf("scan PostgreSQL schema: %v", err)
-			}
-			if !includeMigrations && (strings.Contains(line, "|bun_migrations|") || strings.Contains(line, "|bun_migration_locks|")) {
-				continue
-			}
-			lines = append(lines, strings.Join(strings.Fields(line), " "))
-		}
-		if err := rows.Close(); err != nil {
-			t.Fatalf("close PostgreSQL schema rows: %v", err)
-		}
-	}
-	slices.Sort(lines)
-	return normalizedFingerprint(lines)
 }

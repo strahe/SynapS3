@@ -26,7 +26,7 @@ func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3resp
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
 
-	bucket, err := b.requireActiveBucket(ctx, bucketName)
+	bucket, err := b.requireWritableBucket(ctx, bucketName)
 	if err != nil {
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
@@ -276,13 +276,15 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 	}
 
 	versionID := model.NewVersionID()
-	cacheKey := versionCacheKey(versionID)
 
-	// Assemble parts into a version-specific cache key.
-	cacheInfo, _, err := b.cache.AssembleParts(ctx, bucketName, cacheKey, uploadID, partNumbers)
+	// Assemble into a staged file; the destination is content-addressed and
+	// only nameable once the assembled checksum resolves a content row.
+	staged, _, err := b.cache.AssemblePartsStaged(ctx, bucketName, stagingCacheKey(versionID), uploadID, partNumbers)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("assembling parts: %w", err)
 	}
+	defer func() { _ = staged.Rollback() }()
+	cacheInfo := staged.Info
 
 	// Compute S3 multipart ETag from DB-recorded ETags (source of truth, not re-derived from files)
 	orderedETags := make([]string, len(partNumbers))
@@ -296,9 +298,19 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 
 	// Atomic: create object version + enqueue any needed task + finalize upload status
 	var objectID int64
-	var createdState model.ObjectState
+	mpBucket, err := b.repos.Buckets.GetByID(ctx, upload.BucketID)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("loading bucket for multipart completion: %w", err)
+	}
+	content, err := b.ensureContentForBytes(ctx, b.repos, mpBucket, cacheInfo.Size, cacheInfo.Checksum)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+	if err := staged.CommitAs(bucketName, model.ContentCacheKey(content.ID)); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("committing assembled cache file: %w", err)
+	}
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		reuse, err := b.resolveVersionReuse(ctx, txRepos.Objects, upload.BucketID, cacheInfo.Size, cacheInfo.Checksum)
+		state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
 		if err != nil {
 			return err
 		}
@@ -309,31 +321,25 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 			Key:               keyName,
 			Size:              cacheInfo.Size,
 			ETag:              s3ETag,
-			Checksum:          cacheInfo.Checksum,
 			ContentType:       upload.ContentType,
 			Metadata:          upload.Metadata,
-			CacheKey:          cacheKey,
 			MultipartUploadID: &uploadID,
-			StorageUploadID:   reuse.StorageUploadID,
-			InCache:           true,
-			State:             reuse.State,
+			ContentID:         &content.ID,
 		}
 		objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
 		if err != nil {
 			return fmt.Errorf("creating assembled object version: %w", err)
 		}
-		createdState = version.State
-		if err := b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.State); err != nil {
+		if err := b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state); err != nil {
 			return err
 		}
 
 		return txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted)
 	}); err != nil {
-		b.deleteVersionCacheBestEffort(ctx, bucketName, cacheKey, "orphaned multipart version cache file after complete tx failure")
+		b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after multipart complete tx failure")
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	completed = true
-	b.completeFollowerIfStoredReuseWonRace(ctx, upload.BucketID, bucketName, cacheInfo.Size, cacheInfo.Checksum, objectID, versionID, createdState)
 
 	// Clean up multipart parts from cache (best-effort)
 	_ = b.cache.DeleteUpload(ctx, uploadID)

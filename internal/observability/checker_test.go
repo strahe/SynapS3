@@ -384,7 +384,7 @@ func TestCheckDataSetsMergesWalletScanFailureWithLocalStatus(t *testing.T) {
 			BucketName: "alpha",
 			ProviderID: onChainID(t, "103"),
 			DataSetID:  onChainIDPtr(t, "1003"),
-			Status:     model.StorageDataSetStatusUnavailable,
+			Status:     model.StorageDataSetStatusFailed,
 		},
 	})
 	if err != nil {

@@ -193,6 +193,21 @@ func (f *Filesystem) Put(ctx context.Context, bucket, key string, r io.Reader) (
 	return staged.Info, nil
 }
 
+// stagedDestination resolves the final path for a staged commit and makes sure
+// its directory exists, so a staged file can be named after its content once the
+// checksum is known.
+func (f *Filesystem) stagedDestination(bucket, key string) (string, string, error) {
+	dst, err := f.safePath(bucket, key)
+	if err != nil {
+		return "", "", err
+	}
+	dir := filepath.Dir(dst)
+	if err := ensurePrivateDir(dir); err != nil {
+		return "", "", fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	return dst, dir, nil
+}
+
 func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Reader) (*StagedObject, error) {
 	dst, err := f.safePath(bucket, key)
 	if err != nil {
@@ -271,60 +286,68 @@ func (f *Filesystem) PutStaged(ctx context.Context, bucket, key string, r io.Rea
 
 	var stateMu sync.Mutex
 	committed := false
-	return &StagedObject{
-		Info: info,
-		commit: func() error {
-			stateMu.Lock()
-			defer stateMu.Unlock()
+	commitAs := func(destBucket, destKey string) error {
+		stateMu.Lock()
+		defer stateMu.Unlock()
 
-			if committed {
-				return nil
-			}
-
-			// Acquire shard lock for atomic rename and accounting.
-			mu := f.shardFor(bucket, key)
-			mu.Lock()
-			defer mu.Unlock()
-
-			// Determine old file size for accounting.
-			var oldSize int64
-			if stat, statErr := os.Stat(dst); statErr == nil {
-				oldSize = stat.Size()
-			}
-
-			// Reserve capacity.
-			delta := n - oldSize
-			var reserved bool
-			if f.maxBytes > 0 && delta > 0 {
-				newUsed := f.usedBytes.Add(delta)
-				if newUsed > f.maxBytes {
-					f.usedBytes.Add(-delta)
-					return ErrCacheFull
-				}
-				reserved = true
-			}
-
-			if err := os.Rename(tmpPath, dst); err != nil {
-				if reserved {
-					f.usedBytes.Add(-delta)
-				}
-				return fmt.Errorf("renaming temp to final: %w", err)
-			}
-
-			// Fsync parent directory to ensure the rename is durable.
-			if err := fsyncDir(dir); err != nil {
-				slog.Warn("fsync parent dir failed", "dir", dir, "error", err)
-			}
-
-			// Apply remaining accounting (shrink or unlimited mode).
-			if !reserved {
-				f.usedBytes.Add(delta)
-			}
-
-			committed = true
-			slog.Debug("cached object", "bucket", bucket, "key", key, "size", n)
+		if committed {
 			return nil
-		},
+		}
+
+		destPath, destDir, err := f.stagedDestination(destBucket, destKey)
+		if err != nil {
+			return err
+		}
+
+		// Acquire shard lock for atomic rename and accounting.
+		mu := f.shardFor(destBucket, destKey)
+		mu.Lock()
+		defer mu.Unlock()
+
+		// Determine old file size for accounting.
+		var oldSize int64
+		if stat, statErr := os.Stat(destPath); statErr == nil {
+			oldSize = stat.Size()
+		}
+
+		// Reserve capacity.
+		delta := n - oldSize
+		var reserved bool
+		if f.maxBytes > 0 && delta > 0 {
+			newUsed := f.usedBytes.Add(delta)
+			if newUsed > f.maxBytes {
+				f.usedBytes.Add(-delta)
+				return ErrCacheFull
+			}
+			reserved = true
+		}
+
+		if err := os.Rename(tmpPath, destPath); err != nil {
+			if reserved {
+				f.usedBytes.Add(-delta)
+			}
+			return fmt.Errorf("renaming temp to final: %w", err)
+		}
+
+		// Fsync parent directory to ensure the rename is durable.
+		if err := fsyncDir(destDir); err != nil {
+			slog.Warn("fsync parent dir failed", "dir", destDir, "error", err)
+		}
+
+		// Apply remaining accounting (shrink or unlimited mode).
+		if !reserved {
+			f.usedBytes.Add(delta)
+		}
+
+		committed = true
+		info.Path = destPath
+		slog.Debug("cached object", "bucket", destBucket, "key", destKey, "size", n)
+		return nil
+	}
+	return &StagedObject{
+		Info:     info,
+		commit:   func() error { return commitAs(bucket, key) },
+		commitAs: commitAs,
 		rollback: func() error {
 			stateMu.Lock()
 			defer stateMu.Unlock()
@@ -578,7 +601,7 @@ func (f *Filesystem) PutPart(_ context.Context, uploadID string, partNumber int,
 	}, nil
 }
 
-func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID string, partNumbers []int) (*ObjectInfo, []string, error) {
+func (f *Filesystem) AssemblePartsStaged(_ context.Context, bucket, key, uploadID string, partNumbers []int) (*StagedObject, []string, error) {
 	dst, err := f.safePath(bucket, key)
 	if err != nil {
 		return nil, nil, err
@@ -586,15 +609,6 @@ func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID stri
 	dir := filepath.Dir(dst)
 	if err := ensurePrivateDir(dir); err != nil {
 		return nil, nil, fmt.Errorf("mkdir %s: %w", dir, err)
-	}
-
-	mu := f.shardFor(bucket, key)
-	mu.Lock()
-	defer mu.Unlock()
-
-	var oldSize int64
-	if stat, statErr := os.Stat(dst); statErr == nil {
-		oldSize = stat.Size()
 	}
 
 	file, err := os.CreateTemp(dir, ".synaps3-*.tmp")
@@ -637,53 +651,91 @@ func (f *Filesystem) AssembleParts(_ context.Context, bucket, key, uploadID stri
 		partETags = append(partETags, hex.EncodeToString(partMD5.Sum(nil)))
 	}
 
-	delta := totalSize - oldSize
-	var reserved bool
-	if f.maxBytes > 0 && delta > 0 {
-		newUsed := f.usedBytes.Add(delta)
-		if newUsed > f.maxBytes {
-			f.usedBytes.Add(-delta)
-			return nil, nil, ErrCacheFull
-		}
-		reserved = true
-	}
-
 	if err := file.Sync(); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
 		return nil, nil, fmt.Errorf("fsync assembled file: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
 		return nil, nil, fmt.Errorf("closing assembled file: %w", err)
 	}
 	file = nil
-
-	if err := os.Rename(tmpPath, dst); err != nil {
-		if reserved {
-			f.usedBytes.Add(-delta)
-		}
-		_ = os.Remove(tmpPath)
-		return nil, nil, fmt.Errorf("renaming assembled to final: %w", err)
-	}
-
-	if err := fsyncDir(dir); err != nil {
-		slog.Warn("fsync dir after assemble failed", "dir", dir, "error", err)
-	}
-
-	if !reserved {
-		f.usedBytes.Add(delta)
-	}
 
 	info := &ObjectInfo{
 		Path:     dst,
 		Size:     totalSize,
 		Checksum: hex.EncodeToString(sha256Hash.Sum(nil)),
 	}
-	return info, partETags, nil
+
+	var stateMu sync.Mutex
+	committed := false
+	commitAs := func(destBucket, destKey string) error {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+
+		if committed {
+			return nil
+		}
+
+		destPath, destDir, err := f.stagedDestination(destBucket, destKey)
+		if err != nil {
+			return err
+		}
+
+		mu := f.shardFor(destBucket, destKey)
+		mu.Lock()
+		defer mu.Unlock()
+
+		var oldSize int64
+		if stat, statErr := os.Stat(destPath); statErr == nil {
+			oldSize = stat.Size()
+		}
+
+		delta := totalSize - oldSize
+		var reserved bool
+		if f.maxBytes > 0 && delta > 0 {
+			newUsed := f.usedBytes.Add(delta)
+			if newUsed > f.maxBytes {
+				f.usedBytes.Add(-delta)
+				return ErrCacheFull
+			}
+			reserved = true
+		}
+
+		if err := os.Rename(tmpPath, destPath); err != nil {
+			if reserved {
+				f.usedBytes.Add(-delta)
+			}
+			return fmt.Errorf("renaming assembled to final: %w", err)
+		}
+
+		if err := fsyncDir(destDir); err != nil {
+			slog.Warn("fsync dir after assemble failed", "dir", destDir, "error", err)
+		}
+
+		if !reserved {
+			f.usedBytes.Add(delta)
+		}
+
+		committed = true
+		info.Path = destPath
+		return nil
+	}
+	return &StagedObject{
+		Info:     info,
+		commit:   func() error { return commitAs(bucket, key) },
+		commitAs: commitAs,
+		rollback: func() error {
+			stateMu.Lock()
+			defer stateMu.Unlock()
+
+			if committed {
+				return nil
+			}
+			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		},
+	}, partETags, nil
 }
 
 func (f *Filesystem) DeleteUpload(_ context.Context, uploadID string) error {

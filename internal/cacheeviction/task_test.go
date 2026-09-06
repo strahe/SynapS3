@@ -1,6 +1,7 @@
 package cacheeviction_test
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -8,56 +9,47 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 )
 
-func TestLRUTaskPayloadRoundTripUsesDatabasePrecision(t *testing.T) {
+func TestEvictInputRoundTripNormalizesAccessSnapshot(t *testing.T) {
 	accessedAt := time.Date(2026, time.July, 28, 8, 9, 10, 123456789, time.FixedZone("test", 8*60*60))
-	task := cacheeviction.NewLRUTask(cacheeviction.Candidate{
-		ObjectID:   12,
-		VersionID:  "01J0000000000000000000LRU1",
-		Size:       42,
-		AccessedAt: accessedAt,
-	}, 3, time.Now())
-
-	payload, err := cacheeviction.ParseLRUTaskPayload(task)
+	raw, err := json.Marshal(cacheeviction.EvictInput{
+		ContentID: 41, Generation: 3, AccessedAt: &accessedAt,
+	})
 	if err != nil {
-		t.Fatalf("ParseLRUTaskPayload: %v", err)
+		t.Fatalf("Marshal: %v", err)
 	}
-	want := accessedAt.UTC().Truncate(time.Microsecond)
-	if !payload.AccessedAt.Equal(want) {
-		t.Fatalf("accessed at = %v, want %v", payload.AccessedAt, want)
+
+	got, err := cacheeviction.ParseEvictInput(&model.Task{Input: raw})
+	if err != nil {
+		t.Fatalf("ParseEvictInput: %v", err)
 	}
-	if task.Stage == nil || *task.Stage != cacheeviction.StageLRU {
-		t.Fatalf("stage = %v, want %s", task.Stage, cacheeviction.StageLRU)
+	if want := accessedAt.UTC().Truncate(time.Microsecond); got.AccessedAt == nil || !got.AccessedAt.Equal(want) {
+		t.Fatalf("accessed at = %v, want %v", got.AccessedAt, want)
 	}
-	if task.IdempotencyKey != "evict_cache:lru:"+task.RefVersionID {
-		t.Fatalf("idempotency key = %q", task.IdempotencyKey)
+	if got.ContentID != 41 || got.Generation != 3 {
+		t.Fatalf("input = %#v", got)
 	}
 }
 
-func TestParseLRUTaskPayloadRejectsMalformedSnapshot(t *testing.T) {
-	tests := []struct {
-		name    string
-		payload map[string]any
-	}{
-		{name: "missing", payload: nil},
-		{name: "wrong type", payload: map[string]any{"cache_accessed_at": float64(1)}},
-		{name: "invalid timestamp", payload: map[string]any{"cache_accessed_at": "not-a-time"}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := cacheeviction.ParseLRUTaskPayload(&model.Task{Payload: tt.payload})
-			if err == nil {
-				t.Fatal("ParseLRUTaskPayload returned nil error")
+func TestParseEvictInputRejectsIncompleteIdentity(t *testing.T) {
+	for name, task := range map[string]*model.Task{
+		"nil task":        nil,
+		"missing input":   {},
+		"missing content": {Input: json.RawMessage(`{"generation":1}`)},
+		"zero generation": {Input: json.RawMessage(`{"content_id":41}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := cacheeviction.ParseEvictInput(task); err == nil {
+				t.Fatal("ParseEvictInput succeeded")
 			}
 		})
 	}
 }
 
-func TestAfterUploadTaskUsesIndependentStableKey(t *testing.T) {
-	task := cacheeviction.NewAfterUploadTask(12, "01J0000000000000000000POST", 5, time.Now())
-	if task.Stage == nil || *task.Stage != cacheeviction.StageAfterUpload {
-		t.Fatalf("stage = %v, want %s", task.Stage, cacheeviction.StageAfterUpload)
+func TestCacheTaskKeysIncludeGeneration(t *testing.T) {
+	if cacheeviction.EvictTaskKey(41, 1) == cacheeviction.EvictTaskKey(41, 2) {
+		t.Fatal("eviction generations share an idempotency key")
 	}
-	if task.IdempotencyKey != "evict_cache:"+task.RefVersionID {
-		t.Fatalf("idempotency key = %q", task.IdempotencyKey)
+	if cacheeviction.DurabilityTaskKey(7, 1) == cacheeviction.DurabilityTaskKey(7, 2) {
+		t.Fatal("durability generations share an idempotency key")
 	}
 }

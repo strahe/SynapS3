@@ -285,35 +285,15 @@ func renderTOMLConfig(cfg *Config, presence PersistedFieldPresence, saveMode boo
 			},
 		},
 		{
-			Name: "worker.upload",
+			Name: "worker.tasks",
 			Fields: []initFieldDescriptor{
-				{Field: "worker.upload.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.Upload.Concurrency), Enabled: saveMode},
-				{Field: "worker.upload.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.Upload.PollInterval.String()), Enabled: saveMode},
-				{Field: "worker.upload.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.Upload.MaxRetries), Enabled: saveMode},
-			},
-		},
-		{
-			Name: "worker.provider_replacement",
-			Fields: []initFieldDescriptor{
-				{Field: "worker.provider_replacement.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.ProviderReplacement.Concurrency), Enabled: saveMode},
-				{Field: "worker.provider_replacement.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.ProviderReplacement.PollInterval.String()), Enabled: saveMode},
-				{Field: "worker.provider_replacement.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.ProviderReplacement.MaxRetries), Enabled: saveMode},
-			},
-		},
-		{
-			Name: "worker.evictor",
-			Fields: []initFieldDescriptor{
-				{Field: "worker.evictor.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.Evictor.Concurrency), Enabled: saveMode},
-				{Field: "worker.evictor.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.Evictor.PollInterval.String()), Enabled: saveMode},
-				{Field: "worker.evictor.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.Evictor.MaxRetries), Enabled: saveMode},
-			},
-		},
-		{
-			Name: "worker.storage_cleanup",
-			Fields: []initFieldDescriptor{
-				{Field: "worker.storage_cleanup.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.StorageCleanup.Concurrency), Enabled: saveMode},
-				{Field: "worker.storage_cleanup.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.StorageCleanup.PollInterval.String()), Enabled: saveMode},
-				{Field: "worker.storage_cleanup.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.StorageCleanup.MaxRetries), Enabled: saveMode},
+				{Field: "worker.tasks.concurrency", Key: "concurrency", Value: strconv.Itoa(cfg.Worker.Tasks.Concurrency), Enabled: saveMode},
+				{Field: "worker.tasks.poll_interval", Key: "poll_interval", Value: quoteTOMLString(cfg.Worker.Tasks.PollInterval.String()), Enabled: saveMode},
+				{Field: "worker.tasks.lease_duration", Key: "lease_duration", Value: quoteTOMLString(cfg.Worker.Tasks.LeaseDuration.String()), Enabled: saveMode},
+				{Field: "worker.tasks.max_retries", Key: "max_retries", Value: strconv.Itoa(cfg.Worker.Tasks.MaxRetries), Enabled: saveMode},
+				{Field: "worker.tasks.retention", Key: "retention", Value: quoteTOMLString(cfg.Worker.Tasks.Retention.String()), Enabled: saveMode},
+				{Field: "worker.tasks.provider_mutation_concurrency", Key: "provider_mutation_concurrency", Value: strconv.Itoa(cfg.Worker.Tasks.ProviderMutationConcurrency), Enabled: saveMode},
+				{Field: "worker.tasks.destructive_mutation_concurrency", Key: "destructive_mutation_concurrency", Value: strconv.Itoa(cfg.Worker.Tasks.DestructiveMutationConcurrency), Enabled: saveMode},
 			},
 		},
 		{

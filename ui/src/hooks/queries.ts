@@ -318,20 +318,11 @@ export function useRestoreBucketObjectVersion() {
   })
 }
 
-export function useTasks(taskType: string, stage: string, status: string, limit: number, offset: number) {
+export function useTasks(taskType: string, status: string, limit: number, cursor?: number) {
   return useQuery({
-    queryKey: ['tasks', taskType, stage, status, limit, offset],
-    queryFn: () => api.getTasks({ type: taskType, stage, status, limit, offset }),
+    queryKey: ['tasks', taskType, status, limit, cursor],
+    queryFn: () => api.getTasks({ type: taskType, status, limit, cursor }),
     refetchInterval: 10_000,
-  })
-}
-
-export function useTaskRefDetail(taskId: number, enabled = true) {
-  return useQuery({
-    queryKey: ['taskRefDetail', taskId],
-    queryFn: () => api.getTaskRefDetail(taskId),
-    enabled: Boolean(taskId && enabled),
-    staleTime: 60_000,
   })
 }
 

@@ -24,7 +24,7 @@ func (r *BunObservabilityRepo) ReplaceProviderStates(ctx context.Context, checke
 		now := time.Now().UTC()
 		checkedAt = normalizeCheckedAt(checkedAt, now)
 		for i := range states {
-			prepareProviderState(&states[i], checkedAt, now)
+			prepareProviderState(&states[i], checkedAt)
 		}
 		if _, err := db.NewDelete().Model((*observability.ProviderState)(nil)).Where("1 = 1").Exec(ctx); err != nil {
 			return err
@@ -70,7 +70,7 @@ func (r *BunObservabilityRepo) ReplaceDataSetStates(ctx context.Context, checked
 		now := time.Now().UTC()
 		checkedAt = normalizeCheckedAt(checkedAt, now)
 		for i := range states {
-			prepareDataSetState(&states[i], checkedAt, now)
+			prepareDataSetState(&states[i], checkedAt)
 		}
 		if _, err := db.NewDelete().Model((*observability.DataSetState)(nil)).Where("1 = 1").Exec(ctx); err != nil {
 			return err
@@ -85,8 +85,8 @@ func (r *BunObservabilityRepo) ReplaceDataSetStates(ctx context.Context, checked
 func (r *BunObservabilityRepo) ListDataSetStates(ctx context.Context, opts observability.ListOptions) (observability.DataSetStatePage, error) {
 	limit, offset := normalizeObservabilityPagination(opts)
 	var rows []observability.DataSetState
-	if err := applyDataSetObservabilityFilters(r.db.NewSelect().Model(&rows), opts).
-		OrderExpr("bucket_name ASC, local_data_set_id ASC").
+	if err := applyDataSetObservabilityFilters(withDataSetStateJoins(r.db.NewSelect().Model(&rows)), opts).
+		OrderExpr("observed_bucket.name ASC, observability_data_set_state.local_data_set_id ASC").
 		Limit(limit).
 		Offset(offset).
 		Scan(ctx); err != nil {
@@ -117,9 +117,8 @@ func (r *BunObservabilityRepo) GetDataSetStatesByLocalIDs(ctx context.Context, l
 		return out, nil
 	}
 	var rows []observability.DataSetState
-	if err := r.db.NewSelect().
-		Model(&rows).
-		Where("local_data_set_id IN (?)", bun.List(localIDs)).
+	if err := withDataSetStateJoins(r.db.NewSelect().Model(&rows)).
+		Where("observability_data_set_state.local_data_set_id IN (?)", bun.List(localIDs)).
 		Scan(ctx); err != nil {
 		return nil, err
 	}
@@ -138,7 +137,7 @@ func (r *BunObservabilityRepo) withTx(ctx context.Context, fn func(context.Conte
 	return fn(ctx, r.db)
 }
 
-func prepareProviderState(state *observability.ProviderState, checkedAt time.Time, now time.Time) {
+func prepareProviderState(state *observability.ProviderState, checkedAt time.Time) {
 	if state.ReasonCodes == nil {
 		state.ReasonCodes = []observability.ReasonCode{}
 	}
@@ -148,13 +147,9 @@ func prepareProviderState(state *observability.ProviderState, checkedAt time.Tim
 	if state.LastCheckedAt.IsZero() {
 		state.LastCheckedAt = checkedAt
 	}
-	if state.CreatedAt.IsZero() {
-		state.CreatedAt = now
-	}
-	state.UpdatedAt = now
 }
 
-func prepareDataSetState(state *observability.DataSetState, checkedAt time.Time, now time.Time) {
+func prepareDataSetState(state *observability.DataSetState, checkedAt time.Time) {
 	if state.ReasonCodes == nil {
 		state.ReasonCodes = []observability.ReasonCode{}
 	}
@@ -164,10 +159,6 @@ func prepareDataSetState(state *observability.DataSetState, checkedAt time.Time,
 	if state.LastCheckedAt.IsZero() {
 		state.LastCheckedAt = checkedAt
 	}
-	if state.CreatedAt.IsZero() {
-		state.CreatedAt = now
-	}
-	state.UpdatedAt = now
 }
 
 func insertProviderStateRows(ctx context.Context, db bun.IDB, states []observability.ProviderState) error {
@@ -223,10 +214,7 @@ func normalizeObservabilityPagination(opts observability.ListOptions) (int, int)
 	if limit > maxObservabilityListLimit {
 		limit = maxObservabilityListLimit
 	}
-	offset := opts.Offset
-	if offset < 0 {
-		offset = 0
-	}
+	offset := max(opts.Offset, 0)
 	return limit, offset
 }
 
@@ -242,15 +230,26 @@ func applyProviderObservabilityFilters(q *bun.SelectQuery, opts observability.Li
 
 func applyDataSetObservabilityFilters(q *bun.SelectQuery, opts observability.ListOptions) *bun.SelectQuery {
 	if opts.Status != "" {
-		q.Where("status = ?", opts.Status)
+		q.Where("observability_data_set_state.status = ?", opts.Status)
 	}
 	if opts.BucketID > 0 {
-		q.Where("bucket_id = ?", opts.BucketID)
+		q.Where("observability_data_set_state.bucket_id = ?", opts.BucketID)
 	}
 	if opts.ProviderID != nil {
-		q.Where("provider_id = ?", opts.ProviderID.String())
+		q.Where("observability_data_set_state.provider_id = ?", opts.ProviderID.String())
 	}
 	return q
+}
+
+// withDataSetStateJoins reads the bucket name and local status from the rows
+// that own them instead of from a copy taken when the check ran.
+func withDataSetStateJoins(q *bun.SelectQuery) *bun.SelectQuery {
+	return q.
+		ColumnExpr("observability_data_set_state.*").
+		ColumnExpr("observed_bucket.name AS bucket_name").
+		ColumnExpr("observed_data_set.status AS local_status").
+		Join("JOIN storage_data_sets AS observed_data_set ON observed_data_set.id = observability_data_set_state.local_data_set_id").
+		Join("JOIN buckets AS observed_bucket ON observed_bucket.id = observability_data_set_state.bucket_id")
 }
 
 type observabilityStateAggregate struct {

@@ -18,6 +18,12 @@ type BunMultipartRepo struct {
 var _ MultipartUploadRepository = (*BunMultipartRepo)(nil)
 
 func (r *BunMultipartRepo) Create(ctx context.Context, upload *model.MultipartUpload) error {
+	if upload == nil {
+		return fmt.Errorf("inserting multipart upload: %w", ErrInvalidInput)
+	}
+	if upload.Metadata == nil {
+		upload.Metadata = map[string]string{}
+	}
 	_, err := r.db.NewInsert().Model(upload).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("inserting multipart upload: %w", err)
@@ -119,7 +125,9 @@ func (r *BunMultipartRepo) Delete(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-// CreatePart upserts a part record. If the same (upload_id, part_number) exists, it is replaced.
+// CreatePart upserts a part record. If the same (upload_id, part_number) exists,
+// its bytes are replaced but created_at keeps the first upload's time: a
+// re-uploaded part is the same part, not a new one.
 func (r *BunMultipartRepo) CreatePart(ctx context.Context, part *model.MultipartPart) error {
 	_, err := r.db.NewInsert().
 		Model(part).
@@ -127,7 +135,6 @@ func (r *BunMultipartRepo) CreatePart(ctx context.Context, part *model.Multipart
 		Set("size = EXCLUDED.size").
 		Set("e_tag = EXCLUDED.e_tag").
 		Set("checksum = EXCLUDED.checksum").
-		Set("created_at = EXCLUDED.created_at").
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("upserting multipart part: %w", err)

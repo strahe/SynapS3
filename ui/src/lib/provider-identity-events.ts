@@ -51,10 +51,5 @@ function patchObjectProvenance(data: ObjectProvenance | undefined, providerID: s
     changed = true
     return { ...copy, provider_identity: identity }
   })
-  const failures = data.failures.map((failure) => {
-    if (failure.provider_id !== providerID) return failure
-    changed = true
-    return { ...failure, provider_identity: identity }
-  })
-  return changed ? { ...data, copies, failures } : data
+  return changed ? { ...data, copies } : data
 }

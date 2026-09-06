@@ -1,6 +1,7 @@
 package backend_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -8,14 +9,15 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/uptrace/bun"
@@ -30,6 +32,7 @@ type testBackend struct {
 	cache   cache.Cache
 	storage *testutil.MockStorageClient
 	db      *bun.DB
+	tasks   *taskengine.Service
 }
 
 // newTestBackend constructs a SynapseBackend backed by in-memory SQLite
@@ -43,15 +46,15 @@ func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBacken
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	fsCache := newTestCache(t, 1<<30) // 1 GB
-	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
+	taskService := newBackendTaskService(t, repos)
+	opts = append(opts, backend.WithTaskService(taskService))
 
 	b := backend.New(
 		repos,
 		fsCache,
-		sm,
 		sc,
 		cacheGate,
 		accessTracker,
@@ -64,6 +67,7 @@ func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBacken
 		cache:   fsCache,
 		storage: sc,
 		db:      db,
+		tasks:   taskService,
 	}
 }
 
@@ -73,18 +77,19 @@ func newTestBackendWithMockCache(t *testing.T, mc *testutil.MockCache) *testBack
 	t.Helper()
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, mc, sm, sc, cacheGate, accessTracker, logger)
+	taskService := newBackendTaskService(t, repos)
+	b := backend.New(repos, mc, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService))
 	return &testBackend{
 		backend: b,
 		repos:   repos,
 		cache:   mc,
 		storage: sc,
 		db:      db,
+		tasks:   taskService,
 	}
 }
 
@@ -92,18 +97,19 @@ func newTestBackendWithCache(t *testing.T, c cache.Cache) *testBackend {
 	t.Helper()
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, c, sm, sc, cacheGate, accessTracker, logger)
+	taskService := newBackendTaskService(t, repos)
+	b := backend.New(repos, c, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService))
 	return &testBackend{
 		backend: b,
 		repos:   repos,
 		cache:   c,
 		storage: sc,
 		db:      db,
+		tasks:   taskService,
 	}
 }
 
@@ -113,17 +119,57 @@ func newTestBackendWithSDK(t *testing.T, sc synapse.StorageClient) *testBackend 
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	fsCache := newTestCache(t, 1<<30)
-	sm := state.NewObjectStateMachine()
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, fsCache, sm, sc, cacheGate, accessTracker, logger)
+	taskService := newBackendTaskService(t, repos)
+	b := backend.New(repos, fsCache, sc, cacheGate, accessTracker, logger, backend.WithTaskService(taskService))
 	return &testBackend{
 		backend: b,
 		repos:   repos,
 		cache:   fsCache,
 		db:      db,
+		tasks:   taskService,
 	}
+}
+
+type backendTestTaskHandler struct {
+	definition taskengine.Definition
+}
+
+func (h backendTestTaskHandler) Definition() taskengine.Definition { return h.definition }
+func (backendTestTaskHandler) Execute(context.Context, taskengine.Execution) taskengine.Result {
+	return taskengine.Complete("", nil)
+}
+
+func (backendTestTaskHandler) Recover(context.Context, taskengine.Execution) taskengine.Result {
+	return taskengine.Complete("", nil)
+}
+
+func newBackendTaskService(t *testing.T, repos *repository.Repositories) *taskengine.Service {
+	t.Helper()
+	registry := taskengine.NewRegistry()
+	retryLimit := 5
+	for _, taskType := range []model.TaskType{
+		model.TaskTypeBucketProvision,
+		model.TaskTypeUploadPlan,
+		model.TaskTypeCacheEvict,
+		model.TaskTypeStorageCleanup,
+	} {
+		err := registry.Register(backendTestTaskHandler{definition: taskengine.Definition{
+			Type: taskType, InputVersion: 1,
+			Codec:      taskengine.StrictJSONCodec[map[string]any](nil),
+			RetryLimit: &retryLimit, AllowRetry: true,
+		}})
+		if err != nil {
+			t.Fatalf("registering test task type %s: %v", taskType, err)
+		}
+	}
+	service, err := taskengine.NewService(registry, repos, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("creating task service: %v", err)
+	}
+	return service
 }
 
 func newBackendCacheAccess(

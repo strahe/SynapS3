@@ -28,14 +28,21 @@ type BucketRepository interface {
 	SoftDelete(ctx context.Context, id int64) error
 	// UpdateStatus atomically transitions bucket status using CAS.
 	UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error
+	// PromoteReadyIfProvisioned marks a provisioning bucket ready once enough current data sets are ready.
+	PromoteReadyIfProvisioned(ctx context.Context, id int64, requiredDataSets int) (bool, error)
 	// SetACL stores the bucket ACL JSON blob used by VersityGW access control.
 	SetACL(ctx context.Context, name string, acl []byte) error
 	// SetOwnerAndACL stores both the authoritative owner and compatible ACL.
 	SetOwnerAndACL(ctx context.Context, name string, ownerAccessKey *string, acl []byte) error
 	// UpdateCopyPolicy locks and updates the independently optional bucket policy fields.
 	UpdateCopyPolicy(ctx context.Context, input UpdateBucketCopyPolicyInput) (*model.Bucket, error)
-	// SetDefaultCopies stores the bucket target override. Nil means inherit.
+	// SetDefaultCopies stores the bucket replica target. Nil resets it to the
+	// caller-supplied configured default.
 	SetDefaultCopies(ctx context.Context, name string, copies *int) error
+	// ActiveReplicaSlots returns the ascending copy indexes the bucket still
+	// accepts new writes on. Decommissioned slots keep their rows for history
+	// but never take a new data set.
+	ActiveReplicaSlots(ctx context.Context, bucketID int64) ([]int, error)
 	// CountByOwner returns bucket count for the authoritative owner access key.
 	CountByOwner(ctx context.Context, ownerAccessKey string) (int, error)
 	// AggregateCountsByOwner returns bucket counts grouped by authoritative owner access key.
@@ -97,32 +104,42 @@ type RecoverableDeleteMarker struct {
 type ObjectVersionRef struct {
 	ObjectID  int64  `bun:"object_id"`
 	VersionID string `bun:"version_id"`
+	ContentID *int64 `bun:"content_id"`
 }
 
 type DeleteObjectVersionInput struct {
-	BucketID                 int64
-	Key                      string
-	VersionID                string
-	StorageCleanupMaxRetries *int
+	BucketID  int64
+	Key       string
+	VersionID string
+}
+
+type StorageCleanupReservation struct {
+	ContentID  int64
+	Generation int64
+	TaskID     *int64
 }
 
 type DeleteObjectVersionResult struct {
-	DeletionID           int64
-	CacheKey             string
-	StorageUploadID      *int64
-	StorageCleanupTaskID *int64
+	DeletionID int64
+	ContentID  *int64
+	// ContentUnreferenced reports that this deletion removed the last live
+	// version pointing at the content, so its cached bytes may be released.
+	// Cache residency is content-addressed, so any earlier version sharing
+	// those bytes must keep them.
+	ContentUnreferenced bool
+	StorageCleanup      *StorageCleanupReservation
 }
 
 type DeleteDeletedObjectInput struct {
-	BucketID                 int64
-	Key                      string
-	DeleteMarkerVersionID    string
-	StorageCleanupMaxRetries *int
+	BucketID              int64
+	Key                   string
+	DeleteMarkerVersionID string
 }
 
 type DeletedObjectVersionSnapshot struct {
-	VersionID string
-	CacheKey  string
+	VersionID           string
+	ContentID           *int64
+	ContentUnreferenced bool
 }
 
 type DeleteDeletedObjectResult struct {
@@ -131,7 +148,7 @@ type DeleteDeletedObjectResult struct {
 	DataVersionsDeleted   int
 	DeleteMarkersDeleted  int
 	DeletedVersions       []DeletedObjectVersionSnapshot
-	StorageCleanupTaskIDs []int64
+	StorageCleanups       []StorageCleanupReservation
 }
 
 // ObjectRepository defines persistence operations for object identities and versions.
@@ -145,7 +162,12 @@ type ObjectRepository interface {
 	DeleteMarkerVersion(ctx context.Context, bucketID int64, key string, versionID string) error
 	DeleteObjectVersionPermanently(ctx context.Context, input DeleteObjectVersionInput) (DeleteObjectVersionResult, error)
 	DeleteDeletedObjectPermanently(ctx context.Context, input DeleteDeletedObjectInput) (DeleteDeletedObjectResult, error)
-	UpdateObjectDeletionCacheCleanup(ctx context.Context, versionID string, status model.CacheCleanupStatus, cacheError string) error
+	// ClearContentCachePresence records that a content payload no longer has
+	// cached bytes on this node.
+	ClearContentCachePresence(ctx context.Context, contentID int64) error
+	// ContentIsUnreferenced reports whether any live object version still
+	// points at the content.
+	ContentIsUnreferenced(ctx context.Context, contentID int64) (bool, error)
 	// RestoreCurrentDeleteMarkerStack is the admin trash restore path: it removes
 	// the current delete marker stack until the latest data version becomes current,
 	// unlike S3 versioned delete which removes only one specified delete marker.
@@ -156,28 +178,18 @@ type ObjectRepository interface {
 	GetCurrentVersionByBucketAndKey(ctx context.Context, bucketID int64, key string) (*model.ObjectVersion, error)
 	GetVersionByID(ctx context.Context, versionID string) (*model.ObjectVersion, error)
 	GetVersionByBucketKeyAndID(ctx context.Context, bucketID int64, key string, versionID string) (*model.ObjectVersion, error)
-	FindReusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
-	FindReusableReplicatingVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
-	FindReusableActiveUploadVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error)
 	ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.ObjectVersion, error)
 	ListCurrentVersionsByBucketAtOrAfter(ctx context.Context, bucketID int64, prefix string, fromKey string, maxKeys int) ([]model.ObjectVersion, error)
 	ListVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyMarker string, versionIDMarker string, maxKeys int) ([]ObjectVersionListItem, error)
 	ListVersionsByKey(ctx context.Context, bucketID int64, key string, afterVersionID string, maxKeys int) ([]ObjectVersionListItem, error)
 	ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error)
-	UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error
-	UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error
 	SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error
-	// RecordVersionCacheAccess advances LRU recency without changing whether
-	// the local cache file is present.
-	RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error
-	// RecordVersionCacheCommit marks a newly committed local cache file present
-	// and initializes or advances its LRU recency.
-	RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error
-	SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error
-	FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error)
-	ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error)
-	ListVersionsByStateAfter(ctx context.Context, state model.ObjectState, afterUpdatedAt time.Time, afterVersionID string, limit int) ([]model.ObjectVersion, error)
-	ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error)
+	// RecordContentCacheAccess advances LRU recency for one content payload
+	// without changing whether its bytes are present.
+	RecordContentCacheAccess(ctx context.Context, contentID int64, accessedAt time.Time) error
+	// RecordContentCacheCommit marks a newly written cache file present and
+	// advances its recency in the same write.
+	RecordContentCacheCommit(ctx context.Context, contentID int64, accessedAt time.Time) error
 	// CountByState returns object counts grouped by state.
 	CountByState(ctx context.Context) ([]ObjectStateCount, error)
 	// AggregateByState returns object counts and sizes grouped by state.
@@ -193,35 +205,25 @@ type ObjectRepository interface {
 	AggregateByBucket(ctx context.Context) (map[int64]BucketObjectStats, error)
 }
 
-type StartObjectUploadAttemptInput struct {
+type EnsureContentInput struct {
 	BucketID        int64
-	SourceTaskID    int64
-	SourceVersionID string
 	ContentSize     int64
 	Checksum        string
 	RequestedCopies int
 }
 
-type AppendUploadFailureInput struct {
-	UploadID       int64
-	CopyIndex      int
-	ProviderID     *types.OnChainID
-	TransferMethod string
-	Stage          string
-	ErrorMessage   string
-	Explicit       bool
-}
-
 type RecordIngressStoreProgressInput struct {
-	UploadID      int64
+	ContentID     int64
 	Attempt       int
 	BytesUploaded int64
 }
 
-type StorageUploadProvenance struct {
-	Upload   model.StorageUpload
-	Copies   []model.StorageUploadCopy
-	Failures []model.StorageUploadFailure
+type StorageContentProvenance struct {
+	Upload model.StorageContent
+	Copies []model.StorageCopy
+	// IngressCopy is the copy that performed the ingress transfer, when one
+	// exists. Progress belongs to that transfer rather than to the content.
+	IngressCopy *model.StorageCopy
 }
 
 type StorageDataSetSummary struct {
@@ -229,14 +231,14 @@ type StorageDataSetSummary struct {
 	BucketID           int64                      `bun:"bucket_id"`
 	BucketName         string                     `bun:"bucket_name"`
 	CopyIndex          int                        `bun:"copy_index"`
-	Generation         int                        `bun:"generation"`
+	Generation         int64                      `bun:"generation"`
 	IsCurrent          bool                       `bun:"is_current"`
 	ProviderID         types.OnChainID            `bun:"provider_id"`
 	DataSetID          *types.OnChainID           `bun:"data_set_id"`
 	ClientDataSetID    *types.OnChainID           `bun:"client_data_set_id"`
 	Status             model.StorageDataSetStatus `bun:"status"`
-	CreatedByUploadID  *int64                     `bun:"created_by_upload_id"`
-	LastUsedUploadID   *int64                     `bun:"last_used_upload_id"`
+	CreatedByContentID *int64                     `bun:"created_by_content_id"`
+	LastUsedContentID  *int64                     `bun:"last_used_content_id"`
 	CommittedCopies    int64                      `bun:"committed_copies"`
 	ReadableCopies     int64                      `bun:"readable_copies"`
 	PhysicalBytes      int64                      `bun:"physical_bytes"`
@@ -247,7 +249,7 @@ type StorageDataSetSummary struct {
 }
 
 type ReadableStorageCopy struct {
-	UploadID       int64           `bun:"upload_id"`
+	ContentID      int64           `bun:"content_id"`
 	PieceCID       string          `bun:"piece_cid"`
 	CopyIndex      int             `bun:"copy_index"`
 	ProviderID     types.OnChainID `bun:"provider_id"`
@@ -316,25 +318,27 @@ type BucketStorageHealthRiskDataSet struct {
 }
 
 type StorageCleanupRepository interface {
-	ListCopiesForTask(ctx context.Context, taskID int64) ([]model.StorageCleanupCopy, error)
+	BindTask(ctx context.Context, contentID, generation, taskID int64) error
+	AuthorizeTask(ctx context.Context, contentID, generation, taskID int64) ([]model.StorageCleanupCopy, error)
 	MarkCopyRemoved(ctx context.Context, id int64) error
 	MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error
+	MarkCopyFailed(ctx context.Context, id int64, message string) error
 	MarkCopyUnsupported(ctx context.Context, id int64, message string) error
-	UploadHasObjectReferences(ctx context.Context, uploadID int64) (bool, error)
-	TaskHasObjectReferences(ctx context.Context, taskID int64, uploadID int64) (bool, error)
-	DeleteUploadProvenanceIfUnreferenced(ctx context.Context, uploadID int64) error
+	UploadHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
+	CleanupHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
+	CompleteTask(ctx context.Context, contentID, generation, taskID int64) error
 }
 
 type EnsureDataSetBindingInput struct {
-	BucketID          int64
-	ProviderID        types.OnChainID
-	CopyIndex         int
-	CreatedByUploadID int64
+	BucketID           int64
+	ProviderID         types.OnChainID
+	CopyIndex          int
+	CreatedByContentID int64
 }
 
 type MarkDataSetCreatingInput struct {
 	ID              int64
-	UploadID        int64
+	ContentID       int64
 	TransactionID   string
 	StatusURL       string
 	ClientDataSetID *types.OnChainID
@@ -342,7 +346,7 @@ type MarkDataSetCreatingInput struct {
 
 type MarkDataSetReadyInput struct {
 	ID              int64
-	UploadID        int64
+	ContentID       int64
 	DataSetID       types.OnChainID
 	ClientDataSetID *types.OnChainID
 }
@@ -360,7 +364,23 @@ type UploadCopyBindingInput struct {
 	ProviderID       types.OnChainID
 }
 
-// StorageUploadCopyID names the exact copy row to write. A task that was
+// ReservePullRequestInput records one provider-side copy request before it is
+// sent. AttemptID is the ledger row's identity and SourcePieceCID names the
+// piece being fetched, which is not the same as the content's own CID.
+type ReservePullRequestInput struct {
+	CopyID             int64
+	Generation         int64
+	TaskID             int64
+	AttemptID          string
+	SourceProviderID   types.OnChainID
+	SourceDataSetID    types.OnChainID
+	SourcePieceID      types.OnChainID
+	SourcePieceCID     string
+	SourceRetrievalURL string
+	CommitExtraDataHex string
+}
+
+// StorageCopyID names the exact copy row to write. A task that was
 // queued before the current data set generation took over must still land on
 // the generation it actually stored to, so addressing is separate from the
 // eligibility guards below.
@@ -369,14 +389,18 @@ type UploadCopyBindingInput struct {
 // or a copy that no longer matches, instead of reporting no rows. Coordinators
 // that own one specific copy set it; ordinary upload stages stay idempotent.
 type MarkUploadCopyPieceReadyInput struct {
-	StorageUploadCopyID int64
+	StorageCopyID       int64
 	RequireEligibleCopy bool
-	UploadID            int64
+	ContentID           int64
 	CopyIndex           int
 	PieceCID            string
 	PieceID             *types.OnChainID
 	RetrievalURL        string
 	CommitExtraDataHex  string
+	// PullAttemptID resolves the pull ledger row in the same transaction that
+	// records the piece. Leaving it empty is how an ingress store settles, since
+	// no request was sent to a source provider.
+	PullAttemptID string
 }
 
 // MarkUploadCopyFailedInput names the copy that failed. Without the id the
@@ -385,16 +409,18 @@ type MarkUploadCopyPieceReadyInput struct {
 // either land on the replacement's copy or update nothing at all, leaving the
 // original stuck mid-transfer and holding retirement open.
 type MarkUploadCopyFailedInput struct {
-	StorageUploadCopyID int64
-	UploadID            int64
-	CopyIndex           int
-	LastError           string
+	StorageCopyID int64
+	ContentID     int64
+	CopyIndex     int
+	LastError     string
 }
 
+// MarkUploadCopyCommittedInput requires CommitAttemptID: a committed copy is a
+// projection of a confirmed ledger row, and the schema refuses one without it.
 type MarkUploadCopyCommittedInput struct {
-	StorageUploadCopyID          int64
+	StorageCopyID                int64
 	RequireEligibleCopy          bool
-	UploadID                     int64
+	ContentID                    int64
 	CopyIndex                    int
 	PieceCID                     string
 	PieceID                      *types.OnChainID
@@ -405,92 +431,47 @@ type MarkUploadCopyCommittedInput struct {
 	CommitConfirmedTransactionID string
 }
 
-// AcquireReplicaRepairItemInput identifies the exact repair work already
-// parsed and claimed by the upload worker.
-type AcquireReplicaRepairItemInput struct {
-	TaskID              int64
-	TaskClaimedAt       time.Time
-	StorageDataSetID    int64
-	StorageUploadCopyID int64
-	BucketID            int64
-}
-
-// AcquireUploadTaskInput identifies one claimed ordinary upload task and its
-// optional existing storage upload.
-type AcquireUploadTaskInput struct {
-	TaskID        int64
-	TaskClaimedAt time.Time
-	UploadID      int64
-	VersionID     string
-}
-
-// ReplicaRepairItem is the consistent database snapshot authorized for one
-// replica repair attempt.
-type ReplicaRepairItem struct {
-	DataSet model.StorageDataSet
-	Copy    model.StorageUploadCopy
-	Upload  model.StorageUpload
-	Version model.ObjectVersion
-}
-
 // IncompleteReadableUpload identifies one durable upload that still needs
 // work to reach its frozen target copy count.
 type IncompleteReadableUpload struct {
-	Upload  model.StorageUpload
+	Upload  model.StorageContent
 	Version model.ObjectVersion
 }
 
 type BindReadableUploadInput struct {
-	UploadID    int64
-	BucketID    int64
-	ContentSize int64
-	Checksum    string
+	ContentID int64
+	BucketID  int64
 }
 
 type BindReadableUploadForVersionInput struct {
-	UploadID    int64
-	BucketID    int64
-	ContentSize int64
-	Checksum    string
-	VersionID   string
+	ContentID int64
+	BucketID  int64
+	VersionID string
 }
 
 type FinalizeUploadInput struct {
-	UploadID                   int64
-	EnqueueAfterUploadEviction bool
-	EvictionMaxRetries         int
+	ContentID int64
 }
 
-// NewFinalizeUploadInput builds the shared upload-finalization contract used
-// by every upload completion path.
-func NewFinalizeUploadInput(
-	uploadID int64,
-	enqueueAfterUploadEviction bool,
-	evictionMaxRetries int,
-) FinalizeUploadInput {
-	return FinalizeUploadInput{
-		UploadID:                   uploadID,
-		EnqueueAfterUploadEviction: enqueueAfterUploadEviction,
-		EvictionMaxRetries:         evictionMaxRetries,
-	}
+func NewFinalizeUploadInput(contentID int64) FinalizeUploadInput {
+	return FinalizeUploadInput{ContentID: contentID}
 }
 
-type StorageUploadRepository interface {
-	StartObjectUploadAttempt(ctx context.Context, input StartObjectUploadAttemptInput) (*model.StorageUpload, error)
-	FindActiveUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error)
-	FindLatestUploadBySourceVersion(ctx context.Context, versionID string) (*model.StorageUpload, error)
-	FindLatestUploadsBySourceVersions(ctx context.Context, versionIDs []string) (map[string]model.StorageUpload, error)
-	SetAcceptError(ctx context.Context, uploadID int64, message string) error
-	GetByID(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
-	GetByIDs(ctx context.Context, uploadIDs []int64) (map[int64]model.StorageUpload, error)
-	BeginIngressStoreProgress(ctx context.Context, uploadID int64) (*model.StorageUpload, error)
-	RecordIngressStoreProgress(ctx context.Context, input RecordIngressStoreProgressInput) (*model.StorageUpload, error)
-	GetUploadProvenance(ctx context.Context, uploadID int64) (*StorageUploadProvenance, error)
-	AppendUploadFailure(ctx context.Context, input AppendUploadFailureInput) error
-	ListCopies(ctx context.Context, uploadID int64) ([]model.StorageUploadCopy, error)
-	CountCurrentGenerationCopySlots(ctx context.Context, uploadID int64) (int, error)
-	ListReadableCommittedCopies(ctx context.Context, uploadID int64) ([]ReadableStorageCopy, error)
-	HasReadableCommittedCopy(ctx context.Context, uploadID int64) (bool, error)
+type StorageContentRepository interface {
+	EnsureContent(ctx context.Context, input EnsureContentInput) (*model.StorageContent, error)
+	GetByID(ctx context.Context, contentID int64) (*model.StorageContent, error)
+	GetByIDs(ctx context.Context, contentIDs []int64) (map[int64]model.StorageContent, error)
+	RecordContentFailure(ctx context.Context, contentID int64, message string) error
+	GetIngressCopy(ctx context.Context, contentID int64) (*model.StorageCopy, error)
+	// ContentPipelineState derives pipeline position from the copy rows.
+	ContentPipelineState(ctx context.Context, contentID int64) (model.ObjectState, error)
+	BeginIngressStoreProgress(ctx context.Context, contentID int64) (*model.StorageCopy, error)
+	RecordIngressStoreProgress(ctx context.Context, input RecordIngressStoreProgressInput) (*model.StorageCopy, error)
+	GetUploadProvenance(ctx context.Context, contentID int64) (*StorageContentProvenance, error)
+	ListCopies(ctx context.Context, contentID int64) ([]model.StorageCopy, error)
+	CountCurrentGenerationCopySlots(ctx context.Context, contentID int64) (int, error)
+	ListReadableCommittedCopies(ctx context.Context, contentID int64) ([]ReadableStorageCopy, error)
+	HasReadableCommittedCopy(ctx context.Context, contentID int64) (bool, error)
 	ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error)
 	ListBucketStorageHealthAffectedVersions(ctx context.Context, input BucketStorageHealthAffectedVersionsInput) (BucketStorageHealthAffectedVersionPage, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
@@ -501,24 +482,36 @@ type StorageUploadRepository interface {
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
 	BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error
-	RecoverDataSet(ctx context.Context, input MarkDataSetReadyInput) (bool, error)
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
 	MarkDataSetFailed(ctx context.Context, id int64, lastError string) error
-	MarkDataSetUnavailable(ctx context.Context, id int64, lastError string) error
-	DiscardFailedDataSetCandidate(ctx context.Context, uploadID int64, copyIndex int, storageDataSetID int64) (bool, error)
-	CreateUploadCopiesForBindings(ctx context.Context, uploadID int64, copies []UploadCopyBindingInput) error
-	GetUploadCopy(ctx context.Context, uploadID int64, copyIndex int) (*model.StorageUploadCopy, error)
-	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageUploadCopy, error)
+	// RetireRejectedDataSet ends a failed generation whose creation the chain
+	// refused, so its provider stops being reserved. The caller must have proof
+	// that no data set was created. Reports whether it was retired.
+	RetireRejectedDataSet(ctx context.Context, storageDataSetID int64) (bool, error)
+	CreateUploadCopiesForBindings(ctx context.Context, contentID int64, copies []UploadCopyBindingInput) error
+	GetUploadCopy(ctx context.Context, contentID int64, copyIndex int) (*model.StorageCopy, error)
+	GetUploadCopyByID(ctx context.Context, id int64) (*model.StorageCopy, error)
+	GetLiveVersionForUpload(ctx context.Context, contentID int64) (*model.ObjectVersion, error)
+	ListIncompleteCopiesForDataSet(ctx context.Context, storageDataSetID int64) ([]model.StorageCopy, error)
+	BindDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
+	AuthorizeDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) (*model.StorageDataSet, error)
+	CompleteDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
+	NextCopyWorkGeneration(ctx context.Context, copyID int64) (int64, error)
+	BindCopyTask(ctx context.Context, copyID, generation, taskID int64) error
+	AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID int64) (*model.StorageCopy, error)
+	ReservePullRequest(ctx context.Context, input ReservePullRequestInput) error
+	ReplaceCopyTask(ctx context.Context, copyID, generation, taskID, nextGeneration, nextTaskID int64) error
+	CompleteCopyTask(ctx context.Context, copyID, generation, taskID int64) error
+	NextDataSetRetirementGeneration(ctx context.Context, dataSetID int64) (int64, error)
+	BindDataSetRetirementTask(ctx context.Context, dataSetID, generation, taskID int64) error
+	AuthorizeDataSetRetirementTask(ctx context.Context, dataSetID, generation, taskID int64) (*model.StorageDataSet, error)
+	CompleteDataSetRetirementTask(ctx context.Context, dataSetID, generation, taskID int64) error
 	// GetUploadCopyForDataSet addresses one concrete data set generation.
-	GetUploadCopyForDataSet(ctx context.Context, uploadID, storageDataSetID int64) (*model.StorageUploadCopy, error)
-	AcquireUploadTask(ctx context.Context, input AcquireUploadTaskInput) error
-	AcquireReplicaRepairItem(ctx context.Context, input AcquireReplicaRepairItemInput) (*ReplicaRepairItem, error)
-	NextIncompleteCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
-	NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageUploadCopy, error)
-	ListUnavailableDataSetsWithIncompleteCopies(ctx context.Context, afterID int64, limit int) ([]model.StorageDataSet, error)
+	GetUploadCopyForDataSet(ctx context.Context, contentID, storageDataSetID int64) (*model.StorageCopy, error)
+	NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageCopy, error)
 	ListIncompleteReadableUploads(ctx context.Context, afterID int64, limit int) ([]IncompleteReadableUpload, error)
-	ReassignIngressCopy(ctx context.Context, uploadID int64, unavailableCopyIndex int) (*model.StorageUploadCopy, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
+	ReopenFailedUploadCopy(ctx context.Context, copyID int64) error
 	ReserveCommitAttempt(ctx context.Context, input storagecommit.ReserveInput) (storagecommit.ReserveResult, error)
 	MarkCommitAttempted(ctx context.Context, input storagecommit.AttemptInput) (storagecommit.AttemptResult, error)
 	RecordCommitTransaction(ctx context.Context, input storagecommit.EvidenceInput) error
@@ -562,14 +555,18 @@ type StorageReplacementRepository interface {
 	// Retry resumes failed or cleanup-attention work on the same approved
 	// target. Choosing a different provider requires a new authorization.
 	Retry(ctx context.Context, input RetryReplacementInput) (*storagereplacement.Replacement, error)
+	BindTask(ctx context.Context, replacementID, generation, taskID int64) error
+	AuthorizeTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error)
+	CompleteTask(ctx context.Context, replacementID, generation, taskID int64) error
 
 	GetByID(ctx context.Context, id int64) (*storagereplacement.Replacement, error)
 	GetByClientRequestID(ctx context.Context, bucketID int64, clientRequestID string) (*storagereplacement.Replacement, error)
 	ListForBucket(ctx context.Context, bucketID int64, limit int) ([]storagereplacement.Replacement, error)
 	GetActiveForDataSet(ctx context.Context, dataSetID int64) (*storagereplacement.Replacement, error)
 	// HasInProgressForDataSet reports whether recovery must leave this data set
-	// alone. Terminally failed work does not count, so a stuck slot can still
-	// repair in place.
+	// alone. Operator-paused failed or attention work does not count as actively
+	// progressing, so a stuck slot can still repair in place; its replacement
+	// identity remains reserved until retry, supersession, or completion.
 	HasInProgressForDataSet(ctx context.Context, dataSetID int64) (bool, error)
 	ListActive(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error)
 	ListSupersededCleanupCandidates(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error)
@@ -578,40 +575,24 @@ type StorageReplacementRepository interface {
 	// in one transaction. It touches a fixed number of rows regardless of how
 	// much history the bucket holds.
 	Activate(ctx context.Context, replacementID int64) error
-	// SeedMigrationBatchWithBudget inserts one bounded batch of migration work,
-	// snapshots its retry budget, and advances the cursor.
-	SeedMigrationBatchWithBudget(ctx context.Context, replacementID int64, limit, maxRetries int) (inserted int, done bool, err error)
-	InitializeReplacementItemRetryBudgets(ctx context.Context, maxRetries int) (int, error)
-	ReleaseExpiredItemLeases(ctx context.Context) (int, error)
-	ClaimReadyReplacementItem(ctx context.Context, leaseTTL time.Duration) (*storagereplacement.Item, error)
-	RenewReplacementItemLease(ctx context.Context, token storagereplacement.ClaimToken, leaseTTL time.Duration) error
-	ReleaseReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
-	CancelReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
-	CompleteReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken) error
-	WaitReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextCheck time.Time, lastError string) error
-	DeferReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextAttempt time.Time) error
-	RetryReplacementItemClaim(ctx context.Context, token storagereplacement.ClaimToken, nextAttempt time.Time, lastError string) (storagereplacement.ItemStatus, error)
-	PauseMigration(ctx context.Context, replacementID, expectedStateVersion int64, reason storagereplacement.WaitReason) error
+	SeedMigrationBatch(ctx context.Context, replacementID int64, limit int) (inserted int, done bool, err error)
+	NextPendingReplacementItem(ctx context.Context, replacementID int64) (*storagereplacement.Item, error)
+	MarkReplacementItemCopied(ctx context.Context, replacementID, itemID, targetCopyID int64) error
+	MarkReplacementItemCancelled(ctx context.Context, replacementID, itemID int64) error
+	MarkReplacementItemAttention(ctx context.Context, replacementID, itemID int64, lastError string) error
 	ReplacementExecution(ctx context.Context, replacementID int64) (storagereplacement.ExecutionSnapshot, error)
 	ReplacementProgresses(ctx context.Context, replacementIDs []int64) (map[int64]storagereplacement.ProgressSnapshot, error)
-	RunningReplacementItemClaimForUpload(ctx context.Context, replacementID, uploadID int64) (*storagereplacement.ClaimToken, error)
-	// AcquireItem re-derives a consistent snapshot and revalidates the worker
-	// claim. No provider call may start before it returns.
 	AcquireItem(ctx context.Context, input AcquireReplacementItemInput) (*ReplacementItemSnapshot, error)
-	AttachTargetCopy(ctx context.Context, input AttachReplacementTargetCopyInput) (*model.StorageUploadCopy, error)
+	AttachTargetCopy(ctx context.Context, input AttachReplacementTargetCopyInput) (*model.StorageCopy, error)
 
 	MarkMigrating(ctx context.Context, replacementID int64) error
 	MarkWaiting(ctx context.Context, replacementID int64, reason storagereplacement.WaitReason) error
 	MarkFailed(ctx context.Context, replacementID int64, reason *storagereplacement.FailureReason, lastError string) error
-	// FailCoordinator fails a replacement and its running coordinator atomically.
-	FailCoordinator(ctx context.Context, input ReplacementCoordinatorFailureInput) error
-	// ScheduleCoordinatorRetry updates the replacement and coordinator atomically.
-	ScheduleCoordinatorRetry(ctx context.Context, input ReplacementCoordinatorRetryInput) (model.TaskStatus, error)
 	MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error
 	BeginRetirement(ctx context.Context, replacementID int64) error
 	RecordTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
 	RecordAbandonedTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
-	CompleteAbandonedTargetTermination(ctx context.Context, replacementID int64, observedAt time.Time) error
+	CompleteAbandonedTargetTermination(ctx context.Context, replacementID int64) error
 	// EvaluateRetirementGate reports every blocker by name so the API and UI can
 	// explain why a source is still held.
 	EvaluateRetirementGate(ctx context.Context, replacementID int64, observedEpoch *int64) (RetirementGate, error)
@@ -633,33 +614,15 @@ type AuthorizeReplacementInput struct {
 	SelectionMode    storagereplacement.SelectionMode
 	TargetProviderID types.OnChainID
 	ClientRequestID  string
-	MaxRetries       int
 }
 
 type RetryReplacementInput struct {
-	ReplacementID  int64
-	MaxRetries     int
-	ItemMaxRetries int
-}
-
-type ReplacementCoordinatorFailureInput struct {
 	ReplacementID int64
-	Task          *model.Task
-	FailureReason *storagereplacement.FailureReason
-	LastError     string
-}
-
-type ReplacementCoordinatorRetryInput struct {
-	ReplacementID int64
-	Task          *model.Task
-	LastError     string
-	Backoff       time.Duration
 }
 
 type AcquireReplacementItemInput struct {
 	ReplacementID int64
 	ItemID        int64
-	ItemClaimedAt time.Time
 }
 
 // ReplacementItemSnapshot is the consistent view one migration item needs.
@@ -668,15 +631,14 @@ type ReplacementItemSnapshot struct {
 	Item        storagereplacement.Item
 	Source      model.StorageDataSet
 	Target      model.StorageDataSet
-	Upload      model.StorageUpload
+	Upload      model.StorageContent
 	Version     model.ObjectVersion
 }
 
 type AttachReplacementTargetCopyInput struct {
 	ReplacementID int64
 	ItemID        int64
-	UploadID      int64
-	ItemClaimedAt time.Time
+	ContentID     int64
 }
 
 type RecordTerminationEpochInput struct {
@@ -704,80 +666,63 @@ func (g RetirementGate) Passed() bool { return len(g.Blockers) == 0 }
 
 // TaskRepository defines persistence operations for Task entities.
 type TaskRepository interface {
-	Create(ctx context.Context, task *model.Task) error
-	// EnsureRecurring creates a singleton coordinator task or reactivates its
-	// completed row with the supplied payload. Active, failed, exhausted, and
-	// cancelled rows are left unchanged.
-	EnsureRecurring(ctx context.Context, task *model.Task) (bool, error)
-	// ResumeCoordinator revives a singleton coordinator on an operator's
-	// request, including one that exhausted its retries or failed.
-	ResumeCoordinator(ctx context.Context, task *model.Task) (bool, error)
+	Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
-	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*model.Task, error)
-	HasActiveByIdempotencyKey(ctx context.Context, idempotencyKey string) (bool, error)
-	HasEarlierRunningUploadCopyTask(ctx context.Context, claimedTask *model.Task, uploadID int64, copyIndex int) (bool, error)
-	HasEarlierRunningUploadCopyClaim(ctx context.Context, claimedAt time.Time, uploadID int64, copyIndex int) (bool, error)
-
-	// ClaimReady atomically claims one ready task of the given type by
-	// transitioning it to running and setting a lease. Returns nil if no task is available.
-	ClaimReady(ctx context.Context, taskType model.TaskType, leaseDuration time.Duration) (*model.Task, error)
-	// RenewLease extends the same running task claim.
-	RenewLease(ctx context.Context, task *model.Task, leaseDuration time.Duration) error
-	// Complete marks the same running task claim as completed.
-	Complete(ctx context.Context, task *model.Task) error
-	// CompleteWithMessage marks the same running task claim as completed with a retained status message.
-	CompleteWithMessage(ctx context.Context, task *model.Task, message string) error
-	// FailRunning marks the same running task claim as non-retryably failed.
-	FailRunning(ctx context.Context, task *model.Task, lastError string) error
-	// ScheduleRetryRunning records a retryable failure for the same running claim
-	// and returns the resulting task status.
-	ScheduleRetryRunning(ctx context.Context, task *model.Task, lastError string, backoff time.Duration) (model.TaskStatus, error)
-	// WaitRunning records a non-error wait and releases the running task until scheduled_at.
-	WaitRunning(ctx context.Context, task *model.Task, reason model.TaskWaitReason, message string, delay time.Duration) error
-	// LockRunningClaim locks the same running task claim for a cross-repository
-	// transaction that must decide whether to continue or complete it.
-	LockRunningClaim(ctx context.Context, task *model.Task) error
-	// ContinueRunning completes one successful coordinator item by replacing
-	// its version reference and payload, then returning the same task row to the queue tail.
-	ContinueRunning(ctx context.Context, task *model.Task, refVersionID string, payload map[string]interface{}) error
-	// ReleaseRunning releases the same running task claim back to queued without recording an error.
-	ReleaseRunning(ctx context.Context, task *model.Task) error
-	// CancelRunning marks the same running task claim as cancelled.
-	CancelRunning(ctx context.Context, task *model.Task, message string) error
-	// ReleaseExpiredLeases resets running tasks whose lease has expired back to queued.
-	ReleaseExpiredLeases(ctx context.Context) (int, error)
-	// MarkRunningExhausted marks the same running task claim as exhausted.
-	MarkRunningExhausted(ctx context.Context, task *model.Task, lastError string) error
-	// ListExhausted returns exhausted tasks, ordered by most recent first.
-	ListExhausted(ctx context.Context, limit int) ([]model.Task, error)
-	// RetryExhausted resets an exhausted task back to queued for manual retry.
-	RetryExhausted(ctx context.Context, taskID int64) error
-	// CountByStatus returns task counts grouped by type and status.
+	GetByIdentity(ctx context.Context, taskType model.TaskType, idempotencyKey string) (*model.Task, error)
+	ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error)
+	RenewLease(ctx context.Context, id, generation int64, leaseDuration time.Duration) (time.Time, error)
+	WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint []byte) error
+	ValidateClaim(ctx context.Context, id, generation int64) error
+	Settle(ctx context.Context, id, generation int64, transition TaskTransition) error
+	ShortenLease(ctx context.Context, id, generation int64, duration time.Duration) error
+	WakePending(ctx context.Context, ids []int64) (int, error)
+	RequestCancellation(ctx context.Context, id int64, reason string) error
+	RetryFailed(ctx context.Context, id int64) error
+	AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error
+	DeleteRetained(ctx context.Context, now time.Time, limit int) (int, error)
+	List(ctx context.Context, filter TaskListFilter) (TaskPage, error)
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+	CountUnacknowledgedFailed(ctx context.Context) (int64, error)
 	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
-	// CountActiveObjectTasksByBucket returns active object tasks
-	// whose referenced current object belongs to the given bucket.
 	CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error)
-	// CountActiveBucketTasksByBucketID returns the number of active tasks
-	// that directly reference the given bucket (ref_type=bucket, ref_id=bucketID).
 	CountActiveBucketTasksByBucketID(ctx context.Context, bucketID int64) (int64, error)
-	// CompleteByRef marks all active tasks matching the given ref as completed.
-	CompleteByRef(ctx context.Context, refType string, refID int64, taskType model.TaskType) error
-	// List returns tasks with optional filters, paginated by offset/limit.
-	// Returns the matching tasks and the total count (for pagination).
-	List(ctx context.Context, taskType string, stage string, status string, limit, offset int) ([]model.Task, int, error)
+}
+
+type TaskTransition struct {
+	Status         model.TaskStatus
+	ResumeMode     model.TaskResumeMode
+	AvailableAt    time.Time
+	WaitReason     *string
+	FailureReason  *string
+	LastError      *string
+	StatusMessage  *string
+	IncrementRetry bool
+	RetentionUntil *time.Time
+}
+
+type TaskListFilter struct {
+	Type                       model.TaskType
+	Status                     model.TaskStatus
+	BeforeID                   int64
+	Limit                      int
+	HideHealthyRecurringSystem bool
+}
+
+type TaskPage struct {
+	Tasks        []model.Task
+	NextBeforeID int64
 }
 
 type WalletOperationRepository interface {
 	CreateOrGet(ctx context.Context, input CreateWalletOperationInput) (*model.WalletOperation, bool, error)
 	GetByID(ctx context.Context, id int64) (*model.WalletOperation, error)
-	ClaimPending(ctx context.Context, leaseDuration time.Duration) (*model.WalletOperation, error)
-	MarkSubmitted(ctx context.Context, id int64, txHash string) error
-	MarkConfirmed(ctx context.Context, id int64) error
-	MarkConfirmedWithoutTransaction(ctx context.Context, id int64) error
-	MarkFailed(ctx context.Context, id int64, lastError string) error
-	MarkExpiredRunningUnknown(ctx context.Context) ([]model.WalletOperation, error)
-	ListSubmitted(ctx context.Context, limit int) ([]model.WalletOperation, error)
+	BindTask(ctx context.Context, id, taskID int64) error
+	MarkBroadcastAttempted(ctx context.Context, id, taskID int64) error
+	MarkSubmitted(ctx context.Context, id, taskID int64, txHash string) error
+	MarkConfirmed(ctx context.Context, id, taskID int64, txHash string) error
+	MarkConfirmedWithoutTransaction(ctx context.Context, id, taskID int64) error
+	MarkFailed(ctx context.Context, id, taskID int64, lastError string) error
+	MarkUnknown(ctx context.Context, id, taskID int64, lastError string) error
 	ListRecent(ctx context.Context, limit int) ([]model.WalletOperation, error)
 }
 
@@ -836,16 +781,16 @@ type BucketStatusCount struct {
 type MultipartUploadRepository interface {
 	Create(ctx context.Context, upload *model.MultipartUpload) error
 	GetByUploadID(ctx context.Context, uploadID string) (*model.MultipartUpload, error)
-	ListByBucket(ctx context.Context, bucketID int64, prefix, keyMarker, uploadIDMarker string, maxUploads int) ([]model.MultipartUpload, error)
+	ListByBucket(ctx context.Context, bucketID int64, prefix, keyMarker, contentIDMarker string, maxUploads int) ([]model.MultipartUpload, error)
 	// CountActiveByBucket returns initiated/completing multipart uploads for the given bucket.
 	CountActiveByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// SetStatus atomically transitions status using CAS (compare-and-swap) to prevent races.
-	SetStatus(ctx context.Context, uploadID string, from, to model.MultipartStatus) error
-	Delete(ctx context.Context, uploadID string) error
+	SetStatus(ctx context.Context, contentID string, from, to model.MultipartStatus) error
+	Delete(ctx context.Context, contentID string) error
 
 	// Part operations
 	CreatePart(ctx context.Context, part *model.MultipartPart) error
-	GetParts(ctx context.Context, uploadID string, partNumberMarker, maxParts int) ([]model.MultipartPart, error)
-	GetPartsByNumbers(ctx context.Context, uploadID string, numbers []int) ([]model.MultipartPart, error)
-	DeleteParts(ctx context.Context, uploadID string) error
+	GetParts(ctx context.Context, contentID string, partNumberMarker, maxParts int) ([]model.MultipartPart, error)
+	GetPartsByNumbers(ctx context.Context, contentID string, numbers []int) ([]model.MultipartPart, error)
+	DeleteParts(ctx context.Context, contentID string) error
 }

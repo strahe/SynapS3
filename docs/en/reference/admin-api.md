@@ -35,7 +35,6 @@ Runtime metrics, buckets, objects, tasks, wallet operations, storage health, and
 | `/api/v1/auth/refresh`, `/api/v1/auth/logout` | Require a valid browser session and CSRF header; HTTP Basic auth is not accepted. |
 | `/api/v1/*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 | `/metrics` | Browser session cookie or HTTP Basic auth. |
-| `/admin/exhausted-tasks*` | Browser session cookie with CSRF for unsafe methods, or HTTP Basic auth. |
 
 ### Browser Sessions
 
@@ -92,7 +91,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw`, `POST /api/v1/wallet/approve` | Creates on-chain payment operations. |
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
-| Tasks and storage health | task retry, diagnostic refresh, storage provider and data set refresh | Requeues work or refreshes operational status. |
+| Tasks and storage health | task retry, storage provider and data set refresh | Requeues work or refreshes operational status. |
 | Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends the old service. |
 | Storage confirmation | `POST /api/v1/storage-confirmations/{copy-id}/release` | May permit the provider to store the same piece again. Verify the current attempt before releasing it. |
 
@@ -142,12 +141,14 @@ For object upload, the HTTP `Content-Type` is the uploaded object's content type
 
 ### Bucket Copy Policy
 
-`POST /api/v1/buckets` accepts optional `default_copies` and `minimum_durable_copies` fields. Bucket list, detail, create, and policy-update responses include:
+`POST /api/v1/buckets` accepts optional `default_copies` and `minimum_durable_copies` fields. Either one left out is taken from the server configuration. A bucket stores the policy it was created with, so later configuration changes leave existing buckets alone. Bucket list, detail, create, and policy-update responses include both values as plain integers:
 
-- `minimum_durable_copies`: the explicit bucket value, or `null` for strict per-upload behavior;
-- `effective_minimum_durable_copies`: the current display value after clamping the bucket minimum to the current target.
+- `default_copies`: the bucket's replica target;
+- `minimum_durable_copies`: how many replicas must be stored before the cache may be released. It never exceeds the target.
 
-`PUT /api/v1/buckets/{name}/copy-policy` accepts `default_copies` and `minimum_durable_copies` independently. An omitted field is unchanged. `default_copies: null` inherits the current runtime target for new uploads. `minimum_durable_copies: null` requires every replica frozen for each upload before releasing its cache. An explicit minimum must be between `1` and `8` and cannot exceed the target produced by the same request. An empty request or an invalid final combination returns `400 Bad Request`.
+`PUT /api/v1/buckets/{name}/copy-policy` accepts `default_copies` and `minimum_durable_copies` independently. An omitted field is unchanged. `null` resets that field: `default_copies: null` restores the configured default, and `minimum_durable_copies: null` sets the minimum equal to the replica target. An explicit value must be between `1` and `8`, and the minimum cannot exceed the target produced by the same request. An empty request or an invalid final combination returns `400 Bad Request`.
+
+**Lowering `default_copies` is not supported yet and returns `400 Bad Request`.** The replicas above a lower target would keep running and keep costing, and nothing retires them, so the target can only be raised. A `null` reset that would land below the bucket's current target is refused for the same reason.
 
 Target changes affect new uploads. Minimum changes also re-evaluate retained cache for current uploads. Increasing the minimum cannot restore cache that has already been deleted.
 
@@ -279,18 +280,14 @@ If the attempt changed after it was inspected, the API returns `409 Conflict`. I
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/tasks` | List background tasks. Supports filters such as `type`, `stage`, `status`, `limit`, and `offset`. |
+| `GET` | `/api/v1/tasks` | List background tasks. Supports `type`, `status`, `limit`, and ID-based `cursor`. |
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
-| `GET` | `/api/v1/tasks/{id}/ref-detail` | Resolve the object or storage operation related to a task. |
-| `GET` | `/api/v1/tasks/{id}/diagnostic` | Read task diagnostics. |
-| `POST` | `/api/v1/tasks/{id}/diagnostic/refresh` | Refresh diagnostics. |
-| `POST` | `/api/v1/tasks/{id}/retry` | Retry an exhausted task. |
-| `GET` | `/admin/exhausted-tasks` | List exhausted tasks. Supports `limit` up to `1000`. |
-| `POST` | `/admin/exhausted-tasks/{id}/retry` | Retry an exhausted task (legacy path). |
+| `POST` | `/api/v1/tasks/{id}/retry` | Recover a failed task when `retryable` is true. |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | Dismiss a failed task when `acknowledgeable` is true. |
 
-Replacement and retirement task responses that refer to a bucket include `bucket_name` in list and reference-detail responses. Retrying replacement work from the task queue returns `409 Conflict` with `"code": "replacement_task_retry_unsupported"`. When a replacement task has completed or stopped, use **Open Data Sets**, or open the bucket and go to Details → Storage → Data Sets. A `target_in_use` failure has no Retry action because it requires a different provider.
+The task contract has exactly five stored statuses: `pending`, `running`, `completed`, `failed`, and `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses include product-facing `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. They never expose task input, checkpoint, execution mode, or claim generation.
 
-Task list `progress` is a scope-discriminated object. With `scope: "ingress_store"`, it contains `attempt`, `uploaded_bytes`, `total_bytes`, optional `percent`, `done`, and `updated_at`. With `scope: "provider_replacement"`, it contains the same replacement progress returned by the bucket response. Clients must branch on `scope`.
+Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. `category`, `stage`, `offset`, and total-count pagination are not supported. Provider replacement recovery remains in the Data Sets API, and wallet tasks are not retryable from this endpoint.
 
 ## Wallet and Filecoin
 

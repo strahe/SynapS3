@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -19,9 +20,9 @@ type BunStorageReplacementRepo struct {
 	db bun.IDB
 }
 
-// Authorize is the only way a replacement comes into existence. It runs as one
-// transaction so the superseded predecessor, the new target generation, the
-// replacement record, and its coordinator either all exist or none do.
+// Authorize is the only way a replacement comes into existence. It records
+// domain authorization and topology state only; TaskService binds the
+// coordinator in the caller's transaction.
 func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input AuthorizeReplacementInput) (*storagereplacement.Replacement, bool, error) {
 	input.ClientRequestID = strings.TrimSpace(input.ClientRequestID)
 	if input.BucketID <= 0 || input.SourceDataSetID <= 0 || input.TargetProviderID.IsZero() ||
@@ -52,7 +53,7 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 			result = existing
 			return nil
 		}
-		source, err := (&BunStorageUploadRepo{db: db}).GetDataSetBindingByID(ctx, input.SourceDataSetID)
+		source, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, input.SourceDataSetID)
 		if err != nil {
 			return err
 		}
@@ -138,7 +139,7 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 			SelectionMode:   input.SelectionMode,
 			ClientRequestID: input.ClientRequestID,
 			Status:          storagereplacement.StatusPreparingTarget,
-			ConfirmedAt:     now,
+			TaskGeneration:  1,
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		}
@@ -154,22 +155,6 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		}
 		if err := linkSupersededReplacements(ctx, db, superseded, replacement.ID, now); err != nil {
 			return err
-		}
-		tasks := &BunTaskRepo{db: db}
-		for _, id := range superseded {
-			// Leftover targets keep costing money until their own coordinator
-			// ends them. Queue that work in this transaction so cleanup does
-			// not wait for the next process start.
-			if _, err := tasks.EnsureRecurring(ctx, storagereplacement.NewAbandonedTargetTask(
-				id, input.BucketID, input.MaxRetries, now,
-			)); err != nil {
-				return fmt.Errorf("queueing abandoned replacement cleanup: %w", err)
-			}
-		}
-		if _, err := tasks.EnsureRecurring(ctx, storagereplacement.NewMigrateTask(
-			replacement.ID, input.BucketID, "", input.MaxRetries, now,
-		)); err != nil {
-			return fmt.Errorf("queueing replacement migration coordinator: %w", err)
 		}
 		result = replacement
 		created = true
@@ -198,9 +183,8 @@ func getReplacementByClientRequestID(
 	clientRequestID string,
 ) (*storagereplacement.Replacement, error) {
 	row := new(storagereplacement.Replacement)
-	err := db.NewSelect().
-		Model(row).
-		Where("bucket_id = ? AND client_request_id = ?", bucketID, clientRequestID).
+	err := withReplacementTerminations(db.NewSelect().Model(row)).
+		Where("storage_replacement.bucket_id = ? AND storage_replacement.client_request_id = ?", bucketID, clientRequestID).
 		Scan(ctx)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -259,7 +243,7 @@ func linkSupersededReplacements(ctx context.Context, db bun.IDB, ids []int64, su
 // data rather than remembered, so a retry always restarts at the stage the
 // replacement actually reached.
 func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplacementInput) (*storagereplacement.Replacement, error) {
-	if input.ReplacementID <= 0 || input.MaxRetries < 0 || input.ItemMaxRetries < 0 {
+	if input.ReplacementID <= 0 {
 		return nil, fmt.Errorf("retrying provider replacement: %w", ErrInvalidInput)
 	}
 	var resumed *storagereplacement.Replacement
@@ -271,27 +255,16 @@ func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplac
 		if row.Status == storagereplacement.StatusSuperseded {
 			return fmt.Errorf("retrying provider replacement: %w", storagereplacement.ErrSuperseded)
 		}
+		if row.FailureReason != nil && !row.FailureReason.Valid() {
+			return fmt.Errorf("retrying provider replacement with unknown failure reason %q: %w", *row.FailureReason, storagereplacement.ErrNotRetryable)
+		}
 		if row.FailureReason != nil && *row.FailureReason == storagereplacement.FailureReasonTargetInUse {
 			return fmt.Errorf("retrying provider replacement: %w", storagereplacement.ErrTargetInUse)
 		}
 		if !row.Status.Retryable() {
 			return fmt.Errorf("retrying provider replacement: %w", storagereplacement.ErrNotRetryable)
 		}
-		running, err := db.NewSelect().
-			Model((*model.Task)(nil)).
-			Where("idempotency_key IN (?, ?)",
-				storagereplacement.MigrateTaskKey(row.ID),
-				storagereplacement.RetireTaskKey(row.ID)).
-			Where("status = ?", model.TaskStatusRunning).
-			Count(ctx)
-		if err != nil {
-			return fmt.Errorf("checking replacement coordinator tasks: %w", err)
-		}
-		if running > 0 {
-			return fmt.Errorf("retrying provider replacement: %w", storagereplacement.ErrTaskRunning)
-		}
-
-		target, err := (&BunStorageUploadRepo{db: db}).GetDataSetBindingByID(ctx, row.TargetDataSetID)
+		target, err := (&BunStorageContentRepo{db: db}).GetDataSetBindingByID(ctx, row.TargetDataSetID)
 		if err != nil {
 			return err
 		}
@@ -306,38 +279,34 @@ func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplac
 			next = storagereplacement.StatusMigrating
 		}
 		now := time.Now()
+		if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+			Set("retirement_task_id = NULL").
+			Set("updated_at = ?", now).
+			Where("id = ?", row.SourceDataSetID).
+			Where("retirement_task_id IN (SELECT id FROM tasks WHERE status = ?)", model.TaskStatusFailed).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("releasing failed retirement task: %w", err)
+		}
 		if _, err := db.NewUpdate().Model((*storagereplacement.Item)(nil)).
 			Set("status = ?", storagereplacement.ItemStatusPending).
-			Set("retry_count = 0").
-			Set("max_retries = ?", input.ItemMaxRetries).
-			Set("scheduled_at = ?", now).
 			Set("last_error = NULL").
-			Set("claimed_at = NULL").
-			Set("lease_until = NULL").
 			Set("updated_at = ?", now).
-			Where("replacement_id = ? AND status = ?", row.ID, storagereplacement.ItemStatusFailed).
+			Where("replacement_id = ? AND status = ?", row.ID, storagereplacement.ItemStatusAttention).
 			Exec(ctx); err != nil {
-			return fmt.Errorf("resetting failed replacement items: %w", err)
+			return fmt.Errorf("resetting replacement items needing attention: %w", err)
 		}
 		if err := transitionReplacement(ctx, db, row.ID, []storagereplacement.Status{row.Status}, next, func(q *bun.UpdateQuery) *bun.UpdateQuery {
-			return q.Set("last_error = NULL").Set("wait_reason = NULL").Set("failure_reason = NULL")
+			return q.Set("last_error = NULL").Set("wait_reason = NULL").Set("failure_reason = NULL").
+				Set("task_generation = task_generation + 1").Set("task_id = NULL")
 		}, now); err != nil {
 			return err
-		}
-		task := storagereplacement.NewMigrateTask(row.ID, row.BucketID, "", input.MaxRetries, now)
-		if next == storagereplacement.StatusRetiring {
-			task = storagereplacement.NewRetireTask(row.ID, row.BucketID, input.MaxRetries, now)
-		}
-		// The worker marks the coordinator exhausted or failed on its way into a
-		// retryable state, and automatic recurrence deliberately leaves those
-		// alone. Resuming is the operator's explicit request to undo that.
-		if _, err := (&BunTaskRepo{db: db}).ResumeCoordinator(ctx, task); err != nil {
-			return fmt.Errorf("requeueing replacement coordinator: %w", err)
 		}
 		row.Status = next
 		row.LastError = nil
 		row.WaitReason = nil
 		row.FailureReason = nil
+		row.TaskGeneration++
+		row.TaskID = nil
 		row.UpdatedAt = now
 		resumed = row
 		return nil
@@ -346,6 +315,43 @@ func (r *BunStorageReplacementRepo) Retry(ctx context.Context, input RetryReplac
 		return nil, err
 	}
 	return resumed, nil
+}
+
+func (r *BunStorageReplacementRepo) BindTask(ctx context.Context, replacementID, generation, taskID int64) error {
+	if replacementID < 1 || generation < 1 || taskID < 1 {
+		return ErrInvalidInput
+	}
+	result, err := r.db.NewUpdate().
+		Model((*storagereplacement.Replacement)(nil)).
+		Set("task_id = ?", taskID).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND task_generation = ? AND task_id IS NULL", replacementID, generation).
+		Exec(ctx)
+	return requireTaskFenceRows(result, err, "binding provider replacement task")
+}
+
+func (r *BunStorageReplacementRepo) AuthorizeTask(ctx context.Context, replacementID, generation, taskID int64) (*storagereplacement.Replacement, error) {
+	row := new(storagereplacement.Replacement)
+	err := withReplacementTerminations(r.db.NewSelect().Model(row)).
+		Where("storage_replacement.id = ? AND storage_replacement.task_generation = ? AND storage_replacement.task_id = ?", replacementID, generation, taskID).
+		Scan(ctx)
+	if err == sql.ErrNoRows {
+		return nil, ErrConflict
+	}
+	if err != nil {
+		return nil, fmt.Errorf("authorizing provider replacement task: %w", err)
+	}
+	return row, nil
+}
+
+func (r *BunStorageReplacementRepo) CompleteTask(ctx context.Context, replacementID, generation, taskID int64) error {
+	result, err := r.db.NewUpdate().
+		Model((*storagereplacement.Replacement)(nil)).
+		Set("task_id = NULL").
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND task_generation = ? AND task_id = ?", replacementID, generation, taskID).
+		Exec(ctx)
+	return requireTaskFenceRows(result, err, "completing provider replacement task")
 }
 
 // Activate is the single atomic switch: the target starts receiving writes and
@@ -459,62 +465,6 @@ func (r *BunStorageReplacementRepo) MarkFailed(
 		})
 }
 
-func (r *BunStorageReplacementRepo) FailCoordinator(
-	ctx context.Context,
-	input ReplacementCoordinatorFailureInput,
-) error {
-	if input.ReplacementID <= 0 || input.Task == nil ||
-		(input.FailureReason != nil && !input.FailureReason.Valid()) {
-		return fmt.Errorf("failing provider replacement coordinator: %w", ErrInvalidInput)
-	}
-	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		replacements := &BunStorageReplacementRepo{db: db}
-		if err := replacements.MarkFailed(ctx, input.ReplacementID, input.FailureReason, input.LastError); err != nil {
-			return err
-		}
-		if err := (&BunTaskRepo{db: db}).FailRunning(ctx, input.Task, input.LastError); err != nil {
-			return fmt.Errorf("stopping provider replacement coordinator: %w", err)
-		}
-		return nil
-	})
-}
-
-func (r *BunStorageReplacementRepo) ScheduleCoordinatorRetry(
-	ctx context.Context,
-	input ReplacementCoordinatorRetryInput,
-) (model.TaskStatus, error) {
-	if input.ReplacementID <= 0 || input.Task == nil {
-		return "", fmt.Errorf("scheduling provider replacement coordinator retry: %w", ErrInvalidInput)
-	}
-	var taskStatus model.TaskStatus
-	err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
-		replacement, err := lockReplacementByID(ctx, db, input.ReplacementID)
-		if err != nil {
-			return err
-		}
-		taskStatus, err = (&BunTaskRepo{db: db}).ScheduleRetryRunning(ctx, input.Task, input.LastError, input.Backoff)
-		if err != nil || taskStatus != model.TaskStatusExhausted {
-			return err
-		}
-
-		next, changed := storagereplacement.OnTaskExhausted(replacement.Status)
-		if !changed {
-			return nil
-		}
-		replacementError := input.LastError + " (max retries reached)"
-		return transitionReplacement(ctx, db, replacement.ID, []storagereplacement.Status{replacement.Status}, next,
-			func(q *bun.UpdateQuery) *bun.UpdateQuery {
-				return q.Set("last_error = ?", replacementError).
-					Set("wait_reason = NULL").
-					Set("failure_reason = NULL")
-			}, time.Now())
-	})
-	if err != nil {
-		return "", err
-	}
-	return taskStatus, nil
-}
-
 // MarkCleanupAttention is committed in the same transaction that stops the
 // coordinator task, so automatic retry can never resume suppressed cleanup.
 func (r *BunStorageReplacementRepo) MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error {
@@ -544,25 +494,29 @@ func (r *BunStorageReplacementRepo) RecordTerminationEpoch(ctx context.Context, 
 	if input.ReplacementID <= 0 {
 		return fmt.Errorf("recording replacement termination epoch: %w", ErrInvalidInput)
 	}
-	res, err := r.db.NewUpdate().
-		Model((*storagereplacement.Replacement)(nil)).
-		Set("termination_epoch = ?", input.Epoch).
-		Set("termination_tx_hash = ?", nullableString(input.TxHash)).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", input.ReplacementID).
-		Where("status IN (?, ?, ?)",
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		row, err := selectReplacementForTermination(ctx, db, input.ReplacementID,
 			storagereplacement.StatusRetiring,
 			storagereplacement.StatusWaiting,
-			storagereplacement.StatusCleanupAttention).
-		Where("termination_epoch IS NULL").
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("recording replacement termination epoch: %w", err)
-	}
-	if rows, _ := res.RowsAffected(); rows != 1 {
-		return fmt.Errorf("recording replacement termination epoch: %w", ErrConflict)
-	}
-	return nil
+			storagereplacement.StatusCleanupAttention)
+		if err != nil {
+			return fmt.Errorf("recording replacement termination epoch: %w", err)
+		}
+		termination := &storagereplacement.Termination{
+			ReplacementID:   row.ID,
+			Role:            storagereplacement.TerminationRoleSource,
+			SourceDataSetID: &row.SourceDataSetID,
+			TxHash:          nullableString(input.TxHash),
+			Epoch:           input.Epoch,
+		}
+		if _, err := db.NewInsert().Model(termination).Exec(ctx); err != nil {
+			if isUniqueViolation(err) {
+				return fmt.Errorf("recording replacement termination epoch: %w", ErrConflict)
+			}
+			return fmt.Errorf("recording replacement termination epoch: %w", err)
+		}
+		return nil
+	})
 }
 
 // RecordAbandonedTerminationEpoch persists termination of a superseded target
@@ -575,35 +529,82 @@ func (r *BunStorageReplacementRepo) RecordAbandonedTerminationEpoch(
 	if input.ReplacementID <= 0 || input.Epoch < 0 {
 		return fmt.Errorf("recording abandoned target termination epoch: %w", ErrInvalidInput)
 	}
-	res, err := r.db.NewUpdate().
-		Model((*storagereplacement.Replacement)(nil)).
-		Set("abandoned_termination_epoch = ?", input.Epoch).
-		Set("abandoned_termination_tx_hash = ?", nullableString(input.TxHash)).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", input.ReplacementID).
-		Where("status = ?", storagereplacement.StatusSuperseded).
-		Where("abandoned_termination_epoch IS NULL").
-		Exec(ctx)
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		row, err := selectReplacementForTermination(ctx, db, input.ReplacementID, storagereplacement.StatusSuperseded)
+		if err != nil {
+			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+		}
+		termination := &storagereplacement.Termination{
+			ReplacementID:            row.ID,
+			Role:                     storagereplacement.TerminationRoleAbandonedTarget,
+			AbandonedTargetDataSetID: &row.TargetDataSetID,
+			TxHash:                   nullableString(input.TxHash),
+			Epoch:                    input.Epoch,
+		}
+		if _, err := db.NewInsert().Model(termination).Exec(ctx); err == nil {
+			return nil
+		} else if !isUniqueViolation(err) {
+			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+		}
+		// A crash after the transaction was paid for replays with the same
+		// epoch; anything else is a genuine conflict.
+		existing := new(storagereplacement.Termination)
+		if err := db.NewSelect().Model(existing).
+			Where("replacement_id = ? AND role = ?", row.ID, storagereplacement.TerminationRoleAbandonedTarget).
+			Scan(ctx); err != nil {
+			return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+		}
+		if existing.Epoch == input.Epoch {
+			return nil
+		}
+		return fmt.Errorf("recording abandoned target termination epoch: %w", ErrConflict)
+	})
+}
+
+// selectReplacementForTermination reads the replacement a termination is about
+// to be recorded against, refusing any status that has no term to end.
+func selectReplacementForTermination(
+	ctx context.Context,
+	db bun.IDB,
+	replacementID int64,
+	statuses ...storagereplacement.Status,
+) (*storagereplacement.Replacement, error) {
+	row := new(storagereplacement.Replacement)
+	err := db.NewSelect().
+		Model(row).
+		Where("id = ?", replacementID).
+		Where("status IN (?)", bun.List(statuses)).
+		Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrConflict
+	}
 	if err != nil {
-		return fmt.Errorf("recording abandoned target termination epoch: %w", err)
+		return nil, err
 	}
-	if rows, _ := res.RowsAffected(); rows == 1 {
-		return nil
-	}
-	row, getErr := r.GetByID(ctx, input.ReplacementID)
-	if getErr != nil {
-		return getErr
-	}
-	if row != nil && row.Status == storagereplacement.StatusSuperseded &&
-		row.AbandonedTerminationEpoch != nil && *row.AbandonedTerminationEpoch == input.Epoch {
-		return nil
-	}
-	return fmt.Errorf("recording abandoned target termination epoch: %w", ErrConflict)
+	return row, nil
+}
+
+// withReplacementTerminations projects the end of term recorded for each of a
+// replacement's two data sets. The rows live in storage_data_set_terminations,
+// so a replacement carries no repeated column group of its own.
+func withReplacementTerminations(q *bun.SelectQuery) *bun.SelectQuery {
+	return q.
+		ColumnExpr("storage_replacement.*").
+		ColumnExpr("source_termination.tx_hash AS termination_tx_hash").
+		ColumnExpr("source_termination.epoch AS termination_epoch").
+		ColumnExpr("abandoned_termination.tx_hash AS abandoned_termination_tx_hash").
+		ColumnExpr("abandoned_termination.epoch AS abandoned_termination_epoch").
+		Join("LEFT JOIN storage_data_set_terminations AS source_termination"+
+			" ON source_termination.replacement_id = storage_replacement.id AND source_termination.role = ?",
+			storagereplacement.TerminationRoleSource).
+		Join("LEFT JOIN storage_data_set_terminations AS abandoned_termination"+
+			" ON abandoned_termination.replacement_id = storage_replacement.id AND abandoned_termination.role = ?",
+			storagereplacement.TerminationRoleAbandonedTarget)
 }
 
 func (r *BunStorageReplacementRepo) GetByID(ctx context.Context, id int64) (*storagereplacement.Replacement, error) {
 	row := new(storagereplacement.Replacement)
-	err := r.db.NewSelect().Model(row).Where("id = ?", id).Scan(ctx)
+	err := withReplacementTerminations(r.db.NewSelect().Model(row)).Where("storage_replacement.id = ?", id).Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -629,10 +630,9 @@ func (r *BunStorageReplacementRepo) GetByClientRequestID(
 // can present a stable order.
 func (r *BunStorageReplacementRepo) ListForBucket(ctx context.Context, bucketID int64, limit int) ([]storagereplacement.Replacement, error) {
 	var rows []storagereplacement.Replacement
-	q := r.db.NewSelect().
-		Model(&rows).
-		Where("bucket_id = ?", bucketID).
-		OrderExpr("id DESC")
+	q := withReplacementTerminations(r.db.NewSelect().Model(&rows)).
+		Where("storage_replacement.bucket_id = ?", bucketID).
+		OrderExpr("storage_replacement.id DESC")
 	if limit > 0 {
 		q = q.Limit(limit)
 	}
@@ -644,13 +644,12 @@ func (r *BunStorageReplacementRepo) ListForBucket(ctx context.Context, bucketID 
 
 func (r *BunStorageReplacementRepo) GetActiveForDataSet(ctx context.Context, dataSetID int64) (*storagereplacement.Replacement, error) {
 	row := new(storagereplacement.Replacement)
-	err := r.db.NewSelect().
-		Model(row).
+	err := withReplacementTerminations(r.db.NewSelect().Model(row)).
 		// Either generation is owned by the replacement. After activation the
 		// coordinator writes the target, so a caller asking about the target has
 		// to see the replacement too.
-		Where("source_data_set_id = ? OR target_data_set_id = ?", dataSetID, dataSetID).
-		Where("status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
+		Where("storage_replacement.source_data_set_id = ? OR storage_replacement.target_data_set_id = ?", dataSetID, dataSetID).
+		Where("storage_replacement.status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
 		Limit(1).
 		Scan(ctx)
 	if err != nil {
@@ -665,9 +664,9 @@ func (r *BunStorageReplacementRepo) GetActiveForDataSet(ctx context.Context, dat
 // HasInProgressForDataSet covers both generations a replacement owns. The
 // target matters as much as the source: in-place recovery would otherwise queue
 // repair work on the generation the coordinator is actively writing, and the
-// two would race over the same copy row. It excludes terminally failed and
-// attention states so a generation whose replacement gave up can still recover
-// and repair in place.
+// two would race over the same copy row. It excludes operator-paused failed and
+// attention states so that generation can still recover and repair in place;
+// the replacement nevertheless retains its source, target, and slot identity.
 func (r *BunStorageReplacementRepo) HasInProgressForDataSet(ctx context.Context, dataSetID int64) (bool, error) {
 	exists, err := r.db.NewSelect().
 		Model((*storagereplacement.Replacement)(nil)).
@@ -686,15 +685,14 @@ func (r *BunStorageReplacementRepo) HasInProgressForDataSet(ctx context.Context,
 
 func (r *BunStorageReplacementRepo) ListActive(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error) {
 	var rows []storagereplacement.Replacement
-	if err := r.db.NewSelect().
-		Model(&rows).
-		Where("id > ?", afterID).
-		Where("status IN (?, ?, ?, ?)",
+	if err := withReplacementTerminations(r.db.NewSelect().Model(&rows)).
+		Where("storage_replacement.id > ?", afterID).
+		Where("storage_replacement.status IN (?, ?, ?, ?)",
 			storagereplacement.StatusPreparingTarget,
 			storagereplacement.StatusMigrating,
 			storagereplacement.StatusWaiting,
 			storagereplacement.StatusRetiring).
-		OrderExpr("id ASC").
+		OrderExpr("storage_replacement.id ASC").
 		Limit(limit).
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing active provider replacements: %w", err)
@@ -707,17 +705,16 @@ func (r *BunStorageReplacementRepo) ListActive(ctx context.Context, afterID int6
 // so the abandoned service does not keep costing money.
 func (r *BunStorageReplacementRepo) ListSupersededCleanupCandidates(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error) {
 	var rows []storagereplacement.Replacement
-	if err := r.db.NewSelect().
-		Model(&rows).
-		Where("id > ?", afterID).
-		Where("status = ?", storagereplacement.StatusSuperseded).
+	if err := withReplacementTerminations(r.db.NewSelect().Model(&rows)).
+		Where("storage_replacement.id > ?", afterID).
+		Where("storage_replacement.status = ?", storagereplacement.StatusSuperseded).
 		Where(`EXISTS (
 			SELECT 1 FROM storage_data_sets AS abandoned_target
 			WHERE abandoned_target.id = storage_replacement.target_data_set_id
 			  AND abandoned_target.is_current = ?
 			  AND abandoned_target.status <> ?
 		)`, false, model.StorageDataSetStatusRetired).
-		OrderExpr("id ASC").
+		OrderExpr("storage_replacement.id ASC").
 		Limit(limit).
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing superseded replacement cleanup candidates: %w", err)
@@ -763,7 +760,6 @@ func transitionReplacement(
 	q := db.NewUpdate().
 		Model((*storagereplacement.Replacement)(nil)).
 		Set("status = ?", to).
-		Set("state_version = state_version + 1").
 		Set("updated_at = ?", now).
 		Where("id = ?", replacementID).
 		Where("status IN (?)", bun.List(allowed))
@@ -802,5 +798,33 @@ func lockReplacementByID(ctx context.Context, db bun.IDB, replacementID int64) (
 		}
 		return nil, fmt.Errorf("locking provider replacement: %w", err)
 	}
+	// The lock statement returns the replacement's own columns; the terminations
+	// it records live beside it and callers of this lock read them.
+	if err := loadReplacementTerminations(ctx, db, row); err != nil {
+		return nil, err
+	}
 	return row, nil
+}
+
+// loadReplacementTerminations fills in the termination projection for a
+// replacement read without the join.
+func loadReplacementTerminations(ctx context.Context, db bun.IDB, row *storagereplacement.Replacement) error {
+	var terminations []storagereplacement.Termination
+	if err := db.NewSelect().
+		Model(&terminations).
+		Where("replacement_id = ?", row.ID).
+		Scan(ctx); err != nil {
+		return fmt.Errorf("loading provider replacement terminations: %w", err)
+	}
+	for i := range terminations {
+		termination := &terminations[i]
+		epoch := termination.Epoch
+		switch termination.Role {
+		case storagereplacement.TerminationRoleSource:
+			row.TerminationTxHash, row.TerminationEpoch = termination.TxHash, &epoch
+		case storagereplacement.TerminationRoleAbandonedTarget:
+			row.AbandonedTerminationTxHash, row.AbandonedTerminationEpoch = termination.TxHash, &epoch
+		}
+	}
+	return nil
 }

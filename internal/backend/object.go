@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,12 +17,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/strahe/synaps3/internal/admin"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectlimits"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/storagecleanup"
+	"github.com/strahe/synaps3/internal/storagepipeline"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -34,13 +39,12 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		return s3response.PutObjectOutput{}, err
 	}
 
-	bucket, err := b.requireActiveBucket(ctx, bucketName)
+	bucket, err := b.requireWritableBucket(ctx, bucketName)
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
 
 	versionID := model.NewVersionID()
-	cacheKey := versionCacheKey(versionID)
 
 	if input.ContentLength != nil {
 		if err := objectlimits.ValidateFOCUploadSize(*input.ContentLength); err != nil {
@@ -49,8 +53,9 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		}
 	}
 
-	// Write to a version-specific cache key so overwrites cannot affect older tasks.
-	staged, err := b.cache.PutStaged(ctx, bucketName, cacheKey, objectlimits.LimitFOCUploadReader(input.Body))
+	// Stage beside the content directory: the destination is content-addressed
+	// and only nameable once the staged checksum resolves a content row.
+	staged, err := b.cache.PutStaged(ctx, bucketName, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(input.Body))
 	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
 		if errors.Is(err, objectlimits.ErrTooLarge) {
@@ -73,46 +78,45 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 	}
 	contentType := stringOrDefault(input.ContentType, "application/octet-stream")
 
-	if err := staged.Commit(); err != nil {
+	content, err := b.ensureContentForBytes(ctx, b.repos, bucket, cacheInfo.Size, cacheInfo.Checksum)
+	if err != nil {
+		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
+		return s3response.PutObjectOutput{}, err
+	}
+	cacheKey := model.ContentCacheKey(content.ID)
+	if err := staged.CommitAs(bucketName, cacheKey); err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
 		return s3response.PutObjectOutput{}, fmt.Errorf("committing cache file: %w", err)
 	}
 
 	// Atomic transaction: create object version + enqueue any needed task.
 	var objectID int64
-	var createdState model.ObjectState
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		reuse, err := b.resolveVersionReuse(ctx, txRepos.Objects, bucket.ID, cacheInfo.Size, cacheInfo.Checksum)
+		state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
 		if err != nil {
 			return err
 		}
 
 		version := &model.ObjectVersion{
-			VersionID:       versionID,
-			BucketID:        bucket.ID,
-			Key:             keyName,
-			Size:            cacheInfo.Size,
-			ETag:            cacheInfo.ETag,
-			Checksum:        cacheInfo.Checksum,
-			ContentType:     contentType,
-			Metadata:        meta,
-			CacheKey:        cacheKey,
-			StorageUploadID: reuse.StorageUploadID,
-			InCache:         true,
-			State:           reuse.State,
+			VersionID:   versionID,
+			BucketID:    bucket.ID,
+			Key:         keyName,
+			Size:        cacheInfo.Size,
+			ETag:        cacheInfo.ETag,
+			ContentType: contentType,
+			Metadata:    meta,
+			ContentID:   &content.ID,
 		}
 		objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
 		if err != nil {
 			return fmt.Errorf("creating object version: %w", err)
 		}
-		createdState = version.State
-		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.State)
+		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
 	}); err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
-		b.deleteVersionCacheBestEffort(ctx, bucketName, cacheKey, "orphaned version cache file after put tx failure")
+		b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after put tx failure")
 		return s3response.PutObjectOutput{}, err
 	}
-	b.completeFollowerIfStoredReuseWonRace(ctx, bucket.ID, bucketName, cacheInfo.Size, cacheInfo.Checksum, objectID, versionID, createdState)
 
 	b.logger.Info("object stored", "bucket", bucketName, "key", keyName, "size", cacheInfo.Size, "versionID", versionID)
 	admin.ObjectOperationsTotal.WithLabelValues("put", "success").Inc()
@@ -430,7 +434,7 @@ func (b *SynapseBackend) DeleteObject(ctx context.Context, input *s3.DeleteObjec
 		)
 	}
 
-	bucket, err := b.requireActiveBucket(ctx, *input.Bucket)
+	bucket, err := b.requireWritableBucket(ctx, *input.Bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -448,7 +452,7 @@ func (b *SynapseBackend) DeleteObjects(ctx context.Context, input *s3.DeleteObje
 		)
 	}
 
-	bucket, err := b.requireActiveBucket(ctx, *input.Bucket)
+	bucket, err := b.requireWritableBucket(ctx, *input.Bucket)
 	if err != nil {
 		return s3response.DeleteResult{}, err
 	}
@@ -499,11 +503,16 @@ func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
 	}
 	if !version.IsDeleteMarker {
-		result, err := b.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
-			BucketID:                 bucket.ID,
-			Key:                      key,
-			VersionID:                versionID,
-			StorageCleanupMaxRetries: &b.storageCleanupMaxRetries,
+		var result repository.DeleteObjectVersionResult
+		err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+			var deleteErr error
+			result, deleteErr = txRepos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+				BucketID: bucket.ID, Key: key, VersionID: versionID,
+			})
+			if deleteErr != nil {
+				return deleteErr
+			}
+			return b.bindStorageCleanupTask(ctx, txRepos, result.StorageCleanup)
 		})
 		if err != nil {
 			switch {
@@ -525,7 +534,7 @@ func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model
 				return nil, fmt.Errorf("permanently deleting object version: %w", err)
 			}
 		}
-		b.recordPermanentDeleteCacheCleanup(ctx, bucket.Name, versionID, result.CacheKey)
+		b.releaseContentCache(ctx, bucket.Name, result.ContentID, result.ContentUnreferenced)
 		return &s3.DeleteObjectOutput{
 			VersionId: &versionID,
 		}, nil
@@ -560,8 +569,7 @@ func deleteObjectsDeletedObject(obj types.ObjectIdentifier, out *s3.DeleteObject
 }
 
 func deleteObjectsEntryError(key *string, versionID *string, err error) types.Error {
-	var s3Err s3err.S3Error
-	if errors.As(err, &s3Err) {
+	if s3Err, ok := errors.AsType[s3err.S3Error](err); ok {
 		apiErr := s3Err.BaseError()
 		code := apiErr.Code
 		message := apiErr.Description
@@ -582,8 +590,14 @@ func deleteObjectsEntryError(key *string, versionID *string, err error) types.Er
 	}
 }
 
-func (b *SynapseBackend) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) {
-	objectdeletion.RecordCacheCleanup(
+// releaseContentCache frees cached bytes only once the deletion removed the
+// last live reference to that content. Residency is content-addressed, so bytes
+// another version still names must survive this deletion.
+func (b *SynapseBackend) releaseContentCache(ctx context.Context, bucketName string, contentID *int64, unreferenced bool) {
+	if contentID == nil || !unreferenced {
+		return
+	}
+	objectdeletion.ReleaseContentCache(
 		ctx,
 		b.cache,
 		b.cacheGate,
@@ -591,8 +605,7 @@ func (b *SynapseBackend) recordPermanentDeleteCacheCleanup(ctx context.Context, 
 		b.repos.Objects,
 		b.logger,
 		bucketName,
-		versionID,
-		cacheKey,
+		*contentID,
 	)
 }
 
@@ -623,7 +636,7 @@ func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyOb
 		return s3response.CopyObjectOutput{}, err
 	}
 
-	dstBucket, err := b.requireActiveBucket(ctx, dstBucketName)
+	dstBucket, err := b.requireWritableBucket(ctx, dstBucketName)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
@@ -699,8 +712,7 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 	defer func() { _ = srcResult.Body.Close() }()
 
 	versionID := model.NewVersionID()
-	cacheKey := versionCacheKey(versionID)
-	staged, err := b.cache.PutStaged(ctx, input.DestinationBucket.Name, cacheKey, objectlimits.LimitFOCUploadReader(srcResult.Body))
+	staged, err := b.cache.PutStaged(ctx, input.DestinationBucket.Name, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(srcResult.Body))
 	if err != nil {
 		return copyObjectVersionResult{}, fmt.Errorf("staging copy destination: %w", err)
 	}
@@ -718,40 +730,35 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 		}
 		contentType = stringOrDefault(input.ContentType, "application/octet-stream")
 	} else {
-		for key, value := range input.SourceVersion.Metadata {
-			metadata[key] = value
-		}
+		maps.Copy(metadata, input.SourceVersion.Metadata)
 	}
 
-	if err := staged.Commit(); err != nil {
+	// Content is bucket-scoped, so a copy always resolves content in the
+	// destination bucket, whether or not the source shares it.
+	content, err := b.ensureContentForBytes(ctx, b.repos, input.DestinationBucket, cacheInfo.Size, cacheInfo.Checksum)
+	if err != nil {
+		return copyObjectVersionResult{}, err
+	}
+	if err := staged.CommitAs(input.DestinationBucket.Name, model.ContentCacheKey(content.ID)); err != nil {
 		return copyObjectVersionResult{}, fmt.Errorf("committing copy cache: %w", err)
 	}
 
 	var objectID int64
-	var createdState model.ObjectState
 	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		reuse := versionStorageReuse{State: model.ObjectStateCached}
-		if input.SourceBucket.ID == input.DestinationBucket.ID {
-			var err error
-			reuse, err = b.resolveVersionReuse(ctx, txRepos.Objects, input.DestinationBucket.ID, cacheInfo.Size, cacheInfo.Checksum)
-			if err != nil {
-				return err
-			}
+		state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
+		if err != nil {
+			return err
 		}
 
 		version := &model.ObjectVersion{
-			VersionID:       versionID,
-			BucketID:        input.DestinationBucket.ID,
-			Key:             input.DestinationKey,
-			Size:            cacheInfo.Size,
-			ETag:            cacheInfo.ETag,
-			Checksum:        cacheInfo.Checksum,
-			ContentType:     contentType,
-			Metadata:        metadata,
-			CacheKey:        cacheKey,
-			StorageUploadID: reuse.StorageUploadID,
-			InCache:         true,
-			State:           reuse.State,
+			VersionID:   versionID,
+			BucketID:    input.DestinationBucket.ID,
+			Key:         input.DestinationKey,
+			Size:        cacheInfo.Size,
+			ETag:        cacheInfo.ETag,
+			ContentType: contentType,
+			Metadata:    metadata,
+			ContentID:   &content.ID,
 		}
 		if input.Restore == nil {
 			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
@@ -766,22 +773,11 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 		if err != nil {
 			return fmt.Errorf("creating copy destination version: %w", err)
 		}
-		createdState = version.State
-		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.State)
+		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
 	}); err != nil {
-		b.deleteVersionCacheBestEffort(ctx, input.DestinationBucket.Name, cacheKey, "orphaned version cache file after copy tx failure")
+		b.releaseContentCacheIfUnreferenced(ctx, input.DestinationBucket.Name, content.ID, "orphaned content cache file after copy tx failure")
 		return copyObjectVersionResult{}, err
 	}
-	b.completeFollowerIfStoredReuseWonRace(
-		ctx,
-		input.DestinationBucket.ID,
-		input.DestinationBucket.Name,
-		cacheInfo.Size,
-		cacheInfo.Checksum,
-		objectID,
-		versionID,
-		createdState,
-	)
 
 	return copyObjectVersionResult{
 		SourceVersionID: input.SourceVersion.VersionID,
@@ -991,7 +987,6 @@ func (b *SynapseBackend) ListObjectsV2(ctx context.Context, input *s3.ListObject
 }
 
 // getBucket retrieves a bucket visible to S3 clients.
-// Rejects deleted, create_failed, and delete_failed statuses.
 func (b *SynapseBackend) getBucket(ctx context.Context, name string) (*model.Bucket, error) {
 	bucket, err := b.repos.Buckets.GetByName(ctx, name)
 	if err != nil {
@@ -1003,15 +998,19 @@ func (b *SynapseBackend) getBucket(ctx context.Context, name string) (*model.Buc
 	return bucket, nil
 }
 
-// requireActiveBucket retrieves a bucket that accepts write operations.
-// Active and creating buckets are writable; deleting/failed buckets are rejected.
-func (b *SynapseBackend) requireActiveBucket(ctx context.Context, name string) (*model.Bucket, error) {
+// requireWritableBucket retrieves a bucket that accepts write operations.
+func (b *SynapseBackend) requireWritableBucket(ctx context.Context, name string) (*model.Bucket, error) {
 	bucket, err := b.repos.Buckets.GetByName(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("querying bucket: %w", err)
 	}
-	if bucket == nil || !bucket.Status.IsWritable() {
+	if bucket == nil || !bucket.Status.IsVisible() {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	}
+	if !bucket.Status.IsWritable() {
+		apiErr := s3err.GetAPIError(s3err.ErrSlowDown)
+		apiErr.Description = "The bucket is still being prepared. Please retry shortly."
+		return nil, apiErr
 	}
 	return bucket, nil
 }
@@ -1071,15 +1070,10 @@ func objectPartsRequested(attrs []types.ObjectAttributes) bool {
 	if len(attrs) == 0 {
 		return true
 	}
-	for _, attr := range attrs {
-		if attr == types.ObjectAttributesObjectParts {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(attrs, types.ObjectAttributesObjectParts)
 }
 
-func (b *SynapseBackend) getObjectAttributeParts(ctx context.Context, uploadID *string, input *s3.GetObjectAttributesInput) (*s3response.ObjectParts, error) {
+func (b *SynapseBackend) getObjectAttributeParts(ctx context.Context, contentID *string, input *s3.GetObjectAttributesInput) (*s3response.ObjectParts, error) {
 	maxParts := 1000
 	if input.MaxParts != nil {
 		maxParts = int(*input.MaxParts)
@@ -1104,11 +1098,11 @@ func (b *SynapseBackend) getObjectAttributeParts(ctx context.Context, uploadID *
 		MaxParts:         maxParts,
 		PartNumberMarker: partMarker,
 	}
-	if uploadID == nil || *uploadID == "" {
+	if contentID == nil || *contentID == "" {
 		return result, nil
 	}
 
-	parts, err := b.repos.Multiparts.GetParts(ctx, *uploadID, partMarker, maxParts+1)
+	parts, err := b.repos.Multiparts.GetParts(ctx, *contentID, partMarker, maxParts+1)
 	if err != nil {
 		return nil, fmt.Errorf("listing object attribute parts: %w", err)
 	}
@@ -1168,162 +1162,99 @@ func (b *SynapseBackend) versionForRead(ctx context.Context, bucketID int64, key
 	return version, nil
 }
 
-type versionStorageReuse struct {
-	State           model.ObjectState
-	StorageUploadID *int64
-}
-
-func (b *SynapseBackend) resolveVersionReuse(ctx context.Context, objects repository.ObjectRepository, bucketID int64, size int64, checksum string) (versionStorageReuse, error) {
-	reuse := versionStorageReuse{State: model.ObjectStateCached}
+// ensureContentForBytes binds this write to the content identity for its bytes,
+// creating that identity on first sight. The bytes have their own row with a
+// unique key, so a second write of the same content is a single upsert and the
+// pipeline position is read from that content's copies rather than inferred
+// from whatever version happened to be found first.
+func (b *SynapseBackend) ensureContentForBytes(
+	ctx context.Context,
+	repos *repository.Repositories,
+	bucket *model.Bucket,
+	size int64,
+	checksum string,
+) (*model.StorageContent, error) {
 	if checksum == "" {
-		return reuse, nil
+		return nil, errors.New("cannot identify content without a checksum")
 	}
-
-	stored, err := objects.FindReusableStoredVersion(ctx, bucketID, size, checksum)
-	if err != nil {
-		return reuse, err
+	requestedCopies := b.defaultCopies
+	if bucket.DefaultCopies > 0 {
+		requestedCopies = bucket.DefaultCopies
 	}
-	if stored != nil {
-		reuse.State = model.ObjectStateStored
-		reuse.StorageUploadID = stored.StorageUploadID
-		return reuse, nil
-	}
-
-	replicating, err := objects.FindReusableReplicatingVersion(ctx, bucketID, size, checksum)
-	if err != nil {
-		return reuse, err
-	}
-	if replicating != nil {
-		reuse.State = model.ObjectStateReplicating
-		reuse.StorageUploadID = replicating.StorageUploadID
-		return reuse, nil
-	}
-
-	active, err := objects.FindReusableActiveUploadVersion(ctx, bucketID, size, checksum)
-	if err != nil {
-		return reuse, err
-	}
-	if active != nil {
-		reuse.State = model.ObjectStateUploading
-	}
-	return reuse, nil
+	return repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     size,
+		Checksum:        checksum,
+		RequestedCopies: model.ClampStorageCopies(requestedCopies),
+	})
 }
 
-func (b *SynapseBackend) reusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error) {
-	if checksum == "" {
-		return nil, nil
+func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *repository.Repositories, _ int64, versionID string, contentID *int64, state model.ObjectState) error {
+	if b.taskService == nil {
+		return errors.New("task service is unavailable")
 	}
-	return b.repos.Objects.FindReusableStoredVersion(ctx, bucketID, size, checksum)
-}
-
-func (b *SynapseBackend) completeFollowerIfStoredReuseWonRace(ctx context.Context, bucketID int64, bucketName string, size int64, checksum string, objectID int64, versionID string, createdState model.ObjectState) {
-	if createdState == model.ObjectStateReplicating {
-		b.completeReplicatingFollowerIfUploadFinalized(ctx, bucketName, versionID)
-		return
-	}
-	if createdState != model.ObjectStateUploading || checksum == "" {
-		return
-	}
-
-	reusable, err := b.reusableStoredVersion(ctx, bucketID, size, checksum)
-	if err != nil {
-		b.logger.Warn("checking stored reuse after active upload follower write", "bucket", bucketName, "versionID", versionID, "error", err)
-		return
-	}
-	if reusable == nil || reusable.StorageUploadID == nil {
-		replicating, repErr := b.repos.Objects.FindReusableReplicatingVersion(ctx, bucketID, size, checksum)
-		if repErr != nil {
-			b.logger.Warn("checking replicating reuse after active upload follower write", "bucket", bucketName, "versionID", versionID, "error", repErr)
-			return
-		}
-		if replicating == nil || replicating.StorageUploadID == nil {
-			return
-		}
-		if refs, bindErr := b.repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
-			UploadID:    *replicating.StorageUploadID,
-			BucketID:    bucketID,
-			ContentSize: size,
-			Checksum:    checksum,
-			VersionID:   versionID,
-		}); bindErr != nil {
-			b.logger.Debug("active upload follower was not ready for readable copy reuse", "bucket", bucketName, "versionID", versionID, "error", bindErr)
-		} else if len(refs) > 0 {
-			b.completeReplicatingFollowerIfUploadFinalized(ctx, bucketName, versionID)
-		}
-		return
-	}
-
-	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		if err := txRepos.Objects.SetVersionStorageUploadAndTransition(
-			ctx,
-			versionID,
-			*reusable.StorageUploadID,
-			model.ObjectStateUploading,
-			model.ObjectStateStored,
-		); err != nil {
-			return err
-		}
-		return b.enqueuePostWriteTask(
-			ctx,
-			txRepos,
-			objectID,
-			versionID,
-			model.ObjectStateStored,
-		)
-	}); err != nil {
-		b.logger.Debug("active upload follower already handled or still pending", "bucket", bucketName, "versionID", versionID, "error", err)
-		return
-	}
-}
-
-func (b *SynapseBackend) completeReplicatingFollowerIfUploadFinalized(ctx context.Context, bucketName string, versionID string) {
-	version, err := b.repos.Objects.GetVersionByID(ctx, versionID)
-	if err != nil {
-		b.logger.Warn("checking replicating reuse after follower write", "bucket", bucketName, "versionID", versionID, "error", err)
-		return
-	}
-	if version == nil || version.State != model.ObjectStateReplicating || version.StorageUploadID == nil {
-		return
-	}
-	_, _, err = b.repos.Uploads.FinalizeUploadIfTargetCopiesMet(
-		ctx,
-		repository.NewFinalizeUploadInput(
-			*version.StorageUploadID,
-			b.evictionPolicy.EnqueuesAfterUploadEviction(),
-			b.evictMaxRetries,
-		),
-	)
-	if err != nil {
-		b.logger.Warn("finalizing replicating reuse after follower write", "bucket", bucketName, "versionID", versionID, "uploadID", *version.StorageUploadID, "error", err)
-		return
-	}
-}
-
-func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *repository.Repositories, objectID int64, versionID string, state model.ObjectState) error {
 	switch state {
 	case model.ObjectStateCached:
-		stage := "prepare_upload"
-		task := &model.Task{
-			Type:           model.TaskTypeUpload,
-			Stage:          &stage,
-			RefType:        "object",
-			RefID:          objectID,
-			RefVersionID:   versionID,
-			IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     b.uploadMaxRetries,
-			ScheduledAt:    time.Now(),
-		}
-		return repos.Tasks.Create(ctx, task)
-	case model.ObjectStateStored:
-		if !b.evictionPolicy.EnqueuesAfterUploadEviction() {
+		if contentID == nil {
 			return nil
 		}
-		_, err := repos.CacheEvictions.EnsureAfterUploadTask(ctx, objectID, versionID, b.evictMaxRetries)
+		_, _, err := b.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+			Type:           model.TaskTypeUploadPlan,
+			IdempotencyKey: storagepipeline.UploadPlanKey(*contentID),
+			Input:          storagepipeline.UploadPlanInput{ContentID: *contentID},
+			SubjectType:    "storage_content",
+			SubjectKey:     strconv.FormatInt(*contentID, 10),
+		})
 		return err
+	case model.ObjectStateStored:
+		if !b.evictionPolicy.EnqueuesAfterUploadEviction() || contentID == nil {
+			return nil
+		}
+		return b.enqueueEvictionTask(ctx, repos, *contentID)
 	default:
 		return nil
 	}
+}
+
+// enqueueEvictionTask schedules cache removal for one content payload. Several
+// versions can name the same bytes, so the unit of eviction is the content.
+func (b *SynapseBackend) enqueueEvictionTask(ctx context.Context, repos *repository.Repositories, contentID int64) error {
+	generation, err := repos.CacheEvictions.NextEvictionGeneration(ctx, contentID)
+	if err != nil {
+		return err
+	}
+	taskRow, _, err := b.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+		Type:           model.TaskTypeCacheEvict,
+		IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
+		Input:          cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
+		SubjectType:    "storage_content",
+		SubjectKey:     strconv.FormatInt(contentID, 10),
+	})
+	if err != nil {
+		return err
+	}
+	return repos.CacheEvictions.BindEvictionTask(ctx, contentID, generation, taskRow.ID)
+}
+
+func (b *SynapseBackend) bindStorageCleanupTask(ctx context.Context, repos *repository.Repositories, cleanup *repository.StorageCleanupReservation) error {
+	if cleanup == nil || cleanup.TaskID != nil {
+		return nil
+	}
+	taskRow, _, err := b.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+		Type:           model.TaskTypeStorageCleanup,
+		IdempotencyKey: storagecleanup.TaskKey(cleanup.ContentID, cleanup.Generation),
+		Input:          storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
+		SubjectType:    "storage_content",
+		SubjectKey:     strconv.FormatInt(cleanup.ContentID, 10),
+	})
+	if err != nil {
+		return err
+	}
+	if err := repos.StorageCleanup.BindTask(ctx, cleanup.ContentID, cleanup.Generation, taskRow.ID); err != nil {
+		return err
+	}
+	cleanup.TaskID = &taskRow.ID
+	return nil
 }
 
 func (b *SynapseBackend) objectReaderError(err error) error {
@@ -1348,16 +1279,26 @@ func (b *SynapseBackend) objectReaderError(err error) error {
 	}
 }
 
-func versionCacheKey(versionID string) string {
-	return path.Join(".versions", versionID)
+// stagingCacheKey names a not-yet-committed write inside the content directory,
+// so the staged file and its final content-addressed name share a directory and
+// the commit stays a single rename.
+func stagingCacheKey(versionID string) string {
+	return path.Join(".contents", ".staging-"+versionID)
 }
 
-func (b *SynapseBackend) deleteVersionCacheBestEffort(ctx context.Context, bucketName, cacheKey, message string) {
+// releaseContentCacheIfUnreferenced drops cached bytes left behind by a failed
+// write. Residency is content-addressed, so the file may already back a version
+// a concurrent writer created on the same content and can only go when nothing
+// names it.
+func (b *SynapseBackend) releaseContentCacheIfUnreferenced(ctx context.Context, bucketName string, contentID int64, message string) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if cleanupErr := b.cache.Delete(cleanupCtx, bucketName, cacheKey); cleanupErr != nil {
-		b.logger.Warn(message, "bucket", bucketName, "cacheKey", cacheKey, "error", cleanupErr)
+	unreferenced, err := b.repos.Objects.ContentIsUnreferenced(cleanupCtx, contentID)
+	if err != nil {
+		b.logger.Warn(message, "bucket", bucketName, "contentID", contentID, "error", err)
+		return
 	}
+	b.releaseContentCache(cleanupCtx, bucketName, &contentID, unreferenced)
 }
 
 // Ensure Body is consumed for PutObject, as it might come from

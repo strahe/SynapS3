@@ -111,9 +111,15 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 	cfg.Filecoin.Observability.Interval = 40 * time.Millisecond
 	cfg.Filecoin.Observability.Timeout = time.Second
 	cfg.Filecoin.Observability.Concurrency = 3
-	cfg.Worker.Upload = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 15 * time.Millisecond, MaxRetries: 3}
-	cfg.Worker.Evictor = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 15 * time.Millisecond, MaxRetries: 3}
-	cfg.Worker.StorageCleanup = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 25 * time.Millisecond, MaxRetries: 3}
+	cfg.Worker.Tasks = config.TaskWorkerConfig{
+		Concurrency:                    4,
+		PollInterval:                   15 * time.Millisecond,
+		LeaseDuration:                  time.Second,
+		MaxRetries:                     3,
+		Retention:                      time.Hour,
+		ProviderMutationConcurrency:    4,
+		DestructiveMutationConcurrency: 2,
+	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(AdminPassword), bcrypt.MinCost)
 	if err != nil {
 		return nil, fmt.Errorf("hashing systemtest admin password: %w", err)

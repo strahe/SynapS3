@@ -3,12 +3,14 @@ package backend_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"os"
-	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,7 +22,7 @@ import (
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 	"github.com/prometheus/client_golang/prometheus"
-	synaps3backend "github.com/strahe/synaps3/internal/backend"
+	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -29,6 +31,7 @@ import (
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
+	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -39,7 +42,20 @@ import (
 func seedActiveBucket(t *testing.T, tb *testBackend, name string) *model.Bucket {
 	t.Helper()
 	ctx := context.Background()
-	bkt := &model.Bucket{Name: name, Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: name, Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
+		t.Fatalf("seeding bucket %q: %v", name, err)
+	}
+	return bkt
+}
+
+// seedActiveBucketWithCopies seeds a bucket whose durability policy is the given
+// copy count. Content freezes requested_copies from the policy at first ingest,
+// so a test that wants partially replicated content sets it on the bucket.
+func seedActiveBucketWithCopies(t *testing.T, tb *testBackend, name string, copies int) *model.Bucket {
+	t.Helper()
+	ctx := context.Background()
+	bkt := &model.Bucket{Name: name, Status: model.BucketStatusActive, DefaultCopies: copies, MinimumDurableCopies: copies}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket %q: %v", name, err)
 	}
@@ -60,8 +76,17 @@ func putTestObjectOutput(t *testing.T, tb *testBackend, bucket, key, body string
 		t.Fatalf("getting seeded bucket %q: bucket=%v err=%v", bucket, bkt, err)
 	}
 	versionID := model.NewVersionID()
-	cacheKey := path.Join(".versions", versionID)
-	info, err := tb.cache.Put(ctx, bucket, cacheKey, strings.NewReader(body))
+	sum := sha256.Sum256([]byte(body))
+	content, err := tb.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID:        bkt.ID,
+		ContentSize:     int64(len(body)),
+		Checksum:        hex.EncodeToString(sum[:]),
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("seeding content %s/%s: %v", bucket, key, err)
+	}
+	info, err := tb.cache.Put(ctx, bucket, model.ContentCacheKey(content.ID), strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("seeding cache object %s/%s: %v", bucket, key, err)
 	}
@@ -69,12 +94,10 @@ func putTestObjectOutput(t *testing.T, tb *testBackend, bucket, key, body string
 		VersionID:   versionID,
 		BucketID:    bkt.ID,
 		Key:         key,
+		ContentID:   &content.ID,
 		Size:        info.Size,
 		ETag:        info.ETag,
-		Checksum:    info.Checksum,
 		ContentType: "text/plain",
-		CacheKey:    cacheKey,
-		State:       model.ObjectStateCached,
 	}); err != nil {
 		t.Fatalf("seeding object version %s/%s: %v", bucket, key, err)
 	}
@@ -217,7 +240,7 @@ func putValidTestObjectOutput(t *testing.T, tb *testBackend, bucket, key, body s
 }
 
 func ptrInt64(v int64) *int64 {
-	return &v
+	return new(v)
 }
 
 func assertS3ErrorCode(t *testing.T, err error, wantCode s3err.ErrorCode) {
@@ -234,11 +257,18 @@ func assertS3ErrorCode(t *testing.T, err error, wantCode s3err.ErrorCode) {
 	}
 }
 
+// touchVersionLifecycle forces updated_at to diverge from created_at so a reader
+// that reported the wrong one would be caught. A version is immutable once
+// written now that its mutable state lives on the content and the cache entry,
+// so the divergence has to be staged by the test itself.
 func touchVersionLifecycle(t *testing.T, tb *testBackend, ctx context.Context, versionID string) *model.ObjectVersion {
 	t.Helper()
-	time.Sleep(5 * time.Millisecond)
-	if err := tb.repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("touch version lifecycle: %v", err)
+	if _, err := tb.db.NewUpdate().
+		Model((*model.ObjectVersion)(nil)).
+		Set("updated_at = ?", time.Now().Add(time.Second)).
+		Where("version_id = ?", versionID).
+		Exec(ctx); err != nil {
+		t.Fatalf("touching version %s: %v", versionID, err)
 	}
 	version, err := tb.repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
@@ -269,72 +299,85 @@ func (r *getCurrentVersionByBucketAndKeyAfterReadRepo) GetCurrentVersionByBucket
 func seedBackendObjectVersion(t *testing.T, tb *testBackend, bucket *model.Bucket, key string, size int64, etag, checksum, contentType string, state model.ObjectState, pieceCID, retrievalURL *string) (int64, string) {
 	t.Helper()
 	versionID := model.NewVersionID()
-	createState := state
-	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
-		createState = model.ObjectStateUploading
+	if checksum == "" {
+		checksum = "checksum-" + versionID
+	}
+	content, err := tb.repos.Contents.EnsureContent(context.Background(), repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     size,
+		Checksum:        synaps3testutil.StorageChecksum(checksum),
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("seeding content: %v", err)
 	}
 	version := &model.ObjectVersion{
 		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         key,
+		ContentID:   &content.ID,
 		Size:        size,
 		ETag:        etag,
-		Checksum:    checksum,
 		ContentType: contentType,
-		CacheKey:    ".versions/" + versionID,
-		State:       createState,
 	}
 	objID, err := tb.repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
 	if err != nil {
 		t.Fatalf("seeding object version: %v", err)
 	}
-	if (state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted) && pieceCID != nil && retrievalURL != nil {
-		acceptBackendVersionUpload(t, tb.repos, versionID, *pieceCID, *retrievalURL)
-		if state == model.ObjectStateCacheEvicted {
-			if err := tb.repos.Objects.UpdateVersionState(context.Background(), versionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
-				t.Fatalf("restore seeded cache evicted version: %v", err)
-			}
-		}
+	if state == model.ObjectStateStored && pieceCID != nil && retrievalURL != nil {
+		acceptBackendVersionUpload(t, tb.db, tb.repos, versionID, *pieceCID, *retrievalURL)
 	}
 	return objID, versionID
 }
 
-func acceptBackendVersionUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageUpload {
+// contentSubjectForVersion is the task subject key for the content backing a
+// version. Ingest tasks are keyed on the bytes, not on one version of them.
+func contentSubjectForVersion(t *testing.T, tb *testBackend, versionID string) string {
+	t.Helper()
+	version, err := tb.repos.Objects.GetVersionByID(t.Context(), versionID)
+	if err != nil || version == nil || version.ContentID == nil {
+		t.Fatalf("content for version %s: version=%v err=%v", versionID, version, err)
+	}
+	return strconv.FormatInt(*version.ContentID, 10)
+}
+
+// contentForVersion returns the content a seeded version already points at. The
+// bytes are their own row now, so upload seeding attaches copies to that row
+// rather than minting a second identity for the same version.
+func contentForVersion(t *testing.T, repos *repository.Repositories, version *model.ObjectVersion) *model.StorageContent {
+	t.Helper()
+	if version.ContentID == nil {
+		t.Fatalf("version %s has no content", version.VersionID)
+	}
+	content, err := repos.Contents.GetByID(t.Context(), *version.ContentID)
+	if err != nil || content == nil {
+		t.Fatalf("get content %d: content=%v err=%v", *version.ContentID, content, err)
+	}
+	return content
+}
+
+func acceptBackendVersionUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageContent {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
 		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
 	}
-	if version.State == model.ObjectStateUploading {
-		if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
-			t.Fatalf("mark committing: %v", err)
-		}
-	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("start upload attempt: %v", err)
-	}
+	upload := contentForVersion(t, repos, version)
 	providerID := onChainID(t, "101")
-	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          version.BucketID,
-		ProviderID:        providerID,
-		CopyIndex:         0,
-		CreatedByUploadID: upload.ID,
+	binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:           version.BucketID,
+		ProviderID:         providerID,
+		CopyIndex:          0,
+		CreatedByContentID: upload.ID,
 	})
 	if err != nil {
 		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
 		t.Fatalf("mark dataset ready: %v", err)
 	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
 		CopyIndex:        0,
 		TransferMethod:   model.StorageCopyTransferMethodIngress,
@@ -342,24 +385,20 @@ func acceptBackendVersionUpload(t *testing.T, repos *repository.Repositories, ve
 	}}); err != nil {
 		t.Fatalf("create upload copy: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     upload.ID,
+	synaps3testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
 		PieceID:      onChainIDPtr(t, "1"),
 		RetrievalURL: retrievalURL,
-	}); err != nil {
-		t.Fatalf("mark copy committed: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    version.BucketID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
+	})
+	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		ContentID: upload.ID,
+		BucketID:  version.BucketID,
 	}); err != nil {
 		t.Fatalf("bind readable upload: %v", err)
 	}
-	if finalized, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+	if finalized, _, err := repos.Contents.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{ContentID: upload.ID}); err != nil {
 		t.Fatalf("finalize upload: %v", err)
 	} else if !finalized {
 		t.Fatal("finalize upload = false, want true")
@@ -367,82 +406,63 @@ func acceptBackendVersionUpload(t *testing.T, repos *repository.Repositories, ve
 	return upload
 }
 
-func bindBackendPrimaryCommittedUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageUpload {
+func bindBackendPrimaryCommittedUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageContent {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
 		t.Fatalf("get version for primary bind: version=%v err=%v", version, err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark uploading: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
-		t.Fatalf("mark committing: %v", err)
-	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 3,
-	})
-	if err != nil {
-		t.Fatalf("start upload attempt: %v", err)
-	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          version.BucketID,
-		ProviderID:        onChainID(t, "101"),
-		CopyIndex:         0,
-		CreatedByUploadID: upload.ID,
+	upload := contentForVersion(t, repos, version)
+	primary, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:           version.BucketID,
+		ProviderID:         onChainID(t, "101"),
+		CopyIndex:          0,
+		CreatedByContentID: upload.ID,
 	})
 	if err != nil {
 		t.Fatalf("ensure primary dataset binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:        primary.ID,
-		UploadID:  upload.ID,
+		ContentID: upload.ID,
 		DataSetID: onChainID(t, "1001"),
 	}); err != nil {
 		t.Fatalf("mark primary dataset ready: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          version.BucketID,
-		ProviderID:        onChainID(t, "202"),
-		CopyIndex:         1,
-		CreatedByUploadID: upload.ID,
+	secondary, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:           version.BucketID,
+		ProviderID:         onChainID(t, "202"),
+		CopyIndex:          1,
+		CreatedByContentID: upload.ID,
 	})
 	if err != nil {
 		t.Fatalf("ensure secondary dataset binding: %v", err)
 	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
 		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create upload copy rows: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
-		UploadID:     upload.ID,
+	if err := repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
 		RetrievalURL: retrievalURL,
 	}); err != nil {
 		t.Fatalf("mark primary piece ready: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     upload.ID,
+	synaps3testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
 		PieceID:      onChainIDPtr(t, "2001"),
 		RetrievalURL: retrievalURL,
-	}); err != nil {
-		t.Fatalf("mark primary committed: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    version.BucketID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
+	})
+	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		ContentID: upload.ID,
+		BucketID:  version.BucketID,
 	}); err != nil {
 		t.Fatalf("bind primary committed upload: %v", err)
 	}
@@ -514,7 +534,7 @@ func TestPutObject_HappyPath(t *testing.T) {
 	}
 
 	// Verify cache file exists.
-	if !tb.cache.Exists(ctx, "put-bucket", obj.CacheKey) {
+	if !tb.cache.Exists(ctx, "put-bucket", obj.CacheKey()) {
 		t.Error("cache file does not exist")
 	}
 }
@@ -665,8 +685,8 @@ func requireObjectKeyInvalidArgument(t *testing.T, err error) {
 	}
 }
 
-func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
-	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(11))
+func TestPutObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
+	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "put-retries-bucket")
 
@@ -679,15 +699,15 @@ func TestPutObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 		t.Fatalf("PutObject: %v", err)
 	}
 
-	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	task, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimReady: %v", err)
+		t.Fatalf("ClaimNext: %v", err)
 	}
 	if task == nil {
 		t.Fatal("expected upload task")
 	}
-	if task.MaxRetries != 11 {
-		t.Fatalf("task MaxRetries = %d, want 11", task.MaxRetries)
+	if task.Type != model.TaskTypeUploadPlan || task.RetryLimit == nil || *task.RetryLimit != 5 {
+		t.Fatalf("task = %#v, want upload_plan with retry limit 5", task)
 	}
 }
 
@@ -790,7 +810,7 @@ func TestPutObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 
 	taskCount, err := tb.db.NewSelect().
 		Model((*model.Task)(nil)).
-		Where("ref_type = ? AND ref_id = ?", "object", obj1.ObjectID).
+		Where("type = ?", model.TaskTypeUploadPlan).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting upload tasks: %v", err)
@@ -803,61 +823,130 @@ func TestPutObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 	if err != nil || secondVersion == nil {
 		t.Fatalf("second version: version=%v err=%v", secondVersion, err)
 	}
-	if secondVersion.State != model.ObjectStateUploading {
-		t.Fatalf("second version state = %s, want uploading", secondVersion.State)
+	// Both versions share one content whose ingest plan has not produced a copy
+	// yet, so the derived position is still cached.
+	if secondVersion.State != model.ObjectStateCached {
+		t.Fatalf("second version state = %s, want cached", secondVersion.State)
 	}
 }
 
-func TestPutObjectIdenticalUploadingContentFollowsActiveUploadTask(t *testing.T) {
+func TestPutObjectFreezesRequestedCopiesPerContent(t *testing.T) {
 	tb := newTestBackend(t)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "uploading-reuse-bucket")
+	ctx := t.Context()
+	bucket := seedActiveBucket(t, tb, "requested-copies-freeze")
 
-	firstOut := putValidTestObjectOutput(t, tb, "uploading-reuse-bucket", "file.txt", "same data")
-	bkt, _ := tb.repos.Buckets.GetByName(ctx, "uploading-reuse-bucket")
+	first := putValidTestObjectOutput(t, tb, bucket.Name, "first.txt", "first content")
+	firstVersion, err := tb.repos.Objects.GetVersionByID(ctx, first.VersionID)
+	if err != nil || firstVersion == nil {
+		t.Fatalf("GetVersionByID(first): version=%v err=%v", firstVersion, err)
+	}
+	firstContent := contentForVersion(t, tb.repos, firstVersion)
+	if firstContent.RequestedCopies != 1 {
+		t.Fatalf("first requested_copies = %d, want 1", firstContent.RequestedCopies)
+	}
+
+	twoCopies := 2
+	if _, err := tb.repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name:             bucket.Name,
+		SetDefaultCopies: true,
+		DefaultCopies:    &twoCopies,
+	}); err != nil {
+		t.Fatalf("UpdateCopyPolicy: %v", err)
+	}
+
+	second := putValidTestObjectOutput(t, tb, bucket.Name, "second.txt", "second content")
+	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, second.VersionID)
+	if err != nil || secondVersion == nil {
+		t.Fatalf("GetVersionByID(second): version=%v err=%v", secondVersion, err)
+	}
+	secondContent := contentForVersion(t, tb.repos, secondVersion)
+	if secondContent.RequestedCopies != 2 {
+		t.Fatalf("second requested_copies = %d, want 2", secondContent.RequestedCopies)
+	}
+
+	deduplicated := putValidTestObjectOutput(t, tb, bucket.Name, "deduplicated.txt", "first content")
+	deduplicatedVersion, err := tb.repos.Objects.GetVersionByID(ctx, deduplicated.VersionID)
+	if err != nil || deduplicatedVersion == nil {
+		t.Fatalf("GetVersionByID(deduplicated): version=%v err=%v", deduplicatedVersion, err)
+	}
+	deduplicatedContent := contentForVersion(t, tb.repos, deduplicatedVersion)
+	if deduplicatedContent.ID != firstContent.ID {
+		t.Fatalf("deduplicated content id = %d, want original %d", deduplicatedContent.ID, firstContent.ID)
+	}
+	if deduplicatedContent.RequestedCopies != 1 {
+		t.Fatalf("deduplicated requested_copies = %d, want frozen value 1", deduplicatedContent.RequestedCopies)
+	}
+}
+
+func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) {
+	tb := newTestBackendWithOptions(t, backend.WithEvictionPolicy(cache.EvictionPolicyAfterUpload))
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "stored-reuse-evict-bucket")
+
+	putValidTestObject(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
+	bkt, _ := tb.repos.Buckets.GetByName(ctx, "stored-reuse-evict-bucket")
 	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
 	if err != nil || firstObj == nil {
 		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
 	}
+	acceptBackendVersionUpload(t, tb.db, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
 
-	claimed, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	putValidTestObject(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
+	page, err := tb.repos.Tasks.List(ctx, repository.TaskListFilter{Type: model.TaskTypeCacheEvict, Limit: 10})
 	if err != nil {
-		t.Fatalf("claim upload task: %v", err)
+		t.Fatalf("claim evict task: %v", err)
 	}
-	if claimed == nil || claimed.RefVersionID != firstOut.VersionID {
-		t.Fatalf("claimed task = %#v, want version %s", claimed, firstOut.VersionID)
+	if len(page.Tasks) != 1 {
+		t.Fatal("expected evict task for reused stored content")
 	}
-	if err := tb.repos.Objects.UpdateVersionState(ctx, firstOut.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark first version uploading: %v", err)
+	// Eviction frees one cache file, and that file belongs to the content, so
+	// the task names the content rather than either version of it.
+	task := &page.Tasks[0]
+	contentID := *firstObj.ContentID
+	if task.SubjectKey == nil || *task.SubjectKey != strconv.FormatInt(contentID, 10) {
+		t.Fatalf("evict task content = %v, want %d", task.SubjectKey, contentID)
 	}
+	input, err := cacheeviction.ParseEvictInput(task)
+	if err != nil || input.ContentID != contentID || input.AccessedAt != nil {
+		t.Fatalf("evict input = %#v, err=%v", input, err)
+	}
+	if task.IdempotencyKey != cacheeviction.EvictTaskKey(contentID, input.Generation) {
+		t.Fatalf("evict task key = %q", task.IdempotencyKey)
+	}
+	if task.RetryLimit == nil || *task.RetryLimit != 5 {
+		t.Fatalf("evict task retry limit = %v, want 5", task.RetryLimit)
+	}
+}
 
-	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
-	if err != nil {
-		t.Fatalf("list tasks before second put: %v", err)
-	}
+func TestPutObjectIdenticalStoredContentDoesNotQueueImmediateEvictionOutsideAfterUpload(t *testing.T) {
+	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyLRU, cache.EvictionPolicyNone} {
+		t.Run(string(policy), func(t *testing.T) {
+			tb := newTestBackendWithOptions(t, backend.WithEvictionPolicy(policy))
+			ctx := context.Background()
+			bucketName := "stored-reuse-" + string(policy) + "-bucket"
+			seedActiveBucket(t, tb, bucketName)
 
-	secondOut := putValidTestObjectOutput(t, tb, "uploading-reuse-bucket", "file.txt", "same data")
-	if secondOut.VersionID == "" || secondOut.VersionID == firstOut.VersionID {
-		t.Fatalf("second VersionID = %q, first = %q", secondOut.VersionID, firstOut.VersionID)
-	}
+			putValidTestObject(t, tb, bucketName, "file.txt", "same data")
+			bucket, _ := tb.repos.Buckets.GetByName(ctx, bucketName)
+			first, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
+			if err != nil || first == nil {
+				t.Fatalf("current object after first put: object=%v err=%v", first, err)
+			}
+			acceptBackendVersionUpload(t, tb.db, tb.repos, first.VersionID, "piece-"+string(policy), "https://provider.example/"+string(policy))
 
-	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, secondOut.VersionID)
-	if err != nil || secondVersion == nil {
-		t.Fatalf("second version: version=%v err=%v", secondVersion, err)
-	}
-	if secondVersion.State != model.ObjectStateUploading {
-		t.Fatalf("second version state = %s, want uploading", secondVersion.State)
-	}
-	if secondVersion.PieceCID != nil || secondVersion.RetrievalURL != nil {
-		t.Fatalf("second version storage = piece:%v url:%v, want unset while upload runs", secondVersion.PieceCID, secondVersion.RetrievalURL)
-	}
-
-	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
-	if err != nil {
-		t.Fatalf("list tasks after second put: %v", err)
-	}
-	if len(tasksAfter) != len(tasksBefore) {
-		t.Fatalf("upload task count changed from %d to %d", len(tasksBefore), len(tasksAfter))
+			second := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "same data")
+			stored, err := tb.repos.Objects.GetVersionByID(ctx, second.VersionID)
+			if err != nil || stored == nil || stored.State != model.ObjectStateStored {
+				t.Fatalf("reused version = %#v err=%v, want stored", stored, err)
+			}
+			page, err := tb.repos.Tasks.List(ctx, repository.TaskListFilter{Type: model.TaskTypeCacheEvict, Limit: 10})
+			if err != nil {
+				t.Fatalf("List eviction tasks: %v", err)
+			}
+			if len(page.Tasks) != 0 {
+				t.Fatalf("policy %s immediate eviction tasks=%#v, want none", policy, page.Tasks)
+			}
+		})
 	}
 }
 
@@ -872,12 +961,9 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	if err != nil || firstObj == nil {
 		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
 	}
-	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark first version uploading: %v", err)
-	}
-	acceptBackendVersionUpload(t, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
+	acceptBackendVersionUpload(t, tb.db, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
 
-	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
+	before, err := tb.repos.Tasks.List(ctx, repository.TaskListFilter{Type: model.TaskTypeUploadPlan, Limit: 10})
 	if err != nil {
 		t.Fatalf("list tasks before second put: %v", err)
 	}
@@ -886,6 +972,8 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 		t.Fatalf("second VersionID = %q, first = %q", secondOut.VersionID, firstOut.VersionID)
 	}
 
+	// The rewritten bytes resolve to the content that is already stored, so the
+	// new version inherits its durability instead of re-uploading.
 	secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, secondOut.VersionID)
 	if err != nil || secondVersion == nil {
 		t.Fatalf("second version: version=%v err=%v", secondVersion, err)
@@ -893,23 +981,23 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	if secondVersion.State != model.ObjectStateStored {
 		t.Fatalf("second version state = %s, want stored", secondVersion.State)
 	}
-	if secondVersion.StorageUploadID == nil {
-		t.Fatal("second version storage_upload_id is nil, want reused upload")
+	if secondVersion.ContentID == nil || firstObj.ContentID == nil || *secondVersion.ContentID != *firstObj.ContentID {
+		t.Fatalf("second version content = %v, want the first version's %v", secondVersion.ContentID, firstObj.ContentID)
 	}
 
-	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
+	after, err := tb.repos.Tasks.List(ctx, repository.TaskListFilter{Type: model.TaskTypeUploadPlan, Limit: 10})
 	if err != nil {
 		t.Fatalf("list tasks after second put: %v", err)
 	}
-	if len(tasksAfter) != len(tasksBefore) {
-		t.Fatalf("upload task count changed from %d to %d", len(tasksBefore), len(tasksAfter))
+	if len(after.Tasks) != len(before.Tasks) {
+		t.Fatalf("upload task count changed from %d to %d", len(before.Tasks), len(after.Tasks))
 	}
 }
 
 func TestPutObjectIdenticalReplicatingContentReusesPrimaryCommittedUpload(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
-	seedActiveBucket(t, tb, "replicating-reuse-bucket")
+	seedActiveBucketWithCopies(t, tb, "replicating-reuse-bucket", 3)
 
 	firstOut := putValidTestObjectOutput(t, tb, "replicating-reuse-bucket", "file.txt", "same data")
 	bkt, _ := tb.repos.Buckets.GetByName(ctx, "replicating-reuse-bucket")
@@ -917,9 +1005,9 @@ func TestPutObjectIdenticalReplicatingContentReusesPrimaryCommittedUpload(t *tes
 	if err != nil || firstObj == nil {
 		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
 	}
-	upload := bindBackendPrimaryCommittedUpload(t, tb.repos, firstObj.VersionID, buildDummyCID(t), "https://provider.example/primary")
+	upload := bindBackendPrimaryCommittedUpload(t, tb.db, tb.repos, firstObj.VersionID, buildDummyCID(t), "https://provider.example/primary")
 
-	tasksBefore, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
+	before, err := tb.repos.Tasks.List(ctx, repository.TaskListFilter{Type: model.TaskTypeUploadPlan, Limit: 10})
 	if err != nil {
 		t.Fatalf("list tasks before second put: %v", err)
 	}
@@ -935,93 +1023,18 @@ func TestPutObjectIdenticalReplicatingContentReusesPrimaryCommittedUpload(t *tes
 	if secondVersion.State != model.ObjectStateReplicating {
 		t.Fatalf("second version state = %s, want replicating", secondVersion.State)
 	}
-	if secondVersion.StorageUploadID == nil || *secondVersion.StorageUploadID != upload.ID || !secondVersion.InFilecoin {
-		t.Fatalf("second version storage = upload:%v in_filecoin:%v, want upload %d readable", secondVersion.StorageUploadID, secondVersion.InFilecoin, upload.ID)
+	if secondVersion.ContentID == nil || *secondVersion.ContentID != upload.ID || !secondVersion.InFilecoin {
+		t.Fatalf("second version storage = upload:%v in_filecoin:%v, want upload %d readable", secondVersion.ContentID, secondVersion.InFilecoin, upload.ID)
 	}
 
-	tasksAfter, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", "", 10, 0)
+	after, err := tb.repos.Tasks.List(ctx, repository.TaskListFilter{Type: model.TaskTypeUploadPlan, Limit: 10})
 	if err != nil {
 		t.Fatalf("list tasks after second put: %v", err)
 	}
-	if len(tasksAfter) != len(tasksBefore) {
-		t.Fatalf("upload task count changed from %d to %d", len(tasksBefore), len(tasksAfter))
+	if len(after.Tasks) != len(before.Tasks) {
+		t.Fatalf("upload task count changed from %d to %d", len(before.Tasks), len(after.Tasks))
 	}
 }
-
-func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) {
-	tb := newTestBackendWithOptions(t, synaps3backend.WithEvictionPolicy(cache.EvictionPolicyAfterUpload), synaps3backend.WithEvictMaxRetries(9))
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "stored-reuse-evict-bucket")
-
-	putValidTestObject(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
-	bkt, _ := tb.repos.Buckets.GetByName(ctx, "stored-reuse-evict-bucket")
-	firstObj, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bkt.ID, "file.txt")
-	if err != nil || firstObj == nil {
-		t.Fatalf("current object after first put: obj=%v err=%v", firstObj, err)
-	}
-	if err := tb.repos.Objects.UpdateVersionState(ctx, firstObj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark first version uploading: %v", err)
-	}
-	acceptBackendVersionUpload(t, tb.repos, firstObj.VersionID, "piece-shared", "https://provider.example/shared")
-
-	secondOut := putValidTestObjectOutput(t, tb, "stored-reuse-evict-bucket", "file.txt", "same data")
-	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeEvictCache, time.Minute)
-	if err != nil {
-		t.Fatalf("claim evict task: %v", err)
-	}
-	if task == nil {
-		t.Fatal("expected evict task for reused stored version")
-	}
-	if task.RefVersionID != secondOut.VersionID {
-		t.Fatalf("evict task version = %s, want %s", task.RefVersionID, secondOut.VersionID)
-	}
-	if task.Stage == nil || *task.Stage != cacheeviction.StageAfterUpload {
-		t.Fatalf("evict task stage = %v, want %s", task.Stage, cacheeviction.StageAfterUpload)
-	}
-	if task.IdempotencyKey != "evict_cache:"+secondOut.VersionID {
-		t.Fatalf("evict task key = %q, want stable after_upload version key", task.IdempotencyKey)
-	}
-	if task.MaxRetries != 9 {
-		t.Fatalf("evict task MaxRetries = %d, want 9", task.MaxRetries)
-	}
-}
-
-func TestPutObjectIdenticalStoredContentDoesNotQueueImmediateEvictionOutsideAfterUpload(t *testing.T) {
-	for _, policy := range []cache.EvictionPolicy{cache.EvictionPolicyLRU, cache.EvictionPolicyNone} {
-		t.Run(string(policy), func(t *testing.T) {
-			tb := newTestBackendWithOptions(t, synaps3backend.WithEvictionPolicy(policy))
-			ctx := context.Background()
-			bucketName := "stored-reuse-" + string(policy) + "-bucket"
-			seedActiveBucket(t, tb, bucketName)
-
-			putValidTestObject(t, tb, bucketName, "file.txt", "same data")
-			bucket, _ := tb.repos.Buckets.GetByName(ctx, bucketName)
-			first, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "file.txt")
-			if err != nil || first == nil {
-				t.Fatalf("current object after first put: object=%v err=%v", first, err)
-			}
-			if err := tb.repos.Objects.UpdateVersionState(ctx, first.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-				t.Fatalf("mark first version uploading: %v", err)
-			}
-			acceptBackendVersionUpload(t, tb.repos, first.VersionID, "piece-"+string(policy), "https://provider.example/"+string(policy))
-
-			second := putValidTestObjectOutput(t, tb, bucketName, "file.txt", "same data")
-			stored, err := tb.repos.Objects.GetVersionByID(ctx, second.VersionID)
-			if err != nil || stored == nil || stored.State != model.ObjectStateStored {
-				t.Fatalf("reused version = %#v err=%v, want stored", stored, err)
-			}
-			tasks, total, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeEvictCache), "", "", 10, 0)
-			if err != nil {
-				t.Fatalf("List eviction tasks: %v", err)
-			}
-			if total != 0 || len(tasks) != 0 {
-				t.Fatalf("policy %s immediate eviction tasks total=%d tasks=%#v, want none", policy, total, tasks)
-			}
-		})
-	}
-}
-
-// ---------- GetObject ----------
 
 func TestGetObject_FromCache(t *testing.T) {
 	tb := newTestBackend(t)
@@ -1723,7 +1736,7 @@ func TestListObjects_Pagination(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "list-bucket")
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		key := fmt.Sprintf("obj-%02d", i)
 		putTestObject(t, tb, "list-bucket", key, "data")
 	}
@@ -1836,7 +1849,7 @@ func TestListObjectsV2_ContinuationToken(t *testing.T) {
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "v2-bucket")
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		putTestObject(t, tb, "v2-bucket", fmt.Sprintf("key-%02d", i), "data")
 	}
 
@@ -2206,15 +2219,143 @@ func TestDeleteObject_MissingKeyCreatesDeleteMarker(t *testing.T) {
 	}
 }
 
+func TestDeleteObject_DataVersionPermanentDeleteReportsActiveStorageWork(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-active-storage-work-bucket")
+	// The put leaves an ingest plan scheduled against the content, which is the
+	// storage work that must block the delete.
+	putOut := putValidTestObjectOutput(t, tb, "delete-active-storage-work-bucket", "file.txt", "data")
+	_, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    aws.String("delete-active-storage-work-bucket"),
+		Key:       aws.String("file.txt"),
+		VersionId: aws.String(putOut.VersionID),
+	})
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("DeleteObject error = %T %v, want s3 API error", err, err)
+	}
+	if apiErr.Code != "InvalidRequest" || apiErr.Description != "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later." {
+		t.Fatalf("DeleteObject API error = %#v, want actionable storage-work conflict", apiErr)
+	}
+}
+
+func TestDeleteObjects_DataVersionReportsActiveStorageWorkPerEntry(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-active-storage-work-bucket")
+	putOut := putValidTestObjectOutput(t, tb, "delete-objects-active-storage-work-bucket", "file.txt", "data")
+	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-active-storage-work-bucket"),
+		Delete: &types.Delete{Objects: []types.ObjectIdentifier{
+			{Key: aws.String("file.txt"), VersionId: aws.String(putOut.VersionID)},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects(active storage work): %v", err)
+	}
+	if len(out.Deleted) != 0 || len(out.Error) != 1 {
+		t.Fatalf("DeleteObjects(active storage work) = %#v, want one entry error", out)
+	}
+	entryErr := out.Error[0]
+	if entryErr.Key == nil || *entryErr.Key != "file.txt" || entryErr.VersionId == nil || *entryErr.VersionId != putOut.VersionID {
+		t.Fatalf("entry identity = key:%v version:%v, want file.txt/%s", entryErr.Key, entryErr.VersionId, putOut.VersionID)
+	}
+	if entryErr.Code == nil || *entryErr.Code != "InvalidRequest" {
+		t.Fatalf("entry code = %v, want InvalidRequest", entryErr.Code)
+	}
+	wantMessage := "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later."
+	if entryErr.Message == nil || *entryErr.Message != wantMessage {
+		t.Fatalf("entry message = %v, want %q", entryErr.Message, wantMessage)
+	}
+	got, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil || got == nil {
+		t.Fatalf("version after rejected DeleteObjects = %#v err=%v, want retained", got, err)
+	}
+}
+
+func TestDeleteObjects_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "delete-objects-data-version-bucket")
+
+	putOut := putTestObjectOutput(t, tb, "delete-objects-data-version-bucket", "file.txt", "data")
+	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("delete-objects-data-version-bucket"),
+		Key:    aws.String("file.txt"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject(marker): %v", err)
+	}
+	versionBeforeDelete, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil || versionBeforeDelete == nil {
+		t.Fatalf("GetVersionByID(before delete): version=%v err=%v", versionBeforeDelete, err)
+	}
+	cacheKey := versionBeforeDelete.CacheKey()
+	if !tb.cache.Exists(ctx, "delete-objects-data-version-bucket", cacheKey) {
+		t.Fatal("expected cache file before permanent delete")
+	}
+
+	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String("delete-objects-data-version-bucket"),
+		Delete: &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String("file.txt"), VersionId: aws.String(putOut.VersionID)},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects(data version): %v", err)
+	}
+	if len(out.Error) != 0 {
+		t.Fatalf("Error = %#v, want none", out.Error)
+	}
+	if len(out.Deleted) != 1 {
+		t.Fatalf("Deleted = %#v, want one entry", out.Deleted)
+	}
+	deleted := out.Deleted[0]
+	if deleted.VersionId == nil || *deleted.VersionId != putOut.VersionID {
+		t.Fatalf("deleted VersionId = %v, want %s", deleted.VersionId, putOut.VersionID)
+	}
+	if deleted.DeleteMarker == nil || *deleted.DeleteMarker {
+		t.Fatalf("deleted DeleteMarker = %v, want false", deleted.DeleteMarker)
+	}
+
+	removed, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(after delete): %v", err)
+	}
+	if removed != nil {
+		t.Fatalf("deleted data version still exists: %#v", removed)
+	}
+	if tb.cache.Exists(ctx, "delete-objects-data-version-bucket", cacheKey) {
+		t.Fatal("cache file still exists after permanent delete")
+	}
+	var tombstones int
+	if err := tb.db.NewRaw(`SELECT COUNT(*) FROM object_deletions WHERE version_id = ?`, putOut.VersionID).Scan(ctx, &tombstones); err != nil {
+		t.Fatalf("count object deletions: %v", err)
+	}
+	if tombstones != 1 {
+		t.Fatalf("object deletion tombstones = %d, want 1", tombstones)
+	}
+
+	versionsOut, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String("delete-objects-data-version-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.Versions) != 0 || len(versionsOut.DeleteMarkers) != 1 || *versionsOut.DeleteMarkers[0].VersionId != *marker.VersionId {
+		t.Fatalf("versions=%#v markers=%#v, want only marker %s", versionsOut.Versions, versionsOut.DeleteMarkers, *marker.VersionId)
+	}
+}
+
 func TestDeleteObject_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "delete-data-version-bucket")
 
 	putOut := putTestObjectOutput(t, tb, "delete-data-version-bucket", "file.txt", "data")
-	if _, err := tb.db.NewRaw(`UPDATE tasks SET status = ? WHERE ref_type = ? AND ref_version_id = ?`, model.TaskStatusCompleted, "object", putOut.VersionID).Exec(ctx); err != nil {
-		t.Fatalf("complete upload task: %v", err)
-	}
 	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String("delete-data-version-bucket"),
 		Key:    aws.String("file.txt"),
@@ -2230,7 +2371,8 @@ func TestDeleteObject_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.
 	if err != nil || versionBeforeDelete == nil {
 		t.Fatalf("GetVersionByID(before delete): version=%v err=%v", versionBeforeDelete, err)
 	}
-	if !tb.cache.Exists(ctx, "delete-data-version-bucket", versionBeforeDelete.CacheKey) {
+	cacheKey := versionBeforeDelete.CacheKey()
+	if !tb.cache.Exists(ctx, "delete-data-version-bucket", cacheKey) {
 		t.Fatal("expected cache file before permanent delete")
 	}
 
@@ -2256,16 +2398,20 @@ func TestDeleteObject_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.
 	if deleted != nil {
 		t.Fatalf("deleted data version still exists: %#v", deleted)
 	}
-	if tb.cache.Exists(ctx, "delete-data-version-bucket", versionBeforeDelete.CacheKey) {
+	// That version held the last reference to those bytes, so the shared cache
+	// file goes with it.
+	if tb.cache.Exists(ctx, "delete-data-version-bucket", cacheKey) {
 		t.Fatal("cache file still exists after permanent delete")
 	}
 
-	var cacheStatus string
-	if err := tb.db.NewRaw(`SELECT cache_cleanup_status FROM object_deletions WHERE version_id = ?`, putOut.VersionID).Scan(ctx, &cacheStatus); err != nil {
-		t.Fatalf("object deletion cache status: %v", err)
+	// object_deletions is an append-only tombstone now; the record of the
+	// deletion is the row itself, not a cleanup status on it.
+	var tombstones int
+	if err := tb.db.NewRaw(`SELECT COUNT(*) FROM object_deletions WHERE version_id = ?`, putOut.VersionID).Scan(ctx, &tombstones); err != nil {
+		t.Fatalf("count object deletions: %v", err)
 	}
-	if cacheStatus != string(model.CacheCleanupStatusDeleted) {
-		t.Fatalf("cache cleanup status = %q, want %q", cacheStatus, model.CacheCleanupStatusDeleted)
+	if tombstones != 1 {
+		t.Fatalf("object deletion tombstones = %d, want 1", tombstones)
 	}
 
 	versionsOut, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
@@ -2279,49 +2425,14 @@ func TestDeleteObject_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.
 	}
 }
 
-func TestDeleteObject_DataVersionPermanentDeleteReportsActiveStorageWork(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "delete-active-storage-work-bucket")
-	putOut := putTestObjectOutput(t, tb, "delete-active-storage-work-bucket", "file.txt", "data")
-	version, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
-	if err != nil || version == nil {
-		t.Fatalf("GetVersionByID: version=%#v err=%v", version, err)
-	}
-	if err := tb.repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateVersionState(uploading): %v", err)
-	}
-	stage := "prepare_upload"
-	task := &model.Task{
-		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: version.ObjectID, RefVersionID: version.VersionID,
-		IdempotencyKey: "upload:" + version.VersionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
-	}
-	if err := tb.repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-
-	_, err = tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket:    aws.String("delete-active-storage-work-bucket"),
-		Key:       aws.String("file.txt"),
-		VersionId: aws.String(putOut.VersionID),
-	})
-	apiErr, ok := err.(s3err.APIError)
-	if !ok {
-		t.Fatalf("DeleteObject error = %T %v, want s3 API error", err, err)
-	}
-	if apiErr.Code != "InvalidRequest" || apiErr.Description != "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later." {
-		t.Fatalf("DeleteObject API error = %#v, want actionable storage-work conflict", apiErr)
-	}
-}
-
 func TestDeleteObject_DataVersionPermanentDeleteRemovesCurrentVisibleVersion(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "delete-current-data-version-bucket")
 
 	putOut := putTestObjectOutput(t, tb, "delete-current-data-version-bucket", "file.txt", "data")
-	if _, err := tb.db.NewRaw(`UPDATE tasks SET status = ? WHERE ref_type = ? AND ref_version_id = ?`, model.TaskStatusCompleted, "object", putOut.VersionID).Exec(ctx); err != nil {
-		t.Fatalf("complete upload task: %v", err)
+	if _, err := tb.db.NewRaw(`DELETE FROM tasks WHERE subject_type = ? AND subject_key = ?`, "object_version", putOut.VersionID).Exec(ctx); err != nil {
+		t.Fatalf("remove upload task: %v", err)
 	}
 	out, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket:    aws.String("delete-current-data-version-bucket"),
@@ -2526,136 +2637,6 @@ func TestDeleteObjects_DeleteMarkerVersionRestoresObject(t *testing.T) {
 	}
 }
 
-func TestDeleteObjects_DataVersionPermanentDeleteRemovesHiddenVersion(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "delete-objects-data-version-bucket")
-
-	putOut := putTestObjectOutput(t, tb, "delete-objects-data-version-bucket", "file.txt", "data")
-	if _, err := tb.db.NewRaw(`UPDATE tasks SET status = ? WHERE ref_type = ? AND ref_version_id = ?`, model.TaskStatusCompleted, "object", putOut.VersionID).Exec(ctx); err != nil {
-		t.Fatalf("complete upload task: %v", err)
-	}
-	marker, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String("delete-objects-data-version-bucket"),
-		Key:    aws.String("file.txt"),
-	})
-	if err != nil {
-		t.Fatalf("DeleteObject(marker): %v", err)
-	}
-	versionBeforeDelete, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
-	if err != nil || versionBeforeDelete == nil {
-		t.Fatalf("GetVersionByID(before delete): version=%v err=%v", versionBeforeDelete, err)
-	}
-	if !tb.cache.Exists(ctx, "delete-objects-data-version-bucket", versionBeforeDelete.CacheKey) {
-		t.Fatal("expected cache file before permanent delete")
-	}
-
-	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String("delete-objects-data-version-bucket"),
-		Delete: &types.Delete{
-			Objects: []types.ObjectIdentifier{
-				{Key: aws.String("file.txt"), VersionId: aws.String(putOut.VersionID)},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("DeleteObjects(data version): %v", err)
-	}
-	if len(out.Error) != 0 {
-		t.Fatalf("Error = %#v, want none", out.Error)
-	}
-	if len(out.Deleted) != 1 {
-		t.Fatalf("Deleted = %#v, want one entry", out.Deleted)
-	}
-	deleted := out.Deleted[0]
-	if deleted.VersionId == nil || *deleted.VersionId != putOut.VersionID {
-		t.Fatalf("deleted VersionId = %v, want %s", deleted.VersionId, putOut.VersionID)
-	}
-	if deleted.DeleteMarker == nil || *deleted.DeleteMarker {
-		t.Fatalf("deleted DeleteMarker = %v, want false", deleted.DeleteMarker)
-	}
-
-	removed, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
-	if err != nil {
-		t.Fatalf("GetVersionByID(after delete): %v", err)
-	}
-	if removed != nil {
-		t.Fatalf("deleted data version still exists: %#v", removed)
-	}
-	if tb.cache.Exists(ctx, "delete-objects-data-version-bucket", versionBeforeDelete.CacheKey) {
-		t.Fatal("cache file still exists after permanent delete")
-	}
-	var cacheStatus string
-	if err := tb.db.NewRaw(`SELECT cache_cleanup_status FROM object_deletions WHERE version_id = ?`, putOut.VersionID).Scan(ctx, &cacheStatus); err != nil {
-		t.Fatalf("object deletion cache status: %v", err)
-	}
-	if cacheStatus != string(model.CacheCleanupStatusDeleted) {
-		t.Fatalf("cache cleanup status = %q, want %q", cacheStatus, model.CacheCleanupStatusDeleted)
-	}
-
-	versionsOut, err := tb.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-		Bucket: aws.String("delete-objects-data-version-bucket"),
-	})
-	if err != nil {
-		t.Fatalf("ListObjectVersions: %v", err)
-	}
-	if len(versionsOut.Versions) != 0 || len(versionsOut.DeleteMarkers) != 1 || *versionsOut.DeleteMarkers[0].VersionId != *marker.VersionId {
-		t.Fatalf("versions=%#v markers=%#v, want only marker %s", versionsOut.Versions, versionsOut.DeleteMarkers, *marker.VersionId)
-	}
-}
-
-func TestDeleteObjects_DataVersionReportsActiveStorageWorkPerEntry(t *testing.T) {
-	tb := newTestBackend(t)
-	ctx := context.Background()
-	seedActiveBucket(t, tb, "delete-objects-active-storage-work-bucket")
-	putOut := putTestObjectOutput(t, tb, "delete-objects-active-storage-work-bucket", "file.txt", "data")
-	version, err := tb.repos.Objects.GetVersionByID(ctx, putOut.VersionID)
-	if err != nil || version == nil {
-		t.Fatalf("GetVersionByID: version=%#v err=%v", version, err)
-	}
-	if err := tb.repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateVersionState(uploading): %v", err)
-	}
-	stage := "prepare_upload"
-	task := &model.Task{
-		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: version.ObjectID, RefVersionID: version.VersionID,
-		IdempotencyKey: "upload:" + version.VersionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
-	}
-	if err := tb.repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-
-	out, err := tb.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String("delete-objects-active-storage-work-bucket"),
-		Delete: &types.Delete{Objects: []types.ObjectIdentifier{
-			{Key: aws.String("file.txt"), VersionId: aws.String(putOut.VersionID)},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("DeleteObjects(active storage work): %v", err)
-	}
-	if len(out.Deleted) != 0 || len(out.Error) != 1 {
-		t.Fatalf("DeleteObjects(active storage work) = %#v, want one entry error", out)
-	}
-	entryErr := out.Error[0]
-	if entryErr.Key == nil || *entryErr.Key != "file.txt" || entryErr.VersionId == nil || *entryErr.VersionId != putOut.VersionID {
-		t.Fatalf("entry identity = key:%v version:%v, want file.txt/%s", entryErr.Key, entryErr.VersionId, putOut.VersionID)
-	}
-	if entryErr.Code == nil || *entryErr.Code != "InvalidRequest" {
-		t.Fatalf("entry code = %v, want InvalidRequest", entryErr.Code)
-	}
-	wantMessage := "The object version cannot be deleted while storage is still in progress or a Filecoin transaction is awaiting confirmation. Try again later."
-	if entryErr.Message == nil || *entryErr.Message != wantMessage {
-		t.Fatalf("entry message = %v, want %q", entryErr.Message, wantMessage)
-	}
-	got, err := tb.repos.Objects.GetVersionByID(ctx, version.VersionID)
-	if err != nil || got == nil {
-		t.Fatalf("version after rejected DeleteObjects = %#v err=%v, want retained", got, err)
-	}
-}
-
-// ---------- CopyObject ----------
-
 func TestCopyObject_HappyPath(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
@@ -2745,20 +2726,27 @@ func TestCopyObjectIdenticalCurrentObjectCreatesNewVersion(t *testing.T) {
 		t.Fatalf("object version count = %d, want 2", versionCount)
 	}
 
+	// Ingest is scheduled per content and both copies carry the same bytes into
+	// the same bucket, so the two versions share one plan.
+	if first, second := contentSubjectForVersion(t, tb, obj1.VersionID), contentSubjectForVersion(t, tb, obj2.VersionID); first != second {
+		t.Fatalf("identical copies resolved to contents %s and %s, want one", first, second)
+	}
 	taskCount, err := tb.db.NewSelect().
 		Model((*model.Task)(nil)).
-		Where("ref_type = ? AND ref_id = ?", "object", obj1.ObjectID).
+		Where("type = ?", model.TaskTypeUploadPlan).
+		Where("subject_type = ?", "storage_content").
+		Where("subject_key = ?", contentSubjectForVersion(t, tb, obj2.VersionID)).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting upload tasks: %v", err)
 	}
-	if taskCount != 2 {
-		t.Fatalf("task count = %d, want 2", taskCount)
+	if taskCount != 1 {
+		t.Fatalf("task count = %d, want 1", taskCount)
 	}
 }
 
-func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
-	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(13))
+func TestCopyObjectEnqueuesRegisteredUploadPlan(t *testing.T) {
+	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "copy-retry-src")
 	seedActiveBucket(t, tb, "copy-retry-dst")
@@ -2782,22 +2770,19 @@ func TestCopyObjectUsesConfiguredUploadMaxRetries(t *testing.T) {
 		t.Fatalf("GetByBucketAndKey: %v", err)
 	}
 
-	tasks, _, err := tb.repos.Tasks.List(ctx, string(model.TaskTypeUpload), "", string(model.TaskStatusQueued), 10, 0)
+	page, err := tb.repos.Tasks.List(ctx, repository.TaskListFilter{Type: model.TaskTypeUploadPlan, Status: model.TaskStatusPending, Limit: 10})
 	if err != nil {
 		t.Fatalf("List tasks: %v", err)
 	}
-	for _, task := range tasks {
-		if task.RefType == "object" && task.RefID == dstObj.ObjectID {
-			if task.MaxRetries != 13 {
-				t.Fatalf("copy upload task MaxRetries = %d, want 13", task.MaxRetries)
-			}
-			if task.Stage == nil || *task.Stage != "prepare_upload" {
-				t.Fatalf("copy upload task Stage = %#v, want prepare_upload", task.Stage)
+	for _, task := range page.Tasks {
+		if task.SubjectType != nil && task.SubjectKey != nil && *task.SubjectType == "storage_content" && *task.SubjectKey == contentSubjectForVersion(t, tb, dstObj.VersionID) {
+			if task.RetryLimit == nil || *task.RetryLimit != 5 {
+				t.Fatalf("copy upload task retry limit = %v, want 5", task.RetryLimit)
 			}
 			return
 		}
 	}
-	t.Fatalf("copy upload task for object %d not found in %#v", dstObj.ObjectID, tasks)
+	t.Fatalf("copy upload task for object %d not found in %#v", dstObj.ObjectID, page.Tasks)
 }
 
 func TestCopyObject_MetadataReplace(t *testing.T) {
@@ -3011,8 +2996,11 @@ func TestRestoreObjectVersionCreatesNewCurrentAndPreservesHistory(t *testing.T) 
 			if current.VersionID != versionID {
 				t.Fatalf("current version = %s, want %s", current.VersionID, versionID)
 			}
-			if current.CacheKey == sourceBefore.CacheKey || !tb.cache.Exists(ctx, bucketName, current.CacheKey) {
-				t.Fatalf("restored cache key = %q, source = %q, exists=%v", current.CacheKey, sourceBefore.CacheKey, tb.cache.Exists(ctx, bucketName, current.CacheKey))
+			// A restore rewrites the same bytes, which resolve to the source's
+			// content, so the two versions share one cache file rather than
+			// each keeping a private copy.
+			if current.CacheKey() != sourceBefore.CacheKey() || !tb.cache.Exists(ctx, bucketName, current.CacheKey()) {
+				t.Fatalf("restored cache key = %q, source = %q, exists=%v", current.CacheKey(), sourceBefore.CacheKey(), tb.cache.Exists(ctx, bucketName, current.CacheKey()))
 			}
 			if current.ContentType != sourceBefore.ContentType {
 				t.Fatalf("content type = %q, want %q", current.ContentType, sourceBefore.ContentType)
@@ -3170,22 +3158,30 @@ func TestRestoreObjectVersionRejectsUnavailableSources(t *testing.T) {
 		ctx := context.Background()
 		bucket := seedActiveBucket(t, tb, "restore-unreadable-source")
 		versionID := "01J0000000000000000000BR00"
+		unreadableSize := int64(len(validTestObjectBody("unreadable")))
+		unreadableContent, err := tb.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+			BucketID:        bucket.ID,
+			ContentSize:     unreadableSize,
+			Checksum:        synaps3testutil.StorageChecksum("unreadable-checksum"),
+			RequestedCopies: 1,
+		})
+		if err != nil {
+			t.Fatalf("create unreadable content: %v", err)
+		}
 		if _, err := tb.repos.Objects.CreateVersionAndSetCurrent(ctx, &model.ObjectVersion{
 			VersionID:   versionID,
 			BucketID:    bucket.ID,
 			Key:         "file.txt",
-			Size:        int64(len(validTestObjectBody("unreadable"))),
+			ContentID:   &unreadableContent.ID,
+			Size:        unreadableSize,
 			ETag:        "unreadable-etag",
-			Checksum:    "unreadable-checksum",
 			ContentType: "text/plain",
-			CacheKey:    ".versions/" + versionID,
-			State:       model.ObjectStateCached,
 		}); err != nil {
 			t.Fatalf("create unreadable version: %v", err)
 		}
 		current := putValidTestObjectOutput(t, tb, bucket.Name, "file.txt", "current")
 
-		_, err := tb.backend.RestoreObjectVersion(ctx, bucket.Name, "file.txt", versionID, current.VersionID)
+		_, err = tb.backend.RestoreObjectVersion(ctx, bucket.Name, "file.txt", versionID, current.VersionID)
 		if err == nil {
 			t.Fatal("RestoreObjectVersion succeeded for unreadable source")
 		}
@@ -3202,7 +3198,18 @@ func TestRestoreObjectVersionRejectsUnavailableSources(t *testing.T) {
 		ctx := context.Background()
 		bucket := seedActiveBucket(t, tb, "restore-permanently-deleted")
 		seed := func(versionID, body string) {
-			info, err := tb.cache.Put(ctx, bucket.Name, ".versions/"+versionID, strings.NewReader(validTestObjectBody(body)))
+			payload := validTestObjectBody(body)
+			sum := sha256.Sum256([]byte(payload))
+			content, err := tb.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+				BucketID:        bucket.ID,
+				ContentSize:     int64(len(payload)),
+				Checksum:        hex.EncodeToString(sum[:]),
+				RequestedCopies: 1,
+			})
+			if err != nil {
+				t.Fatalf("ensure content: %v", err)
+			}
+			info, err := tb.cache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(payload))
 			if err != nil {
 				t.Fatalf("cache Put: %v", err)
 			}
@@ -3210,12 +3217,10 @@ func TestRestoreObjectVersionRejectsUnavailableSources(t *testing.T) {
 				VersionID:   versionID,
 				BucketID:    bucket.ID,
 				Key:         "file.txt",
+				ContentID:   &content.ID,
 				Size:        info.Size,
 				ETag:        info.ETag,
-				Checksum:    info.Checksum,
 				ContentType: "text/plain",
-				CacheKey:    ".versions/" + versionID,
-				State:       model.ObjectStateCached,
 			}); err != nil {
 				t.Fatalf("create version: %v", err)
 			}
@@ -3347,8 +3352,18 @@ func TestRestoreObjectVersionCASConflictCleansCommittedCache(t *testing.T) {
 	var usedAfterConcurrentWrite int64
 	changingCache.onGet = func() {
 		versionID := model.NewVersionID()
-		cacheKey := ".versions/" + versionID
-		info, err := baseCache.Put(ctx, bucket.Name, cacheKey, strings.NewReader(validTestObjectBody("concurrent")))
+		payload := validTestObjectBody("concurrent")
+		sum := sha256.Sum256([]byte(payload))
+		content, err := tb.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+			BucketID:        bucket.ID,
+			ContentSize:     int64(len(payload)),
+			Checksum:        hex.EncodeToString(sum[:]),
+			RequestedCopies: 1,
+		})
+		if err != nil {
+			t.Fatalf("ensure concurrent content: %v", err)
+		}
+		info, err := baseCache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(payload))
 		if err != nil {
 			t.Fatalf("cache concurrent version: %v", err)
 		}
@@ -3356,12 +3371,10 @@ func TestRestoreObjectVersionCASConflictCleansCommittedCache(t *testing.T) {
 			VersionID:   versionID,
 			BucketID:    bucket.ID,
 			Key:         "file.txt",
+			ContentID:   &content.ID,
 			Size:        info.Size,
 			ETag:        info.ETag,
-			Checksum:    info.Checksum,
 			ContentType: "text/plain",
-			CacheKey:    cacheKey,
-			State:       model.ObjectStateCached,
 		}); err != nil {
 			t.Fatalf("create concurrent version: %v", err)
 		}
@@ -3400,8 +3413,18 @@ func TestCopyObjectBindsImplicitCurrentReadToResolvedVersion(t *testing.T) {
 		ObjectRepository: baseObjects,
 		afterFirstRead: func() {
 			newVersionID := model.NewVersionID()
-			cacheKey := path.Join(".versions", newVersionID)
-			info, err := tb.cache.Put(ctx, "copy-implicit-race-src", cacheKey, strings.NewReader("new"))
+			sum := sha256.Sum256([]byte("new"))
+			content, err := tb.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+				BucketID:        srcBkt.ID,
+				ContentSize:     int64(len("new")),
+				Checksum:        hex.EncodeToString(sum[:]),
+				RequestedCopies: 1,
+			})
+			if err != nil {
+				hookErr = err
+				return
+			}
+			info, err := tb.cache.Put(ctx, "copy-implicit-race-src", model.ContentCacheKey(content.ID), strings.NewReader("new"))
 			if err != nil {
 				hookErr = err
 				return
@@ -3410,12 +3433,10 @@ func TestCopyObjectBindsImplicitCurrentReadToResolvedVersion(t *testing.T) {
 				VersionID:   newVersionID,
 				BucketID:    srcBkt.ID,
 				Key:         "original.txt",
+				ContentID:   &content.ID,
 				Size:        info.Size,
 				ETag:        info.ETag,
-				Checksum:    info.Checksum,
 				ContentType: "text/plain",
-				CacheKey:    cacheKey,
-				State:       model.ObjectStateCached,
 			})
 		},
 	}

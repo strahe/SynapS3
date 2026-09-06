@@ -26,18 +26,13 @@ const metadata: Record<string, SettingsFieldMetadata> = {
   'cache.eviction_policy': meta('Cache Eviction Policy'),
   'cache.lru_high_watermark_percent': meta('LRU High Watermark'),
   'cache.lru_low_watermark_percent': meta('LRU Low Watermark'),
-  'worker.upload.concurrency': meta('Upload Concurrency'),
-  'worker.upload.max_retries': meta('Upload Max Retries'),
-  'worker.upload.poll_interval': meta('Upload Poll Interval'),
-  'worker.provider_replacement.concurrency': meta('Provider Replacement Concurrency'),
-  'worker.provider_replacement.max_retries': meta('Provider Replacement Max Retries'),
-  'worker.provider_replacement.poll_interval': meta('Provider Replacement Poll Interval'),
-  'worker.evictor.concurrency': meta('Evictor Concurrency'),
-  'worker.evictor.max_retries': meta('Evictor Max Retries'),
-  'worker.evictor.poll_interval': meta('Evictor Poll Interval'),
-  'worker.storage_cleanup.concurrency': meta('Replica Cleanup Concurrency'),
-  'worker.storage_cleanup.max_retries': meta('Replica Cleanup Max Retries'),
-  'worker.storage_cleanup.poll_interval': meta('Replica Cleanup Poll Interval'),
+  'worker.tasks.concurrency': meta('Background Work Concurrency'),
+  'worker.tasks.poll_interval': meta('Background Work Poll Interval'),
+  'worker.tasks.lease_duration': meta('Recovery Lease Duration'),
+  'worker.tasks.max_retries': meta('Background Work Retry Limit'),
+  'worker.tasks.retention': meta('Finished Work Retention'),
+  'worker.tasks.provider_mutation_concurrency': meta('Remote Storage Concurrency'),
+  'worker.tasks.destructive_mutation_concurrency': meta('Remote Cleanup Concurrency'),
 }
 
 function meta(label: string): SettingsFieldMetadata {
@@ -65,6 +60,7 @@ function baseConfig(): SettingsEditableConfig {
       with_cdn: false,
       allow_private_networks: false,
       default_copies: 2,
+      observability: { interval: '5m0s', timeout: '5s', concurrency: 8 },
     },
     cache: {
       dir: '/var/lib/synaps3/cache',
@@ -74,25 +70,14 @@ function baseConfig(): SettingsEditableConfig {
       lru_low_watermark_percent: 80,
     },
     worker: {
-      upload: {
-        concurrency: 4,
+      tasks: {
+        concurrency: 12,
         poll_interval: '5s',
+        lease_duration: '5m0s',
         max_retries: 5,
-      },
-      provider_replacement: {
-        concurrency: 4,
-        poll_interval: '5s',
-        max_retries: 5,
-      },
-      evictor: {
-        concurrency: 2,
-        poll_interval: '1m',
-        max_retries: 3,
-      },
-      storage_cleanup: {
-        concurrency: 2,
-        poll_interval: '1m',
-        max_retries: 5,
+        retention: '168h0m0s',
+        provider_mutation_concurrency: 4,
+        destructive_mutation_concurrency: 2,
       },
     },
     logging: {
@@ -166,15 +151,13 @@ test('settings risk collection reports review-level infrastructure changes', () 
   next.cache.eviction_policy = 'after_upload'
   next.cache.lru_high_watermark_percent = 85
   next.cache.lru_low_watermark_percent = 70
-  next.worker.upload.concurrency = 8
-  next.worker.upload.max_retries = 7
-  next.worker.upload.poll_interval = '1s'
-  next.worker.provider_replacement.concurrency = 6
-  next.worker.provider_replacement.max_retries = 8
-  next.worker.provider_replacement.poll_interval = '2s'
-  next.worker.evictor.concurrency = 3
-  next.worker.evictor.max_retries = 4
-  next.worker.evictor.poll_interval = '30s'
+  next.worker.tasks.concurrency = 16
+  next.worker.tasks.poll_interval = '1s'
+  next.worker.tasks.lease_duration = '2m0s'
+  next.worker.tasks.max_retries = 7
+  next.worker.tasks.retention = '336h0m0s'
+  next.worker.tasks.provider_mutation_concurrency = 6
+  next.worker.tasks.destructive_mutation_concurrency = 3
 
   const changes = collectSettingsRiskChanges(initial, next, {}, metadata)
 
@@ -201,15 +184,13 @@ test('settings risk collection reports review-level infrastructure changes', () 
       ['cache.eviction_policy', 'Cache Eviction Policy', 'lru', 'after_upload', 'medium'],
       ['cache.lru_high_watermark_percent', 'LRU High Watermark', '90', '85', 'medium'],
       ['cache.lru_low_watermark_percent', 'LRU Low Watermark', '80', '70', 'medium'],
-      ['worker.upload.concurrency', 'Upload Concurrency', '4', '8', 'medium'],
-      ['worker.upload.poll_interval', 'Upload Poll Interval', '5s', '1s', 'medium'],
-      ['worker.upload.max_retries', 'Upload Max Retries', '5', '7', 'medium'],
-      ['worker.provider_replacement.concurrency', 'Provider Replacement Concurrency', '4', '6', 'medium'],
-      ['worker.provider_replacement.poll_interval', 'Provider Replacement Poll Interval', '5s', '2s', 'medium'],
-      ['worker.provider_replacement.max_retries', 'Provider Replacement Max Retries', '5', '8', 'medium'],
-      ['worker.evictor.concurrency', 'Evictor Concurrency', '2', '3', 'medium'],
-      ['worker.evictor.poll_interval', 'Evictor Poll Interval', '1m', '30s', 'medium'],
-      ['worker.evictor.max_retries', 'Evictor Max Retries', '3', '4', 'medium'],
+      ['worker.tasks.concurrency', 'Background Work Concurrency', '12', '16', 'medium'],
+      ['worker.tasks.poll_interval', 'Background Work Poll Interval', '5s', '1s', 'medium'],
+      ['worker.tasks.lease_duration', 'Recovery Lease Duration', '5m0s', '2m0s', 'medium'],
+      ['worker.tasks.max_retries', 'Background Work Retry Limit', '5', '7', 'medium'],
+      ['worker.tasks.retention', 'Finished Work Retention', '168h0m0s', '336h0m0s', 'medium'],
+      ['worker.tasks.provider_mutation_concurrency', 'Remote Storage Concurrency', '4', '6', 'medium'],
+      ['worker.tasks.destructive_mutation_concurrency', 'Remote Cleanup Concurrency', '2', '3', 'medium'],
     ]
   )
   assert.deepEqual([...new Set(changes.map(classifySettingsRisk))], ['review'])

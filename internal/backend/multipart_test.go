@@ -2,6 +2,7 @@ package backend_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -11,7 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	synaps3backend "github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/model"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
@@ -251,7 +251,7 @@ func TestUploadPartCopy_CopySourceVersionIDCopiesSpecifiedVersion(t *testing.T) 
 // ---------- CompleteMultipartUpload ----------
 
 func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
-	tb := newTestBackendWithOptions(t, synaps3backend.WithUploadMaxRetries(12))
+	tb := newTestBackend(t)
 	ctx := context.Background()
 	seedActiveBucket(t, tb, "cmp-bucket")
 
@@ -324,15 +324,15 @@ func TestCompleteMultipartUpload_HappyPath(t *testing.T) {
 	if obj.MultipartUploadID == nil || *obj.MultipartUploadID != uploadID {
 		t.Fatalf("object multipart_upload_id = %v, want %s", obj.MultipartUploadID, uploadID)
 	}
-	task, err := tb.repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+	task, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
 	if err != nil {
-		t.Fatalf("ClaimReady: %v", err)
+		t.Fatalf("ClaimNext: %v", err)
 	}
 	if task == nil {
 		t.Fatal("expected upload task")
 	}
-	if task.MaxRetries != 12 {
-		t.Fatalf("task MaxRetries = %d, want 12", task.MaxRetries)
+	if task.Type != model.TaskTypeUploadPlan || task.RetryLimit == nil || *task.RetryLimit != 5 {
+		t.Fatalf("task = %#v, want upload_plan with retry limit 5", task)
 	}
 }
 
@@ -374,9 +374,9 @@ func TestCompleteMultipartUploadRejectsFOCSizeBelowMinimum(t *testing.T) {
 func TestCompleteMultipartUploadRejectsFOCSizeAboveMaximum(t *testing.T) {
 	assembleCalled := false
 	mc := &synaps3testutil.MockCache{
-		AssemblePartsFunc: func(_ context.Context, _, _, _ string, _ []int) (*cache.ObjectInfo, []string, error) {
+		AssemblePartsFunc: func(_ context.Context, _, _, _ string, _ []int) (*cache.StagedObject, []string, error) {
 			assembleCalled = true
-			return &cache.ObjectInfo{Size: chain.MaxUploadSize + 1, ETag: strings.Repeat("a", 32), Checksum: "checksum"}, nil, nil
+			return nil, nil, errors.New("assemble must not run for an oversize object")
 		},
 	}
 	tb := newTestBackendWithMockCache(t, mc)
@@ -492,7 +492,7 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testi
 
 	taskCount, err := tb.db.NewSelect().
 		Model((*model.Task)(nil)).
-		Where("ref_type = ? AND ref_id = ?", "object", obj1.ObjectID).
+		Where("type = ?", model.TaskTypeUploadPlan).
 		Count(ctx)
 	if err != nil {
 		t.Fatalf("counting upload tasks: %v", err)
@@ -505,8 +505,10 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testi
 	if err != nil || secondVersion == nil {
 		t.Fatalf("second version: version=%v err=%v", secondVersion, err)
 	}
-	if secondVersion.State != model.ObjectStateUploading {
-		t.Fatalf("second version state = %s, want uploading", secondVersion.State)
+	// Both versions share one content whose ingest plan has not produced a copy
+	// yet, so the derived position is still cached.
+	if secondVersion.State != model.ObjectStateCached {
+		t.Fatalf("second version state = %s, want cached", secondVersion.State)
 	}
 }
 
@@ -572,7 +574,7 @@ func TestListMultipartUploads_HappyPath(t *testing.T) {
 	seedActiveBucket(t, tb, "lmu-bucket")
 
 	ct := "application/octet-stream"
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		_, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
 			Bucket:      aws.String("lmu-bucket"),
 			Key:         aws.String(fmt.Sprintf("file-%d.bin", i)),

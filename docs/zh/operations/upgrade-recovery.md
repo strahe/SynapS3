@@ -1,94 +1,84 @@
 ---
 title: 升级与恢复
-description: 安全升级 SynapS3，并从常见单机故障场景恢复。
+description: 安全切换到当前数据库基线，并在不重复外部效果的前提下恢复后台工作。
 ---
 
 # 升级与恢复
 
-SynapS3 是单机网关。升级或恢复时，先把本地持久化对象和元数据作为一个一致的数据集保护起来，再恢复后台任务。依赖失败时，先恢复依赖，再重试任务。
+当前 SynapS3 版本使用全新的数据库基线，不迁移也不接管旧数据库中的数据。切换时应按一次全新安装处理，并保留旧运行数据的只读副本。
 
-## 升级前
+## 必须执行的全新基线切换
+
+1. 停止新的 S3 流量，并停止所有旧 SynapS3 进程。
+2. 备份旧数据库，并在继续之前验证备份。
+3. 将旧数据库和旧缓存保留为只读数据；新版本不能使用这两个位置。
+4. 配置新的空数据库路径和新的空缓存目录。
+5. 启动新版本；验证健康状态、生效设置和任务处理后，再恢复流量。
+
+SQLite 在停止进程后创建一致性备份，并验证能够打开：
+
+```bash
+sqlite3 /old/path/synaps3.db ".backup '/backup/path/synaps3-pre-baseline.db'"
+sqlite3 -readonly /backup/path/synaps3-pre-baseline.db "PRAGMA integrity_check;"
+```
+
+完整性检查必须输出 `ok`。把备份、需要保留的 WAL/SHM 文件、旧缓存和匹配的配置作为同一恢复集保护。PostgreSQL 部署应使用 `pg_dump` 或部署批准的数据库快照，并单独验证该备份产物。
+
+新版本会拒绝包含旧 SynapS3 migration marker 或任意业务表的数据库，且不会删除或修改该数据库。旧的 `worker.upload`、`worker.provider_replacement`、`worker.evictor` 和 `worker.storage_cleanup` 配置段也会被拒绝，必须改为 `worker.tasks`。
+
+## 不会接管的内容
+
+全新安装不会接管旧的存储桶、对象、用户、存储数据集、piece、钱包操作、存储提供方替换记录或任务状态。重建本地数据库不会终止已经创建的远端付费存储服务。请保留经过验证的旧备份，后续人工核对并处理这些服务和记录。
+
+不要让新旧 SynapS3 同时使用同一数据库、缓存、钱包工作流或 S3 流量。新版本绝不能连接保留的旧数据库。
+
+## 验证新安装
 
 运行：
 
 ```bash
 curl http://127.0.0.1:9090/healthz
-synaps3 admin task stats
-synaps3 admin task list --status exhausted --limit 50
-```
-
-预期结果：`/healthz` 返回 `ok`，并且所有 exhausted 任务在升级前都有明确处理方式。
-
-升级前，先停止新的 S3 写入，但保持当前 SynapS3 进程运行，直到上传和存储提供方替换都已完成。如果新版本因仍有存储工作进行中而拒绝启动，请让旧版本继续使用未改动的数据库；必要时恢复对应存储提供方，等待工作完成后再重试升级。不要通过修改数据库绕过检查。
-
-如果某个副本仍保留着结果从未确认的存储确认记录（可能由此前中断的旧版本遗留），升级同样会被拒绝。提示信息会给出受影响的副本数量，并附带列出这些副本的查询语句，便于逐条向存储提供方确认该数据是否已经存储，再清除该记录。开发环境也可以直接使用全新数据库重新开始。
-
-创建备份前，停止 S3 流量，并使用当前部署方式的服务管理器停止 SynapS3。
-
-- SQLite 部署：归档完整运行数据卷，并验证归档和校验和。
-- PostgreSQL 部署：创建数据库原生备份，并归档同一时间点的配置和缓存数据。
-
-所有备份产物必须处于同一恢复时间点。准确的备份、校验和重启步骤见[运行数据](../configuration/runtime-data.md)。
-
-## 升级 SynapS3
-
-使用当前部署对应的安装方式替换可执行文件、软件包或容器镜像。Docker 专用命令见 [Docker 部署](../getting-started/docker.md)。
-
-使用当前部署方式的服务管理器启动 SynapS3，然后运行：
-
-```bash
-curl http://127.0.0.1:9090/healthz
 synaps3 admin settings get
 synaps3 admin task stats
 ```
 
-预期结果：`/healthz` 返回 `ok`，生效设置与部署一致，任务队列恢复推进，并且没有意外出现耗尽重试的任务。恢复正常流量前，通过 S3 API 读取一个已知对象。
+预期结果：健康状态为 `ok`，数据库与缓存均指向新位置，任务引擎正常报告活动。恢复正常流量前，创建测试存储桶，写入并读取测试对象，再确认其后台存储任务。
 
-## 运行流程
+## 运行时恢复
 
-```text
-接收写入 -> 保存对象 -> 记录元数据 -> 返回成功 -> 继续后台存储
+切换完成后，所有未完成工作由统一任务引擎处理，持久状态只有 `pending`、`running`、`completed`、`failed` 和 `cancelled`。
+
+- 中断的 running 任务会在 lease 过期后被接管，并强制从恢复模式开始。
+- 恢复过程会先检查 checkpoint 和领域证据，再决定能否发起新的外部效果。
+- 只有 API 标记为可重试的失败任务才能重试；重试始终从恢复模式开始。
+- 存储提供方替换仍在存储桶的 Data Sets 页面恢复。
+- 钱包任务不能从 Tasks 重试。广播结果不确定时，钱包记录会保留 unknown 结果，不会盲目重播。
+- 无法证明存储提供方结果的确认会出现在 `synaps3 admin storage-confirmation list`，等待显式核对。
+
+常用命令：
+
+```bash
+synaps3 admin task list --status failed --limit 100
+synaps3 admin task stats
+synaps3 admin task retry 42
+synaps3 admin task acknowledge 42
+synaps3 admin storage-confirmation list
+synaps3 admin settings get
 ```
 
-- 写入会先提交到本地缓存和元数据，再上传到存储提供方。
-- 存储任务失败后会重试，达到配置的重试上限后进入 `exhausted`。
-- `GetObject` 优先从缓存读取；已有远端元数据时，可以从存储提供方取回对象。
-- 删除存储桶不受支持并返回 `501`；删除对象会让对象从 S3 视图中消失，后续清理会安全继续。
+重试前先恢复失败的依赖。不要手工编辑任务行、清空 checkpoint 或缩短 lease。
 
 ## 恢复矩阵
 
 | 场景 | 恢复方式 |
 | --- | --- |
-| 已建立的存储提供方在首次存储期间暂时不可用 | 恢复原存储提供方。其他已分配且可写的副本会继续处理；未完成副本会等待且不消耗重试次数，并在恢复后自动继续。SynapS3 不会选择替代存储提供方。 |
-| 后台存储任务无法连接存储提供方 | 恢复连接，然后重试 exhausted 存储任务。 |
-| RPC 节点故障 | 恢复 RPC 连接，然后重试 exhausted 任务。 |
-| 私有存储提供方 URL 被阻止 | 默认保持阻止；只在可信私有部署中开启 `filecoin.allow_private_networks`。 |
-| 数据库空间不足 | 释放空间或扩容数据库。 |
-| 缓存磁盘空间不足 | 扩容磁盘、提高 `cache.max_size_gb`，或恢复上传和淘汰进度。 |
-| 存储提供方永久不可用，或需要计划性迁离 | 打开该存储桶，选择 **Details**，然后到 **Storage** → **Data Sets** 替换存储提供方。新存储提供方就绪后，新上传会切过去。已有对象从其他副本或本地缓存复制；两者都没有的对象无法复制，旧存储提供方也不会被关闭。所选目标已被占用时，请改选存储提供方，而不是重试。 |
-| 进程崩溃 | 重启服务，再检查健康状态和任务统计。大多数未完成的存储工作会自动恢复，不会重复提交同一个 piece。无法安全判定结果的工作会出现在 `synaps3 admin storage-confirmation list` 中；采取操作前先核对列出的存储提供方和 transaction 信息。对于已记录的服务关闭交易，SynapS3 会先检查交易状态，再决定是否再次提交。 |
+| 存储提供方或 RPC 暂时不可用 | 恢复连接。等待中的工作会自动继续；只重试标记为可重试的失败任务。 |
+| 数据库空间不足 | 停止流量，释放空间或扩容数据库，再检查健康状态。 |
+| 缓存磁盘空间不足 | 扩容磁盘、提高 `cache.max_size_gb`，或恢复远端存储与缓存清理进度。 |
+| 需要迁离存储提供方 | 打开存储桶并使用 **Details** → **Storage** → **Data Sets**。不要从 Tasks 重试替换。 |
+| 进程崩溃 | 重启 SynapS3。过期 claim 会在不改变任务身份的前提下恢复；核对仍然不确定的存储确认或钱包结果。 |
+| 全新基线启动报告数据库不兼容 | 停止进程，确认配置 DSN 指向预期的新空数据库，并保持报告的旧数据库不变。 |
 
-副本完成存储后，如果存储提供方变为不可用，不一定会产生可重试任务。使用存储健康视图识别受影响副本；恢复目标副本数属于[计划支持的副本修复](../concepts/filecoin-storage-flow.md#计划支持的副本修复)。
+## 备份新安装
 
-## 恢复或回退
-
-1. 停止 S3 流量和 SynapS3。
-2. 验证归档校验和，并选择同一恢复时间点的数据库和缓存产物。
-3. SQLite 恢复完整运行数据卷；PostgreSQL 先恢复数据库原生备份，再恢复匹配的配置和缓存数据。
-4. 回退应用版本时，只让旧版本使用与其兼容的数据。如果无法确认兼容性，恢复升级前的完整恢复时间点。
-5. 启动 SynapS3，再检查 `/healthz`、生效设置、任务统计、耗尽重试的任务、钱包就绪状态，并通过 S3 读取一个已知对象。
-
-这些检查通过前，不要恢复正常流量。
-
-常用命令：
-
-```bash
-synaps3 admin task list --status exhausted --limit 100
-synaps3 admin task stats
-synaps3 admin task retry 42
-synaps3 admin storage-confirmation list
-synaps3 admin s3-user list
-synaps3 admin settings get
-```
-
-修改恢复相关设置后，重启 SynapS3，并同时检查 `/healthz` 和 `synaps3 admin settings get`。
+切换完成后，后续备份仍需把配置、数据库和缓存视为同一恢复时间点。创建文件系统备份前停止 SynapS3；或者使用数据库原生一致性快照，并与缓存恢复点协调。当前布局和验证步骤见[运行数据](../configuration/runtime-data.md)。

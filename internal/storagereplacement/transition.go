@@ -96,18 +96,3 @@ func PhaseFor(status Status) Phase {
 		return PhaseNone
 	}
 }
-
-// OnTaskExhausted maps a status to the state a terminally exhausted coordinator
-// task leaves behind. Retirement goes to operator attention rather than failed
-// because its remaining work is a cleanup decision, not a retryable copy.
-// The second return value reports whether any change is warranted.
-func OnTaskExhausted(status Status) (Status, bool) {
-	switch status {
-	case StatusPreparingTarget, StatusMigrating, StatusWaiting:
-		return StatusFailed, true
-	case StatusRetiring:
-		return StatusCleanupAttention, true
-	default:
-		return status, false
-	}
-}

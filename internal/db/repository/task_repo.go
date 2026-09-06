@@ -3,854 +3,579 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 )
 
-// BunTaskRepo implements TaskRepository using Bun ORM.
+const claimExpiredTaskSQLiteSQL = `UPDATE tasks
+SET status = 'running',
+    resume_mode = 'recover',
+    claim_generation = claim_generation + 1,
+    claimed_at = ?,
+    lease_until = ?,
+    started_at = COALESCE(started_at, ?),
+    finished_at = NULL,
+    updated_at = ?
+WHERE id = (
+    SELECT id
+    FROM tasks
+    WHERE status = 'running' AND lease_until <= ?
+    ORDER BY lease_until, id
+    LIMIT 1
+)
+AND status = 'running' AND lease_until <= ?
+RETURNING *`
+
+const claimPendingTaskSQLiteSQL = `UPDATE tasks
+SET status = 'running',
+    claim_generation = claim_generation + 1,
+    claimed_at = ?,
+    lease_until = ?,
+    started_at = COALESCE(started_at, ?),
+    finished_at = NULL,
+    updated_at = ?
+WHERE id = (
+    SELECT id
+    FROM tasks
+    WHERE status = 'pending' AND available_at <= ?
+    ORDER BY available_at, id
+    LIMIT 1
+)
+AND status = 'pending' AND available_at <= ?
+RETURNING *`
+
+const claimExpiredTaskPostgresSQL = `UPDATE tasks
+SET status = 'running',
+    resume_mode = 'recover',
+    claim_generation = claim_generation + 1,
+    claimed_at = ?,
+    lease_until = ?,
+    started_at = COALESCE(started_at, ?),
+    finished_at = NULL,
+    updated_at = ?
+WHERE id = (
+    SELECT id
+    FROM tasks
+    WHERE status = 'running' AND lease_until <= ?
+    ORDER BY lease_until, id
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+AND status = 'running' AND lease_until <= ?
+RETURNING *`
+
+const claimPendingTaskPostgresSQL = `UPDATE tasks
+SET status = 'running',
+    claim_generation = claim_generation + 1,
+    claimed_at = ?,
+    lease_until = ?,
+    started_at = COALESCE(started_at, ?),
+    finished_at = NULL,
+    updated_at = ?
+WHERE id = (
+    SELECT id
+    FROM tasks
+    WHERE status = 'pending' AND available_at <= ?
+    ORDER BY available_at, id
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+AND status = 'pending' AND available_at <= ?
+RETURNING *`
+
+// BunTaskRepo is the persistence boundary used by TaskService and Engine.
 type BunTaskRepo struct {
 	db bun.IDB
 }
 
 var _ TaskRepository = (*BunTaskRepo)(nil)
 
-const claimReadySQL = `UPDATE tasks
-		 SET status = ?, claimed_at = ?, lease_until = ?, started_at = ?,
-		     last_error = NULL, wait_reason = NULL, status_message = NULL
-		 WHERE id = (
-		     SELECT id FROM tasks
-		     WHERE type = ?
-		       AND status IN ('queued', 'scheduled', 'waiting')
-		       AND scheduled_at <= ?
-		     ORDER BY scheduled_at ASC, id ASC
-		     LIMIT 1
-		 )
-		 AND status IN ('queued', 'scheduled', 'waiting')
-		 RETURNING *`
+func (r *BunTaskRepo) Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error) {
+	if task == nil || task.Type == "" || task.IdempotencyKey == "" || task.InputVersion < 1 || len(task.Input) == 0 || task.InputHash == "" {
+		return nil, false, fmt.Errorf("task identity and canonical input are required: %w", ErrInvalidInput)
+	}
+	if task.Status == "" {
+		task.Status = model.TaskStatusPending
+	}
+	if task.ResumeMode == "" {
+		task.ResumeMode = model.TaskResumeModeExecute
+	}
+	if task.AvailableAt.IsZero() {
+		task.AvailableAt = time.Now()
+	}
 
-func (r *BunTaskRepo) Create(ctx context.Context, task *model.Task) error {
-	if task != nil && task.Status == "" {
-		task.Status = model.TaskStatusQueued
-	}
-	normalizeTaskStage(task)
-	_, err := r.db.NewInsert().Model(task).Exec(ctx)
-	if err != nil {
-		if isUniqueViolation(err) {
-			return fmt.Errorf("inserting task %q: %w", task.IdempotencyKey, ErrAlreadyExists)
+	inserted := false
+	if err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		result, err := db.NewInsert().
+			Model(task).
+			On("CONFLICT (type, idempotency_key) DO NOTHING").
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("enqueuing task %s/%s: %w", task.Type, task.IdempotencyKey, err)
 		}
-		return fmt.Errorf("inserting task: %w", err)
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return nil
+		}
+		inserted = true
+		payload := &model.TaskPayload{TaskID: task.ID, Input: task.Input, Checkpoint: task.Checkpoint}
+		if _, err := db.NewInsert().Model(payload).Exec(ctx); err != nil {
+			return fmt.Errorf("enqueuing task %s/%s payload: %w", task.Type, task.IdempotencyKey, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, false, err
 	}
+	if inserted {
+		return task, true, nil
+	}
+	existing, err := r.GetByIdentity(ctx, task.Type, task.IdempotencyKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing == nil {
+		return nil, false, fmt.Errorf("loading task after identity conflict: %w", ErrNotFound)
+	}
+	return existing, false, nil
+}
+
+// withTaskPayload projects the JSON a task carries from the row that holds it.
+func withTaskPayload(q *bun.SelectQuery) *bun.SelectQuery {
+	return q.
+		ColumnExpr("task.*").
+		ColumnExpr("task_payload.input_json AS input").
+		ColumnExpr("task_payload.checkpoint_json AS checkpoint").
+		Join("JOIN task_payloads AS task_payload ON task_payload.task_id = task.id")
+}
+
+// loadTaskPayload fills in the JSON for a task read without the join, such as
+// one returned by the claim statement.
+func loadTaskPayload(ctx context.Context, db bun.IDB, task *model.Task) error {
+	payload := new(model.TaskPayload)
+	if err := db.NewSelect().Model(payload).Where("task_id = ?", task.ID).Scan(ctx); err != nil {
+		return fmt.Errorf("selecting task %d payload: %w", task.ID, err)
+	}
+	task.Input = payload.Input
+	task.Checkpoint = payload.Checkpoint
 	return nil
 }
 
-func (r *BunTaskRepo) EnsureRecurring(ctx context.Context, task *model.Task) (bool, error) {
-	// Automatic recurrence never revives work that gave up. Exhausted and failed
-	// coordinators wait for an operator, who resumes them through ResumeCoordinator.
-	return r.ensureRecurringTask(ctx, task, model.TaskStatusCompleted)
-}
-
-// ResumeCoordinator restarts a singleton coordinator on an operator's request.
-// It differs from EnsureRecurring in exactly one way: it also revives a task
-// that exhausted its retries or failed outright, which is the state the
-// dedicated replacement retry exists to recover from. Without it the retry
-// would move the replacement back into a working status with nothing queued to
-// do the work, and the record would never leave it.
-func (r *BunTaskRepo) ResumeCoordinator(ctx context.Context, task *model.Task) (bool, error) {
-	if task != nil && !storagereplacement.IsCoordinatorTask(task.Type, task.Stage) {
-		return false, fmt.Errorf("resuming a task that is not a coordinator: %w", ErrInvalidInput)
-	}
-	return r.ensureRecurringTask(ctx, task, model.TaskStatusCompleted, model.TaskStatusExhausted, model.TaskStatusFailed)
-}
-
-func (r *BunTaskRepo) ensureRecurringTask(ctx context.Context, task *model.Task, revivable ...model.TaskStatus) (bool, error) {
-	if task == nil || task.IdempotencyKey == "" || task.Type == "" || task.RefType == "" {
-		return false, fmt.Errorf("recurring task identity is required: %w", ErrInvalidInput)
-	}
-	if task.Status == "" {
-		task.Status = model.TaskStatusQueued
-	}
-	requestedMaxRetries := task.MaxRetries
-	normalizeTaskStage(task)
-	created := false
-	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		existing, err := loadAndLockTaskByIdempotencyKey(ctx, db, task.IdempotencyKey)
-		if err == sql.ErrNoRows {
-			res, err := db.NewInsert().
-				Model(task).
-				On("CONFLICT (idempotency_key) DO NOTHING").
-				Exec(ctx)
-			if err != nil {
-				return fmt.Errorf("inserting recurring task: %w", err)
-			}
-			rows, _ := res.RowsAffected()
-			created = rows == 1
-			if created && requestedMaxRetries == 0 {
-				// Bun otherwise substitutes the SQL default for this zero-valued field.
-				if _, err := db.NewUpdate().
-					Model((*model.Task)(nil)).
-					Set("max_retries = ?", requestedMaxRetries).
-					Where("id = ?", task.ID).
-					Exec(ctx); err != nil {
-					return fmt.Errorf("preserving recurring task zero retries: %w", err)
-				}
-				task.MaxRetries = 0
-			}
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("loading recurring task: %w", err)
-		}
-		if !slices.Contains(revivable, existing.Status) {
-			return nil
-		}
-		now := time.Now()
-		res, err := db.NewUpdate().
-			Model((*model.Task)(nil)).
-			Set("stage = ?", task.Stage).
-			Set("ref_type = ?", task.RefType).
-			Set("ref_id = ?", task.RefID).
-			Set("ref_version_id = ?", task.RefVersionID).
-			Set("payload = ?", task.Payload).
-			Set("status = ?", model.TaskStatusQueued).
-			Set("retry_count = 0").
-			Set("max_retries = ?", task.MaxRetries).
-			Set("last_error = NULL").
-			Set("status_message = NULL").
-			Set("wait_reason = NULL").
-			Set("scheduled_at = ?", now).
-			Set("claimed_at = NULL").
-			Set("lease_until = NULL").
-			Set("started_at = NULL").
-			Set("completed_at = NULL").
-			Where("id = ? AND status = ?", existing.ID, existing.Status).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("reactivating recurring task: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		created = rows == 1
-		return nil
-	})
-	return created, err
-}
-
-func loadAndLockTaskByIdempotencyKey(ctx context.Context, db bun.IDB, idempotencyKey string) (*model.Task, error) {
+func (r *BunTaskRepo) GetByID(ctx context.Context, id int64) (*model.Task, error) {
 	task := new(model.Task)
-	err := db.NewRaw(`UPDATE tasks
-		SET status = status
-		WHERE idempotency_key = ?
-		RETURNING *`, idempotencyKey).Scan(ctx, task)
+	err := withTaskPayload(r.db.NewSelect().Model(task)).Where("task.id = ?", id).Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
+		return nil, fmt.Errorf("selecting task %d: %w", id, err)
+	}
+	return task, nil
+}
+
+func (r *BunTaskRepo) GetByIdentity(ctx context.Context, taskType model.TaskType, key string) (*model.Task, error) {
+	task := new(model.Task)
+	err := withTaskPayload(r.db.NewSelect().Model(task)).
+		Where("task.type = ? AND task.idempotency_key = ?", taskType, key).
+		Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("selecting task %s/%s: %w", taskType, key, err)
+	}
+	return task, nil
+}
+
+func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error) {
+	if leaseDuration <= 0 {
+		return nil, fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
+	}
+	if r.db.Dialect().Name() != dialect.PG {
+		return r.claimNextSQLite(ctx, r.db, leaseDuration)
+	}
+	db, ok := r.db.(*bun.DB)
+	if !ok {
+		return r.claimNextPostgres(ctx, r.db, leaseDuration)
+	}
+	var claimed *model.Task
+	err := db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		var err error
+		claimed, err = r.claimNextPostgres(ctx, tx, leaseDuration)
+		return err
+	})
+	return claimed, err
+}
+
+func (r *BunTaskRepo) claimNextPostgres(ctx context.Context, db bun.IDB, leaseDuration time.Duration) (*model.Task, error) {
+	return claimNextTask(ctx, db, leaseDuration, claimExpiredTaskPostgresSQL, claimPendingTaskPostgresSQL)
+}
+
+func (r *BunTaskRepo) claimNextSQLite(ctx context.Context, db bun.IDB, leaseDuration time.Duration) (*model.Task, error) {
+	return claimNextTask(ctx, db, leaseDuration, claimExpiredTaskSQLiteSQL, claimPendingTaskSQLiteSQL)
+}
+
+func claimNextTask(
+	ctx context.Context,
+	db bun.IDB,
+	leaseDuration time.Duration,
+	recoverySQL string,
+	pendingSQL string,
+) (*model.Task, error) {
+	now := time.Now()
+	leaseUntil := now.Add(leaseDuration)
+	task, err := claimTaskWithSQL(ctx, db, recoverySQL, now, leaseUntil)
+	if err != nil || task != nil {
+		return task, err
+	}
+	return claimTaskWithSQL(ctx, db, pendingSQL, now, leaseUntil)
+}
+
+func claimTaskWithSQL(ctx context.Context, db bun.IDB, query string, now, leaseUntil time.Time) (*model.Task, error) {
+	task := new(model.Task)
+	err := db.NewRaw(query, now, leaseUntil, now, now, now, now).Scan(ctx, task)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claiming next task: %w", err)
+	}
+	if err := loadTaskPayload(ctx, db, task); err != nil {
 		return nil, err
 	}
 	return task, nil
 }
 
-func normalizeTaskStage(task *model.Task) {
-	if task == nil || task.Stage != nil || task.Type != model.TaskTypeUpload {
-		return
-	}
-	stage, _ := task.Payload["stage"].(string)
-	if stage == "" {
-		stage = "prepare_upload"
-	}
-	task.Stage = &stage
-}
-
-func (r *BunTaskRepo) GetByID(ctx context.Context, id int64) (*model.Task, error) {
-	task := new(model.Task)
-	err := r.db.NewSelect().
-		Model(task).
-		Where("id = ?", id).
-		Scan(ctx)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("selecting task by id: %w", err)
-	}
-	return task, nil
-}
-
-func (r *BunTaskRepo) GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*model.Task, error) {
-	task := new(model.Task)
-	err := r.db.NewSelect().
-		Model(task).
-		Where("idempotency_key = ?", idempotencyKey).
-		Scan(ctx)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("selecting task by idempotency key: %w", err)
-	}
-	return task, nil
-}
-
-func (r *BunTaskRepo) HasActiveByIdempotencyKey(ctx context.Context, idempotencyKey string) (bool, error) {
-	count, err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Where("idempotency_key = ?", idempotencyKey).
-		Where("status IN (?)", bun.List(activeTaskStatuses())).
-		Count(ctx)
-	if err != nil {
-		return false, fmt.Errorf("checking active task by idempotency key: %w", err)
-	}
-	return count > 0, nil
-}
-
-func (r *BunTaskRepo) HasEarlierRunningUploadCopyTask(ctx context.Context, claimedTask *model.Task, uploadID int64, copyIndex int) (bool, error) {
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return false, err
-	}
-	uploadIDExpr, copyIndexExpr := runningUploadCopyTaskPayloadExpressions(r.db.Dialect().Name())
-	exists, err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Where("type = ?", model.TaskTypeUpload).
-		Where("status = ?", model.TaskStatusRunning).
-		Where(uploadIDExpr+" = ?", uploadID).
-		Where(copyIndexExpr+" = ?", copyIndex).
-		Where("(claimed_at < ? OR (claimed_at = ? AND id < ?))", claimedAt, claimedAt, taskID).
-		Exists(ctx)
-	if err != nil {
-		return false, fmt.Errorf("checking earlier running upload copy task: %w", err)
-	}
-	return exists, nil
-}
-
-// HasEarlierRunningUploadCopyClaim checks upload precedence for a replacement item.
-func (r *BunTaskRepo) HasEarlierRunningUploadCopyClaim(
-	ctx context.Context,
-	claimedAt time.Time,
-	uploadID int64,
-	copyIndex int,
-) (bool, error) {
-	if claimedAt.IsZero() || uploadID <= 0 || copyIndex < 0 {
-		return false, fmt.Errorf("checking earlier upload copy claim: %w", ErrInvalidInput)
-	}
-	uploadIDExpr, copyIndexExpr := runningUploadCopyTaskPayloadExpressions(r.db.Dialect().Name())
-	exists, err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Where("type = ?", model.TaskTypeUpload).
-		Where("status = ?", model.TaskStatusRunning).
-		Where(uploadIDExpr+" = ?", uploadID).
-		Where(copyIndexExpr+" = ?", copyIndex).
-		Where("claimed_at <= ?", claimedAt).
-		Exists(ctx)
-	if err != nil {
-		return false, fmt.Errorf("checking earlier upload copy claim: %w", err)
-	}
-	return exists, nil
-}
-
-func runningUploadCopyTaskPayloadExpressions(dialectName dialect.Name) (string, string) {
-	if dialectName == dialect.PG {
-		return "CAST(payload ->> 'upload_id' AS BIGINT)", "CAST(payload ->> 'copy_index' AS INTEGER)"
-	}
-	return "CAST(json_extract(payload, '$.upload_id') AS INTEGER)", "CAST(json_extract(payload, '$.copy_index') AS INTEGER)"
-}
-
-// ClaimReady atomically claims one ready task of the given type.
-// Uses a SQLite-safe atomic UPDATE (no SELECT FOR UPDATE).
-// Returns nil, nil if no task is ready.
-func (r *BunTaskRepo) ClaimReady(ctx context.Context, taskType model.TaskType, leaseDuration time.Duration) (*model.Task, error) {
+func (r *BunTaskRepo) RenewLease(ctx context.Context, id, generation int64, leaseDuration time.Duration) (time.Time, error) {
 	now := time.Now()
-	leaseUntil := now.Add(leaseDuration)
-
-	task := new(model.Task)
-	// Atomic claim: UPDATE ... WHERE id = (subquery) RETURNING *
-	// The scheduled_at filter ensures future retry/wait tasks are not claimed prematurely.
-	err := r.db.NewRaw(
-		claimReadySQL,
-		model.TaskStatusRunning, now, leaseUntil, now,
-		taskType,
-		now,
-	).Scan(ctx, task)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("claiming ready task: %w", err)
-	}
-	return task, nil
-}
-
-func (r *BunTaskRepo) RenewLease(ctx context.Context, claimedTask *model.Task, leaseDuration time.Duration) error {
-	if leaseDuration < 0 {
-		leaseDuration = 0
-	}
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	res, err := r.db.NewUpdate().
+	until := now.Add(leaseDuration)
+	result, err := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
-		Set("lease_until = ?", now.Add(leaseDuration)).
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
+		Set("lease_until = ?", until).
+		Set("updated_at = ?", now).
+		Where("id = ? AND status = ?", id, model.TaskStatusRunning).
+		Where("claim_generation = ?", generation).
+		Where("lease_until > ?", now).
 		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("renewing task lease: %w", err)
+		return time.Time{}, fmt.Errorf("renewing task %d lease: %w", id, err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("renewing task %d lease: not in active running claim", taskID)
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return time.Time{}, ErrTaskLeaseLost
 	}
-	return nil
+	return until, nil
 }
 
-// Complete marks a running task as completed.
-func (r *BunTaskRepo) Complete(ctx context.Context, claimedTask *model.Task) error {
-	return r.complete(ctx, claimedTask, "")
-}
-
-func (r *BunTaskRepo) CompleteWithMessage(ctx context.Context, claimedTask *model.Task, message string) error {
-	return r.complete(ctx, claimedTask, message)
-}
-
-func (r *BunTaskRepo) complete(ctx context.Context, claimedTask *model.Task, message string) error {
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
+func (r *BunTaskRepo) WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint []byte) error {
+	if len(checkpoint) == 0 {
+		return fmt.Errorf("checkpoint is required: %w", ErrInvalidInput)
 	}
 	now := time.Now()
-	q := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusCompleted).
-		Set("completed_at = ?", now).
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now)
-	if message == "" {
-		q = q.Set("status_message = NULL")
-	} else {
-		q = q.Set("status_message = ?", message)
-	}
-	res, err := q.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("completing task: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("completing task %d: not in active running claim", taskID)
-	}
-	return nil
-}
-
-// FailRunning marks a running task as failed without scheduling automatic retry.
-func (r *BunTaskRepo) FailRunning(ctx context.Context, claimedTask *model.Task, lastError string) error {
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusFailed).
-		Set("last_error = ?", lastError).
-		Set("status_message = NULL").
-		Set("wait_reason = NULL").
-		Set("completed_at = ?", now).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failing task: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("failing task %d: not in active running claim", taskID)
-	}
-	return nil
-}
-
-func (r *BunTaskRepo) ScheduleRetryRunning(ctx context.Context, claimedTask *model.Task, lastError string, backoff time.Duration) (model.TaskStatus, error) {
-	if backoff < 0 {
-		backoff = 0
-	}
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return "", err
-	}
-
-	var nextStatus model.TaskStatus
-	err = r.runMaybeTx(ctx, func(db bun.IDB) error {
-		now := time.Now()
-		task, err := loadRunningTaskClaim(ctx, db, taskID, claimedAt, now)
-		if err != nil {
-			return err
-		}
-
-		nextRetryCount := task.RetryCount + 1
-		nextStatus = retryStatusForTask(task)
-		completedAt := (*time.Time)(nil)
-		scheduledAt := now.Add(backoff)
-		if nextStatus == model.TaskStatusExhausted {
-			completedAt = &now
-			scheduledAt = now
-		}
-
-		q := db.NewUpdate().
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		result, err := db.NewUpdate().
 			Model((*model.Task)(nil)).
-			Set("status = ?", nextStatus).
-			Set("retry_count = ?", nextRetryCount).
-			Set("last_error = ?", lastError).
-			Set("status_message = NULL").
-			Set("wait_reason = NULL").
-			Set("scheduled_at = ?", scheduledAt).
-			Set("claimed_at = NULL").
-			Set("lease_until = NULL").
-			Set("started_at = NULL").
-			Set("completed_at = ?", completedAt).
-			Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-			Where("claimed_at = ?", claimedAt).
-			Where("lease_until IS NOT NULL AND lease_until > ?", now)
-		res, err := q.Exec(ctx)
+			Set("resume_mode = ?", model.TaskResumeModeRecover).
+			Set("updated_at = ?", now).
+			Where("id = ? AND status = ?", id, model.TaskStatusRunning).
+			Where("claim_generation = ?", generation).
+			Where("lease_until > ?", now).
+			Exec(ctx)
 		if err != nil {
-			return fmt.Errorf("scheduling task retry: %w", err)
+			return fmt.Errorf("writing task %d checkpoint: %w", id, err)
 		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
-			return fmt.Errorf("scheduling retry for task %d: not in same running claim", taskID)
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return ErrTaskLeaseLost
+		}
+		if _, err := db.NewUpdate().
+			Model((*model.TaskPayload)(nil)).
+			Set("checkpoint_json = ?", checkpoint).
+			Where("task_id = ?", id).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("writing task %d checkpoint: %w", id, err)
 		}
 		return nil
 	})
-	if err != nil {
-		return "", err
-	}
-	return nextStatus, nil
 }
 
-func loadRunningTaskClaim(ctx context.Context, db bun.IDB, taskID int64, claimedAt time.Time, now time.Time) (*model.Task, error) {
-	task := new(model.Task)
-	if err := db.NewSelect().
-		Model(task).
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
-		Scan(ctx); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("loading running task claim %d: not in active running claim", taskID)
-		}
-		return nil, fmt.Errorf("loading running task claim: %w", err)
-	}
-	return task, nil
-}
-
-func runningTaskClaim(task *model.Task) (int64, time.Time, error) {
-	if task == nil || task.ID == 0 || task.ClaimedAt == nil {
-		return 0, time.Time{}, fmt.Errorf("running task claim is required: %w", ErrInvalidInput)
-	}
-	return task.ID, *task.ClaimedAt, nil
-}
-
-func retryStatusForTask(task *model.Task) model.TaskStatus {
-	if task.RetryCount+1 >= task.MaxRetries {
-		return model.TaskStatusExhausted
-	}
-	return model.TaskStatusScheduled
-}
-
-func (r *BunTaskRepo) WaitRunning(ctx context.Context, claimedTask *model.Task, reason model.TaskWaitReason, message string, delay time.Duration) error {
-	if delay < 0 {
-		delay = 0
-	}
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
-	}
+func (r *BunTaskRepo) ValidateClaim(ctx context.Context, id, generation int64) error {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusWaiting).
-		Set("last_error = NULL").
-		Set("wait_reason = ?", reason).
-		Set("status_message = ?", message).
-		Set("scheduled_at = ?", now.Add(delay)).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("waiting running task: %w", err)
+	var found int64
+	err := r.db.NewRaw(`UPDATE tasks
+		SET updated_at = updated_at
+		WHERE id = ? AND status = 'running' AND claim_generation = ? AND lease_until > ?
+		RETURNING id`, id, generation, now).Scan(ctx, &found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrTaskLeaseLost
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("waiting task %d: not in active running claim", taskID)
+	if err != nil {
+		return fmt.Errorf("validating task %d claim: %w", id, err)
 	}
 	return nil
 }
 
-func (r *BunTaskRepo) LockRunningClaim(ctx context.Context, claimedTask *model.Task) error {
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
+func (r *BunTaskRepo) Settle(ctx context.Context, id, generation int64, transition TaskTransition) error {
+	if !validTaskTransition(transition) {
+		return fmt.Errorf("invalid task transition: %w", ErrInvalidInput)
 	}
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	query := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
-		Set("status = status").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("locking running task claim: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("locking task %d: not in active running claim", taskID)
-	}
-	return nil
-}
-
-func (r *BunTaskRepo) ContinueRunning(ctx context.Context, claimedTask *model.Task, refVersionID string, payload map[string]interface{}) error {
-	if payload == nil {
-		return fmt.Errorf("continuation payload is required: %w", ErrInvalidInput)
-	}
-	// An object coordinator must keep naming the version it is working on. A
-	// bucket-scoped coordinator legitimately has none between items.
-	if refVersionID == "" && claimedTask != nil && claimedTask.RefType == "object" {
-		return fmt.Errorf("continuation version is required: %w", ErrInvalidInput)
-	}
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("ref_version_id = COALESCE(NULLIF(?, ''), ref_version_id)", refVersionID).
-		Set("payload = ?", payload).
-		Set("status = ?", model.TaskStatusQueued).
-		Set("retry_count = 0").
-		Set("last_error = NULL").
-		Set("status_message = NULL").
-		Set("wait_reason = NULL").
-		Set("scheduled_at = ?", now).
+		Set("status = ?", transition.Status).
+		Set("wait_reason = ?", transition.WaitReason).
+		Set("failure_reason = ?", transition.FailureReason).
+		Set("last_error = ?", transition.LastError).
+		Set("status_message = ?", transition.StatusMessage).
 		Set("claimed_at = NULL").
 		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Set("completed_at = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("continuing running task: %w", err)
+		Set("updated_at = ?", now).
+		Where("id = ? AND status = ?", id, model.TaskStatusRunning).
+		Where("claim_generation = ?", generation).
+		Where("lease_until > ?", now)
+	if transition.IncrementRetry {
+		query = query.Set("retry_count = retry_count + 1")
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("continuing task %d: not in active running claim", taskID)
-	}
-	return nil
-}
-
-func (r *BunTaskRepo) ReleaseRunning(ctx context.Context, claimedTask *model.Task) error {
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	res, err := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusQueued).
-		Set("scheduled_at = ?", now).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("status_message = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("releasing running task: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("releasing task %d: not in active running claim", taskID)
-	}
-	return nil
-}
-
-func (r *BunTaskRepo) CancelRunning(ctx context.Context, claimedTask *model.Task, message string) error {
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	q := r.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusCancelled).
-		Set("completed_at = ?", now).
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now)
-	if message == "" {
-		q = q.Set("status_message = NULL")
+	if transition.Status == model.TaskStatusPending {
+		query = query.
+			Set("resume_mode = CASE WHEN cancellation_requested_at IS NOT NULL THEN ? ELSE ? END", model.TaskResumeModeRecover, transition.ResumeMode).
+			Set("available_at = CASE WHEN cancellation_requested_at IS NOT NULL THEN ? ELSE ? END", now, transition.AvailableAt).
+			Set("finished_at = NULL").
+			Set("retention_until = NULL").
+			Set("acknowledged_at = NULL")
 	} else {
-		q = q.Set("status_message = ?", message)
+		query = query.
+			Set("resume_mode = ?", transition.ResumeMode).
+			Set("finished_at = ?", now).
+			Set("retention_until = ?", transition.RetentionUntil)
 	}
-	res, err := q.Exec(ctx)
+	result, err := query.Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("cancelling running task: %w", err)
+		return fmt.Errorf("settling task %d: %w", id, err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("cancelling task %d: not in active running claim", taskID)
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return ErrTaskLeaseLost
 	}
 	return nil
 }
 
-// ReleaseExpiredLeases resets running tasks whose lease has expired back to queued.
-func (r *BunTaskRepo) ReleaseExpiredLeases(ctx context.Context) (int, error) {
+func validTaskTransition(transition TaskTransition) bool {
+	switch transition.Status {
+	case model.TaskStatusPending:
+		return !transition.AvailableAt.IsZero() &&
+			(transition.ResumeMode == model.TaskResumeModeExecute || transition.ResumeMode == model.TaskResumeModeRecover) &&
+			transition.RetentionUntil == nil
+	case model.TaskStatusCompleted, model.TaskStatusCancelled:
+		return transition.RetentionUntil != nil
+	case model.TaskStatusFailed:
+		return transition.RetentionUntil == nil
+	default:
+		return false
+	}
+}
+
+func (r *BunTaskRepo) ShortenLease(ctx context.Context, id, generation int64, duration time.Duration) error {
+	if duration <= 0 {
+		return fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
+	}
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	result, err := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusQueued).
-		Set("scheduled_at = ?", now).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("status_message = NULL").
-		Where("status = ? AND (lease_until IS NULL OR lease_until < ?)", model.TaskStatusRunning, now).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Set("lease_until = ?", now.Add(duration)).
+		Set("updated_at = ?", now).
+		Where("id = ? AND status = ?", id, model.TaskStatusRunning).
+		Where("claim_generation = ?", generation).
+		Where("lease_until > ?", now).
 		Exec(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("releasing expired leases: %w", err)
+		return fmt.Errorf("shortening task %d lease: %w", id, err)
 	}
-	rows, _ := res.RowsAffected()
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return ErrTaskLeaseLost
+	}
+	return nil
+}
+
+func (r *BunTaskRepo) WakePending(ctx context.Context, ids []int64) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	for _, id := range ids {
+		if id < 1 {
+			return 0, fmt.Errorf("task IDs must be positive: %w", ErrInvalidInput)
+		}
+	}
+	now := time.Now()
+	result, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("available_at = ?", now).
+		Set("updated_at = ?", now).
+		Where("id IN (?)", bun.List(ids)).
+		Where("status = ?", model.TaskStatusPending).
+		Where("available_at > ?", now).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("waking pending tasks: %w", err)
+	}
+	rows, _ := result.RowsAffected()
 	return int(rows), nil
 }
 
-// MarkRunningExhausted marks a running task as exhausted.
-func (r *BunTaskRepo) MarkRunningExhausted(ctx context.Context, claimedTask *model.Task, lastError string) error {
-	taskID, claimedAt, err := runningTaskClaim(claimedTask)
-	if err != nil {
-		return err
-	}
+func (r *BunTaskRepo) RequestCancellation(ctx context.Context, id int64, reason string) error {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	result, err := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusExhausted).
-		Set("last_error = ?", lastError).
-		Set("status_message = NULL").
-		Set("wait_reason = NULL").
-		Set("retry_count = retry_count + 1").
-		Set("completed_at = ?", now).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Where("id = ? AND status = ?", taskID, model.TaskStatusRunning).
-		Where("claimed_at = ?", claimedAt).
-		Where("lease_until IS NOT NULL AND lease_until > ?", now).
+		Set("cancellation_requested_at = COALESCE(cancellation_requested_at, ?)", now).
+		Set("cancellation_reason = COALESCE(cancellation_reason, ?)", nullableText(reason)).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Set("available_at = CASE WHEN status = ? THEN ? ELSE available_at END", model.TaskStatusPending, now).
+		Set("updated_at = ?", now).
+		Where("id = ? AND status IN (?, ?)", id, model.TaskStatusPending, model.TaskStatusRunning).
 		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("marking task exhausted: %w", err)
+		return fmt.Errorf("requesting cancellation for task %d: %w", id, err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("marking task %d exhausted: not in active running claim", taskID)
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-// ListExhausted returns exhausted tasks, ordered by most recent first.
-func (r *BunTaskRepo) ListExhausted(ctx context.Context, limit int) ([]model.Task, error) {
-	var tasks []model.Task
-	q := r.db.NewSelect().
-		Model(&tasks).
-		Where("status = ?", model.TaskStatusExhausted).
-		OrderExpr("COALESCE(completed_at, started_at, scheduled_at) DESC")
-	if limit > 0 {
-		q = q.Limit(limit)
-	}
-	err := q.Scan(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing exhausted tasks: %w", err)
-	}
-	return tasks, nil
-}
-
-func (r *BunTaskRepo) RetryExhausted(ctx context.Context, taskID int64) error {
-	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		task := new(model.Task)
-		err := db.NewSelect().
-			Model(task).
-			Where("id = ? AND status = ?", taskID, model.TaskStatusExhausted).
-			Scan(ctx)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return fmt.Errorf("retrying exhausted task %d: %w", taskID, ErrNotFound)
-			}
-			return fmt.Errorf("loading exhausted task: %w", err)
-		}
-
-		// Replacement work carries state the generic queue knows nothing about,
-		// so it must resume through the dedicated replacement action instead.
-		if storagereplacement.IsCoordinatorTask(task.Type, task.Stage) {
-			return ErrReplacementRetryUnsupported
-		}
-
-		now := time.Now()
-		if err := resetFailedObjectForTaskRetry(ctx, db, task, now); err != nil {
-			return err
-		}
-
-		res, err := db.NewUpdate().
-			Model((*model.Task)(nil)).
-			Set("status = ?", model.TaskStatusQueued).
-			Set("retry_count = 0").
-			Set("scheduled_at = ?", now).
-			Set("claimed_at = NULL").
-			Set("lease_until = NULL").
-			Set("started_at = NULL").
-			Set("completed_at = NULL").
-			Set("last_error = NULL").
-			Set("wait_reason = NULL").
-			Set("status_message = NULL").
-			Where("id = ? AND status = ?", taskID, model.TaskStatusExhausted).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("retrying exhausted task: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
-			return fmt.Errorf("retrying exhausted task %d: %w", taskID, ErrNotFound)
-		}
-		return nil
-	})
-}
-
-func resetFailedObjectForTaskRetry(ctx context.Context, db bun.IDB, task *model.Task, now time.Time) error {
-	if task.Type != model.TaskTypeUpload || task.RefType != "object" || task.RefVersionID == "" {
-		return nil
-	}
-
-	target := retryObjectState(task)
-	uploadID := int64(0)
-	if target == model.ObjectStateReplicating {
-		uploadID = taskPayloadInt64(task.Payload, "upload_id")
-		if uploadID > 0 {
-			if _, err := lockStorageUploadForObjectState(ctx, db, uploadID, target); err != nil {
-				return fmt.Errorf("locking storage upload for task retry: %w", err)
-			}
-		}
-	}
-	q := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("state = ?", target).
-		Set("failed_at_state = NULL").
+func (r *BunTaskRepo) RetryFailed(ctx context.Context, id int64) error {
+	now := time.Now()
+	result, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusPending).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Set("available_at = ?", now).
+		Set("retry_count = 0").
+		Set("failure_reason = NULL").
 		Set("last_error = NULL").
+		Set("status_message = NULL").
+		Set("wait_reason = NULL").
+		Set("finished_at = NULL").
+		Set("acknowledged_at = NULL").
+		Set("retention_until = NULL").
 		Set("updated_at = ?", now).
-		Where("version_id = ? AND state = ?", task.RefVersionID, model.ObjectStateFailed)
-	if uploadID > 0 {
-		q = q.Set("storage_upload_id = ?", uploadID)
+		Where("id = ? AND status = ?", id, model.TaskStatusFailed).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("retrying task %d: %w", id, err)
 	}
-	if _, err := q.Exec(ctx); err != nil {
-		return fmt.Errorf("resetting failed object for task retry: %w", err)
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-func retryObjectState(task *model.Task) model.ObjectState {
-	stage := ""
-	if task.Stage != nil {
-		stage = *task.Stage
+func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error {
+	if retention <= 0 {
+		return fmt.Errorf("retention must be positive: %w", ErrInvalidInput)
 	}
-	if stage == "" {
-		stage, _ = task.Payload["stage"].(string)
+	now := time.Now()
+	result, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("acknowledged_at = COALESCE(acknowledged_at, ?)", now).
+		Set("retention_until = COALESCE(retention_until, ?)", now.Add(retention)).
+		Set("updated_at = ?", now).
+		Where("id = ? AND status = ?", id, model.TaskStatusFailed).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("acknowledging task %d: %w", id, err)
 	}
-	switch stage {
-	case "ingress_commit":
-		return model.ObjectStateCommitting
-	case "peer_pull", "peer_commit":
-		return model.ObjectStateReplicating
-	case "ensure_dataset":
-		if taskPayloadString(task.Payload, "transfer_method") == string(model.StorageCopyTransferMethodPeerPull) {
-			return model.ObjectStateReplicating
-		}
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return ErrNotFound
 	}
-	return model.ObjectStateUploading
+	return nil
 }
 
-func taskPayloadInt64(payload map[string]interface{}, key string) int64 {
-	if payload == nil {
-		return 0
+func (r *BunTaskRepo) DeleteRetained(ctx context.Context, now time.Time, limit int) (int, error) {
+	if now.IsZero() || limit < 1 {
+		return 0, fmt.Errorf("deleting retained tasks: %w", ErrInvalidInput)
 	}
-	raw, ok := payload[key]
-	if !ok {
-		return 0
+	if limit > 1000 {
+		limit = 1000
 	}
-	switch v := raw.(type) {
-	case int:
-		return int64(v)
-	case int64:
-		return v
-	case float64:
-		return int64(v)
+	var ids []int64
+	err := r.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Column("id").
+		Where("retention_until IS NOT NULL AND retention_until <= ?", now).
+		Where(`NOT EXISTS (SELECT 1 FROM object_cache WHERE cache_active_task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM buckets WHERE durability_task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM storage_contents WHERE cleanup_task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM storage_copies WHERE active_task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM storage_data_sets WHERE ensure_task_id = task.id OR retirement_task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM wallet_operations WHERE task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM storage_replacements WHERE task_id = task.id)`).
+		OrderExpr("retention_until, id").
+		Limit(limit).
+		Scan(ctx, &ids)
+	if err != nil {
+		return 0, fmt.Errorf("selecting retained tasks: %w", err)
 	}
-	return 0
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result, err := r.db.NewDelete().
+		Model((*model.Task)(nil)).
+		Where("id IN (?)", bun.List(ids)).
+		Where("retention_until IS NOT NULL AND retention_until <= ?", now).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("deleting retained tasks: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	return int(rows), nil
 }
 
-func taskPayloadString(payload map[string]interface{}, key string) string {
-	if payload == nil {
-		return ""
+func (r *BunTaskRepo) List(ctx context.Context, filter TaskListFilter) (TaskPage, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 50
 	}
-	raw, ok := payload[key]
-	if !ok {
-		return ""
+	var tasks []model.Task
+	query := withTaskPayload(r.db.NewSelect().Model(&tasks)).
+		OrderExpr("task.id DESC").
+		Limit(limit + 1)
+	if filter.Type != "" {
+		query = query.Where("task.type = ?", filter.Type)
 	}
-	value, _ := raw.(string)
-	return value
+	if filter.Status != "" {
+		query = query.Where("task.status = ?", filter.Status)
+	}
+	if filter.HideHealthyRecurringSystem {
+		query = query.Where("(task.type NOT IN (?) OR task.status = ?)", bun.List(model.RecurringSystemTaskTypes()), model.TaskStatusFailed)
+	}
+	if filter.BeforeID > 0 {
+		query = query.Where("task.id < ?", filter.BeforeID)
+	}
+	if err := query.Scan(ctx); err != nil {
+		return TaskPage{}, fmt.Errorf("listing tasks: %w", err)
+	}
+	page := TaskPage{Tasks: tasks}
+	if len(page.Tasks) > limit {
+		page.Tasks = page.Tasks[:limit]
+		page.NextBeforeID = page.Tasks[len(page.Tasks)-1].ID
+	}
+	return page, nil
 }
 
-func (r *BunTaskRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) error {
-	if db, ok := r.db.(*bun.DB); ok {
-		return db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-			return fn(tx)
-		})
-	}
-	return fn(r.db)
-}
-
-// CountByStatus returns task counts grouped by type and status.
 func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, error) {
 	var counts []TaskStatusCount
 	err := r.db.NewSelect().
-		TableExpr("tasks").
-		ColumnExpr("type, status, COUNT(*) AS count").
-		GroupExpr("type, status").
+		Model((*model.Task)(nil)).
+		Column("type", "status").
+		ColumnExpr("COUNT(*) AS count").
+		Group("type", "status").
 		Scan(ctx, &counts)
 	if err != nil {
 		return nil, fmt.Errorf("counting tasks by status: %w", err)
@@ -858,134 +583,64 @@ func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, err
 	return counts, nil
 }
 
+func (r *BunTaskRepo) CountUnacknowledgedFailed(ctx context.Context) (int64, error) {
+	count, err := r.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("status = ?", model.TaskStatusFailed).
+		Where("acknowledged_at IS NULL").
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting unacknowledged failed tasks: %w", err)
+	}
+	return int64(count), nil
+}
+
 func (r *BunTaskRepo) CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error) {
 	var counts []TaskPipelineCount
-	err := r.db.NewRaw(`SELECT pipeline, status, COUNT(*) AS count
-		FROM (
-			SELECT
-				CASE
-					WHEN type = ? AND (stage IS NULL OR stage = '' OR stage IN (?, ?)) THEN 'prepare'
-					WHEN type = ? AND stage = ? THEN 'upload'
-					WHEN type = ? AND stage = ? THEN 'commit'
-					WHEN type = ? AND stage IN (?, ?) THEN 'sync'
-					WHEN type = ? THEN 'evict'
-					WHEN type = ? THEN 'cleanup'
-					ELSE ''
-				END AS pipeline,
-				status
-			FROM tasks
-			WHERE status IN (?)
-		) AS active_tasks
-		WHERE pipeline <> ''
-		GROUP BY pipeline, status`,
-		model.TaskTypeUpload,
-		"prepare_upload",
-		"ensure_dataset",
-		model.TaskTypeUpload,
-		"ingress_store",
-		model.TaskTypeUpload,
-		"ingress_commit",
-		model.TaskTypeUpload,
-		"peer_pull",
-		"peer_commit",
-		model.TaskTypeEvictCache,
-		model.TaskTypeStorageCleanup,
-		bun.List(activeTaskStatuses()),
-	).Scan(ctx, &counts)
+	err := r.db.NewSelect().
+		Model((*model.Task)(nil)).
+		ColumnExpr("type AS pipeline").
+		Column("status").
+		ColumnExpr("COUNT(*) AS count").
+		Where("status IN (?, ?)", model.TaskStatusPending, model.TaskStatusRunning).
+		Where("type NOT IN (?)", bun.List(model.RecurringSystemTaskTypes())).
+		Group("type", "status").
+		Scan(ctx, &counts)
 	if err != nil {
-		return nil, fmt.Errorf("counting overview active task pipeline: %w", err)
+		return nil, fmt.Errorf("counting active task pipeline: %w", err)
 	}
 	return counts, nil
 }
 
-func activeTaskStatuses() []model.TaskStatus {
-	return append(unclaimedTaskStatuses(), model.TaskStatusRunning)
-}
-
-func unclaimedTaskStatuses() []model.TaskStatus {
-	return []model.TaskStatus{
-		model.TaskStatusQueued,
-		model.TaskStatusScheduled,
-		model.TaskStatusWaiting,
-	}
-}
-
 func (r *BunTaskRepo) CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error) {
-	count, err := r.db.NewSelect().
-		TableExpr("tasks AS t").
-		Join("JOIN objects AS o ON o.id = t.ref_id").
-		Where("t.ref_type = ?", "object").
-		Where("o.bucket_id = ?", bucketID).
-		Where("t.status IN (?)", bun.List(activeTaskStatuses())).
-		Count(ctx)
+	var count int64
+	err := r.db.NewRaw(`SELECT COUNT(*)
+		FROM tasks AS t
+		JOIN object_versions AS ov ON ov.version_id = t.subject_key
+		WHERE t.subject_type = 'object_version'
+		  AND t.status IN ('pending', 'running')
+		  AND ov.bucket_id = ?`, bucketID).Scan(ctx, &count)
 	if err != nil {
 		return 0, fmt.Errorf("counting active object tasks by bucket: %w", err)
 	}
-	return int64(count), nil
+	return count, nil
 }
 
 func (r *BunTaskRepo) CountActiveBucketTasksByBucketID(ctx context.Context, bucketID int64) (int64, error) {
 	count, err := r.db.NewSelect().
-		TableExpr("tasks").
-		Where("ref_type = ?", "bucket").
-		Where("ref_id = ?", bucketID).
-		Where("status IN (?)", bun.List(activeTaskStatuses())).
+		Model((*model.Task)(nil)).
+		Where("subject_type = 'bucket' AND subject_key = ?", fmt.Sprint(bucketID)).
+		Where("status IN (?, ?)", model.TaskStatusPending, model.TaskStatusRunning).
 		Count(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("counting active bucket tasks by bucket ID: %w", err)
+		return 0, fmt.Errorf("counting active bucket tasks: %w", err)
 	}
 	return int64(count), nil
 }
 
-// List returns tasks with optional type/stage/status filters, paginated by offset/limit.
-func (r *BunTaskRepo) List(ctx context.Context, taskType string, stage string, status string, limit, offset int) ([]model.Task, int, error) {
-	applyFilters := func(q *bun.SelectQuery) *bun.SelectQuery {
-		if taskType != "" {
-			q = q.Where("type = ?", taskType)
-		}
-		if stage != "" {
-			q = q.Where("stage = ?", stage)
-		}
-		if status != "" {
-			q = q.Where("status = ?", status)
-		}
-		return q
+func nullableText(value string) any {
+	if value == "" {
+		return nil
 	}
-
-	total, err := applyFilters(r.db.NewSelect().Model((*model.Task)(nil))).Count(ctx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("counting tasks: %w", err)
-	}
-	var tasks []model.Task
-	err = applyFilters(r.db.NewSelect().Model(&tasks)).OrderExpr("id DESC").Limit(limit).Offset(offset).Scan(ctx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("listing tasks: %w", err)
-	}
-	return tasks, total, nil
-}
-
-func (r *BunTaskRepo) CompleteByRef(ctx context.Context, refType string, refID int64, taskType model.TaskType) error {
-	now := time.Now()
-	res, err := r.db.NewUpdate().Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusCompleted).
-		Set("completed_at = ?", now).
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("status_message = NULL").
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Where("ref_type = ?", refType).
-		Where("ref_id = ?", refID).
-		Where("type = ?", taskType).
-		Where("status IN (?)", bun.List(activeTaskStatuses())).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("completing tasks by ref: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("no matching %s task for %s/%d: %w", taskType, refType, refID, ErrNotFound)
-	}
-	return nil
+	return value
 }

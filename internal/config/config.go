@@ -86,16 +86,17 @@ type CacheConfig struct {
 }
 
 type WorkerConfig struct {
-	Upload              WorkerPoolConfig `koanf:"upload"`
-	ProviderReplacement WorkerPoolConfig `koanf:"provider_replacement"`
-	Evictor             WorkerPoolConfig `koanf:"evictor"`
-	StorageCleanup      WorkerPoolConfig `koanf:"storage_cleanup"`
+	Tasks TaskWorkerConfig `koanf:"tasks"`
 }
 
-type WorkerPoolConfig struct {
-	Concurrency  int           `koanf:"concurrency"`
-	PollInterval time.Duration `koanf:"poll_interval"`
-	MaxRetries   int           `koanf:"max_retries"`
+type TaskWorkerConfig struct {
+	Concurrency                    int           `koanf:"concurrency"`
+	PollInterval                   time.Duration `koanf:"poll_interval"`
+	LeaseDuration                  time.Duration `koanf:"lease_duration"`
+	MaxRetries                     int           `koanf:"max_retries"`
+	Retention                      time.Duration `koanf:"retention"`
+	ProviderMutationConcurrency    int           `koanf:"provider_mutation_concurrency"`
+	DestructiveMutationConcurrency int           `koanf:"destructive_mutation_concurrency"`
 }
 
 type LoggingConfig struct {
@@ -187,25 +188,14 @@ func defaultConfig() *Config {
 			LRULowWatermarkPercent:  80,
 		},
 		Worker: WorkerConfig{
-			Upload: WorkerPoolConfig{
-				Concurrency:  4,
-				PollInterval: 5 * time.Second,
-				MaxRetries:   5,
-			},
-			ProviderReplacement: WorkerPoolConfig{
-				Concurrency:  4,
-				PollInterval: 5 * time.Second,
-				MaxRetries:   5,
-			},
-			Evictor: WorkerPoolConfig{
-				Concurrency:  2,
-				PollInterval: time.Minute,
-				MaxRetries:   3,
-			},
-			StorageCleanup: WorkerPoolConfig{
-				Concurrency:  2,
-				PollInterval: time.Minute,
-				MaxRetries:   5,
+			Tasks: TaskWorkerConfig{
+				Concurrency:                    12,
+				PollInterval:                   5 * time.Second,
+				LeaseDuration:                  5 * time.Minute,
+				MaxRetries:                     5,
+				Retention:                      7 * 24 * time.Hour,
+				ProviderMutationConcurrency:    4,
+				DestructiveMutationConcurrency: 2,
 			},
 		},
 		Logging: LoggingConfig{
@@ -324,6 +314,16 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 
 	if err := k.Unmarshal("", cfg); err != nil {
 		return nil, PersistedFieldPresence{}, fmt.Errorf("unmarshalling config: %w", err)
+	}
+	for _, legacy := range []string{
+		"worker.upload",
+		"worker.provider_replacement",
+		"worker.evictor",
+		"worker.storage_cleanup",
+	} {
+		if k.Exists(legacy) {
+			return nil, PersistedFieldPresence{}, fmt.Errorf("configuration key %q is no longer supported; configure worker.tasks instead", legacy)
+		}
 	}
 	cfg.Normalize()
 	if applyRuntimeDefaults {
@@ -491,22 +491,32 @@ func (c *Config) FieldValidationErrors() []FieldError {
 		add("s3.region", "must be non-empty")
 	}
 
-	// Worker pools.
-	validatePool := func(name string, p WorkerPoolConfig) {
-		if p.Concurrency < 1 {
-			add(fmt.Sprintf("worker.%s.concurrency", name), fmt.Sprintf("must be >= 1, got %d", p.Concurrency))
-		}
-		if p.PollInterval <= 0 {
-			add(fmt.Sprintf("worker.%s.poll_interval", name), fmt.Sprintf("must be > 0, got %s", p.PollInterval))
-		}
-		if p.MaxRetries < 0 {
-			add(fmt.Sprintf("worker.%s.max_retries", name), fmt.Sprintf("must be >= 0, got %d", p.MaxRetries))
-		}
+	// Universal task engine.
+	tasks := c.Worker.Tasks
+	if tasks.Concurrency < 1 {
+		add("worker.tasks.concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.Concurrency))
 	}
-	validatePool("upload", c.Worker.Upload)
-	validatePool("provider_replacement", c.Worker.ProviderReplacement)
-	validatePool("evictor", c.Worker.Evictor)
-	validatePool("storage_cleanup", c.Worker.StorageCleanup)
+	if tasks.PollInterval <= 0 {
+		add("worker.tasks.poll_interval", fmt.Sprintf("must be > 0, got %s", tasks.PollInterval))
+	}
+	if tasks.LeaseDuration <= 0 {
+		add("worker.tasks.lease_duration", fmt.Sprintf("must be > 0, got %s", tasks.LeaseDuration))
+	}
+	if tasks.LeaseDuration <= tasks.PollInterval {
+		add("worker.tasks.lease_duration", "must be greater than worker.tasks.poll_interval")
+	}
+	if tasks.MaxRetries < 0 {
+		add("worker.tasks.max_retries", fmt.Sprintf("must be >= 0, got %d", tasks.MaxRetries))
+	}
+	if tasks.Retention <= 0 {
+		add("worker.tasks.retention", fmt.Sprintf("must be > 0, got %s", tasks.Retention))
+	}
+	if tasks.ProviderMutationConcurrency < 1 {
+		add("worker.tasks.provider_mutation_concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.ProviderMutationConcurrency))
+	}
+	if tasks.DestructiveMutationConcurrency < 1 {
+		add("worker.tasks.destructive_mutation_concurrency", fmt.Sprintf("must be >= 1, got %d", tasks.DestructiveMutationConcurrency))
+	}
 
 	// Logging.
 	switch c.Logging.Level {

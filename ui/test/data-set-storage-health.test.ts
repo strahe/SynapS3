@@ -69,7 +69,7 @@ test('data set storage health details include non-ready local state', () => {
   assert.deepEqual(
     dataSetStorageHealthDetailParts(
       dataSet({
-        status: 'unavailable',
+        status: 'failed',
         storage_health: {
           status: 'unavailable',
           reason_codes: ['chain_data_set_missing'],
@@ -78,7 +78,7 @@ test('data set storage health details include non-ready local state', () => {
         },
       })
     ),
-    ['chain data set missing', 'local state: unavailable', 'just now']
+    ['chain data set missing', 'local state: failed', 'just now']
   )
 })
 

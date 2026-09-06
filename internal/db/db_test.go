@@ -1,8 +1,10 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,6 +79,92 @@ func TestForceUnlockMigrationsClearsALockLeftByAKilledRun(t *testing.T) {
 	}
 }
 
+func TestForceUnlockMigrationsRejectsLegacyDatabaseWithoutModification(t *testing.T) {
+	cfg := config.DatabaseConfig{
+		Driver: "sqlite", DSN: "file:" + filepath.Join(t.TempDir(), "legacy-force-unlock.db"),
+		MaxOpenConns: 1, MaxIdleConns: 1,
+	}
+	database, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if _, err := database.ExecContext(t.Context(), `CREATE TABLE legacy_tasks (id INTEGER PRIMARY KEY, status TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := database.ExecContext(t.Context(), `INSERT INTO legacy_tasks (id, status) VALUES (1, 'running')`); err != nil {
+		t.Fatalf("seed legacy table: %v", err)
+	}
+
+	err = ForceUnlockMigrations(t.Context(), database)
+	if !errors.Is(err, migrations.ErrIncompatibleDatabase) {
+		t.Fatalf("ForceUnlockMigrations() error = %v, want incompatible database", err)
+	}
+	var status string
+	if err := database.NewRaw(`SELECT status FROM legacy_tasks WHERE id = 1`).Scan(t.Context(), &status); err != nil {
+		t.Fatalf("read legacy row: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("legacy row status = %q, want unchanged", status)
+	}
+	var migrationTables int
+	if err := database.NewRaw(`SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name LIKE 'bun_migration%'`).Scan(t.Context(), &migrationTables); err != nil {
+		t.Fatalf("count migration tables: %v", err)
+	}
+	if migrationTables != 0 {
+		t.Fatalf("force unlock created %d migration metadata tables in legacy database", migrationTables)
+	}
+}
+
+func TestNewRejectsLegacySQLiteBeforeApplyingPersistentPragmas(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "preserved-legacy.db")
+	legacy, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite database: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE legacy_tasks (id INTEGER PRIMARY KEY, status TEXT NOT NULL)`); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create legacy task table: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO legacy_tasks (id, status) VALUES (1, 'running')`); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("seed legacy task: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy sqlite database: %v", err)
+	}
+	before, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("read legacy sqlite database before preflight: %v", err)
+	}
+
+	database, err := New(config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.ToSlash(databasePath) + "?_pragma=journal_mode(WAL)",
+		MaxOpenConns: 2,
+		MaxIdleConns: 2,
+	})
+	if database != nil {
+		_ = database.Close()
+		t.Fatal("New returned a connection for an incompatible database")
+	}
+	if !errors.Is(err, migrations.ErrIncompatibleDatabase) {
+		t.Fatalf("New error = %v, want incompatible database", err)
+	}
+	after, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("read legacy sqlite database after preflight: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("legacy sqlite database changed during compatibility preflight")
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, statErr := os.Stat(databasePath + suffix); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("legacy sqlite sidecar %s exists after rejection: %v", suffix, statErr)
+		}
+	}
+}
+
 func TestRunMigrationsSerializesConcurrentRunnersAndUnlocksAfterCancellation(t *testing.T) {
 	cfg := config.DatabaseConfig{
 		Driver:       "sqlite",
@@ -143,20 +231,15 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	}
 
 	repos := repository.NewRepositories(db)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		versionID := fmt.Sprintf("01J00000000000000000%06d", i+1)
 		task := &model.Task{
-			Type:           model.TaskTypeUpload,
-			RefType:        "object",
-			RefID:          int64(i + 1),
-			RefVersionID:   versionID,
-			IdempotencyKey: fmt.Sprintf("upload:%s", versionID),
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     3,
-			ScheduledAt:    time.Now(),
+			Type: model.TaskTypeUploadPlan, IdempotencyKey: fmt.Sprintf("upload-plan:%s", versionID),
+			InputVersion: 1, Input: []byte(fmt.Sprintf(`{"version_id":%q}`, versionID)), InputHash: versionID,
+			Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
 		}
-		if err := repos.Tasks.Create(ctx, task); err != nil {
-			t.Fatalf("Create() error = %v", err)
+		if _, created, err := repos.Tasks.Enqueue(ctx, task); err != nil || !created {
+			t.Fatalf("Enqueue() created=%t error=%v", created, err)
 		}
 	}
 
@@ -164,17 +247,15 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	var claimedCount atomic.Int64
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
-				task, err := repos.Tasks.ClaimReady(ctx, model.TaskTypeUpload, time.Minute)
+				task, err := repos.Tasks.ClaimNext(ctx, time.Minute)
 				if err != nil {
 					if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
 						busyCount.Add(1)
 						return
 					}
-					t.Errorf("ClaimReady() unexpected error = %v", err)
+					t.Errorf("ClaimNext() unexpected error = %v", err)
 					return
 				}
 				if task == nil {
@@ -182,7 +263,7 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 				}
 				claimedCount.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -198,26 +279,39 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	db := newMigratedSQLiteDB(t, "schema.db")
 
 	objectColumns := sqliteColumns(t, db, "objects")
-	for _, column := range []string{"current_version_id", "size", "e_tag", "checksum", "cache_key", "in_cache", "in_filecoin", "state"} {
+	for _, column := range []string{"size", "e_tag", "checksum", "cache_key", "in_cache", "in_filecoin", "state"} {
 		if objectColumns[column] {
 			t.Fatalf("objects.%s should not exist", column)
 		}
 	}
-	for _, column := range []string{"bucket_id", "key"} {
+	// "Current" is one pointer on the object, not a flag repeated per version.
+	for _, column := range []string{"bucket_id", "key", "current_version_id"} {
 		if !objectColumns[column] {
 			t.Fatalf("objects.%s should exist", column)
 		}
 	}
 
 	versionColumns := sqliteColumns(t, db, "object_versions")
-	for _, column := range []string{"is_current", "in_cache", "storage_upload_id", "multipart_upload_id", "cache_accessed_at"} {
+	for _, column := range []string{"content_id", "multipart_upload_id"} {
 		if !versionColumns[column] {
 			t.Fatalf("object_versions.%s should exist", column)
 		}
 	}
-	for _, column := range []string{"piece_cid", "retrieval_url", "in_filecoin"} {
+	// Bytes, durability and cache residency belong to the content and its cache
+	// entry; a version that carried them would be a second authority for facts
+	// those rows already own.
+	for _, column := range []string{
+		"piece_cid", "retrieval_url", "in_filecoin", "checksum", "state",
+		"in_cache", "cache_accessed_at", "cache_key", "is_current",
+	} {
 		if versionColumns[column] {
 			t.Fatalf("object_versions.%s should not exist", column)
+		}
+	}
+	cacheColumns := sqliteColumns(t, db, "object_cache")
+	for _, column := range []string{"content_id", "in_cache", "cache_accessed_at", "cache_active_task_id"} {
+		if !cacheColumns[column] {
+			t.Fatalf("object_cache.%s should exist", column)
 		}
 	}
 
@@ -226,14 +320,14 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 		t.Fatal("buckets.proof_set_id should not exist")
 	}
 
-	for _, table := range []string{"storage_uploads", "storage_data_sets", "storage_upload_copies", "storage_upload_failures"} {
+	for _, table := range []string{"storage_contents", "storage_data_sets", "storage_copies"} {
 		if columns := sqliteColumns(t, db, table); len(columns) == 0 {
 			t.Fatalf("%s table should exist", table)
 		}
 	}
-	copyColumns := sqliteColumns(t, db, "storage_upload_copies")
-	if !copyColumns["is_new_data_set"] {
-		t.Fatal("storage_upload_copies.is_new_data_set should exist")
+	copyColumns := sqliteColumns(t, db, "storage_copies")
+	if copyColumns["is_new_data_set"] {
+		t.Fatal("storage_copies.is_new_data_set should not exist")
 	}
 	partColumns := sqliteColumns(t, db, "multipart_parts")
 	if !partColumns["checksum"] {
@@ -245,14 +339,12 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 		t.Fatal("idx_objects_bucket_key should exist")
 	}
 	versionIndexes := sqliteIndexes(t, db, "object_versions")
-	if !versionIndexes["idx_object_versions_current_unique"] {
-		t.Fatal("idx_object_versions_current_unique should exist")
+	objectIndexes := sqliteIndexes(t, db, "objects")
+	if !objectIndexes["idx_objects_current_version"] {
+		t.Fatal("idx_objects_current_version should exist")
 	}
-	if !versionIndexes["idx_object_versions_current_bucket_key"] {
-		t.Fatal("idx_object_versions_current_bucket_key should exist")
-	}
-	if !versionIndexes["idx_object_versions_storage_upload"] {
-		t.Fatal("idx_object_versions_storage_upload should exist")
+	if !versionIndexes["idx_object_versions_content"] {
+		t.Fatal("idx_object_versions_content should exist")
 	}
 	if !versionIndexes["idx_object_versions_multipart_upload"] {
 		t.Fatal("idx_object_versions_multipart_upload should exist")
@@ -260,125 +352,132 @@ func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	if !versionIndexes["idx_object_versions_object_created"] {
 		t.Fatal("idx_object_versions_object_created should exist")
 	}
-	if !versionIndexes["idx_object_versions_cache_lru"] {
-		t.Fatal("idx_object_versions_cache_lru should exist")
+	cacheIndexes := sqliteIndexes(t, db, "object_cache")
+	if !cacheIndexes["idx_object_cache_lru"] {
+		t.Fatal("idx_object_cache_lru should exist")
 	}
 	taskIndexes := sqliteIndexes(t, db, "tasks")
-	if !taskIndexes["idx_tasks_type_ready_scheduled"] {
-		t.Fatal("idx_tasks_type_ready_scheduled should exist")
+	for _, name := range []string{
+		"idx_tasks_pending",
+		"idx_tasks_recovery",
+		"idx_tasks_gc",
+		"idx_tasks_type_status_id",
+		"idx_tasks_subject",
+	} {
+		if !taskIndexes[name] {
+			t.Fatalf("%s should exist", name)
+		}
 	}
-	uploadCopyIndexes := sqliteIndexes(t, db, "storage_upload_copies")
-	if !uploadCopyIndexes["idx_storage_upload_copies_status_data_set_upload"] {
-		t.Fatal("idx_storage_upload_copies_status_data_set_upload should exist")
+	uploadCopyIndexes := sqliteIndexes(t, db, "storage_copies")
+	if !uploadCopyIndexes["idx_storage_copies_status_data_set_content"] {
+		t.Fatal("idx_storage_copies_status_data_set_content should exist")
 	}
 }
 
 func TestRunMigrations_ObjectVersionCurrentAndForeignKeyConstraints(t *testing.T) {
 	db := newMigratedSQLiteDB(t, "object-version-constraints.db")
-	ctx := context.Background()
 
-	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (1, 'bucket-a')`)
-	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (2, 'bucket-b')`)
-	mustExec(t, db, `INSERT INTO objects (id, bucket_id, key) VALUES (1, 1, 'file.txt')`)
-	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, is_current) VALUES ('v1', 1, 1, 'file.txt', 1, 'etag-1', 'sum-1', '.versions/v1', TRUE)`)
+	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 1, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
+	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (2, 'bucket-b', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 2, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
+	mustExec(t, db, `INSERT INTO objects (id, bucket_id, key, created_at, updated_at) VALUES (1, 1, 'file.txt', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	// A data version points at the content holding its bytes, and the composite
+	// foreign key welds the size it repeats to that content's size.
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (1, 1, 1, printf('%064x', 1), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (2, 1, 2, printf('%064x', 2), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (3, 1, 3, printf('%064x', 3), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (4, 2, 1, printf('%064x', 4), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('v1', 1, 1, 'file.txt', 1, 1, 'etag-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('v3', 1, 1, 'file.txt', 3, 3, 'etag-3', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	// One column holds one value, so "at most one current version" needs no
+	// partial unique index; pointing at a version of another object is refused
+	// by the pointer's composite foreign key.
+	mustExec(t, db, `UPDATE objects SET current_version_id = 'v1' WHERE id = 1`)
+	mustReject(t, db, "expected a pointer to a missing version to fail", `UPDATE objects SET current_version_id = 'v-missing' WHERE id = 1`)
+	mustReject(t, db, "expected deleting the pointed-at version to fail", `DELETE FROM object_versions WHERE version_id = 'v1'`)
+	mustExec(t, db, `INSERT INTO objects (id, bucket_id, key, created_at, updated_at) VALUES (2, 1, 'other.txt', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected pointing at another object's version to fail", `UPDATE objects SET current_version_id = 'v1' WHERE id = 2`)
+	mustExec(t, db, `UPDATE objects SET current_version_id = 'v3' WHERE id = 1`)
+	mustExec(t, db, `DELETE FROM object_versions WHERE version_id = 'v1'`)
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('v1', 1, 1, 'file.txt', 1, 1, 'etag-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `UPDATE objects SET current_version_id = 'v1' WHERE id = 1`)
 
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, is_current) VALUES ('v2', 1, 1, 'file.txt', 2, 'etag-2', 'sum-2', '.versions/v2', TRUE)`); err == nil {
-		t.Fatal("expected second current version for one object to fail")
-	}
-	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, is_current) VALUES ('v3', 1, 1, 'file.txt', 3, 'etag-3', 'sum-3', '.versions/v3', FALSE)`)
+	mustReject(t, db, "expected object_versions object/bucket/key mismatch to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('wrong-bucket', 1, 2, 'file.txt', 4, 1, 'etag-x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected data object version without content_id to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, created_at, updated_at) VALUES ('data-without-content', 1, 1, 'file.txt', 1, 'etag-x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected version whose size disagrees with its content to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('size-drift', 1, 1, 'file.txt', 1, 99, 'etag-x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected version pointing at another bucket's content to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, created_at, updated_at) VALUES ('cross-bucket-content', 1, 1, 'file.txt', 4, 1, 'etag-x', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected malformed delete marker insert to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, content_type, is_delete_marker, created_at, updated_at) VALUES ('bad-marker', 1, 1, 'file.txt', 1, 1, 'etag-marker', '', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected malformed delete marker update to fail", `UPDATE object_versions SET is_delete_marker = TRUE WHERE version_id = 'v3'`)
+	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id, status, created_at, updated_at) VALUES (1, 'file.txt', 'upload-valid', 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (5, 1, 1, printf('%064x', 5), 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, multipart_upload_id, created_at, updated_at) VALUES ('multipart-valid', 1, 1, 'file.txt', 5, 1, 'etag-mp', 'upload-valid', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected object_versions multipart_upload_id without upload to fail", `INSERT INTO object_versions (version_id, object_id, bucket_id, key, content_id, size, e_tag, multipart_upload_id, created_at, updated_at) VALUES ('multipart-missing', 1, 1, 'file.txt', 5, 1, 'etag-missing', 'upload-missing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, content_type, is_delete_marker, created_at, updated_at) VALUES ('marker-ok', 1, 1, 'file.txt', 0, '', '', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key) VALUES ('wrong-bucket', 1, 2, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/wrong-bucket')`); err == nil {
-		t.Fatal("expected object_versions object/bucket/key mismatch to fail")
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, state) VALUES ('stored-without-upload', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/stored-without-upload', 'stored')`); err == nil {
-		t.Fatal("expected stored object version without storage_upload_id to fail")
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, content_type, cache_key, is_delete_marker, in_cache, state) VALUES ('bad-marker', 1, 1, 'file.txt', 0, 'etag-marker', '', '', '', TRUE, FALSE, 'cached')`); err == nil {
-		t.Fatal("expected malformed delete marker insert to fail")
-	}
-	if _, err := db.ExecContext(ctx, `UPDATE object_versions SET is_delete_marker = TRUE WHERE version_id = 'v3'`); err == nil {
-		t.Fatal("expected malformed delete marker update to fail")
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key) VALUES ('empty-cache-key', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '')`); err == nil {
-		t.Fatal("expected data version without cache_key to fail")
-	}
-	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id, status) VALUES (1, 'file.txt', 'upload-valid', 'completed')`)
-	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, multipart_upload_id) VALUES ('multipart-valid', 1, 1, 'file.txt', 1, 'etag-mp', 'sum-mp', '.versions/multipart-valid', 'upload-valid')`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, multipart_upload_id) VALUES ('multipart-missing', 1, 1, 'file.txt', 1, 'etag-missing', 'sum-missing', '.versions/multipart-missing', 'upload-missing')`); err == nil {
-		t.Fatal("expected object_versions multipart_upload_id without upload to fail")
-	}
-	mustExec(t, db, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, content_type, cache_key, is_delete_marker, in_cache, state) VALUES ('marker-ok', 1, 1, 'file.txt', 0, '', '', '', '', TRUE, FALSE, 'cached')`)
-
-	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, piece_cid, requested_copies) VALUES (1, 1, 'v-upload', 1, 'sum-1', 'complete', 'bafk2bzacefake', 1)`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO object_versions (version_id, object_id, bucket_id, key, size, e_tag, checksum, cache_key, state, storage_upload_id) VALUES ('cached-with-upload', 1, 1, 'file.txt', 1, 'etag-x', 'sum-x', '.versions/cached-with-upload', 'cached', 1)`); err == nil {
-		t.Fatal("expected cached object version with storage_upload_id to fail")
-	}
+	// Residency belongs to the content, so a cache entry cannot name bytes that
+	// do not exist and cannot be recorded twice for one content.
+	mustExec(t, db, `INSERT INTO object_cache (content_id, in_cache, created_at, updated_at) VALUES (1, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected a second cache entry for one content to fail", `INSERT INTO object_cache (content_id, in_cache, created_at, updated_at) VALUES (1, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected a cache entry for missing content to fail", `INSERT INTO object_cache (content_id, in_cache, created_at, updated_at) VALUES (9999, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 }
 
 func TestRunMigrations_StorageProvenanceConstraints(t *testing.T) {
 	db := newMigratedSQLiteDB(t, "storage-provenance-constraints.db")
-	ctx := context.Background()
 
-	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (1, 'bucket-a')`)
-	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (2, 'bucket-b')`)
-	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, piece_cid, requested_copies) VALUES (1, 1, 'v1', 10, 'sum-1', 'complete', 'bafk2bzacefake', 2)`)
-	mustExec(t, db, `INSERT INTO storage_uploads (id, bucket_id, source_version_id, content_size, checksum, status, requested_copies) VALUES (2, 2, 'v2', 10, 'sum-2', 'running', 3)`)
-	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (1, 1, '101', 0, 1, TRUE, '1001', 'ready', 1, 1)`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_upload_id, last_used_upload_id) VALUES (2, '101', 0, 1, TRUE, '1001', 'ready', 2, 2)`); err == nil {
-		t.Fatal("expected provider/data_set reuse across buckets to fail")
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, status, created_by_upload_id, last_used_upload_id) VALUES (1, '202', 0, 1, TRUE, 'pending', 1, 1)`); err == nil {
-		t.Fatal("expected duplicate bucket/copy_index binding to fail")
-	}
+	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 1, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
+	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (2, 'bucket-b', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 2, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, piece_cid, requested_copies, created_at, updated_at) VALUES (1, 1, 10, printf('%064x', 1), 'bafk2bzacefake', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_contents (id, bucket_id, content_size, checksum, requested_copies, created_at, updated_at) VALUES (2, 2, 10, printf('%064x', 2), 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_content_id, last_used_content_id, created_at, updated_at) VALUES (1, 1, '101', 0, 1, TRUE, '1001', 'ready', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected provider/data_set reuse across buckets to fail", `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, data_set_id, status, created_by_content_id, last_used_content_id, created_at, updated_at) VALUES (2, '101', 0, 1, TRUE, '1001', 'ready', 2, 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected duplicate bucket/copy_index binding to fail", `INSERT INTO storage_data_sets (bucket_id, provider_id, copy_index, generation, is_current, status, created_by_content_id, last_used_content_id, created_at, updated_at) VALUES (1, '202', 0, 1, TRUE, 'pending', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 
-	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, status, created_by_upload_id, last_used_upload_id) VALUES (2, 1, '202', 1, 1, TRUE, 'pending', 1, 1)`)
-	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, piece_id, transfer_method, status, retrieval_url, storage_data_set_id) VALUES (1, 0, '101', '2001', 'ingress', 'committed', 'https://provider.example/piece', 1)`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, transfer_method, storage_data_set_id) VALUES (1, 0, '101', 'peer_pull', 1)`); err == nil {
-		t.Fatal("expected duplicate copy for one data set to fail")
-	}
+	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, status, created_by_content_id, last_used_content_id, created_at, updated_at) VALUES (2, 1, '202', 1, 1, TRUE, 'pending', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	// Committed is a projection of a confirmed ledger row, so the evidence has
+	// to exist before the copy can claim it.
+	mustReject(t, db, "expected a committed copy without confirmed evidence to fail", `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, provider_id, piece_id, transfer_method, status, retrieval_url, storage_data_set_id, created_at, updated_at) VALUES (1, 1, 10, 0, '101', '2001', 'ingress', 'committed', 'https://provider.example/piece', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, provider_id, piece_id, transfer_method, status, retrieval_url, storage_data_set_id, created_at, updated_at) VALUES (1, 1, 10, 0, '101', '2001', 'ingress', 'piece_ready', 'https://provider.example/piece', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_commit_attempts (attempt_id, content_id, storage_data_set_id, status, extra_data_hex, transaction_id, confirmed_transaction_id, attempted_at, resolved_at, created_at, updated_at) VALUES ('attempt-1', 1, 1, 'confirmed', 'abcd', 'tx-1', 'tx-1', current_timestamp, current_timestamp, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected a copy to refuse projecting an unconfirmed status", `UPDATE storage_copies SET status = 'committed', confirmed_attempt_id = 'attempt-1', confirmed_attempt_status = 'attempted' WHERE content_id = 1 AND copy_index = 0`)
+	mustReject(t, db, "expected a copy to refuse projecting a missing attempt", `UPDATE storage_copies SET status = 'committed', confirmed_attempt_id = 'attempt-missing', confirmed_attempt_status = 'confirmed' WHERE content_id = 1 AND copy_index = 0`)
+	mustExec(t, db, `UPDATE storage_copies SET status = 'committed', confirmed_attempt_id = 'attempt-1', confirmed_attempt_status = 'confirmed' WHERE content_id = 1 AND copy_index = 0`)
+	mustReject(t, db, "expected a referenced attempt to refuse leaving confirmed", `UPDATE storage_commit_attempts SET status = 'released' WHERE attempt_id = 'attempt-1'`)
+	mustReject(t, db, "expected a referenced attempt to refuse deletion", `DELETE FROM storage_commit_attempts WHERE attempt_id = 'attempt-1'`)
+	mustReject(t, db, "expected duplicate copy for one data set to fail", `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, provider_id, transfer_method, storage_data_set_id, created_at, updated_at) VALUES (1, 1, 10, 0, '101', 'peer_pull', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 	// A replica slot holds both generations while a provider replacement migrates.
-	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, status, created_by_upload_id, last_used_upload_id) VALUES (3, 1, '303', 0, 2, FALSE, 'pending', 1, 1)`)
-	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, transfer_method, storage_data_set_id) VALUES (1, 0, '303', 'peer_pull', 3)`)
-	// Unbound copies still cannot duplicate a slot, which distinct NULL data set
-	// ids would otherwise allow.
-	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, transfer_method) VALUES (1, 3, 'peer_pull')`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_copies (upload_id, copy_index, transfer_method) VALUES (1, 3, 'peer_pull')`); err == nil {
-		t.Fatal("expected duplicate unbound copy for one slot to fail")
-	}
-	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, provider_id, transfer_method, storage_data_set_id) VALUES (1, 1, '202', 'peer_pull', 2)`)
-	if _, err := db.ExecContext(ctx, `UPDATE storage_upload_copies SET status = 'committed' WHERE upload_id = 1 AND copy_index = 1`); err == nil {
-		t.Fatal("expected committed copy without piece identity to fail")
-	}
-	mustExec(t, db, `INSERT INTO storage_upload_copies (upload_id, copy_index, transfer_method) VALUES (1, 2, 'peer_pull')`)
-	if _, err := db.ExecContext(ctx, `UPDATE storage_upload_copies SET status = 'committed', piece_id = '2002', retrieval_url = 'https://provider.example/missing-binding' WHERE upload_id = 1 AND copy_index = 2`); err == nil {
-		t.Fatal("expected committed copy without provider and data set binding to fail")
-	}
-	mustExec(t, db, `UPDATE storage_upload_copies SET status = 'committed', piece_id = '0', retrieval_url = 'https://provider.example/zero-piece' WHERE upload_id = 1 AND copy_index = 1`)
-	mustExec(t, db, `INSERT INTO storage_upload_failures (upload_id, attempt_index, provider_id, transfer_method, stage, error_message, explicit) VALUES (1, 0, '202', 'peer_pull', 'pull', 'pull failed', FALSE)`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_failures (upload_id, attempt_index, transfer_method) VALUES (1, 0, 'peer_pull')`); err == nil {
-		t.Fatal("expected duplicate failure attempt_index for upload to fail")
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO storage_upload_failures (upload_id, attempt_index, transfer_method) VALUES (1, 1, 'legacy')`); err == nil {
-		t.Fatal("expected invalid failure transfer_method to fail")
-	}
+	mustExec(t, db, `INSERT INTO storage_data_sets (id, bucket_id, provider_id, copy_index, generation, is_current, status, created_by_content_id, last_used_content_id, created_at, updated_at) VALUES (3, 1, '303', 0, 2, FALSE, 'pending', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, provider_id, transfer_method, storage_data_set_id, created_at, updated_at) VALUES (1, 1, 10, 0, '303', 'peer_pull', 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	// A copy is always born bound to exactly one data set; the NOT NULL on
+	// storage_data_set_id is what enforces that, so it is the assertion here.
+	mustRejectRequiredColumn(t, db, "expected copy without a data set and provider binding to fail", `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, transfer_method, created_at, updated_at) VALUES (1, 1, 10, 3, 'peer_pull', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO storage_copies (content_id, bucket_id, content_size, copy_index, provider_id, transfer_method, storage_data_set_id, created_at, updated_at) VALUES (1, 1, 10, 1, '202', 'peer_pull', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected committed copy without piece identity to fail", `UPDATE storage_copies SET status = 'committed' WHERE content_id = 1 AND copy_index = 1`)
+	mustExec(t, db, `INSERT INTO storage_commit_attempts (attempt_id, content_id, storage_data_set_id, status, extra_data_hex, transaction_id, confirmed_transaction_id, attempted_at, resolved_at, created_at, updated_at) VALUES ('attempt-2', 1, 2, 'confirmed', 'abcd', 'tx-2', 'tx-2', current_timestamp, current_timestamp, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `UPDATE storage_copies SET status = 'committed', piece_id = '0', retrieval_url = 'https://provider.example/zero-piece', confirmed_attempt_id = 'attempt-2', confirmed_attempt_status = 'confirmed' WHERE content_id = 1 AND copy_index = 1`)
+	mustExec(t, db, `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, created_at, updated_at) VALUES (1, 1, 0, '101', 1, '2001', 'bafk2bzacefake', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected duplicate physical cleanup identity to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, created_at, updated_at) VALUES (1, 1, 0, '101', 1, '2001', 'bafk2bzaceduplicate', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	// Cleanup evidence requires both the data set and the piece it removed;
+	// each NOT NULL is the invariant under test, so supply every other column.
+	mustRejectRequiredColumn(t, db, "expected cleanup evidence without storage_data_set_id to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, piece_id, piece_cid, created_at, updated_at) VALUES (1, 1, 0, '101', '2002', 'bafk2bzacemissingdataset', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustRejectRequiredColumn(t, db, "expected cleanup evidence without piece_id to fail", `INSERT INTO storage_cleanup_copies (content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_cid, created_at, updated_at) VALUES (1, 1, 0, '101', 1, 'bafk2bzacemissingpiece', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 }
 
 func TestRunMigrations_TaskAndMultipartConstraints(t *testing.T) {
 	db := newMigratedSQLiteDB(t, "task-multipart-constraints.db")
 	ctx := context.Background()
 
-	mustExec(t, db, `INSERT INTO buckets (id, name) VALUES (1, 'bucket-a')`)
+	mustExec(t, db, `INSERT INTO buckets (id, name, default_copies, minimum_durable_copies, created_at, updated_at) VALUES (1, 'bucket-a', 8, 8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO bucket_replica_slots (bucket_id, copy_index, created_at, updated_at) SELECT 1, value, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7)`)
 
-	if _, err := db.ExecContext(ctx, `INSERT INTO tasks (type, ref_type, ref_id, ref_version_id, idempotency_key) VALUES ('upload', 'object', 1, '', 'upload:missing-version')`); err == nil {
-		t.Fatal("expected object task without ref_version_id to fail")
-	}
-	mustExec(t, db, `INSERT INTO tasks (type, ref_type, ref_id, ref_version_id, idempotency_key) VALUES ('upload', 'bucket', 1, '', 'bucket:allowed')`)
+	mustReject(t, db, "expected task with incomplete subject identity to fail", `INSERT INTO tasks (type, idempotency_key, input_version, input_hash, subject_type, available_at, created_at, updated_at) VALUES ('custom', 'invalid-subject', 1, 'hash', 'object_version', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO tasks (type, idempotency_key, input_version, input_hash, subject_type, subject_key, available_at, created_at, updated_at) VALUES ('future_extension', 'open-type', 1, 'hash', 'bucket', '1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
 
-	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id) VALUES (1, 'large.bin', 'upload-1')`)
-	mustExec(t, db, `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag) VALUES ('upload-1', 1, 10, 'part-etag')`)
-	if _, err := db.ExecContext(ctx, `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag) VALUES ('upload-1', 10001, 10, 'bad-part')`); err == nil {
-		t.Fatal("expected multipart part_number > 10000 to fail")
-	}
+	mustExec(t, db, `INSERT INTO multipart_uploads (bucket_id, key, upload_id, created_at, updated_at) VALUES (1, 'large.bin', 'upload-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag, created_at) VALUES ('upload-1', 1, 10, 'part-etag', CURRENT_TIMESTAMP)`)
+	mustReject(t, db, "expected multipart part_number > 10000 to fail", `INSERT INTO multipart_parts (upload_id, part_number, size, e_tag, created_at) VALUES ('upload-1', 10001, 10, 'bad-part', CURRENT_TIMESTAMP)`)
 	mustExec(t, db, `DELETE FROM multipart_uploads WHERE upload_id = 'upload-1'`)
 
 	var partCount int
@@ -644,15 +743,79 @@ func newMigratedSQLiteDB(t *testing.T, filename string) *bun.DB {
 	return db
 }
 
-func mustExec(t *testing.T, db *bun.DB, query string, args ...interface{}) {
+func mustExec(t *testing.T, db *bun.DB, query string, args ...any) {
 	t.Helper()
 	if _, err := db.ExecContext(context.Background(), query, args...); err != nil {
 		t.Fatalf("exec %q: %v", query, err)
 	}
 }
 
+// mustReject asserts a statement is refused by the constraint it targets. A
+// statement that omits a required column is refused by the null constraint
+// before that constraint is ever evaluated, so the case would keep passing
+// while proving nothing.
+func mustReject(t *testing.T, db *bun.DB, message, query string, args ...any) {
+	t.Helper()
+	_, err := db.ExecContext(context.Background(), query, args...)
+	if err == nil {
+		t.Fatal(message)
+	}
+	if rejectedByNullConstraint(err) {
+		t.Fatalf("%s: rejected by a null constraint instead of the constraint under test\nquery: %s\nerror: %v", message, query, err)
+	}
+	if rejectedByMissingSchema(err) {
+		t.Fatalf("%s: never reached the constraint under test because the schema has no such table or column\nquery: %s\nerror: %v", message, query, err)
+	}
+}
+
+// rejectedByMissingSchema reports a statement that never reached the constraint
+// under test because it names a table or column the schema does not have. Such a
+// statement fails, so a negative assertion keeps passing while proving nothing —
+// exactly how three stale cases survived a column being removed.
+func rejectedByMissingSchema(err error) bool {
+	for _, missing := range []string{
+		"no such table",       // SQLite
+		"no such column",      // SQLite
+		"has no column named", // SQLite, INSERT column list
+		"does not exist",      // PostgreSQL, relation/column
+		"undefined_table",     // PostgreSQL, SQLSTATE name
+		"undefined_column",    // PostgreSQL, SQLSTATE name
+	} {
+		if strings.Contains(err.Error(), missing) {
+			return true
+		}
+	}
+	return false
+}
+
+// mustRejectRequiredColumn asserts the opposite of mustReject: the omitted
+// column is itself the invariant under test, so a null-constraint rejection is
+// the expected outcome rather than a false pass.
+func mustRejectRequiredColumn(t *testing.T, db *bun.DB, message, query string, args ...any) {
+	t.Helper()
+	_, err := db.ExecContext(context.Background(), query, args...)
+	if err == nil {
+		t.Fatal(message)
+	}
+	if !rejectedByNullConstraint(err) {
+		t.Fatalf("%s: not rejected by a null constraint\nquery: %s\nerror: %v", message, query, err)
+	}
+}
+
+func rejectedByNullConstraint(err error) bool {
+	for _, nullConstraint := range []string{
+		"NOT NULL constraint failed", // SQLite
+		"null value in column",       // PostgreSQL
+	} {
+		if strings.Contains(err.Error(), nullConstraint) {
+			return true
+		}
+	}
+	return false
+}
+
 type sqliteQueryer interface {
-	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 func sqliteColumns(t *testing.T, db sqliteQueryer, table string) map[string]bool {

@@ -3,10 +3,14 @@ package repository_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/versity/versitygw/auth"
 )
 
@@ -16,7 +20,7 @@ func TestBucketRepo_CreateAndGetByName(t *testing.T) {
 
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "test-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "test-bucket", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -63,8 +67,8 @@ func TestBucketRepo_GetNamesByIDs(t *testing.T) {
 		t.Fatalf("GetNamesByIDs empty = %v, want empty map", names)
 	}
 
-	first := &model.Bucket{Name: "names-first", Status: model.BucketStatusActive}
-	second := &model.Bucket{Name: "names-second", Status: model.BucketStatusActive}
+	first := &model.Bucket{Name: "names-first", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
+	second := &model.Bucket{Name: "names-second", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, first); err != nil {
 		t.Fatalf("Create first: %v", err)
 	}
@@ -86,7 +90,7 @@ func TestBucketRepo_GetByID(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "by-id", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "by-id", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -105,7 +109,7 @@ func TestBucketRepo_UpdateCopyPolicy(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "copies-policy", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "copies-policy", Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -122,16 +126,15 @@ func TestBucketRepo_UpdateCopyPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateCopyPolicy set: %v", err)
 	}
-	if updated == nil || updated.DefaultCopies == nil || *updated.DefaultCopies != copies ||
-		updated.MinimumDurableCopies == nil || *updated.MinimumDurableCopies != minimum {
+	if updated == nil || updated.DefaultCopies != copies || updated.MinimumDurableCopies != minimum {
 		t.Fatalf("UpdateCopyPolicy result = %#v, want target/minimum %d/%d", updated, copies, minimum)
 	}
+	assertActiveReplicaSlots(t, ctx, repos, bucket.ID, copies)
 	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
 	if err != nil {
 		t.Fatalf("GetByName after set: %v", err)
 	}
-	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies ||
-		got.MinimumDurableCopies == nil || *got.MinimumDurableCopies != minimum {
+	if got == nil || got.DefaultCopies != copies || got.MinimumDurableCopies != minimum {
 		t.Fatalf("copy policy after set = %#v, want target/minimum %d/%d", got, copies, minimum)
 	}
 
@@ -142,15 +145,85 @@ func TestBucketRepo_UpdateCopyPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateCopyPolicy clear minimum: %v", err)
 	}
-	if updated == nil || updated.DefaultCopies == nil || *updated.DefaultCopies != copies || updated.MinimumDurableCopies != nil {
-		t.Fatalf("UpdateCopyPolicy clear result = %#v, want target %d and strict minimum", updated, copies)
+	if updated == nil || updated.DefaultCopies != copies || updated.MinimumDurableCopies != copies {
+		t.Fatalf("UpdateCopyPolicy clear result = %#v, want target %d and a minimum matching it", updated, copies)
 	}
 	got, err = repos.Buckets.GetByName(ctx, bucket.Name)
 	if err != nil {
 		t.Fatalf("GetByName after clear: %v", err)
 	}
-	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies || got.MinimumDurableCopies != nil {
-		t.Fatalf("copy policy after minimum clear = %#v, want target %d and strict minimum", got, copies)
+	if got == nil || got.DefaultCopies != copies || got.MinimumDurableCopies != copies {
+		t.Fatalf("copy policy after minimum clear = %#v, want target %d and a minimum matching it", got, copies)
+	}
+
+	grown := 6
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name: bucket.Name, SetDefaultCopies: true, DefaultCopies: &grown,
+	}); err != nil {
+		t.Fatalf("UpdateCopyPolicy grow: %v", err)
+	}
+	assertActiveReplicaSlots(t, ctx, repos, bucket.ID, grown)
+	// Setting the same target again is not a lowering.
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name: bucket.Name, SetDefaultCopies: true, DefaultCopies: &grown,
+	}); err != nil {
+		t.Fatalf("UpdateCopyPolicy repeat target: %v", err)
+	}
+	assertActiveReplicaSlots(t, ctx, repos, bucket.ID, grown)
+}
+
+// Lowering the replica target would leave the replicas above it running and
+// billed with nothing to retire them, so it is refused outright and leaves both
+// the policy and the slots untouched.
+func TestBucketRepo_UpdateCopyPolicyRefusesLoweringTheTarget(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "copies-no-lowering", Status: model.BucketStatusActive, DefaultCopies: 4, MinimumDurableCopies: 2}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	lowered := 3
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name: bucket.Name, SetDefaultCopies: true, DefaultCopies: &lowered,
+	}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("lowering the replica target error = %v, want ErrInvalidInput", err)
+	}
+	got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil || got == nil || got.DefaultCopies != 4 || got.MinimumDurableCopies != 2 {
+		t.Fatalf("policy after refused lowering = %#v err=%v, want unchanged 4/2", got, err)
+	}
+	assertActiveReplicaSlots(t, ctx, repos, bucket.ID, 4)
+
+	// Lowering only the minimum stays legal: it releases cache sooner, it does
+	// not strand a paid replica.
+	loweredMinimum := 1
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name: bucket.Name, SetMinimumDurableCopies: true, MinimumDurableCopies: &loweredMinimum,
+	}); err != nil {
+		t.Fatalf("lowering the minimum: %v", err)
+	}
+	got, err = repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil || got == nil || got.DefaultCopies != 4 || got.MinimumDurableCopies != 1 {
+		t.Fatalf("policy after minimum lowering = %#v err=%v, want 4/1", got, err)
+	}
+}
+
+func assertActiveReplicaSlots(t *testing.T, ctx context.Context, repos *repository.Repositories, bucketID int64, want int) {
+	t.Helper()
+	slots, err := repos.Buckets.ActiveReplicaSlots(ctx, bucketID)
+	if err != nil {
+		t.Fatalf("ActiveReplicaSlots: %v", err)
+	}
+	if len(slots) != want {
+		t.Fatalf("active replica slots = %v, want %d", slots, want)
+	}
+	for i, copyIndex := range slots {
+		if copyIndex != i {
+			t.Fatalf("active replica slots = %v, want contiguous 0..%d", slots, want-1)
+		}
 	}
 }
 
@@ -159,7 +232,7 @@ func TestBucketRepo_SetDefaultCopies(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "set-default-copies", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "set-default-copies", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -172,7 +245,7 @@ func TestBucketRepo_SetDefaultCopies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByName: %v", err)
 	}
-	if got == nil || got.DefaultCopies == nil || *got.DefaultCopies != copies {
+	if got == nil || got.DefaultCopies != copies {
 		t.Fatalf("DefaultCopies = %#v, want %d", got, copies)
 	}
 
@@ -202,7 +275,7 @@ func TestBucketRepo_SetACL(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "acl-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "acl-bucket", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -233,7 +306,7 @@ func TestBucketRepo_SetOwnerAndACL(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	owner := strptr("user2")
+	owner := new("user2")
 	if err := repos.S3Accounts.Create(ctx, &model.S3Account{
 		AccessKey: *owner,
 		SecretKey: "secret-" + *owner,
@@ -242,7 +315,7 @@ func TestBucketRepo_SetOwnerAndACL(t *testing.T) {
 		t.Fatalf("S3Accounts.Create: %v", err)
 	}
 
-	bucket := &model.Bucket{Name: "owner-acl-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "owner-acl-bucket", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -277,7 +350,7 @@ func TestBucketRepo_ListActive(t *testing.T) {
 	ctx := context.Background()
 
 	for _, name := range []string{"a", "b", "c"} {
-		b := &model.Bucket{Name: name, Status: model.BucketStatusActive}
+		b := &model.Bucket{Name: name, Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 		if err := repos.Buckets.Create(ctx, b); err != nil {
 			t.Fatalf("Create(%s): %v", name, err)
 		}
@@ -296,7 +369,7 @@ func TestBucketRepo_UpdateStatus(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "cas-status", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "cas-status", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -316,7 +389,7 @@ func TestBucketRepo_HardDelete(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "hard-del", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "hard-del", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -339,7 +412,7 @@ func TestBucketRepo_SoftDelete(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "to-delete", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "to-delete", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -382,7 +455,7 @@ func TestBucketRepo_List(t *testing.T) {
 
 	// Create multiple active buckets.
 	for _, name := range []string{"alpha", "beta", "gamma", "delta"} {
-		b := &model.Bucket{Name: name, Status: model.BucketStatusActive}
+		b := &model.Bucket{Name: name, Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 		if err := repos.Buckets.Create(ctx, b); err != nil {
 			t.Fatalf("Create(%s): %v", name, err)
 		}
@@ -421,7 +494,7 @@ func TestBucketRepo_CountByStatus(t *testing.T) {
 
 	// Seed buckets: 3 active.
 	for _, name := range []string{"a1", "a2", "a3"} {
-		b := &model.Bucket{Name: name, Status: model.BucketStatusActive}
+		b := &model.Bucket{Name: name, Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 		if err := repos.Buckets.Create(ctx, b); err != nil {
 			t.Fatalf("Create(%s): %v", name, err)
 		}
@@ -460,12 +533,12 @@ func TestBucketRepo_AggregateCountsByOwner(t *testing.T) {
 		name  string
 		owner *string
 	}{
-		{name: "owner-a-one", owner: strptr("owner-a")},
-		{name: "owner-a-two", owner: strptr("owner-a")},
-		{name: "owner-b-one", owner: strptr("owner-b")},
+		{name: "owner-a-one", owner: new("owner-a")},
+		{name: "owner-a-two", owner: new("owner-a")},
+		{name: "owner-b-one", owner: new("owner-b")},
 		{name: "unassigned", owner: nil},
 	} {
-		b := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive, OwnerAccessKey: seed.owner}
+		b := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive, OwnerAccessKey: seed.owner, DefaultCopies: 8, MinimumDurableCopies: 8}
 		if err := repos.Buckets.Create(ctx, b); err != nil {
 			t.Fatalf("Create(%s): %v", seed.name, err)
 		}
@@ -499,8 +572,8 @@ func TestBucketRepo_ListACLsReturnsOnlyOwnershipFields(t *testing.T) {
 		t.Fatalf("Marshal ACL: %v", err)
 	}
 	for _, bucket := range []*model.Bucket{
-		{Name: "owned", Status: model.BucketStatusActive, ACL: acl},
-		{Name: "unassigned", Status: model.BucketStatusActive},
+		{Name: "owned", Status: model.BucketStatusActive, ACL: acl, DefaultCopies: 8, MinimumDurableCopies: 8},
+		{Name: "unassigned", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8},
 	} {
 		if err := repos.Buckets.Create(ctx, bucket); err != nil {
 			t.Fatalf("Create(%s): %v", bucket.Name, err)
@@ -527,23 +600,26 @@ func TestBucketRepo_CountStorageDataSets(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "datasets-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "datasets-bucket", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create bucket: %v", err)
 	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+	origin := newObjectVersion(bucket.ID, "dataset-count", "dataset-count", 1)
+	if _, err := createVersion(t, repos, origin); err != nil {
+		t.Fatalf("Create origin version: %v", err)
+	}
+	upload, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
 		BucketID:        bucket.ID,
-		SourceVersionID: "dataset-count",
 		ContentSize:     1,
-		Checksum:        "sum",
+		Checksum:        testutil.StorageChecksum("sum"),
 		RequestedCopies: 3,
 	})
 	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
+		t.Fatalf("EnsureContent: %v", err)
 	}
-	seedCommittedUploadCopies(t, repos, bucket.ID, upload.ID, "bafk2bzacedatasetcount", []storageUploadCopySeed{
-		{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: strptr("https://provider.example/1")},
-		{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: strptr("https://provider.example/2")},
+	seedCommittedUploadCopies(t, db, repos, bucket.ID, upload.ID, "bafk2bzacedatasetcount", []storageUploadCopySeed{
+		{ProviderID: onChainIDPtr(t, "101"), DataSetID: onChainIDPtr(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: new("https://provider.example/1")},
+		{ProviderID: onChainIDPtr(t, "202"), DataSetID: onChainIDPtr(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: new("https://provider.example/2")},
 	})
 
 	count, err := repos.Buckets.CountStorageDataSets(ctx)
@@ -555,6 +631,80 @@ func TestBucketRepo_CountStorageDataSets(t *testing.T) {
 	}
 }
 
-func strptr(s string) *string {
-	return &s
+func TestBucketRepo_PromoteReadyRequiresEveryConfiguredSlot(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := &model.Bucket{Name: "provisioning-bucket", Status: model.BucketStatusProvisioning, DefaultCopies: 8, MinimumDurableCopies: 8}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create bucket: %v", err)
+	}
+
+	markSlotReady := func(copyIndex int, provider, dataSet string) {
+		t.Helper()
+		providerID := onChainIDPtr(t, provider)
+		dataSetID := onChainIDPtr(t, dataSet)
+		clientDataSetID := onChainIDPtr(t, dataSet+"1")
+		binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+			BucketID: bucket.ID, ProviderID: *providerID, CopyIndex: copyIndex,
+		})
+		if err != nil {
+			t.Fatalf("EnsureDataSetBinding(%d): %v", copyIndex, err)
+		}
+		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+			ID: binding.ID, DataSetID: *dataSetID, ClientDataSetID: clientDataSetID,
+		}); err != nil {
+			t.Fatalf("MarkDataSetReady(%d): %v", copyIndex, err)
+		}
+	}
+
+	markSlotReady(0, "101", "1001")
+	promoted, err := repos.Buckets.PromoteReadyIfProvisioned(ctx, bucket.ID, 2)
+	if err != nil || promoted {
+		t.Fatalf("promote with one slot = %v, err=%v; want false", promoted, err)
+	}
+	markSlotReady(2, "303", "3003")
+	promoted, err = repos.Buckets.PromoteReadyIfProvisioned(ctx, bucket.ID, 2)
+	if err != nil || promoted {
+		t.Fatalf("promote with wrong second slot = %v, err=%v; want false", promoted, err)
+	}
+	markSlotReady(1, "202", "2002")
+	promoted, err = repos.Buckets.PromoteReadyIfProvisioned(ctx, bucket.ID, 2)
+	if err != nil || !promoted {
+		t.Fatalf("promote with configured slots = %v, err=%v; want true", promoted, err)
+	}
+	stored, err := repos.Buckets.GetByID(ctx, bucket.ID)
+	if err != nil || stored == nil || stored.Status != model.BucketStatusReady {
+		t.Fatalf("ready bucket = %#v, err=%v", stored, err)
+	}
+}
+
+// A row inserted without explicit timestamps must still carry them, and carry
+// them in bun's encoding rather than the database's own clock format.
+func TestModelInsertsStampAuditTimestamps(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := context.Background()
+
+	before := time.Now().UTC().Add(-time.Second)
+	bucket := &model.Bucket{Name: "stamped-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	stored, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil || stored == nil {
+		t.Fatalf("GetByName: bucket=%#v err=%v", stored, err)
+	}
+	if stored.CreatedAt.Before(before) || stored.UpdatedAt.Before(before) {
+		t.Fatalf("stamped timestamps = created:%s updated:%s, want at or after %s", stored.CreatedAt, stored.UpdatedAt, before)
+	}
+	// Second granularity is what a database default would produce; the hook
+	// writes the same instant bun renders everywhere else.
+	var raw string
+	if err := db.NewRaw(`SELECT created_at FROM buckets WHERE id = ?`, bucket.ID).Scan(ctx, &raw); err != nil {
+		t.Fatalf("read raw created_at: %v", err)
+	}
+	if !strings.Contains(raw, ".") || strings.Contains(raw, " ") {
+		t.Fatalf("stored created_at = %q, want bun's fractional encoding rather than the database clock's", raw)
+	}
 }

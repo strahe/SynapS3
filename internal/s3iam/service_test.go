@@ -102,6 +102,7 @@ func TestServiceDeleteUserAccountRejectsOwnedBuckets(t *testing.T) {
 		Name:           "owned-bucket",
 		OwnerAccessKey: &owner,
 		Status:         model.BucketStatusActive,
+		DefaultCopies:  8, MinimumDurableCopies: 8,
 	}); err != nil {
 		t.Fatalf("Create bucket: %v", err)
 	}

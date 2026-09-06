@@ -51,7 +51,7 @@ Docker 部署通过 `synaps3-data` volume 挂载该路径。Docker 专用的生�
 ## 备份前检查
 
 1. 检查 `curl http://127.0.0.1:9090/healthz`，并记录任何非 `ok` 结果。
-2. 运行 `synaps3 admin task stats` 和 `synaps3 admin task list --status exhausted`，检查活动任务和耗尽重试的任务。
+2. 运行 `synaps3 admin task stats` 和 `synaps3 admin task list --status failed`，检查活动任务和失败任务。
 3. 使用当前部署方式的服务管理器停止 SynapS3，避免备份过程中对象数据、元数据和任务状态继续变化。
 
 不要在 SynapS3 仍在运行时创建文件系统归档。
@@ -103,6 +103,8 @@ sha256sum -c synaps3-data.tgz.sha256
 2. 验证归档校验和，确认数据库与缓存带有相同的恢复时间点标记。
 3. 把运行数据卷恢复到空的替换位置。PostgreSQL 部署先恢复数据库原生备份，再连接匹配的配置和缓存数据。
 4. 确认恢复后的配置和凭据文件权限为 `0600`，并允许 SynapS3 运行账户读取。
-5. 启动 SynapS3，检查 `/healthz`、任务统计和耗尽重试的任务，再通过 S3 API 读取一个已知对象。
+5. 启动 SynapS3，检查 `/healthz`、任务统计和失败任务，再通过 S3 API 读取一个已知对象。
 
 不要把一个时间点的数据库备份与另一个时间点的缓存数据混用。
+
+当前全新数据库基线不能原地恢复旧版 SynapS3 数据库。基线之前的备份必须保持只读，并按照[升级与恢复](../operations/upgrade-recovery.md)使用新的数据库和缓存位置启动。

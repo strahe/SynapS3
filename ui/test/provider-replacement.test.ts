@@ -22,8 +22,6 @@ import {
   replacementRetryable,
   replacementStatusLabel,
   replacementStatusTone,
-  taskHasDataSetsRecovery,
-  taskRetryableFromQueue,
 } from '../src/lib/provider-replacement.ts'
 
 function dataSet(overrides: Partial<StorageDataSetSummary> = {}): StorageDataSetSummary {
@@ -204,27 +202,6 @@ test('a stopped replacement does not block choosing a different provider', () =>
   }
   for (const status of ['failed', 'cleanup_attention'] as const) {
     assert.equal(dataSetReplaceable(set, [replacement({ status, source: owned })]), true, status)
-  }
-})
-
-// The API refuses a queue retry for replacement work, so offering the button
-// would only produce a 409.
-test('replacement work is not retryable from the task queue', () => {
-  for (const stage of ['replace_provider', 'retire_data_set', 'retire_abandoned_target']) {
-    assert.equal(taskRetryableFromQueue({ stage }), false, stage)
-  }
-  for (const stage of ['ingress_store', 'peer_pull', 'repair_replica']) {
-    assert.equal(taskRetryableFromQueue({ stage }), true, stage)
-  }
-  assert.equal(taskRetryableFromQueue({}), true)
-})
-
-test('terminal replacement tasks can recover through Data Sets', () => {
-  for (const stage of ['replace_provider', 'retire_data_set', 'retire_abandoned_target']) {
-    assert.equal(taskHasDataSetsRecovery({ stage, status: 'completed', bucket_name: 'bucket' }), true)
-    assert.equal(taskHasDataSetsRecovery({ stage, status: 'failed', bucket_name: 'bucket' }), true)
-    assert.equal(taskHasDataSetsRecovery({ stage, status: 'running', bucket_name: 'bucket' }), false)
-    assert.equal(taskHasDataSetsRecovery({ stage, status: 'failed' }), false)
   }
 })
 

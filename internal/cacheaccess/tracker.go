@@ -2,6 +2,7 @@ package cacheaccess
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
+	"github.com/strahe/synaps3/internal/model"
 )
 
 const (
@@ -26,9 +28,11 @@ const (
 var ErrLRUAccessUncertain = errors.New("cache access is not reliable enough for LRU eviction")
 
 // Store persists foreground cache access and cache commit metadata.
+// Store persists cache recency. The unit is the content payload, because one
+// cache file backs every version that shares those bytes.
 type Store interface {
-	RecordVersionCacheAccess(context.Context, string, time.Time) error
-	RecordVersionCacheCommit(context.Context, string, time.Time) error
+	RecordContentCacheAccess(context.Context, int64, time.Time) error
+	RecordContentCacheCommit(context.Context, int64, time.Time) error
 }
 
 type trackerEntry struct {
@@ -41,7 +45,7 @@ type trackerEntry struct {
 
 type trackerShard struct {
 	mu      sync.Mutex
-	entries map[string]*trackerEntry
+	entries map[int64]*trackerEntry
 }
 
 // Tracker coalesces durable access-time writes and retains the latest exact
@@ -114,28 +118,28 @@ func (t *Tracker) Run(ctx context.Context, gate *Gate, logger *slog.Logger) {
 // RecordAccess records one successful foreground cache open.
 func (t *Tracker) RecordAccess(
 	ctx context.Context,
-	versionID string,
+	contentID int64,
 	durableAccess *time.Time,
 ) error {
-	return t.record(ctx, versionID, durableAccess, false)
+	return t.record(ctx, contentID, durableAccess, false)
 }
 
 // RecordCommit records a successful local cache commit and forces the presence
 // and access metadata write.
 func (t *Tracker) RecordCommit(
 	ctx context.Context,
-	versionID string,
+	contentID int64,
 	durableAccess *time.Time,
 ) error {
-	return t.record(ctx, versionID, durableAccess, true)
+	return t.record(ctx, contentID, durableAccess, true)
 }
 
 // Latest returns the latest exact in-process access for one version.
-func (t *Tracker) Latest(versionID string) time.Time {
-	shard := t.shard(versionID)
+func (t *Tracker) Latest(contentID int64) time.Time {
+	shard := t.shard(contentID)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	if entry := shard.entries[versionID]; entry != nil {
+	if entry := shard.entries[contentID]; entry != nil {
 		return entry.lastAccess
 	}
 	return time.Time{}
@@ -143,16 +147,16 @@ func (t *Tracker) Latest(versionID string) time.Time {
 
 // FlushWhileGuarded persists one version's latest access. The caller must hold
 // the version's cache gate.
-func (t *Tracker) FlushWhileGuarded(ctx context.Context, versionID string) error {
-	return t.flush(ctx, versionID, cacheeviction.NormalizeAccessTime(t.now()), true)
+func (t *Tracker) FlushWhileGuarded(ctx context.Context, contentID int64) error {
+	return t.flush(ctx, contentID, cacheeviction.NormalizeAccessTime(t.now()), true)
 }
 
 // Forget removes tracking state after the cache entry is deleted or its
 // version is permanently removed.
-func (t *Tracker) Forget(versionID string) {
-	shard := t.shard(versionID)
+func (t *Tracker) Forget(contentID int64) {
+	shard := t.shard(contentID)
 	shard.mu.Lock()
-	delete(shard.entries, versionID)
+	delete(shard.entries, contentID)
 	shard.mu.Unlock()
 }
 
@@ -164,25 +168,25 @@ func (t *Tracker) SafeForLRU() bool {
 
 func (t *Tracker) record(
 	ctx context.Context,
-	versionID string,
+	contentID int64,
 	durableAccess *time.Time,
 	requireCommit bool,
 ) error {
 	now := cacheeviction.NormalizeAccessTime(t.now())
-	shard := t.shard(versionID)
+	shard := t.shard(contentID)
 	shard.mu.Lock()
 	if shard.entries == nil {
-		shard.entries = make(map[string]*trackerEntry)
+		shard.entries = make(map[int64]*trackerEntry)
 	}
-	entry := shard.entries[versionID]
+	entry := shard.entries[contentID]
 	if entry == nil {
 		t.evictOldestCleanLocked(shard)
 		if t.maxEntriesPerShard > 0 && len(shard.entries) >= t.maxEntriesPerShard {
 			shard.mu.Unlock()
-			return t.persistOverflow(ctx, versionID, durableAccess, now, requireCommit)
+			return t.persistOverflow(ctx, contentID, durableAccess, now, requireCommit)
 		}
 		entry = &trackerEntry{}
-		shard.entries[versionID] = entry
+		shard.entries[contentID] = entry
 	}
 
 	if durableAccess != nil {
@@ -210,20 +214,20 @@ func (t *Tracker) record(
 	if !shouldPersist {
 		return nil
 	}
-	return t.persistAndAcknowledge(ctx, shard, versionID, entry, accessedAt, commit)
+	return t.persistAndAcknowledge(ctx, shard, contentID, entry, accessedAt, commit)
 }
 
 func (t *Tracker) persistOverflow(
 	ctx context.Context,
-	versionID string,
+	contentID int64,
 	durableAccess *time.Time,
 	now time.Time,
 	commit bool,
 ) error {
 	accessedAt := nextAccessTime(now, time.Time{}, durableAccess)
-	if err := t.persist(ctx, versionID, accessedAt, commit); err != nil {
+	if err := t.persist(ctx, contentID, accessedAt, commit); err != nil {
 		t.unsafeForLRU.Store(true)
-		return fmt.Errorf("%w: persisting access for %s: %w", ErrLRUAccessUncertain, versionID, err)
+		return fmt.Errorf("%w: persisting access for content %d: %w", ErrLRUAccessUncertain, contentID, err)
 	}
 	return nil
 }
@@ -231,18 +235,18 @@ func (t *Tracker) persistOverflow(
 func (t *Tracker) persistAndAcknowledge(
 	ctx context.Context,
 	shard *trackerShard,
-	versionID string,
+	contentID int64,
 	entry *trackerEntry,
 	accessedAt time.Time,
 	commit bool,
 ) error {
-	if err := t.persist(ctx, versionID, accessedAt, commit); err != nil {
+	if err := t.persist(ctx, contentID, accessedAt, commit); err != nil {
 		return err
 	}
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	if shard.entries[versionID] != entry {
+	if shard.entries[contentID] != entry {
 		return nil
 	}
 	if accessedAt.After(entry.lastPersisted) {
@@ -256,30 +260,30 @@ func (t *Tracker) persistAndAcknowledge(
 
 func (t *Tracker) persist(
 	ctx context.Context,
-	versionID string,
+	contentID int64,
 	accessedAt time.Time,
 	commit bool,
 ) error {
 	if commit {
-		return t.store.RecordVersionCacheCommit(ctx, versionID, accessedAt)
+		return t.store.RecordContentCacheCommit(ctx, contentID, accessedAt)
 	}
-	return t.store.RecordVersionCacheAccess(ctx, versionID, accessedAt)
+	return t.store.RecordContentCacheAccess(ctx, contentID, accessedAt)
 }
 
 func (t *Tracker) sweep(ctx context.Context, gate *Gate) (int, error) {
 	now := cacheeviction.NormalizeAccessTime(t.now())
-	versionIDs := t.snapshotVersionIDs()
+	contentIDs := t.snapshotContentIDs()
 	var (
 		failed   int
 		firstErr error
 	)
-	for _, versionID := range versionIDs {
+	for _, contentID := range contentIDs {
 		if ctx.Err() != nil {
 			break
 		}
 		var err error
-		gate.guardAccess(versionID, func() {
-			err = t.flush(ctx, versionID, now, false)
+		gate.guardAccess(model.ContentCacheKey(contentID), func() {
+			err = t.flush(ctx, contentID, now, false)
 		})
 		if err != nil {
 			failed++
@@ -291,28 +295,28 @@ func (t *Tracker) sweep(ctx context.Context, gate *Gate) (int, error) {
 	return failed, firstErr
 }
 
-func (t *Tracker) snapshotVersionIDs() []string {
-	var versionIDs []string
+func (t *Tracker) snapshotContentIDs() []int64 {
+	var contentIDs []int64
 	for index := range t.shards {
 		shard := &t.shards[index]
 		shard.mu.Lock()
-		for versionID := range shard.entries {
-			versionIDs = append(versionIDs, versionID)
+		for contentID := range shard.entries {
+			contentIDs = append(contentIDs, contentID)
 		}
 		shard.mu.Unlock()
 	}
-	return versionIDs
+	return contentIDs
 }
 
 func (t *Tracker) flush(
 	ctx context.Context,
-	versionID string,
+	contentID int64,
 	now time.Time,
 	force bool,
 ) error {
-	shard := t.shard(versionID)
+	shard := t.shard(contentID)
 	shard.mu.Lock()
-	entry := shard.entries[versionID]
+	entry := shard.entries[contentID]
 	if entry == nil {
 		shard.mu.Unlock()
 		return nil
@@ -334,7 +338,7 @@ func (t *Tracker) flush(
 		if err := t.persistAndAcknowledge(
 			ctx,
 			shard,
-			versionID,
+			contentID,
 			entry,
 			accessedAt,
 			commit,
@@ -345,13 +349,13 @@ func (t *Tracker) flush(
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	if shard.entries[versionID] != entry {
+	if shard.entries[contentID] != entry {
 		return nil
 	}
 	clean := !entry.lastAccess.After(entry.lastPersisted) && entry.commitRequired.IsZero()
 	idle := !entry.lastTouched.IsZero() && now.Sub(entry.lastTouched) >= t.idleRetention
 	if clean && idle {
-		delete(shard.entries, versionID)
+		delete(shard.entries, contentID)
 	}
 	return nil
 }
@@ -361,14 +365,14 @@ func (t *Tracker) evictOldestCleanLocked(shard *trackerShard) {
 		return
 	}
 	var (
-		oldestID      string
+		oldestID      int64
 		oldestEntry   *trackerEntry
 		oldestTouched time.Time
 	)
-	for versionID, entry := range shard.entries {
+	for contentID, entry := range shard.entries {
 		clean := !entry.lastAccess.After(entry.lastPersisted) && entry.commitRequired.IsZero()
 		if clean && (oldestEntry == nil || entry.lastTouched.Before(oldestTouched)) {
-			oldestID = versionID
+			oldestID = contentID
 			oldestEntry = entry
 			oldestTouched = entry.lastTouched
 		}
@@ -393,11 +397,13 @@ func nextAccessTime(now, inMemory time.Time, durable *time.Time) time.Time {
 	return now
 }
 
-func (t *Tracker) shard(versionID string) *trackerShard {
+func (t *Tracker) shard(contentID int64) *trackerShard {
 	if t == nil {
 		panic("nil cache access tracker")
 	}
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(versionID))
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(contentID))
+	_, _ = h.Write(buf[:])
 	return &t.shards[h.Sum32()%trackerShardCount]
 }

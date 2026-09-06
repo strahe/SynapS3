@@ -16,16 +16,15 @@ func TestStorageHealthSQLLiteralAcceptsEveryDomainStatus(t *testing.T) {
 		model.StorageDataSetStatusCreating,
 		model.StorageDataSetStatusReady,
 		model.StorageDataSetStatusFailed,
-		model.StorageDataSetStatusUnavailable,
 		model.StorageDataSetStatusDraining,
 		model.StorageDataSetStatusRetired,
 	}
-	copyStatuses := []model.StorageUploadCopyStatus{
-		model.StorageUploadCopyStatusPending,
-		model.StorageUploadCopyStatusPieceReady,
-		model.StorageUploadCopyStatusCommitting,
-		model.StorageUploadCopyStatusCommitted,
-		model.StorageUploadCopyStatusFailed,
+	copyStatuses := []model.StorageCopyStatus{
+		model.StorageCopyStatusPending,
+		model.StorageCopyStatusPieceReady,
+		model.StorageCopyStatusCommitting,
+		model.StorageCopyStatusCommitted,
+		model.StorageCopyStatusFailed,
 	}
 	observationStatuses := []observability.Status{
 		observability.StatusAvailable,

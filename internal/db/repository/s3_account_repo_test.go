@@ -128,10 +128,10 @@ func TestBucketRepo_OwnerAccessKeyCountAndACLUpdate(t *testing.T) {
 	ownerA := "owner-a"
 	root := "root-access"
 	for _, bucket := range []*model.Bucket{
-		{Name: "a-one", Status: model.BucketStatusActive, OwnerAccessKey: &ownerA},
-		{Name: "a-two", Status: model.BucketStatusActive, OwnerAccessKey: &ownerA},
-		{Name: "root-one", Status: model.BucketStatusActive, OwnerAccessKey: &root},
-		{Name: "unassigned", Status: model.BucketStatusActive},
+		{Name: "a-one", Status: model.BucketStatusActive, OwnerAccessKey: &ownerA, DefaultCopies: 8, MinimumDurableCopies: 8},
+		{Name: "a-two", Status: model.BucketStatusActive, OwnerAccessKey: &ownerA, DefaultCopies: 8, MinimumDurableCopies: 8},
+		{Name: "root-one", Status: model.BucketStatusActive, OwnerAccessKey: &root, DefaultCopies: 8, MinimumDurableCopies: 8},
+		{Name: "unassigned", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8},
 	} {
 		if err := repos.Buckets.Create(ctx, bucket); err != nil {
 			t.Fatalf("Create bucket %s: %v", bucket.Name, err)

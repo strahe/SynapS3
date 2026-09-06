@@ -1,80 +1,11 @@
-import type { ObjectState, ObjectStatus, ObjectUploadStatus } from '@/api/client'
+import type { ObjectState, ObjectStatus } from '@/api/client'
 import type { StatusTone } from '@/components/app/StatusBadge'
 import { titleCaseEnum } from './utils.ts'
-
-export const taskStageOptions = [
-  'all',
-  'prepare_upload',
-  'ensure_dataset',
-  'ingress_store',
-  'ingress_commit',
-  'peer_pull',
-  'peer_commit',
-  'repair_replica',
-  'replace_provider',
-  'reconcile_bucket_durability',
-] as const
-
-export type TaskStageOption = (typeof taskStageOptions)[number]
-
-const taskStageLabels: Record<Exclude<TaskStageOption, 'all'> | '', string> = {
-  prepare_upload: 'Prepare Filecoin storage',
-  ensure_dataset: 'Prepare replica target',
-  ingress_store: 'Upload source replica',
-  ingress_commit: 'Register source replica on-chain',
-  peer_pull: 'Sync peer replica',
-  peer_commit: 'Register peer replica on-chain',
-  repair_replica: 'Resume replica upload',
-  replace_provider: 'Replace provider',
-  reconcile_bucket_durability: 'Apply cache policy',
-  '': 'Upload',
-}
-
-// The retirement stages run on the storage cleanup worker, so they are labelled
-// but never offered in the Upload stage filter, which would return nothing.
-const replacementCleanupStageLabels: Record<string, string> = {
-  retire_data_set: 'Retire replaced provider',
-  retire_abandoned_target: 'Retire unused provider',
-}
-
-export function replacementCleanupStageLabel(stage?: string | null) {
-  return stage ? replacementCleanupStageLabels[stage] : undefined
-}
-
-export function taskTypeLabel(type?: string) {
-  switch (type) {
-    case 'all':
-      return 'All'
-    case 'upload':
-      return 'Upload'
-    case 'evict_cache':
-      return 'Evict Cache'
-    case 'storage_cleanup':
-      return 'Replica Cleanup'
-    default:
-      return titleCaseEnum(type)
-  }
-}
-
-export function taskOperationOptionLabel(stage: TaskStageOption) {
-  if (stage === 'all') return 'All'
-  return taskStageLabels[stage]
-}
-
-export function taskOperationLabel(task: { type?: string; stage?: string }) {
-  const stage = task.stage ?? ''
-  return taskOperationBaseLabel(task.type, stage)
-}
 
 export function taskReplicaLabel(task: { copy_index?: number; copyIndex?: number }) {
   const copyIndex = task.copy_index ?? task.copyIndex
   if (typeof copyIndex !== 'number') return '—'
   return replicaLabel(copyIndex)
-}
-
-export function taskHasByteTransfer(task: { type?: string; stage?: string }) {
-  if (task.type !== 'upload') return false
-  return task.stage === 'ingress_store' || task.stage === ''
 }
 
 export function storageCleanupStatusLabel(copies: Array<{ status?: string }>) {
@@ -118,25 +49,6 @@ export function storageCleanupCopyStatusTone(status?: string): StatusTone {
   }
 }
 
-function taskOperationBaseLabel(type: string | undefined, stage: string) {
-  // Retiring a replaced provider ends a paid service; it is not the ordinary
-  // replica deletion the storage_cleanup type otherwise means.
-  const replacementLabel = replacementCleanupStageLabel(stage)
-  if (replacementLabel) return replacementLabel
-  const stageLabel = taskStageLabels[stage as keyof typeof taskStageLabels]
-  if (stageLabel && stage !== '') return stageLabel
-  switch (type) {
-    case 'evict_cache':
-      return 'Evict local cache'
-    case 'storage_cleanup':
-      return 'Delete remote replicas'
-    case 'upload':
-      return 'Upload object'
-    default:
-      return titleCaseEnum(type) || 'Run task'
-  }
-}
-
 export function replicaLabel(copyIndex: number) {
   return `Replica ${copyIndex + 1}`
 }
@@ -149,25 +61,6 @@ export function transferMethodLabel(method?: string) {
       return 'Peer sync'
     default:
       return method || '—'
-  }
-}
-
-export function uploadStatusLabel(uploadStatus: ObjectUploadStatus, progressPercent: number | null = null) {
-  switch (uploadStatus) {
-    case 'running':
-      return progressPercent === null ? 'Preparing Filecoin storage' : `Uploading to Filecoin ${progressPercent}%`
-    case 'ingress_ready':
-      return 'Registering storage record on-chain'
-    case 'readable':
-      return 'Available, syncing replicas'
-    case 'complete':
-      return 'Stored on Filecoin · On-chain verified'
-    case 'failed':
-      return 'Needs attention'
-    case 'rejected':
-      return 'Upload rejected'
-    case 'superseded':
-      return 'Replaced by newer version'
   }
 }
 
@@ -189,26 +82,21 @@ export function objectStatusLabel(status: ObjectStatus) {
 export function objectStateLabel(
   state: ObjectState | undefined,
   status: ObjectStatus,
-  uploadStatus?: ObjectUploadStatus,
   progressPercent: number | null = null
 ) {
-  if (uploadStatus === 'readable' && (state === 'stored' || state === 'cache_evicted')) {
-    return 'Available, syncing remaining replicas'
-  }
-  if (uploadStatus) return uploadStatusLabel(uploadStatus, progressPercent)
   switch (state) {
     case 'cached':
       return 'Stored in cache'
     case 'uploading':
-      return 'Uploading'
+      return progressPercent === null ? 'Uploading' : `Uploading to Filecoin ${progressPercent}%`
     case 'committing':
       return 'Registering storage record on-chain'
     case 'replicating':
       return 'Syncing replicas'
     case 'stored':
-      return 'Stored'
-    case 'cache_evicted':
-      return 'Stored remotely'
+      // Distinct from a single replica's "Stored" so the object summary and the
+      // per-copy rows stay tellable apart.
+      return 'Stored on Filecoin'
     case 'failed':
       return 'Needs attention'
     default:

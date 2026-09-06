@@ -1,160 +1,112 @@
 package cacheeviction
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 )
 
-const (
-	StageLRU                       = "lru"
-	StageAfterUpload               = "after_upload"
-	StageReconcileBucketDurability = "reconcile_bucket_durability"
+func EvictTaskKey(contentID, generation int64) string {
+	return EvictTaskKeyPrefix + strconv.FormatInt(contentID, 10) + ":" + strconv.FormatInt(generation, 10)
+}
 
-	lruAccessedAtPayloadKey       = "cache_accessed_at"
-	deleteAuthorizedPayloadKey    = "delete_authorized"
-	lruTaskKeyPrefix              = "evict_cache:lru:"
-	afterUploadTaskKeyPrefix      = "evict_cache:"
-	bucketDurabilityTaskKeyPrefix = "evict_cache:bucket_durability:"
+func DurabilityTaskKey(bucketID, generation int64) string {
+	return DurabilityTaskKeyPrefix + strconv.FormatInt(bucketID, 10) + ":" + strconv.FormatInt(generation, 10)
+}
+
+const (
+	EvictTaskKeyPrefix      = "cache-evict:"
+	DurabilityTaskKeyPrefix = "cache-durability:"
 )
 
-// ErrDurabilityThreshold means the current Bucket policy does not authorize deletion.
-var ErrDurabilityThreshold = errors.New("minimum durable copies not met")
+var (
+	ErrDurabilityThreshold = errors.New("minimum durable copies not met")
+	ErrNoLongerEligible    = errors.New("cache entry is no longer eligible")
+	ErrAccessChanged       = errors.New("cache access snapshot changed")
+)
 
-// ErrNoLongerEligible means a planned cache entry no longer matches the deletion contract.
-var ErrNoLongerEligible = errors.New("cache entry is no longer eligible")
-
-// ErrAccessChanged means an LRU candidate was accessed after it was planned.
-var ErrAccessChanged = errors.New("cache access snapshot changed")
-
-// Candidate is the persisted snapshot needed to plan one LRU eviction.
+// Candidate is one cached content payload, not one object version: residency
+// is content-addressed, so several versions of identical bytes share a single
+// eviction decision.
 type Candidate struct {
-	ObjectID   int64     `bun:"object_id"`
-	VersionID  string    `bun:"version_id"`
-	Size       int64     `bun:"size"`
+	ContentID  int64     `bun:"content_id"`
+	BucketID   int64     `bun:"bucket_id"`
+	Size       int64     `bun:"content_size"`
 	AccessedAt time.Time `bun:"cache_accessed_at"`
 }
 
-// LRUTaskPayload is the typed boundary for an LRU task's persisted payload.
-type LRUTaskPayload struct {
-	AccessedAt time.Time
+// EvictInput identifies one cache generation. AccessedAt is present for an LRU
+// authorization and omitted when remote durability directly authorizes removal.
+type EvictInput struct {
+	ContentID  int64      `json:"content_id"`
+	Generation int64      `json:"generation"`
+	AccessedAt *time.Time `json:"accessed_at,omitempty"`
 }
 
-// AuthorizedDeletion is the persisted decision needed to remove one cache
-// entry outside the database transaction that approved it.
+type DurabilityInput struct {
+	BucketID   int64 `json:"bucket_id"`
+	Generation int64 `json:"generation"`
+}
+
 type AuthorizedDeletion struct {
-	Version    model.ObjectVersion
+	Content    model.StorageContent
 	BucketName string
 }
 
-// NormalizeAccessTime matches the timestamp precision supported by both
-// PostgreSQL and SQLite persistence paths.
 func NormalizeAccessTime(value time.Time) time.Time {
 	return value.UTC().Truncate(time.Microsecond)
 }
 
-// NewLRUTask builds the stable task for one candidate access snapshot.
-func NewLRUTask(candidate Candidate, maxRetries int, scheduledAt time.Time) *model.Task {
-	stage := StageLRU
-	payload := LRUTaskPayload{
-		AccessedAt: NormalizeAccessTime(candidate.AccessedAt),
-	}
-	return &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          candidate.ObjectID,
-		RefVersionID:   candidate.VersionID,
-		IdempotencyKey: lruTaskKeyPrefix + candidate.VersionID,
-		Payload:        payload.taskPayload(),
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     maxRetries,
-		ScheduledAt:    scheduledAt,
-	}
-}
-
-// NewAfterUploadTask builds the stable task for post-upload eviction.
-func NewAfterUploadTask(objectID int64, versionID string, maxRetries int, scheduledAt time.Time) *model.Task {
-	stage := StageAfterUpload
-	return &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "object",
-		RefID:          objectID,
-		RefVersionID:   versionID,
-		IdempotencyKey: afterUploadTaskKeyPrefix + versionID,
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     maxRetries,
-		ScheduledAt:    scheduledAt,
-	}
-}
-
-// NewBucketDurabilityTask builds the singleton reconciliation task for one bucket.
-func NewBucketDurabilityTask(bucketID int64, maxRetries int, scheduledAt time.Time) *model.Task {
-	stage := StageReconcileBucketDurability
-	return &model.Task{
-		Type:           model.TaskTypeEvictCache,
-		Stage:          &stage,
-		RefType:        "bucket",
-		RefID:          bucketID,
-		IdempotencyKey: fmt.Sprintf("%s%d", bucketDurabilityTaskKeyPrefix, bucketID),
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     maxRetries,
-		ScheduledAt:    scheduledAt,
-	}
-}
-
-// ParseLRUTaskPayload validates and decodes the persisted LRU access snapshot.
-func ParseLRUTaskPayload(task *model.Task) (LRUTaskPayload, error) {
+func ParseEvictInput(task *model.Task) (EvictInput, error) {
 	if task == nil {
-		return LRUTaskPayload{}, errors.New("nil LRU eviction task")
+		return EvictInput{}, errors.New("nil cache eviction task")
 	}
-	raw, ok := task.Payload[lruAccessedAtPayloadKey]
-	if !ok {
-		return LRUTaskPayload{}, errors.New("LRU eviction task is missing cache_accessed_at")
+	var input EvictInput
+	if err := json.Unmarshal(task.Input, &input); err != nil {
+		return EvictInput{}, fmt.Errorf("decoding cache eviction input: %w", err)
 	}
-	value, ok := raw.(string)
-	if !ok {
-		return LRUTaskPayload{}, fmt.Errorf("LRU eviction task cache_accessed_at has type %T, want string", raw)
+	if input.ContentID < 1 || input.Generation < 1 {
+		return EvictInput{}, errors.New("cache eviction input is incomplete")
 	}
-	accessedAt, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return LRUTaskPayload{}, fmt.Errorf("parsing LRU eviction task cache_accessed_at: %w", err)
+	if input.AccessedAt != nil {
+		normalized := NormalizeAccessTime(*input.AccessedAt)
+		input.AccessedAt = &normalized
 	}
-	return LRUTaskPayload{AccessedAt: NormalizeAccessTime(accessedAt)}, nil
+	return input, nil
 }
 
-// DeleteAuthorized reports whether the task has crossed the durable deletion
-// authorization boundary.
-func DeleteAuthorized(task *model.Task) (bool, error) {
-	if task == nil || task.Payload == nil {
-		return false, nil
+func ParseDurabilityInput(task *model.Task) (DurabilityInput, error) {
+	if task == nil {
+		return DurabilityInput{}, errors.New("nil durability reconciliation task")
 	}
-	raw, ok := task.Payload[deleteAuthorizedPayloadKey]
-	if !ok {
-		return false, nil
+	var input DurabilityInput
+	if err := json.Unmarshal(task.Input, &input); err != nil {
+		return DurabilityInput{}, fmt.Errorf("decoding durability input: %w", err)
 	}
-	authorized, ok := raw.(bool)
-	if !ok {
-		return false, fmt.Errorf("cache eviction task delete_authorized has type %T, want bool", raw)
+	if input.BucketID < 1 || input.Generation < 1 {
+		return DurabilityInput{}, errors.New("durability input is incomplete")
 	}
-	return authorized, nil
+	return input, nil
 }
 
-// WithDeleteAuthorization copies payload before recording an authorization.
-func WithDeleteAuthorization(payload map[string]any) map[string]any {
-	out := make(map[string]any, len(payload)+1)
-	for key, value := range payload {
-		out[key] = value
+func ValidateEvictInput(input *EvictInput) error {
+	if input == nil || input.ContentID < 1 || input.Generation < 1 {
+		return errors.New("content_id and generation are required")
 	}
-	out[deleteAuthorizedPayloadKey] = true
-	return out
+	if input.AccessedAt != nil {
+		normalized := NormalizeAccessTime(*input.AccessedAt)
+		input.AccessedAt = &normalized
+	}
+	return nil
 }
 
-func (p LRUTaskPayload) taskPayload() map[string]any {
-	return map[string]any{
-		lruAccessedAtPayloadKey: NormalizeAccessTime(p.AccessedAt).Format(time.RFC3339Nano),
+func ValidateDurabilityInput(input *DurabilityInput) error {
+	if input == nil || input.BucketID < 1 || input.Generation < 1 {
+		return errors.New("bucket_id and generation are required")
 	}
+	return nil
 }

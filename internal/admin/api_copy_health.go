@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"time"
 
@@ -38,11 +39,10 @@ type copyHealthSummaryResponse struct {
 type copyHealthFact struct {
 	BucketID        int64
 	VersionID       string
-	UploadID        *int64
-	UploadStatus    *model.StorageUploadStatus
+	ContentID       *int64
 	RequestedCopies int
 	CopyIndex       *int
-	CopyStatus      *model.StorageUploadCopyStatus
+	CopyStatus      *model.StorageCopyStatus
 	ProviderID      *types.OnChainID
 	LocalDataSetID  *int64
 	ChainDataSetID  *types.OnChainID
@@ -130,14 +130,16 @@ func copyHealthSummariesByBucket(facts []copyHealthFact, observations map[int64]
 			objects[key] = object
 			order = append(order, key)
 		}
-		if fact.UploadID != nil {
+		if fact.ContentID != nil {
 			object.hasUpload = true
-		}
-		if fact.UploadStatus != nil {
-			object.uploadStatus = fact.UploadStatus
 		}
 		if fact.CopyStatus == nil {
 			continue
+		}
+		if *fact.CopyStatus == model.StorageCopyStatusFailed {
+			object.sawFailedCopy = true
+		} else {
+			object.sawActiveCopy = true
 		}
 		signal := copyHealthSignalFromFact(fact, observations, observationFailed, interval, now)
 		object.addCandidate(fact, signal)
@@ -195,18 +197,21 @@ type copyHealthObjectAccumulator struct {
 	bucketID        int64
 	requestedCopies int
 	hasUpload       bool
-	uploadStatus    *model.StorageUploadStatus
-	candidates      []copyHealthCandidate
-	status          observability.Status
-	reasons         []observability.ReasonCode
-	reasonSet       map[observability.ReasonCode]struct{}
-	stale           bool
-	lastCheckedAt   *time.Time
-	lastError       *string
-	readableCopies  int
-	pendingCopies   int
-	failedCopies    int
-	unknownCopies   int
+	// Gap classification reads the copy rows directly. It used to read a
+	// stored upload status, which described the same pipeline one level away.
+	sawFailedCopy  bool
+	sawActiveCopy  bool
+	candidates     []copyHealthCandidate
+	status         observability.Status
+	reasons        []observability.ReasonCode
+	reasonSet      map[observability.ReasonCode]struct{}
+	stale          bool
+	lastCheckedAt  *time.Time
+	lastError      *string
+	readableCopies int
+	pendingCopies  int
+	failedCopies   int
+	unknownCopies  int
 }
 
 func (a *copyHealthObjectAccumulator) addCandidate(fact copyHealthFact, signal observability.Signal) {
@@ -253,7 +258,7 @@ func (a *copyHealthObjectAccumulator) summarizePolicyCandidates() {
 	})
 
 	selected := min(a.requestedCopies, len(a.candidates))
-	for i := 0; i < selected; i++ {
+	for i := range selected {
 		candidate := a.candidates[i]
 		a.addSelectedCandidate(candidate)
 		underReplicated = underReplicated || candidate.underReplicated
@@ -308,10 +313,10 @@ func (a *copyHealthObjectAccumulator) classifyGapCopies(count int) {
 		return
 	}
 	switch {
-	case a.uploadStatus != nil && (*a.uploadStatus == model.StorageUploadStatusFailed || *a.uploadStatus == model.StorageUploadStatusRejected):
+	case a.sawFailedCopy && !a.sawActiveCopy:
 		a.failedCopies += count
 		a.addReason(observability.ReasonCopyFailed)
-	case a.uploadStatus != nil && (*a.uploadStatus == model.StorageUploadStatusRunning || *a.uploadStatus == model.StorageUploadStatusIngressReady || *a.uploadStatus == model.StorageUploadStatusReadable):
+	case a.sawActiveCopy:
 		a.pendingCopies += count
 		a.addReason(observability.ReasonCopyPending)
 	default:
@@ -337,11 +342,11 @@ func (s *Server) copyHealthRefreshInterval() time.Duration {
 
 func copyHealthCandidateKindForFact(fact copyHealthFact, signal observability.Signal) copyHealthCandidateKind {
 	switch derefCopyStatus(fact.CopyStatus) {
-	case model.StorageUploadCopyStatusPending, model.StorageUploadCopyStatusPieceReady, model.StorageUploadCopyStatusCommitting:
+	case model.StorageCopyStatusPending, model.StorageCopyStatusPieceReady, model.StorageCopyStatusCommitting:
 		return copyHealthCandidatePending
-	case model.StorageUploadCopyStatusFailed:
+	case model.StorageCopyStatusFailed:
 		return copyHealthCandidateFailed
-	case model.StorageUploadCopyStatusCommitted:
+	case model.StorageCopyStatusCommitted:
 		if signal.Status == observability.StatusAvailable {
 			return copyHealthCandidateReadable
 		}
@@ -407,40 +412,38 @@ func copyHealthSignalFromFact(fact copyHealthFact, observations map[int64]observ
 		RetrievalURL:   fact.RetrievalURL,
 		LastError:      fact.LastError,
 	}, observation, interval, now)
-	if observationFailed && derefCopyStatus(fact.CopyStatus) == model.StorageUploadCopyStatusCommitted && hasAnyReason(signal.ReasonCodes, observability.ReasonCopyObservationMissing) {
+	if observationFailed && derefCopyStatus(fact.CopyStatus) == model.StorageCopyStatusCommitted && hasAnyReason(signal.ReasonCodes, observability.ReasonCopyObservationMissing) {
 		return copyHealthQueryFailureSignal(interval, now)
 	}
 	return signal
 }
 
-func provenanceCopyHealthFacts(bucketID int64, versionID string, upload model.StorageUpload, copies []model.StorageUploadCopy) []copyHealthFact {
+func provenanceCopyHealthFacts(bucketID int64, versionID string, upload model.StorageContent, copies []model.StorageCopy) []copyHealthFact {
 	if len(copies) == 0 {
-		uploadID := upload.ID
-		uploadStatus := upload.Status
+		contentID := upload.ID
 		return []copyHealthFact{{
 			BucketID:        bucketID,
 			VersionID:       versionID,
-			UploadID:        &uploadID,
-			UploadStatus:    &uploadStatus,
+			ContentID:       &contentID,
 			RequestedCopies: upload.RequestedCopies,
 		}}
 	}
 	facts := make([]copyHealthFact, 0, len(copies))
 	for _, copyRow := range copies {
-		uploadID := upload.ID
-		uploadStatus := upload.Status
+		contentID := upload.ID
 		copyIndex := copyRow.CopyIndex
 		copyStatus := copyRow.Status
+		providerID := copyRow.ProviderID
+		localDataSetID := copyRow.StorageDataSetID
 		facts = append(facts, copyHealthFact{
 			BucketID:        bucketID,
 			VersionID:       versionID,
-			UploadID:        &uploadID,
-			UploadStatus:    &uploadStatus,
+			ContentID:       &contentID,
 			RequestedCopies: upload.RequestedCopies,
 			CopyIndex:       &copyIndex,
 			CopyStatus:      &copyStatus,
-			ProviderID:      copyRow.ProviderID,
-			LocalDataSetID:  copyRow.StorageDataSetID,
+			ProviderID:      &providerID,
+			LocalDataSetID:  &localDataSetID,
 			ChainDataSetID:  copyRow.DataSetID,
 			PieceID:         copyRow.PieceID,
 			RetrievalURL:    copyRow.RetrievalURL,
@@ -510,7 +513,7 @@ func oldestLastCheckedAtString(current string, candidate *time.Time) string {
 	return current
 }
 
-func derefCopyStatus(status *model.StorageUploadCopyStatus) model.StorageUploadCopyStatus {
+func derefCopyStatus(status *model.StorageCopyStatus) model.StorageCopyStatus {
 	if status == nil {
 		return ""
 	}
@@ -539,10 +542,8 @@ func observabilityStatusRank(status observability.Status) int {
 
 func hasAnyReason(reasons []observability.ReasonCode, want ...observability.ReasonCode) bool {
 	for _, reason := range reasons {
-		for _, target := range want {
-			if reason == target {
-				return true
-			}
+		if slices.Contains(want, reason) {
+			return true
 		}
 	}
 	return false

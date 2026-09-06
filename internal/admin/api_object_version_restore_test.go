@@ -168,13 +168,13 @@ func TestAPIObjectVersionRestoreMapsErrors(t *testing.T) {
 func TestAPIObjectVersionsReturnsCurrentVersionIDOnEveryPage(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "version-token-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "version-token-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, firstID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 1, "etag-1", "checksum-1", "text/plain", "", model.ObjectStateCached)
-	_, secondID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 2, "etag-2", "checksum-2", "text/plain", "", model.ObjectStateCached)
-	_, currentID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 3, "etag-3", "checksum-3", "text/plain", "", model.ObjectStateCached)
+	_, firstID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 1, "etag-1", "checksum-1", "text/plain", model.ObjectStateCached)
+	_, secondID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 2, "etag-2", "checksum-2", "text/plain", model.ObjectStateCached)
+	_, currentID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 3, "etag-3", "checksum-3", "text/plain", model.ObjectStateCached)
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -226,11 +226,11 @@ func TestAPIObjectVersionsReturnsCurrentVersionIDOnEveryPage(t *testing.T) {
 func TestAPIObjectVersionsFallsBackToCurrentVersionInListedPage(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "version-token-race-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "version-token-race-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, currentID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 1, "etag", "checksum", "text/plain", "", model.ObjectStateCached)
+	_, currentID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 1, "etag", "checksum", "text/plain", model.ObjectStateCached)
 	repos.Objects = missingCurrentObjectRepository{ObjectRepository: repos.Objects}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/"+bucket.Name+"/objects/versions?key=file.txt", nil)
 	req.SetPathValue("name", bucket.Name)

@@ -4,8 +4,6 @@ import type {
   ObjectProvenance,
   ObjectStatusDetail,
   ObjectVersionListResponse,
-  TaskListResponse,
-  TaskRefDetail,
   UploadTransferProgress,
 } from '@/api/client'
 
@@ -59,6 +57,11 @@ export function applyUploadStateChangedEventData(queryClient: QueryClient, raw: 
       queryClient.invalidateQueries({ queryKey: ['objectStatusDetail', payload.bucket_name, payload.version_id] })
       queryClient.invalidateQueries({ queryKey: ['objectProvenance', payload.bucket_name, payload.version_id] })
     }
+  } else {
+    queryClient.invalidateQueries({ queryKey: ['objects'] })
+    queryClient.invalidateQueries({ queryKey: ['objectVersions'] })
+    queryClient.invalidateQueries({ queryKey: ['objectStatusDetail'] })
+    queryClient.invalidateQueries({ queryKey: ['objectProvenance'] })
   }
   queryClient.invalidateQueries({ queryKey: ['tasks'] })
   queryClient.invalidateQueries({ queryKey: ['taskRefDetail'] })
@@ -106,29 +109,7 @@ export function applyUploadProgressUpdate(queryClient: QueryClient, payload: Upl
     return next === data.progress ? data : { ...data, progress: next }
   })
 
-  queryClient.setQueriesData<TaskListResponse>({ queryKey: ['tasks'] }, (data) => {
-    if (!data?.tasks.length) return data
-    let changed = false
-    const tasks = data.tasks.map((task) => {
-      const matches =
-        (typeof payload.task_id === 'number' && task.id === payload.task_id) ||
-        (typeof payload.upload_id === 'number' && task.upload_id === payload.upload_id) ||
-        task.ref_version_id === payload.version_id
-      if (!matches) return task
-      if (task.progress?.scope === 'provider_replacement') return task
-      const next = mergeProgress(task.progress, progress)
-      if (next === task.progress) return task
-      changed = true
-      return { ...task, progress: next }
-    })
-    return changed ? { ...data, tasks } : data
-  })
-
-  queryClient.setQueriesData<TaskRefDetail>({ queryKey: ['taskRefDetail'] }, (data) => {
-    if (!data?.object || data.object.version_id !== payload.version_id) return data
-    const next = mergeProgress(data.object.progress, progress)
-    return next === data.object.progress ? data : { ...data, object: { ...data.object, progress: next } }
-  })
+  queryClient.invalidateQueries({ queryKey: ['tasks'] })
 }
 
 function mergeProgress(current: UploadTransferProgress | undefined, next: UploadTransferProgress) {

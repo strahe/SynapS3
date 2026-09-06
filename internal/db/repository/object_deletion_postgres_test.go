@@ -17,9 +17,9 @@ import (
 	"github.com/uptrace/bun"
 )
 
-type storageUploadLockContextKey struct{}
+type storageContentLockContextKey struct{}
 
-type storageUploadLockBarrier struct {
+type storageContentLockBarrier struct {
 	blockedOperation string
 	locked           chan struct{}
 	release          chan struct{}
@@ -28,15 +28,15 @@ type storageUploadLockBarrier struct {
 	attemptOnce      sync.Once
 }
 
-func (h *storageUploadLockBarrier) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
-	if storageUploadLockQuery(event.Query) && ctx.Value(storageUploadLockContextKey{}) != h.blockedOperation {
+func (h *storageContentLockBarrier) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	if storageContentLockQuery(event.Query) && ctx.Value(storageContentLockContextKey{}) != h.blockedOperation {
 		h.attemptOnce.Do(func() { close(h.attempted) })
 	}
 	return ctx
 }
 
-func (h *storageUploadLockBarrier) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
-	if !storageUploadLockQuery(event.Query) || ctx.Value(storageUploadLockContextKey{}) != h.blockedOperation {
+func (h *storageContentLockBarrier) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+	if !storageContentLockQuery(event.Query) || ctx.Value(storageContentLockContextKey{}) != h.blockedOperation {
 		return
 	}
 	h.lockOnce.Do(func() {
@@ -45,114 +45,9 @@ func (h *storageUploadLockBarrier) AfterQuery(ctx context.Context, event *bun.Qu
 	})
 }
 
-func storageUploadLockQuery(query string) bool {
+func storageContentLockQuery(query string) bool {
 	query = strings.ToLower(query)
-	return strings.Contains(query, "update") && strings.Contains(query, "storage_uploads") && strings.Contains(query, "status = status")
-}
-
-func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
-	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
-	}
-
-	for _, tc := range []struct {
-		name             string
-		blockedOperation string
-		wantFollowerBind bool
-		wantUploadStatus model.StorageUploadStatus
-	}{
-		{name: "delete wins", blockedOperation: "delete", wantUploadStatus: model.StorageUploadStatusSuperseded},
-		{name: "reuse wins", blockedOperation: "reuse", wantFollowerBind: true, wantUploadStatus: model.StorageUploadStatusComplete},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			db := permanentDeletePostgresDB(t, dsn)
-			repos := repository.NewRepositories(db)
-			ctx := context.Background()
-			bucket := seedBucket(t, db, "postgres-permanent-delete-"+strings.ReplaceAll(tc.name, " ", "-"))
-			source := newObjectVersion(bucket.ID, "source.txt", model.NewVersionID(), 10)
-			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source); err != nil {
-				t.Fatalf("CreateVersionAndSetCurrent(source): %v", err)
-			}
-			uploadID := acceptTestStorageUploadForVersion(t, repos, bucket.ID, source, "bafk2bzacepostgresreuse")
-			if err := repos.Objects.SetVersionStorageUploadAndTransition(ctx, source.VersionID, uploadID, model.ObjectStateCached, model.ObjectStateStored); err != nil {
-				t.Fatalf("SetVersionStorageUploadAndTransition(source): %v", err)
-			}
-			followerUploadID := uploadID
-			follower := newObjectVersion(bucket.ID, "follower.txt", model.NewVersionID(), source.Size)
-			follower.Checksum = source.Checksum
-			follower.StorageUploadID = &followerUploadID
-			follower.State = model.ObjectStateStored
-
-			barrier := &storageUploadLockBarrier{
-				blockedOperation: tc.blockedOperation,
-				locked:           make(chan struct{}),
-				release:          make(chan struct{}),
-				attempted:        make(chan struct{}),
-			}
-			defer func() {
-				select {
-				case <-barrier.release:
-				default:
-					close(barrier.release)
-				}
-			}()
-			db.AddQueryHook(barrier)
-			deleteCtx := context.WithValue(ctx, storageUploadLockContextKey{}, "delete")
-			reuseCtx := context.WithValue(ctx, storageUploadLockContextKey{}, "reuse")
-			deleteResult := make(chan error, 1)
-			reuseResult := make(chan error, 1)
-			startDelete := func() {
-				go func() {
-					_, err := repos.Objects.DeleteObjectVersionPermanently(deleteCtx, repository.DeleteObjectVersionInput{
-						BucketID: bucket.ID, Key: source.Key, VersionID: source.VersionID,
-					})
-					deleteResult <- err
-				}()
-			}
-			startReuse := func() {
-				go func() {
-					_, err := repos.Objects.CreateVersionAndSetCurrent(reuseCtx, follower)
-					reuseResult <- err
-				}()
-			}
-			if tc.blockedOperation == "delete" {
-				startDelete()
-			} else {
-				startReuse()
-			}
-			waitPostgresDeleteSignal(t, barrier.locked, "first storage upload lock")
-			if tc.blockedOperation == "delete" {
-				startReuse()
-			} else {
-				startDelete()
-			}
-			waitPostgresDeleteSignal(t, barrier.attempted, "competing storage upload lock")
-			close(barrier.release)
-			if err := waitPostgresDeleteResult(t, deleteResult, "permanent delete"); err != nil {
-				t.Fatalf("DeleteObjectVersionPermanently: %v", err)
-			}
-			if err := waitPostgresDeleteResult(t, reuseResult, "content reuse"); err != nil {
-				t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
-			}
-
-			gotFollower, err := repos.Objects.GetVersionByID(ctx, follower.VersionID)
-			if err != nil || gotFollower == nil {
-				t.Fatalf("GetVersionByID(follower): version=%#v err=%v", gotFollower, err)
-			}
-			if tc.wantFollowerBind {
-				if gotFollower.StorageUploadID == nil || *gotFollower.StorageUploadID != uploadID || gotFollower.State != model.ObjectStateStored {
-					t.Fatalf("reuse-winner follower = upload:%#v state:%s, want stored upload %d", gotFollower.StorageUploadID, gotFollower.State, uploadID)
-				}
-			} else if gotFollower.StorageUploadID != nil || gotFollower.State != model.ObjectStateCached {
-				t.Fatalf("delete-winner follower = upload:%#v state:%s, want cached without stale upload", gotFollower.StorageUploadID, gotFollower.State)
-			}
-			upload, err := repos.Uploads.GetByID(ctx, uploadID)
-			if err != nil || upload == nil || upload.Status != tc.wantUploadStatus {
-				t.Fatalf("upload after concurrent delete/reuse = %#v err=%v, want %s", upload, err, tc.wantUploadStatus)
-			}
-		})
-	}
+	return strings.Contains(query, "update") && strings.Contains(query, "storage_contents") && strings.Contains(query, "updated_at = updated_at")
 }
 
 func permanentDeletePostgresDB(t *testing.T, dsn string) *bun.DB {
@@ -220,5 +115,109 @@ func waitPostgresDeleteResult(t *testing.T, result <-chan error, name string) er
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for %s", name)
 		return nil
+	}
+}
+
+// TestPostgresPermanentDeleteSerializesContentReuse pins the race that content
+// dedup creates: one writer permanently deletes the last version of a content
+// while another writes a new version onto the same content. Both must serialize
+// on the content row, and the deletion must only report the content
+// unreferenced when it truly won the race, because that answer is what releases
+// the shared cache file.
+func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
+	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
+	}
+
+	for _, tc := range []struct {
+		name             string
+		blockedOperation string
+		wantUnreferenced bool
+	}{
+		{name: "delete wins", blockedOperation: "delete", wantUnreferenced: true},
+		{name: "reuse wins", blockedOperation: "reuse", wantUnreferenced: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := permanentDeletePostgresDB(t, dsn)
+			repos := repository.NewRepositories(db)
+			ctx := context.Background()
+			bucket := seedBucket(t, db, "postgres-permanent-delete-"+strings.ReplaceAll(tc.name, " ", "-"))
+			contentID := seedContent(t, repos, bucket.ID, "postgres-shared-content", 10)
+
+			source := newObjectVersion(bucket.ID, "source.txt", model.NewVersionID(), 10)
+			source.ContentID = &contentID
+			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, source); err != nil {
+				t.Fatalf("CreateVersionAndSetCurrent(source): %v", err)
+			}
+			follower := newObjectVersion(bucket.ID, "follower.txt", model.NewVersionID(), source.Size)
+			follower.ContentID = &contentID
+
+			barrier := &storageContentLockBarrier{
+				blockedOperation: tc.blockedOperation,
+				locked:           make(chan struct{}),
+				release:          make(chan struct{}),
+				attempted:        make(chan struct{}),
+			}
+			defer func() {
+				select {
+				case <-barrier.release:
+				default:
+					close(barrier.release)
+				}
+			}()
+			db.AddQueryHook(barrier)
+			deleteCtx := context.WithValue(ctx, storageContentLockContextKey{}, "delete")
+			reuseCtx := context.WithValue(ctx, storageContentLockContextKey{}, "reuse")
+			deleteResult := make(chan error, 1)
+			reuseResult := make(chan error, 1)
+			var deleted repository.DeleteObjectVersionResult
+			startDelete := func() {
+				go func() {
+					result, err := repos.Objects.DeleteObjectVersionPermanently(deleteCtx, repository.DeleteObjectVersionInput{
+						BucketID: bucket.ID, Key: source.Key, VersionID: source.VersionID,
+					})
+					deleted = result
+					deleteResult <- err
+				}()
+			}
+			startReuse := func() {
+				go func() {
+					_, err := repos.Objects.CreateVersionAndSetCurrent(reuseCtx, follower)
+					reuseResult <- err
+				}()
+			}
+			if tc.blockedOperation == "delete" {
+				startDelete()
+			} else {
+				startReuse()
+			}
+			waitPostgresDeleteSignal(t, barrier.locked, "first storage content lock")
+			if tc.blockedOperation == "delete" {
+				startReuse()
+			} else {
+				startDelete()
+			}
+			waitPostgresDeleteSignal(t, barrier.attempted, "competing storage content lock")
+			close(barrier.release)
+			if err := waitPostgresDeleteResult(t, deleteResult, "permanent delete"); err != nil {
+				t.Fatalf("DeleteObjectVersionPermanently: %v", err)
+			}
+			if err := waitPostgresDeleteResult(t, reuseResult, "content reuse"); err != nil {
+				t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
+			}
+
+			if deleted.ContentUnreferenced != tc.wantUnreferenced {
+				t.Fatalf("ContentUnreferenced = %t, want %t", deleted.ContentUnreferenced, tc.wantUnreferenced)
+			}
+			unreferenced, err := repos.Objects.ContentIsUnreferenced(ctx, contentID)
+			if err != nil {
+				t.Fatalf("ContentIsUnreferenced: %v", err)
+			}
+			// Whoever won, the follower survives, so the bytes are still named.
+			if unreferenced {
+				t.Fatal("content is unreferenced after the reuse committed")
+			}
+		})
 	}
 }

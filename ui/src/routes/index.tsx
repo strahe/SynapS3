@@ -41,7 +41,7 @@ function OverviewPage() {
 
   const attentionRows = attentionDisplayRows({
     objects: data.objects.attention ?? { needs_attention: 0, unavailable: 0 },
-    tasks: data.tasks.attention ?? { failed: 0, exhausted: 0 },
+    tasks: data.tasks.attention ?? { failed: 0 },
   })
   const pipelineRows = overviewPipelineRows(data.tasks.active_pipeline ?? [])
   const hasActiveTasks = pipelineRows.some((row) => row.total > 0)
@@ -82,9 +82,7 @@ function OverviewPage() {
               <div className="flex h-60 flex-col items-center justify-center gap-2 text-muted-foreground">
                 <CheckCircle2 className="size-5 text-status-success" />
                 <div className="text-sm text-foreground">No attention needed</div>
-                <div className="max-w-full text-center text-xs">
-                  Object failures 0 · Unavailable 0 · Failed tasks 0 · Retry limit reached 0
-                </div>
+                <div className="max-w-full text-center text-xs">Object failures 0 · Unavailable 0 · Failed tasks 0</div>
               </div>
             )}
           </CardContent>
@@ -297,7 +295,7 @@ function AttentionLinkRow({ row }: { row: ReturnType<typeof attentionDisplayRows
     return (
       <Link
         to="/tasks"
-        search={{ type: 'all', status: row.taskStatus }}
+        search={{ status: row.taskStatus }}
         className={className}
         aria-label={`${row.label}: ${formatNumber(row.value)}`}
       >
@@ -327,12 +325,8 @@ function PipelineTooltip({ active, payload, label }: PipelineTooltipProps) {
     <div className="rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
       <div className="mb-1 font-medium">{label}</div>
       <div className="grid grid-cols-[auto_auto] gap-x-3 gap-y-1">
-        <span className="text-muted-foreground">Queued</span>
-        <span className="text-right">{formatNumber(row.queued)}</span>
-        <span className="text-muted-foreground">Scheduled</span>
-        <span className="text-right">{formatNumber(row.scheduled)}</span>
-        <span className="text-muted-foreground">Waiting</span>
-        <span className="text-right">{formatNumber(row.waiting)}</span>
+        <span className="text-muted-foreground">Pending</span>
+        <span className="text-right">{formatNumber(row.pending)}</span>
         <span className="text-muted-foreground">Running</span>
         <span className="text-right">{formatNumber(row.running)}</span>
       </div>

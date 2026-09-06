@@ -57,7 +57,6 @@ type ObjectListItem struct {
 	CurrentVersionID string         `json:"current_version_id"`
 	State            string         `json:"state"`
 	Status           string         `json:"status"`
-	UploadStatus     string         `json:"upload_status"`
 	Location         ObjectLocation `json:"location"`
 }
 
@@ -67,8 +66,8 @@ type ObjectLocation struct {
 }
 
 type ProvenanceResponse struct {
+	State           string           `json:"state"`
 	Status          string           `json:"status"`
-	UploadStatus    string           `json:"upload_status"`
 	RequestedCopies int              `json:"requested_copies"`
 	SuccessCopies   int              `json:"success_copies"`
 	Copies          []ProvenanceCopy `json:"copies"`
@@ -83,20 +82,24 @@ type ProvenanceCopy struct {
 }
 
 type TaskListResponse struct {
-	Tasks []TaskItem `json:"tasks"`
+	Tasks      []TaskItem `json:"tasks"`
+	NextCursor *int64     `json:"next_cursor,omitempty"`
 }
 
 type TaskItem struct {
-	ID            int64   `json:"id"`
-	Type          string  `json:"type"`
-	Stage         *string `json:"stage,omitempty"`
-	Status        string  `json:"status"`
-	RefVersionID  string  `json:"ref_version_id"`
-	RetryCount    int     `json:"retry_count"`
-	LastError     *string `json:"last_error,omitempty"`
-	StatusMessage *string `json:"status_message,omitempty"`
-	WaitReason    *string `json:"wait_reason,omitempty"`
-	ClaimedAt     *string `json:"claimed_at,omitempty"`
+	ID                 int64   `json:"id"`
+	Type               string  `json:"type"`
+	Operation          string  `json:"operation"`
+	Status             string  `json:"status"`
+	PresentationStatus string  `json:"presentation_status"`
+	SubjectType        *string `json:"subject_type,omitempty"`
+	SubjectKey         *string `json:"subject_key,omitempty"`
+	RetryCount         int     `json:"retry_count"`
+	RetryLimit         *int    `json:"retry_limit,omitempty"`
+	LastError          *string `json:"last_error,omitempty"`
+	StatusMessage      *string `json:"status_message,omitempty"`
+	WaitReason         *string `json:"wait_reason,omitempty"`
+	AvailableAt        string  `json:"available_at"`
 }
 
 type ReadinessResult struct {

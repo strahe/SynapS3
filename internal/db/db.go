@@ -25,6 +25,8 @@ import (
 
 const migrationUnlockTimeout = 5 * time.Second
 
+const sqlitePreflightTimeout = 5 * time.Second
+
 // New creates a Bun database connection based on the provided configuration.
 func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 	var (
@@ -42,6 +44,9 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 		db = bun.NewDB(sqldb, pgdialect.New())
 
 	case "sqlite":
+		if err := validateExistingSQLiteTarget(cfg.DSN); err != nil {
+			return nil, err
+		}
 		if err := ensureSQLiteDir(cfg.DSN); err != nil {
 			return nil, err
 		}
@@ -61,8 +66,60 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 	return db, nil
 }
 
+// validateExistingSQLiteTarget runs before the normal connection can apply a
+// persistent journal-mode pragma. An incompatible database is therefore
+// rejected without changing the preserved file.
+func validateExistingSQLiteTarget(dsn string) (retErr error) {
+	path, ok, err := sqliteFilePath(dsn)
+	if err != nil {
+		return fmt.Errorf("resolving sqlite database path: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspecting sqlite database: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("sqlite database path is a directory: %s", path)
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolving sqlite database absolute path: %w", err)
+	}
+	readOnlyURL := url.URL{Scheme: "file", Path: filepath.ToSlash(absolutePath)}
+	query := readOnlyURL.Query()
+	query.Set("mode", "ro")
+	query.Add("_pragma", "busy_timeout(5000)")
+	readOnlyURL.RawQuery = query.Encode()
+
+	sqldb, err := sql.Open("sqlite", readOnlyURL.String())
+	if err != nil {
+		return fmt.Errorf("opening sqlite database for compatibility check: %w", err)
+	}
+	readOnlyDB := bun.NewDB(sqldb, sqlitedialect.New())
+	defer func() {
+		if err := readOnlyDB.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing sqlite compatibility check: %w", err))
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), sqlitePreflightTimeout)
+	defer cancel()
+	if err := migrations.ValidateTarget(ctx, readOnlyDB); err != nil {
+		return fmt.Errorf("validating existing sqlite database: %w", err)
+	}
+	return nil
+}
+
 // RunMigrations initialises the Bun migrator and applies all pending migrations.
 func RunMigrations(ctx context.Context, db *bun.DB) (retErr error) {
+	if err := migrations.ValidateTarget(ctx, db); err != nil {
+		return err
+	}
 	migrator := migrations.NewMigrator(db)
 
 	if err := migrator.Init(ctx); err != nil {
@@ -91,11 +148,30 @@ func RunMigrations(ctx context.Context, db *bun.DB) (retErr error) {
 		slog.Info("no new migrations to apply")
 	}
 
+	// Statistics are an operational concern, not part of the frozen DDL, and the
+	// initial migration returns early on an already-migrated database. Refreshing
+	// them here means a partial index such as idx_tasks_pending is costed against
+	// what the table actually holds rather than against a default guess.
+	if err := analyzeSchema(ctx, db); err != nil {
+		slog.Warn("refreshing planner statistics failed (non-fatal)", "error", err)
+	}
+
+	return nil
+}
+
+// analyzeSchema refreshes query planner statistics for the whole database.
+func analyzeSchema(ctx context.Context, db *bun.DB) error {
+	if _, err := db.ExecContext(ctx, "ANALYZE"); err != nil {
+		return fmt.Errorf("analyzing schema: %w", err)
+	}
 	return nil
 }
 
 // ForceUnlockMigrations releases a migration lock left by a killed run.
 func ForceUnlockMigrations(ctx context.Context, db *bun.DB) error {
+	if err := migrations.ValidateTarget(ctx, db); err != nil {
+		return err
+	}
 	migrator := migrations.NewMigrator(db)
 	if err := migrator.Init(ctx); err != nil {
 		return fmt.Errorf("initializing migrator: %w", err)

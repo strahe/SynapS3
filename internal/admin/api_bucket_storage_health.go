@@ -121,12 +121,12 @@ func (s *Server) handleAPIBucketStorageHealthAffectedVersions(w http.ResponseWri
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
 		return
 	}
-	if s.repos.Uploads == nil {
+	if s.repos.Contents == nil {
 		writeJSON(w, http.StatusOK, bucketStorageHealthAffectedVersionsResponse{Versions: []bucketStorageHealthAffectedVersionResponse{}})
 		return
 	}
 
-	page, err := s.repos.Uploads.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
+	page, err := s.repos.Contents.ListBucketStorageHealthAffectedVersions(ctx, repository.BucketStorageHealthAffectedVersionsInput{
 		BucketID:        bucket.ID,
 		LocalDataSetID:  localDataSetID,
 		Prefix:          prefix,
@@ -146,11 +146,11 @@ func (s *Server) handleAPIBucketStorageHealthAffectedVersions(w http.ResponseWri
 }
 
 func (s *Server) bucketStorageHealthSummaries(ctx context.Context, bucketID int64) (map[int64]bucketStorageHealthSummaryResponse, bool) {
-	if s.repos.Uploads == nil {
+	if s.repos.Contents == nil {
 		return nil, false
 	}
 	staleBefore := s.bucketStorageHealthStaleBefore()
-	summaries, err := s.repos.Uploads.ListBucketStorageHealthSummaries(ctx, bucketID, staleBefore, bucketStorageHealthAffectedVersionsCap)
+	summaries, err := s.repos.Contents.ListBucketStorageHealthSummaries(ctx, bucketID, staleBefore, bucketStorageHealthAffectedVersionsCap)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Warn("api: failed to load bucket storage health facts", "error", err, "bucketID", bucketID)

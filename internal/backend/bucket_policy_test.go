@@ -19,7 +19,7 @@ func TestGetBucketAcl_ExistingBucket(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "acl-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "acl-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestPutBucketAcl_WritableBucket(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "put-acl-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "put-acl-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestPutBucketAclPersistsACL(t *testing.T) {
 	ctx := context.Background()
 	seedS3Account(t, tb, "new-owner")
 
-	bkt := &model.Bucket{Name: "persist-acl-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "persist-acl-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestPutBucketAclPreservesCurrentOwnerWhenACLHasNoOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal current ACL: %v", err)
 	}
-	bkt := &model.Bucket{Name: "preserve-owner-acl-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &currentOwner, ACL: acl}
+	bkt := &model.Bucket{Name: "preserve-owner-acl-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &currentOwner, ACL: acl, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestPutBucketAclPreservesCurrentOwnerWhenACLHasNoOwner(t *testing.T) {
 func TestPutBucketAclRejectsUnknownOwner(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
-	bkt := &model.Bucket{Name: "unknown-put-owner-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "unknown-put-owner-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestChangeBucketOwnerUpdatesACL(t *testing.T) {
 	ctx := context.Background()
 	seedS3Account(t, tb, "replacement-owner")
 
-	bkt := &model.Bucket{Name: "change-owner-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "change-owner-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestListBucketsAndOwnersReturnsStoredOwners(t *testing.T) {
 		{name: "owner-list-unassigned"},
 		{name: "owner-list-malformed", acl: []byte("{")},
 	} {
-		bkt := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive}
+		bkt := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 		switch {
 		case seed.acl != nil:
 			bkt.ACL = seed.acl
@@ -360,7 +360,7 @@ func TestPutBucketOwnershipControlsRejectsUnsupportedModes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal ACL: %v", err)
 	}
-	bkt := &model.Bucket{Name: "ownership-controls-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: acl}
+	bkt := &model.Bucket{Name: "ownership-controls-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: acl, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestDeleteBucketOwnershipControlsIsCompatibilityNoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal ACL: %v", err)
 	}
-	bkt := &model.Bucket{Name: "delete-ownership-controls-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: acl}
+	bkt := &model.Bucket{Name: "delete-ownership-controls-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: acl, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestGetBucketPolicyMissingPolicyReturnsNoSuchBucketPolicy(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "policy-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "policy-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -508,7 +508,7 @@ func TestGetBucketTagging_ReturnsAPIError(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "tag-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "tag-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -545,7 +545,7 @@ func TestGetBucketVersioning_ExistingBucket(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "ver-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "ver-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -566,7 +566,7 @@ func TestPutBucketVersioningEnabledIsNoop(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "put-ver-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "put-ver-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestPutBucketVersioningSuspendedRejected(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "put-ver-suspended-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "put-ver-suspended-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -621,7 +621,7 @@ func TestGetObjectLockConfiguration_ReturnsNotFound(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "lock-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "lock-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -647,7 +647,7 @@ func TestGetBucketOwnershipControls_ReturnsAclCompatibleOwnership(t *testing.T) 
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "own-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "own-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -667,7 +667,7 @@ func TestGetObjectAcl_VisibleBucket(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "obj-acl-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "obj-acl-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -689,7 +689,7 @@ func TestPutObjectAcl_WritableBucket(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "put-obj-acl", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "put-obj-acl", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}

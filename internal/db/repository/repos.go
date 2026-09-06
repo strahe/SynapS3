@@ -15,7 +15,7 @@ type Repositories struct {
 	Buckets          BucketRepository
 	S3Accounts       S3AccountRepository
 	Objects          ObjectRepository
-	Uploads          StorageUploadRepository
+	Contents         StorageContentRepository
 	Replacements     StorageReplacementRepository
 	StorageCleanup   StorageCleanupRepository
 	Tasks            TaskRepository
@@ -33,7 +33,7 @@ func NewRepositories(db bun.IDB) *Repositories {
 		Buckets:          &BunBucketRepo{db: db},
 		S3Accounts:       &BunS3AccountRepo{db: db},
 		Objects:          &BunObjectRepo{db: db},
-		Uploads:          &BunStorageUploadRepo{db: db},
+		Contents:         &BunStorageContentRepo{db: db},
 		Replacements:     &BunStorageReplacementRepo{db: db},
 		StorageCleanup:   &BunStorageCleanupRepo{db: db},
 		Tasks:            &BunTaskRepo{db: db},
@@ -65,10 +65,7 @@ func (r *Repositories) WithTx(ctx context.Context, fn func(txRepos *Repositories
 		if !shouldRetryRepositoryTx(err) || attempt >= 19 {
 			return err
 		}
-		delay := time.Duration(attempt+1) * 25 * time.Millisecond
-		if delay > 200*time.Millisecond {
-			delay = 200 * time.Millisecond
-		}
+		delay := min(time.Duration(attempt+1)*25*time.Millisecond, 200*time.Millisecond)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():

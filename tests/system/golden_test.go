@@ -77,7 +77,7 @@ func TestSystemGoldenPath(t *testing.T) {
 		return struct {
 			VersionID string
 			Snapshot  string
-		}{VersionID: item.CurrentVersionID, Snapshot: raw}, item.UploadStatus == "complete" && item.Location.Filecoin, nil
+		}{VersionID: item.CurrentVersionID, Snapshot: raw}, item.State == "stored" && item.Location.Filecoin, nil
 	})
 
 	provenancePath := "/api/v1/buckets/" + bucket + "/objects/provenance?version_id=" + url.QueryEscape(object.VersionID)
@@ -97,19 +97,21 @@ func TestSystemGoldenPath(t *testing.T) {
 		}
 		return value, true, nil
 	})
-	if provenance.UploadStatus != "complete" {
-		t.Fatalf("provenance upload status = %q, want complete", provenance.UploadStatus)
+	if provenance.State != "stored" {
+		t.Fatalf("provenance state = %q, want stored", provenance.State)
 	}
 
 	e2e.Eventually(t, t.Context(), 5*time.Second, "completed upload tasks", func(ctx context.Context) (string, bool, error) {
 		var tasks e2e.TaskListResponse
-		raw, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload&limit=100", &tasks)
+		raw, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload_plan&limit=100", &tasks)
 		if err != nil {
 			return raw, false, err
 		}
+		// Ingest is planned for the content, not for one version of it, and this
+		// bucket holds exactly one object, so every plan task here is its plan.
 		completed, failed := 0, 0
 		for _, task := range tasks.Tasks {
-			if task.RefVersionID != object.VersionID {
+			if task.SubjectType == nil || *task.SubjectType != "storage_content" {
 				continue
 			}
 			switch task.Status {

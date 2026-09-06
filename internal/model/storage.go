@@ -1,24 +1,12 @@
 package model
 
 import (
-	"encoding/json"
+	"context"
 	"math/bits"
 	"time"
 
 	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
-)
-
-type StorageUploadStatus string
-
-const (
-	StorageUploadStatusRunning      StorageUploadStatus = "running"
-	StorageUploadStatusIngressReady StorageUploadStatus = "ingress_ready"
-	StorageUploadStatusReadable     StorageUploadStatus = "readable"
-	StorageUploadStatusComplete     StorageUploadStatus = "complete"
-	StorageUploadStatusFailed       StorageUploadStatus = "failed"
-	StorageUploadStatusRejected     StorageUploadStatus = "rejected"
-	StorageUploadStatusSuperseded   StorageUploadStatus = "superseded"
 )
 
 // UploadProgressPercent returns a byte-based integer percent when the total is known.
@@ -41,13 +29,12 @@ func UploadProgressPercent(uploaded, total int64) *int {
 type StorageDataSetStatus string
 
 const (
-	StorageDataSetStatusPending     StorageDataSetStatus = "pending"
-	StorageDataSetStatusCreating    StorageDataSetStatus = "creating"
-	StorageDataSetStatusReady       StorageDataSetStatus = "ready"
-	StorageDataSetStatusFailed      StorageDataSetStatus = "failed"
-	StorageDataSetStatusUnavailable StorageDataSetStatus = "unavailable"
-	StorageDataSetStatusDraining    StorageDataSetStatus = "draining"
-	StorageDataSetStatusRetired     StorageDataSetStatus = "retired"
+	StorageDataSetStatusPending  StorageDataSetStatus = "pending"
+	StorageDataSetStatusCreating StorageDataSetStatus = "creating"
+	StorageDataSetStatusReady    StorageDataSetStatus = "ready"
+	StorageDataSetStatusFailed   StorageDataSetStatus = "failed"
+	StorageDataSetStatusDraining StorageDataSetStatus = "draining"
+	StorageDataSetStatusRetired  StorageDataSetStatus = "retired"
 )
 
 type StorageCopyTransferMethod string
@@ -57,41 +44,39 @@ const (
 	StorageCopyTransferMethodPeerPull StorageCopyTransferMethod = "peer_pull"
 )
 
-type StorageUploadCopyStatus string
+type StorageCopyStatus string
 
 const (
-	StorageUploadCopyStatusPending    StorageUploadCopyStatus = "pending"
-	StorageUploadCopyStatusPieceReady StorageUploadCopyStatus = "piece_ready"
-	StorageUploadCopyStatusCommitting StorageUploadCopyStatus = "committing"
-	StorageUploadCopyStatusCommitted  StorageUploadCopyStatus = "committed"
-	StorageUploadCopyStatusFailed     StorageUploadCopyStatus = "failed"
+	StorageCopyStatusPending    StorageCopyStatus = "pending"
+	StorageCopyStatusPieceReady StorageCopyStatus = "piece_ready"
+	StorageCopyStatusCommitting StorageCopyStatus = "committing"
+	StorageCopyStatusCommitted  StorageCopyStatus = "committed"
+	StorageCopyStatusFailed     StorageCopyStatus = "failed"
 )
 
-// StorageUpload records one SDK upload attempt and its persisted outcome.
-type StorageUpload struct {
-	bun.BaseModel `bun:"table:storage_uploads"`
+// StorageContent is the identity of one bucket-scoped byte payload. Object
+// versions point at it, copies place it with providers, and dedup is a lookup
+// on (bucket_id, checksum, content_size) rather than a scan.
+type StorageContent struct {
+	bun.BaseModel `bun:"table:storage_contents"`
 
-	ID                      int64               `bun:",pk,autoincrement"`
-	BucketID                int64               `bun:",notnull"`
-	SourceTaskID            *int64              `bun:",nullzero"`
-	SourceVersionID         string              `bun:",nullzero"`
-	ContentSize             int64               `bun:",notnull"`
-	Checksum                string              `bun:",notnull"`
-	Status                  StorageUploadStatus `bun:",notnull,default:'running'"`
-	PieceCID                *string             `bun:",nullzero"`
-	RequestedCopies         int                 `bun:",notnull"`
-	IngressBytesTransferred int64               `bun:",notnull,default:0"`
-	IngressStoreAttempt     int                 `bun:",notnull,default:0"`
-	ProgressUpdatedAt       *time.Time          `bun:",nullzero"`
-	RawResultJSON           json.RawMessage     `bun:"type:jsonb,nullzero"`
-	ErrorMessage            *string             `bun:",nullzero"`
-	AcceptError             *string             `bun:",nullzero"`
-	AcceptedAt              *time.Time          `bun:",nullzero"`
-	CreatedAt               time.Time           `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt               time.Time           `bun:",nullzero,notnull,default:current_timestamp"`
+	ID          int64   `bun:",pk,autoincrement,identity"`
+	BucketID    int64   `bun:",notnull"`
+	Checksum    string  `bun:"type:text,notnull"`
+	ContentSize int64   `bun:",notnull"`
+	PieceCID    *string `bun:"type:text,nullzero"`
+	// RequestedCopies is the durability target frozen when the content is first
+	// created. Later bucket-policy changes do not rewrite this target, and a
+	// deduplicated write inherits it.
+	RequestedCopies   int        `bun:"type:integer,notnull"`
+	ErrorMessage      *string    `bun:"type:text,nullzero"`
+	AcceptedAt        *time.Time `bun:",nullzero"`
+	CleanupGeneration int64      `bun:",notnull,default:0"`
+	CleanupTaskID     *int64     `bun:",nullzero"`
+	CreatedAt         time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt         time.Time  `bun:",nullzero,notnull"`
 
 	Bucket *Bucket `bun:"rel:belongs-to,join:bucket_id=id"`
-	Task   *Task   `bun:"rel:belongs-to,join:source_task_id=id"`
 }
 
 // StorageDataSet records the bucket ownership of a provider-scoped data set.
@@ -102,73 +87,137 @@ type StorageUpload struct {
 type StorageDataSet struct {
 	bun.BaseModel `bun:"table:storage_data_sets"`
 
-	ID                  int64                `bun:",pk,autoincrement"`
-	BucketID            int64                `bun:",notnull"`
-	ProviderID          types.OnChainID      `bun:"type:text,notnull"`
-	CopyIndex           int                  `bun:",notnull"`
-	Generation          int                  `bun:",notnull"`
-	IsCurrent           bool                 `bun:",notnull"`
-	DataSetID           *types.OnChainID     `bun:"type:text"`
-	ClientDataSetID     *types.OnChainID     `bun:"type:text"`
-	Status              StorageDataSetStatus `bun:",notnull,default:'pending'"`
-	CreateTransactionID *string              `bun:",nullzero"`
-	CreateStatusURL     *string              `bun:",nullzero"`
-	CreatedByUploadID   *int64               `bun:",nullzero"`
-	LastUsedUploadID    *int64               `bun:",nullzero"`
-	LastError           *string              `bun:",nullzero"`
-	CreatedAt           time.Time            `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt           time.Time            `bun:",nullzero,notnull,default:current_timestamp"`
+	ID                   int64                `bun:",pk,autoincrement,identity"`
+	BucketID             int64                `bun:",notnull"`
+	ProviderID           types.OnChainID      `bun:"type:text,notnull"`
+	CopyIndex            int                  `bun:"type:integer,notnull"`
+	Generation           int64                `bun:",notnull,default:1"`
+	IsCurrent            bool                 `bun:",notnull"`
+	DataSetID            *types.OnChainID     `bun:"type:text"`
+	ClientDataSetID      *types.OnChainID     `bun:"type:text"`
+	Status               StorageDataSetStatus `bun:"type:text,notnull,default:'pending'"`
+	CreateTransactionID  *string              `bun:"type:text,nullzero"`
+	CreateStatusURL      *string              `bun:"type:text,nullzero"`
+	CreatedByContentID   *int64               `bun:",nullzero"`
+	LastUsedContentID    *int64               `bun:",nullzero"`
+	LastError            *string              `bun:"type:text,nullzero"`
+	EnsureTaskID         *int64               `bun:",nullzero"`
+	RetirementGeneration int64                `bun:",notnull,default:0"`
+	RetirementTaskID     *int64               `bun:",nullzero"`
+	CreatedAt            time.Time            `bun:",nullzero,notnull"`
+	UpdatedAt            time.Time            `bun:",nullzero,notnull"`
 
-	Bucket          *Bucket        `bun:"rel:belongs-to,join:bucket_id=id"`
-	CreatedByUpload *StorageUpload `bun:"rel:belongs-to,join:created_by_upload_id=id"`
-	LastUsedUpload  *StorageUpload `bun:"rel:belongs-to,join:last_used_upload_id=id"`
+	Bucket           *Bucket         `bun:"rel:belongs-to,join:bucket_id=id"`
+	CreatedByContent *StorageContent `bun:"rel:belongs-to,join:created_by_content_id=id"`
+	LastUsedContent  *StorageContent `bun:"rel:belongs-to,join:last_used_content_id=id"`
 }
 
-// StorageUploadCopy stores one successful copy returned by the SDK.
-type StorageUploadCopy struct {
-	bun.BaseModel `bun:"table:storage_upload_copies"`
+// StorageCopy places one content payload on one data set generation. Ingress
+// progress lives here rather than on the content because it belongs to the
+// concrete transfer that produced it.
+type StorageCopy struct {
+	bun.BaseModel `bun:"table:storage_copies"`
 
-	ID                           int64                     `bun:",pk,autoincrement"`
-	UploadID                     int64                     `bun:",notnull"`
-	CopyIndex                    int                       `bun:",notnull"`
-	ProviderID                   *types.OnChainID          `bun:"type:text"`
-	DataSetID                    *types.OnChainID          `bun:"type:text,scanonly"`
-	PieceID                      *types.OnChainID          `bun:"type:text"`
-	TransferMethod               StorageCopyTransferMethod `bun:",notnull"`
-	Status                       StorageUploadCopyStatus   `bun:",notnull,default:'pending'"`
-	RetrievalURL                 *string                   `bun:",nullzero"`
-	IsNewDataSet                 bool                      `bun:",notnull,default:false"`
-	StorageDataSetID             *int64                    `bun:",nullzero"`
-	CommitExtraDataHex           *string                   `bun:",nullzero"`
-	CommitTransactionID          *string                   `bun:",nullzero"`
-	CommitReadyAt                *time.Time                `bun:",nullzero"`
-	CommitAttemptID              *string                   `bun:",nullzero"`
-	CommitAttemptedAt            *time.Time                `bun:",nullzero"`
-	CommitSubmissionJSON         *string                   `bun:",nullzero"`
-	CommitConfirmedTransactionID *string                   `bun:",nullzero"`
-	CommitAttentionCode          *string                   `bun:",nullzero"`
-	CommitAttentionAt            *time.Time                `bun:",nullzero"`
-	LastError                    *string                   `bun:",nullzero"`
-	CreatedAt                    time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
-	UpdatedAt                    time.Time                 `bun:",nullzero,notnull,default:current_timestamp"`
+	ID        int64 `bun:",pk,autoincrement,identity"`
+	ContentID int64 `bun:",notnull"`
+	BucketID  int64 `bun:",notnull"`
+	// ContentSize repeats the content size so the ingress bound stays a local
+	// check; a composite foreign key keeps the repetition from drifting.
+	ContentSize      int64                     `bun:",notnull"`
+	StorageDataSetID int64                     `bun:",notnull"`
+	CopyIndex        int                       `bun:"type:integer,notnull"`
+	ProviderID       types.OnChainID           `bun:"type:text,notnull"`
+	PieceID          *types.OnChainID          `bun:"type:text"`
+	TransferMethod   StorageCopyTransferMethod `bun:"type:text,notnull"`
+	Status           StorageCopyStatus         `bun:"type:text,notnull,default:'pending'"`
+	RetrievalURL     *string                   `bun:"type:text,nullzero"`
+	// IsNewDataSet is derived by repository reads from the data set's creator.
+	IsNewDataSet       bool       `bun:",scanonly"`
+	CommitExtraDataHex *string    `bun:"type:text,nullzero"`
+	CommitReadyAt      *time.Time `bun:",nullzero"`
+	// ConfirmedAttemptID and ConfirmedAttemptStatus project the ledger row that
+	// proves this copy is committed. A composite foreign key requires the named
+	// attempt to actually be confirmed, so the projection cannot drift.
+	ConfirmedAttemptID      *string    `bun:"type:text,nullzero"`
+	ConfirmedAttemptStatus  *string    `bun:"type:text,nullzero"`
+	IngressBytesTransferred int64      `bun:",notnull,default:0"`
+	IngressStoreAttempt     int        `bun:"type:integer,notnull,default:0"`
+	ProgressUpdatedAt       *time.Time `bun:",nullzero"`
+	WorkGeneration          int64      `bun:",notnull,default:0"`
+	ActiveTaskID            *int64     `bun:",nullzero"`
+	LastError               *string    `bun:"type:text,nullzero"`
+	CreatedAt               time.Time  `bun:",nullzero,notnull"`
+	UpdatedAt               time.Time  `bun:",nullzero,notnull"`
 
-	Upload     *StorageUpload  `bun:"rel:belongs-to,join:upload_id=id"`
+	DataSetID *types.OnChainID `bun:"type:text,scanonly"`
+
+	// Commit evidence is projected from storage_commit_attempts by repository
+	// reads. These fields are not columns on the copy table.
+	CommitAttemptID              *string    `bun:",scanonly"`
+	CommitAttemptedAt            *time.Time `bun:",scanonly"`
+	CommitTransactionID          *string    `bun:",scanonly"`
+	CommitSubmissionJSON         *string    `bun:",scanonly"`
+	CommitConfirmedTransactionID *string    `bun:",scanonly"`
+	CommitAttentionCode          *string    `bun:",scanonly"`
+	CommitAttentionAt            *time.Time `bun:",scanonly"`
+
+	Content    *StorageContent `bun:"rel:belongs-to,join:content_id=id"`
 	StorageSet *StorageDataSet `bun:"rel:belongs-to,join:storage_data_set_id=id"`
 }
 
-// StorageUploadFailure stores one failed provider attempt returned by the SDK.
-type StorageUploadFailure struct {
-	bun.BaseModel `bun:"table:storage_upload_failures"`
+var _ bun.BeforeAppendModelHook = (*StorageContent)(nil)
 
-	ID             int64            `bun:",pk,autoincrement"`
-	UploadID       int64            `bun:",notnull"`
-	AttemptIndex   int              `bun:",notnull"`
-	ProviderID     *types.OnChainID `bun:"type:text"`
-	TransferMethod string           `bun:",notnull"`
-	Stage          *string          `bun:",nullzero"`
-	ErrorMessage   *string          `bun:",nullzero"`
-	Explicit       bool             `bun:",notnull,default:false"`
-	CreatedAt      time.Time        `bun:",nullzero,notnull,default:current_timestamp"`
+// BeforeAppendModel stamps the audit columns on insert. The database has no
+// timestamp default, so every row is written with one encoding instead of two
+// that sort against each other inside the same second.
+func (s *StorageContent) BeforeAppendModel(_ context.Context, query bun.Query) error {
+	if _, ok := query.(*bun.InsertQuery); !ok {
+		return nil
+	}
+	now := time.Now().UTC()
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = now
+	}
+	if s.UpdatedAt.IsZero() {
+		s.UpdatedAt = now
+	}
+	return nil
+}
 
-	Upload *StorageUpload `bun:"rel:belongs-to,join:upload_id=id"`
+var _ bun.BeforeAppendModelHook = (*StorageDataSet)(nil)
+
+// BeforeAppendModel stamps the audit columns on insert. The database has no
+// timestamp default, so every row is written with one encoding instead of two
+// that sort against each other inside the same second.
+func (s *StorageDataSet) BeforeAppendModel(_ context.Context, query bun.Query) error {
+	if _, ok := query.(*bun.InsertQuery); !ok {
+		return nil
+	}
+	now := time.Now().UTC()
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = now
+	}
+	if s.UpdatedAt.IsZero() {
+		s.UpdatedAt = now
+	}
+	return nil
+}
+
+var _ bun.BeforeAppendModelHook = (*StorageCopy)(nil)
+
+// BeforeAppendModel stamps the audit columns on insert. The database has no
+// timestamp default, so every row is written with one encoding instead of two
+// that sort against each other inside the same second.
+func (s *StorageCopy) BeforeAppendModel(_ context.Context, query bun.Query) error {
+	if _, ok := query.(*bun.InsertQuery); !ok {
+		return nil
+	}
+	now := time.Now().UTC()
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = now
+	}
+	if s.UpdatedAt.IsZero() {
+		s.UpdatedAt = now
+	}
+	return nil
 }

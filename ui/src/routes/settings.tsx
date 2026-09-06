@@ -98,18 +98,13 @@ const tabFields = {
     'cache.lru_low_watermark_percent',
   ],
   workers: [
-    'worker.upload.concurrency',
-    'worker.upload.poll_interval',
-    'worker.upload.max_retries',
-    'worker.provider_replacement.concurrency',
-    'worker.provider_replacement.poll_interval',
-    'worker.provider_replacement.max_retries',
-    'worker.evictor.concurrency',
-    'worker.evictor.poll_interval',
-    'worker.evictor.max_retries',
-    'worker.storage_cleanup.concurrency',
-    'worker.storage_cleanup.poll_interval',
-    'worker.storage_cleanup.max_retries',
+    'worker.tasks.concurrency',
+    'worker.tasks.poll_interval',
+    'worker.tasks.lease_duration',
+    'worker.tasks.max_retries',
+    'worker.tasks.retention',
+    'worker.tasks.provider_mutation_concurrency',
+    'worker.tasks.destructive_mutation_concurrency',
   ],
   logging: ['logging.level', 'logging.format', 'logging.s3_access.enabled', 'logging.s3_access.level'],
   runtime: ['database.driver', 'database.dsn', 'database.max_open_conns', 'database.max_idle_conns', 'admin.addr'],
@@ -576,40 +571,12 @@ function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="workers">
-          <div className="grid gap-4 xl:grid-cols-2">
-            <WorkerSection
-              title="Upload Worker"
-              prefix="worker.upload"
-              value={form.worker.upload}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, worker: { ...form.worker, upload: value } })}
-            />
-            <WorkerSection
-              title="Provider Replacement Worker"
-              prefix="worker.provider_replacement"
-              value={form.worker.provider_replacement}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, worker: { ...form.worker, provider_replacement: value } })}
-            />
-            <WorkerSection
-              title="Evictor Worker"
-              prefix="worker.evictor"
-              value={form.worker.evictor}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, worker: { ...form.worker, evictor: value } })}
-            />
-            <WorkerSection
-              title="Replica Cleanup Worker"
-              prefix="worker.storage_cleanup"
-              value={form.worker.storage_cleanup}
-              data={data}
-              errors={fieldErrors}
-              onChange={(value) => setForm({ ...form, worker: { ...form.worker, storage_cleanup: value } })}
-            />
-          </div>
+          <TaskWorkerSection
+            value={form.worker.tasks}
+            data={data}
+            errors={fieldErrors}
+            onChange={(value) => setForm({ ...form, worker: { tasks: value } })}
+          />
         </TabsContent>
 
         <TabsContent value="logging">
@@ -935,27 +902,23 @@ function CheckboxField({
   )
 }
 
-function WorkerSection({
-  title,
-  prefix,
+function TaskWorkerSection({
   value,
   data,
   errors,
   onChange,
 }: {
-  title: string
-  prefix: 'worker.upload' | 'worker.provider_replacement' | 'worker.evictor' | 'worker.storage_cleanup'
-  value: SettingsEditableConfig['worker']['upload']
+  value: SettingsEditableConfig['worker']['tasks']
   data: SettingsData
   errors: Record<string, string>
-  onChange: (value: SettingsEditableConfig['worker']['upload']) => void
+  onChange: (value: SettingsEditableConfig['worker']['tasks']) => void
 }) {
   return (
-    <Section title={title}>
-      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-1">
+    <Section title="Task Engine">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <NumberField
           label="Concurrency"
-          field={`${prefix}.concurrency`}
+          field="worker.tasks.concurrency"
           value={value.concurrency}
           data={data}
           errors={errors}
@@ -963,19 +926,51 @@ function WorkerSection({
         />
         <TextField
           label="Poll Interval"
-          field={`${prefix}.poll_interval`}
+          field="worker.tasks.poll_interval"
           value={value.poll_interval}
           data={data}
           errors={errors}
           onChange={(next) => onChange({ ...value, poll_interval: next })}
         />
+        <TextField
+          label="Lease Duration"
+          field="worker.tasks.lease_duration"
+          value={value.lease_duration}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, lease_duration: next })}
+        />
         <NumberField
           label="Max Retries"
-          field={`${prefix}.max_retries`}
+          field="worker.tasks.max_retries"
           value={value.max_retries}
           data={data}
           errors={errors}
           onChange={(next) => onChange({ ...value, max_retries: next })}
+        />
+        <TextField
+          label="Task Retention"
+          field="worker.tasks.retention"
+          value={value.retention}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, retention: next })}
+        />
+        <NumberField
+          label="Storage Mutation Concurrency"
+          field="worker.tasks.provider_mutation_concurrency"
+          value={value.provider_mutation_concurrency}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, provider_mutation_concurrency: next })}
+        />
+        <NumberField
+          label="Removal Concurrency"
+          field="worker.tasks.destructive_mutation_concurrency"
+          value={value.destructive_mutation_concurrency}
+          data={data}
+          errors={errors}
+          onChange={(next) => onChange({ ...value, destructive_mutation_concurrency: next })}
         />
       </div>
     </Section>

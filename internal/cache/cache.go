@@ -26,12 +26,18 @@ type ObjectInfo struct {
 type StagedObject struct {
 	Info     *ObjectInfo
 	commit   func() error
+	commitAs func(bucket, key string) error
 	rollback func() error
 }
 
 // Commit renames the staged file to the final cache path (atomic).
 // Must be called exactly once. After Commit, Rollback is a no-op.
 func (s *StagedObject) Commit() error { return s.commit() }
+
+// CommitAs commits to a different final path than the one the object was staged
+// under. Cache residency is content-addressed, so writers stage the bytes first
+// and only learn the destination once the checksum has produced a content row.
+func (s *StagedObject) CommitAs(bucket, key string) error { return s.commitAs(bucket, key) }
 
 // Rollback removes the staged temp file without affecting the final cache path.
 // Safe to call multiple times and after Commit (no-op if already committed).
@@ -82,11 +88,12 @@ type Cache interface {
 	// Returns ObjectInfo with the part's Size, ETag (MD5), and Checksum (SHA-256).
 	PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader) (*ObjectInfo, error)
 
-	// AssembleParts concatenates the specified parts in order into a final
-	// object at bucket/key. Returns ObjectInfo for the assembled object and
-	// the ordered list of individual part MD5 hex digests (for S3 ETag computation).
-	// The part files are NOT deleted; call DeleteUpload to clean up.
-	AssembleParts(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*ObjectInfo, []string, error)
+	// AssemblePartsStaged concatenates the specified parts in order into a
+	// staged file next to bucket/key, plus the ordered list of individual part
+	// MD5 hex digests (for S3 ETag computation). The caller names the final
+	// destination through Commit or CommitAs once the assembled checksum has
+	// resolved a content row. The part files are NOT deleted; call DeleteUpload.
+	AssemblePartsStaged(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*StagedObject, []string, error)
 
 	// DeleteUpload removes all part files for the given upload ID.
 	DeleteUpload(ctx context.Context, uploadID string) error

@@ -18,11 +18,13 @@ import (
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/s3access"
 	"github.com/strahe/synaps3/internal/s3iam"
-	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/synapse"
+	"github.com/strahe/synaps3/internal/systemtask"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/worker"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
@@ -82,7 +84,6 @@ type Runtime struct {
 	accessTracker *cacheaccess.Tracker
 	iam           auth.IAMService
 	workers       *worker.Manager
-	observer      *observability.Runner
 	s3Addresses   []string
 	logger        *slog.Logger
 	shutdown      time.Duration
@@ -113,13 +114,86 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	}
 	cacheGate := cacheaccess.NewGate()
 	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
-	stateMachine := state.NewObjectStateMachine()
 	events := admin.NewEventHub()
-	appBackend := backend.New(repos, localCache, stateMachine, opts.Filecoin.Storage, cacheGate, accessTracker, logger,
-		backend.WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries),
-		backend.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
-		backend.WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries),
+	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
+	registry := taskengine.NewRegistry()
+	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
+		Repositories:  repos,
+		Events:        events,
+		Cache:         localCache,
+		CacheGate:     cacheGate,
+		CacheTracker:  accessTracker,
+		Storage:       opts.Filecoin.Storage,
+		Wallet:        opts.Filecoin.Wallet,
+		Receipts:      opts.Filecoin.Receipts,
+		Terminator:    opts.Filecoin.Terminator,
+		Epochs:        opts.Filecoin.Epochs,
+		Observability: observabilityService,
+		CommitStatus: synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
+			Timeout:              15 * time.Second,
+			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+		}),
+		EvictionPolicy: evictionPolicy,
+		MaxCacheBytes:  maxCacheBytes,
+		LRUHighPercent: cfg.Cache.LRUHighWatermarkPercent,
+		LRULowPercent:  cfg.Cache.LRULowWatermarkPercent,
+		DefaultCopies:  cfg.Filecoin.DefaultCopies,
+		MaxRetries:     cfg.Worker.Tasks.MaxRetries,
+		Logger:         logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initializing task handlers: %w", err)
+	}
+	if err := handlers.RegisterCore(registry); err != nil {
+		return nil, fmt.Errorf("registering core task handlers: %w", err)
+	}
+	if err := handlers.RegisterStorage(registry); err != nil {
+		return nil, fmt.Errorf("registering storage task handlers: %w", err)
+	}
+	if err := handlers.RegisterReplacement(registry); err != nil {
+		return nil, fmt.Errorf("registering replacement task handlers: %w", err)
+	}
+	taskService, err := taskengine.NewService(registry, repos, cfg.Worker.Tasks.Retention)
+	if err != nil {
+		return nil, fmt.Errorf("initializing task service: %w", err)
+	}
+	handlers.SetTaskService(taskService)
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency:                    cfg.Worker.Tasks.Concurrency,
+		PollInterval:                   cfg.Worker.Tasks.PollInterval,
+		LeaseDuration:                  cfg.Worker.Tasks.LeaseDuration,
+		Retention:                      cfg.Worker.Tasks.Retention,
+		ProviderMutationConcurrency:    cfg.Worker.Tasks.ProviderMutationConcurrency,
+		DestructiveMutationConcurrency: cfg.Worker.Tasks.DestructiveMutationConcurrency,
+		OnTaskSettled: func(taskRow *model.Task, transition repository.TaskTransition) {
+			publishUploadTaskSettlement(events, taskRow, transition)
+		},
+	}, repos, registry, logger)
+	if err != nil {
+		return nil, fmt.Errorf("initializing task engine: %w", err)
+	}
+	for _, recurring := range []taskengine.EnqueueRequest{
+		{
+			Type: model.TaskTypeCacheCapacityReconcile, IdempotencyKey: systemtask.CacheCapacityKey,
+			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "cache-capacity",
+		},
+		{
+			Type: model.TaskTypeObservabilityRefresh, IdempotencyKey: "system:observability-refresh",
+			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "observability",
+		},
+		{
+			Type: model.TaskTypeGC, IdempotencyKey: "system:task-gc",
+			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "task-gc",
+		},
+	} {
+		if _, _, err := taskService.Enqueue(ctx, recurring); err != nil {
+			return nil, fmt.Errorf("seeding recurring task %s: %w", recurring.Type, err)
+		}
+	}
+	appBackend := backend.New(repos, localCache, opts.Filecoin.Storage, cacheGate, accessTracker, logger,
+		backend.WithTaskService(taskService),
 		backend.WithEvictionPolicy(evictionPolicy),
+		backend.WithDefaultCopies(cfg.Filecoin.DefaultCopies),
 	)
 
 	iamService := s3iam.NewService(repos)
@@ -156,46 +230,10 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, fmt.Errorf("creating S3 server: %w", err)
 	}
 
-	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
-	uploader := worker.NewUploader(repos, localCache, opts.Filecoin.Storage, opts.Filecoin.WalletQuery, stateMachine, evictionPolicy,
-		cfg.Filecoin.DefaultCopies, cfg.Worker.Upload.Concurrency, cfg.Worker.Upload.PollInterval, logger,
-		worker.WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries),
-		worker.WithProviderReplacementMaxRetries(cfg.Worker.ProviderReplacement.MaxRetries),
-		worker.WithPDPStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
-			Timeout:              15 * time.Second,
-			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-		})),
-		worker.WithEventPublisher(events))
-	manager := worker.NewManager(repos, logger, evictionPolicy,
-		uploader,
-		worker.NewProviderReplacementWorker(repos, uploader,
-			cfg.Worker.ProviderReplacement.Concurrency,
-			cfg.Worker.ProviderReplacement.PollInterval,
-			logger),
-		worker.NewEvictor(repos, localCache, cacheGate, accessTracker, stateMachine,
-			cfg.Worker.Evictor.Concurrency, cfg.Worker.Evictor.PollInterval, logger,
-			worker.WithCacheEvictionPolicy(
-				evictionPolicy,
-				maxCacheBytes,
-				cfg.Cache.LRUHighWatermarkPercent,
-				cfg.Cache.LRULowWatermarkPercent,
-				cfg.Worker.Evictor.MaxRetries,
-			)),
-		worker.NewStorageCleanupWorker(repos, opts.Filecoin.Storage,
-			cfg.Worker.StorageCleanup.Concurrency, cfg.Worker.StorageCleanup.PollInterval, logger, worker.WithServiceTermination(opts.Filecoin.Terminator, opts.Filecoin.Epochs)),
-		worker.NewWalletOperationRunner(repos, opts.Filecoin.Wallet, opts.Filecoin.Receipts, 5*time.Second, logger,
-			worker.WithWalletOperationEventPublisher(events)),
-	).WithTaskMaxRetries(cfg.Worker.Upload.MaxRetries, cfg.Worker.Evictor.MaxRetries).
-		WithProviderReplacementRecovery(
-			cfg.Worker.ProviderReplacement.MaxRetries,
-			cfg.Worker.ProviderReplacement.PollInterval,
-		)
+	manager := worker.NewManager(engine, logger)
 
 	adminServer := admin.New(cfg.Admin.Addr, opts.Database, localCache, cacheGate, accessTracker, maxCacheBytes, repos, manager,
 		opts.Filecoin.WalletQuery, cfg.Filecoin.DefaultCopies, logger).
-		WithTaskDiagnosticStatusChecker(synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
-			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-		})).
 		WithEventHub(events).
 		WithObjectUploader(appBackend).
 		WithObjectVersionRestorer(appBackend).
@@ -203,10 +241,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithSettings(opts.Settings).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).
 		WithObservability(observabilityService).
-		WithEvictMaxRetries(cfg.Worker.Evictor.MaxRetries).
-		WithStorageCleanupMaxRetries(cfg.Worker.StorageCleanup.MaxRetries).
-		WithUploadMaxRetries(cfg.Worker.Upload.MaxRetries).
-		WithProviderReplacementMaxRetries(cfg.Worker.ProviderReplacement.MaxRetries).
+		WithTaskService(taskService).
 		WithS3IAM(iamService, rootAccount.Access)
 	if opts.ProviderIdentity != nil {
 		adminServer.WithProviderIdentityResolver(opts.ProviderIdentity)
@@ -245,11 +280,48 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		accessTracker: accessTracker,
 		iam:           iamService,
 		workers:       manager,
-		observer:      observability.NewRunner(observabilityService, logger),
 		s3Addresses:   s3Addresses,
 		logger:        logger,
 		shutdown:      shutdownTimeout,
 	}, nil
+}
+
+func publishUploadTaskSettlement(events admin.EventPublisher, taskRow *model.Task, transition repository.TaskTransition) {
+	if events == nil || taskRow == nil || transition.Status == model.TaskStatusPending || !uploadPipelineTask(taskRow.Type) {
+		return
+	}
+	payload := map[string]any{
+		"task_id":   taskRow.ID,
+		"task_type": taskRow.Type,
+		"status":    transition.Status,
+	}
+	if taskRow.SubjectType != nil {
+		payload["subject_type"] = *taskRow.SubjectType
+	}
+	if taskRow.SubjectKey != nil {
+		payload["subject_key"] = *taskRow.SubjectKey
+		if taskRow.SubjectType != nil && *taskRow.SubjectType == "object_version" {
+			payload["version_id"] = *taskRow.SubjectKey
+		}
+	}
+	events.Publish("upload_state_changed", payload)
+}
+
+func uploadPipelineTask(taskType model.TaskType) bool {
+	switch taskType {
+	case model.TaskTypeUploadPlan,
+		model.TaskTypeStorageDataSetEnsure,
+		model.TaskTypeStorageTransferPlan,
+		model.TaskTypeStorageStore,
+		model.TaskTypeStoragePull,
+		model.TaskTypeStorageCommitCoordinate,
+		model.TaskTypeStorageCommit,
+		model.TaskTypeProviderReplacementCoordinate,
+		model.TaskTypeStorageDataSetRetire:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateOptions(opts RuntimeOptions) error {
@@ -351,13 +423,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return nil
 	})
 	group.Go(func() error {
-		r.observer.Run(groupCtx)
-		if groupCtx.Err() == nil {
-			return errors.New("observer stopped unexpectedly")
-		}
-		return nil
-	})
-	group.Go(func() error {
 		r.accessTracker.Run(groupCtx, r.cacheGate, r.logger)
 		return nil
 	})
@@ -454,7 +519,7 @@ func newObservabilityService(cfg *config.Config, repos *repository.Repositories,
 	return observability.NewService(observability.ServiceOptions{
 		Checker: checker,
 		LocalDataSets: observability.LocalDataSetSourceFunc(func(ctx context.Context) ([]observability.LocalDataSet, error) {
-			summaries, err := repos.Uploads.ListDataSetSummaries(ctx, 0)
+			summaries, err := repos.Contents.ListDataSetSummaries(ctx, 0)
 			if err != nil {
 				return nil, err
 			}

@@ -35,6 +35,9 @@ func TestMultipartRepo_CreateAndGet(t *testing.T) {
 	if got.Key != "some/key" || got.Status != model.MultipartStatusInitiated {
 		t.Errorf("unexpected upload: key=%s status=%s", got.Key, got.Status)
 	}
+	if upload.Metadata == nil || got.Metadata == nil || len(got.Metadata) != 0 {
+		t.Fatalf("nil metadata was not normalized: input=%#v stored=%#v", upload.Metadata, got.Metadata)
+	}
 }
 
 func TestMultipartRepo_GetByUploadID_NotFound(t *testing.T) {

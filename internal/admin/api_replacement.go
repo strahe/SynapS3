@@ -12,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
 )
 
@@ -54,19 +55,37 @@ type providerReplacementResponse struct {
 	Source replacementDataSetResponse `json:"source"`
 	Target replacementDataSetResponse `json:"target"`
 
-	ItemsTotal       int                   `json:"items_total"`
-	ItemsCopied      int                   `json:"items_copied"`
-	Progress         *taskProgressResponse `json:"progress,omitempty"`
-	LastError        *string               `json:"last_error"`
-	TerminationEpoch *int64                `json:"termination_epoch"`
+	ItemsTotal       int                          `json:"items_total"`
+	ItemsCopied      int                          `json:"items_copied"`
+	Progress         *replacementProgressResponse `json:"progress,omitempty"`
+	LastError        *string                      `json:"last_error"`
+	TerminationEpoch *int64                       `json:"termination_epoch"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type replacementProgressResponse struct {
+	Scope               string  `json:"scope"`
+	Phase               string  `json:"phase"`
+	SeedingComplete     bool    `json:"seeding_complete"`
+	ItemsTotal          int     `json:"items_total"`
+	ItemsProcessed      int     `json:"items_processed"`
+	ItemsCopied         int     `json:"items_copied"`
+	ItemsNoLongerNeeded int     `json:"items_no_longer_needed"`
+	ItemsPending        int     `json:"items_pending"`
+	ItemsActive         int     `json:"items_active"`
+	ItemsAttention      int     `json:"items_attention"`
+	ItemsRetrying       int     `json:"items_retrying"`
+	ItemsWaitingSource  int     `json:"items_waiting_source"`
+	ItemsFailed         int     `json:"items_failed"`
+	Percent             *int    `json:"percent,omitempty"`
+	NextRetryAt         *string `json:"next_retry_at,omitempty"`
+}
+
 type replacementDataSetResponse struct {
 	ID               int64                     `json:"id"`
-	Generation       int                       `json:"generation"`
+	Generation       int64                     `json:"generation"`
 	IsCurrent        bool                      `json:"is_current"`
 	Status           string                    `json:"status"`
 	ProviderID       string                    `json:"provider_id"`
@@ -135,13 +154,35 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		return
 	}
 
-	row, created, err := s.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
-		BucketID:         bucket.ID,
-		SourceDataSetID:  source.ID,
-		SelectionMode:    mode,
-		TargetProviderID: targetProvider,
-		ClientRequestID:  req.ClientRequestID,
-		MaxRetries:       s.uploadMaxRetries,
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	var row *storagereplacement.Replacement
+	created := false
+	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		var authorizeErr error
+		row, created, authorizeErr = txRepos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+			BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: mode,
+			TargetProviderID: targetProvider, ClientRequestID: req.ClientRequestID,
+		})
+		if authorizeErr != nil || !created {
+			return authorizeErr
+		}
+		taskRow, _, enqueueErr := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
+			Type:           model.TaskTypeProviderReplacementCoordinate,
+			IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
+			Input:          storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
+			SubjectType:    "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
+		})
+		if enqueueErr != nil {
+			return enqueueErr
+		}
+		if bindErr := txRepos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, taskRow.ID); bindErr != nil {
+			return bindErr
+		}
+		row.TaskID = &taskRow.ID
+		return nil
 	})
 	if err != nil {
 		s.writeReplacementError(w, err, name)
@@ -246,7 +287,7 @@ func (s *Server) replacementProviderCandidates(
 	if err != nil {
 		return nil, err
 	}
-	bindings, err := s.repos.Uploads.ListDataSetBindings(ctx, bucket.ID)
+	bindings, err := s.repos.Contents.ListDataSetBindings(ctx, bucket.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -265,10 +306,31 @@ func (s *Server) handleAPIRetryStorageReplacement(w http.ResponseWriter, r *http
 		return
 	}
 	ctx := r.Context()
-	row, err := s.repos.Replacements.Retry(ctx, repository.RetryReplacementInput{
-		ReplacementID:  id,
-		MaxRetries:     s.uploadMaxRetries,
-		ItemMaxRetries: s.providerReplacementMaxRetries,
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	var row *storagereplacement.Replacement
+	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		var retryErr error
+		row, retryErr = txRepos.Replacements.Retry(ctx, repository.RetryReplacementInput{ReplacementID: id})
+		if retryErr != nil {
+			return retryErr
+		}
+		taskRow, _, enqueueErr := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
+			Type:           model.TaskTypeProviderReplacementCoordinate,
+			IdempotencyKey: storagereplacement.CoordinateTaskKey(row.ID, row.TaskGeneration),
+			Input:          storagereplacement.CoordinateInput{ReplacementID: row.ID, Generation: row.TaskGeneration},
+			SubjectType:    "storage_replacement", SubjectKey: strconv.FormatInt(row.ID, 10),
+		})
+		if enqueueErr != nil {
+			return enqueueErr
+		}
+		if bindErr := txRepos.Replacements.BindTask(ctx, row.ID, row.TaskGeneration, taskRow.ID); bindErr != nil {
+			return bindErr
+		}
+		row.TaskID = &taskRow.ID
+		return nil
 	})
 	if err != nil {
 		s.writeReplacementError(w, err, "")
@@ -374,30 +436,42 @@ func (s *Server) providerReplacementResponseWithProgress(
 	row *storagereplacement.Replacement,
 	progress storagereplacement.ProgressSnapshot,
 ) (providerReplacementResponse, error) {
-	source, err := s.repos.Uploads.GetDataSetBindingByID(ctx, row.SourceDataSetID)
+	source, err := s.repos.Contents.GetDataSetBindingByID(ctx, row.SourceDataSetID)
 	if err != nil {
 		return providerReplacementResponse{}, err
 	}
-	target, err := s.repos.Uploads.GetDataSetBindingByID(ctx, row.TargetDataSetID)
+	target, err := s.repos.Contents.GetDataSetBindingByID(ctx, row.TargetDataSetID)
 	if err != nil {
 		return providerReplacementResponse{}, err
 	}
 	identities := s.providerIdentities(replacementProviderIDs(source, target))
 	response := providerReplacementResponse{
-		ID:               row.ID,
-		BucketName:       bucketName,
-		CopyIndex:        row.CopyIndex,
-		Status:           string(row.Status),
-		SelectionMode:    string(row.SelectionMode),
-		Source:           replacementDataSetView(source, identities),
-		Target:           replacementDataSetView(target, identities),
-		ItemsTotal:       row.ItemsTotal,
-		ItemsCopied:      row.ItemsCopied,
-		Progress:         taskProgressFromReplacement(progress),
+		ID:            row.ID,
+		BucketName:    bucketName,
+		CopyIndex:     row.CopyIndex,
+		Status:        string(row.Status),
+		SelectionMode: string(row.SelectionMode),
+		Source:        replacementDataSetView(source, identities),
+		Target:        replacementDataSetView(target, identities),
+		ItemsTotal:    row.ItemsTotal,
+		ItemsCopied:   row.ItemsCopied,
+		Progress: &replacementProgressResponse{
+			Scope: "provider_replacement", Phase: string(progress.Phase), SeedingComplete: progress.SeedingComplete,
+			ItemsTotal: progress.ItemsTotal, ItemsProcessed: progress.ItemsProcessed,
+			ItemsCopied: progress.ItemsCopied, ItemsNoLongerNeeded: progress.ItemsNoLongerNeeded,
+			ItemsPending: progress.ItemsPending, ItemsActive: progress.ItemsActive,
+			ItemsAttention: progress.ItemsAttention, ItemsRetrying: progress.ItemsRetrying,
+			ItemsWaitingSource: progress.ItemsWaitingSource, ItemsFailed: progress.ItemsFailed,
+			Percent: progress.Percent,
+		},
 		LastError:        row.LastError,
 		TerminationEpoch: row.TerminationEpoch,
 		CreatedAt:        row.CreatedAt,
 		UpdatedAt:        row.UpdatedAt,
+	}
+	if progress.NextRetryAt != nil {
+		value := progress.NextRetryAt.Format(time.RFC3339)
+		response.Progress.NextRetryAt = &value
 	}
 	if row.WaitReason != nil {
 		response.WaitReason = string(*row.WaitReason)
@@ -489,7 +563,7 @@ func (s *Server) replacementSubject(
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
 		return nil, nil, false
 	}
-	source, err := s.repos.Uploads.GetDataSetBindingByID(ctx, dataSetID)
+	source, err := s.repos.Contents.GetDataSetBindingByID(ctx, dataSetID)
 	if err != nil {
 		s.logger.Error("api: failed to load data set for replacement", "error", err, "dataSetID", dataSetID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})

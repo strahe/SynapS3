@@ -77,38 +77,6 @@ func TestFailedResumesAtAnyWorkingPhase(t *testing.T) {
 	}
 }
 
-func TestOnTaskExhausted(t *testing.T) {
-	cases := []struct {
-		status  Status
-		want    Status
-		changed bool
-	}{
-		{StatusPreparingTarget, StatusFailed, true},
-		{StatusMigrating, StatusFailed, true},
-		{StatusWaiting, StatusFailed, true},
-		// Retirement needs an operator decision, not another copy attempt.
-		{StatusRetiring, StatusCleanupAttention, true},
-		{StatusCleanupAttention, StatusCleanupAttention, false},
-		{StatusFailed, StatusFailed, false},
-		{StatusCompleted, StatusCompleted, false},
-		{StatusSuperseded, StatusSuperseded, false},
-	}
-	for _, tc := range cases {
-		got, changed := OnTaskExhausted(tc.status)
-		if got != tc.want || changed != tc.changed {
-			t.Fatalf("OnTaskExhausted(%s) = (%s, %v), want (%s, %v)", tc.status, got, changed, tc.want, tc.changed)
-		}
-	}
-	for _, tc := range cases {
-		if !tc.changed {
-			continue
-		}
-		if !Allowed(tc.status, tc.want) {
-			t.Fatalf("exhaustion moves %s to %s, but the state machine forbids it", tc.status, tc.want)
-		}
-	}
-}
-
 func TestStatusClassification(t *testing.T) {
 	cases := []struct {
 		status    Status
@@ -164,13 +132,10 @@ func TestPhaseForMatchesCoordinatorWork(t *testing.T) {
 
 func TestItemStatusBlocksRetirementWhileExecutable(t *testing.T) {
 	cases := map[ItemStatus]bool{
-		ItemStatusPending:       true,
-		ItemStatusRunning:       true,
-		ItemStatusRetrying:      true,
-		ItemStatusWaitingSource: true,
-		ItemStatusFailed:        true,
-		ItemStatusCopied:        false,
-		ItemStatusCancelled:     false,
+		ItemStatusPending:   true,
+		ItemStatusAttention: true,
+		ItemStatusCopied:    false,
+		ItemStatusCancelled: false,
 	}
 	for status, want := range cases {
 		if got := status.Blocking(); got != want {

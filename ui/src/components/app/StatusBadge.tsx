@@ -32,9 +32,9 @@ export function StatusBadge({
 
 export function bucketStatusTone(status: string): StatusTone {
   switch (status) {
-    case 'active':
+    case 'ready':
       return 'success'
-    case 'creating':
+    case 'provisioning':
     case 'deleting':
       return 'warning'
     case 'create_failed':
@@ -56,7 +56,6 @@ export function taskStatusTone(status: string): StatusTone {
     case 'waiting':
       return 'info'
     case 'failed':
-    case 'exhausted':
       return 'danger'
     default:
       return 'neutral'
@@ -78,8 +77,6 @@ export function objectStateTone(state: string): StatusTone {
     case 'cached':
     case 'uploaded':
       return 'info'
-    case 'cache_evicted':
-      return 'neutral'
     default:
       return 'neutral'
   }

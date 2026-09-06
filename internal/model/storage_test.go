@@ -22,7 +22,7 @@ func TestStorageOnChainIDColumnsUseTextInPostgresDDL(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		model   interface{}
+		model   any
 		columns []string
 	}{
 		{
@@ -31,14 +31,9 @@ func TestStorageOnChainIDColumnsUseTextInPostgresDDL(t *testing.T) {
 			columns: []string{"provider_id", "data_set_id", "client_data_set_id"},
 		},
 		{
-			name:    "storage_upload_copies",
-			model:   (*StorageUploadCopy)(nil),
+			name:    "storage_copies",
+			model:   (*StorageCopy)(nil),
 			columns: []string{"provider_id", "piece_id"},
-		},
-		{
-			name:    "storage_upload_failures",
-			model:   (*StorageUploadFailure)(nil),
-			columns: []string{"provider_id"},
 		},
 	}
 

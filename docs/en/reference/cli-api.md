@@ -81,8 +81,9 @@ synaps3 admin settings get
 synaps3 admin settings set cache.max_size_gb=200
 synaps3 admin settings set cache.eviction_policy=lru cache.lru_high_watermark_percent=90 cache.lru_low_watermark_percent=80
 synaps3 admin task stats
-synaps3 admin task list --status exhausted --limit 100
+synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42
+synaps3 admin task acknowledge 42
 synaps3 admin storage-confirmation list
 synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --yes
 ```
@@ -97,9 +98,9 @@ Admin global flags must appear after `admin` and before the subcommand:
 | `--json` | Return successful responses as JSON. |
 | `--timeout <duration>` | Set the Admin API request timeout. |
 
-Task listing supports `--type`, `--stage`, `--status`, `--limit`, and `--offset`. `--stage` requires `--type`.
+Task listing supports `--type`, `--status`, `--limit`, and ID-based `--cursor`. Valid stored statuses are `pending`, `running`, `completed`, `failed`, and `cancelled`; pending work is presented as queued, scheduled, or waiting.
 
-`synaps3 admin task retry` does not retry provider replacement work. Use **Open Data Sets** from a finished or stopped replacement task, or open the bucket and go to **Details** → **Storage** → **Data Sets**. If the selected provider already stores this bucket, choose a different provider instead of retrying.
+`synaps3 admin task retry` recovers only tasks whose response says they are retryable. Provider replacement recovery remains under **Details** → **Storage** → **Data Sets**, and wallet operations cannot be retried from Tasks. Use `synaps3 admin task acknowledge <id>` to dismiss a failed task after its outcome has been reviewed.
 
 `synaps3 admin storage-confirmation list` shows storage confirmations that need review. Verify the piece CID, provider, current attempt ID, attempted time, and any available transaction evidence before running `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes`; release only if you accept that the provider may already store the piece and resubmission may create duplicate paid storage. A stale attempt ID is refused.
 

@@ -581,7 +581,7 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 			"100.00 GiB",
 			"cache.lru_high_watermark_percent",
 			"cache.lru_low_watermark_percent",
-			"worker.provider_replacement.concurrency",
+			"worker.tasks.concurrency",
 			"Logging",
 		} {
 			if !strings.Contains(out, want) {
@@ -726,9 +726,9 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 					t.Fatalf("cache.lru_low_watermark_percent = %#v, want 70", cache["lru_low_watermark_percent"])
 				}
 				worker := body["worker"].(map[string]any)
-				providerReplacement := worker["provider_replacement"].(map[string]any)
-				if providerReplacement["poll_interval"] != "9s" {
-					t.Fatalf("worker.provider_replacement.poll_interval = %#v, want 9s", providerReplacement["poll_interval"])
+				tasks := worker["tasks"].(map[string]any)
+				if tasks["poll_interval"] != "9s" {
+					t.Fatalf("worker.tasks.poll_interval = %#v, want 9s", tasks["poll_interval"])
 				}
 				filecoin := body["filecoin"].(map[string]any)
 				if filecoin["with_cdn"] != true {
@@ -755,7 +755,7 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 		out, err := runAdminCommand(t, []string{
 			"synaps3", "admin", "--admin-url", ts.URL,
 			"settings", "set", "cache.max_size_gb=8", "cache.lru_high_watermark_percent=85",
-			"cache.lru_low_watermark_percent=70", "worker.provider_replacement.poll_interval=9s",
+			"cache.lru_low_watermark_percent=70", "worker.tasks.poll_interval=9s",
 			"filecoin.with_cdn=true", "logging.level=debug",
 			"logging.s3_access.enabled=false", "logging.s3_access.level=debug",
 		})
@@ -794,13 +794,13 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 			switch {
 			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/tasks":
 				sawList = true
-				if got := r.URL.Query().Get("status"); got != "exhausted" {
-					t.Fatalf("status query = %q, want exhausted", got)
+				if got := r.URL.Query().Get("status"); got != "failed" {
+					t.Fatalf("status query = %q, want failed", got)
 				}
 				if got := r.URL.Query().Get("limit"); got != "50" {
 					t.Fatalf("limit query = %q, want 50", got)
 				}
-				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"tasks": []any{}, "total": 0, "limit": 50, "offset": 0})
+				writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"tasks": []any{}})
 			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/tasks/42/retry":
 				sawRetry = true
 				if got := r.Header.Get("X-SynapS3-Settings-Write"); got != "" {
@@ -813,7 +813,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "list", "--status", "exhausted", "--limit", "50"}); err != nil {
+		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "list", "--status", "failed", "--limit", "50"}); err != nil {
 			t.Fatalf("task list: %v\n%s", err, out)
 		}
 		if out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "retry", "42"}); err != nil {
@@ -859,44 +859,24 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		}
 	})
 
-	t.Run("stage filter requires type before request", func(t *testing.T) {
-		var called bool
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			called = true
-			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"tasks": []any{}, "total": 0, "limit": 20, "offset": 0})
-		}))
-		defer ts.Close()
-
-		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "task", "list", "--stage", "prepare_upload"})
-		if err == nil {
-			t.Fatalf("expected error, output:\n%s", out)
-		}
-		if called {
-			t.Fatal("request was sent")
-		}
-	})
-
-	t.Run("task list ref includes version id", func(t *testing.T) {
+	t.Run("task list includes subject key", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet || r.URL.Path != "/api/v1/tasks" {
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}
 			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{
 				"tasks": []map[string]any{{
-					"id":             7,
-					"type":           "upload",
-					"stage":          "primary_commit",
-					"ref_type":       "object",
-					"ref_id":         11,
-					"ref_version_id": "version-1",
-					"status":         "exhausted",
-					"retry_count":    5,
-					"max_retries":    5,
-					"scheduled_at":   "2026-05-05T10:00:00Z",
+					"id":                  7,
+					"type":                "upload_plan",
+					"operation":           "Prepare storage",
+					"status":              "failed",
+					"presentation_status": "Failed",
+					"subject_type":        "object_version",
+					"subject_key":         "version-1",
+					"retry_count":         5,
+					"retry_limit":         5,
+					"available_at":        "2026-05-05T10:00:00Z",
 				}},
-				"total":  1,
-				"limit":  20,
-				"offset": 0,
 			})
 		}))
 		defer ts.Close()
@@ -905,33 +885,56 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		if err != nil {
 			t.Fatalf("task list: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "object:11:version-1") {
-			t.Fatalf("task output missing version id:\n%s", out)
+		if !strings.Contains(out, "object_version:version-1") {
+			t.Fatalf("task output missing subject key:\n%s", out)
 		}
 	})
 
-	t.Run("task list shows waiting status details", func(t *testing.T) {
+	t.Run("task list json preserves diagnostic and lifecycle fields", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{"tasks": []map[string]any{{
+				"id": 9, "type": "storage_store", "operation": "Store content",
+				"status": "failed", "presentation_status": "dismissed",
+				"retry_count": 5, "retry_limit": 5, "retryable": false, "acknowledgeable": false,
+				"failure_reason": "provider_error", "last_error": "provider unavailable",
+				"available_at": "2026-05-05T10:00:00Z", "started_at": "2026-05-05T10:00:01Z",
+				"finished_at": "2026-05-05T10:00:02Z", "acknowledged_at": "2026-05-05T10:00:03Z",
+				"created_at": "2026-05-05T09:59:00Z", "updated_at": "2026-05-05T10:00:03Z",
+			}}})
+		}))
+		defer ts.Close()
+
+		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "--json", "task", "list"})
+		if err != nil {
+			t.Fatalf("task list json: %v\n%s", err, out)
+		}
+		for _, field := range []string{"failure_reason", "started_at", "finished_at", "acknowledged_at", "created_at", "updated_at"} {
+			if !strings.Contains(out, `"`+field+`"`) {
+				t.Fatalf("task list json dropped %s: %s", field, out)
+			}
+		}
+	})
+
+	t.Run("task list shows presentation status and message", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet || r.URL.Path != "/api/v1/tasks" {
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}
 			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{
 				"tasks": []map[string]any{{
-					"id":             8,
-					"type":           "evict_cache",
-					"ref_type":       "object",
-					"ref_id":         12,
-					"ref_version_id": "version-2",
-					"status":         "waiting",
-					"retry_count":    0,
-					"max_retries":    5,
-					"wait_reason":    "dependency",
-					"status_message": "waiting for all copies to commit",
-					"scheduled_at":   "2026-05-05T10:00:00Z",
+					"id":                  8,
+					"type":                "cache_evict",
+					"operation":           "Free local cache space",
+					"subject_type":        "object_version",
+					"subject_key":         "version-2",
+					"status":              "pending",
+					"presentation_status": "Waiting",
+					"retry_count":         0,
+					"retry_limit":         5,
+					"wait_reason":         "durability_pending",
+					"status_message":      "Waiting for durable storage",
+					"available_at":        "2026-05-05T10:00:00Z",
 				}},
-				"total":  1,
-				"limit":  20,
-				"offset": 0,
 			})
 		}))
 		defer ts.Close()
@@ -943,7 +946,7 @@ func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 		if !strings.Contains(out, "DETAILS") || strings.Contains(out, "LAST_ERROR") {
 			t.Fatalf("task output did not use details column:\n%s", out)
 		}
-		if !strings.Contains(out, "dependency: waiting for all copies to commit") {
+		if !strings.Contains(out, "Waiting for durable storage") || strings.Contains(out, "durability_pending") {
 			t.Fatalf("task output missing waiting details:\n%s", out)
 		}
 	})
@@ -965,7 +968,7 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 					t.Fatalf("limit = %q, want 25", got)
 				}
 				writeAdminTestJSON(t, w, http.StatusOK, []map[string]any{{
-					"copy_id": 42, "upload_id": 7, "copy_index": 1,
+					"copy_id": 42, "content_id": 7, "copy_index": 1,
 					"data_set_row_id": 9, "provider_id": "provider-1", "data_set_id": "dataset-1",
 					"piece_cid": "bafy-piece-1", "attempt_id": "attempt-1", "transaction_id": "0xcommit",
 					"reason_code":  "attempt_only_ambiguous",
@@ -1077,10 +1080,15 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 				"lru_low_watermark_percent":  80,
 			},
 			"worker": map[string]any{
-				"upload":               map[string]any{"concurrency": 4, "poll_interval": "5s", "max_retries": 5},
-				"provider_replacement": map[string]any{"concurrency": 4, "poll_interval": "5s", "max_retries": 5},
-				"evictor":              map[string]any{"concurrency": 2, "poll_interval": "1m0s", "max_retries": 3},
-				"storage_cleanup":      map[string]any{"concurrency": 2, "poll_interval": "1m0s", "max_retries": 5},
+				"tasks": map[string]any{
+					"concurrency":                      12,
+					"poll_interval":                    "5s",
+					"lease_duration":                   "5m0s",
+					"max_retries":                      5,
+					"retention":                        "168h0m0s",
+					"provider_mutation_concurrency":    4,
+					"destructive_mutation_concurrency": 2,
+				},
 			},
 			"logging": map[string]any{
 				"level":     "info",

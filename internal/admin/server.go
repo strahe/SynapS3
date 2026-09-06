@@ -22,8 +22,8 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
-	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/synapse"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/ui"
 	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/auth"
@@ -36,35 +36,31 @@ type WorkerHealthChecker interface {
 
 // Server provides /healthz and /metrics endpoints on a separate port.
 type Server struct {
-	addr                          string
-	db                            *bun.DB
-	cache                         cache.Cache
-	objectReader                  *objectreader.Reader
-	objectStorage                 synapse.StorageClient
-	cacheGate                     *cacheaccess.Gate
-	cacheAccessTracker            *cacheaccess.Tracker
-	objectUploader                objectUploader
-	objectVersionRestorer         objectVersionRestorer
-	cacheMaxBytes                 int64
-	repos                         *repository.Repositories
-	bucketLifecycle               *bucketlifecycle.Service
-	workerHealth                  WorkerHealthChecker
-	wallet                        synapse.WalletQuerier
-	filecoinReadiness             filecoinReadinessProbe
-	observability                 *observability.Service
-	taskDiagnosticChecker         taskDiagnosticStatusChecker
-	providerIdentity              providerIdentityLookup
-	events                        *EventHub
-	settings                      *SettingsService
-	auth                          *authService
-	trustedProxies                []netip.Prefix
-	s3IAM                         auth.IAMService
-	s3RootAccess                  string
-	filecoinDefaultCopies         int
-	evictMaxRetries               int
-	storageCleanupMaxRetries      int
-	uploadMaxRetries              int
-	providerReplacementMaxRetries int
+	addr                  string
+	db                    *bun.DB
+	cache                 cache.Cache
+	objectReader          *objectreader.Reader
+	objectStorage         synapse.StorageClient
+	cacheGate             *cacheaccess.Gate
+	cacheAccessTracker    *cacheaccess.Tracker
+	objectUploader        objectUploader
+	objectVersionRestorer objectVersionRestorer
+	cacheMaxBytes         int64
+	repos                 *repository.Repositories
+	taskService           *taskengine.Service
+	bucketLifecycle       *bucketlifecycle.Service
+	workerHealth          WorkerHealthChecker
+	wallet                synapse.WalletQuerier
+	filecoinReadiness     filecoinReadinessProbe
+	observability         *observability.Service
+	providerIdentity      providerIdentityLookup
+	events                *EventHub
+	settings              *SettingsService
+	auth                  *authService
+	trustedProxies        []netip.Prefix
+	s3IAM                 auth.IAMService
+	s3RootAccess          string
+	filecoinDefaultCopies int
 	// replacementSelector resolves an automatic replacement provider. Nil means
 	// only an explicit Provider ID can be confirmed.
 	replacementSelector providerReplacementSelector
@@ -75,6 +71,12 @@ type Server struct {
 	// Track previously seen label sets to zero stale entries on refresh.
 	prevTaskLabels   map[[2]string]struct{}
 	prevObjectLabels map[string]struct{}
+}
+
+func (s *Server) WithTaskService(service *taskengine.Service) *Server {
+	s.taskService = service
+	s.bucketLifecycle.SetTaskService(service)
+	return s
 }
 
 // New creates a new admin HTTP server.
@@ -98,26 +100,21 @@ func New(
 		panic("admin server requires a cache access tracker")
 	}
 	s := &Server{
-		addr:                          addr,
-		db:                            db,
-		cache:                         c,
-		cacheGate:                     cacheGate,
-		cacheAccessTracker:            cacheAccessTracker,
-		objectReader:                  objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
-		cacheMaxBytes:                 cacheMaxBytes,
-		repos:                         repos,
-		bucketLifecycle:               bucketlifecycle.New(repos, c, logger),
-		workerHealth:                  wh,
-		wallet:                        newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
-		taskDiagnosticChecker:         synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{}),
-		events:                        newAdminEventHub(),
-		filecoinDefaultCopies:         boundedBucketCopies(filecoinDefaultCopies),
-		evictMaxRetries:               5,
-		storageCleanupMaxRetries:      5,
-		uploadMaxRetries:              5,
-		providerReplacementMaxRetries: 5,
-		logger:                        logger,
-		startedAt:                     time.Now(),
+		addr:                  addr,
+		db:                    db,
+		cache:                 c,
+		cacheGate:             cacheGate,
+		cacheAccessTracker:    cacheAccessTracker,
+		objectReader:          objectreader.New(repos, c, nil, cacheGate, cacheAccessTracker, logger),
+		cacheMaxBytes:         cacheMaxBytes,
+		repos:                 repos,
+		bucketLifecycle:       bucketlifecycle.New(repos, c, boundedBucketCopies(filecoinDefaultCopies), logger),
+		workerHealth:          wh,
+		wallet:                newCachedWalletQuerier(wallet, walletCacheTTL, time.Now),
+		events:                newAdminEventHub(),
+		filecoinDefaultCopies: boundedBucketCopies(filecoinDefaultCopies),
+		logger:                logger,
+		startedAt:             time.Now(),
 	}
 	s.watchWalletOperationEvents()
 	return s
@@ -214,34 +211,6 @@ func (s *Server) WithS3IAM(iam auth.IAMService, rootAccess string) *Server {
 	return s
 }
 
-// WithUploadMaxRetries sets the retry budget replacement coordinators inherit.
-func (s *Server) WithUploadMaxRetries(maxRetries int) *Server {
-	if maxRetries > 0 {
-		s.uploadMaxRetries = maxRetries
-	}
-	return s
-}
-
-// WithProviderReplacementMaxRetries sets the provider replacement retry limit.
-func (s *Server) WithProviderReplacementMaxRetries(maxRetries int) *Server {
-	if maxRetries >= 0 {
-		s.providerReplacementMaxRetries = maxRetries
-	}
-	return s
-}
-
-// WithStorageCleanupMaxRetries configures max retries for storage cleanup tasks created by admin actions.
-func (s *Server) WithStorageCleanupMaxRetries(maxRetries int) *Server {
-	s.storageCleanupMaxRetries = maxRetries
-	return s
-}
-
-// WithEvictMaxRetries configures max retries for eviction tasks created by admin actions.
-func (s *Server) WithEvictMaxRetries(maxRetries int) *Server {
-	s.evictMaxRetries = maxRetries
-	return s
-}
-
 // Run starts the admin HTTP server at its configured address.
 func (s *Server) Run(ctx context.Context) error {
 	listener, err := net.Listen("tcp", s.addr)
@@ -270,9 +239,6 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	} else {
 		mux.HandleFunc("GET /healthz", s.handleHealthz)
 		mux.Handle("GET /metrics", promhttp.Handler())
-		mux.HandleFunc("GET /admin/exhausted-tasks", s.handleListExhausted)
-		mux.HandleFunc("POST /admin/exhausted-tasks/{id}/retry", s.handleRetryExhausted)
-
 		// Dashboard API
 		mux.HandleFunc("GET /api/v1/overview", s.handleAPIOverview)
 		mux.HandleFunc("GET /api/v1/events", s.handleAPIEvents)
@@ -303,10 +269,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("POST /api/v1/buckets/{name}/objects/upload", s.handleAPIUploadObject)
 		mux.HandleFunc("GET /api/v1/tasks", s.handleAPITasks)
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
-		mux.HandleFunc("GET /api/v1/tasks/{id}/ref-detail", s.handleAPITaskRefDetail)
-		mux.HandleFunc("GET /api/v1/tasks/{id}/diagnostic", s.handleAPITaskDiagnostic)
-		mux.HandleFunc("POST /api/v1/tasks/{id}/diagnostic/refresh", s.handleAPITaskDiagnosticRefresh)
-		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryExhausted) // only retries exhausted tasks
+		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleAPITaskRetry)
+		mux.HandleFunc("POST /api/v1/tasks/{id}/acknowledge", s.handleAPITaskAcknowledge)
 		mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
 		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
 		mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)
@@ -457,58 +421,54 @@ func (s *Server) cacheRootDir() string {
 	return ""
 }
 
-func (s *Server) handleListExhausted(w http.ResponseWriter, r *http.Request) {
-	const maxExhaustedLimit = 1000
-	limit := 100
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	if limit > maxExhaustedLimit {
-		limit = maxExhaustedLimit
-	}
-
-	tasks, err := s.repos.Tasks.ListExhausted(r.Context(), limit)
-	if err != nil {
-		s.logger.Error("failed to list exhausted tasks", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-
-	// Map to DTO to ensure consistent snake_case JSON and avoid exposing internal fields.
-	items := make([]taskListItem, 0, len(tasks))
-	for i := range tasks {
-		items = append(items, taskListItemFromModel(&tasks[i], nil))
-	}
-
-	writeJSON(w, http.StatusOK, items)
-}
-
-func (s *Server) handleRetryExhausted(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAPITaskRetry(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
 		return
 	}
-
-	if err := s.repos.Tasks.RetryExhausted(r.Context(), id); err != nil {
-		s.logger.Error("failed to retry exhausted task", "taskID", id, "error", err)
-		if errors.Is(err, repository.ErrReplacementRetryUnsupported) {
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	if err := s.taskService.Retry(r.Context(), id); err != nil {
+		if errors.Is(err, taskengine.ErrRetryUnsupported) {
 			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "Retry this replacement from the bucket Details page, under Storage → Data Sets.",
-				"code":  storagereplacement.CodeTaskRetryUnsupported,
+				"error": "This operation cannot be recovered from Tasks.",
+				"code":  "task_retry_unsupported",
 			})
 		} else if errors.Is(err, repository.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found or not in exhausted state"})
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
 		} else {
+			s.logger.Error("api: failed to retry task", "taskID", id, "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		}
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "pending"})
+}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "requeued"})
+func (s *Server) handleAPITaskAcknowledge(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
+		return
+	}
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	if err := s.taskService.Acknowledge(r.Context(), id); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "failed task not found"})
+		} else {
+			s.logger.Error("api: failed to acknowledge task", "taskID", id, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "acknowledged"})
 }
 
 func (s *Server) refreshMetricsLoop(ctx context.Context) {
@@ -571,10 +531,7 @@ func (s *Server) refreshMetrics(ctx context.Context) {
 
 func isActiveTaskStatus(status string) bool {
 	switch status {
-	case string(model.TaskStatusQueued),
-		string(model.TaskStatusScheduled),
-		string(model.TaskStatusWaiting),
-		string(model.TaskStatusRunning):
+	case string(model.TaskStatusPending), string(model.TaskStatusRunning):
 		return true
 	default:
 		return false
