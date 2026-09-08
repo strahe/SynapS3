@@ -114,7 +114,9 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		contentA2 := insertBaselineTestContent(t, db, bucketA, "upload-a2")
 		contentB := insertBaselineTestContent(t, db, bucketB, "upload-b")
 		source := insertBaselineTestDataSet(t, db, bucketA, "101", 0, 1, true)
-		insertBaselineTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
+		copyID := insertBaselineTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
+		mustRejectStatement(t, db, `UPDATE storage_copies
+			SET confirmed_attempt_status = 'confirmed' WHERE id = ?`, copyID)
 
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
 			(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)

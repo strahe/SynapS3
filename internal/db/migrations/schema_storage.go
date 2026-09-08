@@ -299,7 +299,7 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 				// foreign key alone would still allow a committed copy with no
 				// evidence at all, so both directions are stated here.
 				"CONSTRAINT chk_storage_copies_committed_evidence CHECK ((status = 'committed') = (confirmed_attempt_id IS NOT NULL))",
-				"CONSTRAINT chk_storage_copies_confirmed_attempt_shape CHECK ((confirmed_attempt_id IS NULL AND confirmed_attempt_status IS NULL) OR (confirmed_attempt_id <> '' AND confirmed_attempt_status IS NOT NULL))",
+				"CONSTRAINT chk_storage_copies_confirmed_attempt_shape CHECK ((confirmed_attempt_id IS NULL AND confirmed_attempt_status IS NULL) OR (confirmed_attempt_id IS NOT NULL AND confirmed_attempt_id <> '' AND confirmed_attempt_status IS NOT NULL))",
 				"CONSTRAINT chk_storage_copies_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull'))",
 				"CONSTRAINT chk_storage_copies_optional_identity CHECK (provider_id <> '' AND (piece_id IS NULL OR piece_id <> '') AND (retrieval_url IS NULL OR retrieval_url <> '') AND (commit_extra_data_hex IS NULL OR commit_extra_data_hex <> ''))",
 				"CONSTRAINT chk_storage_copies_committed_shape CHECK (status <> 'committed' OR (piece_id IS NOT NULL AND piece_id <> '' AND retrieval_url IS NOT NULL AND retrieval_url <> ''))",
