@@ -287,7 +287,11 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 任务持久状态只有 `pending`、`running`、`completed`、`failed` 和 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应包含面向用户的 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`；不会暴露任务输入、checkpoint、执行模式或 claim generation。
 
-分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。接口不支持 `category`、`stage`、`offset` 或 total-count 分页。存储提供方替换仍通过 Data Sets API 恢复，钱包任务不能从该接口重试。
+`status` 过滤还接受展示别名 `dismissed`。`status=failed` 只返回尚未确认的持久失败，`status=dismissed` 返回已确认的持久失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。这会收窄此前 `status=failed` 同时包含两组任务的行为；需要历史已确认失败的客户端必须另行请求 `dismissed`。
+
+为保持兼容，`/api/v1/overview` 的 `tasks.by_status` 仍按五种持久状态聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 展示状态时使用 `/api/v1/tasks/stats`。
+
+分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。接口不支持 `category`、`stage`、`offset` 或 total-count 分页。存储提供方替换仍通过 Data Sets API 恢复。没有发出外部广播的钱包操作可以在这里恢复，广播结果不确定时仍不可重试；重试结果不确定的 Store 只会向存储提供方查询预期的 parked piece，绝不会重新发送字节。
 
 ## 钱包和 Filecoin
 

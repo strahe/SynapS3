@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -788,6 +789,16 @@ func TestAdminSettingsSetValidationAndPayload(t *testing.T) {
 func TestAdminTaskCommandsAndAPIErrorFields(t *testing.T) {
 	t.Setenv(configEnvVar, "")
 
+	t.Run("task list help documents dismissed status", func(t *testing.T) {
+		out, err := runAdminCommand(t, []string{"synaps3", "admin", "task", "list", "--help"})
+		if err != nil {
+			t.Fatalf("task list help: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "pending, running, completed, failed, cancelled, or dismissed") {
+			t.Fatalf("task list help missing status filters:\n%s", out)
+		}
+	})
+
 	t.Run("task list query and retry path", func(t *testing.T) {
 		var sawList, sawRetry bool
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -994,7 +1005,8 @@ func TestAdminStorageConfirmationCommands(t *testing.T) {
 		if err != nil {
 			t.Fatalf("storage-confirmation list: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "PIECE CID") || !strings.Contains(out, "ATTEMPTED AT") ||
+		if !strings.Contains(out, "CONTENT ID") || strings.Contains(out, "UPLOAD ID") ||
+			!strings.Contains(out, "PIECE CID") || !strings.Contains(out, "ATTEMPTED AT") ||
 			!strings.Contains(out, "bafy-piece-1") || !strings.Contains(out, "2026-08-30T01:00:00Z") ||
 			!strings.Contains(out, "attempt_only_ambiguous") || !strings.Contains(out, "provider-1") ||
 			!strings.Contains(out, "attempt-1") || !strings.Contains(out, "0xcommit") {
@@ -1100,10 +1112,5 @@ func adminTestSettings(network string, allowPrivate bool) map[string]any {
 }
 
 func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, want)
 }

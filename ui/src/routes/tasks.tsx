@@ -45,6 +45,7 @@ const taskStatuses = [
   { value: 'running', label: 'Running' },
   { value: 'completed', label: 'Completed' },
   { value: 'failed', label: 'Failed' },
+  { value: 'dismissed', label: 'Dismissed' },
   { value: 'cancelled', label: 'Cancelled' },
 ] as const
 
@@ -321,7 +322,7 @@ function TaskTable({
                       ) : (
                         <RotateCcw data-icon="inline-start" />
                       )}
-                      Recover
+                      {task.failure_reason === 'store_outcome_unknown' ? 'Check again' : 'Recover'}
                     </Button>
                   )}
                   {task.acknowledgeable && (

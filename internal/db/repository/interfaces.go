@@ -210,8 +210,17 @@ type EnsureContentInput struct {
 	RequestedCopies int
 }
 
+type BeginIngressStoreProgressInput struct {
+	CopyID     int64
+	Generation int64
+	TaskID     int64
+	Attempt    int
+}
+
 type RecordIngressStoreProgressInput struct {
-	ContentID     int64
+	CopyID        int64
+	Generation    int64
+	TaskID        int64
 	Attempt       int
 	BytesUploaded int64
 }
@@ -466,7 +475,7 @@ type StorageContentRepository interface {
 	GetIngressCopy(ctx context.Context, contentID int64) (*model.StorageCopy, error)
 	// ContentPipelineState derives pipeline position from the copy rows.
 	ContentPipelineState(ctx context.Context, contentID int64) (model.ObjectState, error)
-	BeginIngressStoreProgress(ctx context.Context, contentID int64) (*model.StorageCopy, error)
+	BeginIngressStoreProgress(ctx context.Context, input BeginIngressStoreProgressInput) (*model.StorageCopy, error)
 	RecordIngressStoreProgress(ctx context.Context, input RecordIngressStoreProgressInput) (*model.StorageCopy, error)
 	GetUploadProvenance(ctx context.Context, contentID int64) (*StorageContentProvenance, error)
 	ListCopies(ctx context.Context, contentID int64) ([]model.StorageCopy, error)
@@ -499,7 +508,7 @@ type StorageContentRepository interface {
 	CompleteDataSetEnsureTask(ctx context.Context, dataSetID, taskID int64) error
 	NextCopyWorkGeneration(ctx context.Context, copyID int64) (int64, error)
 	BindCopyTask(ctx context.Context, copyID, generation, taskID int64) error
-	AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID int64) (*model.StorageCopy, error)
+	AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error)
 	ReservePullRequest(ctx context.Context, input ReservePullRequestInput) error
 	ReplaceCopyTask(ctx context.Context, copyID, generation, taskID, nextGeneration, nextTaskID int64) error
 	CompleteCopyTask(ctx context.Context, copyID, generation, taskID int64) error
@@ -679,10 +688,12 @@ type TaskRepository interface {
 	WakePending(ctx context.Context, ids []int64) (int, error)
 	RequestCancellation(ctx context.Context, id int64, reason string) error
 	RetryFailed(ctx context.Context, id int64) error
+	ReactivateTerminal(ctx context.Context, id int64) error
 	AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error
 	DeleteRetained(ctx context.Context, now time.Time, limit int) (int, error)
 	List(ctx context.Context, filter TaskListFilter) (TaskPage, error)
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
+	CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error)
 	CountUnacknowledgedFailed(ctx context.Context) (int64, error)
 	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
 	CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error)
@@ -704,6 +715,7 @@ type TaskTransition struct {
 type TaskListFilter struct {
 	Type                       model.TaskType
 	Status                     model.TaskStatus
+	Acknowledged               *bool
 	BeforeID                   int64
 	Limit                      int
 	HideHealthyRecurringSystem bool

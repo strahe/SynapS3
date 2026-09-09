@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -22,6 +23,8 @@ type uploadProgressReporter struct {
 	logger    *slog.Logger
 
 	contentID  int64
+	copyID     int64
+	generation int64
 	taskID     int64
 	versionID  string
 	bucketName string
@@ -33,26 +36,26 @@ type uploadProgressReporter struct {
 	pendingBytes int64
 	pending      bool
 	pendingTimer *time.Timer
+	closed       bool
+	writes       sync.WaitGroup
 }
 
-func (h *TaskHandlers) beginIngressProgress(
+func (h *TaskHandlers) newIngressProgressReporter(
 	ctx context.Context,
 	taskID int64,
+	generation int64,
+	copyID int64,
+	attempt int,
 	content *model.StorageContent,
 	bucket *model.Bucket,
 ) *uploadProgressReporter {
-	if content == nil {
-		return nil
-	}
-	upload, err := h.deps.Repositories.Contents.BeginIngressStoreProgress(ctx, content.ID)
-	if err != nil {
-		h.deps.Logger.Warn("failed to begin ingress upload progress", "content_id", content.ID, "error", err)
+	if content == nil || copyID < 1 || generation < 1 || taskID < 1 || attempt < 1 {
 		return nil
 	}
 	reporter := &uploadProgressReporter{
 		ctx: ctx, repos: h.deps.Repositories, publisher: h.deps.Events, logger: h.deps.Logger,
-		contentID: content.ID, taskID: taskID,
-		attempt: upload.IngressStoreAttempt,
+		contentID: content.ID, copyID: copyID, generation: generation, taskID: taskID,
+		attempt: attempt,
 	}
 	// The transfer belongs to the content; naming a version is only there to
 	// give the progress event something a reader recognises, so a content with
@@ -66,7 +69,7 @@ func (h *TaskHandlers) beginIngressProgress(
 	if bucket != nil {
 		reporter.bucketName = bucket.Name
 	}
-	reporter.record(0, false)
+	reporter.scheduleRecord(0, false)
 	return reporter
 }
 
@@ -76,11 +79,15 @@ func (r *uploadProgressReporter) OnProgress(bytesUploaded int64) {
 	}
 	now := time.Now()
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
 	if r.lastFlush.IsZero() || now.Sub(r.lastFlush) >= uploadProgressFlushInterval {
 		r.cancelPendingLocked()
 		r.lastFlush = now
+		r.scheduleRecordLocked(bytesUploaded, false)
 		r.mu.Unlock()
-		go r.record(bytesUploaded, false)
 		return
 	}
 	r.pendingBytes = bytesUploaded
@@ -96,9 +103,15 @@ func (r *uploadProgressReporter) Flush(bytesUploaded int64, done bool) {
 		return
 	}
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
 	r.cancelPendingLocked()
+	r.writes.Add(1)
 	r.mu.Unlock()
 	r.record(bytesUploaded, done)
+	r.writes.Done()
 }
 
 func (r *uploadProgressReporter) Close() {
@@ -106,13 +119,20 @@ func (r *uploadProgressReporter) Close() {
 		return
 	}
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		r.writes.Wait()
+		return
+	}
+	r.closed = true
 	r.cancelPendingLocked()
 	r.mu.Unlock()
+	r.writes.Wait()
 }
 
 func (r *uploadProgressReporter) flushPending() {
 	r.mu.Lock()
-	if !r.pending {
+	if r.closed || !r.pending {
 		r.pendingTimer = nil
 		r.mu.Unlock()
 		return
@@ -121,8 +141,8 @@ func (r *uploadProgressReporter) flushPending() {
 	r.pending = false
 	r.pendingTimer = nil
 	r.lastFlush = time.Now()
+	r.scheduleRecordLocked(bytesUploaded, false)
 	r.mu.Unlock()
-	r.record(bytesUploaded, false)
 }
 
 func (r *uploadProgressReporter) cancelPendingLocked() {
@@ -133,13 +153,32 @@ func (r *uploadProgressReporter) cancelPendingLocked() {
 	}
 }
 
+func (r *uploadProgressReporter) scheduleRecord(bytesUploaded int64, done bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.scheduleRecordLocked(bytesUploaded, done)
+}
+
+func (r *uploadProgressReporter) scheduleRecordLocked(bytesUploaded int64, done bool) {
+	r.writes.Go(func() {
+		r.record(bytesUploaded, done)
+	})
+}
+
 func (r *uploadProgressReporter) record(bytesUploaded int64, done bool) {
 	ctx, cancel := context.WithTimeout(r.ctx, uploadProgressWriteTimeout)
 	defer cancel()
 	upload, err := r.repos.Contents.RecordIngressStoreProgress(ctx, repository.RecordIngressStoreProgressInput{
-		ContentID: r.contentID, Attempt: r.attempt, BytesUploaded: bytesUploaded,
+		CopyID: r.copyID, Generation: r.generation, TaskID: r.taskID,
+		Attempt: r.attempt, BytesUploaded: bytesUploaded,
 	})
 	if err != nil {
+		if errors.Is(err, repository.ErrConflict) {
+			return
+		}
 		r.logger.Warn("failed to record ingress upload progress", "content_id", r.contentID, "attempt", r.attempt, "error", err)
 		return
 	}

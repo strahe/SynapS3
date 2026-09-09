@@ -581,11 +581,8 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Remote cleanup is ready", nil)
 		}
 		checkpoint = cleanupCheckpoint{CopyID: copyRow.ID, AttemptedAt: time.Now().UTC()}
-		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-			return retryTask(err, "cleanup_checkpoint_failed")
-		}
 		var txHash string
-		err = execution.WithResource(ctx, taskengine.ResourceDestructiveMutation, func(ctx context.Context) error {
+		attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceDestructiveMutation, checkpoint, nil, func(ctx context.Context) error {
 			result, deleteErr := cleanupContext.DeletePieceByID(ctx, copyRow.PieceID.SDK())
 			if result != nil {
 				txHash = result.Hash.String()
@@ -593,6 +590,9 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 			return deleteErr
 		})
 		if err != nil {
+			if !attempted {
+				return retryTask(err, "cleanup_not_started")
+			}
 			return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Checking remote cleanup", nil)
 		}
 		if err := h.deps.Repositories.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, txHash); err != nil {
@@ -612,7 +612,10 @@ func (h *TaskHandlers) walletHandler() taskengine.Handler {
 	definition := taskengine.Definition{
 		Type: model.TaskTypeWalletOperation, InputVersion: 1,
 		Codec:      taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
-		RetryLimit: h.retryLimit(), AllowRetry: false,
+		RetryLimit: h.retryLimit(), AllowRetry: true,
+		CanManualRetry: func(task *model.Task) bool {
+			return task != nil && task.FailureReason != nil && *task.FailureReason == "wallet_broadcast_not_started"
+		},
 	}
 	return taskHandler{
 		definition: definition,
@@ -650,14 +653,11 @@ func (h *TaskHandlers) executeWalletOperation(ctx context.Context, execution tas
 		})
 	}
 	checkpoint := walletoperation.Checkpoint{BroadcastAttempted: true}
-	if err := execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.WalletOperations.MarkBroadcastAttempted(ctx, op.ID, execution.ID())
-	}); err != nil {
-		return h.retryWalletOperation(execution, op.ID, err, "wallet_checkpoint_failed")
-	}
 	var txHash string
 	var alreadyComplete bool
-	err = execution.WithResource(ctx, taskengine.ResourceWallet, func(ctx context.Context) error {
+	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceWallet, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.WalletOperations.MarkBroadcastAttempted(ctx, op.ID, execution.ID())
+	}, func(ctx context.Context) error {
 		requestCtx, cancel := context.WithTimeout(ctx, h.deps.WalletBroadcastTimeout)
 		defer cancel()
 		var broadcastErr error
@@ -665,6 +665,9 @@ func (h *TaskHandlers) executeWalletOperation(ctx context.Context, execution tas
 		return broadcastErr
 	})
 	if err != nil {
+		if !attempted {
+			return retryTask(err, "wallet_broadcast_not_started")
+		}
 		message := fmt.Sprintf("wallet broadcast outcome is unknown: %v", err)
 		return taskengine.Fail(err, "wallet_broadcast_unknown", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.WalletOperations.MarkUnknown(ctx, op.ID, execution.ID(), message)

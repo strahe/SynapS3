@@ -43,26 +43,35 @@ func (g *Gate) Open(
 	cacheKey string,
 	open func() (io.ReadCloser, *cache.ObjectInfo, error),
 ) (*OpenedCacheEntry, error) {
-	shard, entry := g.acquire(cacheKey)
-	entry.mu.RLock()
+	release := g.HoldRead(cacheKey)
 
 	body, info, err := open()
 	if err != nil {
-		entry.mu.RUnlock()
-		g.release(shard, cacheKey, entry)
+		release()
 		return nil, err
 	}
 
 	return &OpenedCacheEntry{
 		Body: &guardedReadCloser{
-			body: body,
-			release: func() {
-				entry.mu.RUnlock()
-				g.release(shard, cacheKey, entry)
-			},
+			body:    body,
+			release: release,
 		},
 		Info: info,
 	}, nil
+}
+
+// HoldRead protects a cache entry from deletion across multiple opens. The
+// returned release function is idempotent and must be called by the holder.
+func (g *Gate) HoldRead(cacheKey string) func() {
+	shard, entry := g.acquire(cacheKey)
+	entry.mu.RLock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.RUnlock()
+			g.release(shard, cacheKey, entry)
+		})
+	}
 }
 
 // Commit serializes a local cache commit with deletion for the same cache key.
@@ -87,11 +96,8 @@ func (g *Gate) GuardDeletion(cacheKey string, remove func()) {
 }
 
 func (g *Gate) guardAccess(cacheKey string, access func()) {
-	shard, entry := g.acquire(cacheKey)
-	defer g.release(shard, cacheKey, entry)
-
-	entry.mu.RLock()
-	defer entry.mu.RUnlock()
+	release := g.HoldRead(cacheKey)
+	defer release()
 	access()
 }
 

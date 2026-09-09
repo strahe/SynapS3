@@ -62,12 +62,14 @@ func (r *BunStorageContentRepo) BindCopyTask(ctx context.Context, copyID, genera
 	return requireTaskFenceRows(result, err, "binding storage copy task")
 }
 
-func (r *BunStorageContentRepo) AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID int64) (*model.StorageCopy, error) {
+func (r *BunStorageContentRepo) AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error) {
 	copyRow := new(model.StorageCopy)
 	q := r.db.NewSelect().Model(copyRow)
 	projectActiveCommitAttempt(q, "storage_copy")
 	err := q.
+		Join("JOIN tasks AS copy_task ON copy_task.id = storage_copy.active_task_id").
 		Where("storage_copy.id = ? AND storage_copy.work_generation = ? AND storage_copy.active_task_id = ?", copyID, generation, taskID).
+		Where("copy_task.status = ? AND copy_task.claim_generation = ? AND copy_task.lease_until > ?", model.TaskStatusRunning, claimGeneration, time.Now()).
 		Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrConflict

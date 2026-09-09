@@ -47,7 +47,7 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-Status should show the task engine as healthy. Task stats use the five stored states: pending, running, completed, failed, and cancelled. The dashboard presents pending work as queued, scheduled, or waiting.
+Status should show the task engine as healthy. Tasks retain five stored states: pending, running, completed, failed, and cancelled. Task stats report acknowledged failures separately as dismissed, and the dashboard presents pending work as queued, scheduled, or waiting.
 
 ## Prometheus Metrics
 

@@ -710,6 +710,106 @@ func TestRecoverCannotStartExternalEffect(t *testing.T) {
 	}
 }
 
+func TestWithCheckpointedEffectSeparatesAdmissionFromAttempt(t *testing.T) {
+	injected := errors.New("injected failure")
+	tests := []struct {
+		name            string
+		mode            model.TaskResumeMode
+		resource        resourceRunner
+		checkpoint      checkpointWriter
+		wantAttempted   bool
+		wantEffectCalls int
+		wantError       error
+	}{
+		{
+			name: "resource admission fails", mode: model.TaskResumeModeExecute,
+			resource: func(context.Context, Resource, func(context.Context) error) error { return context.Canceled },
+			checkpoint: func(context.Context, any, Settlement) error {
+				t.Fatal("checkpoint ran before resource admission")
+				return nil
+			},
+			wantError: context.Canceled,
+		},
+		{
+			name: "checkpoint fails", mode: model.TaskResumeModeExecute,
+			resource: func(ctx context.Context, _ Resource, fn func(context.Context) error) error { return fn(ctx) },
+			checkpoint: func(context.Context, any, Settlement) error {
+				return injected
+			},
+			wantError: injected,
+		},
+		{
+			name: "effect fails", mode: model.TaskResumeModeExecute,
+			resource: func(ctx context.Context, _ Resource, fn func(context.Context) error) error { return fn(ctx) },
+			checkpoint: func(ctx context.Context, _ any, settlement Settlement) error {
+				return settlement(ctx, nil)
+			},
+			wantAttempted: true, wantEffectCalls: 1, wantError: injected,
+		},
+		{
+			name: "recovery is forbidden", mode: model.TaskResumeModeRecover,
+			resource: func(context.Context, Resource, func(context.Context) error) error {
+				t.Fatal("recovery reached resource runner")
+				return nil
+			},
+			checkpoint: func(context.Context, any, Settlement) error {
+				t.Fatal("recovery wrote checkpoint")
+				return nil
+			},
+			wantError: ErrEffectForbidden,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			effectCalls := 0
+			execution := Execution{
+				task: model.Task{ResumeMode: tt.mode}, checkpoint: tt.checkpoint, resource: tt.resource,
+			}
+			attempted, err := execution.WithCheckpointedEffect(t.Context(), ResourceProviderMutation, map[string]bool{"attempted": true}, func(context.Context, *repository.Repositories) error {
+				return nil
+			}, func(context.Context) error {
+				effectCalls++
+				return injected
+			})
+			if attempted != tt.wantAttempted || effectCalls != tt.wantEffectCalls || !errors.Is(err, tt.wantError) {
+				t.Fatalf("result = attempted:%v calls:%d err:%v, want attempted:%v calls:%d err:%v", attempted, effectCalls, err, tt.wantAttempted, tt.wantEffectCalls, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
+	limit := 5
+	var effectCalled atomic.Bool
+	harness := newTaskHarness(t, scriptedHandler{
+		definition: testDefinition(&limit, true),
+		execute: func(ctx context.Context, execution Execution) Result {
+			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, map[string]bool{"attempted": true}, func(ctx context.Context, repos *repository.Repositories) error {
+				if err := repos.Tasks.RequestCancellation(ctx, execution.ID(), "must roll back"); err != nil {
+					return err
+				}
+				return errors.New("reject checkpoint evidence")
+			}, func(context.Context) error {
+				effectCalled.Store(true)
+				return nil
+			})
+			if attempted || err == nil {
+				return Fail(fmt.Errorf("checkpoint result = attempted:%v err:%v", attempted, err), "unexpected_checkpoint_result", nil)
+			}
+			return Fail(err, "effect_not_started", nil)
+		},
+	}, nil)
+	row := enqueueTestTask(t, harness, "checkpoint-rollback", "checkpoint-rollback")
+	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || stored.Status != model.TaskStatusFailed || stored.FailureReason == nil || *stored.FailureReason != "effect_not_started" || stored.CancellationRequestedAt != nil || len(stored.Checkpoint) != 0 {
+		t.Fatalf("rolled-back task = %#v, err=%v", stored, err)
+	}
+	if effectCalled.Load() {
+		t.Fatal("effect ran after checkpoint settlement failed")
+	}
+}
+
 func TestExternalEffectRevalidatesClaimAfterResourceAdmission(t *testing.T) {
 	limit := 5
 	var called atomic.Bool

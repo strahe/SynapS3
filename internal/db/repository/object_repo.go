@@ -1195,6 +1195,7 @@ func prepareObjectVersionsForPermanentDelete(
 			res, err := db.NewUpdate().
 				Model((*model.StorageCopy)(nil)).
 				Set("status = ?", model.StorageCopyStatusFailed).
+				Set("active_task_id = NULL").
 				Set("commit_ready_at = NULL").
 				Set("commit_extra_data_hex = NULL").
 				Set("last_error = ?", "cancelled because the last object version was permanently deleted").
@@ -1205,6 +1206,11 @@ func prepareObjectVersionsForPermanentDelete(
 					model.StorageCopyStatusPieceReady,
 					model.StorageCopyStatusCommitting,
 				})).
+				Where(`active_task_id IS NULL OR EXISTS (
+					SELECT 1 FROM tasks AS terminal_task
+					WHERE terminal_task.id = storage_copy.active_task_id
+					  AND terminal_task.status IN (?, ?, ?)
+				)`, model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled).
 				Where(`NOT EXISTS (
 					SELECT 1 FROM storage_commit_attempts AS unresolved_attempt
 					WHERE unresolved_attempt.content_id = storage_copy.content_id

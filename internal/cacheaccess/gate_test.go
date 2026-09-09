@@ -44,6 +44,21 @@ func TestGateWaitsForOpenedBodyBeforeDeletion(t *testing.T) {
 	waitForGateSignal(t, deleteDone, time.Second, "deletion completion")
 }
 
+func TestGateHoldReadProtectsMultipleOpensAsOneOperation(t *testing.T) {
+	gate := NewGate()
+	release := gate.HoldRead("content-1")
+	deleteStarted := make(chan struct{})
+	go gate.GuardDeletion("content-1", func() { close(deleteStarted) })
+	select {
+	case <-deleteStarted:
+		t.Fatal("deletion entered while the shared read guard was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	release()
+	waitForGateSignal(t, deleteStarted, time.Second, "deletion after shared read guard")
+}
+
 func TestGateBlocksOpenWhileDeletionRuns(t *testing.T) {
 	gate := NewGate()
 	deleteStarted := make(chan struct{})

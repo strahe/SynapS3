@@ -117,25 +117,33 @@ func (r *BunStorageContentRepo) GetByIDs(ctx context.Context, contentIDs []int64
 	return uploadsByID, nil
 }
 
-// BeginIngressStoreProgress starts a fresh progress attempt on the content's
-// ingress copy. Progress belongs to the transfer that produces it, so it lives
-// on that copy row rather than on the content shared by every replica.
-func (r *BunStorageContentRepo) BeginIngressStoreProgress(ctx context.Context, contentID int64) (*model.StorageCopy, error) {
-	if contentID == 0 {
-		return nil, fmt.Errorf("contentID is required: %w", ErrInvalidInput)
+// BeginIngressStoreProgress starts a fresh, fenced progress attempt on the
+// ingress copy. The caller runs this in the same transaction as the task
+// checkpoint that authorizes the provider request.
+func (r *BunStorageContentRepo) BeginIngressStoreProgress(ctx context.Context, input BeginIngressStoreProgressInput) (*model.StorageCopy, error) {
+	if input.CopyID < 1 || input.Generation < 1 || input.TaskID < 1 || input.Attempt < 1 {
+		return nil, fmt.Errorf("beginning ingress store progress: %w", ErrInvalidInput)
 	}
 	now := time.Now()
-	if _, err := r.db.NewUpdate().
-		Model((*model.StorageCopy)(nil)).
-		Set("ingress_store_attempt = ingress_store_attempt + 1").
+	copyRow := new(model.StorageCopy)
+	err := r.db.NewUpdate().
+		Model(copyRow).
+		Set("ingress_store_attempt = ?", input.Attempt).
 		Set("ingress_bytes_transferred = 0").
 		Set("progress_updated_at = ?", now).
 		Set("updated_at = ?", now).
-		Where("content_id = ? AND transfer_method = ?", contentID, model.StorageCopyTransferMethodIngress).
-		Exec(ctx); err != nil {
+		Where("id = ? AND work_generation = ? AND active_task_id = ?", input.CopyID, input.Generation, input.TaskID).
+		Where("ingress_store_attempt = ?", input.Attempt-1).
+		Where("status = ? AND transfer_method = ?", model.StorageCopyStatusPending, model.StorageCopyTransferMethodIngress).
+		Returning("*").
+		Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("beginning ingress store progress: %w", ErrConflict)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("beginning ingress store progress: %w", err)
 	}
-	return r.ingressCopy(ctx, contentID)
+	return copyRow, nil
 }
 
 // GetIngressCopy returns the copy that performs the ingress transfer for this
@@ -204,25 +212,29 @@ func (r *BunStorageContentRepo) ingressCopy(ctx context.Context, contentID int64
 }
 
 func (r *BunStorageContentRepo) RecordIngressStoreProgress(ctx context.Context, input RecordIngressStoreProgressInput) (*model.StorageCopy, error) {
-	if input.ContentID == 0 {
-		return nil, fmt.Errorf("contentID is required: %w", ErrInvalidInput)
-	}
-	if input.Attempt <= 0 {
-		return nil, fmt.Errorf("attempt is required: %w", ErrInvalidInput)
+	if input.CopyID < 1 || input.Generation < 1 || input.TaskID < 1 || input.Attempt < 1 || input.BytesUploaded < 0 {
+		return nil, fmt.Errorf("recording ingress store progress: %w", ErrInvalidInput)
 	}
 	now := time.Now()
 	// content_size is repeated on the copy and pinned there by a composite
 	// foreign key, so the clamp stays a single-row update with no join.
-	if _, err := r.db.NewUpdate().
-		Model((*model.StorageCopy)(nil)).
+	copyRow := new(model.StorageCopy)
+	err := r.db.NewUpdate().
+		Model(copyRow).
 		Set("progress_updated_at = CASE WHEN ingress_bytes_transferred < content_size AND ? > ingress_bytes_transferred THEN ? ELSE progress_updated_at END", input.BytesUploaded, now).
 		Set("ingress_bytes_transferred = CASE WHEN ? > content_size THEN content_size WHEN ? > ingress_bytes_transferred THEN ? ELSE ingress_bytes_transferred END", input.BytesUploaded, input.BytesUploaded, input.BytesUploaded).
-		Where("content_id = ? AND transfer_method = ?", input.ContentID, model.StorageCopyTransferMethodIngress).
+		Where("id = ? AND work_generation = ? AND active_task_id = ?", input.CopyID, input.Generation, input.TaskID).
 		Where("ingress_store_attempt = ?", input.Attempt).
-		Exec(ctx); err != nil {
+		Where("status = ? AND transfer_method = ?", model.StorageCopyStatusPending, model.StorageCopyTransferMethodIngress).
+		Returning("*").
+		Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("recording ingress store progress: %w", ErrConflict)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("recording ingress store progress: %w", err)
 	}
-	return r.ingressCopy(ctx, input.ContentID)
+	return copyRow, nil
 }
 
 func (r *BunStorageContentRepo) GetUploadProvenance(ctx context.Context, contentID int64) (*StorageContentProvenance, error) {

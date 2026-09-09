@@ -362,7 +362,7 @@ func adminTaskCommand() *cli.Command {
 				Usage: "list background tasks",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "type", Usage: "filter by task type"},
-					&cli.StringFlag{Name: "status", Usage: "filter by task status"},
+					&cli.StringFlag{Name: "status", Usage: "filter by status (pending, running, completed, failed, cancelled, or dismissed)"},
 					&cli.IntFlag{Name: "limit", Value: 20, Usage: "maximum tasks to return"},
 					&cli.Int64Flag{Name: "cursor", Usage: "continue before this task ID"},
 				},
@@ -1188,7 +1188,7 @@ func adminStructJSONFieldValue(value reflect.Value, name string) (reflect.Value,
 	valueType := value.Type()
 	for i := range value.NumField() {
 		field := valueType.Field(i)
-		jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
+		jsonName, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if jsonName == name {
 			return value.Field(i), true
 		}
@@ -1484,7 +1484,7 @@ func writeAdminTaskStatsTable(w io.Writer, stats []adminTaskStatusCount) error {
 
 func writeAdminStorageConfirmationsTable(w io.Writer, confirmations []adminStorageConfirmationAttention) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "COPY ID\tUPLOAD ID\tCOPY\tPROVIDER\tDATA SET\tPIECE CID\tATTEMPT\tATTEMPTED AT\tTRANSACTION\tREASON\tATTENTION AT"); err != nil {
+	if _, err := fmt.Fprintln(tw, "COPY ID\tCONTENT ID\tCOPY\tPROVIDER\tDATA SET\tPIECE CID\tATTEMPT\tATTEMPTED AT\tTRANSACTION\tREASON\tATTENTION AT"); err != nil {
 		return err
 	}
 	for _, confirmation := range confirmations {

@@ -116,23 +116,25 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	events := admin.NewEventHub()
 	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
+	pdpStatusChecker := synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
+		Timeout:              15 * time.Second,
+		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
+	})
 	registry := taskengine.NewRegistry()
 	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
-		Repositories:  repos,
-		Events:        events,
-		Cache:         localCache,
-		CacheGate:     cacheGate,
-		CacheTracker:  accessTracker,
-		Storage:       opts.Filecoin.Storage,
-		Wallet:        opts.Filecoin.Wallet,
-		Receipts:      opts.Filecoin.Receipts,
-		Terminator:    opts.Filecoin.Terminator,
-		Epochs:        opts.Filecoin.Epochs,
-		Observability: observabilityService,
-		CommitStatus: synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
-			Timeout:              15 * time.Second,
-			AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
-		}),
+		Repositories:   repos,
+		Events:         events,
+		Cache:          localCache,
+		CacheGate:      cacheGate,
+		CacheTracker:   accessTracker,
+		Storage:        opts.Filecoin.Storage,
+		Wallet:         opts.Filecoin.Wallet,
+		Receipts:       opts.Filecoin.Receipts,
+		Terminator:     opts.Filecoin.Terminator,
+		Epochs:         opts.Filecoin.Epochs,
+		Observability:  observabilityService,
+		CommitStatus:   pdpStatusChecker,
+		ParkedPieces:   pdpStatusChecker,
 		EvictionPolicy: evictionPolicy,
 		MaxCacheBytes:  maxCacheBytes,
 		LRUHighPercent: cfg.Cache.LRUHighWatermarkPercent,

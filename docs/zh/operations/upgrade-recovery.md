@@ -52,13 +52,16 @@ synaps3 admin task stats
 - 恢复过程会先检查 checkpoint 和领域证据，再决定能否发起新的外部效果。
 - 只有 API 标记为可重试的失败任务才能重试；重试始终从恢复模式开始。
 - 存储提供方替换仍在存储桶的 Data Sets 页面恢复。
-- 钱包任务不能从 Tasks 重试。广播结果不确定时，钱包记录会保留 unknown 结果，不会盲目重播。
+- 尚未发出广播的钱包操作可以从 Tasks 恢复；广播结果不确定的钱包操作仍不可重试，并保留为 unknown 结果，不会盲目重播。
+- Store 结果无法确认时，失败任务会提供 **Check again**。该操作只查询存储提供方是否已有预期的 parked piece，绝不会重新上传字节。
+- `status=failed` 只列出尚未确认的失败；使用 `status=dismissed` 查看已确认失败。`dismissed` 是过滤和展示值，不是第六种持久状态。
 - 无法证明存储提供方结果的确认会出现在 `synaps3 admin storage-confirmation list`，等待显式核对。
 
 常用命令：
 
 ```bash
 synaps3 admin task list --status failed --limit 100
+synaps3 admin task list --status dismissed --limit 100
 synaps3 admin task stats
 synaps3 admin task retry 42
 synaps3 admin task acknowledge 42
@@ -67,6 +70,8 @@ synaps3 admin settings get
 ```
 
 重试前先恢复失败的依赖。不要手工编辑任务行、清空 checkpoint 或缩短 lease。
+
+如果永久删除了最后一个引用结果不确定且尚未 Commit 的 Store 的对象，SynapS3 会释放该终态任务绑定。已经到达存储提供方但从未 Commit 的 piece 没有可供本地删除的 provider piece ID，仍由存储提供方既有的 parked-piece 垃圾回收负责清理。
 
 ## 恢复矩阵
 

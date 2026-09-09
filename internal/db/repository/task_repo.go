@@ -475,6 +475,57 @@ func (r *BunTaskRepo) RetryFailed(ctx context.Context, id int64) error {
 	return nil
 }
 
+// ReactivateTerminal reuses a terminal idempotency record as a fresh execute
+// run. It is intentionally narrower than manual retry: callers must first
+// verify that the task's immutable input still describes the desired work.
+func (r *BunTaskRepo) ReactivateTerminal(ctx context.Context, id int64) error {
+	if id < 1 {
+		return fmt.Errorf("reactivating terminal task: %w", ErrInvalidInput)
+	}
+	now := time.Now()
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		result, err := db.NewUpdate().
+			Model((*model.Task)(nil)).
+			Set("status = ?", model.TaskStatusPending).
+			Set("resume_mode = ?", model.TaskResumeModeExecute).
+			Set("available_at = ?", now).
+			Set("wait_reason = NULL").
+			Set("retry_count = 0").
+			Set("failure_reason = NULL").
+			Set("last_error = NULL").
+			Set("status_message = NULL").
+			Set("cancellation_requested_at = NULL").
+			Set("cancellation_reason = NULL").
+			Set("claimed_at = NULL").
+			Set("lease_until = NULL").
+			Set("started_at = NULL").
+			Set("finished_at = NULL").
+			Set("acknowledged_at = NULL").
+			Set("retention_until = NULL").
+			Set("updated_at = ?", now).
+			Where("id = ? AND type = ? AND status IN (?, ?)", id, model.TaskTypeUploadPlan, model.TaskStatusFailed, model.TaskStatusCancelled).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("reactivating terminal task %d: %w", id, err)
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return fmt.Errorf("reactivating terminal task %d: %w", id, ErrConflict)
+		}
+		result, err = db.NewUpdate().
+			Model((*model.TaskPayload)(nil)).
+			Set("checkpoint_json = NULL").
+			Where("task_id = ?", id).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("clearing terminal task %d checkpoint: %w", id, err)
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return fmt.Errorf("clearing terminal task %d checkpoint: %w", id, ErrConflict)
+		}
+		return nil
+	})
+}
+
 func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error {
 	if retention <= 0 {
 		return fmt.Errorf("retention must be positive: %w", ErrInvalidInput)
@@ -552,6 +603,13 @@ func (r *BunTaskRepo) List(ctx context.Context, filter TaskListFilter) (TaskPage
 	if filter.Status != "" {
 		query = query.Where("task.status = ?", filter.Status)
 	}
+	if filter.Acknowledged != nil {
+		if *filter.Acknowledged {
+			query = query.Where("task.acknowledged_at IS NOT NULL")
+		} else {
+			query = query.Where("task.acknowledged_at IS NULL")
+		}
+	}
 	if filter.HideHealthyRecurringSystem {
 		query = query.Where("(task.type NOT IN (?) OR task.status = ?)", bun.List(model.RecurringSystemTaskTypes()), model.TaskStatusFailed)
 	}
@@ -579,6 +637,22 @@ func (r *BunTaskRepo) CountByStatus(ctx context.Context) ([]TaskStatusCount, err
 		Scan(ctx, &counts)
 	if err != nil {
 		return nil, fmt.Errorf("counting tasks by status: %w", err)
+	}
+	return counts, nil
+}
+
+func (r *BunTaskRepo) CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error) {
+	const presentationStatus = "CASE WHEN status = 'failed' AND acknowledged_at IS NOT NULL THEN 'dismissed' ELSE status END"
+	var counts []TaskStatusCount
+	err := r.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Column("type").
+		ColumnExpr(presentationStatus+" AS status").
+		ColumnExpr("COUNT(*) AS count").
+		GroupExpr("type, "+presentationStatus).
+		Scan(ctx, &counts)
+	if err != nil {
+		return nil, fmt.Errorf("counting tasks by presentation status: %w", err)
 	}
 	return counts, nil
 }

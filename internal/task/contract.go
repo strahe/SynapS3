@@ -243,6 +243,30 @@ func (e Execution) WithResource(ctx context.Context, resource Resource, fn func(
 	return e.resource(ctx, resource, fn)
 }
 
+// WithCheckpointedEffect admits an external effect, persists its recovery
+// evidence, and only then invokes effect. A false attempted result guarantees
+// that effect was not called; recovery after a process crash must still rely on
+// the durable checkpoint rather than this return value.
+func (e Execution) WithCheckpointedEffect(
+	ctx context.Context,
+	resource Resource,
+	checkpoint any,
+	settlement Settlement,
+	effect func(context.Context) error,
+) (attempted bool, err error) {
+	if effect == nil {
+		return false, errors.New("external effect is required")
+	}
+	err = e.WithResource(ctx, resource, func(ctx context.Context) error {
+		if err := e.WriteCheckpointWith(ctx, checkpoint, settlement); err != nil {
+			return err
+		}
+		attempted = true
+		return effect(ctx)
+	})
+	return attempted, err
+}
+
 func DecodeInput[T any](execution Execution) (T, error) {
 	var value T
 	err := json.Unmarshal(execution.Input(), &value)

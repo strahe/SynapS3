@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -25,6 +24,7 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -33,6 +33,7 @@ const (
 	storageDependencyWait = time.Minute
 	storagePollInterval   = 5 * time.Second
 	dataSetAttentionAfter = 15 * time.Minute
+	storeAttentionAfter   = 30 * time.Minute
 )
 
 type dataSetCreationCheckpoint struct {
@@ -43,8 +44,10 @@ type dataSetCreationCheckpoint struct {
 }
 
 type storeCheckpoint struct {
-	AttemptedAt time.Time `json:"attempted_at"`
-	PieceCID    string    `json:"piece_cid,omitempty"`
+	AttemptedAt        time.Time `json:"attempted_at"`
+	IntendedPieceCID   string    `json:"intended_piece_cid"`
+	ProviderServiceURL string    `json:"provider_service_url"`
+	IngressAttempt     int       `json:"ingress_attempt,omitempty"`
 }
 
 type pullCheckpoint struct {
@@ -403,18 +406,15 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 	}
 
 	checkpoint = dataSetCreationCheckpoint{AttemptedAt: time.Now().UTC()}
-	if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-		return retryTask(err, "dataset_checkpoint_failed")
-	}
 	var (
 		created     *storage.CreateDataSetResult
-		createErr   error
 		evidenceErr error
 		submission  storage.CreateDataSetSubmission
 	)
 	createCtx, cancelCreate := context.WithCancel(ctx)
-	createErr = execution.WithResource(ctx, taskengine.ResourceProviderMutation, func(context.Context) error {
-		created, createErr = provider.CreateDataSet(createCtx, &storage.CreateDataSetOptions{OnSubmitted: func(sub storage.CreateDataSetSubmission) {
+	attempted, createErr := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint, nil, func(context.Context) error {
+		var err error
+		created, err = provider.CreateDataSet(createCtx, &storage.CreateDataSetOptions{OnSubmitted: func(sub storage.CreateDataSetSubmission) {
 			submission = sub
 			checkpoint.TransactionID = sub.TransactionID
 			checkpoint.StatusURL = sub.StatusURL
@@ -429,9 +429,12 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 			})
 			cancelCreate()
 		}})
-		return createErr
+		return err
 	})
 	cancelCreate()
+	if createErr != nil && !attempted {
+		return retryTask(createErr, "dataset_creation_not_started")
+	}
 	if evidenceErr != nil {
 		clientDataSetID := onChainIDPtr(submission.ClientDataSetID)
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Recording storage service creation", func(ctx context.Context, repos *repository.Repositories) error {
@@ -662,6 +665,20 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 
 func (h *TaskHandlers) storeHandler() taskengine.Handler {
 	definition := copyDefinition(model.TaskTypeStorageStore, h.retryLimit())
+	definition.AllowRetry = true
+	definition.CanManualRetry = func(task *model.Task) bool {
+		if task == nil || task.FailureReason == nil {
+			return false
+		}
+		switch *task.FailureReason {
+		case "store_not_started":
+			return len(task.Checkpoint) == 0
+		case "store_outcome_unknown", "copy_owner_missing", "copy_context_failed":
+			return len(task.Checkpoint) > 0
+		default:
+			return false
+		}
+	}
 	return taskHandler{
 		definition: definition,
 		execute: func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
@@ -688,21 +705,12 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
-	if hasCheckpoint && checkpoint.PieceCID == "" && !mayStore {
-		// Store is content addressed. With no domain or checkpoint result, replaying
-		// the same immutable bytes cannot create a second logical copy.
-		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready to resume", nil)
-	}
 	_, target, content, bucket, err := h.copyContext(ctx, copyRow)
 	if err != nil {
-		return h.copyContextFailure(execution, input, copyRow, err, true)
+		return h.copyContextFailure(execution, input, copyRow, err, !hasCheckpoint)
 	}
-	if checkpoint.PieceCID != "" {
-		pieceCID, err := cid.Parse(checkpoint.PieceCID)
-		if err != nil {
-			return taskengine.Fail(err, "invalid_checkpoint", nil)
-		}
-		return h.finishPieceTransfer(ctx, execution, input, copyRow, target, pieceCID)
+	if hasCheckpoint {
+		return h.recoverStore(ctx, execution, input, copyRow, target, checkpoint)
 	}
 	if !mayStore {
 		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready", nil)
@@ -711,47 +719,121 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 		return h.failCopyTask(execution, input, copyRow, errors.New("cache reader is unavailable"), "dependency_unavailable")
 	}
 	cacheKey := model.ContentCacheKey(content.ID)
-	opened, err := h.deps.CacheGate.Open(cacheKey, func() (io.ReadCloser, *cache.ObjectInfo, error) {
-		return h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
-	})
+	releaseCache := h.deps.CacheGate.HoldRead(cacheKey)
+	defer releaseCache()
+	calculateReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
 		}
 		return h.retryCopyTask(execution, input, copyRow, err, "cache_open_failed")
 	}
-	defer func() { _ = opened.Body.Close() }()
-	checkpoint = storeCheckpoint{AttemptedAt: time.Now().UTC()}
-	if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-		return h.retryCopyTask(execution, input, copyRow, err, "store_checkpoint_failed")
+	pieceInfo, calculateErr := piece.Calculate(calculateReader)
+	closeErr := calculateReader.Close()
+	if calculateErr != nil {
+		return h.retryCopyTask(execution, input, copyRow, calculateErr, "store_identity_failed")
+	}
+	if closeErr != nil {
+		return h.retryCopyTask(execution, input, copyRow, closeErr, "cache_close_failed")
+	}
+	if !pieceInfo.CIDv2.Defined() || content.ContentSize < 0 || pieceInfo.RawSize != uint64(content.ContentSize) {
+		err := fmt.Errorf("calculated storage identity has size %d, expected %d", pieceInfo.RawSize, content.ContentSize)
+		return h.failCopyTask(execution, input, copyRow, err, "store_identity_mismatch")
+	}
+	storeReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
+		}
+		return h.retryCopyTask(execution, input, copyRow, err, "cache_open_failed")
+	}
+	defer func() { _ = storeReader.Close() }()
+	checkpoint = storeCheckpoint{
+		AttemptedAt: time.Now().UTC(), IntendedPieceCID: pieceInfo.CIDv2.String(),
+		ProviderServiceURL: target.ServiceURL(),
+	}
+	var checkpointSettlement taskengine.Settlement
+	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
+		checkpoint.IngressAttempt = copyRow.IngressStoreAttempt + 1
+		checkpointSettlement = func(ctx context.Context, repos *repository.Repositories) error {
+			_, err := repos.Contents.BeginIngressStoreProgress(ctx, repository.BeginIngressStoreProgressInput{
+				CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(), Attempt: checkpoint.IngressAttempt,
+			})
+			return err
+		}
 	}
 	var stored *storage.StoreResult
 	var progress *uploadProgressReporter
-	err = execution.WithResource(ctx, taskengine.ResourceProviderMutation, func(ctx context.Context) error {
+	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint, checkpointSettlement, func(ctx context.Context) error {
 		if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
-			progress = h.beginIngressProgress(ctx, execution.ID(), content, bucket)
+			progress = h.newIngressProgressReporter(ctx, execution.ID(), input.Generation, copyRow.ID, checkpoint.IngressAttempt, content, bucket)
 		}
-		options := &storage.StoreOptions{}
+		options := &storage.StoreOptions{PieceCID: pieceInfo.CIDv2}
 		if progress != nil {
 			options.OnProgress = progress.OnProgress
 		}
 		var storeErr error
-		stored, storeErr = target.Store(ctx, opened.Body, options)
+		stored, storeErr = target.Store(ctx, storeReader, options)
 		return storeErr
 	})
 	defer progress.Close()
 	if err != nil {
+		if !attempted {
+			return h.retryStoreNotStarted(execution, err)
+		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	}
-	if stored == nil || !stored.PieceCID.Defined() {
-		return h.failCopyTask(execution, input, copyRow, errors.New("storage provider returned no piece identity"), "store_result_invalid")
+	if stored == nil || !stored.PieceCID.Equals(pieceInfo.CIDv2) || stored.Size != content.ContentSize {
+		err := errors.New("storage provider returned a mismatched piece identity or size")
+		return h.failCopyTask(execution, input, copyRow, err, "store_result_invalid")
 	}
 	progress.Flush(content.ContentSize, true)
-	checkpoint.PieceCID = stored.PieceCID.String()
-	if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Recording storage transfer", nil)
-	}
 	return h.finishPieceTransfer(ctx, execution, input, copyRow, target, stored.PieceCID)
+}
+
+func (h *TaskHandlers) recoverStore(
+	ctx context.Context,
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	target synapse.DataSetTarget,
+	checkpoint storeCheckpoint,
+) taskengine.Result {
+	if checkpoint.AttemptedAt.IsZero() || checkpoint.IntendedPieceCID == "" || checkpoint.ProviderServiceURL == "" {
+		return taskengine.Fail(errors.New("storage transfer checkpoint is incomplete"), "invalid_checkpoint", nil)
+	}
+	pieceCID, err := cid.Parse(checkpoint.IntendedPieceCID)
+	if err != nil {
+		return taskengine.Fail(err, "invalid_checkpoint", nil)
+	}
+	pieceInfo, err := piece.ParseV2(pieceCID)
+	if err != nil || copyRow.ContentSize < 0 || pieceInfo.RawSize != uint64(copyRow.ContentSize) {
+		if err == nil {
+			err = fmt.Errorf("checkpointed storage identity has size %d, expected %d", pieceInfo.RawSize, copyRow.ContentSize)
+		}
+		return taskengine.Fail(err, "invalid_checkpoint", nil)
+	}
+	if h.deps.ParkedPieces == nil {
+		return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "provider", "Waiting for storage provider", nil)
+	}
+	state, findErr := h.deps.ParkedPieces.FindParkedPiece(ctx, checkpoint.ProviderServiceURL, pieceCID)
+	if findErr == nil && state == synapse.ParkedPieceReady {
+		return h.finishPieceTransfer(ctx, execution, input, copyRow, target, pieceCID)
+	}
+	if time.Since(checkpoint.AttemptedAt) >= storeAttentionAfter {
+		if findErr == nil {
+			findErr = fmt.Errorf("storage transfer remains %s", state)
+		}
+		return taskengine.Fail(findErr, "store_outcome_unknown", nil)
+	}
+	return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+}
+
+func (h *TaskHandlers) retryStoreNotStarted(execution taskengine.Execution, err error) taskengine.Result {
+	if execution.RetryWillFail() {
+		return taskengine.Fail(err, "store_not_started", nil)
+	}
+	return retryTask(err, "store_not_started")
 }
 
 func (h *TaskHandlers) pullHandler() taskengine.Handler {
@@ -1043,7 +1125,7 @@ func (h *TaskHandlers) authorizeCopyTask(
 	if err != nil {
 		return input, nil, true, decodeFailure(string(execution.Type()), err)
 	}
-	copyRow, err := h.deps.Repositories.Contents.AuthorizeCopyTask(ctx, input.CopyID, input.Generation, execution.ID())
+	copyRow, err := h.deps.Repositories.Contents.AuthorizeCopyTask(ctx, input.CopyID, input.Generation, execution.ID(), execution.ClaimGeneration())
 	if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) {
 		return input, nil, true, taskengine.Cancel("Storage work was superseded", nil)
 	}
@@ -1051,7 +1133,7 @@ func (h *TaskHandlers) authorizeCopyTask(
 		if execution.RetryWillFail() {
 			message := err.Error()
 			return input, nil, true, taskengine.Fail(err, "copy_authorization_failed", func(ctx context.Context, repos *repository.Repositories) error {
-				copyRow, authorizeErr := repos.Contents.AuthorizeCopyTask(ctx, input.CopyID, input.Generation, execution.ID())
+				copyRow, authorizeErr := repos.Contents.AuthorizeCopyTask(ctx, input.CopyID, input.Generation, execution.ID(), execution.ClaimGeneration())
 				if errors.Is(authorizeErr, repository.ErrConflict) || errors.Is(authorizeErr, repository.ErrNotFound) {
 					return nil
 				}

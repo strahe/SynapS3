@@ -52,13 +52,16 @@ After the cutover, unfinished work uses one task engine with five stored states:
 - Recovery checks its checkpoint and domain evidence before starting another external effect.
 - A failed task can be retried only when the API marks it retryable; retry always starts in recovery mode.
 - Provider replacement recovery remains in the bucket Data Sets view.
-- Wallet tasks are never retried from Tasks. An uncertain broadcast is retained as an unknown wallet outcome rather than replayed blindly.
+- A wallet operation that stopped before broadcasting can be recovered from Tasks. An uncertain broadcast remains non-retryable and is retained as an unknown wallet outcome rather than replayed blindly.
+- A failed Store whose provider outcome is uncertain offers **Check again**. This action checks the provider for the intended parked piece and never uploads the bytes again.
+- `status=failed` lists unacknowledged failures. Use `status=dismissed` to list acknowledged failures; `dismissed` is a filter and presentation value, not a sixth stored task status.
 - A storage confirmation whose provider outcome cannot be proved appears in `synaps3 admin storage-confirmation list` for explicit review.
 
 Useful commands:
 
 ```bash
 synaps3 admin task list --status failed --limit 100
+synaps3 admin task list --status dismissed --limit 100
 synaps3 admin task stats
 synaps3 admin task retry 42
 synaps3 admin task acknowledge 42
@@ -67,6 +70,8 @@ synaps3 admin settings get
 ```
 
 Restore failed dependencies before retrying work. Do not edit task rows, clear checkpoints, or shorten leases manually.
+
+If the last object that references an uncertain, uncommitted Store is permanently deleted, SynapS3 releases the terminal task binding. A piece that reached the provider but was never committed has no local provider piece ID to delete; the provider's parked-piece garbage collection remains responsible for reclaiming it.
 
 ## Recovery Matrix
 

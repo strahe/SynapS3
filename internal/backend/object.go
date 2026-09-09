@@ -1213,7 +1213,7 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 		if contentID == nil {
 			return nil
 		}
-		_, _, err := b.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+		_, _, err := b.taskService.EnqueueOrReactivateTerminalInTransaction(ctx, repos, taskengine.EnqueueRequest{
 			Type:           model.TaskTypeUploadPlan,
 			IdempotencyKey: storagepipeline.UploadPlanKey(*contentID),
 			Input:          storagepipeline.UploadPlanInput{ContentID: *contentID},

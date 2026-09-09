@@ -47,7 +47,7 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-status 应显示任务引擎正常。task stats 使用 `pending`、`running`、`completed`、`failed` 和 `cancelled` 五种持久状态；仪表盘会把 pending 工作显示为 queued、scheduled 或 waiting。
+status 应显示任务引擎正常。任务仍使用 `pending`、`running`、`completed`、`failed` 和 `cancelled` 五种持久状态；task stats 会把已确认失败单独统计为 dismissed，仪表盘会把 pending 工作显示为 queued、scheduled 或 waiting。
 
 ## Prometheus Metrics
 

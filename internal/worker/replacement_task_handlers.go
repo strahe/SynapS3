@@ -362,12 +362,9 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 			return taskengine.Fail(errors.New("storage service terminator is unavailable"), "dependency_unavailable", nil)
 		}
 		checkpoint = retirementCheckpoint{AttemptedAt: time.Now().UTC()}
-		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-			return h.retryRetirement(execution, row.ID, err, "retirement_checkpoint_failed")
-		}
 		var terminationEpochValue int64
 		var txHash string
-		err = execution.WithResource(ctx, taskengine.ResourceDestructiveMutation, func(ctx context.Context) error {
+		attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceDestructiveMutation, checkpoint, nil, func(ctx context.Context) error {
 			result, terminateErr := h.deps.Terminator.TerminateService(ctx, dataSet.DataSetID.SDK())
 			if result != nil {
 				terminationEpochValue = result.EndEpoch
@@ -375,6 +372,9 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 			}
 			return terminateErr
 		})
+		if err != nil && !attempted {
+			return retryTask(err, "termination_not_started")
+		}
 		if err != nil || terminationEpochValue < 0 {
 			if err == nil {
 				err = errors.New("storage service termination returned an invalid epoch")

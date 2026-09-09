@@ -61,6 +61,44 @@ func (s *Service) EnqueueInTransaction(
 	return s.enqueuePrepared(ctx, txRepos.Tasks, prepared)
 }
 
+// EnqueueOrReactivateTerminalInTransaction is the cached-content upload-plan
+// escape hatch. It preserves one idempotency identity while allowing a new
+// live reference to restart work that ended before creating any copies.
+func (s *Service) EnqueueOrReactivateTerminalInTransaction(
+	ctx context.Context,
+	txRepos *repository.Repositories,
+	request EnqueueRequest,
+) (*model.Task, bool, error) {
+	if txRepos == nil || txRepos.Tasks == nil {
+		return nil, false, errors.New("transaction task repository is required")
+	}
+	if request.Type != model.TaskTypeUploadPlan {
+		return nil, false, fmt.Errorf("terminal reactivation is limited to upload plans: %w", repository.ErrInvalidInput)
+	}
+	prepared, err := s.prepare(request)
+	if err != nil {
+		return nil, false, err
+	}
+	stored, created, err := s.enqueuePrepared(ctx, txRepos.Tasks, prepared)
+	if err != nil || created {
+		return stored, created, err
+	}
+	switch stored.Status {
+	case model.TaskStatusPending, model.TaskStatusRunning:
+		return stored, false, nil
+	case model.TaskStatusFailed, model.TaskStatusCancelled:
+		if err := txRepos.Tasks.ReactivateTerminal(ctx, stored.ID); err != nil {
+			return nil, false, err
+		}
+		stored, err = txRepos.Tasks.GetByID(ctx, stored.ID)
+		return stored, false, err
+	case model.TaskStatusCompleted:
+		return nil, false, fmt.Errorf("completed task conflicts with cached content: %w", repository.ErrConflict)
+	default:
+		return nil, false, fmt.Errorf("task has invalid status %q: %w", stored.Status, repository.ErrConflict)
+	}
+}
+
 // EnqueueTx creates a task and binds its domain owner in one transaction.
 // bind must perform database work only and tolerate a transaction retry.
 func (s *Service) EnqueueTx(

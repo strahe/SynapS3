@@ -59,8 +59,17 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories) *task
 			InputVersion: 1,
 			Codec:        taskengine.StrictJSONCodec[map[string]any](nil),
 			RetryLimit:   &limit,
-			AllowRetry: taskType != model.TaskTypeWalletOperation &&
-				taskType != model.TaskTypeProviderReplacementCoordinate,
+			AllowRetry:   taskType != model.TaskTypeProviderReplacementCoordinate,
+		}
+		if taskType == model.TaskTypeWalletOperation {
+			definition.CanManualRetry = func(task *model.Task) bool {
+				return task.FailureReason != nil && *task.FailureReason == "wallet_broadcast_not_started"
+			}
+		}
+		if taskType == model.TaskTypeStorageStore {
+			definition.CanManualRetry = func(task *model.Task) bool {
+				return task.FailureReason != nil && (*task.FailureReason == "store_not_started" || *task.FailureReason == "store_outcome_unknown")
+			}
 		}
 		if taskType == model.TaskTypeStorageDataSetRetire {
 			definition.CanManualRetry = func(task *model.Task) bool {
@@ -138,14 +147,22 @@ func TestAPITasksRejectsRemovedAndInvalidFilters(t *testing.T) {
 	}
 }
 
-func TestAPITaskStatsUsesFiveStateContract(t *testing.T) {
+func TestAPITaskStatsUsesPresentationStatusContract(t *testing.T) {
 	fixture := newAdminTaskFixture(t)
 	first := fixture.enqueue(t, model.TaskTypeUploadPlan, "one", time.Now(), "", "")
-	fixture.enqueue(t, model.TaskTypeUploadPlan, "two", time.Now(), "", "")
+	second := fixture.enqueue(t, model.TaskTypeUploadPlan, "two", time.Now(), "", "")
+	fixture.enqueue(t, model.TaskTypeUploadPlan, "three", time.Now(), "", "")
 	fixture.transition(t, first.ID, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
 		FailureReason: new("provider_error"), LastError: new("provider unavailable"),
 	})
+	fixture.transition(t, second.ID, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: new("old_error"), LastError: new("old failure"),
+	})
+	if err := fixture.repos.Tasks.AcknowledgeFailed(t.Context(), second.ID, time.Hour); err != nil {
+		t.Fatalf("AcknowledgeFailed: %v", err)
+	}
 
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks/stats", nil)
 	if rr.Code != http.StatusOK {
@@ -158,8 +175,43 @@ func TestAPITaskStatsUsesFiveStateContract(t *testing.T) {
 		counts[[2]string{item.Type, item.Status}] = item.Count
 	}
 	if counts[[2]string{string(model.TaskTypeUploadPlan), string(model.TaskStatusPending)}] != 1 ||
-		counts[[2]string{string(model.TaskTypeUploadPlan), string(model.TaskStatusFailed)}] != 1 {
+		counts[[2]string{string(model.TaskTypeUploadPlan), string(model.TaskStatusFailed)}] != 1 ||
+		counts[[2]string{string(model.TaskTypeUploadPlan), "dismissed"}] != 1 {
 		t.Fatalf("counts = %#v", counts)
+	}
+}
+
+func TestAPITasksSeparatesFailedAndDismissedFilters(t *testing.T) {
+	fixture := newAdminTaskFixture(t)
+	failed := fixture.enqueue(t, model.TaskTypeUploadPlan, "visible-failure", time.Now(), "", "")
+	dismissed := fixture.enqueue(t, model.TaskTypeUploadPlan, "dismissed-failure", time.Now(), "", "")
+	for _, taskRow := range []*model.Task{failed, dismissed} {
+		fixture.transition(t, taskRow.ID, repository.TaskTransition{
+			Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+			FailureReason: new("provider_error"), LastError: new("provider unavailable"),
+		})
+	}
+	if err := fixture.repos.Tasks.AcknowledgeFailed(t.Context(), dismissed.ID, time.Hour); err != nil {
+		t.Fatalf("AcknowledgeFailed: %v", err)
+	}
+
+	for _, tt := range []struct {
+		status       string
+		wantID       int64
+		presentation string
+	}{
+		{status: "failed", wantID: failed.ID, presentation: "failed"},
+		{status: "dismissed", wantID: dismissed.ID, presentation: "dismissed"},
+	} {
+		rr := fixture.request(http.MethodGet, "/api/v1/tasks?status="+tt.status, nil)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%s response = %d %s", tt.status, rr.Code, rr.Body.String())
+		}
+		var page taskListResponse
+		decodeJSON(t, rr, &page)
+		if len(page.Tasks) != 1 || page.Tasks[0].ID != tt.wantID || page.Tasks[0].Status != string(model.TaskStatusFailed) || page.Tasks[0].Presentation != tt.presentation {
+			t.Fatalf("status=%s page = %#v", tt.status, page)
+		}
 	}
 }
 
@@ -187,6 +239,19 @@ func TestAPITasksHideHealthyRecurringSystemWorkButKeepFailures(t *testing.T) {
 	decodeJSON(t, rr, &stats)
 	if len(stats) != 1 || stats[0].Type != string(model.TaskTypeObservabilityRefresh) || stats[0].Status != string(model.TaskStatusFailed) {
 		t.Fatalf("visible task stats = %#v", stats)
+	}
+	if err := fixture.repos.Tasks.AcknowledgeFailed(t.Context(), failed.ID, time.Hour); err != nil {
+		t.Fatalf("acknowledge recurring failure: %v", err)
+	}
+	rr = fixture.request(http.MethodGet, "/api/v1/tasks?status=dismissed", nil)
+	decodeJSON(t, rr, &page)
+	if len(page.Tasks) != 1 || page.Tasks[0].ID != failed.ID || page.Tasks[0].Presentation != "dismissed" {
+		t.Fatalf("dismissed recurring tasks = %#v", page.Tasks)
+	}
+	rr = fixture.request(http.MethodGet, "/api/v1/tasks/stats", nil)
+	decodeJSON(t, rr, &stats)
+	if len(stats) != 1 || stats[0].Type != string(model.TaskTypeObservabilityRefresh) || stats[0].Status != "dismissed" {
+		t.Fatalf("dismissed recurring task stats = %#v", stats)
 	}
 }
 

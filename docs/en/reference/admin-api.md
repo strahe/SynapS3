@@ -287,7 +287,11 @@ If the attempt changed after it was inspected, the API returns `409 Conflict`. I
 
 The task contract has exactly five stored statuses: `pending`, `running`, `completed`, `failed`, and `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses include product-facing `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. They never expose task input, checkpoint, execution mode, or claim generation.
 
-Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. `category`, `stage`, `offset`, and total-count pagination are not supported. Provider replacement recovery remains in the Data Sets API, and wallet tasks are not retryable from this endpoint.
+The `status` filter also accepts the presentation alias `dismissed`. `status=failed` returns only unacknowledged stored failures, while `status=dismissed` returns acknowledged stored failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`. This narrows the earlier `status=failed` behavior, which included both groups; clients that need historical acknowledged failures must request `dismissed` separately.
+
+For compatibility, `/api/v1/overview` keeps `tasks.by_status` grouped by the five stored statuses, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for presentation counts split between `failed` and `dismissed`.
+
+Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. `category`, `stage`, `offset`, and total-count pagination are not supported. Provider replacement recovery remains in the Data Sets API. Wallet broadcasts with no external attempt may be recovered here, but uncertain broadcasts remain non-retryable. Retrying an uncertain Store only checks the provider for the intended parked piece and never resends the bytes.
 
 ## Wallet and Filecoin
 

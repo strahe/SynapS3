@@ -69,15 +69,25 @@ func parseTaskListFilter(r *http.Request) (repository.TaskListFilter, error) {
 	}
 	filter := repository.TaskListFilter{
 		Type:                       model.TaskType(r.URL.Query().Get("type")),
-		Status:                     model.TaskStatus(r.URL.Query().Get("status")),
 		Limit:                      50,
 		HideHealthyRecurringSystem: true,
 	}
+	status := r.URL.Query().Get("status")
 	if filter.Type != "" && !validTaskType(filter.Type) {
 		return repository.TaskListFilter{}, &taskQueryError{"unknown task type"}
 	}
-	if filter.Status != "" && !validTaskStatus(filter.Status) {
-		return repository.TaskListFilter{}, &taskQueryError{"status must be pending, running, completed, failed, or cancelled"}
+	if status != "" && !validTaskStatus(status) {
+		return repository.TaskListFilter{}, &taskQueryError{"status must be pending, running, completed, failed, cancelled, or dismissed"}
+	}
+	switch status {
+	case "failed":
+		filter.Status = model.TaskStatusFailed
+		filter.Acknowledged = new(false)
+	case "dismissed":
+		filter.Status = model.TaskStatusFailed
+		filter.Acknowledged = new(true)
+	default:
+		filter.Status = model.TaskStatus(status)
 	}
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
@@ -100,10 +110,10 @@ type taskQueryError struct{ message string }
 
 func (e *taskQueryError) Error() string { return e.message }
 
-func validTaskStatus(status model.TaskStatus) bool {
+func validTaskStatus(status string) bool {
 	switch status {
-	case model.TaskStatusPending, model.TaskStatusRunning, model.TaskStatusCompleted,
-		model.TaskStatusFailed, model.TaskStatusCancelled:
+	case string(model.TaskStatusPending), string(model.TaskStatusRunning), string(model.TaskStatusCompleted),
+		string(model.TaskStatusFailed), string(model.TaskStatusCancelled), "dismissed":
 		return true
 	default:
 		return false
@@ -231,7 +241,7 @@ type taskStatsItem struct {
 }
 
 func (s *Server) handleAPITaskStats(w http.ResponseWriter, r *http.Request) {
-	counts, err := s.repos.Tasks.CountByStatus(r.Context())
+	counts, err := s.repos.Tasks.CountByPresentationStatus(r.Context())
 	if err != nil {
 		s.logger.Error("api: failed to count tasks", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -239,7 +249,7 @@ func (s *Server) handleAPITaskStats(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]taskStatsItem, 0, len(counts))
 	for _, count := range counts {
-		if model.TaskType(count.Type).IsRecurringSystem() && count.Status != string(model.TaskStatusFailed) {
+		if model.TaskType(count.Type).IsRecurringSystem() && count.Status != string(model.TaskStatusFailed) && count.Status != "dismissed" {
 			continue
 		}
 		items = append(items, taskStatsItem{Type: count.Type, Status: count.Status, Count: count.Count})

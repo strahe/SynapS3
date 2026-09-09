@@ -40,6 +40,7 @@ import (
 	"github.com/strahe/synaps3/internal/walletoperation"
 	"github.com/strahe/synaps3/internal/worker"
 	"github.com/strahe/synapse-go/pdp"
+	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/uptrace/bun"
@@ -68,6 +69,7 @@ type handlerRuntimeOptions struct {
 	walletReceiptTimeout   time.Duration
 	terminator             synapse.ServiceTerminator
 	epochs                 synapse.ChainEpochReader
+	parkedPieces           synapse.ParkedPieceChecker
 	policy                 cache.EvictionPolicy
 	maxBytes               int64
 	highPercent            int
@@ -101,6 +103,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		WalletBroadcastTimeout: options.walletBroadcastTimeout,
 		WalletReceiptTimeout:   options.walletReceiptTimeout,
 		Terminator:             options.terminator, Epochs: options.epochs,
+		ParkedPieces:   options.parkedPieces,
 		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
 		DefaultCopies: 2, MaxRetries: maxRetries, Logger: slog.Default(),
@@ -174,6 +177,12 @@ func (t *testServiceTerminator) TerminateService(context.Context, sdktypes.BigIn
 type testEpochReader struct {
 	epoch int64
 	err   error
+}
+
+type parkedPieceCheckerFunc func(context.Context, string, cid.Cid) (synapse.ParkedPieceState, error)
+
+func (f parkedPieceCheckerFunc) FindParkedPiece(ctx context.Context, serviceURL string, pieceCID cid.Cid) (synapse.ParkedPieceState, error) {
+	return f(ctx, serviceURL, pieceCID)
 }
 
 func (r testEpochReader) CurrentEpoch(context.Context) (int64, error) {
@@ -430,12 +439,17 @@ func (p *recordingWorkerEvents) Publish(topic string, payload map[string]any) {
 func TestTerminalStoreFailureSettlesCopyAndContent(t *testing.T) {
 	events := &recordingWorkerEvents{events: make(chan recordedWorkerEvent, 8)}
 	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
-		return io.NopCloser(strings.NewReader("stored bytes")), &cache.ObjectInfo{Size: 12}, nil
+		return io.NopCloser(strings.NewReader(strings.Repeat("s", 128))), &cache.ObjectInfo{Size: 128}, nil
 	}}
 	target := &testutil.MockStorageTarget{
+		ServiceURLValue: "https://terminal-store.example",
 		StoreFunc: func(_ context.Context, _ io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
-			if options == nil || options.OnProgress == nil {
-				return nil, errors.New("store progress callback is missing")
+			if options == nil || options.OnProgress == nil || !options.PieceCID.Defined() {
+				return nil, errors.New("store progress callback or intended piece identity is missing")
+			}
+			pieceInfo, err := piece.ParseV2(options.PieceCID)
+			if err != nil || pieceInfo.RawSize != 128 {
+				return nil, fmt.Errorf("store piece identity = %#v, err=%v", pieceInfo, err)
 			}
 			options.OnProgress(6)
 			deadline := time.After(time.Second)
@@ -466,14 +480,14 @@ func TestTerminalStoreFailureSettlesCopyAndContent(t *testing.T) {
 		t.Fatalf("create terminal copy bucket: %v", err)
 	}
 	content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-		BucketID: bucket.ID, ContentSize: 12,
+		BucketID: bucket.ID, ContentSize: 128,
 		Checksum: testutil.StorageChecksum(fmt.Sprintf("terminal-%d", sequence)), RequestedCopies: 1,
 	})
 	if err != nil {
 		t.Fatalf("ensure terminal content: %v", err)
 	}
 	version := &model.ObjectVersion{
-		VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "terminal.bin", ContentID: &content.ID, Size: 12,
+		VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "terminal.bin", ContentID: &content.ID, Size: 128,
 		ETag: "etag", ContentType: "application/octet-stream",
 	}
 	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
@@ -632,6 +646,89 @@ func TestStorageCleanupContinuesPastUnsupportedCopy(t *testing.T) {
 	copies, err := runtime.repos.StorageCleanup.AuthorizeTask(ctx, content.ID, 1, taskRow.ID)
 	if err != nil || len(copies) != 2 || copies[1].Status != model.StorageCleanupCopyStatusDeleteScheduled {
 		t.Fatalf("cleanup copies = %#v, err=%v", copies, err)
+	}
+}
+
+func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
+	noRetries := 0
+	var deleteCalls atomic.Int64
+	cleanupContext := testCleanupContext{
+		pieceStatus: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
+			return &storage.PieceStatus{Exists: true}, nil
+		},
+		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+			deleteCalls.Add(1)
+			return nil, errors.New("unexpected remote deletion")
+		},
+	}
+	storageClient := &testutil.MockStorageClient{
+		OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return cleanupContext, nil
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, maxRetries: &noRetries})
+	bucket := &model.Bucket{Name: "cleanup-admission", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
+		t.Fatalf("create cleanup admission bucket: %v", err)
+	}
+	content := &model.StorageContent{
+		BucketID: bucket.ID, ContentSize: 128, Checksum: testutil.StorageChecksum("cleanup-admission"),
+		RequestedCopies: 1, CleanupGeneration: 1,
+	}
+	if _, err := runtime.db.NewInsert().Model(content).Exec(t.Context()); err != nil {
+		t.Fatalf("create cleanup admission content: %v", err)
+	}
+	providerID := testOnChainID(t, 29101)
+	dataSetID := testOnChainID(t, 29102)
+	clientDataSetID := testOnChainID(t, 29103)
+	binding, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: providerID, CopyIndex: 0, CreatedByContentID: content.ID,
+	})
+	if err != nil {
+		t.Fatalf("create cleanup admission binding: %v", err)
+	}
+	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+		ID: binding.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+	}); err != nil {
+		t.Fatalf("mark cleanup admission binding ready: %v", err)
+	}
+	cleanupCopy := &model.StorageCleanupCopy{
+		ContentID: content.ID, BucketID: bucket.ID, CopyIndex: 0, ProviderID: providerID,
+		StorageDataSetID: binding.ID, DataSetID: &dataSetID, ClientDataSetID: &clientDataSetID,
+		PieceID: testOnChainID(t, 29104), PieceCID: testPieceCID(t, "cleanup-admission-piece").String(),
+		Status: model.StorageCleanupCopyStatusPending,
+	}
+	if _, err := runtime.db.NewInsert().Model(cleanupCopy).Exec(t.Context()); err != nil {
+		t.Fatalf("create cleanup admission copy: %v", err)
+	}
+	taskRow, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeStorageCleanup, IdempotencyKey: storagecleanup.TaskKey(content.ID, 1),
+		Input: storagecleanup.Input{ContentID: content.ID, Generation: 1}, SubjectType: "storage_content", SubjectKey: fmt.Sprint(content.ID),
+	})
+	if err != nil {
+		t.Fatalf("enqueue cleanup admission task: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.BindTask(t.Context(), content.ID, 1, taskRow.ID); err != nil {
+		t.Fatalf("bind cleanup admission task: %v", err)
+	}
+	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
+	failing.remaining.Store(1)
+	runtime.repos.Tasks = &limitedClaimRepository{TaskRepository: failing, maximum: 1}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+		t.Fatalf("cleanup admission task = %#v", failed)
+	}
+	copies, err := runtime.repos.StorageCleanup.AuthorizeTask(t.Context(), content.ID, 1, taskRow.ID)
+	if err != nil || len(copies) != 1 || copies[0].Status != model.StorageCleanupCopyStatusPending || copies[0].ScheduledAt != nil {
+		t.Fatalf("cleanup copy after admission failure = %#v, err=%v", copies, err)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("cleanup admission performed %d remote deletions", deleteCalls.Load())
 	}
 }
 
@@ -999,6 +1096,19 @@ type limitedClaimRepository struct {
 	claims  atomic.Int64
 }
 
+type validateFailureRepository struct {
+	repository.TaskRepository
+	remaining atomic.Int64
+	err       error
+}
+
+func (r *validateFailureRepository) ValidateClaim(ctx context.Context, id, generation int64) error {
+	if r.remaining.Add(-1) >= 0 {
+		return r.err
+	}
+	return r.TaskRepository.ValidateClaim(ctx, id, generation)
+}
+
 func (r *limitedClaimRepository) ClaimNext(ctx context.Context, lease time.Duration) (*model.Task, error) {
 	if r.claims.Load() >= r.maximum {
 		return nil, nil
@@ -1029,7 +1139,7 @@ func seedCopyPipeline(t *testing.T, runtime handlerTestRuntime, targetStatus mod
 	}
 	// Content identity comes first: a data version cannot exist without it.
 	upload, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
-		BucketID: bucket.ID, ContentSize: 11,
+		BucketID: bucket.ID, ContentSize: 128,
 		Checksum: testutil.StorageChecksum(fmt.Sprintf("copy-checksum-%d", sequence)), RequestedCopies: 2,
 	})
 	if err != nil {
@@ -1373,6 +1483,81 @@ func TestDataSetDiscoveryFailureNeverCreatesDataSet(t *testing.T) {
 	}
 }
 
+func TestDataSetCreationAdmissionFailureRemainsSafeToRecover(t *testing.T) {
+	noRetries := 0
+	var createCalls atomic.Int64
+	providerID := testOnChainID(t, 29001)
+	provider := &testutil.MockStorageTarget{
+		ProviderIDValue: providerID.SDK(),
+		CreateDataSetFunc: func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+			createCalls.Add(1)
+			return nil, errors.New("unexpected data set creation")
+		},
+	}
+	storageClient := &testutil.MockStorageClient{
+		OpenProviderTargetFunc: func(context.Context, sdktypes.BigInt, storage.NewProviderContextOptions) (synapse.ProviderTarget, error) {
+			return provider, nil
+		},
+		FindMatchingDataSetFunc: func(context.Context, sdktypes.BigInt, map[string]string, bool) (*storage.DataSetRef, error) {
+			return nil, nil
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: storageClient, maxRetries: &noRetries,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	bucket := &model.Bucket{Name: "data-set-admission", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
+		t.Fatalf("create admission bucket: %v", err)
+	}
+	binding, err := runtime.repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: providerID, CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("create pending data set: %v", err)
+	}
+	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: storagepipeline.DataSetEnsureKey(binding.ID),
+		Input: storagepipeline.DataSetInput{DataSetID: binding.ID}, SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(binding.ID),
+	}, func(ctx context.Context, repos *repository.Repositories, row *model.Task, _ bool) error {
+		return repos.Contents.BindDataSetEnsureTask(ctx, binding.ID, row.ID)
+	})
+	if err != nil {
+		t.Fatalf("enqueue data set ensure: %v", err)
+	}
+	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
+	failing.remaining.Store(1)
+	limited := &limitedClaimRepository{TaskRepository: failing, maximum: 2}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "dataset_creation_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+		t.Fatalf("data set admission task = %#v", failed)
+	}
+	stored, err := runtime.repos.Contents.GetDataSetBindingByID(t.Context(), binding.ID)
+	if err != nil || stored.Status != model.StorageDataSetStatusPending || stored.CreateTransactionID != nil || stored.CreateStatusURL != nil {
+		t.Fatalf("data set after admission failure = %#v, err=%v", stored, err)
+	}
+	if createCalls.Load() != 0 {
+		t.Fatalf("data set creation after admission failure = %d calls", createCalls.Load())
+	}
+	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
+		t.Fatalf("retry data set admission task: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
+	})
+	if createCalls.Load() != 0 {
+		t.Fatalf("data set recovery created %d services before returning to execute", createCalls.Load())
+	}
+}
+
 func TestTaskGCLeavesStorageEvidenceIntact(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		policy: cache.EvictionPolicyNone,
@@ -1415,7 +1600,7 @@ func TestStoreTasksReachAndRespectProviderMutationLimit(t *testing.T) {
 	entered := make(chan struct{}, 6)
 	release := make(chan struct{})
 	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
-		return io.NopCloser(strings.NewReader("stored bytes")), &cache.ObjectInfo{Size: 12}, nil
+		return io.NopCloser(strings.NewReader(strings.Repeat("s", 128))), &cache.ObjectInfo{Size: 128}, nil
 	}}
 	storageClient := &testutil.MockStorageClient{}
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
@@ -1442,7 +1627,7 @@ func TestStoreTasksReachAndRespectProviderMutationLimit(t *testing.T) {
 		targetDataSetID := dataSetID.Copy()
 		return &testutil.MockStorageTarget{
 			ProviderIDValue: opts.ProviderID.Copy(), DataSetIDValue: &targetDataSetID,
-			ClientDataSetIDValue: clientID,
+			ClientDataSetIDValue: clientID, ServiceURLValue: "https://store-limit.example",
 			StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
 				current := running.Add(1)
 				for {
@@ -1482,6 +1667,256 @@ func TestStoreTasksReachAndRespectProviderMutationLimit(t *testing.T) {
 	}
 	if maximum.Load() != 4 {
 		t.Fatalf("store provider mutation maximum = %d, want 4", maximum.Load())
+	}
+}
+
+func TestStoreAdmissionFailureDoesNotStartUploadOrProgress(t *testing.T) {
+	noRetries := 0
+	payload := strings.Repeat("s", 128)
+	var cacheOpens, storeCalls atomic.Int64
+	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+		cacheOpens.Add(1)
+		return io.NopCloser(strings.NewReader(payload)), &cache.ObjectInfo{Size: int64(len(payload))}, nil
+	}}
+	target := &testutil.MockStorageTarget{
+		ServiceURLValue: "https://store-admission.example",
+		StoreFunc: func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+			storeCalls.Add(1)
+			return nil, errors.New("unexpected Store call")
+		},
+	}
+	storageClient := &testutil.MockStorageClient{}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		cache: cacheStore, storage: storageClient, maxRetries: &noRetries,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+	targetDataSetID := pipeline.targetSet.DataSetID.SDK()
+	target.DataSetIDValue = &targetDataSetID
+	target.ClientDataSetIDValue = pipeline.targetClient
+	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+		return target, nil
+	}
+	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
+	failing.remaining.Store(1)
+	limited := &limitedClaimRepository{TaskRepository: failing, maximum: 2}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "store_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+		t.Fatalf("store admission task = %#v", failed)
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID || copyRow.IngressStoreAttempt != 0 {
+		t.Fatalf("copy after store admission failure = %#v, err=%v", copyRow, err)
+	}
+	if storeCalls.Load() != 0 || cacheOpens.Load() != 2 {
+		t.Fatalf("store admission calls = store:%d cache:%d, want 0/2", storeCalls.Load(), cacheOpens.Load())
+	}
+	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
+		t.Fatalf("retry store admission task: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
+	})
+	if storeCalls.Load() != 0 || cacheOpens.Load() != 2 {
+		t.Fatalf("store recovery calls = store:%d cache:%d, want no new calls", storeCalls.Load(), cacheOpens.Load())
+	}
+}
+
+func TestStoreManualRetryRequiresUnsettledRecoveryEvidence(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	checkpoint := json.RawMessage(`{"attempted_at":"2026-09-09T00:00:00Z"}`)
+	tests := []struct {
+		name       string
+		reason     string
+		checkpoint json.RawMessage
+		want       bool
+	}{
+		{name: "not started", reason: "store_not_started", want: true},
+		{name: "not started with checkpoint", reason: "store_not_started", checkpoint: checkpoint},
+		{name: "unknown outcome", reason: "store_outcome_unknown", checkpoint: checkpoint, want: true},
+		{name: "unknown outcome without checkpoint", reason: "store_outcome_unknown"},
+		{name: "checkpointed context failure", reason: "copy_context_failed", checkpoint: checkpoint, want: true},
+		{name: "checkpointed owner missing", reason: "copy_owner_missing", checkpoint: checkpoint, want: true},
+		{name: "context failure before checkpoint", reason: "copy_context_failed"},
+		{name: "invalid checkpoint", reason: "invalid_checkpoint", checkpoint: checkpoint},
+		{name: "settled store result failure", reason: "store_result_invalid", checkpoint: checkpoint},
+		{name: "settled presign failure", reason: "commit_presign_failed", checkpoint: checkpoint},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason := tt.reason
+			taskRow := &model.Task{
+				Type: model.TaskTypeStorageStore, Status: model.TaskStatusFailed,
+				FailureReason: &reason, Checkpoint: tt.checkpoint,
+			}
+			if got := runtime.service.Retryable(taskRow); got != tt.want {
+				t.Fatalf("Retryable() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStoreUnknownRecoveryOnlyRechecksParkedPiece(t *testing.T) {
+	payload := strings.Repeat("parked-store", 12)
+	payload = payload[:128]
+	info, err := piece.Calculate(strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("calculate expected piece identity: %v", err)
+	}
+	var cacheOpens, storeCalls, parkedCalls atomic.Int64
+	var parkedError atomic.Bool
+	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+		cacheOpens.Add(1)
+		return io.NopCloser(strings.NewReader(payload)), &cache.ObjectInfo{Size: int64(len(payload))}, nil
+	}}
+	var parkedState atomic.Value
+	parkedState.Store(synapse.ParkedPieceMissing)
+	parked := parkedPieceCheckerFunc(func(_ context.Context, serviceURL string, pieceCID cid.Cid) (synapse.ParkedPieceState, error) {
+		parkedCalls.Add(1)
+		if serviceURL != "https://parked.example" || !pieceCID.Equals(info.CIDv2) {
+			return "", fmt.Errorf("unexpected parked lookup %q %s", serviceURL, pieceCID)
+		}
+		if parkedError.Load() {
+			return "", errors.New("temporary parked-piece lookup failure")
+		}
+		return parkedState.Load().(synapse.ParkedPieceState), nil
+	})
+	target := &testutil.MockStorageTarget{
+		ServiceURLValue: "https://parked.example",
+		StoreFunc: func(_ context.Context, reader io.Reader, options *storage.StoreOptions) (*storage.StoreResult, error) {
+			storeCalls.Add(1)
+			storedBytes, readErr := io.ReadAll(reader)
+			if readErr != nil || string(storedBytes) != payload {
+				return nil, fmt.Errorf("store reader = %d bytes, err=%v", len(storedBytes), readErr)
+			}
+			if options == nil || !options.PieceCID.Equals(info.CIDv2) {
+				return nil, errors.New("store did not receive the intended PieceCIDv2")
+			}
+			return nil, errors.New("provider disconnected after accepting the upload")
+		},
+		PresignForCommitFunc: func(_ context.Context, pieces []storage.PieceInput) ([]byte, error) {
+			if len(pieces) != 1 || !pieces[0].PieceCID.Equals(info.CIDv2) {
+				return nil, errors.New("presign received the wrong piece")
+			}
+			return []byte{0xaa, 0xbb}, nil
+		},
+	}
+	storageClient := &testutil.MockStorageClient{}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		cache: cacheStore, storage: storageClient, parkedPieces: parked, policy: cache.EvictionPolicyNone,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+	version := &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "parked-store.bin",
+		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize, ETag: "parked-store",
+		ContentType: "application/octet-stream",
+	}
+	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+		t.Fatalf("create parked store version: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageContent)(nil)).
+		Set("piece_cid = ?", info.CIDv2.String()).Where("id = ?", pipeline.upload.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("align parked store content identity: %v", err)
+	}
+	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+	targetDataSetID := pipeline.targetSet.DataSetID.SDK()
+	target.DataSetIDValue = &targetDataSetID
+	target.ClientDataSetIDValue = pipeline.targetClient
+	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+		return target, nil
+	}
+	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
+	limitedRepos := *runtime.repos
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 5}
+	limitedRepos.Tasks = limited
+	runtime.repos.Tasks = limited
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Retention: time.Hour, ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+	}, &limitedRepos, runtime.registry, slog.Default())
+	if err != nil {
+		t.Fatalf("new limited task engine: %v", err)
+	}
+	cancel, done := runEngine(t, engine)
+	defer stopHandlerEngine(t, cancel, done)
+
+	recovering := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover && len(task.Checkpoint) > 0
+	})
+	var checkpoint struct {
+		AttemptedAt        time.Time `json:"attempted_at"`
+		IntendedPieceCID   string    `json:"intended_piece_cid"`
+		ProviderServiceURL string    `json:"provider_service_url"`
+	}
+	if err := json.Unmarshal(recovering.Checkpoint, &checkpoint); err != nil {
+		t.Fatalf("decode store checkpoint: %v", err)
+	}
+	if checkpoint.IntendedPieceCID != info.CIDv2.String() || checkpoint.ProviderServiceURL != target.ServiceURL() {
+		t.Fatalf("store checkpoint = %#v", checkpoint)
+	}
+	parkedState.Store(synapse.ParkedPieceProcessing)
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("wake processing store recovery: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	parkedError.Store(true)
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("wake failed store lookup: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 3 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	parkedError.Store(false)
+	parkedState.Store(synapse.ParkedPieceMissing)
+	checkpoint.AttemptedAt = time.Now().Add(-31 * time.Minute)
+	checkpointJSON, err := json.Marshal(checkpoint)
+	if err != nil {
+		t.Fatalf("encode old store checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewRaw(`UPDATE task_payloads SET checkpoint_json = ? WHERE task_id = ?`, checkpointJSON, taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("age store checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("wake store recovery: %v", err)
+	}
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "store_outcome_unknown" || !runtime.service.Retryable(failed) {
+		t.Fatalf("unknown store task = %#v", failed)
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID {
+		t.Fatalf("unknown store copy = %#v, err=%v", copyRow, err)
+	}
+	parkedState.Store(synapse.ParkedPieceReady)
+	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
+		t.Fatalf("retry unknown store: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+	if storeCalls.Load() != 1 || cacheOpens.Load() != 2 || parkedCalls.Load() != 4 {
+		t.Fatalf("store recovery calls = store:%d cache:%d parked:%d, want 1/2/4", storeCalls.Load(), cacheOpens.Load(), parkedCalls.Load())
 	}
 }
 
@@ -2014,15 +2449,60 @@ func TestWalletBroadcastHasIndependentDeadline(t *testing.T) {
 	cancel, done := runHandlerEngine(t, runtime)
 	defer stopHandlerEngine(t, cancel, done)
 
-	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
+	if runtime.service.Retryable(failed) {
+		t.Fatal("wallet task with an uncertain broadcast is unexpectedly retryable")
+	}
 	if broadcasts.Load() != 1 {
 		t.Fatalf("wallet broadcasts = %d, want 1", broadcasts.Load())
 	}
 	stored, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
 	if err != nil || stored.Status != model.WalletOperationStatusUnknown {
 		t.Fatalf("wallet operation = %#v, err=%v, want unknown", stored, err)
+	}
+}
+
+func TestWalletAdmissionFailureRemainsSafeToRecover(t *testing.T) {
+	limit := 0
+	var broadcasts atomic.Int64
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		maxRetries: &limit,
+		wallet: testWalletOperator{fund: func(context.Context, *big.Int) (string, error) {
+			broadcasts.Add(1)
+			return "", errors.New("unexpected wallet broadcast")
+		}},
+	})
+	operation, taskRow := seedWalletTask(t, runtime, "wallet-admission-failure")
+	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
+	failing.remaining.Store(1)
+	limited := &limitedClaimRepository{TaskRepository: failing, maximum: 2}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "wallet_broadcast_not_started" || !runtime.service.Retryable(failed) {
+		t.Fatalf("wallet admission task = %#v", failed)
+	}
+	storedOperation, err := runtime.repos.WalletOperations.GetByID(t.Context(), operation.ID)
+	if err != nil || storedOperation.Status != model.WalletOperationStatusPending || storedOperation.TaskID == nil || *storedOperation.TaskID != taskRow.ID || storedOperation.BroadcastAttemptedAt != nil {
+		t.Fatalf("wallet operation after admission failure = %#v, err=%v", storedOperation, err)
+	}
+	if len(failed.Checkpoint) != 0 || broadcasts.Load() != 0 {
+		t.Fatalf("wallet admission wrote evidence or called effect: checkpoint=%s broadcasts=%d", failed.Checkpoint, broadcasts.Load())
+	}
+	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
+		t.Fatalf("retry not-started wallet task: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
+	})
+	if broadcasts.Load() != 0 {
+		t.Fatalf("wallet recovery broadcast %d times before returning to execute", broadcasts.Load())
 	}
 }
 
@@ -2204,6 +2684,105 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	source, err = runtime.repos.Contents.GetDataSetBindingByID(ctx, source.ID)
 	if err != nil || source == nil || source.RetirementTaskID == nil {
 		t.Fatalf("source retirement reservation = %#v err=%v", source, err)
+	}
+}
+
+func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
+	noRetries := 0
+	terminator := &testServiceTerminator{err: errors.New("unexpected termination")}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		maxRetries: &noRetries, terminator: terminator, epochs: testEpochReader{epoch: 80},
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterReplacement(registry)
+		},
+	})
+	ctx := t.Context()
+	bucket := &model.Bucket{Name: "retirement-admission", Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
+	if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("create retirement admission bucket: %v", err)
+	}
+	source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: testOnChainID(t, 29201), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("create retirement admission source: %v", err)
+	}
+	sourceClientID := testOnChainID(t, 29202)
+	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: source.ID, DataSetID: testOnChainID(t, 29203), ClientDataSetID: &sourceClientID,
+	}); err != nil {
+		t.Fatalf("mark retirement admission source ready: %v", err)
+	}
+	first, created, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: testOnChainID(t, 29204), ClientRequestID: "retirement-admission-first",
+	})
+	if err != nil || !created {
+		t.Fatalf("authorize retirement admission replacement = %#v, created=%v, err=%v", first, created, err)
+	}
+	target, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, first.TargetDataSetID)
+	if err != nil || target == nil {
+		t.Fatalf("load retirement admission target = %#v, err=%v", target, err)
+	}
+	targetClientID := testOnChainID(t, 29205)
+	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: target.ID, DataSetID: testOnChainID(t, 29206), ClientDataSetID: &targetClientID,
+	}); err != nil {
+		t.Fatalf("mark retirement admission target ready: %v", err)
+	}
+	if _, created, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: testOnChainID(t, 29207), ClientRequestID: "retirement-admission-successor",
+	}); err != nil || !created {
+		t.Fatalf("authorize retirement admission successor: created=%v err=%v", created, err)
+	}
+	first, err = runtime.repos.Replacements.GetByID(ctx, first.ID)
+	if err != nil || first.Status != storagereplacement.StatusSuperseded {
+		t.Fatalf("superseded retirement admission replacement = %#v, err=%v", first, err)
+	}
+	generation, err := runtime.repos.Contents.NextDataSetRetirementGeneration(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("next retirement admission generation: %v", err)
+	}
+	taskRow, _, err := runtime.service.Enqueue(ctx, taskengine.EnqueueRequest{
+		Type: model.TaskTypeStorageDataSetRetire, IdempotencyKey: storagereplacement.RetireTaskKey(target.ID, generation),
+		Input:       storagereplacement.RetireInput{ReplacementID: first.ID, DataSetID: target.ID, Generation: generation},
+		SubjectType: "storage_data_set", SubjectKey: fmt.Sprint(target.ID),
+	})
+	if err != nil {
+		t.Fatalf("enqueue retirement admission task: %v", err)
+	}
+	if err := runtime.repos.Contents.BindDataSetRetirementTask(ctx, target.ID, generation, taskRow.ID); err != nil {
+		t.Fatalf("bind retirement admission task: %v", err)
+	}
+	failing := &validateFailureRepository{TaskRepository: runtime.repos.Tasks, err: errors.New("temporary database failure")}
+	failing.remaining.Store(1)
+	limited := &limitedClaimRepository{TaskRepository: failing, maximum: 2}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "termination_not_started" || !runtime.service.Retryable(failed) || len(failed.Checkpoint) != 0 {
+		t.Fatalf("retirement admission task = %#v", failed)
+	}
+	stored, err := runtime.repos.Replacements.GetByID(ctx, first.ID)
+	if err != nil || stored.Status != storagereplacement.StatusSuperseded || stored.AbandonedTerminationEpoch != nil || stored.LastError != nil {
+		t.Fatalf("replacement after retirement admission failure = %#v, err=%v", stored, err)
+	}
+	if terminator.calls.Load() != 0 {
+		t.Fatalf("retirement admission called terminator %d times", terminator.calls.Load())
+	}
+	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+		t.Fatalf("retry retirement admission task: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
+	})
+	if terminator.calls.Load() != 0 {
+		t.Fatalf("retirement recovery terminated service %d times before returning to execute", terminator.calls.Load())
 	}
 }
 

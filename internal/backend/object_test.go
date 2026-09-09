@@ -28,6 +28,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
 	"github.com/strahe/synapse-go/storage"
@@ -875,6 +876,99 @@ func TestPutObjectFreezesRequestedCopiesPerContent(t *testing.T) {
 	}
 	if deduplicatedContent.RequestedCopies != 1 {
 		t.Fatalf("deduplicated requested_copies = %d, want frozen value 1", deduplicatedContent.RequestedCopies)
+	}
+}
+
+func TestPutObjectReactivatesTerminalUploadPlan(t *testing.T) {
+	for _, terminalStatus := range []model.TaskStatus{model.TaskStatusFailed, model.TaskStatusCancelled} {
+		t.Run(string(terminalStatus), func(t *testing.T) {
+			tb := newTestBackend(t)
+			ctx := t.Context()
+			bucket := seedActiveBucket(t, tb, "reactivate-plan-"+string(terminalStatus))
+			first := putValidTestObjectOutput(t, tb, bucket.Name, "first.bin", "reactivated content")
+			version, err := tb.repos.Objects.GetVersionByID(ctx, first.VersionID)
+			if err != nil || version == nil || version.ContentID == nil {
+				t.Fatalf("first version = %#v, err=%v", version, err)
+			}
+			taskRow, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, storagepipeline.UploadPlanKey(*version.ContentID))
+			if err != nil || taskRow == nil {
+				t.Fatalf("upload plan = %#v, err=%v", taskRow, err)
+			}
+			claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+			if err != nil || claimed == nil || claimed.ID != taskRow.ID {
+				t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
+			}
+			if err := tb.repos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, []byte(`{"old":true}`)); err != nil {
+				t.Fatalf("write old checkpoint: %v", err)
+			}
+			if err := tb.repos.Tasks.RequestCancellation(ctx, claimed.ID, "old owner stopped"); err != nil {
+				t.Fatalf("request old cancellation: %v", err)
+			}
+			transition := repository.TaskTransition{
+				Status: terminalStatus, ResumeMode: model.TaskResumeModeRecover,
+				FailureReason: new("old_plan_failed"), LastError: new("old upload plan failed"), IncrementRetry: true,
+			}
+			if terminalStatus == model.TaskStatusCancelled {
+				transition.FailureReason = nil
+				transition.LastError = nil
+				transition.RetentionUntil = new(time.Now().Add(time.Hour))
+			}
+			if err := tb.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, transition); err != nil {
+				t.Fatalf("settle old upload plan: %v", err)
+			}
+			if terminalStatus == model.TaskStatusFailed {
+				if err := tb.repos.Tasks.AcknowledgeFailed(ctx, claimed.ID, time.Hour); err != nil {
+					t.Fatalf("acknowledge old upload plan: %v", err)
+				}
+			}
+
+			second := putValidTestObjectOutput(t, tb, bucket.Name, "second.bin", "reactivated content")
+			secondVersion, err := tb.repos.Objects.GetVersionByID(ctx, second.VersionID)
+			if err != nil || secondVersion == nil || secondVersion.ContentID == nil || *secondVersion.ContentID != *version.ContentID {
+				t.Fatalf("second version = %#v, err=%v", secondVersion, err)
+			}
+			reactivated, err := tb.repos.Tasks.GetByID(ctx, taskRow.ID)
+			if err != nil || reactivated == nil {
+				t.Fatalf("reactivated task = %#v, err=%v", reactivated, err)
+			}
+			if reactivated.Status != model.TaskStatusPending || reactivated.ResumeMode != model.TaskResumeModeExecute ||
+				reactivated.RetryCount != 0 || len(reactivated.Checkpoint) != 0 || reactivated.FailureReason != nil ||
+				reactivated.CancellationRequestedAt != nil || reactivated.CancellationReason != nil || reactivated.AcknowledgedAt != nil || reactivated.RetentionUntil != nil {
+				t.Fatalf("reactivated task retained terminal state: %#v", reactivated)
+			}
+		})
+	}
+}
+
+func TestPutObjectRejectsCompletedUploadPlanForCachedContent(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := t.Context()
+	bucket := seedActiveBucket(t, tb, "completed-cached-plan")
+	first := putValidTestObjectOutput(t, tb, bucket.Name, "first.bin", "completed cached content")
+	version, err := tb.repos.Objects.GetVersionByID(ctx, first.VersionID)
+	if err != nil || version == nil || version.ContentID == nil {
+		t.Fatalf("first version = %#v, err=%v", version, err)
+	}
+	taskRow, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, storagepipeline.UploadPlanKey(*version.ContentID))
+	if err != nil || taskRow == nil {
+		t.Fatalf("upload plan = %#v, err=%v", taskRow, err)
+	}
+	claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
+		t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
+	}
+	if err := tb.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusCompleted, ResumeMode: model.TaskResumeModeRecover, RetentionUntil: new(time.Now().Add(time.Hour)),
+	}); err != nil {
+		t.Fatalf("complete inconsistent upload plan: %v", err)
+	}
+	contentType := "text/plain"
+	validBody := validTestObjectBody("completed cached content")
+	_, err = tb.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: &bucket.Name, Key: new("second.bin"), Body: strings.NewReader(validBody), ContentType: &contentType,
+	})
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("PutObject completed/cached error = %v, want conflict", err)
 	}
 }
 

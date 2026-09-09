@@ -4465,12 +4465,31 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
 	}
-	progressUpload, err := repos.Contents.BeginIngressStoreProgress(context.Background(), upload.ID)
+	copies, err := repos.Contents.ListCopies(context.Background(), upload.ID)
+	if err != nil || len(copies) != 1 {
+		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
+	}
+	taskRow, _, err := repos.Tasks.Enqueue(context.Background(), &model.Task{
+		Type: model.TaskTypeStorageStore, IdempotencyKey: "progress-display", InputVersion: 1,
+		Input: []byte(`{}`), InputHash: "progress-display", Status: model.TaskStatusPending,
+		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue store task: %v", err)
+	}
+	if err := repos.Contents.BindCopyTask(context.Background(), copies[0].ID, 1, taskRow.ID); err != nil {
+		t.Fatalf("BindCopyTask: %v", err)
+	}
+	progressUpload, err := repos.Contents.BeginIngressStoreProgress(context.Background(), repository.BeginIngressStoreProgressInput{
+		CopyID: copies[0].ID, Generation: 1, TaskID: taskRow.ID, Attempt: 1,
+	})
 	if err != nil {
 		t.Fatalf("BeginIngressStoreProgress: %v", err)
 	}
 	if _, err := repos.Contents.RecordIngressStoreProgress(context.Background(), repository.RecordIngressStoreProgressInput{
-		ContentID:     upload.ID,
+		CopyID:        copies[0].ID,
+		Generation:    1,
+		TaskID:        taskRow.ID,
 		Attempt:       progressUpload.IngressStoreAttempt,
 		BytesUploaded: 4,
 	}); err != nil {

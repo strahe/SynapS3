@@ -34,6 +34,7 @@ type TaskHandlerDependencies struct {
 	Epochs                 synapse.ChainEpochReader
 	Observability          *observability.Service
 	CommitStatus           storagecommit.AddPiecesStatusChecker
+	ParkedPieces           synapse.ParkedPieceChecker
 	EvictionPolicy         cache.EvictionPolicy
 	MaxCacheBytes          int64
 	LRUHighPercent         int
