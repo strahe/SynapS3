@@ -91,7 +91,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | 钱包 | `POST /api/v1/wallet/fund`、`POST /api/v1/wallet/withdraw`、`POST /api/v1/wallet/approve` | 创建链上支付操作。 |
 | S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
-| 后台任务和存储健康 | 任务重试、存储提供方和数据集刷新 | 重新入队任务，或刷新运维状态。 |
+| 后台任务和存储健康 | 任务重试与确认、存储提供方和数据集刷新 | 重新入队任务、将已核对的失败标记为已处理并开始保留期，或刷新运维状态。 |
 | 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
 | 存储确认 | `POST /api/v1/storage-confirmations/{copy-id}/release` | 可能允许存储提供方再次存储同一个 piece。释放前必须核对当前 attempt。 |
 
@@ -148,7 +148,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 `PUT /api/v1/buckets/{name}/copy-policy` 可以独立接收 `default_copies` 和 `minimum_durable_copies`。字段缺省时保持不变。传 `null` 表示重置该字段：`default_copies: null` 恢复为配置的默认值，`minimum_durable_copies: null` 将门槛设为与目标副本数相同。显式值必须在 `1` 到 `8` 之间，且门槛不能超过同一请求产生的最终目标副本数。空请求或无效的最终组合返回 `400 Bad Request`。
 
-**目前不支持调低 `default_copies`，调低会返回 `400 Bad Request`。** 超出新目标的那些副本仍会继续运行、继续计费，而且没有任何机制会退役它们，所以目标副本数只能调高。如果 `null` 重置后的值低于存储桶当前的目标副本数，同样会被拒绝。
+**不支持调低 `default_copies`，调低会返回 `400 Bad Request`。** 超出新目标的那些副本仍会继续运行、继续计费，而且没有任何机制会退役它们，所以目标副本数只能调高。如果 `null` 重置后的值低于存储桶当前的目标副本数，同样会被拒绝。
 
 目标副本数变更只影响新上传。最低耐久副本数变更还会重新评估当前上传仍保留的缓存。提高门槛无法恢复已经删除的缓存。
 
@@ -283,15 +283,15 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/tasks` | 列出后台任务。支持 `type`、`status`、`limit` 和基于 ID 的 `cursor`。 |
 | `GET` | `/api/v1/tasks/stats` | 按状态统计任务。 |
 | `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时恢复失败任务。 |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时把失败任务标记为已处理；任务会保留到 retention 到期。 |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时把失败任务标记为已处理。确认后开始计算保留期，到期后可能被清理。 |
 
-任务持久状态只有 `pending`、`running`、`completed`、`failed` 和 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应包含面向用户的 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`；不会暴露任务输入、checkpoint、执行模式或 claim generation。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。
 
-`status` 过滤还接受展示别名 `dismissed`。`status=failed` 只返回尚未确认的持久失败，`status=dismissed` 返回已确认的持久失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。这会收窄此前 `status=failed` 同时包含两组任务的行为；需要历史已确认失败的客户端必须另行请求 `dismissed`。
+`status` 过滤还接受 `dismissed`。`status=failed` 只返回尚未确认的失败，`status=dismissed` 返回已确认的失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。
 
-为保持兼容，`/api/v1/overview` 的 `tasks.by_status` 仍按五种持久状态聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 展示状态时使用 `/api/v1/tasks/stats`。
+`/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。
 
-分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。接口不支持 `category`、`stage`、`offset` 或 total-count 分页。存储提供方替换仍通过 Data Sets API 恢复。没有发出外部广播的钱包操作可以在这里恢复，广播结果不确定时仍不可重试；重试结果不确定的 Store 只会向存储提供方查询预期的 parked piece，绝不会重新发送字节。
+分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换仍通过 Data Sets API 恢复。钱包操作只有在广播开始前才可重试。重试结果不确定的 Store 只会查询存储提供方，不会重新上传字节。
 
 ## 钱包和 Filecoin
 

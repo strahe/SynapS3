@@ -91,7 +91,7 @@ Treat these endpoints as change-window operations. They can change data, credent
 | Wallet | `POST /api/v1/wallet/fund`, `POST /api/v1/wallet/withdraw`, `POST /api/v1/wallet/approve` | Creates on-chain payment operations. |
 | S3 users | `POST /api/v1/s3-users`, `PUT /api/v1/s3-users/{accessKey}`, `POST /api/v1/s3-users/{accessKey}/secret`, `DELETE /api/v1/s3-users/{accessKey}` | Changes client access or invalidates credentials. |
 | Buckets and objects | bucket create, owner/copy-policy updates, object upload/download/delete/restore/permanent-delete | Changes or exposes user-visible S3 data and metadata. |
-| Tasks and storage health | task retry, storage provider and data set refresh | Requeues work or refreshes operational status. |
+| Tasks and storage health | task retry and acknowledgement, storage provider and data set refresh | Requeues work, dismisses a reviewed failure and starts its retention period, or refreshes operational status. |
 | Provider replacement | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`, `POST /api/v1/storage-replacements/{id}/retry` | Creates a new paid storage service, moves a replica to it, and ends the old service. |
 | Storage confirmation | `POST /api/v1/storage-confirmations/{copy-id}/release` | May permit the provider to store the same piece again. Verify the current attempt before releasing it. |
 
@@ -148,7 +148,7 @@ For object upload, the HTTP `Content-Type` is the uploaded object's content type
 
 `PUT /api/v1/buckets/{name}/copy-policy` accepts `default_copies` and `minimum_durable_copies` independently. An omitted field is unchanged. `null` resets that field: `default_copies: null` restores the configured default, and `minimum_durable_copies: null` sets the minimum equal to the replica target. An explicit value must be between `1` and `8`, and the minimum cannot exceed the target produced by the same request. An empty request or an invalid final combination returns `400 Bad Request`.
 
-**Lowering `default_copies` is not supported yet and returns `400 Bad Request`.** The replicas above a lower target would keep running and keep costing, and nothing retires them, so the target can only be raised. A `null` reset that would land below the bucket's current target is refused for the same reason.
+**Lowering `default_copies` is not supported and returns `400 Bad Request`.** The replicas above a lower target would keep running and keep costing, and nothing retires them, so the target can only be raised. A `null` reset that would land below the bucket's current target is refused for the same reason.
 
 Target changes affect new uploads. Minimum changes also re-evaluate retained cache for current uploads. Increasing the minimum cannot restore cache that has already been deleted.
 
@@ -283,15 +283,15 @@ If the attempt changed after it was inspected, the API returns `409 Conflict`. I
 | `GET` | `/api/v1/tasks` | List background tasks. Supports `type`, `status`, `limit`, and ID-based `cursor`. |
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Recover a failed task when `retryable` is true. |
-| `POST` | `/api/v1/tasks/{id}/acknowledge` | Dismiss a failed task when `acknowledgeable` is true. |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | Dismiss a failed task when `acknowledgeable` is true. Acknowledgement starts its retention period, after which it may be cleaned up. |
 
-The task contract has exactly five stored statuses: `pending`, `running`, `completed`, `failed`, and `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses include product-facing `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags. They never expose task input, checkpoint, execution mode, or claim generation.
+`status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags.
 
-The `status` filter also accepts the presentation alias `dismissed`. `status=failed` returns only unacknowledged stored failures, while `status=dismissed` returns acknowledged stored failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`. This narrows the earlier `status=failed` behavior, which included both groups; clients that need historical acknowledged failures must request `dismissed` separately.
+The `status` filter also accepts `dismissed`. `status=failed` returns only unacknowledged failures, while `status=dismissed` returns acknowledged failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`.
 
-For compatibility, `/api/v1/overview` keeps `tasks.by_status` grouped by the five stored statuses, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for presentation counts split between `failed` and `dismissed`.
+`/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`.
 
-Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. `category`, `stage`, `offset`, and total-count pagination are not supported. Provider replacement recovery remains in the Data Sets API. Wallet broadcasts with no external attempt may be recovered here, but uncertain broadcasts remain non-retryable. Retrying an uncertain Store only checks the provider for the intended parked piece and never resends the bytes.
+Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacement recovery remains in the Data Sets API. Wallet operations are retryable only before a broadcast starts. Retrying an uncertain Store checks the provider and does not upload the bytes again.
 
 ## Wallet and Filecoin
 

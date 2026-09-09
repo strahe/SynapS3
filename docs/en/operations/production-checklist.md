@@ -85,7 +85,7 @@ Treat `{"status":"unhealthy"}` as a problem to investigate. It means database, c
 
 ## Upgrade Readiness
 
-This version cannot open an existing SynapS3 application database. Do not replace the running process in place. Preserve the old database as a read-only backup, configure a new empty database and cache directory, and follow [Upgrade and Recovery](./upgrade-recovery.md).
+Back up the database and cache before changing versions, then follow [Upgrade and Recovery](./upgrade-recovery.md). If startup reports that the database is incompatible, leave it unchanged and use a new database and cache directory.
 
 Before upgrading:
 
@@ -95,7 +95,7 @@ synaps3 admin task stats
 synaps3 admin task list --status failed --limit 50
 ```
 
-Expected result: health is `ok`, task queues are understood, and every failed task has a clear handling decision before the replacement instance starts with the new empty database.
+Expected result: health is `ok`, task queues are understood, and every failed task has a clear handling decision before the running process is replaced.
 
 ## Recovery Entry Points
 

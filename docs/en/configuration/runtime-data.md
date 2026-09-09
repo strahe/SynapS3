@@ -107,4 +107,4 @@ sha256sum -c synaps3-data.tgz.sha256
 
 Do not combine a database backup with cache data from another point in time.
 
-The current fresh database baseline cannot restore an earlier SynapS3 database in place. Keep pre-baseline backups read-only and follow [Upgrade and Recovery](../operations/upgrade-recovery.md) to start with new database and cache locations.
+Restore a backup only with a compatible SynapS3 version. If startup reports that the database is incompatible, leave the backup unchanged and follow [Upgrade and Recovery](../operations/upgrade-recovery.md).

@@ -85,7 +85,7 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 
 ## 升级准备
 
-当前版本无法打开已有的 SynapS3 应用数据库。不要直接替换正在运行的进程。请把旧数据库保留为只读备份，配置新的空数据库和空缓存目录，并按[升级与恢复](./upgrade-recovery.md)操作。
+更改版本前先备份数据库和缓存，再按[升级与恢复](./upgrade-recovery.md)操作。如果启动时报告数据库不兼容，请保持该数据库不变，并改用新的数据库和缓存目录。
 
 升级前运行：
 
@@ -95,7 +95,7 @@ synaps3 admin task stats
 synaps3 admin task list --status failed --limit 50
 ```
 
-预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 failed 任务都有明确处理方式，然后再用新的空数据库启动替换实例。
+预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 failed 任务都有明确处理方式，然后再替换正在运行的进程。
 
 ## 恢复入口
 

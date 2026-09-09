@@ -107,4 +107,4 @@ sha256sum -c synaps3-data.tgz.sha256
 
 不要把一个时间点的数据库备份与另一个时间点的缓存数据混用。
 
-当前全新数据库基线不能原地恢复旧版 SynapS3 数据库。基线之前的备份必须保持只读，并按照[升级与恢复](../operations/upgrade-recovery.md)使用新的数据库和缓存位置启动。
+只使用兼容的 SynapS3 版本恢复备份。如果启动时报告数据库不兼容，请保持备份不变，并按[升级与恢复](../operations/upgrade-recovery.md)处理。
