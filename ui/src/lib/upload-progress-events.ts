@@ -108,8 +108,6 @@ export function applyUploadProgressUpdate(queryClient: QueryClient, payload: Upl
     const next = mergeProgress(data.progress, progress)
     return next === data.progress ? data : { ...data, progress: next }
   })
-
-  queryClient.invalidateQueries({ queryKey: ['tasks'] })
 }
 
 function mergeProgress(current: UploadTransferProgress | undefined, next: UploadTransferProgress) {

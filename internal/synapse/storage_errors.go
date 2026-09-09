@@ -58,6 +58,18 @@ type DataSetServiceEndedError struct {
 	Cause error
 }
 
+type PullErrorDisposition uint8
+
+const (
+	PullErrorUnknown PullErrorDisposition = iota
+	PullErrorRetryable
+	PullErrorTerminal
+)
+
+// ErrProviderTransactionRejected is the adapter-level identity for a provider
+// transaction that reached a terminal rejected state.
+var ErrProviderTransactionRejected = pdp.ErrTxRejected
+
 func (e *DataSetServiceEndedError) Error() string {
 	if e == nil || e.Cause == nil {
 		return "storage data set service ended"
@@ -80,6 +92,31 @@ func IsNoProviderCandidates(err error) bool {
 func IsProviderUnavailable(err error) bool {
 	var unavailable *ProviderUnavailableError
 	return errors.As(err, &unavailable)
+}
+
+// ClassifyPullError keeps SDK-specific pull failures at the adapter boundary.
+// Provider and caller interruptions remain retryable; deterministic request or
+// provider rejection errors are terminal. Unknown errors use the task's bounded
+// retry budget so a newly introduced SDK error cannot create a permanent loop.
+func ClassifyPullError(err error) PullErrorDisposition {
+	if err == nil {
+		return PullErrorUnknown
+	}
+	if IsProviderUnavailable(err) || errors.Is(err, context.Canceled) || providerOperationUnavailable(err) {
+		return PullErrorRetryable
+	}
+	if errors.Is(err, pdp.ErrPullFailed) || errors.Is(err, storage.ErrInvalidArgument) || IsDataSetServiceEnded(err) {
+		return PullErrorTerminal
+	}
+	if httpErr, ok := errors.AsType[*pdp.HTTPError](err); ok {
+		if providerHTTPStatusUnavailable(httpErr.StatusCode) {
+			return PullErrorRetryable
+		}
+		if httpErr.StatusCode >= http.StatusBadRequest && httpErr.StatusCode < http.StatusInternalServerError {
+			return PullErrorTerminal
+		}
+	}
+	return PullErrorUnknown
 }
 
 func providerOperationUnavailable(err error) bool {

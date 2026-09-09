@@ -3,8 +3,10 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
@@ -19,11 +21,13 @@ type CacheEvictionRepository interface {
 	// GetCacheEntry returns the residency record for one content payload.
 	GetCacheEntry(ctx context.Context, contentID int64) (*model.ObjectCache, error)
 	NextEvictionGeneration(ctx context.Context, contentID int64) (int64, error)
+	PrepareEviction(ctx context.Context, contentID int64) (CacheEvictionReservation, error)
 	BindEvictionTask(ctx context.Context, contentID, generation, taskID int64) error
 	ListLRUCandidates(ctx context.Context, limit int) ([]cacheeviction.Candidate, error)
 	ActiveEvictionBytes(ctx context.Context) (int64, error)
 	AuthorizeDeletion(ctx context.Context, contentID, generation, taskID int64, expectedAccess *time.Time) (*cacheeviction.AuthorizedDeletion, error)
 	RecordDeletion(ctx context.Context, contentID, generation, taskID int64) error
+	DeletionRecorded(ctx context.Context, contentID, generation int64) (bool, error)
 	ReleaseEviction(ctx context.Context, contentID, generation, taskID int64) error
 
 	NextDurabilityGeneration(ctx context.Context, bucketID int64) (int64, error)
@@ -34,6 +38,11 @@ type CacheEvictionRepository interface {
 	// rows, so there is nothing to advance, only cache to reclaim.
 	NextBucketDurabilityCandidate(ctx context.Context, bucketID, generation, taskID int64) (*model.StorageContent, error)
 	CompleteBucketDurability(ctx context.Context, bucketID, generation, taskID int64) error
+}
+
+type CacheEvictionReservation struct {
+	Generation   int64
+	ActiveTaskID *int64
 }
 
 type BunCacheEvictionRepo struct {
@@ -68,6 +77,68 @@ func (r *BunCacheEvictionRepo) NextEvictionGeneration(ctx context.Context, conte
 		return 0, fmt.Errorf("reading cache operation generation: %w", err)
 	}
 	return generation, nil
+}
+
+// PrepareEviction locks one cache entry and either reuses its matching live
+// eviction or reserves the next generation for the caller to enqueue and bind
+// before its surrounding transaction commits.
+func (r *BunCacheEvictionRepo) PrepareEviction(ctx context.Context, contentID int64) (CacheEvictionReservation, error) {
+	if contentID < 1 {
+		return CacheEvictionReservation{}, ErrInvalidInput
+	}
+	entry, err := lockCacheEntry(ctx, r.db, contentID)
+	if err != nil {
+		return CacheEvictionReservation{}, err
+	}
+	if entry.CacheActiveTaskID == nil {
+		return CacheEvictionReservation{Generation: entry.CacheOperationGeneration + 1}, nil
+	}
+
+	taskRow := new(model.Task)
+	err = withTaskPayload(r.db.NewSelect().
+		Model(taskRow).
+		Where("task.id = ?", *entry.CacheActiveTaskID)).
+		Scan(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CacheEvictionReservation{}, ErrConflict
+	}
+	if err != nil {
+		return CacheEvictionReservation{}, fmt.Errorf("loading active cache eviction task: %w", err)
+	}
+	if taskRow.Status == model.TaskStatusPending || taskRow.Status == model.TaskStatusRunning {
+		expectedSubjectKey := strconv.FormatInt(contentID, 10)
+		var taskInput cacheeviction.EvictInput
+		inputErr := json.Unmarshal(taskRow.Input, &taskInput)
+		if taskRow.Type != model.TaskTypeCacheEvict ||
+			taskRow.InputVersion != 1 || inputErr != nil ||
+			cacheeviction.ValidateEvictInput(&taskInput) != nil ||
+			taskInput.ContentID != contentID || taskInput.Generation != entry.CacheOperationGeneration ||
+			taskRow.IdempotencyKey != cacheeviction.EvictTaskKey(contentID, entry.CacheOperationGeneration) ||
+			taskRow.SubjectType == nil || *taskRow.SubjectType != "storage_content" ||
+			taskRow.SubjectKey == nil || *taskRow.SubjectKey != expectedSubjectKey {
+			return CacheEvictionReservation{}, ErrConflict
+		}
+		return CacheEvictionReservation{
+			Generation:   entry.CacheOperationGeneration,
+			ActiveTaskID: entry.CacheActiveTaskID,
+		}, nil
+	}
+
+	result, err := r.db.NewUpdate().
+		Model((*model.ObjectCache)(nil)).
+		Set("cache_active_task_id = NULL").
+		Set("updated_at = ?", time.Now()).
+		Where("content_id = ?", contentID).
+		Where("cache_operation_generation = ?", entry.CacheOperationGeneration).
+		Where("cache_active_task_id = ?", *entry.CacheActiveTaskID).
+		Exec(ctx)
+	if err != nil {
+		return CacheEvictionReservation{}, fmt.Errorf("clearing terminal cache eviction owner: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return CacheEvictionReservation{}, ErrConflict
+	}
+	return CacheEvictionReservation{Generation: entry.CacheOperationGeneration + 1}, nil
 }
 
 func (r *BunCacheEvictionRepo) BindEvictionTask(ctx context.Context, contentID, generation, taskID int64) error {
@@ -210,10 +281,34 @@ func (r *BunCacheEvictionRepo) RecordDeletion(ctx context.Context, contentID, ge
 		return fmt.Errorf("recording cache deletion: %w", err)
 	}
 	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrConflict
+	if rows == 1 {
+		return nil
 	}
-	return nil
+	recorded, checkErr := r.DeletionRecorded(ctx, contentID, generation)
+	if checkErr != nil {
+		return checkErr
+	}
+	if recorded {
+		return nil
+	}
+	return ErrConflict
+}
+
+func (r *BunCacheEvictionRepo) DeletionRecorded(ctx context.Context, contentID, generation int64) (bool, error) {
+	if contentID < 1 || generation < 1 {
+		return false, ErrInvalidInput
+	}
+	count, err := r.db.NewSelect().
+		Model((*model.ObjectCache)(nil)).
+		Where("content_id = ?", contentID).
+		Where("cache_operation_generation = ?", generation).
+		Where("cache_active_task_id IS NULL").
+		Where("in_cache = ?", false).
+		Count(ctx)
+	if err != nil {
+		return false, fmt.Errorf("checking recorded cache deletion: %w", err)
+	}
+	return count == 1, nil
 }
 
 func (r *BunCacheEvictionRepo) ReleaseEviction(ctx context.Context, contentID, generation, taskID int64) error {

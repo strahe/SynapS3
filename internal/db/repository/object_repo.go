@@ -257,16 +257,6 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 				return err
 			}
 		}
-		// Only ask once the row is gone: while this version still existed it
-		// would count as a reference to its own content and the shared cache
-		// file would never be released.
-		if version.ContentID != nil {
-			unreferenced, err := contentIsUnreferenced(ctx, db, *version.ContentID)
-			if err != nil {
-				return err
-			}
-			result.ContentUnreferenced = unreferenced
-		}
 		return nil
 	})
 	if err != nil {
@@ -433,22 +423,6 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 			return fmt.Errorf("deleting object identity: %w", err)
 		}
 
-		// Whether the cached bytes may go is answered only after the version
-		// rows are gone, and inside this transaction, because a version of
-		// another object can still name the same content.
-		unreferenced := make(map[int64]bool, len(deletedVersionIDsByUpload))
-		for contentID := range deletedVersionIDsByUpload {
-			free, err := contentIsUnreferenced(ctx, db, contentID)
-			if err != nil {
-				return err
-			}
-			unreferenced[contentID] = free
-		}
-		for i := range result.DeletedVersions {
-			if id := result.DeletedVersions[i].ContentID; id != nil {
-				result.DeletedVersions[i].ContentUnreferenced = unreferenced[*id]
-			}
-		}
 		return nil
 	})
 	if err != nil {
@@ -472,6 +446,51 @@ func (r *BunObjectRepo) ClearContentCachePresence(ctx context.Context, contentID
 		return fmt.Errorf("clearing content cache presence: %w", err)
 	}
 	return nil
+}
+
+func (r *BunObjectRepo) ReleaseContentCacheIfUnreferenced(
+	ctx context.Context,
+	contentID int64,
+	release func() error,
+) (bool, error) {
+	if contentID < 1 || release == nil {
+		return false, fmt.Errorf("releasing content cache: %w", ErrInvalidInput)
+	}
+	released := false
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		contents, err := lockStorageContentsByID(ctx, db, []int64{contentID})
+		if err != nil {
+			return fmt.Errorf("locking content for cache release: %w", err)
+		}
+		if contents[contentID] == nil {
+			return ErrNotFound
+		}
+		unreferenced, err := contentIsUnreferenced(ctx, db, contentID)
+		if err != nil {
+			return err
+		}
+		if !unreferenced {
+			return nil
+		}
+		if err := release(); err != nil {
+			return fmt.Errorf("deleting content cache file: %w", err)
+		}
+		if _, err := db.NewUpdate().
+			Model((*model.ObjectCache)(nil)).
+			Set("in_cache = ?", false).
+			Set("cache_presence_generation = cache_presence_generation + 1").
+			Set("updated_at = ?", time.Now()).
+			Where("content_id = ?", contentID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("clearing released content cache presence: %w", err)
+		}
+		released = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return released, nil
 }
 
 // contentIsUnreferenced reports whether any live object version still points at

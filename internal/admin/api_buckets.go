@@ -1250,12 +1250,11 @@ func (s *Server) handleAPIPermanentDeleteBucketObject(w http.ResponseWriter, r *
 		return
 	}
 
-	released := s.releaseContentCache(ctx, bucket.Name, result.ContentID, result.ContentUnreferenced)
-	status := "released"
-	if !released {
+	outcome, releaseErr := s.releaseContentCache(ctx, bucket.Name, result.ContentID)
+	status := string(outcome)
+	if releaseErr != nil {
+		s.logger.Warn("api: failed to release permanently deleted object cache", "bucket", bucketName, "key", key, "versionID", versionID, "error", releaseErr)
 		status = "failed"
-	} else if !result.ContentUnreferenced {
-		status = "retained"
 	}
 	writeJSON(w, http.StatusOK, permanentDeleteObjectResponse{
 		Key:                  key,
@@ -1434,9 +1433,13 @@ func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.R
 // releaseContentCache frees the cached bytes of a content payload, but only
 // after the deletion that removed its last live reference. Residency is
 // content-addressed, so bytes still named by another version must survive.
-func (s *Server) releaseContentCache(ctx context.Context, bucketName string, contentID *int64, unreferenced bool) bool {
-	if contentID == nil || !unreferenced {
-		return true
+func (s *Server) releaseContentCache(
+	ctx context.Context,
+	bucketName string,
+	contentID *int64,
+) (objectdeletion.CacheReleaseOutcome, error) {
+	if contentID == nil {
+		return objectdeletion.CacheReleaseRetained, nil
 	}
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), permanentDeleteCacheCleanupTimeout)
 	defer cancelCleanup()
@@ -1446,7 +1449,6 @@ func (s *Server) releaseContentCache(ctx context.Context, bucketName string, con
 		s.cacheGate,
 		s.cacheAccessTracker,
 		s.repos.Objects,
-		s.logger,
 		bucketName,
 		*contentID,
 	)
@@ -1458,7 +1460,8 @@ func (s *Server) recordDeletedObjectPermanentDeleteCacheCleanup(ctx context.Cont
 	group.SetLimit(permanentDeleteCacheCleanupConcurrency)
 	for _, version := range versions {
 		group.Go(func() error {
-			if !s.releaseContentCache(ctx, bucketName, version.ContentID, version.ContentUnreferenced) {
+			if _, err := s.releaseContentCache(ctx, bucketName, version.ContentID); err != nil {
+				s.logger.Warn("api: failed to release permanently deleted object cache", "bucket", bucketName, "versionID", version.VersionID, "error", err)
 				failed.Add(1)
 			}
 			return nil

@@ -134,6 +134,7 @@ The HTTP endpoints in these examples are for local evaluation. For production, u
 | --- | --- |
 | `AccessDenied` | Confirm the access key and secret key came from `synaps3 admin s3-user create`. |
 | Client tries virtual-hosted buckets | Enable path-style addressing or equivalent client setting. |
+| The first upload after creating a bucket returns `SlowDown` | The storage provider may still be preparing the bucket. Wait briefly, retry the upload, then confirm it with the read command. |
 | Upload succeeds but Filecoin storage is pending | Check the dashboard task view or `synaps3 admin task list --status pending`. |
 | Object size is rejected | Keep the object between `127` and `1,065,353,216` bytes. |
 | Remote host cannot reach the admin dashboard | Keep admin on loopback and use `ssh -L 9090:127.0.0.1:9090 user@server`. |

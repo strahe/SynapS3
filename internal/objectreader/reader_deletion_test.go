@@ -121,20 +121,20 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteObjectVersionPermanently: %v", err)
 	}
-	if deletion.ContentID == nil || !deletion.ContentUnreferenced {
-		t.Fatalf("deletion = %#v, want the last reference to its content removed", deletion)
+	if deletion.ContentID == nil {
+		t.Fatalf("deletion = %#v, want content identity", deletion)
 	}
-	if !objectdeletion.ReleaseContentCache(
+	outcome, releaseErr := objectdeletion.ReleaseContentCache(
 		ctx,
 		mc,
 		gate,
 		tracker,
 		repos.Objects,
-		slog.Default(),
 		bucket.Name,
 		*deletion.ContentID,
-	) {
-		t.Fatal("ReleaseContentCache = false, want the cached bytes released")
+	)
+	if releaseErr != nil || outcome != objectdeletion.CacheReleaseReleased {
+		t.Fatalf("ReleaseContentCache = %q, %v, want released", outcome, releaseErr)
 	}
 	releaseDownloadOnce.Do(func() {
 		close(releaseDownload)

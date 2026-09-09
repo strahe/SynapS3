@@ -62,6 +62,11 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories) *task
 			AllowRetry: taskType != model.TaskTypeWalletOperation &&
 				taskType != model.TaskTypeProviderReplacementCoordinate,
 		}
+		if taskType == model.TaskTypeStorageDataSetRetire {
+			definition.CanManualRetry = func(task *model.Task) bool {
+				return task.FailureReason == nil || *task.FailureReason != "termination_outcome_unknown"
+			}
+		}
 		if err := registry.Register(adminTaskHandler{definition: definition}); err != nil {
 			t.Fatalf("Register(%s): %v", definition.Type, err)
 		}
@@ -79,7 +84,7 @@ func TestAPITasksUsesCursorAndServerPresentation(t *testing.T) {
 	waiting := fixture.enqueue(t, model.TaskTypeCacheEvict, "waiting", now, "object_version", "version-3")
 	fixture.transition(t, waiting.ID, repository.TaskTransition{
 		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeRecover,
-		AvailableAt: now.Add(time.Minute), WaitReason: stringPointer("durability"),
+		AvailableAt: now.Add(time.Minute), WaitReason: new("durability"),
 	})
 	queued := fixture.enqueue(t, model.TaskTypeUploadPlan, "queued", now, "object_version", "version-1")
 	scheduled := fixture.enqueue(t, model.TaskTypeUploadPlan, "scheduled", now.Add(time.Hour), "object_version", "version-2")
@@ -139,7 +144,7 @@ func TestAPITaskStatsUsesFiveStateContract(t *testing.T) {
 	fixture.enqueue(t, model.TaskTypeUploadPlan, "two", time.Now(), "", "")
 	fixture.transition(t, first.ID, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-		FailureReason: stringPointer("provider_error"), LastError: stringPointer("provider unavailable"),
+		FailureReason: new("provider_error"), LastError: new("provider unavailable"),
 	})
 
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks/stats", nil)
@@ -164,7 +169,7 @@ func TestAPITasksHideHealthyRecurringSystemWorkButKeepFailures(t *testing.T) {
 	failed := fixture.enqueue(t, model.TaskTypeObservabilityRefresh, "failed-system", time.Now(), "system", "observability")
 	fixture.transition(t, failed.ID, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-		FailureReason: stringPointer("refresh_failed"), LastError: stringPointer("health refresh failed"),
+		FailureReason: new("refresh_failed"), LastError: new("health refresh failed"),
 	})
 
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks", nil)
@@ -190,12 +195,12 @@ func TestAPITaskRetryAndAcknowledgeFollowDefinition(t *testing.T) {
 	retryable := fixture.enqueue(t, model.TaskTypeUploadPlan, "retryable", time.Now(), "", "")
 	fixture.transition(t, retryable.ID, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-		FailureReason: stringPointer("temporary"), LastError: stringPointer("temporary failure"), IncrementRetry: true,
+		FailureReason: new("temporary"), LastError: new("temporary failure"), IncrementRetry: true,
 	})
 	nonRetryable := fixture.enqueue(t, model.TaskTypeWalletOperation, "wallet", time.Now(), "", "")
 	fixture.transition(t, nonRetryable.ID, repository.TaskTransition{
 		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
-		FailureReason: stringPointer("unknown_outcome"), LastError: stringPointer("transaction outcome unknown"),
+		FailureReason: new("unknown_outcome"), LastError: new("transaction outcome unknown"),
 	})
 
 	rr := fixture.request(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(retryable.ID, 10)+"/retry", nil)
@@ -238,11 +243,16 @@ func TestAPITaskFlagsComeFromRegistry(t *testing.T) {
 	fixture.transition(t, wallet.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
 	replacement := fixture.enqueue(t, model.TaskTypeProviderReplacementCoordinate, "flags-replacement", time.Now(), "", "")
 	fixture.transition(t, replacement.ID, repository.TaskTransition{Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover})
+	retirement := fixture.enqueue(t, model.TaskTypeStorageDataSetRetire, "flags-retirement", time.Now(), "", "")
+	fixture.transition(t, retirement.ID, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: new("termination_outcome_unknown"),
+	})
 
 	rr := fixture.request(http.MethodGet, "/api/v1/tasks?status=failed", nil)
 	var body taskListResponse
 	decodeJSON(t, rr, &body)
-	if len(body.Tasks) != 3 {
+	if len(body.Tasks) != 4 {
 		t.Fatalf("tasks = %#v", body.Tasks)
 	}
 	byType := make(map[string]taskListItem, len(body.Tasks))
@@ -258,6 +268,14 @@ func TestAPITaskFlagsComeFromRegistry(t *testing.T) {
 	if byType[string(model.TaskTypeProviderReplacementCoordinate)].Retryable ||
 		!byType[string(model.TaskTypeProviderReplacementCoordinate)].Acknowledgeable {
 		t.Fatalf("replacement flags = %#v", byType[string(model.TaskTypeProviderReplacementCoordinate)])
+	}
+	if byType[string(model.TaskTypeStorageDataSetRetire)].Retryable ||
+		!byType[string(model.TaskTypeStorageDataSetRetire)].Acknowledgeable {
+		t.Fatalf("retirement flags = %#v", byType[string(model.TaskTypeStorageDataSetRetire)])
+	}
+	rr = fixture.request(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(retirement.ID, 10)+"/retry", nil)
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), `"code":"task_retry_unsupported"`) {
+		t.Fatalf("retirement retry status = %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -327,5 +345,3 @@ func decodeJSON(t *testing.T, rr *httptest.ResponseRecorder, target any) {
 		t.Fatalf("Decode: %v; body=%s", err, rr.Body.String())
 	}
 }
-
-func stringPointer(value string) *string { return &value }

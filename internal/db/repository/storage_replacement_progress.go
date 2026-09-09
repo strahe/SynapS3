@@ -20,13 +20,8 @@ func (r *BunStorageReplacementRepo) ReplacementExecution(
 	var snapshot storagereplacement.ExecutionSnapshot
 	err := r.db.NewRaw(`SELECT replacement.id AS replacement_id,
 		       replacement.seeding_complete,
-		       replacement.items_total,
-		       replacement.items_copied,
 		       EXISTS (SELECT 1 FROM storage_replacement_items AS item
 		               WHERE item.replacement_id = replacement.id AND item.status = 'pending') AS has_pending,
-		       FALSE AS has_active,
-		       FALSE AS has_retrying,
-		       FALSE AS has_waiting_source,
 		       EXISTS (SELECT 1 FROM storage_replacement_items AS item
 		               WHERE item.replacement_id = replacement.id AND item.status = 'attention') AS has_failed
 		FROM storage_replacements AS replacement

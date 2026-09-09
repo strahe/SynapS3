@@ -124,15 +124,10 @@ type ProgressSnapshot struct {
 // intentionally reports presence rather than item counts; full aggregates are
 // reserved for operator-facing progress reads.
 type ExecutionSnapshot struct {
-	ReplacementID    int64 `bun:"replacement_id"`
-	SeedingComplete  bool  `bun:"seeding_complete"`
-	ItemsTotal       int   `bun:"items_total"`
-	ItemsCopied      int   `bun:"items_copied"`
-	HasPending       bool  `bun:"has_pending"`
-	HasActive        bool  `bun:"has_active"`
-	HasRetrying      bool  `bun:"has_retrying"`
-	HasWaitingSource bool  `bun:"has_waiting_source"`
-	HasFailed        bool  `bun:"has_failed"`
+	ReplacementID   int64 `bun:"replacement_id"`
+	SeedingComplete bool  `bun:"seeding_complete"`
+	HasPending      bool  `bun:"has_pending"`
+	HasFailed       bool  `bun:"has_failed"`
 }
 
 var _ bun.BeforeAppendModelHook = (*Replacement)(nil)

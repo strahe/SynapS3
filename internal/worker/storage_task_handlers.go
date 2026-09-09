@@ -25,7 +25,6 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
-	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -452,9 +451,6 @@ func (h *TaskHandlers) runDataSetEnsure(ctx context.Context, execution taskengin
 		}
 		return h.completeDataSetEnsure(binding, execution.ID(), dataSetID, clientDataSetID)
 	}
-	if submission.TransactionID != "" || createErr != nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage service creation", nil)
-	}
 	return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage service creation", nil)
 }
 
@@ -475,7 +471,7 @@ func (h *TaskHandlers) waitDataSetCreation(
 		StatusURL: checkpoint.StatusURL, ClientDataSetID: &clientSDK,
 	})
 	if err != nil {
-		if errors.Is(err, pdp.ErrTxRejected) {
+		if errors.Is(err, synapse.ErrProviderTransactionRejected) {
 			return taskengine.Fail(err, "dataset_creation_rejected", dataSetFailureSettlement(binding.ID, execution.ID(), err.Error(), true))
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for storage service", nil)
@@ -697,7 +693,7 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 		// the same immutable bytes cannot create a second logical copy.
 		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready to resume", nil)
 	}
-	binding, target, content, bucket, err := h.copyContext(ctx, copyRow)
+	_, target, content, bucket, err := h.copyContext(ctx, copyRow)
 	if err != nil {
 		return h.copyContextFailure(execution, input, copyRow, err, true)
 	}
@@ -755,7 +751,6 @@ func (h *TaskHandlers) runStore(ctx context.Context, execution taskengine.Execut
 	if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Recording storage transfer", nil)
 	}
-	_ = binding
 	return h.finishPieceTransfer(ctx, execution, input, copyRow, target, stored.PieceCID)
 }
 
@@ -842,7 +837,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		if statusErr == nil && status != nil && status.Exists {
 			return h.finishPieceTransferWithExtra(execution, input, copyRow, target, pieceCID, checkpoint.CommitExtraDataHex, checkpoint.AttemptID)
 		}
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 	}
 	pieceCID, err := cid.Parse(checkpoint.PieceCID)
 	if err != nil {
@@ -860,7 +855,14 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		return pullErr
 	})
 	if err != nil {
-		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+		switch synapse.ClassifyPullError(err) {
+		case synapse.PullErrorRetryable:
+			return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
+		case synapse.PullErrorTerminal:
+			return h.failPullTask(execution, input, copyRow, checkpoint.AttemptID, err, "pull_failed")
+		default:
+			return h.retryPullTask(execution, input, copyRow, checkpoint.AttemptID, err, "pull_request_failed")
+		}
 	}
 	return h.finishPieceTransferWithExtra(execution, input, copyRow, target, pieceCID, checkpoint.CommitExtraDataHex, checkpoint.AttemptID)
 }
@@ -974,7 +976,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	case storagecommit.AdvanceSubmitted, storagecommit.AdvancePending:
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Waiting for storage registration", nil)
 	case storagecommit.AdvanceRejected:
-		return h.retryResolvedCopyTask(execution, input, copyRow, pdp.ErrTxRejected, "commit_rejected")
+		return h.retryResolvedCopyTask(execution, input, copyRow, synapse.ErrProviderTransactionRejected, "commit_rejected")
 	case storagecommit.AdvanceNeedsAttention:
 		if advanced.Continue && advanced.AttentionCode.Valid() {
 			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
@@ -1059,7 +1061,7 @@ func (h *TaskHandlers) authorizeCopyTask(
 				if copyRow.CommitAttemptedAt != nil {
 					return nil
 				}
-				return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message)
+				return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
 			})
 		}
 		return input, nil, true, retryTask(err, "copy_authorization_failed")
@@ -1270,6 +1272,37 @@ func (h *TaskHandlers) retryCopyTask(
 	return h.failCopyTask(execution, input, copyRow, err, reason)
 }
 
+func (h *TaskHandlers) retryPullTask(
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	pullAttemptID string,
+	err error,
+	reason string,
+) taskengine.Result {
+	if !execution.RetryWillFail() {
+		return retryTask(err, reason)
+	}
+	return h.failPullTask(execution, input, copyRow, pullAttemptID, err, reason)
+}
+
+func (h *TaskHandlers) failPullTask(
+	execution taskengine.Execution,
+	input storagepipeline.CopyGenerationInput,
+	copyRow *model.StorageCopy,
+	pullAttemptID string,
+	err error,
+	reason string,
+) taskengine.Result {
+	if copyRow == nil || copyRow.CommitAttemptedAt != nil {
+		return taskengine.Fail(err, reason, nil)
+	}
+	message := err.Error()
+	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
+		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, pullAttemptID)
+	})
+}
+
 func (h *TaskHandlers) retryResolvedCopyTask(
 	execution taskengine.Execution,
 	input storagepipeline.CopyGenerationInput,
@@ -1297,7 +1330,7 @@ func (h *TaskHandlers) failCopyTask(
 	}
 	message := err.Error()
 	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
-		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message)
+		return h.settleCopyFailure(ctx, repos, execution, input, copyRow, message, "")
 	})
 }
 
@@ -1308,12 +1341,14 @@ func (h *TaskHandlers) settleCopyFailure(
 	input storagepipeline.CopyGenerationInput,
 	copyRow *model.StorageCopy,
 	message string,
+	pullAttemptID string,
 ) error {
 	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{
 		StorageCopyID: copyRow.ID,
 		ContentID:     copyRow.ContentID,
 		CopyIndex:     copyRow.CopyIndex,
 		LastError:     message,
+		PullAttemptID: pullAttemptID,
 	}); err != nil {
 		return err
 	}
@@ -1429,10 +1464,14 @@ func (h *TaskHandlers) enqueueAfterUploadEvictions(ctx context.Context, repos *r
 			continue
 		}
 		seen[contentID] = struct{}{}
-		generation, err := repos.CacheEvictions.NextEvictionGeneration(ctx, contentID)
+		reservation, err := repos.CacheEvictions.PrepareEviction(ctx, contentID)
 		if err != nil {
 			return err
 		}
+		if reservation.ActiveTaskID != nil {
+			continue
+		}
+		generation := reservation.Generation
 		taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 			Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
 			Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: generation},

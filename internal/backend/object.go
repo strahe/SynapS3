@@ -84,37 +84,44 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		return s3response.PutObjectOutput{}, err
 	}
 	cacheKey := model.ContentCacheKey(content.ID)
-	if err := staged.CommitAs(bucketName, cacheKey); err != nil {
-		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
-		return s3response.PutObjectOutput{}, fmt.Errorf("committing cache file: %w", err)
-	}
-
-	// Atomic transaction: create object version + enqueue any needed task.
 	var objectID int64
-	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
-		if err != nil {
-			return err
+	cacheCommitted := false
+	// The content gate stays held from the physical commit through the database
+	// transaction. A deletion therefore observes either the old state or the
+	// new file and its committed version/presence together.
+	err = b.cacheGate.Commit(cacheKey, func() error {
+		if err := staged.CommitAs(bucketName, cacheKey); err != nil {
+			return fmt.Errorf("committing cache file: %w", err)
 		}
+		cacheCommitted = true
+		return b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+			state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
+			if err != nil {
+				return err
+			}
 
-		version := &model.ObjectVersion{
-			VersionID:   versionID,
-			BucketID:    bucket.ID,
-			Key:         keyName,
-			Size:        cacheInfo.Size,
-			ETag:        cacheInfo.ETag,
-			ContentType: contentType,
-			Metadata:    meta,
-			ContentID:   &content.ID,
-		}
-		objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
-		if err != nil {
-			return fmt.Errorf("creating object version: %w", err)
-		}
-		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
-	}); err != nil {
+			version := &model.ObjectVersion{
+				VersionID:   versionID,
+				BucketID:    bucket.ID,
+				Key:         keyName,
+				Size:        cacheInfo.Size,
+				ETag:        cacheInfo.ETag,
+				ContentType: contentType,
+				Metadata:    meta,
+				ContentID:   &content.ID,
+			}
+			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+			if err != nil {
+				return fmt.Errorf("creating object version: %w", err)
+			}
+			return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
+		})
+	})
+	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
-		b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after put tx failure")
+		if cacheCommitted {
+			b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after put tx failure")
+		}
 		return s3response.PutObjectOutput{}, err
 	}
 
@@ -534,7 +541,7 @@ func (b *SynapseBackend) deleteObjectInBucket(ctx context.Context, bucket *model
 				return nil, fmt.Errorf("permanently deleting object version: %w", err)
 			}
 		}
-		b.releaseContentCache(ctx, bucket.Name, result.ContentID, result.ContentUnreferenced)
+		b.releaseContentCache(ctx, bucket.Name, result.ContentID)
 		return &s3.DeleteObjectOutput{
 			VersionId: &versionID,
 		}, nil
@@ -593,20 +600,21 @@ func deleteObjectsEntryError(key *string, versionID *string, err error) types.Er
 // releaseContentCache frees cached bytes only once the deletion removed the
 // last live reference to that content. Residency is content-addressed, so bytes
 // another version still names must survive this deletion.
-func (b *SynapseBackend) releaseContentCache(ctx context.Context, bucketName string, contentID *int64, unreferenced bool) {
-	if contentID == nil || !unreferenced {
+func (b *SynapseBackend) releaseContentCache(ctx context.Context, bucketName string, contentID *int64) {
+	if contentID == nil {
 		return
 	}
-	objectdeletion.ReleaseContentCache(
+	if _, err := objectdeletion.ReleaseContentCache(
 		ctx,
 		b.cache,
 		b.cacheGate,
 		b.cacheAccessTracker,
 		b.repos.Objects,
-		b.logger,
 		bucketName,
 		*contentID,
-	)
+	); err != nil {
+		b.logger.Warn("releasing content cache failed", "bucket", bucketName, "contentID", *contentID, "error", err)
+	}
 }
 
 func (b *SynapseBackend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
@@ -709,10 +717,10 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 	if err != nil {
 		return copyObjectVersionResult{}, err
 	}
-	defer func() { _ = srcResult.Body.Close() }()
 
 	versionID := model.NewVersionID()
 	staged, err := b.cache.PutStaged(ctx, input.DestinationBucket.Name, stagingCacheKey(versionID), objectlimits.LimitFOCUploadReader(srcResult.Body))
+	_ = srcResult.Body.Close()
 	if err != nil {
 		return copyObjectVersionResult{}, fmt.Errorf("staging copy destination: %w", err)
 	}
@@ -739,43 +747,50 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 	if err != nil {
 		return copyObjectVersionResult{}, err
 	}
-	if err := staged.CommitAs(input.DestinationBucket.Name, model.ContentCacheKey(content.ID)); err != nil {
-		return copyObjectVersionResult{}, fmt.Errorf("committing copy cache: %w", err)
-	}
-
+	cacheKey := model.ContentCacheKey(content.ID)
 	var objectID int64
-	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
-		if err != nil {
-			return err
+	cacheCommitted := false
+	err = b.cacheGate.Commit(cacheKey, func() error {
+		if err := staged.CommitAs(input.DestinationBucket.Name, cacheKey); err != nil {
+			return fmt.Errorf("committing copy cache: %w", err)
 		}
+		cacheCommitted = true
+		return b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+			state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
+			if err != nil {
+				return err
+			}
 
-		version := &model.ObjectVersion{
-			VersionID:   versionID,
-			BucketID:    input.DestinationBucket.ID,
-			Key:         input.DestinationKey,
-			Size:        cacheInfo.Size,
-			ETag:        cacheInfo.ETag,
-			ContentType: contentType,
-			Metadata:    metadata,
-			ContentID:   &content.ID,
+			version := &model.ObjectVersion{
+				VersionID:   versionID,
+				BucketID:    input.DestinationBucket.ID,
+				Key:         input.DestinationKey,
+				Size:        cacheInfo.Size,
+				ETag:        cacheInfo.ETag,
+				ContentType: contentType,
+				Metadata:    metadata,
+				ContentID:   &content.ID,
+			}
+			if input.Restore == nil {
+				objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+			} else {
+				objectID, err = txRepos.Objects.CreateRestoredVersionAndSetCurrent(
+					ctx,
+					version,
+					input.Restore.SourceVersionID,
+					input.Restore.ExpectedCurrentVersionID,
+				)
+			}
+			if err != nil {
+				return fmt.Errorf("creating copy destination version: %w", err)
+			}
+			return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
+		})
+	})
+	if err != nil {
+		if cacheCommitted {
+			b.releaseContentCacheIfUnreferenced(ctx, input.DestinationBucket.Name, content.ID, "orphaned content cache file after copy tx failure")
 		}
-		if input.Restore == nil {
-			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
-		} else {
-			objectID, err = txRepos.Objects.CreateRestoredVersionAndSetCurrent(
-				ctx,
-				version,
-				input.Restore.SourceVersionID,
-				input.Restore.ExpectedCurrentVersionID,
-			)
-		}
-		if err != nil {
-			return fmt.Errorf("creating copy destination version: %w", err)
-		}
-		return b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state)
-	}); err != nil {
-		b.releaseContentCacheIfUnreferenced(ctx, input.DestinationBucket.Name, content.ID, "orphaned content cache file after copy tx failure")
 		return copyObjectVersionResult{}, err
 	}
 
@@ -1219,10 +1234,14 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 // enqueueEvictionTask schedules cache removal for one content payload. Several
 // versions can name the same bytes, so the unit of eviction is the content.
 func (b *SynapseBackend) enqueueEvictionTask(ctx context.Context, repos *repository.Repositories, contentID int64) error {
-	generation, err := repos.CacheEvictions.NextEvictionGeneration(ctx, contentID)
+	reservation, err := repos.CacheEvictions.PrepareEviction(ctx, contentID)
 	if err != nil {
 		return err
 	}
+	if reservation.ActiveTaskID != nil {
+		return nil
+	}
+	generation := reservation.Generation
 	taskRow, _, err := b.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 		Type:           model.TaskTypeCacheEvict,
 		IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
@@ -1293,12 +1312,17 @@ func stagingCacheKey(versionID string) string {
 func (b *SynapseBackend) releaseContentCacheIfUnreferenced(ctx context.Context, bucketName string, contentID int64, message string) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	unreferenced, err := b.repos.Objects.ContentIsUnreferenced(cleanupCtx, contentID)
-	if err != nil {
+	if _, err := objectdeletion.ReleaseContentCache(
+		cleanupCtx,
+		b.cache,
+		b.cacheGate,
+		b.cacheAccessTracker,
+		b.repos.Objects,
+		bucketName,
+		contentID,
+	); err != nil {
 		b.logger.Warn(message, "bucket", bucketName, "contentID", contentID, "error", err)
-		return
 	}
-	b.releaseContentCache(cleanupCtx, bucketName, &contentID, unreferenced)
 }
 
 // Ensure Body is consumed for PutObject, as it might come from

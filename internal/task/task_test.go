@@ -382,6 +382,33 @@ func TestServiceRetryForcesRecoverAndAcknowledgeStartsRetention(t *testing.T) {
 	}
 }
 
+func TestServiceManualRetryPredicateUsesFailureEvidence(t *testing.T) {
+	limit := 5
+	definition := testDefinition(&limit, true)
+	definition.CanManualRetry = func(task *model.Task) bool {
+		return task != nil && task.FailureReason != nil && *task.FailureReason != "unsafe_outcome"
+	}
+	harness := newTaskHarness(t, scriptedHandler{
+		definition: definition,
+		execute: func(context.Context, Execution) Result {
+			return Fail(errors.New("outcome is unknown"), "unsafe_outcome", nil)
+		},
+	}, nil)
+	row := enqueueTestTask(t, harness, "unsafe-retry", "unsafe-retry")
+	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+
+	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || stored == nil || stored.Status != model.TaskStatusFailed {
+		t.Fatalf("failed task = %#v, err=%v", stored, err)
+	}
+	if harness.service.Retryable(stored) {
+		t.Fatal("unsafe failed task is retryable")
+	}
+	if err := harness.service.Retry(t.Context(), row.ID); !errors.Is(err, ErrRetryUnsupported) {
+		t.Fatalf("Retry = %v, want ErrRetryUnsupported", err)
+	}
+}
+
 func TestCancellationWakesPendingTaskAndForcesRecovery(t *testing.T) {
 	limit := 5
 	var executed atomic.Bool

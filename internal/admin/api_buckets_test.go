@@ -307,49 +307,18 @@ func (c *contextRecordingDeleteCache) recordedContexts() []context.Context {
 	return append([]context.Context(nil), c.contexts...)
 }
 
-type blockingDeleteCache struct {
+type selectiveFailingDeleteCache struct {
 	cache.Cache
-	started   chan struct{}
-	release   chan struct{}
-	failKey   string
-	deletes   atomic.Int32
-	active    atomic.Int32
-	maxActive atomic.Int32
+	failKey string
+	deletes atomic.Int32
 }
 
-func (c *blockingDeleteCache) Delete(ctx context.Context, _, key string) error {
-	currentActive := c.active.Add(1)
-	defer c.active.Add(-1)
-	for {
-		maxActive := c.maxActive.Load()
-		if currentActive <= maxActive || c.maxActive.CompareAndSwap(maxActive, currentActive) {
-			break
-		}
-	}
+func (c *selectiveFailingDeleteCache) Delete(_ context.Context, _, key string) error {
 	c.deletes.Add(1)
-	c.started <- struct{}{}
-	select {
-	case <-c.release:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 	if key == c.failKey {
 		return errors.New("cache error")
 	}
 	return nil
-}
-
-func waitDeleteStarts(t *testing.T, started <-chan struct{}, want int) {
-	t.Helper()
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for i := range want {
-		select {
-		case <-started:
-		case <-timer.C:
-			t.Fatalf("cache cleanup starts = %d, want %d", i, want)
-		}
-	}
 }
 
 type storageUploadSelectCounter struct {
@@ -4280,7 +4249,7 @@ func TestAPIBucketDeletedObjectPermanentDeleteUsesIsolatedCacheCleanupContexts(t
 	}
 }
 
-func TestAPIBucketDeletedObjectPermanentDeleteRunsCacheCleanupInParallel(t *testing.T) {
+func TestAPIBucketDeletedObjectPermanentDeleteReportsEveryCacheCleanupOutcome(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
@@ -4296,10 +4265,8 @@ func TestAPIBucketDeletedObjectPermanentDeleteRunsCacheCleanupInParallel(t *test
 		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
 	}
 
-	testCache := &blockingDeleteCache{
+	testCache := &selectiveFailingDeleteCache{
 		Cache:   srv.cache,
-		started: make(chan struct{}, 3),
-		release: make(chan struct{}),
 		failKey: adminVersionCacheKey(t, repos, secondVersionID),
 	}
 	srv.cache = testCache
@@ -4307,27 +4274,7 @@ func TestAPIBucketDeletedObjectPermanentDeleteRunsCacheCleanupInParallel(t *test
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-parallel-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
 	setBucketWriteHeaders(req)
 	rr := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		newBucketAPIMux(srv).ServeHTTP(rr, req)
-		close(done)
-	}()
-
-	waitDeleteStarts(t, testCache.started, 3)
-	if got := testCache.maxActive.Load(); got < 2 {
-		t.Fatalf("max concurrent cache cleanups = %d, want at least 2", got)
-	}
-	select {
-	case <-done:
-		t.Fatal("handler returned before cache cleanup completed")
-	default:
-	}
-	close(testCache.release)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("handler did not return after cache cleanup completed")
-	}
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())

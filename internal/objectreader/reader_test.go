@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -493,6 +494,80 @@ func TestOpenCacheMissMarksCacheLocationAbsent(t *testing.T) {
 	}
 	if dbVersion.InCache {
 		t.Fatal("version in_cache = true, want false after confirmed cache miss")
+	}
+}
+
+func TestOpenCacheMissDoesNotOverwriteConcurrentCommitPresence(t *testing.T) {
+	firstGetStarted := make(chan struct{})
+	allowFirstGetToReturn := make(chan struct{})
+	var present atomic.Bool
+	var getCalls atomic.Int64
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			if getCalls.Add(1) == 1 {
+				close(firstGetStarted)
+				<-allowFirstGetToReturn
+				return nil, nil, os.ErrNotExist
+			}
+			if present.Load() {
+				return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
+			}
+			return nil, nil, os.ErrNotExist
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := &model.Bucket{Name: "cache-miss-commit-race-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR12",
+		BucketID:    bucket.ID,
+		Key:         "concurrent-cache.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+
+	gate := cacheaccess.NewGate()
+	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
+	reader := New(repos, mc, nil, gate, tracker, slog.Default())
+	openDone := make(chan error, 1)
+	go func() {
+		result, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+		if result != nil && result.Body != nil {
+			_ = result.Body.Close()
+		}
+		openDone <- err
+	}()
+
+	<-firstGetStarted
+	commitErr := gate.Commit(version.CacheKey(), func() error {
+		present.Store(true)
+		return repos.Objects.RecordContentCacheCommit(ctx, *version.ContentID, time.Now())
+	})
+	close(allowFirstGetToReturn)
+	if commitErr != nil {
+		t.Fatalf("commit cache presence: %v", commitErr)
+	}
+	if err := <-openDone; !errors.Is(err, ErrNoSuchKey) {
+		t.Fatalf("Open error = %v, want ErrNoSuchKey after provider fallback", err)
+	}
+	if getCalls.Load() != 2 {
+		t.Fatalf("cache get calls = %d, want initial miss plus guarded recheck", getCalls.Load())
+	}
+	stored, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || stored == nil {
+		t.Fatalf("version after cache commit race: version=%v err=%v", stored, err)
+	}
+	if !stored.InCache {
+		t.Fatal("concurrent cache commit was overwritten by stale miss")
 	}
 }
 

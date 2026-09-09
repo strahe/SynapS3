@@ -121,9 +121,8 @@ func waitPostgresDeleteResult(t *testing.T, result <-chan error, name string) er
 // TestPostgresPermanentDeleteSerializesContentReuse pins the race that content
 // dedup creates: one writer permanently deletes the last version of a content
 // while another writes a new version onto the same content. Both must serialize
-// on the content row, and the deletion must only report the content
-// unreferenced when it truly won the race, because that answer is what releases
-// the shared cache file.
+// on the content row. Cache release rechecks after both operations commit, so
+// the surviving follower must retain the shared file regardless of lock order.
 func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
 	if dsn == "" {
@@ -133,10 +132,9 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		blockedOperation string
-		wantUnreferenced bool
 	}{
-		{name: "delete wins", blockedOperation: "delete", wantUnreferenced: true},
-		{name: "reuse wins", blockedOperation: "reuse", wantUnreferenced: false},
+		{name: "delete wins", blockedOperation: "delete"},
+		{name: "reuse wins", blockedOperation: "reuse"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := permanentDeletePostgresDB(t, dsn)
@@ -171,13 +169,11 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 			reuseCtx := context.WithValue(ctx, storageContentLockContextKey{}, "reuse")
 			deleteResult := make(chan error, 1)
 			reuseResult := make(chan error, 1)
-			var deleted repository.DeleteObjectVersionResult
 			startDelete := func() {
 				go func() {
-					result, err := repos.Objects.DeleteObjectVersionPermanently(deleteCtx, repository.DeleteObjectVersionInput{
+					_, err := repos.Objects.DeleteObjectVersionPermanently(deleteCtx, repository.DeleteObjectVersionInput{
 						BucketID: bucket.ID, Key: source.Key, VersionID: source.VersionID,
 					})
-					deleted = result
 					deleteResult <- err
 				}()
 			}
@@ -207,9 +203,6 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 				t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
 			}
 
-			if deleted.ContentUnreferenced != tc.wantUnreferenced {
-				t.Fatalf("ContentUnreferenced = %t, want %t", deleted.ContentUnreferenced, tc.wantUnreferenced)
-			}
 			unreferenced, err := repos.Objects.ContentIsUnreferenced(ctx, contentID)
 			if err != nil {
 				t.Fatalf("ContentIsUnreferenced: %v", err)
@@ -217,6 +210,14 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 			// Whoever won, the follower survives, so the bytes are still named.
 			if unreferenced {
 				t.Fatal("content is unreferenced after the reuse committed")
+			}
+			deleteCalls := 0
+			released, err := repos.Objects.ReleaseContentCacheIfUnreferenced(ctx, contentID, func() error {
+				deleteCalls++
+				return nil
+			})
+			if err != nil || released || deleteCalls != 0 {
+				t.Fatalf("cache release = %t, %v calls=%d, want retained", released, err, deleteCalls)
 			}
 		})
 	}

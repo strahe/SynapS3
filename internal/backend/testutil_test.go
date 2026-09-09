@@ -30,6 +30,7 @@ type testBackend struct {
 	backend *backend.SynapseBackend
 	repos   *repository.Repositories
 	cache   cache.Cache
+	gate    *cacheaccess.Gate
 	storage *testutil.MockStorageClient
 	db      *bun.DB
 	tasks   *taskengine.Service
@@ -65,6 +66,7 @@ func newTestBackendWithOptions(t *testing.T, opts ...backend.Option) *testBacken
 		backend: b,
 		repos:   repos,
 		cache:   fsCache,
+		gate:    cacheGate,
 		storage: sc,
 		db:      db,
 		tasks:   taskService,
@@ -87,6 +89,7 @@ func newTestBackendWithMockCache(t *testing.T, mc *testutil.MockCache) *testBack
 		backend: b,
 		repos:   repos,
 		cache:   mc,
+		gate:    cacheGate,
 		storage: sc,
 		db:      db,
 		tasks:   taskService,
@@ -107,6 +110,7 @@ func newTestBackendWithCache(t *testing.T, c cache.Cache) *testBackend {
 		backend: b,
 		repos:   repos,
 		cache:   c,
+		gate:    cacheGate,
 		storage: sc,
 		db:      db,
 		tasks:   taskService,
@@ -128,6 +132,7 @@ func newTestBackendWithSDK(t *testing.T, sc synapse.StorageClient) *testBackend 
 		backend: b,
 		repos:   repos,
 		cache:   fsCache,
+		gate:    cacheGate,
 		db:      db,
 		tasks:   taskService,
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -31,9 +30,10 @@ func newReleaseTracker() *cacheaccess.Tracker {
 }
 
 type presenceRecorder struct {
-	mu       sync.Mutex
-	cleared  []int64
-	clearErr error
+	mu         sync.Mutex
+	cleared    []int64
+	clearErr   error
+	referenced bool
 }
 
 func (r *presenceRecorder) ClearContentCachePresence(_ context.Context, contentID int64) error {
@@ -41,6 +41,23 @@ func (r *presenceRecorder) ClearContentCachePresence(_ context.Context, contentI
 	defer r.mu.Unlock()
 	r.cleared = append(r.cleared, contentID)
 	return r.clearErr
+}
+
+func (r *presenceRecorder) ReleaseContentCacheIfUnreferenced(
+	ctx context.Context,
+	contentID int64,
+	release func() error,
+) (bool, error) {
+	if r.referenced {
+		return false, nil
+	}
+	if err := release(); err != nil {
+		return false, err
+	}
+	if err := r.ClearContentCachePresence(ctx, contentID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func newReleaseCache(deleteErr error) (*testutil.MockCache, *[]string) {
@@ -62,11 +79,11 @@ func TestReleaseContentCacheDeletesTheContentKeyAndClearsPresence(t *testing.T) 
 	gate := cacheaccess.NewGate()
 	tracker := newReleaseTracker()
 
-	if !objectdeletion.ReleaseContentCache(
-		context.Background(), mockCache, gate, tracker, recorder,
-		slog.New(slog.DiscardHandler), "bucket", 41,
-	) {
-		t.Fatal("ReleaseContentCache = false, want true")
+	outcome, err := objectdeletion.ReleaseContentCache(
+		context.Background(), mockCache, gate, tracker, recorder, "bucket", 41,
+	)
+	if err != nil || outcome != objectdeletion.CacheReleaseReleased {
+		t.Fatalf("ReleaseContentCache = %q, %v, want released", outcome, err)
 	}
 	if want := model.ContentCacheKey(41); len(*deleted) != 1 || (*deleted)[0] != want {
 		t.Fatalf("deleted keys = %v, want [%s]", *deleted, want)
@@ -80,15 +97,30 @@ func TestReleaseContentCacheReportsFailureWithoutClearingPresence(t *testing.T) 
 	mockCache, _ := newReleaseCache(errors.New("disk is busy"))
 	recorder := &presenceRecorder{}
 
-	if objectdeletion.ReleaseContentCache(
-		context.Background(), mockCache, cacheaccess.NewGate(), newReleaseTracker(), recorder,
-		slog.New(slog.DiscardHandler), "bucket", 41,
-	) {
-		t.Fatal("ReleaseContentCache = true, want false when the file could not be removed")
+	outcome, err := objectdeletion.ReleaseContentCache(
+		context.Background(), mockCache, cacheaccess.NewGate(), newReleaseTracker(), recorder, "bucket", 41,
+	)
+	if err == nil || outcome != objectdeletion.CacheReleaseRetained {
+		t.Fatalf("ReleaseContentCache = %q, %v, want retained with an error", outcome, err)
 	}
 	// Presence must survive a failed delete, or the next reader would be told
 	// bytes are gone while the file is still there.
 	if len(recorder.cleared) != 0 {
 		t.Fatalf("cleared presence = %v, want none", recorder.cleared)
+	}
+}
+
+func TestReleaseContentCacheRetainsReferencedContent(t *testing.T) {
+	mockCache, deleted := newReleaseCache(nil)
+	recorder := &presenceRecorder{referenced: true}
+
+	outcome, err := objectdeletion.ReleaseContentCache(
+		context.Background(), mockCache, cacheaccess.NewGate(), newReleaseTracker(), recorder, "bucket", 41,
+	)
+	if err != nil || outcome != objectdeletion.CacheReleaseRetained {
+		t.Fatalf("ReleaseContentCache = %q, %v, want retained", outcome, err)
+	}
+	if len(*deleted) != 0 || len(recorder.cleared) != 0 {
+		t.Fatalf("retained content deleted=%v cleared=%v", *deleted, recorder.cleared)
 	}
 }

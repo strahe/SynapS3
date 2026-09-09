@@ -122,11 +122,16 @@ func (h *TaskHandlers) planLRUEvictions(ctx context.Context, bytesToPlan int64) 
 		createdThisBatch := 0
 		for i := range candidates {
 			candidate := candidates[i]
+			scheduled := false
 			err := h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
-				generation, err := repos.CacheEvictions.NextEvictionGeneration(ctx, candidate.ContentID)
+				reservation, err := repos.CacheEvictions.PrepareEviction(ctx, candidate.ContentID)
 				if err != nil {
 					return err
 				}
+				if reservation.ActiveTaskID != nil {
+					return nil
+				}
+				generation := reservation.Generation
 				accessedAt := cacheeviction.NormalizeAccessTime(candidate.AccessedAt)
 				taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 					Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(candidate.ContentID, generation),
@@ -136,13 +141,20 @@ func (h *TaskHandlers) planLRUEvictions(ctx context.Context, bytesToPlan int64) 
 				if err != nil {
 					return err
 				}
-				return repos.CacheEvictions.BindEvictionTask(ctx, candidate.ContentID, generation, taskRow.ID)
+				if err := repos.CacheEvictions.BindEvictionTask(ctx, candidate.ContentID, generation, taskRow.ID); err != nil {
+					return err
+				}
+				scheduled = true
+				return nil
 			})
 			if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) {
 				continue
 			}
 			if err != nil {
 				return plannedBytes, plannedTasks, fmt.Errorf("planning cache cleanup for content %d: %w", candidate.ContentID, err)
+			}
+			if !scheduled {
+				continue
 			}
 			plannedBytes += candidate.Size
 			bytesToPlan -= candidate.Size
@@ -185,24 +197,34 @@ func (h *TaskHandlers) runCacheEviction(
 	if err != nil {
 		return decodeFailure(string(model.TaskTypeCacheEvict), err)
 	}
-	if _, _, err := taskengine.DecodeCheckpoint[cacheEvictionCheckpoint](execution); err != nil {
-		return taskengine.Fail(err, "invalid_checkpoint", nil)
-	}
 	if h.deps.Cache == nil || h.deps.CacheGate == nil || h.deps.CacheTracker == nil {
-		return taskengine.Fail(errors.New("cache deletion dependencies are unavailable"), "dependency_unavailable", nil)
+		return taskengine.Fail(
+			errors.New("cache deletion dependencies are unavailable"),
+			"dependency_unavailable",
+			h.releaseCacheEvictionSettlement(input, execution.ID()),
+		)
 	}
-	if input.AccessedAt != nil {
-		if h.deps.EvictionPolicy != cache.EvictionPolicyLRU || !h.deps.CacheTracker.SafeForLRU() {
-			return h.completeCacheEvictionWithoutDelete(input, execution.ID(), "Cache removal is no longer needed")
-		}
-		if h.deps.Cache.UsedBytes() <= cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRULowPercent) {
-			return h.completeCacheEvictionWithoutDelete(input, execution.ID(), "Local cache usage reached its target")
+	if _, _, checkpointErr := taskengine.DecodeCheckpoint[cacheEvictionCheckpoint](execution); checkpointErr != nil {
+		return taskengine.Fail(checkpointErr, "invalid_checkpoint", h.releaseCacheEvictionSettlement(input, execution.ID()))
+	}
+	if allowDelete {
+		checkpoint := cacheEvictionCheckpoint{AttemptedAt: time.Now().UTC()}
+		if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+			return h.retryCacheEviction(execution, input, err, "cache_checkpoint_failed")
 		}
 	}
 	var result taskengine.Result
-	// The gate is held on the content key: identical bytes written under
-	// several object keys share one cache file, so they contend for one lock.
 	h.deps.CacheGate.GuardDeletion(model.ContentCacheKey(input.ContentID), func() {
+		if input.AccessedAt != nil {
+			if h.deps.EvictionPolicy != cache.EvictionPolicyLRU || !h.deps.CacheTracker.SafeForLRU() {
+				result = h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
+				return
+			}
+			if h.deps.Cache.UsedBytes() <= cacheWatermarkBytes(h.deps.MaxCacheBytes, h.deps.LRULowPercent) {
+				result = h.cancelCacheEviction(input, execution.ID(), "Local cache usage reached its target")
+				return
+			}
+		}
 		result = h.deleteAuthorizedCacheEntry(ctx, execution, input, allowDelete)
 	})
 	return result
@@ -217,15 +239,15 @@ func (h *TaskHandlers) deleteAuthorizedCacheEntry(
 	deletionSucceeded := false
 	if input.AccessedAt != nil && allowDelete {
 		if !h.deps.CacheTracker.SafeForLRU() {
-			return h.completeCacheEvictionWithoutDelete(input, execution.ID(), "Cache removal is no longer needed")
+			return h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
 		}
 		entry, err := h.deps.Repositories.CacheEvictions.GetCacheEntry(ctx, input.ContentID)
 		if err != nil {
-			return retryTask(err, "cache_entry_load_failed")
+			return h.retryCacheEviction(execution, input, err, "cache_entry_load_failed")
 		}
 		content, err := h.deps.Repositories.Contents.GetByID(ctx, input.ContentID)
 		if err != nil {
-			return retryTask(err, "cache_content_load_failed")
+			return h.retryCacheEviction(execution, input, err, "cache_content_load_failed")
 		}
 		if entry == nil || content == nil || entry.CacheAccessedAt == nil ||
 			!cacheeviction.NormalizeAccessTime(*entry.CacheAccessedAt).Equal(*input.AccessedAt) ||
@@ -233,73 +255,136 @@ func (h *TaskHandlers) deleteAuthorizedCacheEntry(
 			if entry != nil && entry.CacheAccessedAt != nil &&
 				cacheeviction.NormalizeAccessTime(h.deps.CacheTracker.Latest(input.ContentID)).After(cacheeviction.NormalizeAccessTime(*entry.CacheAccessedAt)) {
 				if flushErr := h.deps.CacheTracker.FlushWhileGuarded(ctx, input.ContentID); flushErr != nil {
-					return retryTask(flushErr, "cache_access_flush_failed")
+					return h.retryCacheEviction(execution, input, flushErr, "cache_access_flush_failed")
 				}
 			}
-			return h.completeCacheEvictionWithoutDelete(input, execution.ID(), "Cached data was used after cleanup was scheduled")
+			return h.cancelCacheEviction(input, execution.ID(), "Cached data was used after cleanup was scheduled")
 		}
 		if !h.reserveLRUDeletion(content.ContentSize) {
-			return h.completeCacheEvictionWithoutDelete(input, execution.ID(), "Local cache usage reached its target")
+			return h.cancelCacheEviction(input, execution.ID(), "Local cache usage reached its target")
 		}
 		defer func() { h.finishLRUDeletion(content.ContentSize, deletionSucceeded) }()
 	}
-
-	authorized, err := h.deps.Repositories.CacheEvictions.AuthorizeDeletion(
-		ctx, input.ContentID, input.Generation, execution.ID(), input.AccessedAt,
-	)
-	switch {
-	case errors.Is(err, cacheeviction.ErrDurabilityThreshold) && input.AccessedAt == nil:
-		return taskengine.Suspend(model.TaskResumeModeExecute, dependencyWait, "durability", "Waiting for durable storage", nil)
-	case errors.Is(err, cacheeviction.ErrDurabilityThreshold), errors.Is(err, cacheeviction.ErrNoLongerEligible),
-		errors.Is(err, cacheeviction.ErrAccessChanged), errors.Is(err, repository.ErrNotFound), errors.Is(err, repository.ErrConflict):
-		return h.completeCacheEvictionWithoutDelete(input, execution.ID(), "Cache removal is no longer needed")
-	case err != nil:
-		return retryTask(err, "cache_authorization_failed")
-	}
 	if !allowDelete {
-		body, _, err := h.deps.Cache.Get(ctx, authorized.BucketName, model.ContentCacheKey(authorized.Content.ID))
+		entry, err := h.deps.Repositories.CacheEvictions.GetCacheEntry(ctx, input.ContentID)
+		if err != nil {
+			return h.retryCacheEviction(execution, input, err, "cache_entry_load_failed")
+		}
+		if entry == nil {
+			return h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
+		}
+		content, err := h.deps.Repositories.Contents.GetByID(ctx, input.ContentID)
+		if err != nil {
+			return h.retryCacheEviction(execution, input, err, "cache_content_load_failed")
+		}
+		if content == nil {
+			return h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
+		}
+		bucket, err := h.deps.Repositories.Buckets.GetByID(ctx, content.BucketID)
+		if err != nil {
+			return h.retryCacheEviction(execution, input, err, "cache_bucket_load_failed")
+		}
+		if bucket == nil {
+			return h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
+		}
+		body, _, err := h.deps.Cache.Get(ctx, bucket.Name, model.ContentCacheKey(input.ContentID))
 		switch {
 		case err == nil:
 			if body == nil {
-				return retryTask(errors.New("cache returned an empty read handle"), "cache_observation_failed")
+				return h.retryCacheEviction(execution, input, errors.New("cache returned an empty read handle"), "cache_observation_failed")
 			}
 			if closeErr := body.Close(); closeErr != nil {
-				return retryTask(closeErr, "cache_observation_failed")
+				return h.retryCacheEviction(execution, input, closeErr, "cache_observation_failed")
 			}
 			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Local cache removal is ready", nil)
 		case os.IsNotExist(err):
-			h.deps.CacheTracker.Forget(input.ContentID)
-			return taskengine.Complete("Local cache removed", func(ctx context.Context, repos *repository.Repositories) error {
+			finalizeErr := h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
+				if err := repos.Tasks.ValidateClaim(ctx, execution.ID(), execution.ClaimGeneration()); err != nil {
+					return err
+				}
 				return repos.CacheEvictions.RecordDeletion(ctx, input.ContentID, input.Generation, execution.ID())
 			})
+			if errors.Is(finalizeErr, repository.ErrConflict) || errors.Is(finalizeErr, repository.ErrNotFound) {
+				return h.cancelCacheEviction(input, execution.ID(), "Cache removal was superseded")
+			}
+			if finalizeErr != nil {
+				return h.retryCacheEviction(execution, input, finalizeErr, "cache_record_failed")
+			}
+			h.deps.CacheTracker.Forget(input.ContentID)
+			return taskengine.Complete("Local cache removed", nil)
 		default:
-			return retryTask(err, "cache_observation_failed")
+			return h.retryCacheEviction(execution, input, err, "cache_observation_failed")
 		}
 	}
-	checkpoint := cacheEvictionCheckpoint{AttemptedAt: time.Now().UTC()}
-	if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
-		return retryTask(err, "cache_checkpoint_failed")
-	}
-	if err := h.deps.Cache.Delete(ctx, authorized.BucketName, model.ContentCacheKey(authorized.Content.ID)); err != nil {
-		return retryTask(err, "cache_delete_failed")
+	deleteErr := h.deps.Repositories.WithTx(ctx, func(repos *repository.Repositories) error {
+		if err := repos.Tasks.ValidateClaim(ctx, execution.ID(), execution.ClaimGeneration()); err != nil {
+			return err
+		}
+		authorized, err := repos.CacheEvictions.AuthorizeDeletion(
+			ctx, input.ContentID, input.Generation, execution.ID(), input.AccessedAt,
+		)
+		if err != nil {
+			return err
+		}
+		if err := h.deps.Cache.Delete(ctx, authorized.BucketName, model.ContentCacheKey(authorized.Content.ID)); err != nil {
+			return fmt.Errorf("deleting cache file: %w", err)
+		}
+		return repos.CacheEvictions.RecordDeletion(ctx, input.ContentID, input.Generation, execution.ID())
+	})
+	if deleteErr != nil {
+		recorded, checkErr := h.deps.Repositories.CacheEvictions.DeletionRecorded(ctx, input.ContentID, input.Generation)
+		if checkErr == nil && recorded {
+			h.deps.CacheTracker.Forget(input.ContentID)
+			if input.AccessedAt != nil {
+				deletionSucceeded = true
+			}
+			return taskengine.Complete("Local cache removed", nil)
+		}
+		switch {
+		case errors.Is(deleteErr, cacheeviction.ErrDurabilityThreshold) && input.AccessedAt == nil:
+			return taskengine.Suspend(model.TaskResumeModeExecute, dependencyWait, "durability", "Waiting for durable storage", nil)
+		case errors.Is(deleteErr, cacheeviction.ErrDurabilityThreshold), errors.Is(deleteErr, cacheeviction.ErrNoLongerEligible),
+			errors.Is(deleteErr, cacheeviction.ErrAccessChanged), errors.Is(deleteErr, repository.ErrNotFound), errors.Is(deleteErr, repository.ErrConflict):
+			return h.cancelCacheEviction(input, execution.ID(), "Cache removal is no longer needed")
+		default:
+			return h.retryCacheEviction(execution, input, errors.Join(deleteErr, checkErr), "cache_delete_failed")
+		}
 	}
 	h.deps.CacheTracker.Forget(input.ContentID)
 	if input.AccessedAt != nil {
 		deletionSucceeded = true
 	}
-	return taskengine.Complete("Local cache removed", func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.CacheEvictions.RecordDeletion(ctx, input.ContentID, input.Generation, execution.ID())
-	})
+	return taskengine.Complete("Local cache removed", nil)
 }
 
-func (h *TaskHandlers) completeCacheEvictionWithoutDelete(input cacheeviction.EvictInput, taskID int64, message string) taskengine.Result {
-	return taskengine.Cancel(message, func(ctx context.Context, repos *repository.Repositories) error {
+func (h *TaskHandlers) cancelCacheEviction(
+	input cacheeviction.EvictInput,
+	taskID int64,
+	message string,
+) taskengine.Result {
+	return taskengine.Cancel(message, h.releaseCacheEvictionSettlement(input, taskID))
+}
+
+func (h *TaskHandlers) releaseCacheEvictionSettlement(input cacheeviction.EvictInput, taskID int64) taskengine.Settlement {
+	return func(ctx context.Context, repos *repository.Repositories) error {
 		err := repos.CacheEvictions.ReleaseEviction(ctx, input.ContentID, input.Generation, taskID)
 		if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) {
 			return nil
 		}
 		return err
-	})
+	}
+}
+
+func (h *TaskHandlers) retryCacheEviction(
+	execution taskengine.Execution,
+	input cacheeviction.EvictInput,
+	err error,
+	reason string,
+) taskengine.Result {
+	if execution.RetryWillFail() {
+		return taskengine.Fail(err, reason, h.releaseCacheEvictionSettlement(input, execution.ID()))
+	}
+	return taskengine.RetryBackoff(err, reason, nil)
 }
 
 func (h *TaskHandlers) reserveLRUDeletion(size int64) bool {
@@ -369,10 +454,14 @@ func (h *TaskHandlers) cacheDurabilityHandler() taskengine.Handler {
 			if h.taskService == nil {
 				return errors.New("task service is unavailable")
 			}
-			generation, err := repos.CacheEvictions.NextEvictionGeneration(ctx, candidate.ID)
+			reservation, err := repos.CacheEvictions.PrepareEviction(ctx, candidate.ID)
 			if err != nil {
 				return err
 			}
+			if reservation.ActiveTaskID != nil {
+				return nil
+			}
+			generation := reservation.Generation
 			taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 				Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(candidate.ID, generation),
 				Input:       cacheeviction.EvictInput{ContentID: candidate.ID, Generation: generation},

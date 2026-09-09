@@ -90,6 +90,13 @@ type Definition struct {
 	Codec        Codec
 	RetryLimit   *int
 	AllowRetry   bool
+	// CanManualRetry optionally narrows AllowRetry for one failed task based on
+	// its durable failure evidence. Nil preserves the type-wide policy.
+	CanManualRetry func(*model.Task) bool
+}
+
+func (d Definition) manualRetryAllowed(task *model.Task) bool {
+	return d.AllowRetry && (d.CanManualRetry == nil || d.CanManualRetry(task))
 }
 
 func (d Definition) validate() error {

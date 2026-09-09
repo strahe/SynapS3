@@ -76,8 +76,16 @@ func (r *BunStorageCleanupRepo) MarkCopyRemoved(ctx context.Context, id int64) e
 		Set("last_error = NULL").
 		Set("updated_at = ?", now).
 		Where("id = ?", id).
+		Where("status IN (?)", bun.List([]model.StorageCleanupCopyStatus{
+			model.StorageCleanupCopyStatusPending,
+			model.StorageCleanupCopyStatusDeleteScheduled,
+			model.StorageCleanupCopyStatusFailed,
+		})).
 		Exec(ctx)
-	return storageCleanupCopyUpdateResult(res, err, "marking storage cleanup copy removed")
+	if err := storageCleanupCopyTransitionResult(ctx, r.db, res, err, id, model.StorageCleanupCopyStatusRemoved, "", "marking storage cleanup copy removed"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *BunStorageCleanupRepo) MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error {
@@ -90,8 +98,12 @@ func (r *BunStorageCleanupRepo) MarkCopyDeleteScheduled(ctx context.Context, id 
 		Set("last_error = NULL").
 		Set("updated_at = ?", now).
 		Where("id = ?", id).
+		Where("status = ?", model.StorageCleanupCopyStatusPending).
 		Exec(ctx)
-	return storageCleanupCopyUpdateResult(res, err, "marking storage cleanup copy scheduled")
+	return storageCleanupCopyTransitionResult(
+		ctx, r.db, res, err, id, model.StorageCleanupCopyStatusDeleteScheduled, txHash,
+		"marking storage cleanup copy scheduled",
+	)
 }
 
 func (r *BunStorageCleanupRepo) MarkCopyFailed(ctx context.Context, id int64, message string) error {
@@ -232,4 +244,44 @@ func storageCleanupCopyUpdateResult(res sql.Result, err error, op string) error 
 		return fmt.Errorf("%s: %w", op, ErrNotFound)
 	}
 	return nil
+}
+
+func storageCleanupCopyTransitionResult(
+	ctx context.Context,
+	db bun.IDB,
+	res sql.Result,
+	err error,
+	id int64,
+	idempotentStatus model.StorageCleanupCopyStatus,
+	idempotentTxHash string,
+	op string,
+) error {
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 1 {
+		return nil
+	}
+	var current struct {
+		Status       model.StorageCleanupCopyStatus `bun:"status"`
+		DeleteTxHash *string                        `bun:"delete_tx_hash"`
+	}
+	err = db.NewSelect().
+		Model((*model.StorageCleanupCopy)(nil)).
+		Column("status", "delete_tx_hash").
+		Where("id = ?", id).
+		Scan(ctx, &current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%s: %w", op, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: checking current state: %w", op, err)
+	}
+	if current.Status == idempotentStatus &&
+		(idempotentStatus != model.StorageCleanupCopyStatusDeleteScheduled ||
+			(current.DeleteTxHash != nil && *current.DeleteTxHash == idempotentTxHash)) {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", op, ErrConflict)
 }

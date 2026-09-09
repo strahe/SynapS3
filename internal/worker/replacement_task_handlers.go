@@ -113,7 +113,7 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 		if snapshot.HasFailed {
 			return h.failReplacement(row.ID, errors.New("stored content migration requires attention"), "replacement_item_attention")
 		}
-		if !snapshot.SeedingComplete || snapshot.ItemsCopied < snapshot.ItemsTotal {
+		if !snapshot.SeedingComplete || snapshot.HasPending {
 			return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "copy_work", "Waiting for stored content migration", nil)
 		}
 		return h.scheduleReplacementRetirement(input, execution.ID(), row, row.SourceDataSetID, "Old storage service retirement scheduled")
@@ -259,6 +259,9 @@ func (h *TaskHandlers) dataSetRetireHandler() taskengine.Handler {
 			return storagereplacement.ValidateRetireInput(*input)
 		}),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
+		CanManualRetry: func(task *model.Task) bool {
+			return task == nil || task.FailureReason == nil || *task.FailureReason != "termination_outcome_unknown"
+		},
 	}
 	return taskHandler{
 		definition: definition,

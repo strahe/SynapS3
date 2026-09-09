@@ -2,12 +2,14 @@ package worker_test
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -71,6 +73,7 @@ type handlerRuntimeOptions struct {
 	highPercent            int
 	lowPercent             int
 	concurrency            int
+	maxRetries             *int
 	register               func(*worker.TaskHandlers, *taskengine.Registry) error
 }
 
@@ -88,6 +91,10 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	}
 	gate := cacheaccess.NewGate()
 	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
+	maxRetries := 5
+	if options.maxRetries != nil {
+		maxRetries = *options.maxRetries
+	}
 	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
 		Repositories: repos, Events: options.events, Cache: cacheStore, CacheGate: gate, CacheTracker: tracker,
 		Storage: storageClient, Wallet: options.wallet, Receipts: options.receipts,
@@ -96,7 +103,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		Terminator:             options.terminator, Epochs: options.epochs,
 		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
-		DefaultCopies: 2, MaxRetries: 5, Logger: slog.Default(),
+		DefaultCopies: 2, MaxRetries: maxRetries, Logger: slog.Default(),
 	})
 	if err != nil {
 		t.Fatalf("new task handlers: %v", err)
@@ -393,6 +400,10 @@ func TestLRUDeletionWaitsForOpenReaderAndCancelsAfterNewAccess(t *testing.T) {
 	stored, err := runtime.repos.Objects.GetVersionByID(t.Context(), version.VersionID)
 	if err != nil || stored == nil || !stored.InCache {
 		t.Fatalf("recently used version = %#v, err=%v", stored, err)
+	}
+	entry, err := runtime.repos.CacheEvictions.GetCacheEntry(t.Context(), *version.ContentID)
+	if err != nil || entry == nil || entry.CacheActiveTaskID != nil {
+		t.Fatalf("cancelled cache eviction owner = %#v, err=%v", entry, err)
 	}
 }
 
@@ -747,7 +758,7 @@ func TestCacheEvictionRecoverObservesBeforeReturningToExecute(t *testing.T) {
 	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
 		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(*version.ContentID, generation),
 		Input:       cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: generation},
-		SubjectType: "object_version", SubjectKey: version.VersionID,
+		SubjectType: "storage_content", SubjectKey: fmt.Sprint(*version.ContentID),
 	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
 		return repos.CacheEvictions.BindEvictionTask(ctx, *version.ContentID, generation, taskRow.ID)
 	})
@@ -790,6 +801,195 @@ func TestCacheEvictionRecoverObservesBeforeReturningToExecute(t *testing.T) {
 	}
 	if len(stored.Checkpoint) == 0 {
 		t.Fatal("cache eviction completed without an attempted-effect checkpoint")
+	}
+	entry, err := runtime.repos.CacheEvictions.GetCacheEntry(t.Context(), *version.ContentID)
+	if err != nil || entry == nil {
+		t.Fatalf("load cache entry after eviction = %#v, err=%v", entry, err)
+	}
+	if entry.CacheActiveTaskID != nil || entry.InCache {
+		t.Fatalf("cache entry after eviction = %#v, want owner released and in_cache=false", entry)
+	}
+}
+
+func TestCacheEvictionRecoverConvergesAfterDeletionWasAlreadyRecorded(t *testing.T) {
+	var deleteCalls atomic.Int64
+	cacheStore := &testutil.MockCache{
+		GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+		DeleteFunc: func(context.Context, string, string) error {
+			deleteCalls.Add(1)
+			return nil
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{cache: cacheStore, policy: cache.EvictionPolicyNone})
+	version := seedStoredCacheObject(t, runtime, 11, time.Now().UTC().Add(-time.Hour))
+	generation, err := runtime.repos.CacheEvictions.NextEvictionGeneration(t.Context(), *version.ContentID)
+	if err != nil {
+		t.Fatalf("next eviction generation: %v", err)
+	}
+	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(*version.ContentID, generation),
+		Input:       cacheeviction.EvictInput{ContentID: *version.ContentID, Generation: generation},
+		SubjectType: "storage_content", SubjectKey: fmt.Sprint(*version.ContentID),
+	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+		return repos.CacheEvictions.BindEvictionTask(ctx, *version.ContentID, generation, taskRow.ID)
+	})
+	if err != nil {
+		t.Fatalf("enqueue cache eviction: %v", err)
+	}
+	// Simulate a crash after unlink + RecordDeletion committed but before the
+	// engine persisted the task's completed transition.
+	if err := runtime.repos.CacheEvictions.RecordDeletion(t.Context(), *version.ContentID, generation, taskRow.ID); err != nil {
+		t.Fatalf("record cache deletion before recovery: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Where("id = ?", taskRow.ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("force recovery mode: %v", err)
+	}
+
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+	if got := deleteCalls.Load(); got != 0 {
+		t.Fatalf("cache delete calls during recovery = %d, want 0", got)
+	}
+	entry, err := runtime.repos.CacheEvictions.GetCacheEntry(t.Context(), *version.ContentID)
+	if err != nil || entry == nil {
+		t.Fatalf("load cache entry after recovery = %#v, err=%v", entry, err)
+	}
+	if entry.CacheActiveTaskID != nil || entry.InCache {
+		t.Fatalf("cache entry after recovery = %#v, want owner released and in_cache=false", entry)
+	}
+}
+
+func TestCacheEvictionRecoverCancelsAfterNewGenerationCompletes(t *testing.T) {
+	cacheStore := &testutil.MockCache{
+		GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, os.ErrNotExist
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{cache: cacheStore, policy: cache.EvictionPolicyNone})
+	version := seedStoredCacheObject(t, runtime, 11, time.Now().UTC().Add(-time.Hour))
+	contentID := *version.ContentID
+
+	firstGeneration, err := runtime.repos.CacheEvictions.NextEvictionGeneration(t.Context(), contentID)
+	if err != nil {
+		t.Fatalf("next first eviction generation: %v", err)
+	}
+	firstTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, firstGeneration),
+		Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: firstGeneration},
+		SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
+	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+		return repos.CacheEvictions.BindEvictionTask(ctx, contentID, firstGeneration, taskRow.ID)
+	})
+	if err != nil {
+		t.Fatalf("enqueue first cache eviction: %v", err)
+	}
+	if err := runtime.repos.CacheEvictions.RecordDeletion(t.Context(), contentID, firstGeneration, firstTask.ID); err != nil {
+		t.Fatalf("record first cache deletion: %v", err)
+	}
+	if err := runtime.repos.Objects.RecordContentCacheCommit(t.Context(), contentID, time.Now()); err != nil {
+		t.Fatalf("restore cache presence: %v", err)
+	}
+
+	reservation, err := runtime.repos.CacheEvictions.PrepareEviction(t.Context(), contentID)
+	if err != nil {
+		t.Fatalf("prepare replacement eviction: %v", err)
+	}
+	if reservation.ActiveTaskID != nil || reservation.Generation <= firstGeneration {
+		t.Fatalf("replacement eviction reservation = %#v", reservation)
+	}
+	secondTask, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, reservation.Generation),
+		Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: reservation.Generation},
+		SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
+		AvailableAt: time.Now().Add(time.Hour),
+	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+		return repos.CacheEvictions.BindEvictionTask(ctx, contentID, reservation.Generation, taskRow.ID)
+	})
+	if err != nil {
+		t.Fatalf("enqueue replacement cache eviction: %v", err)
+	}
+	if err := runtime.repos.CacheEvictions.RecordDeletion(t.Context(), contentID, reservation.Generation, secondTask.ID); err != nil {
+		t.Fatalf("record replacement cache deletion: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Where("id = ?", firstTask.ID).
+		Exec(t.Context()); err != nil {
+		t.Fatalf("force first task recovery mode: %v", err)
+	}
+
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	stored := waitForTask(t, runtime.repos, firstTask.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCancelled
+	})
+	if stored.RetryCount != 0 || stored.LastError != nil {
+		t.Fatalf("superseded task diagnostics = retry_count=%d last_error=%v", stored.RetryCount, stored.LastError)
+	}
+	entry, err := runtime.repos.CacheEvictions.GetCacheEntry(t.Context(), contentID)
+	if err != nil || entry == nil {
+		t.Fatalf("load cache entry after superseded recovery = %#v, err=%v", entry, err)
+	}
+	if entry.CacheOperationGeneration != reservation.Generation || entry.CacheActiveTaskID != nil || entry.InCache {
+		t.Fatalf("newer cache generation changed by stale recovery: %#v", entry)
+	}
+}
+
+func TestCacheEvictionPersistentDeleteFailureReleasesOwner(t *testing.T) {
+	deleteErr := errors.New("cache filesystem is read-only")
+	cacheStore := &testutil.MockCache{
+		DeleteFunc: func(context.Context, string, string) error {
+			return deleteErr
+		},
+	}
+	noRetries := 0
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		cache: cacheStore, policy: cache.EvictionPolicyNone, maxRetries: &noRetries,
+	})
+	version := seedStoredCacheObject(t, runtime, 11, time.Now().UTC().Add(-time.Hour))
+	contentID := *version.ContentID
+	generation, err := runtime.repos.CacheEvictions.NextEvictionGeneration(t.Context(), contentID)
+	if err != nil {
+		t.Fatalf("next eviction generation: %v", err)
+	}
+	taskRow, _, err := runtime.service.EnqueueTx(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
+		Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
+		SubjectType: "storage_content", SubjectKey: fmt.Sprint(contentID),
+	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+		return repos.CacheEvictions.BindEvictionTask(ctx, contentID, generation, taskRow.ID)
+	})
+	if err != nil {
+		t.Fatalf("enqueue cache eviction: %v", err)
+	}
+
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	stored := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if stored.FailureReason == nil || *stored.FailureReason != "cache_delete_failed" {
+		t.Fatalf("failure reason = %v, want cache_delete_failed", stored.FailureReason)
+	}
+	if stored.LastError == nil || !strings.Contains(*stored.LastError, deleteErr.Error()) {
+		t.Fatalf("last error = %v, want %q", stored.LastError, deleteErr)
+	}
+	entry, err := runtime.repos.CacheEvictions.GetCacheEntry(t.Context(), contentID)
+	if err != nil || entry == nil {
+		t.Fatalf("load cache entry after failed eviction = %#v, err=%v", entry, err)
+	}
+	if entry.CacheActiveTaskID != nil || !entry.InCache {
+		t.Fatalf("cache entry after failed eviction = %#v, want released owner and retained cache", entry)
 	}
 }
 
@@ -1285,14 +1485,31 @@ func TestStoreTasksReachAndRespectProviderMutationLimit(t *testing.T) {
 	}
 }
 
-func TestPullRecoverObservesAndNeverRepeatsAmbiguousRequest(t *testing.T) {
+func TestPullRecoverObservesThenRepeatsIdenticalRequestInExecute(t *testing.T) {
 	var pullCalls, statusCalls atomic.Int64
 	statusObserved := make(chan struct{})
+	type observedPull struct {
+		piece string
+		extra string
+		url   string
+	}
+	var observedMu sync.Mutex
+	var observed []observedPull
 	target := &testutil.MockStorageTarget{
 		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
-		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
-			pullCalls.Add(1)
-			return nil, errors.New("ambiguous provider disconnect")
+		PullFunc: func(_ context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+			call := pullCalls.Add(1)
+			observedMu.Lock()
+			observed = append(observed, observedPull{
+				piece: request.Pieces[0].String(),
+				extra: hex.EncodeToString(request.ExtraData),
+				url:   request.From(request.Pieces[0]),
+			})
+			observedMu.Unlock()
+			if call == 1 {
+				return nil, errors.New("ambiguous provider disconnect")
+			}
+			return &storage.PullResult{}, nil
 		},
 		PieceStatusFunc: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
 			if statusCalls.Add(1) == 1 {
@@ -1309,6 +1526,14 @@ func TestPullRecoverObservesAndNeverRepeatsAmbiguousRequest(t *testing.T) {
 		},
 	})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+	version := &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "pull-recovery.bin",
+		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize, ETag: "pull-recovery",
+		ContentType: "application/octet-stream",
+	}
+	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+		t.Fatalf("create pull recovery version: %v", err)
+	}
 	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
 	dataSetID := pipeline.targetSet.DataSetID.SDK()
 	target.DataSetIDValue = &dataSetID
@@ -1317,9 +1542,17 @@ func TestPullRecoverObservesAndNeverRepeatsAmbiguousRequest(t *testing.T) {
 		return target, nil
 	}
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
-	runtime.repos.Tasks = limited
-	cancel, done := runHandlerEngine(t, runtime)
+	limitedRepos := *runtime.repos
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 3}
+	limitedRepos.Tasks = limited
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+	}, &limitedRepos, runtime.registry, slog.Default())
+	if err != nil {
+		t.Fatalf("new limited task engine: %v", err)
+	}
+	cancel, done := runEngine(t, engine)
 	defer stopHandlerEngine(t, cancel, done)
 
 	recovering := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
@@ -1350,10 +1583,206 @@ func TestPullRecoverObservesAndNeverRepeatsAmbiguousRequest(t *testing.T) {
 		t.Fatal("pull recovery did not inspect target piece")
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
 	})
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("make repeated pull ready: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+	if pullCalls.Load() != 2 {
+		t.Fatalf("pull calls = %d, want 2", pullCalls.Load())
+	}
+	observedMu.Lock()
+	defer observedMu.Unlock()
+	if len(observed) != 2 || observed[0] != observed[1] {
+		t.Fatalf("pull requests = %#v, want two identical requests", observed)
+	}
+}
+
+func TestPullProviderFailureAtomicallyAbandonsAttemptAndCopy(t *testing.T) {
+	target := &testutil.MockStorageTarget{
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) { return []byte{0xaa, 0xbb}, nil },
+		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+			return nil, fmt.Errorf("provider pull: %w", pdp.ErrPullFailed)
+		},
+	}
+	storageClient := &testutil.MockStorageClient{}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: storageClient, policy: cache.EvictionPolicyNone,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+	dataSetID := pipeline.targetSet.DataSetID.SDK()
+	target.DataSetIDValue = &dataSetID
+	target.ClientDataSetIDValue = pipeline.targetClient
+	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+		return target, nil
+	}
+	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "pull_failed" {
+		t.Fatalf("pull task failure = %#v, want pull_failed", failed)
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil {
+		t.Fatalf("failed pull copy = %#v, err=%v", copyRow, err)
+	}
+	var attempts []storagepull.Attempt
+	if err := runtime.db.NewSelect().Model(&attempts).Where("content_id = ?", pipeline.target.ContentID).Scan(t.Context()); err != nil {
+		t.Fatalf("load pull attempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != storagepull.AttemptStatusAbandoned ||
+		attempts[0].ResolvedAt == nil || attempts[0].LastError == nil {
+		t.Fatalf("pull attempts = %#v, want one resolved abandoned attempt", attempts)
+	}
+	if err := runtime.repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
+		StorageCopyID: pipeline.target.ID, ContentID: pipeline.target.ContentID,
+		CopyIndex: pipeline.target.CopyIndex, PullAttemptID: attempts[0].AttemptID,
+		LastError: "replayed pull failure",
+	}); err != nil {
+		t.Fatalf("replay abandoned pull settlement: %v", err)
+	}
+	if err := runtime.repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
+		StorageCopyID: pipeline.target.ID, ContentID: pipeline.target.ContentID,
+		CopyIndex: pipeline.target.CopyIndex, PullAttemptID: "different-attempt",
+		LastError: "mismatched pull failure",
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("mismatched abandoned pull settlement = %v, want ErrConflict", err)
+	}
+}
+
+func newPullErrorTask(
+	t *testing.T,
+	pullErr error,
+	maxRetries *int,
+	pullCalls *atomic.Int64,
+) (handlerTestRuntime, seededCopyPipeline, *model.Task) {
+	t.Helper()
+	target := &testutil.MockStorageTarget{
+		PresignForCommitFunc: func(context.Context, []storage.PieceInput) ([]byte, error) {
+			return []byte{0xaa, 0xbb}, nil
+		},
+		PullFunc: func(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+			pullCalls.Add(1)
+			return nil, pullErr
+		},
+	}
+	storageClient := &testutil.MockStorageClient{}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: storageClient, policy: cache.EvictionPolicyNone, maxRetries: maxRetries,
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+	target.ProviderIDValue = pipeline.targetSet.ProviderID.SDK()
+	dataSetID := pipeline.targetSet.DataSetID.SDK()
+	target.DataSetIDValue = &dataSetID
+	target.ClientDataSetIDValue = pipeline.targetClient
+	storageClient.OpenDataSetTargetFunc = func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.DataSetTarget, error) {
+		return target, nil
+	}
+	return runtime, pipeline, bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStoragePull)
+}
+
+func assertFailedPullSettlement(
+	t *testing.T,
+	runtime handlerTestRuntime,
+	pipeline seededCopyPipeline,
+	taskRow *model.Task,
+	wantReason string,
+) {
+	t.Helper()
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != wantReason {
+		t.Fatalf("pull task failure = %#v, want %s", failed, wantReason)
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow == nil || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil {
+		t.Fatalf("failed pull copy = %#v, err=%v", copyRow, err)
+	}
+	var attempts []storagepull.Attempt
+	if err := runtime.db.NewSelect().Model(&attempts).Where("content_id = ?", pipeline.target.ContentID).Scan(t.Context()); err != nil {
+		t.Fatalf("load pull attempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != storagepull.AttemptStatusAbandoned || attempts[0].ResolvedAt == nil {
+		t.Fatalf("pull attempts = %#v, want one resolved abandoned attempt", attempts)
+	}
+}
+
+func TestPullTerminalClientErrorsSettleAttemptAndCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "bad request", err: &pdp.HTTPError{StatusCode: http.StatusBadRequest}},
+		{name: "invalid arguments", err: storage.ErrInvalidArgument},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var pullCalls atomic.Int64
+			runtime, pipeline, taskRow := newPullErrorTask(t, tt.err, nil, &pullCalls)
+			assertFailedPullSettlement(t, runtime, pipeline, taskRow, "pull_failed")
+			if pullCalls.Load() != 1 {
+				t.Fatalf("pull calls = %d, want 1", pullCalls.Load())
+			}
+		})
+	}
+}
+
+func TestPullRetryableProviderErrorKeepsCopyOpen(t *testing.T) {
+	limit := 0
+	var pullCalls atomic.Int64
+	runtime, pipeline, taskRow := newPullErrorTask(
+		t,
+		&pdp.HTTPError{StatusCode: http.StatusServiceUnavailable},
+		&limit,
+		&pullCalls,
+	)
+	limitedRepos := *runtime.repos
+	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+	}, &limitedRepos, runtime.registry, slog.Default())
+	if err != nil {
+		t.Fatalf("new limited task engine: %v", err)
+	}
+	cancel, done := runEngine(t, engine)
+	defer stopHandlerEngine(t, cancel, done)
+	pending := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return pullCalls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute
+	})
+	if pending.RetryCount != 0 {
+		t.Fatalf("retry count = %d, want 0 for retryable provider failure", pending.RetryCount)
+	}
+	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
+	if err != nil || copyRow == nil || copyRow.Status == model.StorageCopyStatusFailed || copyRow.ActiveTaskID == nil {
+		t.Fatalf("retryable pull copy = %#v, err=%v", copyRow, err)
+	}
+}
+
+func TestPullUnknownErrorFailsWhenRetryBudgetIsExhausted(t *testing.T) {
+	limit := 0
+	var pullCalls atomic.Int64
+	runtime, pipeline, taskRow := newPullErrorTask(t, errors.New("new sdk pull failure"), &limit, &pullCalls)
+	assertFailedPullSettlement(t, runtime, pipeline, taskRow, "pull_request_failed")
 	if pullCalls.Load() != 1 {
-		t.Fatalf("pull calls = %d, want exactly 1", pullCalls.Load())
+		t.Fatalf("pull calls = %d, want 1", pullCalls.Load())
 	}
 }
 
@@ -1652,6 +2081,130 @@ func seedWalletTask(t *testing.T, runtime handlerTestRuntime, requestID string) 
 		t.Fatalf("seed wallet task: %v", err)
 	}
 	return operation, taskRow
+}
+
+func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			return handlers.RegisterReplacement(registry)
+		},
+	})
+	ctx := t.Context()
+	bucket := &model.Bucket{
+		Name: "replacement-cancelled-item", Status: model.BucketStatusActive,
+		DefaultCopies: 1, MinimumDurableCopies: 1,
+	}
+	if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 11,
+		Checksum: testutil.StorageChecksum("replacement-cancelled-item"), RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("ensure content: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "cancelled.bin", Size: content.ContentSize,
+		ETag: "cancelled", ContentType: "application/octet-stream", ContentID: &content.ID,
+	}
+	if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+		t.Fatalf("create object version: %v", err)
+	}
+	sourceProvider := testOnChainID(t, 7401)
+	source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: sourceProvider, CopyIndex: 0, CreatedByContentID: content.ID,
+	})
+	if err != nil {
+		t.Fatalf("create source binding: %v", err)
+	}
+	sourceClientID := testOnChainID(t, 7402)
+	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: source.ID, ContentID: content.ID, DataSetID: testOnChainID(t, 7403), ClientDataSetID: &sourceClientID,
+	}); err != nil {
+		t.Fatalf("mark source ready: %v", err)
+	}
+	replacement, created, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID,
+		SelectionMode:    storagereplacement.SelectionModeManual,
+		TargetProviderID: testOnChainID(t, 7404), ClientRequestID: "cancelled-item",
+	})
+	if err != nil || !created {
+		t.Fatalf("authorize replacement = %#v created=%v err=%v", replacement, created, err)
+	}
+	target, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, replacement.TargetDataSetID)
+	if err != nil || target == nil {
+		t.Fatalf("load target = %#v err=%v", target, err)
+	}
+	targetClientID := testOnChainID(t, 7405)
+	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: target.ID, ContentID: content.ID, DataSetID: testOnChainID(t, 7406), ClientDataSetID: &targetClientID,
+	}); err != nil {
+		t.Fatalf("mark target ready: %v", err)
+	}
+	if err := runtime.repos.Replacements.Activate(ctx, replacement.ID); err != nil {
+		t.Fatalf("activate replacement: %v", err)
+	}
+	if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: target.ID, CopyIndex: target.CopyIndex,
+		TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: target.ProviderID,
+	}}); err != nil {
+		t.Fatalf("create target copy: %v", err)
+	}
+	item := &storagereplacement.Item{
+		ReplacementID: replacement.ID, ContentID: content.ID, TargetDataSetID: target.ID,
+		Status: storagereplacement.ItemStatusCancelled,
+	}
+	if _, err := runtime.db.NewInsert().Model(item).Exec(ctx); err != nil {
+		t.Fatalf("insert cancelled replacement item: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().
+		Model((*storagereplacement.Replacement)(nil)).
+		Set("seeding_complete = ?", true).
+		Set("items_total = ?", 1).
+		Where("id = ?", replacement.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("complete replacement seeding: %v", err)
+	}
+	coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
+		Type:           model.TaskTypeProviderReplacementCoordinate,
+		IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
+		Input: storagereplacement.CoordinateInput{
+			ReplacementID: replacement.ID, Generation: replacement.TaskGeneration,
+		},
+		SubjectType: "storage_replacement", SubjectKey: fmt.Sprint(replacement.ID),
+	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+		return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
+	})
+	if err != nil {
+		t.Fatalf("enqueue replacement coordinator: %v", err)
+	}
+
+	limitedRepos := *runtime.repos
+	limitedRepos.Tasks = &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
+	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
+		Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseDuration: 300 * time.Millisecond,
+		Retention: time.Hour, ProviderMutationConcurrency: 4, DestructiveMutationConcurrency: 2,
+	}, &limitedRepos, runtime.registry, slog.Default())
+	if err != nil {
+		t.Fatalf("new limited task engine: %v", err)
+	}
+	cancel, done := runEngine(t, engine)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+	stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("load replacement after coordination = %#v err=%v", stored, err)
+	}
+	if stored.Status != storagereplacement.StatusRetiring || stored.TaskID != nil {
+		t.Fatalf("replacement after cancelled item = %#v, want retiring with coordinator released", stored)
+	}
+	source, err = runtime.repos.Contents.GetDataSetBindingByID(ctx, source.ID)
+	if err != nil || source == nil || source.RetirementTaskID == nil {
+		t.Fatalf("source retirement reservation = %#v err=%v", source, err)
+	}
 }
 
 func TestRetirementRecoveryPersistsReturnedEpochWithoutRepeatingTermination(t *testing.T) {

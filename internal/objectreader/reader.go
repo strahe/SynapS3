@@ -143,9 +143,7 @@ func (r *Reader) openVersion(ctx context.Context, bucketName, key, versionID str
 	if !os.IsNotExist(cacheErr) {
 		return nil, fmt.Errorf("%w: %w", ErrCacheRead, cacheErr)
 	}
-	if version.InCache {
-		r.markCachePresence(ctx, version.VersionID, false)
-	}
+	r.reconcileCacheMiss(ctx, bucketName, version)
 
 	rc, err := r.downloadVersionFromProvider(ctx, key, version)
 	if errors.Is(err, ErrCacheMiss) {
@@ -200,9 +198,7 @@ func (r *Reader) open(ctx context.Context, bucketName, key string, visible Bucke
 		return nil, fmt.Errorf("%w: %w", ErrCacheRead, cacheErr)
 	}
 	cacheMiss = true
-	if version.InCache {
-		r.markCachePresence(ctx, version.VersionID, false)
-	}
+	r.reconcileCacheMiss(ctx, bucketName, version)
 
 	rc, err := r.downloadVersionFromProvider(ctx, key, version)
 	if errors.Is(err, ErrCacheMiss) {
@@ -309,7 +305,7 @@ func (r *Reader) streamAndRehydrate(
 			skipRehydration bool
 		)
 		err := r.cacheGate.Commit(
-			versionID,
+			cacheKey,
 			func() error {
 				persistedVersion, err := r.repos.Objects.GetVersionByID(ctx, versionID)
 				if err != nil {
@@ -361,13 +357,28 @@ func (r *Reader) streamAndRehydrate(
 	return body
 }
 
-func (r *Reader) markCachePresence(ctx context.Context, versionID string, inCache bool) {
-	if r == nil || r.repos == nil || r.repos.Objects == nil || versionID == "" {
+func (r *Reader) reconcileCacheMiss(ctx context.Context, bucketName string, version *model.ObjectVersion) {
+	if r == nil || r.repos == nil || r.repos.Objects == nil || version == nil || !version.InCache || version.ContentID == nil {
 		return
 	}
-	if err := r.repos.Objects.SetVersionCachePresence(ctx, versionID, inCache); err != nil {
-		r.logger.Warn("cache location update failed", "versionID", versionID, "inCache", inCache, "error", err)
-	}
+	cacheKey := version.CacheKey()
+	r.cacheGate.GuardDeletion(cacheKey, func() {
+		body, _, err := r.cache.Get(ctx, bucketName, cacheKey)
+		switch {
+		case err == nil && body != nil:
+			if closeErr := body.Close(); closeErr != nil {
+				r.logger.Warn("cache miss recheck close failed", "cacheKey", cacheKey, "error", closeErr)
+			}
+		case err == nil:
+			r.logger.Warn("cache miss recheck returned an empty read handle", "cacheKey", cacheKey)
+		case os.IsNotExist(err):
+			if persistErr := r.repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); persistErr != nil {
+				r.logger.Warn("cache location update failed", "versionID", version.VersionID, "inCache", false, "error", persistErr)
+			}
+		default:
+			r.logger.Warn("cache miss recheck failed", "cacheKey", cacheKey, "error", err)
+		}
+	})
 }
 
 func (r *Reader) openCached(
@@ -376,7 +387,7 @@ func (r *Reader) openCached(
 	version *model.ObjectVersion,
 ) (io.ReadCloser, error) {
 	opened, err := r.cacheGate.Open(
-		version.VersionID,
+		version.CacheKey(),
 		func() (io.ReadCloser, *cache.ObjectInfo, error) {
 			return r.cache.Get(ctx, bucketName, version.CacheKey())
 		},

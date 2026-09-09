@@ -306,37 +306,45 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
-	if err := staged.CommitAs(bucketName, model.ContentCacheKey(content.ID)); err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("committing assembled cache file: %w", err)
-	}
-	if err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
-		if err != nil {
-			return err
+	cacheKey := model.ContentCacheKey(content.ID)
+	cacheCommitted := false
+	err = b.cacheGate.Commit(cacheKey, func() error {
+		if err := staged.CommitAs(bucketName, cacheKey); err != nil {
+			return fmt.Errorf("committing assembled cache file: %w", err)
 		}
+		cacheCommitted = true
+		return b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+			state, err := txRepos.Contents.ContentPipelineState(ctx, content.ID)
+			if err != nil {
+				return err
+			}
 
-		version := &model.ObjectVersion{
-			VersionID:         versionID,
-			BucketID:          upload.BucketID,
-			Key:               keyName,
-			Size:              cacheInfo.Size,
-			ETag:              s3ETag,
-			ContentType:       upload.ContentType,
-			Metadata:          upload.Metadata,
-			MultipartUploadID: &uploadID,
-			ContentID:         &content.ID,
-		}
-		objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
-		if err != nil {
-			return fmt.Errorf("creating assembled object version: %w", err)
-		}
-		if err := b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state); err != nil {
-			return err
-		}
+			version := &model.ObjectVersion{
+				VersionID:         versionID,
+				BucketID:          upload.BucketID,
+				Key:               keyName,
+				Size:              cacheInfo.Size,
+				ETag:              s3ETag,
+				ContentType:       upload.ContentType,
+				Metadata:          upload.Metadata,
+				MultipartUploadID: &uploadID,
+				ContentID:         &content.ID,
+			}
+			objectID, err = txRepos.Objects.CreateVersionAndSetCurrent(ctx, version)
+			if err != nil {
+				return fmt.Errorf("creating assembled object version: %w", err)
+			}
+			if err := b.enqueuePostWriteTask(ctx, txRepos, objectID, versionID, version.ContentID, state); err != nil {
+				return err
+			}
 
-		return txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted)
-	}); err != nil {
-		b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after multipart complete tx failure")
+			return txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted)
+		})
+	})
+	if err != nil {
+		if cacheCommitted {
+			b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after multipart complete tx failure")
+		}
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	completed = true

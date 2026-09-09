@@ -1444,6 +1444,42 @@ func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input 
 			return err
 		}
 		now := time.Now()
+		if input.PullAttemptID != "" {
+			result, err := db.NewUpdate().
+				Model((*storagepull.Attempt)(nil)).
+				Set("status = ?", storagepull.AttemptStatusAbandoned).
+				Set("last_error = ?", lastError).
+				Set("resolved_at = ?", now).
+				Set("updated_at = ?", now).
+				Where("attempt_id = ?", input.PullAttemptID).
+				Where("content_id = ?", contentID).
+				Where(`storage_data_set_id = (
+					SELECT storage_data_set_id FROM storage_copies WHERE id = ?
+				)`, copyID).
+				Where("status = ? AND resolved_at IS NULL", storagepull.AttemptStatusAttempted).
+				Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("abandoning failed storage pull: %w", err)
+			}
+			rows, _ := result.RowsAffected()
+			if rows == 0 {
+				count, err := db.NewSelect().
+					Model((*storagepull.Attempt)(nil)).
+					Where("attempt_id = ?", input.PullAttemptID).
+					Where("content_id = ?", contentID).
+					Where(`storage_data_set_id = (
+						SELECT storage_data_set_id FROM storage_copies WHERE id = ?
+					)`, copyID).
+					Where("status = ? AND resolved_at IS NOT NULL", storagepull.AttemptStatusAbandoned).
+					Count(ctx)
+				if err != nil {
+					return fmt.Errorf("checking abandoned storage pull: %w", err)
+				}
+				if count != 1 {
+					return fmt.Errorf("abandoning failed storage pull: %w", ErrConflict)
+				}
+			}
+		}
 		if _, err := db.NewUpdate().
 			Model((*storagecommit.Attempt)(nil)).
 			Set("status = ?", storagecommit.AttemptStatusReleased).

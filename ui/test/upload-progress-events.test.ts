@@ -52,7 +52,7 @@ test('upload progress events patch object list cache by version id', () => {
 
   const data = qc.getQueryData<ObjectListResponse>(['objects', 'photos', '', '/', '', 50])
   assert.equal(data?.objects[0]?.progress?.percent, 40)
-  assert.equal(qc.getQueryCache().find({ queryKey: ['tasks'] })?.state.isInvalidated, true)
+  assert.equal(qc.getQueryCache().find({ queryKey: ['tasks'] })?.state.isInvalidated, false)
 })
 
 test('upload progress events ignore stale attempts and late running updates', () => {

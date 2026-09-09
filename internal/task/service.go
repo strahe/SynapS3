@@ -150,7 +150,7 @@ func (s *Service) Retry(ctx context.Context, id int64) error {
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownType, task.Type)
 	}
-	if !definition.AllowRetry {
+	if !definition.manualRetryAllowed(task) {
 		return ErrRetryUnsupported
 	}
 	return s.repos.Tasks.RetryFailed(ctx, id)
@@ -172,7 +172,7 @@ func (s *Service) Retryable(task *model.Task) bool {
 		return false
 	}
 	definition, ok := s.registry.Definition(task.Type)
-	return ok && definition.AllowRetry
+	return ok && definition.manualRetryAllowed(task)
 }
 
 func (s *Service) Acknowledgeable(task *model.Task) bool {

@@ -120,14 +120,9 @@ type StorageCleanupReservation struct {
 }
 
 type DeleteObjectVersionResult struct {
-	DeletionID int64
-	ContentID  *int64
-	// ContentUnreferenced reports that this deletion removed the last live
-	// version pointing at the content, so its cached bytes may be released.
-	// Cache residency is content-addressed, so any earlier version sharing
-	// those bytes must keep them.
-	ContentUnreferenced bool
-	StorageCleanup      *StorageCleanupReservation
+	DeletionID     int64
+	ContentID      *int64
+	StorageCleanup *StorageCleanupReservation
 }
 
 type DeleteDeletedObjectInput struct {
@@ -137,9 +132,8 @@ type DeleteDeletedObjectInput struct {
 }
 
 type DeletedObjectVersionSnapshot struct {
-	VersionID           string
-	ContentID           *int64
-	ContentUnreferenced bool
+	VersionID string
+	ContentID *int64
 }
 
 type DeleteDeletedObjectResult struct {
@@ -165,6 +159,10 @@ type ObjectRepository interface {
 	// ClearContentCachePresence records that a content payload no longer has
 	// cached bytes on this node.
 	ClearContentCachePresence(ctx context.Context, contentID int64) error
+	// ReleaseContentCacheIfUnreferenced locks the content row, rechecks live
+	// references, and invokes release before clearing cache presence in the
+	// same transaction. The callback must be idempotent.
+	ReleaseContentCacheIfUnreferenced(ctx context.Context, contentID int64, release func() error) (bool, error)
 	// ContentIsUnreferenced reports whether any live object version still
 	// points at the content.
 	ContentIsUnreferenced(ctx context.Context, contentID int64) (bool, error)
@@ -413,6 +411,9 @@ type MarkUploadCopyFailedInput struct {
 	ContentID     int64
 	CopyIndex     int
 	LastError     string
+	// PullAttemptID abandons the unresolved provider pull in the same
+	// transaction as the copy failure. Empty means this was not a pull failure.
+	PullAttemptID string
 }
 
 // MarkUploadCopyCommittedInput requires CommitAttemptID: a committed copy is a
