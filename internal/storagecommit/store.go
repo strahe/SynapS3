@@ -10,8 +10,8 @@ import (
 const MaxActiveAttemptsPerDataSet = 4
 
 type CopyIdentity struct {
-	StorageUploadCopyID int64
-	UploadID            int64
+	StorageCopyID       int64
+	ContentID           int64
 	CopyIndex           int
 	StorageDataSetID    int64
 	RequireEligibleCopy bool
@@ -32,7 +32,7 @@ type ReserveInput struct {
 
 type ReserveResult struct {
 	State ReservationState
-	Copy  model.StorageUploadCopy
+	Copy  model.StorageCopy
 	// AttentionHeld counts the data set's active attempts already flagged for
 	// operator attention. It is set only when capacity turned the reservation
 	// away, so a waiting result with zero here is queued behind work that is
@@ -49,7 +49,7 @@ type AttemptInput struct {
 
 type AttemptResult struct {
 	Entered bool
-	Copy    model.StorageUploadCopy
+	Copy    model.StorageCopy
 }
 
 type EvidenceInput struct {
@@ -77,6 +77,7 @@ type ResetInput struct {
 type ReleaseInput struct {
 	Copy              CopyIdentity
 	AttemptID         string
+	Reason            ReleaseReason
 	KnownNotSubmitted bool
 	ClearReadyAt      bool
 	ClearExtraData    bool

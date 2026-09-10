@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +51,7 @@ func TestAdminEventHubDoesNotBlockOnSlowSubscribers(t *testing.T) {
 	fast, unsubscribeFast := hub.subscribe()
 	defer unsubscribeFast()
 
-	for i := 0; i < adminEventSubscriberBuffer; i++ {
+	for range adminEventSubscriberBuffer {
 		hub.publish("provider_identity_updated", map[string]any{"provider_id": "101"})
 		select {
 		case <-fast:
@@ -193,7 +194,7 @@ func TestAdminEventsHandlerStreamsUploadProgressEvent(t *testing.T) {
 	}
 
 	events.Publish("upload_progress_updated", map[string]any{
-		"upload_id":   int64(11),
+		"content_id":  int64(11),
 		"version_id":  "01J000000000000000PROG01",
 		"bucket_name": "photos",
 		"object_key":  "image.jpg",
@@ -218,7 +219,7 @@ func TestAdminEventsHandlerStreamsUploadProgressEvent(t *testing.T) {
 	var payload struct {
 		Seq       uint64 `json:"seq"`
 		Topic     string `json:"topic"`
-		UploadID  int64  `json:"upload_id"`
+		ContentID int64  `json:"content_id"`
 		VersionID string `json:"version_id"`
 		Progress  struct {
 			Scope         string `json:"scope"`
@@ -232,7 +233,7 @@ func TestAdminEventsHandlerStreamsUploadProgressEvent(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(dataLine), "data: ")), &payload); err != nil {
 		t.Fatalf("Unmarshal SSE data: %v", err)
 	}
-	if payload.Seq != 1 || payload.Topic != "upload_progress_updated" || payload.UploadID != 11 || payload.VersionID != "01J000000000000000PROG01" || payload.Progress.Percent == nil || *payload.Progress.Percent != 40 {
+	if payload.Seq != 1 || payload.Topic != "upload_progress_updated" || payload.ContentID != 11 || payload.VersionID != "01J000000000000000PROG01" || payload.Progress.Percent == nil || *payload.Progress.Percent != 40 {
 		t.Fatalf("payload = %#v, want upload progress event payload", payload)
 	}
 }
@@ -271,12 +272,7 @@ func readSSEEventLines(t *testing.T, reader *bufio.Reader) []string {
 }
 
 func containsLine(lines []string, want string) bool {
-	for _, line := range lines {
-		if line == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(lines, want)
 }
 
 func findDataLine(lines []string) string {

@@ -55,7 +55,7 @@ synaps3 wallet generate
 示例：
 
 ```json
-{"status":"unhealthy","errors":["worker/uploader: not responding"]}
+{"status":"unhealthy","errors":["worker/tasks: not responding"]}
 ```
 
 检查任务状态：
@@ -109,21 +109,21 @@ synaps3 admin settings get cache.lru_low_watermark_percent
 - 先确认主机仍有可用磁盘空间，再按容量增大 `cache.max_size_gb`。
 - 恢复存储提供方连接和后台任务进度，让排队上传完成并触发缓存淘汰。
 - 默认的 `lru` 适合按容量自动清理。降低高水位可以为新写入保留更多余量，并始终满足 `0 <= low < high <= 100`。
-- 只有希望版本达到存储桶要求的最低耐久副本数后，在下一次 Evictor 轮询中删除对应版本时，才使用 `after_upload`。
+- 只有希望版本达到存储桶要求的最低耐久副本数后异步删除对应版本时，才使用 `after_upload`。
 - 需要完全禁用自动清理时使用 `none`。
 
-LRU 无法清理 multipart 暂存数据、未达到存储桶最低耐久副本数的版本，或没有可读已提交远端副本的版本。写入不会同步触发淘汰，因此在 Evictor 追赶完成或出现安全候选前，仍可能继续返回 `507 Insufficient Storage`。
+LRU 无法清理 multipart 暂存数据、未达到存储桶最低耐久副本数的版本，或没有可读已提交远端副本的版本。写入不会同步触发清理，因此在后台清理追赶完成或出现安全候选前，仍可能继续返回 `507 Insufficient Storage`。
 
-LRU 删除失败后，任务仍会作为 exhausted 工作保留，并在一小时冷却后重新具备执行资格。先修复任务中报告的文件系统或数据库问题；需要提前重试时，运行 `synaps3 admin task retry <id>`。
+LRU 删除失败后，任务仍会作为 failed 工作保留。先修复任务中报告的文件系统或数据库问题；任务标记为可重试时，可运行 `synaps3 admin task retry <id>`。
 
 修改缓存设置后，重启 SynapS3，检查 `/healthz`，再运行 `synaps3 admin settings get` 验证实际生效的缓存设置。
 
-## Exhausted 任务
+## Failed 任务
 
-列出 exhausted 任务：
+列出 failed 任务：
 
 ```bash
-synaps3 admin task list --status exhausted --limit 100
+synaps3 admin task list --status failed --limit 100
 ```
 
 确认 RPC 连接、存储提供方可用性、钱包余额、FWSS approval 和缓存磁盘容量都已就绪后，再重试。
@@ -132,7 +132,7 @@ synaps3 admin task list --status exhausted --limit 100
 synaps3 admin task retry 42
 ```
 
-存储提供方替换工作是例外：不要从 Tasks 重试。复制重试和等待可读内容会自动继续，重启后也一样。已完成或已停止的替换任务会提供 **Open Data Sets**，直接打开受影响存储桶的 **Details** → **Storage** → **Data Sets**。仅在页面显示 **Retry replacement** 时使用它；需要处理的内容会按当前 `worker.provider_replacement.max_retries` 设置重试，已经完成的内容会保留。如果所选存储提供方已经存储该桶，请改选其他存储提供方。
+API 会判断每个失败任务能否安全重试。存储提供方替换从 **Details** → **Storage** → **Data Sets** 恢复。只有尚未发出广播的钱包操作可以从 Tasks 恢复；广播结果不确定时仍不可重试。Store 结果不确定时会提供 **Check again**，它只观察存储提供方，不会再次上传。只有在核对失败结果后才使用 **Dismiss** 或 `synaps3 admin task acknowledge <id>`；确认后的任务会继续保留配置的时长，再由后台清理。
 
 ## 存储提供方或 RPC 问题
 
@@ -159,4 +159,4 @@ curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 2. Access key 和 secret key 来自 `synaps3 admin s3-user create`。
 3. 本地评估使用 `http://localhost:8080`，生产环境使用正确的 HTTPS S3 地址。
 4. 对象大小在 `127` 到 `1,065,353,216` 字节之间，并且对象键符合 [S3 兼容性限制](../reference/s3-compatibility.md#稳定限制)。
-5. 仪表盘任务页显示 Filecoin 存储处于 `queued`、`running` 还是 `exhausted`。
+5. 仪表盘任务页显示 Filecoin 存储处于 `queued`、`running`、`waiting` 还是 `failed`。

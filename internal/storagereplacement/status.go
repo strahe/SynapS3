@@ -22,8 +22,8 @@ const (
 	// StatusCleanupAttention means retirement cannot proceed without an
 	// operator decision. Automatic task retry is suppressed.
 	StatusCleanupAttention Status = "cleanup_attention"
-	// StatusFailed means the work exhausted its retries and needs the operator
-	// to retry it from the Data Sets surface.
+	// StatusFailed means automatic recovery stopped and the operator must retry
+	// it from the Data Sets surface.
 	StatusFailed Status = "failed"
 	// StatusCompleted means the source service was terminated and observed as
 	// terminated.
@@ -92,27 +92,18 @@ type ItemStatus string
 const (
 	// ItemStatusPending is seeded work not yet attempted.
 	ItemStatusPending ItemStatus = "pending"
-	// ItemStatusRunning is an item leased by a replacement worker.
-	ItemStatusRunning ItemStatus = "running"
-	// ItemStatusRetrying is temporarily failed work waiting for its persisted
-	// retry schedule. It remains retirement-blocking.
-	ItemStatusRetrying ItemStatus = "retrying"
-	// ItemStatusWaitingSource means no readable copy and no cached content is
-	// available yet. The coordinator moves on and revisits it later.
-	ItemStatusWaitingSource ItemStatus = "waiting_source"
 	// ItemStatusCopied means the target holds a committed readable copy.
 	ItemStatusCopied ItemStatus = "copied"
 	// ItemStatusCancelled means the content no longer needs migrating.
 	ItemStatusCancelled ItemStatus = "cancelled"
-	// ItemStatusFailed exhausted its item-level retry budget. Other items may
-	// continue, but the source cannot retire until an operator retries it.
-	ItemStatusFailed ItemStatus = "failed"
+	// ItemStatusAttention requires an operator decision before retirement.
+	ItemStatusAttention ItemStatus = "attention"
 )
 
 // Executable reports whether an item is still active or recoverable.
 func (s ItemStatus) Executable() bool {
 	switch s {
-	case ItemStatusPending, ItemStatusRunning, ItemStatusRetrying, ItemStatusWaitingSource:
+	case ItemStatusPending:
 		return true
 	default:
 		return false
@@ -122,8 +113,7 @@ func (s ItemStatus) Executable() bool {
 // Blocking reports whether the item prevents the source from being retired.
 func (s ItemStatus) Blocking() bool {
 	switch s {
-	case ItemStatusPending, ItemStatusRunning, ItemStatusRetrying,
-		ItemStatusWaitingSource, ItemStatusFailed:
+	case ItemStatusPending, ItemStatusAttention:
 		return true
 	default:
 		return false
@@ -133,9 +123,7 @@ func (s ItemStatus) Blocking() bool {
 // Valid reports whether the value is a known item status.
 func (s ItemStatus) Valid() bool {
 	switch s {
-	case ItemStatusPending, ItemStatusRunning, ItemStatusRetrying,
-		ItemStatusWaitingSource, ItemStatusCopied, ItemStatusCancelled,
-		ItemStatusFailed:
+	case ItemStatusPending, ItemStatusCopied, ItemStatusCancelled, ItemStatusAttention:
 		return true
 	default:
 		return false

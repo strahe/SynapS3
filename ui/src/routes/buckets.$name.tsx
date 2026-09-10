@@ -34,11 +34,9 @@ import {
   type ObjectItem,
   type ObjectProvenance,
   type ObjectProvenanceCopy,
-  type ObjectProvenanceFailure,
   type ObjectState,
   type ObjectStatus,
   type ObjectUploadClientProgress,
-  type ObjectUploadStatus,
   type ObjectVersionItem,
   objectVersionAlreadyCurrentCode,
   type ProviderReplacement,
@@ -115,19 +113,16 @@ import {
   useRestoreBucketObjectVersion,
   useRetryProviderReplacement,
   useS3Users,
-  useSettings,
   useStartProviderReplacement,
   useUpdateBucketCopyPolicy,
   useUpdateBucketOwner,
 } from '@/hooks/queries'
 import {
-  bucketCopyPolicyInheritOptionLabel,
   bucketCopyPolicyLabel,
   bucketCopyPolicySavedMessage,
   bucketCopyPolicyValue,
   clampMinimumDurableCopiesValue,
   copyPolicyOptions,
-  inheritedCopyPolicyValue,
   minimumDurableCopiesChoiceNote,
   minimumDurableCopiesFixedCountNote,
   minimumDurableCopiesLabel,
@@ -137,9 +132,10 @@ import {
   minimumDurableCopiesWarning,
   persistMinimumDurableCopies,
   replicaTargetChoiceNote,
+  replicaTargetLocked,
+  replicaTargetLockNote,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
-  strictMinimumDurableCopiesValue,
 } from '@/lib/bucket-copy-policy'
 import { type BucketRouteSearch, normalizeBucketRouteSearch } from '@/lib/bucket-route-search'
 import {
@@ -181,11 +177,9 @@ import {
   storageConfirmationListCommand,
   storageConfirmationReleaseWarning,
 } from '@/lib/storage-confirmation-attention'
-import { objectStateLabel, replicaLabel, transferMethodLabel, uploadStatusLabel } from '@/lib/storage-status-labels'
+import { objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
 import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
-
-type ProvenanceFailureDialogState = { title: string; text: string }
 
 const objectBrowserSkeletonRows = ['row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8']
 
@@ -433,7 +427,6 @@ function ObjectVersionsDialog({
                             versionID={version.version_id}
                             state={version.state}
                             status={version.status}
-                            uploadStatus={version.upload_status}
                             progress={version.progress}
                             compact
                           />
@@ -716,82 +709,60 @@ function ObjectProvenanceDialog({
 }) {
   const provenance = useObjectProvenance(bucketName, versionID, open)
   const data = provenance.data
-  const [failureDialog, setFailureDialog] = useState<ProvenanceFailureDialogState | null>(null)
-
-  const handleOpenChange = (next: boolean) => {
-    if (!next) setFailureDialog(null)
-    onOpenChange(next)
-  }
 
   return (
-    <>
-      <Dialog open={open} onOpenChange={handleOpenChange}>
-        <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-5xl lg:p-6">
-          <DialogHeader>
-            <DialogTitle>Storage provenance</DialogTitle>
-            <DialogDescription className="pr-8">
-              <span className="sr-only">Storage provenance for selected object version.</span>
-            </DialogDescription>
-            <div className="flex min-w-0 flex-col gap-1 pr-8 text-muted-foreground">
-              <CopyableValue
-                label="Object key"
-                value={objectKey}
-                monospace
-                maxLength={objectKey.length}
-                className="max-w-full"
-              />
-              <CopyableValue
-                label="Version"
-                value={versionID}
-                monospace
-                maxLength={versionID.length}
-                className="max-w-full"
-              />
-            </div>
-          </DialogHeader>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] sm:max-w-5xl lg:p-6">
+        <DialogHeader>
+          <DialogTitle>Storage provenance</DialogTitle>
+          <DialogDescription className="pr-8">
+            <span className="sr-only">Storage provenance for selected object version.</span>
+          </DialogDescription>
+          <div className="flex min-w-0 flex-col gap-1 pr-8 text-muted-foreground">
+            <CopyableValue
+              label="Object key"
+              value={objectKey}
+              monospace
+              maxLength={objectKey.length}
+              className="max-w-full"
+            />
+            <CopyableValue
+              label="Version"
+              value={versionID}
+              monospace
+              maxLength={versionID.length}
+              className="max-w-full"
+            />
+          </div>
+        </DialogHeader>
 
-          {provenance.isLoading ? (
-            <div className="flex h-40 items-center justify-center">
-              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-            </div>
-          ) : provenance.error ? (
-            <div className="text-sm text-destructive">Failed to load provenance</div>
-          ) : data ? (
-            <div className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1">
-              <ProvenanceSummary data={data} />
-              <ProvenanceCopies copies={data.copies} />
-              <ProvenanceFailures
-                failures={data.failures}
-                onOpenError={(failure) => {
-                  if (!failure.error) return
-                  setFailureDialog({ title: 'Failed Attempt Error', text: failure.error })
-                }}
-              />
-            </div>
-          ) : null}
-        </DialogContent>
-      </Dialog>
-      <DetailTextDialog
-        title={failureDialog?.title ?? 'Failed Attempt Error'}
-        text={failureDialog?.text ?? null}
-        onClose={() => setFailureDialog(null)}
-      />
-    </>
+        {provenance.isLoading ? (
+          <div className="flex h-40 items-center justify-center">
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+          </div>
+        ) : provenance.error ? (
+          <div className="text-sm text-destructive">Failed to load provenance</div>
+        ) : data ? (
+          <div className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1">
+            <ProvenanceSummary data={data} />
+            <ProvenanceCopies copies={data.copies} />
+          </div>
+        ) : null}
+      </DialogContent>
+    </Dialog>
   )
 }
 
 function ProvenanceSummary({ data }: { data: ObjectProvenance }) {
-  const progressPercent = data.upload_status === 'running' ? uploadProgressPercent(data.progress) : null
-  const uploadLabel = data.upload_status ? uploadStatusLabel(data.upload_status, progressPercent) : 'No upload recorded'
+  const progressPercent = uploadProgressPercent(data.progress)
 
   return (
     <dl className="grid gap-x-8 gap-y-4 rounded-md border border-border p-3 text-sm sm:grid-cols-2 lg:grid-cols-6">
       <ProvenanceSummaryItem
         label="Object status"
-        value={objectStateLabel(data.state, data.status, data.upload_status, progressPercent)}
-        className="lg:col-span-2"
+        value={objectStateLabel(data.state, data.status, progressPercent)}
+        className="lg:col-span-4"
       />
-      <ProvenanceSummaryItem label="Upload" value={uploadLabel} className="lg:col-span-2" />
       <ProvenanceSummaryItem label="Replicas" value={`${data.success_copies} / ${data.requested_copies}`} />
       <ProvenanceSummaryItem
         label="Object copy health"
@@ -928,51 +899,6 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
   )
 }
 
-function ProvenanceFailures({
-  failures,
-  onOpenError,
-}: {
-  failures: ObjectProvenanceFailure[]
-  onOpenError: (failure: ObjectProvenanceFailure) => void
-}) {
-  return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <div className="border-b border-border bg-muted/50 px-3 py-2 text-sm font-medium">Failed attempts</div>
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="px-3">Provider</TableHead>
-            <TableHead className="px-3">Transfer</TableHead>
-            <TableHead className="px-3">Stage</TableHead>
-            <TableHead className="px-3">Error</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {failures.map((failure) => (
-            <TableRow key={`${failure.attempt_index}-${failure.provider_id ?? 'unknown'}`}>
-              <TableCell className="px-3">
-                <ProviderIdentityCell providerID={failure.provider_id} identity={failure.provider_identity} />
-              </TableCell>
-              <TableCell className="px-3">{transferMethodLabel(failure.transfer_method)}</TableCell>
-              <TableCell className="px-3">{failure.stage ?? '—'}</TableCell>
-              <TableCell className="max-w-md px-3">
-                <ProvenanceFailureErrorCell failure={failure} onOpenError={onOpenError} />
-              </TableCell>
-            </TableRow>
-          ))}
-          {failures.length === 0 && (
-            <TableRow>
-              <TableCell colSpan={4} className="h-20 text-center text-muted-foreground">
-                No failed attempts recorded
-              </TableCell>
-            </TableRow>
-          )}
-        </TableBody>
-      </Table>
-    </div>
-  )
-}
-
 function OptionalCopyableValue({
   label,
   value,
@@ -984,28 +910,6 @@ function OptionalCopyableValue({
 }) {
   if (!value) return <span className="font-mono text-xs">—</span>
   return <CopyableValue label={label} value={value} monospace maxLength={maxLength} />
-}
-
-function ProvenanceFailureErrorCell({
-  failure,
-  onOpenError,
-}: {
-  failure: ObjectProvenanceFailure
-  onOpenError: (failure: ObjectProvenanceFailure) => void
-}) {
-  if (!failure.error) {
-    return <span className="text-muted-foreground">—</span>
-  }
-  return (
-    <Button
-      type="button"
-      variant="link"
-      onClick={() => onOpenError(failure)}
-      className="h-auto max-w-full justify-start p-0 text-left text-xs font-normal text-muted-foreground hover:text-foreground"
-    >
-      <span className="truncate">{failure.error}</span>
-    </Button>
-  )
 }
 
 function LocationBadges({ location }: { location: { cache: boolean; filecoin: boolean } }) {
@@ -1026,7 +930,6 @@ function ObjectStatusIcon({
   versionID,
   state,
   status,
-  uploadStatus,
   progress,
   compact = false,
 }: {
@@ -1034,22 +937,20 @@ function ObjectStatusIcon({
   versionID: string
   state?: ObjectState
   status: ObjectStatus
-  uploadStatus?: ObjectUploadStatus
   progress?: UploadTransferProgress
   compact?: boolean
 }) {
   const [detailEnabled, setDetailEnabled] = useState(false)
-  const visualStatus = objectVisualStatus(status, uploadStatus)
-  const detail = useObjectStatusDetail(bucketName, versionID, visualStatus === 'warning' && detailEnabled)
-  const progressPercent = uploadStatus === 'running' ? uploadProgressPercent(progress) : null
-  const displayLabel = objectStateLabel(state, status, uploadStatus, progressPercent)
+  const detail = useObjectStatusDetail(bucketName, versionID, status === 'warning' && detailEnabled)
+  const progressPercent = uploadProgressPercent(progress)
+  const displayLabel = objectStateLabel(state, status, progressPercent)
   const progressDetail =
     progressPercent === null || !progress
       ? null
       : `${formatBytes(progress.uploaded_bytes)} of ${formatBytes(progress.total_bytes)} uploaded`
 
   const loadDetail = () => {
-    if (visualStatus === 'warning') setDetailEnabled(true)
+    if (status === 'warning') setDetailEnabled(true)
   }
 
   return (
@@ -1067,21 +968,21 @@ function ObjectStatusIcon({
           onFocus={loadDetail}
           onClick={loadDetail}
         >
-          {objectStatusIcon(visualStatus, compact, progressPercent)}
+          {objectStatusIcon(status, compact, progressPercent)}
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-sm items-start whitespace-normal text-left">
         <div className="flex max-w-xs flex-col gap-1">
           <span className="font-medium">{displayLabel}</span>
           {progressDetail && <span className="break-words opacity-90">{progressDetail}</span>}
-          {visualStatus === 'warning' && (
+          {status === 'warning' && (
             <span className="break-words opacity-90">
               {detail.isLoading
                 ? 'Loading issue details'
                 : detail.error
                   ? 'Failed to load issue details'
                   : detail.data?.message
-                    ? `${failureStageLabel(detail.data.failed_at_state)}: ${detail.data.message}`
+                    ? detail.data.message
                     : 'No issue details recorded'}
             </span>
           )}
@@ -1110,16 +1011,6 @@ function objectStatusIcon(status: ObjectStatus, compact = false, progressPercent
       return <CircleSlash className={`${sizeClass} text-status-danger`} />
     default:
       return <Clock3 className={`${sizeClass} text-status-info`} />
-  }
-}
-
-function objectVisualStatus(status: ObjectStatus, uploadStatus?: ObjectUploadStatus): ObjectStatus {
-  switch (uploadStatus) {
-    case 'failed':
-    case 'rejected':
-      return 'warning'
-    default:
-      return status
   }
 }
 
@@ -1178,25 +1069,6 @@ function CopyAttentionDetails({ reasonCode, attentionAt }: { reasonCode: string;
       </div>
     </details>
   )
-}
-
-function failureStageLabel(state?: string) {
-  switch (state) {
-    case 'uploading':
-      return 'Failed while uploading'
-    case 'committing':
-      return 'Failed while registering storage record'
-    case 'replicating':
-      return 'Failed while syncing replicas'
-    case 'stored':
-      return 'Failed after storage'
-    case 'cached':
-      return 'Failed while cached'
-    case 'cache_evicted':
-      return 'Failed after cache removal'
-    default:
-      return 'Failure'
-  }
 }
 
 function ObjectBrowserPage() {
@@ -1408,7 +1280,7 @@ function ObjectBrowserPage() {
                 variant="outline"
                 size="sm"
                 onClick={() => setUploadOpen(true)}
-                disabled={bucket.data?.status !== 'active'}
+                disabled={bucket.data?.status !== 'ready'}
               >
                 <Upload data-icon="inline-start" /> Upload
               </Button>
@@ -2560,17 +2432,13 @@ function BucketDetailsSettings({
   onChangeOwner: () => void
 }) {
   const updateCopyPolicy = useUpdateBucketCopyPolicy()
-  const { data: settings } = useSettings()
   const currentCopyPolicy = bucketCopyPolicyValue(bucket)
   const currentMinimumDurableCopies = minimumDurableCopiesValue(bucket)
   const [copyPolicy, setCopyPolicy] = useState(currentCopyPolicy)
   const [minimumDurableCopies, setMinimumDurableCopies] = useState(currentMinimumDurableCopies)
   const [copyPolicyError, setCopyPolicyError] = useState<string | null>(null)
   const [copyPolicyNotice, setCopyPolicyNotice] = useState<string | null>(null)
-  const runtimeDefaultCopies = settings?.runtime_filecoin_default_copies
-  const inheritedTargetCopies =
-    currentCopyPolicy === inheritedCopyPolicyValue ? bucket.effective_copies : runtimeDefaultCopies
-  const targetCopies = selectedTargetCopies(copyPolicy, inheritedTargetCopies)
+  const targetCopies = selectedTargetCopies(copyPolicy)
   const minimumOptions = minimumDurableCopiesOptions(targetCopies)
 
   useEffect(() => {
@@ -2594,19 +2462,15 @@ function BucketDetailsSettings({
       nextMinimumDurableCopies !== undefined) &&
     copyPolicyNotice == null
   const handleCopyPolicyChange = (next: string) => {
-    const nextTarget = selectedTargetCopies(next, inheritedTargetCopies)
+    const nextTarget = selectedTargetCopies(next)
     setCopyPolicy(next)
-    setMinimumDurableCopies((current) => {
-      if (
-        bucket.minimum_durable_copies != null &&
-        nextTarget != null &&
-        bucket.minimum_durable_copies > bucket.effective_copies &&
-        bucket.minimum_durable_copies <= nextTarget
-      ) {
-        return bucket.minimum_durable_copies.toString()
-      }
-      return clampMinimumDurableCopiesValue(current, nextTarget)
-    })
+    // "All replicas" follows the target: a minimum that matched the old target
+    // keeps matching the new one instead of quietly becoming a fixed count.
+    setMinimumDurableCopies((current) =>
+      Number(current) === Number(currentCopyPolicy) && nextTarget != null
+        ? nextTarget.toString()
+        : clampMinimumDurableCopiesValue(current, nextTarget)
+    )
     setCopyPolicyError(null)
     setCopyPolicyNotice(null)
   }
@@ -2621,12 +2485,7 @@ function BucketDetailsSettings({
     updateCopyPolicy.mutate(
       {
         name: bucket.name,
-        defaultCopies:
-          copyPolicy === currentCopyPolicy
-            ? undefined
-            : copyPolicy === inheritedCopyPolicyValue
-              ? null
-              : Number(copyPolicy),
+        defaultCopies: copyPolicy === currentCopyPolicy ? undefined : Number(copyPolicy),
         minimumDurableCopies: nextMinimumDurableCopies,
       },
       {
@@ -2674,11 +2533,12 @@ function BucketDetailsSettings({
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value={inheritedCopyPolicyValue}>
-                    {bucketCopyPolicyInheritOptionLabel(bucket, runtimeDefaultCopies)}
-                  </SelectItem>
                   {copyPolicyOptions.map((copies) => (
-                    <SelectItem key={copies} value={copies.toString()}>
+                    <SelectItem
+                      key={copies}
+                      value={copies.toString()}
+                      disabled={replicaTargetLocked(copies, bucket.default_copies)}
+                    >
                       {copies} {copies === 1 ? 'copy' : 'copies'}
                     </SelectItem>
                   ))}
@@ -2686,6 +2546,7 @@ function BucketDetailsSettings({
               </SelectContent>
             </Select>
             <FieldDescription>{replicaTargetChoiceNote()}</FieldDescription>
+            {bucket.default_copies > 1 && <FieldDescription>{replicaTargetLockNote()}</FieldDescription>}
           </Field>
           <Field>
             <FieldLabel htmlFor={`bucket-minimum-durable-copies-${bucket.id}`}>Release cache after</FieldLabel>
@@ -2699,7 +2560,6 @@ function BucketDetailsSettings({
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value={strictMinimumDurableCopiesValue}>All replicas (strict)</SelectItem>
                   {minimumOptions.map((copies) => (
                     <SelectItem key={copies} value={copies.toString()}>
                       {minimumDurableCopiesOptionLabel(copies, targetCopies)}
@@ -2708,7 +2568,7 @@ function BucketDetailsSettings({
                 </SelectGroup>
               </SelectContent>
             </Select>
-            {minimumDurableCopies === strictMinimumDurableCopiesValue ? (
+            {targetCopies != null && Number(minimumDurableCopies) === targetCopies ? (
               <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
             ) : (
               <FieldDescription>{minimumDurableCopiesFixedCountNote()}</FieldDescription>
@@ -2849,7 +2709,6 @@ function ObjectBrowserTable({
                           versionID={object.current_version_id}
                           state={object.state}
                           status={object.status}
-                          uploadStatus={object.upload_status}
                           progress={object.progress}
                           compact
                         />

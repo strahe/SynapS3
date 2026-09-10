@@ -42,7 +42,10 @@ func Eventually[T any](
 	var lastErr error
 	for {
 		value, ready, err := poll(waitCtx)
-		last, lastErr = value, err
+		if err == nil {
+			last = value
+		}
+		lastErr = err
 		if err == nil && ready {
 			return value
 		}

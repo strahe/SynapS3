@@ -1,11 +1,9 @@
 package objectdeletion_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -17,133 +15,112 @@ import (
 	"github.com/strahe/synaps3/internal/testutil"
 )
 
-type cleanupRecorder struct {
-	mu     sync.Mutex
-	status model.CacheCleanupStatus
+type noopAccessStore struct{}
+
+func (*noopAccessStore) RecordContentCacheAccess(context.Context, int64, time.Time) error {
+	return nil
 }
 
-func (r *cleanupRecorder) UpdateObjectDeletionCacheCleanup(
-	_ context.Context,
-	_ string,
-	status model.CacheCleanupStatus,
-	_ string,
-) error {
+func (*noopAccessStore) RecordContentCacheCommit(context.Context, int64, time.Time) error {
+	return nil
+}
+
+func newReleaseTracker() *cacheaccess.Tracker {
+	return cacheaccess.NewTracker(0, &noopAccessStore{})
+}
+
+type presenceRecorder struct {
+	mu         sync.Mutex
+	cleared    []int64
+	clearErr   error
+	referenced bool
+}
+
+func (r *presenceRecorder) ClearContentCachePresence(_ context.Context, contentID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.status = status
-	return nil
+	r.cleared = append(r.cleared, contentID)
+	return r.clearErr
 }
 
-type cleanupAccessStore struct{}
-
-func (*cleanupAccessStore) RecordVersionCacheAccess(context.Context, string, time.Time) error {
-	return nil
+func (r *presenceRecorder) ReleaseContentCacheIfUnreferenced(
+	ctx context.Context,
+	contentID int64,
+	release func() error,
+) (bool, error) {
+	if r.referenced {
+		return false, nil
+	}
+	if err := release(); err != nil {
+		return false, err
+	}
+	if err := r.ClearContentCachePresence(ctx, contentID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func (*cleanupAccessStore) RecordVersionCacheCommit(context.Context, string, time.Time) error {
-	return nil
-}
-
-func TestRecordCacheCleanupWaitsForOpenResponseBody(t *testing.T) {
-	deleted := make(chan struct{})
-	mockCache := &testutil.MockCache{
-		DeleteFunc: func(context.Context, string, string) error {
-			close(deleted)
-			return nil
-		},
-	}
-	gate := cacheaccess.NewGate()
-	tracker := cacheaccess.NewTracker(
-		cacheaccess.DefaultPersistenceInterval,
-		new(cleanupAccessStore),
-	)
-	if err := tracker.RecordAccess(context.Background(), "version-1", nil); err != nil {
-		t.Fatalf("RecordAccess: %v", err)
-	}
-	opened, err := gate.Open(
-		"version-1",
-		func() (io.ReadCloser, *cache.ObjectInfo, error) {
-			return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-
-	recorder := new(cleanupRecorder)
-	cleanupDone := make(chan model.CacheCleanupStatus, 1)
-	go func() {
-		cleanupDone <- objectdeletion.RecordCacheCleanup(
-			context.Background(),
-			mockCache,
-			gate,
-			tracker,
-			recorder,
-			slog.Default(),
-			"bucket",
-			"version-1",
-			".versions/version-1",
-		)
-	}()
-
-	select {
-	case <-deleted:
-		t.Fatal("permanent deletion removed a cache file while its response body was open")
-	case <-time.After(20 * time.Millisecond):
-	}
-	if tracker.Latest("version-1").IsZero() {
-		t.Fatal("permanent deletion retired access tracking while the response body was open")
-	}
-	if err := opened.Body.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	select {
-	case status := <-cleanupDone:
-		if status != model.CacheCleanupStatusDeleted {
-			t.Fatalf("cleanup status = %s, want deleted", status)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("permanent deletion did not resume after the response body closed")
-	}
-	if got := tracker.Latest("version-1"); !got.IsZero() {
-		t.Fatalf("tracking entry after permanent deletion = %s, want retired", got)
-	}
-}
-
-func TestRecordCacheCleanupRetiresTrackingWhenCacheDeleteFails(t *testing.T) {
-	deleteErr := errors.New("cache delete failed")
-	mockCache := &testutil.MockCache{
-		DeleteFunc: func(context.Context, string, string) error {
+func newReleaseCache(deleteErr error) (*testutil.MockCache, *[]string) {
+	deleted := new([]string)
+	return &testutil.MockCache{
+		DeleteFunc: func(_ context.Context, _, key string) error {
+			*deleted = append(*deleted, key)
 			return deleteErr
 		},
-	}
-	gate := cacheaccess.NewGate()
-	tracker := cacheaccess.NewTracker(
-		cacheaccess.DefaultPersistenceInterval,
-		new(cleanupAccessStore),
-	)
-	if err := tracker.RecordAccess(context.Background(), "version-failed", nil); err != nil {
-		t.Fatalf("RecordAccess: %v", err)
-	}
-	if tracker.Latest("version-failed").IsZero() {
-		t.Fatal("tracker did not retain the initial cache access")
-	}
+		GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			return nil, nil, errors.New("unused")
+		},
+	}, deleted
+}
 
-	status := objectdeletion.RecordCacheCleanup(
-		context.Background(),
-		mockCache,
-		gate,
-		tracker,
-		new(cleanupRecorder),
-		slog.Default(),
-		"bucket",
-		"version-failed",
-		".versions/version-failed",
+func TestReleaseContentCacheDeletesTheContentKeyAndClearsPresence(t *testing.T) {
+	mockCache, deleted := newReleaseCache(nil)
+	recorder := &presenceRecorder{}
+	gate := cacheaccess.NewGate()
+	tracker := newReleaseTracker()
+
+	outcome, err := objectdeletion.ReleaseContentCache(
+		context.Background(), mockCache, gate, tracker, recorder, "bucket", 41,
 	)
-	if status != model.CacheCleanupStatusFailed {
-		t.Fatalf("cleanup status = %s, want failed", status)
+	if err != nil || outcome != objectdeletion.CacheReleaseReleased {
+		t.Fatalf("ReleaseContentCache = %q, %v, want released", outcome, err)
 	}
-	if got := tracker.Latest("version-failed"); !got.IsZero() {
-		t.Fatalf("tracking entry after permanent deletion = %s, want retired", got)
+	if want := model.ContentCacheKey(41); len(*deleted) != 1 || (*deleted)[0] != want {
+		t.Fatalf("deleted keys = %v, want [%s]", *deleted, want)
+	}
+	if len(recorder.cleared) != 1 || recorder.cleared[0] != 41 {
+		t.Fatalf("cleared presence = %v, want [41]", recorder.cleared)
+	}
+}
+
+func TestReleaseContentCacheReportsFailureWithoutClearingPresence(t *testing.T) {
+	mockCache, _ := newReleaseCache(errors.New("disk is busy"))
+	recorder := &presenceRecorder{}
+
+	outcome, err := objectdeletion.ReleaseContentCache(
+		context.Background(), mockCache, cacheaccess.NewGate(), newReleaseTracker(), recorder, "bucket", 41,
+	)
+	if err == nil || outcome != objectdeletion.CacheReleaseRetained {
+		t.Fatalf("ReleaseContentCache = %q, %v, want retained with an error", outcome, err)
+	}
+	// Presence must survive a failed delete, or the next reader would be told
+	// bytes are gone while the file is still there.
+	if len(recorder.cleared) != 0 {
+		t.Fatalf("cleared presence = %v, want none", recorder.cleared)
+	}
+}
+
+func TestReleaseContentCacheRetainsReferencedContent(t *testing.T) {
+	mockCache, deleted := newReleaseCache(nil)
+	recorder := &presenceRecorder{referenced: true}
+
+	outcome, err := objectdeletion.ReleaseContentCache(
+		context.Background(), mockCache, cacheaccess.NewGate(), newReleaseTracker(), recorder, "bucket", 41,
+	)
+	if err != nil || outcome != objectdeletion.CacheReleaseRetained {
+		t.Fatalf("ReleaseContentCache = %q, %v, want retained", outcome, err)
+	}
+	if len(*deleted) != 0 || len(recorder.cleared) != 0 {
+		t.Fatalf("retained content deleted=%v cleared=%v", *deleted, recorder.cleared)
 	}
 }

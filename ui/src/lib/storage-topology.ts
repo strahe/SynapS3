@@ -195,7 +195,6 @@ export function localStatusTone(status: string): StorageTopologyTone {
     case 'pending':
       return 'warning'
     case 'failed':
-    case 'unavailable':
       return 'danger'
     default:
       return 'neutral'

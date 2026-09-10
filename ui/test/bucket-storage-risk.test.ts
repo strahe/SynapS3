@@ -50,7 +50,7 @@ test('data set risk action is shown only for storage attention states', () => {
   )
   assert.equal(
     dataSetNeedsStorageRiskReview({
-      status: 'unavailable',
+      status: 'failed',
       referenced_version_count: 2,
       storage_health: { status: 'available', reason_codes: [] },
     }),
@@ -58,7 +58,7 @@ test('data set risk action is shown only for storage attention states', () => {
   )
   assert.equal(
     dataSetNeedsStorageRiskReview({
-      status: 'unavailable',
+      status: 'failed',
       referenced_version_count: 0,
       storage_health: { status: 'unavailable', reason_codes: [] },
     }),
@@ -87,7 +87,7 @@ test('data set storage impact labels distinguish healthy, attention, and cleanup
   )
   assert.equal(
     dataSetStorageImpactLabel({
-      status: 'unavailable',
+      status: 'failed',
       current_version_count: 1,
       referenced_version_count: 2,
       storage_health: { status: 'unavailable', reason_codes: [] },
@@ -96,7 +96,7 @@ test('data set storage impact labels distinguish healthy, attention, and cleanup
   )
   assert.equal(
     dataSetStorageImpactLabel({
-      status: 'unavailable',
+      status: 'failed',
       current_version_count: 0,
       referenced_version_count: 2,
       storage_health: { status: 'unavailable', reason_codes: [] },
@@ -105,7 +105,7 @@ test('data set storage impact labels distinguish healthy, attention, and cleanup
   )
   assert.equal(
     dataSetStorageImpactLabel({
-      status: 'unavailable',
+      status: 'failed',
       current_version_count: 0,
       referenced_version_count: 0,
       storage_health: { status: 'unavailable', reason_codes: [] },
@@ -153,7 +153,7 @@ test('data set storage impact tone highlights only retained versions needing rev
   )
   assert.equal(
     dataSetStorageImpactTone({
-      status: 'unavailable',
+      status: 'failed',
       current_version_count: 1,
       referenced_version_count: 2,
       storage_health: { status: 'unavailable', reason_codes: [] },
@@ -162,7 +162,7 @@ test('data set storage impact tone highlights only retained versions needing rev
   )
   assert.equal(
     dataSetStorageImpactTone({
-      status: 'unavailable',
+      status: 'failed',
       current_version_count: 0,
       referenced_version_count: 2,
       storage_health: { status: 'unavailable', reason_codes: [] },
@@ -171,7 +171,7 @@ test('data set storage impact tone highlights only retained versions needing rev
   )
   assert.equal(
     dataSetStorageImpactTone({
-      status: 'unavailable',
+      status: 'failed',
       current_version_count: 0,
       referenced_version_count: 0,
       storage_health: { status: 'unavailable', reason_codes: [] },

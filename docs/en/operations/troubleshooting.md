@@ -55,7 +55,7 @@ Expected result: health changes from `setup` to `ok` after restart.
 Example:
 
 ```json
-{"status":"unhealthy","errors":["worker/uploader: not responding"]}
+{"status":"unhealthy","errors":["worker/tasks: not responding"]}
 ```
 
 Check task pressure:
@@ -109,21 +109,21 @@ Recovery options:
 - Confirm the host has free disk space, then increase `cache.max_size_gb` if capacity allows.
 - Restore storage provider connectivity and background task progress so queued uploads can complete and cache eviction can run.
 - Use the default `lru` policy for capacity-based cleanup. Lower the high watermark to leave more write headroom, and keep `0 <= low < high <= 100`.
-- Use `after_upload` only when each version should be removed on the next Evictor poll after its bucket's minimum durable copies commit.
+- Use `after_upload` only when each version should be removed asynchronously after its bucket's minimum durable copies commit.
 - Use `none` when automatic removal must be disabled.
 
-LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. A write does not synchronously run eviction, so `507 Insufficient Storage` can continue until the Evictor catches up or safe candidates become available.
+LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. A write does not synchronously run cleanup, so `507 Insufficient Storage` can continue until background cleanup catches up or safe candidates become available.
 
-Failed LRU deletion tasks remain visible as exhausted work and become eligible again after a one-hour cooldown. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` to retry sooner.
+Failed LRU deletion tasks remain visible as failed work. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` when the task is marked retryable.
 
 After changing a cache setting, restart SynapS3, check `/healthz`, and verify the effective cache values with `synaps3 admin settings get`.
 
-## Exhausted Tasks
+## Failed Tasks
 
-List exhausted work:
+List failed work:
 
 ```bash
-synaps3 admin task list --status exhausted --limit 100
+synaps3 admin task list --status failed --limit 100
 ```
 
 Retry only after RPC connectivity, storage provider availability, wallet funds, FWSS approval, and cache disk capacity are ready.
@@ -132,7 +132,7 @@ Retry only after RPC connectivity, storage provider availability, wallet funds, 
 synaps3 admin task retry 42
 ```
 
-Provider replacement work is the exception: do not retry it from Tasks. Copy retries and waits for readable content resume automatically, including after a restart. Finished or stopped replacement tasks provide **Open Data Sets**, which opens the affected bucket directly at **Details** → **Storage** → **Data Sets**. Use **Retry replacement** only when that action is shown. It retries content that needs attention with the current `worker.provider_replacement.max_retries` setting and keeps completed work. If the selected provider already stores this bucket, choose a different provider instead.
+The API decides whether each failed task can be retried safely. Provider replacement work is recovered from **Details** → **Storage** → **Data Sets**. A wallet operation can be recovered from Tasks only when no broadcast started; an uncertain broadcast remains non-retryable. An uncertain Store offers **Check again**, which observes the provider without uploading again. Use **Dismiss** or `synaps3 admin task acknowledge <id>` only after reviewing the failure; acknowledged tasks remain available for the configured retention period before cleanup.
 
 ## Provider or RPC Issues
 
@@ -159,4 +159,4 @@ Check these in order:
 2. Access key and secret came from `synaps3 admin s3-user create`.
 3. Endpoint is `http://localhost:8080` for local evaluation or the correct HTTPS address for production.
 4. Object size is between `127` and `1,065,353,216` bytes, and the object key meets the [S3 compatibility limits](../reference/s3-compatibility.md#stable-limits).
-5. Dashboard task view shows whether Filecoin storage is queued, running, or exhausted.
+5. Dashboard task view shows whether Filecoin storage is queued, running, waiting, or failed.

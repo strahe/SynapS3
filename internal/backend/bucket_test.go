@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/strahe/synaps3/internal/model"
@@ -24,7 +26,7 @@ func TestCreateBucket_HappyPath(t *testing.T) {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 
-	// Verify bucket in DB with status=creating.
+	// The namespace is visible while provider storage is prepared in the background.
 	bucket, err := tb.repos.Buckets.GetByName(ctx, "my-bucket")
 	if err != nil {
 		t.Fatalf("GetByName: %v", err)
@@ -32,9 +34,25 @@ func TestCreateBucket_HappyPath(t *testing.T) {
 	if bucket == nil {
 		t.Fatal("bucket not found in DB")
 	}
-	if bucket.Status != model.BucketStatusActive {
-		t.Errorf("bucket status = %q, want %q", bucket.Status, model.BucketStatusActive)
+	if bucket.Status != model.BucketStatusProvisioning {
+		t.Errorf("bucket status = %q, want %q", bucket.Status, model.BucketStatusProvisioning)
 	}
+	provisionTask, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
+	if err != nil || provisionTask == nil || provisionTask.Status != model.TaskStatusPending {
+		t.Fatalf("bucket provision task = %#v, err=%v", provisionTask, err)
+	}
+}
+
+func TestProvisioningBucketRejectsObjectWritesAsRetryable(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := t.Context()
+	if err := tb.backend.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("warming-bucket")}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	_, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String("warming-bucket"), Key: aws.String("object.bin"),
+	})
+	requireAPIErrorCode(t, err, s3err.GetAPIError(s3err.ErrSlowDown))
 }
 
 func TestCreateBucketRejectsMissingBucketInput(t *testing.T) {
@@ -156,7 +174,7 @@ func TestHeadBucket_Exists(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed an active bucket directly via repos.
-	bkt := &model.Bucket{Name: "head-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "head-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -216,7 +234,7 @@ func TestDeleteBucket_NotSupported(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()
 
-	bkt := &model.Bucket{Name: "del-bucket", Status: model.BucketStatusActive}
+	bkt := &model.Bucket{Name: "del-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := tb.repos.Buckets.Create(ctx, bkt); err != nil {
 		t.Fatalf("seeding bucket: %v", err)
 	}
@@ -246,7 +264,7 @@ func TestListBuckets_OnlyActive(t *testing.T) {
 
 	// Seed active buckets.
 	for _, name := range []string{"active-1", "active-2", "active-3"} {
-		b := &model.Bucket{Name: name, Status: model.BucketStatusActive}
+		b := &model.Bucket{Name: name, Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 		if err := tb.repos.Buckets.Create(ctx, b); err != nil {
 			t.Fatalf("seeding bucket %q: %v", name, err)
 		}
@@ -285,7 +303,7 @@ func TestListBucketsFiltersNonAdminByOwnerAccessKey(t *testing.T) {
 		{name: "legacy-root-bucket"},
 		{name: "malformed-acl-bucket", acl: []byte("{")},
 	} {
-		b := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive}
+		b := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 		switch {
 		case seed.acl != nil:
 			b.ACL = seed.acl

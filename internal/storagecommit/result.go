@@ -14,12 +14,24 @@ const (
 	AdvanceNeedsAttention  AdvanceState = "needs_attention"
 )
 
+// Valid reports whether the application can write this release reason. The
+// database keeps the column open so newer binaries can add reasons safely.
+func (r ReleaseReason) Valid() bool {
+	switch r {
+	case ReleaseBeforeSubmitCanceled, ReleaseDataSetUnavailable, ReleaseOwnerTerminal, ReleaseManualDuplicateAck:
+		return true
+	default:
+		return false
+	}
+}
+
 type ReleaseReason string
 
 const (
 	ReleaseBeforeSubmitCanceled ReleaseReason = "before_submit_canceled"
 	ReleaseDataSetUnavailable   ReleaseReason = "data_set_unavailable"
 	ReleaseOwnerTerminal        ReleaseReason = "owner_terminal"
+	ReleaseManualDuplicateAck   ReleaseReason = "manual_duplicate_acknowledgement"
 )
 
 type AdvanceResult struct {

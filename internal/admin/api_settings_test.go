@@ -342,8 +342,8 @@ func TestSettingsValidateReportsDraftValidationRules(t *testing.T) {
 		},
 		{
 			name:    "duration parse",
-			payload: `{"worker":{"upload":{"poll_interval":"not-a-duration"}}}`,
-			field:   "worker.upload.poll_interval",
+			payload: `{"worker":{"tasks":{"poll_interval":"not-a-duration"}}}`,
+			field:   "worker.tasks.poll_interval",
 		},
 		{
 			name:    "env managed field",
@@ -448,7 +448,7 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 			"lru_high_watermark_percent":86,
 			"lru_low_watermark_percent":71
 		},
-		"worker":{"upload":{"poll_interval":"9s"}},
+		"worker":{"tasks":{"poll_interval":"9s"}},
 		"logging":{"format":"text","s3_access":{"enabled":false,"level":"debug"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -482,8 +482,8 @@ func TestSettingsPUTPersistsNonSecretFieldsAndReturnsRestartRequired(t *testing.
 	if loaded.Server.Port != ":8088" {
 		t.Fatalf("saved server.port = %q, want :8088", loaded.Server.Port)
 	}
-	if loaded.Worker.Upload.PollInterval.String() != "9s" {
-		t.Fatalf("saved worker.upload.poll_interval = %s, want 9s", loaded.Worker.Upload.PollInterval)
+	if loaded.Worker.Tasks.PollInterval.String() != "9s" {
+		t.Fatalf("saved worker.tasks.poll_interval = %s, want 9s", loaded.Worker.Tasks.PollInterval)
 	}
 	if loaded.Filecoin.DefaultCopies != 3 {
 		t.Fatalf("saved filecoin.default_copies = %d, want 3", loaded.Filecoin.DefaultCopies)
@@ -746,15 +746,13 @@ func TestSettingsPUTRejectsEnvManagedFieldChanges(t *testing.T) {
 		{name: "cache eviction policy", envName: "SYNAPS3_CACHE_EVICTION_POLICY", payload: `{"cache":{"eviction_policy":"after_upload"}}`, field: "cache.eviction_policy"},
 		{name: "cache LRU high watermark", envName: "SYNAPS3_CACHE_LRU_HIGH_WATERMARK_PERCENT", payload: `{"cache":{"lru_high_watermark_percent":85}}`, field: "cache.lru_high_watermark_percent"},
 		{name: "cache LRU low watermark", envName: "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT", payload: `{"cache":{"lru_low_watermark_percent":70}}`, field: "cache.lru_low_watermark_percent"},
-		{name: "upload concurrency", envName: "SYNAPS3_WORKER_UPLOAD_CONCURRENCY", payload: `{"worker":{"upload":{"concurrency":2}}}`, field: "worker.upload.concurrency"},
-		{name: "upload poll interval", envName: "SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL", payload: `{"worker":{"upload":{"poll_interval":"9s"}}}`, field: "worker.upload.poll_interval"},
-		{name: "upload max retries", envName: "SYNAPS3_WORKER_UPLOAD_MAX_RETRIES", payload: `{"worker":{"upload":{"max_retries":9}}}`, field: "worker.upload.max_retries"},
-		{name: "provider replacement concurrency", envName: "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_CONCURRENCY", payload: `{"worker":{"provider_replacement":{"concurrency":2}}}`, field: "worker.provider_replacement.concurrency"},
-		{name: "provider replacement poll interval", envName: "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_POLL_INTERVAL", payload: `{"worker":{"provider_replacement":{"poll_interval":"9s"}}}`, field: "worker.provider_replacement.poll_interval"},
-		{name: "provider replacement max retries", envName: "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_MAX_RETRIES", payload: `{"worker":{"provider_replacement":{"max_retries":9}}}`, field: "worker.provider_replacement.max_retries"},
-		{name: "evictor concurrency", envName: "SYNAPS3_WORKER_EVICTOR_CONCURRENCY", payload: `{"worker":{"evictor":{"concurrency":2}}}`, field: "worker.evictor.concurrency"},
-		{name: "evictor poll interval", envName: "SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL", payload: `{"worker":{"evictor":{"poll_interval":"2m"}}}`, field: "worker.evictor.poll_interval"},
-		{name: "evictor max retries", envName: "SYNAPS3_WORKER_EVICTOR_MAX_RETRIES", payload: `{"worker":{"evictor":{"max_retries":4}}}`, field: "worker.evictor.max_retries"},
+		{name: "task concurrency", envName: "SYNAPS3_WORKER_TASKS_CONCURRENCY", payload: `{"worker":{"tasks":{"concurrency":2}}}`, field: "worker.tasks.concurrency"},
+		{name: "task poll interval", envName: "SYNAPS3_WORKER_TASKS_POLL_INTERVAL", payload: `{"worker":{"tasks":{"poll_interval":"9s"}}}`, field: "worker.tasks.poll_interval"},
+		{name: "task lease duration", envName: "SYNAPS3_WORKER_TASKS_LEASE_DURATION", payload: `{"worker":{"tasks":{"lease_duration":"9m"}}}`, field: "worker.tasks.lease_duration"},
+		{name: "task max retries", envName: "SYNAPS3_WORKER_TASKS_MAX_RETRIES", payload: `{"worker":{"tasks":{"max_retries":9}}}`, field: "worker.tasks.max_retries"},
+		{name: "task retention", envName: "SYNAPS3_WORKER_TASKS_RETENTION", payload: `{"worker":{"tasks":{"retention":"72h"}}}`, field: "worker.tasks.retention"},
+		{name: "provider mutation concurrency", envName: "SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", payload: `{"worker":{"tasks":{"provider_mutation_concurrency":2}}}`, field: "worker.tasks.provider_mutation_concurrency"},
+		{name: "destructive mutation concurrency", envName: "SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", payload: `{"worker":{"tasks":{"destructive_mutation_concurrency":2}}}`, field: "worker.tasks.destructive_mutation_concurrency"},
 		{name: "logging level", envName: "SYNAPS3_LOGGING_LEVEL", payload: `{"logging":{"level":"debug"}}`, field: "logging.level"},
 		{name: "logging format", envName: "SYNAPS3_LOGGING_FORMAT", payload: `{"logging":{"format":"text"}}`, field: "logging.format"},
 		{name: "s3 access logging enabled", envName: "SYNAPS3_LOGGING_S3_ACCESS_ENABLED", payload: `{"logging":{"s3_access":{"enabled":false}}}`, field: "logging.s3_access.enabled", envValue: "true"},
@@ -799,7 +797,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"server":{"port":"not-a-port"},
 		"s3":{"region":""},
 		"filecoin":{"rpc_url":"ftp://example.invalid/rpc","default_copies":0},
-		"worker":{"upload":{"max_retries":-1}},
+		"worker":{"tasks":{"max_retries":-1}},
 		"logging":{"level":"verbose","format":"xml","s3_access":{"level":"verbose"}}
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -816,7 +814,7 @@ func TestSettingsPUTRejectsInvalidEditableFields(t *testing.T) {
 		"s3.region",
 		"filecoin.rpc_url",
 		"filecoin.default_copies",
-		"worker.upload.max_retries",
+		"worker.tasks.max_retries",
 		"logging.level",
 		"logging.format",
 		"logging.s3_access.level",

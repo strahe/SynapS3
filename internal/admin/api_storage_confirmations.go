@@ -12,7 +12,7 @@ import (
 
 type storageConfirmationAttentionResponse struct {
 	CopyID        int64     `json:"copy_id"`
-	UploadID      int64     `json:"upload_id"`
+	ContentID     int64     `json:"content_id"`
 	CopyIndex     int       `json:"copy_index"`
 	DataSetRowID  int64     `json:"data_set_row_id"`
 	ProviderID    string    `json:"provider_id"`
@@ -44,7 +44,7 @@ func (s *Server) handleAPIListStorageConfirmations(w http.ResponseWriter, r *htt
 		}
 		limit = parsed
 	}
-	records, err := s.repos.Uploads.ListCommitAttention(r.Context(), limit)
+	records, err := s.repos.Contents.ListCommitAttention(r.Context(), limit)
 	if err != nil {
 		s.logger.Error("api: failed to list storage confirmations", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -53,7 +53,7 @@ func (s *Server) handleAPIListStorageConfirmations(w http.ResponseWriter, r *htt
 	response := make([]storageConfirmationAttentionResponse, 0, len(records))
 	for _, record := range records {
 		response = append(response, storageConfirmationAttentionResponse{
-			CopyID: record.CopyID, UploadID: record.UploadID, CopyIndex: record.CopyIndex,
+			CopyID: record.CopyID, ContentID: record.ContentID, CopyIndex: record.CopyIndex,
 			DataSetRowID: record.DataSetRowID, ProviderID: record.ProviderID, DataSetID: record.DataSetID,
 			PieceCID: record.PieceCID, AttemptID: record.AttemptID, TransactionID: record.TransactionID,
 			ReasonCode: string(record.Code), AttemptedAt: record.AttemptedAt, AttentionAt: record.AttentionAt,
@@ -78,7 +78,7 @@ func (s *Server) handleAPIReleaseStorageConfirmation(w http.ResponseWriter, r *h
 		})
 		return
 	}
-	err = s.repos.Uploads.ReleaseCommitAttention(r.Context(), storagecommit.ManualReleaseInput{
+	err = s.repos.Contents.ReleaseCommitAttention(r.Context(), storagecommit.ManualReleaseInput{
 		CopyID: copyID, ExpectedAttemptID: req.ExpectedAttemptID, AcknowledgePossibleDuplicate: true,
 	})
 	switch {

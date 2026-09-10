@@ -77,7 +77,7 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 - `GET /metrics`
 - 缓存使用量
 - 任务队列深度
-- exhausted 任务数量
+- failed 任务数量
 - 后台任务活动
 - 存储提供方和数据集健康状态
 
@@ -85,15 +85,17 @@ synaps3 admin settings set filecoin.network=mainnet --yes
 
 ## 升级准备
 
+更改版本前先备份数据库和缓存，再按[升级与恢复](./upgrade-recovery.md)操作。如果启动时报告数据库不兼容，请保持该数据库不变，并改用新的数据库和缓存目录。
+
 升级前运行：
 
 ```bash
 curl http://127.0.0.1:9090/healthz
 synaps3 admin task stats
-synaps3 admin task list --status exhausted --limit 50
+synaps3 admin task list --status failed --limit 50
 ```
 
-预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 exhausted 任务都有明确处理方式。
+预期结果：`/healthz` 返回 `ok`，任务队列状态已确认，所有 failed 任务都有明确处理方式，然后再替换正在运行的进程。
 
 ## 恢复入口
 

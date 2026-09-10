@@ -97,7 +97,7 @@ func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
 		{
 			name: "healthy committed copy",
 			facts: CopyFacts{
-				Status:         model.StorageUploadCopyStatusCommitted,
+				Status:         model.StorageCopyStatusCommitted,
 				ProviderID:     onChainIDPtr(t, "101"),
 				LocalDataSetID: &localDataSetID,
 				ChainDataSetID: onChainIDPtr(t, "1001"),
@@ -111,7 +111,7 @@ func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
 		{
 			name: "pending copy",
 			facts: CopyFacts{
-				Status: model.StorageUploadCopyStatusPending,
+				Status: model.StorageCopyStatusPending,
 			},
 			wantStatus:  StatusDegraded,
 			wantReasons: []ReasonCode{ReasonCopyPending},
@@ -119,7 +119,7 @@ func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
 		{
 			name: "committing copy",
 			facts: CopyFacts{
-				Status: model.StorageUploadCopyStatusCommitting,
+				Status: model.StorageCopyStatusCommitting,
 			},
 			wantStatus:  StatusDegraded,
 			wantReasons: []ReasonCode{ReasonCopyCommitting},
@@ -127,7 +127,7 @@ func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
 		{
 			name: "failed copy",
 			facts: CopyFacts{
-				Status:    model.StorageUploadCopyStatusFailed,
+				Status:    model.StorageCopyStatusFailed,
 				LastError: stringPtr("provider rejected piece"),
 			},
 			wantStatus:  StatusUnavailable,
@@ -136,7 +136,7 @@ func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
 		{
 			name: "committed copy missing evidence",
 			facts: CopyFacts{
-				Status:         model.StorageUploadCopyStatusCommitted,
+				Status:         model.StorageCopyStatusCommitted,
 				LocalDataSetID: &localDataSetID,
 				ChainDataSetID: onChainIDPtr(t, "1001"),
 			},
@@ -147,7 +147,7 @@ func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
 		{
 			name: "committed copy missing observation",
 			facts: CopyFacts{
-				Status:         model.StorageUploadCopyStatusCommitted,
+				Status:         model.StorageCopyStatusCommitted,
 				ProviderID:     onChainIDPtr(t, "101"),
 				LocalDataSetID: &localDataSetID,
 				ChainDataSetID: onChainIDPtr(t, "1001"),
@@ -160,7 +160,7 @@ func TestCopyHealthFromFactsClassifiesLocalCopyState(t *testing.T) {
 		{
 			name: "unavailable data set observation",
 			facts: CopyFacts{
-				Status:         model.StorageUploadCopyStatusCommitted,
+				Status:         model.StorageCopyStatusCommitted,
 				ProviderID:     onChainIDPtr(t, "101"),
 				LocalDataSetID: &localDataSetID,
 				ChainDataSetID: onChainIDPtr(t, "1001"),
@@ -192,7 +192,7 @@ func TestCopyHealthFromFactsTreatsStaleDataSetAsUnknown(t *testing.T) {
 	observation := copyHealthDataSetObservation(t, localDataSetID, StatusAvailable, nil, checkedAt)
 	observation.Signal = BuildSignal(StatusAvailable, nil, nil, &checkedAt, time.Hour, now)
 	got := CopyHealthFromFacts(CopyFacts{
-		Status:         model.StorageUploadCopyStatusCommitted,
+		Status:         model.StorageCopyStatusCommitted,
 		ProviderID:     onChainIDPtr(t, "101"),
 		LocalDataSetID: &localDataSetID,
 		ChainDataSetID: onChainIDPtr(t, "1001"),

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/storage"
+	"github.com/uptrace/bun"
 )
 
 func newTestReader(
@@ -57,7 +59,7 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "reader-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "reader-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -70,17 +72,15 @@ func TestOpenUsesProviderFallbackAndRehydratesCache(t *testing.T) {
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR01",
-		State:       model.ObjectStateUploading,
 	}
-	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version))
 	if err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
-	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/piece")
+	acceptReaderVersionUpload(t, db, repos, version.VersionID, pieceCID, "https://provider.example/piece")
 	previousAccess := time.Now().Add(-24 * time.Hour)
-	if err := repos.Objects.RecordVersionCacheAccess(ctx, version.VersionID, previousAccess); err != nil {
-		t.Fatalf("RecordVersionCacheAccess before rehydrate: %v", err)
+	if err := repos.Objects.RecordContentCacheAccess(ctx, *version.ContentID, previousAccess); err != nil {
+		t.Fatalf("RecordContentCacheAccess before rehydrate: %v", err)
 	}
 
 	storageClient := &testutil.MockStorageClient{
@@ -144,7 +144,7 @@ func TestOpenVersionForCopyUsesProviderWithoutRehydratingSourceCache(t *testing.
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "copy-reader-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "copy-reader-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -157,13 +157,11 @@ func TestOpenVersionForCopyUsesProviderWithoutRehydratingSourceCache(t *testing.
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR09",
-		State:       model.ObjectStateUploading,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
-	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/copy")
+	acceptReaderVersionUpload(t, db, repos, version.VersionID, pieceCID, "https://provider.example/copy")
 	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
 		t.Fatalf("SetVersionCachePresence: %v", err)
 	}
@@ -218,7 +216,7 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "replicating-reader-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "replicating-reader-bucket", Status: model.BucketStatusActive, DefaultCopies: 3, MinimumDurableCopies: 3}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -231,22 +229,18 @@ func TestOpenReplicatingVersionUsesPrimaryCopyOnly(t *testing.T) {
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR05",
-		State:       model.ObjectStateCached,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
-	uploadID := bindReaderPrimaryCommittedUpload(t, repos, version.VersionID, pieceCID, "https://primary.example/piece")
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     uploadID,
+	contentID := bindReaderPrimaryCommittedUpload(t, db, repos, version.VersionID, pieceCID, "https://primary.example/piece")
+	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		ContentID:    contentID,
 		CopyIndex:    1,
 		PieceCID:     pieceCID,
 		PieceID:      onChainIDPtr(t, "2"),
 		RetrievalURL: "https://secondary.example/piece",
-	}); err != nil {
-		t.Fatalf("MarkUploadCopyCommitted secondary: %v", err)
-	}
+	})
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -284,7 +278,7 @@ func TestOpenCacheHitCoalescesAccessPersistenceWithoutLifecyclePresenceWrite(t *
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "cache-hit-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "cache-hit-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -296,10 +290,8 @@ func TestOpenCacheHitCoalescesAccessPersistenceWithoutLifecyclePresenceWrite(t *
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR08",
-		State:       model.ObjectStateCached,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	objects := &countingObjectRepo{ObjectRepository: repos.Objects}
@@ -345,21 +337,21 @@ func (r *countingObjectRepo) SetVersionCachePresence(ctx context.Context, versio
 	return r.ObjectRepository.SetVersionCachePresence(ctx, versionID, inCache)
 }
 
-func (r *countingObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
+func (r *countingObjectRepo) RecordContentCacheAccess(ctx context.Context, contentID int64, accessedAt time.Time) error {
 	r.cacheAccessWrites++
 	if r.cacheAccessErr != nil {
 		return r.cacheAccessErr
 	}
-	return r.ObjectRepository.RecordVersionCacheAccess(ctx, versionID, accessedAt)
+	return r.ObjectRepository.RecordContentCacheAccess(ctx, contentID, accessedAt)
 }
 
-func (r *countingObjectRepo) RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error {
+func (r *countingObjectRepo) RecordContentCacheCommit(ctx context.Context, contentID int64, accessedAt time.Time) error {
 	r.cacheAccessWrites++
 	r.cacheCommitWrites++
 	if r.cacheAccessErr != nil {
 		return r.cacheAccessErr
 	}
-	return r.ObjectRepository.RecordVersionCacheCommit(ctx, versionID, accessedAt)
+	return r.ObjectRepository.RecordContentCacheCommit(ctx, contentID, accessedAt)
 }
 
 func TestOpenCacheHitReconcilesStaleAbsentPresence(t *testing.T) {
@@ -371,7 +363,7 @@ func TestOpenCacheHitReconcilesStaleAbsentPresence(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "cache-presence-reconcile-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "cache-presence-reconcile-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -383,10 +375,8 @@ func TestOpenCacheHitReconcilesStaleAbsentPresence(t *testing.T) {
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR11",
-		State:       model.ObjectStateCached,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
@@ -422,7 +412,7 @@ func TestOpenCacheHitIgnoresCacheAccessPersistenceFailure(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "cache-access-failure-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "cache-access-failure-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -434,10 +424,8 @@ func TestOpenCacheHitIgnoresCacheAccessPersistenceFailure(t *testing.T) {
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR10",
-		State:       model.ObjectStateCached,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	objects := &countingObjectRepo{
@@ -473,7 +461,7 @@ func TestOpenCacheMissMarksCacheLocationAbsent(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "cache-miss-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "cache-miss-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -485,10 +473,8 @@ func TestOpenCacheMissMarksCacheLocationAbsent(t *testing.T) {
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR06",
-		State:       model.ObjectStateCached,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 
@@ -511,6 +497,80 @@ func TestOpenCacheMissMarksCacheLocationAbsent(t *testing.T) {
 	}
 }
 
+func TestOpenCacheMissDoesNotOverwriteConcurrentCommitPresence(t *testing.T) {
+	firstGetStarted := make(chan struct{})
+	allowFirstGetToReturn := make(chan struct{})
+	var present atomic.Bool
+	var getCalls atomic.Int64
+	mc := &testutil.MockCache{
+		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
+			if getCalls.Add(1) == 1 {
+				close(firstGetStarted)
+				<-allowFirstGetToReturn
+				return nil, nil, os.ErrNotExist
+			}
+			if present.Load() {
+				return io.NopCloser(bytes.NewReader([]byte("cached"))), &cache.ObjectInfo{Size: 6}, nil
+			}
+			return nil, nil, os.ErrNotExist
+		},
+	}
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := &model.Bucket{Name: "cache-miss-commit-race-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	version := &model.ObjectVersion{
+		VersionID:   "01J0000000000000000000OR12",
+		BucketID:    bucket.ID,
+		Key:         "concurrent-cache.txt",
+		Size:        6,
+		ETag:        "object-etag",
+		Checksum:    "object-checksum",
+		ContentType: "text/plain",
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
+		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
+	}
+
+	gate := cacheaccess.NewGate()
+	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
+	reader := New(repos, mc, nil, gate, tracker, slog.Default())
+	openDone := make(chan error, 1)
+	go func() {
+		result, err := reader.Open(ctx, bucket.Name, version.Key, S3Visibility)
+		if result != nil && result.Body != nil {
+			_ = result.Body.Close()
+		}
+		openDone <- err
+	}()
+
+	<-firstGetStarted
+	commitErr := gate.Commit(version.CacheKey(), func() error {
+		present.Store(true)
+		return repos.Objects.RecordContentCacheCommit(ctx, *version.ContentID, time.Now())
+	})
+	close(allowFirstGetToReturn)
+	if commitErr != nil {
+		t.Fatalf("commit cache presence: %v", commitErr)
+	}
+	if err := <-openDone; !errors.Is(err, ErrNoSuchKey) {
+		t.Fatalf("Open error = %v, want ErrNoSuchKey after provider fallback", err)
+	}
+	if getCalls.Load() != 2 {
+		t.Fatalf("cache get calls = %d, want initial miss plus guarded recheck", getCalls.Load())
+	}
+	stored, err := repos.Objects.GetVersionByID(ctx, version.VersionID)
+	if err != nil || stored == nil {
+		t.Fatalf("version after cache commit race: version=%v err=%v", stored, err)
+	}
+	if !stored.InCache {
+		t.Fatal("concurrent cache commit was overwritten by stale miss")
+	}
+}
+
 func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
 	mc := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
@@ -524,7 +584,7 @@ func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "rehydrate-fail-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "rehydrate-fail-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -537,13 +597,11 @@ func TestOpenRehydrateFailureDoesNotMarkCacheLocationPresent(t *testing.T) {
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR07",
-		State:       model.ObjectStateUploading,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
-	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/piece")
+	acceptReaderVersionUpload(t, db, repos, version.VersionID, pieceCID, "https://provider.example/piece")
 	if err := repos.Objects.SetVersionCachePresence(ctx, version.VersionID, false); err != nil {
 		t.Fatalf("SetVersionCachePresence: %v", err)
 	}
@@ -592,7 +650,7 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "deleted-reader-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "deleted-reader-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -605,14 +663,12 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR02",
-		State:       model.ObjectStateUploading,
 	}
-	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version)
+	_, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version))
 	if err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
-	acceptReaderVersionUpload(t, repos, version.VersionID, pieceCID, "https://provider.example/deleted")
+	acceptReaderVersionUpload(t, db, repos, version.VersionID, pieceCID, "https://provider.example/deleted")
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -624,10 +680,8 @@ func TestOpenTreatsCurrentVersionChangeAfterProviderDownloadAsMissing(t *testing
 				ETag:        "new-etag",
 				Checksum:    "new-checksum",
 				ContentType: "text/plain",
-				CacheKey:    ".versions/01J0000000000000000000OR03",
-				State:       model.ObjectStateCached,
 			}
-			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
+			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, replacement)); err != nil {
 				t.Fatalf("Objects.CreateVersionAndSetCurrent replacement: %v", err)
 			}
 			return io.NopCloser(bytes.NewReader([]byte("remote"))), nil
@@ -661,7 +715,7 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "version-reader-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "version-reader-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -674,13 +728,11 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 		ETag:        "old-etag",
 		Checksum:    "old-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR04",
-		State:       model.ObjectStateUploading,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, oldVersion)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent old: %v", err)
 	}
-	acceptReaderVersionUpload(t, repos, oldVersion.VersionID, pieceCID, "https://provider.example/old")
+	acceptReaderVersionUpload(t, db, repos, oldVersion.VersionID, pieceCID, "https://provider.example/old")
 
 	storageClient := &testutil.MockStorageClient{
 		DownloadFunc: func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -692,10 +744,8 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 				ETag:        "new-etag",
 				Checksum:    "new-checksum",
 				ContentType: "text/plain",
-				CacheKey:    ".versions/01J0000000000000000000OR05",
-				State:       model.ObjectStateCached,
 			}
-			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
+			if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, replacement)); err != nil {
 				t.Fatalf("Objects.CreateVersionAndSetCurrent replacement: %v", err)
 			}
 			return io.NopCloser(bytes.NewReader([]byte("old"))), nil
@@ -723,7 +773,51 @@ func TestOpenVersionDoesNotRestartWhenCurrentVersionChanges(t *testing.T) {
 	}
 }
 
-func acceptReaderVersionUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) {
+// withReaderContent gives a seeded version the content identity it now requires,
+// freezing the bucket's durability policy the way production ingest does.
+func withReaderContent(t *testing.T, repos *repository.Repositories, version *model.ObjectVersion) *model.ObjectVersion {
+	t.Helper()
+	if version.IsDeleteMarker || version.ContentID != nil {
+		return version
+	}
+	checksum := version.Checksum
+	if checksum == "" {
+		checksum = "checksum-" + version.VersionID
+	}
+	requestedCopies := 1
+	if bucket, err := repos.Buckets.GetByID(t.Context(), version.BucketID); err != nil {
+		t.Fatalf("load bucket %d: %v", version.BucketID, err)
+	} else if bucket != nil {
+		requestedCopies = bucket.DefaultCopies
+	}
+	content, err := repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
+		BucketID:        version.BucketID,
+		ContentSize:     version.Size,
+		Checksum:        testutil.StorageChecksum(checksum),
+		RequestedCopies: requestedCopies,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent for %s: %v", version.VersionID, err)
+	}
+	version.ContentID = &content.ID
+	return version
+}
+
+// readerContentForVersion returns the content a seeded version points at, so
+// upload seeding attaches copies to it instead of minting a second identity.
+func readerContentForVersion(t *testing.T, repos *repository.Repositories, version *model.ObjectVersion) *model.StorageContent {
+	t.Helper()
+	if version.ContentID == nil {
+		t.Fatalf("version %s has no content", version.VersionID)
+	}
+	content, err := repos.Contents.GetByID(context.Background(), *version.ContentID)
+	if err != nil || content == nil {
+		t.Fatalf("get content %d: content=%v err=%v", *version.ContentID, content, err)
+	}
+	return content
+}
+
+func acceptReaderVersionUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
@@ -733,29 +827,20 @@ func acceptReaderVersionUpload(t *testing.T, repos *repository.Repositories, ver
 	providerID := onChainID(t, "101")
 	dataSetID := onChainID(t, "1001")
 	pieceID := onChainIDPtr(t, "1")
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("start upload attempt: %v", err)
-	}
-	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          version.BucketID,
-		ProviderID:        providerID,
-		CopyIndex:         0,
-		CreatedByUploadID: upload.ID,
+	upload := readerContentForVersion(t, repos, version)
+	binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:           version.BucketID,
+		ProviderID:         providerID,
+		CopyIndex:          0,
+		CreatedByContentID: upload.ID,
 	})
 	if err != nil {
 		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: dataSetID}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID}); err != nil {
 		t.Fatalf("mark dataset ready: %v", err)
 	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
 		CopyIndex:        0,
 		TransferMethod:   model.StorageCopyTransferMethodIngress,
@@ -763,87 +848,64 @@ func acceptReaderVersionUpload(t *testing.T, repos *repository.Repositories, ver
 	}}); err != nil {
 		t.Fatalf("create upload copy: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     upload.ID,
+	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
 		PieceID:      pieceID,
 		RetrievalURL: retrievalURL,
-	}); err != nil {
-		t.Fatalf("mark copy committed: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    version.BucketID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
+	})
+	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		ContentID: upload.ID,
+		BucketID:  version.BucketID,
 	}); err != nil {
 		t.Fatalf("bind readable upload: %v", err)
 	}
-	if finalized, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+	if finalized, _, err := repos.Contents.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{ContentID: upload.ID}); err != nil {
 		t.Fatalf("finalize upload: %v", err)
 	} else if !finalized {
 		t.Fatal("finalize upload = false, want true")
 	}
 }
 
-func bindReaderPrimaryCommittedUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) int64 {
+func bindReaderPrimaryCommittedUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) int64 {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
 		t.Fatalf("get version for primary bind: version=%v err=%v", version, err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark uploading: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
-		t.Fatalf("mark committing: %v", err)
-	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 3,
-	})
-	if err != nil {
-		t.Fatalf("start upload attempt: %v", err)
-	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
+	upload := readerContentForVersion(t, repos, version)
+	primary, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByContentID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
+	secondary, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByContentID: upload.ID})
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("primary ready: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
 		t.Fatalf("secondary ready: %v", err)
 	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
 		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
 	}); err != nil {
 		t.Fatalf("create copy rows: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     upload.ID,
+	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
 		PieceID:      onChainIDPtr(t, "1"),
 		RetrievalURL: retrievalURL,
-	}); err != nil {
-		t.Fatalf("primary committed: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    version.BucketID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
+	})
+	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		ContentID: upload.ID,
+		BucketID:  version.BucketID,
 	}); err != nil {
 		t.Fatalf("bind primary committed: %v", err)
 	}

@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -33,23 +32,16 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 	ctx := context.Background()
 
 	bucket := &model.Bucket{
-		Name:   "wallet-proofset",
-		Status: model.BucketStatusActive,
+		Name:          "wallet-proofset",
+		Status:        model.BucketStatusActive,
+		DefaultCopies: 1, MinimumDurableCopies: 1,
 	}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("creating bucket: %v", err)
 	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		ContentSize:     1,
-		Checksum:        "wallet-checksum",
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("start upload attempt: %v", err)
-	}
+	upload := insertAdminStorageContentSnapshot(t, db, bucket.ID, "01J000000000000000WALLET0", 1, "wallet-checksum", 1)
 	pieceCID := "piece-wallet"
-	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{{
+	seedAdminCommittedCopies(t, db, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{{
 		ProviderID:     onChainID(t, "101"),
 		DataSetID:      onChainID(t, "1001"),
 		PieceID:        onChainIDPtr(t, "1"),
@@ -57,43 +49,10 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 		RetrievalURL:   "https://provider.example/wallet",
 	}})
 
-	tasks := []*model.Task{
-		{
-			Type:           model.TaskTypeUpload,
-			RefType:        "object",
-			RefID:          1,
-			RefVersionID:   "01J000000000000000WALLET1",
-			IdempotencyKey: "wallet-upload-pending",
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     5,
-			ScheduledAt:    time.Now(),
-		},
-		{
-			Type:           model.TaskTypeUpload,
-			RefType:        "object",
-			RefID:          2,
-			RefVersionID:   "01J000000000000000WALLET2",
-			IdempotencyKey: "wallet-upload-completed",
-			Status:         model.TaskStatusCompleted,
-			MaxRetries:     5,
-			ScheduledAt:    time.Now(),
-		},
-		{
-			Type:           model.TaskTypeEvictCache,
-			RefType:        "object",
-			RefID:          3,
-			RefVersionID:   "01J000000000000000WALLET3",
-			IdempotencyKey: "wallet-evict-pending",
-			Status:         model.TaskStatusQueued,
-			MaxRetries:     5,
-			ScheduledAt:    time.Now(),
-		},
-	}
-	for _, task := range tasks {
-		if err := repos.Tasks.Create(ctx, task); err != nil {
-			t.Fatalf("creating task %q: %v", task.IdempotencyKey, err)
-		}
-	}
+	taskService := newAdminTestTaskService(t, repos)
+	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageStore, "wallet-store-pending", model.TaskStatusPending)
+	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageCommit, "wallet-commit-completed", model.TaskStatusCompleted)
+	overviewSeedTask(t, taskService, repos, model.TaskTypeCacheEvict, "wallet-evict-pending", model.TaskStatusPending)
 
 	nonce := uint64(7)
 	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
@@ -120,7 +79,7 @@ func TestHandleAPIWallet_ReturnsStructuredWalletResponse(t *testing.T) {
 				LockupRatePerMonth:  big.NewInt(172800),
 			},
 		},
-	}, config.DefaultFilecoinCopies, testLogger())
+	}, config.DefaultFilecoinCopies, testLogger()).WithTaskService(taskService)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/wallet", nil)
 	rr := httptest.NewRecorder()
@@ -393,6 +352,6 @@ func newWalletOperationTestServer(t *testing.T) (*Server, *repository.Repositori
 	repos := repository.NewRepositories(db)
 	srv := newTestServer("127.0.0.1:0", db, &stubCache{rootDir: t.TempDir()}, 1<<20, repos, nil, &stubWalletQuerier{
 		info: &synapse.WalletInfo{Address: "0xabc"},
-	}, config.DefaultFilecoinCopies, testLogger())
+	}, config.DefaultFilecoinCopies, testLogger()).WithTaskService(newAdminTestTaskService(t, repos))
 	return srv, repos
 }

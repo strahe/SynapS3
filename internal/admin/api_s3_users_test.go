@@ -199,7 +199,7 @@ func TestS3UsersListIncludesOwnedBucketCount(t *testing.T) {
 		{name: "owner-b-one", owner: "owner-b"},
 		{name: "unassigned"},
 	} {
-		bucket := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive}
+		bucket := &model.Bucket{Name: seed.name, Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 		if seed.owner != "" {
 			data, err := json.Marshal(auth.ACL{Owner: seed.owner})
 			if err != nil {
@@ -282,7 +282,7 @@ func TestS3UsersUpdateIncludesOwnedBucketCount(t *testing.T) {
 			t.Fatalf("Marshal ACL: %v", err)
 		}
 		owner := "owner-access"
-		if err := repos.Buckets.Create(ctx, &model.Bucket{Name: name, Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: data}); err != nil {
+		if err := repos.Buckets.Create(ctx, &model.Bucket{Name: name, Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: data, DefaultCopies: 1, MinimumDurableCopies: 1}); err != nil {
 			t.Fatalf("Buckets.Create(%s): %v", name, err)
 		}
 	}
@@ -315,7 +315,7 @@ func TestS3UsersDeleteOwnedUserReturnsConflict(t *testing.T) {
 		t.Fatalf("Marshal ACL: %v", err)
 	}
 	owner := "owner-access"
-	if err := repos.Buckets.Create(context.Background(), &model.Bucket{Name: "owned-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: data}); err != nil {
+	if err := repos.Buckets.Create(context.Background(), &model.Bucket{Name: "owned-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: data, DefaultCopies: 1, MinimumDurableCopies: 1}); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 
@@ -360,6 +360,7 @@ func TestS3UsersDeleteSucceedsAfterBucketsTransferredToRoot(t *testing.T) {
 		Status:         model.BucketStatusActive,
 		OwnerAccessKey: &owner,
 		ACL:            acl,
+		DefaultCopies:  8, MinimumDurableCopies: 8,
 	}); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}

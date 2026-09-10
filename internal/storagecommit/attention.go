@@ -4,7 +4,7 @@ import "time"
 
 type AttentionRecord struct {
 	CopyID        int64
-	UploadID      int64
+	ContentID     int64
 	CopyIndex     int
 	DataSetRowID  int64
 	ProviderID    string

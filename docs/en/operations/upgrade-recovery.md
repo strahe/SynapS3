@@ -1,11 +1,11 @@
 ---
 title: Upgrade and Recovery
-description: Upgrade SynapS3 safely and recover from common single-node failure scenarios.
+description: Upgrade SynapS3 safely and recover background work.
 ---
 
 # Upgrade and Recovery
 
-SynapS3 is a single-node gateway. During an upgrade or recovery, protect locally durable object data and metadata as one consistent set, then resume background tasks. Restore failed dependencies before retrying work.
+Before changing versions, protect the database and cache as one recovery point. Restore failed dependencies before retrying background work.
 
 ## Before Upgrading
 
@@ -14,27 +14,20 @@ Run:
 ```bash
 curl http://127.0.0.1:9090/healthz
 synaps3 admin task stats
-synaps3 admin task list --status exhausted --limit 50
+synaps3 admin task list --status failed --limit 50
 ```
 
-Expected result: health is `ok`, and every exhausted task has a clear handling decision before the process is replaced.
+Expected result: health is `ok`, and every failed task has a clear handling decision before the process is replaced.
 
-Before upgrading, stop incoming S3 writes but leave the current SynapS3 process running until uploads and provider replacements have finished. If the new version refuses to start because storage work is still in progress, run the previous version against the unchanged database, restore the affected provider if necessary, and let that work finish before retrying the upgrade. Do not alter the database to bypass this check.
-
-The upgrade is also refused when a stored copy still records a storage confirmation whose outcome was never resolved, which an interrupted earlier version could leave behind. The message reports how many copies are affected and includes the query that lists them, so you can confirm with the provider whether each piece was stored before clearing that record. A development environment can start from a fresh database instead.
-
-Stop S3 traffic and SynapS3 with the service manager used by your deployment before creating a backup.
-
-- SQLite deployments: archive the complete runtime data volume, then verify the archive and its checksum.
-- PostgreSQL deployments: create a database-native backup and archive the matching configuration and cache data.
-
-Keep every backup artifact at the same recovery point. Follow [Runtime Data](../configuration/runtime-data.md) for exact backup, verification, and restart steps.
+Stop incoming S3 traffic and SynapS3 before creating a backup. Keep the database, cache, configuration, and credentials at the same recovery point. Follow [Runtime Data](../configuration/runtime-data.md) for backup and verification steps.
 
 ## Upgrade SynapS3
 
-Replace the executable, package, or container image through the same installation method used for the current deployment. Docker-specific commands are documented on the [Docker Deployment](../getting-started/docker.md) page.
+Replace the executable, package, or container image through the same installation method used for the deployment. Docker-specific commands are documented on the [Docker Deployment](../getting-started/docker.md) page.
 
-Start SynapS3 with the service manager used by your deployment, then run:
+Start SynapS3 with the intended database and cache. If startup reports that the database is incompatible, stop the process, leave the database unchanged, and follow [If the Database Is Incompatible](#if-the-database-is-incompatible).
+
+After startup, run:
 
 ```bash
 curl http://127.0.0.1:9090/healthz
@@ -42,53 +35,73 @@ synaps3 admin settings get
 synaps3 admin task stats
 ```
 
-Expected result: health is `ok`, effective settings match the deployment, and task queues resume without unexpected exhausted work. Read a known object through the S3 API before restoring normal traffic.
+Expected result: health is `ok`, effective settings match the deployment, and background work resumes without unexpected failures. Read a known object through the S3 API before restoring normal traffic.
 
-## Runtime Flow
+## If the Database Is Incompatible
 
-```text
-Receive write -> save object -> record metadata -> return success -> continue background storage
+1. Stop incoming S3 traffic and every SynapS3 process using the deployment.
+2. Back up the reported database and verify the backup.
+3. Keep the database and matching cache read-only. Do not edit either location to bypass the compatibility check.
+4. Configure an empty database and cache directory for the replacement installation.
+5. Start SynapS3 and verify health, effective settings, and background task processing before restoring traffic.
+
+For SQLite, create a consistent backup after the process stops and verify that it opens:
+
+```bash
+sqlite3 /old/path/synaps3.db ".backup '/backup/path/synaps3-pre-upgrade.db'"
+sqlite3 -readonly /backup/path/synaps3-pre-upgrade.db "PRAGMA integrity_check;"
 ```
 
-- Writes commit to local cache and metadata before provider upload.
-- Failed storage tasks retry and move to `exhausted` after the configured retry limit.
-- `GetObject` reads from cache first and can retrieve from the provider when metadata is available.
-- Bucket deletion is not supported and returns `501`; object deletion removes the object from S3 visibility while cleanup continues safely.
+The integrity check must print `ok`. Protect the backup, its WAL/SHM files when retained, the matching cache, and the configuration as one recovery set. PostgreSQL deployments should use `pg_dump` or the deployment's approved database snapshot and verify that artifact separately.
+
+SynapS3 leaves an incompatible database unchanged. Deprecated `worker.upload`, `worker.provider_replacement`, `worker.evictor`, and `worker.storage_cleanup` configuration sections are also rejected; replace them with `worker.tasks` settings.
+
+Starting with an empty database does not import existing buckets, objects, users, storage data sets, wallet operations, provider replacements, or tasks. Existing paid remote storage services remain active. Keep the verified backup so those services and records can be reviewed and handled separately.
+
+Do not run the preserved installation and its replacement against the same database, cache, wallet workflow, or S3 traffic. After starting the replacement, create an S3 user and test bucket, then write and read a test object before restoring normal traffic.
+
+## Recover Background Work
+
+After a restart, unfinished work becomes eligible to continue automatically.
+
+- Retry a failed task only when the dashboard or API marks it retryable.
+- Recover provider replacements from **Details** → **Storage** → **Data Sets**.
+- A wallet operation can be retried from Tasks only when no broadcast started. An uncertain broadcast remains non-retryable.
+- For an uncertain Store, **Check again** checks the provider without uploading the object again.
+- `status=failed` lists unacknowledged failures. Use `status=dismissed` to list acknowledged failures.
+- Review unresolved storage confirmations with `synaps3 admin storage-confirmation list`.
+
+Useful commands:
+
+```bash
+synaps3 admin task list --status failed --limit 100
+synaps3 admin task list --status dismissed --limit 100
+synaps3 admin task stats
+synaps3 admin task retry 42
+synaps3 admin task acknowledge 42
+synaps3 admin storage-confirmation list
+synaps3 admin settings get
+```
+
+Restore failed dependencies before retrying work. Use the dashboard, Admin API, or CLI instead of editing the application database.
 
 ## Recovery Matrix
 
 | Scenario | Recovery |
 | --- | --- |
-| Established provider is temporarily unavailable during initial storage | Restore the original provider. Other assigned writable copies continue, while the unfinished copy waits without consuming retries and resumes automatically. SynapS3 does not select a replacement provider. |
-| Background storage task cannot reach a provider | Restore connectivity, then retry exhausted storage tasks. |
-| RPC node down | Restore RPC connectivity, then retry exhausted tasks. |
-| Private provider URL blocked | Keep blocked by default; enable `filecoin.allow_private_networks` only for trusted private deployments. |
-| Database full | Free space or scale the database. |
-| Cache disk full | Increase disk, raise `cache.max_size_gb`, or restore upload and eviction progress. |
-| Provider is permanently unavailable, or must be evacuated | Open the bucket, choose **Details**, then **Storage** → **Data Sets**, and replace the provider. New uploads move to the new provider once it is ready. Existing objects copy from another replica or from local cache; an object with neither cannot be copied, and the old provider is not shut down. If the selected target is already in use, choose another provider rather than retrying it. |
-| Process crash | Restart the service, then verify health and task statistics. Most unfinished storage work resumes automatically without submitting the same piece again. Work whose outcome cannot be determined safely appears in `synaps3 admin storage-confirmation list`; inspect the listed provider and transaction details before taking action. Recorded service-shutdown transactions are checked before another shutdown is submitted. |
-
-A provider becoming unavailable after a copy has already been stored does not necessarily create a retryable task. Use storage-health views to identify affected copies. Restoring the target copy count is part of [Planned Replica Repair](../concepts/filecoin-storage-flow.md#planned-replica-repair).
+| Storage provider or RPC is temporarily unavailable | Restore connectivity. Waiting work resumes automatically; retry only failed tasks marked retryable. |
+| Database full | Stop traffic, free space or scale the database, then verify health. |
+| Cache disk full | Increase disk or `cache.max_size_gb`, or restore remote storage and cache-cleanup progress. |
+| Provider must be evacuated | Open the bucket and use **Details** → **Storage** → **Data Sets**. Do not retry the replacement from Tasks. |
+| Process crash | Restart SynapS3, verify health and task statistics, then review any unresolved storage confirmation or wallet outcome. |
+| Startup reports an incompatible database | Stop the process, verify that the configured database is the intended one, and preserve it unchanged before using an empty replacement database. |
 
 ## Restore or Roll Back
 
 1. Stop S3 traffic and SynapS3.
-2. Verify archive checksums and select database and cache artifacts from the same recovery point.
+2. Verify backup checksums and select database and cache artifacts from the same recovery point.
 3. For SQLite, restore the complete runtime data volume. For PostgreSQL, restore the database-native backup first, then the matching configuration and cache data.
-4. If rolling back the application, start the previous release only with data that is compatible with that version. When compatibility is uncertain, restore the pre-upgrade recovery point.
-5. Start SynapS3, then check `/healthz`, effective settings, task statistics, exhausted tasks, wallet readiness, and a known S3 object.
+4. If rolling back the application, use only data compatible with the selected version. When compatibility is uncertain, restore the pre-upgrade recovery point.
+5. Start SynapS3, then check `/healthz`, effective settings, task statistics, failed tasks, wallet readiness, and a known S3 object.
 
 Do not resume normal traffic until these checks pass.
-
-Useful commands:
-
-```bash
-synaps3 admin task list --status exhausted --limit 100
-synaps3 admin task stats
-synaps3 admin task retry 42
-synaps3 admin storage-confirmation list
-synaps3 admin s3-user list
-synaps3 admin settings get
-```
-
-After changing a recovery-related setting, restart SynapS3 and verify both `/healthz` and `synaps3 admin settings get`.

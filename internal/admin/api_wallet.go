@@ -14,6 +14,8 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
+	taskengine "github.com/strahe/synaps3/internal/task"
+	"github.com/strahe/synaps3/internal/walletoperation"
 )
 
 // --- Response DTOs ---
@@ -97,7 +99,6 @@ type walletOperationDTO struct {
 	Status          string  `json:"status"`
 	TxHash          *string `json:"tx_hash,omitempty"`
 	LastError       *string `json:"last_error,omitempty"`
-	LeaseUntil      *string `json:"lease_until,omitempty"`
 	StartedAt       *string `json:"started_at,omitempty"`
 	SubmittedAt     *string `json:"submitted_at,omitempty"`
 	CompletedAt     *string `json:"completed_at,omitempty"`
@@ -169,11 +170,11 @@ func (s *Server) handleAPIWallet(w http.ResponseWriter, r *http.Request) {
 		resp.PartialErrors["task_counts"] = "database query failed"
 	}
 	for _, tc := range taskCounts {
-		if model.TaskType(tc.Type) != model.TaskTypeUpload {
+		if !walletStorageTaskType(model.TaskType(tc.Type)) {
 			continue
 		}
 		switch tc.Status {
-		case string(model.TaskStatusQueued), string(model.TaskStatusScheduled), string(model.TaskStatusWaiting), string(model.TaskStatusRunning):
+		case string(model.TaskStatusPending), string(model.TaskStatusRunning):
 			biz.OnchainTasksPending += int(tc.Count)
 		case string(model.TaskStatusCompleted):
 			biz.OnchainTasksCompleted += int(tc.Count)
@@ -182,6 +183,17 @@ func (s *Server) handleAPIWallet(w http.ResponseWriter, r *http.Request) {
 	resp.Business = biz
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func walletStorageTaskType(taskType model.TaskType) bool {
+	switch taskType {
+	case model.TaskTypeStorageDataSetEnsure, model.TaskTypeStorageStore, model.TaskTypeStoragePull,
+		model.TaskTypeStorageCommit, model.TaskTypeStorageDataSetRetire,
+		model.TaskTypeProviderReplacementCoordinate:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) handleAPIWalletFund(w http.ResponseWriter, r *http.Request) {
@@ -255,10 +267,34 @@ func (s *Server) handleAPIWalletOperation(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	op, _, err := s.repos.WalletOperations.CreateOrGet(r.Context(), repository.CreateWalletOperationInput{
-		Type:            opType,
-		ClientRequestID: clientRequestID,
-		Amount:          amount,
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "wallet operations unavailable"})
+		return
+	}
+	var op *model.WalletOperation
+	err = s.repos.WithTx(r.Context(), func(txRepos *repository.Repositories) error {
+		var createErr error
+		op, _, createErr = txRepos.WalletOperations.CreateOrGet(r.Context(), repository.CreateWalletOperationInput{
+			Type: opType, ClientRequestID: clientRequestID, Amount: amount,
+		})
+		if createErr != nil || op == nil || op.TaskID != nil || op.Status != model.WalletOperationStatusPending {
+			return createErr
+		}
+		taskRow, _, enqueueErr := s.taskService.EnqueueInTransaction(r.Context(), txRepos, taskengine.EnqueueRequest{
+			Type:           model.TaskTypeWalletOperation,
+			IdempotencyKey: walletoperation.TaskKey(op.ID),
+			Input:          walletoperation.Input{OperationID: op.ID},
+			SubjectType:    "wallet_operation",
+			SubjectKey:     strconv.FormatInt(op.ID, 10),
+		})
+		if enqueueErr != nil {
+			return enqueueErr
+		}
+		if bindErr := txRepos.WalletOperations.BindTask(r.Context(), op.ID, taskRow.ID); bindErr != nil {
+			return bindErr
+		}
+		op.TaskID = &taskRow.ID
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, repository.ErrWalletOperationConflict) {
@@ -352,7 +388,6 @@ func walletOperationToDTO(op *model.WalletOperation) walletOperationDTO {
 		Status:          string(op.Status),
 		TxHash:          op.TxHash,
 		LastError:       op.LastError,
-		LeaseUntil:      timeToString(op.LeaseUntil),
 		StartedAt:       timeToString(op.StartedAt),
 		SubmittedAt:     timeToString(op.SubmittedAt),
 		CompletedAt:     timeToString(op.CompletedAt),

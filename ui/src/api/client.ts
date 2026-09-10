@@ -107,8 +107,8 @@ export interface OverviewData {
   }
   tasks: {
     by_status: Record<string, number>
-    attention: { failed: number; exhausted: number }
-    active_pipeline: Array<{ pipeline: string; by_status: Record<string, number>; total: number }>
+    attention: { failed: number }
+    active_pipeline: Array<{ operation: string; by_status: Record<string, number>; total: number }>
   }
   cache: { used_bytes: number; max_bytes: number }
   workers: Record<string, boolean>
@@ -189,15 +189,15 @@ export interface OverviewFilecoinStorageHealth {
   partial_errors: Record<string, string>
 }
 
+export type BucketStatus = 'provisioning' | 'ready'
+
 export interface BucketItem {
   id: number
   name: string
   owner_access_key: string | null
-  default_copies: number | null
-  effective_copies: number
-  minimum_durable_copies: number | null
-  effective_minimum_durable_copies: number
-  status: string
+  default_copies: number
+  minimum_durable_copies: number
+  status: BucketStatus
   object_count: number
   total_size_bytes: number
   storage_health: BucketStorageHealthSummary
@@ -363,10 +363,8 @@ export interface BucketMutationResponse {
   id: number
   name: string
   owner_access_key: string | null
-  default_copies: number | null
-  effective_copies: number
-  minimum_durable_copies: number | null
-  effective_minimum_durable_copies: number
+  default_copies: number
+  minimum_durable_copies: number
   status: string
 }
 
@@ -376,16 +374,7 @@ export interface ObjectLocation {
 }
 
 export type ObjectStatus = 'uploading' | 'syncing' | 'success' | 'warning' | 'unavailable'
-export type ObjectState = 'cached' | 'uploading' | 'committing' | 'replicating' | 'stored' | 'cache_evicted' | 'failed'
-export type ObjectUploadStatus =
-  | 'running'
-  | 'ingress_ready'
-  | 'readable'
-  | 'complete'
-  | 'failed'
-  | 'rejected'
-  | 'superseded'
-
+export type ObjectState = 'cached' | 'uploading' | 'committing' | 'replicating' | 'stored' | 'failed'
 export interface UploadTransferProgress {
   scope: 'ingress_store'
   attempt: number
@@ -405,7 +394,6 @@ export interface ObjectItem {
   size: number
   state: ObjectState
   status: ObjectStatus
-  upload_status?: ObjectUploadStatus
   progress?: UploadTransferProgress
   location: ObjectLocation
   content_type: string
@@ -477,7 +465,7 @@ export interface RestoreObjectVersionResponse {
 export interface PermanentDeleteObjectResponse {
   key: string
   version_id: string
-  cache_cleanup_status: string
+  cache_release: string
   storage_cleanup_task_id?: number
 }
 
@@ -497,7 +485,6 @@ export interface ObjectVersionItem {
   state: ObjectState
   status: ObjectStatus
   is_delete_marker: boolean
-  upload_status?: ObjectUploadStatus
   progress?: UploadTransferProgress
   location: ObjectLocation
   content_type: string
@@ -556,9 +543,7 @@ export interface ObjectStatusDetail {
   version_id: string
   state: ObjectState
   status: ObjectStatus
-  upload_status?: ObjectUploadStatus
   progress?: UploadTransferProgress
-  failed_at_state?: string
   message?: string
   updated_at: string
 }
@@ -610,239 +595,60 @@ export interface ObjectProvenanceCopy {
   attention_at?: string
 }
 
-export interface ObjectProvenanceFailure {
-  attempt_index: number
-  provider_id?: string
-  provider_identity?: ProviderIdentity
-  transfer_method: string
-  stage?: string
-  error?: string
-}
-
 export interface ObjectProvenance {
   version_id: string
   state: ObjectState
   status: ObjectStatus
-  upload_status?: ObjectUploadStatus
   progress?: UploadTransferProgress
   piece_cid?: string
   requested_copies: number
   success_copies: number
   copy_health: CopyHealthSummary
   copies: ObjectProvenanceCopy[]
-  failures: ObjectProvenanceFailure[]
   updated_at: string
 }
 
 export interface TaskItem {
   id: number
   type: string
-  stage?: string
-  upload_id?: number
-  copy_index?: number
-  ref_type: string
-  ref_id: number
-  bucket_name?: string
-  ref_version_id: string
-  status: string
-  progress?: TaskProgress
+  operation: string
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+  presentation_status:
+    | 'queued'
+    | 'scheduled'
+    | 'waiting'
+    | 'running'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
+    | 'dismissed'
+  subject_type?: string
+  subject_key?: string
   retry_count: number
-  max_retries: number
+  retry_limit?: number
+  retryable: boolean
+  acknowledgeable: boolean
   last_error?: string
   status_message?: string
   wait_reason?: string
-  scheduled_at: string
-  claimed_at?: string
-  completed_at?: string
+  failure_reason?: string
+  available_at: string
+  started_at?: string
+  finished_at?: string
+  acknowledged_at?: string
+  created_at: string
+  updated_at: string
 }
 
 export interface TaskListResponse {
   tasks: TaskItem[]
-  total: number
-  limit: number
-  offset: number
-}
-
-export type TaskDiagnosticCurrentState =
-  | 'not_applicable'
-  | 'preparing'
-  | 'transferring'
-  | 'waiting_for_chain'
-  | 'confirmed'
-  | 'rejected'
-  | 'mismatch'
-  | 'unavailable'
-  | 'unknown'
-
-export type TaskDiagnosticNextAction =
-  | 'none'
-  | 'wait'
-  | 'retry_task'
-  | 'check_wallet_funds'
-  | 'check_wallet_approval'
-  | 'inspect_provider'
-  | 'inspect_task'
-
-export type TaskDiagnosticOperation = 'none' | 'prepare_upload' | 'transfer_piece' | 'create_data_set' | 'add_pieces'
-
-export interface TaskDiagnosticTaskFacts {
-  id?: number
-  type: string
-  stage?: string
-  status: string
-  retry_count?: number
-  max_retries?: number
-  last_error?: string
-  status_message?: string
-  wait_reason?: string
-  scheduled_at?: string
-}
-
-export interface TaskDiagnosticUploadFacts {
-  id?: number
-  status?: string
-  requested_copies?: number
-  error_message?: string
-  accept_error?: string
-}
-
-export interface TaskDiagnosticCopyFacts {
-  upload_id?: number
-  copy_index?: number
-  status?: string
-  provider_id?: string
-  storage_data_set_id?: number
-  chain_data_set_id?: string
-  piece_id?: string
-  transfer_method?: string
-  commit_transaction_id?: string
-  last_error?: string
-}
-
-export interface TaskDiagnosticDataSetFacts {
-  id?: number
-  status?: string
-  provider_id?: string
-  copy_index?: number
-  chain_data_set_id?: string
-  client_data_set_id?: string
-  create_transaction_id?: string
-  create_status_url?: string
-  last_error?: string
-}
-
-export interface TaskDiagnosticProviderFacts {
-  provider_id?: string
-  status?: ObservabilityStatus
-  reason_codes?: string[]
-  service_url?: string
-  health_status?: string
-  last_error?: string
-}
-
-export interface TaskDiagnosticTransactionFacts {
-  kind: TaskDiagnosticOperation
-  status_url?: string
-  service_url?: string
-  data_set_id?: string
-  transaction_id?: string
-  piece_count?: number
-}
-
-export type TaskDiagnosticLiveState =
-  | 'skipped'
-  | 'pending'
-  | 'confirmed'
-  | 'rejected'
-  | 'mismatch'
-  | 'unavailable'
-  | 'unknown'
-
-export interface TaskDiagnosticLiveCheck {
-  state: TaskDiagnosticLiveState
-  status_url?: string
-  tx_status?: string
-  data_set_id?: string
-  data_set_created?: boolean
-  pieces_added?: boolean
-  piece_count?: number
-  confirmed_piece_ids?: string[]
-  error?: string
-}
-
-export interface TaskDiagnosticEvidence {
-  task: TaskDiagnosticTaskFacts
-  upload?: TaskDiagnosticUploadFacts
-  copy?: TaskDiagnosticCopyFacts
-  data_set?: TaskDiagnosticDataSetFacts
-  provider?: TaskDiagnosticProviderFacts
-  transaction?: TaskDiagnosticTransactionFacts
-  live_check?: TaskDiagnosticLiveCheck
-  operation: TaskDiagnosticOperation
-}
-
-export interface TaskDiagnostic {
-  checked_at: string
-  current_state: TaskDiagnosticCurrentState
-  signal: ObservabilitySignal
-  reason_codes: string[]
-  next_action: TaskDiagnosticNextAction
-  evidence: TaskDiagnosticEvidence
+  next_cursor?: number
 }
 
 export interface TaskStatusCount {
   type: string
   status: string
   count: number
-}
-
-export interface TaskRefObjectDetail {
-  bucket_name: string
-  key: string
-  version_id: string
-  size: number
-  state: ObjectState
-  status: ObjectStatus
-  upload_status?: ObjectUploadStatus
-  progress?: UploadTransferProgress
-  location: ObjectLocation
-  content_type: string
-  updated_at: string
-}
-
-export interface TaskStorageCleanupCopyDetail {
-  copy_index: number
-  provider_id?: string
-  data_set_id?: string
-  client_data_set_id?: string
-  piece_id?: string
-  piece_cid: string
-  status: string
-  delete_tx_hash?: string
-  last_error?: string
-}
-
-export interface TaskStorageCleanupDeletedVersionDetail {
-  bucket_name: string
-  key: string
-  version_id: string
-  size: number
-  deleted_at: string
-}
-
-export interface TaskStorageCleanupDetail {
-  upload_id: number
-  deleted_versions: TaskStorageCleanupDeletedVersionDetail[]
-  copies: TaskStorageCleanupCopyDetail[]
-}
-
-export interface TaskRefDetail {
-  ref_type: string
-  ref_id: number
-  ref_version_id: string
-  bucket_name?: string
-  object: TaskRefObjectDetail | null
-  storage_cleanup?: TaskStorageCleanupDetail
 }
 
 export interface PaymentAccountData {
@@ -920,7 +726,6 @@ export interface WalletOperation {
   status: WalletOperationStatus
   tx_hash?: string
   last_error?: string
-  lease_until?: string
   started_at?: string
   submitted_at?: string
   completed_at?: string
@@ -1029,16 +834,17 @@ export interface SettingsCacheConfig {
 }
 
 export interface SettingsWorkerConfig {
-  upload: SettingsWorkerPoolConfig
-  provider_replacement: SettingsWorkerPoolConfig
-  evictor: SettingsWorkerPoolConfig
-  storage_cleanup: SettingsWorkerPoolConfig
+  tasks: SettingsTaskWorkerConfig
 }
 
-export interface SettingsWorkerPoolConfig {
+export interface SettingsTaskWorkerConfig {
   concurrency: number
   poll_interval: string
+  lease_duration: string
   max_retries: number
+  retention: string
+  provider_mutation_concurrency: number
+  destructive_mutation_concurrency: number
 }
 
 export interface SettingsLoggingConfig {
@@ -1106,10 +912,7 @@ export type SettingsUpdatePayload = Partial<{
   }
   cache: Partial<SettingsCacheConfig>
   worker: Partial<{
-    upload: Partial<SettingsWorkerPoolConfig>
-    provider_replacement: Partial<SettingsWorkerPoolConfig>
-    evictor: Partial<SettingsWorkerPoolConfig>
-    storage_cleanup: Partial<SettingsWorkerPoolConfig>
+    tasks: Partial<SettingsTaskWorkerConfig>
   }>
   logging: Partial<Pick<SettingsLoggingConfig, 'level' | 'format'>> & {
     s3_access?: Partial<SettingsS3AccessLoggingConfig>
@@ -1330,23 +1133,18 @@ export const api = {
     if (versionId) params.push(`version_id=${encodeURIComponent(versionId)}`)
     return `${BASE}/buckets/${encodeURIComponent(name)}/objects/download?${params.join('&')}`
   },
-  getTasks: (params: { type?: string; stage?: string; status?: string; limit?: number; offset?: number }) => {
+  getTasks: (params: { type?: string; status?: string; limit?: number; cursor?: number }) => {
     const sp = new URLSearchParams()
     if (params.type) sp.set('type', params.type)
-    if (params.stage) sp.set('stage', params.stage)
     if (params.status) sp.set('status', params.status)
     if (params.limit) sp.set('limit', params.limit.toString())
-    if (params.offset) sp.set('offset', params.offset.toString())
+    if (params.cursor) sp.set('cursor', params.cursor.toString())
     const qs = sp.toString()
     return fetchJSON<TaskListResponse>(`/tasks${qs ? `?${qs}` : ''}`)
   },
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
-  getTaskRefDetail: (id: number) => fetchJSON<TaskRefDetail>(`/tasks/${id}/ref-detail`),
-  getTaskDiagnostic: (id: number, options?: APIRequestOptions) =>
-    fetchJSON<TaskDiagnostic>(`/tasks/${id}/diagnostic`, options),
-  refreshTaskDiagnostic: (id: number, options?: APIRequestOptions) =>
-    fetchJSON<TaskDiagnostic>(`/tasks/${id}/diagnostic/refresh`, { method: 'POST', ...options }),
   retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
+  acknowledgeTask: (id: number) => fetchJSON(`/tasks/${id}/acknowledge`, { method: 'POST' }),
   getSystemInfo: () => fetchJSON<OverviewData['system']>('/system/info'),
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),

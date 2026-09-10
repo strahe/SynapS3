@@ -20,6 +20,10 @@ import (
 	"github.com/strahe/synapse-go/storage"
 )
 
+// TestOpenVersionDoesNotRehydrateAfterPermanentDeletion pins the race between a
+// provider download and a permanent delete. Cache residency is content
+// addressed, so the deletion gate is held on the content key and a reader that
+// started before the delete must not write the file back afterwards.
 func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 	downloadStarted := make(chan struct{})
 	releaseDownload := make(chan struct{})
@@ -49,7 +53,7 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "reader-permanent-delete-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "reader-permanent-delete-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -61,14 +65,13 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 		ETag:        "object-etag",
 		Checksum:    "object-checksum",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/01J0000000000000000000OR12",
-		State:       model.ObjectStateUploading,
 	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, withReaderContent(t, repos, version)); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
 	acceptReaderVersionUpload(
 		t,
+		db,
 		repos,
 		version.VersionID,
 		buildTestCID(t),
@@ -118,19 +121,20 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteObjectVersionPermanently: %v", err)
 	}
-	status := objectdeletion.RecordCacheCleanup(
+	if deletion.ContentID == nil {
+		t.Fatalf("deletion = %#v, want content identity", deletion)
+	}
+	outcome, releaseErr := objectdeletion.ReleaseContentCache(
 		ctx,
 		mc,
 		gate,
 		tracker,
 		repos.Objects,
-		slog.Default(),
 		bucket.Name,
-		version.VersionID,
-		deletion.CacheKey,
+		*deletion.ContentID,
 	)
-	if status != model.CacheCleanupStatusDeleted {
-		t.Fatalf("cache cleanup status = %s, want deleted", status)
+	if releaseErr != nil || outcome != objectdeletion.CacheReleaseReleased {
+		t.Fatalf("ReleaseContentCache = %q, %v, want released", outcome, releaseErr)
 	}
 	releaseDownloadOnce.Do(func() {
 		close(releaseDownload)
@@ -159,7 +163,7 @@ func TestOpenVersionDoesNotRehydrateAfterPermanentDeletion(t *testing.T) {
 	if putCalls != 0 {
 		t.Fatalf("cache Put calls after permanent deletion = %d, want 0", putCalls)
 	}
-	if got := tracker.Latest(version.VersionID); !got.IsZero() {
+	if got := tracker.Latest(*deletion.ContentID); !got.IsZero() {
 		t.Fatalf("tracking entry after permanent deletion = %s, want none", got)
 	}
 }

@@ -71,10 +71,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `filecoin.observability` | Provider and local data set health checks. |
 | `database` | SQLite or PostgreSQL metadata database. |
 | `cache` | Local object cache directory, capacity, and eviction policy. |
-| `worker.upload` | Background Filecoin storage concurrency, polling, and retries. |
-| `worker.provider_replacement` | Provider-replacement transfer concurrency, polling, and copy retries. |
-| `worker.evictor` | Local cache eviction tasks. |
-| `worker.storage_cleanup` | Remote copy cleanup tasks. |
+| `worker.tasks` | Shared background task execution, recovery, retention, and provider mutation limits. |
 | `logging` | Runtime log level, format, and S3 access logs. |
 | `admin` | Dashboard, Admin API listener, and Admin auth settings. |
 
@@ -95,18 +92,20 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `cache.eviction_policy` | `lru` |
 | `cache.lru_high_watermark_percent` | `90` |
 | `cache.lru_low_watermark_percent` | `80` |
-| `worker.upload.concurrency` | `4` |
-| `worker.upload.max_retries` | `5` |
-| `worker.provider_replacement.concurrency` | `4` |
-| `worker.provider_replacement.poll_interval` | `5s` |
-| `worker.provider_replacement.max_retries` | `5` |
+| `worker.tasks.concurrency` | `12` |
+| `worker.tasks.poll_interval` | `5s` |
+| `worker.tasks.lease_duration` | `5m` |
+| `worker.tasks.max_retries` | `5` |
+| `worker.tasks.retention` | `168h` |
+| `worker.tasks.provider_mutation_concurrency` | `4` |
+| `worker.tasks.destructive_mutation_concurrency` | `2` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.provider_replacement` settings do not affect ordinary uploads. Changing `worker.provider_replacement.max_retries` applies to replacement work discovered afterward and content retried with **Retry replacement**; work already in progress keeps its current limit. Changes to provider replacement concurrency, polling, or retries require a SynapS3 restart.
+`worker.tasks.concurrency` limits all background operations. Remote storage creation, Store, Pull, and commit submission additionally share `provider_mutation_concurrency`; remote cleanup and service retirement share `destructive_mutation_concurrency`. Status and confirmation checks do not consume either mutation limit. Wallet mutations are serialized. Task settings require a SynapS3 restart, and existing tasks retain the retry limit recorded when they were created.
 
 ## Admin Session Lifetime
 
@@ -127,7 +126,7 @@ The login page uses a browser-session cookie by default. Selecting **Keep me sig
 Cache eviction policies have these user-visible results:
 
 - `lru`: when cache usage reaches the high watermark, SynapS3 removes the least recently accessed remotely safe entries until usage reaches the low watermark.
-- `after_upload`: after a version meets its bucket's minimum durable copies, SynapS3 queues it for removal at the next Evictor poll. A later remote read can restore the cache, and that restored entry is not immediately removed again.
+- `after_upload`: after a version meets its bucket's minimum durable copies, SynapS3 queues it for asynchronous removal. A later remote read can restore the cache, and that restored entry is not immediately removed again.
 - `none`: SynapS3 does not automatically remove local cache data.
 
 The LRU watermarks must always satisfy `0 <= low < high <= 100`. They remain saved but have no effect under `after_upload` or `none`.

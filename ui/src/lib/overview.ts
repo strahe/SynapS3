@@ -11,16 +11,14 @@ export interface AttentionDisplayRow {
   value: number
   tone: AttentionTone
   target: 'buckets' | 'tasks'
-  taskStatus?: 'failed' | 'exhausted'
+  taskStatus?: 'failed'
 }
 
 export interface PipelineDisplayRow {
   key: string
   label: string
   total: number
-  queued: number
-  scheduled: number
-  waiting: number
+  pending: number
   running: number
 }
 
@@ -71,24 +69,29 @@ const filecoinStorageHealthLevelStyles: Record<FilecoinStorageHealthLevel, Filec
   },
 }
 
-const workerOrder = ['uploader', 'evictor', 'storage_cleanup', 'wallet_operations']
+const workerOrder = ['tasks']
 const workerLabels: Record<string, string> = {
-  uploader: 'Upload',
-  evictor: 'Cache Evictor',
-  storage_cleanup: 'Replica Cleanup',
-  wallet_operations: 'Wallet Operations',
+  tasks: 'Task Engine',
 }
 
-const pipelineOrder = ['prepare', 'upload', 'commit', 'sync', 'evict', 'cleanup'] as const
-type PipelineKey = (typeof pipelineOrder)[number]
-
-const pipelineLabels: Record<PipelineKey, string> = {
-  prepare: 'Prepare',
-  upload: 'Upload',
-  commit: 'Commit',
-  sync: 'Sync',
-  evict: 'Evict',
-  cleanup: 'Cleanup',
+const taskOperationLabels: Record<string, string> = {
+  bucket_provision: 'Prepare bucket storage',
+  upload_plan: 'Prepare upload',
+  storage_dataset_ensure: 'Prepare storage',
+  storage_transfer_plan: 'Plan transfer',
+  storage_store: 'Store content',
+  storage_pull: 'Transfer content',
+  storage_commit_coordinate: 'Prepare confirmation',
+  storage_commit: 'Confirm storage',
+  provider_replacement_coordinate: 'Replace provider',
+  cache_capacity_reconcile: 'Manage local cache capacity',
+  cache_evict: 'Remove cached copy',
+  cache_reconcile_durability: 'Review durability',
+  storage_cleanup: 'Remove remote copy',
+  storage_dataset_retire: 'Retire service',
+  wallet_operation: 'Wallet request',
+  observability_refresh: 'Refresh health',
+  task_gc: 'Remove expired task records',
 }
 
 export function workerHealthRows(workers: Record<string, boolean>) {
@@ -130,31 +133,19 @@ export function attentionDisplayRows(attention: {
       target: 'tasks' as const,
       taskStatus: 'failed' as const,
     },
-    {
-      key: 'exhausted_tasks',
-      label: 'Retry limit reached',
-      value: attention.tasks.exhausted,
-      tone: 'danger' as const,
-      target: 'tasks' as const,
-      taskStatus: 'exhausted' as const,
-    },
   ].filter((row) => row.value > 0)
 }
 
 export function overviewPipelineRows(activePipeline: OverviewData['tasks']['active_pipeline']): PipelineDisplayRow[] {
-  const byPipeline = new Map(activePipeline.map((row) => [row.pipeline, row]))
-  return pipelineOrder.map((key) => {
-    const row = byPipeline.get(key)
-    return {
-      key,
-      label: pipelineLabels[key],
-      total: row?.total ?? 0,
-      queued: row?.by_status.queued ?? 0,
-      scheduled: row?.by_status.scheduled ?? 0,
-      waiting: row?.by_status.waiting ?? 0,
-      running: row?.by_status.running ?? 0,
-    }
-  })
+  return activePipeline
+    .map((row) => ({
+      key: row.operation,
+      label: taskOperationLabels[row.operation] ?? 'Background operation',
+      total: row.total,
+      pending: row.by_status.pending ?? 0,
+      running: row.by_status.running ?? 0,
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label))
 }
 
 export function filecoinStorageHealthLevelLabel(level: FilecoinStorageHealthLevel) {

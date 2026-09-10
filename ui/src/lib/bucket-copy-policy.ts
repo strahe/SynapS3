@@ -1,31 +1,31 @@
 import type { BucketItem } from '@/api/client'
 
-type BucketCopyPolicy = Pick<
-  BucketItem,
-  'default_copies' | 'effective_copies' | 'minimum_durable_copies' | 'effective_minimum_durable_copies'
->
+type BucketCopyPolicy = Pick<BucketItem, 'default_copies' | 'minimum_durable_copies'>
 
-export const inheritedCopyPolicyValue = 'inherit'
-export const strictMinimumDurableCopiesValue = 'strict'
 export const copyPolicyOptions = Array.from({ length: 8 }, (_, index) => index + 1)
 
 export function bucketCopyPolicyValue(bucket: Pick<BucketItem, 'default_copies'>) {
-  return bucket.default_copies == null ? inheritedCopyPolicyValue : bucket.default_copies.toString()
+  return bucket.default_copies.toString()
 }
 
-export function bucketCopyPolicyLabel(bucket: BucketCopyPolicy) {
-  const copies = copyCountLabel(bucket.effective_copies)
-  return bucket.default_copies == null ? `Inherits global default (${copies})` : `Override (${copies})`
-}
-
-export function bucketCopyPolicyInheritOptionLabel(bucket: BucketCopyPolicy, runtimeDefaultCopies?: number) {
-  const copies = bucket.default_copies == null ? bucket.effective_copies : runtimeDefaultCopies
-  if (copies == null) return 'Inherit current runtime default'
-  return `Inherit current runtime default (${copyCountLabel(copies)})`
+export function bucketCopyPolicyLabel(bucket: Pick<BucketItem, 'default_copies'>) {
+  return copyCountLabel(bucket.default_copies)
 }
 
 export function replicaTargetChoiceNote() {
   return 'Applies to new uploads. Existing objects keep the replica target they started with.'
+}
+
+// Lowering the target would leave the replicas above it stored and billed with
+// nothing to retire them, so the server refuses it. Offer those counts as
+// visibly unavailable rather than hiding them, so the choice reads as
+// temporarily closed instead of missing.
+export function replicaTargetLocked(copies: number, currentCopies: number) {
+  return copies < currentCopies
+}
+
+export function replicaTargetLockNote() {
+  return 'Lowering the replica target is not supported yet.'
 }
 
 export function bucketCopyPolicySavedMessage() {
@@ -33,34 +33,31 @@ export function bucketCopyPolicySavedMessage() {
 }
 
 export function minimumDurableCopiesChoiceNote() {
-  return 'Keeps cache until every replica of that upload is stored, including later Replicas increases.'
+  return 'Keeps cache until every replica of that upload is stored.'
 }
 
 export function minimumDurableCopiesFixedCountNote() {
   return 'Keeps this count if Replicas later increases.'
 }
 
-export function minimumDurableCopiesValue(bucket: Pick<BucketItem, 'minimum_durable_copies' | 'effective_copies'>) {
-  if (bucket.minimum_durable_copies == null) return strictMinimumDurableCopiesValue
-  if (bucket.minimum_durable_copies > bucket.effective_copies) return bucket.effective_copies.toString()
-  return bucket.minimum_durable_copies.toString()
+export function minimumDurableCopiesValue(bucket: BucketCopyPolicy) {
+  return Math.min(bucket.minimum_durable_copies, bucket.default_copies).toString()
 }
 
 export function minimumDurableCopiesLabel(bucket: BucketCopyPolicy) {
-  if (bucket.minimum_durable_copies == null) return 'All replicas (strict)'
-  return `${bucket.effective_minimum_durable_copies} of ${bucket.effective_copies} ${bucket.effective_copies === 1 ? 'replica' : 'replicas'}`
+  const target = bucket.default_copies
+  return `${Math.min(bucket.minimum_durable_copies, target)} of ${target} ${target === 1 ? 'replica' : 'replicas'}`
 }
 
 export function minimumDurableCopiesOptionLabel(copies: number, targetCopies?: number | null) {
   const count = `${copies} ${copies === 1 ? 'replica' : 'replicas'}`
   if (targetCopies != null && copies === targetCopies) {
-    return `${count} (fixed count)`
+    return `${count} (all replicas)`
   }
   return count
 }
 
-export function selectedTargetCopies(copyPolicy: string, runtimeDefaultCopies?: number) {
-  if (copyPolicy === inheritedCopyPolicyValue) return runtimeDefaultCopies ?? null
+export function selectedTargetCopies(copyPolicy: string) {
   const copies = Number(copyPolicy)
   return Number.isInteger(copies) && copies >= 1 && copies <= 8 ? copies : null
 }
@@ -71,22 +68,18 @@ export function minimumDurableCopiesOptions(targetCopies: number | null) {
 }
 
 export function clampMinimumDurableCopiesValue(value: string, targetCopies: number | null) {
-  if (value === strictMinimumDurableCopiesValue) return value
-  if (targetCopies == null) return strictMinimumDurableCopiesValue
+  if (targetCopies == null) return value
   const copies = Number(value)
-  if (!Number.isInteger(copies) || copies < 1) return strictMinimumDurableCopiesValue
+  if (!Number.isInteger(copies) || copies < 1) return targetCopies.toString()
   if (copies > targetCopies) return targetCopies.toString()
   return value
 }
 
 export function persistMinimumDurableCopies(
   selected: string,
-  storedMinimum: number | null,
+  storedMinimum: number,
   targetCopies: number | null
-): number | null | undefined {
-  if (selected === strictMinimumDurableCopiesValue) {
-    return storedMinimum == null ? undefined : null
-  }
+): number | undefined {
   const selectedNumber = Number(selected)
   if (!Number.isInteger(selectedNumber) || selectedNumber < 1 || selectedNumber > 8) {
     return undefined
@@ -101,7 +94,6 @@ export function minimumDurableCopiesWarning() {
 }
 
 export function showsMinimumDurableCopiesWarning(value: string, targetCopies: number | null) {
-  if (value === strictMinimumDurableCopiesValue) return false
   const copies = Number(value)
   return Number.isInteger(copies) && targetCopies != null && copies < targetCopies
 }

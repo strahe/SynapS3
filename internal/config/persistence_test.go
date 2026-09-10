@@ -166,8 +166,8 @@ func TestInitAppDataDir_DefaultCreatesReferenceConfigAndRuntimeDirs(t *testing.T
 	if loaded.Server.Port != defaults.Server.Port {
 		t.Fatalf("Server.Port = %q, want default %q", loaded.Server.Port, defaults.Server.Port)
 	}
-	if loaded.Worker.Upload.Concurrency != defaults.Worker.Upload.Concurrency {
-		t.Fatalf("Worker.Upload.Concurrency = %d, want default %d", loaded.Worker.Upload.Concurrency, defaults.Worker.Upload.Concurrency)
+	if loaded.Worker.Tasks.Concurrency != defaults.Worker.Tasks.Concurrency {
+		t.Fatalf("Worker.Tasks.Concurrency = %d, want default %d", loaded.Worker.Tasks.Concurrency, defaults.Worker.Tasks.Concurrency)
 	}
 	if loaded.Logging.Level != defaults.Logging.Level {
 		t.Fatalf("Logging.Level = %q, want default %q", loaded.Logging.Level, defaults.Logging.Level)
@@ -238,8 +238,7 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"[server]",
 		"# port = \":8080\"",
 		"[server.tls]",
-		"[worker.upload]",
-		"[worker.provider_replacement]",
+		"[worker.tasks]",
 		"[logging]",
 		"[logging.s3_access]",
 		"[admin.auth]",
@@ -297,7 +296,7 @@ func TestInitAppDataDir_CommentedFieldsCanBeUncommentedInPlace(t *testing.T) {
 	}
 	text := strings.ReplaceAll(string(data), "# port = \":8080\"", "port = \":9191\"")
 	text = strings.ReplaceAll(text, "# level = \"info\"", "level = \"debug\"")
-	text = strings.ReplaceAll(text, "# concurrency = 4", "concurrency = 6")
+	text = strings.ReplaceAll(text, "# concurrency = 12", "concurrency = 6")
 	if err := os.WriteFile(result.ConfigPath, []byte(text), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -312,8 +311,8 @@ func TestInitAppDataDir_CommentedFieldsCanBeUncommentedInPlace(t *testing.T) {
 	if loaded.Logging.Level != "debug" {
 		t.Fatalf("Logging.Level = %q, want debug", loaded.Logging.Level)
 	}
-	if loaded.Worker.Upload.Concurrency != 6 {
-		t.Fatalf("Worker.Upload.Concurrency = %d, want 6", loaded.Worker.Upload.Concurrency)
+	if loaded.Worker.Tasks.Concurrency != 6 {
+		t.Fatalf("Worker.Tasks.Concurrency = %d, want 6", loaded.Worker.Tasks.Concurrency)
 	}
 }
 
@@ -328,8 +327,8 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	cfg.Cache.EvictionPolicy = "NONE"
 	cfg.Cache.LRUHighWatermarkPercent = 87
 	cfg.Cache.LRULowWatermarkPercent = 72
-	cfg.Worker.Upload.PollInterval = 7 * time.Second
-	cfg.Worker.Evictor.PollInterval = 2 * time.Minute
+	cfg.Worker.Tasks.PollInterval = 7 * time.Second
+	cfg.Worker.Tasks.LeaseDuration = 2 * time.Minute
 	cfg.Logging.S3Access.Enabled = false
 	cfg.Logging.S3Access.Level = "debug"
 
@@ -363,15 +362,13 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 		"interval = \"5m0s\"",
 		"timeout = \"5s\"",
 		"concurrency = 8",
-		"[worker.upload]",
+		"[worker.tasks]",
 		"poll_interval = \"7s\"",
-		"[worker.provider_replacement]",
 		"[cache]",
 		"eviction_policy = \"none\"",
 		"lru_high_watermark_percent = 87",
 		"lru_low_watermark_percent = 72",
-		"[worker.evictor]",
-		"poll_interval = \"2m0s\"",
+		"lease_duration = \"2m0s\"",
 		"[logging.s3_access]",
 		"enabled = false",
 		"level = \"debug\"",
@@ -391,11 +388,11 @@ func TestSaveGeneratedTOML_RoundTripsWithCommentsAndUsesPrivatePermissions(t *te
 	if loaded.Server.Port != cfg.Server.Port {
 		t.Fatalf("Server.Port = %q, want %q", loaded.Server.Port, cfg.Server.Port)
 	}
-	if loaded.Worker.Upload.PollInterval != cfg.Worker.Upload.PollInterval {
-		t.Fatalf("Upload poll interval = %s, want %s", loaded.Worker.Upload.PollInterval, cfg.Worker.Upload.PollInterval)
+	if loaded.Worker.Tasks.PollInterval != cfg.Worker.Tasks.PollInterval {
+		t.Fatalf("Task poll interval = %s, want %s", loaded.Worker.Tasks.PollInterval, cfg.Worker.Tasks.PollInterval)
 	}
-	if loaded.Worker.Evictor.PollInterval != cfg.Worker.Evictor.PollInterval {
-		t.Fatalf("Evictor poll interval = %s, want %s", loaded.Worker.Evictor.PollInterval, cfg.Worker.Evictor.PollInterval)
+	if loaded.Worker.Tasks.LeaseDuration != cfg.Worker.Tasks.LeaseDuration {
+		t.Fatalf("Task lease duration = %s, want %s", loaded.Worker.Tasks.LeaseDuration, cfg.Worker.Tasks.LeaseDuration)
 	}
 	if loaded.Cache.EvictionPolicy != "none" ||
 		loaded.Cache.LRUHighWatermarkPercent != 87 ||

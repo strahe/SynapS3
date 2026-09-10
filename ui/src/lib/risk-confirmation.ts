@@ -147,59 +147,65 @@ export function collectSettingsRiskChanges(
     'Changes when capacity-based cache eviction stops.'
   )
 
-  addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'upload')
-  addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'provider_replacement')
-  addWorkerRiskChanges(changes, initial, next, envManaged, metadata, 'evictor')
-
-  return changes
-}
-
-function addWorkerRiskChanges(
-  changes: SettingsRiskChange[],
-  initial: SettingsEditableConfig,
-  next: SettingsEditableConfig,
-  envManaged: Record<string, string>,
-  metadata: Record<string, SettingsFieldMetadata>,
-  pool: 'upload' | 'provider_replacement' | 'evictor'
-) {
-  const prefix = `worker.${pool}`
-  const initialPool = initial.worker[pool]
-  const nextPool = next.worker[pool]
-
-  if (nextPool.concurrency > initialPool.concurrency) {
-    pushRiskChange(
-      changes,
-      metadata,
-      envManaged,
-      `${prefix}.concurrency`,
-      initialPool.concurrency,
-      nextPool.concurrency,
+  if (next.worker.tasks.concurrency > initial.worker.tasks.concurrency) {
+    addChanged(
+      'worker.tasks.concurrency',
+      initial.worker.tasks.concurrency,
+      next.worker.tasks.concurrency,
       'medium',
       'Increases concurrent background work.'
     )
   }
-  pushRiskChange(
-    changes,
-    metadata,
-    envManaged,
-    `${prefix}.poll_interval`,
-    initialPool.poll_interval,
-    nextPool.poll_interval,
+  addChanged(
+    'worker.tasks.poll_interval',
+    initial.worker.tasks.poll_interval,
+    next.worker.tasks.poll_interval,
     'medium',
-    'Changes how often background work is polled.'
+    'Changes how often ready background work is checked.'
   )
-  if (nextPool.max_retries > initialPool.max_retries) {
-    pushRiskChange(
-      changes,
-      metadata,
-      envManaged,
-      `${prefix}.max_retries`,
-      initialPool.max_retries,
-      nextPool.max_retries,
+  addChanged(
+    'worker.tasks.lease_duration',
+    initial.worker.tasks.lease_duration,
+    next.worker.tasks.lease_duration,
+    'medium',
+    'Changes how quickly interrupted work can be recovered.'
+  )
+  if (next.worker.tasks.max_retries > initial.worker.tasks.max_retries) {
+    addChanged(
+      'worker.tasks.max_retries',
+      initial.worker.tasks.max_retries,
+      next.worker.tasks.max_retries,
       'medium',
-      'Increases retry attempts for failed background work.'
+      'Increases automatic recovery attempts for failed background work.'
     )
   }
+  addChanged(
+    'worker.tasks.retention',
+    initial.worker.tasks.retention,
+    next.worker.tasks.retention,
+    'medium',
+    'Changes how long finished background operations remain visible.'
+  )
+  if (next.worker.tasks.provider_mutation_concurrency > initial.worker.tasks.provider_mutation_concurrency) {
+    addChanged(
+      'worker.tasks.provider_mutation_concurrency',
+      initial.worker.tasks.provider_mutation_concurrency,
+      next.worker.tasks.provider_mutation_concurrency,
+      'medium',
+      'Increases concurrent requests that change remote storage.'
+    )
+  }
+  if (next.worker.tasks.destructive_mutation_concurrency > initial.worker.tasks.destructive_mutation_concurrency) {
+    addChanged(
+      'worker.tasks.destructive_mutation_concurrency',
+      initial.worker.tasks.destructive_mutation_concurrency,
+      next.worker.tasks.destructive_mutation_concurrency,
+      'medium',
+      'Increases concurrent remote cleanup and retirement requests.'
+    )
+  }
+
+  return changes
 }
 
 function pushRiskChange(

@@ -476,8 +476,17 @@ func TestAssemblePartsCapacityEnforcement(t *testing.T) {
 		t.Fatalf("UsedBytes after parts = %d, want 10", fs.UsedBytes())
 	}
 
-	if _, _, err := fs.AssembleParts(ctx, "bkt", "key", "up-assemble-cap", []int{1, 2}); err != ErrCacheFull {
-		t.Fatalf("AssembleParts over capacity err = %v, want ErrCacheFull", err)
+	// Capacity is reserved when the staged file claims its destination, so the
+	// refusal surfaces at commit rather than during assembly.
+	staged, _, err := fs.AssemblePartsStaged(ctx, "bkt", "key", "up-assemble-cap", []int{1, 2})
+	if err != nil {
+		t.Fatalf("AssemblePartsStaged: %v", err)
+	}
+	if err := staged.Commit(); err != ErrCacheFull {
+		t.Fatalf("assembled commit over capacity err = %v, want ErrCacheFull", err)
+	}
+	if err := staged.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
 	}
 	if fs.UsedBytes() != 10 {
 		t.Fatalf("UsedBytes after failed assemble = %d, want 10", fs.UsedBytes())
@@ -531,7 +540,7 @@ func TestConcurrentPuts(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, goroutines)
 
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -621,10 +630,14 @@ func TestPutPartAndAssemble(t *testing.T) {
 	}
 
 	// Assemble
-	assembled, partETags, err := fs.AssembleParts(ctx, "bkt", "assembled-key", "upload-1", []int{1, 2})
+	staged, partETags, err := fs.AssemblePartsStaged(ctx, "bkt", "assembled-key", "upload-1", []int{1, 2})
 	if err != nil {
-		t.Fatalf("AssembleParts: %v", err)
+		t.Fatalf("AssemblePartsStaged: %v", err)
 	}
+	if err := staged.Commit(); err != nil {
+		t.Fatalf("commit assembled: %v", err)
+	}
+	assembled := staged.Info
 
 	expectedData := append([]byte{}, part1Data...)
 	expectedData = append(expectedData, part2Data...)
@@ -727,9 +740,12 @@ func TestAssemblePartsUsedBytes(t *testing.T) {
 	_, _ = fs.PutPart(ctx, "up-ub", 2, bytes.NewReader(p2))
 	partsSize := int64(len(p1) + len(p2))
 
-	_, _, err := fs.AssembleParts(ctx, "bkt", "key", "up-ub", []int{1, 2})
+	staged, _, err := fs.AssemblePartsStaged(ctx, "bkt", "key", "up-ub", []int{1, 2})
 	if err != nil {
-		t.Fatalf("AssembleParts: %v", err)
+		t.Fatalf("AssemblePartsStaged: %v", err)
+	}
+	if err := staged.Commit(); err != nil {
+		t.Fatalf("commit assembled: %v", err)
 	}
 
 	// UsedBytes = parts + assembled object

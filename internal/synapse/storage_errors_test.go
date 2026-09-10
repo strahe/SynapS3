@@ -5,12 +5,45 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"testing"
 
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/spregistry"
 	"github.com/strahe/synapse-go/storage"
 )
+
+func TestClassifyPullError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want PullErrorDisposition
+	}{
+		{name: "provider failed", err: fmt.Errorf("pull: %w", pdp.ErrPullFailed), want: PullErrorTerminal},
+		{name: "invalid request", err: fmt.Errorf("pull: %w", storage.ErrInvalidArgument), want: PullErrorTerminal},
+		{name: "bad request", err: &pdp.HTTPError{StatusCode: http.StatusBadRequest}, want: PullErrorTerminal},
+		{name: "not found", err: &pdp.HTTPError{StatusCode: http.StatusNotFound}, want: PullErrorTerminal},
+		{name: "request timeout", err: &pdp.HTTPError{StatusCode: http.StatusRequestTimeout}, want: PullErrorRetryable},
+		{name: "too early", err: &pdp.HTTPError{StatusCode: http.StatusTooEarly}, want: PullErrorRetryable},
+		{name: "rate limited", err: &pdp.HTTPError{StatusCode: http.StatusTooManyRequests}, want: PullErrorRetryable},
+		{name: "server error", err: &pdp.HTTPError{StatusCode: http.StatusBadGateway}, want: PullErrorRetryable},
+		{name: "network error", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection reset")}, want: PullErrorRetryable},
+		{name: "caller cancelled", err: context.Canceled, want: PullErrorRetryable},
+		{name: "caller deadline", err: context.DeadlineExceeded, want: PullErrorRetryable},
+		{name: "normalized provider unavailable", err: &ProviderUnavailableError{Cause: errors.New("offline")}, want: PullErrorRetryable},
+		{name: "unknown", err: errors.New("new sdk error"), want: PullErrorUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ClassifyPullError(tt.err); got != tt.want {
+				t.Fatalf("ClassifyPullError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestNormalizeSelectUploadTargetsError(t *testing.T) {
 	t.Parallel()

@@ -28,7 +28,7 @@ func assertTestDBsAreIsolated(t *testing.T, newDB func(*testing.T) *bun.DB) {
 	first := newDB(t)
 	second := newDB(t)
 
-	bucket := &model.Bucket{Name: "isolated-db-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "isolated-db-bucket", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
 	if _, err := first.NewInsert().Model(bucket).Exec(ctx); err != nil {
 		t.Fatalf("insert bucket into first db: %v", err)
 	}

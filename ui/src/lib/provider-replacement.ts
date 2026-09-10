@@ -145,24 +145,6 @@ const replacementErrorMessages: Record<string, string> = {
 }
 
 /**
- * Provider replacement work resumes from the Data Sets view, never from the task
- * queue, so the Tasks page must not offer a Retry the API will refuse.
- */
-export function taskRetryableFromQueue(task: { stage?: string | null }) {
-  return (
-    task.stage !== 'replace_provider' && task.stage !== 'retire_data_set' && task.stage !== 'retire_abandoned_target'
-  )
-}
-
-export function taskHasDataSetsRecovery(task: { stage?: string | null; status: string; bucket_name?: string | null }) {
-  return (
-    Boolean(task.bucket_name) &&
-    ['replace_provider', 'retire_data_set', 'retire_abandoned_target'].includes(task.stage ?? '') &&
-    ['completed', 'failed', 'exhausted', 'cancelled'].includes(task.status)
-  )
-}
-
-/**
  * What the operator should do next, in their terms. The recorded error is
  * developer diagnostics and belongs behind a detail view, not on the card.
  */

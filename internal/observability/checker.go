@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -497,12 +498,7 @@ func lessDecimalString(a, b string) bool {
 }
 
 func reasonCodeContains(codes []ReasonCode, want ReasonCode) bool {
-	for _, code := range codes {
-		if code == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(codes, want)
 }
 
 func worseStatus(current, next Status) Status {
@@ -531,7 +527,7 @@ func localStatusSeverity(status model.StorageDataSetStatus) Status {
 		return StatusAvailable
 	case model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating:
 		return StatusDegraded
-	case model.StorageDataSetStatusFailed, model.StorageDataSetStatusUnavailable, model.StorageDataSetStatusRetired:
+	case model.StorageDataSetStatusFailed, model.StorageDataSetStatusRetired:
 		return StatusUnavailable
 	default:
 		return StatusDegraded

@@ -44,7 +44,7 @@ The key boundary is between the S3 response and Filecoin upload. When a write is
 | Behavior | Operator impact |
 | --- | --- |
 | S3 writes land locally first | While local runtime data is intact, accepted writes remain available from local storage until eligible cache eviction. After eviction, reads require an available remote copy. |
-| Background tasks handle Filecoin upload | Watch task queues and exhausted tasks. |
+| Background tasks handle Filecoin storage | Watch pending, running, and failed tasks. |
 | Cache is part of durability | Treat cache disk as runtime data, not disposable scratch space. |
 | Admin API controls operations | Use Admin auth; keep it on loopback or behind HTTPS and access control. |
 

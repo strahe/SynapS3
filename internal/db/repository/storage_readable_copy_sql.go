@@ -17,8 +17,7 @@ func readableCommittedCopyPredicateSQL(copyAlias, dataSetAlias string) string {
 // also treat a data set as its own readable source while it is being finalized.
 func readableCommittedCopyPredicateWithDataSetStatusSQL(copyAlias, dataSetAlias, dataSetStatusCondition string) string {
 	return fmt.Sprintf(`%[1]s.status = %[3]s
-		  AND %[1]s.storage_data_set_id IS NOT NULL
-		  AND %[1]s.provider_id IS NOT NULL AND %[1]s.provider_id <> ''
+			  AND %[1]s.provider_id <> ''
 		  AND %[2]s.data_set_id IS NOT NULL AND %[2]s.data_set_id <> ''
 		  AND %[4]s
 		  AND %[1]s.piece_id IS NOT NULL AND %[1]s.piece_id <> ''
@@ -31,34 +30,30 @@ func readableCommittedCopyPredicateWithDataSetStatusSQL(copyAlias, dataSetAlias,
 }
 
 // A replica slot can hold several data set generations during a provider
-// replacement, so a lookup that knows only the upload and the slot must resolve
-// to the generation that currently owns the slot. A copy with no data set yet
-// belongs to the slot until one is assigned.
+// replacement, so a lookup that knows only the upload and the slot resolves to
+// the bound generation that currently owns the slot.
 func currentGenerationCopySQL(copyAlias string) string {
-	return fmt.Sprintf(`(
-		%[1]s.storage_data_set_id IS NULL
-		OR EXISTS (
+	return fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM storage_data_sets AS current_slot_data_set
 			WHERE current_slot_data_set.id = %[1]s.storage_data_set_id
 			  AND current_slot_data_set.is_current
-		)
-	)`, copyAlias)
+		)`, copyAlias)
 }
 
 // Durability is measured in logical replica slots. One slot can hold several
 // physical data set generations while a provider replacement is in flight, and
 // those generations must never count as separate replicas.
-func distinctReadableSlotCountSQL(copyAlias, dataSetAlias, uploadIDExpr string) string {
+func distinctReadableSlotCountSQL(copyAlias, dataSetAlias, contentIDExpr string) string {
 	return fmt.Sprintf(`(
 		SELECT COUNT(DISTINCT %[2]s.copy_index)
-		FROM storage_upload_copies AS %[1]s
+		FROM storage_copies AS %[1]s
 		JOIN storage_data_sets AS %[2]s ON %[2]s.id = %[1]s.storage_data_set_id
-		WHERE %[1]s.upload_id = %[3]s
+		WHERE %[1]s.content_id = %[3]s
 		  AND %[4]s
 	)`,
 		copyAlias,
 		dataSetAlias,
-		uploadIDExpr,
+		contentIDExpr,
 		readableCommittedCopyPredicateSQL(copyAlias, dataSetAlias),
 	)
 }

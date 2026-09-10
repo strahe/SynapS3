@@ -29,7 +29,6 @@ import {
   bucketCopyPolicyLabel,
   clampMinimumDurableCopiesValue,
   copyPolicyOptions,
-  inheritedCopyPolicyValue,
   minimumDurableCopiesChoiceNote,
   minimumDurableCopiesFixedCountNote,
   minimumDurableCopiesLabel,
@@ -39,7 +38,6 @@ import {
   replicaTargetChoiceNote,
   selectedTargetCopies,
   showsMinimumDurableCopiesWarning,
-  strictMinimumDurableCopiesValue,
 } from '@/lib/bucket-copy-policy'
 import {
   bucketStorageHealthLabel,
@@ -57,22 +55,26 @@ function CreateBucketDialog() {
   const [open, setOpen] = useState(false)
   const [bucketName, setBucketName] = useState('')
   const [ownerAccessKey, setOwnerAccessKey] = useState('')
-  const [copyPolicy, setCopyPolicy] = useState(inheritedCopyPolicyValue)
-  const [minimumDurableCopies, setMinimumDurableCopies] = useState(strictMinimumDurableCopiesValue)
+  const [copyPolicyOverride, setCopyPolicyOverride] = useState<string | null>(null)
+  const [minimumDurableCopiesOverride, setMinimumDurableCopiesOverride] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const { data: users = [], isLoading: usersLoading, error: usersError } = useS3Users()
   const { data: settings } = useSettings()
   const createBucket = useCreateBucket()
   const navigate = useNavigate()
   const runtimeDefaultCopies = settings?.runtime_filecoin_default_copies
-  const targetCopies = selectedTargetCopies(copyPolicy, runtimeDefaultCopies)
+  // A bucket stores its own policy, so the dialog only pre-selects the
+  // configured target instead of offering an "inherit" value to store.
+  const copyPolicy = copyPolicyOverride ?? runtimeDefaultCopies?.toString() ?? ''
+  const targetCopies = selectedTargetCopies(copyPolicy)
+  const minimumDurableCopies = minimumDurableCopiesOverride ?? targetCopies?.toString() ?? ''
   const minimumOptions = minimumDurableCopiesOptions(targetCopies)
 
   const reset = () => {
     setBucketName('')
     setOwnerAccessKey('')
-    setCopyPolicy(inheritedCopyPolicyValue)
-    setMinimumDurableCopies(strictMinimumDurableCopiesValue)
+    setCopyPolicyOverride(null)
+    setMinimumDurableCopiesOverride(null)
     setError(null)
     createBucket.reset()
   }
@@ -95,8 +97,8 @@ function CreateBucketDialog() {
     }
 
     setError(null)
-    const defaultCopies = copyPolicy === inheritedCopyPolicyValue ? null : Number(copyPolicy)
-    const minimumCopies = minimumDurableCopies === strictMinimumDurableCopiesValue ? null : Number(minimumDurableCopies)
+    const defaultCopies = targetCopies
+    const minimumCopies = selectedTargetCopies(minimumDurableCopies)
     createBucket.mutate(
       { name, ownerAccessKey, defaultCopies, minimumDurableCopies: minimumCopies },
       {
@@ -116,9 +118,11 @@ function CreateBucketDialog() {
   const ownerError = error === 'Bucket owner is required' ? error : null
   const formError = error && !bucketNameError && !ownerError ? error : null
   const handleCopyPolicyChange = (next: string) => {
-    const nextTarget = selectedTargetCopies(next, runtimeDefaultCopies)
-    setCopyPolicy(next)
-    setMinimumDurableCopies((current) => clampMinimumDurableCopiesValue(current, nextTarget))
+    const nextTarget = selectedTargetCopies(next)
+    setCopyPolicyOverride(next)
+    setMinimumDurableCopiesOverride((current) =>
+      current == null ? null : clampMinimumDurableCopiesValue(current, nextTarget)
+    )
   }
 
   return (
@@ -173,11 +177,6 @@ function CreateBucketDialog() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value={inheritedCopyPolicyValue}>
-                      {runtimeDefaultCopies == null
-                        ? 'Inherit current runtime default'
-                        : `Inherit current runtime default (${runtimeDefaultCopies} ${runtimeDefaultCopies === 1 ? 'copy' : 'copies'})`}
-                    </SelectItem>
                     {copyPolicyOptions.map((copies) => (
                       <SelectItem key={copies} value={copies.toString()}>
                         {copies} {copies === 1 ? 'copy' : 'copies'}
@@ -186,10 +185,9 @@ function CreateBucketDialog() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              {copyPolicy === inheritedCopyPolicyValue && runtimeDefaultCopies == null ? (
+              {targetCopies == null ? (
                 <FieldDescription>
-                  The current runtime default is unavailable. Choose a replica count to configure an explicit
-                  cache-release threshold.
+                  The current runtime default is unavailable. Choose a replica count for this bucket.
                 </FieldDescription>
               ) : (
                 <FieldDescription>{replicaTargetChoiceNote()}</FieldDescription>
@@ -199,7 +197,7 @@ function CreateBucketDialog() {
               <FieldLabel htmlFor="bucket-minimum-durable-copies">Release cache after</FieldLabel>
               <Select
                 value={minimumDurableCopies}
-                onValueChange={setMinimumDurableCopies}
+                onValueChange={setMinimumDurableCopiesOverride}
                 disabled={createBucket.isPending}
               >
                 <SelectTrigger id="bucket-minimum-durable-copies" className="w-full">
@@ -207,7 +205,6 @@ function CreateBucketDialog() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value={strictMinimumDurableCopiesValue}>All replicas (strict)</SelectItem>
                     {minimumOptions.map((copies) => (
                       <SelectItem key={copies} value={copies.toString()}>
                         {minimumDurableCopiesOptionLabel(copies, targetCopies)}
@@ -216,7 +213,7 @@ function CreateBucketDialog() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              {minimumDurableCopies === strictMinimumDurableCopiesValue ? (
+              {targetCopies != null && Number(minimumDurableCopies) === targetCopies ? (
                 <FieldDescription>{minimumDurableCopiesChoiceNote()}</FieldDescription>
               ) : (
                 <FieldDescription>{minimumDurableCopiesFixedCountNote()}</FieldDescription>

@@ -40,7 +40,7 @@ func TestLoggerOmitsQueryAndObjectDetailFields(t *testing.T) {
 		Action: "GetObject",
 	})
 
-	for _, field := range []string{"query", "bucket", "key", "remote_ip", "bytes_sent", "object_size", "uploadID", "partNumber", "versionID", "bucket_owner"} {
+	for _, field := range []string{"query", "bucket", "key", "remote_ip", "bytes_sent", "object_size", "contentID", "partNumber", "versionID", "bucket_owner"} {
 		if _, ok := record[field]; ok {
 			t.Fatalf("record should omit %q: %#v", field, record)
 		}

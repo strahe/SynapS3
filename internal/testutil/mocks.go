@@ -185,7 +185,11 @@ type MockStorageTarget struct {
 	ClientDataSetIDValue sdktypes.BigInt
 	ServiceURLValue      string
 	WithCDNValue         bool
+	CreateDataSetFunc    func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
+	WaitDataSetFunc      func(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
+	StoreFunc            func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
 	PresignForCommitFunc func(context.Context, []storage.PieceInput) ([]byte, error)
+	PullFunc             func(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommitFunc     func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
 	GetCommitStatusFunc  func(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
 	PieceStatusFunc      func(context.Context, cid.Cid) (*storage.PieceStatus, error)
@@ -240,15 +244,24 @@ func (m *MockStorageTarget) ServiceURL() string {
 	return "https://provider.example"
 }
 
-func (m *MockStorageTarget) CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+func (m *MockStorageTarget) CreateDataSet(ctx context.Context, opts *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error) {
+	if m.CreateDataSetFunc != nil {
+		return m.CreateDataSetFunc(ctx, opts)
+	}
 	return nil, errors.New("MockStorageTarget.CreateDataSet not configured")
 }
 
-func (m *MockStorageTarget) WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+func (m *MockStorageTarget) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+	if m.WaitDataSetFunc != nil {
+		return m.WaitDataSetFunc(ctx, submission)
+	}
 	return nil, errors.New("MockStorageTarget.WaitForDataSetCreated not configured")
 }
 
-func (m *MockStorageTarget) Store(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error) {
+func (m *MockStorageTarget) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
+	if m.StoreFunc != nil {
+		return m.StoreFunc(ctx, reader, opts)
+	}
 	return nil, errors.New("MockStorageTarget.Store not configured")
 }
 
@@ -259,7 +272,10 @@ func (m *MockStorageTarget) PresignForCommit(ctx context.Context, pieces []stora
 	return nil, errors.New("MockStorageTarget.PresignForCommit not configured")
 }
 
-func (m *MockStorageTarget) Pull(context.Context, storage.PullRequest) (*storage.PullResult, error) {
+func (m *MockStorageTarget) Pull(ctx context.Context, request storage.PullRequest) (*storage.PullResult, error) {
+	if m.PullFunc != nil {
+		return m.PullFunc(ctx, request)
+	}
 	return nil, errors.New("MockStorageTarget.Pull not configured")
 }
 
@@ -316,7 +332,7 @@ type MockCache struct {
 	CreateBucketDirFunc func(ctx context.Context, bucket string) error
 	DeleteBucketDirFunc func(ctx context.Context, bucket string) error
 	PutPartFunc         func(ctx context.Context, uploadID string, partNumber int, r io.Reader) (*cache.ObjectInfo, error)
-	AssemblePartsFunc   func(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.ObjectInfo, []string, error)
+	AssemblePartsFunc   func(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error)
 	DeleteUploadFunc    func(ctx context.Context, uploadID string) error
 }
 
@@ -383,11 +399,11 @@ func (m *MockCache) PutPart(ctx context.Context, uploadID string, partNumber int
 	return nil, errors.New("MockCache.PutPart not configured")
 }
 
-func (m *MockCache) AssembleParts(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.ObjectInfo, []string, error) {
+func (m *MockCache) AssemblePartsStaged(ctx context.Context, bucket, key, uploadID string, partNumbers []int) (*cache.StagedObject, []string, error) {
 	if m.AssemblePartsFunc != nil {
 		return m.AssemblePartsFunc(ctx, bucket, key, uploadID, partNumbers)
 	}
-	return nil, nil, errors.New("MockCache.AssembleParts not configured")
+	return nil, nil, errors.New("MockCache.AssemblePartsStaged not configured")
 }
 
 func (m *MockCache) DeleteUpload(ctx context.Context, uploadID string) error {

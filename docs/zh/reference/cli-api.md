@@ -81,8 +81,9 @@ synaps3 admin settings get
 synaps3 admin settings set cache.max_size_gb=200
 synaps3 admin settings set cache.eviction_policy=lru cache.lru_high_watermark_percent=90 cache.lru_low_watermark_percent=80
 synaps3 admin task stats
-synaps3 admin task list --status exhausted --limit 100
+synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42
+synaps3 admin task acknowledge 42
 synaps3 admin storage-confirmation list
 synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --yes
 ```
@@ -97,9 +98,9 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 | `--json` | 以 JSON 返回成功响应。 |
 | `--timeout <duration>` | 设置 Admin API 请求超时。 |
 
-列出后台任务时支持 `--type`、`--stage`、`--status`、`--limit` 和 `--offset`。`--stage` 必须与 `--type` 一起使用。
+列出后台任务时支持 `--type`、`--status`、`--limit` 和基于任务 ID 的 `--cursor`。有效的状态过滤值为 `pending`、`running`、`completed`、`failed`、`cancelled` 和 `dismissed`。pending 工作会显示为 queued、scheduled 或 waiting；`failed` 返回尚未确认的失败，`dismissed` 返回已确认的失败。
 
-`synaps3 admin task retry` 不会重试存储提供方替换工作。请在已完成或已停止的替换任务上使用 **Open Data Sets**，或打开存储桶并前往 **Details** → **Storage** → **Data Sets**。如果所选存储提供方已经存储该桶，请改选其他存储提供方，而不是重试。
+`synaps3 admin task retry` 只恢复响应中标记为可重试的失败任务。存储提供方替换仍在 **Details** → **Storage** → **Data Sets** 中恢复。只有尚未发出广播的钱包操作可以重试；广播结果不确定时仍不可重试。Store 结果不确定时，dashboard 会把 Retry 显示为 **Check again**：该操作只查询存储提供方，不会重新上传。核对失败结果后，可用 `synaps3 admin task acknowledge <id>` 将任务标记为已处理；确认后开始计算保留期，到期后可能被清理。
 
 `synaps3 admin storage-confirmation list` 会显示需要核对的存储确认。核对存储提供方、transaction 和当前 attempt 后，使用 `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes` 表示确认存储提供方可能已经接受该 piece，并允许正常恢复流程再次提交。过期的 attempt ID 会被拒绝。
 

@@ -59,6 +59,22 @@ type StorageClient interface {
 	OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (CleanupContext, error)
 }
 
+// ParkedPieceState describes the provider-local state of a content-addressed
+// piece before it has been committed on chain.
+type ParkedPieceState string
+
+const (
+	ParkedPieceMissing    ParkedPieceState = "missing"
+	ParkedPieceProcessing ParkedPieceState = "processing"
+	ParkedPieceReady      ParkedPieceState = "parked"
+)
+
+// ParkedPieceChecker observes the provider's parked-piece endpoint without
+// treating an on-chain lookup as evidence that an upload did not happen.
+type ParkedPieceChecker interface {
+	FindParkedPiece(context.Context, string, cid.Cid) (ParkedPieceState, error)
+}
+
 // ServiceTerminator is the destructive service-lifecycle boundary. It is used
 // only after replacement cleanup authorization and the retirement safety gate
 // have both passed.

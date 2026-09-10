@@ -251,9 +251,15 @@ func (r *calibrationRuntime) PrepareConfig() error {
 	cfg.Filecoin.Observability.Concurrency = 4
 	cfg.Cache.MaxSizeGB = 1
 	cfg.Cache.EvictionPolicy = "after_upload"
-	cfg.Worker.Upload = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 5 * time.Second, MaxRetries: 3}
-	cfg.Worker.Evictor = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 5 * time.Second, MaxRetries: 3}
-	cfg.Worker.StorageCleanup = config.WorkerPoolConfig{Concurrency: 1, PollInterval: 30 * time.Second, MaxRetries: 3}
+	cfg.Worker.Tasks = config.TaskWorkerConfig{
+		Concurrency:                    4,
+		PollInterval:                   5 * time.Second,
+		LeaseDuration:                  5 * time.Minute,
+		MaxRetries:                     3,
+		Retention:                      7 * 24 * time.Hour,
+		ProviderMutationConcurrency:    4,
+		DestructiveMutationConcurrency: 2,
+	}
 	cfg.Logging.Level = "warn"
 	cfg.Logging.Format = "text"
 	cfg.Logging.S3Access.Enabled = false
@@ -724,11 +730,11 @@ func waitForStoredObject(t *testing.T, admin *e2e.AdminClient, bucket, key strin
 			return storedObject{Snapshot: raw}, false, nil
 		}
 		item := list.Objects[0]
-		if item.Status == "warning" || item.State == "failed" || item.UploadStatus == "failed" || item.UploadStatus == "rejected" {
+		if item.Status == "warning" || item.State == "failed" {
 			return storedObject{VersionID: item.CurrentVersionID, Snapshot: raw}, false, fmt.Errorf("object entered failed state: %s", e2e.DiagnosticValue(item))
 		}
 		resolveUploadDependency(t, ctx, admin, item.CurrentVersionID, actions, taskProgress)
-		return storedObject{VersionID: item.CurrentVersionID, Snapshot: raw}, item.CurrentVersionID != "" && item.UploadStatus == "complete" && item.Location.Filecoin, nil
+		return storedObject{VersionID: item.CurrentVersionID, Snapshot: raw}, item.CurrentVersionID != "" && item.State == "stored" && item.Location.Filecoin, nil
 	}, e2e.WithPollInterval(5*time.Second))
 }
 
@@ -738,7 +744,7 @@ func resolveUploadDependency(t *testing.T, ctx context.Context, admin *e2e.Admin
 		return
 	}
 	var tasks e2e.TaskListResponse
-	raw, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload&limit=100", &tasks)
+	raw, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload_plan&limit=100", &tasks)
 	if err != nil {
 		t.Fatalf("GET upload tasks: %v; body=%s", err, e2e.Redact(raw))
 	}
@@ -746,7 +752,7 @@ func resolveUploadDependency(t *testing.T, ctx context.Context, admin *e2e.Admin
 		progress.Changed(t, "upload tasks", uploadTaskSummary(tasks, versionID))
 	}
 	for _, task := range tasks.Tasks {
-		if task.RefVersionID != versionID || task.Status != "waiting" || task.WaitReason == nil || *task.WaitReason != "dependency" {
+		if !taskHasSubject(task, "object_version", versionID) || task.Status != "pending" || task.WaitReason == nil || *task.WaitReason != "funding" {
 			continue
 		}
 		message := nullableString(task.StatusMessage)
@@ -817,7 +823,7 @@ func waitForCommittedCopies(t *testing.T, admin *e2e.AdminClient, bucket, versio
 			return provenance, false, err
 		}
 		progress.Changed(t, "provenance", provenanceSummary(provenance))
-		if provenance.UploadStatus == "failed" || provenance.UploadStatus == "rejected" {
+		if provenance.State == "failed" {
 			return provenance, false, fmt.Errorf("upload failed: %s", e2e.DiagnosticValue(provenance))
 		}
 		if provenance.RequestedCopies != integrationCopies || provenance.SuccessCopies != integrationCopies || len(provenance.Copies) != integrationCopies {
@@ -871,7 +877,7 @@ func waitForCompletedUploadTasks(t *testing.T, admin *e2e.AdminClient, versionID
 	lastSummary := "none"
 	e2e.Eventually(t, t.Context(), uploadTaskTimeout, "all upload tasks completed without failures", func(ctx context.Context) (string, bool, error) {
 		var tasks e2e.TaskListResponse
-		_, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload&limit=100", &tasks)
+		_, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload_plan&limit=100", &tasks)
 		if err != nil {
 			return lastSummary, false, err
 		}
@@ -879,13 +885,13 @@ func waitForCompletedUploadTasks(t *testing.T, admin *e2e.AdminClient, versionID
 		progress.Changed(t, "upload tasks", lastSummary)
 		seen, active, failed := 0, 0, 0
 		for _, task := range tasks.Tasks {
-			if task.RefVersionID != versionID {
+			if !taskHasSubject(task, "object_version", versionID) {
 				continue
 			}
 			seen++
 			switch task.Status {
 			case "completed":
-			case "failed", "exhausted", "cancelled":
+			case "failed", "cancelled":
 				failed++
 			default:
 				active++
@@ -1112,12 +1118,11 @@ func objectListSummary(list e2e.ObjectListResponse) string {
 	}
 	item := list.Objects[0]
 	return fmt.Sprintf(
-		"count=%d version=%s state=%s status=%s upload=%s cache=%t filecoin=%t",
+		"count=%d version=%s state=%s status=%s cache=%t filecoin=%t",
 		len(list.Objects),
 		item.CurrentVersionID,
 		item.State,
 		item.Status,
-		item.UploadStatus,
 		item.Location.Cache,
 		item.Location.Filecoin,
 	)
@@ -1125,9 +1130,9 @@ func objectListSummary(list e2e.ObjectListResponse) string {
 
 func provenanceSummary(provenance e2e.ProvenanceResponse) string {
 	lines := []string{fmt.Sprintf(
-		"status=%s upload=%s requested=%d success=%d",
+		"state=%s status=%s requested=%d success=%d",
+		provenance.State,
 		provenance.Status,
-		provenance.UploadStatus,
 		provenance.RequestedCopies,
 		provenance.SuccessCopies,
 	)}
@@ -1148,17 +1153,16 @@ func provenanceSummary(provenance e2e.ProvenanceResponse) string {
 func uploadTaskSummary(tasks e2e.TaskListResponse, versionID string) string {
 	lines := make([]string, 0, len(tasks.Tasks))
 	for _, task := range tasks.Tasks {
-		if task.RefVersionID != versionID {
+		if !taskHasSubject(task, "object_version", versionID) {
 			continue
 		}
 		lines = append(lines, fmt.Sprintf(
-			"- id=%d type=%s stage=%s status=%s retry=%d claimed=%s wait=%s message=%s error=%s",
+			"- id=%d type=%s status=%s retry=%d available=%s wait=%s message=%s error=%s",
 			task.ID,
 			task.Type,
-			nullableString(task.Stage),
 			task.Status,
 			task.RetryCount,
-			nullableString(task.ClaimedAt),
+			task.AvailableAt,
 			nullableString(task.WaitReason),
 			shortLogValue(nullableString(task.StatusMessage)),
 			shortLogValue(nullableString(task.LastError)),
@@ -1168,6 +1172,11 @@ func uploadTaskSummary(tasks e2e.TaskListResponse, versionID string) string {
 		return "none"
 	}
 	return strings.Join(lines, "\n")
+}
+
+func taskHasSubject(task e2e.TaskItem, subjectType, subjectKey string) bool {
+	return task.SubjectType != nil && task.SubjectKey != nil &&
+		*task.SubjectType == subjectType && *task.SubjectKey == subjectKey
 }
 
 func observabilitySnapshotSummary(providers e2e.ProviderObservationPage, dataSets e2e.DataSetObservationPage) string {

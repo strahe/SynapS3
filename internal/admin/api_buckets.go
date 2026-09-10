@@ -17,12 +17,16 @@ import (
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
+	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/objectkey"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagecleanup"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/versity/versitygw/auth"
 	"golang.org/x/sync/errgroup"
@@ -42,18 +46,16 @@ const (
 )
 
 type bucketListItem struct {
-	ID                            int64                              `json:"id"`
-	Name                          string                             `json:"name"`
-	OwnerAccessKey                *string                            `json:"owner_access_key"`
-	DefaultCopies                 *int                               `json:"default_copies"`
-	EffectiveCopies               int                                `json:"effective_copies"`
-	MinimumDurableCopies          *int                               `json:"minimum_durable_copies"`
-	EffectiveMinimumDurableCopies int                                `json:"effective_minimum_durable_copies"`
-	Status                        string                             `json:"status"`
-	ObjectCount                   int64                              `json:"object_count"`
-	TotalSizeBytes                int64                              `json:"total_size_bytes"`
-	StorageHealth                 bucketStorageHealthSummaryResponse `json:"storage_health"`
-	CreatedAt                     string                             `json:"created_at"`
+	ID                   int64                              `json:"id"`
+	Name                 string                             `json:"name"`
+	OwnerAccessKey       *string                            `json:"owner_access_key"`
+	DefaultCopies        int                                `json:"default_copies"`
+	MinimumDurableCopies int                                `json:"minimum_durable_copies"`
+	Status               string                             `json:"status"`
+	ObjectCount          int64                              `json:"object_count"`
+	TotalSizeBytes       int64                              `json:"total_size_bytes"`
+	StorageHealth        bucketStorageHealthSummaryResponse `json:"storage_health"`
+	CreatedAt            string                             `json:"created_at"`
 }
 
 type bucketCreateRequest struct {
@@ -64,33 +66,29 @@ type bucketCreateRequest struct {
 }
 
 type bucketMutationResponse struct {
-	ID                            int64   `json:"id"`
-	Name                          string  `json:"name"`
-	OwnerAccessKey                *string `json:"owner_access_key"`
-	DefaultCopies                 *int    `json:"default_copies"`
-	EffectiveCopies               int     `json:"effective_copies"`
-	MinimumDurableCopies          *int    `json:"minimum_durable_copies"`
-	EffectiveMinimumDurableCopies int     `json:"effective_minimum_durable_copies"`
-	Status                        string  `json:"status"`
+	ID                   int64   `json:"id"`
+	Name                 string  `json:"name"`
+	OwnerAccessKey       *string `json:"owner_access_key"`
+	DefaultCopies        int     `json:"default_copies"`
+	MinimumDurableCopies int     `json:"minimum_durable_copies"`
+	Status               string  `json:"status"`
 }
 
 type bucketDetailResponse struct {
-	ID                            int64                              `json:"id"`
-	Name                          string                             `json:"name"`
-	OwnerAccessKey                *string                            `json:"owner_access_key"`
-	DefaultCopies                 *int                               `json:"default_copies"`
-	EffectiveCopies               int                                `json:"effective_copies"`
-	MinimumDurableCopies          *int                               `json:"minimum_durable_copies"`
-	EffectiveMinimumDurableCopies int                                `json:"effective_minimum_durable_copies"`
-	Status                        string                             `json:"status"`
-	ObjectCount                   int64                              `json:"object_count"`
-	TotalSizeBytes                int64                              `json:"total_size_bytes"`
-	StorageHealth                 bucketStorageHealthSummaryResponse `json:"storage_health"`
-	CreatedAt                     string                             `json:"created_at"`
-	UpdatedAt                     string                             `json:"updated_at"`
-	VersioningStatus              string                             `json:"versioning_status"`
-	VersioningEnforced            bool                               `json:"versioning_enforced"`
-	DataSets                      []storageDataSetSummaryResponse    `json:"data_sets"`
+	ID                   int64                              `json:"id"`
+	Name                 string                             `json:"name"`
+	OwnerAccessKey       *string                            `json:"owner_access_key"`
+	DefaultCopies        int                                `json:"default_copies"`
+	MinimumDurableCopies int                                `json:"minimum_durable_copies"`
+	Status               string                             `json:"status"`
+	ObjectCount          int64                              `json:"object_count"`
+	TotalSizeBytes       int64                              `json:"total_size_bytes"`
+	StorageHealth        bucketStorageHealthSummaryResponse `json:"storage_health"`
+	CreatedAt            string                             `json:"created_at"`
+	UpdatedAt            string                             `json:"updated_at"`
+	VersioningStatus     string                             `json:"versioning_status"`
+	VersioningEnforced   bool                               `json:"versioning_enforced"`
+	DataSets             []storageDataSetSummaryResponse    `json:"data_sets"`
 	// Replacements is the bucket's full history, newest first.
 	Replacements []providerReplacementResponse `json:"replacements"`
 }
@@ -100,7 +98,7 @@ type storageDataSetSummaryResponse struct {
 	BucketID           int64                     `json:"bucket_id"`
 	BucketName         string                    `json:"bucket_name,omitempty"`
 	CopyIndex          int                       `json:"copy_index"`
-	Generation         int                       `json:"generation"`
+	Generation         int64                     `json:"generation"`
 	IsCurrent          bool                      `json:"is_current"`
 	Replaceable        bool                      `json:"replaceable"`
 	ProviderID         string                    `json:"provider_id"`
@@ -108,8 +106,8 @@ type storageDataSetSummaryResponse struct {
 	DataSetID          *string                   `json:"data_set_id,omitempty"`
 	ClientDataSetID    *string                   `json:"client_data_set_id,omitempty"`
 	Status             string                    `json:"status"`
-	CreatedByUploadID  *int64                    `json:"created_by_upload_id,omitempty"`
-	LastUsedUploadID   *int64                    `json:"last_used_upload_id,omitempty"`
+	CreatedByContentID *int64                    `json:"created_by_content_id,omitempty"`
+	LastUsedContentID  *int64                    `json:"last_used_content_id,omitempty"`
 	CommittedCopies    int64                     `json:"committed_copies"`
 	ReadableCopies     int64                     `json:"readable_copies"`
 	PhysicalBytes      int64                     `json:"physical_bytes"`
@@ -137,21 +135,6 @@ type bucketOwnerUpdateRequest struct {
 type bucketCopyPolicyUpdateRequest struct {
 	DefaultCopies        json.RawMessage `json:"default_copies"`
 	MinimumDurableCopies json.RawMessage `json:"minimum_durable_copies"`
-}
-
-func (s *Server) effectiveBucketCopies(bucket *model.Bucket) int {
-	if bucket != nil && bucket.DefaultCopies != nil {
-		return boundedBucketCopies(*bucket.DefaultCopies)
-	}
-	return boundedBucketCopies(s.filecoinDefaultCopies)
-}
-
-func (s *Server) effectiveBucketMinimumDurableCopies(bucket *model.Bucket) int {
-	target := s.effectiveBucketCopies(bucket)
-	if bucket == nil || bucket.MinimumDurableCopies == nil || *bucket.MinimumDurableCopies > target {
-		return target
-	}
-	return *bucket.MinimumDurableCopies
 }
 
 func boundedBucketCopies(copies int) int {
@@ -220,18 +203,16 @@ func (s *Server) handleAPIListBuckets(w http.ResponseWriter, r *http.Request) {
 		}
 		stats := statsMap[b.ID]
 		items = append(items, bucketListItem{
-			ID:                            b.ID,
-			Name:                          b.Name,
-			OwnerAccessKey:                s.adminOwnerAccessKey(b.OwnerAccessKey),
-			DefaultCopies:                 b.DefaultCopies,
-			EffectiveCopies:               s.effectiveBucketCopies(&b),
-			MinimumDurableCopies:          b.MinimumDurableCopies,
-			EffectiveMinimumDurableCopies: s.effectiveBucketMinimumDurableCopies(&b),
-			Status:                        string(b.Status),
-			ObjectCount:                   stats.Count,
-			TotalSizeBytes:                stats.TotalSize,
-			StorageHealth:                 bucketStorageHealthSummaryForBucket(storageHealthMap, b.ID, storageHealthFailed),
-			CreatedAt:                     b.CreatedAt.Format(time.RFC3339),
+			ID:                   b.ID,
+			Name:                 b.Name,
+			OwnerAccessKey:       s.adminOwnerAccessKey(b.OwnerAccessKey),
+			DefaultCopies:        b.DefaultCopies,
+			MinimumDurableCopies: b.MinimumDurableCopies,
+			Status:               string(b.Status),
+			ObjectCount:          stats.Count,
+			TotalSizeBytes:       stats.TotalSize,
+			StorageHealth:        bucketStorageHealthSummaryForBucket(storageHealthMap, b.ID, storageHealthFailed),
+			CreatedAt:            b.CreatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -285,31 +266,19 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var bucket *model.Bucket
-	err = s.repos.WithTx(r.Context(), func(txRepos *repository.Repositories) error {
-		owner, err := txRepos.S3Accounts.LockByAccessKey(r.Context(), actualOwnerAccessKey)
-		if err != nil {
-			return err
-		}
-		if owner == nil {
-			return auth.ErrNoSuchUser
-		}
-		bucket = &model.Bucket{
-			Name:                 name,
-			ACL:                  acl,
-			OwnerAccessKey:       &actualOwnerAccessKey,
-			DefaultCopies:        req.DefaultCopies,
-			MinimumDurableCopies: req.MinimumDurableCopies,
-			Status:               model.BucketStatusActive,
-		}
-		return txRepos.Buckets.Create(r.Context(), bucket)
+	bucket, err := s.bucketLifecycle.CreateWithOptions(r.Context(), bucketlifecycle.CreateOptions{
+		Name:                 name,
+		ACL:                  acl,
+		OwnerAccessKey:       &actualOwnerAccessKey,
+		DefaultCopies:        req.DefaultCopies,
+		MinimumDurableCopies: req.MinimumDurableCopies,
 	})
 	if err != nil {
 		if errors.Is(err, repository.ErrAlreadyExists) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket already exists"})
 			return
 		}
-		if errors.Is(err, auth.ErrNoSuchUser) {
+		if errors.Is(err, bucketlifecycle.ErrOwnerNotFound) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "S3 owner not found"})
 			return
 		}
@@ -317,17 +286,13 @@ func (s *Server) handleAPICreateBucket(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	s.bucketLifecycle.EnsureCacheBucketDir(r.Context(), name)
-
 	writeJSON(w, http.StatusCreated, bucketMutationResponse{
-		ID:                            bucket.ID,
-		Name:                          bucket.Name,
-		OwnerAccessKey:                s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		DefaultCopies:                 bucket.DefaultCopies,
-		EffectiveCopies:               s.effectiveBucketCopies(bucket),
-		MinimumDurableCopies:          bucket.MinimumDurableCopies,
-		EffectiveMinimumDurableCopies: s.effectiveBucketMinimumDurableCopies(bucket),
-		Status:                        string(bucket.Status),
+		ID:                   bucket.ID,
+		Name:                 bucket.Name,
+		OwnerAccessKey:       s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:        bucket.DefaultCopies,
+		MinimumDurableCopies: bucket.MinimumDurableCopies,
+		Status:               string(bucket.Status),
 	})
 }
 
@@ -357,8 +322,8 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dataSets := make([]storageDataSetSummaryResponse, 0)
-	if s.repos.Uploads != nil {
-		summaries, err := s.repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+	if s.repos.Contents != nil {
+		summaries, err := s.repos.Contents.ListDataSetSummaries(ctx, bucket.ID)
 		if err != nil {
 			s.logger.Error("api: failed to list bucket storage data sets", "error", err, "name", bucketName)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -369,23 +334,21 @@ func (s *Server) handleAPIGetBucket(w http.ResponseWriter, r *http.Request) {
 	storageHealthMap, storageHealthFailed := s.bucketStorageHealthSummaries(ctx, bucket.ID)
 
 	writeJSON(w, http.StatusOK, bucketDetailResponse{
-		ID:                            bucket.ID,
-		Name:                          bucket.Name,
-		OwnerAccessKey:                s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		DefaultCopies:                 bucket.DefaultCopies,
-		EffectiveCopies:               s.effectiveBucketCopies(bucket),
-		MinimumDurableCopies:          bucket.MinimumDurableCopies,
-		EffectiveMinimumDurableCopies: s.effectiveBucketMinimumDurableCopies(bucket),
-		Status:                        string(bucket.Status),
-		ObjectCount:                   stats.Count,
-		TotalSizeBytes:                stats.TotalSize,
-		StorageHealth:                 bucketStorageHealthSummaryForBucket(storageHealthMap, bucket.ID, storageHealthFailed),
-		CreatedAt:                     bucket.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:                     bucket.UpdatedAt.Format(time.RFC3339),
-		VersioningStatus:              "Enabled",
-		VersioningEnforced:            true,
-		DataSets:                      dataSets,
-		Replacements:                  s.bucketReplacementResponses(ctx, bucket.Name, bucket.ID),
+		ID:                   bucket.ID,
+		Name:                 bucket.Name,
+		OwnerAccessKey:       s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:        bucket.DefaultCopies,
+		MinimumDurableCopies: bucket.MinimumDurableCopies,
+		Status:               string(bucket.Status),
+		ObjectCount:          stats.Count,
+		TotalSizeBytes:       stats.TotalSize,
+		StorageHealth:        bucketStorageHealthSummaryForBucket(storageHealthMap, bucket.ID, storageHealthFailed),
+		CreatedAt:            bucket.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:            bucket.UpdatedAt.Format(time.RFC3339),
+		VersioningStatus:     "Enabled",
+		VersioningEnforced:   true,
+		DataSets:             dataSets,
+		Replacements:         s.bucketReplacementResponses(ctx, bucket.Name, bucket.ID),
 	})
 }
 
@@ -445,14 +408,12 @@ func (s *Server) handleAPIUpdateBucketOwner(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, bucketMutationResponse{
-		ID:                            bucket.ID,
-		Name:                          bucket.Name,
-		OwnerAccessKey:                s.adminOwnerAccessKey(&actualOwnerAccessKey),
-		DefaultCopies:                 bucket.DefaultCopies,
-		EffectiveCopies:               s.effectiveBucketCopies(bucket),
-		MinimumDurableCopies:          bucket.MinimumDurableCopies,
-		EffectiveMinimumDurableCopies: s.effectiveBucketMinimumDurableCopies(bucket),
-		Status:                        string(bucket.Status),
+		ID:                   bucket.ID,
+		Name:                 bucket.Name,
+		OwnerAccessKey:       s.adminOwnerAccessKey(&actualOwnerAccessKey),
+		DefaultCopies:        bucket.DefaultCopies,
+		MinimumDurableCopies: bucket.MinimumDurableCopies,
+		Status:               string(bucket.Status),
 	})
 }
 
@@ -478,12 +439,22 @@ func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	// A bucket stores its policy, so an explicit null is a reset to the current
+	// configured target rather than a standing inheritance.
+	if setDefaultCopies && defaultCopies == nil {
+		configured := s.filecoinDefaultCopies
+		defaultCopies = &configured
+	}
 	if !setDefaultCopies && !setMinimumCopies {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "copy policy update requires at least one field"})
 		return
 	}
 
 	var bucket *model.Bucket
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
 	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
 		updated, err := txRepos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
 			Name:                    bucketName,
@@ -498,10 +469,23 @@ func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.
 		if updated == nil || !updated.Status.IsAdminVisible() {
 			return repository.ErrNotFound
 		}
-		if updated.MinimumDurableCopies != nil && *updated.MinimumDurableCopies > s.effectiveBucketCopies(updated) {
-			return fmt.Errorf("minimum_durable_copies cannot exceed the effective replica target: %w", repository.ErrInvalidInput)
+		if err := s.bucketLifecycle.ScheduleProvision(ctx, txRepos, updated); err != nil {
+			return err
 		}
-		if _, err := txRepos.CacheEvictions.EnsureBucketDurabilityReconciliation(ctx, updated.ID, s.evictMaxRetries); err != nil {
+		generation, err := txRepos.CacheEvictions.NextDurabilityGeneration(ctx, updated.ID)
+		if err != nil {
+			return err
+		}
+		taskRow, _, err := s.taskService.EnqueueInTransaction(ctx, txRepos, taskengine.EnqueueRequest{
+			Type:           model.TaskTypeCacheReconcileDurability,
+			IdempotencyKey: cacheeviction.DurabilityTaskKey(updated.ID, generation),
+			Input:          cacheeviction.DurabilityInput{BucketID: updated.ID, Generation: generation},
+			SubjectType:    "bucket", SubjectKey: strconv.FormatInt(updated.ID, 10),
+		})
+		if err != nil {
+			return err
+		}
+		if err := txRepos.CacheEvictions.BindDurabilityTask(ctx, updated.ID, generation, taskRow.ID); err != nil {
 			return err
 		}
 		bucket = updated
@@ -509,6 +493,12 @@ func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.
 	})
 	if errors.Is(err, repository.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+	if errors.Is(err, repository.ErrReplicaTargetLowered) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "lowering the replica target is not supported yet; existing replicas above the new target would keep running",
+		})
 		return
 	}
 	if errors.Is(err, repository.ErrInvalidInput) {
@@ -522,14 +512,12 @@ func (s *Server) handleAPIUpdateBucketCopyPolicy(w http.ResponseWriter, r *http.
 	}
 
 	writeJSON(w, http.StatusOK, bucketMutationResponse{
-		ID:                            bucket.ID,
-		Name:                          bucket.Name,
-		OwnerAccessKey:                s.adminOwnerAccessKey(bucket.OwnerAccessKey),
-		DefaultCopies:                 bucket.DefaultCopies,
-		EffectiveCopies:               s.effectiveBucketCopies(bucket),
-		MinimumDurableCopies:          bucket.MinimumDurableCopies,
-		EffectiveMinimumDurableCopies: s.effectiveBucketMinimumDurableCopies(bucket),
-		Status:                        string(bucket.Status),
+		ID:                   bucket.ID,
+		Name:                 bucket.Name,
+		OwnerAccessKey:       s.adminOwnerAccessKey(bucket.OwnerAccessKey),
+		DefaultCopies:        bucket.DefaultCopies,
+		MinimumDurableCopies: bucket.MinimumDurableCopies,
+		Status:               string(bucket.Status),
 	})
 }
 
@@ -634,8 +622,8 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			DataSetID:          onChainIDStringPtr(summary.DataSetID),
 			ClientDataSetID:    onChainIDStringPtr(summary.ClientDataSetID),
 			Status:             string(summary.Status),
-			CreatedByUploadID:  summary.CreatedByUploadID,
-			LastUsedUploadID:   summary.LastUsedUploadID,
+			CreatedByContentID: summary.CreatedByContentID,
+			LastUsedContentID:  summary.LastUsedContentID,
 			CommittedCopies:    summary.CommittedCopies,
 			ReadableCopies:     summary.ReadableCopies,
 			PhysicalBytes:      summary.PhysicalBytes,
@@ -729,7 +717,6 @@ type objectListItem struct {
 	Size             int64                   `json:"size"`
 	State            string                  `json:"state"`
 	Status           string                  `json:"status"`
-	UploadStatus     *string                 `json:"upload_status,omitempty"`
 	Progress         *uploadProgressResponse `json:"progress,omitempty"`
 	Location         objectLocation          `json:"location"`
 	ContentType      string                  `json:"content_type"`
@@ -745,29 +732,25 @@ type objectLocation struct {
 }
 
 type objectStatusDetailResponse struct {
-	VersionID     string                  `json:"version_id"`
-	State         string                  `json:"state"`
-	Status        string                  `json:"status"`
-	UploadStatus  *string                 `json:"upload_status,omitempty"`
-	Progress      *uploadProgressResponse `json:"progress,omitempty"`
-	FailedAtState *string                 `json:"failed_at_state,omitempty"`
-	Message       *string                 `json:"message,omitempty"`
-	UpdatedAt     string                  `json:"updated_at"`
+	VersionID string                  `json:"version_id"`
+	State     string                  `json:"state"`
+	Status    string                  `json:"status"`
+	Progress  *uploadProgressResponse `json:"progress,omitempty"`
+	Message   *string                 `json:"message,omitempty"`
+	UpdatedAt string                  `json:"updated_at"`
 }
 
 type objectProvenanceResponse struct {
-	VersionID       string                            `json:"version_id"`
-	State           string                            `json:"state"`
-	Status          string                            `json:"status"`
-	UploadStatus    *string                           `json:"upload_status,omitempty"`
-	Progress        *uploadProgressResponse           `json:"progress,omitempty"`
-	PieceCID        *string                           `json:"piece_cid,omitempty"`
-	RequestedCopies int                               `json:"requested_copies"`
-	SuccessCopies   int                               `json:"success_copies"`
-	CopyHealth      copyHealthSummaryResponse         `json:"copy_health"`
-	Copies          []objectProvenanceCopyResponse    `json:"copies"`
-	Failures        []objectProvenanceFailureResponse `json:"failures"`
-	UpdatedAt       string                            `json:"updated_at"`
+	VersionID       string                         `json:"version_id"`
+	State           string                         `json:"state"`
+	Status          string                         `json:"status"`
+	Progress        *uploadProgressResponse        `json:"progress,omitempty"`
+	PieceCID        *string                        `json:"piece_cid,omitempty"`
+	RequestedCopies int                            `json:"requested_copies"`
+	SuccessCopies   int                            `json:"success_copies"`
+	CopyHealth      copyHealthSummaryResponse      `json:"copy_health"`
+	Copies          []objectProvenanceCopyResponse `json:"copies"`
+	UpdatedAt       string                         `json:"updated_at"`
 }
 
 type objectProvenanceCopyResponse struct {
@@ -785,15 +768,6 @@ type objectProvenanceCopyResponse struct {
 	AttentionAt      *string                   `json:"attention_at,omitempty"`
 }
 
-type objectProvenanceFailureResponse struct {
-	AttemptIndex     int                       `json:"attempt_index"`
-	ProviderID       *string                   `json:"provider_id,omitempty"`
-	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
-	TransferMethod   string                    `json:"transfer_method"`
-	Stage            *string                   `json:"stage,omitempty"`
-	Error            *string                   `json:"error,omitempty"`
-}
-
 type uploadProgressResponse struct {
 	Scope         string `json:"scope"`
 	Attempt       int    `json:"attempt"`
@@ -804,22 +778,13 @@ type uploadProgressResponse struct {
 	UpdatedAt     string `json:"updated_at"`
 }
 
-func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bool, uploadStatus *model.StorageUploadStatus) string {
+// objectAdminStatusWithUpload derives the operator-facing status. It no longer
+// takes a separate upload status: that value described the same pipeline as
+// state, which is itself derived from the copy rows, so the two could only ever
+// agree or be wrong.
+func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bool) string {
 	if state == model.ObjectStateFailed {
 		return objectAdminStatusWarning
-	}
-	if uploadStatus != nil {
-		switch *uploadStatus {
-		case model.StorageUploadStatusFailed,
-			model.StorageUploadStatusRejected:
-			return objectAdminStatusWarning
-		case model.StorageUploadStatusIngressReady:
-			return objectAdminStatusUploading
-		case model.StorageUploadStatusReadable:
-			return objectAdminStatusSyncing
-		case model.StorageUploadStatusComplete:
-			return objectAdminStatusSuccess
-		}
 	}
 	if !inCache && !inFilecoin {
 		return objectAdminStatusUnavailable
@@ -829,7 +794,7 @@ func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bo
 		return objectAdminStatusUploading
 	case model.ObjectStateCommitting, model.ObjectStateReplicating:
 		return objectAdminStatusSyncing
-	case model.ObjectStateStored, model.ObjectStateCacheEvicted:
+	case model.ObjectStateStored:
 		return objectAdminStatusSuccess
 	default:
 		return objectAdminStatusUnavailable
@@ -837,120 +802,95 @@ func objectAdminStatusWithUpload(state model.ObjectState, inCache, inFilecoin bo
 }
 
 type objectAdminUploadInfo struct {
-	Status   *model.StorageUploadStatus
 	Message  *string
 	Progress *uploadProgressResponse
 }
 
-func (s *Server) objectAdminStorageUpload(ctx context.Context, version model.ObjectVersion) (*model.StorageUpload, error) {
-	if s.repos.Uploads == nil {
+func (s *Server) objectAdminStorageContent(ctx context.Context, version model.ObjectVersion) (*model.StorageContent, error) {
+	if s.repos.Contents == nil {
 		return nil, nil
 	}
-	if version.StorageUploadID != nil {
-		return s.repos.Uploads.GetByID(ctx, *version.StorageUploadID)
+	if version.ContentID != nil {
+		return s.repos.Contents.GetByID(ctx, *version.ContentID)
 	}
-	return s.repos.Uploads.FindLatestUploadBySourceVersion(ctx, version.VersionID)
+	return nil, nil
 }
 
 func (s *Server) objectAdminUploadInfo(ctx context.Context, version model.ObjectVersion) (objectAdminUploadInfo, error) {
-	upload, err := s.objectAdminStorageUpload(ctx, version)
+	upload, err := s.objectAdminStorageContent(ctx, version)
 	if err != nil || upload == nil {
 		return objectAdminUploadInfo{}, err
 	}
+	ingress, err := s.repos.Contents.GetIngressCopy(ctx, upload.ID)
+	if err != nil {
+		return objectAdminUploadInfo{}, err
+	}
 	return objectAdminUploadInfo{
-		Status:   &upload.Status,
 		Message:  uploadStatusMessage(upload),
-		Progress: uploadProgressResponseFromUpload(upload),
+		Progress: uploadProgressResponseFromUpload(ingress),
 	}, nil
 }
 
 func (s *Server) objectAdminUploadInfos(ctx context.Context, versions []model.ObjectVersion) (map[string]objectAdminUploadInfo, error) {
 	infos := make(map[string]objectAdminUploadInfo, len(versions))
-	if s.repos.Uploads == nil || len(versions) == 0 {
+	if s.repos.Contents == nil || len(versions) == 0 {
 		return infos, nil
 	}
-	uploadIDSet := make(map[int64]struct{})
-	versionIDSet := make(map[string]struct{})
+	contentIDSet := make(map[int64]struct{})
 	for _, version := range versions {
 		if version.IsDeleteMarker {
 			continue
 		}
-		if version.StorageUploadID != nil {
-			uploadIDSet[*version.StorageUploadID] = struct{}{}
-		} else {
-			versionIDSet[version.VersionID] = struct{}{}
+		if version.ContentID != nil {
+			contentIDSet[*version.ContentID] = struct{}{}
 		}
 	}
-	uploadIDs := make([]int64, 0, len(uploadIDSet))
-	for uploadID := range uploadIDSet {
-		uploadIDs = append(uploadIDs, uploadID)
+	contentIDs := make([]int64, 0, len(contentIDSet))
+	for contentID := range contentIDSet {
+		contentIDs = append(contentIDs, contentID)
 	}
-	uploadsByID, err := s.repos.Uploads.GetByIDs(ctx, uploadIDs)
-	if err != nil {
-		return nil, err
-	}
-	versionIDs := make([]string, 0, len(versionIDSet))
-	for versionID := range versionIDSet {
-		versionIDs = append(versionIDs, versionID)
-	}
-	uploadsByVersionID, err := s.repos.Uploads.FindLatestUploadsBySourceVersions(ctx, versionIDs)
+	uploadsByID, err := s.repos.Contents.GetByIDs(ctx, contentIDs)
 	if err != nil {
 		return nil, err
 	}
 	for _, version := range versions {
-		var upload model.StorageUpload
-		var ok bool
-		if version.StorageUploadID != nil {
-			upload, ok = uploadsByID[*version.StorageUploadID]
-		} else {
-			upload, ok = uploadsByVersionID[version.VersionID]
+		if version.ContentID == nil {
+			continue
 		}
+		upload, ok := uploadsByID[*version.ContentID]
 		if !ok {
 			continue
 		}
-		status := upload.Status
+		ingress, err := s.repos.Contents.GetIngressCopy(ctx, upload.ID)
+		if err != nil {
+			return nil, err
+		}
 		infos[version.VersionID] = objectAdminUploadInfo{
-			Status:   &status,
 			Message:  uploadStatusMessage(&upload),
-			Progress: uploadProgressResponseFromUpload(&upload),
+			Progress: uploadProgressResponseFromUpload(ingress),
 		}
 	}
 	return infos, nil
 }
 
-func uploadStatusString(status *model.StorageUploadStatus) *string {
-	if status == nil {
-		return nil
-	}
-	value := string(*status)
-	return &value
-}
-
-func uploadStatusMessage(upload *model.StorageUpload) *string {
+func uploadStatusMessage(upload *model.StorageContent) *string {
 	if upload == nil {
 		return nil
 	}
 	if upload.ErrorMessage != nil && *upload.ErrorMessage != "" {
 		return upload.ErrorMessage
 	}
-	if upload.AcceptError != nil && *upload.AcceptError != "" {
-		return upload.AcceptError
-	}
 	return nil
 }
 
-func uploadProgressResponseFromUpload(upload *model.StorageUpload) *uploadProgressResponse {
+// uploadProgressResponseFromUpload reads the ingress copy, not the content:
+// progress belongs to the transfer that produced it.
+func uploadProgressResponseFromUpload(upload *model.StorageCopy) *uploadProgressResponse {
 	if upload == nil || upload.ProgressUpdatedAt == nil || upload.IngressStoreAttempt <= 0 {
 		return nil
 	}
-	uploaded := upload.IngressBytesTransferred
-	if uploaded < 0 {
-		uploaded = 0
-	}
-	total := upload.ContentSize
-	if total < 0 {
-		total = 0
-	}
+	uploaded := max(upload.IngressBytesTransferred, 0)
+	total := max(upload.ContentSize, 0)
 	if uploaded > total {
 		uploaded = total
 	}
@@ -1016,9 +956,12 @@ type permanentDeleteObjectRequest struct {
 }
 
 type permanentDeleteObjectResponse struct {
-	Key                  string `json:"key"`
-	VersionID            string `json:"version_id"`
-	CacheCleanupStatus   string `json:"cache_cleanup_status"`
+	Key       string `json:"key"`
+	VersionID string `json:"version_id"`
+	// CacheRelease reports what happened to the cached bytes: released when this
+	// deletion removed the last reference, retained when another version still
+	// names them, failed when the local file could not be removed.
+	CacheRelease         string `json:"cache_release"`
 	StorageCleanupTaskID *int64 `json:"storage_cleanup_task_id,omitempty"`
 }
 
@@ -1037,12 +980,9 @@ type permanentDeleteDeletedObjectResponse struct {
 }
 
 type objectDeletionListItem struct {
-	Key                string  `json:"key"`
-	VersionID          string  `json:"version_id"`
-	CacheCleanupStatus string  `json:"cache_cleanup_status"`
-	CacheError         *string `json:"cache_error,omitempty"`
-	CreatedAt          string  `json:"created_at"`
-	DeletedAt          string  `json:"deleted_at"`
+	Key       string `json:"key"`
+	VersionID string `json:"version_id"`
+	DeletedAt string `json:"deleted_at"`
 }
 
 type objectDeletionListResponse struct {
@@ -1126,8 +1066,7 @@ func (s *Server) handleAPIBucketObjects(w http.ResponseWriter, r *http.Request) 
 			CurrentVersionID: o.VersionID,
 			Size:             o.Size,
 			State:            string(o.State),
-			Status:           objectAdminStatusWithUpload(o.State, o.InCache, o.InFilecoin, uploadInfo.Status),
-			UploadStatus:     uploadStatusString(uploadInfo.Status),
+			Status:           objectAdminStatusWithUpload(o.State, o.InCache, o.InFilecoin),
 			Progress:         uploadInfo.Progress,
 			Location:         objectLocation{Cache: o.InCache, Filecoin: o.InFilecoin},
 			ContentType:      o.ContentType,
@@ -1281,11 +1220,20 @@ func (s *Server) handleAPIPermanentDeleteBucketObject(w http.ResponseWriter, r *
 		return
 	}
 
-	result, err := s.repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
-		BucketID:                 bucket.ID,
-		Key:                      key,
-		VersionID:                versionID,
-		StorageCleanupMaxRetries: &s.storageCleanupMaxRetries,
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	var result repository.DeleteObjectVersionResult
+	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		var deleteErr error
+		result, deleteErr = txRepos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+			BucketID: bucket.ID, Key: key, VersionID: versionID,
+		})
+		if deleteErr != nil {
+			return deleteErr
+		}
+		return s.bindStorageCleanupTask(ctx, txRepos, result.StorageCleanup)
 	})
 	if err != nil {
 		switch {
@@ -1302,12 +1250,17 @@ func (s *Server) handleAPIPermanentDeleteBucketObject(w http.ResponseWriter, r *
 		return
 	}
 
-	status := s.recordPermanentDeleteCacheCleanupWithTimeout(ctx, bucket.Name, versionID, result.CacheKey)
+	outcome, releaseErr := s.releaseContentCache(ctx, bucket.Name, result.ContentID)
+	status := string(outcome)
+	if releaseErr != nil {
+		s.logger.Warn("api: failed to release permanently deleted object cache", "bucket", bucketName, "key", key, "versionID", versionID, "error", releaseErr)
+		status = "failed"
+	}
 	writeJSON(w, http.StatusOK, permanentDeleteObjectResponse{
 		Key:                  key,
 		VersionID:            versionID,
-		CacheCleanupStatus:   string(status),
-		StorageCleanupTaskID: result.StorageCleanupTaskID,
+		CacheRelease:         status,
+		StorageCleanupTaskID: cleanupReservationTaskID(result.StorageCleanup),
 	})
 }
 
@@ -1341,11 +1294,25 @@ func (s *Server) handleAPIPermanentDeleteDeletedBucketObject(w http.ResponseWrit
 		return
 	}
 
-	result, err := s.repos.Objects.DeleteDeletedObjectPermanently(ctx, repository.DeleteDeletedObjectInput{
-		BucketID:                 bucket.ID,
-		Key:                      key,
-		DeleteMarkerVersionID:    deleteMarkerVersionID,
-		StorageCleanupMaxRetries: &s.storageCleanupMaxRetries,
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	var result repository.DeleteDeletedObjectResult
+	err = s.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		var deleteErr error
+		result, deleteErr = txRepos.Objects.DeleteDeletedObjectPermanently(ctx, repository.DeleteDeletedObjectInput{
+			BucketID: bucket.ID, Key: key, DeleteMarkerVersionID: deleteMarkerVersionID,
+		})
+		if deleteErr != nil {
+			return deleteErr
+		}
+		for i := range result.StorageCleanups {
+			if err := s.bindStorageCleanupTask(ctx, txRepos, &result.StorageCleanups[i]); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		switch {
@@ -1363,9 +1330,11 @@ func (s *Server) handleAPIPermanentDeleteDeletedBucketObject(w http.ResponseWrit
 	}
 
 	cacheCleanupFailedCount := s.recordDeletedObjectPermanentDeleteCacheCleanup(ctx, bucket.Name, result.DeletedVersions)
-	storageCleanupTaskIDs := result.StorageCleanupTaskIDs
-	if storageCleanupTaskIDs == nil {
-		storageCleanupTaskIDs = []int64{}
+	storageCleanupTaskIDs := make([]int64, 0, len(result.StorageCleanups))
+	for i := range result.StorageCleanups {
+		if result.StorageCleanups[i].TaskID != nil {
+			storageCleanupTaskIDs = append(storageCleanupTaskIDs, *result.StorageCleanups[i].TaskID)
+		}
 	}
 	writeJSON(w, http.StatusOK, permanentDeleteDeletedObjectResponse{
 		Key:                     result.Key,
@@ -1375,6 +1344,34 @@ func (s *Server) handleAPIPermanentDeleteDeletedBucketObject(w http.ResponseWrit
 		CacheCleanupFailedCount: cacheCleanupFailedCount,
 		StorageCleanupTaskIDs:   storageCleanupTaskIDs,
 	})
+}
+
+func (s *Server) bindStorageCleanupTask(ctx context.Context, repos *repository.Repositories, cleanup *repository.StorageCleanupReservation) error {
+	if cleanup == nil || cleanup.TaskID != nil {
+		return nil
+	}
+	taskRow, _, err := s.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
+		Type:           model.TaskTypeStorageCleanup,
+		IdempotencyKey: storagecleanup.TaskKey(cleanup.ContentID, cleanup.Generation),
+		Input:          storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
+		SubjectType:    "storage_content",
+		SubjectKey:     strconv.FormatInt(cleanup.ContentID, 10),
+	})
+	if err != nil {
+		return err
+	}
+	if err := repos.StorageCleanup.BindTask(ctx, cleanup.ContentID, cleanup.Generation, taskRow.ID); err != nil {
+		return err
+	}
+	cleanup.TaskID = &taskRow.ID
+	return nil
+}
+
+func cleanupReservationTaskID(cleanup *repository.StorageCleanupReservation) *int64 {
+	if cleanup == nil {
+		return nil
+	}
+	return cleanup.TaskID
 }
 
 func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.Request) {
@@ -1411,7 +1408,7 @@ func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.R
 	q := s.db.NewSelect().
 		Model(&deletions).
 		Where("bucket_id = ?", bucket.ID).
-		OrderExpr("created_at DESC, id DESC").
+		OrderExpr("deleted_at DESC, id DESC").
 		Limit(limit).
 		Offset(offset)
 	if key := r.URL.Query().Get("key"); key != "" {
@@ -1425,35 +1422,36 @@ func (s *Server) handleAPIBucketObjectDeletions(w http.ResponseWriter, r *http.R
 	items := make([]objectDeletionListItem, 0, len(deletions))
 	for _, deletion := range deletions {
 		items = append(items, objectDeletionListItem{
-			Key:                deletion.Key,
-			VersionID:          deletion.VersionID,
-			CacheCleanupStatus: string(deletion.CacheCleanupStatus),
-			CacheError:         deletion.CacheError,
-			CreatedAt:          deletion.CreatedAt.Format(time.RFC3339),
-			DeletedAt:          deletion.DeletedAt.Format(time.RFC3339),
+			Key:       deletion.Key,
+			VersionID: deletion.VersionID,
+			DeletedAt: deletion.DeletedAt.Format(time.RFC3339),
 		})
 	}
 	writeJSON(w, http.StatusOK, objectDeletionListResponse{Deletions: items})
 }
 
-func (s *Server) recordPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versionID string, cacheKey string) model.CacheCleanupStatus {
-	return objectdeletion.RecordCacheCleanup(
-		ctx,
+// releaseContentCache frees the cached bytes of a content payload, but only
+// after the deletion that removed its last live reference. Residency is
+// content-addressed, so bytes still named by another version must survive.
+func (s *Server) releaseContentCache(
+	ctx context.Context,
+	bucketName string,
+	contentID *int64,
+) (objectdeletion.CacheReleaseOutcome, error) {
+	if contentID == nil {
+		return objectdeletion.CacheReleaseRetained, nil
+	}
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), permanentDeleteCacheCleanupTimeout)
+	defer cancelCleanup()
+	return objectdeletion.ReleaseContentCache(
+		cleanupCtx,
 		s.cache,
 		s.cacheGate,
 		s.cacheAccessTracker,
 		s.repos.Objects,
-		s.logger,
 		bucketName,
-		versionID,
-		cacheKey,
+		*contentID,
 	)
-}
-
-func (s *Server) recordPermanentDeleteCacheCleanupWithTimeout(ctx context.Context, bucketName string, versionID string, cacheKey string) model.CacheCleanupStatus {
-	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), permanentDeleteCacheCleanupTimeout)
-	defer cancelCleanup()
-	return s.recordPermanentDeleteCacheCleanup(cleanupCtx, bucketName, versionID, cacheKey)
 }
 
 func (s *Server) recordDeletedObjectPermanentDeleteCacheCleanup(ctx context.Context, bucketName string, versions []repository.DeletedObjectVersionSnapshot) int {
@@ -1461,9 +1459,9 @@ func (s *Server) recordDeletedObjectPermanentDeleteCacheCleanup(ctx context.Cont
 	var group errgroup.Group
 	group.SetLimit(permanentDeleteCacheCleanupConcurrency)
 	for _, version := range versions {
-		version := version
 		group.Go(func() error {
-			if s.recordPermanentDeleteCacheCleanupWithTimeout(ctx, bucketName, version.VersionID, version.CacheKey) == model.CacheCleanupStatusFailed {
+			if _, err := s.releaseContentCache(ctx, bucketName, version.ContentID); err != nil {
+				s.logger.Warn("api: failed to release permanently deleted object cache", "bucket", bucketName, "versionID", version.VersionID, "error", err)
 				failed.Add(1)
 			}
 			return nil
@@ -1664,7 +1662,6 @@ type objectVersionListItem struct {
 	State          string                  `json:"state"`
 	Status         string                  `json:"status"`
 	IsDeleteMarker bool                    `json:"is_delete_marker"`
-	UploadStatus   *string                 `json:"upload_status,omitempty"`
 	Progress       *uploadProgressResponse `json:"progress,omitempty"`
 	Location       objectLocation          `json:"location"`
 	ContentType    string                  `json:"content_type"`
@@ -1723,24 +1720,15 @@ func (s *Server) handleAPIBucketObjectStatusDetail(w http.ResponseWriter, r *htt
 		return
 	}
 
-	var failedAtState *string
-	if version.FailedAtState != nil {
-		state := string(*version.FailedAtState)
-		failedAtState = &state
-	}
-	message := version.LastError
-	if message == nil {
-		message = uploadInfo.Message
-	}
+	// The stage a failure happened at is no longer recorded: position is derived
+	// from the copies, and the copy's own error is what an operator can act on.
 	writeJSON(w, http.StatusOK, objectStatusDetailResponse{
-		VersionID:     version.VersionID,
-		State:         string(version.State),
-		Status:        objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, uploadInfo.Status),
-		UploadStatus:  uploadStatusString(uploadInfo.Status),
-		Progress:      uploadInfo.Progress,
-		FailedAtState: failedAtState,
-		Message:       message,
-		UpdatedAt:     version.UpdatedAt.Format(time.RFC3339),
+		VersionID: version.VersionID,
+		State:     string(version.State),
+		Status:    objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin),
+		Progress:  uploadInfo.Progress,
+		Message:   uploadInfo.Message,
+		UpdatedAt: version.UpdatedAt.Format(time.RFC3339),
 	})
 }
 
@@ -1782,14 +1770,13 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 	resp := objectProvenanceResponse{
 		VersionID:  version.VersionID,
 		State:      string(version.State),
-		Status:     objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, nil),
+		Status:     objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin),
 		CopyHealth: emptyCopyHealthSummary(),
 		Copies:     make([]objectProvenanceCopyResponse, 0),
-		Failures:   make([]objectProvenanceFailureResponse, 0),
 		UpdatedAt:  version.UpdatedAt.Format(time.RFC3339),
 	}
 
-	upload, err := s.objectAdminStorageUpload(ctx, *version)
+	upload, err := s.objectAdminStorageContent(ctx, *version)
 	if err != nil {
 		s.logger.Error("api: failed to load object provenance upload", "error", err, "bucket", bucketName, "versionID", versionID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -1801,9 +1788,9 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		return
 	}
 
-	provenance, err := s.repos.Uploads.GetUploadProvenance(ctx, upload.ID)
+	provenance, err := s.repos.Contents.GetUploadProvenance(ctx, upload.ID)
 	if err != nil {
-		s.logger.Error("api: failed to load object provenance", "error", err, "bucket", bucketName, "versionID", versionID, "uploadID", upload.ID)
+		s.logger.Error("api: failed to load object provenance", "error", err, "bucket", bucketName, "versionID", versionID, "contentID", upload.ID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
@@ -1811,30 +1798,21 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	readableCopies, err := s.repos.Uploads.ListReadableCommittedCopies(ctx, upload.ID)
+	readableCopies, err := s.repos.Contents.ListReadableCommittedCopies(ctx, upload.ID)
 	if err != nil {
-		s.logger.Error("api: failed to count readable provenance copies", "error", err, "bucket", bucketName, "versionID", versionID, "uploadID", upload.ID)
+		s.logger.Error("api: failed to count readable provenance copies", "error", err, "bucket", bucketName, "versionID", versionID, "contentID", upload.ID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-
-	resp.UploadStatus = uploadStatusString(&provenance.Upload.Status)
-	resp.Progress = uploadProgressResponseFromUpload(&provenance.Upload)
-	resp.Status = objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin, &provenance.Upload.Status)
+	resp.Progress = uploadProgressResponseFromUpload(provenance.IngressCopy)
+	resp.Status = objectAdminStatusWithUpload(version.State, version.InCache, version.InFilecoin)
 	resp.PieceCID = provenance.Upload.PieceCID
 	resp.RequestedCopies = provenance.Upload.RequestedCopies
 	resp.SuccessCopies = len(readableCopies)
 	resp.UpdatedAt = provenance.Upload.UpdatedAt.Format(time.RFC3339)
-	providerIDs := make([]idtypes.OnChainID, 0, len(provenance.Copies)+len(provenance.Failures))
+	providerIDs := make([]idtypes.OnChainID, 0, len(provenance.Copies))
 	for _, copyRow := range provenance.Copies {
-		if copyRow.ProviderID != nil {
-			providerIDs = append(providerIDs, *copyRow.ProviderID)
-		}
-	}
-	for _, failure := range provenance.Failures {
-		if failure.ProviderID != nil {
-			providerIDs = append(providerIDs, *failure.ProviderID)
-		}
+		providerIDs = append(providerIDs, copyRow.ProviderID)
 	}
 	providerIdentities := s.providerIdentities(providerIDs)
 	copyFacts := provenanceCopyHealthFacts(bucket.ID, version.VersionID, provenance.Upload, provenance.Copies)
@@ -1850,6 +1828,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 		copyHealthByIndex[*fact.CopyIndex] = copyHealthInfoFromSignal(copyHealthSignalFromFact(fact, copyObservations, copyHealthFailed, copyHealthInterval, copyHealthNow))
 	}
 	for _, copyRow := range provenance.Copies {
+		providerID := copyRow.ProviderID
 		var attentionAt *string
 		if copyRow.CommitAttentionAt != nil {
 			value := copyRow.CommitAttentionAt.Format(time.RFC3339)
@@ -1859,8 +1838,8 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			CopyIndex:        copyRow.CopyIndex,
 			Status:           string(copyRow.Status),
 			Health:           copyHealthByIndex[copyRow.CopyIndex],
-			ProviderID:       onChainIDStringPtr(copyRow.ProviderID),
-			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, copyRow.ProviderID),
+			ProviderID:       onChainIDStringPtr(&providerID),
+			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, &providerID),
 			DataSetID:        onChainIDStringPtr(copyRow.DataSetID),
 			PieceID:          onChainIDStringPtr(copyRow.PieceID),
 			TransferMethod:   string(copyRow.TransferMethod),
@@ -1868,16 +1847,6 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			IsNewDataSet:     copyRow.IsNewDataSet,
 			AttentionCode:    copyRow.CommitAttentionCode,
 			AttentionAt:      attentionAt,
-		})
-	}
-	for _, failure := range provenance.Failures {
-		resp.Failures = append(resp.Failures, objectProvenanceFailureResponse{
-			AttemptIndex:     failure.AttemptIndex,
-			ProviderID:       onChainIDStringPtr(failure.ProviderID),
-			ProviderIdentity: providerIdentityFromSnapshotPtr(providerIdentities, failure.ProviderID),
-			TransferMethod:   failure.TransferMethod,
-			Stage:            failure.Stage,
-			Error:            failure.ErrorMessage,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -1965,9 +1934,8 @@ func (s *Server) handleAPIBucketObjectVersions(w http.ResponseWriter, r *http.Re
 			Key:            v.Key,
 			Size:           v.Size,
 			State:          string(v.State),
-			Status:         objectAdminStatusWithUpload(v.State, v.InCache, v.InFilecoin, uploadInfo.Status),
+			Status:         objectAdminStatusWithUpload(v.State, v.InCache, v.InFilecoin),
 			IsDeleteMarker: v.IsDeleteMarker,
-			UploadStatus:   uploadStatusString(uploadInfo.Status),
 			Progress:       uploadInfo.Progress,
 			Location:       objectLocation{Cache: v.InCache, Filecoin: v.InFilecoin},
 			ContentType:    v.ContentType,

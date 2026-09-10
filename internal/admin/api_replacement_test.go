@@ -3,7 +3,6 @@ package admin
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -57,11 +56,11 @@ func newReplacementAPIFixture(t *testing.T, selector providerReplacementSelector
 		srv.WithProviderReplacement(selector)
 	}
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "replacement-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "replacement-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := srv.repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create bucket: %v", err)
 	}
-	binding, err := srv.repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+	binding, err := srv.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
 		BucketID:   bucket.ID,
 		ProviderID: onChainIDValue("101"),
 		CopyIndex:  0,
@@ -69,13 +68,13 @@ func newReplacementAPIFixture(t *testing.T, selector providerReplacementSelector
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
-	if err := srv.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := srv.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:        binding.ID,
 		DataSetID: onChainIDValue("1001"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}
-	source, err := srv.repos.Uploads.GetDataSetBindingByID(ctx, binding.ID)
+	source, err := srv.repos.Contents.GetDataSetBindingByID(ctx, binding.ID)
 	if err != nil || source == nil {
 		t.Fatalf("GetDataSetBindingByID: %#v err=%v", source, err)
 	}
@@ -131,6 +130,7 @@ func TestAPIStartDataSetReplacementManualMode(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d body=%s, want 201", rec.Code, rec.Body.String())
 	}
+	rawBody := rec.Body.String()
 	body := decodeReplacement(t, rec)
 	if body.Status != string(storagereplacement.StatusPreparingTarget) {
 		t.Fatalf("status = %s, want preparing_target", body.Status)
@@ -145,8 +145,15 @@ func TestAPIStartDataSetReplacementManualMode(t *testing.T) {
 	if body.ItemsTotal != 0 || body.ItemsCopied != 0 {
 		t.Fatalf("progress = %d/%d, want no migration work yet", body.ItemsCopied, body.ItemsTotal)
 	}
-	if body.Progress == nil || body.Progress.Scope != "provider_replacement" || body.Progress.SeedingComplete || body.Progress.Percent != nil {
+	if body.Progress == nil || body.Progress.Phase != string(storagereplacement.PhasePrepare) || body.Progress.SeedingComplete || body.Progress.Percent != nil {
 		t.Fatalf("structured progress = %#v, want indeterminate provider replacement progress", body.Progress)
+	}
+	if body.Progress.Scope != "provider_replacement" ||
+		!strings.Contains(rawBody, `"items_active":0`) ||
+		!strings.Contains(rawBody, `"items_retrying":0`) ||
+		!strings.Contains(rawBody, `"items_waiting_source":0`) ||
+		!strings.Contains(rawBody, `"items_failed":0`) {
+		t.Fatalf("replacement progress wire contract = %s", rawBody)
 	}
 }
 
@@ -177,7 +184,7 @@ func TestAPIStartDataSetReplacementIsIdempotent(t *testing.T) {
 	}
 	firstReplacement := decodeReplacement(t, first)
 	ctx := context.Background()
-	if err := fixture.srv.repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+	if err := fixture.srv.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID: firstReplacement.Target.ID, DataSetID: onChainIDValue("2002"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
@@ -361,55 +368,6 @@ func TestAPIRetryStorageReplacementRejectsPermanentTargetConflict(t *testing.T) 
 	}
 	if got := decodeAPIError(t, retry)["code"]; got != storagereplacement.CodeTargetInUse {
 		t.Fatalf("retry code = %q, want %q", got, storagereplacement.CodeTargetInUse)
-	}
-}
-
-// Replacement work carries state the task queue knows nothing about, so the
-// generic retry must refuse it and point the operator at the Data Sets surface.
-func TestRetryExhaustedRejectsReplacementCoordinator(t *testing.T) {
-	srv, _ := newBucketAPITestServer(t)
-	ctx := context.Background()
-	stage := storagereplacement.StageMigrate
-	task := &model.Task{
-		Type:           model.TaskTypeUpload,
-		Stage:          &stage,
-		RefType:        "bucket",
-		RefID:          1,
-		IdempotencyKey: storagereplacement.MigrateTaskKey(42),
-		Payload:        storagereplacement.NewMigratePayload(42),
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     1,
-	}
-	if err := srv.repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("Create task: %v", err)
-	}
-	if _, err := srv.db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusExhausted).
-		Where("id = ?", task.ID).
-		Exec(ctx); err != nil {
-		t.Fatalf("mark exhausted: %v", err)
-	}
-
-	err := srv.repos.Tasks.RetryExhausted(ctx, task.ID)
-	if !errors.Is(err, repository.ErrReplacementRetryUnsupported) {
-		t.Fatalf("RetryExhausted = %v, want the replacement rejection", err)
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", srv.handleRetryExhausted)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+strconv.FormatInt(task.ID, 10)+"/retry", nil)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d body=%s, want 409", rec.Code, rec.Body.String())
-	}
-	body := decodeAPIError(t, rec)
-	if body["code"] != storagereplacement.CodeTaskRetryUnsupported {
-		t.Fatalf("code = %q, want %q", body["code"], storagereplacement.CodeTaskRetryUnsupported)
-	}
-	if !strings.Contains(body["error"], "Data Sets") {
-		t.Fatalf("error = %q, want it to point at the Data Sets surface", body["error"])
 	}
 }
 

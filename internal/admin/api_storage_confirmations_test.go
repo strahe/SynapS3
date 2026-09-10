@@ -14,7 +14,7 @@ import (
 )
 
 type storageConfirmationAPIRepo struct {
-	repository.StorageUploadRepository
+	repository.StorageContentRepository
 	records      []storagecommit.AttentionRecord
 	releaseInput storagecommit.ManualReleaseInput
 	releaseErr   error
@@ -32,12 +32,12 @@ func (r *storageConfirmationAPIRepo) ReleaseCommitAttention(_ context.Context, i
 func TestAPIStorageConfirmationsListAndRelease(t *testing.T) {
 	now := time.Date(2026, 8, 30, 1, 2, 3, 0, time.UTC)
 	repo := &storageConfirmationAPIRepo{records: []storagecommit.AttentionRecord{{
-		CopyID: 12, UploadID: 7, CopyIndex: 1, DataSetRowID: 9,
+		CopyID: 12, ContentID: 7, CopyIndex: 1, DataSetRowID: 9,
 		ProviderID: "provider-1", DataSetID: "dataset-1", PieceCID: "piece-1",
 		AttemptID: "attempt-1", Code: storagecommit.AttentionAttemptOnlyAmbiguous,
 		AttemptedAt: now.Add(-time.Second), AttentionAt: now,
 	}}}
-	srv := &Server{repos: &repository.Repositories{Uploads: repo}, logger: testLogger()}
+	srv := &Server{repos: &repository.Repositories{Contents: repo}, logger: testLogger()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/storage-confirmations", srv.handleAPIListStorageConfirmations)
 	mux.HandleFunc("POST /api/v1/storage-confirmations/{id}/release", srv.handleAPIReleaseStorageConfirmation)
@@ -69,7 +69,7 @@ func TestAPIStorageConfirmationsListAndRelease(t *testing.T) {
 
 func TestAPIStorageConfirmationReleaseRequiresAcknowledgement(t *testing.T) {
 	repo := &storageConfirmationAPIRepo{}
-	srv := &Server{repos: &repository.Repositories{Uploads: repo}, logger: testLogger()}
+	srv := &Server{repos: &repository.Repositories{Contents: repo}, logger: testLogger()}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-confirmations/12/release", strings.NewReader(`{}`))
 	req.SetPathValue("id", "12")
 	req.Header.Set("Content-Type", "application/json")
@@ -86,7 +86,7 @@ func TestAPIStorageConfirmationReleaseRequiresAcknowledgement(t *testing.T) {
 
 func TestAPIStorageConfirmationReleaseRejectsStaleAttempt(t *testing.T) {
 	repo := &storageConfirmationAPIRepo{releaseErr: repository.ErrConflict}
-	srv := &Server{repos: &repository.Repositories{Uploads: repo}, logger: testLogger()}
+	srv := &Server{repos: &repository.Repositories{Contents: repo}, logger: testLogger()}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/storage-confirmations/12/release", strings.NewReader(`{"acknowledge_possible_duplicate":true,"expected_attempt_id":"stale-attempt"}`))
 	req.SetPathValue("id", "12")
 	req.Header.Set("Content-Type", "application/json")

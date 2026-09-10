@@ -32,7 +32,7 @@ func storageHealthAbnormalObservationStatusListSQL() string {
 }
 
 func storageHealthCommittedCopyStatusSQL() string {
-	return storageHealthSQLLiteral(string(model.StorageUploadCopyStatusCommitted))
+	return storageHealthSQLLiteral(string(model.StorageCopyStatusCommitted))
 }
 
 func storageHealthAvailableObservationStatusSQL() string {
@@ -67,14 +67,13 @@ var storageHealthSQLLiterals = func() map[string]struct{} {
 		string(model.StorageDataSetStatusCreating),
 		string(model.StorageDataSetStatusReady),
 		string(model.StorageDataSetStatusFailed),
-		string(model.StorageDataSetStatusUnavailable),
 		string(model.StorageDataSetStatusDraining),
 		string(model.StorageDataSetStatusRetired),
-		string(model.StorageUploadCopyStatusPending),
-		string(model.StorageUploadCopyStatusPieceReady),
-		string(model.StorageUploadCopyStatusCommitting),
-		string(model.StorageUploadCopyStatusCommitted),
-		string(model.StorageUploadCopyStatusFailed),
+		string(model.StorageCopyStatusPending),
+		string(model.StorageCopyStatusPieceReady),
+		string(model.StorageCopyStatusCommitting),
+		string(model.StorageCopyStatusCommitted),
+		string(model.StorageCopyStatusFailed),
 		string(observability.StatusAvailable),
 		string(observability.StatusDegraded),
 		string(observability.StatusUnavailable),

@@ -31,7 +31,7 @@ Missing required configuration:
 Failed check:
 
 ```json
-{"status":"unhealthy","errors":["worker/uploader: not responding"]}
+{"status":"unhealthy","errors":["worker/tasks: not responding"]}
 ```
 
 `setup` means required configuration is missing. `unhealthy` means a database, cache, or background task check failed; check the returned errors first.
@@ -47,7 +47,7 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-Status should show background task processing as healthy. Task stats show whether work is queued, running, failed, or exhausted.
+Status should show background task processing as healthy. Task stats report acknowledged failures separately as dismissed, and the dashboard presents pending work as queued, scheduled, or waiting.
 
 ## Prometheus Metrics
 
@@ -74,9 +74,6 @@ Key metrics:
 | `synaps3_cache_used_bytes` | Current cache disk usage. |
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | Cache read behavior. |
 | `synaps3_cache_lru_eviction_paused` | `1` when LRU eviction is paused because recent cache access could not be retained safely. Resolve the persistence error and restart SynapS3. |
-| `synaps3_worker_tasks_processed_total` | Background task throughput by result. |
-| `synaps3_worker_tasks_exhausted_total` | Tasks that exhausted retries. |
-| `synaps3_worker_task_duration_seconds` | Background task processing duration. |
 | `synaps3_task_queue_depth` | Active tasks by type and status. |
 | `synaps3_object_state_distribution` | Object counts by lifecycle state. |
 
@@ -87,7 +84,7 @@ Key metrics:
 | `/healthz` returns `setup` | Run `synaps3 admin status` or `synaps3 admin settings get`, set the reported missing configuration, restart, and check again. |
 | `/healthz` returns `unhealthy` | Check database, cache directory, and background task error messages. |
 | Cache usage approaches capacity | Increase capacity or restore upload and eviction progress. |
-| Exhausted task count increases | Fix the dependency, then retry tasks. |
+| Failed task count increases | Fix the dependency, then retry only tasks marked retryable. |
 | Provider health is degraded | Check RPC, provider URLs, and network reachability. |
 
 See [Troubleshooting](./troubleshooting.md) for recovery steps.

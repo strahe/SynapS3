@@ -47,14 +47,13 @@ type objectAttentionOverview struct {
 }
 
 type taskAttentionOverview struct {
-	Failed    int64 `json:"failed"`
-	Exhausted int64 `json:"exhausted"`
+	Failed int64 `json:"failed"`
 }
 
 type taskPipelineOverview struct {
-	Pipeline string           `json:"pipeline"`
-	ByStatus map[string]int64 `json:"by_status"`
-	Total    int64            `json:"total"`
+	Operation string           `json:"operation"`
+	ByStatus  map[string]int64 `json:"by_status"`
+	Total     int64            `json:"total"`
 }
 
 type cacheOverview struct {
@@ -129,12 +128,17 @@ func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("overview: failed to count tasks", "error", err)
 	} else {
 		for _, tc := range taskCounts {
+			if model.TaskType(tc.Type).IsRecurringSystem() && tc.Status != string(model.TaskStatusFailed) {
+				continue
+			}
 			resp.Tasks.ByStatus[tc.Status] += tc.Count
 		}
-		resp.Tasks.Attention = taskAttentionOverview{
-			Failed:    resp.Tasks.ByStatus[string(model.TaskStatusFailed)],
-			Exhausted: resp.Tasks.ByStatus[string(model.TaskStatusExhausted)],
-		}
+	}
+	unacknowledgedFailed, err := s.repos.Tasks.CountUnacknowledgedFailed(ctx)
+	if err != nil {
+		s.logger.Warn("overview: failed to count task attention", "error", err)
+	} else {
+		resp.Tasks.Attention = taskAttentionOverview{Failed: unacknowledgedFailed}
 	}
 	taskPipelineCounts, err := s.repos.Tasks.CountOverviewActivePipeline(ctx)
 	if err != nil {
@@ -213,25 +217,20 @@ func (s *Server) filecoinStorageHealthOverview(ctx context.Context) filecoinStor
 }
 
 func taskPipelineOverviewRows(counts []repository.TaskPipelineCount) []taskPipelineOverview {
-	pipelines := []string{"prepare", "upload", "commit", "sync", "evict", "cleanup"}
-	rows := make([]taskPipelineOverview, 0, len(pipelines))
-	index := make(map[string]int, len(pipelines))
-	for _, pipeline := range pipelines {
-		index[pipeline] = len(rows)
-		rows = append(rows, taskPipelineOverview{
-			Pipeline: pipeline,
-			ByStatus: map[string]int64{
-				string(model.TaskStatusQueued):    0,
-				string(model.TaskStatusScheduled): 0,
-				string(model.TaskStatusWaiting):   0,
-				string(model.TaskStatusRunning):   0,
-			},
-		})
-	}
+	rows := make([]taskPipelineOverview, 0)
+	index := make(map[string]int)
 	for _, count := range counts {
 		i, ok := index[count.Pipeline]
 		if !ok {
-			continue
+			i = len(rows)
+			index[count.Pipeline] = i
+			rows = append(rows, taskPipelineOverview{
+				Operation: count.Pipeline,
+				ByStatus: map[string]int64{
+					string(model.TaskStatusPending): 0,
+					string(model.TaskStatusRunning): 0,
+				},
+			})
 		}
 		rows[i].ByStatus[count.Status] += count.Count
 		rows[i].Total += count.Count

@@ -134,6 +134,7 @@ alias 会把凭据保存在 `~/.mc/config.json`。无回显提示可以避免 se
 | --- | --- |
 | `AccessDenied` | 确认 access key 和 secret key 来自 `synaps3 admin s3-user create`。 |
 | 客户端使用 virtual-hosted 存储桶访问 | 开启 path-style addressing 或客户端中的等价设置。 |
-| 上传成功但 Filecoin 存储仍在等待 | 查看仪表盘任务页，或运行 `synaps3 admin task list --status queued`。 |
+| 创建存储桶后的首次上传返回 `SlowDown` | 存储提供方可能仍在准备该存储桶。短暂等待后重试上传，再使用读取命令确认结果。 |
+| 上传成功但 Filecoin 存储仍在等待 | 查看仪表盘任务页，或运行 `synaps3 admin task list --status pending`。 |
 | 对象大小被拒绝 | 确保对象大小在 `127` 到 `1,065,353,216` 字节之间。 |
 | 远程主机无法访问 Admin 仪表盘 | 保持 Admin 监听本机回环地址，并使用 `ssh -L 9090:127.0.0.1:9090 user@server`。 |

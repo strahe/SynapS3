@@ -20,30 +20,19 @@ var ErrInvalidInput = errors.New("invalid input")
 // ErrConflict is returned when a compare-and-restore operation sees stale state.
 var ErrConflict = errors.New("conflict")
 
+// ErrReplicaTargetLowered reports an attempt to reduce a bucket's replica
+// target. It stays an ErrInvalidInput so existing handling still applies, but it
+// is distinguishable because the reason a caller needs to hear is specific.
+var ErrReplicaTargetLowered = fmt.Errorf("lowering the replica target is not supported: %w", ErrInvalidInput)
+
 // ErrPermanentDeleteStorageBusy reports that a permanent delete cannot yet
 // cancel storage work without risking a remote write. It remains compatible
 // with ErrConflict for existing callers.
 var ErrPermanentDeleteStorageBusy = fmt.Errorf("permanent delete blocked by storage work: %w", ErrConflict)
 
-// ErrReplicaRepairItemCancelled reports that the exact repair copy no longer
-// has work the claimed coordinator may execute.
-var ErrReplicaRepairItemCancelled = errors.New("replica repair item cancelled")
-
-// ErrUploadTaskCancelled reports that an ordinary upload task no longer has
-// live storage work it may execute.
-var ErrUploadTaskCancelled = errors.New("upload task cancelled")
-
-// ErrTaskClaimLost reports that a worker no longer owns the running task claim.
-var ErrTaskClaimLost = errors.New("task claim lost")
-
-// ErrItemClaimLost reports that a provider replacement worker no longer owns
-// the item lease identified by its fencing token.
-var ErrItemClaimLost = errors.New("replacement item claim lost")
-
-// ErrReplacementRetryUnsupported means the task belongs to an operator-approved
-// provider replacement, which resumes only through its own retry action so the
-// replacement record and the task never disagree. It wraps ErrConflict.
-var ErrReplacementRetryUnsupported = fmt.Errorf("provider replacement work cannot be retried from the task queue: %w", ErrConflict)
+// ErrTaskLeaseLost reports that a claim generation is stale or its lease can
+// no longer be proven valid.
+var ErrTaskLeaseLost = errors.New("task lease lost")
 
 // ErrAlreadyCurrent is returned when a restore would not change the current object representation.
 var ErrAlreadyCurrent = errors.New("already current")

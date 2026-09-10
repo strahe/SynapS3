@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ipfs/go-cid"
 	"github.com/strahe/synapse-go/pdp"
 )
 
@@ -196,18 +197,67 @@ func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiec
 	return result, nil
 }
 
-func (c *PDPStatusChecker) clientForStatusURL(statusURL string) (*pdp.Client, error) {
-	parsed, err := url.Parse(statusURL)
+// FindParkedPiece checks the provider-local piece endpoint once. Its client
+// uses the same redirect, DNS, and private-network protections as status
+// polling.
+func (c *PDPStatusChecker) FindParkedPiece(ctx context.Context, serviceURL string, pieceCID cid.Cid) (ParkedPieceState, error) {
+	client, err := c.clientForServiceURL(serviceURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse status URL: %w", err)
+		return "", err
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("unsupported status URL scheme %q", parsed.Scheme)
+	found, err := client.FindPiece(ctx, pieceCID)
+	switch {
+	case errors.Is(err, pdp.ErrPieceNotFound):
+		return ParkedPieceMissing, nil
+	case errors.Is(err, pdp.ErrPieceProcessing):
+		return ParkedPieceProcessing, nil
+	case err != nil:
+		return "", err
+	case found == nil:
+		return "", errors.New("empty parked-piece response")
 	}
-	if parsed.Host == "" {
-		return nil, fmt.Errorf("missing status URL host")
+	foundCID, err := cid.Parse(found.PieceCID)
+	if err != nil {
+		return "", fmt.Errorf("parse parked piece identity: %w", err)
+	}
+	if !foundCID.Equals(pieceCID) {
+		return "", fmt.Errorf("parked piece identity mismatch: got %s want %s", foundCID, pieceCID)
+	}
+	return ParkedPieceReady, nil
+}
+
+func (c *PDPStatusChecker) clientForServiceURL(serviceURL string) (*pdp.Client, error) {
+	parsed, err := parsePDPHTTPURL(serviceURL, "service URL")
+	if err != nil {
+		return nil, err
+	}
+	return c.newPDPClient(parsed.String())
+}
+
+func (c *PDPStatusChecker) clientForStatusURL(statusURL string) (*pdp.Client, error) {
+	parsed, err := parsePDPHTTPURL(statusURL, "status URL")
+	if err != nil {
+		return nil, err
 	}
 	base := &url.URL{Scheme: parsed.Scheme, Host: parsed.Host}
+	return c.newPDPClient(base.String())
+}
+
+func parsePDPHTTPURL(rawURL, label string) (*url.URL, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", label, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported %s scheme %q", label, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("missing %s host", label)
+	}
+	return parsed, nil
+}
+
+func (c *PDPStatusChecker) newPDPClient(baseURL string) (*pdp.Client, error) {
 	httpClient := c.httpClient
 	if httpClient == nil {
 		timeout := c.timeout
@@ -216,7 +266,7 @@ func (c *PDPStatusChecker) clientForStatusURL(statusURL string) (*pdp.Client, er
 		}
 		httpClient = newPDPStatusHTTPClient(timeout, c.allowPrivateNetworks)
 	}
-	return pdp.New(base.String(),
+	return pdp.New(baseURL,
 		pdp.WithHTTPClient(httpClient),
 		pdp.WithMaxRetries(0),
 	)

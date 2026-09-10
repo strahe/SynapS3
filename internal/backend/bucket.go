@@ -6,8 +6,8 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
 	"github.com/strahe/synaps3/internal/db/repository"
-	"github.com/strahe/synaps3/internal/model"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -45,29 +45,18 @@ func (b *SynapseBackend) createBucketWithOwner(ctx context.Context, name, owner 
 	if owner != "" {
 		ownerPtr = &owner
 	}
-	var bucket *model.Bucket
-	err := b.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
-		if owner != "" {
-			account, err := txRepos.S3Accounts.LockByAccessKey(ctx, owner)
-			if err != nil {
-				return err
-			}
-			if account == nil {
-				return auth.ErrNoSuchUser
-			}
-		}
-		bucket = &model.Bucket{
-			Name:           name,
-			ACL:            acl,
-			OwnerAccessKey: ownerPtr,
-			Status:         model.BucketStatusActive,
-		}
-		return txRepos.Buckets.Create(ctx, bucket)
+	bucket, err := b.bucketLifecycle.CreateWithOptions(ctx, bucketlifecycle.CreateOptions{
+		Name:           name,
+		ACL:            acl,
+		OwnerAccessKey: ownerPtr,
 	})
+	if errors.Is(err, bucketlifecycle.ErrOwnerNotFound) {
+		return auth.ErrNoSuchUser
+	}
 	if err != nil {
 		return err
 	}
-	b.bucketLifecycle.EnsureCacheBucketDir(ctx, bucket.Name)
+	b.logger.Info("bucket storage provisioning scheduled", "bucket", bucket.Name, "id", bucket.ID)
 	return nil
 }
 

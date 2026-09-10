@@ -8,11 +8,14 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 )
 
 // BunObjectRepo implements ObjectRepository using Bun ORM.
@@ -37,10 +40,7 @@ func (r *BunObjectRepo) CreateVersionAndSetCurrent(ctx context.Context, version 
 		if !shouldRetryObjectWrite(err, canRestartTx) || attempt >= 19 {
 			return 0, err
 		}
-		delay := time.Duration(attempt+1) * 25 * time.Millisecond
-		if delay > 200*time.Millisecond {
-			delay = 200 * time.Millisecond
-		}
+		delay := min(time.Duration(attempt+1)*25*time.Millisecond, 200*time.Millisecond)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -66,10 +66,7 @@ func (r *BunObjectRepo) CreateVersionAndSetCurrentIfChanged(ctx context.Context,
 		if !shouldRetryObjectWrite(err, canRestartTx) || attempt >= 19 {
 			return ObjectVersionWriteResult{}, err
 		}
-		delay := time.Duration(attempt+1) * 25 * time.Millisecond
-		if delay > 200*time.Millisecond {
-			delay = 200 * time.Millisecond
-		}
+		delay := min(time.Duration(attempt+1)*25*time.Millisecond, 200*time.Millisecond)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -99,10 +96,7 @@ func (r *BunObjectRepo) CreateRestoredVersionAndSetCurrent(ctx context.Context, 
 		if !shouldRetryObjectWrite(err, canRestartTx) || attempt >= 19 {
 			return 0, err
 		}
-		delay := time.Duration(attempt+1) * 25 * time.Millisecond
-		if delay > 200*time.Millisecond {
-			delay = 200 * time.Millisecond
-		}
+		delay := min(time.Duration(attempt+1)*25*time.Millisecond, 200*time.Millisecond)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -123,12 +117,9 @@ func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, buc
 		Key:            key,
 		Size:           0,
 		ETag:           "",
-		Checksum:       "",
 		ContentType:    "",
-		CacheKey:       "",
-		InCache:        false,
+		Metadata:       map[string]string{},
 		IsDeleteMarker: true,
-		State:          model.ObjectStateCached,
 	}
 
 	_, canRestartTx := r.db.(*bun.DB)
@@ -142,10 +133,7 @@ func (r *BunObjectRepo) CreateDeleteMarkerAndSetCurrent(ctx context.Context, buc
 		if !shouldRetryObjectWrite(err, canRestartTx) || attempt >= 19 {
 			return nil, err
 		}
-		delay := time.Duration(attempt+1) * 25 * time.Millisecond
-		if delay > 200*time.Millisecond {
-			delay = 200 * time.Millisecond
-		}
+		delay := min(time.Duration(attempt+1)*25*time.Millisecond, 200*time.Millisecond)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -178,11 +166,11 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 		if version == nil {
 			return ErrNotFound
 		}
-		preliminaryUploads, err := authoritativeStorageUploadsForVersions(ctx, db, []*model.ObjectVersion{version})
+		preliminaryUploads, err := authoritativeStorageContentsForVersions(ctx, db, []*model.ObjectVersion{version})
 		if err != nil {
 			return err
 		}
-		lockedUploads, err := lockStorageUploadsByID(ctx, db, sortedStorageUploadIDs(preliminaryUploads))
+		lockedUploads, err := lockStorageContentsByID(ctx, db, sortedContentIDs(preliminaryUploads))
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return ErrPermanentDeleteStorageBusy
@@ -208,11 +196,11 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 		if err := objectVersionPermanentDeleteStateError(version.State); err != nil {
 			return err
 		}
-		currentUploads, err := authoritativeStorageUploadsForVersions(ctx, db, []*model.ObjectVersion{version})
+		currentUploads, err := authoritativeStorageContentsForVersions(ctx, db, []*model.ObjectVersion{version})
 		if err != nil {
 			return err
 		}
-		if !sameStorageUploadIDs(preliminaryUploads, currentUploads) {
+		if !sameContentIDs(preliminaryUploads, currentUploads) {
 			return ErrPermanentDeleteStorageBusy
 		}
 		if err := prepareObjectVersionsForPermanentDelete(ctx, db, []*model.ObjectVersion{version}, lockedUploads); err != nil {
@@ -223,18 +211,13 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 
 		now := time.Now()
 		deletion := &model.ObjectDeletion{
-			BucketID:           version.BucketID,
-			ObjectID:           version.ObjectID,
-			Key:                version.Key,
-			VersionID:          version.VersionID,
-			CacheKey:           version.CacheKey,
-			StorageUploadID:    version.StorageUploadID,
-			Size:               version.Size,
-			Checksum:           version.Checksum,
-			CacheCleanupStatus: model.CacheCleanupStatusPending,
-			CreatedAt:          now,
-			UpdatedAt:          now,
-			DeletedAt:          now,
+			BucketID:  version.BucketID,
+			ObjectID:  version.ObjectID,
+			Key:       version.Key,
+			VersionID: version.VersionID,
+			ContentID: version.ContentID,
+			Size:      version.Size,
+			DeletedAt: now,
 		}
 		if _, err := db.NewInsert().Model(deletion).Exec(ctx); err != nil {
 			if isUniqueViolation(err) {
@@ -243,17 +226,21 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 			return fmt.Errorf("recording object deletion: %w", err)
 		}
 		result.DeletionID = deletion.ID
-		result.CacheKey = version.CacheKey
-		result.StorageUploadID = version.StorageUploadID
+		result.ContentID = version.ContentID
 
-		if version.StorageUploadID != nil {
-			cleanupTaskID, err := createStorageCleanupTaskForDeletedVersion(ctx, db, *version.StorageUploadID, version.VersionID, input.StorageCleanupMaxRetries)
+		if version.ContentID != nil {
+			cleanup, err := reserveStorageCleanupForDeletedVersions(ctx, db, *version.ContentID, []string{version.VersionID})
 			if err != nil {
 				return err
 			}
-			result.StorageCleanupTaskID = cleanupTaskID
+			result.StorageCleanup = cleanup
 		}
 
+		if wasCurrent {
+			if err := repointObjectAwayFromVersion(ctx, db, objectID, version.VersionID); err != nil {
+				return err
+			}
+		}
 		res, err := db.NewDelete().
 			Model((*model.ObjectVersion)(nil)).
 			Where("version_id = ?", version.VersionID).
@@ -266,7 +253,7 @@ func (r *BunObjectRepo) DeleteObjectVersionPermanently(ctx context.Context, inpu
 			return ErrNotFound
 		}
 		if wasCurrent {
-			if err := promoteLatestVersionOrDeleteObject(ctx, db, objectID); err != nil {
+			if err := deleteObjectIdentityIfEmpty(ctx, db, objectID); err != nil {
 				return err
 			}
 		}
@@ -310,11 +297,11 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 			versionIDs = append(versionIDs, versions[i].VersionID)
 		}
 		preliminaryDataVersions := dataObjectVersionPointers(versions)
-		preliminaryUploads, err := authoritativeStorageUploadsForVersions(ctx, db, preliminaryDataVersions)
+		preliminaryUploads, err := authoritativeStorageContentsForVersions(ctx, db, preliminaryDataVersions)
 		if err != nil {
 			return err
 		}
-		lockedUploads, err := lockStorageUploadsByID(ctx, db, sortedStorageUploadIDs(preliminaryUploads))
+		lockedUploads, err := lockStorageContentsByID(ctx, db, sortedContentIDs(preliminaryUploads))
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return ErrPermanentDeleteStorageBusy
@@ -354,11 +341,11 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 			}
 			dataVersions = append(dataVersions, &versions[i])
 		}
-		currentUploads, err := authoritativeStorageUploadsForVersions(ctx, db, dataVersions)
+		currentUploads, err := authoritativeStorageContentsForVersions(ctx, db, dataVersions)
 		if err != nil {
 			return err
 		}
-		if !sameStorageUploadIDs(preliminaryUploads, currentUploads) {
+		if !sameContentIDs(preliminaryUploads, currentUploads) {
 			return ErrPermanentDeleteStorageBusy
 		}
 		if err := prepareObjectVersionsForPermanentDelete(ctx, db, dataVersions, lockedUploads); err != nil {
@@ -375,27 +362,22 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 				continue
 			}
 			deletions = append(deletions, model.ObjectDeletion{
-				BucketID:           version.BucketID,
-				ObjectID:           version.ObjectID,
-				Key:                version.Key,
-				VersionID:          version.VersionID,
-				CacheKey:           version.CacheKey,
-				StorageUploadID:    version.StorageUploadID,
-				Size:               version.Size,
-				Checksum:           version.Checksum,
-				CacheCleanupStatus: model.CacheCleanupStatusPending,
-				CreatedAt:          now,
-				UpdatedAt:          now,
-				DeletedAt:          now,
+				BucketID:  version.BucketID,
+				ObjectID:  version.ObjectID,
+				Key:       version.Key,
+				VersionID: version.VersionID,
+				ContentID: version.ContentID,
+				Size:      version.Size,
+				DeletedAt: now,
 			})
 			result.DeletedVersions = append(result.DeletedVersions, DeletedObjectVersionSnapshot{
 				VersionID: version.VersionID,
-				CacheKey:  version.CacheKey,
+				ContentID: version.ContentID,
 			})
 			result.DataVersionsDeleted++
-			if version.StorageUploadID != nil {
-				uploadID := *version.StorageUploadID
-				deletedVersionIDsByUpload[uploadID] = append(deletedVersionIDsByUpload[uploadID], version.VersionID)
+			if version.ContentID != nil {
+				contentID := *version.ContentID
+				deletedVersionIDsByUpload[contentID] = append(deletedVersionIDsByUpload[contentID], version.VersionID)
 			}
 		}
 
@@ -408,16 +390,26 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 			}
 		}
 
-		for uploadID, deletedVersionIDs := range deletedVersionIDsByUpload {
-			cleanupTaskID, err := createStorageCleanupTaskForDeletedVersions(ctx, db, uploadID, deletedVersionIDs, input.StorageCleanupMaxRetries)
+		for contentID, deletedVersionIDs := range deletedVersionIDsByUpload {
+			cleanup, err := reserveStorageCleanupForDeletedVersions(ctx, db, contentID, deletedVersionIDs)
 			if err != nil {
 				return err
 			}
-			if cleanupTaskID != nil {
-				result.StorageCleanupTaskIDs = append(result.StorageCleanupTaskIDs, *cleanupTaskID)
+			if cleanup != nil {
+				result.StorageCleanups = append(result.StorageCleanups, *cleanup)
 			}
 		}
 
+		// The object stops pointing at any version before the rows go; the
+		// pointer's foreign key would otherwise refuse the delete.
+		if _, err := db.NewUpdate().
+			Model((*model.Object)(nil)).
+			Set("current_version_id = NULL").
+			Set("updated_at = ?", now).
+			Where("id = ?", current.ObjectID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("clearing object current version: %w", err)
+		}
 		if _, err := db.NewDelete().
 			Model((*model.ObjectVersion)(nil)).
 			Where("object_id = ?", current.ObjectID).
@@ -430,6 +422,7 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 			Exec(ctx); err != nil {
 			return fmt.Errorf("deleting object identity: %w", err)
 		}
+
 		return nil
 	})
 	if err != nil {
@@ -438,30 +431,90 @@ func (r *BunObjectRepo) DeleteDeletedObjectPermanently(ctx context.Context, inpu
 	return result, nil
 }
 
-func (r *BunObjectRepo) UpdateObjectDeletionCacheCleanup(ctx context.Context, versionID string, status model.CacheCleanupStatus, cacheError string) error {
-	if versionID == "" || status == "" {
-		return fmt.Errorf("updating object deletion cache cleanup: %w", ErrInvalidInput)
+func (r *BunObjectRepo) ClearContentCachePresence(ctx context.Context, contentID int64) error {
+	if contentID < 1 {
+		return fmt.Errorf("clearing content cache presence: %w", ErrInvalidInput)
 	}
-	now := time.Now()
-	q := r.db.NewUpdate().
-		Model((*model.ObjectDeletion)(nil)).
-		Set("cache_cleanup_status = ?", status).
-		Set("cache_cleaned_at = ?", now).
-		Set("updated_at = ?", now)
-	if cacheError == "" {
-		q = q.Set("cache_error = NULL")
-	} else {
-		q = q.Set("cache_error = ?", cacheError)
-	}
-	res, err := q.Where("version_id = ?", versionID).Exec(ctx)
+	_, err := r.db.NewUpdate().
+		Model((*model.ObjectCache)(nil)).
+		Set("in_cache = ?", false).
+		Set("cache_presence_generation = cache_presence_generation + 1").
+		Set("updated_at = ?", time.Now()).
+		Where("content_id = ?", contentID).
+		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("updating object deletion cache cleanup: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("updating object deletion cache cleanup: %w", ErrNotFound)
+		return fmt.Errorf("clearing content cache presence: %w", err)
 	}
 	return nil
+}
+
+func (r *BunObjectRepo) ReleaseContentCacheIfUnreferenced(
+	ctx context.Context,
+	contentID int64,
+	release func() error,
+) (bool, error) {
+	if contentID < 1 || release == nil {
+		return false, fmt.Errorf("releasing content cache: %w", ErrInvalidInput)
+	}
+	released := false
+	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
+		contents, err := lockStorageContentsByID(ctx, db, []int64{contentID})
+		if err != nil {
+			return fmt.Errorf("locking content for cache release: %w", err)
+		}
+		if contents[contentID] == nil {
+			return ErrNotFound
+		}
+		unreferenced, err := contentIsUnreferenced(ctx, db, contentID)
+		if err != nil {
+			return err
+		}
+		if !unreferenced {
+			return nil
+		}
+		if err := release(); err != nil {
+			return fmt.Errorf("deleting content cache file: %w", err)
+		}
+		if _, err := db.NewUpdate().
+			Model((*model.ObjectCache)(nil)).
+			Set("in_cache = ?", false).
+			Set("cache_presence_generation = cache_presence_generation + 1").
+			Set("updated_at = ?", time.Now()).
+			Where("content_id = ?", contentID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("clearing released content cache presence: %w", err)
+		}
+		released = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return released, nil
+}
+
+// contentIsUnreferenced reports whether any live object version still points at
+// the content. Cache release and remote cleanup both hang off this answer, so it
+// must be read inside the same transaction that removed the version.
+func contentIsUnreferenced(ctx context.Context, db bun.IDB, contentID int64) (bool, error) {
+	count, err := db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("content_id = ?", contentID).
+		Count(ctx)
+	if err != nil {
+		return false, fmt.Errorf("counting live versions for content %d: %w", contentID, err)
+	}
+	return count == 0, nil
+}
+
+// ContentIsUnreferenced reports whether any live object version still points at
+// the content, so callers outside a deletion transaction can decide whether
+// releasing its cached bytes is safe.
+func (r *BunObjectRepo) ContentIsUnreferenced(ctx context.Context, contentID int64) (bool, error) {
+	if contentID <= 0 {
+		return false, fmt.Errorf("checking content references: %w", ErrInvalidInput)
+	}
+	return contentIsUnreferenced(ctx, r.db, contentID)
 }
 
 func (r *BunObjectRepo) RestoreCurrentDeleteMarkerStack(ctx context.Context, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error) {
@@ -516,7 +569,8 @@ func (r *BunObjectRepo) GetCurrentVersionByObjectID(ctx context.Context, objectI
 		Model(version).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version")
-	err := q.Where("object_version.object_id = ? AND object_version.is_current = ?", objectID, true).Scan(ctx)
+	err := q.Where("object_version.object_id = ?", objectID).
+		Where("current_object.current_version_id = object_version.version_id").Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -532,7 +586,8 @@ func (r *BunObjectRepo) GetCurrentVersionByBucketAndKey(ctx context.Context, buc
 		Model(version).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version")
-	err := q.Where("object_version.bucket_id = ? AND object_version.key = ? AND object_version.is_current = ?", bucketID, key, true).Scan(ctx)
+	err := q.Where("object_version.bucket_id = ? AND object_version.key = ?", bucketID, key).
+		Where("current_object.current_version_id = object_version.version_id").Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -574,109 +629,6 @@ func (r *BunObjectRepo) GetVersionByBucketKeyAndID(ctx context.Context, bucketID
 	return version, nil
 }
 
-func (r *BunObjectRepo) FindReusableStoredVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error) {
-	version := new(model.ObjectVersion)
-	q := r.db.NewSelect().
-		Model(version).
-		ModelTableExpr("object_versions AS object_version")
-	q = withObjectVersionStorageColumns(q, "object_version")
-	err := q.Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
-		Where("object_version.is_delete_marker = ?", false).
-		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateStored, model.ObjectStateCacheEvicted})).
-		Where("storage_upload.status IN (?)", bun.List([]model.StorageUploadStatus{
-			model.StorageUploadStatusReadable,
-			model.StorageUploadStatusComplete,
-		})).
-		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
-		OrderExpr("object_version.created_at DESC").
-		OrderExpr("object_version.version_id DESC").
-		Limit(1).
-		Scan(ctx)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("finding reusable stored object version: %w", err)
-	}
-	return version, nil
-}
-
-func (r *BunObjectRepo) FindReusableReplicatingVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error) {
-	version := new(model.ObjectVersion)
-	q := r.db.NewSelect().
-		Model(version).
-		ModelTableExpr("object_versions AS object_version")
-	q = withObjectVersionStorageColumns(q, "object_version")
-	err := q.Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
-		Where("object_version.is_delete_marker = ?", false).
-		Where("object_version.state = ?", model.ObjectStateReplicating).
-		Where(usableCopyExistsSQL("object_version.storage_upload_id")).
-		OrderExpr("object_version.created_at DESC").
-		OrderExpr("object_version.version_id DESC").
-		Limit(1).
-		Scan(ctx)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("finding reusable replicating object version: %w", err)
-	}
-	return version, nil
-}
-
-func (r *BunObjectRepo) FindReusableActiveUploadVersion(ctx context.Context, bucketID int64, size int64, checksum string) (*model.ObjectVersion, error) {
-	version := new(model.ObjectVersion)
-	err := r.db.NewSelect().
-		Model(version).
-		ModelTableExpr("object_versions AS object_version").
-		ColumnExpr("object_version.*").
-		Where("object_version.bucket_id = ? AND object_version.size = ? AND object_version.checksum = ?", bucketID, size, checksum).
-		Where("object_version.is_delete_marker = ?", false).
-		Where("object_version.state IN (?)", bun.List([]model.ObjectState{model.ObjectStateCached, model.ObjectStateUploading, model.ObjectStateCommitting})).
-		Where("object_version.in_cache = ?", true).
-		Where(`(
-			EXISTS (
-				SELECT 1 FROM storage_uploads AS active_upload
-				WHERE active_upload.source_version_id = object_version.version_id
-				  AND active_upload.status IN (?)
-				  AND (
-					(object_version.state = ? AND active_upload.status IN (?, ?))
-					OR (
-						object_version.state = ?
-						AND `+usableCopyExistsSQL("active_upload.id")+`
-					)
-				  )
-			)
-			OR (
-				object_version.state IN (?, ?)
-				AND EXISTS (
-					SELECT 1 FROM tasks AS active_task
-					WHERE active_task.ref_type = ?
-					  AND active_task.ref_version_id = object_version.version_id
-					  AND active_task.type = ?
-					  AND active_task.status IN (?)
-				)
-			)
-		)`,
-			bun.List(activeUploadStatuses()),
-			model.ObjectStateUploading, model.StorageUploadStatusRunning, model.StorageUploadStatusIngressReady,
-			model.ObjectStateCommitting,
-			model.ObjectStateCached, model.ObjectStateUploading,
-			"object", model.TaskTypeUpload, bun.List(activeTaskStatuses()),
-		).
-		OrderExpr("object_version.created_at DESC").
-		OrderExpr("object_version.version_id DESC").
-		Limit(1).
-		Scan(ctx)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("finding reusable active upload object version: %w", err)
-	}
-	return version, nil
-}
-
 func (r *BunObjectRepo) ListCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]model.ObjectVersion, error) {
 	return r.listCurrentVersionsByBucket(ctx, bucketID, prefix, afterKey, false, maxKeys)
 }
@@ -687,23 +639,27 @@ func (r *BunObjectRepo) ListCurrentVersionsByBucketAtOrAfter(ctx context.Context
 
 func (r *BunObjectRepo) listCurrentVersionsByBucket(ctx context.Context, bucketID int64, prefix string, keyBoundary string, includeBoundary bool, maxKeys int) ([]model.ObjectVersion, error) {
 	var versions []model.ObjectVersion
-	keyExpr := keyOrderExpr(r.db, "object_version.key")
+	// Listing walks the objects unique key and follows each pointer, so the
+	// bucket+key ordering comes from objects rather than from a partial index
+	// over every version.
+	keyExpr := keyOrderExpr(r.db, "current_object.key")
 	q := r.db.NewSelect().
 		Model(&versions).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version").
-		Where("object_version.bucket_id = ? AND object_version.is_current = ?", bucketID, true).
+		Where("current_object.bucket_id = ?", bucketID).
+		Where("current_object.current_version_id = object_version.version_id").
 		Where("object_version.is_delete_marker = ?", false).
 		OrderExpr(keyExpr + " ASC")
 
 	if prefix != "" {
-		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
+		q = applyCaseSensitivePrefixFilter(r.db, q, "current_object.key", prefix)
 	}
 	if keyBoundary != "" {
 		if includeBoundary {
-			q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">="), keyBoundary)
+			q = q.Where(keyComparisonSQL(r.db, "current_object.key", ">="), keyBoundary)
 		} else {
-			q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), keyBoundary)
+			q = q.Where(keyComparisonSQL(r.db, "current_object.key", ">"), keyBoundary)
 		}
 	}
 	if maxKeys > 0 {
@@ -788,22 +744,22 @@ func (r *BunObjectRepo) ListVersionsByKey(ctx context.Context, bucketID int64, k
 
 func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucketID int64, prefix string, afterKey string, maxKeys int) ([]RecoverableDeleteMarker, error) {
 	var markers []model.ObjectVersion
-	keyExpr := keyOrderExpr(r.db, "object_version.key")
+	keyExpr := keyOrderExpr(r.db, "current_object.key")
 	q := r.db.NewSelect().
 		Model(&markers).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version").
-		Where("object_version.bucket_id = ?", bucketID).
-		Where("object_version.is_current = ?", true).
+		Where("current_object.bucket_id = ?", bucketID).
+		Where("current_object.current_version_id = object_version.version_id").
 		Where("object_version.is_delete_marker = ?", true).
 		Where("EXISTS (SELECT 1 FROM object_versions AS data_version WHERE data_version.object_id = object_version.object_id AND data_version.is_delete_marker = ?)", false).
 		OrderExpr(keyExpr + " ASC")
 
 	if prefix != "" {
-		q = applyCaseSensitivePrefixFilter(r.db, q, "object_version.key", prefix)
+		q = applyCaseSensitivePrefixFilter(r.db, q, "current_object.key", prefix)
 	}
 	if afterKey != "" {
-		q = q.Where(keyComparisonSQL(r.db, "object_version.key", ">"), afterKey)
+		q = q.Where(keyComparisonSQL(r.db, "current_object.key", ">"), afterKey)
 	}
 	if maxKeys > 0 {
 		q = q.Limit(maxKeys)
@@ -834,224 +790,59 @@ func (r *BunObjectRepo) ListRecoverableDeleteMarkers(ctx context.Context, bucket
 	return items, nil
 }
 
-func (r *BunObjectRepo) UpdateVersionState(ctx context.Context, versionID string, from, to model.ObjectState) error {
-	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		return updateVersionState(ctx, db, versionID, from, to)
-	})
-}
-
-func (r *BunObjectRepo) UpdateVersionStateToFailed(ctx context.Context, versionID string, from model.ObjectState, lastError string) error {
-	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		now := time.Now()
-		res, err := db.NewUpdate().
-			Model((*model.ObjectVersion)(nil)).
-			Set("state = ?", model.ObjectStateFailed).
-			Set("storage_upload_id = NULL").
-			Set("failed_at_state = ?", from).
-			Set("last_error = ?", lastError).
-			Set("updated_at = ?", now).
-			Where("version_id = ? AND state = ?", versionID, from).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("updating object version state to failed: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
-			return fmt.Errorf("state transition %s→failed failed: version %s not in expected state", from, versionID)
-		}
-		return nil
-	})
-}
-
 func (r *BunObjectRepo) SetVersionCachePresence(ctx context.Context, versionID string, inCache bool) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		return setVersionCachePresence(ctx, db, versionID, inCache)
 	})
 }
 
-func (r *BunObjectRepo) RecordVersionCacheAccess(ctx context.Context, versionID string, accessedAt time.Time) error {
-	return executeVersionCacheAccessUpdate(
-		ctx,
-		r.newVersionCacheAccessUpdate(versionID, accessedAt),
-		versionID,
-	)
+// RecordContentCacheAccess advances LRU recency for one content payload without
+// asserting that its bytes are present.
+func (r *BunObjectRepo) RecordContentCacheAccess(ctx context.Context, contentID int64, accessedAt time.Time) error {
+	return r.recordContentCacheAccess(ctx, contentID, accessedAt, false)
 }
 
-func (r *BunObjectRepo) RecordVersionCacheCommit(ctx context.Context, versionID string, accessedAt time.Time) error {
-	query := r.newVersionCacheAccessUpdate(versionID, accessedAt).
-		Set("in_cache = ?", true)
-	return executeVersionCacheAccessUpdate(ctx, query, versionID)
+// RecordContentCacheCommit marks a freshly written cache file present and
+// advances its recency in the same write.
+func (r *BunObjectRepo) RecordContentCacheCommit(ctx context.Context, contentID int64, accessedAt time.Time) error {
+	return r.recordContentCacheAccess(ctx, contentID, accessedAt, true)
 }
 
-func (r *BunObjectRepo) newVersionCacheAccessUpdate(
-	versionID string,
-	accessedAt time.Time,
-) *bun.UpdateQuery {
-	accessedAt = cacheeviction.NormalizeAccessTime(accessedAt)
-	return r.db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set(
-			`cache_accessed_at = CASE
-				WHEN cache_accessed_at IS NULL OR cache_accessed_at < ? THEN ?
-				ELSE cache_accessed_at
-			END`,
-			accessedAt,
-			accessedAt,
-		).
-		Where("version_id = ? AND is_delete_marker = ?", versionID, false)
-}
-
-func executeVersionCacheAccessUpdate(
-	ctx context.Context,
-	query *bun.UpdateQuery,
-	versionID string,
-) error {
-	res, err := query.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("recording version cache access: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("recording version cache access: version %s not found", versionID)
-	}
-	return nil
-}
-
-func (r *BunObjectRepo) SetVersionStorageUploadAndTransition(ctx context.Context, versionID string, storageUploadID int64, from, to model.ObjectState) error {
+func (r *BunObjectRepo) recordContentCacheAccess(ctx context.Context, contentID int64, accessedAt time.Time, present bool) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		upload, err := lockStorageUploadForObjectState(ctx, db, storageUploadID, to)
-		if err != nil {
-			return fmt.Errorf("locking storage upload for version transition: %w", err)
+		if contentID < 1 {
+			return nil
 		}
-		if to == model.ObjectStateStored || to == model.ObjectStateCacheEvicted {
-			if err := requireCurrentMinimumDurableCopies(ctx, db, upload); err != nil {
-				return fmt.Errorf("checking storage upload durability for version transition: %w", err)
-			}
+		normalized := cacheeviction.NormalizeAccessTime(accessedAt)
+		if present {
+			return upsertContentCachePresence(ctx, db, contentID, true, &normalized)
 		}
-		now := time.Now()
-		res, err := db.NewUpdate().
-			Model((*model.ObjectVersion)(nil)).
-			Set("storage_upload_id = ?", storageUploadID).
-			Set("state = ?", to).
-			Set("updated_at = ?", now).
-			Where("version_id = ? AND state = ?", versionID, from).
-			Exec(ctx)
-		if err != nil {
-			return fmt.Errorf("setting version storage upload and transitioning state: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		if rows == 0 {
-			return fmt.Errorf("SetVersionStorageUploadAndTransition %s→%s failed: version %s not in expected state or upload not usable", from, to, versionID)
+		// An access-only write must never claim the bytes are present: the
+		// reader may have served them from a provider.
+		if _, err := db.NewUpdate().
+			Model((*model.ObjectCache)(nil)).
+			Set(`cache_accessed_at = CASE
+				WHEN cache_accessed_at IS NULL OR cache_accessed_at < ? THEN ?
+				ELSE cache_accessed_at END`, normalized, normalized).
+			Set("updated_at = ?", time.Now()).
+			Where("content_id = ?", contentID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("recording content cache access: %w", err)
 		}
 		return nil
 	})
 }
 
-func (r *BunObjectRepo) FailUploadingContentFollowers(ctx context.Context, bucketID int64, size int64, checksum string, leaderVersionID string, lastError string) ([]ObjectVersionRef, error) {
-	var refs []ObjectVersionRef
-	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		now := time.Now()
-		query := `UPDATE object_versions
-			SET state = ?, failed_at_state = state, last_error = ?, updated_at = ?
-			WHERE bucket_id = ? AND size = ? AND checksum = ? AND state IN (?, ?)
-			  AND (
-				version_id = ?
-				OR NOT EXISTS (
-					SELECT 1 FROM tasks
-					WHERE tasks.ref_type = ?
-					  AND tasks.ref_version_id = object_versions.version_id
-					  AND tasks.type = ?
-					  AND tasks.status IN (?)
-				)
-				AND NOT EXISTS (
-					SELECT 1 FROM storage_uploads AS active_upload
-					WHERE active_upload.source_version_id = object_versions.version_id
-					  AND active_upload.status IN (?)
-				)
-			  )
-			RETURNING object_id, version_id`
-		err := db.NewRaw(query,
-			model.ObjectStateFailed,
-			lastError,
-			now,
-			bucketID,
-			size,
-			checksum,
-			model.ObjectStateUploading,
-			model.ObjectStateCommitting,
-			leaderVersionID,
-			"object",
-			model.TaskTypeUpload,
-			bun.List(activeTaskStatuses()),
-			bun.List(activeUploadStatuses()),
-		).Scan(ctx, &refs)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return fmt.Errorf("no active upload object versions matched content: %w", ErrNotFound)
-			}
-			return fmt.Errorf("failing active upload object versions: %w", err)
-		}
-		if len(refs) == 0 {
-			return fmt.Errorf("no active upload object versions matched content: %w", ErrNotFound)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return refs, nil
-}
-
-func (r *BunObjectRepo) ListVersionsByState(ctx context.Context, state model.ObjectState, limit int) ([]model.ObjectVersion, error) {
-	return r.ListVersionsByStateAfter(ctx, state, time.Time{}, "", limit)
-}
-
-func (r *BunObjectRepo) ListVersionsByStateAfter(ctx context.Context, state model.ObjectState, afterUpdatedAt time.Time, afterVersionID string, limit int) ([]model.ObjectVersion, error) {
-	var versions []model.ObjectVersion
-	q := r.db.NewSelect().
-		Model(&versions).
-		ModelTableExpr("object_versions AS object_version")
-	q = withObjectVersionStorageColumns(q, "object_version").
-		Where("object_version.state = ?", state).
-		Where("object_version.is_delete_marker = ?", false).
-		OrderExpr("object_version.updated_at ASC, object_version.version_id ASC")
-	if !afterUpdatedAt.IsZero() || afterVersionID != "" {
-		q = q.Where("(object_version.updated_at > ? OR (object_version.updated_at = ? AND object_version.version_id > ?))", afterUpdatedAt, afterUpdatedAt, afterVersionID)
-	}
-	if limit > 0 {
-		q = q.Limit(limit)
-	}
-	if err := q.Scan(ctx); err != nil {
-		return nil, fmt.Errorf("listing object versions by state: %w", err)
-	}
-	return versions, nil
-}
-
-func (r *BunObjectRepo) ResetStaleVersionStates(ctx context.Context, fromState, toState model.ObjectState, staleBefore time.Time) (int, error) {
-	var reset int
-	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
-		versionIDs, err := resetStaleVersions(ctx, db, fromState, toState, staleBefore)
-		if err != nil {
-			return err
-		}
-		reset = len(versionIDs)
-		return nil
-	})
-	if err != nil {
-		return reset, err
-	}
-	return reset, nil
-}
-
-// CountByState returns current object counts grouped by state.
 func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, error) {
 	var counts []ObjectStateCount
+	state := objectVersionStateSQL("object_version")
 	err := r.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
-		ColumnExpr("state, COUNT(*) AS count").
-		Where("is_current = ?", true).
-		Where("is_delete_marker = ?", false).
-		GroupExpr("state").
+		ColumnExpr(state+" AS state, COUNT(*) AS count").
+		Join("LEFT JOIN storage_contents AS storage_content ON storage_content.id = object_version.content_id").
+		Where(currentVersionPredicateSQL("object_version")).
+		Where("object_version.is_delete_marker = ?", false).
+		GroupExpr(state).
 		Scan(ctx, &counts)
 	if err != nil {
 		return nil, fmt.Errorf("counting current object versions by state: %w", err)
@@ -1062,12 +853,14 @@ func (r *BunObjectRepo) CountByState(ctx context.Context) ([]ObjectStateCount, e
 // AggregateByState returns current object counts and sizes grouped by state.
 func (r *BunObjectRepo) AggregateByState(ctx context.Context) ([]ObjectStateAggregate, error) {
 	var rows []ObjectStateAggregate
+	state := objectVersionStateSQL("object_version")
 	err := r.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
-		ColumnExpr("state, COUNT(*) AS count, COALESCE(SUM(size), 0) AS total_size").
-		Where("is_current = ?", true).
-		Where("is_delete_marker = ?", false).
-		GroupExpr("state").
+		ColumnExpr(state+" AS state, COUNT(*) AS count, COALESCE(SUM(object_version.size), 0) AS total_size").
+		Join("LEFT JOIN storage_contents AS storage_content ON storage_content.id = object_version.content_id").
+		Where(currentVersionPredicateSQL("object_version")).
+		Where("object_version.is_delete_marker = ?", false).
+		GroupExpr(state).
 		Scan(ctx, &rows)
 	if err != nil {
 		return nil, fmt.Errorf("aggregating current object versions by state: %w", err)
@@ -1077,39 +870,32 @@ func (r *BunObjectRepo) AggregateByState(ctx context.Context) ([]ObjectStateAggr
 
 func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAttentionCount, error) {
 	var count ObjectAttentionCount
+	// Pipeline position and cache residency are derived from the content's
+	// copies and its cache entry, so the counts read those rather than columns
+	// object_versions no longer owns.
 	query := `WITH current_versions AS (
-			SELECT version_id, storage_upload_id, state, in_cache
-			FROM object_versions
-			WHERE is_current = ?
-			  AND is_delete_marker = ?
-		),
-		latest_upload_refs AS (
-			SELECT source_upload.source_version_id, MAX(source_upload.id) AS latest_upload_id
-			FROM storage_uploads AS source_upload
-			JOIN current_versions AS current_version
-			  ON current_version.version_id = source_upload.source_version_id
-			 AND current_version.storage_upload_id IS NULL
-			WHERE source_upload.source_version_id <> ''
-			GROUP BY source_upload.source_version_id
+			SELECT object_version.version_id,
+			       object_version.content_id,
+			       ` + objectVersionStateSQL("object_version") + ` AS state,
+			       COALESCE(cache_entry.in_cache, FALSE) AS in_cache
+			FROM object_versions AS object_version
+			LEFT JOIN storage_contents AS storage_content
+			  ON storage_content.id = object_version.content_id
+			LEFT JOIN object_cache AS cache_entry
+			  ON cache_entry.content_id = object_version.content_id
+			WHERE ` + currentVersionPredicateSQL("object_version") + `
+			  AND object_version.is_delete_marker = ?
 		)
 		SELECT
-			COALESCE(SUM(CASE WHEN current_version.state = ? OR latest_upload.status IN (?, ?) THEN 1 ELSE 0 END), 0) AS needs_attention,
-			COALESCE(SUM(CASE WHEN current_version.in_cache = ? AND NOT (current_version.state IN (?, ?, ?) AND ` + usableCopyExistsSQL("current_version.storage_upload_id") + `) THEN 1 ELSE 0 END), 0) AS unavailable
+			COALESCE(SUM(CASE WHEN current_version.state = ? OR version_content.error_message IS NOT NULL THEN 1 ELSE 0 END), 0) AS needs_attention,
+			COALESCE(SUM(CASE WHEN current_version.in_cache = ? AND NOT ` + usableCopyExistsSQL("current_version.content_id") + ` THEN 1 ELSE 0 END), 0) AS unavailable
 		FROM current_versions AS current_version
-		LEFT JOIN latest_upload_refs AS latest_upload_ref
-		  ON latest_upload_ref.source_version_id = current_version.version_id
-		LEFT JOIN storage_uploads AS latest_upload
-		  ON latest_upload.id = COALESCE(current_version.storage_upload_id, latest_upload_ref.latest_upload_id)`
+		LEFT JOIN storage_contents AS version_content
+		  ON version_content.id = current_version.content_id`
 	err := r.db.NewRaw(query,
-		true,
 		false,
 		model.ObjectStateFailed,
-		model.StorageUploadStatusFailed,
-		model.StorageUploadStatusRejected,
 		false,
-		model.ObjectStateReplicating,
-		model.ObjectStateStored,
-		model.ObjectStateCacheEvicted,
 	).Scan(ctx, &count)
 	if err != nil {
 		return ObjectAttentionCount{}, fmt.Errorf("counting overview object attention: %w", err)
@@ -1121,7 +907,8 @@ func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAtten
 func (r *BunObjectRepo) CountByBucket(ctx context.Context, bucketID int64) (int64, error) {
 	count, err := r.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
-		Where("bucket_id = ? AND is_current = ?", bucketID, true).
+		Where("bucket_id = ?", bucketID).
+		Where(currentVersionPredicateSQL("object_version")).
 		Where("is_delete_marker = ?", false).
 		Count(ctx)
 	if err != nil {
@@ -1136,7 +923,8 @@ func (r *BunObjectRepo) TotalSizeByBucket(ctx context.Context, bucketID int64) (
 	err := r.db.NewSelect().
 		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("COALESCE(SUM(size), 0)").
-		Where("bucket_id = ? AND is_current = ?", bucketID, true).
+		Where("bucket_id = ?", bucketID).
+		Where(currentVersionPredicateSQL("object_version")).
 		Where("is_delete_marker = ?", false).
 		Scan(ctx, &total)
 	if err != nil {
@@ -1152,7 +940,8 @@ func (r *BunObjectRepo) BucketStats(ctx context.Context, bucketID int64) (Bucket
 		Model((*model.ObjectVersion)(nil)).
 		ColumnExpr("COUNT(*) AS count").
 		ColumnExpr("COALESCE(SUM(size), 0) AS total_size").
-		Where("bucket_id = ? AND is_current = ?", bucketID, true).
+		Where("bucket_id = ?", bucketID).
+		Where(currentVersionPredicateSQL("object_version")).
 		Where("is_delete_marker = ?", false).
 		Scan(ctx, &stats)
 	if err != nil {
@@ -1173,7 +962,7 @@ func (r *BunObjectRepo) AggregateByBucket(ctx context.Context) (map[int64]Bucket
 		ColumnExpr("bucket_id").
 		ColumnExpr("COUNT(*) AS count").
 		ColumnExpr("COALESCE(SUM(size), 0) AS total_size").
-		Where("is_current = ?", true).
+		Where(currentVersionPredicateSQL("object_version")).
 		Where("is_delete_marker = ?", false).
 		GroupExpr("bucket_id").
 		Scan(ctx, &rows)
@@ -1196,16 +985,68 @@ func (r *BunObjectRepo) runMaybeTx(ctx context.Context, fn func(bun.IDB) error) 
 	return fn(r.db)
 }
 
+// withObjectVersionStorageColumns projects everything an object version no
+// longer stores. Content identity lives on storage_contents, cache residency on
+// object_cache, and pipeline position is a function of the copy rows. Every read
+// that returns a model.ObjectVersion must go through here, or those fields come
+// back as zero values rather than facts.
 func withObjectVersionStorageColumns(q *bun.SelectQuery, alias string) *bun.SelectQuery {
 	return q.
 		ColumnExpr(alias + ".*").
-		ColumnExpr("storage_upload.piece_cid AS piece_cid").
-		ColumnExpr("CASE WHEN " + alias + ".state IN ('replicating', 'stored', 'cache_evicted') AND " + usableCopyExistsSQL(alias+".storage_upload_id") + " THEN TRUE ELSE FALSE END AS in_filecoin").
-		Join("LEFT JOIN storage_uploads AS storage_upload ON storage_upload.id = " + alias + ".storage_upload_id")
+		ColumnExpr("CASE WHEN current_object.current_version_id = " + alias + ".version_id THEN TRUE ELSE FALSE END AS is_current").
+		ColumnExpr("COALESCE(storage_content.checksum, '') AS checksum").
+		ColumnExpr("storage_content.piece_cid AS piece_cid").
+		ColumnExpr("COALESCE(object_cache_entry.in_cache, FALSE) AS in_cache").
+		ColumnExpr("object_cache_entry.cache_accessed_at AS cache_accessed_at").
+		ColumnExpr("CASE WHEN " + usableCopyExistsSQL(alias+".content_id") + " THEN TRUE ELSE FALSE END AS in_filecoin").
+		ColumnExpr(objectVersionStateSQL(alias) + " AS state").
+		Join("JOIN objects AS current_object ON current_object.id = " + alias + ".object_id").
+		Join("LEFT JOIN storage_contents AS storage_content ON storage_content.id = " + alias + ".content_id").
+		Join("LEFT JOIN object_cache AS object_cache_entry ON object_cache_entry.content_id = " + alias + ".content_id")
 }
 
-func usableCopyExistsSQL(uploadIDExpr string) string {
-	return "EXISTS (SELECT 1 FROM storage_upload_copies AS storage_copy JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id WHERE storage_copy.upload_id = " + uploadIDExpr + " AND storage_copy.status = 'committed' AND storage_copy.storage_data_set_id IS NOT NULL AND storage_copy.provider_id IS NOT NULL AND storage_copy.provider_id <> '' AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> '' AND storage_data_set.status IN ('ready', 'draining') AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> '' AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> '')"
+// currentVersionPredicateSQL matches the one version an object currently serves.
+// "Current" is the object's pointer, so it is asked of objects rather than of a
+// flag repeated on every version.
+func currentVersionPredicateSQL(alias string) string {
+	return "EXISTS (SELECT 1 FROM objects AS current_pointer WHERE current_pointer.id = " + alias +
+		".object_id AND current_pointer.current_version_id = " + alias + ".version_id)"
+}
+
+// objectVersionStateSQL derives how far a version's content has travelled. The
+// value used to be a stored column that could disagree with the copies it
+// summarised; deriving it makes that disagreement unrepresentable. A version
+// with no content is a delete marker and has no pipeline to report.
+func objectVersionStateSQL(alias string) string {
+	return fmt.Sprintf("CASE WHEN %s.content_id IS NULL THEN '%s' ELSE (%s) END",
+		alias, model.ObjectStateCached, contentPipelineStateSQL())
+}
+
+// contentPipelineStateSQL expects a storage_content alias in scope.
+func contentPipelineStateSQL() string {
+	contentID := "storage_content.id"
+	readableSlots := distinctReadableSlotCountSQL("state_copy", "state_data_set", contentID)
+	anyCopy := "EXISTS (SELECT 1 FROM storage_copies AS any_copy WHERE any_copy.content_id = " + contentID + ")"
+	everyCopyFailed := "NOT EXISTS (SELECT 1 FROM storage_copies AS live_copy WHERE live_copy.content_id = " + contentID +
+		" AND live_copy.status <> '" + string(model.StorageCopyStatusFailed) + "')"
+	committing := "EXISTS (SELECT 1 FROM storage_copies AS committing_copy WHERE committing_copy.content_id = " + contentID +
+		" AND committing_copy.status IN ('" + string(model.StorageCopyStatusPieceReady) + "', '" + string(model.StorageCopyStatusCommitting) + "'))"
+	return fmt.Sprintf(`CASE
+		WHEN %[1]s >= COALESCE(storage_content.requested_copies, 1) THEN '%[5]s'
+		WHEN %[1]s >= 1 THEN '%[6]s'
+		WHEN %[2]s AND %[3]s THEN '%[7]s'
+		WHEN %[4]s THEN '%[8]s'
+		WHEN %[2]s THEN '%[9]s'
+		ELSE '%[10]s'
+	END`,
+		readableSlots, anyCopy, everyCopyFailed, committing,
+		model.ObjectStateStored, model.ObjectStateReplicating, model.ObjectStateFailed,
+		model.ObjectStateCommitting, model.ObjectStateUploading, model.ObjectStateCached,
+	)
+}
+
+func usableCopyExistsSQL(contentIDExpr string) string {
+	return "EXISTS (SELECT 1 FROM storage_copies AS storage_copy JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id WHERE storage_copy.content_id = " + contentIDExpr + " AND storage_copy.status = 'committed' AND storage_copy.provider_id <> '' AND storage_data_set.data_set_id IS NOT NULL AND storage_data_set.data_set_id <> '' AND storage_data_set.status IN ('ready', 'draining') AND storage_copy.piece_id IS NOT NULL AND storage_copy.piece_id <> '' AND storage_copy.retrieval_url IS NOT NULL AND storage_copy.retrieval_url <> '')"
 }
 
 func objectVersionPermanentDeleteStateError(state model.ObjectState) error {
@@ -1215,7 +1056,6 @@ func objectVersionPermanentDeleteStateError(state model.ObjectState) error {
 		model.ObjectStateCommitting,
 		model.ObjectStateReplicating,
 		model.ObjectStateStored,
-		model.ObjectStateCacheEvicted,
 		model.ObjectStateFailed:
 		return nil
 	default:
@@ -1227,37 +1067,36 @@ func prepareObjectVersionsForPermanentDelete(
 	ctx context.Context,
 	db bun.IDB,
 	versions []*model.ObjectVersion,
-	uploadsByID map[int64]*model.StorageUpload,
+	uploadsByID map[int64]*model.StorageContent,
 ) error {
 	if len(versions) == 0 {
 		return nil
 	}
 
 	deletingVersionIDs := make([]string, 0, len(versions))
-	bucketIDs := make(map[int64]struct{})
 	for _, version := range versions {
 		if version == nil || version.VersionID == "" {
 			return fmt.Errorf("preparing permanent delete storage work: %w", ErrInvalidInput)
 		}
 		deletingVersionIDs = append(deletingVersionIDs, version.VersionID)
-		bucketIDs[version.BucketID] = struct{}{}
 	}
 	sort.Strings(deletingVersionIDs)
 
-	uploadIDs := sortedStorageUploadIDs(uploadsByID)
-	var copies []model.StorageUploadCopy
-	if len(uploadIDs) > 0 {
-		if err := db.NewSelect().
-			Model(&copies).
-			Where("upload_id IN (?)", bun.List(uploadIDs)).
-			OrderExpr("id ASC").
+	contentIDs := sortedContentIDs(uploadsByID)
+	var copies []model.StorageCopy
+	if len(contentIDs) > 0 {
+		query := db.NewSelect().Model(&copies)
+		projectActiveCommitAttempt(query, "storage_copy")
+		if err := query.
+			Where("storage_copy.content_id IN (?)", bun.List(contentIDs)).
+			OrderExpr("storage_copy.id ASC").
 			Scan(ctx); err != nil {
 			return fmt.Errorf("loading storage copies for permanent delete: %w", err)
 		}
 	}
 	for i := range copies {
 		res, err := db.NewUpdate().
-			Model((*model.StorageUploadCopy)(nil)).
+			Model((*model.StorageCopy)(nil)).
 			Set("updated_at = updated_at").
 			Where("id = ?", copies[i].ID).
 			Exec(ctx)
@@ -1271,15 +1110,12 @@ func prepareObjectVersionsForPermanentDelete(
 	}
 
 	relatedVersionIDs := append([]string(nil), deletingVersionIDs...)
-	for _, upload := range uploadsByID {
-		relatedVersionIDs = appendUniqueString(relatedVersionIDs, upload.SourceVersionID)
-	}
 	var boundVersionIDs []string
-	if len(uploadIDs) > 0 {
+	if len(contentIDs) > 0 {
 		if err := db.NewSelect().
 			Model((*model.ObjectVersion)(nil)).
 			Column("version_id").
-			Where("storage_upload_id IN (?)", bun.List(uploadIDs)).
+			Where("content_id IN (?)", bun.List(contentIDs)).
 			Scan(ctx, &boundVersionIDs); err != nil {
 			return fmt.Errorf("loading storage upload references for permanent delete: %w", err)
 		}
@@ -1289,91 +1125,98 @@ func prepareObjectVersionsForPermanentDelete(
 	}
 	sort.Strings(relatedVersionIDs)
 
-	bucketIDList := make([]int64, 0, len(bucketIDs))
-	for bucketID := range bucketIDs {
-		bucketIDList = append(bucketIDList, bucketID)
+	// Ingest is scheduled against the content, so a version cannot be removed
+	// while work is in flight for either the version or the bytes it names.
+	contentSubjectKeys := make([]string, 0, len(contentIDs))
+	for _, contentID := range contentIDs {
+		contentSubjectKeys = append(contentSubjectKeys, strconv.FormatInt(contentID, 10))
 	}
-	sort.Slice(bucketIDList, func(i, j int) bool { return bucketIDList[i] < bucketIDList[j] })
-	var taskIDs []int64
-	if err := db.NewSelect().
-		Model((*model.Task)(nil)).
-		Column("id").
-		Where("type = ?", model.TaskTypeUpload).
-		Where(`(
-			(ref_type = ? AND ref_version_id IN (?))
-			OR (ref_type = ? AND ref_id IN (?) AND ref_version_id IN (?))
-		)`, "object", bun.List(deletingVersionIDs), "bucket", bun.List(bucketIDList), bun.List(relatedVersionIDs)).
-		OrderExpr("id ASC").
-		Scan(ctx, &taskIDs); err != nil {
+	var relatedTasks []model.Task
+	taskQuery := db.NewSelect().
+		Model(&relatedTasks).
+		Column("id", "status").
+		OrderExpr("id ASC")
+	if len(contentSubjectKeys) > 0 {
+		taskQuery = taskQuery.Where(
+			"(subject_type = ? AND subject_key IN (?)) OR (subject_type = ? AND subject_key IN (?))",
+			"object_version", bun.List(relatedVersionIDs),
+			"storage_content", bun.List(contentSubjectKeys),
+		)
+	} else {
+		taskQuery = taskQuery.Where("subject_type = ? AND subject_key IN (?)", "object_version", bun.List(relatedVersionIDs))
+	}
+	if db.Dialect().Name() == dialect.PG {
+		taskQuery = taskQuery.For("UPDATE")
+	}
+	if err := taskQuery.Scan(ctx); err != nil {
 		return fmt.Errorf("loading storage tasks for permanent delete: %w", err)
 	}
-	for _, taskID := range taskIDs {
-		if _, err := db.NewUpdate().
-			Model((*model.Task)(nil)).
-			Set("status = status").
-			Where("id = ?", taskID).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("locking storage task for permanent delete: %w", err)
-		}
-	}
-	if len(taskIDs) > 0 {
-		activeTasksExist, err := db.NewSelect().
-			Model((*model.Task)(nil)).
-			Where("id IN (?)", bun.List(taskIDs)).
-			Where("status IN (?)", bun.List(activeTaskStatuses())).
-			Exists(ctx)
-		if err != nil {
-			return fmt.Errorf("rechecking active storage tasks for permanent delete: %w", err)
-		}
-		if activeTasksExist {
+	for i := range relatedTasks {
+		if relatedTasks[i].Status == model.TaskStatusPending || relatedTasks[i].Status == model.TaskStatusRunning {
 			return ErrPermanentDeleteStorageBusy
 		}
 	}
-	if len(uploadIDs) == 0 {
+	if len(contentIDs) == 0 {
 		return nil
 	}
 
-	copiesByUploadID := make(map[int64][]model.StorageUploadCopy)
+	copiesByContentID := make(map[int64][]model.StorageCopy)
 	for _, copyRow := range copies {
-		copiesByUploadID[copyRow.UploadID] = append(copiesByUploadID[copyRow.UploadID], copyRow)
+		copiesByContentID[copyRow.ContentID] = append(copiesByContentID[copyRow.ContentID], copyRow)
 	}
-	for _, uploadID := range uploadIDs {
-		upload := uploadsByID[uploadID]
-		liveVersion, err := selectLiveObjectVersionForStorageUpload(ctx, db, upload, deletingVersionIDs)
+	for _, contentID := range contentIDs {
+		upload := uploadsByID[contentID]
+		liveVersion, err := selectLiveObjectVersionForStorageContent(ctx, db, upload, deletingVersionIDs)
 		if err != nil {
 			return err
 		}
 		if liveVersion != nil {
 			continue
 		}
-		for _, copyRow := range copiesByUploadID[uploadID] {
+		for _, copyRow := range copiesByContentID[contentID] {
 			if storageUploadCopyHasAttemptedCommit(copyRow) {
 				return ErrPermanentDeleteStorageBusy
 			}
 			if !storageUploadCopyCanBeCancelledForPermanentDelete(copyRow) {
 				continue
 			}
+			now := time.Now()
+			if _, err := db.NewUpdate().
+				Model((*storagecommit.Attempt)(nil)).
+				Set("status = ?", storagecommit.AttemptStatusReleased).
+				Set("release_reason = ?", string(storagecommit.ReleaseOwnerTerminal)).
+				Set("resolved_at = ?", now).
+				Set("updated_at = ?", now).
+				Where("content_id = ? AND storage_data_set_id = ?", copyRow.ContentID, copyRow.StorageDataSetID).
+				Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusReserved).
+				Exec(ctx); err != nil {
+				return fmt.Errorf("releasing storage reservation for permanent delete: %w", err)
+			}
 			res, err := db.NewUpdate().
-				Model((*model.StorageUploadCopy)(nil)).
-				Set("status = ?", model.StorageUploadCopyStatusFailed).
+				Model((*model.StorageCopy)(nil)).
+				Set("status = ?", model.StorageCopyStatusFailed).
+				Set("active_task_id = NULL").
 				Set("commit_ready_at = NULL").
-				Set("commit_attempt_id = NULL").
-				Set("commit_attempted_at = NULL").
-				Set("commit_submission_json = NULL").
 				Set("commit_extra_data_hex = NULL").
-				Set("commit_transaction_id = NULL").
-				Set("commit_confirmed_transaction_id = NULL").
-				Set("commit_attention_code = NULL").
-				Set("commit_attention_at = NULL").
 				Set("last_error = ?", "cancelled because the last object version was permanently deleted").
-				Set("updated_at = ?", time.Now()).
+				Set("updated_at = ?", now).
 				Where("id = ?", copyRow.ID).
-				Where("status IN (?)", bun.List([]model.StorageUploadCopyStatus{
-					model.StorageUploadCopyStatusPending,
-					model.StorageUploadCopyStatusPieceReady,
-					model.StorageUploadCopyStatusCommitting,
+				Where("status IN (?)", bun.List([]model.StorageCopyStatus{
+					model.StorageCopyStatusPending,
+					model.StorageCopyStatusPieceReady,
+					model.StorageCopyStatusCommitting,
 				})).
-				Where("NOT " + attemptedStorageCommitSQL("storage_upload_copy")).
+				Where(`active_task_id IS NULL OR EXISTS (
+					SELECT 1 FROM tasks AS terminal_task
+					WHERE terminal_task.id = storage_copy.active_task_id
+					  AND terminal_task.status IN (?, ?, ?)
+				)`, model.TaskStatusCompleted, model.TaskStatusFailed, model.TaskStatusCancelled).
+				Where(`NOT EXISTS (
+					SELECT 1 FROM storage_commit_attempts AS unresolved_attempt
+					WHERE unresolved_attempt.content_id = storage_copy.content_id
+					  AND unresolved_attempt.storage_data_set_id = storage_copy.storage_data_set_id
+					  AND unresolved_attempt.resolved_at IS NULL
+				)`).
 				Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("cancelling storage copy for permanent delete: %w", err)
@@ -1384,38 +1227,36 @@ func prepareObjectVersionsForPermanentDelete(
 			}
 		}
 		if _, err := db.NewUpdate().
-			Model((*model.StorageUpload)(nil)).
-			Set("status = ?", model.StorageUploadStatusSuperseded).
-			Set("error_message = ?", "superseded because the last object version was permanently deleted").
+			Model((*model.StorageContent)(nil)).
+			Set("error_message = ?", "the last object version referencing this content was permanently deleted").
 			Set("updated_at = ?", time.Now()).
-			Where("id = ?", uploadID).
-			Where("status <> ?", model.StorageUploadStatusSuperseded).
+			Where("id = ?", contentID).
 			Exec(ctx); err != nil {
-			return fmt.Errorf("closing storage upload for permanent delete: %w", err)
+			return fmt.Errorf("closing storage content for permanent delete: %w", err)
 		}
 	}
 	return nil
 }
 
-func authoritativeStorageUploadsForVersions(
+func authoritativeStorageContentsForVersions(
 	ctx context.Context,
 	db bun.IDB,
 	versions []*model.ObjectVersion,
-) (map[int64]*model.StorageUpload, error) {
-	uploadsByID := make(map[int64]*model.StorageUpload)
+) (map[int64]*model.StorageContent, error) {
+	uploadsByID := make(map[int64]*model.StorageContent)
 	for _, version := range versions {
 		if version == nil || version.VersionID == "" {
 			return nil, fmt.Errorf("loading permanent delete storage uploads: %w", ErrInvalidInput)
 		}
-		upload, err := authoritativeStorageUploadForVersion(ctx, db, version)
+		upload, err := authoritativeStorageContentForVersion(ctx, db, version)
 		if err != nil {
 			return nil, err
 		}
 		if upload == nil {
 			continue
 		}
-		uploadID := upload.ID
-		version.StorageUploadID = &uploadID
+		contentID := upload.ID
+		version.ContentID = &contentID
 		uploadsByID[upload.ID] = upload
 	}
 	return uploadsByID, nil
@@ -1445,15 +1286,12 @@ func sameObjectVersionIDs(versions []model.ObjectVersion, expectedIDs []string) 
 	return slices.Equal(actualIDs, expected)
 }
 
-func authoritativeStorageUploadForVersion(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (*model.StorageUpload, error) {
-	upload := new(model.StorageUpload)
-	q := db.NewSelect().Model(upload)
-	if version.StorageUploadID != nil && *version.StorageUploadID > 0 {
-		q = q.Where("id = ?", *version.StorageUploadID)
-	} else {
-		q = q.Where("source_version_id = ?", version.VersionID).OrderExpr("id DESC").Limit(1)
+func authoritativeStorageContentForVersion(ctx context.Context, db bun.IDB, version *model.ObjectVersion) (*model.StorageContent, error) {
+	if version.ContentID == nil || *version.ContentID <= 0 {
+		return nil, nil
 	}
-	if err := q.Scan(ctx); err != nil {
+	upload := new(model.StorageContent)
+	if err := db.NewSelect().Model(upload).Where("id = ?", *version.ContentID).Scan(ctx); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -1462,25 +1300,25 @@ func authoritativeStorageUploadForVersion(ctx context.Context, db bun.IDB, versi
 	return upload, nil
 }
 
-func sortedStorageUploadIDs(uploadsByID map[int64]*model.StorageUpload) []int64 {
+func sortedContentIDs(uploadsByID map[int64]*model.StorageContent) []int64 {
 	ids := make([]int64, 0, len(uploadsByID))
 	for id := range uploadsByID {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	return ids
 }
 
-func storageUploadCopyCanBeCancelledForPermanentDelete(copyRow model.StorageUploadCopy) bool {
+func storageUploadCopyCanBeCancelledForPermanentDelete(copyRow model.StorageCopy) bool {
 	switch copyRow.Status {
-	case model.StorageUploadCopyStatusPending, model.StorageUploadCopyStatusPieceReady, model.StorageUploadCopyStatusCommitting:
+	case model.StorageCopyStatusPending, model.StorageCopyStatusPieceReady, model.StorageCopyStatusCommitting:
 		return true
 	default:
 		return false
 	}
 }
 
-func storageUploadCopyHasAttemptedCommit(copyRow model.StorageUploadCopy) bool {
+func storageUploadCopyHasAttemptedCommit(copyRow model.StorageCopy) bool {
 	if copyRow.CommitAttemptID != nil && *copyRow.CommitAttemptID != "" && copyRow.CommitAttemptedAt != nil {
 		return true
 	}
@@ -1488,286 +1326,77 @@ func storageUploadCopyHasAttemptedCommit(copyRow model.StorageUploadCopy) bool {
 	// never resolved, including rows older code left behind when it sent a
 	// submitted copy back to 'piece_ready'. Treat those as busy so a permanent
 	// delete cannot discard a piece the provider may still be paid to keep.
-	return copyRow.Status != model.StorageUploadCopyStatusCommitted &&
+	return copyRow.Status != model.StorageCopyStatusCommitted &&
 		copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != ""
 }
 
-const defaultStorageCleanupMaxRetries = 5
-
-func createStorageCleanupTaskForDeletedVersion(ctx context.Context, db bun.IDB, uploadID int64, deletedVersionID string, maxRetries *int) (*int64, error) {
-	return createStorageCleanupTaskForDeletedVersions(ctx, db, uploadID, []string{deletedVersionID}, maxRetries)
-}
-
-func createStorageCleanupTaskForDeletedVersions(ctx context.Context, db bun.IDB, uploadID int64, deletedVersionIDs []string, maxRetries *int) (*int64, error) {
-	if uploadID == 0 || len(deletedVersionIDs) == 0 {
-		return nil, fmt.Errorf("creating storage cleanup task: %w", ErrInvalidInput)
+func reserveStorageCleanupForDeletedVersions(ctx context.Context, db bun.IDB, contentID int64, deletedVersionIDs []string) (*StorageCleanupReservation, error) {
+	if contentID == 0 || len(deletedVersionIDs) == 0 {
+		return nil, fmt.Errorf("preparing storage cleanup: %w", ErrInvalidInput)
 	}
-	copies, err := storageCleanupCopySnapshots(ctx, db, uploadID)
+	copies, err := storageCleanupCopySnapshots(ctx, db, contentID)
 	if err != nil {
 		return nil, err
 	}
 	if len(copies) == 0 {
 		return nil, nil
 	}
-
-	idempotencyKey := fmt.Sprintf("storage_cleanup:%d", uploadID)
-	task := new(model.Task)
-	err = db.NewSelect().
-		Model(task).
-		Where("idempotency_key = ?", idempotencyKey).
-		Scan(ctx)
-	if err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("selecting storage cleanup task: %w", err)
-	}
-	if err == nil {
-		return reuseStorageCleanupTask(ctx, db, task, uploadID, deletedVersionIDs, maxRetries)
-	}
-
-	now := time.Now()
-	maxRetriesValue := storageCleanupMaxRetries(maxRetries)
-	task = &model.Task{
-		Type:           model.TaskTypeStorageCleanup,
-		RefType:        "storage_upload",
-		RefID:          uploadID,
-		RefVersionID:   "",
-		IdempotencyKey: idempotencyKey,
-		Payload:        storageCleanupTaskPayload(uploadID, deletedVersionIDs),
-		Status:         model.TaskStatusQueued,
-		MaxRetries:     maxRetriesValue,
-		ScheduledAt:    now,
-	}
-	res, err := db.NewInsert().
-		Model(task).
-		On("CONFLICT (idempotency_key) DO NOTHING").
-		Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("creating storage cleanup task: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		task = new(model.Task)
-		if err := db.NewSelect().
-			Model(task).
-			Where("idempotency_key = ?", idempotencyKey).
-			Scan(ctx); err != nil {
-			return nil, fmt.Errorf("selecting concurrent storage cleanup task: %w", err)
-		}
-		return reuseStorageCleanupTask(ctx, db, task, uploadID, deletedVersionIDs, maxRetries)
-	}
-	if maxRetriesValue == 0 {
-		if _, err := db.NewUpdate().
-			Model((*model.Task)(nil)).
-			Set("max_retries = 0").
-			Where("id = ?", task.ID).
-			Exec(ctx); err != nil {
-			return nil, fmt.Errorf("setting storage cleanup task max retries: %w", err)
-		}
-	}
-	if _, err := syncStorageCleanupCopySnapshots(ctx, db, task.ID, uploadID, copies); err != nil {
-		return nil, err
-	}
-	return &task.ID, nil
-}
-
-func reuseStorageCleanupTask(ctx context.Context, db bun.IDB, task *model.Task, uploadID int64, deletedVersionIDs []string, maxRetries *int) (*int64, error) {
-	if task == nil {
-		return nil, fmt.Errorf("reusing storage cleanup task: %w", ErrInvalidInput)
-	}
-	copies, err := storageCleanupCopySnapshots(ctx, db, uploadID)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := syncStorageCleanupCopySnapshots(ctx, db, task.ID, uploadID, copies); err != nil {
-		return nil, err
-	}
-	if task.Status != model.TaskStatusCompleted {
-		if taskStatusIsActive(task.Status) {
-			if err := updateStorageCleanupTaskPayload(ctx, db, task, uploadID, deletedVersionIDs); err != nil {
-				return nil, err
-			}
-		}
-		return &task.ID, nil
-	}
-
-	remainingCopiesExist, err := db.NewSelect().
-		Model((*model.StorageCleanupCopy)(nil)).
-		Where("task_id = ? AND status <> ?", task.ID, model.StorageCleanupCopyStatusRemoved).
-		Exists(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("checking retained storage cleanup copies: %w", err)
-	}
-	if !remainingCopiesExist {
-		return &task.ID, nil
-	}
-
-	now := time.Now()
-	res, err := db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("status = ?", model.TaskStatusQueued).
-		Set("retry_count = 0").
-		Set("max_retries = ?", storageCleanupMaxRetries(maxRetries)).
-		Set("payload = ?", mergeStorageCleanupTaskPayload(task.Payload, uploadID, deletedVersionIDs)).
-		Set("scheduled_at = ?", now).
-		Set("claimed_at = NULL").
-		Set("lease_until = NULL").
-		Set("started_at = NULL").
-		Set("completed_at = NULL").
-		Set("last_error = NULL").
-		Set("wait_reason = NULL").
-		Set("status_message = NULL").
-		Where("id = ? AND status = ?", task.ID, model.TaskStatusCompleted).
-		Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("requeueing retained storage cleanup task: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return nil, fmt.Errorf("requeueing retained storage cleanup task %d: %w", task.ID, ErrConflict)
-	}
-	return &task.ID, nil
-}
-
-func syncStorageCleanupCopySnapshots(
-	ctx context.Context,
-	db bun.IDB,
-	taskID int64,
-	uploadID int64,
-	copies []model.StorageCleanupCopy,
-) (int, error) {
-	if taskID <= 0 || uploadID <= 0 {
-		return 0, fmt.Errorf("syncing storage cleanup copy snapshots: %w", ErrInvalidInput)
-	}
-	if len(copies) == 0 {
-		return 0, nil
-	}
 	now := time.Now()
 	for i := range copies {
-		copies[i].TaskID = taskID
 		copies[i].CreatedAt = now
 		copies[i].UpdatedAt = now
 	}
-	res, err := db.NewInsert().
+	_, err = db.NewInsert().
 		Model(&copies).
-		On("CONFLICT (task_id, copy_index) DO NOTHING").
+		On("CONFLICT (content_id, storage_data_set_id, piece_id) DO NOTHING").
 		Exec(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("syncing storage cleanup copy snapshots: %w", err)
+		return nil, fmt.Errorf("persisting storage cleanup snapshots: %w", err)
 	}
-	rows, _ := res.RowsAffected()
-	return int(rows), nil
-}
-
-func updateStorageCleanupTaskPayload(ctx context.Context, db bun.IDB, task *model.Task, uploadID int64, deletedVersionIDs []string) error {
-	payload := mergeStorageCleanupTaskPayload(task.Payload, uploadID, deletedVersionIDs)
-	res, err := db.NewUpdate().
-		Model((*model.Task)(nil)).
-		Set("payload = ?", payload).
-		Where("id = ?", task.ID).
-		Exec(ctx)
+	reservation := new(StorageCleanupReservation)
+	err = db.NewRaw(`UPDATE storage_contents
+		SET cleanup_generation = cleanup_generation + CASE WHEN cleanup_task_id IS NULL THEN 1 ELSE 0 END,
+		    updated_at = ?
+		WHERE id = ?
+		RETURNING id AS content_id, cleanup_generation AS generation, cleanup_task_id AS task_id`, now, contentID).Scan(ctx, reservation)
 	if err != nil {
-		return fmt.Errorf("updating storage cleanup task payload: %w", err)
+		return nil, fmt.Errorf("reserving storage cleanup generation: %w", err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("updating storage cleanup task payload %d: %w", task.ID, ErrNotFound)
-	}
-	return nil
-}
-
-func taskStatusIsActive(status model.TaskStatus) bool {
-	for _, active := range activeTaskStatuses() {
-		if status == active {
-			return true
-		}
-	}
-	return false
-}
-
-func storageCleanupMaxRetries(maxRetries *int) int {
-	if maxRetries == nil {
-		return defaultStorageCleanupMaxRetries
-	}
-	return *maxRetries
-}
-
-func storageCleanupTaskPayload(uploadID int64, deletedVersionIDs []string) map[string]interface{} {
-	payload := map[string]interface{}{
-		"storage_upload_id": uploadID,
-	}
-	if len(deletedVersionIDs) > 0 {
-		payload["deleted_source_version"] = deletedVersionIDs[0]
-	}
-	payload["deleted_source_versions"] = deletedVersionIDs
-	return payload
-}
-
-func mergeStorageCleanupTaskPayload(existing map[string]interface{}, uploadID int64, deletedVersionIDs []string) map[string]interface{} {
-	merged := storageCleanupPayloadVersionIDs(existing)
-	for _, versionID := range deletedVersionIDs {
-		merged = appendUniqueString(merged, versionID)
-	}
-	return storageCleanupTaskPayload(uploadID, merged)
-}
-
-func storageCleanupPayloadVersionIDs(payload map[string]interface{}) []string {
-	var out []string
-	if payload == nil {
-		return out
-	}
-
-	switch values := payload["deleted_source_versions"].(type) {
-	case []string:
-		for _, value := range values {
-			out = appendUniqueString(out, value)
-		}
-	case []interface{}:
-		for _, value := range values {
-			text, ok := value.(string)
-			if ok {
-				out = appendUniqueString(out, text)
-			}
-		}
-	}
-	legacy, ok := payload["deleted_source_version"].(string)
-	if ok {
-		out = appendUniqueString(out, legacy)
-	}
-	return out
+	return reservation, nil
 }
 
 func appendUniqueString(values []string, value string) []string {
 	if value == "" {
 		return values
 	}
-	for _, existing := range values {
-		if existing == value {
-			return values
-		}
+	if slices.Contains(values, value) {
+		return values
 	}
 	return append(values, value)
 }
 
-func storageCleanupCopySnapshots(ctx context.Context, db bun.IDB, uploadID int64) ([]model.StorageCleanupCopy, error) {
+func storageCleanupCopySnapshots(ctx context.Context, db bun.IDB, contentID int64) ([]model.StorageCleanupCopy, error) {
 	var copies []model.StorageCleanupCopy
 	err := db.NewRaw(`SELECT
-			storage_copy.upload_id,
+			storage_copy.content_id,
+			storage_copy.bucket_id,
 			storage_copy.copy_index,
 			storage_copy.provider_id,
 			storage_copy.storage_data_set_id,
 			storage_data_set.data_set_id,
 			storage_data_set.client_data_set_id,
 			storage_copy.piece_id,
-			storage_upload.piece_cid,
+			storage_content.piece_cid,
 			storage_copy.retrieval_url,
 			? AS status
-		FROM storage_upload_copies AS storage_copy
-		JOIN storage_uploads AS storage_upload ON storage_upload.id = storage_copy.upload_id
-		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
-		WHERE storage_copy.upload_id = ? AND storage_copy.status = ?
+		FROM storage_copies AS storage_copy
+		JOIN storage_contents AS storage_content ON storage_content.id = storage_copy.content_id
+		JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
+		WHERE storage_copy.content_id = ? AND storage_copy.status = ?
 		ORDER BY storage_copy.copy_index ASC`,
 		model.StorageCleanupCopyStatusPending,
-		uploadID,
-		model.StorageUploadCopyStatusCommitted,
+		contentID,
+		model.StorageCopyStatusCommitted,
 	).Scan(ctx, &copies)
 	if err != nil {
 		return nil, fmt.Errorf("loading storage cleanup copy snapshots: %w", err)
@@ -1863,7 +1492,6 @@ func createRestoredVersionAndSetCurrent(ctx context.Context, db bun.IDB, version
 
 	now := time.Now()
 	version.ObjectID = source.ObjectID
-	version.IsCurrent = true
 	if version.CreatedAt.IsZero() {
 		version.CreatedAt = now
 	}
@@ -1871,27 +1499,22 @@ func createRestoredVersionAndSetCurrent(ctx context.Context, db bun.IDB, version
 		version.UpdatedAt = now
 	}
 
-	res, err := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("is_current = ?", false).
-		Where("object_id = ? AND version_id = ? AND is_current = ?", source.ObjectID, expectedCurrentVersionID, true).
-		Exec(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("clearing expected current version: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows != 1 {
-		return 0, fmt.Errorf("creating restored object version: %w", ErrConflict)
-	}
 	if _, err := db.NewInsert().Model(version).Exec(ctx); err != nil {
 		return 0, fmt.Errorf("inserting restored object version: %w", err)
 	}
-	if _, err := db.NewUpdate().
+	// Moving the pointer is the compare-and-set: it succeeds only while the
+	// caller's expected version is still the current one.
+	res, err := db.NewUpdate().
 		Model((*model.Object)(nil)).
+		Set("current_version_id = ?", version.VersionID).
 		Set("updated_at = ?", now).
-		Where("id = ?", source.ObjectID).
-		Exec(ctx); err != nil {
-		return 0, fmt.Errorf("updating restored object identity timestamp: %w", err)
+		Where("id = ? AND current_version_id = ?", source.ObjectID, expectedCurrentVersionID).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("pointing object at restored version: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows != 1 {
+		return 0, fmt.Errorf("creating restored object version: %w", ErrConflict)
 	}
 	return source.ObjectID, nil
 }
@@ -1912,7 +1535,6 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 		}
 
 		version.ObjectID = obj.ID
-		version.IsCurrent = true
 		if version.CreatedAt.IsZero() {
 			version.CreatedAt = now
 		}
@@ -1922,6 +1544,17 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 		if _, insertErr := db.NewInsert().Model(version).Exec(ctx); insertErr != nil {
 			return ObjectVersionWriteResult{}, fmt.Errorf("inserting object version: %w", insertErr)
 		}
+		// The object is inserted with a null pointer because its version does
+		// not exist yet; one update completes the identity.
+		if _, updateErr := db.NewUpdate().
+			Model((*model.Object)(nil)).
+			Set("current_version_id = ?", version.VersionID).
+			Set("updated_at = ?", now).
+			Where("id = ?", obj.ID).
+			Exec(ctx); updateErr != nil {
+			return ObjectVersionWriteResult{}, fmt.Errorf("pointing new object at its first version: %w", updateErr)
+		}
+		version.IsCurrent = true
 		return ObjectVersionWriteResult{
 			ObjectID:  obj.ID,
 			VersionID: version.VersionID,
@@ -1931,29 +1564,22 @@ func createVersionAndSetCurrentFromExisting(ctx context.Context, db bun.IDB, ver
 	}
 
 	version.ObjectID = existing.ID
-	version.IsCurrent = true
 	if version.CreatedAt.IsZero() {
 		version.CreatedAt = now
 	}
 	if version.UpdatedAt.IsZero() {
 		version.UpdatedAt = now
 	}
-	if _, err := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("is_current = ?", false).
-		Where("object_id = ? AND is_current = ?", existing.ID, true).
-		Exec(ctx); err != nil {
-		return ObjectVersionWriteResult{}, fmt.Errorf("clearing previous current version: %w", err)
-	}
 	if _, insertErr := db.NewInsert().Model(version).Exec(ctx); insertErr != nil {
 		return ObjectVersionWriteResult{}, fmt.Errorf("inserting object version: %w", insertErr)
 	}
 	if _, updateErr := db.NewUpdate().
 		Model((*model.Object)(nil)).
+		Set("current_version_id = ?", version.VersionID).
 		Set("updated_at = ?", now).
 		Where("id = ?", existing.ID).
 		Exec(ctx); updateErr != nil {
-		return ObjectVersionWriteResult{}, fmt.Errorf("updating object identity timestamp: %w", updateErr)
+		return ObjectVersionWriteResult{}, fmt.Errorf("pointing object at new version: %w", updateErr)
 	}
 	return ObjectVersionWriteResult{
 		ObjectID:  existing.ID,
@@ -1994,18 +1620,11 @@ func createDeleteMarkerAndSetCurrent(ctx context.Context, db bun.IDB, marker *mo
 		}
 	}
 
-	marker.IsCurrent = true
 	marker.IsDeleteMarker = true
 	marker.Size = 0
 	marker.ETag = ""
-	marker.Checksum = ""
 	marker.ContentType = ""
-	marker.CacheKey = ""
-	marker.StorageUploadID = nil
-	marker.InCache = false
-	marker.State = model.ObjectStateCached
-	marker.FailedAtState = nil
-	marker.LastError = nil
+	marker.ContentID = nil
 	if marker.CreatedAt.IsZero() {
 		marker.CreatedAt = now
 	}
@@ -2013,20 +1632,20 @@ func createDeleteMarkerAndSetCurrent(ctx context.Context, db bun.IDB, marker *mo
 		marker.UpdatedAt = now
 	}
 
-	if _, err := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("is_current = ?", false).
-		Where("object_id = ? AND is_current = ?", marker.ObjectID, true).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("clearing previous current version: %w", err)
-	}
 	if _, err := db.NewInsert().
 		Model(marker).
-		Column("version_id", "object_id", "bucket_id", "key", "size", "e_tag", "checksum", "content_type", "metadata", "cache_key", "storage_upload_id", "in_cache", "is_current", "is_delete_marker", "state", "failed_at_state", "last_error", "created_at", "updated_at").
+		Column("version_id", "object_id", "bucket_id", "key", "content_id", "size", "e_tag", "content_type", "metadata", "is_delete_marker", "created_at", "updated_at").
 		Value("content_type", "?", "").
-		Value("in_cache", "?", false).
 		Exec(ctx); err != nil {
 		return fmt.Errorf("inserting delete marker: %w", err)
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("current_version_id = ?", marker.VersionID).
+		Set("updated_at = ?", now).
+		Where("id = ?", marker.ObjectID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("pointing object at delete marker: %w", err)
 	}
 	return nil
 }
@@ -2046,16 +1665,66 @@ func deleteMarkerVersion(ctx context.Context, db bun.IDB, bucketID int64, key st
 		return fmt.Errorf("deleting marker version: %w", ErrInvalidInput)
 	}
 
+	// The object's pointer has to leave this version before the row can go.
+	if version.IsCurrent {
+		if err := repointObjectAwayFromVersion(ctx, db, version.ObjectID, versionID); err != nil {
+			return err
+		}
+	}
 	if _, err := db.NewDelete().
 		Model((*model.ObjectVersion)(nil)).
 		Where("bucket_id = ? AND key = ? AND version_id = ?", bucketID, key, versionID).
 		Exec(ctx); err != nil {
 		return fmt.Errorf("deleting marker version: %w", err)
 	}
-	if !version.IsCurrent {
+	if version.IsCurrent {
+		return deleteObjectIdentityIfEmpty(ctx, db, version.ObjectID)
+	}
+	return nil
+}
+
+// repointObjectAwayFromVersion moves the object's current pointer to the newest
+// version that is not the one about to be deleted, or clears it when that
+// version was the last. A version can only be removed once nothing points at it.
+func repointObjectAwayFromVersion(ctx context.Context, db bun.IDB, objectID int64, versionID string) error {
+	next, err := selectLatestVersionByObjectIDExcluding(ctx, db, objectID, versionID)
+	if err != nil {
+		return err
+	}
+	query := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", objectID)
+	if next == nil {
+		query = query.Set("current_version_id = NULL")
+	} else {
+		query = query.Set("current_version_id = ?", next.VersionID)
+	}
+	if _, err := query.Exec(ctx); err != nil {
+		return fmt.Errorf("repointing object away from version %s: %w", versionID, err)
+	}
+	return nil
+}
+
+// deleteObjectIdentityIfEmpty removes an object that has no versions left.
+func deleteObjectIdentityIfEmpty(ctx context.Context, db bun.IDB, objectID int64) error {
+	remaining, err := db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("object_id = ?", objectID).
+		Count(ctx)
+	if err != nil {
+		return fmt.Errorf("counting remaining object versions: %w", err)
+	}
+	if remaining > 0 {
 		return nil
 	}
-	return promoteLatestVersionOrDeleteObject(ctx, db, version.ObjectID)
+	if _, err := db.NewDelete().
+		Model((*model.Object)(nil)).
+		Where("id = ?", objectID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("deleting empty object identity: %w", err)
+	}
+	return nil
 }
 
 func restoreCurrentDeleteMarkerStack(ctx context.Context, db bun.IDB, bucketID int64, key string, currentMarkerVersionID string) (*model.ObjectVersion, error) {
@@ -2095,79 +1764,35 @@ func restoreCurrentDeleteMarkerStack(ctx context.Context, db bun.IDB, bucketID i
 		return nil, fmt.Errorf("restoring delete marker stack: %w", ErrConflict)
 	}
 
+	// The pointer moves before the markers go: a version cannot be deleted while
+	// the object still points at it.
+	if _, err := db.NewUpdate().
+		Model((*model.Object)(nil)).
+		Set("current_version_id = ?", restoreTarget.VersionID).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", current.ObjectID).
+		Exec(ctx); err != nil {
+		return nil, fmt.Errorf("pointing object at restored version: %w", err)
+	}
 	if _, err := db.NewDelete().
 		Model((*model.ObjectVersion)(nil)).
 		Where("object_id = ? AND version_id IN (?)", current.ObjectID, bun.List(markerIDs)).
 		Exec(ctx); err != nil {
 		return nil, fmt.Errorf("deleting marker stack: %w", err)
 	}
-	if _, err := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("is_current = ?", true).
-		Where("version_id = ?", restoreTarget.VersionID).
-		Exec(ctx); err != nil {
-		return nil, fmt.Errorf("restoring data version current flag: %w", err)
-	}
-	if _, err := db.NewUpdate().
-		Model((*model.Object)(nil)).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", current.ObjectID).
-		Exec(ctx); err != nil {
-		return nil, fmt.Errorf("updating object identity timestamp: %w", err)
-	}
 	restoreTarget.IsCurrent = true
 	return restoreTarget, nil
 }
 
-func promoteLatestVersionOrDeleteObject(ctx context.Context, db bun.IDB, objectID int64) error {
-	latest, err := selectLatestVersionByObjectID(ctx, db, objectID)
-	if err != nil {
-		return err
-	}
-	if latest == nil {
-		if _, err := db.NewDelete().
-			Model((*model.Object)(nil)).
-			Where("id = ?", objectID).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("deleting empty object identity: %w", err)
-		}
-		return nil
-	}
-	if _, err := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("is_current = (version_id = ?)", latest.VersionID).
-		Where("object_id = ?", objectID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("promoting latest version: %w", err)
-	}
-	if _, err := db.NewUpdate().
-		Model((*model.Object)(nil)).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", objectID).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("updating object identity timestamp: %w", err)
-	}
-	return nil
-}
-
 func normalizeObjectVersion(version *model.ObjectVersion) {
-	version.FailedAtState = nil
-	version.LastError = nil
-	if version.State == "" {
-		version.State = model.ObjectStateCached
+	if version.Metadata == nil {
+		version.Metadata = map[string]string{}
 	}
-	if version.State != model.ObjectStateCacheEvicted {
-		version.InCache = true
-	}
-	if version.InCache && !version.IsDeleteMarker && version.CacheAccessedAt == nil {
-		accessedAt := version.CreatedAt
-		if accessedAt.IsZero() {
-			accessedAt = time.Now()
-		}
-		version.CacheAccessedAt = &accessedAt
-	}
-	if version.ContentType == "" {
-		version.ContentType = "application/octet-stream"
+	if version.IsDeleteMarker {
+		version.ContentID = nil
+		version.Size = 0
+		version.ETag = ""
+		version.ContentType = ""
 	}
 }
 
@@ -2189,7 +1814,8 @@ func selectCurrentVersionByObjectID(ctx context.Context, db bun.IDB, objectID in
 		Model(version).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version")
-	err := q.Where("object_version.object_id = ? AND object_version.is_current = ?", objectID, true).Scan(ctx)
+	err := q.Where("object_version.object_id = ?", objectID).
+		Where("current_object.current_version_id = object_version.version_id").Scan(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -2202,7 +1828,8 @@ func selectCurrentVersionByBucketAndKey(ctx context.Context, db bun.IDB, bucketI
 		Model(version).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version")
-	err := q.Where("object_version.bucket_id = ? AND object_version.key = ? AND object_version.is_current = ?", bucketID, key, true).Scan(ctx)
+	err := q.Where("object_version.bucket_id = ? AND object_version.key = ?", bucketID, key).
+		Where("current_object.current_version_id = object_version.version_id").Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -2228,13 +1855,16 @@ func selectVersionByBucketKeyAndID(ctx context.Context, db bun.IDB, bucketID int
 	return version, nil
 }
 
-func selectLatestVersionByObjectID(ctx context.Context, db bun.IDB, objectID int64) (*model.ObjectVersion, error) {
+// selectLatestVersionByObjectIDExcluding finds the version that should take over
+// when one version is about to be removed.
+func selectLatestVersionByObjectIDExcluding(ctx context.Context, db bun.IDB, objectID int64, excludeVersionID string) (*model.ObjectVersion, error) {
 	version := new(model.ObjectVersion)
 	q := db.NewSelect().
 		Model(version).
 		ModelTableExpr("object_versions AS object_version")
 	q = withObjectVersionStorageColumns(q, "object_version")
 	err := q.Where("object_version.object_id = ?", objectID).
+		Where("object_version.version_id <> ?", excludeVersionID).
 		OrderExpr("object_version.created_at DESC").
 		OrderExpr("object_version.version_id DESC").
 		Limit(1).
@@ -2243,7 +1873,7 @@ func selectLatestVersionByObjectID(ctx context.Context, db bun.IDB, objectID int
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("selecting latest object version: %w", err)
+		return nil, fmt.Errorf("selecting replacement object version: %w", err)
 	}
 	return version, nil
 }
@@ -2338,9 +1968,12 @@ func objectVersionMatchesVersion(current *model.ObjectVersion, version *model.Ob
 	if current == nil || current.State == model.ObjectStateFailed || current.IsDeleteMarker {
 		return false
 	}
-	return current.Size == version.Size &&
+	// Content identity carries bucket, checksum and size, so it replaces the
+	// old size+checksum pair. The incoming version only ever carries a content
+	// id; checksum is a read projection and would compare empty here.
+	return current.ContentID != nil && version.ContentID != nil &&
+		*current.ContentID == *version.ContentID &&
 		current.ETag == version.ETag &&
-		current.Checksum == version.Checksum &&
 		current.ContentType == version.ContentType &&
 		maps.Equal(current.Metadata, version.Metadata)
 }
@@ -2355,57 +1988,12 @@ func restoreSourceAlreadyCurrent(source, current *model.ObjectVersion) bool {
 	if current.State == model.ObjectStateFailed || current.IsDeleteMarker || (!current.InCache && !current.InFilecoin) {
 		return false
 	}
-	return current.Size == source.Size &&
-		current.Checksum == source.Checksum &&
+	// Identical bytes are identical content rows, so content identity replaces
+	// the old size+checksum comparison and no longer depends on a projection.
+	return source.ContentID != nil && current.ContentID != nil &&
+		*source.ContentID == *current.ContentID &&
 		current.ContentType == source.ContentType &&
 		maps.Equal(current.Metadata, source.Metadata)
-}
-
-func updateVersionState(ctx context.Context, db bun.IDB, versionID string, from, to model.ObjectState) error {
-	now := time.Now()
-	q := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("state = ?", to).
-		Set("updated_at = ?", now).
-		Where("version_id = ? AND state = ?", versionID, from)
-	q = applyCacheLocationForState(q, to)
-	if from == model.ObjectStateFailed {
-		q = q.Set("failed_at_state = NULL")
-		q = q.Set("last_error = NULL")
-	}
-	res, err := q.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("updating object version state: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("state transition %s→%s failed: version %s not in expected state", from, to, versionID)
-	}
-	return nil
-}
-
-func resetStaleVersions(ctx context.Context, db bun.IDB, fromState, toState model.ObjectState, staleBefore time.Time) ([]string, error) {
-	now := time.Now()
-	var rows []struct {
-		VersionID string `bun:"version_id"`
-	}
-	cacheColumn := cacheLocationSQLForState(toState)
-	query := `UPDATE object_versions SET state = ?, updated_at = ?` + cacheColumn + ` WHERE state = ? AND updated_at < ? RETURNING version_id`
-	args := []interface{}{toState, now, fromState, staleBefore}
-	if fromState == model.ObjectStateFailed {
-		query = `UPDATE object_versions SET state = ?, failed_at_state = NULL, last_error = NULL, updated_at = ?` + cacheColumn + ` WHERE state = ? AND updated_at < ? RETURNING version_id`
-	}
-	if err := db.NewRaw(query, args...).Scan(ctx, &rows); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("resetting stale object versions: %w", err)
-	}
-	versionIDs := make([]string, 0, len(rows))
-	for _, row := range rows {
-		versionIDs = append(versionIDs, row.VersionID)
-	}
-	return versionIDs, nil
 }
 
 func objectIdentityFromVersion(version *model.ObjectVersion) *model.Object {
@@ -2415,40 +2003,57 @@ func objectIdentityFromVersion(version *model.ObjectVersion) *model.Object {
 	}
 }
 
+// setVersionCachePresence records residency against the version's content.
+// Several versions can share one cached file, so presence is stored once per
+// content rather than once per version.
 func setVersionCachePresence(ctx context.Context, db bun.IDB, versionID string, inCache bool) error {
-	res, err := db.NewUpdate().
-		Model((*model.ObjectVersion)(nil)).
-		Set("in_cache = ?", inCache).
-		Where("version_id = ?", versionID).
-		Exec(ctx)
+	contentID, err := contentIDForVersion(ctx, db, versionID)
 	if err != nil {
 		return fmt.Errorf("setting version cache presence: %w", err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("setting version cache presence: version %s not found", versionID)
+	if contentID == nil {
+		return nil
+	}
+	return upsertContentCachePresence(ctx, db, *contentID, inCache, nil)
+}
+
+func contentIDForVersion(ctx context.Context, db bun.IDB, versionID string) (*int64, error) {
+	var contentID *int64
+	err := db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Column("content_id").
+		Where("version_id = ?", versionID).
+		Scan(ctx, &contentID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("version %s not found", versionID)
+		}
+		return nil, err
+	}
+	return contentID, nil
+}
+
+// upsertContentCachePresence writes the residency row, creating it the first
+// time a content is cached.
+func upsertContentCachePresence(ctx context.Context, db bun.IDB, contentID int64, inCache bool, accessedAt *time.Time) error {
+	now := time.Now()
+	entry := &model.ObjectCache{
+		ContentID:       contentID,
+		InCache:         inCache,
+		CacheAccessedAt: accessedAt,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	query := db.NewInsert().Model(entry).On("CONFLICT (content_id) DO UPDATE").
+		Set("in_cache = EXCLUDED.in_cache").
+		Set("updated_at = EXCLUDED.updated_at")
+	if accessedAt != nil {
+		query = query.Set(`cache_accessed_at = CASE
+			WHEN object_cache.cache_accessed_at IS NULL OR object_cache.cache_accessed_at < EXCLUDED.cache_accessed_at
+			THEN EXCLUDED.cache_accessed_at ELSE object_cache.cache_accessed_at END`)
+	}
+	if _, err := query.Exec(ctx); err != nil {
+		return fmt.Errorf("recording content cache presence: %w", err)
 	}
 	return nil
-}
-
-func applyCacheLocationForState(q *bun.UpdateQuery, state model.ObjectState) *bun.UpdateQuery {
-	switch state {
-	case model.ObjectStateCached:
-		return q.Set("in_cache = ?", true)
-	case model.ObjectStateCacheEvicted:
-		return q.Set("in_cache = ?", false)
-	default:
-		return q
-	}
-}
-
-func cacheLocationSQLForState(state model.ObjectState) string {
-	switch state {
-	case model.ObjectStateCached:
-		return ", in_cache = TRUE"
-	case model.ObjectStateCacheEvicted:
-		return ", in_cache = FALSE"
-	default:
-		return ""
-	}
 }

@@ -31,7 +31,7 @@ curl http://127.0.0.1:9090/healthz
 检查失败时：
 
 ```json
-{"status":"unhealthy","errors":["worker/uploader: not responding"]}
+{"status":"unhealthy","errors":["worker/tasks: not responding"]}
 ```
 
 `setup` 表示需要补齐缺失配置。`unhealthy` 表示数据库、缓存或后台任务检查失败，优先查看返回的错误列表。
@@ -47,7 +47,7 @@ synaps3 admin status
 synaps3 admin task stats
 ```
 
-status 应显示后台任务处理正常。task stats 会显示 `queued`、`running`、`failed` 或 `exhausted` 的任务数量。
+status 应显示后台任务处理正常。task stats 会把已确认失败单独统计为 dismissed，仪表盘会把 pending 工作显示为 queued、scheduled 或 waiting。
 
 ## Prometheus Metrics
 
@@ -74,9 +74,6 @@ scrape_configs:
 | `synaps3_cache_used_bytes` | 当前缓存磁盘使用量。 |
 | `synaps3_cache_hits_total` / `synaps3_cache_misses_total` | 缓存读取行为。 |
 | `synaps3_cache_lru_eviction_paused` | 因近期缓存访问记录无法安全保留而暂停 LRU 淘汰时为 `1`；请先排除持久化错误，再重启 SynapS3。 |
-| `synaps3_worker_tasks_processed_total` | 按结果统计的后台任务吞吐。 |
-| `synaps3_worker_tasks_exhausted_total` | 已耗尽重试次数的任务。 |
-| `synaps3_worker_task_duration_seconds` | 后台任务处理耗时。 |
 | `synaps3_task_queue_depth` | 按类型和状态统计的活跃任务。 |
 | `synaps3_object_state_distribution` | 按生命周期状态统计的对象数量。 |
 
@@ -87,7 +84,7 @@ scrape_configs:
 | `/healthz` 返回 `setup` | 运行 `synaps3 admin status` 或 `synaps3 admin settings get`，按报告补齐必要配置，重启后再次检查。 |
 | `/healthz` 返回 `unhealthy` | 检查数据库、缓存目录和后台任务错误信息。 |
 | 缓存使用量接近容量 | 增大容量，或恢复上传和淘汰进度。 |
-| exhausted 任务增加 | 修复依赖后重试任务。 |
+| failed 任务增加 | 修复依赖后，只重试标记为可重试的任务。 |
 | 存储提供方健康状态下降 | 检查 RPC、存储提供方 URL 和网络可达性。 |
 
 恢复步骤见[故障排查](./troubleshooting.md)。

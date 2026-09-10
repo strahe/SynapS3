@@ -29,10 +29,15 @@ function baseConfig(): SettingsEditableConfig {
       lru_low_watermark_percent: 80,
     },
     worker: {
-      upload: { concurrency: 4, poll_interval: '5s', max_retries: 5 },
-      provider_replacement: { concurrency: 4, poll_interval: '5s', max_retries: 5 },
-      evictor: { concurrency: 2, poll_interval: '1m0s', max_retries: 3 },
-      storage_cleanup: { concurrency: 2, poll_interval: '1m0s', max_retries: 5 },
+      tasks: {
+        concurrency: 12,
+        poll_interval: '5s',
+        lease_duration: '5m0s',
+        max_retries: 5,
+        retention: '168h0m0s',
+        provider_mutation_concurrency: 4,
+        destructive_mutation_concurrency: 2,
+      },
     },
     logging: {
       level: 'info',
@@ -126,17 +131,28 @@ test('settings payload omits env-managed LRU watermarks', () => {
   assert.equal(payload.cache?.lru_low_watermark_percent, undefined)
 })
 
-test('settings payload keeps provider replacement worker independent from uploads', () => {
+test('settings payload includes the unified task engine settings', () => {
   const initial = baseConfig()
   const form = baseConfig()
-  form.worker.provider_replacement = { concurrency: 7, poll_interval: '11s', max_retries: 9 }
+  form.worker.tasks = {
+    concurrency: 16,
+    poll_interval: '3s',
+    lease_duration: '3m0s',
+    max_retries: 7,
+    retention: '336h0m0s',
+    provider_mutation_concurrency: 6,
+    destructive_mutation_concurrency: 3,
+  }
 
   const payload = buildSettingsPayload(form, initial, {})
 
-  assert.deepEqual(payload.worker?.provider_replacement, {
-    concurrency: 7,
-    poll_interval: '11s',
-    max_retries: 9,
+  assert.deepEqual(payload.worker?.tasks, {
+    concurrency: 16,
+    poll_interval: '3s',
+    lease_duration: '3m0s',
+    max_retries: 7,
+    retention: '336h0m0s',
+    provider_mutation_concurrency: 6,
+    destructive_mutation_concurrency: 3,
   })
-  assert.deepEqual(payload.worker?.upload, { concurrency: 4, poll_interval: '5s', max_retries: 5 })
 })

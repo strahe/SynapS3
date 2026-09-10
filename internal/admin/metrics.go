@@ -47,22 +47,6 @@ var (
 		Help:      "Whether LRU cache eviction is paused because recent cache access could not be retained safely",
 	})
 
-	// WorkerTasksProcessed counts tasks processed by worker type and result.
-	WorkerTasksProcessed = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "synaps3",
-		Subsystem: "worker",
-		Name:      "tasks_processed_total",
-		Help:      "Total tasks processed by worker type and result",
-	}, []string{"worker", "result"})
-
-	// TasksExhaustedTotal counts tasks that entered exhausted status by worker type and task type.
-	TasksExhaustedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "synaps3",
-		Subsystem: "worker",
-		Name:      "tasks_exhausted_total",
-		Help:      "Total tasks that entered exhausted status",
-	}, []string{"worker", "task_type"})
-
 	// TaskQueueDepth tracks active task count by type and status.
 	TaskQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "synaps3",
@@ -70,15 +54,6 @@ var (
 		Name:      "queue_depth",
 		Help:      "Number of tasks by type and status",
 	}, []string{"type", "status"})
-
-	// WorkerTaskDuration tracks per-task processing duration in seconds.
-	WorkerTaskDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "synaps3",
-		Subsystem: "worker",
-		Name:      "task_duration_seconds",
-		Help:      "Task processing duration in seconds by worker",
-		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 0.1s to ~200s
-	}, []string{"worker"})
 
 	// ObjectStateDistribution tracks object count by state.
 	ObjectStateDistribution = promauto.NewGaugeVec(prometheus.GaugeOpts{

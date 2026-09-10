@@ -35,7 +35,6 @@ Setup 模式不提供运行时指标、存储桶、对象、后台任务、钱�
 | `/api/v1/auth/refresh`、`/api/v1/auth/logout` | 需要有效浏览器会话和 CSRF header；不接受 HTTP Basic auth。 |
 | `/api/v1/*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
 | `/metrics` | 浏览器 session cookie 或 HTTP Basic auth。 |
-| `/admin/exhausted-tasks*` | 浏览器 session cookie；写请求方法需要 CSRF。也可用 HTTP Basic auth。 |
 
 ### 浏览器会话
 
@@ -92,7 +91,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | 钱包 | `POST /api/v1/wallet/fund`、`POST /api/v1/wallet/withdraw`、`POST /api/v1/wallet/approve` | 创建链上支付操作。 |
 | S3 用户 | `POST /api/v1/s3-users`、`PUT /api/v1/s3-users/{accessKey}`、`POST /api/v1/s3-users/{accessKey}/secret`、`DELETE /api/v1/s3-users/{accessKey}` | 改变客户端访问权限，或让已有凭据失效。 |
 | 存储桶和对象 | 创建存储桶、更新 owner/copy-policy，以及上传、下载、删除、恢复或永久删除对象 | 改变或暴露用户可见的 S3 数据和元数据。 |
-| 后台任务和存储健康 | 任务重试、诊断刷新、存储提供方和数据集刷新 | 重新入队任务，或刷新运维状态。 |
+| 后台任务和存储健康 | 任务重试与确认、存储提供方和数据集刷新 | 重新入队任务、将已核对的失败标记为已处理并开始保留期，或刷新运维状态。 |
 | 存储提供方替换 | `POST /api/v1/buckets/{name}/data-sets/{id}/replacement`、`POST /api/v1/storage-replacements/{id}/retry` | 创建新的付费存储服务，把副本迁移过去，并终止旧服务。 |
 | 存储确认 | `POST /api/v1/storage-confirmations/{copy-id}/release` | 可能允许存储提供方再次存储同一个 piece。释放前必须核对当前 attempt。 |
 
@@ -142,12 +141,14 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 ### 存储桶副本策略
 
-`POST /api/v1/buckets` 接受可选的 `default_copies` 和 `minimum_durable_copies` 字段。存储桶列表、详情、创建和策略更新响应包含：
+`POST /api/v1/buckets` 接受可选的 `default_copies` 和 `minimum_durable_copies` 字段，缺省时取服务端配置值。存储桶会保存创建时的策略，之后修改配置不影响已有存储桶。存储桶列表、详情、创建和策略更新响应中，这两个字段都是整数：
 
-- `minimum_durable_copies`：存储桶显式设置的值；`null` 表示按每次上传采用严格策略；
-- `effective_minimum_durable_copies`：将当前存储桶门槛限制在当前目标副本数以内后，用于展示的值。
+- `default_copies`：该存储桶的目标副本数；
+- `minimum_durable_copies`：释放缓存前必须完成的副本数，不会超过目标副本数。
 
-`PUT /api/v1/buckets/{name}/copy-policy` 可以独立接收 `default_copies` 和 `minimum_durable_copies`。字段缺省时保持不变。`default_copies: null` 表示新上传继承当前运行时目标副本数。`minimum_durable_copies: null` 表示必须完成单次上传冻结的所有副本后才能释放缓存。显式门槛必须在 `1` 到 `8` 之间，且不能超过同一请求产生的最终目标副本数。空请求或无效的最终组合返回 `400 Bad Request`。
+`PUT /api/v1/buckets/{name}/copy-policy` 可以独立接收 `default_copies` 和 `minimum_durable_copies`。字段缺省时保持不变。传 `null` 表示重置该字段：`default_copies: null` 恢复为配置的默认值，`minimum_durable_copies: null` 将门槛设为与目标副本数相同。显式值必须在 `1` 到 `8` 之间，且门槛不能超过同一请求产生的最终目标副本数。空请求或无效的最终组合返回 `400 Bad Request`。
+
+**不支持调低 `default_copies`，调低会返回 `400 Bad Request`。** 超出新目标的那些副本仍会继续运行、继续计费，而且没有任何机制会退役它们，所以目标副本数只能调高。如果 `null` 重置后的值低于存储桶当前的目标副本数，同样会被拒绝。
 
 目标副本数变更只影响新上传。最低耐久副本数变更还会重新评估当前上传仍保留的缓存。提高门槛无法恢复已经删除的缓存。
 
@@ -279,18 +280,18 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 | Method | Path | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/tasks` | 列出后台任务。支持 `type`、`stage`、`status`、`limit`、`offset` 等过滤。 |
+| `GET` | `/api/v1/tasks` | 列出后台任务。支持 `type`、`status`、`limit` 和基于 ID 的 `cursor`。 |
 | `GET` | `/api/v1/tasks/stats` | 按状态统计任务。 |
-| `GET` | `/api/v1/tasks/{id}/ref-detail` | 解析后台任务关联的对象或存储操作。 |
-| `GET` | `/api/v1/tasks/{id}/diagnostic` | 读取任务诊断。 |
-| `POST` | `/api/v1/tasks/{id}/diagnostic/refresh` | 刷新诊断。 |
-| `POST` | `/api/v1/tasks/{id}/retry` | 重试 exhausted 任务。 |
-| `GET` | `/admin/exhausted-tasks` | 列出 exhausted 任务。支持最大为 `1000` 的 `limit`。 |
-| `POST` | `/admin/exhausted-tasks/{id}/retry` | 重试 exhausted 任务（遗留路径）。 |
+| `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时恢复失败任务。 |
+| `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时把失败任务标记为已处理。确认后开始计算保留期，到期后可能被清理。 |
 
-引用存储桶的替换和退休任务会在列表与引用详情响应中包含 `bucket_name`。从任务队列重试存储提供方替换工作会返回 `409 Conflict` 和 `"code": "replacement_task_retry_unsupported"`。替换任务完成或停止后，可以使用 **Open Data Sets**，或打开存储桶并前往 Details → Storage → Data Sets。`target_in_use` 失败不会显示 Retry，因为它需要改选存储提供方。
+`status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。
 
-任务列表中的 `progress` 是按 `scope` 区分的联合对象。`scope: "ingress_store"` 返回 `attempt`、`uploaded_bytes`、`total_bytes`、可选 `percent`、`done` 与 `updated_at`。`scope: "provider_replacement"` 返回与存储桶响应相同的替换进度。客户端必须先按 `scope` 分支。
+`status` 过滤还接受 `dismissed`。`status=failed` 只返回尚未确认的失败，`status=dismissed` 返回已确认的失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。
+
+`/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。
+
+分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换仍通过 Data Sets API 恢复。钱包操作只有在广播开始前才可重试。重试结果不确定的 Store 只会查询存储提供方，不会重新上传字节。
 
 ## 钱包和 Filecoin
 

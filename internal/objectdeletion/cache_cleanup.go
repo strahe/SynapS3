@@ -2,54 +2,60 @@ package objectdeletion
 
 import (
 	"context"
-	"log/slog"
 
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/model"
 )
 
-type cacheCleanupRecorder interface {
-	UpdateObjectDeletionCacheCleanup(ctx context.Context, versionID string, status model.CacheCleanupStatus, cacheError string) error
+type cacheReleaseRepository interface {
+	ReleaseContentCacheIfUnreferenced(ctx context.Context, contentID int64, release func() error) (bool, error)
 }
 
-func RecordCacheCleanup(
+type CacheReleaseOutcome string
+
+const (
+	CacheReleaseRetained CacheReleaseOutcome = "retained"
+	CacheReleaseReleased CacheReleaseOutcome = "released"
+)
+
+// ReleaseContentCache removes the cached bytes of one content payload after the
+// last object version referencing it has been permanently deleted.
+//
+// Cache residency is content-addressed, so several versions can share a single
+// file. Deleting one of them must leave the file alone; only the disappearance
+// of the final reference releases it. The reference decision is rechecked while
+// the content row and deletion gate are both held.
+//
+// The deletion gate is held on the content key for the same reason: two
+// versions of identical bytes contend for one file, not one file each.
+func ReleaseContentCache(
 	ctx context.Context,
 	c cache.Cache,
 	gate *cacheaccess.Gate,
 	tracker *cacheaccess.Tracker,
-	recorder cacheCleanupRecorder,
-	logger *slog.Logger,
+	repository cacheReleaseRepository,
 	bucketName string,
-	versionID string,
-	cacheKey string,
-) model.CacheCleanupStatus {
+	contentID int64,
+) (CacheReleaseOutcome, error) {
 	if gate == nil {
-		panic("cache cleanup requires a cache access gate")
+		panic("cache release requires a cache access gate")
 	}
 	if tracker == nil {
-		panic("cache cleanup requires a cache access tracker")
+		panic("cache release requires a cache access tracker")
 	}
-	status := model.CacheCleanupStatusSkipped
-	cacheErr := ""
-	var deleteErr error
-	gate.GuardDeletion(versionID, func() {
-		if cacheKey != "" {
-			deleteErr = c.Delete(ctx, bucketName, cacheKey)
+	cacheKey := model.ContentCacheKey(contentID)
+	outcome := CacheReleaseRetained
+	var releaseErr error
+	gate.GuardDeletion(cacheKey, func() {
+		var released bool
+		released, releaseErr = repository.ReleaseContentCacheIfUnreferenced(ctx, contentID, func() error {
+			return c.Delete(ctx, bucketName, cacheKey)
+		})
+		if releaseErr == nil && released {
+			tracker.Forget(contentID)
+			outcome = CacheReleaseReleased
 		}
-		tracker.Forget(versionID)
 	})
-	if cacheKey != "" {
-		if deleteErr != nil {
-			status = model.CacheCleanupStatusFailed
-			cacheErr = deleteErr.Error()
-			logger.Warn("permanent delete cache cleanup failed", "bucket", bucketName, "versionID", versionID, "cacheKey", cacheKey, "error", deleteErr)
-		} else {
-			status = model.CacheCleanupStatusDeleted
-		}
-	}
-	if err := recorder.UpdateObjectDeletionCacheCleanup(ctx, versionID, status, cacheErr); err != nil {
-		logger.Warn("recording permanent delete cache cleanup failed", "bucket", bucketName, "versionID", versionID, "status", status, "error", err)
-	}
-	return status
+	return outcome, releaseErr
 }

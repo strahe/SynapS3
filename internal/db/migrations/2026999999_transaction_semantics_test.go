@@ -82,6 +82,43 @@ func TestMigrationRepairsMarkerForCompletePostState(t *testing.T) {
 	testMigrationDialects(t, testMigrationRepairsMarkerForCompletePostState)
 }
 
+func TestInitialBaselineRepairsMissingMarkerOnlyForCompletePostState(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		if err := runMigrationBody(ctx, db, up2026090101InitialSchema); err != nil {
+			t.Fatalf("simulate committed baseline without marker: %v", err)
+		}
+		migrator := NewMigrator(db)
+		if err := migrator.Init(ctx); err != nil {
+			t.Fatalf("initialize migrator: %v", err)
+		}
+		if err := ValidateTarget(ctx, db); err != nil {
+			t.Fatalf("validate complete baseline without marker: %v", err)
+		}
+		if _, err := migrator.Migrate(ctx); err != nil {
+			t.Fatalf("repair baseline marker: %v", err)
+		}
+		assertAppliedMigrationCount(t, ctx, migrator, 1)
+	})
+}
+
+func TestInitialBaselineRejectsPartialPostStateWithEmptyMarker(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		migrator := NewMigrator(db)
+		if err := migrator.Init(ctx); err != nil {
+			t.Fatalf("initialize migrator: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, "CREATE TABLE tasks (id INTEGER PRIMARY KEY)"); err != nil {
+			t.Fatalf("create partial baseline: %v", err)
+		}
+		if err := ValidateTarget(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
+			t.Fatalf("validate partial baseline = %v, want ErrIncompatibleDatabase", err)
+		}
+		assertAppliedMigrationCount(t, ctx, migrator, 0)
+	})
+}
+
 func testMigrationRepairsMarkerForCompletePostState(t *testing.T, db *bun.DB) {
 	ctx := context.Background()
 	executions := 0

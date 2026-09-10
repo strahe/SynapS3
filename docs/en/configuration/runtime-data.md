@@ -51,7 +51,7 @@ Keep `config.toml`, `.env`, credential files, and exported secrets at permission
 ## Before a Backup
 
 1. Check `curl http://127.0.0.1:9090/healthz` and record any non-`ok` result.
-2. Review active and exhausted work with `synaps3 admin task stats` and `synaps3 admin task list --status exhausted`.
+2. Review active and failed work with `synaps3 admin task stats` and `synaps3 admin task list --status failed`.
 3. Stop SynapS3 with the service manager used by your deployment so object data, metadata, and task state cannot change during the backup.
 
 Do not create a filesystem archive while SynapS3 is still running.
@@ -103,6 +103,8 @@ sha256sum -c synaps3-data.tgz.sha256
 2. Verify the archive checksum and confirm the database and cache have the same recovery-point label.
 3. Restore the runtime volume into an empty replacement location. For PostgreSQL, restore the database-native backup before attaching the matching configuration and cache data.
 4. Confirm the restored configuration and credential files are `0600` and readable by the SynapS3 account.
-5. Start SynapS3, check `/healthz`, review task statistics and exhausted tasks, then read a known object through the S3 API.
+5. Start SynapS3, check `/healthz`, review task statistics and failed tasks, then read a known object through the S3 API.
 
 Do not combine a database backup with cache data from another point in time.
+
+Restore a backup only with a compatible SynapS3 version. If startup reports that the database is incompatible, leave the backup unchanged and follow [Upgrade and Recovery](../operations/upgrade-recovery.md).

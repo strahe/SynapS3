@@ -3,48 +3,49 @@ package cacheaccess
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/strahe/synaps3/internal/model"
 )
 
 type recordingAccessStore struct {
 	mu          sync.Mutex
 	fail        bool
-	accessCalls map[string][]time.Time
-	commitCalls map[string][]time.Time
+	accessCalls map[int64][]time.Time
+	commitCalls map[int64][]time.Time
 }
 
 func newRecordingAccessStore() *recordingAccessStore {
 	return &recordingAccessStore{
-		accessCalls: make(map[string][]time.Time),
-		commitCalls: make(map[string][]time.Time),
+		accessCalls: make(map[int64][]time.Time),
+		commitCalls: make(map[int64][]time.Time),
 	}
 }
 
-func (s *recordingAccessStore) RecordVersionCacheAccess(
+func (s *recordingAccessStore) RecordContentCacheAccess(
 	_ context.Context,
-	versionID string,
+	contentID int64,
 	accessedAt time.Time,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.accessCalls[versionID] = append(s.accessCalls[versionID], accessedAt)
+	s.accessCalls[contentID] = append(s.accessCalls[contentID], accessedAt)
 	if s.fail {
 		return errors.New("database unavailable")
 	}
 	return nil
 }
 
-func (s *recordingAccessStore) RecordVersionCacheCommit(
+func (s *recordingAccessStore) RecordContentCacheCommit(
 	_ context.Context,
-	versionID string,
+	contentID int64,
 	accessedAt time.Time,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.commitCalls[versionID] = append(s.commitCalls[versionID], accessedAt)
+	s.commitCalls[contentID] = append(s.commitCalls[contentID], accessedAt)
 	if s.fail {
 		return errors.New("database unavailable")
 	}
@@ -57,10 +58,10 @@ func (s *recordingAccessStore) setFail(fail bool) {
 	s.mu.Unlock()
 }
 
-func (s *recordingAccessStore) callCounts(versionID string) (int, int) {
+func (s *recordingAccessStore) callCounts(contentID int64) (int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.accessCalls[versionID]), len(s.commitCalls[versionID])
+	return len(s.accessCalls[contentID]), len(s.commitCalls[contentID])
 }
 
 func TestTrackerCoalescesAccessWritesAndKeepsLatestTimestamp(t *testing.T) {
@@ -69,26 +70,26 @@ func TestTrackerCoalescesAccessWritesAndKeepsLatestTimestamp(t *testing.T) {
 	now := time.Date(2026, time.July, 28, 1, 0, 0, 0, time.UTC)
 	tracker.now = func() time.Time { return now }
 
-	if err := tracker.RecordAccess(context.Background(), "version-1", nil); err != nil {
+	if err := tracker.RecordAccess(context.Background(), 1, nil); err != nil {
 		t.Fatalf("first RecordAccess: %v", err)
 	}
 	now = now.Add(10 * time.Second)
-	if err := tracker.RecordAccess(context.Background(), "version-1", nil); err != nil {
+	if err := tracker.RecordAccess(context.Background(), 1, nil); err != nil {
 		t.Fatalf("second RecordAccess: %v", err)
 	}
-	accessCalls, commitCalls := store.callCounts("version-1")
+	accessCalls, commitCalls := store.callCounts(1)
 	if accessCalls != 1 || commitCalls != 0 {
 		t.Fatalf("store calls = access %d commit %d, want 1 and 0", accessCalls, commitCalls)
 	}
-	if got := tracker.Latest("version-1"); !got.Equal(now) {
+	if got := tracker.Latest(1); !got.Equal(now) {
 		t.Fatalf("Latest = %s, want %s", got, now)
 	}
 
 	now = now.Add(time.Minute)
-	if err := tracker.RecordAccess(context.Background(), "version-1", nil); err != nil {
+	if err := tracker.RecordAccess(context.Background(), 1, nil); err != nil {
 		t.Fatalf("third RecordAccess: %v", err)
 	}
-	accessCalls, _ = store.callCounts("version-1")
+	accessCalls, _ = store.callCounts(1)
 	if accessCalls != 2 {
 		t.Fatalf("access writes = %d, want 2", accessCalls)
 	}
@@ -102,7 +103,7 @@ func TestTrackerCommitFailureRetriesAsCommitDuringSweep(t *testing.T) {
 	now := time.Date(2026, time.July, 28, 2, 0, 0, 0, time.UTC)
 	tracker.now = func() time.Time { return now }
 
-	if err := tracker.RecordCommit(context.Background(), "version-commit", nil); err == nil {
+	if err := tracker.RecordCommit(context.Background(), 2, nil); err == nil {
 		t.Fatal("RecordCommit error = nil, want persistence failure")
 	}
 	store.setFail(false)
@@ -111,7 +112,7 @@ func TestTrackerCommitFailureRetriesAsCommitDuringSweep(t *testing.T) {
 	if err != nil || failed != 0 {
 		t.Fatalf("sweep: failed=%d err=%v", failed, err)
 	}
-	accessCalls, commitCalls := store.callCounts("version-commit")
+	accessCalls, commitCalls := store.callCounts(2)
 	if accessCalls != 0 || commitCalls != 2 {
 		t.Fatalf("store calls = access %d commit %d, want 0 and 2", accessCalls, commitCalls)
 	}
@@ -122,7 +123,7 @@ func TestTrackerSweepDoesNotPersistForgottenCommitAfterDeletion(t *testing.T) {
 	store.setFail(true)
 	tracker := NewTracker(0, store)
 	gate := NewGate()
-	if err := tracker.RecordCommit(context.Background(), "version-deleted", nil); err == nil {
+	if err := tracker.RecordCommit(context.Background(), 3, nil); err == nil {
 		t.Fatal("RecordCommit error = nil, want persistence failure")
 	}
 	store.setFail(false)
@@ -131,10 +132,10 @@ func TestTrackerSweepDoesNotPersistForgottenCommitAfterDeletion(t *testing.T) {
 	releaseDelete := make(chan struct{})
 	deleteDone := make(chan struct{})
 	go func() {
-		gate.GuardDeletion("version-deleted", func() {
+		gate.GuardDeletion(model.ContentCacheKey(3), func() {
 			close(deleteStarted)
 			<-releaseDelete
-			tracker.Forget("version-deleted")
+			tracker.Forget(3)
 		})
 		close(deleteDone)
 	}()
@@ -161,7 +162,7 @@ func TestTrackerSweepDoesNotPersistForgottenCommitAfterDeletion(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for sweep")
 	}
-	accessCalls, commitCalls := store.callCounts("version-deleted")
+	accessCalls, commitCalls := store.callCounts(3)
 	if accessCalls != 0 || commitCalls != 1 {
 		t.Fatalf("store calls = access %d commit %d, want only the initial failed commit", accessCalls, commitCalls)
 	}
@@ -175,11 +176,11 @@ func TestTrackerStaysBoundedAndPausesLRUWhenDirtyAccessCannotPersist(t *testing.
 	now := time.Date(2026, time.July, 28, 3, 0, 0, 0, time.UTC)
 	tracker.now = func() time.Time { return now }
 
-	versionIDs := sameTrackerShardVersionIDs(tracker, 3)
-	if err := tracker.RecordAccess(context.Background(), versionIDs[0], nil); err == nil {
+	contentIDs := sameTrackerShardContentIDs(tracker, 3)
+	if err := tracker.RecordAccess(context.Background(), contentIDs[0], nil); err == nil {
 		t.Fatal("first RecordAccess error = nil, want persistence failure")
 	}
-	err := tracker.RecordAccess(context.Background(), versionIDs[1], nil)
+	err := tracker.RecordAccess(context.Background(), contentIDs[1], nil)
 	if !errors.Is(err, ErrLRUAccessUncertain) {
 		t.Fatalf("overflow error = %v, want ErrLRUAccessUncertain", err)
 	}
@@ -187,7 +188,7 @@ func TestTrackerStaysBoundedAndPausesLRUWhenDirtyAccessCannotPersist(t *testing.
 		t.Fatal("SafeForLRU = true after an access could not be retained")
 	}
 
-	shard := tracker.shard(versionIDs[0])
+	shard := tracker.shard(contentIDs[0])
 	shard.mu.Lock()
 	entryCount := len(shard.entries)
 	shard.mu.Unlock()
@@ -195,7 +196,7 @@ func TestTrackerStaysBoundedAndPausesLRUWhenDirtyAccessCannotPersist(t *testing.
 		t.Fatalf("tracked entries = %d, want hard cap 1", entryCount)
 	}
 
-	_ = tracker.RecordAccess(context.Background(), versionIDs[2], nil)
+	_ = tracker.RecordAccess(context.Background(), contentIDs[2], nil)
 	shard.mu.Lock()
 	entryCount = len(shard.entries)
 	shard.mu.Unlock()
@@ -210,20 +211,20 @@ func TestTrackerEvictsCleanEntryAtShardCapacity(t *testing.T) {
 	tracker.maxEntriesPerShard = 1
 	now := time.Date(2026, time.July, 28, 4, 0, 0, 0, time.UTC)
 	tracker.now = func() time.Time { return now }
-	versionIDs := sameTrackerShardVersionIDs(tracker, 2)
+	contentIDs := sameTrackerShardContentIDs(tracker, 2)
 
-	if err := tracker.RecordAccess(context.Background(), versionIDs[0], nil); err != nil {
+	if err := tracker.RecordAccess(context.Background(), contentIDs[0], nil); err != nil {
 		t.Fatalf("first RecordAccess: %v", err)
 	}
 	now = now.Add(time.Second)
-	if err := tracker.RecordAccess(context.Background(), versionIDs[1], nil); err != nil {
+	if err := tracker.RecordAccess(context.Background(), contentIDs[1], nil); err != nil {
 		t.Fatalf("second RecordAccess: %v", err)
 	}
 
-	if got := tracker.Latest(versionIDs[0]); !got.IsZero() {
+	if got := tracker.Latest(contentIDs[0]); !got.IsZero() {
 		t.Fatalf("evicted clean entry access = %s, want zero", got)
 	}
-	if got := tracker.Latest(versionIDs[1]); !got.Equal(now) {
+	if got := tracker.Latest(contentIDs[1]); !got.Equal(now) {
 		t.Fatalf("retained entry access = %s, want %s", got, now)
 	}
 	if !tracker.SafeForLRU() {
@@ -234,11 +235,11 @@ func TestTrackerEvictsCleanEntryAtShardCapacity(t *testing.T) {
 func TestTrackerForgetRemovesVersionState(t *testing.T) {
 	store := newRecordingAccessStore()
 	tracker := NewTracker(time.Minute, store)
-	if err := tracker.RecordAccess(context.Background(), "version-forget", nil); err != nil {
+	if err := tracker.RecordAccess(context.Background(), 4, nil); err != nil {
 		t.Fatalf("RecordAccess: %v", err)
 	}
-	tracker.Forget("version-forget")
-	if got := tracker.Latest("version-forget"); !got.IsZero() {
+	tracker.Forget(4)
+	if got := tracker.Latest(4); !got.IsZero() {
 		t.Fatalf("Latest after Forget = %s, want zero", got)
 	}
 }
@@ -248,24 +249,23 @@ func TestTrackerAdvancesPastEqualDurableTimestamp(t *testing.T) {
 	tracker := NewTracker(time.Minute, store)
 	durable := time.Date(2026, time.July, 28, 5, 0, 0, 123456000, time.UTC)
 	tracker.now = func() time.Time { return durable }
-	if err := tracker.RecordAccess(context.Background(), "version-equal", &durable); err != nil {
+	if err := tracker.RecordAccess(context.Background(), 5, &durable); err != nil {
 		t.Fatalf("RecordAccess: %v", err)
 	}
 	want := durable.Add(time.Microsecond)
-	if got := tracker.Latest("version-equal"); !got.Equal(want) {
+	if got := tracker.Latest(5); !got.Equal(want) {
 		t.Fatalf("Latest = %s, want %s", got, want)
 	}
 }
 
-func sameTrackerShardVersionIDs(tracker *Tracker, count int) []string {
-	first := "version-shard"
+func sameTrackerShardContentIDs(tracker *Tracker, count int) []int64 {
+	const first int64 = 1000
 	target := tracker.shard(first)
-	versionIDs := []string{first}
-	for index := 0; len(versionIDs) < count; index++ {
-		candidate := fmt.Sprintf("version-shard-%d", index)
+	contentIDs := []int64{first}
+	for candidate := first + 1; len(contentIDs) < count; candidate++ {
 		if tracker.shard(candidate) == target {
-			versionIDs = append(versionIDs, candidate)
+			contentIDs = append(contentIDs, candidate)
 		}
 	}
-	return versionIDs
+	return contentIDs
 }

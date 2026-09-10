@@ -678,15 +678,12 @@ func TestAdminAuthBasicAuthRejectsCrossSiteBrowserUnsafeRequests(t *testing.T) {
 	}
 }
 
-func TestAdminAuthFailureLimitLogoutExpiryAndLegacyProtection(t *testing.T) {
+func TestAdminAuthFailureLimitLogoutAndExpiry(t *testing.T) {
 	srv := newTestAuthServer(t, "admin-password")
 	mux := http.NewServeMux()
 	srv.registerAuthRoutes(mux)
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "metrics"})
-	})
-	mux.HandleFunc("GET /admin/exhausted-tasks", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "legacy"})
 	})
 	handler := srv.withAdminAuth(mux)
 
@@ -707,7 +704,7 @@ func TestAdminAuthFailureLimitLogoutExpiryAndLegacyProtection(t *testing.T) {
 		t.Fatalf("limited login status = %d, want 429", limitedRR.Code)
 	}
 
-	for _, path := range []string{"/metrics", "/admin/exhausted-tasks"} {
+	for _, path := range []string{"/metrics"} {
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		if rr.Code != http.StatusUnauthorized {

@@ -17,7 +17,7 @@ test('provider identity events patch bucket detail cache', () => {
     id: 1,
     name: 'photos',
     owner_access_key: null,
-    status: 'active',
+    status: 'ready',
     object_count: 1,
     total_size_bytes: 1,
     created_at: '2026-05-06T00:00:00Z',
@@ -68,13 +68,6 @@ test('provider identity events patch provenance cache', () => {
         is_new_data_set: false,
       },
     ],
-    failures: [
-      {
-        attempt_index: 0,
-        provider_id: '101',
-        transfer_method: 'peer_pull',
-      },
-    ],
     updated_at: '2026-05-06T00:00:00Z',
   })
 
@@ -91,7 +84,6 @@ test('provider identity events patch provenance cache', () => {
   const provenance = qc.getQueryData<ObjectProvenance>(['objectProvenance', 'photos', 'v1'])
   assert.equal(provenance?.copies[0]?.provider_identity?.name, 'alpha-pdp')
   assert.equal(provenance?.copies[1]?.provider_identity, undefined)
-  assert.equal(provenance?.failures[0]?.provider_identity?.filecoin_actor_id, 'f01234')
 })
 
 test('provider identity events ignore unrelated providers', () => {
@@ -100,7 +92,7 @@ test('provider identity events ignore unrelated providers', () => {
     id: 1,
     name: 'photos',
     owner_access_key: null,
-    status: 'active',
+    status: 'ready',
     object_count: 1,
     total_size_bytes: 1,
     created_at: '2026-05-06T00:00:00Z',

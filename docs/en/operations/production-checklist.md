@@ -77,7 +77,7 @@ At minimum, monitor:
 - `GET /metrics`
 - cache usage
 - task queue depth
-- exhausted task count
+- failed task count
 - background task activity
 - provider and data set health
 
@@ -85,15 +85,17 @@ Treat `{"status":"unhealthy"}` as a problem to investigate. It means database, c
 
 ## Upgrade Readiness
 
+Back up the database and cache before changing versions, then follow [Upgrade and Recovery](./upgrade-recovery.md). If startup reports that the database is incompatible, leave it unchanged and use a new database and cache directory.
+
 Before upgrading:
 
 ```bash
 curl http://127.0.0.1:9090/healthz
 synaps3 admin task stats
-synaps3 admin task list --status exhausted --limit 50
+synaps3 admin task list --status failed --limit 50
 ```
 
-Expected result: health is `ok`, task queues are understood, and every exhausted task has a clear handling decision before the process is replaced.
+Expected result: health is `ok`, task queues are understood, and every failed task has a clear handling decision before the running process is replaced.
 
 ## Recovery Entry Points
 

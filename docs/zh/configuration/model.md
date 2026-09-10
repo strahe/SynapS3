@@ -71,10 +71,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `filecoin.observability` | 存储提供方和本地数据集健康检查。 |
 | `database` | SQLite 或 PostgreSQL 元数据数据库。 |
 | `cache` | 本地对象缓存目录、容量和淘汰策略。 |
-| `worker.upload` | 后台 Filecoin 存储并发、轮询和重试。 |
-| `worker.provider_replacement` | 存储提供方替换传输的并发、轮询与复制重试。 |
-| `worker.evictor` | 本地缓存淘汰任务。 |
-| `worker.storage_cleanup` | 远端副本清理任务。 |
+| `worker.tasks` | 统一后台任务执行、恢复、保留时间和存储变更并发限制。 |
 | `logging` | 运行时日志等级、格式和 S3 access log。 |
 | `admin` | 仪表盘、Admin API 监听地址和 Admin 认证设置。 |
 
@@ -95,18 +92,20 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `cache.eviction_policy` | `lru` |
 | `cache.lru_high_watermark_percent` | `90` |
 | `cache.lru_low_watermark_percent` | `80` |
-| `worker.upload.concurrency` | `4` |
-| `worker.upload.max_retries` | `5` |
-| `worker.provider_replacement.concurrency` | `4` |
-| `worker.provider_replacement.poll_interval` | `5s` |
-| `worker.provider_replacement.max_retries` | `5` |
+| `worker.tasks.concurrency` | `12` |
+| `worker.tasks.poll_interval` | `5s` |
+| `worker.tasks.lease_duration` | `5m` |
+| `worker.tasks.max_retries` | `5` |
+| `worker.tasks.retention` | `168h` |
+| `worker.tasks.provider_mutation_concurrency` | `4` |
+| `worker.tasks.destructive_mutation_concurrency` | `2` |
 | `admin.addr` | `127.0.0.1:9090` |
 | `admin.trusted_proxies` | `[]` |
 | `admin.auth.enabled` | `true` |
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.provider_replacement` 配置不会影响普通上传。修改 `worker.provider_replacement.max_retries` 后，新发现的替换内容和通过 **Retry replacement** 重试的内容会使用新值；已经进行中的内容保留原有上限。修改存储提供方替换的并发、轮询或重试配置后必须重启 SynapS3。
+`worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。任务设置修改后必须重启 SynapS3，已经创建的任务保留创建时记录的重试上限。
 
 ## Admin 会话时长
 
@@ -127,7 +126,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 缓存淘汰策略会产生以下用户可见结果：
 
 - `lru`：缓存使用量达到高水位后，SynapS3 按最近访问时间淘汰最久未使用且远端安全的条目，直到降至低水位。
-- `after_upload`：版本达到其存储桶要求的最低耐久副本数后，会在下一次 Evictor 轮询时加入清理。之后从远端读取并回填的缓存不会再次被立即删除。
+- `after_upload`：版本达到其存储桶要求的最低耐久副本数后，会加入异步清理。之后从远端读取并回填的缓存不会再次被立即删除。
 - `none`：SynapS3 不会自动清理本地缓存。
 
 LRU 水位始终必须满足 `0 <= low < high <= 100`。在 `after_upload` 或 `none` 下仍会保存这些值，但不会生效。

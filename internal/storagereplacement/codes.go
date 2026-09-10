@@ -15,10 +15,6 @@ const (
 	CodeTargetUnavailable   = "replacement_target_unavailable"
 	CodeIdempotencyConflict = "replacement_idempotency_conflict"
 	CodeSourceNotCurrent    = "replacement_source_not_current"
-
-	// CodeTaskRetryUnsupported is returned by the generic exhausted-task retry
-	// endpoint when the task belongs to a replacement.
-	CodeTaskRetryUnsupported = "replacement_task_retry_unsupported"
 )
 
 // Code maps a replacement error to its stable API code. It returns an empty

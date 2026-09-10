@@ -37,7 +37,7 @@ type Advancer struct {
 }
 
 type AdvanceInput struct {
-	Copy                model.StorageUploadCopy
+	Copy                model.StorageCopy
 	Binding             model.StorageDataSet
 	Target              synapse.DataSetTarget
 	Pieces              []storage.PieceInput
@@ -49,11 +49,11 @@ type AdvanceInput struct {
 // not be reconstructed. It never submits or confirms provider work.
 func (a *Advancer) AdvanceUnavailable(
 	ctx context.Context,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	binding model.StorageDataSet,
 ) (AdvanceResult, error) {
-	if a == nil || a.Store == nil || copyRow.ID <= 0 || copyRow.UploadID <= 0 || copyRow.CopyIndex < 0 ||
-		copyRow.StorageDataSetID == nil || *copyRow.StorageDataSetID != binding.ID ||
+	if a == nil || a.Store == nil || copyRow.ID <= 0 || copyRow.ContentID <= 0 || copyRow.CopyIndex < 0 ||
+		copyRow.StorageDataSetID != binding.ID ||
 		copyRow.CommitAttemptID == nil || *copyRow.CommitAttemptID == "" || copyRow.CommitAttemptedAt == nil {
 		return AdvanceResult{}, errors.New("invalid unavailable storage commit input")
 	}
@@ -70,10 +70,10 @@ func (a *Advancer) AdvanceUnavailable(
 		return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
 	}
 	return a.attention(ctx, CopyIdentity{
-		StorageUploadCopyID: copyRow.ID,
-		UploadID:            copyRow.UploadID,
-		CopyIndex:           copyRow.CopyIndex,
-		StorageDataSetID:    binding.ID,
+		StorageCopyID:    copyRow.ID,
+		ContentID:        copyRow.ContentID,
+		CopyIndex:        copyRow.CopyIndex,
+		StorageDataSetID: binding.ID,
 	}, attemptID, AttentionDataSetUnavailable, true)
 }
 
@@ -81,19 +81,19 @@ func (a *Advancer) AdvanceUnavailable(
 // is terminal without requiring a provider context.
 func (a *Advancer) ReleaseTerminalReservation(
 	ctx context.Context,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	binding model.StorageDataSet,
 ) (AdvanceResult, error) {
-	if a == nil || a.Store == nil || copyRow.ID <= 0 || copyRow.UploadID <= 0 || copyRow.CopyIndex < 0 ||
-		copyRow.StorageDataSetID == nil || *copyRow.StorageDataSetID != binding.ID ||
+	if a == nil || a.Store == nil || copyRow.ID <= 0 || copyRow.ContentID <= 0 || copyRow.CopyIndex < 0 ||
+		copyRow.StorageDataSetID != binding.ID ||
 		copyRow.CommitAttemptID == nil || *copyRow.CommitAttemptID == "" || copyRow.CommitAttemptedAt != nil {
 		return AdvanceResult{}, errors.New("invalid terminal storage commit reservation")
 	}
 	return a.release(ctx, CopyIdentity{
-		StorageUploadCopyID: copyRow.ID,
-		UploadID:            copyRow.UploadID,
-		CopyIndex:           copyRow.CopyIndex,
-		StorageDataSetID:    binding.ID,
+		StorageCopyID:    copyRow.ID,
+		ContentID:        copyRow.ContentID,
+		CopyIndex:        copyRow.CopyIndex,
+		StorageDataSetID: binding.ID,
 	}, copyRow, ReleaseOwnerTerminal, true, true, false)
 }
 
@@ -148,7 +148,7 @@ func (a *Advancer) Advance(ctx context.Context, input AdvanceInput) (AdvanceResu
 func (a *Advancer) submitReserved(
 	ctx context.Context,
 	input AdvanceInput,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 ) (AdvanceResult, error) {
 	if copyRow.CommitAttemptID == nil || *copyRow.CommitAttemptID == "" {
 		return AdvanceResult{}, errors.New("reserved storage commit has no attempt token")
@@ -268,7 +268,7 @@ type commitEvidenceError struct {
 func (a *Advancer) observe(
 	ctx context.Context,
 	input AdvanceInput,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 ) (AdvanceResult, error) {
 	identity := copyIdentity(input, false)
 	attemptID := *copyRow.CommitAttemptID
@@ -329,7 +329,7 @@ func (a *Advancer) observe(
 func (a *Advancer) observeTransaction(
 	ctx context.Context,
 	input AdvanceInput,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 ) (AdvanceResult, error) {
 	identity := copyIdentity(input, false)
 	attemptID := *copyRow.CommitAttemptID
@@ -376,7 +376,7 @@ func (a *Advancer) observeTransaction(
 			AttemptID: attemptID,
 			Confirmation: &storage.CommitResult{
 				TransactionID:          transactionID,
-				ConfirmedTransactionID: result.ConfirmedTransactionID,
+				ConfirmedTransactionID: confirmedTransactionID(transactionID, result.ConfirmedTransactionID),
 				DataSet:                ref,
 				PieceIDs:               pieceIDs,
 			},
@@ -396,7 +396,7 @@ func (a *Advancer) observeTransaction(
 func (a *Advancer) classifySDKStatus(
 	ctx context.Context,
 	identity CopyIdentity,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	attemptID string,
 	status *storage.CommitStatus,
 ) (AdvanceResult, error) {
@@ -415,7 +415,7 @@ func (a *Advancer) classifySDKStatus(
 			AttemptID: attemptID,
 			Confirmation: &storage.CommitResult{
 				TransactionID:          status.TransactionID,
-				ConfirmedTransactionID: status.ConfirmedTransactionID,
+				ConfirmedTransactionID: confirmedTransactionID(status.TransactionID, status.ConfirmedTransactionID),
 				DataSet:                *status.DataSet,
 				PieceIDs:               status.PieceIDs,
 			},
@@ -430,10 +430,17 @@ func (a *Advancer) classifySDKStatus(
 	}
 }
 
+func confirmedTransactionID(transactionID, confirmedTransactionID string) string {
+	if confirmedTransactionID != "" {
+		return confirmedTransactionID
+	}
+	return transactionID
+}
+
 func (a *Advancer) pendingOrAttention(
 	ctx context.Context,
 	identity CopyIdentity,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	attemptID string,
 ) (AdvanceResult, error) {
 	return a.pendingOrAttentionWithCode(
@@ -444,7 +451,7 @@ func (a *Advancer) pendingOrAttention(
 func (a *Advancer) pendingOrAttentionWithCode(
 	ctx context.Context,
 	identity CopyIdentity,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	attemptID string,
 	code AttentionCode,
 ) (AdvanceResult, error) {
@@ -457,7 +464,7 @@ func (a *Advancer) pendingOrAttentionWithCode(
 func (a *Advancer) attentionForCopy(
 	ctx context.Context,
 	identity CopyIdentity,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	attemptID string,
 	code AttentionCode,
 	keepObserving bool,
@@ -469,7 +476,7 @@ func (a *Advancer) attentionForCopy(
 }
 
 func existingAttentionResult(
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	attemptID string,
 	fallbackCode AttentionCode,
 	keepObserving bool,
@@ -537,7 +544,7 @@ func (a *Advancer) reset(ctx context.Context, identity CopyIdentity, attemptID s
 func (a *Advancer) release(
 	ctx context.Context,
 	identity CopyIdentity,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	reason ReleaseReason,
 	clearReadyAt bool,
 	clearExtraData bool,
@@ -550,6 +557,7 @@ func (a *Advancer) release(
 	err := a.Store.ReleaseCommitAttempt(evidenceCtx, ReleaseInput{
 		Copy:              identity,
 		AttemptID:         *copyRow.CommitAttemptID,
+		Reason:            reason,
 		KnownNotSubmitted: knownNotSubmitted,
 		ClearReadyAt:      clearReadyAt,
 		ClearExtraData:    clearExtraData,
@@ -571,7 +579,7 @@ func (a *Advancer) release(
 func (a *Advancer) releaseUnavailable(
 	ctx context.Context,
 	identity CopyIdentity,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	cause error,
 	knownNotSubmitted bool,
 ) (AdvanceResult, error) {
@@ -595,7 +603,7 @@ func dataSetRefusesWrites(err error) bool {
 func (a *Advancer) commitExtraData(
 	ctx context.Context,
 	target synapse.DataSetTarget,
-	copyRow model.StorageUploadCopy,
+	copyRow model.StorageCopy,
 	pieces []storage.PieceInput,
 ) (string, error) {
 	if copyRow.CommitExtraDataHex != nil && *copyRow.CommitExtraDataHex != "" {
@@ -614,8 +622,8 @@ func (a *Advancer) commitExtraData(
 func (a *Advancer) validateInput(input AdvanceInput) error {
 	if a == nil || a.Store == nil || input.Target == nil || input.Binding.ID <= 0 ||
 		input.Binding.DataSetID == nil || input.Binding.DataSetID.IsZero() ||
-		input.Copy.ID <= 0 || input.Copy.UploadID <= 0 || input.Copy.CopyIndex < 0 ||
-		input.Copy.StorageDataSetID == nil || *input.Copy.StorageDataSetID != input.Binding.ID ||
+		input.Copy.ID <= 0 || input.Copy.ContentID <= 0 || input.Copy.CopyIndex < 0 ||
+		input.Copy.StorageDataSetID != input.Binding.ID ||
 		len(input.Pieces) != 1 || !input.Pieces[0].PieceCID.Defined() {
 		return errors.New("invalid storage commit advance input")
 	}
@@ -624,8 +632,8 @@ func (a *Advancer) validateInput(input AdvanceInput) error {
 
 func copyIdentity(input AdvanceInput, requireEligibleCopy bool) CopyIdentity {
 	return CopyIdentity{
-		StorageUploadCopyID: input.Copy.ID,
-		UploadID:            input.Copy.UploadID,
+		StorageCopyID:       input.Copy.ID,
+		ContentID:           input.Copy.ContentID,
 		CopyIndex:           input.Copy.CopyIndex,
 		StorageDataSetID:    input.Binding.ID,
 		RequireEligibleCopy: requireEligibleCopy,

@@ -1,7 +1,10 @@
 package admin
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,14 +21,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/strahe/synaps3/internal/bucketlifecycle"
+
 	"github.com/strahe/synaps3/internal/cache"
-	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/config"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/s3iam"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/chain"
@@ -38,6 +44,28 @@ func newBucketAPITestServer(t *testing.T) (*Server, *repository.Repositories) {
 	return newBucketAPITestServerWithRuntimeCopies(t, config.DefaultFilecoinCopies)
 }
 
+func insertAdminStorageContentSnapshot(
+	t *testing.T,
+	db bun.IDB,
+	bucketID int64,
+	originVersionID string,
+	contentSize int64,
+	checksum string,
+	requestedCopies int,
+) *model.StorageContent {
+	t.Helper()
+	upload := &model.StorageContent{
+		BucketID:        bucketID,
+		ContentSize:     contentSize,
+		Checksum:        testutil.StorageChecksum(checksum),
+		RequestedCopies: requestedCopies,
+	}
+	if _, err := db.NewInsert().Model(upload).Exec(t.Context()); err != nil {
+		t.Fatalf("insert historical storage upload snapshot: %v", err)
+	}
+	return upload
+}
+
 func newBucketAPITestServerWithRuntimeCopies(t *testing.T, filecoinDefaultCopies int) (*Server, *repository.Repositories) {
 	t.Helper()
 
@@ -49,6 +77,7 @@ func newBucketAPITestServerWithRuntimeCopies(t *testing.T, filecoinDefaultCopies
 
 	repos := repository.NewRepositories(db)
 	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, filecoinDefaultCopies, testLogger())
+	srv.WithTaskService(newAdminTestTaskService(t, repos))
 	return srv, repos
 }
 
@@ -112,7 +141,7 @@ type writeDeadlineRecorder struct {
 }
 
 type failingBucketStorageHealthUploadRepo struct {
-	repository.StorageUploadRepository
+	repository.StorageContentRepository
 }
 
 func (r failingBucketStorageHealthUploadRepo) ListBucketStorageHealthSummaries(context.Context, int64, time.Time, int) ([]repository.BucketStorageHealthSummary, error) {
@@ -207,8 +236,21 @@ func (u *cacheBackedObjectUploader) PutObject(ctx context.Context, input s3respo
 		return s3response.PutObjectOutput{}, err
 	}
 	versionID := model.NewVersionID()
-	cacheKey := ".versions/" + versionID
-	info, err := u.cache.Put(ctx, *input.Bucket, cacheKey, input.Body)
+	body, err := io.ReadAll(input.Body)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	sum := sha256.Sum256(body)
+	content, err := u.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     int64(len(body)),
+		Checksum:        hex.EncodeToString(sum[:]),
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	info, err := u.cache.Put(ctx, *input.Bucket, model.ContentCacheKey(content.ID), bytes.NewReader(body))
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -220,12 +262,10 @@ func (u *cacheBackedObjectUploader) PutObject(ctx context.Context, input s3respo
 		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         *input.Key,
+		ContentID:   &content.ID,
 		Size:        info.Size,
 		ETag:        info.ETag,
-		Checksum:    info.Checksum,
 		ContentType: contentType,
-		CacheKey:    cacheKey,
-		State:       model.ObjectStateCached,
 	}); err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -267,49 +307,18 @@ func (c *contextRecordingDeleteCache) recordedContexts() []context.Context {
 	return append([]context.Context(nil), c.contexts...)
 }
 
-type blockingDeleteCache struct {
+type selectiveFailingDeleteCache struct {
 	cache.Cache
-	started   chan struct{}
-	release   chan struct{}
-	failKey   string
-	deletes   atomic.Int32
-	active    atomic.Int32
-	maxActive atomic.Int32
+	failKey string
+	deletes atomic.Int32
 }
 
-func (c *blockingDeleteCache) Delete(ctx context.Context, _, key string) error {
-	currentActive := c.active.Add(1)
-	defer c.active.Add(-1)
-	for {
-		maxActive := c.maxActive.Load()
-		if currentActive <= maxActive || c.maxActive.CompareAndSwap(maxActive, currentActive) {
-			break
-		}
-	}
+func (c *selectiveFailingDeleteCache) Delete(_ context.Context, _, key string) error {
 	c.deletes.Add(1)
-	c.started <- struct{}{}
-	select {
-	case <-c.release:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 	if key == c.failKey {
 		return errors.New("cache error")
 	}
 	return nil
-}
-
-func waitDeleteStarts(t *testing.T, started <-chan struct{}, want int) {
-	t.Helper()
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for i := 0; i < want; i++ {
-		select {
-		case <-started:
-		case <-timer.C:
-			t.Fatalf("cache cleanup starts = %d, want %d", i, want)
-		}
-	}
 }
 
 type storageUploadSelectCounter struct {
@@ -318,7 +327,7 @@ type storageUploadSelectCounter struct {
 
 func (c *storageUploadSelectCounter) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
 	query := strings.ToLower(strings.TrimSpace(event.Query))
-	if strings.HasPrefix(query, "select") && (strings.Contains(query, `from "storage_uploads"`) || strings.Contains(query, "from storage_uploads")) {
+	if strings.HasPrefix(query, "select") && (strings.Contains(query, `from "storage_contents"`) || strings.Contains(query, "from storage_contents")) {
 		c.selects.Add(1)
 	}
 	return ctx
@@ -345,38 +354,37 @@ func (f *fakeAPIProviderIdentityResolver) ProviderIdentities(providerIDs []idtyp
 	return out
 }
 
-func seedAdminObjectVersion(t *testing.T, repos *repository.Repositories, bucket *model.Bucket, key string, size int64, etag, checksum, contentType, cacheKey string, state model.ObjectState) (int64, string) {
+func seedAdminObjectVersion(t *testing.T, db *bun.DB, repos *repository.Repositories, bucket *model.Bucket, key string, size int64, etag, checksum, contentType string, state model.ObjectState) (int64, string) {
 	t.Helper()
 	versionID := model.NewVersionID()
-	if cacheKey == "" {
-		cacheKey = ".versions/" + versionID
+	if checksum == "" {
+		checksum = "checksum-" + versionID
 	}
-	createState := state
-	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
-		createState = model.ObjectStateUploading
+	requestedCopies := bucket.DefaultCopies
+	content, err := repos.Contents.EnsureContent(context.Background(), repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     size,
+		Checksum:        testutil.StorageChecksum(checksum),
+		RequestedCopies: requestedCopies,
+	})
+	if err != nil {
+		t.Fatalf("Contents.EnsureContent: %v", err)
 	}
 	version := &model.ObjectVersion{
 		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         key,
+		ContentID:   &content.ID,
 		Size:        size,
 		ETag:        etag,
-		Checksum:    checksum,
 		ContentType: contentType,
-		CacheKey:    cacheKey,
-		State:       createState,
 	}
 	objID, err := repos.Objects.CreateVersionAndSetCurrent(context.Background(), version)
 	if err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
-	if state == model.ObjectStateStored || state == model.ObjectStateCacheEvicted {
-		acceptAdminVersionUpload(t, repos, versionID, "piece-"+versionID, "https://provider.example/piece/"+versionID)
-		if state == model.ObjectStateCacheEvicted {
-			if err := repos.Objects.UpdateVersionState(context.Background(), versionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
-				t.Fatalf("Objects.UpdateVersionState cache_evicted: %v", err)
-			}
-		}
+	if state == model.ObjectStateStored {
+		acceptAdminVersionUpload(t, db, repos, versionID, "piece-"+versionID, "https://provider.example/piece/"+versionID)
 	}
 	return objID, versionID
 }
@@ -390,7 +398,7 @@ type adminStorageCopySeed struct {
 	RetrievalURL   string
 }
 
-func seedAdminCommittedCopies(t *testing.T, repos *repository.Repositories, bucketID int64, uploadID int64, pieceCID string, copies []adminStorageCopySeed) {
+func seedAdminCommittedCopies(t *testing.T, db *bun.DB, repos *repository.Repositories, bucketID int64, contentID int64, pieceCID string, copies []adminStorageCopySeed) {
 	t.Helper()
 	ctx := context.Background()
 	inputs := make([]repository.UploadCopyBindingInput, 0, len(copies))
@@ -399,16 +407,16 @@ func seedAdminCommittedCopies(t *testing.T, repos *repository.Repositories, buck
 		if i > 0 && copyIndex == 0 {
 			copyIndex = i
 		}
-		binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-			BucketID:          bucketID,
-			ProviderID:        copySeed.ProviderID,
-			CopyIndex:         copyIndex,
-			CreatedByUploadID: uploadID,
+		binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+			BucketID:           bucketID,
+			ProviderID:         copySeed.ProviderID,
+			CopyIndex:          copyIndex,
+			CreatedByContentID: contentID,
 		})
 		if err != nil {
 			t.Fatalf("ensure dataset binding: %v", err)
 		}
-		if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: uploadID, DataSetID: copySeed.DataSetID}); err != nil {
+		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: contentID, DataSetID: copySeed.DataSetID}); err != nil {
 			t.Fatalf("mark dataset ready: %v", err)
 		}
 		transferMethod := copySeed.TransferMethod
@@ -426,80 +434,113 @@ func seedAdminCommittedCopies(t *testing.T, repos *repository.Repositories, buck
 		})
 		copies[i].CopyIndex = copyIndex
 	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, uploadID, inputs); err != nil {
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, contentID, inputs); err != nil {
 		t.Fatalf("create upload copies: %v", err)
 	}
 	for _, copySeed := range copies {
-		if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-			UploadID:     uploadID,
+		testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+			ContentID:    contentID,
 			CopyIndex:    copySeed.CopyIndex,
 			PieceCID:     pieceCID,
 			PieceID:      copySeed.PieceID,
 			RetrievalURL: copySeed.RetrievalURL,
-		}); err != nil {
-			t.Fatalf("mark copy committed: %v", err)
-		}
+		})
 	}
 }
 
-func acceptAdminVersionUpload(t *testing.T, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageUpload {
+// adminVersionCacheKey is the content-addressed cache key backing one version.
+func adminVersionCacheKey(t *testing.T, repos *repository.Repositories, versionID string) string {
+	t.Helper()
+	version, err := repos.Objects.GetVersionByID(context.Background(), versionID)
+	if err != nil || version == nil {
+		t.Fatalf("get version %s: version=%v err=%v", versionID, version, err)
+	}
+	return version.CacheKey()
+}
+
+// adminContentForVersion returns the content a seeded version points at. The
+// bytes own their row now, so upload seeding attaches copies to it rather than
+// minting a second identity for the same version.
+func adminContentForVersion(t *testing.T, repos *repository.Repositories, version *model.ObjectVersion) *model.StorageContent {
+	t.Helper()
+	if version.ContentID == nil {
+		t.Fatalf("version %s has no content", version.VersionID)
+	}
+	content, err := repos.Contents.GetByID(context.Background(), *version.ContentID)
+	if err != nil || content == nil {
+		t.Fatalf("get content %d: content=%v err=%v", *version.ContentID, content, err)
+	}
+	return content
+}
+
+// adminSlotBinding returns the data set bound to one of the bucket's replica
+// slots, creating it on the given provider only when the slot is still free.
+// Slots belong to the bucket, so several contents share the same data sets.
+func adminSlotBinding(t *testing.T, repos *repository.Repositories, bucketID int64, copyIndex int, provider string, contentID int64) *model.StorageDataSet {
+	t.Helper()
+	ctx := context.Background()
+	binding, err := repos.Contents.GetDataSetBindingByCopyIndex(ctx, bucketID, copyIndex)
+	if err != nil {
+		t.Fatalf("load dataset binding %d: %v", copyIndex, err)
+	}
+	if binding == nil {
+		binding, err = repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+			BucketID: bucketID, ProviderID: onChainID(t, provider), CopyIndex: copyIndex, CreatedByContentID: contentID,
+		})
+		if err != nil {
+			t.Fatalf("ensure dataset binding %d: %v", copyIndex, err)
+		}
+	}
+	return binding
+}
+
+func acceptAdminVersionUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string, pieceCID string, retrievalURL string) *model.StorageContent {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
 		t.Fatalf("get version for upload accept: version=%v err=%v", version, err)
 	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("start upload attempt: %v", err)
+	upload := adminContentForVersion(t, repos, version)
+	// Accepting content means every requested replica is committed, so the seed
+	// follows the content's own durability target rather than assuming one.
+	for copyIndex := range max(upload.RequestedCopies, 1) {
+		pieceID := onChainIDPtr(t, fmt.Sprintf("1%d", copyIndex))
+		binding := adminSlotBinding(t, repos, version.BucketID, copyIndex, fmt.Sprintf("10%d", copyIndex+1), upload.ID)
+		providerID := binding.ProviderID
+		if binding.DataSetID == nil {
+			dataSetID := onChainID(t, fmt.Sprintf("1001%d%d", upload.ID, copyIndex))
+			if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID}); err != nil {
+				t.Fatalf("mark dataset %d ready: %v", copyIndex, err)
+			}
+		}
+		transferMethod := model.StorageCopyTransferMethodPeerPull
+		if copyIndex == 0 {
+			transferMethod = model.StorageCopyTransferMethodIngress
+		}
+		if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+			StorageDataSetID: binding.ID,
+			CopyIndex:        copyIndex,
+			TransferMethod:   transferMethod,
+			ProviderID:       providerID,
+		}}); err != nil {
+			t.Fatalf("create upload copy %d: %v", copyIndex, err)
+		}
+		testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+			ContentID:    upload.ID,
+			CopyIndex:    copyIndex,
+			PieceCID:     pieceCID,
+			PieceID:      pieceID,
+			RetrievalURL: retrievalURL,
+		})
 	}
-	providerID := onChainID(t, "101")
-	dataSetID := onChainID(t, fmt.Sprintf("1001%d", upload.ID))
-	pieceID := onChainIDPtr(t, "1")
-	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          version.BucketID,
-		ProviderID:        providerID,
-		CopyIndex:         0,
-		CreatedByUploadID: upload.ID,
-	})
-	if err != nil {
-		t.Fatalf("ensure dataset binding: %v", err)
-	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, UploadID: upload.ID, DataSetID: dataSetID}); err != nil {
-		t.Fatalf("mark dataset ready: %v", err)
-	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
-		StorageDataSetID: binding.ID,
-		CopyIndex:        0,
-		TransferMethod:   model.StorageCopyTransferMethodIngress,
-		ProviderID:       providerID,
-	}}); err != nil {
-		t.Fatalf("create upload copy: %v", err)
-	}
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     upload.ID,
-		CopyIndex:    0,
-		PieceCID:     pieceCID,
-		PieceID:      pieceID,
-		RetrievalURL: retrievalURL,
-	}); err != nil {
-		t.Fatalf("mark upload copy committed: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    version.BucketID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
+	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		ContentID: upload.ID,
+		BucketID:  version.BucketID,
 	}); err != nil {
 		t.Fatalf("bind readable upload: %v", err)
 	}
-	if finalized, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
+	if finalized, _, err := repos.Contents.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{ContentID: upload.ID}); err != nil {
 		t.Fatalf("finalize upload: %v", err)
 	} else if !finalized {
 		t.Fatal("finalize upload = false, want true")
@@ -507,110 +548,82 @@ func acceptAdminVersionUpload(t *testing.T, repos *repository.Repositories, vers
 	return upload
 }
 
-func bindAdminPartialUpload(t *testing.T, repos *repository.Repositories, versionID string) *model.StorageUpload {
+func bindAdminPartialUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string) *model.StorageContent {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
 		t.Fatalf("get version for partial upload: version=%v err=%v", version, err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("partial uploading: %v", err)
+	upload := adminContentForVersion(t, repos, version)
+	primary := adminSlotBinding(t, repos, version.BucketID, 0, "101", upload.ID)
+	secondary := adminSlotBinding(t, repos, version.BucketID, 1, "202", upload.ID)
+	if primary.DataSetID == nil {
+		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+			t.Fatalf("primary dataset ready: %v", err)
+		}
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
-		t.Fatalf("partial committing: %v", err)
+	if secondary.DataSetID == nil {
+		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
+			t.Fatalf("secondary dataset ready: %v", err)
+		}
 	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 2,
-	})
-	if err != nil {
-		t.Fatalf("start partial upload attempt: %v", err)
-	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
-	if err != nil {
-		t.Fatalf("primary binding: %v", err)
-	}
-	secondary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "202"), CopyIndex: 1, CreatedByUploadID: upload.ID})
-	if err != nil {
-		t.Fatalf("secondary binding: %v", err)
-	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
-		t.Fatalf("primary dataset ready: %v", err)
-	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
-		t.Fatalf("secondary dataset ready: %v", err)
-	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
-		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
-		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "202")},
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: primary.ProviderID},
+		{StorageDataSetID: secondary.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: secondary.ProviderID},
 	}); err != nil {
 		t.Fatalf("create upload copies: %v", err)
 	}
 	pieceCID := "piece-partial-" + versionID
-	if err := repos.Uploads.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
-		UploadID:     upload.ID,
+	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     pieceCID,
 		PieceID:      onChainIDPtr(t, "301"),
 		RetrievalURL: "https://primary.example/piece/" + versionID,
-	}); err != nil {
-		t.Fatalf("primary committed: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    version.BucketID,
-		ContentSize: version.Size,
-		Checksum:    version.Checksum,
+	})
+	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		ContentID: upload.ID,
+		BucketID:  version.BucketID,
 	}); err != nil {
 		t.Fatalf("bind primary committed upload: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 1, LastError: "secondary pull: timeout"}); err != nil {
+	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{ContentID: upload.ID, CopyIndex: 1, LastError: "secondary pull: timeout"}); err != nil {
 		t.Fatalf("mark secondary failed: %v", err)
 	}
 	return upload
 }
 
-func markAdminStoredOnPrimaryUpload(t *testing.T, repos *repository.Repositories, versionID string) *model.StorageUpload {
+func markAdminStoredOnPrimaryUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string) *model.StorageContent {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
 		t.Fatalf("get version for stored-on-primary upload: version=%v err=%v", version, err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("stored-on-primary uploading: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateUploading, model.ObjectStateCommitting); err != nil {
-		t.Fatalf("stored-on-primary committing: %v", err)
-	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
+	upload, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
 		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
 		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
+		Checksum:        testutil.StorageChecksum("checksum-" + version.VersionID),
 		RequestedCopies: 3,
 	})
 	if err != nil {
 		t.Fatalf("start stored-on-primary upload attempt: %v", err)
 	}
-	primary, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByUploadID: upload.ID})
+	primary, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{BucketID: version.BucketID, ProviderID: onChainID(t, "101"), CopyIndex: 0, CreatedByContentID: upload.ID})
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	if err := repos.Uploads.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, UploadID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("primary dataset ready: %v", err)
 	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{
 		{StorageDataSetID: primary.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101")},
 	}); err != nil {
 		t.Fatalf("create upload copy: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
-		UploadID:     upload.ID,
+	if err := repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		ContentID:    upload.ID,
 		CopyIndex:    0,
 		PieceCID:     "piece-primary-" + versionID,
 		RetrievalURL: "https://primary.example/piece/" + versionID,
@@ -620,36 +633,24 @@ func markAdminStoredOnPrimaryUpload(t *testing.T, repos *repository.Repositories
 	return upload
 }
 
-func markAdminFailedUpload(t *testing.T, repos *repository.Repositories, versionID string, message string) *model.StorageUpload {
+func markAdminFailedUpload(t *testing.T, db *bun.DB, repos *repository.Repositories, versionID string, message string) *model.StorageContent {
 	t.Helper()
 	ctx := context.Background()
 	version, err := repos.Objects.GetVersionByID(ctx, versionID)
 	if err != nil || version == nil {
 		t.Fatalf("get version for failed upload: version=%v err=%v", version, err)
 	}
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("failed upload state: %v", err)
-	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        version.BucketID,
-		SourceVersionID: version.VersionID,
-		ContentSize:     version.Size,
-		Checksum:        version.Checksum,
-		RequestedCopies: 3,
-	})
-	if err != nil {
-		t.Fatalf("start failed upload attempt: %v", err)
-	}
-	binding, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          version.BucketID,
-		ProviderID:        onChainID(t, "101"),
-		CopyIndex:         0,
-		CreatedByUploadID: upload.ID,
+	upload := adminContentForVersion(t, repos, version)
+	binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:           version.BucketID,
+		ProviderID:         onChainID(t, "101"),
+		CopyIndex:          0,
+		CreatedByContentID: upload.ID,
 	})
 	if err != nil {
 		t.Fatalf("ensure failed upload dataset: %v", err)
 	}
-	if err := repos.Uploads.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
 		StorageDataSetID: binding.ID,
 		CopyIndex:        0,
 		TransferMethod:   model.StorageCopyTransferMethodIngress,
@@ -657,8 +658,13 @@ func markAdminFailedUpload(t *testing.T, repos *repository.Repositories, version
 	}}); err != nil {
 		t.Fatalf("create failed upload copy: %v", err)
 	}
-	if err := repos.Uploads.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{UploadID: upload.ID, CopyIndex: 0, LastError: message}); err != nil {
+	if err := repos.Contents.MarkUploadCopyFailed(ctx, repository.MarkUploadCopyFailedInput{ContentID: upload.ID, CopyIndex: 0, LastError: message}); err != nil {
 		t.Fatalf("mark failed upload copy: %v", err)
+	}
+	// Ingest failure is reported to operators from the content, so the copy
+	// error is recorded there too, the way the pipeline does it.
+	if err := repos.Contents.RecordContentFailure(ctx, upload.ID, message); err != nil {
+		t.Fatalf("record content failure: %v", err)
 	}
 	return upload
 }
@@ -666,13 +672,22 @@ func markAdminFailedUpload(t *testing.T, repos *repository.Repositories, version
 func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repositories, bucketName, key, body string) *cache.ObjectInfo {
 	t.Helper()
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: bucketName, Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: bucketName, Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 	versionID := model.NewVersionID()
-	cacheKey := ".versions/" + versionID
-	info, err := srv.cache.Put(ctx, bucket.Name, cacheKey, strings.NewReader(body))
+	sum := sha256.Sum256([]byte(body))
+	content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     int64(len(body)),
+		Checksum:        hex.EncodeToString(sum[:]),
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("Contents.EnsureContent: %v", err)
+	}
+	info, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(content.ID), strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("cache.Put: %v", err)
 	}
@@ -680,12 +695,10 @@ func seedCachedDownloadObject(t *testing.T, srv *Server, repos *repository.Repos
 		VersionID:   versionID,
 		BucketID:    bucket.ID,
 		Key:         key,
+		ContentID:   &content.ID,
 		Size:        info.Size,
 		ETag:        info.ETag,
-		Checksum:    info.Checksum,
 		ContentType: "text/plain",
-		CacheKey:    cacheKey,
-		State:       model.ObjectStateCached,
 	}); err != nil {
 		t.Fatalf("Objects.CreateVersionAndSetCurrent: %v", err)
 	}
@@ -757,8 +770,12 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if bucket == nil {
 		t.Fatal("expected bucket to be created")
 	}
-	if bucket.Status != model.BucketStatusActive {
-		t.Fatalf("bucket status = %s, want %s", bucket.Status, model.BucketStatusActive)
+	if bucket.Status != model.BucketStatusProvisioning {
+		t.Fatalf("bucket status = %s, want %s", bucket.Status, model.BucketStatusProvisioning)
+	}
+	provisionTask, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
+	if err != nil || provisionTask == nil || provisionTask.Status != model.TaskStatusPending {
+		t.Fatalf("bucket provision task = %#v, err=%v", provisionTask, err)
 	}
 	acl, err := auth.ParseACL(bucket.ACL)
 	if err != nil {
@@ -767,20 +784,18 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if acl.Owner != "owner-access" {
 		t.Fatalf("owner = %q, want owner-access", acl.Owner)
 	}
-	if bucket.DefaultCopies == nil || *bucket.DefaultCopies != 4 {
+	if bucket.DefaultCopies != 4 {
 		t.Fatalf("bucket default_copies = %v, want 4", bucket.DefaultCopies)
 	}
-	if bucket.MinimumDurableCopies == nil || *bucket.MinimumDurableCopies != 2 {
+	if bucket.MinimumDurableCopies != 2 {
 		t.Fatalf("bucket minimum_durable_copies = %v, want 2", bucket.MinimumDurableCopies)
 	}
 
 	var body struct {
-		Name            string  `json:"name"`
-		OwnerAccessKey  *string `json:"owner_access_key"`
-		DefaultCopies   *int    `json:"default_copies"`
-		EffectiveCopies int     `json:"effective_copies"`
-		MinimumCopies   *int    `json:"minimum_durable_copies"`
-		EffectiveMin    int     `json:"effective_minimum_durable_copies"`
+		Name           string  `json:"name"`
+		OwnerAccessKey *string `json:"owner_access_key"`
+		DefaultCopies  int     `json:"default_copies"`
+		MinimumCopies  int     `json:"minimum_durable_copies"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode response: %v", err)
@@ -788,11 +803,11 @@ func TestHandleAPIBuckets_CreateBucket(t *testing.T) {
 	if body.OwnerAccessKey == nil || *body.OwnerAccessKey != "owner-access" {
 		t.Fatalf("owner_access_key = %v, want owner-access", body.OwnerAccessKey)
 	}
-	if body.DefaultCopies == nil || *body.DefaultCopies != 4 || body.EffectiveCopies != 4 {
-		t.Fatalf("copy policy response = default:%v effective:%d, want 4/4", body.DefaultCopies, body.EffectiveCopies)
+	if body.DefaultCopies != 4 {
+		t.Fatalf("copy policy response = %d, want 4", body.DefaultCopies)
 	}
-	if body.MinimumCopies == nil || *body.MinimumCopies != 2 || body.EffectiveMin != 2 {
-		t.Fatalf("minimum copy policy response = minimum:%v effective:%d, want 2/2", body.MinimumCopies, body.EffectiveMin)
+	if body.MinimumCopies != 2 {
+		t.Fatalf("minimum copy policy response = %d, want 2", body.MinimumCopies)
 	}
 }
 
@@ -913,11 +928,95 @@ func TestHandleAPIBuckets_CreateBucketRejectsMinimumAboveTarget(t *testing.T) {
 	}
 }
 
+func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "objects-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "kept.txt", 4, "etag-kept", "checksum-kept", "text/plain", model.ObjectStateCached)
+	acceptAdminVersionUpload(t, srv.db, repos, versionID, "piece-kept", "https://provider.example/kept")
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/objects-bucket/objects")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body struct {
+		Objects []struct {
+			Key              string         `json:"key"`
+			CurrentVersionID string         `json:"current_version_id"`
+			State            string         `json:"state"`
+			Status           string         `json:"status"`
+			Location         objectLocation `json:"location"`
+		} `json:"objects"`
+		Folders []objectFolderItem `json:"folders"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Objects) != 1 {
+		t.Fatalf("objects len = %d, want 1", len(body.Objects))
+	}
+	if body.Objects[0].Key != "kept.txt" {
+		t.Fatalf("key = %q, want %q", body.Objects[0].Key, "kept.txt")
+	}
+	if body.Objects[0].CurrentVersionID == "" {
+		t.Fatal("expected current version id")
+	}
+	if body.Objects[0].Status != "success" {
+		t.Fatalf("status = %q, want success", body.Objects[0].Status)
+	}
+	if body.Objects[0].State != string(model.ObjectStateStored) {
+		t.Fatalf("state = %q, want stored", body.Objects[0].State)
+	}
+	if !body.Objects[0].Location.Cache || !body.Objects[0].Location.Filecoin {
+		t.Fatalf("location = %#v, want cache and filecoin", body.Objects[0].Location)
+	}
+	if len(body.Folders) != 0 {
+		t.Fatalf("folders len = %d, want 0 for flat object list", len(body.Folders))
+	}
+	if body.Folders == nil {
+		t.Fatal("folders should be an empty array, not null")
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/objects-bucket/objects")
+	if err != nil {
+		t.Fatalf("GET bucket objects raw: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var raw struct {
+		Objects []map[string]any `json:"objects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("Decode raw: %v", err)
+	}
+	if raw.Objects[0]["state"] != string(model.ObjectStateStored) {
+		t.Fatalf("object list state = %#v, want stored", raw.Objects[0]["state"])
+	}
+	if _, ok := raw.Objects[0]["storage"]; ok {
+		t.Fatal("object list exposed storage instead of location")
+	}
+	if _, ok := raw.Objects[0]["attention"]; ok {
+		t.Fatal("object list exposed attention")
+	}
+}
+
 func TestAPIBucketDetail(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "detail-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "detail-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -929,7 +1028,7 @@ func TestAPIBucketDetail(t *testing.T) {
 		{key: "a.txt", size: 5},
 		{key: "b.txt", size: 7},
 	} {
-		seedAdminObjectVersion(t, repos, bucket, tc.key, tc.size, tc.key, tc.key, "text/plain", "", model.ObjectStateCached)
+		seedAdminObjectVersion(t, srv.db, repos, bucket, tc.key, tc.size, tc.key, tc.key, "text/plain", model.ObjectStateCached)
 	}
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -991,26 +1090,17 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	srv.WithProviderIdentityResolver(identityResolver)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "detail-datasets-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "detail-datasets-bucket", Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: "01J000000000000000DATASET1",
-		ContentSize:     1,
-		Checksum:        "checksum-dataset-detail",
-		RequestedCopies: 3,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
+	upload := insertAdminStorageContentSnapshot(t, srv.db, bucket.ID, "01J000000000000000DATASET1", 1, "checksum-dataset-detail", 3)
 	pieceCID := "bafk2bzacedatasetdetail"
-	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{
+	seedAdminCommittedCopies(t, srv.db, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{
 		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
 		{ProviderID: onChainID(t, "202"), DataSetID: onChainID(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://provider.example/2"},
 	})
-	summaries, err := repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+	summaries, err := repos.Contents.ListDataSetSummaries(ctx, bucket.ID)
 	if err != nil {
 		t.Fatalf("ListDataSetSummaries: %v", err)
 	}
@@ -1112,21 +1202,12 @@ func TestAPIBucketDetail_DataSetStorageHealthQueryFailureReturnsUnknownPlacehold
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "detail-datasets-storage-health-error", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "detail-datasets-storage-health-error", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: "01J000000000000000AVAILERR",
-		ContentSize:     1,
-		Checksum:        "checksum-dataset-storage-health-error",
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
-	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, "bafk2bzacestoragehealtherror", []adminStorageCopySeed{
+	upload := insertAdminStorageContentSnapshot(t, srv.db, bucket.ID, "01J000000000000000AVAILERR", 1, "checksum-dataset-storage-health-error", 1)
+	seedAdminCommittedCopies(t, srv.db, repos, bucket.ID, upload.ID, "bafk2bzacestoragehealtherror", []adminStorageCopySeed{
 		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/1"},
 	})
 	srv.WithObservability(observability.NewService(observability.ServiceOptions{
@@ -1207,26 +1288,18 @@ func TestAPIBucketsStorageHealthSummaryUsesRetainedVersionRisk(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "storage-health-summary-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-health-summary-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	seedAdminObjectVersion(t, repos, bucket, "stored.txt", 4, "etag-storage-health", "checksum-storage-health", "text/plain", "", model.ObjectStateStored)
-	unreferencedUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: "01J0000000000000000APISH0",
-		ContentSize:     1,
-		Checksum:        "checksum-unreferenced-storage-health",
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt unreferenced: %v", err)
-	}
-	if _, err := repos.Uploads.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
-		BucketID:          bucket.ID,
-		ProviderID:        onChainID(t, "202"),
-		CopyIndex:         1,
-		CreatedByUploadID: unreferencedUpload.ID,
+	testutil.OpenBucketReplicaSlots(t, srv.db, bucket.ID, 2)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "stored.txt", 4, "etag-storage-health", "checksum-storage-health", "text/plain", model.ObjectStateStored)
+	unreferencedUpload := insertAdminStorageContentSnapshot(t, srv.db, bucket.ID, "01J0000000000000000APISH0", 1, "checksum-unreferenced-storage-health", 1)
+	if _, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID:           bucket.ID,
+		ProviderID:         onChainID(t, "202"),
+		CopyIndex:          1,
+		CreatedByContentID: unreferencedUpload.ID,
 	}); err != nil {
 		t.Fatalf("EnsureDataSetBinding unreferenced: %v", err)
 	}
@@ -1329,7 +1402,7 @@ func TestCopyHealthSummaryIgnoresExtraCopyRowsAfterRequestedCopiesMet(t *testing
 	checkedAt := time.Now().UTC()
 	staleCheckedAt := checkedAt.Add(-3 * time.Hour)
 	bucketID := int64(1)
-	uploadID := int64(10)
+	contentID := int64(10)
 	requestedCopies := 2
 	versionID := "01J0000000000000000COPYOK"
 	firstLocalDataSetID := int64(101)
@@ -1347,8 +1420,8 @@ func TestCopyHealthSummaryIgnoresExtraCopyRowsAfterRequestedCopiesMet(t *testing
 	firstRetrievalURL := "https://provider.example/one"
 	secondRetrievalURL := "https://provider.example/two"
 	staleRetrievalURL := "https://provider.example/stale"
-	failedStatus := model.StorageUploadCopyStatusFailed
-	committedStatus := model.StorageUploadCopyStatusCommitted
+	failedStatus := model.StorageCopyStatusFailed
+	committedStatus := model.StorageCopyStatusCommitted
 	failedCopyIndex := 2
 	staleCopyIndex := 3
 	firstCopyIndex := 0
@@ -1358,7 +1431,7 @@ func TestCopyHealthSummaryIgnoresExtraCopyRowsAfterRequestedCopiesMet(t *testing
 		{
 			BucketID:        bucketID,
 			VersionID:       versionID,
-			UploadID:        &uploadID,
+			ContentID:       &contentID,
 			RequestedCopies: requestedCopies,
 			CopyIndex:       &firstCopyIndex,
 			CopyStatus:      &committedStatus,
@@ -1371,7 +1444,7 @@ func TestCopyHealthSummaryIgnoresExtraCopyRowsAfterRequestedCopiesMet(t *testing
 		{
 			BucketID:        bucketID,
 			VersionID:       versionID,
-			UploadID:        &uploadID,
+			ContentID:       &contentID,
 			RequestedCopies: requestedCopies,
 			CopyIndex:       &secondCopyIndex,
 			CopyStatus:      &committedStatus,
@@ -1384,7 +1457,7 @@ func TestCopyHealthSummaryIgnoresExtraCopyRowsAfterRequestedCopiesMet(t *testing
 		{
 			BucketID:        bucketID,
 			VersionID:       versionID,
-			UploadID:        &uploadID,
+			ContentID:       &contentID,
 			RequestedCopies: requestedCopies,
 			CopyIndex:       &failedCopyIndex,
 			CopyStatus:      &failedStatus,
@@ -1392,7 +1465,7 @@ func TestCopyHealthSummaryIgnoresExtraCopyRowsAfterRequestedCopiesMet(t *testing
 		{
 			BucketID:        bucketID,
 			VersionID:       versionID,
-			UploadID:        &uploadID,
+			ContentID:       &contentID,
 			RequestedCopies: requestedCopies,
 			CopyIndex:       &staleCopyIndex,
 			CopyStatus:      &committedStatus,
@@ -1426,7 +1499,7 @@ func TestCopyHealthSummaryIgnoresExtraCopyRowsAfterRequestedCopiesMet(t *testing
 
 func TestCopyHealthSummaryTreatsUnobservedCommittedCopyAsNotVerified(t *testing.T) {
 	bucketID := int64(1)
-	uploadID := int64(10)
+	contentID := int64(10)
 	requestedCopies := 1
 	versionID := "01J0000000000000000COPYNV"
 	localDataSetID := int64(101)
@@ -1435,12 +1508,12 @@ func TestCopyHealthSummaryTreatsUnobservedCommittedCopyAsNotVerified(t *testing.
 	pieceID := idtypes.NewOnChainID(3001)
 	retrievalURL := "https://provider.example/unverified"
 	copyIndex := 0
-	committedStatus := model.StorageUploadCopyStatusCommitted
+	committedStatus := model.StorageCopyStatusCommitted
 
 	summaries := copyHealthSummariesByBucket([]copyHealthFact{{
 		BucketID:        bucketID,
 		VersionID:       versionID,
-		UploadID:        &uploadID,
+		ContentID:       &contentID,
 		RequestedCopies: requestedCopies,
 		CopyIndex:       &copyIndex,
 		CopyStatus:      &committedStatus,
@@ -1464,79 +1537,15 @@ func TestCopyHealthSummaryTreatsUnobservedCommittedCopyAsNotVerified(t *testing.
 	}
 }
 
-func TestCopyHealthSummaryClassifiesUploadGapsBySeverity(t *testing.T) {
-	bucketID := int64(1)
-	baseUploadID := int64(10)
-	requestedCopies := 3
-
-	tests := []struct {
-		name         string
-		uploadStatus model.StorageUploadStatus
-		wantStatus   observability.Status
-		wantPending  int
-		wantFailed   int
-		wantUnknown  int
-		wantReason   observability.ReasonCode
-	}{
-		{
-			name:         "running upload gaps are pending",
-			uploadStatus: model.StorageUploadStatusRunning,
-			wantStatus:   observability.StatusDegraded,
-			wantPending:  requestedCopies,
-			wantReason:   observability.ReasonCopyPending,
-		},
-		{
-			name:         "failed upload gaps are unavailable",
-			uploadStatus: model.StorageUploadStatusFailed,
-			wantStatus:   observability.StatusUnavailable,
-			wantFailed:   requestedCopies,
-			wantReason:   observability.ReasonCopyFailed,
-		},
-		{
-			name:         "complete upload gaps are unknown",
-			uploadStatus: model.StorageUploadStatusComplete,
-			wantStatus:   observability.StatusUnknown,
-			wantUnknown:  requestedCopies,
-			wantReason:   observability.ReasonCopyObservationMissing,
-		},
-	}
-
-	for i, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			uploadID := baseUploadID + int64(i)
-			summaries := copyHealthSummariesByBucket([]copyHealthFact{{
-				BucketID:        bucketID,
-				VersionID:       fmt.Sprintf("01J0000000000000000GAP%03d", i),
-				UploadID:        &uploadID,
-				UploadStatus:    &tt.uploadStatus,
-				RequestedCopies: requestedCopies,
-			}}, nil, false, time.Hour)
-
-			health := summaries[bucketID]
-			if health.Status != string(tt.wantStatus) ||
-				health.TotalObjects != 1 ||
-				health.UnhealthyObjects != 1 ||
-				health.RequestedCopies != requestedCopies ||
-				health.PendingCopies != tt.wantPending ||
-				health.FailedCopies != tt.wantFailed ||
-				health.UnknownCopies != tt.wantUnknown ||
-				!hasReason(health.ReasonCodes, observability.ReasonCopyUnderReplicated) ||
-				!hasReason(health.ReasonCodes, tt.wantReason) {
-				t.Fatalf("copy_health = %#v, want %s gaps classified by upload status", health, tt.wantStatus)
-			}
-		})
-	}
-}
-
 func TestAPIBucketsCopyHealthObservabilityFailureReturnsUnknown(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "copy-health-observability-error", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "copy-health-observability-error", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 1, "etag-copy-health-error", "checksum-copy-health-error", "text/plain", "", model.ObjectStateStored)
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 1, "etag-copy-health-error", "checksum-copy-health-error", "text/plain", model.ObjectStateStored)
 	srv.WithObservability(observability.NewService(observability.ServiceOptions{
 		Store: &bucketStorageHealthErrorStore{err: errors.New("database password leaked copy health")},
 	}))
@@ -1576,11 +1585,11 @@ func TestAPIBucketObjectProvenanceUsesStoredCopyHealthObservations(t *testing.T)
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "stored-copy-health-observation", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "stored-copy-health-observation", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 1, "etag-stored-copy-health", "checksum-stored-copy-health", "text/plain", "", model.ObjectStateStored)
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 1, "etag-stored-copy-health", "checksum-stored-copy-health", "text/plain", model.ObjectStateStored)
 	replaceBucketDataSetObservability(t, repos, bucket.ID, observability.StatusAvailable, nil, time.Now().UTC())
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -1620,11 +1629,11 @@ func TestAPIBucketsStorageHealthSummaryFailureReturnsUnknown(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "storage-health-summary-error", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-health-summary-error", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	repos.Uploads = failingBucketStorageHealthUploadRepo{StorageUploadRepository: repos.Uploads}
+	repos.Contents = failingBucketStorageHealthUploadRepo{StorageContentRepository: repos.Contents}
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -1683,11 +1692,11 @@ func TestAPIBucketsStorageHealthNoUploadObjectHasNoDataRisk(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "storage-health-no-upload", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-health-no-upload", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "cached.txt", 1, "etag-no-upload-health", "checksum-no-upload-health", "text/plain", "", model.ObjectStateCached)
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "cached.txt", 1, "etag-no-upload-health", "checksum-no-upload-health", "text/plain", model.ObjectStateCached)
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -1740,127 +1749,1504 @@ func TestAPIBucketsStorageHealthNoUploadObjectHasNoDataRisk(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&provenanceBody); err != nil {
 		t.Fatalf("Decode provenance: %v", err)
 	}
+	// A data version always has content now, so the object is under-replicated
+	// against that content's target rather than having no durability target.
 	if provenanceBody.CopyHealth.Status != string(observability.StatusUnknown) ||
 		provenanceBody.CopyHealth.TotalObjects != 1 ||
 		provenanceBody.CopyHealth.UnhealthyObjects != 1 ||
-		provenanceBody.CopyHealth.RequestedCopies != 0 ||
-		provenanceBody.CopyHealth.UnknownCopies != 0 ||
+		provenanceBody.CopyHealth.RequestedCopies != 1 ||
+		provenanceBody.CopyHealth.ReadableCopies != 0 ||
 		!hasReason(provenanceBody.CopyHealth.ReasonCodes, observability.ReasonCopyObservationMissing) {
-		t.Fatalf("provenance copy_health = %#v, want no-upload object marked unknown without virtual copies", provenanceBody.CopyHealth)
+		t.Fatalf("provenance copy_health = %#v, want an un-ingested object marked unknown against its content target", provenanceBody.CopyHealth)
+	}
+}
+
+func TestBucketStorageHealthAffectedVersionsResponseDeduplicatesProviderLookups(t *testing.T) {
+	providerID := onChainID(t, "501")
+	identityResolver := &fakeAPIProviderIdentityResolver{
+		identities: map[string]*providerIdentityResponse{
+			"501": {RegistryProviderID: "501", Name: "risk-pdp"},
+		},
+	}
+	srv := &Server{providerIdentity: identityResolver}
+	createdAt := time.Date(2026, 5, 23, 12, 30, 0, 123456789, time.UTC)
+	status := observability.StatusUnavailable
+
+	resp := srv.bucketStorageHealthAffectedVersionsResponse(repository.BucketStorageHealthAffectedVersionPage{
+		Versions: []repository.BucketStorageHealthAffectedVersion{{
+			Version: model.ObjectVersion{
+				VersionID: "01J000000000000000APIR99",
+				Key:       "docs/current.txt",
+				CreatedAt: createdAt,
+				UpdatedAt: createdAt,
+			},
+			RiskDataSets: []repository.BucketStorageHealthRiskDataSet{
+				{LocalDataSetID: 1, ProviderID: providerID, LocalStatus: model.StorageDataSetStatusReady, ObservationStatus: &status},
+				{LocalDataSetID: 2, ProviderID: providerID, LocalStatus: model.StorageDataSetStatusReady, ObservationStatus: &status},
+			},
+		}},
+	}, createdAt.Add(-time.Hour))
+
+	if got, want := identityResolver.requests, [][]string{{"501"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider identity requests = %#v, want %#v", got, want)
+	}
+	if len(resp.Versions) != 1 || len(resp.Versions[0].RiskDataSets) != 2 {
+		t.Fatalf("response risk datasets = %#v, want two datasets", resp.Versions)
+	}
+	for _, dataSet := range resp.Versions[0].RiskDataSets {
+		if dataSet.ProviderIdentity == nil || dataSet.ProviderIdentity.Name != "risk-pdp" {
+			t.Fatalf("provider identity = %#v, want reused identity", dataSet.ProviderIdentity)
+		}
+	}
+}
+
+func TestBucketStorageHealthSummaryFromRepositoryFormatsLastCheckedAtUTC(t *testing.T) {
+	checkedAt := time.Date(2026, 5, 23, 20, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	got := bucketStorageHealthSummaryFromRepository(repository.BucketStorageHealthSummary{
+		BucketID:               1,
+		ReasonCodes:            []observability.ReasonCode{},
+		AffectedVersionsCap:    200,
+		AffectedVersionsCapped: 0,
+		LastCheckedAt:          &checkedAt,
+	})
+	if got.LastCheckedAt != "2026-05-23T12:00:00Z" {
+		t.Fatalf("last_checked_at = %q, want UTC RFC3339", got.LastCheckedAt)
+	}
+}
+
+func TestAPIBucketsCopyHealthObservabilityFailurePreservesLocalCopyStatus(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	partialCopies := 2
+	bucket := &model.Bucket{Name: "copy-health-observability-local-status", Status: model.BucketStatusActive, DefaultCopies: partialCopies, MinimumDurableCopies: partialCopies}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "partial.txt", 1, "etag-copy-health-local-status", "checksum-copy-health-local-status", "text/plain", model.ObjectStateCached)
+	bindAdminPartialUpload(t, srv.db, repos, versionID)
+	srv.WithObservability(observability.NewService(observability.ServiceOptions{
+		Store: &bucketStorageHealthErrorStore{err: errors.New("database password leaked copy health")},
+	}))
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/objects/provenance?version_id=" + url.QueryEscape(versionID))
+	if err != nil {
+		t.Fatalf("GET provenance: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var body struct {
+		CopyHealth apiCopyHealthBody `json:"copy_health"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.CopyHealth.Status != string(observability.StatusUnavailable) ||
+		body.CopyHealth.FailedCopies != 1 ||
+		body.CopyHealth.UnknownCopies != 1 ||
+		body.CopyHealth.PendingCopies != 0 ||
+		body.CopyHealth.LastError != "copy health query failed" ||
+		!hasReason(body.CopyHealth.ReasonCodes, observability.ReasonCopyFailed) {
+		t.Fatalf("copy_health = %#v, want failed local copy preserved with committed copy unknown", body.CopyHealth)
+	}
+}
+
+func replaceBucketDataSetObservability(t *testing.T, repos *repository.Repositories, bucketID int64, status observability.Status, reasons []observability.ReasonCode, checkedAt time.Time) {
+	t.Helper()
+	summaries, err := repos.Contents.ListDataSetSummaries(context.Background(), bucketID)
+	if err != nil {
+		t.Fatalf("ListDataSetSummaries: %v", err)
+	}
+	states := make([]observability.DataSetState, 0, len(summaries))
+	for _, summary := range summaries {
+		states = append(states, observability.DataSetState{
+			LocalDataSetID:  summary.ID,
+			BucketID:        summary.BucketID,
+			BucketName:      summary.BucketName,
+			CopyIndex:       summary.CopyIndex,
+			ProviderID:      summary.ProviderID,
+			ChainDataSetID:  summary.DataSetID,
+			ClientDataSetID: summary.ClientDataSetID,
+			LocalStatus:     summary.Status,
+			Status:          status,
+			ReasonCodes:     reasons,
+			LastCheckedAt:   checkedAt,
+			Evidence:        map[string]any{},
+		})
+	}
+	if err := repos.Observability.ReplaceDataSetStates(context.Background(), checkedAt, states); err != nil {
+		t.Fatalf("ReplaceDataSetStates: %v", err)
+	}
+}
+
+func copyHealthDataSetObservationForTest(localID int64, checkedAt time.Time) observability.DataSetObservation {
+	return observability.DataSetObservationFromState(observability.DataSetState{
+		LocalDataSetID: localID,
+		Status:         observability.StatusAvailable,
+		LastCheckedAt:  checkedAt,
+	}, time.Hour, checkedAt)
+}
+
+func assertUnavailableBucketStorageHealth(t *testing.T, health apiBucketStorageHealthBody, wantReason observability.ReasonCode) {
+	t.Helper()
+	if health.Status != string(observability.StatusUnavailable) ||
+		health.AbnormalDataSets != 2 ||
+		health.AffectedVersionsCapped != 1 ||
+		health.AffectedVersionsCap != 200 ||
+		health.AffectedVersionsExceedsCap ||
+		!hasReason(health.ReasonCodes, wantReason) ||
+		hasReason(health.ReasonCodes, observability.ReasonChainDataSetInactive) {
+		t.Fatalf("storage_health = %#v, want unavailable storage source risk from one retained version", health)
+	}
+}
+
+func assertNoLegacyBucketStorageHealthFields(t *testing.T, raw map[string]any) {
+	t.Helper()
+	health, ok := raw["storage_health"].(map[string]any)
+	if !ok {
+		t.Fatalf("storage_health missing or wrong shape: %#v", raw["storage_health"])
+	}
+	for _, field := range []string{
+		"affected_data_sets",
+		"affected_objects",
+		"objects_with_readable_copy",
+		"objects_without_readable_copy",
+		"unavailable_objects",
+		"unknown_objects",
+	} {
+		if _, ok := health[field]; ok {
+			t.Fatalf("storage_health includes legacy field %q: %#v", field, health)
+		}
+	}
+}
+
+func hasReason(reasons []observability.ReasonCode, want observability.ReasonCode) bool {
+	return slices.Contains(reasons, want)
+}
+
+type bucketStorageHealthErrorStore struct {
+	err error
+}
+
+func (s *bucketStorageHealthErrorStore) ReplaceProviderStates(context.Context, time.Time, []observability.ProviderState) error {
+	return nil
+}
+
+func (s *bucketStorageHealthErrorStore) ListProviderStates(context.Context, observability.ListOptions) (observability.ProviderStatePage, error) {
+	return observability.ProviderStatePage{}, nil
+}
+
+func (s *bucketStorageHealthErrorStore) ReplaceDataSetStates(context.Context, time.Time, []observability.DataSetState) error {
+	return nil
+}
+
+func (s *bucketStorageHealthErrorStore) ListDataSetStates(context.Context, observability.ListOptions) (observability.DataSetStatePage, error) {
+	return observability.DataSetStatePage{}, nil
+}
+
+func (s *bucketStorageHealthErrorStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
+	return nil, s.err
+}
+
+func TestAPIBuckets_ListAllBuckets(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	for _, bucket := range []*model.Bucket{
+		{Name: "alpha-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1},
+		{Name: "beta-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1},
+		{Name: "gamma-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1},
+	} {
+		if err := repos.Buckets.Create(ctx, bucket); err != nil {
+			t.Fatalf("Buckets.Create(%s): %v", bucket.Name, err)
+		}
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets")
+	if err != nil {
+		t.Fatalf("GET buckets: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+
+	got := make(map[string]string, len(body))
+	for _, item := range body {
+		got[item.Name] = item.Status
+	}
+
+	for _, name := range []string{"alpha-bucket", "beta-bucket", "gamma-bucket"} {
+		if got[name] != string(model.BucketStatusActive) {
+			t.Fatalf("%s status = %q, want %q", name, got[name], model.BucketStatusActive)
+		}
+	}
+}
+
+func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
+	ctx := context.Background()
+
+	ownedACL, err := json.Marshal(auth.ACL{Owner: "owner-access"})
+	if err != nil {
+		t.Fatalf("Marshal ACL: %v", err)
+	}
+	ownerAccess := "owner-access"
+	if err := repos.S3Accounts.Create(ctx, &model.S3Account{AccessKey: ownerAccess, SecretKey: "owner-secret", Role: auth.RoleUserPlus}); err != nil {
+		t.Fatalf("S3Accounts.Create: %v", err)
+	}
+	overrideCopies := 3
+	for _, bucket := range []*model.Bucket{
+		{Name: "owned-bucket", Status: model.BucketStatusActive, ACL: ownedACL, OwnerAccessKey: &ownerAccess, DefaultCopies: overrideCopies, MinimumDurableCopies: overrideCopies},
+		{Name: "unassigned-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1},
+	} {
+		if err := repos.Buckets.Create(ctx, bucket); err != nil {
+			t.Fatalf("Buckets.Create(%s): %v", bucket.Name, err)
+		}
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets")
+	if err != nil {
+		t.Fatalf("GET buckets: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var listBody []struct {
+		Name           string  `json:"name"`
+		OwnerAccessKey *string `json:"owner_access_key"`
+		DefaultCopies  int     `json:"default_copies"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listBody); err != nil {
+		t.Fatalf("Decode list: %v", err)
+	}
+	owners := make(map[string]*string, len(listBody))
+	copyPolicies := make(map[string]int, len(listBody))
+	for _, item := range listBody {
+		owners[item.Name] = item.OwnerAccessKey
+		copyPolicies[item.Name] = item.DefaultCopies
+	}
+	if owners["owned-bucket"] == nil || *owners["owned-bucket"] != "owner-access" {
+		t.Fatalf("owned-bucket owner = %v, want owner-access", owners["owned-bucket"])
+	}
+	if owners["unassigned-bucket"] != nil {
+		t.Fatalf("unassigned-bucket owner = %v, want nil", *owners["unassigned-bucket"])
+	}
+	if copyPolicies["owned-bucket"] != 3 {
+		t.Fatalf("owned bucket copy policy = %d, want 3", copyPolicies["owned-bucket"])
+	}
+	if copyPolicies["unassigned-bucket"] != 1 {
+		t.Fatalf("unassigned bucket copy policy = %d, want 1", copyPolicies["unassigned-bucket"])
+	}
+
+	detailResp, err := http.Get(ts.URL + "/api/v1/buckets/owned-bucket")
+	if err != nil {
+		t.Fatalf("GET bucket detail: %v", err)
+	}
+	defer func() { _ = detailResp.Body.Close() }()
+	if detailResp.StatusCode != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d", detailResp.StatusCode, http.StatusOK)
+	}
+	var detailBody struct {
+		OwnerAccessKey *string `json:"owner_access_key"`
+		DefaultCopies  int     `json:"default_copies"`
+	}
+	if err := json.NewDecoder(detailResp.Body).Decode(&detailBody); err != nil {
+		t.Fatalf("Decode detail: %v", err)
+	}
+	if detailBody.OwnerAccessKey == nil || *detailBody.OwnerAccessKey != "owner-access" {
+		t.Fatalf("detail owner = %v, want owner-access", detailBody.OwnerAccessKey)
+	}
+	if detailBody.DefaultCopies != 3 {
+		t.Fatalf("detail copy policy = %d, want 3", detailBody.DefaultCopies)
+	}
+}
+
+func TestAPIBucketCopyPolicy_UpdateAndClear(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "copy-policy-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	setReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader(`{"default_copies":5}`))
+	if err != nil {
+		t.Fatalf("NewRequest set: %v", err)
+	}
+	setReq.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(setReq)
+	setResp, err := http.DefaultClient.Do(setReq)
+	if err != nil {
+		t.Fatalf("PUT copy policy set: %v", err)
+	}
+	defer func() { _ = setResp.Body.Close() }()
+	if setResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(setResp.Body)
+		t.Fatalf("set status = %d, want %d body=%s", setResp.StatusCode, http.StatusOK, body)
+	}
+	var setBody struct {
+		Name          string `json:"name"`
+		DefaultCopies int    `json:"default_copies"`
+	}
+	if err := json.NewDecoder(setResp.Body).Decode(&setBody); err != nil {
+		t.Fatalf("Decode set response: %v", err)
+	}
+	if setBody.Name != bucket.Name || setBody.DefaultCopies != 5 {
+		t.Fatalf("set copy policy response = %#v, want target 5", setBody)
+	}
+
+	clearReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader("{\"default_copies\": \n null \t}"))
+	if err != nil {
+		t.Fatalf("NewRequest clear: %v", err)
+	}
+	clearReq.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(clearReq)
+	clearResp, err := http.DefaultClient.Do(clearReq)
+	if err != nil {
+		t.Fatalf("PUT copy policy clear: %v", err)
+	}
+	defer func() { _ = clearResp.Body.Close() }()
+	if clearResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(clearResp.Body)
+		t.Fatalf("clear status = %d, want %d body=%s", clearResp.StatusCode, http.StatusOK, body)
+	}
+	var clearBody struct {
+		DefaultCopies int `json:"default_copies"`
+	}
+	if err := json.NewDecoder(clearResp.Body).Decode(&clearBody); err != nil {
+		t.Fatalf("Decode clear response: %v", err)
+	}
+	// An explicit null resets the stored target to the configured default
+	// rather than parking the bucket on a null that has to be resolved later.
+	if clearBody.DefaultCopies != 5 {
+		t.Fatalf("clear copy policy response = %#v, want reset to the configured 5", clearBody)
+	}
+
+	// Reset resolves to a concrete number before it is stored, so a reset that
+	// would land below the bucket's target is a lowering like any other.
+	raiseReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader(`{"default_copies":7}`))
+	if err != nil {
+		t.Fatalf("NewRequest raise: %v", err)
+	}
+	raiseReq.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(raiseReq)
+	raiseResp, err := http.DefaultClient.Do(raiseReq)
+	if err != nil {
+		t.Fatalf("PUT copy policy raise: %v", err)
+	}
+	defer func() { _ = raiseResp.Body.Close() }()
+	if raiseResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(raiseResp.Body)
+		t.Fatalf("raise status = %d, want %d body=%s", raiseResp.StatusCode, http.StatusOK, body)
+	}
+
+	resetReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader(`{"default_copies":null}`))
+	if err != nil {
+		t.Fatalf("NewRequest reset: %v", err)
+	}
+	resetReq.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(resetReq)
+	resetResp, err := http.DefaultClient.Do(resetReq)
+	if err != nil {
+		t.Fatalf("PUT copy policy reset: %v", err)
+	}
+	defer func() { _ = resetResp.Body.Close() }()
+	if resetResp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resetResp.Body)
+		t.Fatalf("reset-below-target status = %d, want %d body=%s", resetResp.StatusCode, http.StatusBadRequest, body)
+	}
+	stored, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil || stored == nil || stored.DefaultCopies != 7 {
+		t.Fatalf("stored bucket after refused reset = %#v err=%v, want target still 7", stored, err)
+	}
+}
+
+func TestAPIBucketCopyPolicy_IndependentFieldsValidateFinalPolicyAndUseOneCoordinator(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "independent-copy-policy-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	update := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/independent-copy-policy-bucket/copy-policy", strings.NewReader(body))
+		req.SetPathValue("name", bucket.Name)
+		req.Header.Set("Content-Type", "application/json")
+		setBucketWriteHeaders(req)
+		rr := httptest.NewRecorder()
+		srv.handleAPIUpdateBucketCopyPolicy(rr, req)
+		return rr
+	}
+	assertStored := func(wantTarget, wantMinimum int) {
+		t.Helper()
+		got, err := repos.Buckets.GetByName(ctx, bucket.Name)
+		if err != nil || got == nil {
+			t.Fatalf("GetByName: bucket=%#v err=%v", got, err)
+		}
+		if got.DefaultCopies != wantTarget || got.MinimumDurableCopies != wantMinimum {
+			t.Fatalf("stored policy = target:%d minimum:%d, want target:%d minimum:%d", got.DefaultCopies, got.MinimumDurableCopies, wantTarget, wantMinimum)
+		}
+		assertActiveBucketReplicaSlots(t, ctx, repos, bucket.ID, wantTarget)
+	}
+
+	if rr := update(`{"default_copies":4,"minimum_durable_copies":2}`); rr.Code != http.StatusOK {
+		t.Fatalf("joint update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(4, 2)
+
+	if rr := update(`{"minimum_durable_copies":3}`); rr.Code != http.StatusOK {
+		t.Fatalf("minimum-only update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(4, 3)
+
+	if rr := update(`{"default_copies":6}`); rr.Code != http.StatusOK {
+		t.Fatalf("target-only update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(6, 3)
+
+	// Lowering is refused whole: neither the target nor the slots move.
+	if rr := update(`{"default_copies":3}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("target reduction status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertStored(6, 3)
+
+	if rr := update(`{"minimum_durable_copies":null}`); rr.Code != http.StatusOK {
+		t.Fatalf("clear minimum status = %d body=%s", rr.Code, rr.Body.String())
+	} else {
+		var response struct {
+			Minimum int `json:"minimum_durable_copies"`
+			Target  int `json:"default_copies"`
+		}
+		if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+			t.Fatalf("Decode clear minimum response: %v", err)
+		}
+		if response.Minimum != 6 || response.Target != 6 {
+			t.Fatalf("clear minimum response = %#v, want the target materialised as 6/6", response)
+		}
+	}
+	assertStored(6, 6)
+
+	page, err := repos.Tasks.List(ctx, repository.TaskListFilter{
+		Type:  model.TaskTypeCacheReconcileDurability,
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("List coordinator tasks: %v", err)
+	}
+	latestBucket, err := repos.Buckets.GetByID(ctx, bucket.ID)
+	if err != nil || latestBucket == nil {
+		t.Fatalf("GetByID: bucket=%#v err=%v", latestBucket, err)
+	}
+	if len(page.Tasks) != 4 || page.Tasks[0].SubjectType == nil || *page.Tasks[0].SubjectType != "bucket" ||
+		page.Tasks[0].SubjectKey == nil || *page.Tasks[0].SubjectKey != strconv.FormatInt(bucket.ID, 10) {
+		t.Fatalf("coordinator tasks=%#v, want four immutable policy generations", page.Tasks)
+	}
+	if latestBucket.DurabilityGeneration != 4 || latestBucket.DurabilityTaskID == nil || *latestBucket.DurabilityTaskID != page.Tasks[0].ID {
+		t.Fatalf("latest bucket fence = generation:%d task:%v, want generation 4 task %d", latestBucket.DurabilityGeneration, latestBucket.DurabilityTaskID, page.Tasks[0].ID)
+	}
+}
+
+func TestAPIBucketCopyPolicy_RejectsMinimumAboveReplicaTarget(t *testing.T) {
+	_, repos := newBucketAPITestServerWithRuntimeCopies(t, 2)
+	ctx := context.Background()
+	bucket := &model.Bucket{
+		Name: "clamped-copy-policy-bucket", Status: model.BucketStatusActive,
+		DefaultCopies: 2, MinimumDurableCopies: 2,
+	}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	// The policy is stored, so a minimum above the replica target is refused
+	// instead of being written and clamped on every read.
+	minimum := 5
+	if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+		Name: bucket.Name, SetMinimumDurableCopies: true, MinimumDurableCopies: &minimum,
+	}); !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("UpdateCopyPolicy minimum above target error = %v, want ErrInvalidInput", err)
+	}
+	stored, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil || stored == nil || stored.MinimumDurableCopies != 2 {
+		t.Fatalf("stored bucket = %#v err=%v, want unchanged minimum 2", stored, err)
+	}
+}
+
+func TestAPIBucketCopyPolicy_RejectsInvalidPayloads(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "invalid-copy-policy-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing field", body: `{}`},
+		{name: "unknown field", body: `{"default_copies":3,"extra":true}`},
+		{name: "string copies", body: `{"default_copies":"3"}`},
+		{name: "fractional copies", body: `{"default_copies":3.5}`},
+		{name: "zero copies", body: `{"default_copies":0}`},
+		{name: "too many copies", body: `{"default_copies":9}`},
+		{name: "zero minimum", body: `{"minimum_durable_copies":0}`},
+		{name: "too many minimum", body: `{"minimum_durable_copies":9}`},
+		{name: "minimum exceeds target", body: `{"default_copies":2,"minimum_durable_copies":3}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/invalid-copy-policy-bucket/copy-policy", strings.NewReader(tc.body))
+			req.SetPathValue("name", bucket.Name)
+			req.Header.Set("Content-Type", "application/json")
+			setBucketWriteHeaders(req)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIUpdateBucketCopyPolicy(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAPIBucketOwner_UpdateAssignsExistingS3User(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 4, "owner-access")
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "assign-owner-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/assign-owner-bucket/owner", strings.NewReader(`{"owner_access_key":"owner-access"}`))
+	req.SetPathValue("name", bucket.Name)
+	req.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUpdateBucketOwner(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	acl, err := auth.ParseACL(updated.ACL)
+	if err != nil {
+		t.Fatalf("ParseACL: %v", err)
+	}
+	if acl.Owner != "owner-access" {
+		t.Fatalf("owner = %q, want owner-access", acl.Owner)
+	}
+	var body struct {
+		OwnerAccessKey *string `json:"owner_access_key"`
+		DefaultCopies  int     `json:"default_copies"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode response: %v", err)
+	}
+	if body.OwnerAccessKey == nil || *body.OwnerAccessKey != "owner-access" {
+		t.Fatalf("response owner = %v, want owner-access", body.OwnerAccessKey)
+	}
+	if body.DefaultCopies != 1 {
+		t.Fatalf("owner update copy policy = %d, want the bucket's stored 1", body.DefaultCopies)
+	}
+}
+
+func TestAPIBucketOwner_UpdateAllowsInternalRootOwner(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
+	ctx := context.Background()
+	owner := "owner-access"
+	acl, err := json.Marshal(auth.ACL{Owner: owner})
+	if err != nil {
+		t.Fatalf("Marshal ACL: %v", err)
+	}
+	bucket := &model.Bucket{Name: "root-transfer-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: acl, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/root-transfer-bucket/owner", strings.NewReader(`{"owner_access_key":"`+internalRootOwnerAccessKey+`"}`))
+	req.SetPathValue("name", bucket.Name)
+	req.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUpdateBucketOwner(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	if updated.OwnerAccessKey == nil || *updated.OwnerAccessKey != srv.s3RootAccess {
+		t.Fatalf("stored owner = %v, want root access", updated.OwnerAccessKey)
+	}
+	updatedACL, err := auth.ParseACL(updated.ACL)
+	if err != nil {
+		t.Fatalf("ParseACL: %v", err)
+	}
+	if updatedACL.Owner != srv.s3RootAccess {
+		t.Fatalf("ACL owner = %q, want root access", updatedACL.Owner)
+	}
+	var body struct {
+		OwnerAccessKey *string `json:"owner_access_key"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode response: %v", err)
+	}
+	if body.OwnerAccessKey == nil || *body.OwnerAccessKey != internalRootOwnerAccessKey {
+		t.Fatalf("response owner = %v, want internal root token", body.OwnerAccessKey)
+	}
+}
+
+func TestAPIBucketOwner_UpdateRejectsUnknownS3User(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "unknown-owner-target", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/unknown-owner-target/owner", strings.NewReader(`{"owner_access_key":"missing-owner"}`))
+	req.SetPathValue("name", bucket.Name)
+	req.Header.Set("Content-Type", "application/json")
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIUpdateBucketOwner(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+}
+
+func TestAPIBucketOwner_UpdateRejectsMalformedStrictJSON(t *testing.T) {
+	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "strict-owner-target", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "unknown field", body: `{"owner_access_key":"owner-access","extra":true}`},
+		{name: "trailing object", body: `{"owner_access_key":"owner-access"} {}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/strict-owner-target/owner", strings.NewReader(tc.body))
+			req.SetPathValue("name", bucket.Name)
+			req.Header.Set("Content-Type", "application/json")
+			setBucketWriteHeaders(req)
+			rr := httptest.NewRecorder()
+
+			srv.handleAPIUpdateBucketOwner(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAPIBucketDetail_ActiveBucket(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "active-detail-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/active-detail-bucket")
+	if err != nil {
+		t.Fatalf("GET bucket detail: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body struct {
+		Name               string `json:"name"`
+		Status             string `json:"status"`
+		VersioningStatus   string `json:"versioning_status"`
+		VersioningEnforced bool   `json:"versioning_enforced"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.Name != bucket.Name {
+		t.Fatalf("name = %q, want %q", body.Name, bucket.Name)
+	}
+	if body.Status != string(model.BucketStatusActive) {
+		t.Fatalf("status = %q, want %q", body.Status, model.BucketStatusActive)
+	}
+	if body.VersioningStatus != "Enabled" || !body.VersioningEnforced {
+		t.Fatalf("versioning = %q enforced=%v, want Enabled/enforced", body.VersioningStatus, body.VersioningEnforced)
+	}
+}
+
+func TestAPIBucketObjectsDelimiterReturnsCurrentLevelFoldersAndFiles(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "folder-list-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "docs/guide.md", 4, "etag-doc", "checksum-doc", "text/markdown", model.ObjectStateStored)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "photos/", 0, "etag-marker", "checksum-marker", "application/x-directory", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "photos/2026/a.jpg", 7, "etag-photo", "checksum-photo", "image/jpeg", model.ObjectStateStored)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "root.txt", 5, "etag-root", "checksum-root", "text/plain", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/folder-list-bucket/objects?delimiter=/")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Folders) != 2 {
+		t.Fatalf("folders len = %d, want 2: %#v", len(body.Folders), body.Folders)
+	}
+	if body.Folders[0].Name != "docs" || body.Folders[0].Prefix != "docs/" {
+		t.Fatalf("first folder = %#v, want docs/", body.Folders[0])
+	}
+	if body.Folders[1].Name != "photos" || body.Folders[1].Prefix != "photos/" {
+		t.Fatalf("second folder = %#v, want photos/", body.Folders[1])
+	}
+	if len(body.Objects) != 1 || body.Objects[0].Key != "root.txt" {
+		t.Fatalf("objects = %#v, want root.txt only", body.Objects)
+	}
+}
+
+func TestAPIBucketObjectsDelimiterPrefixReturnsNestedLevel(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "nested-folder-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "photos/", 0, "etag-marker", "checksum-marker", "application/x-directory", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "photos/cover.jpg", 5, "etag-cover", "checksum-cover", "image/jpeg", model.ObjectStateStored)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "photos/2026/a.jpg", 7, "etag-photo", "checksum-photo", "image/jpeg", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/nested-folder-bucket/objects?prefix=" + url.QueryEscape("photos/") + "&delimiter=/")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Folders) != 1 || body.Folders[0].Name != "2026" || body.Folders[0].Prefix != "photos/2026/" {
+		t.Fatalf("folders = %#v, want photos/2026/", body.Folders)
+	}
+	if len(body.Objects) != 1 || body.Objects[0].Key != "photos/cover.jpg" {
+		t.Fatalf("objects = %#v, want photos/cover.jpg only", body.Objects)
+	}
+}
+
+func TestAPIBucketObjectsDelimiterPreservesSlashOnlyFolderName(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "slash-folder-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "a//child.txt", 1, "etag-slash", "checksum-slash", "text/plain", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/slash-folder-bucket/objects?prefix=" + url.QueryEscape("a/") + "&delimiter=/")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(body.Folders) != 1 || body.Folders[0].Name != "/" || body.Folders[0].Prefix != "a//" {
+		t.Fatalf("folders = %#v, want slash-only folder a//", body.Folders)
+	}
+}
+
+func TestAPIBucketObjectsRejectsUnsupportedDelimiter(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "unsupported-delimiter-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/unsupported-delimiter-bucket/objects?delimiter=:")
+	if err != nil {
+		t.Fatalf("GET bucket objects: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestAPIBucketObjectsDelimiterPaginationSkipsDuplicateFolders(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "folder-page-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "a/1.txt", 1, "etag-a1", "checksum-a1", "text/plain", model.ObjectStateStored)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "a/2.txt", 1, "etag-a2", "checksum-a2", "text/plain", model.ObjectStateStored)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "b/1.txt", 1, "etag-b1", "checksum-b1", "text/plain", model.ObjectStateStored)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/folder-page-bucket/objects?delimiter=/&limit=1")
+	if err != nil {
+		t.Fatalf("GET page 1: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var page1 objectListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&page1); err != nil {
+		t.Fatalf("Decode page 1: %v", err)
+	}
+	if len(page1.Folders) != 1 || page1.Folders[0].Prefix != "a/" || len(page1.Objects) != 0 || !page1.HasMore || page1.NextMarker == "" {
+		t.Fatalf("page 1 = %#v, want a/ folder and next marker", page1)
+	}
+
+	resp2, err := http.Get(ts.URL + "/api/v1/buckets/folder-page-bucket/objects?delimiter=/&limit=1&after=" + url.QueryEscape(page1.NextMarker))
+	if err != nil {
+		t.Fatalf("GET page 2: %v", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+
+	var page2 objectListResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&page2); err != nil {
+		t.Fatalf("Decode page 2: %v", err)
+	}
+	if len(page2.Folders) != 1 || page2.Folders[0].Prefix != "b/" || len(page2.Objects) != 0 {
+		t.Fatalf("page 2 = %#v, want b/ folder only", page2)
+	}
+}
+
+func TestListBucketObjectEntriesSkipsEmittedFolderSubtree(t *testing.T) {
+	keys := make([]string, adminObjectListingBatchSize*2+1)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("a/%04d.txt", i)
+	}
+	objects := &recordingObjectListRepo{keys: keys}
+	srv := &Server{repos: &repository.Repositories{Objects: objects}}
+
+	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
+	if err != nil {
+		t.Fatalf("listBucketObjectEntries: %v", err)
+	}
+
+	if len(folders) != 1 || folders[0].Prefix != "a/" || len(files) != 0 || hasMore || nextMarker != "" {
+		t.Fatalf("listing = folders:%#v files:%#v hasMore:%v nextMarker:%q, want a/ folder only", folders, files, hasMore, nextMarker)
+	}
+	if objects.scanCalls() > 2 {
+		t.Fatalf("object list scans = %d, want at most 2 without walking every child batch", objects.scanCalls())
+	}
+}
+
+func TestListBucketObjectEntriesKeepsCurrentBatchAcrossSiblingFolders(t *testing.T) {
+	keys := make([]string, 50)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("dir-%02d/file.txt", i)
+	}
+	objects := &recordingObjectListRepo{keys: keys}
+	srv := &Server{repos: &repository.Repositories{Objects: objects}}
+
+	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
+	if err != nil {
+		t.Fatalf("listBucketObjectEntries: %v", err)
+	}
+
+	if len(folders) != 50 || len(files) != 0 || hasMore || nextMarker != "" {
+		t.Fatalf("listing = folders:%d files:%#v hasMore:%v nextMarker:%q, want 50 folders only", len(folders), files, hasMore, nextMarker)
+	}
+	if objects.scanCalls() != 1 {
+		t.Fatalf("object list scans = %d, want 1 for sibling folders in one batch", objects.scanCalls())
+	}
+}
+
+func TestListBucketObjectEntriesSkipsDuplicateRowsBeforeSiblingFolders(t *testing.T) {
+	keys := make([]string, 0, 100)
+	for i := range 50 {
+		keys = append(keys, fmt.Sprintf("dir-%02d/a.txt", i), fmt.Sprintf("dir-%02d/b.txt", i))
+	}
+	objects := &recordingObjectListRepo{keys: keys}
+	srv := &Server{repos: &repository.Repositories{Objects: objects}}
+
+	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
+	if err != nil {
+		t.Fatalf("listBucketObjectEntries: %v", err)
+	}
+
+	if len(folders) != 50 || len(files) != 0 || hasMore || nextMarker != "" {
+		t.Fatalf("listing = folders:%d files:%#v hasMore:%v nextMarker:%q, want 50 folders only", len(folders), files, hasMore, nextMarker)
+	}
+	if objects.scanCalls() != 1 {
+		t.Fatalf("object list scans = %d, want 1 while duplicate folder rows fit in one batch", objects.scanCalls())
+	}
+}
+
+func TestAPIBucketObjects_DeleteListAndRestore(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", model.ObjectStateCached)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	deleteReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/buckets/trash-bucket/objects?key="+url.QueryEscape("folder/file.txt"), nil)
+	if err != nil {
+		t.Fatalf("NewRequest delete: %v", err)
+	}
+	setBucketWriteHeaders(deleteReq)
+	deleteResp, err := ts.Client().Do(deleteReq)
+	if err != nil {
+		t.Fatalf("DELETE bucket object: %v", err)
+	}
+	defer func() { _ = deleteResp.Body.Close() }()
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want %d, body=%s", deleteResp.StatusCode, http.StatusOK, readBody(t, deleteResp.Body))
+	}
+	var deleteBody struct {
+		Key                   string `json:"key"`
+		DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+		DeletedAt             string `json:"deleted_at"`
+	}
+	if err := json.NewDecoder(deleteResp.Body).Decode(&deleteBody); err != nil {
+		t.Fatalf("Decode delete: %v", err)
+	}
+	if deleteBody.Key != "folder/file.txt" || deleteBody.DeleteMarkerVersionID == "" || deleteBody.DeletedAt == "" {
+		t.Fatalf("delete response = %#v, want marker metadata", deleteBody)
+	}
+
+	listResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET live objects: %v", err)
+	}
+	defer func() { _ = listResp.Body.Close() }()
+	var live objectListResponse
+	if err := json.NewDecoder(listResp.Body).Decode(&live); err != nil {
+		t.Fatalf("Decode live objects: %v", err)
+	}
+	if len(live.Objects) != 0 {
+		t.Fatalf("live objects = %#v, want deleted object hidden", live.Objects)
+	}
+
+	versionsResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/versions?key=" + url.QueryEscape("folder/file.txt"))
+	if err != nil {
+		t.Fatalf("GET object versions: %v", err)
+	}
+	defer func() { _ = versionsResp.Body.Close() }()
+	var versionsBody struct {
+		Versions []struct {
+			VersionID       string `json:"version_id"`
+			IsCurrent       bool   `json:"is_current"`
+			IsDeleteMarker  bool   `json:"is_delete_marker"`
+			UploadStatus    string `json:"upload_status"`
+			DownloadVisible bool   `json:"download_visible"`
+		} `json:"versions"`
+	}
+	if err := json.NewDecoder(versionsResp.Body).Decode(&versionsBody); err != nil {
+		t.Fatalf("Decode versions: %v", err)
+	}
+	if len(versionsBody.Versions) != 2 {
+		t.Fatalf("versions len = %d, want 2", len(versionsBody.Versions))
+	}
+	if versionsBody.Versions[0].VersionID != deleteBody.DeleteMarkerVersionID || !versionsBody.Versions[0].IsCurrent || !versionsBody.Versions[0].IsDeleteMarker {
+		t.Fatalf("first version = %#v, want current delete marker", versionsBody.Versions[0])
+	}
+	if versionsBody.Versions[1].VersionID != versionID || versionsBody.Versions[1].IsDeleteMarker {
+		t.Fatalf("second version = %#v, want data version %s", versionsBody.Versions[1], versionID)
+	}
+
+	deletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET deleted objects: %v", err)
+	}
+	defer func() { _ = deletedResp.Body.Close() }()
+	var deletedBody struct {
+		Objects []struct {
+			Key                   string `json:"key"`
+			DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+			DeletedAt             string `json:"deleted_at"`
+			RestoreVersionID      string `json:"restore_version_id"`
+			RestoreSize           int64  `json:"restore_size"`
+			RestoreContentType    string `json:"restore_content_type"`
+			RestoreETag           string `json:"restore_etag"`
+		} `json:"objects"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := json.NewDecoder(deletedResp.Body).Decode(&deletedBody); err != nil {
+		t.Fatalf("Decode deleted objects: %v", err)
+	}
+	if len(deletedBody.Objects) != 1 {
+		t.Fatalf("deleted objects len = %d, want 1", len(deletedBody.Objects))
+	}
+	deleted := deletedBody.Objects[0]
+	if deleted.Key != "folder/file.txt" || deleted.DeleteMarkerVersionID != deleteBody.DeleteMarkerVersionID || deleted.RestoreVersionID != versionID || deleted.RestoreSize != 7 || deleted.RestoreContentType != "text/plain" || deleted.RestoreETag != "etag-file" || deleted.DeletedAt == "" {
+		t.Fatalf("deleted object = %#v, want recoverable file", deleted)
+	}
+
+	restoreReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/trash-bucket/objects/restore", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", deleteBody.DeleteMarkerVersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest restore: %v", err)
+	}
+	setBucketWriteHeaders(restoreReq)
+	restoreResp, err := ts.Client().Do(restoreReq)
+	if err != nil {
+		t.Fatalf("POST restore object: %v", err)
+	}
+	defer func() { _ = restoreResp.Body.Close() }()
+	if restoreResp.StatusCode != http.StatusOK {
+		t.Fatalf("restore status = %d, want %d, body=%s", restoreResp.StatusCode, http.StatusOK, readBody(t, restoreResp.Body))
+	}
+	var restoreBody struct {
+		Key               string `json:"key"`
+		RestoredVersionID string `json:"restored_version_id"`
+	}
+	if err := json.NewDecoder(restoreResp.Body).Decode(&restoreBody); err != nil {
+		t.Fatalf("Decode restore: %v", err)
+	}
+	if restoreBody.Key != "folder/file.txt" || restoreBody.RestoredVersionID != versionID {
+		t.Fatalf("restore response = %#v, want data version restored", restoreBody)
+	}
+
+	restoredListResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET restored objects: %v", err)
+	}
+	defer func() { _ = restoredListResp.Body.Close() }()
+	var restoredLive objectListResponse
+	if err := json.NewDecoder(restoredListResp.Body).Decode(&restoredLive); err != nil {
+		t.Fatalf("Decode restored objects: %v", err)
+	}
+	if len(restoredLive.Objects) != 1 || restoredLive.Objects[0].Key != "folder/file.txt" || restoredLive.Objects[0].CurrentVersionID != versionID {
+		t.Fatalf("restored live objects = %#v, want restored file", restoredLive.Objects)
+	}
+
+	emptyDeletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET deleted objects after restore: %v", err)
+	}
+	defer func() { _ = emptyDeletedResp.Body.Close() }()
+	var emptyDeleted struct {
+		Objects []struct{} `json:"objects"`
+	}
+	if err := json.NewDecoder(emptyDeletedResp.Body).Decode(&emptyDeleted); err != nil {
+		t.Fatalf("Decode empty deleted: %v", err)
+	}
+	if len(emptyDeleted.Objects) != 0 {
+		t.Fatalf("deleted objects after restore len = %d, want 0", len(emptyDeleted.Objects))
+	}
+}
+
+func TestAPIBucketObjectDeleteRejectsInvalidObjectKey(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	bucket := &model.Bucket{Name: "delete-key-validation-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(context.Background(), bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	key := strings.Repeat("你", 342)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/delete-key-validation-bucket/objects?key="+url.QueryEscape(key), nil)
+	req.SetPathValue("name", bucket.Name)
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+
+	srv.handleAPIDeleteBucketObject(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "1024 UTF-8 bytes") {
+		t.Fatalf("body = %s, want object key byte-limit error", rr.Body.String())
+	}
+	version, err := repos.Objects.GetCurrentVersionByBucketAndKey(context.Background(), bucket.ID, key)
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if version != nil {
+		t.Fatalf("current version = %#v, want no persisted delete marker", version)
+	}
+}
+
+func TestAPIBucketDeletedObjectPermanentDeleteRemovesDeletedObject(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-permanent-delete-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", model.ObjectStateCached)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	deleteReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/buckets/trash-permanent-delete-bucket/objects?key="+url.QueryEscape("folder/file.txt"), nil)
+	if err != nil {
+		t.Fatalf("NewRequest delete: %v", err)
+	}
+	setBucketWriteHeaders(deleteReq)
+	deleteResp, err := ts.Client().Do(deleteReq)
+	if err != nil {
+		t.Fatalf("DELETE bucket object: %v", err)
+	}
+	defer func() { _ = deleteResp.Body.Close() }()
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want %d, body=%s", deleteResp.StatusCode, http.StatusOK, readBody(t, deleteResp.Body))
+	}
+	var deleteBody struct {
+		DeleteMarkerVersionID string `json:"delete_marker_version_id"`
+	}
+	if err := json.NewDecoder(deleteResp.Body).Decode(&deleteBody); err != nil {
+		t.Fatalf("Decode delete: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/trash-permanent-delete-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", deleteBody.DeleteMarkerVersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest permanent delete: %v", err)
+	}
+	setBucketWriteHeaders(req)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST permanent delete deleted object: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("permanent delete status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	var body struct {
+		Key                   string  `json:"key"`
+		DeleteMarkerVersionID string  `json:"delete_marker_version_id"`
+		DataVersionsDeleted   int     `json:"data_versions_deleted"`
+		DeleteMarkersDeleted  int     `json:"delete_markers_deleted"`
+		StorageCleanupTaskIDs []int64 `json:"storage_cleanup_task_ids"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode permanent delete: %v", err)
+	}
+	if body.Key != "folder/file.txt" || body.DeleteMarkerVersionID != deleteBody.DeleteMarkerVersionID || body.DataVersionsDeleted != 1 || body.DeleteMarkersDeleted != 1 {
+		t.Fatalf("permanent delete response = %#v, want deleted object counts", body)
+	}
+
+	deletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-permanent-delete-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
+	if err != nil {
+		t.Fatalf("GET deleted objects: %v", err)
+	}
+	defer func() { _ = deletedResp.Body.Close() }()
+	var deletedBody struct {
+		Objects []struct{} `json:"objects"`
+	}
+	if err := json.NewDecoder(deletedResp.Body).Decode(&deletedBody); err != nil {
+		t.Fatalf("Decode deleted objects: %v", err)
+	}
+	if len(deletedBody.Objects) != 0 {
+		t.Fatalf("deleted objects after permanent delete len = %d, want 0", len(deletedBody.Objects))
+	}
+
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID: %v", err)
+	}
+	if gotVersion != nil {
+		t.Fatalf("data version still exists after deleted object permanent delete: %#v", gotVersion)
+	}
+}
+
+func TestAPIBucketDeletedObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "trash-permanent-delete-busy-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", model.ObjectStateUploading)
+	if _, _, err := srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
+		Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload:" + versionID,
+		Input: map[string]any{"version_id": versionID}, SubjectType: "object_version", SubjectKey: versionID,
+	}); err != nil {
+		t.Fatalf("Enqueue upload task: %v", err)
+	}
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-busy-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	want := "Storage work for one or more versions is still in progress or awaiting Filecoin confirmation. Check the related tasks, then try again."
+	if body["error"] != want {
+		t.Fatalf("error = %q, want %q", body["error"], want)
+	}
+	for _, id := range []string{versionID, marker.VersionID} {
+		got, loadErr := repos.Objects.GetVersionByID(ctx, id)
+		if loadErr != nil || got == nil {
+			t.Fatalf("version %s after rejected delete = %#v err=%v, want retained", id, got, loadErr)
+		}
+	}
+}
+
+// TestCopyHealthSummaryClassifiesCopyGapsBySeverity pins how missing replicas
+// are reported. Severity comes from the copies themselves now, so a content
+// whose copies all failed reads unavailable while one still in flight reads
+// degraded.
+func TestCopyHealthSummaryClassifiesCopyGapsBySeverity(t *testing.T) {
+	bucketID := int64(1)
+	baseContentID := int64(10)
+	requestedCopies := 3
+
+	tests := []struct {
+		name        string
+		copyStatus  *model.StorageCopyStatus
+		wantStatus  observability.Status
+		wantPending int
+		wantFailed  int
+		wantUnknown int
+		wantReason  observability.ReasonCode
+	}{
+		{
+			name:        "in-flight copies leave the rest pending",
+			copyStatus:  new(model.StorageCopyStatusPending),
+			wantStatus:  observability.StatusDegraded,
+			wantPending: requestedCopies,
+			wantReason:  observability.ReasonCopyPending,
+		},
+		{
+			name:       "failed copies make the gaps unavailable",
+			copyStatus: new(model.StorageCopyStatusFailed),
+			wantStatus: observability.StatusUnavailable,
+			wantFailed: requestedCopies,
+			wantReason: observability.ReasonCopyFailed,
+		},
+		{
+			name:        "content with no copies at all is unknown",
+			copyStatus:  nil,
+			wantStatus:  observability.StatusUnknown,
+			wantUnknown: requestedCopies,
+			wantReason:  observability.ReasonCopyObservationMissing,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contentID := baseContentID + int64(i)
+			copyIndex := 0
+			fact := copyHealthFact{
+				BucketID:        bucketID,
+				VersionID:       fmt.Sprintf("01J0000000000000000GAP%03d", i),
+				ContentID:       &contentID,
+				RequestedCopies: requestedCopies,
+			}
+			if tt.copyStatus != nil {
+				fact.CopyIndex = &copyIndex
+				fact.CopyStatus = tt.copyStatus
+			}
+			summaries := copyHealthSummariesByBucket([]copyHealthFact{fact}, nil, false, time.Hour)
+
+			health := summaries[bucketID]
+			if health.Status != string(tt.wantStatus) ||
+				health.TotalObjects != 1 ||
+				health.UnhealthyObjects != 1 ||
+				health.RequestedCopies != requestedCopies ||
+				health.PendingCopies != tt.wantPending ||
+				health.FailedCopies != tt.wantFailed ||
+				health.UnknownCopies != tt.wantUnknown ||
+				!hasReason(health.ReasonCodes, observability.ReasonCopyUnderReplicated) ||
+				!hasReason(health.ReasonCodes, tt.wantReason) {
+				t.Fatalf("copy_health = %#v, want %s gaps classified by copy status", health, tt.wantStatus)
+			}
+		})
 	}
 }
 
 func TestAPIBucketStorageHealthAffectedVersionsRequiresStableCutoff(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "storage-risk-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-risk-bucket", Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	otherBucket := &model.Bucket{Name: "storage-risk-other-bucket", Status: model.BucketStatusActive}
+	testutil.OpenBucketReplicaSlots(t, srv.db, bucket.ID, 3)
+	otherBucket := &model.Bucket{Name: "storage-risk-other-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
 		t.Fatalf("Other Buckets.Create: %v", err)
 	}
 
+	currentContent, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 4, Checksum: testutil.StorageChecksum("checksum-current-risk"), RequestedCopies: 2,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent current: %v", err)
+	}
 	currentVersion := &model.ObjectVersion{
 		VersionID:   "01J000000000000000APIR01",
 		BucketID:    bucket.ID,
 		Key:         "docs/current.txt",
+		ContentID:   &currentContent.ID,
 		Size:        4,
 		ETag:        "etag-current-risk",
-		Checksum:    "checksum-current-risk",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/current-risk",
-		State:       model.ObjectStateCached,
 	}
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, currentVersion); err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent current: %v", err)
 	}
-	currentUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: currentVersion.VersionID,
-		ContentSize:     currentVersion.Size,
-		Checksum:        currentVersion.Checksum,
-		RequestedCopies: 2,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt current: %v", err)
-	}
-	seedAdminCommittedCopies(t, repos, bucket.ID, currentUpload.ID, "bafk2bzacestorageriskcurrent", []adminStorageCopySeed{
+	seedAdminCommittedCopies(t, srv.db, repos, bucket.ID, currentContent.ID, "bafk2bzacestorageriskcurrent", []adminStorageCopySeed{
 		{CopyIndex: 0, ProviderID: onChainID(t, "501"), DataSetID: onChainID(t, "9501"), PieceID: onChainIDPtr(t, "9901"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/current-risk"},
 		{CopyIndex: 1, ProviderID: onChainID(t, "502"), DataSetID: onChainID(t, "9502"), PieceID: onChainIDPtr(t, "9902"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://provider.example/current-readable"},
 	})
-	if err := repos.Objects.UpdateVersionState(ctx, currentVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateVersionState current uploading: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
-		UploadID:    currentUpload.ID,
-		BucketID:    bucket.ID,
-		ContentSize: currentVersion.Size,
-		Checksum:    currentVersion.Checksum,
-		VersionID:   currentVersion.VersionID,
+	if _, err := repos.Contents.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+		ContentID: currentContent.ID,
+		BucketID:  bucket.ID,
+		VersionID: currentVersion.VersionID,
 	}); err != nil {
 		t.Fatalf("BindReadableUploadForVersion current: %v", err)
 	}
 
+	oldContent, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 5, Checksum: testutil.StorageChecksum("checksum-old-risk"), RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent old: %v", err)
+	}
 	oldVersion := &model.ObjectVersion{
 		VersionID:   "01J000000000000000APIR02",
 		BucketID:    bucket.ID,
 		Key:         "docs/old.txt",
+		ContentID:   &oldContent.ID,
 		Size:        5,
 		ETag:        "etag-old-risk",
-		Checksum:    "checksum-old-risk",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/old-risk",
-		State:       model.ObjectStateCached,
 	}
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, oldVersion); err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent old: %v", err)
 	}
-	oldUpload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: oldVersion.VersionID,
-		ContentSize:     oldVersion.Size,
-		Checksum:        oldVersion.Checksum,
-		RequestedCopies: 1,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt old: %v", err)
-	}
-	seedAdminCommittedCopies(t, repos, bucket.ID, oldUpload.ID, "bafk2bzacestorageriskold", []adminStorageCopySeed{
+	seedAdminCommittedCopies(t, srv.db, repos, bucket.ID, oldContent.ID, "bafk2bzacestorageriskold", []adminStorageCopySeed{
 		{CopyIndex: 2, ProviderID: onChainID(t, "503"), DataSetID: onChainID(t, "9503"), PieceID: onChainIDPtr(t, "9903"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://provider.example/old-risk"},
 	})
-	if err := repos.Objects.UpdateVersionState(ctx, oldVersion.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("UpdateVersionState old uploading: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
-		UploadID:    oldUpload.ID,
-		BucketID:    bucket.ID,
-		ContentSize: oldVersion.Size,
-		Checksum:    oldVersion.Checksum,
-		VersionID:   oldVersion.VersionID,
+	if _, err := repos.Contents.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+		ContentID: oldContent.ID,
+		BucketID:  bucket.ID,
+		VersionID: oldVersion.VersionID,
 	}); err != nil {
 		t.Fatalf("BindReadableUploadForVersion old: %v", err)
 	}
-	if err := repos.Objects.SetVersionCachePresence(ctx, oldVersion.VersionID, false); err != nil {
-		t.Fatalf("SetVersionCachePresence old: %v", err)
+	if err := repos.Objects.ClearContentCachePresence(ctx, oldContent.ID); err != nil {
+		t.Fatalf("ClearContentCachePresence old: %v", err)
+	}
+	replacementContent, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 6, Checksum: testutil.StorageChecksum("checksum-old-replacement"), RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent replacement: %v", err)
 	}
 	replacement := &model.ObjectVersion{
 		VersionID:   "01J000000000000000APIR03",
 		BucketID:    bucket.ID,
 		Key:         oldVersion.Key,
+		ContentID:   &replacementContent.ID,
 		Size:        6,
 		ETag:        "etag-old-replacement",
-		Checksum:    "checksum-old-replacement",
 		ContentType: "text/plain",
-		CacheKey:    ".versions/old-replacement",
-		State:       model.ObjectStateCached,
 	}
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, replacement); err != nil {
 		t.Fatalf("CreateVersionAndSetCurrent replacement: %v", err)
 	}
 
-	summaries, err := repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+	summaries, err := repos.Contents.ListDataSetSummaries(ctx, bucket.ID)
 	if err != nil {
 		t.Fatalf("ListDataSetSummaries: %v", err)
 	}
@@ -1873,9 +3259,9 @@ func TestAPIBucketStorageHealthAffectedVersionsRequiresStableCutoff(t *testing.T
 		checkedAt = checkedAt.Add(time.Microsecond)
 	}
 	if err := repos.Observability.ReplaceDataSetStates(ctx, checkedAt, []observability.DataSetState{
-		{LocalDataSetID: byCopyIndex[0].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: byCopyIndex[0].ProviderID, ChainDataSetID: byCopyIndex[0].DataSetID, Status: observability.StatusUnavailable, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetMissing}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
-		{LocalDataSetID: byCopyIndex[1].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 1, ProviderID: byCopyIndex[1].ProviderID, ChainDataSetID: byCopyIndex[1].DataSetID, Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
-		{LocalDataSetID: byCopyIndex[2].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 2, ProviderID: byCopyIndex[2].ProviderID, ChainDataSetID: byCopyIndex[2].DataSetID, Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: byCopyIndex[0].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 0, ProviderID: byCopyIndex[0].ProviderID, ChainDataSetID: byCopyIndex[0].DataSetID, LocalStatus: byCopyIndex[0].Status, Status: observability.StatusUnavailable, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetMissing}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: byCopyIndex[1].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 1, ProviderID: byCopyIndex[1].ProviderID, ChainDataSetID: byCopyIndex[1].DataSetID, LocalStatus: byCopyIndex[1].Status, Status: observability.StatusAvailable, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
+		{LocalDataSetID: byCopyIndex[2].ID, BucketID: bucket.ID, BucketName: bucket.Name, CopyIndex: 2, ProviderID: byCopyIndex[2].ProviderID, ChainDataSetID: byCopyIndex[2].DataSetID, LocalStatus: byCopyIndex[2].Status, Status: observability.StatusDegraded, ReasonCodes: []observability.ReasonCode{observability.ReasonChainDataSetUnmanaged}, LastCheckedAt: checkedAt, Evidence: map[string]any{}},
 	}); err != nil {
 		t.Fatalf("ReplaceDataSetStates: %v", err)
 	}
@@ -2111,37 +3497,20 @@ func TestAPIBucketStorageHealthAffectedVersionsRequiresStableCutoff(t *testing.T
 func TestAPIBucketStorageHealthAffectedVersionsClampsLimit(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "storage-risk-limit-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "storage-risk-limit-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 
 	for i := range 51 {
-		version := &model.ObjectVersion{
-			VersionID:   fmt.Sprintf("01J000000000000LIMIT%03d", i),
-			BucketID:    bucket.ID,
-			Key:         fmt.Sprintf("docs/limit-%03d.txt", i),
-			Size:        int64(i + 1),
-			ETag:        fmt.Sprintf("etag-limit-%03d", i),
-			Checksum:    fmt.Sprintf("checksum-limit-%03d", i),
-			ContentType: "text/plain",
-			CacheKey:    fmt.Sprintf(".versions/limit-%03d", i),
-			State:       model.ObjectStateCached,
+		_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, fmt.Sprintf("docs/limit-%03d.txt", i), int64(i+1),
+			fmt.Sprintf("etag-limit-%03d", i), fmt.Sprintf("checksum-limit-%03d", i), "text/plain", model.ObjectStateCached)
+		version, err := repos.Objects.GetVersionByID(ctx, versionID)
+		if err != nil || version == nil {
+			t.Fatalf("GetVersionByID %d: version=%v err=%v", i, version, err)
 		}
-		if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
-			t.Fatalf("CreateVersionAndSetCurrent %d: %v", i, err)
-		}
-		upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-			BucketID:        bucket.ID,
-			SourceVersionID: version.VersionID,
-			ContentSize:     version.Size,
-			Checksum:        version.Checksum,
-			RequestedCopies: 1,
-		})
-		if err != nil {
-			t.Fatalf("StartObjectUploadAttempt %d: %v", i, err)
-		}
-		seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, fmt.Sprintf("bafk2bzacelimit%03d", i), []adminStorageCopySeed{{
+		content := adminContentForVersion(t, repos, version)
+		seedAdminCommittedCopies(t, srv.db, repos, bucket.ID, content.ID, fmt.Sprintf("bafk2bzacelimit%03d", i), []adminStorageCopySeed{{
 			CopyIndex:      0,
 			ProviderID:     onChainID(t, "901"),
 			DataSetID:      onChainID(t, "9901"),
@@ -2149,21 +3518,16 @@ func TestAPIBucketStorageHealthAffectedVersionsClampsLimit(t *testing.T) {
 			TransferMethod: model.StorageCopyTransferMethodIngress,
 			RetrievalURL:   fmt.Sprintf("https://provider.example/limit-%03d", i),
 		}})
-		if err := repos.Objects.UpdateVersionState(ctx, version.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-			t.Fatalf("UpdateVersionState %d: %v", i, err)
-		}
-		if _, err := repos.Uploads.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
-			UploadID:    upload.ID,
-			BucketID:    bucket.ID,
-			ContentSize: version.Size,
-			Checksum:    version.Checksum,
-			VersionID:   version.VersionID,
+		if _, err := repos.Contents.BindReadableUploadForVersion(ctx, repository.BindReadableUploadForVersionInput{
+			ContentID: content.ID,
+			BucketID:  bucket.ID,
+			VersionID: version.VersionID,
 		}); err != nil {
 			t.Fatalf("BindReadableUploadForVersion %d: %v", i, err)
 		}
 	}
 
-	summaries, err := repos.Uploads.ListDataSetSummaries(ctx, bucket.ID)
+	summaries, err := repos.Contents.ListDataSetSummaries(ctx, bucket.ID)
 	if err != nil {
 		t.Fatalf("ListDataSetSummaries: %v", err)
 	}
@@ -2178,6 +3542,7 @@ func TestAPIBucketStorageHealthAffectedVersionsClampsLimit(t *testing.T) {
 		CopyIndex:      summaries[0].CopyIndex,
 		ProviderID:     summaries[0].ProviderID,
 		ChainDataSetID: summaries[0].DataSetID,
+		LocalStatus:    summaries[0].Status,
 		Status:         observability.StatusUnavailable,
 		ReasonCodes:    []observability.ReasonCode{observability.ReasonChainDataSetMissing},
 		LastCheckedAt:  checkedAt,
@@ -2205,1722 +3570,402 @@ func TestAPIBucketStorageHealthAffectedVersionsClampsLimit(t *testing.T) {
 	}
 }
 
-func TestBucketStorageHealthAffectedVersionsResponseDeduplicatesProviderLookups(t *testing.T) {
-	providerID := onChainID(t, "501")
-	identityResolver := &fakeAPIProviderIdentityResolver{
-		identities: map[string]*providerIdentityResponse{
-			"501": {RegistryProviderID: "501", Name: "risk-pdp"},
-		},
-	}
-	srv := &Server{providerIdentity: identityResolver}
-	createdAt := time.Date(2026, 5, 23, 12, 30, 0, 123456789, time.UTC)
-	status := observability.StatusUnavailable
-
-	resp := srv.bucketStorageHealthAffectedVersionsResponse(repository.BucketStorageHealthAffectedVersionPage{
-		Versions: []repository.BucketStorageHealthAffectedVersion{{
-			Version: model.ObjectVersion{
-				VersionID: "01J000000000000000APIR99",
-				Key:       "docs/current.txt",
-				CreatedAt: createdAt,
-				UpdatedAt: createdAt,
-			},
-			RiskDataSets: []repository.BucketStorageHealthRiskDataSet{
-				{LocalDataSetID: 1, ProviderID: providerID, LocalStatus: model.StorageDataSetStatusReady, ObservationStatus: &status},
-				{LocalDataSetID: 2, ProviderID: providerID, LocalStatus: model.StorageDataSetStatusReady, ObservationStatus: &status},
-			},
-		}},
-	}, createdAt.Add(-time.Hour))
-
-	if got, want := identityResolver.requests, [][]string{{"501"}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("provider identity requests = %#v, want %#v", got, want)
-	}
-	if len(resp.Versions) != 1 || len(resp.Versions[0].RiskDataSets) != 2 {
-		t.Fatalf("response risk datasets = %#v, want two datasets", resp.Versions)
-	}
-	for _, dataSet := range resp.Versions[0].RiskDataSets {
-		if dataSet.ProviderIdentity == nil || dataSet.ProviderIdentity.Name != "risk-pdp" {
-			t.Fatalf("provider identity = %#v, want reused identity", dataSet.ProviderIdentity)
-		}
-	}
-}
-
-func TestBucketStorageHealthSummaryFromRepositoryFormatsLastCheckedAtUTC(t *testing.T) {
-	checkedAt := time.Date(2026, 5, 23, 20, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))
-	got := bucketStorageHealthSummaryFromRepository(repository.BucketStorageHealthSummary{
-		BucketID:               1,
-		ReasonCodes:            []observability.ReasonCode{},
-		AffectedVersionsCap:    200,
-		AffectedVersionsCapped: 0,
-		LastCheckedAt:          &checkedAt,
-	})
-	if got.LastCheckedAt != "2026-05-23T12:00:00Z" {
-		t.Fatalf("last_checked_at = %q, want UTC RFC3339", got.LastCheckedAt)
-	}
-}
-
-func TestAPIBucketsCopyHealthObservabilityFailurePreservesLocalCopyStatus(t *testing.T) {
+// TestAPIBucketObjects_StatusMappingAndDetail pins the operator-facing status a
+// version maps to. Every input is now a fact about the content's copies or its
+// cache entry, so the mapping is exercised through those rather than through a
+// state column.
+func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "copy-health-observability-local-status", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "status-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "partial.txt", 1, "etag-copy-health-local-status", "checksum-copy-health-local-status", "text/plain", "", model.ObjectStateCached)
-	bindAdminPartialUpload(t, repos, versionID)
+	_, warningVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "warning.txt", 4, "etag-warning", "checksum-warning", "text/plain", model.ObjectStateCached)
+	markAdminFailedUpload(t, srv.db, repos, warningVersionID, "provider rejected piece")
+
+	_, unavailableVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "unavailable.txt", 1, "etag-unavailable", "checksum-unavailable", "text/plain", model.ObjectStateCached)
+	unavailableVersion, err := repos.Objects.GetVersionByID(ctx, unavailableVersionID)
+	if err != nil || unavailableVersion == nil {
+		t.Fatalf("GetVersionByID(unavailable): version=%v err=%v", unavailableVersion, err)
+	}
+	if err := repos.Objects.ClearContentCachePresence(ctx, *unavailableVersion.ContentID); err != nil {
+		t.Fatalf("unavailable cache presence: %v", err)
+	}
+
+	_, storedVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "stored.txt", 2, "etag-stored", "checksum-stored", "text/plain", model.ObjectStateCached)
+	acceptAdminVersionUpload(t, srv.db, repos, storedVersionID, "piece-stored", "https://provider.example/stored")
+
+	partialCopies := 2
+	partialBucket := &model.Bucket{Name: "status-partial-bucket", Status: model.BucketStatusActive, DefaultCopies: partialCopies, MinimumDurableCopies: partialCopies}
+	if err := repos.Buckets.Create(ctx, partialBucket); err != nil {
+		t.Fatalf("Buckets.Create(partial): %v", err)
+	}
+	_, partialVersionID := seedAdminObjectVersion(t, srv.db, repos, partialBucket, "partial.txt", 3, "etag-partial", "checksum-partial", "text/plain", model.ObjectStateCached)
+	bindAdminPartialUpload(t, srv.db, repos, partialVersionID)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	statusByKey := func(bucketName string) map[string]string {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucketName + "/objects")
+		if err != nil {
+			t.Fatalf("GET bucket objects: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var list struct {
+			Objects []struct {
+				Key    string `json:"key"`
+				Status string `json:"status"`
+			} `json:"objects"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+			t.Fatalf("Decode list: %v", err)
+		}
+		byKey := map[string]string{}
+		for _, object := range list.Objects {
+			byKey[object.Key] = object.Status
+		}
+		return byKey
+	}
+
+	main := statusByKey("status-bucket")
+	if main["warning.txt"] != "warning" {
+		t.Fatalf("warning status = %q, want warning", main["warning.txt"])
+	}
+	if main["unavailable.txt"] != "unavailable" {
+		t.Fatalf("unavailable status = %q, want unavailable", main["unavailable.txt"])
+	}
+	if main["stored.txt"] != "success" {
+		t.Fatalf("stored status = %q, want success", main["stored.txt"])
+	}
+	if partial := statusByKey("status-partial-bucket"); partial["partial.txt"] != "syncing" {
+		t.Fatalf("partial status = %q, want syncing", partial["partial.txt"])
+	}
+
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(warningVersionID))
+	if err != nil {
+		t.Fatalf("GET status detail: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status detail code = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var detail objectStatusDetailResponse
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		t.Fatalf("Decode detail: %v", err)
+	}
+	if detail.VersionID != warningVersionID || detail.Status != "warning" {
+		t.Fatalf("detail = %#v, want version %s warning", detail, warningVersionID)
+	}
+	if detail.State != string(model.ObjectStateFailed) {
+		t.Fatalf("detail state = %q, want failed", detail.State)
+	}
+	if detail.Message == nil || *detail.Message != "provider rejected piece" {
+		t.Fatalf("message = %#v, want provider rejected piece", detail.Message)
+	}
+
+	otherBucket := &model.Bucket{Name: "other-status-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
+		t.Fatalf("other bucket: %v", err)
+	}
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/other-status-bucket/objects/status-detail?version_id=" + url.QueryEscape(warningVersionID))
+	if err != nil {
+		t.Fatalf("GET status detail wrong bucket: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("wrong bucket status detail code = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestAPIBucketObjectProvenance(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	identityResolver := &fakeAPIProviderIdentityResolver{
+		identities: map[string]*providerIdentityResponse{
+			"101": {
+				RegistryProviderID:     "101",
+				Name:                   "alpha-pdp",
+				ServiceProviderAddress: "0x1111111111111111111111111111111111111111",
+				FilecoinActorID:        "f01234",
+				ServiceURL:             "https://alpha.example",
+			},
+		},
+	}
+	srv.WithProviderIdentityResolver(identityResolver)
+	ctx := context.Background()
+
+	provenanceCopies := 2
+	bucket := &model.Bucket{Name: "provenance-bucket", Status: model.BucketStatusActive, DefaultCopies: provenanceCopies, MinimumDurableCopies: provenanceCopies}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, oldVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 7, "etag-old-provenance", "checksum-old-provenance", "text/plain", model.ObjectStateStored)
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 8, "etag-provenance", "checksum-provenance", "text/plain", model.ObjectStateCached)
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil {
+		t.Fatalf("GetVersionByID: version=%v err=%v", version, err)
+	}
+	content := adminContentForVersion(t, repos, version)
+	pieceCID := "bafk2bzaceadminprovenance"
+	seedAdminCommittedCopies(t, srv.db, repos, bucket.ID, content.ID, pieceCID, []adminStorageCopySeed{
+		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://ingress.example/piece"},
+		{ProviderID: onChainID(t, "102"), DataSetID: onChainID(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://peer.example/piece"},
+	})
+	if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
+		ContentID: content.ID,
+		BucketID:  bucket.ID,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForContent: %v", err)
+	}
+	if _, _, err := repos.Contents.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{ContentID: content.ID}); err != nil {
+		t.Fatalf("FinalizeUploadIfTargetCopiesMet: %v", err)
+	}
+
+	_, noCopyVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "cached.txt", 3, "etag-cached", "checksum-cached", "text/plain", model.ObjectStateCached)
+	_, partialVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "partial-provenance.txt", 4, "etag-partial-provenance", "checksum-partial-provenance", "text/plain", model.ObjectStateCached)
+	bindAdminPartialUpload(t, srv.db, repos, partialVersionID)
+	_, failedVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "failed-provenance.txt", 5, "etag-failed-provenance", "checksum-failed-provenance", "text/plain", model.ObjectStateCached)
+	markAdminFailedUpload(t, srv.db, repos, failedVersionID, "provider rejected piece")
+	replaceBucketDataSetObservability(t, repos, bucket.ID, observability.StatusAvailable, nil, time.Now().UTC())
 	srv.WithObservability(observability.NewService(observability.ServiceOptions{
-		Store: &bucketStorageHealthErrorStore{err: errors.New("database password leaked copy health")},
+		Store:           repos.Observability,
+		RefreshInterval: time.Hour,
 	}))
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucket.Name + "/objects/provenance?version_id=" + url.QueryEscape(versionID))
-	if err != nil {
-		t.Fatalf("GET provenance: %v", err)
+	type provenanceBody struct {
+		VersionID       string            `json:"version_id"`
+		Status          string            `json:"status"`
+		PieceCID        string            `json:"piece_cid"`
+		RequestedCopies int               `json:"requested_copies"`
+		SuccessCopies   int               `json:"success_copies"`
+		CopyHealth      apiCopyHealthBody `json:"copy_health"`
+		Copies          []struct {
+			CopyIndex        int                       `json:"copy_index"`
+			Status           string                    `json:"status"`
+			Health           apiCopyHealthBody         `json:"health"`
+			ProviderID       string                    `json:"provider_id"`
+			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
+			DataSetID        string                    `json:"data_set_id"`
+			PieceID          string                    `json:"piece_id"`
+			TransferMethod   string                    `json:"transfer_method"`
+			RetrievalURL     string                    `json:"retrieval_url"`
+			IsNewDataSet     bool                      `json:"is_new_data_set"`
+		} `json:"copies"`
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-	var body struct {
-		CopyHealth apiCopyHealthBody `json:"copy_health"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if body.CopyHealth.Status != string(observability.StatusUnavailable) ||
-		body.CopyHealth.FailedCopies != 1 ||
-		body.CopyHealth.UnknownCopies != 1 ||
-		body.CopyHealth.PendingCopies != 0 ||
-		body.CopyHealth.LastError != "copy health query failed" ||
-		!hasReason(body.CopyHealth.ReasonCodes, observability.ReasonCopyFailed) {
-		t.Fatalf("copy_health = %#v, want failed local copy preserved with committed copy unknown", body.CopyHealth)
-	}
-}
-
-func replaceBucketDataSetObservability(t *testing.T, repos *repository.Repositories, bucketID int64, status observability.Status, reasons []observability.ReasonCode, checkedAt time.Time) {
-	t.Helper()
-	summaries, err := repos.Uploads.ListDataSetSummaries(context.Background(), bucketID)
-	if err != nil {
-		t.Fatalf("ListDataSetSummaries: %v", err)
-	}
-	states := make([]observability.DataSetState, 0, len(summaries))
-	for _, summary := range summaries {
-		states = append(states, observability.DataSetState{
-			LocalDataSetID:  summary.ID,
-			BucketID:        summary.BucketID,
-			BucketName:      summary.BucketName,
-			CopyIndex:       summary.CopyIndex,
-			ProviderID:      summary.ProviderID,
-			ChainDataSetID:  summary.DataSetID,
-			ClientDataSetID: summary.ClientDataSetID,
-			LocalStatus:     summary.Status,
-			Status:          status,
-			ReasonCodes:     reasons,
-			LastCheckedAt:   checkedAt,
-			Evidence:        map[string]any{},
-		})
-	}
-	if err := repos.Observability.ReplaceDataSetStates(context.Background(), checkedAt, states); err != nil {
-		t.Fatalf("ReplaceDataSetStates: %v", err)
-	}
-}
-
-func copyHealthDataSetObservationForTest(localID int64, checkedAt time.Time) observability.DataSetObservation {
-	return observability.DataSetObservationFromState(observability.DataSetState{
-		LocalDataSetID: localID,
-		Status:         observability.StatusAvailable,
-		LastCheckedAt:  checkedAt,
-	}, time.Hour, checkedAt)
-}
-
-func assertUnavailableBucketStorageHealth(t *testing.T, health apiBucketStorageHealthBody, wantReason observability.ReasonCode) {
-	t.Helper()
-	if health.Status != string(observability.StatusUnavailable) ||
-		health.AbnormalDataSets != 2 ||
-		health.AffectedVersionsCapped != 1 ||
-		health.AffectedVersionsCap != 200 ||
-		health.AffectedVersionsExceedsCap ||
-		!hasReason(health.ReasonCodes, wantReason) ||
-		hasReason(health.ReasonCodes, observability.ReasonChainDataSetInactive) {
-		t.Fatalf("storage_health = %#v, want unavailable storage source risk from one retained version", health)
-	}
-}
-
-func assertNoLegacyBucketStorageHealthFields(t *testing.T, raw map[string]any) {
-	t.Helper()
-	health, ok := raw["storage_health"].(map[string]any)
-	if !ok {
-		t.Fatalf("storage_health missing or wrong shape: %#v", raw["storage_health"])
-	}
-	for _, field := range []string{
-		"affected_data_sets",
-		"affected_objects",
-		"objects_with_readable_copy",
-		"objects_without_readable_copy",
-		"unavailable_objects",
-		"unknown_objects",
-	} {
-		if _, ok := health[field]; ok {
-			t.Fatalf("storage_health includes legacy field %q: %#v", field, health)
-		}
-	}
-}
-
-func hasReason(reasons []observability.ReasonCode, want observability.ReasonCode) bool {
-	for _, reason := range reasons {
-		if reason == want {
-			return true
-		}
-	}
-	return false
-}
-
-type bucketStorageHealthErrorStore struct {
-	err error
-}
-
-func (s *bucketStorageHealthErrorStore) ReplaceProviderStates(context.Context, time.Time, []observability.ProviderState) error {
-	return nil
-}
-
-func (s *bucketStorageHealthErrorStore) ListProviderStates(context.Context, observability.ListOptions) (observability.ProviderStatePage, error) {
-	return observability.ProviderStatePage{}, nil
-}
-
-func (s *bucketStorageHealthErrorStore) ReplaceDataSetStates(context.Context, time.Time, []observability.DataSetState) error {
-	return nil
-}
-
-func (s *bucketStorageHealthErrorStore) ListDataSetStates(context.Context, observability.ListOptions) (observability.DataSetStatePage, error) {
-	return observability.DataSetStatePage{}, nil
-}
-
-func (s *bucketStorageHealthErrorStore) GetDataSetStatesByLocalIDs(context.Context, []int64) (map[int64]observability.DataSetState, error) {
-	return nil, s.err
-}
-
-func TestAPIBuckets_ListAllBuckets(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	for _, bucket := range []*model.Bucket{
-		{Name: "alpha-bucket", Status: model.BucketStatusActive},
-		{Name: "beta-bucket", Status: model.BucketStatusActive},
-		{Name: "gamma-bucket", Status: model.BucketStatusActive},
-	} {
-		if err := repos.Buckets.Create(ctx, bucket); err != nil {
-			t.Fatalf("Buckets.Create(%s): %v", bucket.Name, err)
-		}
-	}
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets")
-	if err != nil {
-		t.Fatalf("GET buckets: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var body []struct {
-		Name   string `json:"name"`
-		Status string `json:"status"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-
-	got := make(map[string]string, len(body))
-	for _, item := range body {
-		got[item.Name] = item.Status
-	}
-
-	for _, name := range []string{"alpha-bucket", "beta-bucket", "gamma-bucket"} {
-		if got[name] != string(model.BucketStatusActive) {
-			t.Fatalf("%s status = %q, want %q", name, got[name], model.BucketStatusActive)
-		}
-	}
-}
-
-func TestAPIBuckets_ListAndDetailIncludeOwnerAccessKey(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
-	ctx := context.Background()
-
-	ownedACL, err := json.Marshal(auth.ACL{Owner: "owner-access"})
-	if err != nil {
-		t.Fatalf("Marshal ACL: %v", err)
-	}
-	ownerAccess := "owner-access"
-	if err := repos.S3Accounts.Create(ctx, &model.S3Account{AccessKey: ownerAccess, SecretKey: "owner-secret", Role: auth.RoleUserPlus}); err != nil {
-		t.Fatalf("S3Accounts.Create: %v", err)
-	}
-	overrideCopies := 3
-	for _, bucket := range []*model.Bucket{
-		{Name: "owned-bucket", Status: model.BucketStatusActive, ACL: ownedACL, OwnerAccessKey: &ownerAccess, DefaultCopies: &overrideCopies},
-		{Name: "unassigned-bucket", Status: model.BucketStatusActive},
-	} {
-		if err := repos.Buckets.Create(ctx, bucket); err != nil {
-			t.Fatalf("Buckets.Create(%s): %v", bucket.Name, err)
-		}
-	}
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets")
-	if err != nil {
-		t.Fatalf("GET buckets: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("list status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-	var listBody []struct {
-		Name            string  `json:"name"`
-		OwnerAccessKey  *string `json:"owner_access_key"`
-		DefaultCopies   *int    `json:"default_copies"`
-		EffectiveCopies int     `json:"effective_copies"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&listBody); err != nil {
-		t.Fatalf("Decode list: %v", err)
-	}
-	owners := make(map[string]*string, len(listBody))
-	copyPolicies := make(map[string]struct {
-		defaultCopies   *int
-		effectiveCopies int
-	}, len(listBody))
-	for _, item := range listBody {
-		owners[item.Name] = item.OwnerAccessKey
-		copyPolicies[item.Name] = struct {
-			defaultCopies   *int
-			effectiveCopies int
-		}{defaultCopies: item.DefaultCopies, effectiveCopies: item.EffectiveCopies}
-	}
-	if owners["owned-bucket"] == nil || *owners["owned-bucket"] != "owner-access" {
-		t.Fatalf("owned-bucket owner = %v, want owner-access", owners["owned-bucket"])
-	}
-	if owners["unassigned-bucket"] != nil {
-		t.Fatalf("unassigned-bucket owner = %v, want nil", *owners["unassigned-bucket"])
-	}
-	if copyPolicies["owned-bucket"].defaultCopies == nil || *copyPolicies["owned-bucket"].defaultCopies != 3 || copyPolicies["owned-bucket"].effectiveCopies != 3 {
-		t.Fatalf("owned bucket copy policy = %#v, want override 3", copyPolicies["owned-bucket"])
-	}
-	if copyPolicies["unassigned-bucket"].defaultCopies != nil || copyPolicies["unassigned-bucket"].effectiveCopies != 5 {
-		t.Fatalf("unassigned bucket copy policy = %#v, want inherited 5", copyPolicies["unassigned-bucket"])
-	}
-
-	detailResp, err := http.Get(ts.URL + "/api/v1/buckets/owned-bucket")
-	if err != nil {
-		t.Fatalf("GET bucket detail: %v", err)
-	}
-	defer func() { _ = detailResp.Body.Close() }()
-	if detailResp.StatusCode != http.StatusOK {
-		t.Fatalf("detail status = %d, want %d", detailResp.StatusCode, http.StatusOK)
-	}
-	var detailBody struct {
-		OwnerAccessKey  *string `json:"owner_access_key"`
-		DefaultCopies   *int    `json:"default_copies"`
-		EffectiveCopies int     `json:"effective_copies"`
-	}
-	if err := json.NewDecoder(detailResp.Body).Decode(&detailBody); err != nil {
-		t.Fatalf("Decode detail: %v", err)
-	}
-	if detailBody.OwnerAccessKey == nil || *detailBody.OwnerAccessKey != "owner-access" {
-		t.Fatalf("detail owner = %v, want owner-access", detailBody.OwnerAccessKey)
-	}
-	if detailBody.DefaultCopies == nil || *detailBody.DefaultCopies != 3 || detailBody.EffectiveCopies != 3 {
-		t.Fatalf("detail copy policy = default:%v effective:%d, want 3/3", detailBody.DefaultCopies, detailBody.EffectiveCopies)
-	}
-}
-
-func TestAPIBucketCopyPolicy_UpdateAndClear(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "copy-policy-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	setReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader(`{"default_copies":6}`))
-	if err != nil {
-		t.Fatalf("NewRequest set: %v", err)
-	}
-	setReq.Header.Set("Content-Type", "application/json")
-	setBucketWriteHeaders(setReq)
-	setResp, err := http.DefaultClient.Do(setReq)
-	if err != nil {
-		t.Fatalf("PUT copy policy set: %v", err)
-	}
-	defer func() { _ = setResp.Body.Close() }()
-	if setResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(setResp.Body)
-		t.Fatalf("set status = %d, want %d body=%s", setResp.StatusCode, http.StatusOK, body)
-	}
-	var setBody struct {
-		Name            string `json:"name"`
-		DefaultCopies   *int   `json:"default_copies"`
-		EffectiveCopies int    `json:"effective_copies"`
-	}
-	if err := json.NewDecoder(setResp.Body).Decode(&setBody); err != nil {
-		t.Fatalf("Decode set response: %v", err)
-	}
-	if setBody.Name != bucket.Name || setBody.DefaultCopies == nil || *setBody.DefaultCopies != 6 || setBody.EffectiveCopies != 6 {
-		t.Fatalf("set copy policy response = %#v, want override 6", setBody)
-	}
-
-	clearReq, err := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/buckets/copy-policy-bucket/copy-policy", strings.NewReader("{\"default_copies\": \n null \t}"))
-	if err != nil {
-		t.Fatalf("NewRequest clear: %v", err)
-	}
-	clearReq.Header.Set("Content-Type", "application/json")
-	setBucketWriteHeaders(clearReq)
-	clearResp, err := http.DefaultClient.Do(clearReq)
-	if err != nil {
-		t.Fatalf("PUT copy policy clear: %v", err)
-	}
-	defer func() { _ = clearResp.Body.Close() }()
-	if clearResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(clearResp.Body)
-		t.Fatalf("clear status = %d, want %d body=%s", clearResp.StatusCode, http.StatusOK, body)
-	}
-	var clearBody struct {
-		DefaultCopies   *int `json:"default_copies"`
-		EffectiveCopies int  `json:"effective_copies"`
-	}
-	if err := json.NewDecoder(clearResp.Body).Decode(&clearBody); err != nil {
-		t.Fatalf("Decode clear response: %v", err)
-	}
-	if clearBody.DefaultCopies != nil || clearBody.EffectiveCopies != 5 {
-		t.Fatalf("clear copy policy response = %#v, want inherited 5", clearBody)
-	}
-}
-
-func TestAPIBucketCopyPolicy_IndependentFieldsValidateFinalPolicyAndUseOneCoordinator(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 5)
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "independent-copy-policy-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	update := func(body string) *httptest.ResponseRecorder {
+	getProvenance := func(bucketName, targetVersionID string) (provenanceBody, int) {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/independent-copy-policy-bucket/copy-policy", strings.NewReader(body))
-		req.SetPathValue("name", bucket.Name)
-		req.Header.Set("Content-Type", "application/json")
-		setBucketWriteHeaders(req)
-		rr := httptest.NewRecorder()
-		srv.handleAPIUpdateBucketCopyPolicy(rr, req)
-		return rr
-	}
-	assertStored := func(wantTarget, wantMinimum *int) {
-		t.Helper()
-		got, err := repos.Buckets.GetByName(ctx, bucket.Name)
-		if err != nil || got == nil {
-			t.Fatalf("GetByName: bucket=%#v err=%v", got, err)
+		resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucketName + "/objects/provenance?version_id=" + url.QueryEscape(targetVersionID))
+		if err != nil {
+			t.Fatalf("GET provenance: %v", err)
 		}
-		if !reflect.DeepEqual(got.DefaultCopies, wantTarget) || !reflect.DeepEqual(got.MinimumDurableCopies, wantMinimum) {
-			t.Fatalf("stored policy = target:%v minimum:%v, want target:%v minimum:%v", got.DefaultCopies, got.MinimumDurableCopies, wantTarget, wantMinimum)
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return provenanceBody{}, resp.StatusCode
 		}
-	}
-
-	targetFour, minimumTwo := 4, 2
-	if rr := update(`{"default_copies":4,"minimum_durable_copies":2}`); rr.Code != http.StatusOK {
-		t.Fatalf("joint update status = %d body=%s", rr.Code, rr.Body.String())
-	}
-	assertStored(&targetFour, &minimumTwo)
-
-	minimumThree := 3
-	if rr := update(`{"minimum_durable_copies":3}`); rr.Code != http.StatusOK {
-		t.Fatalf("minimum-only update status = %d body=%s", rr.Code, rr.Body.String())
-	}
-	assertStored(&targetFour, &minimumThree)
-
-	targetThree := 3
-	if rr := update(`{"default_copies":3}`); rr.Code != http.StatusOK {
-		t.Fatalf("target-only update status = %d body=%s", rr.Code, rr.Body.String())
-	}
-	assertStored(&targetThree, &minimumThree)
-
-	if rr := update(`{"default_copies":2}`); rr.Code != http.StatusBadRequest {
-		t.Fatalf("invalid target reduction status = %d body=%s", rr.Code, rr.Body.String())
-	}
-	assertStored(&targetThree, &minimumThree)
-
-	if rr := update(`{"minimum_durable_copies":null}`); rr.Code != http.StatusOK {
-		t.Fatalf("clear minimum status = %d body=%s", rr.Code, rr.Body.String())
-	} else {
-		var response struct {
-			Minimum     *int `json:"minimum_durable_copies"`
-			Effective   int  `json:"effective_minimum_durable_copies"`
-			Target      *int `json:"default_copies"`
-			TargetValue int  `json:"effective_copies"`
+		var body provenanceBody
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("Decode provenance: %v", err)
 		}
-		if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
-			t.Fatalf("Decode clear minimum response: %v", err)
-		}
-		if response.Minimum != nil || response.Effective != 3 || response.Target == nil || *response.Target != 3 || response.TargetValue != 3 {
-			t.Fatalf("clear minimum response = %#v, want strict 3/3", response)
-		}
+		return body, resp.StatusCode
 	}
-	assertStored(&targetThree, nil)
 
-	tasks, total, err := repos.Tasks.List(ctx, string(model.TaskTypeEvictCache), cacheeviction.StageReconcileBucketDurability, "", 10, 0)
-	if err != nil {
-		t.Fatalf("List coordinator tasks: %v", err)
+	detail, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", statusCode, http.StatusOK)
 	}
-	if total != 1 || len(tasks) != 1 || tasks[0].RefType != "bucket" || tasks[0].RefID != bucket.ID {
-		t.Fatalf("coordinator tasks total=%d tasks=%#v, want one bucket task", total, tasks)
+	if detail.VersionID != versionID || detail.Status != "success" {
+		t.Fatalf("detail status = %#v, want stored provenance", detail)
+	}
+	if detail.PieceCID != pieceCID || detail.RequestedCopies != 2 || detail.SuccessCopies != 2 {
+		t.Fatalf("detail counts = %#v, want piece and 2/2 copies", detail)
+	}
+	if detail.CopyHealth.Status != string(observability.StatusAvailable) || detail.CopyHealth.RequestedCopies != 2 || detail.CopyHealth.ReadableCopies != 2 || len(detail.CopyHealth.ReasonCodes) != 0 {
+		t.Fatalf("copy_health = %#v, want healthy 2/2 provenance", detail.CopyHealth)
+	}
+	if len(detail.Copies) != 2 || detail.Copies[0].ProviderID != "101" || detail.Copies[0].TransferMethod != string(model.StorageCopyTransferMethodIngress) || detail.Copies[1].TransferMethod != string(model.StorageCopyTransferMethodPeerPull) {
+		t.Fatalf("copies = %#v, want provider scoped copy provenance", detail.Copies)
+	}
+	if detail.Copies[0].IsNewDataSet || detail.Copies[1].IsNewDataSet {
+		t.Fatalf("copies = %#v, want reused data sets derived from the earlier content", detail.Copies)
+	}
+	if detail.Copies[0].Health.Status != string(observability.StatusAvailable) || len(detail.Copies[0].Health.ReasonCodes) != 0 {
+		t.Fatalf("copy health = %#v, want healthy copy", detail.Copies[0].Health)
+	}
+	if detail.Copies[0].ProviderIdentity == nil || detail.Copies[0].ProviderIdentity.Name != "alpha-pdp" || detail.Copies[0].ProviderIdentity.FilecoinActorID != "f01234" {
+		t.Fatalf("copy provider_identity = %#v, want enriched copy identity", detail.Copies[0].ProviderIdentity)
+	}
+	if detail.Copies[1].ProviderID != "102" || detail.Copies[1].ProviderIdentity != nil {
+		t.Fatalf("secondary copy = %#v, want provider_id compatibility without identity when lookup fails", detail.Copies[1])
+	}
+	peerBinding, err := repos.Contents.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 1)
+	if err != nil || peerBinding == nil {
+		t.Fatalf("GetDataSetBindingByCopyIndex peer: binding=%v err=%v", peerBinding, err)
+	}
+	// A draining generation still serves reads, so it keeps counting.
+	if err := repos.Contents.MarkDataSetDraining(ctx, peerBinding.ID, "provider service ended"); err != nil {
+		t.Fatalf("MarkDataSetDraining peer: %v", err)
+	}
+	drainingDetail, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("draining status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if drainingDetail.SuccessCopies != 2 {
+		t.Fatalf("draining provenance = %#v, want draining dataset counted as readable", drainingDetail)
+	}
+	if !reflect.DeepEqual(identityResolver.requests[0], []string{"101", "102"}) {
+		t.Fatalf("provider identity request = %#v, want one provenance snapshot request", identityResolver.requests)
+	}
+
+	oldDetail, statusCode := getProvenance("provenance-bucket", oldVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("old version status = %d, want %d", statusCode, http.StatusOK)
+	}
+	// The historical version was accepted against the same two-slot policy, so
+	// it reports both replicas too.
+	if oldDetail.VersionID != oldVersionID || oldDetail.Status != "success" || oldDetail.SuccessCopies != 2 ||
+		len(oldDetail.Copies) != 2 || !oldDetail.Copies[0].IsNewDataSet || !oldDetail.Copies[1].IsNewDataSet {
+		t.Fatalf("old version provenance = %#v, want historical stored version", oldDetail)
+	}
+
+	partialDetail, statusCode := getProvenance("provenance-bucket", partialVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("partial status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if partialDetail.Status != "syncing" || partialDetail.SuccessCopies != 1 {
+		t.Fatalf("partial provenance = %#v, want partially replicated detail", partialDetail)
+	}
+
+	failedDetail, statusCode := getProvenance("provenance-bucket", failedVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("failed status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if failedDetail.Status != "warning" || failedDetail.SuccessCopies != 0 {
+		t.Fatalf("failed provenance = %#v, want failed ingest detail", failedDetail)
+	}
+
+	// Once it is retired it serves nothing, and drops out of readable copies.
+	if _, err := srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("status = ?", model.StorageDataSetStatusRetired).
+		Where("id = ?", peerBinding.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("retire peer binding: %v", err)
+	}
+	retiredDetail, statusCode := getProvenance("provenance-bucket", versionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("retired status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if retiredDetail.SuccessCopies != 1 {
+		t.Fatalf("retired provenance = %#v, want the retired dataset excluded from readable copies", retiredDetail)
+	}
+
+	// A version whose content has no copies yet still answers, with nothing to
+	// show for provenance.
+	noCopies, statusCode := getProvenance("provenance-bucket", noCopyVersionID)
+	if statusCode != http.StatusOK {
+		t.Fatalf("no-copy status = %d, want %d", statusCode, http.StatusOK)
+	}
+	if noCopies.VersionID != noCopyVersionID || len(noCopies.Copies) != 0 {
+		t.Fatalf("no-copy provenance = %#v, want empty copy detail", noCopies)
+	}
+
+	otherBucket := &model.Bucket{Name: "other-provenance-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
+		t.Fatalf("other bucket: %v", err)
+	}
+	_, statusCode = getProvenance("other-provenance-bucket", versionID)
+	if statusCode != http.StatusNotFound {
+		t.Fatalf("wrong bucket provenance code = %d, want %d", statusCode, http.StatusNotFound)
 	}
 }
 
-func TestAPIBucketCopyPolicy_EffectiveMinimumClampsWithoutRewritingStoredValue(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithRuntimeCopies(t, 2)
-	minimum := 5
-	bucket := &model.Bucket{
-		Name:                 "clamped-copy-policy-bucket",
-		MinimumDurableCopies: &minimum,
-		Status:               model.BucketStatusActive,
-	}
-	if err := repos.Buckets.Create(context.Background(), bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/clamped-copy-policy-bucket", nil)
-	req.SetPathValue("name", bucket.Name)
-	rr := httptest.NewRecorder()
-	srv.handleAPIGetBucket(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("GET status = %d body=%s", rr.Code, rr.Body.String())
-	}
-	var response struct {
-		Minimum   *int `json:"minimum_durable_copies"`
-		Effective int  `json:"effective_minimum_durable_copies"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
-		t.Fatalf("Decode response: %v", err)
-	}
-	if response.Minimum == nil || *response.Minimum != 5 || response.Effective != 2 {
-		t.Fatalf("minimum response = stored:%v effective:%d, want 5 clamped to 2", response.Minimum, response.Effective)
-	}
-	stored, err := repos.Buckets.GetByName(context.Background(), bucket.Name)
-	if err != nil || stored == nil || stored.MinimumDurableCopies == nil || *stored.MinimumDurableCopies != 5 {
-		t.Fatalf("stored bucket after GET = %#v err=%v, want unchanged minimum 5", stored, err)
-	}
-}
-
-func TestAPIBucketCopyPolicy_RejectsInvalidPayloads(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "invalid-copy-policy-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	for _, tc := range []struct {
-		name string
-		body string
-	}{
-		{name: "missing field", body: `{}`},
-		{name: "unknown field", body: `{"default_copies":3,"extra":true}`},
-		{name: "string copies", body: `{"default_copies":"3"}`},
-		{name: "fractional copies", body: `{"default_copies":3.5}`},
-		{name: "zero copies", body: `{"default_copies":0}`},
-		{name: "too many copies", body: `{"default_copies":9}`},
-		{name: "zero minimum", body: `{"minimum_durable_copies":0}`},
-		{name: "too many minimum", body: `{"minimum_durable_copies":9}`},
-		{name: "minimum exceeds target", body: `{"default_copies":2,"minimum_durable_copies":3}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/invalid-copy-policy-bucket/copy-policy", strings.NewReader(tc.body))
-			req.SetPathValue("name", bucket.Name)
-			req.Header.Set("Content-Type", "application/json")
-			setBucketWriteHeaders(req)
-			rr := httptest.NewRecorder()
-
-			srv.handleAPIUpdateBucketCopyPolicy(rr, req)
-
-			if rr.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
-			}
-		})
-	}
-}
-
-func TestAPIBucketOwner_UpdateAssignsExistingS3User(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithS3UsersAndRuntimeCopies(t, 4, "owner-access")
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "assign-owner-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/assign-owner-bucket/owner", strings.NewReader(`{"owner_access_key":"owner-access"}`))
-	req.SetPathValue("name", bucket.Name)
-	req.Header.Set("Content-Type", "application/json")
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIUpdateBucketOwner(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	acl, err := auth.ParseACL(updated.ACL)
-	if err != nil {
-		t.Fatalf("ParseACL: %v", err)
-	}
-	if acl.Owner != "owner-access" {
-		t.Fatalf("owner = %q, want owner-access", acl.Owner)
-	}
-	var body struct {
-		OwnerAccessKey  *string `json:"owner_access_key"`
-		DefaultCopies   *int    `json:"default_copies"`
-		EffectiveCopies int     `json:"effective_copies"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode response: %v", err)
-	}
-	if body.OwnerAccessKey == nil || *body.OwnerAccessKey != "owner-access" {
-		t.Fatalf("response owner = %v, want owner-access", body.OwnerAccessKey)
-	}
-	if body.DefaultCopies != nil || body.EffectiveCopies != 4 {
-		t.Fatalf("owner update copy policy = default:%v effective:%d, want inherited 4", body.DefaultCopies, body.EffectiveCopies)
-	}
-}
-
-func TestAPIBucketOwner_UpdateAllowsInternalRootOwner(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
-	ctx := context.Background()
-	owner := "owner-access"
-	acl, err := json.Marshal(auth.ACL{Owner: owner})
-	if err != nil {
-		t.Fatalf("Marshal ACL: %v", err)
-	}
-	bucket := &model.Bucket{Name: "root-transfer-bucket", Status: model.BucketStatusActive, OwnerAccessKey: &owner, ACL: acl}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/root-transfer-bucket/owner", strings.NewReader(`{"owner_access_key":"`+internalRootOwnerAccessKey+`"}`))
-	req.SetPathValue("name", bucket.Name)
-	req.Header.Set("Content-Type", "application/json")
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIUpdateBucketOwner(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	updated, err := repos.Buckets.GetByName(ctx, bucket.Name)
-	if err != nil {
-		t.Fatalf("GetByName: %v", err)
-	}
-	if updated.OwnerAccessKey == nil || *updated.OwnerAccessKey != srv.s3RootAccess {
-		t.Fatalf("stored owner = %v, want root access", updated.OwnerAccessKey)
-	}
-	updatedACL, err := auth.ParseACL(updated.ACL)
-	if err != nil {
-		t.Fatalf("ParseACL: %v", err)
-	}
-	if updatedACL.Owner != srv.s3RootAccess {
-		t.Fatalf("ACL owner = %q, want root access", updatedACL.Owner)
-	}
-	var body struct {
-		OwnerAccessKey *string `json:"owner_access_key"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode response: %v", err)
-	}
-	if body.OwnerAccessKey == nil || *body.OwnerAccessKey != internalRootOwnerAccessKey {
-		t.Fatalf("response owner = %v, want internal root token", body.OwnerAccessKey)
-	}
-}
-
-func TestAPIBucketOwner_UpdateRejectsUnknownS3User(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "unknown-owner-target", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/unknown-owner-target/owner", strings.NewReader(`{"owner_access_key":"missing-owner"}`))
-	req.SetPathValue("name", bucket.Name)
-	req.Header.Set("Content-Type", "application/json")
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIUpdateBucketOwner(rr, req)
-
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
-	}
-}
-
-func TestAPIBucketOwner_UpdateRejectsMalformedStrictJSON(t *testing.T) {
-	srv, repos := newBucketAPITestServerWithS3Users(t, "owner-access")
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "strict-owner-target", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	for _, tc := range []struct {
-		name string
-		body string
-	}{
-		{name: "unknown field", body: `{"owner_access_key":"owner-access","extra":true}`},
-		{name: "trailing object", body: `{"owner_access_key":"owner-access"} {}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPut, "/api/v1/buckets/strict-owner-target/owner", strings.NewReader(tc.body))
-			req.SetPathValue("name", bucket.Name)
-			req.Header.Set("Content-Type", "application/json")
-			setBucketWriteHeaders(req)
-			rr := httptest.NewRecorder()
-
-			srv.handleAPIUpdateBucketOwner(rr, req)
-
-			if rr.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
-			}
-		})
-	}
-}
-
-func TestAPIBucketDetail_ActiveBucket(t *testing.T) {
+func TestAPIBucketObjectVersions(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "active-detail-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "versions-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
+	_, oldVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", model.ObjectStateCached)
+	acceptAdminVersionUpload(t, srv.db, repos, oldVersionID, "piece-old", "https://provider.example/old")
+	_, currentVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 7, "etag-current", "checksum-current", "text/plain", model.ObjectStateCached)
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/active-detail-bucket")
+	resp, err := http.Get(ts.URL + "/api/v1/buckets/versions-bucket/objects/versions?key=" + url.QueryEscape("file.txt"))
 	if err != nil {
-		t.Fatalf("GET bucket detail: %v", err)
+		t.Fatalf("GET object versions: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
 	}
 
 	var body struct {
-		Name               string `json:"name"`
-		Status             string `json:"status"`
-		VersioningStatus   string `json:"versioning_status"`
-		VersioningEnforced bool   `json:"versioning_enforced"`
+		Versions []struct {
+			VersionID string         `json:"version_id"`
+			State     string         `json:"state"`
+			Status    string         `json:"status"`
+			Location  objectLocation `json:"location"`
+			IsCurrent bool           `json:"is_current"`
+		} `json:"versions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	if body.Name != bucket.Name {
-		t.Fatalf("name = %q, want %q", body.Name, bucket.Name)
+	if len(body.Versions) != 2 {
+		t.Fatalf("versions len = %d, want 2", len(body.Versions))
 	}
-	if body.Status != string(model.BucketStatusActive) {
-		t.Fatalf("status = %q, want %q", body.Status, model.BucketStatusActive)
+	if body.Versions[0].VersionID != currentVersionID || !body.Versions[0].IsCurrent {
+		t.Fatalf("first version = %#v, want current %s", body.Versions[0], currentVersionID)
 	}
-	if body.VersioningStatus != "Enabled" || !body.VersioningEnforced {
-		t.Fatalf("versioning = %q enforced=%v, want Enabled/enforced", body.VersioningStatus, body.VersioningEnforced)
+	if body.Versions[1].VersionID != oldVersionID || body.Versions[1].IsCurrent {
+		t.Fatalf("second version = %#v, want old %s", body.Versions[1], oldVersionID)
 	}
-}
+	// Each version carries its own bytes here, so their derived positions differ.
+	if body.Versions[0].Status != "uploading" {
+		t.Fatalf("current version status = %q, want uploading", body.Versions[0].Status)
+	}
+	if body.Versions[0].State != string(model.ObjectStateCached) {
+		t.Fatalf("current version state = %q, want cached", body.Versions[0].State)
+	}
+	if !body.Versions[0].Location.Cache || body.Versions[0].Location.Filecoin {
+		t.Fatalf("current version location = %#v, want cache only", body.Versions[0].Location)
+	}
+	if body.Versions[1].Status != "success" {
+		t.Fatalf("old version status = %q, want success", body.Versions[1].Status)
+	}
+	if body.Versions[1].State != string(model.ObjectStateStored) {
+		t.Fatalf("old version state = %q, want stored", body.Versions[1].State)
+	}
+	if !body.Versions[1].Location.Cache || !body.Versions[1].Location.Filecoin {
+		t.Fatalf("old version location = %#v, want cache and filecoin", body.Versions[1].Location)
+	}
 
-func TestAPIBucketObjects_ActiveBucket(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "objects-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "kept.txt", 4, "etag-kept", "checksum-kept", "text/plain", "", model.ObjectStateCached)
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark uploading: %v", err)
-	}
-	acceptAdminVersionUpload(t, repos, versionID, "piece-kept", "https://provider.example/kept")
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/objects-bucket/objects")
+	resp, err = http.Get(ts.URL + "/api/v1/buckets/versions-bucket/objects/versions?key=" + url.QueryEscape("file.txt"))
 	if err != nil {
-		t.Fatalf("GET bucket objects: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var body struct {
-		Objects []struct {
-			Key              string         `json:"key"`
-			CurrentVersionID string         `json:"current_version_id"`
-			State            string         `json:"state"`
-			Status           string         `json:"status"`
-			Location         objectLocation `json:"location"`
-		} `json:"objects"`
-		Folders []objectFolderItem `json:"folders"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(body.Objects) != 1 {
-		t.Fatalf("objects len = %d, want 1", len(body.Objects))
-	}
-	if body.Objects[0].Key != "kept.txt" {
-		t.Fatalf("key = %q, want %q", body.Objects[0].Key, "kept.txt")
-	}
-	if body.Objects[0].CurrentVersionID == "" {
-		t.Fatal("expected current version id")
-	}
-	if body.Objects[0].Status != "success" {
-		t.Fatalf("status = %q, want success", body.Objects[0].Status)
-	}
-	if body.Objects[0].State != string(model.ObjectStateStored) {
-		t.Fatalf("state = %q, want stored", body.Objects[0].State)
-	}
-	if !body.Objects[0].Location.Cache || !body.Objects[0].Location.Filecoin {
-		t.Fatalf("location = %#v, want cache and filecoin", body.Objects[0].Location)
-	}
-	if len(body.Folders) != 0 {
-		t.Fatalf("folders len = %d, want 0 for flat object list", len(body.Folders))
-	}
-	if body.Folders == nil {
-		t.Fatal("folders should be an empty array, not null")
-	}
-
-	resp, err = http.Get(ts.URL + "/api/v1/buckets/objects-bucket/objects")
-	if err != nil {
-		t.Fatalf("GET bucket objects raw: %v", err)
+		t.Fatalf("GET object versions raw: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var raw struct {
-		Objects []map[string]any `json:"objects"`
+		Versions []map[string]any `json:"versions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		t.Fatalf("Decode raw: %v", err)
 	}
-	if raw.Objects[0]["state"] != string(model.ObjectStateStored) {
-		t.Fatalf("object list state = %#v, want stored", raw.Objects[0]["state"])
-	}
-	if _, ok := raw.Objects[0]["storage"]; ok {
-		t.Fatal("object list exposed storage instead of location")
-	}
-	if _, ok := raw.Objects[0]["attention"]; ok {
-		t.Fatal("object list exposed attention")
-	}
-}
-
-func TestAPIBucketObjectsDelimiterReturnsCurrentLevelFoldersAndFiles(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "folder-list-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	seedAdminObjectVersion(t, repos, bucket, "docs/guide.md", 4, "etag-doc", "checksum-doc", "text/markdown", "", model.ObjectStateStored)
-	seedAdminObjectVersion(t, repos, bucket, "photos/", 0, "etag-marker", "checksum-marker", "application/x-directory", "", model.ObjectStateCached)
-	seedAdminObjectVersion(t, repos, bucket, "photos/2026/a.jpg", 7, "etag-photo", "checksum-photo", "image/jpeg", "", model.ObjectStateStored)
-	seedAdminObjectVersion(t, repos, bucket, "root.txt", 5, "etag-root", "checksum-root", "text/plain", "", model.ObjectStateStored)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/folder-list-bucket/objects?delimiter=/")
-	if err != nil {
-		t.Fatalf("GET bucket objects: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var body objectListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(body.Folders) != 2 {
-		t.Fatalf("folders len = %d, want 2: %#v", len(body.Folders), body.Folders)
-	}
-	if body.Folders[0].Name != "docs" || body.Folders[0].Prefix != "docs/" {
-		t.Fatalf("first folder = %#v, want docs/", body.Folders[0])
-	}
-	if body.Folders[1].Name != "photos" || body.Folders[1].Prefix != "photos/" {
-		t.Fatalf("second folder = %#v, want photos/", body.Folders[1])
-	}
-	if len(body.Objects) != 1 || body.Objects[0].Key != "root.txt" {
-		t.Fatalf("objects = %#v, want root.txt only", body.Objects)
-	}
-}
-
-func TestAPIBucketObjectsDelimiterPrefixReturnsNestedLevel(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "nested-folder-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	seedAdminObjectVersion(t, repos, bucket, "photos/", 0, "etag-marker", "checksum-marker", "application/x-directory", "", model.ObjectStateCached)
-	seedAdminObjectVersion(t, repos, bucket, "photos/cover.jpg", 5, "etag-cover", "checksum-cover", "image/jpeg", "", model.ObjectStateStored)
-	seedAdminObjectVersion(t, repos, bucket, "photos/2026/a.jpg", 7, "etag-photo", "checksum-photo", "image/jpeg", "", model.ObjectStateStored)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/nested-folder-bucket/objects?prefix=" + url.QueryEscape("photos/") + "&delimiter=/")
-	if err != nil {
-		t.Fatalf("GET bucket objects: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var body objectListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(body.Folders) != 1 || body.Folders[0].Name != "2026" || body.Folders[0].Prefix != "photos/2026/" {
-		t.Fatalf("folders = %#v, want photos/2026/", body.Folders)
-	}
-	if len(body.Objects) != 1 || body.Objects[0].Key != "photos/cover.jpg" {
-		t.Fatalf("objects = %#v, want photos/cover.jpg only", body.Objects)
-	}
-}
-
-func TestAPIBucketObjectsDelimiterPreservesSlashOnlyFolderName(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "slash-folder-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	seedAdminObjectVersion(t, repos, bucket, "a//child.txt", 1, "etag-slash", "checksum-slash", "text/plain", "", model.ObjectStateStored)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/slash-folder-bucket/objects?prefix=" + url.QueryEscape("a/") + "&delimiter=/")
-	if err != nil {
-		t.Fatalf("GET bucket objects: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var body objectListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(body.Folders) != 1 || body.Folders[0].Name != "/" || body.Folders[0].Prefix != "a//" {
-		t.Fatalf("folders = %#v, want slash-only folder a//", body.Folders)
-	}
-}
-
-func TestAPIBucketObjectsRejectsUnsupportedDelimiter(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "unsupported-delimiter-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/unsupported-delimiter-bucket/objects?delimiter=:")
-	if err != nil {
-		t.Fatalf("GET bucket objects: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestAPIBucketObjectsDelimiterPaginationSkipsDuplicateFolders(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "folder-page-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	seedAdminObjectVersion(t, repos, bucket, "a/1.txt", 1, "etag-a1", "checksum-a1", "text/plain", "", model.ObjectStateStored)
-	seedAdminObjectVersion(t, repos, bucket, "a/2.txt", 1, "etag-a2", "checksum-a2", "text/plain", "", model.ObjectStateStored)
-	seedAdminObjectVersion(t, repos, bucket, "b/1.txt", 1, "etag-b1", "checksum-b1", "text/plain", "", model.ObjectStateStored)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/folder-page-bucket/objects?delimiter=/&limit=1")
-	if err != nil {
-		t.Fatalf("GET page 1: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var page1 objectListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&page1); err != nil {
-		t.Fatalf("Decode page 1: %v", err)
-	}
-	if len(page1.Folders) != 1 || page1.Folders[0].Prefix != "a/" || len(page1.Objects) != 0 || !page1.HasMore || page1.NextMarker == "" {
-		t.Fatalf("page 1 = %#v, want a/ folder and next marker", page1)
-	}
-
-	resp2, err := http.Get(ts.URL + "/api/v1/buckets/folder-page-bucket/objects?delimiter=/&limit=1&after=" + url.QueryEscape(page1.NextMarker))
-	if err != nil {
-		t.Fatalf("GET page 2: %v", err)
-	}
-	defer func() { _ = resp2.Body.Close() }()
-
-	var page2 objectListResponse
-	if err := json.NewDecoder(resp2.Body).Decode(&page2); err != nil {
-		t.Fatalf("Decode page 2: %v", err)
-	}
-	if len(page2.Folders) != 1 || page2.Folders[0].Prefix != "b/" || len(page2.Objects) != 0 {
-		t.Fatalf("page 2 = %#v, want b/ folder only", page2)
-	}
-}
-
-func TestListBucketObjectEntriesSkipsEmittedFolderSubtree(t *testing.T) {
-	keys := make([]string, adminObjectListingBatchSize*2+1)
-	for i := range keys {
-		keys[i] = fmt.Sprintf("a/%04d.txt", i)
-	}
-	objects := &recordingObjectListRepo{keys: keys}
-	srv := &Server{repos: &repository.Repositories{Objects: objects}}
-
-	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
-	if err != nil {
-		t.Fatalf("listBucketObjectEntries: %v", err)
-	}
-
-	if len(folders) != 1 || folders[0].Prefix != "a/" || len(files) != 0 || hasMore || nextMarker != "" {
-		t.Fatalf("listing = folders:%#v files:%#v hasMore:%v nextMarker:%q, want a/ folder only", folders, files, hasMore, nextMarker)
-	}
-	if objects.scanCalls() > 2 {
-		t.Fatalf("object list scans = %d, want at most 2 without walking every child batch", objects.scanCalls())
-	}
-}
-
-func TestListBucketObjectEntriesKeepsCurrentBatchAcrossSiblingFolders(t *testing.T) {
-	keys := make([]string, 50)
-	for i := range keys {
-		keys[i] = fmt.Sprintf("dir-%02d/file.txt", i)
-	}
-	objects := &recordingObjectListRepo{keys: keys}
-	srv := &Server{repos: &repository.Repositories{Objects: objects}}
-
-	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
-	if err != nil {
-		t.Fatalf("listBucketObjectEntries: %v", err)
-	}
-
-	if len(folders) != 50 || len(files) != 0 || hasMore || nextMarker != "" {
-		t.Fatalf("listing = folders:%d files:%#v hasMore:%v nextMarker:%q, want 50 folders only", len(folders), files, hasMore, nextMarker)
-	}
-	if objects.scanCalls() != 1 {
-		t.Fatalf("object list scans = %d, want 1 for sibling folders in one batch", objects.scanCalls())
-	}
-}
-
-func TestListBucketObjectEntriesSkipsDuplicateRowsBeforeSiblingFolders(t *testing.T) {
-	keys := make([]string, 0, 100)
-	for i := 0; i < 50; i++ {
-		keys = append(keys, fmt.Sprintf("dir-%02d/a.txt", i), fmt.Sprintf("dir-%02d/b.txt", i))
-	}
-	objects := &recordingObjectListRepo{keys: keys}
-	srv := &Server{repos: &repository.Repositories{Objects: objects}}
-
-	folders, files, hasMore, nextMarker, err := srv.listBucketObjectEntries(t.Context(), 1, "", "/", "", 50)
-	if err != nil {
-		t.Fatalf("listBucketObjectEntries: %v", err)
-	}
-
-	if len(folders) != 50 || len(files) != 0 || hasMore || nextMarker != "" {
-		t.Fatalf("listing = folders:%d files:%#v hasMore:%v nextMarker:%q, want 50 folders only", len(folders), files, hasMore, nextMarker)
-	}
-	if objects.scanCalls() != 1 {
-		t.Fatalf("object list scans = %d, want 1 while duplicate folder rows fit in one batch", objects.scanCalls())
-	}
-}
-
-func TestAPIBucketObjects_DeleteListAndRestore(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "trash-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", "", model.ObjectStateCached)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	deleteReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/buckets/trash-bucket/objects?key="+url.QueryEscape("folder/file.txt"), nil)
-	if err != nil {
-		t.Fatalf("NewRequest delete: %v", err)
-	}
-	setBucketWriteHeaders(deleteReq)
-	deleteResp, err := ts.Client().Do(deleteReq)
-	if err != nil {
-		t.Fatalf("DELETE bucket object: %v", err)
-	}
-	defer func() { _ = deleteResp.Body.Close() }()
-	if deleteResp.StatusCode != http.StatusOK {
-		t.Fatalf("delete status = %d, want %d, body=%s", deleteResp.StatusCode, http.StatusOK, readBody(t, deleteResp.Body))
-	}
-	var deleteBody struct {
-		Key                   string `json:"key"`
-		DeleteMarkerVersionID string `json:"delete_marker_version_id"`
-		DeletedAt             string `json:"deleted_at"`
-	}
-	if err := json.NewDecoder(deleteResp.Body).Decode(&deleteBody); err != nil {
-		t.Fatalf("Decode delete: %v", err)
-	}
-	if deleteBody.Key != "folder/file.txt" || deleteBody.DeleteMarkerVersionID == "" || deleteBody.DeletedAt == "" {
-		t.Fatalf("delete response = %#v, want marker metadata", deleteBody)
-	}
-
-	listResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects?prefix=" + url.QueryEscape("folder/"))
-	if err != nil {
-		t.Fatalf("GET live objects: %v", err)
-	}
-	defer func() { _ = listResp.Body.Close() }()
-	var live objectListResponse
-	if err := json.NewDecoder(listResp.Body).Decode(&live); err != nil {
-		t.Fatalf("Decode live objects: %v", err)
-	}
-	if len(live.Objects) != 0 {
-		t.Fatalf("live objects = %#v, want deleted object hidden", live.Objects)
-	}
-
-	versionsResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/versions?key=" + url.QueryEscape("folder/file.txt"))
-	if err != nil {
-		t.Fatalf("GET object versions: %v", err)
-	}
-	defer func() { _ = versionsResp.Body.Close() }()
-	var versionsBody struct {
-		Versions []struct {
-			VersionID       string `json:"version_id"`
-			IsCurrent       bool   `json:"is_current"`
-			IsDeleteMarker  bool   `json:"is_delete_marker"`
-			UploadStatus    string `json:"upload_status"`
-			DownloadVisible bool   `json:"download_visible"`
-		} `json:"versions"`
-	}
-	if err := json.NewDecoder(versionsResp.Body).Decode(&versionsBody); err != nil {
-		t.Fatalf("Decode versions: %v", err)
-	}
-	if len(versionsBody.Versions) != 2 {
-		t.Fatalf("versions len = %d, want 2", len(versionsBody.Versions))
-	}
-	if versionsBody.Versions[0].VersionID != deleteBody.DeleteMarkerVersionID || !versionsBody.Versions[0].IsCurrent || !versionsBody.Versions[0].IsDeleteMarker {
-		t.Fatalf("first version = %#v, want current delete marker", versionsBody.Versions[0])
-	}
-	if versionsBody.Versions[1].VersionID != versionID || versionsBody.Versions[1].IsDeleteMarker {
-		t.Fatalf("second version = %#v, want data version %s", versionsBody.Versions[1], versionID)
-	}
-
-	deletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
-	if err != nil {
-		t.Fatalf("GET deleted objects: %v", err)
-	}
-	defer func() { _ = deletedResp.Body.Close() }()
-	var deletedBody struct {
-		Objects []struct {
-			Key                   string `json:"key"`
-			DeleteMarkerVersionID string `json:"delete_marker_version_id"`
-			DeletedAt             string `json:"deleted_at"`
-			RestoreVersionID      string `json:"restore_version_id"`
-			RestoreSize           int64  `json:"restore_size"`
-			RestoreContentType    string `json:"restore_content_type"`
-			RestoreETag           string `json:"restore_etag"`
-		} `json:"objects"`
-		HasMore bool `json:"has_more"`
-	}
-	if err := json.NewDecoder(deletedResp.Body).Decode(&deletedBody); err != nil {
-		t.Fatalf("Decode deleted objects: %v", err)
-	}
-	if len(deletedBody.Objects) != 1 {
-		t.Fatalf("deleted objects len = %d, want 1", len(deletedBody.Objects))
-	}
-	deleted := deletedBody.Objects[0]
-	if deleted.Key != "folder/file.txt" || deleted.DeleteMarkerVersionID != deleteBody.DeleteMarkerVersionID || deleted.RestoreVersionID != versionID || deleted.RestoreSize != 7 || deleted.RestoreContentType != "text/plain" || deleted.RestoreETag != "etag-file" || deleted.DeletedAt == "" {
-		t.Fatalf("deleted object = %#v, want recoverable file", deleted)
-	}
-
-	restoreReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/trash-bucket/objects/restore", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", deleteBody.DeleteMarkerVersionID)))
-	if err != nil {
-		t.Fatalf("NewRequest restore: %v", err)
-	}
-	setBucketWriteHeaders(restoreReq)
-	restoreResp, err := ts.Client().Do(restoreReq)
-	if err != nil {
-		t.Fatalf("POST restore object: %v", err)
-	}
-	defer func() { _ = restoreResp.Body.Close() }()
-	if restoreResp.StatusCode != http.StatusOK {
-		t.Fatalf("restore status = %d, want %d, body=%s", restoreResp.StatusCode, http.StatusOK, readBody(t, restoreResp.Body))
-	}
-	var restoreBody struct {
-		Key               string `json:"key"`
-		RestoredVersionID string `json:"restored_version_id"`
-	}
-	if err := json.NewDecoder(restoreResp.Body).Decode(&restoreBody); err != nil {
-		t.Fatalf("Decode restore: %v", err)
-	}
-	if restoreBody.Key != "folder/file.txt" || restoreBody.RestoredVersionID != versionID {
-		t.Fatalf("restore response = %#v, want data version restored", restoreBody)
-	}
-
-	restoredListResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects?prefix=" + url.QueryEscape("folder/"))
-	if err != nil {
-		t.Fatalf("GET restored objects: %v", err)
-	}
-	defer func() { _ = restoredListResp.Body.Close() }()
-	var restoredLive objectListResponse
-	if err := json.NewDecoder(restoredListResp.Body).Decode(&restoredLive); err != nil {
-		t.Fatalf("Decode restored objects: %v", err)
-	}
-	if len(restoredLive.Objects) != 1 || restoredLive.Objects[0].Key != "folder/file.txt" || restoredLive.Objects[0].CurrentVersionID != versionID {
-		t.Fatalf("restored live objects = %#v, want restored file", restoredLive.Objects)
-	}
-
-	emptyDeletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
-	if err != nil {
-		t.Fatalf("GET deleted objects after restore: %v", err)
-	}
-	defer func() { _ = emptyDeletedResp.Body.Close() }()
-	var emptyDeleted struct {
-		Objects []struct{} `json:"objects"`
-	}
-	if err := json.NewDecoder(emptyDeletedResp.Body).Decode(&emptyDeleted); err != nil {
-		t.Fatalf("Decode empty deleted: %v", err)
-	}
-	if len(emptyDeleted.Objects) != 0 {
-		t.Fatalf("deleted objects after restore len = %d, want 0", len(emptyDeleted.Objects))
-	}
-}
-
-func TestAPIBucketObjectDeleteRejectsInvalidObjectKey(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	bucket := &model.Bucket{Name: "delete-key-validation-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(context.Background(), bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	key := strings.Repeat("你", 342)
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/delete-key-validation-bucket/objects?key="+url.QueryEscape(key), nil)
-	req.SetPathValue("name", bucket.Name)
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-
-	srv.handleAPIDeleteBucketObject(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "1024 UTF-8 bytes") {
-		t.Fatalf("body = %s, want object key byte-limit error", rr.Body.String())
-	}
-	version, err := repos.Objects.GetCurrentVersionByBucketAndKey(context.Background(), bucket.ID, key)
-	if err != nil {
-		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
-	}
-	if version != nil {
-		t.Fatalf("current version = %#v, want no persisted delete marker", version)
-	}
-}
-
-func TestAPIBucketDeletedObjectPermanentDeleteRemovesDeletedObject(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "trash-permanent-delete-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", "", model.ObjectStateCached)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	deleteReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/buckets/trash-permanent-delete-bucket/objects?key="+url.QueryEscape("folder/file.txt"), nil)
-	if err != nil {
-		t.Fatalf("NewRequest delete: %v", err)
-	}
-	setBucketWriteHeaders(deleteReq)
-	deleteResp, err := ts.Client().Do(deleteReq)
-	if err != nil {
-		t.Fatalf("DELETE bucket object: %v", err)
-	}
-	defer func() { _ = deleteResp.Body.Close() }()
-	if deleteResp.StatusCode != http.StatusOK {
-		t.Fatalf("delete status = %d, want %d, body=%s", deleteResp.StatusCode, http.StatusOK, readBody(t, deleteResp.Body))
-	}
-	var deleteBody struct {
-		DeleteMarkerVersionID string `json:"delete_marker_version_id"`
-	}
-	if err := json.NewDecoder(deleteResp.Body).Decode(&deleteBody); err != nil {
-		t.Fatalf("Decode delete: %v", err)
-	}
-
-	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/trash-permanent-delete-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", deleteBody.DeleteMarkerVersionID)))
-	if err != nil {
-		t.Fatalf("NewRequest permanent delete: %v", err)
-	}
-	setBucketWriteHeaders(req)
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("POST permanent delete deleted object: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("permanent delete status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
-	}
-	var body struct {
-		Key                   string  `json:"key"`
-		DeleteMarkerVersionID string  `json:"delete_marker_version_id"`
-		DataVersionsDeleted   int     `json:"data_versions_deleted"`
-		DeleteMarkersDeleted  int     `json:"delete_markers_deleted"`
-		StorageCleanupTaskIDs []int64 `json:"storage_cleanup_task_ids"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode permanent delete: %v", err)
-	}
-	if body.Key != "folder/file.txt" || body.DeleteMarkerVersionID != deleteBody.DeleteMarkerVersionID || body.DataVersionsDeleted != 1 || body.DeleteMarkersDeleted != 1 {
-		t.Fatalf("permanent delete response = %#v, want deleted object counts", body)
-	}
-
-	deletedResp, err := http.Get(ts.URL + "/api/v1/buckets/trash-permanent-delete-bucket/objects/deleted?prefix=" + url.QueryEscape("folder/"))
-	if err != nil {
-		t.Fatalf("GET deleted objects: %v", err)
-	}
-	defer func() { _ = deletedResp.Body.Close() }()
-	var deletedBody struct {
-		Objects []struct{} `json:"objects"`
-	}
-	if err := json.NewDecoder(deletedResp.Body).Decode(&deletedBody); err != nil {
-		t.Fatalf("Decode deleted objects: %v", err)
-	}
-	if len(deletedBody.Objects) != 0 {
-		t.Fatalf("deleted objects after permanent delete len = %d, want 0", len(deletedBody.Objects))
-	}
-
-	gotVersion, err := repos.Objects.GetVersionByID(ctx, versionID)
-	if err != nil {
-		t.Fatalf("GetVersionByID: %v", err)
-	}
-	if gotVersion != nil {
-		t.Fatalf("data version still exists after deleted object permanent delete: %#v", gotVersion)
-	}
-}
-
-func TestAPIBucketDeletedObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "trash-permanent-delete-busy-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	objectID, versionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", "", model.ObjectStateUploading)
-	stage := "prepare_upload"
-	task := &model.Task{
-		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: objectID, RefVersionID: versionID,
-		IdempotencyKey: "upload:" + versionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
-	}
-	if err := repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
-	if err != nil {
-		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-busy-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-	newBucketAPIMux(srv).ServeHTTP(rr, req)
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
-	}
-	var body map[string]string
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	want := "Storage work for one or more versions is still in progress or awaiting Filecoin confirmation. Check the related tasks, then try again."
-	if body["error"] != want {
-		t.Fatalf("error = %q, want %q", body["error"], want)
-	}
-	for _, id := range []string{versionID, marker.VersionID} {
-		got, loadErr := repos.Objects.GetVersionByID(ctx, id)
-		if loadErr != nil || got == nil {
-			t.Fatalf("version %s after rejected delete = %#v err=%v, want retained", id, got, loadErr)
-		}
-	}
-}
-
-func TestAPIBucketDeletedObjectPermanentDeleteCompletesCacheCleanupWhenRequestIsCanceled(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "trash-permanent-delete-cancel-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", ".versions/cancel-first", model.ObjectStateCached)
-	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", ".versions/cancel-second", model.ObjectStateCached)
-	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
-	if err != nil {
-		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
-	}
-
-	reqCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	testCache := &cancelingDeleteCache{Cache: srv.cache, cancel: cancel}
-	srv.cache = testCache
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-cancel-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID))).WithContext(reqCtx)
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-	newBucketAPIMux(srv).ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body struct {
-		DataVersionsDeleted int `json:"data_versions_deleted"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if body.DataVersionsDeleted != 2 {
-		t.Fatalf("data_versions_deleted = %d, want 2", body.DataVersionsDeleted)
-	}
-	if got := testCache.deletes.Load(); got != 2 {
-		t.Fatalf("cache cleanup deletes = %d, want 2 after request cancellation", got)
-	}
-}
-
-func TestAPIBucketDeletedObjectPermanentDeleteUsesIsolatedCacheCleanupContexts(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "trash-permanent-delete-context-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", ".versions/context-first", model.ObjectStateCached)
-	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", ".versions/context-second", model.ObjectStateCached)
-	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
-	if err != nil {
-		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
-	}
-
-	testCache := &contextRecordingDeleteCache{Cache: srv.cache}
-	srv.cache = testCache
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-context-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-	newBucketAPIMux(srv).ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	contexts := testCache.recordedContexts()
-	if got := len(contexts); got != 2 {
-		t.Fatalf("cache cleanup contexts = %d, want 2", got)
-	}
-	if contexts[0] == contexts[1] {
-		t.Fatal("cache cleanup reused one context across deleted versions")
-	}
-}
-
-func TestAPIBucketDeletedObjectPermanentDeleteRunsCacheCleanupInParallel(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "trash-permanent-delete-parallel-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", ".versions/parallel-first", model.ObjectStateCached)
-	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", ".versions/parallel-second", model.ObjectStateCached)
-	seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 9, "etag-third", "checksum-third", "text/plain", ".versions/parallel-third", model.ObjectStateCached)
-	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
-	if err != nil {
-		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
-	}
-
-	testCache := &blockingDeleteCache{
-		Cache:   srv.cache,
-		started: make(chan struct{}, 3),
-		release: make(chan struct{}),
-		failKey: ".versions/parallel-second",
-	}
-	srv.cache = testCache
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-parallel-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		newBucketAPIMux(srv).ServeHTTP(rr, req)
-		close(done)
-	}()
-
-	waitDeleteStarts(t, testCache.started, 3)
-	if got := testCache.maxActive.Load(); got < 2 {
-		t.Fatalf("max concurrent cache cleanups = %d, want at least 2", got)
-	}
-	select {
-	case <-done:
-		t.Fatal("handler returned before cache cleanup completed")
-	default:
-	}
-	close(testCache.release)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("handler did not return after cache cleanup completed")
-	}
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body struct {
-		DataVersionsDeleted     int `json:"data_versions_deleted"`
-		CacheCleanupFailedCount int `json:"cache_cleanup_failed_count"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if body.DataVersionsDeleted != 3 {
-		t.Fatalf("data_versions_deleted = %d, want 3", body.DataVersionsDeleted)
-	}
-	if body.CacheCleanupFailedCount != 1 {
-		t.Fatalf("cache_cleanup_failed_count = %d, want 1", body.CacheCleanupFailedCount)
-	}
-	if got := testCache.deletes.Load(); got != 3 {
-		t.Fatalf("cache cleanup deletes = %d, want 3", got)
-	}
-}
-
-func TestAPIBucketObjectPermanentDeleteRemovesVersion(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "version-permanent-delete-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, oldVersionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 7, "etag-old", "checksum-old", "text/plain", "", model.ObjectStateCached)
-	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", "", model.ObjectStateCached)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/version-permanent-delete-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID)))
-	if err != nil {
-		t.Fatalf("NewRequest permanent delete version: %v", err)
-	}
-	setBucketWriteHeaders(req)
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("POST permanent delete version: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("permanent delete version status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
-	}
-	var body struct {
-		Key                string `json:"key"`
-		VersionID          string `json:"version_id"`
-		CacheCleanupStatus string `json:"cache_cleanup_status"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode permanent delete version: %v", err)
-	}
-	if body.Key != "folder/file.txt" || body.VersionID != currentVersionID || body.CacheCleanupStatus == "" {
-		t.Fatalf("permanent delete version response = %#v, want deleted version metadata", body)
-	}
-	gotVersion, err := repos.Objects.GetVersionByID(ctx, currentVersionID)
-	if err != nil {
-		t.Fatalf("GetVersionByID(deleted): %v", err)
-	}
-	if gotVersion != nil {
-		t.Fatalf("data version still exists after version permanent delete: %#v", gotVersion)
-	}
-	gotOldVersion, err := repos.Objects.GetVersionByID(ctx, oldVersionID)
-	if err != nil || gotOldVersion == nil {
-		t.Fatalf("GetVersionByID(promoted): version=%v err=%v", gotOldVersion, err)
-	}
-	if !gotOldVersion.IsCurrent {
-		t.Fatalf("old version is_current = false, want true after current version permanent delete")
-	}
-}
-
-func TestAPIBucketObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-	bucket := &model.Bucket{Name: "version-permanent-delete-busy-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	objectID, versionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", "", model.ObjectStateCached)
-	stage := "prepare_upload"
-	task := &model.Task{
-		Type: model.TaskTypeUpload, Stage: &stage, RefType: "object", RefID: objectID, RefVersionID: versionID,
-		IdempotencyKey: "upload:" + versionID, Status: model.TaskStatusQueued, MaxRetries: 5, ScheduledAt: time.Now(),
-	}
-	if err := repos.Tasks.Create(ctx, task); err != nil {
-		t.Fatalf("Tasks.Create: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/version-permanent-delete-busy-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", versionID)))
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-	newBucketAPIMux(srv).ServeHTTP(rr, req)
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
-	}
-	var body map[string]string
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	want := "Storage work for this version is still in progress or awaiting Filecoin confirmation. Check the related task, then try again."
-	if body["error"] != want {
-		t.Fatalf("error = %q, want %q", body["error"], want)
-	}
-}
-
-func TestAPIBucketObjectPermanentDeleteRecordsCacheCleanupWhenRequestIsCanceled(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "version-permanent-delete-cancel-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", "cache-key", model.ObjectStateCached)
-
-	reqCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	testCache := &cancelingDeleteCache{Cache: srv.cache, cancel: cancel}
-	srv.cache = testCache
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/version-permanent-delete-cancel-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID))).WithContext(reqCtx)
-	setBucketWriteHeaders(req)
-	rr := httptest.NewRecorder()
-	newBucketAPIMux(srv).ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var body struct {
-		CacheCleanupStatus string `json:"cache_cleanup_status"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if body.CacheCleanupStatus != string(model.CacheCleanupStatusDeleted) {
-		t.Fatalf("cache cleanup status = %q, want %q", body.CacheCleanupStatus, model.CacheCleanupStatusDeleted)
-	}
-	if got := testCache.deletes.Load(); got != 1 {
-		t.Fatalf("cache cleanup deletes = %d, want 1 after request cancellation", got)
-	}
-	var gotStatus model.CacheCleanupStatus
-	if err := srv.db.NewRaw(`SELECT cache_cleanup_status FROM object_deletions WHERE version_id = ?`, currentVersionID).Scan(ctx, &gotStatus); err != nil {
-		t.Fatalf("select object deletion cache cleanup status: %v", err)
-	}
-	if gotStatus != model.CacheCleanupStatusDeleted {
-		t.Fatalf("recorded cache cleanup status = %q, want %q", gotStatus, model.CacheCleanupStatusDeleted)
-	}
-}
-
-func TestAPIBucketObjectPermanentDeleteReportsCacheCleanupFailedOnCacheError(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "version-permanent-delete-cache-error-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", "cache-key", model.ObjectStateCached)
-
-	srv.cache = &cancelingDeleteCache{Cache: srv.cache, deleteErr: errors.New("cache error")}
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/version-permanent-delete-cache-error-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID)))
-	if err != nil {
-		t.Fatalf("NewRequest permanent delete version: %v", err)
-	}
-	setBucketWriteHeaders(req)
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("POST permanent delete version: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("permanent delete version status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
-	}
-	var body struct {
-		CacheCleanupStatus string `json:"cache_cleanup_status"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode permanent delete version: %v", err)
-	}
-	if body.CacheCleanupStatus != string(model.CacheCleanupStatusFailed) {
-		t.Fatalf("cache cleanup status = %q, want %q", body.CacheCleanupStatus, model.CacheCleanupStatusFailed)
-	}
-	gotVersion, err := repos.Objects.GetVersionByID(ctx, currentVersionID)
-	if err != nil {
-		t.Fatalf("GetVersionByID(deleted): %v", err)
-	}
-	if gotVersion != nil {
-		t.Fatalf("data version still exists after cache cleanup failed: %#v", gotVersion)
-	}
-	var deletion model.ObjectDeletion
-	if err := srv.db.NewSelect().Model(&deletion).Where("version_id = ?", currentVersionID).Scan(ctx); err != nil {
-		t.Fatalf("select object deletion: %v", err)
-	}
-	if deletion.CacheCleanupStatus != model.CacheCleanupStatusFailed {
-		t.Fatalf("recorded cache cleanup status = %q, want %q", deletion.CacheCleanupStatus, model.CacheCleanupStatusFailed)
-	}
-	if deletion.CacheError == nil || !strings.Contains(*deletion.CacheError, "cache error") {
-		t.Fatalf("recorded cache error = %v, want cache error", deletion.CacheError)
+	if raw.Versions[0]["state"] != string(model.ObjectStateCached) {
+		t.Fatalf("version list state = %#v, want cached", raw.Versions[0]["state"])
+	}
+	if _, ok := raw.Versions[0]["storage"]; ok {
+		t.Fatal("version list exposed storage instead of location")
 	}
 }
 
@@ -3928,16 +3973,18 @@ func TestAPIBucketObjectDeletionsSupportsOffset(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "deletion-history-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "deletion-history-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
+	// object_deletions is a pure tombstone now: it records that a version was
+	// removed and nothing about the cache.
 	for i := 1; i <= 3; i++ {
-		ts := time.Date(2026, time.May, 10, 12, i, 0, 0, time.UTC)
+		deletedAt := time.Date(2026, time.May, 10, 12, i, 0, 0, time.UTC)
 		if _, err := srv.db.NewRaw(`INSERT INTO object_deletions
-			(bucket_id, object_id, key, version_id, cache_key, size, checksum, cache_cleanup_status, created_at, updated_at, deleted_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			bucket.ID, int64(i), fmt.Sprintf("file-%d.txt", i), fmt.Sprintf("version-%d", i), fmt.Sprintf("cache-%d", i), int64(i), fmt.Sprintf("checksum-%d", i), model.CacheCleanupStatusDeleted, ts, ts, ts,
+			(bucket_id, object_id, key, version_id, size, deleted_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			bucket.ID, int64(i), fmt.Sprintf("file-%d.txt", i), fmt.Sprintf("version-%d", i), int64(i), deletedAt,
 		).Exec(ctx); err != nil {
 			t.Fatalf("insert object deletion %d: %v", i, err)
 		}
@@ -3974,11 +4021,319 @@ func TestAPIBucketObjectDeletionsSupportsOffset(t *testing.T) {
 	}
 }
 
+func TestAPIBucketObjectPermanentDeleteRemovesVersion(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "version-permanent-delete-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, oldVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-old", "checksum-old", "text/plain", model.ObjectStateCached)
+	_, currentVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", model.ObjectStateCached)
+
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/version-permanent-delete-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest permanent delete version: %v", err)
+	}
+	setBucketWriteHeaders(req)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST permanent delete version: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("permanent delete version status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	var body struct {
+		Key          string `json:"key"`
+		VersionID    string `json:"version_id"`
+		CacheRelease string `json:"cache_release"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode permanent delete version: %v", err)
+	}
+	// The two versions carry different bytes, so removing one releases its own
+	// content's cache file rather than retaining shared bytes.
+	if body.Key != "folder/file.txt" || body.VersionID != currentVersionID || body.CacheRelease != "released" {
+		t.Fatalf("permanent delete version response = %#v, want deleted version metadata", body)
+	}
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, currentVersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(deleted): %v", err)
+	}
+	if gotVersion != nil {
+		t.Fatalf("data version still exists after version permanent delete: %#v", gotVersion)
+	}
+	gotOldVersion, err := repos.Objects.GetVersionByID(ctx, oldVersionID)
+	if err != nil || gotOldVersion == nil {
+		t.Fatalf("GetVersionByID(promoted): version=%v err=%v", gotOldVersion, err)
+	}
+	if !gotOldVersion.IsCurrent {
+		t.Fatalf("old version is_current = false, want true after current version permanent delete")
+	}
+}
+
+func TestAPIBucketObjectPermanentDeleteReleasesCacheWhenRequestIsCanceled(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "version-permanent-delete-cancel-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, currentVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", model.ObjectStateCached)
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	testCache := &cancelingDeleteCache{Cache: srv.cache, cancel: cancel}
+	srv.cache = testCache
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/version-permanent-delete-cancel-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID))).WithContext(reqCtx)
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		CacheRelease string `json:"cache_release"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	// Cache release runs on a context detached from the request, so cancelling
+	// the caller must not leave the bytes behind.
+	if body.CacheRelease != "released" {
+		t.Fatalf("cache_release = %q, want released", body.CacheRelease)
+	}
+	if got := testCache.deletes.Load(); got != 1 {
+		t.Fatalf("cache cleanup deletes = %d, want 1 after request cancellation", got)
+	}
+}
+
+func TestAPIBucketObjectPermanentDeleteReportsCacheReleaseFailedOnCacheError(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "version-permanent-delete-cache-error-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, currentVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", model.ObjectStateCached)
+
+	srv.cache = &cancelingDeleteCache{Cache: srv.cache, deleteErr: errors.New("cache error")}
+	ts := httptest.NewServer(newBucketAPIMux(srv))
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/buckets/version-permanent-delete-cache-error-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", currentVersionID)))
+	if err != nil {
+		t.Fatalf("NewRequest permanent delete version: %v", err)
+	}
+	setBucketWriteHeaders(req)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST permanent delete version: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("permanent delete version status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
+	}
+	var body struct {
+		CacheRelease string `json:"cache_release"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode permanent delete version: %v", err)
+	}
+	// A failed release is reported, but the deletion itself still stands.
+	if body.CacheRelease != "failed" {
+		t.Fatalf("cache_release = %q, want failed", body.CacheRelease)
+	}
+	gotVersion, err := repos.Objects.GetVersionByID(ctx, currentVersionID)
+	if err != nil {
+		t.Fatalf("GetVersionByID(deleted): %v", err)
+	}
+	if gotVersion != nil {
+		t.Fatalf("data version still exists after cache cleanup failed: %#v", gotVersion)
+	}
+	deletions, err := srv.db.NewSelect().
+		Model((*model.ObjectDeletion)(nil)).
+		Where("version_id = ?", currentVersionID).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("count object deletions: %v", err)
+	}
+	if deletions != 1 {
+		t.Fatalf("object deletion tombstones = %d, want 1", deletions)
+	}
+}
+
+func TestAPIBucketDeletedObjectPermanentDeleteCompletesCacheCleanupWhenRequestIsCanceled(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-permanent-delete-cancel-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", model.ObjectStateCached)
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	testCache := &cancelingDeleteCache{Cache: srv.cache, cancel: cancel}
+	srv.cache = testCache
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-cancel-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID))).WithContext(reqCtx)
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		DataVersionsDeleted int `json:"data_versions_deleted"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.DataVersionsDeleted != 2 {
+		t.Fatalf("data_versions_deleted = %d, want 2", body.DataVersionsDeleted)
+	}
+	if got := testCache.deletes.Load(); got != 2 {
+		t.Fatalf("cache cleanup deletes = %d, want 2 after request cancellation", got)
+	}
+}
+
+func TestAPIBucketDeletedObjectPermanentDeleteUsesIsolatedCacheCleanupContexts(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-permanent-delete-context-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", model.ObjectStateCached)
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	testCache := &contextRecordingDeleteCache{Cache: srv.cache}
+	srv.cache = testCache
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-context-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	contexts := testCache.recordedContexts()
+	if got := len(contexts); got != 2 {
+		t.Fatalf("cache cleanup contexts = %d, want 2", got)
+	}
+	if contexts[0] == contexts[1] {
+		t.Fatal("cache cleanup reused one context across deleted versions")
+	}
+}
+
+func TestAPIBucketDeletedObjectPermanentDeleteReportsEveryCacheCleanupOutcome(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+
+	bucket := &model.Bucket{Name: "trash-permanent-delete-parallel-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-first", "checksum-first", "text/plain", model.ObjectStateCached)
+	_, secondVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-second", "checksum-second", "text/plain", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 9, "etag-third", "checksum-third", "text/plain", model.ObjectStateCached)
+	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "folder/file.txt", model.NewVersionID())
+	if err != nil {
+		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
+	}
+
+	testCache := &selectiveFailingDeleteCache{
+		Cache:   srv.cache,
+		failKey: adminVersionCacheKey(t, repos, secondVersionID),
+	}
+	srv.cache = testCache
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/trash-permanent-delete-parallel-bucket/objects/deleted/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"delete_marker_version_id":%q}`, "folder/file.txt", marker.VersionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		DataVersionsDeleted     int `json:"data_versions_deleted"`
+		CacheCleanupFailedCount int `json:"cache_cleanup_failed_count"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if body.DataVersionsDeleted != 3 {
+		t.Fatalf("data_versions_deleted = %d, want 3", body.DataVersionsDeleted)
+	}
+	if body.CacheCleanupFailedCount != 1 {
+		t.Fatalf("cache_cleanup_failed_count = %d, want 1", body.CacheCleanupFailedCount)
+	}
+	if got := testCache.deletes.Load(); got != 3 {
+		t.Fatalf("cache cleanup deletes = %d, want 3", got)
+	}
+}
+
+func TestAPIBucketObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	ctx := context.Background()
+	bucket := &model.Bucket{Name: "version-permanent-delete-busy-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Buckets.Create: %v", err)
+	}
+	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", model.ObjectStateCached)
+	if _, _, err := srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
+		Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload:" + versionID,
+		Input: map[string]any{"version_id": versionID}, SubjectType: "object_version", SubjectKey: versionID,
+	}); err != nil {
+		t.Fatalf("Enqueue upload task: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/version-permanent-delete-busy-bucket/objects/permanent-delete", strings.NewReader(fmt.Sprintf(`{"key":%q,"version_id":%q}`, "folder/file.txt", versionID)))
+	setBucketWriteHeaders(req)
+	rr := httptest.NewRecorder()
+	newBucketAPIMux(srv).ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	want := "Storage work for this version is still in progress or awaiting Filecoin confirmation. Check the related task, then try again."
+	if body["error"] != want {
+		t.Fatalf("error = %q, want %q", body["error"], want)
+	}
+}
+
 func TestAPIBucketObjectDeletionsAllowsReadWithoutWriteHeader(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "deletion-history-auth-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "deletion-history-auth-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -4000,16 +4355,16 @@ func TestAPIBucketObjects_RestoreRejectsStaleMarker(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "stale-restore-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "stale-restore-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", "", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", model.ObjectStateCached)
 	marker, err := repos.Objects.CreateDeleteMarkerAndSetCurrent(ctx, bucket.ID, "file.txt", "01J0000000000000000000ADM1")
 	if err != nil {
 		t.Fatalf("CreateDeleteMarkerAndSetCurrent: %v", err)
 	}
-	seedAdminObjectVersion(t, repos, bucket, "file.txt", 6, "etag-new", "checksum-new", "text/plain", "", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 6, "etag-new", "checksum-new", "text/plain", model.ObjectStateCached)
 
 	ts := httptest.NewServer(newBucketAPIMux(srv))
 	defer ts.Close()
@@ -4033,7 +4388,7 @@ func TestAPIBucketDeletedObjects_ExcludesMarkerWithoutDataVersion(t *testing.T) 
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "empty-trash-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "empty-trash-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -4075,275 +4430,66 @@ func TestAPIBucketDeletedObjects_ExcludesMarkerWithoutDataVersion(t *testing.T) 
 	}
 }
 
-func TestAPIBucketObjectVersions(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "versions-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, oldVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-old", "checksum-old", "text/plain", "", model.ObjectStateCached)
-	if err := repos.Objects.UpdateVersionState(ctx, oldVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("old uploading: %v", err)
-	}
-	acceptAdminVersionUpload(t, repos, oldVersionID, "piece-old", "https://provider.example/old")
-	_, currentVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 7, "etag-current", "checksum-current", "text/plain", "", model.ObjectStateCached)
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/versions-bucket/objects/versions?key=" + url.QueryEscape("file.txt"))
-	if err != nil {
-		t.Fatalf("GET object versions: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, readBody(t, resp.Body))
-	}
-
-	var body struct {
-		Versions []struct {
-			VersionID string         `json:"version_id"`
-			State     string         `json:"state"`
-			Status    string         `json:"status"`
-			Location  objectLocation `json:"location"`
-			IsCurrent bool           `json:"is_current"`
-		} `json:"versions"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(body.Versions) != 2 {
-		t.Fatalf("versions len = %d, want 2", len(body.Versions))
-	}
-	if body.Versions[0].VersionID != currentVersionID || !body.Versions[0].IsCurrent {
-		t.Fatalf("first version = %#v, want current %s", body.Versions[0], currentVersionID)
-	}
-	if body.Versions[1].VersionID != oldVersionID || body.Versions[1].IsCurrent {
-		t.Fatalf("second version = %#v, want old %s", body.Versions[1], oldVersionID)
-	}
-	if body.Versions[0].Status != "uploading" {
-		t.Fatalf("current version status = %q, want uploading", body.Versions[0].Status)
-	}
-	if body.Versions[0].State != string(model.ObjectStateCached) {
-		t.Fatalf("current version state = %q, want cached", body.Versions[0].State)
-	}
-	if !body.Versions[0].Location.Cache || body.Versions[0].Location.Filecoin {
-		t.Fatalf("current version location = %#v, want cache only", body.Versions[0].Location)
-	}
-	if body.Versions[1].Status != "success" {
-		t.Fatalf("old version status = %q, want success", body.Versions[1].Status)
-	}
-	if body.Versions[1].State != string(model.ObjectStateStored) {
-		t.Fatalf("old version state = %q, want stored", body.Versions[1].State)
-	}
-	if !body.Versions[1].Location.Cache || !body.Versions[1].Location.Filecoin {
-		t.Fatalf("old version location = %#v, want cache and filecoin", body.Versions[1].Location)
-	}
-
-	resp, err = http.Get(ts.URL + "/api/v1/buckets/versions-bucket/objects/versions?key=" + url.QueryEscape("file.txt"))
-	if err != nil {
-		t.Fatalf("GET object versions raw: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var raw struct {
-		Versions []map[string]any `json:"versions"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		t.Fatalf("Decode raw: %v", err)
-	}
-	if raw.Versions[0]["state"] != string(model.ObjectStateCached) {
-		t.Fatalf("version list state = %#v, want cached", raw.Versions[0]["state"])
-	}
-	if _, ok := raw.Versions[0]["storage"]; ok {
-		t.Fatal("version list exposed storage instead of location")
-	}
-}
-
-func TestAPIBucketObjects_StatusMappingAndDetail(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "status-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, warningVersionID := seedAdminObjectVersion(t, repos, bucket, "warning.txt", 4, "etag-warning", "checksum-warning", "text/plain", "", model.ObjectStateCached)
-	if err := repos.Objects.UpdateVersionState(ctx, warningVersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("warning uploading: %v", err)
-	}
-	if err := repos.Objects.UpdateVersionStateToFailed(ctx, warningVersionID, model.ObjectStateUploading, "provider rejected piece"); err != nil {
-		t.Fatalf("warning failed: %v", err)
-	}
-
-	unavailable := &model.ObjectVersion{
-		VersionID:   "01J000000000000000UNAVAIL",
-		BucketID:    bucket.ID,
-		Key:         "unavailable.txt",
-		Size:        1,
-		ETag:        "etag-unavailable",
-		Checksum:    "checksum-unavailable",
-		ContentType: "text/plain",
-		CacheKey:    "cache-unavailable",
-		State:       model.ObjectStateCached,
-		InCache:     false,
-	}
-	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, unavailable); err != nil {
-		t.Fatalf("unavailable version: %v", err)
-	}
-	if err := repos.Objects.SetVersionCachePresence(ctx, unavailable.VersionID, false); err != nil {
-		t.Fatalf("unavailable cache presence: %v", err)
-	}
-	_, storedOnPrimaryVersionID := seedAdminObjectVersion(t, repos, bucket, "stored-primary.txt", 2, "etag-primary", "checksum-primary", "text/plain", "", model.ObjectStateCached)
-	markAdminStoredOnPrimaryUpload(t, repos, storedOnPrimaryVersionID)
-	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "partial.txt", 3, "etag-partial", "checksum-partial", "text/plain", "", model.ObjectStateCached)
-	bindAdminPartialUpload(t, repos, partialVersionID)
-	_, failedUploadVersionID := seedAdminObjectVersion(t, repos, bucket, "failed-upload.txt", 5, "etag-failed-upload", "checksum-failed-upload", "text/plain", "", model.ObjectStateCached)
-	markAdminFailedUpload(t, repos, failedUploadVersionID, "provider rejected piece")
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects")
-	if err != nil {
-		t.Fatalf("GET bucket objects: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var list struct {
-		Objects []struct {
-			Key          string `json:"key"`
-			Status       string `json:"status"`
-			UploadStatus string `json:"upload_status"`
-		} `json:"objects"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		t.Fatalf("Decode list: %v", err)
-	}
-
-	statusByKey := map[string]string{}
-	uploadStatusByKey := map[string]string{}
-	for _, object := range list.Objects {
-		statusByKey[object.Key] = object.Status
-		uploadStatusByKey[object.Key] = object.UploadStatus
-	}
-	if statusByKey["warning.txt"] != "warning" {
-		t.Fatalf("warning status = %q, want warning", statusByKey["warning.txt"])
-	}
-	if statusByKey["unavailable.txt"] != "unavailable" {
-		t.Fatalf("unavailable status = %q, want unavailable", statusByKey["unavailable.txt"])
-	}
-	if uploadStatusByKey["stored-primary.txt"] != string(model.StorageUploadStatusIngressReady) {
-		t.Fatalf("stored-primary upload_status = %q, want ingress_ready", uploadStatusByKey["stored-primary.txt"])
-	}
-	if statusByKey["partial.txt"] != "syncing" || uploadStatusByKey["partial.txt"] != string(model.StorageUploadStatusReadable) {
-		t.Fatalf("partial status/upload_status = %q/%q, want syncing/readable", statusByKey["partial.txt"], uploadStatusByKey["partial.txt"])
-	}
-	if statusByKey["failed-upload.txt"] != "warning" || uploadStatusByKey["failed-upload.txt"] != string(model.StorageUploadStatusFailed) {
-		t.Fatalf("failed upload status/upload_status = %q/%q, want warning/failed", statusByKey["failed-upload.txt"], uploadStatusByKey["failed-upload.txt"])
-	}
-
-	resp, err = http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(warningVersionID))
-	if err != nil {
-		t.Fatalf("GET status detail: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status detail code = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-	var detail objectStatusDetailResponse
-	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
-		t.Fatalf("Decode detail: %v", err)
-	}
-	if detail.VersionID != warningVersionID || detail.Status != "warning" {
-		t.Fatalf("detail = %#v, want version %s warning", detail, warningVersionID)
-	}
-	if detail.State != string(model.ObjectStateFailed) {
-		t.Fatalf("detail state = %q, want failed", detail.State)
-	}
-	if detail.FailedAtState == nil || *detail.FailedAtState != string(model.ObjectStateUploading) {
-		t.Fatalf("failed_at_state = %#v, want uploading", detail.FailedAtState)
-	}
-	if detail.Message == nil || *detail.Message != "provider rejected piece" {
-		t.Fatalf("message = %#v, want provider rejected piece", detail.Message)
-	}
-
-	resp, err = http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(partialVersionID))
-	if err != nil {
-		t.Fatalf("GET partial status detail: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var partialDetail struct {
-		VersionID    string `json:"version_id"`
-		Status       string `json:"status"`
-		UploadStatus string `json:"upload_status"`
-		Message      string `json:"message"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&partialDetail); err != nil {
-		t.Fatalf("Decode partial detail: %v", err)
-	}
-	if partialDetail.VersionID != partialVersionID || partialDetail.Status != "syncing" || partialDetail.UploadStatus != string(model.StorageUploadStatusReadable) {
-		t.Fatalf("partial detail = %#v, want readable syncing detail", partialDetail)
-	}
-	if partialDetail.Message != "secondary pull: timeout" {
-		t.Fatalf("partial message = %q, want secondary pull: timeout", partialDetail.Message)
-	}
-
-	resp, err = http.Get(ts.URL + "/api/v1/buckets/status-bucket/objects/status-detail?version_id=" + url.QueryEscape(failedUploadVersionID))
-	if err != nil {
-		t.Fatalf("GET failed upload status detail: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var failedUploadDetail struct {
-		UploadStatus string `json:"upload_status"`
-		Message      string `json:"message"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&failedUploadDetail); err != nil {
-		t.Fatalf("Decode failed upload detail: %v", err)
-	}
-	if failedUploadDetail.UploadStatus != string(model.StorageUploadStatusFailed) || failedUploadDetail.Message != "provider rejected piece" {
-		t.Fatalf("failed upload detail = %#v, want failed/provider rejected piece", failedUploadDetail)
-	}
-
-	otherBucket := &model.Bucket{Name: "other-status-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
-		t.Fatalf("other bucket: %v", err)
-	}
-	resp, err = http.Get(ts.URL + "/api/v1/buckets/other-status-bucket/objects/status-detail?version_id=" + url.QueryEscape(warningVersionID))
-	if err != nil {
-		t.Fatalf("GET status detail wrong bucket: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("wrong bucket status detail code = %d, want %d", resp.StatusCode, http.StatusNotFound)
-	}
-}
-
 func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
-	bucket := &model.Bucket{Name: "object-progress-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "object-progress-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(context.Background(), bucket); err != nil {
 		t.Fatalf("Create bucket: %v", err)
 	}
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "uploading.txt", 10, "etag-progress", "checksum-progress", "text/plain", "", model.ObjectStateUploading)
-	upload, err := repos.Uploads.StartObjectUploadAttempt(context.Background(), repository.StartObjectUploadAttemptInput{
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "uploading.txt", 10, "etag-progress", "checksum-progress", "text/plain", model.ObjectStateUploading)
+	upload, err := repos.Contents.EnsureContent(context.Background(), repository.EnsureContentInput{
 		BucketID:        bucket.ID,
-		SourceVersionID: versionID,
 		ContentSize:     10,
-		Checksum:        "checksum-progress",
+		Checksum:        testutil.StorageChecksum("checksum-progress"),
 		RequestedCopies: 3,
 	})
 	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
+		t.Fatalf("EnsureContent: %v", err)
 	}
-	progressUpload, err := repos.Uploads.BeginIngressStoreProgress(context.Background(), upload.ID)
+	// Ingress progress belongs to the transfer that produces it, so the content
+	// needs its ingress copy before progress can be recorded.
+	binding, err := repos.Contents.EnsureDataSetBinding(context.Background(), repository.EnsureDataSetBindingInput{
+		BucketID:           bucket.ID,
+		ProviderID:         onChainID(t, "101"),
+		CopyIndex:          0,
+		CreatedByContentID: upload.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	if err := repos.Contents.CreateUploadCopiesForBindings(context.Background(), upload.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID,
+		CopyIndex:        0,
+		TransferMethod:   model.StorageCopyTransferMethodIngress,
+		ProviderID:       binding.ProviderID,
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+	}
+	copies, err := repos.Contents.ListCopies(context.Background(), upload.ID)
+	if err != nil || len(copies) != 1 {
+		t.Fatalf("ListCopies = %#v, err=%v", copies, err)
+	}
+	taskRow, _, err := repos.Tasks.Enqueue(context.Background(), &model.Task{
+		Type: model.TaskTypeStorageStore, IdempotencyKey: "progress-display", InputVersion: 1,
+		Input: []byte(`{}`), InputHash: "progress-display", Status: model.TaskStatusPending,
+		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue store task: %v", err)
+	}
+	if err := repos.Contents.BindCopyTask(context.Background(), copies[0].ID, 1, taskRow.ID); err != nil {
+		t.Fatalf("BindCopyTask: %v", err)
+	}
+	progressUpload, err := repos.Contents.BeginIngressStoreProgress(context.Background(), repository.BeginIngressStoreProgressInput{
+		CopyID: copies[0].ID, Generation: 1, TaskID: taskRow.ID, Attempt: 1,
+	})
 	if err != nil {
 		t.Fatalf("BeginIngressStoreProgress: %v", err)
 	}
-	if _, err := repos.Uploads.RecordIngressStoreProgress(context.Background(), repository.RecordIngressStoreProgressInput{
-		UploadID:      upload.ID,
+	if _, err := repos.Contents.RecordIngressStoreProgress(context.Background(), repository.RecordIngressStoreProgressInput{
+		CopyID:        copies[0].ID,
+		Generation:    1,
+		TaskID:        taskRow.ID,
 		Attempt:       progressUpload.IngressStoreAttempt,
 		BytesUploaded: 4,
 	}); err != nil {
@@ -4381,233 +4527,6 @@ func TestAPIBucketObjectsIncludesPrimaryTransferProgress(t *testing.T) {
 	}
 }
 
-func TestAPIBucketObjectProvenance(t *testing.T) {
-	srv, repos := newBucketAPITestServer(t)
-	identityResolver := &fakeAPIProviderIdentityResolver{
-		identities: map[string]*providerIdentityResponse{
-			"101": {
-				RegistryProviderID:     "101",
-				Name:                   "alpha-pdp",
-				ServiceProviderAddress: "0x1111111111111111111111111111111111111111",
-				FilecoinActorID:        "f01234",
-				ServiceURL:             "https://alpha.example",
-			},
-			"303": {
-				RegistryProviderID: "303",
-				Name:               "gamma-pdp",
-				FilecoinActorID:    "f05678",
-			},
-		},
-	}
-	srv.WithProviderIdentityResolver(identityResolver)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "provenance-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Buckets.Create: %v", err)
-	}
-	_, oldVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 7, "etag-old-provenance", "checksum-old-provenance", "text/plain", "", model.ObjectStateStored)
-	_, versionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 8, "etag-provenance", "checksum-provenance", "text/plain", "", model.ObjectStateCached)
-	if err := repos.Objects.UpdateVersionState(ctx, versionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("mark uploading: %v", err)
-	}
-	upload, err := repos.Uploads.StartObjectUploadAttempt(ctx, repository.StartObjectUploadAttemptInput{
-		BucketID:        bucket.ID,
-		SourceVersionID: versionID,
-		ContentSize:     8,
-		Checksum:        "checksum-provenance",
-		RequestedCopies: 2,
-	})
-	if err != nil {
-		t.Fatalf("StartObjectUploadAttempt: %v", err)
-	}
-	pieceCID := "bafk2bzaceadminprovenance"
-	seedAdminCommittedCopies(t, repos, bucket.ID, upload.ID, pieceCID, []adminStorageCopySeed{
-		{ProviderID: onChainID(t, "101"), DataSetID: onChainID(t, "1001"), PieceID: onChainIDPtr(t, "2001"), TransferMethod: model.StorageCopyTransferMethodIngress, RetrievalURL: "https://ingress.example/piece"},
-		{ProviderID: onChainID(t, "202"), DataSetID: onChainID(t, "2002"), PieceID: onChainIDPtr(t, "3001"), TransferMethod: model.StorageCopyTransferMethodPeerPull, RetrievalURL: "https://peer.example/piece"},
-	})
-	if err := repos.Uploads.AppendUploadFailure(ctx, repository.AppendUploadFailureInput{
-		UploadID:       upload.ID,
-		ProviderID:     onChainIDPtr(t, "303"),
-		TransferMethod: string(model.StorageCopyTransferMethodPeerPull),
-		Stage:          "peer_pull",
-		ErrorMessage:   "provider timed out",
-	}); err != nil {
-		t.Fatalf("AppendUploadFailure: %v", err)
-	}
-	if _, err := repos.Uploads.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
-		UploadID:    upload.ID,
-		BucketID:    bucket.ID,
-		ContentSize: 8,
-		Checksum:    "checksum-provenance",
-	}); err != nil {
-		t.Fatalf("BindReadableUploadForContent: %v", err)
-	}
-	if _, _, err := repos.Uploads.FinalizeUploadIfTargetCopiesMet(ctx, repository.FinalizeUploadInput{UploadID: upload.ID}); err != nil {
-		t.Fatalf("FinalizeUploadIfTargetCopiesMet: %v", err)
-	}
-
-	_, noUploadVersionID := seedAdminObjectVersion(t, repos, bucket, "cached.txt", 3, "etag-cached", "checksum-cached", "text/plain", "", model.ObjectStateCached)
-	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "partial-provenance.txt", 4, "etag-partial-provenance", "checksum-partial-provenance", "text/plain", "", model.ObjectStateCached)
-	bindAdminPartialUpload(t, repos, partialVersionID)
-	_, failedVersionID := seedAdminObjectVersion(t, repos, bucket, "failed-provenance.txt", 5, "etag-failed-provenance", "checksum-failed-provenance", "text/plain", "", model.ObjectStateCached)
-	markAdminFailedUpload(t, repos, failedVersionID, "provider rejected piece")
-	replaceBucketDataSetObservability(t, repos, bucket.ID, observability.StatusAvailable, nil, time.Now().UTC())
-	srv.WithObservability(observability.NewService(observability.ServiceOptions{
-		Store:           repos.Observability,
-		RefreshInterval: time.Hour,
-	}))
-
-	ts := httptest.NewServer(newBucketAPIMux(srv))
-	defer ts.Close()
-
-	type provenanceBody struct {
-		VersionID       string            `json:"version_id"`
-		Status          string            `json:"status"`
-		UploadStatus    string            `json:"upload_status"`
-		PieceCID        string            `json:"piece_cid"`
-		RequestedCopies int               `json:"requested_copies"`
-		SuccessCopies   int               `json:"success_copies"`
-		CopyHealth      apiCopyHealthBody `json:"copy_health"`
-		Copies          []struct {
-			CopyIndex        int                       `json:"copy_index"`
-			Status           string                    `json:"status"`
-			Health           apiCopyHealthBody         `json:"health"`
-			ProviderID       string                    `json:"provider_id"`
-			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
-			DataSetID        string                    `json:"data_set_id"`
-			PieceID          string                    `json:"piece_id"`
-			TransferMethod   string                    `json:"transfer_method"`
-			RetrievalURL     string                    `json:"retrieval_url"`
-			IsNewDataSet     bool                      `json:"is_new_data_set"`
-		} `json:"copies"`
-		Failures []struct {
-			AttemptIndex     int                       `json:"attempt_index"`
-			ProviderID       string                    `json:"provider_id"`
-			ProviderIdentity *providerIdentityResponse `json:"provider_identity"`
-			TransferMethod   string                    `json:"transfer_method"`
-			Stage            string                    `json:"stage"`
-			Error            string                    `json:"error"`
-		} `json:"failures"`
-	}
-	getProvenance := func(bucketName, targetVersionID string) (provenanceBody, int) {
-		t.Helper()
-		resp, err := http.Get(ts.URL + "/api/v1/buckets/" + bucketName + "/objects/provenance?version_id=" + url.QueryEscape(targetVersionID))
-		if err != nil {
-			t.Fatalf("GET provenance: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode != http.StatusOK {
-			return provenanceBody{}, resp.StatusCode
-		}
-		var body provenanceBody
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			t.Fatalf("Decode provenance: %v", err)
-		}
-		return body, resp.StatusCode
-	}
-
-	detail, statusCode := getProvenance("provenance-bucket", versionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if detail.VersionID != versionID || detail.Status != "success" || detail.UploadStatus != string(model.StorageUploadStatusComplete) {
-		t.Fatalf("detail status = %#v, want stored provenance", detail)
-	}
-	if detail.PieceCID != pieceCID || detail.RequestedCopies != 2 || detail.SuccessCopies != 2 {
-		t.Fatalf("detail counts = %#v, want piece and 2/2 copies", detail)
-	}
-	if detail.CopyHealth.Status != string(observability.StatusAvailable) || detail.CopyHealth.RequestedCopies != 2 || detail.CopyHealth.ReadableCopies != 2 || len(detail.CopyHealth.ReasonCodes) != 0 {
-		t.Fatalf("copy_health = %#v, want healthy 2/2 provenance", detail.CopyHealth)
-	}
-	if len(detail.Copies) != 2 || detail.Copies[0].ProviderID != "101" || detail.Copies[0].TransferMethod != string(model.StorageCopyTransferMethodIngress) || detail.Copies[1].TransferMethod != string(model.StorageCopyTransferMethodPeerPull) {
-		t.Fatalf("copies = %#v, want provider scoped copy provenance", detail.Copies)
-	}
-	if detail.Copies[0].Health.Status != string(observability.StatusAvailable) || len(detail.Copies[0].Health.ReasonCodes) != 0 {
-		t.Fatalf("copy health = %#v, want healthy copy", detail.Copies[0].Health)
-	}
-	if detail.Copies[0].ProviderIdentity == nil || detail.Copies[0].ProviderIdentity.Name != "alpha-pdp" || detail.Copies[0].ProviderIdentity.FilecoinActorID != "f01234" {
-		t.Fatalf("copy provider_identity = %#v, want enriched copy identity", detail.Copies[0].ProviderIdentity)
-	}
-	if detail.Copies[1].ProviderID != "202" || detail.Copies[1].ProviderIdentity != nil {
-		t.Fatalf("secondary copy = %#v, want provider_id compatibility without identity when lookup fails", detail.Copies[1])
-	}
-	if len(detail.Failures) != 1 || detail.Failures[0].ProviderID != "303" || detail.Failures[0].Stage != "peer_pull" || detail.Failures[0].Error != "provider timed out" {
-		t.Fatalf("failures = %#v, want recorded provider attempt", detail.Failures)
-	}
-	if detail.Failures[0].ProviderIdentity == nil || detail.Failures[0].ProviderIdentity.Name != "gamma-pdp" || detail.Failures[0].ProviderIdentity.FilecoinActorID != "f05678" {
-		t.Fatalf("failure provider_identity = %#v, want enriched failure identity", detail.Failures[0].ProviderIdentity)
-	}
-	peerBinding, err := repos.Uploads.GetDataSetBindingByCopyIndex(ctx, bucket.ID, 1)
-	if err != nil || peerBinding == nil {
-		t.Fatalf("GetDataSetBindingByCopyIndex peer: binding=%v err=%v", peerBinding, err)
-	}
-	if err := repos.Uploads.MarkDataSetUnavailable(ctx, peerBinding.ID, "provider dataset retired"); err != nil {
-		t.Fatalf("MarkDataSetUnavailable peer: %v", err)
-	}
-	unavailableDetail, statusCode := getProvenance("provenance-bucket", versionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("unavailable status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if unavailableDetail.SuccessCopies != 1 {
-		t.Fatalf("unavailable provenance = %#v, want unavailable dataset excluded from readable copies", unavailableDetail)
-	}
-	if err := repos.Uploads.MarkDataSetDraining(ctx, peerBinding.ID, "provider service ended"); err != nil {
-		t.Fatalf("MarkDataSetDraining peer: %v", err)
-	}
-	drainingDetail, statusCode := getProvenance("provenance-bucket", versionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("draining status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if drainingDetail.SuccessCopies != 2 {
-		t.Fatalf("draining provenance = %#v, want draining dataset counted as readable", drainingDetail)
-	}
-	if !reflect.DeepEqual(identityResolver.requests[0], []string{"101", "202", "303"}) {
-		t.Fatalf("provider identity request = %#v, want one provenance snapshot request", identityResolver.requests)
-	}
-
-	oldDetail, statusCode := getProvenance("provenance-bucket", oldVersionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("old version status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if oldDetail.VersionID != oldVersionID || oldDetail.Status != "success" || oldDetail.SuccessCopies != 1 {
-		t.Fatalf("old version provenance = %#v, want historical stored version", oldDetail)
-	}
-
-	partialDetail, statusCode := getProvenance("provenance-bucket", partialVersionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("partial status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if partialDetail.Status != "syncing" || partialDetail.UploadStatus != string(model.StorageUploadStatusReadable) || partialDetail.SuccessCopies != 1 {
-		t.Fatalf("partial provenance = %#v, want readable upload detail", partialDetail)
-	}
-
-	failedDetail, statusCode := getProvenance("provenance-bucket", failedVersionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("failed status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if failedDetail.Status != "warning" || failedDetail.UploadStatus != string(model.StorageUploadStatusFailed) || failedDetail.SuccessCopies != 0 {
-		t.Fatalf("failed provenance = %#v, want failed upload detail", failedDetail)
-	}
-
-	noUpload, statusCode := getProvenance("provenance-bucket", noUploadVersionID)
-	if statusCode != http.StatusOK {
-		t.Fatalf("no-upload status = %d, want %d", statusCode, http.StatusOK)
-	}
-	if noUpload.VersionID != noUploadVersionID || len(noUpload.Copies) != 0 || len(noUpload.Failures) != 0 || noUpload.UploadStatus != "" {
-		t.Fatalf("no-upload provenance = %#v, want empty upload detail", noUpload)
-	}
-
-	otherBucket := &model.Bucket{Name: "other-provenance-bucket", Status: model.BucketStatusActive}
-	if err := repos.Buckets.Create(ctx, otherBucket); err != nil {
-		t.Fatalf("other bucket: %v", err)
-	}
-	_, statusCode = getProvenance("other-provenance-bucket", versionID)
-	if statusCode != http.StatusNotFound {
-		t.Fatalf("wrong bucket provenance code = %d, want %d", statusCode, http.StatusNotFound)
-	}
-}
-
 func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	counter := &storageUploadSelectCounter{}
@@ -4619,17 +4538,17 @@ func TestAPIBucketObjects_LoadsUploadStatusInBatches(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "batched-upload-status-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "batched-upload-status-bucket", Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	seedAdminObjectVersion(t, repos, bucket, "stored.txt", 2, "etag-stored", "checksum-stored", "text/plain", "", model.ObjectStateStored)
-	_, primaryVersionID := seedAdminObjectVersion(t, repos, bucket, "primary.txt", 3, "etag-primary", "checksum-primary", "text/plain", "", model.ObjectStateCached)
-	markAdminStoredOnPrimaryUpload(t, repos, primaryVersionID)
-	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "partial.txt", 4, "etag-partial", "checksum-partial", "text/plain", "", model.ObjectStateCached)
-	bindAdminPartialUpload(t, repos, partialVersionID)
-	_, failedVersionID := seedAdminObjectVersion(t, repos, bucket, "failed.txt", 5, "etag-failed", "checksum-failed", "text/plain", "", model.ObjectStateCached)
-	markAdminFailedUpload(t, repos, failedVersionID, "provider rejected piece")
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "stored.txt", 2, "etag-stored", "checksum-stored", "text/plain", model.ObjectStateStored)
+	_, primaryVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "primary.txt", 3, "etag-primary", "checksum-primary", "text/plain", model.ObjectStateCached)
+	markAdminStoredOnPrimaryUpload(t, srv.db, repos, primaryVersionID)
+	_, partialVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "partial.txt", 4, "etag-partial", "checksum-partial", "text/plain", model.ObjectStateCached)
+	bindAdminPartialUpload(t, srv.db, repos, partialVersionID)
+	_, failedVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "failed.txt", 5, "etag-failed", "checksum-failed", "text/plain", model.ObjectStateCached)
+	markAdminFailedUpload(t, srv.db, repos, failedVersionID, "provider rejected piece")
 
 	counter.selects.Store(0)
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -4658,17 +4577,17 @@ func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
 	repos := repository.NewRepositories(db)
 	srv := newTestServer("127.0.0.1:0", db, localCache, 1<<20, repos, nil, nil, config.DefaultFilecoinCopies, testLogger())
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "batched-version-status-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "batched-version-status-bucket", Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	seedAdminObjectVersion(t, repos, bucket, "file.txt", 2, "etag-stored", "checksum-stored", "text/plain", "", model.ObjectStateStored)
-	_, primaryVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 3, "etag-primary", "checksum-primary", "text/plain", "", model.ObjectStateCached)
-	markAdminStoredOnPrimaryUpload(t, repos, primaryVersionID)
-	_, partialVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 4, "etag-partial", "checksum-partial", "text/plain", "", model.ObjectStateCached)
-	bindAdminPartialUpload(t, repos, partialVersionID)
-	_, failedVersionID := seedAdminObjectVersion(t, repos, bucket, "file.txt", 5, "etag-failed", "checksum-failed", "text/plain", "", model.ObjectStateCached)
-	markAdminFailedUpload(t, repos, failedVersionID, "provider rejected piece")
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 2, "etag-stored", "checksum-stored", "text/plain", model.ObjectStateStored)
+	_, primaryVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 3, "etag-primary", "checksum-primary", "text/plain", model.ObjectStateCached)
+	markAdminStoredOnPrimaryUpload(t, srv.db, repos, primaryVersionID)
+	_, partialVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 4, "etag-partial", "checksum-partial", "text/plain", model.ObjectStateCached)
+	bindAdminPartialUpload(t, srv.db, repos, partialVersionID)
+	_, failedVersionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 5, "etag-failed", "checksum-failed", "text/plain", model.ObjectStateCached)
+	markAdminFailedUpload(t, srv.db, repos, failedVersionID, "provider rejected piece")
 
 	counter.selects.Store(0)
 	ts := httptest.NewServer(newBucketAPIMux(srv))
@@ -4689,7 +4608,7 @@ func TestAPIBucketObjectVersions_LoadsUploadStatusInBatches(t *testing.T) {
 func TestAPIBucketObjectUpload_PassesRequestToUploader(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "upload-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "upload-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -4760,7 +4679,7 @@ func TestAPIBucketObjectUpload_PassesRequestToUploader(t *testing.T) {
 func TestAPIBucketObjectUpload_RejectsMissingUploaderSize(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "upload-missing-size-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "upload-missing-size-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -4790,7 +4709,7 @@ func TestAPIBucketObjectUpload_RejectsMissingUploaderSize(t *testing.T) {
 func TestAPIBucketObjectUpload_RejectsEmptyObject(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "upload-empty-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "upload-empty-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -4843,7 +4762,7 @@ func TestAPIBucketObjectUpload_RejectsFOCSizeLimits(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv, repos := newBucketAPITestServer(t)
 			ctx := context.Background()
-			bucket := &model.Bucket{Name: "upload-size-limit-bucket", Status: model.BucketStatusActive}
+			bucket := &model.Bucket{Name: "upload-size-limit-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 			if err := repos.Buckets.Create(ctx, bucket); err != nil {
 				t.Fatalf("Buckets.Create: %v", err)
 			}
@@ -4972,7 +4891,7 @@ func TestAPIBucketObjectUpload_MapsUploaderErrors(t *testing.T) {
 func TestAPIBucketObjectUpload_AppearsInObjectList(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "upload-list-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "upload-list-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -5054,14 +4973,23 @@ func TestAPIBucketObjectDownload_FromCache(t *testing.T) {
 func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "download-version-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "download-version-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 
 	oldVersionID := model.NewVersionID()
-	oldCacheKey := ".versions/" + oldVersionID
-	oldInfo, err := srv.cache.Put(ctx, bucket.Name, oldCacheKey, strings.NewReader("old admin"))
+	oldSum := sha256.Sum256([]byte("old admin"))
+	oldContent, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     int64(len("old admin")),
+		Checksum:        hex.EncodeToString(oldSum[:]),
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent old: %v", err)
+	}
+	oldInfo, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(oldContent.ID), strings.NewReader("old admin"))
 	if err != nil {
 		t.Fatalf("cache.Put old: %v", err)
 	}
@@ -5069,18 +4997,25 @@ func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
 		VersionID:   oldVersionID,
 		BucketID:    bucket.ID,
 		Key:         "folder/report.txt",
+		ContentID:   &oldContent.ID,
 		Size:        oldInfo.Size,
 		ETag:        oldInfo.ETag,
-		Checksum:    oldInfo.Checksum,
 		ContentType: "text/plain",
-		CacheKey:    oldCacheKey,
-		State:       model.ObjectStateCached,
 	}); err != nil {
 		t.Fatalf("create old version: %v", err)
 	}
 	newVersionID := model.NewVersionID()
-	newCacheKey := ".versions/" + newVersionID
-	newInfo, err := srv.cache.Put(ctx, bucket.Name, newCacheKey, strings.NewReader("new admin"))
+	newSum := sha256.Sum256([]byte("new admin"))
+	newContent, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID:        bucket.ID,
+		ContentSize:     int64(len("new admin")),
+		Checksum:        hex.EncodeToString(newSum[:]),
+		RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent new: %v", err)
+	}
+	newInfo, err := srv.cache.Put(ctx, bucket.Name, model.ContentCacheKey(newContent.ID), strings.NewReader("new admin"))
 	if err != nil {
 		t.Fatalf("cache.Put new: %v", err)
 	}
@@ -5088,12 +5023,10 @@ func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
 		VersionID:   newVersionID,
 		BucketID:    bucket.ID,
 		Key:         "folder/report.txt",
+		ContentID:   &newContent.ID,
 		Size:        newInfo.Size,
 		ETag:        newInfo.ETag,
-		Checksum:    newInfo.Checksum,
 		ContentType: "text/plain",
-		CacheKey:    newCacheKey,
-		State:       model.ObjectStateCached,
 	}); err != nil {
 		t.Fatalf("create new version: %v", err)
 	}
@@ -5119,7 +5052,7 @@ func TestAPIBucketObjectDownload_WithVersionID(t *testing.T) {
 func TestAPIBucketObjectDownload_DeleteMarkerVersionIsMethodNotAllowed(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "download-marker-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "download-marker-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -5142,11 +5075,11 @@ func TestAPIBucketObjectDownload_DeleteMarkerVersionIsMethodNotAllowed(t *testin
 func TestAPIBucketObjectDownload_ClearsWriteDeadline(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
-	bucket := &model.Bucket{Name: "deadline-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "deadline-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
-	seedAdminObjectVersion(t, repos, bucket, "folder/report.txt", 11, "etag", "checksum", "text/plain", "", model.ObjectStateCached)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/report.txt", 11, "etag", "checksum", "text/plain", model.ObjectStateCached)
 	var rr *writeDeadlineRecorder
 	mockCache := &testutil.MockCache{
 		GetFunc: func(_ context.Context, _, _ string) (io.ReadCloser, *cache.ObjectInfo, error) {
@@ -5189,7 +5122,7 @@ func TestAPIBucketObjectDownload_NotFound(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "download-missing-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "download-missing-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -5243,7 +5176,7 @@ func TestAPIBucket_DeleteReturnsNotImplemented(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "delete-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "delete-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
@@ -5283,12 +5216,12 @@ func TestAPIBucket_DeleteRecursiveReturnsNotImplemented(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()
 
-	bucket := &model.Bucket{Name: "recursive-delete-bucket", Status: model.BucketStatusActive}
+	bucket := &model.Bucket{Name: "recursive-delete-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 
-	seedAdminObjectVersion(t, repos, bucket, "file.txt", 5, "etag-file", "checksum-file", "text/plain", "", model.ObjectStateStored)
+	seedAdminObjectVersion(t, srv.db, repos, bucket, "file.txt", 5, "etag-file", "checksum-file", "text/plain", model.ObjectStateStored)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/buckets/recursive-delete-bucket?recursive=true", nil)
 	req.SetPathValue("name", bucket.Name)
@@ -5318,5 +5251,16 @@ func TestAPIBucket_DeleteRecursiveReturnsNotImplemented(t *testing.T) {
 	}
 	if len(objects) != 1 {
 		t.Fatalf("visible objects len = %d, want 1", len(objects))
+	}
+}
+
+func assertActiveBucketReplicaSlots(t *testing.T, ctx context.Context, repos *repository.Repositories, bucketID int64, want int) {
+	t.Helper()
+	slots, err := repos.Buckets.ActiveReplicaSlots(ctx, bucketID)
+	if err != nil {
+		t.Fatalf("ActiveReplicaSlots: %v", err)
+	}
+	if len(slots) != want {
+		t.Fatalf("active replica slots = %v, want %d", slots, want)
 	}
 }

@@ -18,10 +18,10 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ipfs/go-cid"
-	"github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 	appTypes "github.com/strahe/synaps3/internal/types"
+	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -395,11 +395,11 @@ func (c *memoryDataSetTarget) Store(ctx context.Context, reader io.Reader, opts 
 	if err != nil {
 		return nil, err
 	}
-	digest, err := multihash.Sum(content, multihash.SHA2_256, -1)
+	pieceInfo, err := piece.CalculateFromBytes(content)
 	if err != nil {
-		return nil, fmt.Errorf("memory filecoin: hashing piece: %w", err)
+		return nil, fmt.Errorf("memory filecoin: calculating piece identity: %w", err)
 	}
-	pieceCID := cid.NewCidV1(cid.Raw, digest)
+	pieceCID := pieceInfo.CIDv2
 	if opts != nil && opts.PieceCID.Defined() && !opts.PieceCID.Equals(pieceCID) {
 		return nil, fmt.Errorf("memory filecoin: supplied CID does not match content")
 	}

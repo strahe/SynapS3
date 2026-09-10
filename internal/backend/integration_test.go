@@ -6,19 +6,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	cid "github.com/ipfs/go-cid"
-	"github.com/multiformats/go-multihash"
+	"github.com/ipfs/go-cid"
+	multihash "github.com/multiformats/go-multihash"
 	"github.com/strahe/synaps3/internal/backend"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
-	"github.com/strahe/synaps3/internal/state"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/storage"
 	"github.com/uptrace/bun"
@@ -43,12 +43,11 @@ func newIntegrationBackend(t *testing.T) *integrationBackend {
 	if err != nil {
 		t.Fatalf("creating test cache: %v", err)
 	}
-	sm := state.NewObjectStateMachine()
 	sc := &testutil.MockStorageClient{}
 	logger := slog.Default()
 	cacheGate, accessTracker := newBackendCacheAccess(repos)
 
-	b := backend.New(repos, fsCache, sm, sc, cacheGate, accessTracker, logger)
+	b := backend.New(repos, fsCache, sc, cacheGate, accessTracker, logger, backend.WithTaskService(newBackendTaskService(t, repos)))
 	return &integrationBackend{
 		backend: b,
 		repos:   repos,
@@ -58,18 +57,42 @@ func newIntegrationBackend(t *testing.T) *integrationBackend {
 	}
 }
 
-// findTasks queries all tasks matching the given ref type and ref ID.
+// findTasks queries the storage tasks reachable from one object. Ingest is
+// scheduled per content now, so the object is reached through the contents its
+// versions point at.
 func findTasks(t *testing.T, db *bun.DB, refType string, refID int64) []model.Task {
 	t.Helper()
+	if refType != "object" {
+		t.Fatalf("unsupported test task subject %q", refType)
+	}
 	var tasks []model.Task
 	err := db.NewSelect().Model(&tasks).
-		Where("ref_type = ? AND ref_id = ?", refType, refID).
+		Where("task.subject_type = ?", "storage_content").
+		Where(`EXISTS (
+			SELECT 1 FROM object_versions AS task_version
+			WHERE CAST(task_version.content_id AS TEXT) = task.subject_key
+			  AND task_version.object_id = ?
+		)`, refID).
 		OrderExpr("id ASC").
 		Scan(context.Background())
 	if err != nil {
 		t.Fatalf("querying tasks: %v", err)
 	}
 	return tasks
+}
+
+// contentSubject is the task subject key for the content a version points at.
+func contentSubject(t *testing.T, db *bun.DB, versionID string) string {
+	t.Helper()
+	var contentID int64
+	if err := db.NewSelect().
+		Table("object_versions").
+		Column("content_id").
+		Where("version_id = ?", versionID).
+		Scan(context.Background(), &contentID); err != nil {
+		t.Fatalf("reading content for version %s: %v", versionID, err)
+	}
+	return strconv.FormatInt(contentID, 10)
 }
 
 // putObject is a helper that calls PutObject with the given string body.
@@ -118,101 +141,59 @@ func TestIntegration_FullWritePath(t *testing.T) {
 	if err != nil || obj == nil {
 		t.Fatalf("expected object in DB, got err=%v obj=%v", err, obj)
 	}
+	// Nothing has reached a provider yet, and pipeline position is read from
+	// the content's copies, so the object is cached and no further.
 	if obj.State != model.ObjectStateCached {
 		t.Fatalf("expected state=cached, got %s", obj.State)
 	}
-	if obj.VersionID == "" {
-		t.Fatal("expected current version id")
+	if obj.VersionID == "" || obj.ContentID == nil {
+		t.Fatalf("expected a current version bound to content, got version=%q content=%v", obj.VersionID, obj.ContentID)
+	}
+	if !obj.InCache {
+		t.Fatal("expected the written bytes to be cached")
 	}
 
 	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 upload task, got %d", len(tasks))
 	}
-	if tasks[0].Type != model.TaskTypeUpload {
-		t.Fatalf("expected task type upload, got %s", tasks[0].Type)
+	if tasks[0].Type != model.TaskTypeUploadPlan {
+		t.Fatalf("expected task type upload_plan, got %s", tasks[0].Type)
 	}
-	if tasks[0].RefVersionID != obj.VersionID {
-		t.Fatalf("expected task version=%s, got %s", obj.VersionID, tasks[0].RefVersionID)
-	}
-
-	// 2. Simulate uploader: cached → uploading
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatalf("cached→uploading: %v", err)
+	// Ingest is planned for the bytes, so the task names the content.
+	if want := contentSubject(t, ib.db, obj.VersionID); tasks[0].SubjectKey == nil || *tasks[0].SubjectKey != want {
+		t.Fatalf("expected task content=%s, got %v", want, tasks[0].SubjectKey)
 	}
 
-	acceptBackendVersionUpload(t, ib.repos, obj.VersionID, "bafk2test123", "https://provider.example/pieces/test")
+	// 2. Simulate the uploader placing the content with a provider.
+	acceptBackendVersionUpload(t, ib.db, ib.repos, obj.VersionID, "bafk2test123", "https://provider.example/pieces/test")
 
 	obj, _ = ib.repos.Objects.GetCurrentVersionByObjectID(ctx, obj.ObjectID)
 	if obj.State != model.ObjectStateStored {
 		t.Fatalf("expected state=stored, got %s", obj.State)
 	}
-	if obj.StorageUploadID == nil || obj.PieceCID == nil || *obj.PieceCID != "bafk2test123" {
-		t.Fatalf("expected accepted upload with PieceCID=bafk2test123, got upload=%v piece=%v", obj.StorageUploadID, obj.PieceCID)
+	if obj.ContentID == nil || obj.PieceCID == nil || *obj.PieceCID != "bafk2test123" {
+		t.Fatalf("expected accepted content with PieceCID=bafk2test123, got content=%v piece=%v", obj.ContentID, obj.PieceCID)
+	}
+	if !obj.InFilecoin {
+		t.Fatal("expected a readable committed copy after acceptance")
 	}
 
-	// 3. Simulate evictor: stored → cache_evicted, remove cache file
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
-		t.Fatalf("stored→cache_evicted: %v", err)
+	// 3. Simulate the evictor: durability is unchanged, only the cached copy goes.
+	cacheKey := obj.CacheKey()
+	if err := ib.repos.Objects.ClearContentCachePresence(ctx, *obj.ContentID); err != nil {
+		t.Fatalf("mark cache absent: %v", err)
 	}
-	if err := ib.cache.Delete(ctx, "test-bucket", obj.CacheKey); err != nil {
+	if err := ib.cache.Delete(ctx, "test-bucket", cacheKey); err != nil {
 		t.Fatalf("cache delete: %v", err)
 	}
 
 	obj, _ = ib.repos.Objects.GetCurrentVersionByObjectID(ctx, obj.ObjectID)
-	if obj.State != model.ObjectStateCacheEvicted {
-		t.Fatalf("expected state=cache_evicted, got %s", obj.State)
+	if obj.State != model.ObjectStateStored || obj.InCache {
+		t.Fatalf("expected stored remote-only object, got state=%s in_cache=%v", obj.State, obj.InCache)
 	}
-	if ib.cache.Exists(ctx, "test-bucket", obj.CacheKey) {
+	if ib.cache.Exists(ctx, "test-bucket", cacheKey) {
 		t.Fatal("expected cache file to be gone")
-	}
-}
-
-func TestIntegration_OverwritePath(t *testing.T) {
-	ib := newIntegrationBackend(t)
-	ctx := context.Background()
-
-	bucket := testutil.SeedBucket(t, ib.db, "bucket")
-
-	// First write
-	putObject(t, ib.backend, "bucket", "key", "v1")
-
-	obj, _ := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
-	firstVersionID := obj.VersionID
-	if firstVersionID == "" {
-		t.Fatal("expected current version id after first put")
-	}
-
-	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
-	if len(tasks) != 1 || tasks[0].RefVersionID != firstVersionID {
-		t.Fatalf("expected 1 task with first version, got %d tasks", len(tasks))
-	}
-
-	// Overwrite
-	putObject(t, ib.backend, "bucket", "key", "v2")
-
-	obj, _ = ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
-	secondVersionID := obj.VersionID
-	if secondVersionID == "" || secondVersionID == firstVersionID {
-		t.Fatalf("expected new current version after overwrite, first=%s second=%s", firstVersionID, secondVersionID)
-	}
-
-	tasks = findTasks(t, ib.db, "object", obj.ObjectID)
-	if len(tasks) != 2 {
-		t.Fatalf("expected 2 tasks, got %d", len(tasks))
-	}
-	if tasks[1].RefVersionID != secondVersionID {
-		t.Fatalf("expected second task version=%s, got %s", secondVersionID, tasks[1].RefVersionID)
-	}
-
-	if tasks[0].RefVersionID != firstVersionID {
-		t.Fatalf("expected first task version=%s, got %s", firstVersionID, tasks[0].RefVersionID)
-	}
-
-	// GetObject should return the current version.
-	body := getObjectBody(t, ib.backend, "bucket", "key")
-	if want := validTestObjectBody("v2"); body != want {
-		t.Fatalf("expected body=%q, got %q", want, body)
 	}
 }
 
@@ -228,11 +209,6 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 
 	obj, _ := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "test-key")
 
-	// Simulate full pipeline to cache_evicted
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateCached, model.ObjectStateUploading); err != nil {
-		t.Fatal(err)
-	}
-
 	// Create a valid CID for PieceCID
 	mh, err := multihash.Sum([]byte("test"), multihash.SHA2_256, -1)
 	if err != nil {
@@ -240,16 +216,17 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	}
 	testPieceCID := cid.NewCidV1(cid.Raw, mh)
 
-	acceptBackendVersionUpload(t, ib.repos, obj.VersionID, testPieceCID.String(), "https://provider.example/pieces/test")
-	if err := ib.repos.Objects.UpdateVersionState(ctx, obj.VersionID, model.ObjectStateStored, model.ObjectStateCacheEvicted); err != nil {
+	// Simulate a stored object whose local cache has been removed. Residency is
+	// content-addressed, so both the record and the file are keyed on content.
+	acceptBackendVersionUpload(t, ib.db, ib.repos, obj.VersionID, testPieceCID.String(), "https://provider.example/pieces/test")
+	cacheKey := obj.CacheKey()
+	if err := ib.repos.Objects.ClearContentCachePresence(ctx, *obj.ContentID); err != nil {
 		t.Fatal(err)
 	}
-
-	// Remove cache file
-	if err := ib.cache.Delete(ctx, "test-bucket", obj.CacheKey); err != nil {
+	if err := ib.cache.Delete(ctx, "test-bucket", cacheKey); err != nil {
 		t.Fatal(err)
 	}
-	if ib.cache.Exists(ctx, "test-bucket", obj.CacheKey) {
+	if ib.cache.Exists(ctx, "test-bucket", cacheKey) {
 		t.Fatal("cache should be empty after eviction")
 	}
 
@@ -270,8 +247,8 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	// Cache rehydration is async (TeeReader goroutine writes while body is consumed).
 	// Poll with a timeout to avoid flakiness.
 	rehydrated := false
-	for i := 0; i < 200; i++ {
-		if ib.cache.Exists(ctx, "test-bucket", obj.CacheKey) {
+	for range 200 {
+		if ib.cache.Exists(ctx, "test-bucket", cacheKey) {
 			rehydrated = true
 			break
 		}
@@ -279,255 +256,6 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	}
 	if !rehydrated {
 		t.Fatal("expected cache to be rehydrated after cold read (timed out)")
-	}
-}
-
-func TestIntegration_CopyObjectPath(t *testing.T) {
-	ib := newIntegrationBackend(t)
-	ctx := context.Background()
-
-	bucket := testutil.SeedBucket(t, ib.db, "bucket")
-
-	// Put source object
-	putOut := putObject(t, ib.backend, "bucket", "src-key", "data")
-
-	// Copy source → dest
-	srcCopy := "bucket/src-key"
-	dstBucket := "bucket"
-	dstKey := "dst-key"
-	_, err := ib.backend.CopyObject(ctx, s3response.CopyObjectInput{
-		Bucket:     &dstBucket,
-		Key:        &dstKey,
-		CopySource: &srcCopy,
-	})
-	if err != nil {
-		t.Fatalf("CopyObject: %v", err)
-	}
-
-	// Verify destination object exists
-	dstObj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "dst-key")
-	if err != nil || dstObj == nil {
-		t.Fatalf("expected dst object, got err=%v", err)
-	}
-
-	// ETags should match (same data)
-	srcETag := strings.Trim(putOut.ETag, `"`)
-	if dstObj.ETag != srcETag {
-		t.Fatalf("expected dst etag=%s, got %s", srcETag, dstObj.ETag)
-	}
-
-	if dstObj.State != model.ObjectStateUploading {
-		t.Fatalf("expected dst state=uploading, got %s", dstObj.State)
-	}
-
-	// Same-bucket copies of content with an active upload follow the source task.
-	dstTasks := findTasks(t, ib.db, "object", dstObj.ObjectID)
-	if len(dstTasks) != 0 {
-		t.Fatalf("expected no destination upload task, got %d", len(dstTasks))
-	}
-
-	// GetObject on dest should return the same data
-	body := getObjectBody(t, ib.backend, "bucket", "dst-key")
-	if want := validTestObjectBody("data"); body != want {
-		t.Fatalf("expected body=%q, got %q", want, body)
-	}
-}
-
-func TestIntegration_DeletePath_CreatesDeleteMarker(t *testing.T) {
-	ib := newIntegrationBackend(t)
-	ctx := context.Background()
-
-	bucket := testutil.SeedBucket(t, ib.db, "bucket")
-	putOut := putObject(t, ib.backend, "bucket", "key", "data")
-
-	deleteOut, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: strPtr("bucket"),
-		Key:    strPtr("key"),
-	})
-	if err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
-	if deleteOut.DeleteMarker == nil || !*deleteOut.DeleteMarker || deleteOut.VersionId == nil || *deleteOut.VersionId == "" {
-		t.Fatalf("DeleteObject output = %#v, want delete marker version", deleteOut)
-	}
-
-	current, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
-	if err != nil {
-		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
-	}
-	if current == nil || !current.IsDeleteMarker {
-		t.Fatalf("current version = %#v, want delete marker", current)
-	}
-
-	if _, err := ib.backend.GetObject(ctx, &s3.GetObjectInput{Bucket: strPtr("bucket"), Key: strPtr("key")}); err == nil {
-		t.Fatal("GetObject after delete returned nil error")
-	}
-	listOut, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: strPtr("bucket")})
-	if err != nil {
-		t.Fatalf("ListObjectsV2: %v", err)
-	}
-	if len(listOut.Contents) != 0 {
-		t.Fatalf("ListObjectsV2 contents = %#v, want deleted object hidden", listOut.Contents)
-	}
-	versionsOut, err := ib.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: strPtr("bucket")})
-	if err != nil {
-		t.Fatalf("ListObjectVersions: %v", err)
-	}
-	if len(versionsOut.DeleteMarkers) != 1 || versionsOut.DeleteMarkers[0].VersionId == nil || *versionsOut.DeleteMarkers[0].VersionId != *deleteOut.VersionId {
-		t.Fatalf("delete markers = %#v, want created marker", versionsOut.DeleteMarkers)
-	}
-	if len(versionsOut.Versions) != 1 || versionsOut.Versions[0].VersionId == nil || *versionsOut.Versions[0].VersionId != putOut.VersionID {
-		t.Fatalf("versions = %#v, want original data version", versionsOut.Versions)
-	}
-
-	if _, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket:    strPtr("bucket"),
-		Key:       strPtr("key"),
-		VersionId: deleteOut.VersionId,
-	}); err != nil {
-		t.Fatalf("DeleteObject marker version: %v", err)
-	}
-	if body := getObjectBody(t, ib.backend, "bucket", "key"); body != validTestObjectBody("data") {
-		t.Fatalf("restored body = %q, want data", body)
-	}
-}
-
-func TestIntegration_BucketLifecycle(t *testing.T) {
-	ib := newIntegrationBackend(t)
-	ctx := context.Background()
-
-	// 1. CreateBucket — bucket should be immediately active
-	err := ib.backend.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: strPtr("my-bucket"),
-	}, nil)
-	if err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
-
-	// Verify bucket in active status
-	bkt, err := ib.repos.Buckets.GetByName(ctx, "my-bucket")
-	if err != nil || bkt == nil {
-		t.Fatalf("expected bucket, got err=%v", err)
-	}
-	if bkt.Status != model.BucketStatusActive {
-		t.Fatalf("expected status=active, got %s", bkt.Status)
-	}
-
-	// 2. HeadBucket should succeed
-	_, err = ib.backend.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: strPtr("my-bucket"),
-	})
-	if err != nil {
-		t.Fatalf("HeadBucket: %v", err)
-	}
-
-	// 3. Bucket should appear in ListBuckets
-	listOut, err := ib.backend.ListBuckets(ctx, s3response.ListBucketsInput{IsAdmin: true})
-	if err != nil {
-		t.Fatalf("ListBuckets: %v", err)
-	}
-	found := false
-	for _, b := range listOut.Buckets.Bucket {
-		if b.Name == "my-bucket" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("expected my-bucket in ListBuckets")
-	}
-
-	// 4. PutObject should succeed on active bucket
-	putObject(t, ib.backend, "my-bucket", "temp-key", "temp")
-
-	// 5. DeleteBucket should return error (not supported)
-	err = ib.backend.DeleteBucket(ctx, "my-bucket")
-	if err == nil {
-		t.Fatal("expected DeleteBucket to return error (not supported)")
-	}
-}
-
-func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
-	ib := newIntegrationBackend(t)
-	ctx := context.Background()
-
-	bucket := testutil.SeedBucket(t, ib.db, "bucket")
-
-	// 1. CreateMultipartUpload
-	createOut, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
-		Bucket: strPtr("bucket"),
-		Key:    strPtr("big-file"),
-	})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
-	uploadID := createOut.UploadId
-
-	// 2. UploadPart 1
-	part1Num := int32(1)
-	part1Body := validTestObjectBody("part1-data")
-	part1Out, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:     strPtr("bucket"),
-		Key:        strPtr("big-file"),
-		UploadId:   &uploadID,
-		PartNumber: &part1Num,
-		Body:       strings.NewReader(part1Body),
-	})
-	if err != nil {
-		t.Fatalf("UploadPart 1: %v", err)
-	}
-
-	// 3. UploadPart 2
-	part2Num := int32(2)
-	part2Body := "part2-data"
-	part2Out, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:     strPtr("bucket"),
-		Key:        strPtr("big-file"),
-		UploadId:   &uploadID,
-		PartNumber: &part2Num,
-		Body:       strings.NewReader(part2Body),
-	})
-	if err != nil {
-		t.Fatalf("UploadPart 2: %v", err)
-	}
-
-	// 4. CompleteMultipartUpload
-	_, _, err = ib.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   strPtr("bucket"),
-		Key:      strPtr("big-file"),
-		UploadId: &uploadID,
-		MultipartUpload: &types.CompletedMultipartUpload{
-			Parts: []types.CompletedPart{
-				{PartNumber: &part1Num, ETag: part1Out.ETag},
-				{PartNumber: &part2Num, ETag: part2Out.ETag},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("CompleteMultipartUpload: %v", err)
-	}
-
-	// 5. Verify object exists with correct size
-	obj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "big-file")
-	if err != nil || obj == nil {
-		t.Fatalf("expected object after complete, err=%v", err)
-	}
-	expectedBody := part1Body + part2Body
-	expectedSize := int64(len(expectedBody))
-	if obj.Size != expectedSize {
-		t.Fatalf("expected size=%d, got %d", expectedSize, obj.Size)
-	}
-
-	// Verify upload task created
-	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
-	if len(tasks) == 0 {
-		t.Fatal("expected upload task for completed multipart object")
-	}
-
-	// 6. GetObject → verify assembled body
-	body := getObjectBody(t, ib.backend, "bucket", "big-file")
-	if body != expectedBody {
-		t.Fatalf("expected body=%q, got %q", expectedBody, body)
 	}
 }
 
@@ -539,8 +267,8 @@ func TestIntegration_MultipartUpload_Abort(t *testing.T) {
 
 	// 1. CreateMultipartUpload
 	createOut, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
-		Bucket: strPtr("bucket"),
-		Key:    strPtr("file"),
+		Bucket: new("bucket"),
+		Key:    new("file"),
 	})
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
@@ -550,8 +278,8 @@ func TestIntegration_MultipartUpload_Abort(t *testing.T) {
 	// 2. UploadPart
 	part1Num := int32(1)
 	_, err = ib.backend.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:     strPtr("bucket"),
-		Key:        strPtr("file"),
+		Bucket:     new("bucket"),
+		Key:        new("file"),
 		UploadId:   &uploadID,
 		PartNumber: &part1Num,
 		Body:       strings.NewReader("data"),
@@ -562,8 +290,8 @@ func TestIntegration_MultipartUpload_Abort(t *testing.T) {
 
 	// 3. AbortMultipartUpload
 	err = ib.backend.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-		Bucket:   strPtr("bucket"),
-		Key:      strPtr("file"),
+		Bucket:   new("bucket"),
+		Key:      new("file"),
 		UploadId: &uploadID,
 	})
 	if err != nil {
@@ -604,6 +332,322 @@ func TestIntegration_MultipartUpload_Abort(t *testing.T) {
 	}
 }
 
+func TestIntegration_OverwritePath(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, ib.db, "bucket")
+
+	// First write
+	putObject(t, ib.backend, "bucket", "key", "v1")
+
+	obj, _ := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
+	firstVersionID := obj.VersionID
+	if firstVersionID == "" {
+		t.Fatal("expected current version id after first put")
+	}
+
+	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
+	firstSubject := contentSubject(t, ib.db, firstVersionID)
+	if len(tasks) != 1 || tasks[0].SubjectKey == nil || *tasks[0].SubjectKey != firstSubject {
+		t.Fatalf("expected 1 task with first content, got %d tasks", len(tasks))
+	}
+
+	// Overwrite
+	putObject(t, ib.backend, "bucket", "key", "v2")
+
+	obj, _ = ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
+	secondVersionID := obj.VersionID
+	if secondVersionID == "" || secondVersionID == firstVersionID {
+		t.Fatalf("expected new current version after overwrite, first=%s second=%s", firstVersionID, secondVersionID)
+	}
+
+	tasks = findTasks(t, ib.db, "object", obj.ObjectID)
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+	secondSubject := contentSubject(t, ib.db, secondVersionID)
+	if tasks[1].SubjectKey == nil || *tasks[1].SubjectKey != secondSubject {
+		t.Fatalf("expected second task content=%s, got %v", secondSubject, tasks[1].SubjectKey)
+	}
+
+	if tasks[0].SubjectKey == nil || *tasks[0].SubjectKey != firstSubject {
+		t.Fatalf("expected first task content=%s, got %v", firstSubject, tasks[0].SubjectKey)
+	}
+
+	// GetObject should return the current version.
+	body := getObjectBody(t, ib.backend, "bucket", "key")
+	if want := validTestObjectBody("v2"); body != want {
+		t.Fatalf("expected body=%q, got %q", want, body)
+	}
+}
+
+func TestIntegration_CopyObjectPath(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, ib.db, "bucket")
+
+	// Put source object
+	putOut := putObject(t, ib.backend, "bucket", "src-key", "data")
+
+	// Copy source → dest
+	srcCopy := "bucket/src-key"
+	dstBucket := "bucket"
+	dstKey := "dst-key"
+	_, err := ib.backend.CopyObject(ctx, s3response.CopyObjectInput{
+		Bucket:     &dstBucket,
+		Key:        &dstKey,
+		CopySource: &srcCopy,
+	})
+	if err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+
+	// Verify destination object exists
+	dstObj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "dst-key")
+	if err != nil || dstObj == nil {
+		t.Fatalf("expected dst object, got err=%v", err)
+	}
+
+	// ETags should match (same data)
+	srcETag := strings.Trim(putOut.ETag, `"`)
+	if dstObj.ETag != srcETag {
+		t.Fatalf("expected dst etag=%s, got %s", srcETag, dstObj.ETag)
+	}
+
+	// Pipeline position is derived from the content's copies, and no copy exists
+	// until the ingest plan runs, so a fresh copy reads as cached.
+	if dstObj.State != model.ObjectStateCached {
+		t.Fatalf("expected dst state=cached, got %s", dstObj.State)
+	}
+
+	// Same-bucket copies of identical bytes resolve to one content, so they
+	// share its single ingest plan instead of scheduling a second.
+	dstTasks := findTasks(t, ib.db, "object", dstObj.ObjectID)
+	if len(dstTasks) != 1 {
+		t.Fatalf("expected the destination to share one upload task, got %d", len(dstTasks))
+	}
+	totalPlans, err := ib.db.NewSelect().
+		Model((*model.Task)(nil)).
+		Where("type = ?", model.TaskTypeUploadPlan).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("counting upload tasks: %v", err)
+	}
+	if totalPlans != 1 {
+		t.Fatalf("upload task count = %d, want 1", totalPlans)
+	}
+
+	// GetObject on dest should return the same data
+	body := getObjectBody(t, ib.backend, "bucket", "dst-key")
+	if want := validTestObjectBody("data"); body != want {
+		t.Fatalf("expected body=%q, got %q", want, body)
+	}
+}
+
+func TestIntegration_DeletePath_CreatesDeleteMarker(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, ib.db, "bucket")
+	putOut := putObject(t, ib.backend, "bucket", "key", "data")
+
+	deleteOut, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: new("bucket"),
+		Key:    new("key"),
+	})
+	if err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if deleteOut.DeleteMarker == nil || !*deleteOut.DeleteMarker || deleteOut.VersionId == nil || *deleteOut.VersionId == "" {
+		t.Fatalf("DeleteObject output = %#v, want delete marker version", deleteOut)
+	}
+
+	current, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "key")
+	if err != nil {
+		t.Fatalf("GetCurrentVersionByBucketAndKey: %v", err)
+	}
+	if current == nil || !current.IsDeleteMarker {
+		t.Fatalf("current version = %#v, want delete marker", current)
+	}
+
+	if _, err := ib.backend.GetObject(ctx, &s3.GetObjectInput{Bucket: new("bucket"), Key: new("key")}); err == nil {
+		t.Fatal("GetObject after delete returned nil error")
+	}
+	listOut, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: new("bucket")})
+	if err != nil {
+		t.Fatalf("ListObjectsV2: %v", err)
+	}
+	if len(listOut.Contents) != 0 {
+		t.Fatalf("ListObjectsV2 contents = %#v, want deleted object hidden", listOut.Contents)
+	}
+	versionsOut, err := ib.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: new("bucket")})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if len(versionsOut.DeleteMarkers) != 1 || versionsOut.DeleteMarkers[0].VersionId == nil || *versionsOut.DeleteMarkers[0].VersionId != *deleteOut.VersionId {
+		t.Fatalf("delete markers = %#v, want created marker", versionsOut.DeleteMarkers)
+	}
+	if len(versionsOut.Versions) != 1 || versionsOut.Versions[0].VersionId == nil || *versionsOut.Versions[0].VersionId != putOut.VersionID {
+		t.Fatalf("versions = %#v, want original data version", versionsOut.Versions)
+	}
+
+	if _, err := ib.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    new("bucket"),
+		Key:       new("key"),
+		VersionId: deleteOut.VersionId,
+	}); err != nil {
+		t.Fatalf("DeleteObject marker version: %v", err)
+	}
+	if body := getObjectBody(t, ib.backend, "bucket", "key"); body != validTestObjectBody("data") {
+		t.Fatalf("restored body = %q, want data", body)
+	}
+}
+
+func TestIntegration_BucketLifecycle(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	// 1. CreateBucket creates the namespace and schedules provider storage.
+	err := ib.backend.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: new("my-bucket"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	// Provider storage is not ready until the provisioning task finishes.
+	bkt, err := ib.repos.Buckets.GetByName(ctx, "my-bucket")
+	if err != nil || bkt == nil {
+		t.Fatalf("expected bucket, got err=%v", err)
+	}
+	if bkt.Status != model.BucketStatusProvisioning {
+		t.Fatalf("expected status=provisioning, got %s", bkt.Status)
+	}
+
+	// 2. HeadBucket should succeed
+	_, err = ib.backend.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: new("my-bucket"),
+	})
+	if err != nil {
+		t.Fatalf("HeadBucket: %v", err)
+	}
+
+	// 3. Bucket should appear in ListBuckets
+	listOut, err := ib.backend.ListBuckets(ctx, s3response.ListBucketsInput{IsAdmin: true})
+	if err != nil {
+		t.Fatalf("ListBuckets: %v", err)
+	}
+	found := false
+	for _, b := range listOut.Buckets.Bucket {
+		if b.Name == "my-bucket" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected my-bucket in ListBuckets")
+	}
+
+	if err := ib.repos.Buckets.UpdateStatus(ctx, bkt.ID, model.BucketStatusProvisioning, model.BucketStatusReady); err != nil {
+		t.Fatalf("mark test bucket ready: %v", err)
+	}
+
+	// 4. PutObject should succeed after provisioning completes.
+	putObject(t, ib.backend, "my-bucket", "temp-key", "temp")
+
+	// 5. DeleteBucket should return error (not supported)
+	err = ib.backend.DeleteBucket(ctx, "my-bucket")
+	if err == nil {
+		t.Fatal("expected DeleteBucket to return error (not supported)")
+	}
+}
+
+func TestIntegration_MultipartUpload_HappyPath(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := context.Background()
+
+	bucket := testutil.SeedBucket(t, ib.db, "bucket")
+
+	// 1. CreateMultipartUpload
+	createOut, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: new("bucket"),
+		Key:    new("big-file"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	contentID := createOut.UploadId
+
+	// 2. UploadPart 1
+	part1Num := int32(1)
+	part1Body := validTestObjectBody("part1-data")
+	part1Out, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     new("bucket"),
+		Key:        new("big-file"),
+		UploadId:   &contentID,
+		PartNumber: &part1Num,
+		Body:       strings.NewReader(part1Body),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 1: %v", err)
+	}
+
+	// 3. UploadPart 2
+	part2Num := int32(2)
+	part2Body := "part2-data"
+	part2Out, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     new("bucket"),
+		Key:        new("big-file"),
+		UploadId:   &contentID,
+		PartNumber: &part2Num,
+		Body:       strings.NewReader(part2Body),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 2: %v", err)
+	}
+
+	// 4. CompleteMultipartUpload
+	_, _, err = ib.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   new("bucket"),
+		Key:      new("big-file"),
+		UploadId: &contentID,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{
+				{PartNumber: &part1Num, ETag: part1Out.ETag},
+				{PartNumber: &part2Num, ETag: part2Out.ETag},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload: %v", err)
+	}
+
+	// 5. Verify object exists with correct size
+	obj, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "big-file")
+	if err != nil || obj == nil {
+		t.Fatalf("expected object after complete, err=%v", err)
+	}
+	expectedBody := part1Body + part2Body
+	expectedSize := int64(len(expectedBody))
+	if obj.Size != expectedSize {
+		t.Fatalf("expected size=%d, got %d", expectedSize, obj.Size)
+	}
+
+	// Verify upload task created
+	tasks := findTasks(t, ib.db, "object", obj.ObjectID)
+	if len(tasks) == 0 {
+		t.Fatal("expected upload task for completed multipart object")
+	}
+
+	// 6. GetObject → verify assembled body
+	body := getObjectBody(t, ib.backend, "bucket", "big-file")
+	if body != expectedBody {
+		t.Fatalf("expected body=%q, got %q", expectedBody, body)
+	}
+}
+
 func TestIntegration_StringAndShutdown(t *testing.T) {
 	ib := newIntegrationBackend(t)
 
@@ -623,10 +667,10 @@ func TestIntegration_ListMultipartUploads(t *testing.T) {
 	testutil.SeedBucket(t, ib.db, "bucket")
 
 	// Create 3 multipart uploads
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		key := fmt.Sprintf("multi-key-%d", i)
 		_, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
-			Bucket: strPtr("bucket"),
+			Bucket: new("bucket"),
 			Key:    &key,
 		})
 		if err != nil {
@@ -636,7 +680,7 @@ func TestIntegration_ListMultipartUploads(t *testing.T) {
 
 	// ListMultipartUploads
 	listOut, err := ib.backend.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
-		Bucket: strPtr("bucket"),
+		Bucket: new("bucket"),
 	})
 	if err != nil {
 		t.Fatalf("ListMultipartUploads: %v", err)
@@ -651,7 +695,7 @@ func TestIntegration_ListMultipartUploads(t *testing.T) {
 	// Verify MaxUploads pagination
 	maxUploads := int32(1)
 	listOut2, err := ib.backend.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
-		Bucket:     strPtr("bucket"),
+		Bucket:     new("bucket"),
 		MaxUploads: &maxUploads,
 	})
 	if err != nil {
@@ -673,22 +717,22 @@ func TestIntegration_ListParts(t *testing.T) {
 
 	// Create multipart upload
 	createOut, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
-		Bucket: strPtr("bucket"),
-		Key:    strPtr("parts-file"),
+		Bucket: new("bucket"),
+		Key:    new("parts-file"),
 	})
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
-	uploadID := createOut.UploadId
+	contentID := createOut.UploadId
 
 	// Upload 3 parts
 	for i := int32(1); i <= 3; i++ {
 		partNum := i
 		body := fmt.Sprintf("part-%d-data", i)
 		_, err := ib.backend.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket:     strPtr("bucket"),
-			Key:        strPtr("parts-file"),
-			UploadId:   &uploadID,
+			Bucket:     new("bucket"),
+			Key:        new("parts-file"),
+			UploadId:   &contentID,
 			PartNumber: &partNum,
 			Body:       strings.NewReader(body),
 		})
@@ -699,9 +743,9 @@ func TestIntegration_ListParts(t *testing.T) {
 
 	// ListParts
 	listOut, err := ib.backend.ListParts(ctx, &s3.ListPartsInput{
-		Bucket:   strPtr("bucket"),
-		Key:      strPtr("parts-file"),
-		UploadId: &uploadID,
+		Bucket:   new("bucket"),
+		Key:      new("parts-file"),
+		UploadId: &contentID,
 	})
 	if err != nil {
 		t.Fatalf("ListParts: %v", err)
@@ -724,9 +768,9 @@ func TestIntegration_ListParts(t *testing.T) {
 	// ListParts with MaxParts pagination
 	maxParts := int32(1)
 	listOut2, err := ib.backend.ListParts(ctx, &s3.ListPartsInput{
-		Bucket:   strPtr("bucket"),
-		Key:      strPtr("parts-file"),
-		UploadId: &uploadID,
+		Bucket:   new("bucket"),
+		Key:      new("parts-file"),
+		UploadId: &contentID,
 		MaxParts: &maxParts,
 	})
 	if err != nil {
@@ -751,21 +795,21 @@ func TestIntegration_UploadPartCopy(t *testing.T) {
 
 	// Create a multipart upload
 	createOut, err := ib.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
-		Bucket: strPtr("bucket"),
-		Key:    strPtr("copy-dst"),
+		Bucket: new("bucket"),
+		Key:    new("copy-dst"),
 	})
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
-	uploadID := createOut.UploadId
+	contentID := createOut.UploadId
 
 	// UploadPartCopy: copy source into part 1
 	partNum := int32(1)
 	copySource := "bucket/copy-src"
 	partCopyOut, err := ib.backend.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
-		Bucket:     strPtr("bucket"),
-		Key:        strPtr("copy-dst"),
-		UploadId:   &uploadID,
+		Bucket:     new("bucket"),
+		Key:        new("copy-dst"),
+		UploadId:   &contentID,
 		PartNumber: &partNum,
 		CopySource: &copySource,
 	})
@@ -778,9 +822,9 @@ func TestIntegration_UploadPartCopy(t *testing.T) {
 
 	// Complete the multipart upload with the copied part
 	_, _, err = ib.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   strPtr("bucket"),
-		Key:      strPtr("copy-dst"),
-		UploadId: &uploadID,
+		Bucket:   new("bucket"),
+		Key:      new("copy-dst"),
+		UploadId: &contentID,
 		MultipartUpload: &types.CompletedMultipartUpload{
 			Parts: []types.CompletedPart{
 				{PartNumber: &partNum, ETag: partCopyOut.ETag},
@@ -811,7 +855,7 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 		Bucket:      &srcBucket,
 		Key:         &srcKey,
 		Body:        strings.NewReader(validTestObjectBody("copy-me")),
-		ContentType: strPtr("text/plain"),
+		ContentType: new("text/plain"),
 	})
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
@@ -858,8 +902,10 @@ func TestIntegration_CopyObject_MetadataMatch(t *testing.T) {
 	if dstObj.ContentType != srcObj.ContentType {
 		t.Fatalf("content-type mismatch: src=%s dst=%s", srcObj.ContentType, dstObj.ContentType)
 	}
-	if dstObj.State != model.ObjectStateUploading {
-		t.Fatalf("expected dst state=uploading, got %s", dstObj.State)
+	// Pipeline position is derived from the content's copies, and no copy exists
+	// until the ingest plan runs, so a fresh copy reads as cached.
+	if dstObj.State != model.ObjectStateCached {
+		t.Fatalf("expected dst state=cached, got %s", dstObj.State)
 	}
 	if dstObj.VersionID == "" {
 		t.Fatal("expected destination current version id")
@@ -881,11 +927,11 @@ func TestIntegration_DeleteObjects_BatchCreatesDeleteMarkers(t *testing.T) {
 	putObject(t, ib.backend, "bucket", "file-b", "bbb")
 
 	out, err := ib.backend.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: strPtr("bucket"),
+		Bucket: new("bucket"),
 		Delete: &types.Delete{
 			Objects: []types.ObjectIdentifier{
-				{Key: strPtr("file-a")},
-				{Key: strPtr("file-b")},
+				{Key: new("file-a")},
+				{Key: new("file-b")},
 			},
 		},
 	})
@@ -910,7 +956,7 @@ func TestIntegration_DeleteObjects_BatchCreatesDeleteMarkers(t *testing.T) {
 		}
 	}
 
-	listOut, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: strPtr("bucket")})
+	listOut, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: new("bucket")})
 	if err != nil {
 		t.Fatalf("ListObjectsV2: %v", err)
 	}
@@ -918,7 +964,7 @@ func TestIntegration_DeleteObjects_BatchCreatesDeleteMarkers(t *testing.T) {
 		t.Fatalf("ListObjectsV2 contents = %#v, want hidden objects", listOut.Contents)
 	}
 
-	versionsOut, err := ib.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: strPtr("bucket")})
+	versionsOut, err := ib.backend.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: new("bucket")})
 	if err != nil {
 		t.Fatalf("ListObjectVersions: %v", err)
 	}
@@ -942,7 +988,7 @@ func TestIntegration_ListObjectsV2_Pagination(t *testing.T) {
 	// Page 1: MaxKeys=2
 	maxKeys := int32(2)
 	out1, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:  strPtr("bucket"),
+		Bucket:  new("bucket"),
 		MaxKeys: &maxKeys,
 	})
 	if err != nil {
@@ -966,7 +1012,7 @@ func TestIntegration_ListObjectsV2_Pagination(t *testing.T) {
 
 	// Page 2
 	out2, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:            strPtr("bucket"),
+		Bucket:            new("bucket"),
 		MaxKeys:           &maxKeys,
 		ContinuationToken: out1.NextContinuationToken,
 	})
@@ -985,7 +1031,7 @@ func TestIntegration_ListObjectsV2_Pagination(t *testing.T) {
 
 	// Page 3 (last page, should have 1 object)
 	out3, err := ib.backend.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:            strPtr("bucket"),
+		Bucket:            new("bucket"),
 		MaxKeys:           &maxKeys,
 		ContinuationToken: out2.NextContinuationToken,
 	})
@@ -1026,7 +1072,7 @@ func TestIntegration_HeadObject(t *testing.T) {
 		Bucket:      &bucketName,
 		Key:         &keyName,
 		Body:        strings.NewReader(content),
-		ContentType: strPtr("application/json"),
+		ContentType: new("application/json"),
 	})
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
@@ -1034,8 +1080,8 @@ func TestIntegration_HeadObject(t *testing.T) {
 
 	// HeadObject
 	headOut, err := ib.backend.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: strPtr("bucket"),
-		Key:    strPtr("head-key"),
+		Bucket: new("bucket"),
+		Key:    new("head-key"),
 	})
 	if err != nil {
 		t.Fatalf("HeadObject: %v", err)
@@ -1084,23 +1130,19 @@ func TestIntegration_GetObject_CacheMiss_NoPieceCID(t *testing.T) {
 	}
 
 	// Manually delete from cache to simulate a cache miss
-	if err := ib.cache.Delete(ctx, "bucket", obj.CacheKey); err != nil {
+	if err := ib.cache.Delete(ctx, "bucket", obj.CacheKey()); err != nil {
 		t.Fatalf("cache delete: %v", err)
 	}
-	if ib.cache.Exists(ctx, "bucket", obj.CacheKey) {
+	if ib.cache.Exists(ctx, "bucket", obj.CacheKey()) {
 		t.Fatal("expected cache file to be gone")
 	}
 
 	// GetObject should fail — object is in DB but no cache and no PieceCID for SP download
 	_, err = ib.backend.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: strPtr("bucket"),
-		Key:    strPtr("evicted-key"),
+		Bucket: new("bucket"),
+		Key:    new("evicted-key"),
 	})
 	if err == nil {
 		t.Fatal("expected GetObject to fail on cache miss with no PieceCID")
 	}
-}
-
-func strPtr(s string) *string {
-	return &s
 }

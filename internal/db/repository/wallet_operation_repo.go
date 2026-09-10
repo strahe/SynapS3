@@ -72,139 +72,113 @@ func (r *BunWalletOperationRepo) GetByID(ctx context.Context, id int64) (*model.
 	return op, nil
 }
 
-func (r *BunWalletOperationRepo) ClaimPending(ctx context.Context, leaseDuration time.Duration) (*model.WalletOperation, error) {
-	now := time.Now()
-	leaseUntil := now.Add(leaseDuration)
-	op := new(model.WalletOperation)
-	err := r.db.NewRaw(
-		`UPDATE wallet_operations SET status = ?, started_at = ?, lease_until = ?, updated_at = ?
-		 WHERE id = (
-		     SELECT id FROM wallet_operations
-		     WHERE status = ?
-		       AND NOT EXISTS (
-		           SELECT 1 FROM wallet_operations in_flight
-		           WHERE in_flight.status IN (?, ?)
-		       )
-		     ORDER BY created_at ASC, id ASC
-		     LIMIT 1
-		 )
-		 AND status = ?
-		 RETURNING *`,
-		model.WalletOperationStatusRunning, now, leaseUntil, now,
-		model.WalletOperationStatusPending,
-		model.WalletOperationStatusRunning,
-		model.WalletOperationStatusSubmitted,
-		model.WalletOperationStatusPending,
-	).Scan(ctx, op)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("claiming pending wallet operation: %w", err)
+func (r *BunWalletOperationRepo) BindTask(ctx context.Context, id, taskID int64) error {
+	if id < 1 || taskID < 1 {
+		return ErrInvalidInput
 	}
-	return op, nil
+	res, err := r.db.NewUpdate().
+		Model((*model.WalletOperation)(nil)).
+		Set("task_id = ?", taskID).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ? AND status = ?", id, model.WalletOperationStatusPending).
+		Where("task_id IS NULL OR task_id = ?", taskID).
+		Exec(ctx)
+	return requireRows(res, err, "binding wallet operation task")
 }
 
-func (r *BunWalletOperationRepo) MarkSubmitted(ctx context.Context, id int64, txHash string) error {
+func (r *BunWalletOperationRepo) MarkBroadcastAttempted(ctx context.Context, id, taskID int64) error {
+	now := time.Now()
+	res, err := r.db.NewUpdate().
+		Model((*model.WalletOperation)(nil)).
+		Set("broadcast_attempted_at = COALESCE(broadcast_attempted_at, ?)", now).
+		Set("started_at = COALESCE(started_at, ?)", now).
+		Set("updated_at = ?", now).
+		Where("id = ? AND task_id = ? AND status = ?", id, taskID, model.WalletOperationStatusPending).
+		Exec(ctx)
+	return requireRows(res, err, "marking wallet operation broadcast attempted")
+}
+
+func (r *BunWalletOperationRepo) MarkSubmitted(ctx context.Context, id, taskID int64, txHash string) error {
+	if txHash == "" {
+		return ErrInvalidInput
+	}
 	now := time.Now()
 	res, err := r.db.NewUpdate().
 		Model((*model.WalletOperation)(nil)).
 		Set("status = ?", model.WalletOperationStatusSubmitted).
 		Set("tx_hash = ?", txHash).
-		Set("submitted_at = ?", now).
-		Set("lease_until = NULL").
+		Set("submitted_at = COALESCE(submitted_at, ?)", now).
 		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status IN (?, ?)", model.WalletOperationStatusRunning, model.WalletOperationStatusSubmitted).
+		Where("id = ? AND task_id = ?", id, taskID).
+		Where("status IN (?, ?)", model.WalletOperationStatusPending, model.WalletOperationStatusSubmitted).
+		Where("tx_hash IS NULL OR tx_hash = ?", txHash).
 		Exec(ctx)
 	return requireRows(res, err, "marking wallet operation submitted")
 }
 
-func (r *BunWalletOperationRepo) MarkConfirmed(ctx context.Context, id int64) error {
+func (r *BunWalletOperationRepo) MarkConfirmed(ctx context.Context, id, taskID int64, txHash string) error {
 	now := time.Now()
 	res, err := r.db.NewUpdate().
 		Model((*model.WalletOperation)(nil)).
 		Set("status = ?", model.WalletOperationStatusConfirmed).
+		Set("tx_hash = ?", txHash).
 		Set("last_error = NULL").
-		Set("lease_until = NULL").
+		Set("task_id = NULL").
 		Set("completed_at = ?", now).
 		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status = ?", model.WalletOperationStatusSubmitted).
+		Where("id = ? AND task_id = ?", id, taskID).
+		Where("status IN (?, ?)", model.WalletOperationStatusPending, model.WalletOperationStatusSubmitted).
+		Where("tx_hash IS NULL OR tx_hash = ?", txHash).
 		Exec(ctx)
 	return requireRows(res, err, "marking wallet operation confirmed")
 }
 
-func (r *BunWalletOperationRepo) MarkConfirmedWithoutTransaction(ctx context.Context, id int64) error {
+func (r *BunWalletOperationRepo) MarkConfirmedWithoutTransaction(ctx context.Context, id, taskID int64) error {
 	now := time.Now()
 	res, err := r.db.NewUpdate().
 		Model((*model.WalletOperation)(nil)).
 		Set("status = ?", model.WalletOperationStatusConfirmed).
 		Set("tx_hash = NULL").
 		Set("last_error = NULL").
-		Set("lease_until = NULL").
+		Set("task_id = NULL").
 		Set("submitted_at = NULL").
 		Set("completed_at = ?", now).
 		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status = ?", model.WalletOperationStatusRunning).
+		Where("id = ? AND task_id = ?", id, taskID).
+		Where("status = ?", model.WalletOperationStatusPending).
 		Exec(ctx)
 	return requireRows(res, err, "marking wallet operation confirmed without transaction")
 }
 
-func (r *BunWalletOperationRepo) MarkFailed(ctx context.Context, id int64, lastError string) error {
+func (r *BunWalletOperationRepo) MarkFailed(ctx context.Context, id, taskID int64, lastError string) error {
 	now := time.Now()
 	res, err := r.db.NewUpdate().
 		Model((*model.WalletOperation)(nil)).
 		Set("status = ?", model.WalletOperationStatusFailed).
 		Set("last_error = ?", lastError).
-		Set("lease_until = NULL").
+		Set("task_id = NULL").
 		Set("completed_at = ?", now).
 		Set("updated_at = ?", now).
-		Where("id = ?", id).
-		Where("status IN (?, ?, ?)", model.WalletOperationStatusRunning, model.WalletOperationStatusSubmitted, model.WalletOperationStatusPending).
+		Where("id = ? AND task_id = ?", id, taskID).
+		Where("status IN (?, ?)", model.WalletOperationStatusSubmitted, model.WalletOperationStatusPending).
 		Exec(ctx)
 	return requireRows(res, err, "marking wallet operation failed")
 }
 
-func (r *BunWalletOperationRepo) MarkExpiredRunningUnknown(ctx context.Context) ([]model.WalletOperation, error) {
+func (r *BunWalletOperationRepo) MarkUnknown(ctx context.Context, id, taskID int64, lastError string) error {
 	now := time.Now()
-	var ops []model.WalletOperation
-	err := r.db.NewRaw(
-		`UPDATE wallet_operations
-		    SET status = ?, last_error = ?, lease_until = NULL, completed_at = ?, updated_at = ?
-		  WHERE status = ?
-		    AND (tx_hash IS NULL OR tx_hash = '')
-		    AND lease_until IS NOT NULL
-		    AND lease_until < ?
-		  RETURNING *`,
-		model.WalletOperationStatusUnknown,
-		"operation state is unknown after restart before transaction hash was recorded",
-		now,
-		now,
-		model.WalletOperationStatusRunning,
-		now,
-	).Scan(ctx, &ops)
-	if err != nil {
-		return nil, fmt.Errorf("marking expired wallet operations unknown: %w", err)
-	}
-	return ops, nil
-}
-
-func (r *BunWalletOperationRepo) ListSubmitted(ctx context.Context, limit int) ([]model.WalletOperation, error) {
-	limit = normalizeWalletOperationLimit(limit)
-	var ops []model.WalletOperation
-	err := r.db.NewSelect().
-		Model(&ops).
-		Where("status = ?", model.WalletOperationStatusSubmitted).
-		Where("tx_hash IS NOT NULL AND tx_hash <> ''").
-		OrderExpr("submitted_at ASC, id ASC").
-		Limit(limit).
-		Scan(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing submitted wallet operations: %w", err)
-	}
-	return ops, nil
+	res, err := r.db.NewUpdate().
+		Model((*model.WalletOperation)(nil)).
+		Set("status = ?", model.WalletOperationStatusUnknown).
+		Set("last_error = ?", lastError).
+		Set("task_id = NULL").
+		Set("completed_at = ?", now).
+		Set("updated_at = ?", now).
+		Where("id = ? AND task_id = ?", id, taskID).
+		Where("status = ?", model.WalletOperationStatusPending).
+		Where("broadcast_attempted_at IS NOT NULL").
+		Exec(ctx)
+	return requireRows(res, err, "marking wallet operation unknown")
 }
 
 func (r *BunWalletOperationRepo) ListRecent(ctx context.Context, limit int) ([]model.WalletOperation, error) {

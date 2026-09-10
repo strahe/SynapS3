@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/strahe/synapse-go/piece"
 )
 
 const (
@@ -14,6 +16,61 @@ const (
 	testAddPiecesTxHash     = "0x7890abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456"
 	testConfirmedTxHash     = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 )
+
+func TestPDPStatusCheckerFindsProviderParkedPiece(t *testing.T) {
+	info, err := piece.Calculate(strings.NewReader(strings.Repeat("p", 128)))
+	if err != nil {
+		t.Fatalf("calculate piece identity: %v", err)
+	}
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		want       ParkedPieceState
+	}{
+		{name: "parked", statusCode: http.StatusOK, body: fmt.Sprintf(`{"pieceCid":%q}`, info.CIDv2), want: ParkedPieceReady},
+		{name: "processing", statusCode: http.StatusAccepted, want: ParkedPieceProcessing},
+		{name: "missing", statusCode: http.StatusNotFound, want: ParkedPieceMissing},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/provider/api/pdp/piece" || r.URL.Query().Get("pieceCid") != info.CIDv2.String() {
+					t.Fatalf("parked-piece request = %s?%s", r.URL.Path, r.URL.RawQuery)
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = fmt.Fprint(w, tt.body)
+			}))
+			defer server.Close()
+
+			checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
+			got, err := checker.FindParkedPiece(t.Context(), server.URL+"/provider/api", info.CIDv2)
+			if err != nil || got != tt.want {
+				t.Fatalf("FindParkedPiece = %q, %v; want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPDPStatusCheckerRejectsMismatchedParkedPiece(t *testing.T) {
+	want, err := piece.Calculate(strings.NewReader(strings.Repeat("w", 128)))
+	if err != nil {
+		t.Fatalf("calculate wanted piece identity: %v", err)
+	}
+	other, err := piece.Calculate(strings.NewReader(strings.Repeat("o", 128)))
+	if err != nil {
+		t.Fatalf("calculate other piece identity: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"pieceCid":%q}`, other.CIDv2)
+	}))
+	defer server.Close()
+
+	checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
+	if _, err := checker.FindParkedPiece(t.Context(), server.URL, want.CIDv2); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("mismatched parked-piece error = %v", err)
+	}
+}
 
 func TestPDPStatusCheckerChecksDataSetCreationStatusOnce(t *testing.T) {
 	var requests int

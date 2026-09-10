@@ -262,6 +262,8 @@ func seedStorageDataSet(t *testing.T, db *bun.DB, bucketID int64, providerID str
 		BucketID:   bucketID,
 		ProviderID: onChainID(t, providerID),
 		CopyIndex:  int(bucketID),
+		Generation: 1,
+		IsCurrent:  true,
 		DataSetID:  onChainIDPtr(t, dataSetID),
 		Status:     status,
 	}

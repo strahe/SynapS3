@@ -163,77 +163,33 @@ var fieldMetadataByPath = map[string]FieldMetadata{
 		Env:         "SYNAPS3_CACHE_LRU_LOW_WATERMARK_PERCENT",
 		Editable:    true,
 	},
-	"worker.upload.concurrency": {
-		Label:       "Upload Concurrency",
-		Description: "Number of upload worker jobs that may run concurrently.",
-		Env:         "SYNAPS3_WORKER_UPLOAD_CONCURRENCY",
-		Editable:    true,
+	"worker.tasks.concurrency": {
+		Label: "Task Concurrency", Description: "Maximum background operations that may run at once. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_CONCURRENCY", Editable: true,
 	},
-	"worker.upload.poll_interval": {
-		Label:       "Upload Poll Interval",
-		Description: "Interval between upload worker polling cycles.",
-		Env:         "SYNAPS3_WORKER_UPLOAD_POLL_INTERVAL",
-		Editable:    true,
+	"worker.tasks.poll_interval": {
+		Label: "Task Poll Interval", Description: "Interval between checks for ready background operations. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_POLL_INTERVAL", Editable: true,
 	},
-	"worker.upload.max_retries": {
-		Label:       "Upload Max Retries",
-		Description: "Maximum retry attempts for failed upload work.",
-		Env:         "SYNAPS3_WORKER_UPLOAD_MAX_RETRIES",
-		Editable:    true,
+	"worker.tasks.lease_duration": {
+		Label: "Task Lease Duration", Description: "Time another process waits before recovering interrupted background work. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_LEASE_DURATION", Editable: true,
 	},
-	"worker.provider_replacement.concurrency": {
-		Label:       "Provider Replacement Concurrency",
-		Description: "Number of provider replacement transfers that may run concurrently. Restart required.",
-		Env:         "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_CONCURRENCY",
-		Editable:    true,
+	"worker.tasks.max_retries": {
+		Label: "Task Max Retries", Description: "Default retry limit for background operations. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_MAX_RETRIES", Editable: true,
 	},
-	"worker.provider_replacement.poll_interval": {
-		Label:       "Provider Replacement Poll Interval",
-		Description: "Interval between checks for provider replacement work. Restart required.",
-		Env:         "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_POLL_INTERVAL",
-		Editable:    true,
+	"worker.tasks.retention": {
+		Label: "Task Retention", Description: "How long finished background operations remain visible. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_RETENTION", Editable: true,
 	},
-	"worker.provider_replacement.max_retries": {
-		Label:       "Provider Replacement Max Retries",
-		Description: "Maximum retry attempts for each provider replacement copy. Restart required.",
-		Env:         "SYNAPS3_WORKER_PROVIDER_REPLACEMENT_MAX_RETRIES",
-		Editable:    true,
+	"worker.tasks.provider_mutation_concurrency": {
+		Label: "Storage Mutation Concurrency", Description: "Maximum concurrent requests that change remote storage. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_PROVIDER_MUTATION_CONCURRENCY", Editable: true,
 	},
-	"worker.evictor.concurrency": {
-		Label:       "Evictor Concurrency",
-		Description: "Number of cache eviction jobs that may run concurrently.",
-		Env:         "SYNAPS3_WORKER_EVICTOR_CONCURRENCY",
-		Editable:    true,
-	},
-	"worker.evictor.poll_interval": {
-		Label:       "Evictor Poll Interval",
-		Description: "Interval between cache evictor polling cycles.",
-		Env:         "SYNAPS3_WORKER_EVICTOR_POLL_INTERVAL",
-		Editable:    true,
-	},
-	"worker.evictor.max_retries": {
-		Label:       "Evictor Max Retries",
-		Description: "Maximum retry attempts for failed eviction work.",
-		Env:         "SYNAPS3_WORKER_EVICTOR_MAX_RETRIES",
-		Editable:    true,
-	},
-	"worker.storage_cleanup.concurrency": {
-		Label:       "Replica Cleanup Concurrency",
-		Description: "Number of remote replica cleanup jobs that may run concurrently.",
-		Env:         "SYNAPS3_WORKER_STORAGE_CLEANUP_CONCURRENCY",
-		Editable:    true,
-	},
-	"worker.storage_cleanup.poll_interval": {
-		Label:       "Replica Cleanup Poll Interval",
-		Description: "Interval between remote replica cleanup polling cycles.",
-		Env:         "SYNAPS3_WORKER_STORAGE_CLEANUP_POLL_INTERVAL",
-		Editable:    true,
-	},
-	"worker.storage_cleanup.max_retries": {
-		Label:       "Replica Cleanup Max Retries",
-		Description: "Maximum retry attempts for failed remote replica cleanup work.",
-		Env:         "SYNAPS3_WORKER_STORAGE_CLEANUP_MAX_RETRIES",
-		Editable:    true,
+	"worker.tasks.destructive_mutation_concurrency": {
+		Label: "Removal Concurrency", Description: "Maximum concurrent remote cleanup and retirement requests. Restart required.",
+		Env: "SYNAPS3_WORKER_TASKS_DESTRUCTIVE_MUTATION_CONCURRENCY", Editable: true,
 	},
 	"logging.level": {
 		Label:       "Level",
