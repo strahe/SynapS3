@@ -1068,6 +1068,102 @@ func (f commitStatusCheckerFunc) GetAddPiecesStatus(
 	return f(ctx, input)
 }
 
+func TestCommitCapacityWakesOnlyTheQueueHead(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	_, copies, pieceCID := seedAdvancerCopies(t, db, 7)
+	taskIDs := make([]int64, len(copies))
+	for i, copyRow := range copies {
+		task, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+			Type: model.TaskTypeStorageCommit, IdempotencyKey: fmt.Sprintf("queue-%d", copyRow.ID),
+			InputVersion: 1, Input: []byte(`{}`), InputHash: "queue", AvailableAt: time.Now().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("enqueue commit task %d: %v", i, err)
+		}
+		taskIDs[i] = task.ID
+		if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
+			Set("active_task_id = ?", task.ID).Where("id = ?", copyRow.ID).Exec(t.Context()); err != nil {
+			t.Fatalf("bind commit task %d: %v", i, err)
+		}
+	}
+	reserve := func(i int) storagecommit.ReservationState {
+		t.Helper()
+		result, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+			Copy: advancerCopyIdentity(copies[i]), AttemptID: fmt.Sprintf("queue-attempt-%d", i),
+		})
+		if err != nil {
+			t.Fatalf("reserve copy %d: %v", i, err)
+		}
+		return result.State
+	}
+	release := func(i int) {
+		t.Helper()
+		if err := repos.Contents.ReleaseCommitAttempt(t.Context(), storagecommit.ReleaseInput{
+			Copy: advancerCopyIdentity(copies[i]), AttemptID: fmt.Sprintf("queue-attempt-%d", i),
+			Reason: storagecommit.ReleaseBeforeSubmitCanceled, ClearReadyAt: true, ClearExtraData: true,
+		}); err != nil {
+			t.Fatalf("release copy %d: %v", i, err)
+		}
+	}
+	runnable := func(step string, want ...int) {
+		t.Helper()
+		var got []int
+		for i, id := range taskIDs {
+			task, err := repos.Tasks.GetByID(t.Context(), id)
+			if err != nil {
+				t.Fatalf("load commit task %d: %v", i, err)
+			}
+			if !task.AvailableAt.After(time.Now()) {
+				got = append(got, i)
+			}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("%s: runnable queue tasks = %v, want %v", step, got, want)
+		}
+	}
+
+	for i := range 7 {
+		want := storagecommit.ReservationAcquired
+		if i >= storagecommit.MaxActiveAttemptsPerDataSet {
+			want = storagecommit.ReservationWaiting
+		}
+		if state := reserve(i); state != want {
+			t.Fatalf("reserve copy %d = %s, want %s", i, state, want)
+		}
+	}
+	runnable("while every slot is taken")
+
+	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: advancerCopyIdentity(copies[0]), AttemptID: "queue-attempt-0", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("mark copy 0 attempted: %v", err)
+	}
+	pieceID := idtypes.OnChainIDFromSDK(sdktypes.NewBigInt(5001))
+	if err := repos.Contents.MarkUploadCopyCommitted(t.Context(), repository.MarkUploadCopyCommittedInput{
+		StorageCopyID: copies[0].ID, ContentID: copies[0].ContentID, CopyIndex: 0,
+		PieceCID: pieceCID.String(), PieceID: &pieceID, RetrievalURL: "https://provider.example/piece",
+		CommitExtraDataHex: "abcd", CommitTransactionID: "0x01", CommitAttemptID: "queue-attempt-0",
+		CommitConfirmedTransactionID: "0x01",
+	}); err != nil {
+		t.Fatalf("confirm copy 0: %v", err)
+	}
+	runnable("after a confirmation frees one slot", 4)
+
+	if state := reserve(4); state != storagecommit.ReservationAcquired {
+		t.Fatalf("woken head reservation = %s", state)
+	}
+	runnable("after the head takes the last slot", 4)
+
+	release(1)
+	release(2)
+	runnable("after two releases", 4, 5)
+	if state := reserve(5); state != storagecommit.ReservationAcquired {
+		t.Fatalf("second head reservation = %s", state)
+	}
+	runnable("after the head reserves with a slot left", 4, 5, 6)
+}
+
 func seedAdvancerCopies(t *testing.T, db *bun.DB, count int) (*model.StorageDataSet, []model.StorageCopy, cid.Cid) {
 	t.Helper()
 	pieceCID := advancerTestCID(t)

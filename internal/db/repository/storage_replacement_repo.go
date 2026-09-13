@@ -100,6 +100,43 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		if inUse > 0 {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrTargetInUse)
 		}
+		// Superseding an earlier replacement abandons its target. While that
+		// target's creation fence is held the storage service may still be
+		// created on chain with nothing left to track or retire it, so the new
+		// request waits until the creation finishes or is proven rejected.
+		creating, err := db.NewSelect().
+			Model((*storagereplacement.Replacement)(nil)).
+			Join("JOIN storage_data_sets AS target_data_set ON target_data_set.id = storage_replacement.target_data_set_id").
+			Where("storage_replacement.source_data_set_id = ?", source.ID).
+			Where("storage_replacement.status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
+			Where("target_data_set.ensure_task_id IS NOT NULL").
+			// A fence only holds the slot while something can still come of it:
+			// the creation task is live, or the row remembers a request that may
+			// have reached the chain. A dead task over a generation that never
+			// asked for a data set holds nothing worth protecting.
+			Where(`(
+				EXISTS (
+					SELECT 1 FROM tasks AS ensure_task
+					WHERE ensure_task.id = target_data_set.ensure_task_id
+					  AND ensure_task.status IN (?, ?)
+				)
+				OR (target_data_set.client_data_set_id IS NOT NULL AND target_data_set.client_data_set_id <> '')
+				OR (target_data_set.create_transaction_id IS NOT NULL AND target_data_set.create_transaction_id <> '')
+			)`, model.TaskStatusPending, model.TaskStatusRunning).
+			Count(ctx)
+		if err != nil {
+			return fmt.Errorf("checking earlier replacement targets: %w", err)
+		}
+		if creating > 0 {
+			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrTargetCreating)
+		}
+		// A fence still held past that check was left by a creation task that
+		// died before sending anything. Its target is given up here, fence and
+		// all: left in place, retrying that task would create a storage service
+		// for a replacement nothing is completing anymore.
+		if err := abandonUnsentReplacementTargets(ctx, db, source.ID); err != nil {
+			return err
+		}
 
 		now := time.Now()
 		// The single-active-replacement index rejects a second live row for one
@@ -164,6 +201,44 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		return nil, false, err
 	}
 	return result, created, nil
+}
+
+// abandonUnsentReplacementTargets gives up the targets of a source's earlier
+// unfinished replacements whose creation fence outlived its task. Authorize
+// calls it only after refusing while any of them might still be created, so
+// every target left here never sent a request and holds no storage service.
+func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceDataSetID int64) error {
+	var targets []struct {
+		ID           int64 `bun:"id"`
+		EnsureTaskID int64 `bun:"ensure_task_id"`
+	}
+	if err := db.NewSelect().
+		Model((*storagereplacement.Replacement)(nil)).
+		Join("JOIN storage_data_sets AS target_data_set ON target_data_set.id = storage_replacement.target_data_set_id").
+		ColumnExpr("target_data_set.id, target_data_set.ensure_task_id").
+		Where("storage_replacement.source_data_set_id = ?", sourceDataSetID).
+		Where("storage_replacement.status NOT IN (?, ?)", storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
+		Where("target_data_set.ensure_task_id IS NOT NULL").
+		Scan(ctx, &targets); err != nil {
+		return fmt.Errorf("selecting unsent replacement targets: %w", err)
+	}
+	contents := &BunStorageContentRepo{db: db}
+	for _, target := range targets {
+		if err := contents.MarkDataSetFailed(ctx, target.ID, "Replaced before its storage service was created"); err != nil {
+			return err
+		}
+		retired, err := contents.RetireRejectedDataSet(ctx, target.ID)
+		if err != nil {
+			return err
+		}
+		if !retired {
+			return fmt.Errorf("retiring unsent replacement target %d: %w", target.ID, ErrConflict)
+		}
+		if err := contents.CompleteDataSetEnsureTask(ctx, target.ID, target.EnsureTaskID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func replacementRequestMatches(row *storagereplacement.Replacement, input AuthorizeReplacementInput) bool {
@@ -467,9 +542,12 @@ func (r *BunStorageReplacementRepo) MarkFailed(
 
 // MarkCleanupAttention is committed in the same transaction that stops the
 // coordinator task, so automatic retry can never resume suppressed cleanup.
+// Marking a replacement that already waits for attention only refreshes its
+// error, so a retried task that stops again for the same reason can still
+// settle.
 func (r *BunStorageReplacementRepo) MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error {
 	return r.transition(ctx, replacementID,
-		[]storagereplacement.Status{storagereplacement.StatusRetiring, storagereplacement.StatusWaiting},
+		[]storagereplacement.Status{storagereplacement.StatusRetiring, storagereplacement.StatusWaiting, storagereplacement.StatusCleanupAttention},
 		storagereplacement.StatusCleanupAttention,
 		func(q *bun.UpdateQuery) *bun.UpdateQuery {
 			return q.Set("last_error = ?", lastError).Set("wait_reason = NULL")
@@ -696,28 +774,6 @@ func (r *BunStorageReplacementRepo) ListActive(ctx context.Context, afterID int6
 		Limit(limit).
 		Scan(ctx); err != nil {
 		return nil, fmt.Errorf("listing active provider replacements: %w", err)
-	}
-	return rows, nil
-}
-
-// A superseded replacement leaves behind a target generation that holds partly
-// migrated data and no coverage obligation. It still needs its own retirement
-// so the abandoned service does not keep costing money.
-func (r *BunStorageReplacementRepo) ListSupersededCleanupCandidates(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error) {
-	var rows []storagereplacement.Replacement
-	if err := withReplacementTerminations(r.db.NewSelect().Model(&rows)).
-		Where("storage_replacement.id > ?", afterID).
-		Where("storage_replacement.status = ?", storagereplacement.StatusSuperseded).
-		Where(`EXISTS (
-			SELECT 1 FROM storage_data_sets AS abandoned_target
-			WHERE abandoned_target.id = storage_replacement.target_data_set_id
-			  AND abandoned_target.is_current = ?
-			  AND abandoned_target.status <> ?
-		)`, false, model.StorageDataSetStatusRetired).
-		OrderExpr("storage_replacement.id ASC").
-		Limit(limit).
-		Scan(ctx); err != nil {
-		return nil, fmt.Errorf("listing superseded replacement cleanup candidates: %w", err)
 	}
 	return rows, nil
 }

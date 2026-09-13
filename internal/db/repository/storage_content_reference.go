@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -113,11 +114,22 @@ func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, ve
 		return nil
 	}
 	contents, err := lockStorageContentsByID(ctx, db, []int64{*version.ContentID})
+	if errors.Is(err, ErrNotFound) {
+		// Content rows are only deleted when their cleanup finishes, so the bytes
+		// have to be written again, which creates new content.
+		return fmt.Errorf("storage content %d: %w", *version.ContentID, ErrContentCleanupInProgress)
+	}
 	if err != nil {
 		return err
 	}
-	if contents[*version.ContentID] == nil {
+	content := contents[*version.ContentID]
+	if content == nil {
 		return fmt.Errorf("storage content %d: %w", *version.ContentID, ErrNotFound)
+	}
+	// Cleanup starts only when the last version is gone, and a new version
+	// cannot bring content back while it is being removed.
+	if content.CleanupTaskID != nil {
+		return fmt.Errorf("storage content %d: %w", *version.ContentID, ErrContentCleanupInProgress)
 	}
 	// A data version is only created after its bytes are durably in the local
 	// cache, so the content is resident. Residency is per content: versions that

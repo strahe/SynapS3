@@ -30,6 +30,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectreader"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/s3iam"
+	"github.com/strahe/synaps3/internal/storagepipeline"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -663,7 +664,10 @@ func markAdminFailedUpload(t *testing.T, db *bun.DB, repos *repository.Repositor
 	}
 	// Ingest failure is reported to operators from the content, so the copy
 	// error is recorded there too, the way the pipeline does it.
-	if err := repos.Contents.RecordContentFailure(ctx, upload.ID, message); err != nil {
+	if _, err := db.NewUpdate().Model((*model.StorageContent)(nil)).
+		Set("error_message = ?", message).
+		Where("id = ?", upload.ID).
+		Exec(ctx); err != nil {
 		t.Fatalf("record content failure: %v", err)
 	}
 	return upload
@@ -3046,9 +3050,15 @@ func TestAPIBucketDeletedObjectPermanentDeleteReportsActiveStorageWork(t *testin
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 7, "etag-file", "checksum-file", "text/plain", model.ObjectStateUploading)
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil || version.ContentID == nil {
+		t.Fatalf("GetVersionByID = %#v, err=%v", version, err)
+	}
+	// Ingest is scheduled against the content the version names.
 	if _, _, err := srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload:" + versionID,
-		Input: map[string]any{"version_id": versionID}, SubjectType: "object_version", SubjectKey: versionID,
+		Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(*version.ContentID),
+		Input:       map[string]any{"content_id": *version.ContentID},
+		SubjectType: "storage_content", SubjectKey: strconv.FormatInt(*version.ContentID, 10),
 	}); err != nil {
 		t.Fatalf("Enqueue upload task: %v", err)
 	}
@@ -4305,9 +4315,15 @@ func TestAPIBucketObjectPermanentDeleteReportsActiveStorageWork(t *testing.T) {
 		t.Fatalf("Buckets.Create: %v", err)
 	}
 	_, versionID := seedAdminObjectVersion(t, srv.db, repos, bucket, "folder/file.txt", 8, "etag-current", "checksum-current", "text/plain", model.ObjectStateCached)
+	version, err := repos.Objects.GetVersionByID(ctx, versionID)
+	if err != nil || version == nil || version.ContentID == nil {
+		t.Fatalf("GetVersionByID = %#v, err=%v", version, err)
+	}
+	// Ingest is scheduled against the content the version names.
 	if _, _, err := srv.taskService.Enqueue(ctx, taskengine.EnqueueRequest{
-		Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload:" + versionID,
-		Input: map[string]any{"version_id": versionID}, SubjectType: "object_version", SubjectKey: versionID,
+		Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(*version.ContentID),
+		Input:       map[string]any{"content_id": *version.ContentID},
+		SubjectType: "storage_content", SubjectKey: strconv.FormatInt(*version.ContentID, 10),
 	}); err != nil {
 		t.Fatalf("Enqueue upload task: %v", err)
 	}

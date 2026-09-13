@@ -7,6 +7,11 @@ var (
 	// that has not reached a terminal state.
 	ErrActiveReplacement = errors.New("data set already has an active replacement")
 
+	// ErrTargetCreating means an earlier replacement of this replica may still
+	// get its target storage service created on chain, so superseding it would
+	// leave that service untracked.
+	ErrTargetCreating = errors.New("an earlier replacement target is still being created")
+
 	// ErrSuperseded means a later confirmation took ownership of this work.
 	ErrSuperseded = errors.New("replacement has been superseded")
 

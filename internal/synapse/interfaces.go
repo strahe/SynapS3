@@ -28,6 +28,12 @@ type ProviderTarget interface {
 	StorageTarget
 	CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
 	WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
+	// ContextIdentity is the payer, chain, and record keeper the target signs
+	// for. Client data set IDs are only unique within it.
+	ContextIdentity() storage.ContextIdentity
+	// FindDataSetByClientDataSetID reads the chain for the data set a create
+	// request with this ID produced. Not found only means none is visible yet.
+	FindDataSetByClientDataSetID(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error)
 }
 
 // DataSetTarget is an immutable existing data set used for piece operations.
@@ -80,6 +86,15 @@ type ParkedPieceChecker interface {
 // have both passed.
 type ServiceTerminator interface {
 	TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*TerminationResult, error)
+	// VerifyServicePayer reads the data set's record and fails with
+	// ErrServicePaidByAnother when this wallet does not pay for it; any other
+	// error means the record could not be read. It sends nothing, so a caller can
+	// check before committing to a termination.
+	VerifyServicePayer(ctx context.Context, dataSetID sdktypes.BigInt) error
+	// ContextIdentity reports the payer, chain, and record keeper this
+	// terminator signs for, so a caller can tell that a recorded request was
+	// made under another one.
+	ContextIdentity() storage.ContextIdentity
 }
 
 // TerminationResult records what the chain agreed to. EndEpoch is the epoch at

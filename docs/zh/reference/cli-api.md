@@ -84,6 +84,7 @@ synaps3 admin task stats
 synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42
 synaps3 admin task acknowledge 42
+synaps3 admin task acknowledge --type storage_store --yes
 synaps3 admin storage-confirmation list
 synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --yes
 ```
@@ -100,7 +101,7 @@ Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 
 列出后台任务时支持 `--type`、`--status`、`--limit` 和基于任务 ID 的 `--cursor`。有效的状态过滤值为 `pending`、`running`、`completed`、`failed`、`cancelled` 和 `dismissed`。pending 工作会显示为 queued、scheduled 或 waiting；`failed` 返回尚未确认的失败，`dismissed` 返回已确认的失败。
 
-`synaps3 admin task retry` 只恢复响应中标记为可重试的失败任务。存储提供方替换仍在 **Details** → **Storage** → **Data Sets** 中恢复。只有尚未发出广播的钱包操作可以重试；广播结果不确定时仍不可重试。Store 结果不确定时，dashboard 会把 Retry 显示为 **Check again**：该操作只查询存储提供方，不会重新上传。核对失败结果后，可用 `synaps3 admin task acknowledge <id>` 将任务标记为已处理；确认后开始计算保留期，到期后可能被清理。
+`synaps3 admin task retry` 只恢复响应中标记为可重试的失败任务。存储提供方替换仍在 **Details** → **Storage** → **Data Sets** 中恢复。只有尚未发出广播的钱包操作可以重试；广播结果不确定时仍不可重试。Store 结果不确定时，dashboard 会把 Retry 显示为 **Check again**：该操作只查询存储提供方，不会重新上传。核对失败结果后，可用 `synaps3 admin task acknowledge <id>` 将任务标记为已处理；确认后开始计算保留期，到期后可能被清理。需要清理积压时，不带 ID 运行并用 `--yes` 确认：`--type` 限定某一种操作，`--before` 指定 RFC 3339 截止时刻（默认为当前时间），该时刻之后记录的失败仍然可见。
 
 `synaps3 admin storage-confirmation list` 会显示需要核对的存储确认。核对存储提供方、transaction 和当前 attempt 后，使用 `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes` 表示确认存储提供方可能已经接受该 piece，并允许正常恢复流程再次提交。过期的 attempt ID 会被拒绝。
 

@@ -84,6 +84,7 @@ synaps3 admin task stats
 synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42
 synaps3 admin task acknowledge 42
+synaps3 admin task acknowledge --type storage_store --yes
 synaps3 admin storage-confirmation list
 synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --yes
 ```
@@ -100,7 +101,7 @@ Admin global flags must appear after `admin` and before the subcommand:
 
 Task listing supports `--type`, `--status`, `--limit`, and ID-based `--cursor`. Valid status filters are `pending`, `running`, `completed`, `failed`, `cancelled`, and `dismissed`. Pending work is presented as queued, scheduled, or waiting; `failed` returns unacknowledged failures and `dismissed` returns acknowledged failures.
 
-`synaps3 admin task retry` recovers only tasks whose response says they are retryable. Provider replacement recovery remains under **Details** → **Storage** → **Data Sets**. A wallet operation can be retried only when its broadcast never started; an operation with an uncertain broadcast remains non-retryable. For an uncertain Store, the dashboard labels Retry as **Check again**: this checks the provider without uploading again. Use `synaps3 admin task acknowledge <id>` to dismiss a failed task after reviewing its outcome; acknowledgement starts its retention period, after which it may be cleaned up.
+`synaps3 admin task retry` recovers only tasks whose response says they are retryable. Provider replacement recovery remains under **Details** → **Storage** → **Data Sets**. A wallet operation can be retried only when its broadcast never started; an operation with an uncertain broadcast remains non-retryable. For an uncertain Store, the dashboard labels Retry as **Check again**: this checks the provider without uploading again. Use `synaps3 admin task acknowledge <id>` to dismiss a failed task after reviewing its outcome; acknowledgement starts its retention period, after which it may be cleaned up. To clear a backlog, run it without an ID and confirm with `--yes`: `--type` limits it to one operation, and `--before` sets an RFC 3339 cutoff that defaults to now, so failures recorded later stay visible.
 
 `synaps3 admin storage-confirmation list` shows storage confirmations that need review. Verify the piece CID, provider, current attempt ID, attempted time, and any available transaction evidence before running `storage-confirmation release <copy-id> --attempt-id <attempt-id> --yes`; release only if you accept that the provider may already store the piece and resubmission may create duplicate paid storage. A stale attempt ID is refused.
 

@@ -271,6 +271,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/tasks/stats", s.handleAPITaskStats)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleAPITaskRetry)
 		mux.HandleFunc("POST /api/v1/tasks/{id}/acknowledge", s.handleAPITaskAcknowledge)
+		mux.HandleFunc("GET /api/v1/tasks/acknowledge/preview", s.handleAPITaskAcknowledgePreview)
+		mux.HandleFunc("POST /api/v1/tasks/acknowledge", s.handleAPITaskAcknowledgeMatching)
 		mux.HandleFunc("GET /api/v1/system/info", s.handleAPISystemInfo)
 		mux.HandleFunc("GET /api/v1/workers", s.handleAPIWorkers)
 		mux.HandleFunc("GET /api/v1/cache/stats", s.handleAPICacheStats)

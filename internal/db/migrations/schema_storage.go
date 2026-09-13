@@ -225,6 +225,7 @@ type storageCleanupCopy2026090101 struct {
 	ClientDataSetID  *string `bun:"type:text"`
 	PieceID          string  `bun:"type:text,notnull"`
 	PieceCID         string  `bun:"type:text,notnull"`
+	Checksum         string  `bun:"type:text,notnull"`
 	RetrievalURL     *string `bun:"type:text"`
 	Status           string  `bun:"type:text,notnull,default:'pending'"`
 	DeleteTxHash     *string `bun:"type:text"`
@@ -370,9 +371,9 @@ func storageCommitAttemptTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_commit_attempts_attention CHECK ((attention_code IS NULL AND attention_at IS NULL) OR (attention_code IS NOT NULL AND attention_at IS NOT NULL AND attempted_at IS NOT NULL))",
 			"CONSTRAINT chk_storage_commit_attempts_release CHECK ((status = 'released' AND release_reason IS NOT NULL) OR (status <> 'released' AND release_reason IS NULL))",
 		},
-		foreignKeys: []string{
-			"(content_id, storage_data_set_id) REFERENCES storage_copies (content_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-		},
+		// The ledger outlives the copy it was made for: finishing a content's
+		// cleanup deletes the copy, and (content_id, storage_data_set_id) stays
+		// here as a value.
 	}
 }
 
@@ -388,9 +389,8 @@ func storagePullAttemptTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_pull_attempts_error CHECK (last_error IS NULL OR (status = 'abandoned' AND last_error <> ''))",
 			"CONSTRAINT chk_storage_pull_attempts_abandoned CHECK (status <> 'abandoned' OR resolved_at IS NOT NULL)",
 		},
-		foreignKeys: []string{
-			"(content_id, storage_data_set_id) REFERENCES storage_copies (content_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-		},
+		// Like commit attempts, pull attempts keep the copy identity as values
+		// once cleanup has deleted the copy.
 	}
 }
 
@@ -433,10 +433,10 @@ func storageReplacementItemTable2026090101() initialTableSpec {
 		},
 		foreignKeys: []string{
 			"(replacement_id) REFERENCES storage_replacements (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"(content_id) REFERENCES storage_contents (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			"(replacement_id, target_data_set_id) REFERENCES storage_replacements (id, target_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"(content_id, target_data_set_id) REFERENCES storage_copies (content_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
+		// content_id stays a value once cleanup deletes the content and its
+		// copies; cleanup waits while an item that blocks retirement names it.
 	}
 }
 
@@ -445,15 +445,16 @@ func storageCleanupCopyTable2026090101() initialTableSpec {
 		name:  "storage_cleanup_copies",
 		model: (*storageCleanupCopy2026090101)(nil),
 		constraints: []string{
-			"CONSTRAINT chk_storage_cleanup_copies_identity CHECK (provider_id <> '' AND piece_id <> '' AND piece_cid <> '' AND (data_set_id IS NULL OR data_set_id <> '') AND (client_data_set_id IS NULL OR client_data_set_id <> '') AND (delete_tx_hash IS NULL OR delete_tx_hash <> ''))",
+			"CONSTRAINT chk_storage_cleanup_copies_identity CHECK (provider_id <> '' AND piece_id <> '' AND piece_cid <> '' AND checksum <> '' AND (data_set_id IS NULL OR data_set_id <> '') AND (client_data_set_id IS NULL OR client_data_set_id <> '') AND (delete_tx_hash IS NULL OR delete_tx_hash <> ''))",
 			// The replica slot is a row, so the index is a foreign key rather than a range check.
 			"CONSTRAINT fk_storage_cleanup_copies_replica_slot FOREIGN KEY (bucket_id, copy_index) REFERENCES bucket_replica_slots (bucket_id, copy_index) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			"CONSTRAINT chk_storage_cleanup_copies_status CHECK (status IN ('pending', 'delete_scheduled', 'removed', 'failed', 'unsupported'))",
 			"CONSTRAINT chk_storage_cleanup_copies_delete_scheduled CHECK (status <> 'delete_scheduled' OR (delete_tx_hash IS NOT NULL AND scheduled_at IS NOT NULL))",
 			"CONSTRAINT uq_storage_cleanup_copies_physical UNIQUE (content_id, storage_data_set_id, piece_id)",
 		},
+		// The content a cleanup removed is deleted once the cleanup finishes, so
+		// its identity and checksum stay here as values rather than a reference.
 		foreignKeys: []string{
-			"(content_id, bucket_id) REFERENCES storage_contents (id, bucket_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			"(storage_data_set_id, bucket_id, copy_index, provider_id) REFERENCES storage_data_sets (id, bucket_id, copy_index, provider_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 	}

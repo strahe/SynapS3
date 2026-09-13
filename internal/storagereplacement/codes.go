@@ -6,6 +6,7 @@ import "errors"
 // on these, so treat them as part of the public contract.
 const (
 	CodeActive              = "replacement_active"
+	CodeTargetCreating      = "replacement_target_creating"
 	CodeSuperseded          = "replacement_superseded"
 	CodeNotRetryable        = "replacement_not_retryable"
 	CodeTaskRunning         = "replacement_task_running"
@@ -23,6 +24,8 @@ func Code(err error) string {
 	switch {
 	case errors.Is(err, ErrActiveReplacement):
 		return CodeActive
+	case errors.Is(err, ErrTargetCreating):
+		return CodeTargetCreating
 	case errors.Is(err, ErrSuperseded):
 		return CodeSuperseded
 	case errors.Is(err, ErrNotRetryable):

@@ -74,8 +74,8 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 		dataSetID := insertBaselineTestDataSet(t, db, bucketID, "cleanup-provider", 2, 1, false)
 		var cleanupID int64
 		if err := db.QueryRow(`INSERT INTO storage_cleanup_copies
-			(content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, created_at, updated_at)
-			VALUES (?, ?, 2, 'cleanup-provider', ?, 'piece-1', 'piece-cid-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			(content_id, bucket_id, copy_index, provider_id, storage_data_set_id, piece_id, piece_cid, checksum, created_at, updated_at)
+			VALUES (?, ?, 2, 'cleanup-provider', ?, 'piece-1', 'piece-cid-1', 'checksum-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 			RETURNING id`, contentID, bucketID, dataSetID).Scan(&cleanupID); err != nil {
 			t.Fatalf("insert cleanup copy: %v", err)
 		}
@@ -197,9 +197,6 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			SET status = 'attempted', attempted_at = current_timestamp,
 			    extra_data_hex = 'abcd', submission_json = '{}'
 			WHERE attempt_id = 'attempt-2'`)
-		mustRejectStatement(t, db, `INSERT INTO storage_commit_attempts
-			(attempt_id, content_id, storage_data_set_id, created_at, updated_at)
-			VALUES ('cross-copy', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA2, source)
 
 		target := insertBaselineTestDataSet(t, db, bucketA, "202", 0, 2, false)
 		var replacementID int64
@@ -230,9 +227,6 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
 			 selection_mode, client_request_id, status, created_at, updated_at)
 			VALUES (?, 0, ?, ?, 'manual', 'replacement-3', 'preparing_target', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, source, target)
-		mustRejectStatement(t, db, `INSERT INTO storage_replacement_items
-			(replacement_id, content_id, target_data_set_id, created_at, updated_at)
-			VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, replacementID, contentA, target)
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
 			(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)
 			VALUES (?, ?, 1, ?, 0, '202', 'ingress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, bucketA, target)

@@ -30,6 +30,15 @@ var ErrReplicaTargetLowered = fmt.Errorf("lowering the replica target is not sup
 // with ErrConflict for existing callers.
 var ErrPermanentDeleteStorageBusy = fmt.Errorf("permanent delete blocked by storage work: %w", ErrConflict)
 
+// ErrContentCleanupInProgress reports that a write names content whose cleanup
+// has started or already deleted it. The bytes have to be written again once
+// the cleanup finishes, which then creates new content.
+var ErrContentCleanupInProgress = errors.New("storage content is being cleaned up")
+
+// ErrContentCleanupNotReady reports that a finished cleanup cannot delete its
+// content yet because other work still needs the rows.
+var ErrContentCleanupNotReady = errors.New("storage content cleanup is waiting for other work")
+
 // ErrTaskLeaseLost reports that a claim generation is stale or its lease can
 // no longer be proven valid.
 var ErrTaskLeaseLost = errors.New("task lease lost")

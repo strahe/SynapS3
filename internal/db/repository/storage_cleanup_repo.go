@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
 
@@ -218,21 +220,101 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 	return row.Count > 0, nil
 }
 
-func (r *BunStorageCleanupRepo) CompleteTask(ctx context.Context, contentID, generation, taskID int64) error {
-	result, err := r.db.NewUpdate().
-		Model((*model.StorageContent)(nil)).
-		Set("cleanup_task_id = NULL").
-		Set("updated_at = ?", time.Now()).
-		Where("id = ? AND cleanup_generation = ? AND cleanup_task_id = ?", contentID, generation, taskID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("completing storage cleanup task: %w", err)
+// FinalizeContent deletes the current-state rows of content whose remote
+// cleanup finished: its cache record, its copies, and the content row. Commit,
+// pull, replacement, cleanup, and deletion ledgers keep their rows and name the
+// content by value. It returns ErrContentCleanupNotReady while anything could
+// still need those rows, and must run in the caller's transaction.
+func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, generation, taskID int64) error {
+	if contentID < 1 || generation < 1 || taskID < 1 {
+		return ErrInvalidInput
 	}
-	rows, _ := result.RowsAffected()
-	if rows != 1 {
-		return ErrConflict
+	contents, err := lockStorageContentsByID(ctx, r.db, []int64{contentID})
+	if err != nil {
+		return fmt.Errorf("finalizing storage cleanup: %w", err)
+	}
+	content := contents[contentID]
+	if content.CleanupGeneration != generation || content.CleanupTaskID == nil || *content.CleanupTaskID != taskID {
+		return fmt.Errorf("finalizing storage cleanup: %w", ErrConflict)
+	}
+	ready, err := contentCleanupReady(ctx, r.db, contentID)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return ErrContentCleanupNotReady
+	}
+	now := time.Now()
+	for _, column := range []string{"created_by_content_id", "last_used_content_id"} {
+		if _, err := r.db.NewUpdate().
+			Model((*model.StorageDataSet)(nil)).
+			Set(column+" = NULL").
+			Set("updated_at = ?", now).
+			Where(column+" = ?", contentID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("finalizing storage cleanup: clearing data set %s: %w", column, err)
+		}
+	}
+	for _, rows := range []struct {
+		model  any
+		column string
+	}{
+		{(*model.ObjectCache)(nil), "content_id"},
+		{(*model.StorageCopy)(nil), "content_id"},
+		{(*model.StorageContent)(nil), "id"},
+	} {
+		if _, err := r.db.NewDelete().Model(rows.model).Where(rows.column+" = ?", contentID).Exec(ctx); err != nil {
+			return fmt.Errorf("finalizing storage cleanup: %w", err)
+		}
 	}
 	return nil
+}
+
+// contentCleanupReady reports whether nothing can still need a cleaned-up
+// content's rows: no live version names it, its bytes are out of the cache with
+// no cache task running, no commit attempt or copy task is still open, and no
+// replacement item that blocks retirement names it.
+func contentCleanupReady(ctx context.Context, db bun.IDB, contentID int64) (bool, error) {
+	unreferenced, err := contentIsUnreferenced(ctx, db, contentID)
+	if err != nil || !unreferenced {
+		return false, err
+	}
+	for _, check := range []struct {
+		what  string
+		query *bun.SelectQuery
+	}{
+		{"cache residency", db.NewSelect().Model((*model.ObjectCache)(nil)).
+			Where("content_id = ?", contentID).
+			Where(`in_cache = ? OR EXISTS (
+				SELECT 1 FROM tasks AS cache_task
+				WHERE cache_task.id = object_cache.cache_active_task_id
+				  AND cache_task.status IN (?, ?)
+			)`, true, model.TaskStatusPending, model.TaskStatusRunning)},
+		{"open commit attempts", db.NewSelect().Model((*storagecommit.Attempt)(nil)).
+			Where("content_id = ? AND resolved_at IS NULL", contentID)},
+		{"copy tasks", db.NewSelect().Model((*model.StorageCopy)(nil)).
+			Where("content_id = ?", contentID).
+			Where(`EXISTS (
+				SELECT 1 FROM tasks AS copy_task
+				WHERE copy_task.id = storage_copy.active_task_id
+				  AND copy_task.status IN (?, ?)
+			)`, model.TaskStatusPending, model.TaskStatusRunning)},
+		// Pending and attention items are the ones ItemStatus.Blocking counts.
+		{"replacement items", db.NewSelect().Model((*storagereplacement.Item)(nil)).
+			Where("content_id = ?", contentID).
+			Where("status IN (?)", bun.List([]storagereplacement.ItemStatus{
+				storagereplacement.ItemStatusPending, storagereplacement.ItemStatusAttention,
+			}))},
+	} {
+		count, err := check.query.Count(ctx)
+		if err != nil {
+			return false, fmt.Errorf("checking %s before finalizing storage cleanup: %w", check.what, err)
+		}
+		if count > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func storageCleanupCopyUpdateResult(res sql.Result, err error, op string) error {

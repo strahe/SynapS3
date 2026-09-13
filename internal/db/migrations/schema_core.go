@@ -288,9 +288,10 @@ func createObjectLifecycleSchema(ctx context.Context, db bun.IDB) error {
 			"CONSTRAINT chk_object_deletions_identity CHECK (key <> '' AND version_id <> '')",
 			"CONSTRAINT chk_object_deletions_size CHECK (size >= 0)",
 		},
+		// The tombstone keeps content_id as a value: the content row is deleted
+		// once its cleanup finishes.
 		foreignKeys: []string{
 			"(bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-			"(content_id, bucket_id) REFERENCES storage_contents (id, bucket_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 	}); err != nil {
 		return err

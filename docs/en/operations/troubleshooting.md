@@ -132,7 +132,7 @@ Retry only after RPC connectivity, storage provider availability, wallet funds, 
 synaps3 admin task retry 42
 ```
 
-The API decides whether each failed task can be retried safely. Provider replacement work is recovered from **Details** → **Storage** → **Data Sets**. A wallet operation can be recovered from Tasks only when no broadcast started; an uncertain broadcast remains non-retryable. An uncertain Store offers **Check again**, which observes the provider without uploading again. Use **Dismiss** or `synaps3 admin task acknowledge <id>` only after reviewing the failure; acknowledged tasks remain available for the configured retention period before cleanup.
+The API decides whether each failed task can be retried safely. Provider replacement work is recovered from **Details** → **Storage** → **Data Sets**. A wallet operation can be recovered from Tasks only when no broadcast started; an uncertain broadcast remains non-retryable. An uncertain Store offers **Check again**, which observes the provider without uploading again. Use **Dismiss** or `synaps3 admin task acknowledge <id>` only after reviewing the failure; acknowledged tasks remain available for the configured retention period before cleanup. When failures have piled up, **Dismiss all** on the Tasks page clears the ones the current Operation filter selects, and `synaps3 admin task acknowledge --type <operation> --yes` does the same from the CLI; failures recorded after you confirm stay in the list.
 
 ## Provider or RPC Issues
 

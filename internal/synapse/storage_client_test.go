@@ -45,7 +45,7 @@ func TestStorageServiceAdapterSelectUploadTargetsPreservesPartialSelection(t *te
 		t.Fatalf("storage.New: %v", err)
 	}
 
-	targets, err := AdaptStorageService(service).SelectUploadTargets(t.Context(), storage.SelectUploadContextsOptions{Copies: 2})
+	targets, err := AdaptStorageService(service, nil, storage.ContextIdentity{}).SelectUploadTargets(t.Context(), storage.SelectUploadContextsOptions{Copies: 2})
 	if !IsNoProviderCandidates(err) || len(targets) != 1 {
 		t.Fatalf("targets = %#v, error = %T %v; want one usable target and NoProviderCandidatesError", targets, err, err)
 	}
@@ -78,7 +78,7 @@ func TestStorageServiceAdapterFindMatchingDataSetUsesExactMetadataAndStablePrefe
 		t.Fatalf("storage.New: %v", err)
 	}
 
-	ref, err := AdaptStorageService(service).FindMatchingDataSet(t.Context(), providerID, map[string]string{
+	ref, err := AdaptStorageService(service, nil, storage.ContextIdentity{}).FindMatchingDataSet(t.Context(), providerID, map[string]string{
 		"source":  "caller-value-must-not-override-synaps3",
 		"bucket":  "photos",
 		"withCDN": "caller-value-must-not-enable-cdn",
@@ -116,7 +116,7 @@ func TestStorageServiceAdapterFindMatchingDataSetRequiresEmptyMetadataKey(t *tes
 		t.Fatalf("storage.New: %v", err)
 	}
 
-	ref, err := AdaptStorageService(service).FindMatchingDataSet(
+	ref, err := AdaptStorageService(service, nil, storage.ContextIdentity{}).FindMatchingDataSet(
 		t.Context(),
 		providerID,
 		map[string]string{"bucket": "photos"},
@@ -157,7 +157,7 @@ func TestStorageServiceAdapterPrepareUploadReturnsCostsWithoutFunding(t *testing
 	if err != nil {
 		t.Fatalf("storage.New: %v", err)
 	}
-	adapter := AdaptStorageService(service)
+	adapter := AdaptStorageService(service, nil, storage.ContextIdentity{})
 	target := newProviderTargetAdapter(providerContext)
 
 	got, err := adapter.PrepareUpload(t.Context(), 4096, []StorageTarget{target})
@@ -202,7 +202,7 @@ func (f *staticDataSetFinder) FindDataSets(_ context.Context, payer common.Addre
 
 func dataSetDetails(dataSetID, clientDataSetID, providerID uint64, live, managed, active bool, endEpoch sdktypes.Epoch, metadata map[string]string) *storage.DataSetDetails {
 	return &storage.DataSetDetails{
-		DataSetInfo: &warmstorage.DataSetInfo{
+		DataSetInfo: warmstorage.DataSetInfo{
 			DataSetID:       sdktypes.NewBigInt(dataSetID),
 			ClientDataSetID: sdktypes.NewBigInt(clientDataSetID),
 			ProviderID:      sdktypes.NewBigInt(providerID),

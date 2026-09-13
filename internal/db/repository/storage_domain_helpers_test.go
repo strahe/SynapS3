@@ -152,6 +152,137 @@ func TestAuthorizeReplacementPreservesCurrentSource(t *testing.T) {
 	}
 }
 
+// An earlier replacement whose target may still be created on chain cannot be
+// abandoned: superseding it would leave that service untracked. Once the
+// target's creation fence is released, a new request proceeds as before.
+func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "replacement-target-creating")
+	source, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	first, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: onChainID(t, "202"), ClientRequestID: "target-creating-first",
+	})
+	if err != nil {
+		t.Fatalf("Authorize(first): %v", err)
+	}
+	ensureTask, _, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+		Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "target-creating-ensure",
+		InputVersion: 1, Input: []byte(`{}`), InputHash: "target-creating-ensure",
+	})
+	if err != nil {
+		t.Fatalf("enqueue target ensure: %v", err)
+	}
+	if err := repos.Contents.BindDataSetEnsureTask(t.Context(), first.TargetDataSetID, ensureTask.ID); err != nil {
+		t.Fatalf("bind target ensure: %v", err)
+	}
+	successor := repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: onChainID(t, "303"), ClientRequestID: "target-creating-successor",
+	}
+	if _, _, err := repos.Replacements.Authorize(t.Context(), successor); !errors.Is(err, storagereplacement.ErrTargetCreating) {
+		t.Fatalf("Authorize(successor) error = %v, want ErrTargetCreating", err)
+	}
+	if kept, err := repos.Replacements.GetByID(t.Context(), first.ID); err != nil || kept.Status == storagereplacement.StatusSuperseded {
+		t.Fatalf("first replacement = %#v err=%v, want it still in charge of its target", kept, err)
+	}
+
+	if err := repos.Contents.CompleteDataSetEnsureTask(t.Context(), first.TargetDataSetID, ensureTask.ID); err != nil {
+		t.Fatalf("release target ensure: %v", err)
+	}
+	if _, created, err := repos.Replacements.Authorize(t.Context(), successor); err != nil || !created {
+		t.Fatalf("Authorize(successor after creation) created=%v err=%v", created, err)
+	}
+	if superseded, err := repos.Replacements.GetByID(t.Context(), first.ID); err != nil || superseded.Status != storagereplacement.StatusSuperseded {
+		t.Fatalf("first replacement = %#v err=%v, want it superseded", superseded, err)
+	}
+}
+
+// TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent checks that a
+// creation fence left behind by a dead task holds the replica slot only while
+// the target row shows a request that may have reached the chain.
+func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		bucket   string
+		recordID bool
+		blocked  bool
+	}{
+		{name: "nothing was sent", bucket: "replacement-dead-fence-unsent", recordID: false, blocked: false},
+		{name: "a request may have gone out", bucket: "replacement-dead-fence-sent", recordID: true, blocked: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := t.Context()
+			bucket := seedBucket(t, db, tt.bucket)
+			source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+				BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
+			})
+			if err != nil {
+				t.Fatalf("EnsureDataSetBinding: %v", err)
+			}
+			first, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+				TargetProviderID: onChainID(t, "202"), ClientRequestID: "dead-fence-first",
+			})
+			if err != nil {
+				t.Fatalf("Authorize(first): %v", err)
+			}
+			ensureTask, _, err := repos.Tasks.Enqueue(ctx, &model.Task{
+				Type: model.TaskTypeStorageDataSetEnsure, IdempotencyKey: "dead-fence-ensure",
+				InputVersion: 1, Input: []byte(`{}`), InputHash: "dead-fence-ensure",
+			})
+			if err != nil {
+				t.Fatalf("enqueue target ensure: %v", err)
+			}
+			if err := repos.Contents.BindDataSetEnsureTask(ctx, first.TargetDataSetID, ensureTask.ID); err != nil {
+				t.Fatalf("bind target ensure: %v", err)
+			}
+			if tt.recordID {
+				if err := repos.Contents.RecordDataSetClientID(ctx, first.TargetDataSetID, onChainID(t, "909")); err != nil {
+					t.Fatalf("record client data set ID: %v", err)
+				}
+			}
+			// The creation task ended without releasing its fence.
+			if _, err := db.NewRaw(`UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?`,
+				model.TaskStatusFailed, time.Now(), ensureTask.ID).Exec(ctx); err != nil {
+				t.Fatalf("fail target ensure: %v", err)
+			}
+
+			successor := repository.AuthorizeReplacementInput{
+				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+				TargetProviderID: onChainID(t, "303"), ClientRequestID: "dead-fence-successor",
+			}
+			_, created, err := repos.Replacements.Authorize(ctx, successor)
+			if tt.blocked {
+				if !errors.Is(err, storagereplacement.ErrTargetCreating) {
+					t.Fatalf("Authorize(successor) error = %v, want ErrTargetCreating", err)
+				}
+				return
+			}
+			if err != nil || !created {
+				t.Fatalf("Authorize(successor) created=%v err=%v, want the slot released", created, err)
+			}
+			// The earlier target is given up together with its fence, so retrying
+			// the dead creation task finds nothing left to create.
+			abandoned, err := repos.Contents.GetDataSetBindingByID(ctx, first.TargetDataSetID)
+			if err != nil || abandoned == nil || abandoned.Status != model.StorageDataSetStatusRetired || abandoned.EnsureTaskID != nil {
+				t.Fatalf("earlier target = %#v err=%v, want it retired with its creation fence released", abandoned, err)
+			}
+			if _, err := repos.Contents.AuthorizeDataSetEnsureTask(ctx, first.TargetDataSetID, ensureTask.ID); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("authorizing the dead creation task error = %v, want ErrConflict", err)
+			}
+		})
+	}
+}
+
 func TestAttachReplacementTargetCopyRejectsMismatchedUpload(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -358,12 +489,6 @@ func TestStorageContentBindingRejectsCrossBucketIdentity(t *testing.T) {
 		WHERE version_id = ?`, content.ID, version.VersionID).Exec(t.Context()); err == nil {
 		t.Fatal("direct cross-bucket object version binding succeeded")
 	}
-	if _, err := db.NewRaw(`INSERT INTO object_deletions
-		(bucket_id, object_id, key, version_id, content_id, size, deleted_at)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		targetBucket.ID, 1, "cross-bucket.txt", model.NewVersionID(), content.ID, 11).Exec(t.Context()); err == nil {
-		t.Fatal("direct cross-bucket object deletion binding succeeded")
-	}
 }
 
 func startCopyHealthUpload(
@@ -458,6 +583,68 @@ func bindStorageHealthVersion(
 		ContentID: contentID, BucketID: bucketID, VersionID: version.VersionID,
 	}); err != nil {
 		t.Fatalf("BindReadableUploadForVersion: %v", err)
+	}
+}
+
+// A failed copy flags its content only once no copy is left that holds it or
+// may still hold it.
+func TestCopyFailureFlagsContentOnlyWhenNoCopyCanServeIt(t *testing.T) {
+	tests := []struct {
+		name     string
+		other    string
+		wantFlag bool
+	}{
+		{name: "a readable copy remains", other: "readable"},
+		{name: "another copy is still pending", other: "pending"},
+		{name: "the last copy fails", other: "failed", wantFlag: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			bucket := seedBucket(t, db, "copy-failure-"+tt.other)
+			upload := startCopyHealthUpload(t, repos, bucket.ID, model.NewVersionID(), 11, "copy-failure-"+tt.other, 2)
+			if tt.other == "readable" {
+				commitStorageHealthCopy(t, db, repos, bucket.ID, upload.ID, 0, "101", "1001", "3001", "https://provider-101.example/piece")
+			} else {
+				ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 0, "101")
+			}
+			failing := ensureCopyHealthBinding(t, repos, bucket.ID, upload.ID, 1, "102")
+			bindings := []repository.UploadCopyBindingInput{{
+				StorageDataSetID: failing.ID, CopyIndex: 1, TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: onChainID(t, "102"),
+			}}
+			if tt.other != "readable" {
+				other, err := repos.Contents.GetDataSetBindingByCopyIndex(t.Context(), bucket.ID, 0)
+				if err != nil || other == nil {
+					t.Fatalf("GetDataSetBindingByCopyIndex = %#v, err=%v", other, err)
+				}
+				bindings = append(bindings, repository.UploadCopyBindingInput{
+					StorageDataSetID: other.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: onChainID(t, "101"),
+				})
+			}
+			if err := repos.Contents.CreateUploadCopiesForBindings(t.Context(), upload.ID, bindings); err != nil {
+				t.Fatalf("CreateUploadCopiesForBindings: %v", err)
+			}
+			if tt.other == "failed" {
+				if err := repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
+					ContentID: upload.ID, CopyIndex: 0, LastError: "first provider rejected the transfer",
+				}); err != nil {
+					t.Fatalf("MarkUploadCopyFailed(0): %v", err)
+				}
+			}
+			if err := repos.Contents.MarkUploadCopyFailed(t.Context(), repository.MarkUploadCopyFailedInput{
+				ContentID: upload.ID, CopyIndex: 1, LastError: "second provider rejected the transfer",
+			}); err != nil {
+				t.Fatalf("MarkUploadCopyFailed(1): %v", err)
+			}
+			stored, err := repos.Contents.GetByID(t.Context(), upload.ID)
+			if err != nil || stored == nil {
+				t.Fatalf("GetByID = %#v, err=%v", stored, err)
+			}
+			if flagged := stored.ErrorMessage != nil; flagged != tt.wantFlag {
+				t.Fatalf("content error = %v, want flagged=%t", stored.ErrorMessage, tt.wantFlag)
+			}
+		})
 	}
 }
 

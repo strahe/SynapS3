@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	initialPortableSchemaFingerprint = "82c448b3d6eb4bc627cc6ae913091c21c8b440903dd09a85032a653515a80323"
+	initialPortableSchemaFingerprint = "21723d7d64f621047bd6fd1879851008fdc18c3fd0b173168e063a0ae3d0c7d6"
 )
 
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
@@ -162,6 +162,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		{"storage_data_sets", "ensure_task_id"},
 		{"storage_replacement_items", "target_data_set_id"},
 		{"storage_cleanup_copies", "bucket_id"},
+		{"storage_cleanup_copies", "checksum"},
 		{"object_versions", "content_id"},
 		{"object_cache", "cache_active_task_id"},
 		{"wallet_operations", "broadcast_attempted_at"},

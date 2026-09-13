@@ -370,6 +370,11 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 			"error": "this replica is already being replaced",
 			"code":  code,
 		})
+	case errors.Is(err, storagereplacement.ErrTargetCreating):
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "the earlier replacement of this replica is still setting up its storage service",
+			"code":  code,
+		})
 	case errors.Is(err, storagereplacement.ErrTargetInUse):
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "that provider already stores a replica of this bucket",

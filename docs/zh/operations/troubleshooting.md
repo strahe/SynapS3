@@ -132,7 +132,7 @@ synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42
 ```
 
-API 会判断每个失败任务能否安全重试。存储提供方替换从 **Details** → **Storage** → **Data Sets** 恢复。只有尚未发出广播的钱包操作可以从 Tasks 恢复；广播结果不确定时仍不可重试。Store 结果不确定时会提供 **Check again**，它只观察存储提供方，不会再次上传。只有在核对失败结果后才使用 **Dismiss** 或 `synaps3 admin task acknowledge <id>`；确认后的任务会继续保留配置的时长，再由后台清理。
+API 会判断每个失败任务能否安全重试。存储提供方替换从 **Details** → **Storage** → **Data Sets** 恢复。只有尚未发出广播的钱包操作可以从 Tasks 恢复；广播结果不确定时仍不可重试。Store 结果不确定时会提供 **Check again**，它只观察存储提供方，不会再次上传。只有在核对失败结果后才使用 **Dismiss** 或 `synaps3 admin task acknowledge <id>`；确认后的任务会继续保留配置的时长，再由后台清理。失败任务积压时，任务页的 **Dismiss all** 会处理当前操作类型筛选下的失败任务，命令行对应 `synaps3 admin task acknowledge --type <操作> --yes`；在你确认之后才记录的失败仍会留在列表里。
 
 ## 存储提供方或 RPC 问题
 

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"net/url"
@@ -142,9 +143,7 @@ func DefaultFilecoinRPCURL(network string) (string, bool) {
 // DefaultFilecoinRPCURLs returns a copy of the built-in Filecoin RPC URL map.
 func DefaultFilecoinRPCURLs() map[string]string {
 	out := make(map[string]string, len(defaultFilecoinRPCURLs))
-	for network, rpcURL := range defaultFilecoinRPCURLs {
-		out[network] = rpcURL
-	}
+	maps.Copy(out, defaultFilecoinRPCURLs)
 	return out
 }
 
@@ -178,7 +177,7 @@ func defaultConfig() *Config {
 		},
 		Database: DatabaseConfig{
 			Driver:       "sqlite",
-			MaxOpenConns: 4,
+			MaxOpenConns: 32,
 			MaxIdleConns: 2,
 		},
 		Cache: CacheConfig{
@@ -296,7 +295,7 @@ func loadWithOptions(path string, includeEnv, applyRuntimeDefaults bool) (*Confi
 
 	if includeEnv {
 		// Overlay environment variables: SYNAPS3_SERVER_PORT → server.port
-		if err := k.Load(env.ProviderWithValue("SYNAPS3_", ".", func(s, value string) (string, interface{}) {
+		if err := k.Load(env.ProviderWithValue("SYNAPS3_", ".", func(s, value string) (string, any) {
 			if field, ok := EnvFieldForName(s); ok {
 				if field == "admin.trusted_proxies" {
 					return field, splitEnvList(value)

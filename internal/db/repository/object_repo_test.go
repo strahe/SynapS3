@@ -111,7 +111,10 @@ func TestObjectRepo_CountOverviewAttention(t *testing.T) {
 	if _, err := createVersion(t, repos, failedContent); err != nil {
 		t.Fatalf("seed failed-content version: %v", err)
 	}
-	if err := repos.Contents.RecordContentFailure(ctx, *failedContent.ContentID, "provider failed"); err != nil {
+	if _, err := db.NewUpdate().Model((*model.StorageContent)(nil)).
+		Set("error_message = ?", "provider failed").
+		Where("id = ?", *failedContent.ContentID).
+		Exec(ctx); err != nil {
 		t.Fatalf("record content failure: %v", err)
 	}
 

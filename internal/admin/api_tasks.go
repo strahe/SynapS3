@@ -1,6 +1,9 @@
 package admin
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -238,6 +241,100 @@ type taskStatsItem struct {
 	Type   string `json:"type"`
 	Status string `json:"status"`
 	Count  int64  `json:"count"`
+}
+
+type taskAcknowledgeRequest struct {
+	Type         string `json:"type,omitempty"`
+	FailedBefore string `json:"failed_before,omitempty"`
+}
+
+type taskAcknowledgeResponse struct {
+	Acknowledged int `json:"acknowledged"`
+}
+
+type taskAcknowledgePreviewResponse struct {
+	Count int    `json:"count"`
+	AsOf  string `json:"as_of"`
+}
+
+// taskAcknowledgeMaxBodyBytes bounds the bulk dismissal body. It carries an
+// operation name and a timestamp and nothing else.
+const taskAcknowledgeMaxBodyBytes = 4096
+
+// handleAPITaskAcknowledgePreview reports how many failures a bulk dismissal
+// would cover, and the cutoff it counted them at. Confirming with that same
+// cutoff dismisses exactly what was counted: failures recorded in between stay
+// visible instead of being swept up by a number the operator never saw.
+func (s *Server) handleAPITaskAcknowledgePreview(w http.ResponseWriter, r *http.Request) {
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	filter := repository.TaskAcknowledgeFilter{FailedBefore: time.Now().UTC()}
+	if taskType := r.URL.Query().Get("type"); taskType != "" {
+		if !validTaskType(model.TaskType(taskType)) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown task type"})
+			return
+		}
+		filter.Type = model.TaskType(taskType)
+	}
+	count, err := s.taskService.CountAcknowledgeable(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("api: failed to count dismissable tasks", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, taskAcknowledgePreviewResponse{
+		Count: count, AsOf: filter.FailedBefore.Format(time.RFC3339Nano),
+	})
+}
+
+// handleAPITaskAcknowledgeMatching dismisses a backlog of failures in one call.
+// It takes the same selection the Tasks page offers: an optional operation and
+// the moment the operator decided, so failures recorded later stay visible.
+func (s *Server) handleAPITaskAcknowledgeMatching(w http.ResponseWriter, r *http.Request) {
+	if s.taskService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
+		return
+	}
+	// A body that does not decode cleanly is refused rather than partially
+	// applied: a mistyped field would otherwise widen the dismissal to everything
+	// instead of the selection the operator confirmed. An empty body, however it
+	// is framed, still selects every failure before now.
+	var request taskAcknowledgeRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, taskAcknowledgeMaxBodyBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	filter := repository.TaskAcknowledgeFilter{FailedBefore: time.Now()}
+	if request.Type != "" {
+		if !validTaskType(model.TaskType(request.Type)) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown task type"})
+			return
+		}
+		filter.Type = model.TaskType(request.Type)
+	}
+	if request.FailedBefore != "" {
+		failedBefore, err := time.Parse(time.RFC3339, request.FailedBefore)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed_before must be an RFC 3339 time"})
+			return
+		}
+		filter.FailedBefore = failedBefore
+	}
+	acknowledged, err := s.taskService.AcknowledgeMatching(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("api: failed to acknowledge tasks", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, taskAcknowledgeResponse{Acknowledged: acknowledged})
 }
 
 func (s *Server) handleAPITaskStats(w http.ResponseWriter, r *http.Request) {

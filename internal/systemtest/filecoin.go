@@ -334,6 +334,9 @@ func (c *memoryProviderTarget) CreateDataSet(ctx context.Context, opts *storage.
 	}
 	clientIDValue, _ := id.Uint64()
 	clientID := sdktypes.NewBigInt(clientIDValue + 500000)
+	if opts != nil && opts.ClientDataSetID != nil {
+		clientID = opts.ClientDataSetID.Copy()
+	}
 	txID := "create-" + id.String()
 	m.submissions[txID] = id.Copy()
 	dataSet := &memoryDataSet{
@@ -357,6 +360,29 @@ func (c *memoryProviderTarget) CreateDataSet(ctx context.Context, opts *storage.
 		return nil, err
 	}
 	return &storage.CreateDataSetResult{TransactionID: txID, DataSet: ref}, nil
+}
+
+func (c *memoryProviderTarget) ContextIdentity() storage.ContextIdentity {
+	return storage.ContextIdentity{
+		Payer:        common.HexToAddress("0x00000000000000000000000000000000000000a1"),
+		ChainID:      314159,
+		RecordKeeper: common.HexToAddress("0x00000000000000000000000000000000000000b2"),
+	}
+}
+
+func (c *memoryProviderTarget) FindDataSetByClientDataSetID(ctx context.Context, clientID sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.DataSetRef{}, false, err
+	}
+	c.filecoin.mu.RLock()
+	defer c.filecoin.mu.RUnlock()
+	for _, dataSet := range c.filecoin.dataSets {
+		if dataSet.provider.Equal(c.provider) && dataSet.clientID.Equal(clientID) {
+			ref, err := storage.NewDataSetRef(c.provider, dataSet.id, dataSet.clientID)
+			return ref, err == nil, err
+		}
+	}
+	return storage.DataSetRef{}, false, nil
 }
 
 func (c *memoryProviderTarget) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
@@ -615,6 +641,22 @@ func copyBigIntPtr(value sdktypes.BigInt) *sdktypes.BigInt {
 }
 
 // GetWalletInfo returns a complete, funded wallet snapshot.
+// ContextIdentity reports what this fake signs for, matching the identity its
+// provider contexts carry.
+func (m *MemoryFilecoin) ContextIdentity() storage.ContextIdentity {
+	return storage.ContextIdentity{
+		Payer:        common.HexToAddress("0x00000000000000000000000000000000000000a1"),
+		ChainID:      314159,
+		RecordKeeper: common.HexToAddress("0x00000000000000000000000000000000000000b2"),
+	}
+}
+
+// VerifyServicePayer accepts every data set: the fake only holds data sets its
+// own wallet created.
+func (m *MemoryFilecoin) VerifyServicePayer(context.Context, sdktypes.BigInt) error {
+	return nil
+}
+
 // TerminateService ends a data set's service. The fake reports an end of term
 // the chain has already reached, because a system test exercises the operator
 // flow rather than chain timing; use terminationDelay to make retirement wait.

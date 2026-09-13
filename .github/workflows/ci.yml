@@ -45,7 +45,7 @@ jobs:
           cache: true
 
       - name: Test PostgreSQL persistence contracts
-        run: go test ./internal/db/migrations ./internal/db/repository -count=1
+        run: go test ./internal/db/migrations ./internal/db/repository ./internal/task -count=1
 
   check:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}

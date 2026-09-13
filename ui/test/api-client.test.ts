@@ -56,6 +56,33 @@ function installFakeXMLHttpRequest() {
   }
 }
 
+test('bulk task dismissal posts the operation filter and the cutoff', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; method?: string; body?: BodyInit | null }> = []
+  globalThis.fetch = (async (input, init) => {
+    calls.push({ url: String(input), method: init?.method, body: init?.body })
+    return new Response(JSON.stringify({ acknowledged: 3 }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+
+  try {
+    const result = await api.acknowledgeTasks({ type: 'storage_store', failed_before: '2026-09-12T08:30:00Z' })
+    assert.equal(result.acknowledged, 3)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]?.url, '/api/v1/tasks/acknowledge')
+  assert.equal(calls[0]?.method, 'POST')
+  assert.deepEqual(JSON.parse(String(calls[0]?.body)), {
+    type: 'storage_store',
+    failed_before: '2026-09-12T08:30:00Z',
+  })
+})
+
 test('admin login sends remember mode and refreshes the stored csrf token', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{

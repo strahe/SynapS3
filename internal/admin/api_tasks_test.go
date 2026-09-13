@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/uptrace/bun"
 )
 
 type adminTaskHandler struct {
@@ -346,9 +348,184 @@ func TestAPITaskFlagsComeFromRegistry(t *testing.T) {
 
 type adminTaskFixture struct {
 	t       *testing.T
+	db      *bun.DB
 	repos   *repository.Repositories
 	service *taskengine.Service
 	server  *Server
+}
+
+// TestAPITaskBulkAcknowledgeDismissesTheSelectedBacklog checks that a bulk
+// dismissal covers the selected operation only, and reports how many it
+// dismissed.
+func TestAPITaskBulkAcknowledgeDismissesTheSelectedBacklog(t *testing.T) {
+	fixture := newAdminTaskFixture(t)
+	now := time.Now()
+	fail := func(taskType model.TaskType, key string) *model.Task {
+		t.Helper()
+		row := fixture.enqueue(t, taskType, key, now, "storage_copy", key)
+		fixture.transition(t, row.ID, repository.TaskTransition{
+			Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+			FailureReason: new("store_not_started"), LastError: new("provider unavailable"),
+		})
+		return row
+	}
+	stored := fail(model.TaskTypeStorageStore, "bulk-store")
+	evicted := fail(model.TaskTypeCacheEvict, "bulk-evict")
+
+	rr := fixture.request(http.MethodPost, "/api/v1/tasks/acknowledge", strings.NewReader(`{"type":"storage_store"}`))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Acknowledged int `json:"acknowledged"`
+	}
+	decodeJSON(t, rr, &body)
+	if body.Acknowledged != 1 {
+		t.Fatalf("acknowledged = %d, want 1", body.Acknowledged)
+	}
+	dismissed, err := fixture.repos.Tasks.GetByID(t.Context(), stored.ID)
+	if err != nil || dismissed == nil || dismissed.AcknowledgedAt == nil || dismissed.RetentionUntil == nil {
+		t.Fatalf("dismissed task = %#v, err=%v", dismissed, err)
+	}
+	untouched, err := fixture.repos.Tasks.GetByID(t.Context(), evicted.ID)
+	if err != nil || untouched == nil || untouched.AcknowledgedAt != nil {
+		t.Fatalf("task of another operation = %#v, err=%v", untouched, err)
+	}
+
+	rr = fixture.request(http.MethodPost, "/api/v1/tasks/acknowledge", strings.NewReader(`{"type":"not-an-operation"}`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unknown type status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	rr = fixture.request(http.MethodPost, "/api/v1/tasks/acknowledge", strings.NewReader(`{"failed_before":"yesterday"}`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid cutoff status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+}
+
+// The number an operator confirms has to be the number that is dismissed. The
+// preview counts and reports the cutoff it counted at; confirming with that
+// cutoff leaves anything that failed in between visible.
+func TestAPITaskBulkAcknowledgePreviewFreezesWhatIsDismissed(t *testing.T) {
+	fixture := newAdminTaskFixture(t)
+	now := time.Now()
+	fail := func(taskType model.TaskType, key string) *model.Task {
+		t.Helper()
+		row := fixture.enqueue(t, taskType, key, now, "storage_copy", key)
+		fixture.transition(t, row.ID, repository.TaskTransition{
+			Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+			FailureReason: new("store_not_started"), LastError: new("provider unavailable"),
+		})
+		return row
+	}
+	seen := fail(model.TaskTypeStorageStore, "preview-seen")
+	fail(model.TaskTypeCacheEvict, "preview-other-operation")
+
+	rr := fixture.request(http.MethodGet, "/api/v1/tasks/acknowledge/preview?type=storage_store", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("preview status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var preview struct {
+		Count int    `json:"count"`
+		AsOf  string `json:"as_of"`
+	}
+	decodeJSON(t, rr, &preview)
+	if preview.Count != 1 || preview.AsOf == "" {
+		t.Fatalf("preview = %#v, want one dismissable failure and a cutoff", preview)
+	}
+
+	// A failure recorded after the operator looked must survive the dismissal.
+	later := fail(model.TaskTypeStorageStore, "preview-unseen")
+	asOf, err := time.Parse(time.RFC3339Nano, preview.AsOf)
+	if err != nil {
+		t.Fatalf("parse preview cutoff: %v", err)
+	}
+	if _, err := fixture.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("finished_at = ?", asOf.Add(time.Minute)).Where("id = ?", later.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("record a later failure: %v", err)
+	}
+
+	rr = fixture.request(http.MethodPost, "/api/v1/tasks/acknowledge",
+		strings.NewReader(`{"type":"storage_store","failed_before":"`+preview.AsOf+`"}`))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Acknowledged int `json:"acknowledged"`
+	}
+	decodeJSON(t, rr, &body)
+	if body.Acknowledged != preview.Count {
+		t.Fatalf("acknowledged = %d, want the previewed %d", body.Acknowledged, preview.Count)
+	}
+	dismissed, err := fixture.repos.Tasks.GetByID(t.Context(), seen.ID)
+	if err != nil || dismissed == nil || dismissed.AcknowledgedAt == nil {
+		t.Fatalf("previewed failure = %#v, err=%v, want it dismissed", dismissed, err)
+	}
+	kept, err := fixture.repos.Tasks.GetByID(t.Context(), later.ID)
+	if err != nil || kept == nil || kept.AcknowledgedAt != nil {
+		t.Fatalf("failure recorded after the preview = %#v, err=%v, want it still visible", kept, err)
+	}
+
+	rr = fixture.request(http.MethodGet, "/api/v1/tasks/acknowledge/preview?type=not-an-operation", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unknown preview type status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+}
+
+// A body that does not decode cleanly is refused rather than partially applied:
+// a mistyped field would otherwise dismiss every operation instead of the one
+// the operator selected.
+func TestAPITaskBulkAcknowledgeRefusesUnusableRequests(t *testing.T) {
+	fixture := newAdminTaskFixture(t)
+	now := time.Now()
+	row := fixture.enqueue(t, model.TaskTypeStorageStore, "strict-decode", now, "storage_copy", "strict-decode")
+	fixture.transition(t, row.ID, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: new("store_not_started"), LastError: new("provider unavailable"),
+	})
+
+	bodies := map[string]string{
+		"misspelled field": `{"typ":"storage_store"}`,
+		"wrong value type": `{"type":123}`,
+		"trailing content": `{"type":"storage_store"}{"type":"cache_evict"}`,
+		"oversized body":   `{"type":"` + strings.Repeat("x", taskAcknowledgeMaxBodyBytes) + `"}`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			rr := fixture.request(http.MethodPost, "/api/v1/tasks/acknowledge", strings.NewReader(body))
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+			}
+		})
+	}
+	kept, err := fixture.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || kept == nil || kept.AcknowledgedAt != nil {
+		t.Fatalf("failure = %#v, err=%v, want it untouched by every refused request", kept, err)
+	}
+}
+
+// Scripts and proxies may stream a request without declaring its length. An
+// empty body still selects every failure recorded before now.
+func TestAPITaskBulkAcknowledgeAcceptsAnEmptyBodyOfUnknownLength(t *testing.T) {
+	fixture := newAdminTaskFixture(t)
+	row := fixture.enqueue(t, model.TaskTypeStorageStore, "streamed-empty", time.Now(), "storage_copy", "streamed-empty")
+	fixture.transition(t, row.ID, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: new("store_not_started"), LastError: new("provider unavailable"),
+	})
+
+	// httptest reports a reader it cannot measure as ContentLength -1, which is
+	// how a chunked request arrives.
+	rr := fixture.request(http.MethodPost, "/api/v1/tasks/acknowledge", io.MultiReader())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Acknowledged int `json:"acknowledged"`
+	}
+	decodeJSON(t, rr, &body)
+	if body.Acknowledged != 1 {
+		t.Fatalf("acknowledged = %d, want 1", body.Acknowledged)
+	}
 }
 
 func newAdminTaskFixture(t *testing.T) *adminTaskFixture {
@@ -357,7 +534,7 @@ func newAdminTaskFixture(t *testing.T) *adminTaskFixture {
 	repos := repository.NewRepositories(db)
 	service := newAdminTestTaskService(t, repos)
 	server := newTestServer(":0", db, nil, 0, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).WithTaskService(service)
-	return &adminTaskFixture{t: t, repos: repos, service: service, server: server}
+	return &adminTaskFixture{t: t, db: db, repos: repos, service: service, server: server}
 }
 
 func (f *adminTaskFixture) enqueue(t *testing.T, taskType model.TaskType, key string, availableAt time.Time, subjectType, subjectKey string) *model.Task {
@@ -386,21 +563,20 @@ func (f *adminTaskFixture) transition(t *testing.T, id int64, transition reposit
 	}
 }
 
-func (f *adminTaskFixture) request(method, path string, body *strings.Reader) *httptest.ResponseRecorder {
+func (f *adminTaskFixture) request(method, path string, body io.Reader) *httptest.ResponseRecorder {
 	f.t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/tasks", f.server.handleAPITasks)
 	mux.HandleFunc("GET /api/v1/tasks/stats", f.server.handleAPITaskStats)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", f.server.handleAPITaskRetry)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/acknowledge", f.server.handleAPITaskAcknowledge)
-	var requestBody *strings.Reader
-	if body != nil {
-		requestBody = body
-	} else {
-		requestBody = strings.NewReader("")
+	mux.HandleFunc("GET /api/v1/tasks/acknowledge/preview", f.server.handleAPITaskAcknowledgePreview)
+	mux.HandleFunc("POST /api/v1/tasks/acknowledge", f.server.handleAPITaskAcknowledgeMatching)
+	if body == nil {
+		body = strings.NewReader("")
 	}
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest(method, path, requestBody))
+	mux.ServeHTTP(rr, httptest.NewRequest(method, path, body))
 	return rr
 }
 

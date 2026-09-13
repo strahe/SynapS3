@@ -284,10 +284,32 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 | `GET` | `/api/v1/tasks/stats` | 按状态统计任务。 |
 | `POST` | `/api/v1/tasks/{id}/retry` | 当 `retryable` 为 true 时恢复失败任务。 |
 | `POST` | `/api/v1/tasks/{id}/acknowledge` | 当 `acknowledgeable` 为 true 时把失败任务标记为已处理。确认后开始计算保留期，到期后可能被清理。 |
+| `GET` | `/api/v1/tasks/acknowledge/preview` | 统计批量处理会覆盖多少条失败任务，同样接受可选的 `type`，返回 `count` 和统计时刻 `as_of`。 |
+| `POST` | `/api/v1/tasks/acknowledge` | 一次性处理积压的失败任务，返回 `acknowledged` 表示处理了多少条。 |
 
 `status` 为 `pending`、`running`、`completed`、`failed` 或 `cancelled`。`presentation_status` 会把 pending 工作显示为 `queued`、`scheduled` 或 `waiting`，并把已确认的失败任务显示为 `dismissed`。响应还包含 `operation`、可选的 subject 身份，以及服务端计算的 `retryable` 和 `acknowledgeable`。
 
 `status` 过滤还接受 `dismissed`。`status=failed` 只返回尚未确认的失败，`status=dismissed` 返回已确认的失败；`/api/v1/tasks/stats` 也分别以 `failed` 和 `dismissed` 统计两组任务。
+
+批量处理接受 JSON 请求体，其中 `type` 和 RFC 3339 格式的 `failed_before` 都是可选的，`failed_before` 默认为服务端处理请求的时刻：
+
+```json
+{
+  "type": "storage_store",
+  "failed_before": "2026-09-12T08:30:00Z"
+}
+```
+
+该时刻之后记录的失败仍然可见，因此清理积压不会掩盖还没有人看过的失败。`type` 未知、`failed_before` 无法解析，或请求体包含未知字段、多余内容、超过 4 KiB 时返回 `400 Bad Request`。
+
+需要先看到数量再处理时，先统计，再用统计时刻确认：
+
+```bash
+curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
+# {"count":12,"as_of":"2026-09-12T08:30:00.123456789Z"}
+```
+
+把返回的 `as_of` 作为 `failed_before` 回传，处理的就正好是统计到的那些。
 
 `/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。
 

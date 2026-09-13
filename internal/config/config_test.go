@@ -907,8 +907,8 @@ func TestDefaultConfig_DatabasePool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() failed: %v", err)
 	}
-	if cfg.Database.MaxOpenConns != 4 {
-		t.Errorf("Database.MaxOpenConns = %d, want 4", cfg.Database.MaxOpenConns)
+	if cfg.Database.MaxOpenConns != 32 {
+		t.Errorf("Database.MaxOpenConns = %d, want 32", cfg.Database.MaxOpenConns)
 	}
 	if cfg.Database.MaxIdleConns != 2 {
 		t.Errorf("Database.MaxIdleConns = %d, want 2", cfg.Database.MaxIdleConns)

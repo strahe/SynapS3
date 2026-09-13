@@ -30,9 +30,11 @@ type EngineConfig struct {
 }
 
 const (
-	retryBaseDelay      = 10 * time.Second
-	retryMaximumDelay   = 5 * time.Minute
-	retryJitterFraction = 0.20
+	retryBaseDelay           = 10 * time.Second
+	retryMaximumDelay        = 5 * time.Minute
+	resourceWaitBaseDelay    = 2 * time.Second
+	resourceWaitMaximumDelay = time.Minute
+	backoffJitterFraction    = 0.20
 )
 
 // Engine is the only task claimant and lease owner.
@@ -48,7 +50,12 @@ type Engine struct {
 	settlementRetryDelays []time.Duration
 	renewalRetryDelays    []time.Duration
 	retryDelay            func(int) time.Duration
-	lastTick              atomic.Int64
+	resourceWaitDelay     func(int) time.Duration
+	resourceWaitMu        sync.Mutex
+	// resourceWaits counts each task's consecutive resource waits. It is kept
+	// in memory only; a restart merely restarts the backoff.
+	resourceWaits map[int64]int
+	lastTick      atomic.Int64
 }
 
 type recoveryRequest struct {
@@ -80,6 +87,8 @@ func NewEngine(config EngineConfig, repos *repository.Repositories, registry *Re
 		settlementRetryDelays: []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second},
 		renewalRetryDelays:    []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second},
 		retryDelay:            defaultRetryDelay,
+		resourceWaitDelay:     defaultResourceWaitDelay,
+		resourceWaits:         make(map[int64]int),
 	}, nil
 }
 
@@ -357,6 +366,7 @@ func (e *Engine) commitResult(ctx context.Context, claimed *model.Task, result R
 		})
 		cancel()
 		if lastErr == nil {
+			e.recordResourceWait(claimed.ID, result.resourceWait)
 			e.notifyTaskSettled(claimed, transition)
 			return nil
 		}
@@ -427,9 +437,13 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 		transition.Status = model.TaskStatusCompleted
 		transition.RetentionUntil = &retention
 	case resultSuspend:
+		delay := result.delay
+		if result.resourceWait {
+			delay = e.resourceWaitDelay(e.consecutiveResourceWaits(claimed.ID))
+		}
 		transition.Status = model.TaskStatusPending
 		transition.ResumeMode = result.resumeMode
-		transition.AvailableAt = now.Add(result.delay)
+		transition.AvailableAt = now.Add(delay)
 	case resultRetry:
 		if claimed.RetryLimit != nil && claimed.RetryCount >= *claimed.RetryLimit {
 			transition.Status = model.TaskStatusFailed
@@ -453,24 +467,46 @@ func (e *Engine) transitionFor(claimed *model.Task, result Result) repository.Ta
 }
 
 func defaultRetryDelay(retryCount int) time.Duration {
-	return retryDelayWithJitter(retryCount, rand.Float64())
+	return backoffDelay(retryCount, retryBaseDelay, retryMaximumDelay, rand.Float64())
 }
 
-func retryDelayWithJitter(retryCount int, jitterUnit float64) time.Duration {
-	if retryCount < 0 {
-		retryCount = 0
+func defaultResourceWaitDelay(waits int) time.Duration {
+	return backoffDelay(waits, resourceWaitBaseDelay, resourceWaitMaximumDelay, rand.Float64())
+}
+
+func backoffDelay(attempt int, base, maximum time.Duration, jitterUnit float64) time.Duration {
+	if attempt < 0 {
+		attempt = 0
 	}
-	delay := retryBaseDelay
-	for range retryCount {
-		if delay >= retryMaximumDelay/2 {
-			delay = retryMaximumDelay
+	delay := base
+	for range attempt {
+		if delay >= maximum/2 {
+			delay = maximum
 			break
 		}
 		delay *= 2
 	}
 	jitterUnit = min(max(jitterUnit, 0), 1)
-	jitter := 1 + retryJitterFraction*(2*jitterUnit-1)
-	return min(time.Duration(float64(delay)*jitter), retryMaximumDelay)
+	jitter := 1 + backoffJitterFraction*(2*jitterUnit-1)
+	return min(time.Duration(float64(delay)*jitter), maximum)
+}
+
+func (e *Engine) consecutiveResourceWaits(id int64) int {
+	e.resourceWaitMu.Lock()
+	defer e.resourceWaitMu.Unlock()
+	return e.resourceWaits[id]
+}
+
+// recordResourceWait extends a task's wait streak after a settled resource
+// wait; any other settled result ends the streak.
+func (e *Engine) recordResourceWait(id int64, waited bool) {
+	e.resourceWaitMu.Lock()
+	defer e.resourceWaitMu.Unlock()
+	if waited {
+		e.resourceWaits[id]++
+		return
+	}
+	delete(e.resourceWaits, id)
 }
 
 func (e *Engine) renewLease(
@@ -614,18 +650,29 @@ func (e *Engine) nextRecovery() (recoveryRequest, bool) {
 	return recoveryRequest{}, false
 }
 
+// heldResource marks a context whose claim already holds a slot of a gate.
+type heldResource struct{ resource Resource }
+
+// withResource never waits for a slot: a full gate returns ErrResourceBusy so
+// the worker is free to claim other tasks instead of idling behind the gate.
 func (e *Engine) withResource(ctx context.Context, resource Resource, fn func(context.Context) error) error {
 	gate, ok := e.gates[resource]
 	if !ok || fn == nil {
 		return fmt.Errorf("unknown task resource %q", resource)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ctx.Value(heldResource{resource}) != nil {
+		return fn(ctx)
+	}
 	select {
 	case gate <- struct{}{}:
-		defer func() { <-gate }()
-		return fn(ctx)
-	case <-ctx.Done():
-		return ctx.Err()
+	default:
+		return ErrResourceBusy
 	}
+	defer func() { <-gate }()
+	return fn(context.WithValue(ctx, heldResource{resource}, true))
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) bool {

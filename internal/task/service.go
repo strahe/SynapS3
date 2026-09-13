@@ -198,6 +198,18 @@ func (s *Service) Acknowledge(ctx context.Context, id int64) error {
 	return s.repos.Tasks.AcknowledgeFailed(ctx, id, s.retention)
 }
 
+// AcknowledgeMatching dismisses a backlog of failures in one step and reports
+// how many it dismissed.
+func (s *Service) AcknowledgeMatching(ctx context.Context, filter repository.TaskAcknowledgeFilter) (int, error) {
+	return s.repos.Tasks.AcknowledgeFailedMatching(ctx, filter, s.retention)
+}
+
+// CountAcknowledgeable reports how many failures AcknowledgeMatching would
+// dismiss under the same filter.
+func (s *Service) CountAcknowledgeable(ctx context.Context, filter repository.TaskAcknowledgeFilter) (int, error) {
+	return s.repos.Tasks.CountFailedMatching(ctx, filter)
+}
+
 func (s *Service) WakeInTransaction(ctx context.Context, txRepos *repository.Repositories, ids []int64) (int, error) {
 	if txRepos == nil || txRepos.Tasks == nil {
 		return 0, errors.New("transaction task repository is required")

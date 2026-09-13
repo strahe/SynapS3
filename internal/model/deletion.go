@@ -49,6 +49,7 @@ type StorageCleanupCopy struct {
 	ClientDataSetID  *types.OnChainID         `bun:"type:text"`
 	PieceID          types.OnChainID          `bun:"type:text,notnull"`
 	PieceCID         string                   `bun:"type:text,notnull"`
+	Checksum         string                   `bun:"type:text,notnull"`
 	RetrievalURL     *string                  `bun:"type:text,nullzero"`
 	Status           StorageCleanupCopyStatus `bun:"type:text,notnull,default:'pending'"`
 	DeleteTxHash     *string                  `bun:"type:text,nullzero"`

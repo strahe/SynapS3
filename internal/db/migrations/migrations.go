@@ -166,6 +166,7 @@ func initialSchemaPostStateComplete(ctx context.Context, db bun.IDB) (bool, erro
 		{"storage_commit_attempts", "attempt_id"},
 		{"storage_replacement_items", "target_data_set_id"},
 		{"storage_cleanup_copies", "bucket_id"},
+		{"storage_cleanup_copies", "checksum"},
 		{"object_versions", "content_id"},
 		{"object_cache", "content_id"},
 	} {

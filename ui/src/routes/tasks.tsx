@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import { api, type TaskItem } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import { DangerActionAlertDialog } from '@/components/app/DangerActionAlertDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { StatusBadge, taskStatusTone } from '@/components/app/StatusBadge'
@@ -97,6 +98,10 @@ function TasksPage() {
   const filterKey = `${taskType}:${status}`
   const previousFilterKey = useRef(filterKey)
   const tasks = useTasks(taskType, status, PAGE_SIZE, cursor)
+  // What the operator is asked to confirm: the server's own count, the moment
+  // it counted, and the operation it counted for. Confirming sends all three
+  // back, so nothing that failed while the dialog was open is swept up.
+  const [dismissAllScope, setDismissAllScope] = useState<DismissAllScope | null>(null)
 
   useEffect(() => {
     if (previousFilterKey.current === filterKey) return
@@ -111,11 +116,24 @@ function TasksPage() {
   }
   const retry = useMutation({ mutationFn: api.retryTask, onSuccess: refreshTasks })
   const acknowledge = useMutation({ mutationFn: api.acknowledgeTask, onSuccess: refreshTasks })
-  const actionError = retry.error ?? acknowledge.error
+  const previewDismissAll = useMutation({
+    mutationFn: api.previewAcknowledgeTasks,
+    onSuccess: (preview, variables) => setDismissAllScope({ ...preview, type: variables.type }),
+  })
+  const dismissAll = useMutation({
+    mutationFn: api.acknowledgeTasks,
+    onSuccess: () => {
+      setDismissAllScope(null)
+      refreshTasks()
+    },
+  })
+  const actionError = retry.error ?? acknowledge.error ?? previewDismissAll.error
 
   const setFilters = (nextType: TaskOperationFilter, nextStatus: TaskStatusFilter) => {
     retry.reset()
     acknowledge.reset()
+    previewDismissAll.reset()
+    dismissAll.reset()
     navigate({
       to: '/tasks',
       search: {
@@ -148,10 +166,26 @@ function TasksPage() {
         title="Tasks"
         description="Review background operations and recover work that needs attention."
         actions={
-          <Button variant="outline" size="sm" onClick={() => tasks.refetch()} disabled={tasks.isFetching}>
-            <RefreshCw data-icon="inline-start" className={tasks.isFetching ? 'animate-spin' : undefined} />
-            Refresh
-          </Button>
+          <div className="flex items-center gap-2">
+            {status === 'failed' && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!tasks.data?.tasks.length || previewDismissAll.isPending}
+                onClick={() => {
+                  dismissAll.reset()
+                  previewDismissAll.mutate({ type: search.type })
+                }}
+              >
+                <X data-icon="inline-start" />
+                Dismiss all
+              </Button>
+            )}
+            <Button variant="outline" size="sm" onClick={() => tasks.refetch()} disabled={tasks.isFetching}>
+              <RefreshCw data-icon="inline-start" className={tasks.isFetching ? 'animate-spin' : undefined} />
+              Refresh
+            </Button>
+          </div>
         }
       />
 
@@ -256,8 +290,37 @@ function TasksPage() {
           </EmptyHeader>
         </Empty>
       )}
+
+      <DangerActionAlertDialog
+        open={dismissAllScope !== null}
+        onOpenChange={(open) => {
+          if (open) return
+          dismissAll.reset()
+          setDismissAllScope(null)
+        }}
+        title="Dismiss failed tasks"
+        description={dismissAllDescription(dismissAllScope?.count ?? 0, dismissAllScope?.type)}
+        confirmLabel={dismissAllScope?.count === 1 ? 'Dismiss 1 task' : `Dismiss ${dismissAllScope?.count ?? 0} tasks`}
+        pending={dismissAll.isPending}
+        confirmDisabled={dismissAllScope?.count === 0}
+        error={dismissAll.error ? errorMessage(dismissAll.error) : null}
+        onConfirm={() => {
+          if (!dismissAllScope) return
+          dismissAll.mutate({ type: dismissAllScope.type, failed_before: dismissAllScope.as_of })
+        }}
+      />
     </div>
   )
+}
+
+type DismissAllScope = { count: number; as_of: string; type?: string }
+
+function dismissAllDescription(count: number, operation?: string) {
+  const label = operation ? (taskOperations.find((option) => option.value === operation)?.label ?? operation) : ''
+  const scope = label ? ` for ${label}` : ''
+  if (count === 0) return `No failed tasks${scope} are left to dismiss.`
+  const tasks = count === 1 ? '1 failed task' : `${count} failed tasks`
+  return `${tasks}${scope} will move to Dismissed and be removed after the retention period. Tasks that fail after you confirm stay in the list, and nothing is retried.`
 }
 
 function TaskTable({
