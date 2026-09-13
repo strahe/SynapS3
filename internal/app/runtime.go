@@ -302,9 +302,6 @@ func publishUploadTaskSettlement(events admin.EventPublisher, taskRow *model.Tas
 	}
 	if taskRow.SubjectKey != nil {
 		payload["subject_key"] = *taskRow.SubjectKey
-		if taskRow.SubjectType != nil && *taskRow.SubjectType == "object_version" {
-			payload["version_id"] = *taskRow.SubjectKey
-		}
 	}
 	events.Publish("upload_state_changed", payload)
 }

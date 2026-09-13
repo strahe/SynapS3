@@ -345,7 +345,7 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		if cacheCommitted {
 			b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after multipart complete tx failure")
 		}
-		return s3response.CompleteMultipartUploadResult{}, "", err
+		return s3response.CompleteMultipartUploadResult{}, "", contentWriteError(err)
 	}
 	completed = true
 

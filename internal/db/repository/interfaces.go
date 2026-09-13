@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -333,7 +334,9 @@ type StorageCleanupRepository interface {
 	MarkCopyUnsupported(ctx context.Context, id int64, message string) error
 	UploadHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
 	CleanupHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
-	CompleteTask(ctx context.Context, contentID, generation, taskID int64) error
+	// FinalizeContent deletes a cleaned-up content's current-state rows: its
+	// cache record, its copies, and the content row. Ledgers keep theirs.
+	FinalizeContent(ctx context.Context, contentID, generation, taskID int64) error
 }
 
 type EnsureDataSetBindingInput struct {
@@ -441,13 +444,6 @@ type MarkUploadCopyCommittedInput struct {
 	CommitConfirmedTransactionID string
 }
 
-// IncompleteReadableUpload identifies one durable upload that still needs
-// work to reach its frozen target copy count.
-type IncompleteReadableUpload struct {
-	Upload  model.StorageContent
-	Version model.ObjectVersion
-}
-
 type BindReadableUploadInput struct {
 	ContentID int64
 	BucketID  int64
@@ -471,7 +467,6 @@ type StorageContentRepository interface {
 	EnsureContent(ctx context.Context, input EnsureContentInput) (*model.StorageContent, error)
 	GetByID(ctx context.Context, contentID int64) (*model.StorageContent, error)
 	GetByIDs(ctx context.Context, contentIDs []int64) (map[int64]model.StorageContent, error)
-	RecordContentFailure(ctx context.Context, contentID int64, message string) error
 	GetIngressCopy(ctx context.Context, contentID int64) (*model.StorageCopy, error)
 	// ContentPipelineState derives pipeline position from the copy rows.
 	ContentPipelineState(ctx context.Context, contentID int64) (model.ObjectState, error)
@@ -490,6 +485,9 @@ type StorageContentRepository interface {
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
 	EnsureDataSetBinding(ctx context.Context, input EnsureDataSetBindingInput) (*model.StorageDataSet, error)
 	MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error
+	// RecordDataSetClientID ties a generation to the client data set ID of its
+	// create request before the request is sent. The ID never changes later.
+	RecordDataSetClientID(ctx context.Context, id int64, clientDataSetID types.OnChainID) error
 	MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error
 	BackfillClientDataSetID(ctx context.Context, input BackfillClientDataSetIDInput) error
 	MarkDataSetDraining(ctx context.Context, id int64, lastError string) error
@@ -519,7 +517,6 @@ type StorageContentRepository interface {
 	// GetUploadCopyForDataSet addresses one concrete data set generation.
 	GetUploadCopyForDataSet(ctx context.Context, contentID, storageDataSetID int64) (*model.StorageCopy, error)
 	NextFinalizableCopyForDataSet(ctx context.Context, storageDataSetID int64) (*model.StorageCopy, error)
-	ListIncompleteReadableUploads(ctx context.Context, afterID int64, limit int) ([]IncompleteReadableUpload, error)
 	MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error
 	ReopenFailedUploadCopy(ctx context.Context, copyID int64) error
 	ReserveCommitAttempt(ctx context.Context, input storagecommit.ReserveInput) (storagecommit.ReserveResult, error)
@@ -579,7 +576,6 @@ type StorageReplacementRepository interface {
 	// identity remains reserved until retry, supersession, or completion.
 	HasInProgressForDataSet(ctx context.Context, dataSetID int64) (bool, error)
 	ListActive(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error)
-	ListSupersededCleanupCandidates(ctx context.Context, afterID int64, limit int) ([]storagereplacement.Replacement, error)
 
 	// Activate makes the target the write target and marks the source draining
 	// in one transaction. It touches a fixed number of rows regardless of how
@@ -610,11 +606,10 @@ type StorageReplacementRepository interface {
 	// refuses premature completion even when called outside the worker.
 	CompleteRetirement(ctx context.Context, replacementID int64, observedEpoch int64) error
 
-	// CountAbandonedTargetSoleCopies and RetireAbandonedTarget clean up a target
-	// a later confirmation replaced. They retire the opposite generation from
-	// CompleteRetirement and never change the replacement record.
+	// CountAbandonedTargetSoleCopies counts the copies that only the target a
+	// later confirmation replaced still holds. CompleteAbandonedTargetTermination
+	// refuses to retire that target while any remain.
 	CountAbandonedTargetSoleCopies(ctx context.Context, targetDataSetID int64) (int, error)
-	RetireAbandonedTarget(ctx context.Context, replacementID int64) error
 }
 
 // AuthorizeReplacementInput is one operator confirmation.
@@ -681,7 +676,7 @@ type TaskRepository interface {
 	GetByIdentity(ctx context.Context, taskType model.TaskType, idempotencyKey string) (*model.Task, error)
 	ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error)
 	RenewLease(ctx context.Context, id, generation int64, leaseDuration time.Duration) (time.Time, error)
-	WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint []byte) error
+	WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint json.RawMessage) error
 	ValidateClaim(ctx context.Context, id, generation int64) error
 	Settle(ctx context.Context, id, generation int64, transition TaskTransition) error
 	ShortenLease(ctx context.Context, id, generation int64, duration time.Duration) error
@@ -690,14 +685,18 @@ type TaskRepository interface {
 	RetryFailed(ctx context.Context, id int64) error
 	ReactivateTerminal(ctx context.Context, id int64) error
 	AcknowledgeFailed(ctx context.Context, id int64, retention time.Duration) error
+	// AcknowledgeFailedMatching dismisses every unacknowledged failure the filter
+	// covers and reports how many it dismissed.
+	AcknowledgeFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter, retention time.Duration) (int, error)
+	// CountFailedMatching reports how many failures the same filter covers, so a
+	// bulk dismissal can be previewed before it is confirmed.
+	CountFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter) (int, error)
 	DeleteRetained(ctx context.Context, now time.Time, limit int) (int, error)
 	List(ctx context.Context, filter TaskListFilter) (TaskPage, error)
 	CountByStatus(ctx context.Context) ([]TaskStatusCount, error)
 	CountByPresentationStatus(ctx context.Context) ([]TaskStatusCount, error)
 	CountUnacknowledgedFailed(ctx context.Context) (int64, error)
 	CountOverviewActivePipeline(ctx context.Context) ([]TaskPipelineCount, error)
-	CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error)
-	CountActiveBucketTasksByBucketID(ctx context.Context, bucketID int64) (int64, error)
 }
 
 type TaskTransition struct {
@@ -710,6 +709,13 @@ type TaskTransition struct {
 	StatusMessage  *string
 	IncrementRetry bool
 	RetentionUntil *time.Time
+}
+
+// TaskAcknowledgeFilter selects the failures one bulk dismissal covers. The
+// cutoff is what the operator saw: failures recorded after it stay visible.
+type TaskAcknowledgeFilter struct {
+	Type         model.TaskType
+	FailedBefore time.Time
 }
 
 type TaskListFilter struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -187,12 +188,15 @@ type MockStorageTarget struct {
 	WithCDNValue         bool
 	CreateDataSetFunc    func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
 	WaitDataSetFunc      func(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
-	StoreFunc            func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
-	PresignForCommitFunc func(context.Context, []storage.PieceInput) ([]byte, error)
-	PullFunc             func(context.Context, storage.PullRequest) (*storage.PullResult, error)
-	SubmitCommitFunc     func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
-	GetCommitStatusFunc  func(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
-	PieceStatusFunc      func(context.Context, cid.Cid) (*storage.PieceStatus, error)
+	// ContextIdentityValue overrides DefaultContextIdentity.
+	ContextIdentityValue      storage.ContextIdentity
+	FindDataSetByClientIDFunc func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error)
+	StoreFunc                 func(context.Context, io.Reader, *storage.StoreOptions) (*storage.StoreResult, error)
+	PresignForCommitFunc      func(context.Context, []storage.PieceInput) ([]byte, error)
+	PullFunc                  func(context.Context, storage.PullRequest) (*storage.PullResult, error)
+	SubmitCommitFunc          func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
+	GetCommitStatusFunc       func(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
+	PieceStatusFunc           func(context.Context, cid.Cid) (*storage.PieceStatus, error)
 }
 
 func NewMockProviderTarget(providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) *MockStorageTarget {
@@ -256,6 +260,28 @@ func (m *MockStorageTarget) WaitForDataSetCreated(ctx context.Context, submissio
 		return m.WaitDataSetFunc(ctx, submission)
 	}
 	return nil, errors.New("MockStorageTarget.WaitForDataSetCreated not configured")
+}
+
+// DefaultContextIdentity is the signing identity mock targets report unless a
+// test sets ContextIdentityValue.
+var DefaultContextIdentity = storage.ContextIdentity{
+	Payer:        common.HexToAddress("0x00000000000000000000000000000000000000a1"),
+	ChainID:      314159,
+	RecordKeeper: common.HexToAddress("0x00000000000000000000000000000000000000b2"),
+}
+
+func (m *MockStorageTarget) ContextIdentity() storage.ContextIdentity {
+	if m.ContextIdentityValue != (storage.ContextIdentity{}) {
+		return m.ContextIdentityValue
+	}
+	return DefaultContextIdentity
+}
+
+func (m *MockStorageTarget) FindDataSetByClientDataSetID(ctx context.Context, clientDataSetID sdktypes.BigInt) (storage.DataSetRef, bool, error) {
+	if m.FindDataSetByClientIDFunc != nil {
+		return m.FindDataSetByClientIDFunc(ctx, clientDataSetID)
+	}
+	return storage.DataSetRef{}, false, errors.New("MockStorageTarget.FindDataSetByClientDataSetID not configured")
 }
 
 func (m *MockStorageTarget) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
@@ -417,6 +443,28 @@ func (m *MockCache) DeleteUpload(ctx context.Context, uploadID string) error {
 // synapse.ServiceTerminator.
 type MockServiceTerminator struct {
 	TerminateServiceFunc func(ctx context.Context, dataSetID sdktypes.BigInt) (*synapse.TerminationResult, error)
+	// VerifyServicePayerFunc defaults to accepting every data set.
+	VerifyServicePayerFunc func(ctx context.Context, dataSetID sdktypes.BigInt) error
+	// ContextIdentityValue overrides DefaultContextIdentity.
+	ContextIdentityValue storage.ContextIdentity
+}
+
+// VerifyServicePayer calls VerifyServicePayerFunc, accepting every data set when
+// no test sets it.
+func (m *MockServiceTerminator) VerifyServicePayer(ctx context.Context, dataSetID sdktypes.BigInt) error {
+	if m.VerifyServicePayerFunc != nil {
+		return m.VerifyServicePayerFunc(ctx, dataSetID)
+	}
+	return nil
+}
+
+// ContextIdentity returns ContextIdentityValue, or DefaultContextIdentity when
+// no test sets it.
+func (m *MockServiceTerminator) ContextIdentity() storage.ContextIdentity {
+	if m.ContextIdentityValue != (storage.ContextIdentity{}) {
+		return m.ContextIdentityValue
+	}
+	return DefaultContextIdentity
 }
 
 func (m *MockServiceTerminator) TerminateService(ctx context.Context, dataSetID sdktypes.BigInt) (*synapse.TerminationResult, error) {

@@ -11,15 +11,25 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagereplacement"
+	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
+	"github.com/strahe/synapse-go/storage"
 )
 
 const replacementSeedBatchSize = 100
 
 type retirementCheckpoint struct {
+	// AttemptedAt is when the latest termination request was sent.
 	AttemptedAt      time.Time `json:"attempted_at"`
 	TerminationEpoch *int64    `json:"termination_epoch,omitempty"`
 	TransactionHash  string    `json:"transaction_hash,omitempty"`
+	// Sends counts termination requests; it paces the ones that follow an
+	// unobserved outcome.
+	Sends int `json:"sends,omitempty"`
+	// Identity is what the first request signed for. A numeric data set ID means
+	// something else on another chain, so recovery compares this before it reads
+	// the chain or sends again.
+	Identity *storage.ContextIdentity `json:"identity,omitempty"`
 }
 
 func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
@@ -28,7 +38,9 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 		Codec: taskengine.StrictJSONCodec(func(input *storagereplacement.CoordinateInput) error {
 			return storagereplacement.ValidateCoordinateInput(*input)
 		}),
-		RetryLimit: h.retryLimit(), AllowRetry: false,
+		// The coordinator re-reads the replacement ledger on every wake and a
+		// replacement can run for days, so transient errors must not exhaust it.
+		RetryLimit: nil, AllowRetry: false,
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagereplacement.CoordinateInput](execution)
@@ -173,6 +185,12 @@ func (h *TaskHandlers) coordinateReplacementItem(
 		return h.retryReplacement(execution, replacement.ID, err, "replacement_copy_task_load_failed")
 	}
 	if copyTask != nil && copyTask.Status == model.TaskStatusFailed {
+		// The copy task still holds the copy and an operator can retry it, for
+		// example after an unknown transfer outcome, so the replacement waits
+		// for that retry instead of failing as a whole.
+		if h.taskService != nil && h.taskService.Retryable(copyTask) {
+			return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "copy_work", "Waiting for a failed migration task to be retried", nil)
+		}
 		message := "stored content migration failed"
 		if copyTask.LastError != nil {
 			message = *copyTask.LastError
@@ -337,6 +355,15 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
+	if hasCheckpoint && checkpoint.Identity != nil && h.deps.Terminator != nil &&
+		*checkpoint.Identity != h.deps.Terminator.ContextIdentity() {
+		// The wallet or network moved after a request went out. The same numeric
+		// data set ID names a different service on another chain, and an end
+		// epoch read there would say nothing about ours, so this reads nothing
+		// and sends nothing until the original configuration is back.
+		return stopRetirement(abandoned, row.ID,
+			errors.New("the wallet or network changed after storage service retirement began"), "termination_identity_changed")
+	}
 	if terminationEpoch == nil && checkpoint.TerminationEpoch != nil {
 		if *checkpoint.TerminationEpoch < 0 {
 			return taskengine.Fail(errors.New("storage service retirement checkpoint has an invalid epoch"), "invalid_checkpoint", nil)
@@ -346,14 +373,12 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 		))
 	}
 	if terminationEpoch == nil {
-		if hasCheckpoint {
-			err := errors.New("storage service termination outcome could not be recovered")
-			if abandoned {
-				return taskengine.Fail(err, "termination_outcome_unknown", nil)
-			}
-			return taskengine.Fail(err, "termination_outcome_unknown", func(ctx context.Context, repos *repository.Repositories) error {
-				return repos.Replacements.MarkCleanupAttention(ctx, row.ID, err.Error())
-			})
+		if hasCheckpoint && !mayTerminate {
+			// A request may already have been sent. Execute reads the chain before
+			// sending another one, so resuming there cannot end the service twice;
+			// the delay gives the earlier request time to land.
+			wait := max(time.Until(checkpoint.AttemptedAt.Add(unobservedOutcomeDelay(checkpoint.Sends))), 0)
+			return taskengine.Suspend(model.TaskResumeModeExecute, wait, "provider_confirmation", "Checking storage service retirement", nil)
 		}
 		if !mayTerminate {
 			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage service is ready to retire", nil)
@@ -361,7 +386,23 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 		if h.deps.Terminator == nil {
 			return taskengine.Fail(errors.New("storage service terminator is unavailable"), "dependency_unavailable", nil)
 		}
-		checkpoint = retirementCheckpoint{AttemptedAt: time.Now().UTC()}
+		identity := h.deps.Terminator.ContextIdentity()
+		if !contextIdentityComplete(identity) {
+			return taskengine.Fail(errors.New("storage signing identity is incomplete"), "dependency_unavailable", nil)
+		}
+		// Ownership is read before anything is recorded. The checkpoint below
+		// binds the identity a request goes out under; a refusal after it would
+		// bind an identity nothing was sent for, and an operator who put the right
+		// wallet back could never retry past it.
+		if err := h.deps.Terminator.VerifyServicePayer(ctx, dataSet.DataSetID.SDK()); err != nil {
+			if errors.Is(err, synapse.ErrServicePaidByAnother) {
+				return stopRetirement(abandoned, row.ID, err, "termination_payer_mismatch")
+			}
+			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "provider_confirmation", "Checking storage service retirement", nil)
+		}
+		checkpoint = retirementCheckpoint{
+			AttemptedAt: time.Now().UTC(), Sends: checkpoint.Sends + 1, Identity: &identity,
+		}
 		var terminationEpochValue int64
 		var txHash string
 		attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceDestructiveMutation, checkpoint, nil, func(ctx context.Context) error {
@@ -373,18 +414,28 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 			return terminateErr
 		})
 		if err != nil && !attempted {
+			if errors.Is(err, taskengine.ErrResourceBusy) {
+				return taskengine.ResourceWait("Waiting for other removal operations to finish")
+			}
 			return retryTask(err, "termination_not_started")
 		}
-		if err != nil || terminationEpochValue < 0 {
-			if err == nil {
-				err = errors.New("storage service termination returned an invalid epoch")
-			}
-			if abandoned {
-				return taskengine.Fail(err, "termination_outcome_unknown", nil)
-			}
-			return taskengine.Fail(err, "termination_outcome_unknown", func(ctx context.Context, repos *repository.Repositories) error {
-				return repos.Replacements.MarkCleanupAttention(ctx, row.ID, err.Error())
-			})
+		if synapse.IsTerminationBlocked(err) {
+			// Settling payment debt is the operator's decision; it is never
+			// retried automatically.
+			return stopRetirement(abandoned, row.ID, err, "termination_blocked")
+		}
+		if errors.Is(err, synapse.ErrServicePaidByAnother) {
+			return stopRetirement(abandoned, row.ID, err, "termination_payer_mismatch")
+		}
+		if err != nil {
+			// The outcome is unknown, or the provider is still publishing it. The
+			// next request reads the chain first and only goes out while the
+			// service is still running there.
+			return taskengine.Suspend(model.TaskResumeModeExecute, unobservedOutcomeDelay(checkpoint.Sends), "provider_confirmation", "Checking storage service retirement", nil)
+		}
+		if terminationEpochValue < 0 {
+			return stopRetirement(abandoned, row.ID,
+				errors.New("storage service termination returned an invalid epoch"), "termination_outcome_unknown")
 		}
 		checkpoint.TerminationEpoch = &terminationEpochValue
 		checkpoint.TransactionHash = txHash
@@ -409,8 +460,16 @@ func (h *TaskHandlers) runDataSetRetirement(ctx context.Context, execution taske
 			if err := repos.Replacements.CompleteAbandonedTargetTermination(ctx, row.ID); err != nil {
 				return err
 			}
-		} else if err := repos.Replacements.CompleteRetirement(ctx, row.ID, observedEpoch); err != nil {
-			return err
+		} else {
+			// A task retried after it stopped for attention finishes with the
+			// replacement still marked for it. The retirement it was stopped on is
+			// done, so the replacement returns to retiring and completes.
+			if err := repos.Replacements.BeginRetirement(ctx, row.ID); err != nil && !errors.Is(err, repository.ErrConflict) {
+				return err
+			}
+			if err := repos.Replacements.CompleteRetirement(ctx, row.ID, observedEpoch); err != nil {
+				return err
+			}
 		}
 		return repos.Contents.CompleteDataSetRetirementTask(ctx, input.DataSetID, input.Generation, execution.ID())
 	})
@@ -447,6 +506,18 @@ func (h *TaskHandlers) retryRetirement(
 		if replacement == nil || replacement.Status == storagereplacement.StatusSuperseded {
 			return nil
 		}
+		return repos.Replacements.MarkCleanupAttention(ctx, replacementID, err.Error())
+	})
+}
+
+// stopRetirement fails a retirement that needs an operator. A replacement still
+// in progress is marked for cleanup attention; an abandoned target belongs to
+// one that already ended, so only the task stops.
+func stopRetirement(abandoned bool, replacementID int64, err error, reason string) taskengine.Result {
+	if abandoned {
+		return taskengine.Fail(err, reason, nil)
+	}
+	return taskengine.Fail(err, reason, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.Replacements.MarkCleanupAttention(ctx, replacementID, err.Error())
 	})
 }

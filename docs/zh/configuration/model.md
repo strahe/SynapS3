@@ -61,6 +61,8 @@ Admin 端点有独立的暴露范围控制。让 `admin.addr` 保持回环地址
 
 SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL 运维体系或需要外置元数据数据库时，可以使用 PostgreSQL；其 DSN 必须保存在受保护的配置或密钥存储中。
 
+`database.max_open_conns` 决定连接池大小。SQLite 同一时刻仍只有一个连接能写入，其余连接用于读取；写入遇到数据库忙时最多等待 5 秒（`busy_timeout`），超时则以 `SQLITE_BUSY` 失败。
+
 ## 主要配置段
 
 | 配置段 | 用途 |
@@ -86,7 +88,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
 | `database.driver` | `sqlite` |
-| `database.max_open_conns` | `4` |
+| `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
@@ -105,7 +107,7 @@ SQLite 是 SynapS3 单机部署的默认且推荐数据库。已有 PostgreSQL �
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。任务设置修改后必须重启 SynapS3，已经创建的任务保留创建时记录的重试上限。
+`worker.tasks.concurrency` 限制全部后台操作。创建远端存储、Store、Pull 和提交存储承诺共同受 `provider_mutation_concurrency` 限制；远端清理与服务退休共同受 `destructive_mutation_concurrency` 限制。状态和确认查询不占用这些变更并发额度。钱包变更始终串行执行。操作遇到对应额度已满时会先让出、稍后自动再试，不占用 `concurrency` 名额，其他后台任务照常运行。任务设置修改后必须重启 SynapS3，已经创建的任务保留创建时记录的重试上限。
 
 ## Admin 会话时长
 

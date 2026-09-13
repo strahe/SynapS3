@@ -253,7 +253,7 @@ func TestInitAppDataDir_WritesCommentedReferenceConfig(t *testing.T) {
 		"[database]",
 		"driver = \"sqlite\"",
 		"dsn = ",
-		"# max_open_conns = 4",
+		"# max_open_conns = 32",
 		"[cache]",
 		"dir = ",
 		"# max_size_gb = 100",
@@ -423,7 +423,7 @@ func TestSaveForSettingsGeneratedTOMLCommentsAndPreservesAbsentManualFields(t *t
 	for _, want := range []string{
 		"# Database connection string.",
 		"# dsn = \"\"",
-		"# max_open_conns = 4",
+		"# max_open_conns = 32",
 		"driver = \"sqlite\"",
 		"dir = \"/var/lib/synaps3/cache\"",
 	} {
@@ -456,7 +456,7 @@ func assertConfigContains(t *testing.T, text, want string) {
 
 func assertConfigLacksEnabledLine(t *testing.T, text, want string) {
 	t.Helper()
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if line == want {
 			t.Fatalf("generated config contains enabled line %q:\n%s", want, text)
 		}
@@ -465,7 +465,7 @@ func assertConfigLacksEnabledLine(t *testing.T, text, want string) {
 
 func assertConfigLacksEnabledPrefix(t *testing.T, text, prefix string) {
 	t.Helper()
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if strings.HasPrefix(line, prefix) {
 			t.Fatalf("generated config contains enabled line with prefix %q:\n%s", prefix, text)
 		}

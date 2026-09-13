@@ -19,7 +19,9 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 		Codec: taskengine.StrictJSONCodec(func(input *bucketlifecycle.ProvisionInput) error {
 			return bucketlifecycle.ValidateProvisionInput(*input)
 		}),
-		RetryLimit: h.retryLimit(), AllowRetry: true,
+		// Provisioning re-reads bucket state on every wake and can wait a long
+		// time for providers, so transient errors must not exhaust it.
+		RetryLimit: nil, AllowRetry: true,
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[bucketlifecycle.ProvisionInput](execution)

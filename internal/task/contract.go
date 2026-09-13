@@ -21,6 +21,7 @@ var (
 	ErrInvalidResult    = errors.New("invalid task result")
 	ErrRegistryFrozen   = errors.New("task registry is frozen")
 	ErrEffectForbidden  = errors.New("external effects are forbidden during recovery")
+	ErrResourceBusy     = errors.New("task resource is busy")
 	ErrCodecPanic       = errors.New("task input codec panicked")
 	ErrInvalidCanonical = errors.New("task input codec returned invalid canonical JSON")
 )
@@ -136,6 +137,7 @@ type Result struct {
 	kind          ResultKind
 	delay         time.Duration
 	retryBackoff  bool
+	resourceWait  bool
 	resumeMode    model.TaskResumeMode
 	waitReason    string
 	failureReason string
@@ -152,6 +154,16 @@ func Suspend(mode model.TaskResumeMode, delay time.Duration, reason, message str
 	return Result{
 		kind: resultSuspend, resumeMode: mode, delay: delay,
 		waitReason: reason, message: message, settlement: settlement,
+	}
+}
+
+// ResourceWait yields a task that found its resource gate full. It resumes in
+// execute mode after a backoff that grows with the task's consecutive waits,
+// and it consumes no retry budget.
+func ResourceWait(message string) Result {
+	return Result{
+		kind: resultSuspend, resumeMode: model.TaskResumeModeExecute, resourceWait: true,
+		waitReason: "resource", message: message,
 	}
 }
 
@@ -233,6 +245,10 @@ func (e Execution) WriteCheckpointWith(ctx context.Context, value any, settlemen
 	return e.checkpoint(ctx, value, settlement)
 }
 
+// WithResource runs fn while holding one slot of resource. It never waits for a
+// slot: a full gate returns ErrResourceBusy, which handlers turn into
+// ResourceWait. A nested call for a resource the context already holds reuses
+// that slot.
 func (e Execution) WithResource(ctx context.Context, resource Resource, fn func(context.Context) error) error {
 	if e.Mode() != model.TaskResumeModeExecute {
 		return ErrEffectForbidden

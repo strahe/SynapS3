@@ -76,22 +76,7 @@ func (r *BunStorageContentRepo) ReserveCommitAttempt(
 			return nil
 		}
 		var headID int64
-		err = db.NewSelect().
-			Model((*model.StorageCopy)(nil)).
-			Column("id").
-			Where("storage_data_set_id = ?", input.Copy.StorageDataSetID).
-			Where("status = ?", model.StorageCopyStatusPieceReady).
-			Where("commit_ready_at IS NOT NULL").
-			Where(`NOT EXISTS (
-				SELECT 1 FROM storage_commit_attempts AS unresolved_attempt
-				WHERE unresolved_attempt.content_id = storage_copy.content_id
-				  AND unresolved_attempt.storage_data_set_id = storage_copy.storage_data_set_id
-				  AND unresolved_attempt.resolved_at IS NULL
-			)`).
-			OrderExpr("commit_ready_at ASC").
-			OrderExpr("id ASC").
-			Limit(1).
-			Scan(ctx, &headID)
+		err = commitFIFOHead(db, input.Copy.StorageDataSetID).Column("id").Scan(ctx, &headID)
 		if err != nil {
 			return fmt.Errorf("selecting next FIFO storage commit: %w", err)
 		}
@@ -116,6 +101,11 @@ func (r *BunStorageContentRepo) ReserveCommitAttempt(
 		}
 		copyRow, err = loadCommitCopy(ctx, db, copyID, input.Copy.StorageDataSetID)
 		if err != nil {
+			return err
+		}
+		// Capacity may remain after this reservation; the next copy in line
+		// must not sleep through it.
+		if err := wakeCommitFIFOHead(ctx, db, input.Copy.StorageDataSetID); err != nil {
 			return err
 		}
 		out.State = storagecommit.ReservationAcquired
@@ -305,7 +295,10 @@ func (r *BunStorageContentRepo) ResetCommitAttempt(ctx context.Context, input st
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
-		return projectResolvedCommitAttempt(ctx, db, copyID, now, true, true, nullableString(input.LastError))
+		if err := projectResolvedCommitAttempt(ctx, db, copyID, now, true, true, nullableString(input.LastError)); err != nil {
+			return err
+		}
+		return wakeCommitFIFOHead(ctx, db, input.Copy.StorageDataSetID)
 	})
 }
 
@@ -341,7 +334,10 @@ func (r *BunStorageContentRepo) ReleaseCommitAttempt(ctx context.Context, input 
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
-		return projectResolvedCommitAttempt(ctx, db, copyID, now, input.ClearReadyAt, input.ClearExtraData, nil)
+		if err := projectResolvedCommitAttempt(ctx, db, copyID, now, input.ClearReadyAt, input.ClearExtraData, nil); err != nil {
+			return err
+		}
+		return wakeCommitFIFOHead(ctx, db, input.Copy.StorageDataSetID)
 	})
 }
 
@@ -377,7 +373,7 @@ func (r *BunStorageContentRepo) ReleaseCommitReservation(
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return ErrConflict
 		}
-		return nil
+		return wakeCommitFIFOHead(ctx, db, input.Copy.StorageDataSetID)
 	})
 }
 
@@ -397,6 +393,53 @@ func countActiveCommitAttemptsForDataSet(ctx context.Context, db bun.IDB, storag
 		return 0, fmt.Errorf("counting active storage commit attempts: %w", err)
 	}
 	return count, nil
+}
+
+// commitFIFOHead selects the only copy of a data set allowed to reserve the
+// next commit attempt: the oldest ready copy without an unresolved attempt.
+func commitFIFOHead(db bun.IDB, storageDataSetID int64) *bun.SelectQuery {
+	return db.NewSelect().
+		Model((*model.StorageCopy)(nil)).
+		Where("storage_data_set_id = ?", storageDataSetID).
+		Where("status = ?", model.StorageCopyStatusPieceReady).
+		Where("commit_ready_at IS NOT NULL").
+		Where(`NOT EXISTS (
+			SELECT 1 FROM storage_commit_attempts AS unresolved_attempt
+			WHERE unresolved_attempt.content_id = storage_copy.content_id
+			  AND unresolved_attempt.storage_data_set_id = storage_copy.storage_data_set_id
+			  AND unresolved_attempt.resolved_at IS NULL
+		)`).
+		OrderExpr("commit_ready_at ASC").
+		OrderExpr("id ASC").
+		Limit(1)
+}
+
+// wakeCommitFIFOHead makes the queue head's task runnable when its data set has
+// commit capacity, so waiting copies advance without polling. Callers invoke it
+// after any change that frees capacity or moves the head.
+func wakeCommitFIFOHead(ctx context.Context, db bun.IDB, storageDataSetID int64) error {
+	active, err := countActiveCommitAttemptsForDataSet(ctx, db, storageDataSetID)
+	if err != nil {
+		return err
+	}
+	if active >= storagecommit.MaxActiveAttemptsPerDataSet {
+		return nil
+	}
+	var taskID sql.NullInt64
+	err = commitFIFOHead(db, storageDataSetID).Column("active_task_id").Scan(ctx, &taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("selecting storage commit queue head: %w", err)
+	}
+	if !taskID.Valid {
+		return nil
+	}
+	if _, err := (&BunTaskRepo{db: db}).WakePending(ctx, []int64{taskID.Int64}); err != nil {
+		return fmt.Errorf("waking storage commit queue head: %w", err)
+	}
+	return nil
 }
 
 func countCommitAttentionAttemptsForDataSet(ctx context.Context, db bun.IDB, storageDataSetID int64) (int, error) {
@@ -508,6 +551,9 @@ func (r *BunStorageContentRepo) ReleaseCommitAttention(ctx context.Context, inpu
 		}
 		if err := projectResolvedCommitAttempt(ctx, db, copyID, now, true, true, nil); err != nil {
 			return fmt.Errorf("releasing storage confirmation attention: %w", err)
+		}
+		if err := wakeCommitFIFOHead(ctx, db, initial.StorageDataSetID); err != nil {
+			return err
 		}
 		return resumeCommitTaskAfterAttentionRelease(ctx, db, initial.ActiveTaskID)
 	})

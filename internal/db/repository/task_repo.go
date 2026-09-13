@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -195,7 +196,14 @@ func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration
 		return nil, fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
 	}
 	if r.db.Dialect().Name() != dialect.PG {
-		return r.claimNextSQLite(ctx, r.db, leaseDuration)
+		// The claim and its payload read commit together, as on PostgreSQL.
+		var claimed *model.Task
+		err := runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+			var err error
+			claimed, err = r.claimNextSQLite(ctx, db, leaseDuration)
+			return err
+		})
+		return claimed, err
 	}
 	db, ok := r.db.(*bun.DB)
 	if !ok {
@@ -270,7 +278,7 @@ func (r *BunTaskRepo) RenewLease(ctx context.Context, id, generation int64, leas
 	return until, nil
 }
 
-func (r *BunTaskRepo) WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint []byte) error {
+func (r *BunTaskRepo) WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint json.RawMessage) error {
 	if len(checkpoint) == 0 {
 		return fmt.Errorf("checkpoint is required: %w", ErrInvalidInput)
 	}
@@ -290,12 +298,18 @@ func (r *BunTaskRepo) WriteCheckpoint(ctx context.Context, id, generation int64,
 		if rows, _ := result.RowsAffected(); rows != 1 {
 			return ErrTaskLeaseLost
 		}
-		if _, err := db.NewUpdate().
+		// checkpoint must stay a json.RawMessage: bun renders a plain []byte as
+		// a bytea/blob literal, which PostgreSQL jsonb rejects.
+		result, err = db.NewUpdate().
 			Model((*model.TaskPayload)(nil)).
 			Set("checkpoint_json = ?", checkpoint).
 			Where("task_id = ?", id).
-			Exec(ctx); err != nil {
+			Exec(ctx)
+		if err != nil {
 			return fmt.Errorf("writing task %d checkpoint: %w", id, err)
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return fmt.Errorf("writing task %d checkpoint: payload row not found: %w", id, ErrNotFound)
 		}
 		return nil
 	})
@@ -382,10 +396,12 @@ func (r *BunTaskRepo) ShortenLease(ctx context.Context, id, generation int64, du
 		return fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
 	}
 	now := time.Now()
+	shortened := now.Add(duration)
 	result, err := r.db.NewUpdate().
 		Model((*model.Task)(nil)).
 		Set("resume_mode = ?", model.TaskResumeModeRecover).
-		Set("lease_until = ?", now.Add(duration)).
+		// Shortening never extends a lease that already expires sooner.
+		Set("lease_until = CASE WHEN lease_until < ? THEN lease_until ELSE ? END", shortened, shortened).
 		Set("updated_at = ?", now).
 		Where("id = ? AND status = ?", id, model.TaskStatusRunning).
 		Where("claim_generation = ?", generation).
@@ -548,6 +564,61 @@ func (r *BunTaskRepo) AcknowledgeFailed(ctx context.Context, id int64, retention
 	return nil
 }
 
+// acknowledgeFailedMatching selects the failures one bulk dismissal covers. The
+// preview and the dismissal itself share it, so the number an operator confirms
+// is the number that is dismissed.
+func acknowledgeFailedMatching(filter TaskAcknowledgeFilter) func(bun.QueryBuilder) bun.QueryBuilder {
+	return func(query bun.QueryBuilder) bun.QueryBuilder {
+		query = query.
+			Where("status = ? AND acknowledged_at IS NULL", model.TaskStatusFailed).
+			Where("finished_at IS NOT NULL AND finished_at <= ?", filter.FailedBefore)
+		if filter.Type != "" {
+			query = query.Where("type = ?", filter.Type)
+		}
+		return query
+	}
+}
+
+func (r *BunTaskRepo) CountFailedMatching(ctx context.Context, filter TaskAcknowledgeFilter) (int, error) {
+	if filter.FailedBefore.IsZero() {
+		return 0, fmt.Errorf("counting failed tasks: %w", ErrInvalidInput)
+	}
+	count, err := r.db.NewSelect().
+		Model((*model.Task)(nil)).
+		ApplyQueryBuilder(acknowledgeFailedMatching(filter)).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("counting failed tasks: %w", err)
+	}
+	return count, nil
+}
+
+func (r *BunTaskRepo) AcknowledgeFailedMatching(
+	ctx context.Context,
+	filter TaskAcknowledgeFilter,
+	retention time.Duration,
+) (int, error) {
+	if retention <= 0 {
+		return 0, fmt.Errorf("retention must be positive: %w", ErrInvalidInput)
+	}
+	if filter.FailedBefore.IsZero() {
+		return 0, fmt.Errorf("acknowledging failed tasks: %w", ErrInvalidInput)
+	}
+	now := time.Now()
+	result, err := r.db.NewUpdate().
+		Model((*model.Task)(nil)).
+		Set("acknowledged_at = ?", now).
+		Set("retention_until = ?", now.Add(retention)).
+		Set("updated_at = ?", now).
+		ApplyQueryBuilder(acknowledgeFailedMatching(filter)).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("acknowledging failed tasks: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	return int(rows), nil
+}
+
 func (r *BunTaskRepo) DeleteRetained(ctx context.Context, now time.Time, limit int) (int, error) {
 	if now.IsZero() || limit < 1 {
 		return 0, fmt.Errorf("deleting retained tasks: %w", ErrInvalidInput)
@@ -594,7 +665,12 @@ func (r *BunTaskRepo) List(ctx context.Context, filter TaskListFilter) (TaskPage
 		limit = 50
 	}
 	var tasks []model.Task
-	query := withTaskPayload(r.db.NewSelect().Model(&tasks)).
+	// A listing never decodes inputs, so it leaves them out; manual-retry checks
+	// read the checkpoint, which stays.
+	query := r.db.NewSelect().Model(&tasks).
+		ColumnExpr("task.*").
+		ColumnExpr("task_payload.checkpoint_json AS checkpoint").
+		Join("JOIN task_payloads AS task_payload ON task_payload.task_id = task.id").
 		OrderExpr("task.id DESC").
 		Limit(limit + 1)
 	if filter.Type != "" {
@@ -684,32 +760,6 @@ func (r *BunTaskRepo) CountOverviewActivePipeline(ctx context.Context) ([]TaskPi
 		return nil, fmt.Errorf("counting active task pipeline: %w", err)
 	}
 	return counts, nil
-}
-
-func (r *BunTaskRepo) CountActiveObjectTasksByBucket(ctx context.Context, bucketID int64) (int64, error) {
-	var count int64
-	err := r.db.NewRaw(`SELECT COUNT(*)
-		FROM tasks AS t
-		JOIN object_versions AS ov ON ov.version_id = t.subject_key
-		WHERE t.subject_type = 'object_version'
-		  AND t.status IN ('pending', 'running')
-		  AND ov.bucket_id = ?`, bucketID).Scan(ctx, &count)
-	if err != nil {
-		return 0, fmt.Errorf("counting active object tasks by bucket: %w", err)
-	}
-	return count, nil
-}
-
-func (r *BunTaskRepo) CountActiveBucketTasksByBucketID(ctx context.Context, bucketID int64) (int64, error) {
-	count, err := r.db.NewSelect().
-		Model((*model.Task)(nil)).
-		Where("subject_type = 'bucket' AND subject_key = ?", fmt.Sprint(bucketID)).
-		Where("status IN (?, ?)", model.TaskStatusPending, model.TaskStatusRunning).
-		Count(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("counting active bucket tasks: %w", err)
-	}
-	return int64(count), nil
 }
 
 func nullableText(value string) any {

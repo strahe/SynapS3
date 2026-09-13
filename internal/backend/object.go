@@ -122,7 +122,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 		if cacheCommitted {
 			b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after put tx failure")
 		}
-		return s3response.PutObjectOutput{}, err
+		return s3response.PutObjectOutput{}, contentWriteError(err)
 	}
 
 	b.logger.Info("object stored", "bucket", bucketName, "key", keyName, "size", cacheInfo.Size, "versionID", versionID)
@@ -791,7 +791,7 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 		if cacheCommitted {
 			b.releaseContentCacheIfUnreferenced(ctx, input.DestinationBucket.Name, content.ID, "orphaned content cache file after copy tx failure")
 		}
-		return copyObjectVersionResult{}, err
+		return copyObjectVersionResult{}, contentWriteError(err)
 	}
 
 	return copyObjectVersionResult{
@@ -1028,6 +1028,18 @@ func (b *SynapseBackend) requireWritableBucket(ctx context.Context, name string)
 		return nil, apiErr
 	}
 	return bucket, nil
+}
+
+// contentWriteError asks the client to retry a write whose bytes are still
+// being removed after their last version was deleted; the retry then stores
+// them as new content.
+func contentWriteError(err error) error {
+	if !errors.Is(err, repository.ErrContentCleanupInProgress) {
+		return err
+	}
+	apiErr := s3err.GetAPIError(s3err.ErrSlowDown)
+	apiErr.Description = "The same data is still being removed after an earlier delete. Please retry shortly."
+	return apiErr
 }
 
 func stringOrDefault(s *string, def string) string {

@@ -215,7 +215,7 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 	if _, err := repos.Objects.CreateVersionAndSetCurrent(ctx, failed); err != nil {
 		t.Fatalf("seed failed object: %v", err)
 	}
-	overviewSeedFailedCopy(t, repos, bucket.ID, *failed.ContentID)
+	overviewSeedFailedCopy(t, db, repos, bucket.ID, *failed.ContentID)
 
 	// A version is unavailable when nothing can serve it: no cached bytes and
 	// no readable committed copy.
@@ -321,7 +321,7 @@ func TestAPIOverviewIncludesAttentionAndActivePipeline(t *testing.T) {
 
 // overviewSeedFailedCopy binds one copy for a content and fails it, which is
 // how a content's ingest failure is now expressed.
-func overviewSeedFailedCopy(t *testing.T, repos *repository.Repositories, bucketID, contentID int64) {
+func overviewSeedFailedCopy(t *testing.T, db *bun.DB, repos *repository.Repositories, bucketID, contentID int64) {
 	t.Helper()
 	ctx := context.Background()
 	binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
@@ -336,7 +336,10 @@ func overviewSeedFailedCopy(t *testing.T, repos *repository.Repositories, bucket
 	}}); err != nil {
 		t.Fatalf("seed failed copy: %v", err)
 	}
-	if err := repos.Contents.RecordContentFailure(ctx, contentID, "ingest failed"); err != nil {
+	if _, err := db.NewUpdate().Model((*model.StorageContent)(nil)).
+		Set("error_message = ?", "ingest failed").
+		Where("id = ?", contentID).
+		Exec(ctx); err != nil {
 		t.Fatalf("record content failure: %v", err)
 	}
 }

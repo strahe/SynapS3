@@ -132,6 +132,8 @@ export function dataSetGenerationLabel(dataSet: StorageDataSetSummary) {
 
 const replacementErrorMessages: Record<string, string> = {
   replacement_active: 'This replica is already being replaced. Wait for it to finish or retry it below.',
+  replacement_target_creating:
+    'The earlier replacement of this replica is still setting up its new storage service. Wait for it to finish, or retry that setup from Tasks if it stopped.',
   replacement_target_in_use: 'That provider already stores a replica of this bucket. Choose a different one.',
   replacement_target_invalid: 'Choose a provider other than the one being replaced.',
   replacement_no_eligible_provider:

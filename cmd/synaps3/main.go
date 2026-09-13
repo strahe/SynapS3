@@ -21,6 +21,8 @@ import (
 	"github.com/strahe/synaps3/internal/provider"
 	"github.com/strahe/synaps3/internal/synapse"
 	sdk "github.com/strahe/synapse-go"
+	sdkstorage "github.com/strahe/synapse-go/storage"
+	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/uptrace/bun"
 	"github.com/urfave/cli/v3"
 )
@@ -316,7 +318,15 @@ func runServe(ctx context.Context, src config.Source) error {
 	}
 	defer func() { _ = client.Close() }()
 	resolvedAddresses := client.ResolvedAddresses()
-	storageClient := synapse.AdaptStorageService(client.Storage())
+	// What this node signs for. Destructive storage requests compare it against
+	// what a recorded request used, so a changed wallet or network stops them
+	// instead of acting on a data set ID that means something else there.
+	storageIdentity := sdkstorage.ContextIdentity{
+		Payer:        client.Address(),
+		ChainID:      sdktypes.ChainID(client.Chain().ChainID()),
+		RecordKeeper: resolvedAddresses.FWSS,
+	}
+	storageClient := synapse.AdaptStorageService(client.Storage(), client.WarmStorage(), storageIdentity)
 	walletQuerier := synapse.NewWalletQuerier(client.Payments(), client.Address(), client.Chain(), resolvedAddresses)
 	walletOperator := synapse.NewWalletOperator(client.Payments(), resolvedAddresses.USDFC)
 	filecoinReadiness := synapse.NewReadinessChecker(

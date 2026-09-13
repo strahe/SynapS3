@@ -61,6 +61,8 @@ The Admin endpoint has separate exposure controls. Keep `admin.addr` on loopback
 
 SQLite is the default and recommended database for SynapS3 single-node deployments. PostgreSQL remains available when a deployment already operates an external PostgreSQL service or needs an external metadata database. Keep its DSN in protected configuration or secret storage.
 
+`database.max_open_conns` sizes the connection pool. SQLite still writes through one connection at a time; the other connections serve reads, and a write that finds the database busy waits up to five seconds (`busy_timeout`) before it fails with `SQLITE_BUSY`.
+
 ## Main Sections
 
 | Section | Purpose |
@@ -86,7 +88,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `filecoin.network` | `calibration` |
 | `filecoin.default_copies` | `3` |
 | `database.driver` | `sqlite` |
-| `database.max_open_conns` | `4` |
+| `database.max_open_conns` | `32` |
 | `database.max_idle_conns` | `2` |
 | `cache.max_size_gb` | `100` |
 | `cache.eviction_policy` | `lru` |
@@ -105,7 +107,7 @@ SQLite is the default and recommended database for SynapS3 single-node deploymen
 | `admin.auth.username` | `admin` |
 | `admin.auth.session_ttl` | `12h` |
 
-`worker.tasks.concurrency` limits all background operations. Remote storage creation, Store, Pull, and commit submission additionally share `provider_mutation_concurrency`; remote cleanup and service retirement share `destructive_mutation_concurrency`. Status and confirmation checks do not consume either mutation limit. Wallet mutations are serialized. Task settings require a SynapS3 restart, and existing tasks retain the retry limit recorded when they were created.
+`worker.tasks.concurrency` limits all background operations. Remote storage creation, Store, Pull, and commit submission additionally share `provider_mutation_concurrency`; remote cleanup and service retirement share `destructive_mutation_concurrency`. Status and confirmation checks do not consume either mutation limit. Wallet mutations are serialized. An operation that finds its limit full steps aside and tries again shortly instead of holding a `concurrency` slot, so other background work keeps running. Task settings require a SynapS3 restart, and existing tasks retain the retry limit recorded when they were created.
 
 ## Admin Session Lifetime
 

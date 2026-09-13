@@ -459,6 +459,15 @@ func (r *BunObjectRepo) ReleaseContentCacheIfUnreferenced(
 	released := false
 	err := r.runMaybeTx(ctx, func(db bun.IDB) error {
 		contents, err := lockStorageContentsByID(ctx, db, []int64{contentID})
+		if errors.Is(err, ErrNotFound) {
+			// A finished cleanup deleted the content. Its ID is never reused, so a
+			// file still under its key is an orphan that nothing can name.
+			if err := release(); err != nil {
+				return fmt.Errorf("deleting orphaned content cache file: %w", err)
+			}
+			released = true
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("locking content for cache release: %w", err)
 		}
@@ -1109,24 +1118,11 @@ func prepareObjectVersionsForPermanentDelete(
 		}
 	}
 
-	relatedVersionIDs := append([]string(nil), deletingVersionIDs...)
-	var boundVersionIDs []string
-	if len(contentIDs) > 0 {
-		if err := db.NewSelect().
-			Model((*model.ObjectVersion)(nil)).
-			Column("version_id").
-			Where("content_id IN (?)", bun.List(contentIDs)).
-			Scan(ctx, &boundVersionIDs); err != nil {
-			return fmt.Errorf("loading storage upload references for permanent delete: %w", err)
-		}
+	if len(contentIDs) == 0 {
+		return nil
 	}
-	for _, versionID := range boundVersionIDs {
-		relatedVersionIDs = appendUniqueString(relatedVersionIDs, versionID)
-	}
-	sort.Strings(relatedVersionIDs)
-
 	// Ingest is scheduled against the content, so a version cannot be removed
-	// while work is in flight for either the version or the bytes it names.
+	// while work is in flight for the bytes it names.
 	contentSubjectKeys := make([]string, 0, len(contentIDs))
 	for _, contentID := range contentIDs {
 		contentSubjectKeys = append(contentSubjectKeys, strconv.FormatInt(contentID, 10))
@@ -1135,16 +1131,8 @@ func prepareObjectVersionsForPermanentDelete(
 	taskQuery := db.NewSelect().
 		Model(&relatedTasks).
 		Column("id", "status").
+		Where("subject_type = ? AND subject_key IN (?)", "storage_content", bun.List(contentSubjectKeys)).
 		OrderExpr("id ASC")
-	if len(contentSubjectKeys) > 0 {
-		taskQuery = taskQuery.Where(
-			"(subject_type = ? AND subject_key IN (?)) OR (subject_type = ? AND subject_key IN (?))",
-			"object_version", bun.List(relatedVersionIDs),
-			"storage_content", bun.List(contentSubjectKeys),
-		)
-	} else {
-		taskQuery = taskQuery.Where("subject_type = ? AND subject_key IN (?)", "object_version", bun.List(relatedVersionIDs))
-	}
 	if db.Dialect().Name() == dialect.PG {
 		taskQuery = taskQuery.For("UPDATE")
 	}
@@ -1155,9 +1143,6 @@ func prepareObjectVersionsForPermanentDelete(
 		if relatedTasks[i].Status == model.TaskStatusPending || relatedTasks[i].Status == model.TaskStatusRunning {
 			return ErrPermanentDeleteStorageBusy
 		}
-	}
-	if len(contentIDs) == 0 {
-		return nil
 	}
 
 	copiesByContentID := make(map[int64][]model.StorageCopy)
@@ -1224,6 +1209,9 @@ func prepareObjectVersionsForPermanentDelete(
 			rows, _ := res.RowsAffected()
 			if rows == 0 {
 				return fmt.Errorf("cancelling storage copy %d for permanent delete: %w", copyRow.ID, ErrPermanentDeleteStorageBusy)
+			}
+			if err := wakeCommitFIFOHead(ctx, db, copyRow.StorageDataSetID); err != nil {
+				return err
 			}
 		}
 		if _, err := db.NewUpdate().
@@ -1330,28 +1318,37 @@ func storageUploadCopyHasAttemptedCommit(copyRow model.StorageCopy) bool {
 		copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != ""
 }
 
+// reserveStorageCleanupForDeletedVersions starts the cleanup of content once the
+// deletion removes its last live version; while another version still names the
+// bytes nothing is reserved. It is reserved even without a committed copy,
+// because the cleanup is also what finally deletes the content's rows.
 func reserveStorageCleanupForDeletedVersions(ctx context.Context, db bun.IDB, contentID int64, deletedVersionIDs []string) (*StorageCleanupReservation, error) {
 	if contentID == 0 || len(deletedVersionIDs) == 0 {
 		return nil, fmt.Errorf("preparing storage cleanup: %w", ErrInvalidInput)
+	}
+	live, err := selectLiveObjectVersionForStorageContent(ctx, db, &model.StorageContent{ID: contentID}, deletedVersionIDs)
+	if err != nil {
+		return nil, err
+	}
+	if live != nil {
+		return nil, nil
 	}
 	copies, err := storageCleanupCopySnapshots(ctx, db, contentID)
 	if err != nil {
 		return nil, err
 	}
-	if len(copies) == 0 {
-		return nil, nil
-	}
 	now := time.Now()
-	for i := range copies {
-		copies[i].CreatedAt = now
-		copies[i].UpdatedAt = now
-	}
-	_, err = db.NewInsert().
-		Model(&copies).
-		On("CONFLICT (content_id, storage_data_set_id, piece_id) DO NOTHING").
-		Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("persisting storage cleanup snapshots: %w", err)
+	if len(copies) > 0 {
+		for i := range copies {
+			copies[i].CreatedAt = now
+			copies[i].UpdatedAt = now
+		}
+		if _, err := db.NewInsert().
+			Model(&copies).
+			On("CONFLICT (content_id, storage_data_set_id, piece_id) DO NOTHING").
+			Exec(ctx); err != nil {
+			return nil, fmt.Errorf("persisting storage cleanup snapshots: %w", err)
+		}
 	}
 	reservation := new(StorageCleanupReservation)
 	err = db.NewRaw(`UPDATE storage_contents
@@ -1363,16 +1360,6 @@ func reserveStorageCleanupForDeletedVersions(ctx context.Context, db bun.IDB, co
 		return nil, fmt.Errorf("reserving storage cleanup generation: %w", err)
 	}
 	return reservation, nil
-}
-
-func appendUniqueString(values []string, value string) []string {
-	if value == "" {
-		return values
-	}
-	if slices.Contains(values, value) {
-		return values
-	}
-	return append(values, value)
 }
 
 func storageCleanupCopySnapshots(ctx context.Context, db bun.IDB, contentID int64) ([]model.StorageCleanupCopy, error) {
@@ -1387,6 +1374,7 @@ func storageCleanupCopySnapshots(ctx context.Context, db bun.IDB, contentID int6
 			storage_data_set.client_data_set_id,
 			storage_copy.piece_id,
 			storage_content.piece_cid,
+			storage_content.checksum,
 			storage_copy.retrieval_url,
 			? AS status
 		FROM storage_copies AS storage_copy

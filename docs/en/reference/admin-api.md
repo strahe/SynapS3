@@ -284,10 +284,32 @@ If the attempt changed after it was inspected, the API returns `409 Conflict`. I
 | `GET` | `/api/v1/tasks/stats` | Count tasks by status. |
 | `POST` | `/api/v1/tasks/{id}/retry` | Recover a failed task when `retryable` is true. |
 | `POST` | `/api/v1/tasks/{id}/acknowledge` | Dismiss a failed task when `acknowledgeable` is true. Acknowledgement starts its retention period, after which it may be cleaned up. |
+| `GET` | `/api/v1/tasks/acknowledge/preview` | Count what a bulk dismissal would cover. Accepts the same optional `type`. Returns `count` and the `as_of` cutoff it counted at. |
+| `POST` | `/api/v1/tasks/acknowledge` | Dismiss a backlog of failed tasks at once. Returns `acknowledged` with the number dismissed. |
 
 `status` is `pending`, `running`, `completed`, `failed`, or `cancelled`. `presentation_status` renders pending work as `queued`, `scheduled`, or `waiting`, and acknowledged failures as `dismissed`. Responses also include `operation`, optional subject identity, and server-computed `retryable` and `acknowledgeable` flags.
 
 The `status` filter also accepts `dismissed`. `status=failed` returns only unacknowledged failures, while `status=dismissed` returns acknowledged failures. `/api/v1/tasks/stats` reports those groups separately as `failed` and `dismissed`.
+
+Bulk dismissal takes a JSON body with an optional `type` and an optional RFC 3339 `failed_before`, which defaults to the moment the request is handled:
+
+```json
+{
+  "type": "storage_store",
+  "failed_before": "2026-09-12T08:30:00Z"
+}
+```
+
+Failures recorded after that moment stay visible, so a backlog can be cleared without hiding a failure nobody has reviewed. An unknown `type` or an unparsable `failed_before` returns `400 Bad Request`, as does a body with unknown fields, trailing content, or more than 4 KiB.
+
+To show a number before dismissing, count first and then confirm with the cutoff that count was taken at:
+
+```bash
+curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
+# {"count":12,"as_of":"2026-09-12T08:30:00.123456789Z"}
+```
+
+Passing that `as_of` back as `failed_before` dismisses exactly what was counted.
 
 `/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`.
 

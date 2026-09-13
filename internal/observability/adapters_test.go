@@ -15,7 +15,7 @@ func TestStorageDataSetScannerMapsDataSetDetails(t *testing.T) {
 	finder := &dataSetDetailsFinder{dataSets: []*storage.DataSetDetails{
 		nil,
 		{
-			DataSetInfo: &warmstorage.DataSetInfo{
+			DataSetInfo: warmstorage.DataSetInfo{
 				DataSetID:       sdktypes.NewBigInt(1001),
 				ClientDataSetID: sdktypes.NewBigInt(9001),
 				ProviderID:      sdktypes.NewBigInt(101),
@@ -26,7 +26,7 @@ func TestStorageDataSetScannerMapsDataSetDetails(t *testing.T) {
 			Metadata:        map[string]string{"source": "synaps3", "bucket": "photos"},
 		},
 		{
-			DataSetInfo: &warmstorage.DataSetInfo{
+			DataSetInfo: warmstorage.DataSetInfo{
 				DataSetID:       sdktypes.NewBigInt(1002),
 				ClientDataSetID: sdktypes.NewBigInt(9002),
 				ProviderID:      sdktypes.NewBigInt(102),
@@ -37,7 +37,7 @@ func TestStorageDataSetScannerMapsDataSetDetails(t *testing.T) {
 			Metadata:        map[string]string{"source": "synaps3", "bucket": "empty"},
 		},
 		{
-			DataSetInfo: &warmstorage.DataSetInfo{
+			DataSetInfo: warmstorage.DataSetInfo{
 				DataSetID:       sdktypes.NewBigInt(1003),
 				ClientDataSetID: sdktypes.NewBigInt(9003),
 				ProviderID:      sdktypes.NewBigInt(103),

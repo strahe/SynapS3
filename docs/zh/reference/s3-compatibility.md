@@ -59,7 +59,7 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 
 ## 版本控制行为
 
-存储桶按 versioning-enabled 处理。不带 `versionId` 的删除会创建 delete marker。带 `versionId` 的请求要么删除对应的数据版本或 delete marker，要么返回错误；系统不会保留请求并在之后自动执行。删除 delete marker 不受 Filecoin 存储进度阻塞。当存储工作仍在进行，或已提交的 Filecoin 交易仍在等待确认时，删除数据版本会收到 `400 InvalidRequest`，`DeleteObjects` 则为对应条目返回 `InvalidRequest`。对于其他条件均符合永久删除要求的数据版本，已停止且尚未提交交易的存储工作不会阻止删除。数据版本删除后，不再被任何版本引用的远端存储会进入后台清理；其他版本仍在使用的共享存储会保留。Version listing 会返回对象版本和 delete markers。
+存储桶按 versioning-enabled 处理。不带 `versionId` 的删除会创建 delete marker。带 `versionId` 的请求要么删除对应的数据版本或 delete marker，要么返回错误；系统不会保留请求并在之后自动执行。删除 delete marker 不受 Filecoin 存储进度阻塞。当存储工作仍在进行，或已提交的 Filecoin 交易仍在等待确认时，删除数据版本会收到 `400 InvalidRequest`，`DeleteObjects` 则为对应条目返回 `InvalidRequest`。对于其他条件均符合永久删除要求的数据版本，已停止且尚未提交交易的存储工作不会阻止删除。数据版本删除后，不再被任何版本引用的远端存储会进入后台清理；其他版本仍在使用的共享存储会保留。清理会请求存储提供方删除副本，但并非所有存储提供方都支持：提供方不支持或无法删除的副本，在该版本从网关消失后仍可能留在提供方处。清理完成前（通常几分钟内），向该存储桶上传相同内容会收到 `503 SlowDown`；稍后重试即可，届时会作为新数据存储。Version listing 会返回对象版本和 delete markers。
 
 ## 有意不支持
 

@@ -74,7 +74,11 @@ type taskHarness struct {
 
 func newTaskHarness(t *testing.T, handler Handler, config *EngineConfig) taskHarness {
 	t.Helper()
-	db := testutil.NewTestFileDB(t)
+	return newTaskHarnessWithDB(t, testutil.NewTestFileDB(t), handler, config)
+}
+
+func newTaskHarnessWithDB(t *testing.T, db *bun.DB, handler Handler, config *EngineConfig) taskHarness {
+	t.Helper()
 	repos := repository.NewRepositories(db)
 	registry := NewRegistry()
 	if err := registry.Register(handler); err != nil {
@@ -323,25 +327,69 @@ func TestRetryBackoffUsesPersistedRetryCount(t *testing.T) {
 	}
 }
 
-func TestRetryDelayIsExponentialJitteredAndCapped(t *testing.T) {
+func TestBackoffDelayIsExponentialJitteredAndCapped(t *testing.T) {
 	tests := []struct {
-		name       string
-		retryCount int
-		jitter     float64
-		want       time.Duration
+		name          string
+		attempt       int
+		base, maximum time.Duration
+		jitter        float64
+		want          time.Duration
 	}{
-		{name: "first low jitter", retryCount: 0, jitter: 0, want: 8 * time.Second},
-		{name: "first midpoint", retryCount: 0, jitter: 0.5, want: 10 * time.Second},
-		{name: "third midpoint", retryCount: 2, jitter: 0.5, want: 40 * time.Second},
-		{name: "negative count", retryCount: -1, jitter: 0.5, want: 10 * time.Second},
-		{name: "hard cap", retryCount: 20, jitter: 1, want: 5 * time.Minute},
+		{name: "first retry low jitter", attempt: 0, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0, want: 8 * time.Second},
+		{name: "first retry midpoint", attempt: 0, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0.5, want: 10 * time.Second},
+		{name: "third retry midpoint", attempt: 2, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0.5, want: 40 * time.Second},
+		{name: "negative count", attempt: -1, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 0.5, want: 10 * time.Second},
+		{name: "retry hard cap", attempt: 20, base: retryBaseDelay, maximum: retryMaximumDelay, jitter: 1, want: 5 * time.Minute},
+		{name: "first resource wait", attempt: 0, base: resourceWaitBaseDelay, maximum: resourceWaitMaximumDelay, jitter: 0.5, want: 2 * time.Second},
+		{name: "resource wait hard cap", attempt: 20, base: resourceWaitBaseDelay, maximum: resourceWaitMaximumDelay, jitter: 1, want: time.Minute},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := retryDelayWithJitter(tt.retryCount, tt.jitter); got != tt.want {
+			if got := backoffDelay(tt.attempt, tt.base, tt.maximum, tt.jitter); got != tt.want {
 				t.Fatalf("delay = %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResourceWaitBacksOffWithoutConsumingRetries(t *testing.T) {
+	noRetries := 0
+	var executions atomic.Int64
+	harness := newTaskHarness(t, scriptedHandler{
+		definition: testDefinition(&noRetries, true),
+		execute: func(context.Context, Execution) Result {
+			switch executions.Add(1) {
+			case 3:
+				return Suspend(model.TaskResumeModeExecute, 0, "dependency", "Waiting for something else", nil)
+			case 5:
+				return Complete("admitted", nil)
+			default:
+				return ResourceWait("Waiting for capacity")
+			}
+		},
+	}, nil)
+	var streaks []int
+	harness.engine.resourceWaitDelay = func(consecutive int) time.Duration {
+		streaks = append(streaks, consecutive)
+		return 0
+	}
+	row := enqueueTestTask(t, harness, "resource-wait", "resource-wait")
+
+	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+	waiting, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || waiting.Status != model.TaskStatusPending || waiting.ResumeMode != model.TaskResumeModeExecute ||
+		waiting.WaitReason == nil || *waiting.WaitReason != "resource" || waiting.RetryCount != 0 || len(waiting.Checkpoint) != 0 {
+		t.Fatalf("waiting task = %#v, err=%v", waiting, err)
+	}
+	for range 4 {
+		harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+	}
+	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil || stored.Status != model.TaskStatusCompleted || stored.RetryCount != 0 {
+		t.Fatalf("task after resource waits = %#v, err=%v", stored, err)
+	}
+	if fmt.Sprint(streaks) != "[0 1 0]" {
+		t.Fatalf("resource wait streaks = %v, want [0 1 0]: consecutive waits back off and any other outcome resets", streaks)
 	}
 }
 
@@ -810,6 +858,53 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 	}
 }
 
+func TestCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T) {
+	for name, openDB := range map[string]func(*testing.T) *bun.DB{
+		"sqlite":   testutil.NewTestFileDB,
+		"postgres": testutil.NewTestPostgresDB,
+	} {
+		t.Run(name, func(t *testing.T) {
+			limit := 5
+			var repos *repository.Repositories
+			var duringEffect json.RawMessage
+			harness := newTaskHarnessWithDB(t, openDB(t), scriptedHandler{
+				definition: testDefinition(&limit, true),
+				execute: func(ctx context.Context, execution Execution) Result {
+					attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, map[string]string{"attempt": "one"}, nil, func(ctx context.Context) error {
+						stored, err := repos.Tasks.GetByID(ctx, execution.ID())
+						if err != nil {
+							return err
+						}
+						duringEffect = stored.Checkpoint
+						return nil
+					})
+					if !attempted || err != nil {
+						return Fail(fmt.Errorf("checkpointed effect = attempted:%v err:%v", attempted, err), "unexpected_effect_result", nil)
+					}
+					return Complete("effect finished", nil)
+				},
+			}, nil)
+			repos = harness.repos
+			row := enqueueTestTask(t, harness, "checkpoint-commit", "checkpoint-commit")
+			harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+
+			stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+			if err != nil {
+				t.Fatalf("load task: %v", err)
+			}
+			if stored.Status != model.TaskStatusCompleted {
+				t.Fatalf("task after effect = %#v", stored)
+			}
+			for label, raw := range map[string]json.RawMessage{"during effect": duringEffect, "after settlement": stored.Checkpoint} {
+				var checkpoint map[string]string
+				if err := json.Unmarshal(raw, &checkpoint); err != nil || checkpoint["attempt"] != "one" {
+					t.Fatalf("checkpoint %s = %s, err=%v", label, raw, err)
+				}
+			}
+		})
+	}
+}
+
 func TestExternalEffectRevalidatesClaimAfterResourceAdmission(t *testing.T) {
 	limit := 5
 	var called atomic.Bool
@@ -1204,57 +1299,153 @@ func TestClaimNextConcurrentClaimsAreUnique(t *testing.T) {
 	}
 }
 
-func TestProviderResourceGateReachesAndEnforcesConfiguredLimit(t *testing.T) {
+func TestResourceGateYieldsWhenFullAndReusesHeldSlot(t *testing.T) {
 	limit := 5
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)
-	const calls = 12
-	var running, maximum atomic.Int64
-	entered := make(chan struct{}, calls)
+	capacity := harness.engine.config.ProviderMutationConcurrency
+	entered := make(chan struct{}, capacity)
+	nest := make(chan struct{})
+	nested := make(chan error, capacity)
 	release := make(chan struct{})
-	errorsCh := make(chan error, calls)
-	var workers sync.WaitGroup
-	for range calls {
-		workers.Go(func() {
-			err := harness.engine.withResource(t.Context(), ResourceProviderMutation, func(context.Context) error {
-				current := running.Add(1)
-				for {
-					observed := maximum.Load()
-					if current <= observed || maximum.CompareAndSwap(observed, current) {
-						break
-					}
-				}
+	held := make(chan error, capacity)
+	var holders sync.WaitGroup
+	for range capacity {
+		holders.Go(func() {
+			held <- harness.engine.withResource(t.Context(), ResourceProviderMutation, func(ctx context.Context) error {
 				entered <- struct{}{}
+				<-nest
+				nested <- harness.engine.withResource(ctx, ResourceProviderMutation, func(context.Context) error { return nil })
 				<-release
-				running.Add(-1)
 				return nil
 			})
-			errorsCh <- err
 		})
 	}
-	for range harness.engine.config.ProviderMutationConcurrency {
+	for range capacity {
 		select {
 		case <-entered:
 		case <-time.After(time.Second):
-			t.Fatal("provider mutation gate did not reach configured concurrency")
+			t.Fatal("provider mutation gate did not admit its configured capacity")
 		}
 	}
-	if maximum.Load() != int64(harness.engine.config.ProviderMutationConcurrency) {
-		t.Fatalf("provider mutation concurrency = %d", maximum.Load())
+	called := false
+	err := harness.engine.withResource(t.Context(), ResourceProviderMutation, func(context.Context) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, ErrResourceBusy) || called {
+		t.Fatalf("full gate = called:%v err:%v, want immediate ErrResourceBusy", called, err)
 	}
-	select {
-	case <-entered:
-		t.Fatal("provider mutation gate exceeded configured concurrency")
-	case <-time.After(20 * time.Millisecond):
+	close(nest)
+	for range capacity {
+		if err := <-nested; err != nil {
+			t.Fatalf("nested use of a held slot on a full gate: %v", err)
+		}
 	}
 	close(release)
-	workers.Wait()
-	close(errorsCh)
-	for err := range errorsCh {
+	holders.Wait()
+	close(held)
+	for err := range held {
 		if err != nil {
-			t.Fatalf("provider resource call: %v", err)
+			t.Fatalf("slot holder: %v", err)
 		}
 	}
-	if maximum.Load() != 4 {
-		t.Fatalf("provider mutation maximum = %d, want 4", maximum.Load())
+	if err := harness.engine.withResource(t.Context(), ResourceProviderMutation, func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("gate after release: %v", err)
+	}
+}
+
+func TestResourceWaitFreesWorkersForOtherTasks(t *testing.T) {
+	noRetries := 0
+	holding := make(chan string, 3)
+	release := make(chan struct{})
+	harness := newTaskHarness(t, scriptedHandler{
+		definition: testDefinition(&noRetries, true),
+		execute: func(ctx context.Context, execution Execution) Result {
+			input, err := DecodeInput[testInput](execution)
+			if err != nil {
+				return Fail(err, "invalid_input", nil)
+			}
+			if input.Value == "plain" {
+				return Complete("plain work finished", nil)
+			}
+			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, input, nil, func(ctx context.Context) error {
+				holding <- input.Value
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+			if !attempted && errors.Is(err, ErrResourceBusy) {
+				return ResourceWait("Waiting for capacity")
+			}
+			if err != nil {
+				return Fail(err, "unexpected_effect_error", nil)
+			}
+			return Complete("gated work finished", nil)
+		},
+	}, &EngineConfig{
+		Concurrency: 2, PollInterval: 10 * time.Millisecond, LeaseDuration: 5 * time.Second, Retention: time.Hour,
+		ProviderMutationConcurrency: 1, DestructiveMutationConcurrency: 1,
+	})
+	harness.engine.resourceWaitDelay = func(int) time.Duration { return 50 * time.Millisecond }
+	gated := map[string]*model.Task{}
+	for _, key := range []string{"gated-1", "gated-2", "gated-3"} {
+		gated[key] = enqueueTestTask(t, harness, key, key)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	stopped := make(chan struct{})
+	go func() {
+		_ = harness.engine.Run(ctx)
+		close(stopped)
+	}()
+	defer func() {
+		cancel()
+		<-stopped
+	}()
+	waitFor := func(id int64, predicate func(*model.Task) bool) *model.Task {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			stored, err := harness.repos.Tasks.GetByID(t.Context(), id)
+			if err != nil {
+				t.Fatalf("load task %d: %v", id, err)
+			}
+			if predicate(stored) {
+				return stored
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("task %d did not reach the expected state: %#v", id, stored)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	var holder string
+	select {
+	case holder = <-holding:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no gated task acquired the provider slot")
+	}
+	// With both workers saturated by gated work, a blocking gate would starve
+	// this task until the slot holder finished.
+	plain := enqueueTestTask(t, harness, "plain", "plain")
+	waitFor(plain.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+	for key, row := range gated {
+		if key == holder {
+			continue
+		}
+		waitFor(row.ID, func(task *model.Task) bool {
+			return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeExecute &&
+				task.WaitReason != nil && *task.WaitReason == "resource" && task.RetryCount == 0 && len(task.Checkpoint) == 0
+		})
+	}
+	close(release)
+	for _, row := range gated {
+		stored := waitFor(row.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusCompleted })
+		if stored.RetryCount != 0 {
+			t.Fatalf("gated task consumed retries while waiting: %#v", stored)
+		}
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/objectdeletion"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/synapse"
 	"github.com/strahe/synaps3/internal/systemtask"
@@ -37,6 +38,8 @@ const (
 type cleanupCheckpoint struct {
 	CopyID      int64     `json:"copy_id"`
 	AttemptedAt time.Time `json:"attempted_at"`
+	// Finalized records that the content's rows were deleted.
+	Finalized bool `json:"finalized,omitempty"`
 }
 
 type cacheCapacityCheckpoint struct {
@@ -501,6 +504,15 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 	if h.deps.Storage == nil {
 		return taskengine.Fail(errors.New("storage cleanup client is unavailable"), "dependency_unavailable", nil)
 	}
+	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[cleanupCheckpoint](execution)
+	if err != nil {
+		return taskengine.Fail(err, "invalid_checkpoint", nil)
+	}
+	// Finalizing deleted the content's rows, so there is nothing left to
+	// authorize against.
+	if checkpoint.Finalized {
+		return taskengine.Complete("Stored data removed", nil)
+	}
 	copies, err := h.deps.Repositories.StorageCleanup.AuthorizeTask(ctx, input.ContentID, input.Generation, execution.ID())
 	if err != nil {
 		if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) {
@@ -518,18 +530,12 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 	if hasReferences {
 		return taskengine.Suspend(model.TaskResumeModeRecover, dependencyWait, "references", "Waiting for stored data references", nil)
 	}
-	checkpoint, hasCheckpoint, err := taskengine.DecodeCheckpoint[cleanupCheckpoint](execution)
-	if err != nil {
-		return taskengine.Fail(err, "invalid_checkpoint", nil)
-	}
-	hasUnsupported := false
 	for i := range copies {
 		copyRow := copies[i]
 		switch copyRow.Status {
-		case model.StorageCleanupCopyStatusRemoved:
-			continue
-		case model.StorageCleanupCopyStatusUnsupported:
-			hasUnsupported = true
+		// A deletion the provider cannot perform stays recorded as unsupported
+		// and does not keep the content from being finalized.
+		case model.StorageCleanupCopyStatusRemoved, model.StorageCleanupCopyStatusUnsupported:
 			continue
 		}
 		if copyRow.DataSetID == nil || copyRow.DataSetID.IsZero() || copyRow.ProviderID.IsZero() || copyRow.PieceID.IsZero() || copyRow.PieceCID == "" {
@@ -537,7 +543,6 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 			if err := h.deps.Repositories.StorageCleanup.MarkCopyUnsupported(ctx, copyRow.ID, message); err != nil {
 				return retryTask(err, "cleanup_evidence_failed")
 			}
-			hasUnsupported = true
 			continue
 		}
 		pieceCID, err := cid.Parse(copyRow.PieceCID)
@@ -546,7 +551,6 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 			if markErr := h.deps.Repositories.StorageCleanup.MarkCopyUnsupported(ctx, copyRow.ID, message); markErr != nil {
 				return retryTask(markErr, "cleanup_evidence_failed")
 			}
-			hasUnsupported = true
 			continue
 		}
 		providerID := copyRow.ProviderID.SDK()
@@ -591,6 +595,9 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 		})
 		if err != nil {
 			if !attempted {
+				if errors.Is(err, taskengine.ErrResourceBusy) {
+					return taskengine.ResourceWait("Waiting for other removal operations to finish")
+				}
 				return retryTask(err, "cleanup_not_started")
 			}
 			return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Checking remote cleanup", nil)
@@ -600,12 +607,40 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
 	}
-	if hasUnsupported {
-		return taskengine.Fail(errors.New("one or more remote replica deletions are unsupported"), "cleanup_unsupported", nil)
+	return h.finishStorageCleanup(ctx, execution, input)
+}
+
+// finishStorageCleanup releases the content's cached bytes and then deletes its
+// current-state rows, so writing the same bytes again starts new content. The
+// ledgers keep their rows, including any remote deletion left unsupported.
+func (h *TaskHandlers) finishStorageCleanup(ctx context.Context, execution taskengine.Execution, input storagecleanup.Input) taskengine.Result {
+	if h.deps.Cache == nil || h.deps.CacheGate == nil || h.deps.CacheTracker == nil {
+		return taskengine.Fail(errors.New("cache dependencies are unavailable"), "dependency_unavailable", nil)
 	}
-	return taskengine.Complete("Remote replicas removed", func(ctx context.Context, repos *repository.Repositories) error {
-		return repos.StorageCleanup.CompleteTask(ctx, input.ContentID, input.Generation, execution.ID())
+	content, err := h.deps.Repositories.Contents.GetByID(ctx, input.ContentID)
+	if err != nil || content == nil {
+		return retryTask(errors.Join(err, repository.ErrNotFound), "cleanup_content_load_failed")
+	}
+	bucket, err := h.deps.Repositories.Buckets.GetByID(ctx, content.BucketID)
+	if err != nil || bucket == nil {
+		return retryTask(errors.Join(err, repository.ErrNotFound), "cleanup_bucket_load_failed")
+	}
+	if _, err := objectdeletion.ReleaseContentCache(
+		ctx, h.deps.Cache, h.deps.CacheGate, h.deps.CacheTracker, h.deps.Repositories.Objects, bucket.Name, input.ContentID,
+	); err != nil {
+		return retryTask(err, "cleanup_cache_release_failed")
+	}
+	finalized := cleanupCheckpoint{AttemptedAt: time.Now().UTC(), Finalized: true}
+	err = execution.WriteCheckpointWith(ctx, finalized, func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.StorageCleanup.FinalizeContent(ctx, input.ContentID, input.Generation, execution.ID())
 	})
+	if errors.Is(err, repository.ErrContentCleanupNotReady) {
+		return taskengine.Suspend(model.TaskResumeModeRecover, dependencyWait, "references", "Waiting for other work on the stored data to finish", nil)
+	}
+	if err != nil {
+		return retryTask(err, "cleanup_finalize_failed")
+	}
+	return taskengine.Complete("Stored data removed", nil)
 }
 
 func (h *TaskHandlers) walletHandler() taskengine.Handler {
@@ -666,6 +701,9 @@ func (h *TaskHandlers) executeWalletOperation(ctx context.Context, execution tas
 	})
 	if err != nil {
 		if !attempted {
+			if errors.Is(err, taskengine.ErrResourceBusy) {
+				return taskengine.ResourceWait("Waiting for another wallet operation to finish")
+			}
 			return retryTask(err, "wallet_broadcast_not_started")
 		}
 		message := fmt.Sprintf("wallet broadcast outcome is unknown: %v", err)

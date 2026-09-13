@@ -52,7 +52,7 @@ func (s *StorageDataSetScanner) ScanWalletDataSets(ctx context.Context) ([]Chain
 	}
 	out := make([]ChainDataSet, 0, len(dataSets))
 	for _, dataSet := range dataSets {
-		if dataSet == nil || dataSet.DataSetInfo == nil {
+		if dataSet == nil || dataSet.DataSetID.IsZero() {
 			continue
 		}
 		hasActivePieces := dataSet.HasActivePieces

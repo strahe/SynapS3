@@ -15,6 +15,7 @@ func TestBaselineRepresentativeQueriesUseSupportingIndexes(t *testing.T) {
 			t.Fatalf("create initial schema: %v", err)
 		}
 		seedObjectPlanBacklog(t, db)
+		seedStorageCommitPlanBacklog(t, db)
 		seedTaskPlanBacklog(t, db)
 		seedWalletPlanBacklog(t, db)
 
@@ -220,6 +221,97 @@ func seedObjectPlanBacklog(t *testing.T, db *bun.DB) {
 		t.Fatalf("seed query-plan version history: %v", err)
 	}
 	for _, table := range []string{"objects", "object_versions", "object_cache"} {
+		if _, err := db.ExecContext(t.Context(), "ANALYZE "+table); err != nil {
+			t.Fatalf("analyze query-plan table %s: %v", table, err)
+		}
+	}
+}
+
+func seedStorageCommitPlanBacklog(t *testing.T, db *bun.DB) {
+	t.Helper()
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO storage_data_sets (
+		id, bucket_id, provider_id, copy_index, generation, is_current,
+		data_set_id, status, created_at, updated_at)
+		VALUES (1, 1, 'query-plan-provider', 0, 1, TRUE,
+		'query-plan-data-set', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed query-plan storage data set: %v", err)
+	}
+
+	// A representative history backlog makes the unresolved partial index
+	// materially cheaper than the broader copy-history index.
+	var insertCopies, insertHistory, insertUnresolved string
+	if db.Dialect().Name() == dialect.PG {
+		insertCopies = `INSERT INTO storage_copies (
+			content_id, bucket_id, content_size, storage_data_set_id, copy_index,
+			provider_id, piece_id, transfer_method, status, commit_ready_at,
+			created_at, updated_at)
+			SELECT value, 1, 1, 1, 0,
+			       'query-plan-provider', 'piece-' || value, 'ingress', 'piece_ready',
+			       '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM generate_series(1, 512) AS series(value)`
+		insertHistory = `INSERT INTO storage_commit_attempts (
+			attempt_id, content_id, storage_data_set_id, status, release_reason,
+			resolved_at, created_at, updated_at)
+			SELECT 'history-' || content_id || '-' || generation, content_id, 1,
+			       'released', 'query_plan_history', CURRENT_TIMESTAMP,
+			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM generate_series(1, 512) AS contents(content_id)
+			CROSS JOIN generate_series(1, 8) AS generations(generation)`
+		insertUnresolved = `INSERT INTO storage_commit_attempts (
+			attempt_id, content_id, storage_data_set_id, status, created_at, updated_at)
+			SELECT 'unresolved-' || content_id, content_id, 1, 'reserved',
+			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM generate_series(8, 512, 8) AS contents(content_id)`
+	} else {
+		insertCopies = `WITH RECURSIVE contents(content_id) AS (
+			SELECT 1 UNION ALL SELECT content_id + 1 FROM contents WHERE content_id < 512
+		)
+		INSERT INTO storage_copies (
+			content_id, bucket_id, content_size, storage_data_set_id, copy_index,
+			provider_id, piece_id, transfer_method, status, commit_ready_at,
+			created_at, updated_at)
+			SELECT content_id, 1, 1, 1, 0,
+			       'query-plan-provider', 'piece-' || content_id, 'ingress', 'piece_ready',
+			       '2026-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM contents`
+		insertHistory = `WITH RECURSIVE
+			contents(content_id) AS (
+				SELECT 1 UNION ALL SELECT content_id + 1 FROM contents WHERE content_id < 512
+			),
+			generations(generation) AS (
+				SELECT 1 UNION ALL SELECT generation + 1 FROM generations WHERE generation < 8
+			)
+			INSERT INTO storage_commit_attempts (
+				attempt_id, content_id, storage_data_set_id, status, release_reason,
+				resolved_at, created_at, updated_at)
+			SELECT 'history-' || content_id || '-' || generation, content_id, 1,
+			       'released', 'query_plan_history', CURRENT_TIMESTAMP,
+			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM contents CROSS JOIN generations`
+		insertUnresolved = `WITH RECURSIVE contents(content_id) AS (
+			SELECT 8 UNION ALL SELECT content_id + 8 FROM contents WHERE content_id < 512
+		)
+		INSERT INTO storage_commit_attempts (
+			attempt_id, content_id, storage_data_set_id, status, created_at, updated_at)
+			SELECT 'unresolved-' || content_id, content_id, 1, 'reserved',
+			       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			FROM contents`
+	}
+
+	statements := []struct {
+		name      string
+		statement string
+	}{
+		{"storage copies", insertCopies},
+		{"storage commit history", insertHistory},
+		{"unresolved commit attempts", insertUnresolved},
+	}
+	for _, item := range statements {
+		if _, err := db.ExecContext(t.Context(), item.statement); err != nil {
+			t.Fatalf("seed query-plan %s: %v", item.name, err)
+		}
+	}
+	for _, table := range []string{"storage_copies", "storage_commit_attempts"} {
 		if _, err := db.ExecContext(t.Context(), "ANALYZE "+table); err != nil {
 			t.Fatalf("analyze query-plan table %s: %v", table, err)
 		}

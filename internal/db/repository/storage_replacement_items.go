@@ -411,7 +411,10 @@ func clearUnattemptedReplacementReservation(
 			  AND unresolved_attempt.resolved_at IS NULL
 		)`).
 		Exec(ctx)
-	return err
+	if err != nil {
+		return err
+	}
+	return wakeCommitFIFOHead(ctx, db, targetDataSetID)
 }
 
 func sourceCopyState(ctx context.Context, db bun.IDB, contentID, sourceDataSetID int64) (bool, bool, error) {

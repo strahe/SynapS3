@@ -209,24 +209,11 @@ func (r *BunStorageReplacementRepo) CountAbandonedTargetSoleCopies(ctx context.C
 	return count, nil
 }
 
-// RetireAbandonedTarget marks an abandoned generation retired. It never touches
-// the replacement record, which stays superseded, and it refuses a generation
-// that still owns its slot.
-func (r *BunStorageReplacementRepo) RetireAbandonedTarget(ctx context.Context, replacementID int64) error {
-	return r.retireAbandonedTarget(ctx, replacementID, false)
-}
-
 // CompleteAbandonedTargetTermination retires the superseded target once its end
-// of term has been recorded, refusing to retire one that has none.
+// of term has been recorded, refusing to retire one that has none. It never
+// touches the replacement record, which stays superseded, and it refuses a
+// generation that still owns its slot.
 func (r *BunStorageReplacementRepo) CompleteAbandonedTargetTermination(ctx context.Context, replacementID int64) error {
-	return r.retireAbandonedTarget(ctx, replacementID, true)
-}
-
-func (r *BunStorageReplacementRepo) retireAbandonedTarget(
-	ctx context.Context,
-	replacementID int64,
-	requireRecordedTermination bool,
-) error {
 	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
 		row, err := lockReplacementByID(ctx, db, replacementID)
 		if err != nil {
@@ -251,8 +238,7 @@ func (r *BunStorageReplacementRepo) retireAbandonedTarget(
 			return fmt.Errorf("retiring abandoned target of replacement %d holds %d sole copies: %w",
 				replacementID, sole, storagereplacement.ErrPrematureComplete)
 		}
-		if requireRecordedTermination &&
-			(row.Status != storagereplacement.StatusSuperseded || row.AbandonedTerminationEpoch == nil) {
+		if row.Status != storagereplacement.StatusSuperseded || row.AbandonedTerminationEpoch == nil {
 			return fmt.Errorf("completing abandoned target termination: %w", ErrConflict)
 		}
 		res, err := db.NewUpdate().

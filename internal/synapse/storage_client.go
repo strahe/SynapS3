@@ -10,6 +10,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
+	"github.com/strahe/synapse-go/warmstorage"
 )
 
 // StorageServiceAdapter adapts synapse-go's concrete immutable storage
@@ -17,10 +18,26 @@ import (
 type StorageServiceAdapter struct {
 	service    *storage.Service
 	terminator storageServiceTerminator
+	dataSets   dataSetStateReader
+	identity   storage.ContextIdentity
 }
 
-func AdaptStorageService(service *storage.Service) *StorageServiceAdapter {
-	return &StorageServiceAdapter{service: service, terminator: service}
+// AdaptStorageService wraps the SDK storage service. dataSets reads the FWSS
+// service state that termination checks before every request, and identity is
+// what this service signs for: destructive requests refuse a record that
+// belongs to another payer.
+func AdaptStorageService(service *storage.Service, dataSets *warmstorage.Service, identity storage.ContextIdentity) *StorageServiceAdapter {
+	adapter := &StorageServiceAdapter{service: service, terminator: service, identity: identity}
+	if dataSets != nil {
+		adapter.dataSets = dataSets
+	}
+	return adapter
+}
+
+// ContextIdentity reports the payer, chain, and record keeper this service
+// signs for.
+func (s *StorageServiceAdapter) ContextIdentity() storage.ContextIdentity {
+	return s.identity
 }
 
 func (s *StorageServiceAdapter) Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error) {
@@ -121,7 +138,7 @@ func (s *StorageServiceAdapter) FindMatchingDataSet(
 	}
 	var best *storage.DataSetDetails
 	for _, dataSet := range dataSets {
-		if dataSet == nil || dataSet.DataSetInfo == nil || dataSet.DataSetID.IsZero() ||
+		if dataSet == nil || dataSet.DataSetID.IsZero() ||
 			!dataSet.ProviderID.Equal(providerID) || dataSet.PDPEndEpoch != 0 ||
 			!dataSet.IsLive || !dataSet.IsManaged || !maps.Equal(dataSet.Metadata, wanted) {
 			continue
@@ -207,6 +224,19 @@ func (c *providerTargetAdapter) CreateDataSet(ctx context.Context, opts *storage
 func (c *providerTargetAdapter) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
 	result, err := c.provider.WaitForDataSetCreated(ctx, submission)
 	return result, NormalizeProviderOperationError(ctx, err)
+}
+
+func (c *providerTargetAdapter) ContextIdentity() storage.ContextIdentity {
+	return c.provider.ContextIdentity()
+}
+
+// FindDataSetByClientDataSetID reads the chain rather than the provider, so its
+// errors are not classified as provider failures.
+func (c *providerTargetAdapter) FindDataSetByClientDataSetID(
+	ctx context.Context,
+	clientDataSetID sdktypes.BigInt,
+) (storage.DataSetRef, bool, error) {
+	return c.provider.FindDataSetByClientDataSetID(ctx, clientDataSetID)
 }
 
 type dataSetTargetAdapter struct {

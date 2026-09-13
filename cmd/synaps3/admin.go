@@ -446,28 +446,45 @@ func adminTaskCommand() *cli.Command {
 			},
 			{
 				Name:      "acknowledge",
-				Usage:     "dismiss a failed task",
-				ArgsUsage: "<id>",
+				Usage:     "dismiss a failed task, or a backlog of failed tasks",
+				ArgsUsage: "[id]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "type", Usage: "dismiss only failures of this operation type"},
+					&cli.StringFlag{Name: "before", Usage: "dismiss only failures recorded before this RFC 3339 time (default: now)"},
+					&cli.BoolFlag{Name: "yes", Usage: "confirm dismissing every matching failed task"},
+				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					taskID, err := requireSingleArg(cmd, "task id")
-					if err != nil {
-						return err
+					if cmd.Args().Len() > 0 {
+						if cmd.String("type") != "" || cmd.String("before") != "" || cmd.Bool("yes") {
+							return errors.New("pass either a task id or the bulk flags, not both")
+						}
+						return acknowledgeSingleTask(ctx, cmd)
 					}
-					if _, err := strconv.ParseInt(taskID, 10, 64); err != nil {
-						return fmt.Errorf("invalid task id %q", taskID)
+					if !cmd.Bool("yes") {
+						return errors.New("dismissing a backlog requires --yes")
+					}
+					payload := map[string]string{}
+					if value := cmd.String("type"); value != "" {
+						payload["type"] = value
+					}
+					if value := cmd.String("before"); value != "" {
+						if _, err := time.Parse(time.RFC3339, value); err != nil {
+							return fmt.Errorf("invalid --before time %q", value)
+						}
+						payload["failed_before"] = value
 					}
 					client, opts, err := newAdminClientFromCommand(ctx, cmd)
 					if err != nil {
 						return err
 					}
-					var resp map[string]string
-					if err := client.postJSON(ctx, "/api/v1/tasks/"+url.PathEscape(taskID)+"/acknowledge", nil, &resp, false); err != nil {
+					var resp adminTaskAcknowledgeResult
+					if err := client.postJSON(ctx, "/api/v1/tasks/acknowledge", payload, &resp, false); err != nil {
 						return err
 					}
 					if opts.JSON {
 						return writeAdminJSON(cmd.Root().Writer, resp)
 					}
-					_, err = fmt.Fprintf(cmd.Root().Writer, "Task %s %s\n", taskID, resp["status"])
+					_, err = fmt.Fprintf(cmd.Root().Writer, "Dismissed %d failed tasks\n", resp.Acknowledged)
 					return err
 				},
 			},
@@ -1208,6 +1225,33 @@ func validateAdminRole(role string, allowEmpty bool) error {
 	default:
 		return fmt.Errorf("invalid S3 user role %q", role)
 	}
+}
+
+type adminTaskAcknowledgeResult struct {
+	Acknowledged int `json:"acknowledged"`
+}
+
+func acknowledgeSingleTask(ctx context.Context, cmd *cli.Command) error {
+	taskID, err := requireSingleArg(cmd, "task id")
+	if err != nil {
+		return err
+	}
+	if _, err := strconv.ParseInt(taskID, 10, 64); err != nil {
+		return fmt.Errorf("invalid task id %q", taskID)
+	}
+	client, opts, err := newAdminClientFromCommand(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	var resp map[string]string
+	if err := client.postJSON(ctx, "/api/v1/tasks/"+url.PathEscape(taskID)+"/acknowledge", nil, &resp, false); err != nil {
+		return err
+	}
+	if opts.JSON {
+		return writeAdminJSON(cmd.Root().Writer, resp)
+	}
+	_, err = fmt.Fprintf(cmd.Root().Writer, "Task %s %s\n", taskID, resp["status"])
+	return err
 }
 
 func requireSingleArg(cmd *cli.Command, label string) (string, error) {

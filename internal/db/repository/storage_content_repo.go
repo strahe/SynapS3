@@ -168,26 +168,6 @@ func (r *BunStorageContentRepo) ContentPipelineState(ctx context.Context, conten
 	return model.ObjectState(state), nil
 }
 
-// RecordContentFailure stores the message explaining why this content could not
-// be placed. Whether it counts as failed is derived from its copies; only the
-// human-readable reason is persisted.
-func (r *BunStorageContentRepo) RecordContentFailure(ctx context.Context, contentID int64, message string) error {
-	if contentID < 1 {
-		return fmt.Errorf("recording content failure: %w", ErrInvalidInput)
-	}
-	_, err := r.db.NewUpdate().
-		Model((*model.StorageContent)(nil)).
-		Set("error_message = ?", message).
-		Set("updated_at = ?", time.Now()).
-		Where("id = ?", contentID).
-		Where("accepted_at IS NULL").
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("recording content failure: %w", err)
-	}
-	return nil
-}
-
 func (r *BunStorageContentRepo) GetIngressCopy(ctx context.Context, contentID int64) (*model.StorageCopy, error) {
 	copyRow, err := r.ingressCopy(ctx, contentID)
 	if errors.Is(err, ErrNotFound) {
@@ -730,6 +710,23 @@ func (r *BunStorageContentRepo) MarkDataSetCreating(ctx context.Context, input M
 	return nil
 }
 
+func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id int64, clientDataSetID types.OnChainID) error {
+	if id <= 0 || clientDataSetID.IsZero() {
+		return fmt.Errorf("recording storage client data set ID: %w", ErrInvalidInput)
+	}
+	res, err := r.db.NewUpdate().
+		Model((*model.StorageDataSet)(nil)).
+		Set("client_data_set_id = ?", clientDataSetID).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", id).
+		Where("(client_data_set_id IS NULL OR client_data_set_id = ?)", clientDataSetID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("recording storage client data set ID: %w", err)
+	}
+	return requireDataSetStatusUpdate(ctx, r.db, id, res, "recording storage client data set ID")
+}
+
 func (r *BunStorageContentRepo) MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		return markDataSetReady(ctx, db, input.ID, input.ContentID, input.DataSetID, input.ClientDataSetID)
@@ -1094,58 +1091,6 @@ func (r *BunStorageContentRepo) NextFinalizableCopyForDataSet(ctx context.Contex
 	return copyRow, nil
 }
 
-func (r *BunStorageContentRepo) ListIncompleteReadableUploads(
-	ctx context.Context,
-	afterID int64,
-	limit int,
-) ([]IncompleteReadableUpload, error) {
-	var uploads []model.StorageContent
-	q := r.db.NewSelect().
-		Model(&uploads).
-		Where("accepted_at IS NULL").
-		Where("id > ?", afterID).
-		Where(`EXISTS (
-			SELECT 1 FROM object_versions AS live_version
-			WHERE live_version.is_delete_marker = ?
-			  AND live_version.state = ?
-			  AND `+objectVersionReferencesStorageContentSQL("live_version", "storage_content")+`
-		)`, false, model.ObjectStateStored).
-		OrderExpr("id ASC")
-	if limit > 0 {
-		q = q.Limit(limit)
-	}
-	if err := q.Scan(ctx); err != nil {
-		return nil, fmt.Errorf("listing incomplete readable storage uploads: %w", err)
-	}
-
-	items := make([]IncompleteReadableUpload, 0, len(uploads))
-	for i := range uploads {
-		version := new(model.ObjectVersion)
-		err := r.db.NewSelect().
-			Model(version).
-			Where("is_delete_marker = ?", false).
-			Where("state = ?", model.ObjectStateStored).
-			Where("content_id = ?", uploads[i].ID).
-			OrderExpr("in_cache DESC").
-			OrderExpr("CASE WHEN EXISTS (SELECT 1 FROM objects AS pointer WHERE pointer.id = object_version.object_id AND pointer.current_version_id = object_version.version_id) THEN 0 ELSE 1 END ASC").
-			OrderExpr("created_at DESC").
-			OrderExpr("version_id DESC").
-			Limit(1).
-			Scan(ctx)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return nil, fmt.Errorf("selecting durable version for incomplete readable upload %d: %w", uploads[i].ID, err)
-		}
-		items = append(items, IncompleteReadableUpload{
-			Upload:  uploads[i],
-			Version: *version,
-		})
-	}
-	return items, nil
-}
-
 func (r *BunStorageContentRepo) MarkUploadCopyPieceReady(ctx context.Context, input MarkUploadCopyPieceReadyInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
 		if err := lockStorageContentForCopyMutation(ctx, db, input.ContentID); err != nil {
@@ -1430,7 +1375,7 @@ func (r *BunStorageContentRepo) MarkUploadCopyCommitted(ctx context.Context, inp
 		if err := updateUploadReadable(ctx, db, input.ContentID, input.PieceCID, now); err != nil {
 			return err
 		}
-		return nil
+		return wakeCommitFIFOHead(ctx, db, initial.StorageDataSetID)
 	})
 }
 
@@ -1543,6 +1488,14 @@ func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input 
 			}
 			return nil
 		}
+		var storageDataSetID int64
+		if err := db.NewSelect().Model((*model.StorageCopy)(nil)).Column("storage_data_set_id").
+			Where("id = ?", copyID).Scan(ctx, &storageDataSetID); err != nil {
+			return fmt.Errorf("loading failed storage copy data set: %w", err)
+		}
+		if err := wakeCommitFIFOHead(ctx, db, storageDataSetID); err != nil {
+			return err
+		}
 		readableCount, err := countReadableReplicaSlots(ctx, db, contentID)
 		if err != nil {
 			return err
@@ -1559,6 +1512,9 @@ func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input 
 		if err != nil {
 			return fmt.Errorf("counting viable storage upload copies: %w", err)
 		}
+		// Content needs attention only when no copy is left that holds it or may
+		// still hold it; a failed copy next to readable, submitted, or pending
+		// ones is not a problem with the content.
 		if readableCount == 0 && submittedCount == 0 && viableCount == 0 {
 			_, err = db.NewUpdate().
 				Model((*model.StorageContent)(nil)).
@@ -1569,16 +1525,6 @@ func (r *BunStorageContentRepo) MarkUploadCopyFailed(ctx context.Context, input 
 				Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("marking storage upload failed: %w", err)
-			}
-		} else if readableCount > 0 {
-			_, err = db.NewUpdate().
-				Model((*model.StorageContent)(nil)).
-				Set("error_message = ?", lastError).
-				Set("updated_at = ?", now).
-				Where("id = ?", contentID).
-				Exec(ctx)
-			if err != nil {
-				return fmt.Errorf("marking storage upload readable after copy failure: %w", err)
 			}
 		}
 		return nil
@@ -1884,7 +1830,7 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, contentID int64
 	if dataSetID.IsZero() {
 		return fmt.Errorf("dataSetID is required: %w", ErrInvalidInput)
 	}
-	res, err := db.NewUpdate().
+	query := db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
 		Set("status = ?", model.StorageDataSetStatusReady).
 		Set("data_set_id = ?", dataSetID).
@@ -1898,8 +1844,13 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, contentID int64
 			WHERE other.id <> ?
 			  AND other.provider_id = (SELECT provider_id FROM storage_data_sets WHERE id = ?)
 			  AND other.data_set_id = ?
-		)`, id, id, dataSetID).
-		Exec(ctx)
+		)`, id, id, dataSetID)
+	if clientDataSetID != nil {
+		// A recorded ID names the request this generation sent, so a result
+		// carrying a different one is never written over it.
+		query = query.Where("(client_data_set_id IS NULL OR client_data_set_id = '' OR client_data_set_id = ?)", clientDataSetID)
+	}
+	res, err := query.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage data set ready: %w", err)
 	}

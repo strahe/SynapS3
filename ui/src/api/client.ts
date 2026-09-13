@@ -1145,6 +1145,15 @@ export const api = {
   getTaskStats: () => fetchJSON<TaskStatusCount[]>('/tasks/stats'),
   retryTask: (id: number) => fetchJSON(`/tasks/${id}/retry`, { method: 'POST' }),
   acknowledgeTask: (id: number) => fetchJSON(`/tasks/${id}/acknowledge`, { method: 'POST' }),
+  previewAcknowledgeTasks: (payload: { type?: string }) => {
+    const qs = payload.type ? `?${new URLSearchParams({ type: payload.type }).toString()}` : ''
+    return fetchJSON<{ count: number; as_of: string }>(`/tasks/acknowledge/preview${qs}`)
+  },
+  acknowledgeTasks: (payload: { type?: string; failed_before: string }) =>
+    fetchJSON<{ acknowledged: number }>('/tasks/acknowledge', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   getSystemInfo: () => fetchJSON<OverviewData['system']>('/system/info'),
   getWorkers: () => fetchJSON<{ workers: Record<string, boolean> }>('/workers'),
   getCacheStats: () => fetchJSON<{ used_bytes: number; max_bytes: number }>('/cache/stats'),

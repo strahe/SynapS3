@@ -994,8 +994,12 @@ func TestPutObjectIdenticalStoredContentQueuesAfterUploadEviction(t *testing.T) 
 		t.Fatal("expected evict task for reused stored content")
 	}
 	// Eviction frees one cache file, and that file belongs to the content, so
-	// the task names the content rather than either version of it.
-	task := &page.Tasks[0]
+	// the task names the content rather than either version of it. A listing
+	// leaves inputs out, so read the task itself.
+	task, err := tb.repos.Tasks.GetByID(ctx, page.Tasks[0].ID)
+	if err != nil || task == nil {
+		t.Fatalf("load evict task = %#v, err=%v", task, err)
+	}
 	contentID := *firstObj.ContentID
 	if task.SubjectKey == nil || *task.SubjectKey != strconv.FormatInt(contentID, 10) {
 		t.Fatalf("evict task content = %v, want %d", task.SubjectKey, contentID)
@@ -1085,6 +1089,69 @@ func TestPutObjectIdenticalStoredContentReusesChainStorage(t *testing.T) {
 	}
 	if len(after.Tasks) != len(before.Tasks) {
 		t.Fatalf("upload task count changed from %d to %d", len(before.Tasks), len(after.Tasks))
+	}
+}
+
+// TestPutObjectDuringContentCleanupAsksClientToRetry checks that writing bytes
+// whose last version was just deleted asks the client to retry without leaving
+// a version or cache file behind, and that once cleanup finishes the same bytes
+// are stored as new content.
+func TestPutObjectDuringContentCleanupAsksClientToRetry(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	bucket := seedActiveBucket(t, tb, "cleanup-reupload-bucket")
+	first := putValidTestObjectOutput(t, tb, bucket.Name, "file.txt", "cleanup data")
+	version, err := tb.repos.Objects.GetVersionByID(ctx, first.VersionID)
+	if err != nil || version == nil || version.ContentID == nil {
+		t.Fatalf("first version = %#v, err=%v", version, err)
+	}
+	contentID := *version.ContentID
+	// The upload fails before anything is stored remotely, so the delete is allowed.
+	plan, err := tb.repos.Tasks.GetByIdentity(ctx, model.TaskTypeUploadPlan, storagepipeline.UploadPlanKey(contentID))
+	if err != nil || plan == nil {
+		t.Fatalf("upload plan = %#v, err=%v", plan, err)
+	}
+	claimed, err := tb.repos.Tasks.ClaimNext(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != plan.ID {
+		t.Fatalf("claimed upload plan = %#v, err=%v", claimed, err)
+	}
+	if err := tb.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+		FailureReason: new("upload_failed"), LastError: new("upload failed"),
+	}); err != nil {
+		t.Fatalf("fail upload plan: %v", err)
+	}
+	if _, err := tb.backend.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket.Name), Key: aws.String("file.txt"), VersionId: aws.String(first.VersionID),
+	}); err != nil {
+		t.Fatalf("DeleteObject(version): %v", err)
+	}
+	content, err := tb.repos.Contents.GetByID(ctx, contentID)
+	if err != nil || content == nil || content.CleanupTaskID == nil {
+		t.Fatalf("content after last delete = %#v, err=%v", content, err)
+	}
+
+	contentType := "text/plain"
+	_, err = tb.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: &bucket.Name, Key: new("again.txt"), Body: strings.NewReader(validTestObjectBody("cleanup data")), ContentType: &contentType,
+	})
+	requireAPIErrorCode(t, err, s3err.GetAPIError(s3err.ErrSlowDown))
+	if current, err := tb.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "again.txt"); current != nil || (err != nil && !errors.Is(err, repository.ErrNotFound)) {
+		t.Fatalf("version after refused put = %#v, err=%v", current, err)
+	}
+	if tb.cache.Exists(ctx, bucket.Name, model.ContentCacheKey(contentID)) {
+		t.Fatal("refused put left a cache file under the content being removed")
+	}
+
+	if err := tb.repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+		return txRepos.StorageCleanup.FinalizeContent(ctx, contentID, content.CleanupGeneration, *content.CleanupTaskID)
+	}); err != nil {
+		t.Fatalf("FinalizeContent: %v", err)
+	}
+	again := putValidTestObjectOutput(t, tb, bucket.Name, "again.txt", "cleanup data")
+	stored, err := tb.repos.Objects.GetVersionByID(ctx, again.VersionID)
+	if err != nil || stored == nil || stored.ContentID == nil || *stored.ContentID == contentID {
+		t.Fatalf("version after cleanup = %#v, err=%v, want new content", stored, err)
 	}
 }
 

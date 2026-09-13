@@ -8,15 +8,19 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 
 	_ "modernc.org/sqlite"
@@ -77,6 +81,49 @@ func newTestSQLiteDB(t *testing.T, dsn string) *bun.DB {
 		t.Fatalf("running migrations: %v", err)
 	}
 
+	return db
+}
+
+// NewTestPostgresDB creates an isolated PostgreSQL schema with all migrations
+// applied, reading SYNAPS3_POSTGRES_TEST_DSN. The test is skipped when the DSN
+// is unset, and the schema is dropped when the test completes.
+func NewTestPostgresDB(t *testing.T) *bun.DB {
+	t.Helper()
+
+	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
+	}
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse PostgreSQL DSN: %v", err)
+	}
+	adminDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open PostgreSQL admin connection: %v", err)
+	}
+	digest := sha256.Sum256(fmt.Appendf(nil, "%s-%d", t.Name(), time.Now().UnixNano()))
+	schema := "test_" + hex.EncodeToString(digest[:16])
+	if _, err := adminDB.Exec("CREATE SCHEMA " + schema); err != nil {
+		_ = adminDB.Close()
+		t.Fatalf("create PostgreSQL schema: %v", err)
+	}
+	config.RuntimeParams["search_path"] = schema
+	db := bun.NewDB(stdlib.OpenDB(*config), pgdialect.New())
+	t.Cleanup(func() {
+		_ = db.Close()
+		_, _ = adminDB.Exec("DROP SCHEMA " + schema + " CASCADE")
+		_ = adminDB.Close()
+	})
+
+	ctx := context.Background()
+	migrator := migrations.NewMigrator(db)
+	if err := migrator.Init(ctx); err != nil {
+		t.Fatalf("init migrator: %v", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("running migrations: %v", err)
+	}
 	return db
 }
 
