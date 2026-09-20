@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/payments"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -144,7 +145,7 @@ func TestStorageServiceAdapterPrepareUploadReturnsCostsWithoutFunding(t *testing
 	if err != nil {
 		t.Fatalf("NewProviderContext: %v", err)
 	}
-	want := &storage.MultiContextCosts{DepositNeeded: big.NewInt(123), NeedsFWSSMaxApproval: true, Ready: false}
+	want := &sdkcosts.MultiContextCosts{DepositNeeded: big.NewInt(123), NeedsFWSSMaxApproval: true, Ready: false}
 	costs := &staticCostCalculator{costs: want}
 	funder := &recordingPaymentsFunder{}
 	service, err := storage.New(storage.Options{
@@ -164,8 +165,11 @@ func TestStorageServiceAdapterPrepareUploadReturnsCostsWithoutFunding(t *testing
 	if err != nil {
 		t.Fatalf("PrepareUpload: %v", err)
 	}
-	if got != want || costs.dataSize.Cmp(big.NewInt(4096)) != 0 || len(costs.refs) != 1 {
-		t.Fatalf("costs = %#v, calculator size = %v refs = %#v", got, costs.dataSize, costs.refs)
+	if got != want || len(costs.pieceSizes) != 1 || costs.pieceSizes[0] != 4096 || len(costs.refs) != 1 {
+		t.Fatalf("costs = %#v, calculator piece sizes = %v refs = %#v", got, costs.pieceSizes, costs.refs)
+	}
+	if !costs.refs[0].IsNewDataSet {
+		t.Fatalf("calculator ref = %#v, want a new data set", costs.refs[0])
 	}
 	if funder.calls != 0 {
 		t.Fatalf("funding calls = %d, want none", funder.calls)
@@ -216,14 +220,14 @@ func dataSetDetails(dataSetID, clientDataSetID, providerID uint64, live, managed
 }
 
 type staticCostCalculator struct {
-	costs    *storage.MultiContextCosts
-	dataSize *big.Int
-	refs     []storage.ContextCostRef
+	costs      *sdkcosts.MultiContextCosts
+	pieceSizes []uint64
+	refs       []sdkcosts.MultiContextRef
 }
 
-func (c *staticCostCalculator) CalculateMultiContextCosts(_ context.Context, _ common.Address, dataSize *big.Int, refs []storage.ContextCostRef, _ storage.MultiCostOptions) (*storage.MultiContextCosts, error) {
-	c.dataSize = new(big.Int).Set(dataSize)
-	c.refs = append([]storage.ContextCostRef(nil), refs...)
+func (c *staticCostCalculator) CalculateMultiContextCosts(_ context.Context, _ common.Address, pieceSizes []uint64, refs []sdkcosts.MultiContextRef, _ *sdkcosts.UploadCostOptions) (*sdkcosts.MultiContextCosts, error) {
+	c.pieceSizes = append([]uint64(nil), pieceSizes...)
+	c.refs = append([]sdkcosts.MultiContextRef(nil), refs...)
 	return c.costs, nil
 }
 

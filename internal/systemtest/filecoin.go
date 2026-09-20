@@ -21,6 +21,7 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/synapse"
 	appTypes "github.com/strahe/synaps3/internal/types"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -91,14 +92,14 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 	}
 }
 
-func (m *MemoryFilecoin) PrepareUpload(ctx context.Context, _ uint64, targets []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
+func (m *MemoryFilecoin) PrepareUpload(ctx context.Context, _ uint64, targets []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("%w: upload has no contexts", errInvalidFilecoinSequence)
 	}
-	return &storage.MultiContextCosts{DepositNeeded: new(big.Int), Ready: true}, nil
+	return &sdkcosts.MultiContextCosts{DepositNeeded: new(big.Int), Ready: true}, nil
 }
 
 func (m *MemoryFilecoin) SelectUploadTargets(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {

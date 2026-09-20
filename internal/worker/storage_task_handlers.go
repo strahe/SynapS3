@@ -26,6 +26,7 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -243,7 +244,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 	return taskHandler{definition: definition, execute: run, recover: run}
 }
 
-func uploadFundingWaitMessage(costs *storage.MultiContextCosts) string {
+func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {
 	parts := make([]string, 0, 2)
 	if costs != nil && costs.DepositNeeded != nil && costs.DepositNeeded.Sign() > 0 {
 		parts = append(parts, fmt.Sprintf("deposit %s USDFC base units", costs.DepositNeeded.String()))

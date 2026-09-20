@@ -130,7 +130,7 @@ test('settings risk collection classifies high-risk security boundary changes', 
     ]
   )
   const privateNetworks = changes.find((change) => change.field === 'filecoin.allow_private_networks')
-  assert.match(privateNetworks?.reason ?? '', /diagnostic/i)
+  assert.match(privateNetworks?.reason ?? '', /storage provider operations, retrieval, and diagnostics/i)
   assert.equal(settingsRiskNeedsStrongConfirmation(changes), true)
 })
 

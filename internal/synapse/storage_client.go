@@ -8,6 +8,7 @@ import (
 	"maps"
 
 	"github.com/ipfs/go-cid"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 	"github.com/strahe/synapse-go/warmstorage"
@@ -44,7 +45,7 @@ func (s *StorageServiceAdapter) Download(ctx context.Context, pieceCID cid.Cid, 
 	return s.service.Download(ctx, pieceCID, opts)
 }
 
-func (s *StorageServiceAdapter) PrepareUpload(ctx context.Context, dataSize uint64, targets []StorageTarget) (*storage.MultiContextCosts, error) {
+func (s *StorageServiceAdapter) PrepareUpload(ctx context.Context, dataSize uint64, targets []StorageTarget) (*sdkcosts.MultiContextCosts, error) {
 	contexts := make([]storage.StorageContext, 0, len(targets))
 	for i, target := range targets {
 		adapter, ok := target.(interface{ sdkStorageContext() storage.StorageContext })
@@ -54,8 +55,8 @@ func (s *StorageServiceAdapter) PrepareUpload(ctx context.Context, dataSize uint
 		contexts = append(contexts, adapter.sdkStorageContext())
 	}
 	prepared, err := s.service.Prepare(ctx, &storage.PrepareOptions{
-		DataSize: dataSize,
-		Contexts: contexts,
+		PieceSizes: []uint64{dataSize},
+		Contexts:   contexts,
 	})
 	if err != nil {
 		return nil, normalizeResolutionOperationError(err)

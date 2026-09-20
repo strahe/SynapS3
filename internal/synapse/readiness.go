@@ -15,6 +15,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectlimits"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/payments"
 	"github.com/strahe/synapse-go/spregistry"
 	"github.com/strahe/synapse-go/storage"
@@ -76,11 +77,11 @@ type readinessStorage interface {
 	GetStorageInfo(ctx context.Context, opts *storage.GetStorageInfoOptions) (*storage.StorageInfo, error)
 	CalculateMultiContextCosts(
 		ctx context.Context,
-		dataSizeBytes uint64,
+		pieceSizes []uint64,
 		refs []storage.ContextCostRef,
 		opts storage.MultiCostOptions,
 		payer common.Address,
-	) (*storage.MultiContextCosts, error)
+	) (*sdkcosts.MultiContextCosts, error)
 }
 
 type ReadinessClient interface {
@@ -195,7 +196,7 @@ func (c *ReadinessChecker) checkClient(ctx context.Context, cfg ReadinessConfig,
 		result.warning(
 			"private_networks",
 			"Private network provider URLs are allowed.",
-			"Use this only for trusted private infrastructure that serves retrieval and diagnostic URLs.",
+			"Use this only with trusted private infrastructure for storage, retrieval, and diagnostics.",
 		)
 	}
 
@@ -341,7 +342,7 @@ func (c *ReadinessChecker) checkStorage(
 
 	costs, err := storageSvc.CalculateMultiContextCosts(
 		ctx,
-		readinessCostEstimateDataSize(),
+		[]uint64{readinessCostEstimateDataSize()},
 		refs,
 		storage.MultiCostOptions{EnableCDN: cfg.WithCDN},
 		client.Address(),

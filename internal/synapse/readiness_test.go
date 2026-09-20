@@ -14,6 +14,7 @@ import (
 	"github.com/strahe/synaps3/internal/objectlimits"
 	sdk "github.com/strahe/synapse-go"
 	"github.com/strahe/synapse-go/chain"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/payments"
 	"github.com/strahe/synapse-go/spregistry"
 	"github.com/strahe/synapse-go/storage"
@@ -67,8 +68,13 @@ func TestReadinessCheckerUsesApprovedProviderInventoryAndCostEstimate(t *testing
 	if len(client.storage.costRefs) != cfg.DefaultCopies {
 		t.Fatalf("cost refs = %d, want %d", len(client.storage.costRefs), cfg.DefaultCopies)
 	}
-	if client.storage.costDataSize != uint64(objectlimits.MinFOCUploadSize) {
-		t.Fatalf("cost data size = %d, want %d", client.storage.costDataSize, objectlimits.MinFOCUploadSize)
+	if len(client.storage.costPieceSizes) != 1 || client.storage.costPieceSizes[0] != uint64(objectlimits.MinFOCUploadSize) {
+		t.Fatalf("cost piece sizes = %v, want [%d]", client.storage.costPieceSizes, objectlimits.MinFOCUploadSize)
+	}
+	for i, ref := range client.storage.costRefs {
+		if ref.DataSetID != nil {
+			t.Fatalf("cost ref %d data set ID = %v, want a new data set", i, ref.DataSetID)
+		}
 	}
 	if client.storage.costPayer != client.address {
 		t.Fatalf("cost payer = %s, want %s", client.storage.costPayer.Hex(), client.address.Hex())
@@ -225,8 +231,8 @@ func TestReadinessCheckerWarnsWhenPrivateNetworksAreAllowed(t *testing.T) {
 	if check.Message != "Private network provider URLs are allowed." {
 		t.Fatalf("private_networks message = %q, want provider URL warning", check.Message)
 	}
-	if check.Action != "Use this only for trusted private infrastructure that serves retrieval and diagnostic URLs." {
-		t.Fatalf("private_networks action = %q, want retrieval and diagnostic URL warning", check.Action)
+	if check.Action != "Use this only with trusted private infrastructure for storage, retrieval, and diagnostics." {
+		t.Fatalf("private_networks action = %q, want storage, retrieval, and diagnostics warning", check.Action)
 	}
 }
 
@@ -353,8 +359,8 @@ func readinessAccountWithFundedUntil(funds int64, fundedUntil *big.Int) *payment
 	}
 }
 
-func readinessCosts(deposit int64, needsApproval, ready bool) *storage.MultiContextCosts {
-	return &storage.MultiContextCosts{
+func readinessCosts(deposit int64, needsApproval, ready bool) *sdkcosts.MultiContextCosts {
+	return &sdkcosts.MultiContextCosts{
 		RatePerEpoch:         big.NewInt(1),
 		RatePerMonth:         big.NewInt(100),
 		DepositNeeded:        big.NewInt(deposit),
@@ -503,13 +509,13 @@ func (f *fakeReadinessPayments) AccountInfo(context.Context, common.Address, com
 }
 
 type fakeReadinessStorage struct {
-	info         *storage.StorageInfo
-	infoErr      error
-	costs        *storage.MultiContextCosts
-	costErr      error
-	costRefs     []storage.ContextCostRef
-	costPayer    common.Address
-	costDataSize uint64
+	info           *storage.StorageInfo
+	infoErr        error
+	costs          *sdkcosts.MultiContextCosts
+	costErr        error
+	costRefs       []storage.ContextCostRef
+	costPayer      common.Address
+	costPieceSizes []uint64
 }
 
 func (f *fakeReadinessStorage) GetStorageInfo(context.Context, *storage.GetStorageInfoOptions) (*storage.StorageInfo, error) {
@@ -518,13 +524,13 @@ func (f *fakeReadinessStorage) GetStorageInfo(context.Context, *storage.GetStora
 
 func (f *fakeReadinessStorage) CalculateMultiContextCosts(
 	_ context.Context,
-	dataSize uint64,
+	pieceSizes []uint64,
 	refs []storage.ContextCostRef,
 	_ storage.MultiCostOptions,
 	payer common.Address,
-) (*storage.MultiContextCosts, error) {
+) (*sdkcosts.MultiContextCosts, error) {
 	f.costRefs = append([]storage.ContextCostRef(nil), refs...)
 	f.costPayer = payer
-	f.costDataSize = dataSize
+	f.costPieceSizes = append([]uint64(nil), pieceSizes...)
 	return f.costs, f.costErr
 }

@@ -32,9 +32,10 @@ import (
 )
 
 const (
-	integrationNetwork = "calibration"
-	integrationCopies  = 3
-	uploadTaskTimeout  = 2 * time.Minute
+	integrationNetwork     = "calibration"
+	integrationCopies      = 3
+	bucketProvisionTimeout = 10 * time.Minute
+	uploadTaskTimeout      = 2 * time.Minute
 
 	adminUsername = "admin"
 )
@@ -81,6 +82,7 @@ func TestCalibrationBackedGoldenPath(t *testing.T) {
 	if _, err := s3Client.CreateBucket(t.Context(), &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v\n%s", err, runtime.Diagnostics())
 	}
+	waitForBucketReady(t, admin, bucket)
 
 	content := bytes.Repeat([]byte("synaps3-calibration-e2e\n"), 6000)
 	checksum := sha256.Sum256(content)
@@ -101,7 +103,7 @@ func TestCalibrationBackedGoldenPath(t *testing.T) {
 	object := waitForStoredObject(t, admin, bucket, key, walletActions)
 	provenance := waitForCommittedCopies(t, admin, bucket, object.VersionID)
 	assertDataSetMetadata(t, t.Context(), privateKey, bucket, provenance)
-	waitForCompletedUploadTasks(t, admin, object.VersionID)
+	waitForCompletedUploadTasks(t, admin)
 	waitForCacheEviction(t, admin, bucket, key)
 	logStep(t, "verifying cold S3 read after cache eviction")
 	waitForS3Object(t, runtime, s3Client, bucket, key, content, checksum)
@@ -715,6 +717,52 @@ type storedObject struct {
 	Snapshot  string
 }
 
+type calibrationBucketStatus struct {
+	Status   string `json:"status"`
+	DataSets []struct {
+		CopyIndex int     `json:"copy_index"`
+		Provider  string  `json:"provider_id"`
+		DataSetID *string `json:"data_set_id,omitempty"`
+		Status    string  `json:"status"`
+	} `json:"data_sets"`
+}
+
+func waitForBucketReady(t *testing.T, admin *e2e.AdminClient, bucket string) {
+	t.Helper()
+	progress := newProgressLog()
+	e2e.Eventually(t, t.Context(), bucketProvisionTimeout, "Calibration bucket storage to become ready", func(ctx context.Context) (string, bool, error) {
+		var status calibrationBucketStatus
+		raw, err := admin.GetJSON(ctx, "/api/v1/buckets/"+url.PathEscape(bucket), &status)
+		if err != nil {
+			return raw, false, err
+		}
+		summary := calibrationBucketStatusSummary(status)
+		progress.Changed(t, "bucket storage", summary)
+		switch status.Status {
+		case "ready":
+			return summary, true, nil
+		case "provisioning":
+			return summary, false, nil
+		default:
+			return summary, false, fmt.Errorf("unexpected bucket status %q", status.Status)
+		}
+	}, e2e.WithPollInterval(5*time.Second))
+}
+
+func calibrationBucketStatusSummary(bucket calibrationBucketStatus) string {
+	lines := []string{fmt.Sprintf("status=%s data_sets=%d", bucket.Status, len(bucket.DataSets))}
+	for _, dataSet := range bucket.DataSets {
+		lines = append(lines, fmt.Sprintf(
+			"- copy=%d provider=%s dataset=%s status=%s",
+			dataSet.CopyIndex,
+			dataSet.Provider,
+			nullableString(dataSet.DataSetID),
+			dataSet.Status,
+		))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func waitForStoredObject(t *testing.T, admin *e2e.AdminClient, bucket, key string, actions *calibrationWalletActions) storedObject {
 	t.Helper()
 	progress := newProgressLog()
@@ -733,26 +781,23 @@ func waitForStoredObject(t *testing.T, admin *e2e.AdminClient, bucket, key strin
 		if item.Status == "warning" || item.State == "failed" {
 			return storedObject{VersionID: item.CurrentVersionID, Snapshot: raw}, false, fmt.Errorf("object entered failed state: %s", e2e.DiagnosticValue(item))
 		}
-		resolveUploadDependency(t, ctx, admin, item.CurrentVersionID, actions, taskProgress)
+		resolveUploadDependency(t, ctx, admin, actions, taskProgress)
 		return storedObject{VersionID: item.CurrentVersionID, Snapshot: raw}, item.CurrentVersionID != "" && item.State == "stored" && item.Location.Filecoin, nil
 	}, e2e.WithPollInterval(5*time.Second))
 }
 
-func resolveUploadDependency(t *testing.T, ctx context.Context, admin *e2e.AdminClient, versionID string, actions *calibrationWalletActions, progress *progressLog) {
+func resolveUploadDependency(t *testing.T, ctx context.Context, admin *e2e.AdminClient, actions *calibrationWalletActions, progress *progressLog) {
 	t.Helper()
-	if versionID == "" {
-		return
-	}
 	var tasks e2e.TaskListResponse
 	raw, err := admin.GetJSON(ctx, "/api/v1/tasks?type=upload_plan&limit=100", &tasks)
 	if err != nil {
 		t.Fatalf("GET upload tasks: %v; body=%s", err, e2e.Redact(raw))
 	}
 	if progress != nil {
-		progress.Changed(t, "upload tasks", uploadTaskSummary(tasks, versionID))
+		progress.Changed(t, "upload tasks", uploadTaskSummary(tasks))
 	}
 	for _, task := range tasks.Tasks {
-		if !taskHasSubject(task, "object_version", versionID) || task.Status != "pending" || task.WaitReason == nil || *task.WaitReason != "funding" {
+		if task.Status != "pending" || task.WaitReason == nil || *task.WaitReason != "funding" {
 			continue
 		}
 		message := nullableString(task.StatusMessage)
@@ -871,7 +916,7 @@ func assertDataSetMetadata(t *testing.T, ctx context.Context, privateKey, bucket
 	}
 }
 
-func waitForCompletedUploadTasks(t *testing.T, admin *e2e.AdminClient, versionID string) {
+func waitForCompletedUploadTasks(t *testing.T, admin *e2e.AdminClient) {
 	t.Helper()
 	progress := newProgressLog()
 	lastSummary := "none"
@@ -881,13 +926,10 @@ func waitForCompletedUploadTasks(t *testing.T, admin *e2e.AdminClient, versionID
 		if err != nil {
 			return lastSummary, false, err
 		}
-		lastSummary = uploadTaskSummary(tasks, versionID)
+		lastSummary = uploadTaskSummary(tasks)
 		progress.Changed(t, "upload tasks", lastSummary)
 		seen, active, failed := 0, 0, 0
 		for _, task := range tasks.Tasks {
-			if !taskHasSubject(task, "object_version", versionID) {
-				continue
-			}
 			seen++
 			switch task.Status {
 			case "completed":
@@ -1150,12 +1192,9 @@ func provenanceSummary(provenance e2e.ProvenanceResponse) string {
 	return strings.Join(lines, "\n")
 }
 
-func uploadTaskSummary(tasks e2e.TaskListResponse, versionID string) string {
+func uploadTaskSummary(tasks e2e.TaskListResponse) string {
 	lines := make([]string, 0, len(tasks.Tasks))
 	for _, task := range tasks.Tasks {
-		if !taskHasSubject(task, "object_version", versionID) {
-			continue
-		}
 		lines = append(lines, fmt.Sprintf(
 			"- id=%d type=%s status=%s retry=%d available=%s wait=%s message=%s error=%s",
 			task.ID,
@@ -1172,11 +1211,6 @@ func uploadTaskSummary(tasks e2e.TaskListResponse, versionID string) string {
 		return "none"
 	}
 	return strings.Join(lines, "\n")
-}
-
-func taskHasSubject(task e2e.TaskItem, subjectType, subjectKey string) bool {
-	return task.SubjectType != nil && task.SubjectKey != nil &&
-		*task.SubjectType == subjectType && *task.SubjectKey == subjectKey
 }
 
 func observabilitySnapshotSummary(providers e2e.ProviderObservationPage, dataSets e2e.DataSetObservationPage) string {
