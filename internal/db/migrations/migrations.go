@@ -56,9 +56,34 @@ func NewMigrator(db *bun.DB) *migrate.Migrator {
 }
 
 // ValidateTarget accepts an empty application database or a database whose
-// applied migrations are an exact ordered prefix of the current registry.
+// applied migrations and schema match the current unreleased baseline.
 func ValidateTarget(ctx context.Context, db bun.IDB) error {
-	return validateTarget(ctx, db, Migrations)
+	if err := validateTarget(ctx, db, Migrations); err != nil {
+		return err
+	}
+	markerExists, err := tableExists(ctx, db, "bun_migrations")
+	if err != nil || !markerExists {
+		return err
+	}
+	var names []string
+	if err := db.NewRaw("SELECT name FROM bun_migrations ORDER BY id").Scan(ctx, &names); err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	statusURLExists, err := columnExists(ctx, db, "storage_commit_attempts", "status_url")
+	if err != nil {
+		return fmt.Errorf("checking commit status URL column: %w", err)
+	}
+	oldJSONExists, err := columnExists(ctx, db, "storage_commit_attempts", "submission_json")
+	if err != nil {
+		return fmt.Errorf("checking obsolete commit submission column: %w", err)
+	}
+	if !statusURLExists || oldJSONExists {
+		return incompatibleDatabaseError()
+	}
+	return nil
 }
 
 func validateTarget(ctx context.Context, db bun.IDB, registry *migrate.Migrations) error {
@@ -164,6 +189,7 @@ func initialSchemaPostStateComplete(ctx context.Context, db bun.IDB) (bool, erro
 		{"storage_copies", "content_id"},
 		{"storage_copies", "storage_data_set_id"},
 		{"storage_commit_attempts", "attempt_id"},
+		{"storage_commit_attempts", "status_url"},
 		{"storage_replacement_items", "target_data_set_id"},
 		{"storage_cleanup_copies", "bucket_id"},
 		{"storage_cleanup_copies", "checksum"},
@@ -182,6 +208,7 @@ func initialSchemaPostStateComplete(ctx context.Context, db bun.IDB) (bool, erro
 		{"multipart_uploads", "id"},
 		{"storage_copies", "commit_attempt_id"},
 		{"storage_copies", "commit_transaction_id"},
+		{"storage_commit_attempts", "submission_json"},
 		{"storage_copies", "upload_id"},
 		{"storage_replacement_items", "target_copy_id"},
 		{"object_versions", "state"},

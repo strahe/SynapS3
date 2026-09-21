@@ -98,7 +98,7 @@ func TestInitialBaselineRepairsMissingMarkerOnlyForCompletePostState(t *testing.
 		if _, err := migrator.Migrate(ctx); err != nil {
 			t.Fatalf("repair baseline marker: %v", err)
 		}
-		assertAppliedMigrationCount(t, ctx, migrator, 2)
+		assertAppliedMigrationCount(t, ctx, migrator, 1)
 	})
 }
 

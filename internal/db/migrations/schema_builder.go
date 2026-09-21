@@ -47,8 +47,6 @@ type initialJSONColumnSpec struct {
 
 func initialJSONColumns(table string) []initialJSONColumnSpec {
 	switch table {
-	case "storage_commit_attempts":
-		return []initialJSONColumnSpec{{name: "submission_json", shape: initialJSONObject, nullable: true, text: true}}
 	case "task_payloads":
 		return []initialJSONColumnSpec{
 			{name: "input_json", shape: initialJSONObject},

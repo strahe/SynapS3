@@ -571,7 +571,7 @@ type storageCommitAttempt2026090101 struct {
 	Status                 string  `bun:"type:text,notnull,default:'reserved'"`
 	ExtraDataHex           *string `bun:"type:text"`
 	TransactionID          *string `bun:"type:text"`
-	SubmissionJSON         *string `bun:"type:text"`
+	StatusURL              *string `bun:"type:text"`
 	ConfirmedTransactionID *string `bun:"type:text"`
 	AttentionCode          *string `bun:"type:text"`
 	AttentionAt            *time.Time
@@ -826,23 +826,22 @@ func storageCopyConfirmedAttemptForeignKey2026090101() initialForwardForeignKey 
 
 func storageCommitAttemptTable2026090101() initialTableSpec {
 	return initialTableSpec{
-		name:        "storage_commit_attempts",
-		jsonColumns: initialJSONColumns("storage_commit_attempts"),
-		model:       (*storageCommitAttempt2026090101)(nil),
+		name:  "storage_commit_attempts",
+		model: (*storageCommitAttempt2026090101)(nil),
 		constraints: []string{
-			"CONSTRAINT chk_storage_commit_attempts_identity CHECK (attempt_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (submission_json IS NULL OR submission_json <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (attention_code IS NULL OR attention_code <> '') AND (release_reason IS NULL OR release_reason <> ''))",
+			"CONSTRAINT chk_storage_commit_attempts_identity CHECK (attempt_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (status_url IS NULL OR status_url <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (attention_code IS NULL OR attention_code <> '') AND (release_reason IS NULL OR release_reason <> ''))",
 			"CONSTRAINT chk_storage_commit_attempts_status CHECK (status IN ('reserved', 'attempted', 'confirmed', 'released', 'rejected'))",
 			// Candidate key for the copy's confirmed-attempt projection.
 			"CONSTRAINT uq_storage_commit_attempts_status UNIQUE (attempt_id, status)",
 			"CONSTRAINT chk_storage_commit_attempts_resolution CHECK ((status IN ('reserved', 'attempted') AND resolved_at IS NULL) OR (status IN ('confirmed', 'released', 'rejected') AND resolved_at IS NOT NULL))",
 			`CONSTRAINT chk_storage_commit_attempts_evidence_shape CHECK (
-				(status = 'reserved' AND attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND submission_json IS NULL AND confirmed_transaction_id IS NULL AND attention_code IS NULL AND attention_at IS NULL AND last_error IS NULL)
+				(status = 'reserved' AND attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND status_url IS NULL AND confirmed_transaction_id IS NULL AND attention_code IS NULL AND attention_at IS NULL AND last_error IS NULL)
 				OR (status = 'attempted' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND confirmed_transaction_id IS NULL AND last_error IS NULL)
 				OR (status = 'confirmed' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND transaction_id IS NOT NULL AND confirmed_transaction_id IS NOT NULL AND last_error IS NULL)
-				OR (status = 'released' AND confirmed_transaction_id IS NULL AND last_error IS NULL AND ((attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND submission_json IS NULL AND attention_code IS NULL AND attention_at IS NULL) OR (attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL)))
+				OR (status = 'released' AND confirmed_transaction_id IS NULL AND last_error IS NULL AND ((attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND status_url IS NULL AND attention_code IS NULL AND attention_at IS NULL) OR (attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL)))
 				OR (status = 'rejected' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND confirmed_transaction_id IS NULL AND last_error IS NOT NULL AND last_error <> '')
 			)`,
-			"CONSTRAINT chk_storage_commit_attempts_submission CHECK (submission_json IS NULL OR transaction_id IS NOT NULL)",
+			"CONSTRAINT chk_storage_commit_attempts_status_url CHECK (status_url IS NULL OR transaction_id IS NOT NULL)",
 			"CONSTRAINT chk_storage_commit_attempts_attention CHECK ((attention_code IS NULL AND attention_at IS NULL) OR (attention_code IS NOT NULL AND attention_at IS NOT NULL AND attempted_at IS NOT NULL))",
 			"CONSTRAINT chk_storage_commit_attempts_release CHECK ((status = 'released' AND release_reason IS NOT NULL) OR (status <> 'released' AND release_reason IS NULL))",
 		},

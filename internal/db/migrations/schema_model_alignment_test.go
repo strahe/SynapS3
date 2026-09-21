@@ -23,7 +23,7 @@ import (
 	"github.com/uptrace/bun/dialect"
 )
 
-func TestRuntimeModelsMatchAppliedMigrations(t *testing.T) {
+func TestRuntimeModelsMatchAppliedBaseline(t *testing.T) {
 	models := runtimePersistentModels()
 	runtimeTablesFromAST := runtimePersistentModelTablesFromAST(t)
 
@@ -43,9 +43,6 @@ func TestRuntimeModelsMatchAppliedMigrations(t *testing.T) {
 
 		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
 			t.Fatalf("create initial schema: %v", err)
-		}
-		if err := runMigrationBody(t.Context(), db, up2026092101CommitStatusURL); err != nil {
-			t.Fatalf("create final commit ledger: %v", err)
 		}
 		appliedTables := applicationSchemaTables(t, db)
 		if !slices.Equal(appliedTables, registeredTables) {
