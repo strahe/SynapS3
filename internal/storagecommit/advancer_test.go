@@ -33,6 +33,7 @@ func TestAdvancerPersistsFourSubmissionsBeforeConfirmationAndAdmitsFIFO(t *testi
 	}
 
 	var presignCalls, submissionCalls, confirmationCalls int
+	submittedTransactions := make(map[string]string)
 	target.PresignForCommitFunc = func(context.Context, []storage.PieceInput) ([]byte, error) {
 		presignCalls++
 		return []byte{0xab, 0xcd}, nil
@@ -40,24 +41,27 @@ func TestAdvancerPersistsFourSubmissionsBeforeConfirmationAndAdmitsFIFO(t *testi
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		submissionCalls++
 		tx := fmt.Sprintf("0x%064x", submissionCalls)
-		if request.OnSubmitted != nil {
-			request.OnSubmitted(tx)
-		}
-		return &storage.CommitSubmission{
+		submission := storage.CommitSubmission{
 			Kind: storage.CommitKindAddPieces, TransactionID: tx,
 			StatusURL:  fmt.Sprintf("https://provider.example/status/%d", submissionCalls),
 			ProviderID: binding.ProviderID.SDK(), DataSet: &dataSetRef,
 			PieceCIDs: []cid.Cid{pieceCID},
-		}, nil
+		}
+		submittedTransactions[submission.StatusURL] = tx
+		if request.OnSubmitted != nil {
+			request.OnSubmitted(submission)
+		}
+		return &submission, nil
 	}
 	confirm := false
-	target.GetCommitStatusFunc = func(_ context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+	target.GetCommitStatusFunc = func(_ context.Context, statusURL string) (*storage.CommitStatus, error) {
 		confirmationCalls++
+		tx := submittedTransactions[statusURL]
 		if !confirm {
-			return &storage.CommitStatus{State: storage.CommitStatePending, TransactionID: submission.TransactionID}, nil
+			return &storage.CommitStatus{Kind: storage.CommitKindAddPieces, State: storage.CommitStatePending, TransactionID: tx, DataSet: &dataSetRef}, nil
 		}
 		return &storage.CommitStatus{
-			State: storage.CommitStateConfirmed, TransactionID: submission.TransactionID,
+			Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed, TransactionID: tx,
 			DataSet:  &dataSetRef,
 			PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(5001)},
 		}, nil
@@ -79,7 +83,7 @@ func TestAdvancerPersistsFourSubmissionsBeforeConfirmationAndAdmitsFIFO(t *testi
 	for i := range 4 {
 		persisted := loadAdvancerCopy(t, repos, copies[i].ID)
 		if persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil ||
-			persisted.CommitTransactionID == nil || persisted.CommitSubmissionJSON == nil {
+			persisted.CommitTransactionID == nil || persisted.CommitStatusURL == nil {
 			t.Fatalf("copy %d submission evidence was not fully persisted: %#v", i, persisted)
 		}
 	}
@@ -140,6 +144,126 @@ func TestAdvancerPersistsFourSubmissionsBeforeConfirmationAndAdmitsFIFO(t *testi
 	}
 	if submissionCalls != 5 {
 		t.Fatalf("submission calls = %d, want 5", submissionCalls)
+	}
+}
+
+func TestAdvancerRejectsMismatchedCommitStatus(t *testing.T) {
+	for _, mismatch := range []string{"transaction", "kind", "data set", "piece count", "rejected transaction"} {
+		t.Run(mismatch, func(t *testing.T) {
+			db := testutil.NewTestDB(t)
+			repos := repository.NewRepositories(db)
+			binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
+			identity := advancerCopyIdentity(copies[0])
+			if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+				Copy: identity, AttemptID: "status-mismatch",
+			}); err != nil {
+				t.Fatalf("reserve: %v", err)
+			}
+			if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+				Copy: identity, AttemptID: "status-mismatch", ExtraDataHex: "abcd",
+			}); err != nil {
+				t.Fatalf("mark attempted: %v", err)
+			}
+			const statusURL = "https://provider.example/status/commit"
+			if err := repos.Contents.RecordCommitSubmission(t.Context(), storagecommit.EvidenceInput{
+				Copy: identity, AttemptID: "status-mismatch", TransactionID: "0xexpected", StatusURL: statusURL,
+			}); err != nil {
+				t.Fatalf("record status URL: %v", err)
+			}
+			target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
+			target.ClientDataSetIDValue = sdktypes.NewBigInt(9001)
+			ref, ok := target.DataSetRef()
+			if !ok {
+				t.Fatal("mock target has no data set ref")
+			}
+			status := &storage.CommitStatus{
+				Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed,
+				TransactionID: "0xexpected", DataSet: &ref,
+				PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(5001)},
+			}
+			switch mismatch {
+			case "transaction":
+				status.TransactionID = "0xother"
+			case "kind":
+				status.Kind = storage.CommitKindCreateAndAdd
+			case "data set":
+				other, err := storage.NewDataSetRef(binding.ProviderID.SDK(), sdktypes.NewBigInt(9999), sdktypes.NewBigInt(9001))
+				if err != nil {
+					t.Fatal(err)
+				}
+				status.DataSet = &other
+			case "piece count":
+				status.PieceIDs = nil
+			case "rejected transaction":
+				status.State = storage.CommitStateRejected
+				status.TransactionID = "0xother"
+			}
+			target.GetCommitStatusFunc = func(_ context.Context, gotURL string) (*storage.CommitStatus, error) {
+				if gotURL != statusURL {
+					t.Fatalf("status URL = %q, want %q", gotURL, statusURL)
+				}
+				return status, nil
+			}
+			result, err := (&storagecommit.Advancer{Store: repos.Contents}).Advance(t.Context(), storagecommit.AdvanceInput{
+				Copy: *loadAdvancerCopy(t, repos, copies[0].ID), Binding: *binding, Target: target,
+				Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
+			})
+			if err != nil || result.State != storagecommit.AdvanceNeedsAttention ||
+				result.AttentionCode != storagecommit.AttentionSubmissionMismatch || result.Confirmation != nil {
+				t.Fatalf("mismatched status = %#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestCommitEvidenceIsAtomicAndIdempotent(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	_, copies, _ := seedAdvancerCopies(t, db, 1)
+	identity := advancerCopyIdentity(copies[0])
+	if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
+		Copy: identity, AttemptID: "atomic-evidence",
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
+		Copy: identity, AttemptID: "atomic-evidence", ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("mark attempted: %v", err)
+	}
+	evidence := storagecommit.EvidenceInput{
+		Copy: identity, AttemptID: "atomic-evidence",
+		TransactionID: "0xsubmitted", StatusURL: "https://provider.example/status/submitted",
+	}
+	withoutURL := evidence
+	withoutURL.StatusURL = ""
+	if err := repos.Contents.RecordCommitSubmission(t.Context(), withoutURL); err == nil {
+		t.Fatal("accepted submission evidence without status URL")
+	}
+	before := loadAdvancerCopy(t, repos, copies[0].ID)
+	if before.CommitTransactionID != nil || before.CommitStatusURL != nil {
+		t.Fatalf("invalid evidence partially persisted: %#v", before)
+	}
+	if err := repos.Contents.RecordCommitSubmission(t.Context(), evidence); err != nil {
+		t.Fatalf("record evidence: %v", err)
+	}
+	if err := repos.Contents.RecordCommitSubmission(t.Context(), evidence); err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	conflict := evidence
+	conflict.StatusURL = "https://provider.example/status/other"
+	if err := repos.Contents.RecordCommitSubmission(t.Context(), conflict); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("conflicting URL error = %v, want conflict", err)
+	}
+	conflict = evidence
+	conflict.TransactionID = "0xother"
+	if err := repos.Contents.RecordCommitSubmission(t.Context(), conflict); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("conflicting transaction error = %v, want conflict", err)
+	}
+	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
+	if copyRow.CommitTransactionID == nil || *copyRow.CommitTransactionID != evidence.TransactionID ||
+		copyRow.CommitStatusURL == nil || *copyRow.CommitStatusURL != evidence.StatusURL {
+		t.Fatalf("conflicting writes changed evidence: %#v", copyRow)
 	}
 }
 
@@ -345,7 +469,7 @@ func TestAdvancerSubmissionCallbackPreventsErrorBasedReset(t *testing.T) {
 		return []byte{0xab, 0xcd}, nil
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
-		request.OnSubmitted("0xcallback")
+		request.OnSubmitted(storage.CommitSubmission{TransactionID: "0xcallback", StatusURL: "https://provider.example/status/callback"})
 		return nil, storage.ErrInvalidArgument
 	}
 
@@ -358,7 +482,8 @@ func TestAdvancerSubmissionCallbackPreventsErrorBasedReset(t *testing.T) {
 	}
 	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
 	if copyRow.CommitAttemptID == nil || copyRow.CommitAttemptedAt == nil ||
-		copyRow.CommitTransactionID == nil || *copyRow.CommitTransactionID != "0xcallback" {
+		copyRow.CommitTransactionID == nil || *copyRow.CommitTransactionID != "0xcallback" ||
+		copyRow.CommitStatusURL == nil || *copyRow.CommitStatusURL != "https://provider.example/status/callback" {
 		t.Fatalf("callback evidence was reset: %#v", copyRow)
 	}
 }
@@ -377,7 +502,7 @@ func TestAdvancerSurfacesDurableSubmissionEvidenceFailure(t *testing.T) {
 		return []byte{0xab}, nil
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
-		request.OnSubmitted("0xevidence")
+		request.OnSubmitted(storage.CommitSubmission{TransactionID: "0xevidence", StatusURL: "https://provider.example/status/evidence"})
 		return &storage.CommitSubmission{
 			Kind: storage.CommitKindAddPieces, TransactionID: "0xevidence",
 			StatusURL:  "https://provider.example/status/evidence",
@@ -397,7 +522,7 @@ func TestAdvancerSurfacesDurableSubmissionEvidenceFailure(t *testing.T) {
 	}
 	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
 	if persisted.CommitAttemptID == nil || persisted.CommitAttemptedAt == nil ||
-		persisted.CommitTransactionID != nil || persisted.CommitSubmissionJSON != nil {
+		persisted.CommitTransactionID != nil || persisted.CommitStatusURL != nil {
 		t.Fatalf("failed evidence write lost attempt fence or invented evidence: %#v", persisted)
 	}
 }
@@ -418,7 +543,7 @@ func TestAdvancerUnavailableConfirmationWaitsThenRecoversFromAttention(t *testin
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		const tx = "0xunavailable"
-		request.OnSubmitted(tx)
+		request.OnSubmitted(storage.CommitSubmission{TransactionID: tx, StatusURL: "https://provider.example/status/unavailable"})
 		return &storage.CommitSubmission{
 			Kind: storage.CommitKindAddPieces, TransactionID: tx,
 			StatusURL:  "https://provider.example/status/unavailable",
@@ -427,12 +552,12 @@ func TestAdvancerUnavailableConfirmationWaitsThenRecoversFromAttention(t *testin
 		}, nil
 	}
 	confirmed := false
-	target.GetCommitStatusFunc = func(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error) {
+	target.GetCommitStatusFunc = func(context.Context, string) (*storage.CommitStatus, error) {
 		if !confirmed {
 			return nil, storage.ErrDataSetUnavailable
 		}
 		return &storage.CommitStatus{
-			State: storage.CommitStateConfirmed, TransactionID: "0xunavailable",
+			Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed, TransactionID: "0xunavailable",
 			ConfirmedTransactionID: "0xconfirmed", DataSet: &dataSetRef,
 			PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(5001)},
 		}, nil
@@ -617,7 +742,7 @@ func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *t
 	}
 	target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
 		const tx = "0x0000000000000000000000000000000000000000000000000000000000000101"
-		request.OnSubmitted(tx)
+		request.OnSubmitted(storage.CommitSubmission{TransactionID: tx, StatusURL: "https://provider.example/status/invalid"})
 		return &storage.CommitSubmission{
 			Kind: storage.CommitKindAddPieces, TransactionID: tx,
 			StatusURL:  "https://provider.example/status/invalid",
@@ -627,21 +752,21 @@ func TestAdvancerFullSubmissionInvalidStatusKeepsStableAttentionAndRecovers(t *t
 	}
 	mode := "invalid"
 	statusCalls := 0
-	target.GetCommitStatusFunc = func(_ context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+	target.GetCommitStatusFunc = func(_ context.Context, statusURL string) (*storage.CommitStatus, error) {
 		statusCalls++
 		switch mode {
 		case "invalid":
 			return nil, fmt.Errorf("provider status identity: %w", pdp.ErrInvalidStatus)
 		case "pending":
-			return &storage.CommitStatus{State: storage.CommitStatePending, TransactionID: submission.TransactionID}, nil
+			return &storage.CommitStatus{Kind: storage.CommitKindAddPieces, State: storage.CommitStatePending, TransactionID: "0x0000000000000000000000000000000000000000000000000000000000000101", DataSet: &dataSetRef}, nil
 		case "confirmed":
 			return &storage.CommitStatus{
-				State: storage.CommitStateConfirmed, TransactionID: submission.TransactionID,
+				Kind: storage.CommitKindAddPieces, State: storage.CommitStateConfirmed, TransactionID: "0x0000000000000000000000000000000000000000000000000000000000000101",
 				ConfirmedTransactionID: "0xconfirmed", DataSet: &dataSetRef,
 				PieceIDs: []sdktypes.BigInt{sdktypes.NewBigInt(5001)},
 			}, nil
 		case "rejected":
-			return &storage.CommitStatus{State: storage.CommitStateRejected, TransactionID: submission.TransactionID}, nil
+			return &storage.CommitStatus{Kind: storage.CommitKindAddPieces, State: storage.CommitStateRejected, TransactionID: "0x0000000000000000000000000000000000000000000000000000000000000101", DataSet: &dataSetRef}, nil
 		default:
 			t.Fatalf("unexpected status mode %q", mode)
 			return nil, nil
@@ -1278,7 +1403,7 @@ func TestAdvancerWriteBlockedDataSetReleasesAttemptWithCause(t *testing.T) {
 			return []byte{0xab}, nil
 		}
 		target.SubmitCommitFunc = func(_ context.Context, request storage.CommitRequest) (*storage.CommitSubmission, error) {
-			request.OnSubmitted("0xwriteblocked")
+			request.OnSubmitted(storage.CommitSubmission{TransactionID: "0xwriteblocked", StatusURL: "https://provider.example/status/writeblocked"})
 			return nil, writeBlocked()
 		}
 
@@ -1294,74 +1419,6 @@ func TestAdvancerWriteBlockedDataSetReleasesAttemptWithCause(t *testing.T) {
 			persisted.CommitAttemptedAt == nil || persisted.CommitTransactionID == nil ||
 			*persisted.CommitTransactionID != "0xwriteblocked" {
 			t.Fatalf("write-blocked release dropped submitted evidence: %#v", persisted)
-		}
-	})
-}
-
-func TestAdvancerUnreadableSubmissionFallsBackToTransactionEvidence(t *testing.T) {
-	seed := func(t *testing.T, repos *repository.Repositories, copyRow model.StorageCopy) {
-		t.Helper()
-		identity := advancerCopyIdentity(copyRow)
-		if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
-			Copy: identity, AttemptID: "unreadable",
-		}); err != nil {
-			t.Fatalf("reserve: %v", err)
-		}
-		if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-			Copy: identity, AttemptID: "unreadable", ExtraDataHex: "abcd",
-		}); err != nil {
-			t.Fatalf("mark attempted: %v", err)
-		}
-		if err := repos.Contents.RecordCommitSubmission(t.Context(), storagecommit.EvidenceInput{
-			Copy: identity, AttemptID: "unreadable", TransactionID: "0xunreadable",
-			// A future envelope version stands in for any submission this build can
-			// no longer decode, such as an SDK that renamed a field.
-			SubmissionJSON: `{"version":99,"submission":{}}`,
-		}); err != nil {
-			t.Fatalf("record submission: %v", err)
-		}
-	}
-
-	t.Run("confirms through the recorded transaction", func(t *testing.T) {
-		db := testutil.NewTestDB(t)
-		repos := repository.NewRepositories(db)
-		binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
-		seed(t, repos, copies[0])
-		target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
-		target.ClientDataSetIDValue = sdktypes.NewBigInt(9001)
-		target.GetCommitStatusFunc = func(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error) {
-			t.Fatal("unreadable submission reached GetCommitStatus")
-			return nil, nil
-		}
-		checker := commitStatusCheckerFunc(func(context.Context, synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error) {
-			return synapse.PDPStatusResult{
-				State: synapse.PDPStatusConfirmed, ConfirmedPieceIDs: []string{"5001"},
-				ConfirmedTransactionID: "0xconfirmedtx",
-			}, nil
-		})
-
-		result, err := (&storagecommit.Advancer{Store: repos.Contents, StatusChecker: checker}).Advance(
-			t.Context(), storagecommit.AdvanceInput{
-				Copy: *loadAdvancerCopy(t, repos, copies[0].ID), Binding: *binding, Target: target,
-				Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
-			})
-		if err != nil || result.State != storagecommit.AdvanceConfirmed || result.Confirmation == nil ||
-			result.Confirmation.ConfirmedTransactionID != "0xconfirmedtx" {
-			t.Fatalf("advance = %#v err=%v, want confirmation from transaction evidence", result, err)
-		}
-	})
-
-	t.Run("rejects submission without transaction evidence", func(t *testing.T) {
-		db := testutil.NewTestDB(t)
-		repos := repository.NewRepositories(db)
-		_, copies, _ := seedAdvancerCopies(t, db, 1)
-		seed(t, repos, copies[0])
-		if _, err := db.NewUpdate().
-			Model((*storagecommit.Attempt)(nil)).
-			Set("transaction_id = NULL").
-			Where("attempt_id = ?", "unreadable").
-			Exec(t.Context()); err == nil {
-			t.Fatal("commit ledger accepted submission evidence without a transaction")
 		}
 	})
 }

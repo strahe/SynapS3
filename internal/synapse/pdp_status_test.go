@@ -76,7 +76,7 @@ func TestPDPStatusCheckerChecksDataSetCreationStatusOnce(t *testing.T) {
 	var requests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
-		if r.URL.Path != "/pdp/data-sets/created/0xabc" {
+		if r.URL.Path != "/pdp/data-sets/created/"+testCreateDataSetTxHash {
 			t.Fatalf("path = %q, want creation status path", r.URL.Path)
 		}
 		_, _ = fmt.Fprintf(w, `{"createMessageHash":%q,"service":"svc","txStatus":"pending","dataSetCreated":false,"ok":null}`, testCreateDataSetTxHash)
@@ -85,7 +85,7 @@ func TestPDPStatusCheckerChecksDataSetCreationStatusOnce(t *testing.T) {
 
 	checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
 	got := checker.CheckDataSetCreationStatus(t.Context(), DataSetCreationStatusInput{
-		StatusURL:     server.URL + "/pdp/data-sets/created/0xabc",
+		StatusURL:     server.URL + "/pdp/data-sets/created/" + testCreateDataSetTxHash,
 		TransactionID: testCreateDataSetTxHash,
 	})
 
@@ -215,7 +215,7 @@ func TestPDPStatusCheckerClassifiesSDKRejectedCreationStatuses(t *testing.T) {
 
 			checker := NewPDPStatusChecker(PDPStatusCheckerOptions{Timeout: time.Second, AllowPrivateNetworks: true})
 			got := checker.CheckDataSetCreationStatus(t.Context(), DataSetCreationStatusInput{
-				StatusURL:     server.URL + "/pdp/data-sets/created/0xabc",
+				StatusURL:     server.URL + "/pdp/data-sets/created/" + testCreateDataSetTxHash,
 				TransactionID: testCreateDataSetTxHash,
 			})
 

@@ -53,11 +53,11 @@ type AttemptResult struct {
 }
 
 type EvidenceInput struct {
-	Copy           CopyIdentity
-	AttemptID      string
-	TransactionID  string
-	SubmissionJSON string
-	Now            time.Time
+	Copy          CopyIdentity
+	AttemptID     string
+	TransactionID string
+	StatusURL     string
+	Now           time.Time
 }
 
 type AttentionInput struct {

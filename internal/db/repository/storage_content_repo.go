@@ -244,7 +244,7 @@ func (r *BunStorageContentRepo) ListCopies(ctx context.Context, contentID int64)
 			active_commit_attempt.attempt_id AS commit_attempt_id,
 			active_commit_attempt.attempted_at AS commit_attempted_at,
 			active_commit_attempt.transaction_id AS commit_transaction_id,
-			active_commit_attempt.submission_json AS commit_submission_json,
+			active_commit_attempt.status_url AS commit_status_url,
 			active_commit_attempt.confirmed_transaction_id AS commit_confirmed_transaction_id,
 			active_commit_attempt.attention_code AS commit_attention_code,
 			active_commit_attempt.attention_at AS commit_attention_at

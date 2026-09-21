@@ -28,7 +28,7 @@ type StorageTarget interface {
 type ProviderTarget interface {
 	StorageTarget
 	CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
-	WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
+	WaitForDataSetCreated(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error)
 	// ContextIdentity is the payer, chain, and record keeper the target signs
 	// for. Client data set IDs are only unique within it.
 	ContextIdentity() storage.ContextIdentity
@@ -44,7 +44,7 @@ type DataSetTarget interface {
 	PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error)
 	Pull(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommit(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
-	GetCommitStatus(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
+	GetCommitStatus(context.Context, string) (*storage.CommitStatus, error)
 	PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error)
 }
 

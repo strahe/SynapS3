@@ -11,6 +11,7 @@ import (
 	"maps"
 	"math/big"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,13 +49,14 @@ type memoryPiece struct {
 type MemoryFilecoin struct {
 	mu sync.RWMutex
 
-	providers       []sdktypes.BigInt
-	dataSets        map[string]*memoryDataSet
-	pendingDataSets map[string]sdktypes.BigInt
-	submissions     map[string]sdktypes.BigInt
-	pieces          map[string]*memoryPiece
-	nextDataSet     map[string]uint64
-	nextPiece       uint64
+	providers         []sdktypes.BigInt
+	dataSets          map[string]*memoryDataSet
+	pendingDataSets   map[string]sdktypes.BigInt
+	submissions       map[string]sdktypes.BigInt
+	commitSubmissions map[string]storage.CommitSubmission
+	pieces            map[string]*memoryPiece
+	nextDataSet       map[string]uint64
+	nextPiece         uint64
 	// terminated records the epoch at which each data set's service ends, and
 	// epoch is the observed chain head. Tests advance the head to prove that
 	// retirement waits for the chain rather than for the call returning.
@@ -81,14 +83,15 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 			sdktypes.NewBigInt(103),
 			sdktypes.NewBigInt(104),
 		},
-		dataSets:        make(map[string]*memoryDataSet),
-		pendingDataSets: make(map[string]sdktypes.BigInt),
-		submissions:     make(map[string]sdktypes.BigInt),
-		pieces:          make(map[string]*memoryPiece),
-		nextDataSet:     make(map[string]uint64),
-		nextPiece:       1,
-		terminated:      make(map[string]int64),
-		epoch:           1000,
+		dataSets:          make(map[string]*memoryDataSet),
+		pendingDataSets:   make(map[string]sdktypes.BigInt),
+		submissions:       make(map[string]sdktypes.BigInt),
+		commitSubmissions: make(map[string]storage.CommitSubmission),
+		pieces:            make(map[string]*memoryPiece),
+		nextDataSet:       make(map[string]uint64),
+		nextPiece:         1,
+		terminated:        make(map[string]int64),
+		epoch:             1000,
 	}
 }
 
@@ -351,7 +354,7 @@ func (c *memoryProviderTarget) CreateDataSet(ctx context.Context, opts *storage.
 
 	submission := storage.CreateDataSetSubmission{
 		ProviderID: c.provider.Copy(), TransactionID: txID,
-		StatusURL: c.ServiceURL() + "/status/" + txID, ClientDataSetID: copyBigIntPtr(clientID),
+		StatusURL: c.ServiceURL() + "/status/" + txID, ClientDataSetID: clientID.Copy(),
 	}
 	if opts != nil && opts.OnSubmitted != nil {
 		opts.OnSubmitted(submission)
@@ -386,29 +389,26 @@ func (c *memoryProviderTarget) FindDataSetByClientDataSetID(ctx context.Context,
 	return storage.DataSetRef{}, false, nil
 }
 
-func (c *memoryProviderTarget) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+func (c *memoryProviderTarget) WaitForDataSetCreated(ctx context.Context, statusURL string, clientDataSetID sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !submission.ProviderID.Equal(c.provider) {
-		return nil, fmt.Errorf("%w: submission provider %s does not match target provider %s",
-			errInvalidFilecoinSequence, submission.ProviderID.String(), c.provider.String())
-	}
-	if submission.ClientDataSetID == nil {
-		return nil, fmt.Errorf("%w: submission is missing client data set ID", errInvalidFilecoinSequence)
+	txID, ok := strings.CutPrefix(statusURL, c.ServiceURL()+"/status/")
+	if !ok || txID == "" {
+		return nil, fmt.Errorf("%w: invalid dataset status URL %q", errInvalidFilecoinSequence, statusURL)
 	}
 	c.filecoin.mu.RLock()
-	id, ok := c.filecoin.submissions[submission.TransactionID]
+	id, ok := c.filecoin.submissions[txID]
 	dataSet := c.filecoin.dataSets[id.String()]
 	c.filecoin.mu.RUnlock()
-	if !ok || dataSet == nil || !dataSet.provider.Equal(c.provider) {
-		return nil, fmt.Errorf("%w: unknown dataset submission %q", errInvalidFilecoinSequence, submission.TransactionID)
+	if !ok || dataSet == nil || !dataSet.provider.Equal(c.provider) || !dataSet.clientID.Equal(clientDataSetID) {
+		return nil, fmt.Errorf("%w: unknown dataset submission %q", errInvalidFilecoinSequence, txID)
 	}
 	ref, err := storage.NewDataSetRef(c.provider, id, dataSet.clientID)
 	if err != nil {
 		return nil, err
 	}
-	return &storage.CreateDataSetResult{TransactionID: submission.TransactionID, DataSet: ref}, nil
+	return &storage.CreateDataSetResult{TransactionID: txID, DataSet: ref}, nil
 }
 
 func (c *memoryDataSetTarget) Store(ctx context.Context, reader io.Reader, opts *storage.StoreOptions) (*storage.StoreResult, error) {
@@ -534,23 +534,30 @@ func (c *memoryDataSetTarget) SubmitCommit(ctx context.Context, request storage.
 	}
 	txID := fmt.Sprintf("commit-%s-%s", dataSetID.String(), pieceIDs[0].String())
 	c.filecoin.mu.Unlock()
-	if request.OnSubmitted != nil {
-		request.OnSubmitted(txID)
-	}
-	return &storage.CommitSubmission{
+	submission := storage.CommitSubmission{
 		Kind: storage.CommitKindAddPieces, TransactionID: txID,
 		StatusURL:  c.ServiceURL() + "/status/" + txID,
 		ProviderID: c.provider.Copy(), DataSet: &c.ref,
 		PieceCIDs: append([]cid.Cid(nil), pieceCIDs(request.Pieces)...),
-	}, nil
+	}
+	c.filecoin.mu.Lock()
+	c.filecoin.commitSubmissions[submission.StatusURL] = submission
+	c.filecoin.mu.Unlock()
+	if request.OnSubmitted != nil {
+		request.OnSubmitted(submission)
+	}
+	return &submission, nil
 }
 
-func (c *memoryDataSetTarget) GetCommitStatus(ctx context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+func (c *memoryDataSetTarget) GetCommitStatus(ctx context.Context, statusURL string) (*storage.CommitStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	c.filecoin.mu.RLock()
+	submission, found := c.filecoin.commitSubmissions[statusURL]
+	c.filecoin.mu.RUnlock()
 	dataSetID := c.DataSetID()
-	if dataSetID == nil || submission.Kind != storage.CommitKindAddPieces || submission.DataSet == nil ||
+	if !found || dataSetID == nil || submission.Kind != storage.CommitKindAddPieces || submission.DataSet == nil ||
 		!submission.ProviderID.Equal(c.provider) || !submission.DataSet.DataSetID().Equal(*dataSetID) || len(submission.PieceCIDs) == 0 {
 		return nil, fmt.Errorf("%w: commit submission does not match target", errInvalidFilecoinSequence)
 	}

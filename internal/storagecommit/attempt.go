@@ -30,7 +30,7 @@ type Attempt struct {
 	Status                 AttemptStatus `bun:"status,type:text,notnull,default:'reserved'"`
 	ExtraDataHex           *string       `bun:"extra_data_hex,type:text,nullzero"`
 	TransactionID          *string       `bun:"transaction_id,type:text,nullzero"`
-	SubmissionJSON         *string       `bun:"submission_json,type:text,nullzero"`
+	StatusURL              *string       `bun:"status_url,type:text,nullzero"`
 	ConfirmedTransactionID *string       `bun:"confirmed_transaction_id,type:text,nullzero"`
 	AttentionCode          *string       `bun:"attention_code,type:text,nullzero"`
 	AttentionAt            *time.Time    `bun:"attention_at,nullzero"`

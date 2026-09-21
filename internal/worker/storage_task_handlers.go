@@ -633,10 +633,7 @@ func (h *TaskHandlers) waitDataSetCreation(
 	checkpoint dataSetCreationCheckpoint,
 	clientDataSetID sdktypes.BigInt,
 ) taskengine.Result {
-	result, err := provider.WaitForDataSetCreated(ctx, storage.CreateDataSetSubmission{
-		ProviderID: binding.ProviderID.SDK(), TransactionID: checkpoint.TransactionID,
-		StatusURL: checkpoint.StatusURL, ClientDataSetID: &clientDataSetID,
-	})
+	result, err := provider.WaitForDataSetCreated(ctx, checkpoint.StatusURL, clientDataSetID)
 	if err != nil {
 		if errors.Is(err, synapse.ErrProviderTransactionRejected) {
 			if checkpoint.Sends > 1 {

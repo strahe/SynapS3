@@ -222,8 +222,8 @@ func (c *providerTargetAdapter) CreateDataSet(ctx context.Context, opts *storage
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 
-func (c *providerTargetAdapter) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
-	result, err := c.provider.WaitForDataSetCreated(ctx, submission)
+func (c *providerTargetAdapter) WaitForDataSetCreated(ctx context.Context, statusURL string, clientDataSetID sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
+	result, err := c.provider.WaitForDataSetCreated(ctx, statusURL, clientDataSetID)
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 
@@ -272,8 +272,8 @@ func (c *dataSetTargetAdapter) SubmitCommit(ctx context.Context, request storage
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 
-func (c *dataSetTargetAdapter) GetCommitStatus(ctx context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
-	result, err := c.dataSet.GetCommitStatus(ctx, submission)
+func (c *dataSetTargetAdapter) GetCommitStatus(ctx context.Context, statusURL string) (*storage.CommitStatus, error) {
+	result, err := c.dataSet.GetCommitStatus(ctx, statusURL)
 	return result, NormalizeProviderOperationError(ctx, err)
 }
 

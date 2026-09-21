@@ -103,6 +103,9 @@ func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input
 	}
 	status, err := client.GetDataSetCreationStatus(ctx, statusURL)
 	if status == nil {
+		if errors.Is(err, pdp.ErrInvalidStatus) {
+			return result.withError(PDPStatusMismatch, err.Error())
+		}
 		if err == nil {
 			err = errors.New("empty data set creation status")
 		}
@@ -163,6 +166,9 @@ func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiec
 	}
 	status, err := client.GetAddPiecesStatus(ctx, statusURL)
 	if status == nil {
+		if errors.Is(err, pdp.ErrInvalidStatus) {
+			result.State = PDPStatusMismatch
+		}
 		if err == nil {
 			err = errors.New("empty add-pieces status")
 		}
