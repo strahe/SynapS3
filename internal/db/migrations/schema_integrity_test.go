@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	initialPortableSchemaFingerprint = "657cbdd208ba7ff26431b90df7f03e40233b0475ab25253508b58922fd828c7e"
+	initialPortableSchemaFingerprint = "4a57bf16ec5d242f43154dd29183049c592641f4b7acee471f4aa269fb2d7b83"
 )
 
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
@@ -139,7 +139,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		"multipart_uploads", "multipart_parts", "storage_contents", "storage_data_sets",
 		"storage_copies", "storage_commit_attempts", "storage_replacements",
 		"storage_pull_attempts", "storage_replacement_items", "storage_cleanup_copies", "wallet_operations", "tasks",
-		"observability_collection_states", "observability_provider_states", "observability_data_set_states",
+		"observability_collection_states", "observability_provider_states", "observability_data_set_states", "provider_upload_speed_tests",
 		"task_payloads", "storage_data_set_terminations",
 	} {
 		if exists, err := tableExists(t.Context(), db, table); err != nil || !exists {
@@ -148,6 +148,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 	}
 	for _, column := range []struct{ table, name string }{
 		{"tasks", "claim_generation"},
+		{"provider_upload_speed_tests", "active_task_id"},
 		{"task_payloads", "checkpoint_json"},
 		{"storage_data_set_terminations", "epoch"},
 		{"storage_copies", "active_task_id"},
@@ -181,6 +182,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		"idx_storage_data_sets_bucket_provider_active",
 		"idx_storage_replacements_active_bucket_slot",
 		"idx_wallet_operations_recent",
+		"idx_provider_upload_speed_tests_active_task",
 	} {
 		if exists, err := indexExists(t.Context(), db, index); err != nil || !exists {
 			t.Errorf("index %s exists=%t err=%v", index, exists, err)

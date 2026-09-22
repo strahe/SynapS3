@@ -79,6 +79,7 @@ func NewEngine(config EngineConfig, repos *repository.Repositories, registry *Re
 		config: config, repos: repos, registry: registry, logger: logger,
 		gates: map[Resource]chan struct{}{
 			ResourceProviderMutation:    make(chan struct{}, config.ProviderMutationConcurrency),
+			ResourceProviderUploadSpeed: make(chan struct{}, 1),
 			ResourceDestructiveMutation: make(chan struct{}, config.DestructiveMutationConcurrency),
 			ResourceWallet:              make(chan struct{}, 1),
 		},

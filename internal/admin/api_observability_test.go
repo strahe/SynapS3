@@ -12,6 +12,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/testutil"
 )
 
@@ -174,6 +175,83 @@ func TestAPIObservabilityProviders(t *testing.T) {
 	}
 	if len(body.Items) != 1 || body.Items[0].Facts.ProviderID.String() != "101" {
 		t.Fatalf("items = %+v, want provider 101", body.Items)
+	}
+}
+
+func TestAPIProviderUploadSpeedTestAdmitsOneTaskAndListsResult(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Now().UTC()
+	serviceURL := "https://provider.example"
+	if err := repos.Observability.ReplaceProviderStates(t.Context(), checkedAt, []observability.ProviderState{{
+		ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable,
+		Active: new(true), HasPDP: new(true), ServiceURL: &serviceURL,
+		LastCheckedAt: checkedAt, ReasonCodes: []observability.ReasonCode{}, Evidence: map[string]any{},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		repos: repos, observability: observability.NewService(observability.ServiceOptions{Store: repos.Observability}),
+		taskService: newAdminTestTaskService(t, repos), logger: testLogger(),
+	}
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/observability/providers/101/upload-speed-test", nil)
+		req.SetPathValue("provider_id", "101")
+		rr := httptest.NewRecorder()
+		srv.handleAPIProviderUploadSpeedTest(rr, req)
+		return rr
+	}
+	if rr := request(); rr.Code != http.StatusAccepted {
+		t.Fatalf("first POST = %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := request(); rr.Code != http.StatusConflict {
+		t.Fatalf("duplicate POST = %d: %s", rr.Code, rr.Body.String())
+	}
+	getSpeed := func() providerUploadSpeedView {
+		t.Helper()
+		getReq := httptest.NewRequest(http.MethodGet, "/api/v1/observability/providers", nil)
+		getRR := httptest.NewRecorder()
+		srv.handleAPIObservabilityProviders(getRR, getReq)
+		var page struct {
+			Items []struct {
+				UploadSpeedTest providerUploadSpeedView `json:"upload_speed_test"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal(getRR.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) != 1 {
+			t.Fatalf("listed providers = %+v", page.Items)
+		}
+		return page.Items[0].UploadSpeedTest
+	}
+	if got := getSpeed(); got.State != string(providerbenchmark.StateTesting) {
+		t.Fatalf("active speed test = %+v", got)
+	}
+	row, err := repos.ProviderUploadSpeed.Get(t.Context(), "101")
+	if err != nil || row == nil || row.ActiveTaskID == nil {
+		t.Fatalf("active speed test row = %+v, %v", row, err)
+	}
+	if err := repos.ProviderUploadSpeed.Finish(t.Context(), "101", *row.ActiveTaskID, providerbenchmark.StateSucceeded,
+		1000, providerbenchmark.SampleBytes, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := getSpeed(); got.State != string(providerbenchmark.StateSucceeded) || got.BytesPerSecond == nil {
+		t.Fatalf("successful speed test = %+v", got)
+	}
+	newURL := "https://another-provider.example"
+	if err := repos.Observability.ReplaceProviderStates(t.Context(), time.Now().UTC(), []observability.ProviderState{{
+		ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable,
+		Active: new(true), HasPDP: new(true), ServiceURL: &newURL,
+		LastCheckedAt: time.Now().UTC(), ReasonCodes: []observability.ReasonCode{}, Evidence: map[string]any{},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getSpeed(); got.State != "stale" || got.BytesPerSecond != nil {
+		t.Fatalf("changed-address speed test = %+v", got)
+	}
+	if rr := request(); rr.Code != http.StatusAccepted {
+		t.Fatalf("new-address POST = %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -562,6 +562,33 @@ test('observability list APIs omit query string when params are empty', async ()
   assert.deepEqual(requestedURLs, ['/api/v1/observability/providers', '/api/v1/observability/data-sets'])
 })
 
+test('provider upload speed test posts to the selected provider with CSRF', async () => {
+  const originalFetch = globalThis.fetch
+  let url = ''
+  let method = ''
+  let csrf = ''
+  globalThis.fetch = (async (input, init) => {
+    url = input.toString()
+    method = init?.method ?? ''
+    csrf = new Headers(init?.headers).get('X-SynapS3-CSRF') ?? ''
+    return new Response(JSON.stringify({ task_id: 42, state: 'testing' }), {
+      status: 202,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as typeof fetch
+  try {
+    setAdminCSRFToken('speed-csrf')
+    const result = await api.testProviderUploadSpeed('101')
+    assert.deepEqual(result, { task_id: 42, state: 'testing' })
+  } finally {
+    setAdminCSRFToken('')
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(url, '/api/v1/observability/providers/101/upload-speed-test')
+  assert.equal(method, 'POST')
+  assert.equal(csrf, 'speed-csrf')
+})
+
 test('object download URL encodes bucket name and object key', () => {
   assert.equal(
     api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),

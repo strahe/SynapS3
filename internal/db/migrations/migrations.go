@@ -32,6 +32,7 @@ var initialSchemaTableNames = []string{
 	"observability_collection_states",
 	"observability_data_set_states",
 	"observability_provider_states",
+	"provider_upload_speed_tests",
 	"s3_accounts",
 	"storage_cleanup_copies",
 	"storage_commit_attempts",
@@ -81,6 +82,13 @@ func ValidateTarget(ctx context.Context, db bun.IDB) error {
 		return fmt.Errorf("checking obsolete commit submission column: %w", err)
 	}
 	if !statusURLExists || oldJSONExists {
+		return incompatibleDatabaseError()
+	}
+	benchmarkExists, err := tableExists(ctx, db, "provider_upload_speed_tests")
+	if err != nil {
+		return fmt.Errorf("checking provider upload speed tests: %w", err)
+	}
+	if !benchmarkExists {
 		return incompatibleDatabaseError()
 	}
 	return nil

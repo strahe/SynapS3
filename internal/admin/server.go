@@ -284,6 +284,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("GET /api/v1/filecoin/readiness", s.handleAPIFilecoinReadiness)
 		mux.HandleFunc("GET /api/v1/observability/providers", s.handleAPIObservabilityProviders)
 		mux.HandleFunc("POST /api/v1/observability/providers/refresh", s.handleAPIRefreshObservabilityProviders)
+		mux.HandleFunc("POST /api/v1/observability/providers/{provider_id}/upload-speed-test", s.handleAPIProviderUploadSpeedTest)
 		mux.HandleFunc("GET /api/v1/observability/data-sets", s.handleAPIObservabilityDataSets)
 		mux.HandleFunc("POST /api/v1/observability/data-sets/refresh", s.handleAPIRefreshObservabilityDataSets)
 		if s.s3IAM != nil {

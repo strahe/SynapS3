@@ -7,6 +7,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/types"
@@ -750,6 +751,13 @@ type ObservabilityRepository interface {
 	ReplaceDataSetStates(ctx context.Context, checkedAt time.Time, states []observability.DataSetState) error
 	ListDataSetStates(ctx context.Context, opts observability.ListOptions) (observability.DataSetStatePage, error)
 	GetDataSetStatesByLocalIDs(ctx context.Context, localIDs []int64) (map[int64]observability.DataSetState, error)
+}
+
+type ProviderUploadSpeedRepository interface {
+	Begin(context.Context, string, string, int64) error
+	Finish(context.Context, string, int64, providerbenchmark.State, int64, int64, string) error
+	Get(context.Context, string) (*providerbenchmark.Result, error)
+	ListByProviderIDs(context.Context, []string) (map[string]providerbenchmark.Result, error)
 }
 
 type CreateWalletOperationInput struct {

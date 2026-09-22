@@ -328,8 +328,11 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 | `POST` | `/api/v1/filecoin/readiness/preflight` | Validate pending Filecoin settings. |
 | `GET` | `/api/v1/observability/providers` | Provider health data. |
 | `POST` | `/api/v1/observability/providers/refresh` | Refresh provider health. |
+| `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | Start one 32 MiB upload speed test for an available provider. Returns `202 Accepted` with `task_id`; a test already in progress returns `409 Conflict`. |
 | `GET` | `/api/v1/observability/data-sets` | Local data set health data. |
 | `POST` | `/api/v1/observability/data-sets/refresh` | Refresh data set health. |
+
+Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; a changed service address makes the result `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests cannot be retried through the task retry endpoint; start a new test instead.
 
 ## Settings and S3 Users
 

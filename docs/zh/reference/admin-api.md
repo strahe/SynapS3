@@ -328,8 +328,11 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `POST` | `/api/v1/filecoin/readiness/preflight` | 验证待保存的 Filecoin 设置。 |
 | `GET` | `/api/v1/observability/providers` | 存储提供方健康数据。 |
 | `POST` | `/api/v1/observability/providers/refresh` | 刷新存储提供方健康状态。 |
+| `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | 对可用的存储提供方发起一次 32 MiB 上传测速。返回 `202 Accepted` 和 `task_id`；已有测速进行中时返回 `409 Conflict`。 |
 | `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
+
+存储提供方列表可选返回最近一次手动测速的 `upload_speed_test`。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；服务地址变化后，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。失败测速不能通过任务重试接口重试，请重新发起测速。
 
 ## 设置和 S3 用户
 

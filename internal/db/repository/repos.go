@@ -12,17 +12,18 @@ import (
 // dependency for service/backend layers.  The WithTx helper executes a callback
 // inside a database transaction with a clone of Repositories backed by the tx.
 type Repositories struct {
-	Buckets          BucketRepository
-	S3Accounts       S3AccountRepository
-	Objects          ObjectRepository
-	Contents         StorageContentRepository
-	Replacements     StorageReplacementRepository
-	StorageCleanup   StorageCleanupRepository
-	Tasks            TaskRepository
-	CacheEvictions   CacheEvictionRepository
-	Multiparts       MultipartUploadRepository
-	WalletOperations WalletOperationRepository
-	Observability    ObservabilityRepository
+	Buckets             BucketRepository
+	S3Accounts          S3AccountRepository
+	Objects             ObjectRepository
+	Contents            StorageContentRepository
+	Replacements        StorageReplacementRepository
+	StorageCleanup      StorageCleanupRepository
+	Tasks               TaskRepository
+	CacheEvictions      CacheEvictionRepository
+	Multiparts          MultipartUploadRepository
+	WalletOperations    WalletOperationRepository
+	Observability       ObservabilityRepository
+	ProviderUploadSpeed ProviderUploadSpeedRepository
 
 	db bun.IDB
 }
@@ -30,18 +31,19 @@ type Repositories struct {
 // NewRepositories constructs a Repositories with concrete Bun-backed implementations.
 func NewRepositories(db bun.IDB) *Repositories {
 	return &Repositories{
-		Buckets:          &BunBucketRepo{db: db},
-		S3Accounts:       &BunS3AccountRepo{db: db},
-		Objects:          &BunObjectRepo{db: db},
-		Contents:         &BunStorageContentRepo{db: db},
-		Replacements:     &BunStorageReplacementRepo{db: db},
-		StorageCleanup:   &BunStorageCleanupRepo{db: db},
-		Tasks:            &BunTaskRepo{db: db},
-		CacheEvictions:   &BunCacheEvictionRepo{db: db},
-		Multiparts:       &BunMultipartRepo{db: db},
-		WalletOperations: &BunWalletOperationRepo{db: db},
-		Observability:    &BunObservabilityRepo{db: db},
-		db:               db,
+		Buckets:             &BunBucketRepo{db: db},
+		S3Accounts:          &BunS3AccountRepo{db: db},
+		Objects:             &BunObjectRepo{db: db},
+		Contents:            &BunStorageContentRepo{db: db},
+		Replacements:        &BunStorageReplacementRepo{db: db},
+		StorageCleanup:      &BunStorageCleanupRepo{db: db},
+		Tasks:               &BunTaskRepo{db: db},
+		CacheEvictions:      &BunCacheEvictionRepo{db: db},
+		Multiparts:          &BunMultipartRepo{db: db},
+		WalletOperations:    &BunWalletOperationRepo{db: db},
+		Observability:       &BunObservabilityRepo{db: db},
+		ProviderUploadSpeed: &BunProviderUploadSpeedRepo{db: db},
+		db:                  db,
 	}
 }
 

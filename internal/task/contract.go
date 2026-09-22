@@ -194,6 +194,7 @@ type Resource string
 
 const (
 	ResourceProviderMutation    Resource = "provider_mutation"
+	ResourceProviderUploadSpeed Resource = "provider_upload_speed"
 	ResourceDestructiveMutation Resource = "destructive_mutation"
 	ResourceWallet              Resource = "wallet"
 )

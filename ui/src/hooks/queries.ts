@@ -370,6 +370,17 @@ export function useObservabilityProviders(
   })
 }
 
+export function useTestProviderUploadSpeed() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.testProviderUploadSpeed,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+}
+
 export function useObservabilityDataSets(params: ObservabilityListParams, enabled = true) {
   return useQuery({
     queryKey: ['observabilityDataSets', params],

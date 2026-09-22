@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepipeline"
@@ -70,14 +71,17 @@ type handlerRuntimeOptions struct {
 	terminator             synapse.ServiceTerminator
 	epochs                 synapse.ChainEpochReader
 	parkedPieces           synapse.ParkedPieceChecker
-	policy                 cache.EvictionPolicy
-	maxBytes               int64
-	highPercent            int
-	lowPercent             int
-	concurrency            int
-	maxRetries             *int
-	leaseDuration          time.Duration
-	register               func(*worker.TaskHandlers, *taskengine.Registry) error
+	uploadSpeedProbe       interface {
+		Probe(context.Context, string) (time.Duration, error)
+	}
+	policy        cache.EvictionPolicy
+	maxBytes      int64
+	highPercent   int
+	lowPercent    int
+	concurrency   int
+	maxRetries    *int
+	leaseDuration time.Duration
+	register      func(*worker.TaskHandlers, *taskengine.Registry) error
 }
 
 func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerTestRuntime {
@@ -98,13 +102,18 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	if options.maxRetries != nil {
 		maxRetries = *options.maxRetries
 	}
+	var observabilityService *observability.Service
+	if options.uploadSpeedProbe != nil {
+		observabilityService = observability.NewService(observability.ServiceOptions{Store: repos.Observability})
+	}
 	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
 		Repositories: repos, Events: options.events, Cache: cacheStore, CacheGate: gate, CacheTracker: tracker,
 		Storage: storageClient, Wallet: options.wallet, Receipts: options.receipts,
 		WalletBroadcastTimeout: options.walletBroadcastTimeout,
 		WalletReceiptTimeout:   options.walletReceiptTimeout,
 		Terminator:             options.terminator, Epochs: options.epochs,
-		ParkedPieces:   options.parkedPieces,
+		ParkedPieces:  options.parkedPieces,
+		Observability: observabilityService, UploadSpeedProbe: options.uploadSpeedProbe,
 		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
 		DefaultCopies: 2, MaxRetries: maxRetries, Logger: slog.Default(),
