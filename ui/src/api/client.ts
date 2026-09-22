@@ -157,6 +157,16 @@ export interface ObservabilityProviderFacts {
 export interface ObservabilityProviderObservation {
   facts: ObservabilityProviderFacts
   signal: ObservabilitySignal
+  upload_speed_test?: ProviderUploadSpeedTest
+}
+
+export interface ProviderUploadSpeedTest {
+  state: 'testing' | 'succeeded' | 'failed' | 'stale'
+  sample_bytes: number
+  duration_ms?: number
+  bytes_per_second?: number
+  tested_at?: string
+  failure_code?: string
 }
 
 export interface ObservabilityDataSetFacts {
@@ -1163,6 +1173,11 @@ export const api = {
   ) =>
     fetchJSON<ObservabilityListResponse<ObservabilityProviderObservation>>(
       `/observability/providers${observabilityListQuery(params)}`
+    ),
+  testProviderUploadSpeed: (providerID: string) =>
+    fetchJSON<{ task_id: number; state: 'testing' }>(
+      `/observability/providers/${encodeURIComponent(providerID)}/upload-speed-test`,
+      { method: 'POST' }
     ),
   getObservabilityDataSets: (params: ObservabilityListParams = {}) =>
     fetchJSON<ObservabilityListResponse<ObservabilityDataSetObservation>>(

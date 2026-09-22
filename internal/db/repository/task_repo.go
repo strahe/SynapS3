@@ -637,6 +637,7 @@ func (r *BunTaskRepo) DeleteRetained(ctx context.Context, now time.Time, limit i
 		Where(`NOT EXISTS (SELECT 1 FROM storage_copies WHERE active_task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM storage_data_sets WHERE ensure_task_id = task.id OR retirement_task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM wallet_operations WHERE task_id = task.id)`).
+		Where(`NOT EXISTS (SELECT 1 FROM provider_upload_speed_tests WHERE active_task_id = task.id)`).
 		Where(`NOT EXISTS (SELECT 1 FROM storage_replacements WHERE task_id = task.id)`).
 		OrderExpr("retention_until, id").
 		Limit(limit).

@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Database, Info } from 'lucide-react'
+import { Database, Gauge, Info, Loader2 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
@@ -9,7 +9,9 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { activePiecesValue } from '@/lib/data-set-storage-health'
+import { canTestProviderUploadSpeed, providerUploadSpeedLabel } from '@/lib/provider-upload-speed'
 import { replicaLabel } from '@/lib/storage-status-labels'
 import {
   dataSetChainIDValue,
@@ -32,6 +34,8 @@ export function ProvidersTableCard({
   contextNote,
   onPageChange,
   onSelect,
+  onTestUploadSpeed,
+  testingProviderID,
 }: {
   rows: StorageTopologyProviderRow[]
   total: number
@@ -42,6 +46,8 @@ export function ProvidersTableCard({
   contextNote?: string
   onPageChange: (page: number) => void
   onSelect: (item: StorageTopologyProviderRow) => void
+  onTestUploadSpeed: (providerID: string) => void
+  testingProviderID?: string
 }) {
   return (
     <div className="flex flex-col gap-3">
@@ -69,7 +75,30 @@ export function ProvidersTableCard({
                     <CopyableValue label="Provider" value={row.providerID} monospace maxLength={16} />
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2">
-                    <StatusBadge tone={observabilityStatusTone(row.status)}>{row.status}</StatusBadge>
+                    <div className="flex items-center gap-2">
+                      <StatusBadge tone={observabilityStatusTone(row.status)}>{row.status}</StatusBadge>
+                      {canTestProviderUploadSpeed(row.provider) && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              aria-label={`Test upload speed for provider ${row.providerID} (32 MiB)`}
+                              disabled={testingProviderID === row.providerID}
+                              onClick={() => onTestUploadSpeed(row.providerID)}
+                            >
+                              {testingProviderID === row.providerID ? <Loader2 className="animate-spin" /> : <Gauge />}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Test upload speed with 32 MiB</TooltipContent>
+                        </Tooltip>
+                      )}
+                      {row.provider?.upload_speed_test && (
+                        <span className="text-xs text-muted-foreground">
+                          {providerUploadSpeedLabel(row.provider.upload_speed_test)}
+                        </span>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                     {row.provider ? providerFactsSummary(row.provider) : '—'}

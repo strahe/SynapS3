@@ -29,6 +29,7 @@ const (
 	TaskTypeStorageDataSetRetire          TaskType = "storage_dataset_retire"
 	TaskTypeWalletOperation               TaskType = "wallet_operation"
 	TaskTypeObservabilityRefresh          TaskType = "observability_refresh"
+	TaskTypeProviderUploadSpeedTest       TaskType = "provider_upload_speed_test"
 	TaskTypeGC                            TaskType = "task_gc"
 )
 

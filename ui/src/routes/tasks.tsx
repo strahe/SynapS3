@@ -38,6 +38,7 @@ const taskOperations = [
   { value: 'storage_cleanup', label: 'Remove remote storage copy' },
   { value: 'storage_dataset_retire', label: 'Retire storage service' },
   { value: 'wallet_operation', label: 'Process wallet request' },
+  { value: 'provider_upload_speed_test', label: 'Test provider upload speed' },
 ] as const
 
 const taskStatuses = [

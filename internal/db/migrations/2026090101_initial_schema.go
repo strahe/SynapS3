@@ -1057,6 +1057,22 @@ type observabilityProviderState2026090101 struct {
 	Evidence      json.RawMessage `bun:"evidence_json,type:jsonb,notnull"`
 }
 
+type providerUploadSpeedTest2026090101 struct {
+	bun.BaseModel `bun:"table:provider_upload_speed_tests"`
+
+	ProviderID     string `bun:"type:text,pk"`
+	State          string `bun:"type:text,notnull"`
+	ServiceURLHash string `bun:"type:text,notnull"`
+	SampleBytes    int64  `bun:",notnull"`
+	DurationMS     *int64
+	BytesPerSecond *int64
+	TestedAt       *time.Time
+	FailureCode    *string `bun:"type:text"`
+	ActiveTaskID   *int64
+	CreatedAt      time.Time `bun:",notnull"`
+	UpdatedAt      time.Time `bun:",notnull"`
+}
+
 type observabilityDataSetState2026090101 struct {
 	bun.BaseModel `bun:"table:observability_data_set_states"`
 
@@ -1095,6 +1111,16 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 			},
 		},
 		{
+			name:  "provider_upload_speed_tests",
+			model: (*providerUploadSpeedTest2026090101)(nil),
+			constraints: []string{
+				"CONSTRAINT chk_provider_upload_speed_tests_state CHECK (state IN ('testing', 'succeeded', 'failed'))",
+				"CONSTRAINT chk_provider_upload_speed_tests_identity CHECK (provider_id <> '' AND length(service_url_hash) = 64 AND sample_bytes > 0)",
+				"CONSTRAINT chk_provider_upload_speed_tests_result CHECK ((state = 'testing' AND active_task_id IS NOT NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NULL AND failure_code IS NULL) OR (state = 'succeeded' AND active_task_id IS NULL AND duration_ms > 0 AND bytes_per_second > 0 AND tested_at IS NOT NULL AND failure_code IS NULL) OR (state = 'failed' AND active_task_id IS NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NOT NULL AND failure_code IS NOT NULL))",
+			},
+			foreignKeys: []string{"(active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT"},
+		},
+		{
 			name:        "observability_data_set_states",
 			model:       (*observabilityDataSetState2026090101)(nil),
 			jsonColumns: initialJSONColumns("observability_data_set_states"),
@@ -1115,6 +1141,7 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 	}
 	return createInitialIndexes(ctx, db,
 		initialIndexSpec{name: "idx_observability_provider_states_status", table: "observability_provider_states", columns: []string{"status", "last_checked_at"}},
+		initialIndexSpec{name: "idx_provider_upload_speed_tests_active_task", table: "provider_upload_speed_tests", columns: []string{"active_task_id"}, where: "active_task_id IS NOT NULL", unique: true},
 		initialIndexSpec{name: "idx_observability_data_set_states_bucket_status", table: "observability_data_set_states", columns: []string{"bucket_id", "status", "last_checked_at"}},
 		initialIndexSpec{name: "idx_observability_data_set_states_provider_status", table: "observability_data_set_states", columns: []string{"provider_id", "status", "last_checked_at"}},
 	)

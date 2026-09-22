@@ -32,14 +32,17 @@ type TaskHandlerDependencies struct {
 	Terminator             synapse.ServiceTerminator
 	Epochs                 synapse.ChainEpochReader
 	Observability          *observability.Service
-	ParkedPieces           synapse.ParkedPieceChecker
-	EvictionPolicy         cache.EvictionPolicy
-	MaxCacheBytes          int64
-	LRUHighPercent         int
-	LRULowPercent          int
-	DefaultCopies          int
-	MaxRetries             int
-	Logger                 *slog.Logger
+	UploadSpeedProbe       interface {
+		Probe(context.Context, string) (time.Duration, error)
+	}
+	ParkedPieces   synapse.ParkedPieceChecker
+	EvictionPolicy cache.EvictionPolicy
+	MaxCacheBytes  int64
+	LRUHighPercent int
+	LRULowPercent  int
+	DefaultCopies  int
+	MaxRetries     int
+	Logger         *slog.Logger
 }
 
 type EventPublisher interface {
@@ -97,6 +100,7 @@ func (h *TaskHandlers) RegisterCore(registry *taskengine.Registry) error {
 		h.storageCleanupHandler(),
 		h.walletHandler(),
 		h.observabilityHandler(),
+		h.providerUploadSpeedHandler(),
 		h.gcHandler(),
 	} {
 		if err := registry.Register(handler); err != nil {

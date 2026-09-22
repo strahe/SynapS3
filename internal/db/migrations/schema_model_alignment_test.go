@@ -16,6 +16,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
@@ -79,6 +80,7 @@ func runtimePersistentModels() []any {
 		(*model.WalletOperation)(nil),
 		(*observability.CollectionState)(nil),
 		(*observability.ProviderState)(nil),
+		(*providerbenchmark.Result)(nil),
 		(*observability.DataSetState)(nil),
 	}
 }

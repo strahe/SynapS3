@@ -54,6 +54,7 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories) *task
 		model.TaskTypeStorageDataSetRetire,
 		model.TaskTypeWalletOperation,
 		model.TaskTypeObservabilityRefresh,
+		model.TaskTypeProviderUploadSpeedTest,
 		model.TaskTypeGC,
 	} {
 		definition := taskengine.Definition{

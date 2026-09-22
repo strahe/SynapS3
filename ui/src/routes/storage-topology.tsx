@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { Database, RefreshCw, TriangleAlert } from 'lucide-react'
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
-import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '@/api/client'
+import { APIError, type ObservabilityDataSetObservation, type ObservabilityProviderObservation } from '@/api/client'
 import { PageHeader } from '@/components/app/PageHeader'
 import { TopologyDetailSheet } from '@/components/storage-topology/StorageTopologyDetailSheet'
 import { DataSetsTableCard, ProvidersTableCard } from '@/components/storage-topology/StorageTopologyTables'
@@ -11,7 +11,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useObservabilityDataSets, useObservabilityProviders } from '@/hooks/queries'
+import { useObservabilityDataSets, useObservabilityProviders, useTestProviderUploadSpeed } from '@/hooks/queries'
 import {
   buildStorageTopologyGraph,
   buildTopologyProviderOptions,
@@ -117,6 +117,8 @@ function StorageTopologyPage() {
   const [dataSetPage, setDataSetPage] = useState(1)
   const [selection, setSelection] = useState<TopologySelectionState | null>(null)
   const [pinnedContext, setPinnedContext] = useState<PinnedTopologyContext | null>(null)
+  const [uploadSpeedTestError, setUploadSpeedTestError] = useState<string | null>(null)
+  const testProviderUploadSpeed = useTestProviderUploadSpeed()
   const selectionProviderID = search.selection_provider ?? observabilityProviderParam(filters.provider)
   const selectionBucketName = search.selection_bucket ?? observabilityBucketParam(filters.bucket)
 
@@ -430,6 +432,18 @@ function StorageTopologyPage() {
     qc.invalidateQueries({ queryKey: ['observabilityDataSets'] })
   }
 
+  function startProviderUploadSpeedTest(providerID: string) {
+    setUploadSpeedTestError(null)
+    testProviderUploadSpeed.mutate(providerID, {
+      onError: (error) =>
+        setUploadSpeedTestError(
+          error instanceof APIError && error.status === 409
+            ? `A test is already running, or provider #${providerID} is not available for testing. Check its details before trying again.`
+            : `Could not start the upload speed test for provider #${providerID}. Try again.`
+        ),
+    })
+  }
+
   const pageClassName =
     tab === 'topology'
       ? 'flex h-[calc(100svh-3.5rem)] min-h-0 min-w-0 flex-col gap-4 overflow-hidden px-6 pt-6 pb-0 md:h-svh'
@@ -468,6 +482,13 @@ function StorageTopologyPage() {
         </div>
       )}
 
+      {tab === 'providers' && uploadSpeedTestError && (
+        <Alert variant="destructive">
+          <AlertTitle>Upload speed test not started</AlertTitle>
+          <AlertDescription>{uploadSpeedTestError}</AlertDescription>
+        </Alert>
+      )}
+
       {snapshotLoading ? (
         <TopologyLoading />
       ) : snapshotError ? (
@@ -495,6 +516,8 @@ function StorageTopologyPage() {
           }
           onPageChange={setProviderPage}
           onSelect={selectProvider}
+          onTestUploadSpeed={startProviderUploadSpeedTest}
+          testingProviderID={testProviderUploadSpeed.isPending ? testProviderUploadSpeed.variables : undefined}
         />
       ) : (
         <DataSetsTableCard

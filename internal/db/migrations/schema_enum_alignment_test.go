@@ -41,6 +41,7 @@ func TestClosedLifecycleEnumsMatchAppliedChecks(t *testing.T) {
 		{directory: "observability", typeName: "CollectionType", table: "observability_collection_states", constraint: "chk_observability_collection_type"},
 		{directory: "observability", typeName: "Status", table: "observability_provider_states", constraint: "chk_observability_provider_status"},
 		{directory: "observability", typeName: "Status", table: "observability_data_set_states", constraint: "chk_observability_data_set_status"},
+		{directory: "providerbenchmark", typeName: "State", table: "provider_upload_speed_tests", constraint: "chk_provider_upload_speed_tests_state"},
 		{directory: "storagecommit", typeName: "AttemptStatus", table: "storage_commit_attempts", constraint: "chk_storage_commit_attempts_status"},
 		{directory: "storagepull", typeName: "AttemptStatus", table: "storage_pull_attempts", constraint: "chk_storage_pull_attempts_status"},
 		{directory: "storagereplacement", typeName: "SelectionMode", table: "storage_replacements", constraint: "chk_storage_replacements_selection_mode"},

@@ -1,12 +1,20 @@
 package admin
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
+	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
 )
 
@@ -29,7 +37,7 @@ func (s *Server) handleAPIObservabilityProviders(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, page)
+	s.writeProviderObservations(w, r, page)
 }
 
 func (s *Server) handleAPIRefreshObservabilityProviders(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +59,118 @@ func (s *Server) handleAPIRefreshObservabilityProviders(w http.ResponseWriter, r
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, page)
+	s.writeProviderObservations(w, r, page)
+}
+
+type providerUploadSpeedView struct {
+	State          string     `json:"state"`
+	SampleBytes    int64      `json:"sample_bytes"`
+	DurationMS     *int64     `json:"duration_ms,omitempty"`
+	BytesPerSecond *int64     `json:"bytes_per_second,omitempty"`
+	TestedAt       *time.Time `json:"tested_at,omitempty"`
+	FailureCode    *string    `json:"failure_code,omitempty"`
+}
+
+type providerObservationWithSpeed struct {
+	observability.ProviderObservation
+	UploadSpeedTest *providerUploadSpeedView `json:"upload_speed_test,omitempty"`
+}
+
+type providerPageWithSpeed struct {
+	Items         []providerObservationWithSpeed `json:"items"`
+	Summary       observability.Summary          `json:"summary"`
+	SummarySignal observability.SummarySignal    `json:"summary_signal"`
+	Total         int                            `json:"total"`
+	Limit         int                            `json:"limit"`
+	Offset        int                            `json:"offset"`
+}
+
+func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Request, page observability.ProviderObservationPage) {
+	if s.repos == nil || s.repos.ProviderUploadSpeed == nil {
+		writeJSON(w, http.StatusOK, page)
+		return
+	}
+	ids := make([]string, 0, len(page.Items))
+	for _, item := range page.Items {
+		ids = append(ids, item.Facts.ProviderID.String())
+	}
+	tests, err := s.repos.ProviderUploadSpeed.ListByProviderIDs(r.Context(), ids)
+	if err != nil {
+		s.logger.Error("api: failed to list provider upload speed tests", "error", err)
+		writeJSON(w, http.StatusOK, page)
+		return
+	}
+	items := make([]providerObservationWithSpeed, 0, len(page.Items))
+	for _, item := range page.Items {
+		view := providerObservationWithSpeed{ProviderObservation: item}
+		if row, ok := tests[item.Facts.ProviderID.String()]; ok {
+			view.UploadSpeedTest = &providerUploadSpeedView{
+				State: string(row.State), SampleBytes: row.SampleBytes,
+				DurationMS: row.DurationMS, BytesPerSecond: row.BytesPerSecond, TestedAt: row.TestedAt, FailureCode: row.FailureCode,
+			}
+			if row.State != providerbenchmark.StateTesting && (item.Facts.ServiceURL == nil || providerbenchmark.URLHash(*item.Facts.ServiceURL) != row.ServiceURLHash) {
+				view.UploadSpeedTest = &providerUploadSpeedView{State: "stale", SampleBytes: row.SampleBytes, TestedAt: row.TestedAt}
+			}
+		}
+		items = append(items, view)
+	}
+	writeJSON(w, http.StatusOK, providerPageWithSpeed{
+		Items: items, Summary: page.Summary,
+		SummarySignal: page.SummarySignal, Total: page.Total, Limit: page.Limit, Offset: page.Offset,
+	})
+}
+
+func (s *Server) handleAPIProviderUploadSpeedTest(w http.ResponseWriter, r *http.Request) {
+	if s.observability == nil || s.taskService == nil || s.repos == nil || s.repos.ProviderUploadSpeed == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "upload speed testing unavailable"})
+		return
+	}
+	id, err := idtypes.ParseOnChainID("provider_id", r.PathValue("provider_id"))
+	if err != nil || id.IsZero() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid provider ID"})
+		return
+	}
+	serviceURL, eligible, err := providerbenchmark.CurrentServiceURL(r.Context(), s.observability, id)
+	if err != nil {
+		s.logger.Error("api: failed to load provider", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if !eligible {
+		page, listErr := s.observability.ListProviderObservations(r.Context(), observability.ListOptions{ProviderID: &id, Limit: 1})
+		if listErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			return
+		}
+		if len(page.Items) == 0 {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider not found"})
+			return
+		}
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "provider is not available for testing"})
+		return
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	input := providerbenchmark.Input{ProviderID: id.String(), ServiceURLHash: providerbenchmark.URLHash(serviceURL)}
+	taskRow, _, err := s.taskService.EnqueueTx(r.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeProviderUploadSpeedTest, IdempotencyKey: "provider-upload-speed:" + id.String() + ":" + hex.EncodeToString(nonce[:]),
+		Input: input, SubjectType: "provider", SubjectKey: id.String(),
+	}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+		return repos.ProviderUploadSpeed.Begin(ctx, id.String(), input.ServiceURLHash, taskRow.ID)
+	})
+	if errors.Is(err, repository.ErrConflict) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "upload speed test already running"})
+		return
+	}
+	if err != nil {
+		s.logger.Error("api: failed to start provider upload speed test", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"task_id": taskRow.ID, "state": "testing"})
 }
 
 func (s *Server) handleAPIObservabilityDataSets(w http.ResponseWriter, r *http.Request) {
