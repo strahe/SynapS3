@@ -553,7 +553,6 @@ export type ObjectUploadCopyStatus = 'pending' | 'piece_ready' | 'committing' | 
 export type StorageCommitAttentionCode =
   | 'attempt_only_ambiguous'
   | 'unattributed_piece'
-  | 'invalid_submission'
   | 'submission_mismatch'
   | 'data_set_unavailable'
   | 'confirmation_timeout'

@@ -195,8 +195,19 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			WHERE attempt_id = 'attempt-2'`)
 		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
 			SET status = 'attempted', attempted_at = current_timestamp,
-			    extra_data_hex = 'abcd', submission_json = '{}'
+			    extra_data_hex = 'abcd', status_url = 'https://provider.example/status'
 			WHERE attempt_id = 'attempt-2'`)
+		mustRejectStatement(t, db, `UPDATE storage_commit_attempts
+			SET status = 'attempted', attempted_at = current_timestamp,
+			    extra_data_hex = 'abcd', transaction_id = '0xabc'
+			WHERE attempt_id = 'attempt-2'`)
+		if _, err := db.Exec(`UPDATE storage_commit_attempts
+			SET status = 'attempted', attempted_at = current_timestamp,
+			    extra_data_hex = 'abcd', transaction_id = '0xabc',
+			    status_url = 'https://provider.example/status'
+			WHERE attempt_id = 'attempt-2'`); err != nil {
+			t.Fatalf("record complete commit submission: %v", err)
+		}
 
 		target := insertBaselineTestDataSet(t, db, bucketA, "202", 0, 2, false)
 		var replacementID int64

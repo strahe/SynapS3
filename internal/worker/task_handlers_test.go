@@ -3764,7 +3764,7 @@ func TestDataSetEnsureReleasesTheProviderWhenCreationIsRejected(t *testing.T) {
 	providerID := testOnChainID(t, 26000+sequence)
 	target := &testutil.MockStorageTarget{
 		ProviderIDValue: providerID.SDK(),
-		WaitDataSetFunc: func(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+		WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 			return nil, pdp.ErrTxRejected
 		},
 	}
@@ -3935,13 +3935,13 @@ func TestDataSetCreationWithUnobservedOutcomeResendsTheSameID(t *testing.T) {
 			}
 			opts.OnSubmitted(storage.CreateDataSetSubmission{
 				ProviderID: providerID.SDK(), TransactionID: "0x" + strings.Repeat("ab", 32),
-				StatusURL: "https://provider.example/pdp/data-sets/created/2", ClientDataSetID: opts.ClientDataSetID,
+				StatusURL: "https://provider.example/pdp/data-sets/created/2", ClientDataSetID: opts.ClientDataSetID.Copy(),
 			})
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
 		// The resent request loses to the first one, which did land after all.
-		WaitDataSetFunc: func(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+		WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 			landed.Store(true)
 			return nil, pdp.ErrTxRejected
 		},
@@ -4070,7 +4070,7 @@ func TestDataSetCreationRecoveryStopsOnChangedIdentityOrConflict(t *testing.T) {
 					sends.Add(1)
 					return nil, errors.New("unexpected create request")
 				},
-				WaitDataSetFunc: func(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+				WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 					waits.Add(1)
 					// What the provider would report: the data set the original
 					// wallet's request created.
@@ -4291,7 +4291,7 @@ func TestDataSetCreationLooksUpARejectedResendInsteadOfGivingUp(t *testing.T) {
 	var lookups atomic.Int64
 	target := &testutil.MockStorageTarget{
 		ProviderIDValue: providerID.SDK(),
-		WaitDataSetFunc: func(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+		WaitDataSetFunc: func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 			return nil, fmt.Errorf("submission: %w", synapse.ErrProviderTransactionRejected)
 		},
 		FindDataSetByClientIDFunc: func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error) {

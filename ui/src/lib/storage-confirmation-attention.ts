@@ -3,7 +3,6 @@ import type { StorageCommitAttentionCode } from '@/api/client'
 const knownAttentionLabels = {
   attempt_only_ambiguous: 'Submission result unknown',
   unattributed_piece: 'Piece ownership unknown',
-  invalid_submission: 'Saved submission is invalid',
   submission_mismatch: 'Confirmation does not match',
   data_set_unavailable: 'Data set is unavailable',
   confirmation_timeout: 'Confirmation timed out',

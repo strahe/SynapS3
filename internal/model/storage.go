@@ -156,7 +156,7 @@ type StorageCopy struct {
 	CommitAttemptID              *string    `bun:",scanonly"`
 	CommitAttemptedAt            *time.Time `bun:",scanonly"`
 	CommitTransactionID          *string    `bun:",scanonly"`
-	CommitSubmissionJSON         *string    `bun:",scanonly"`
+	CommitStatusURL              *string    `bun:",scanonly"`
 	CommitConfirmedTransactionID *string    `bun:",scanonly"`
 	CommitAttentionCode          *string    `bun:",scanonly"`
 	CommitAttentionAt            *time.Time `bun:",scanonly"`

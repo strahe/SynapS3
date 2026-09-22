@@ -26,6 +26,7 @@ import (
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/piece"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
@@ -243,7 +244,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 	return taskHandler{definition: definition, execute: run, recover: run}
 }
 
-func uploadFundingWaitMessage(costs *storage.MultiContextCosts) string {
+func uploadFundingWaitMessage(costs *sdkcosts.MultiContextCosts) string {
 	parts := make([]string, 0, 2)
 	if costs != nil && costs.DepositNeeded != nil && costs.DepositNeeded.Sign() > 0 {
 		parts = append(parts, fmt.Sprintf("deposit %s USDFC base units", costs.DepositNeeded.String()))
@@ -632,10 +633,7 @@ func (h *TaskHandlers) waitDataSetCreation(
 	checkpoint dataSetCreationCheckpoint,
 	clientDataSetID sdktypes.BigInt,
 ) taskengine.Result {
-	result, err := provider.WaitForDataSetCreated(ctx, storage.CreateDataSetSubmission{
-		ProviderID: binding.ProviderID.SDK(), TransactionID: checkpoint.TransactionID,
-		StatusURL: checkpoint.StatusURL, ClientDataSetID: &clientDataSetID,
-	})
+	result, err := provider.WaitForDataSetCreated(ctx, checkpoint.StatusURL, clientDataSetID)
 	if err != nil {
 		if errors.Is(err, synapse.ErrProviderTransactionRejected) {
 			if checkpoint.Sends > 1 {
@@ -1290,7 +1288,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	target, err := h.openReadyDataSet(ctx, binding)
 	if err != nil {
 		if copyRow.CommitAttemptedAt != nil && copyRow.CommitAttemptID != nil {
-			advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents, StatusChecker: h.deps.CommitStatus}
+			advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents}
 			advanced, advanceErr := advancer.AdvanceUnavailable(ctx, *copyRow, *binding)
 			if advanceErr != nil {
 				return h.retryCopyTask(execution, input, copyRow, advanceErr, "commit_recovery_failed")
@@ -1304,7 +1302,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
 	}
-	advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents, StatusChecker: h.deps.CommitStatus}
+	advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents}
 	advance := func(ctx context.Context) (storagecommit.AdvanceResult, error) {
 		return advancer.Advance(ctx, storagecommit.AdvanceInput{
 			Copy: *copyRow, Binding: *binding, Target: target,

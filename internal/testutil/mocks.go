@@ -9,6 +9,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/synapse"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -26,7 +27,7 @@ var (
 type MockStorageClient struct {
 	UploadFunc              func(ctx context.Context, r io.Reader, opts *storage.UploadOptions) (*storage.UploadResult, error)
 	DownloadFunc            func(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
-	PrepareUploadFunc       func(ctx context.Context, dataSize uint64, targets []synapse.StorageTarget) (*storage.MultiContextCosts, error)
+	PrepareUploadFunc       func(ctx context.Context, dataSize uint64, targets []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error)
 	SelectUploadTargetsFunc func(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error)
 	OpenProviderTargetFunc  func(ctx context.Context, providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) (synapse.ProviderTarget, error)
 	OpenDataSetTargetFunc   func(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.DataSetTarget, error)
@@ -58,11 +59,11 @@ func (m *MockStorageClient) Download(ctx context.Context, pieceCID cid.Cid, opts
 	return nil, errors.New("MockStorageClient.Download not configured")
 }
 
-func (m *MockStorageClient) PrepareUpload(ctx context.Context, dataSize uint64, targets []synapse.StorageTarget) (*storage.MultiContextCosts, error) {
+func (m *MockStorageClient) PrepareUpload(ctx context.Context, dataSize uint64, targets []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error) {
 	if m.PrepareUploadFunc != nil {
 		return m.PrepareUploadFunc(ctx, dataSize, targets)
 	}
-	return &storage.MultiContextCosts{Ready: true}, nil
+	return &sdkcosts.MultiContextCosts{Ready: true}, nil
 }
 
 func (m *MockStorageClient) SelectUploadTargets(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]synapse.StorageTarget, error) {
@@ -187,7 +188,7 @@ type MockStorageTarget struct {
 	ServiceURLValue      string
 	WithCDNValue         bool
 	CreateDataSetFunc    func(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
-	WaitDataSetFunc      func(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
+	WaitDataSetFunc      func(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error)
 	// ContextIdentityValue overrides DefaultContextIdentity.
 	ContextIdentityValue      storage.ContextIdentity
 	FindDataSetByClientIDFunc func(context.Context, sdktypes.BigInt) (storage.DataSetRef, bool, error)
@@ -195,7 +196,7 @@ type MockStorageTarget struct {
 	PresignForCommitFunc      func(context.Context, []storage.PieceInput) ([]byte, error)
 	PullFunc                  func(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommitFunc          func(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
-	GetCommitStatusFunc       func(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
+	GetCommitStatusFunc       func(context.Context, string) (*storage.CommitStatus, error)
 	PieceStatusFunc           func(context.Context, cid.Cid) (*storage.PieceStatus, error)
 }
 
@@ -255,9 +256,9 @@ func (m *MockStorageTarget) CreateDataSet(ctx context.Context, opts *storage.Cre
 	return nil, errors.New("MockStorageTarget.CreateDataSet not configured")
 }
 
-func (m *MockStorageTarget) WaitForDataSetCreated(ctx context.Context, submission storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error) {
+func (m *MockStorageTarget) WaitForDataSetCreated(ctx context.Context, statusURL string, clientDataSetID sdktypes.BigInt) (*storage.CreateDataSetResult, error) {
 	if m.WaitDataSetFunc != nil {
-		return m.WaitDataSetFunc(ctx, submission)
+		return m.WaitDataSetFunc(ctx, statusURL, clientDataSetID)
 	}
 	return nil, errors.New("MockStorageTarget.WaitForDataSetCreated not configured")
 }
@@ -312,9 +313,9 @@ func (m *MockStorageTarget) SubmitCommit(ctx context.Context, request storage.Co
 	return nil, errors.New("MockStorageTarget.SubmitCommit not configured")
 }
 
-func (m *MockStorageTarget) GetCommitStatus(ctx context.Context, submission storage.CommitSubmission) (*storage.CommitStatus, error) {
+func (m *MockStorageTarget) GetCommitStatus(ctx context.Context, statusURL string) (*storage.CommitStatus, error) {
 	if m.GetCommitStatusFunc != nil {
-		return m.GetCommitStatusFunc(ctx, submission)
+		return m.GetCommitStatusFunc(ctx, statusURL)
 	}
 	return nil, errors.New("MockStorageTarget.GetCommitStatus not configured")
 }

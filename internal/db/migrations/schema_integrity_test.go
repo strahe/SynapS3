@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	initialPortableSchemaFingerprint = "21723d7d64f621047bd6fd1879851008fdc18c3fd0b173168e063a0ae3d0c7d6"
+	initialPortableSchemaFingerprint = "657cbdd208ba7ff26431b90df7f03e40233b0475ab25253508b58922fd828c7e"
 )
 
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
@@ -211,7 +211,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		{"storage_copies", "commit_attempt_id"},
 		{"storage_copies", "commit_attempted_at"},
 		{"storage_copies", "commit_transaction_id"},
-		{"storage_copies", "commit_submission_json"},
+		{"storage_copies", "commit_status_url"},
 		{"storage_copies", "commit_confirmed_transaction_id"},
 		{"storage_copies", "commit_attention_code"},
 		{"storage_copies", "commit_attention_at"},
@@ -452,6 +452,28 @@ func TestFreshBaselineIsIdempotentAndCannotRollback(t *testing.T) {
 		}
 		if exists, err := tableExists(ctx, db, "tasks"); err != nil || !exists {
 			t.Fatalf("tasks table exists=%t err=%v after rejected rollback", exists, err)
+		}
+	})
+}
+
+func TestValidateTargetRejectsObsoleteCommitLedgerShape(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		migrator := NewMigrator(db)
+		if err := migrator.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := migrator.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateTarget(ctx, db); err != nil {
+			t.Fatalf("validate current schema: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE storage_commit_attempts RENAME COLUMN status_url TO submission_json`); err != nil {
+			t.Fatalf("simulate obsolete commit ledger: %v", err)
+		}
+		if err := ValidateTarget(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
+			t.Fatalf("validate obsolete commit ledger = %v, want incompatible database", err)
 		}
 	})
 }

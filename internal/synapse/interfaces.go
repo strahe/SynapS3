@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
 	sdktypes "github.com/strahe/synapse-go/types"
 )
@@ -27,7 +28,7 @@ type StorageTarget interface {
 type ProviderTarget interface {
 	StorageTarget
 	CreateDataSet(context.Context, *storage.CreateDataSetOptions) (*storage.CreateDataSetResult, error)
-	WaitForDataSetCreated(context.Context, storage.CreateDataSetSubmission) (*storage.CreateDataSetResult, error)
+	WaitForDataSetCreated(context.Context, string, sdktypes.BigInt) (*storage.CreateDataSetResult, error)
 	// ContextIdentity is the payer, chain, and record keeper the target signs
 	// for. Client data set IDs are only unique within it.
 	ContextIdentity() storage.ContextIdentity
@@ -43,7 +44,7 @@ type DataSetTarget interface {
 	PresignForCommit(context.Context, []storage.PieceInput) ([]byte, error)
 	Pull(context.Context, storage.PullRequest) (*storage.PullResult, error)
 	SubmitCommit(context.Context, storage.CommitRequest) (*storage.CommitSubmission, error)
-	GetCommitStatus(context.Context, storage.CommitSubmission) (*storage.CommitStatus, error)
+	GetCommitStatus(context.Context, string) (*storage.CommitStatus, error)
 	PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error)
 }
 
@@ -57,7 +58,7 @@ type CleanupContext interface {
 // staged provider operations.
 type StorageClient interface {
 	Download(ctx context.Context, pieceCID cid.Cid, opts *storage.DownloadOptions) (io.ReadCloser, error)
-	PrepareUpload(ctx context.Context, dataSize uint64, targets []StorageTarget) (*storage.MultiContextCosts, error)
+	PrepareUpload(ctx context.Context, dataSize uint64, targets []StorageTarget) (*sdkcosts.MultiContextCosts, error)
 	SelectUploadTargets(ctx context.Context, opts storage.SelectUploadContextsOptions) ([]StorageTarget, error)
 	OpenProviderTarget(ctx context.Context, providerID sdktypes.BigInt, opts storage.NewProviderContextOptions) (ProviderTarget, error)
 	OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (DataSetTarget, error)

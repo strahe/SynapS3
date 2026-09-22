@@ -244,7 +244,7 @@ func (r *BunStorageContentRepo) ListCopies(ctx context.Context, contentID int64)
 			active_commit_attempt.attempt_id AS commit_attempt_id,
 			active_commit_attempt.attempted_at AS commit_attempted_at,
 			active_commit_attempt.transaction_id AS commit_transaction_id,
-			active_commit_attempt.submission_json AS commit_submission_json,
+			active_commit_attempt.status_url AS commit_status_url,
 			active_commit_attempt.confirmed_transaction_id AS commit_confirmed_transaction_id,
 			active_commit_attempt.attention_code AS commit_attention_code,
 			active_commit_attempt.attention_at AS commit_attention_at
@@ -1312,14 +1312,14 @@ func (r *BunStorageContentRepo) MarkUploadCopyCommitted(ctx context.Context, inp
 			attemptQuery := db.NewUpdate().
 				Model((*storagecommit.Attempt)(nil)).
 				Set("status = ?", storagecommit.AttemptStatusConfirmed).
-				Set("transaction_id = COALESCE(transaction_id, ?)", input.CommitTransactionID).
 				Set("confirmed_transaction_id = ?", input.CommitConfirmedTransactionID).
 				Set("resolved_at = ?", now).
 				Set("updated_at = ?", now).
 				Where("attempt_id = ?", input.CommitAttemptID).
 				Where("content_id = ? AND storage_data_set_id = ?", input.ContentID, copyIdentity.StorageDataSetID).
 				Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
-				Where("(transaction_id IS NULL OR transaction_id = ?)", input.CommitTransactionID)
+				Where("transaction_id = ?", input.CommitTransactionID).
+				Where("status_url IS NOT NULL")
 			if input.CommitExtraDataHex != "" {
 				attemptQuery = attemptQuery.Where("extra_data_hex = ?", input.CommitExtraDataHex)
 			}

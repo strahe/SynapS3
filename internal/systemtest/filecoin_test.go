@@ -89,7 +89,7 @@ func TestMemoryFilecoinLifecycleAndProviderIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SubmitCommit provider %s: %v", uploadContext.ProviderID().String(), err)
 		}
-		status, err := uploadContext.GetCommitStatus(ctx, *submission)
+		status, err := uploadContext.GetCommitStatus(ctx, submission.StatusURL)
 		if err != nil || status == nil || status.State != storage.CommitStateConfirmed || len(status.PieceIDs) != 1 {
 			t.Fatalf("GetCommitStatus provider %s: status=%#v err=%v", uploadContext.ProviderID().String(), status, err)
 		}

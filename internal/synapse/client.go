@@ -26,6 +26,7 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*sdk.Client, error) {
 		sdk.WithRPCURL(cfg.RPCURL),
 		sdk.WithSource(dataSetSource),
 		sdk.WithCDN(cfg.WithCDN),
+		sdk.WithoutUploadBatching(),
 		sdk.WithAllowPrivateNetworks(cfg.AllowPrivateNetworks),
 	}
 	if cfg.Logger != nil {

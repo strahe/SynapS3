@@ -197,45 +197,21 @@ func (r *BunStorageContentRepo) MarkCommitAttempted(
 	return out, err
 }
 
-func (r *BunStorageContentRepo) RecordCommitTransaction(ctx context.Context, input storagecommit.EvidenceInput) error {
-	if err := validateCommitEvidenceInput(input, false); err != nil {
-		return err
-	}
-	return r.mutateAttempt(ctx, input.Copy, "recording storage commit transaction", func(db bun.IDB, _ int64) error {
-		res, err := db.NewUpdate().
-			Model((*storagecommit.Attempt)(nil)).
-			Set("transaction_id = COALESCE(transaction_id, ?)", input.TransactionID).
-			Set("updated_at = ?", commitInputTime(input.Now)).
-			Where("attempt_id = ?", input.AttemptID).
-			Where("content_id = ? AND storage_data_set_id = ?", input.Copy.ContentID, input.Copy.StorageDataSetID).
-			Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
-			Where("(transaction_id IS NULL OR transaction_id = ?)", input.TransactionID).
-			Exec(ctx)
-		if err != nil {
-			return err
-		}
-		if rows, _ := res.RowsAffected(); rows != 1 {
-			return ErrConflict
-		}
-		return nil
-	})
-}
-
 func (r *BunStorageContentRepo) RecordCommitSubmission(ctx context.Context, input storagecommit.EvidenceInput) error {
-	if err := validateCommitEvidenceInput(input, true); err != nil {
+	if err := validateCommitSubmissionInput(input); err != nil {
 		return err
 	}
 	return r.mutateAttempt(ctx, input.Copy, "recording storage commit submission", func(db bun.IDB, _ int64) error {
 		res, err := db.NewUpdate().
 			Model((*storagecommit.Attempt)(nil)).
 			Set("transaction_id = COALESCE(transaction_id, ?)", input.TransactionID).
-			Set("submission_json = COALESCE(submission_json, ?)", input.SubmissionJSON).
+			Set("status_url = COALESCE(status_url, ?)", input.StatusURL).
 			Set("updated_at = ?", commitInputTime(input.Now)).
 			Where("attempt_id = ?", input.AttemptID).
 			Where("content_id = ? AND storage_data_set_id = ?", input.Copy.ContentID, input.Copy.StorageDataSetID).
 			Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
 			Where("(transaction_id IS NULL OR transaction_id = ?)", input.TransactionID).
-			Where("(submission_json IS NULL OR submission_json = ?)", input.SubmissionJSON).
+			Where("(status_url IS NULL OR status_url = ?)", input.StatusURL).
 			Exec(ctx)
 		if err != nil {
 			return err
@@ -323,7 +299,7 @@ func (r *BunStorageContentRepo) ReleaseCommitAttempt(ctx context.Context, input 
 					storagecommit.AttemptStatusReserved,
 					storagecommit.AttemptStatusAttempted,
 				})).
-				Where("transaction_id IS NULL AND submission_json IS NULL")
+				Where("transaction_id IS NULL AND status_url IS NULL")
 		} else {
 			q = q.Where("status = ?", storagecommit.AttemptStatusReserved)
 		}
@@ -676,7 +652,7 @@ func projectActiveCommitAttempt(q *bun.SelectQuery, copyAlias string) {
 		ColumnExpr("active_commit_attempt.attempt_id AS commit_attempt_id").
 		ColumnExpr("active_commit_attempt.attempted_at AS commit_attempted_at").
 		ColumnExpr("active_commit_attempt.transaction_id AS commit_transaction_id").
-		ColumnExpr("active_commit_attempt.submission_json AS commit_submission_json").
+		ColumnExpr("active_commit_attempt.status_url AS commit_status_url").
 		ColumnExpr("active_commit_attempt.confirmed_transaction_id AS commit_confirmed_transaction_id").
 		ColumnExpr("active_commit_attempt.attention_code AS commit_attention_code").
 		ColumnExpr("active_commit_attempt.attention_at AS commit_attention_at").
@@ -742,11 +718,11 @@ func validateCommitCopyIdentity(identity storagecommit.CopyIdentity) error {
 	return nil
 }
 
-func validateCommitEvidenceInput(input storagecommit.EvidenceInput, requireSubmission bool) error {
+func validateCommitSubmissionInput(input storagecommit.EvidenceInput) error {
 	if err := validateCommitCopyIdentity(input.Copy); err != nil ||
 		input.AttemptID == "" ||
 		input.TransactionID == "" ||
-		(requireSubmission && input.SubmissionJSON == "") {
+		input.StatusURL == "" {
 		return fmt.Errorf("recording storage commit evidence: %w", ErrInvalidInput)
 	}
 	return nil

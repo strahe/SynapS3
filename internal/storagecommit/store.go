@@ -53,11 +53,11 @@ type AttemptResult struct {
 }
 
 type EvidenceInput struct {
-	Copy           CopyIdentity
-	AttemptID      string
-	TransactionID  string
-	SubmissionJSON string
-	Now            time.Time
+	Copy          CopyIdentity
+	AttemptID     string
+	TransactionID string
+	StatusURL     string
+	Now           time.Time
 }
 
 type AttentionInput struct {
@@ -94,7 +94,6 @@ type ReservationReleaseInput struct {
 type Store interface {
 	ReserveCommitAttempt(context.Context, ReserveInput) (ReserveResult, error)
 	MarkCommitAttempted(context.Context, AttemptInput) (AttemptResult, error)
-	RecordCommitTransaction(context.Context, EvidenceInput) error
 	RecordCommitSubmission(context.Context, EvidenceInput) error
 	MarkCommitAttention(context.Context, AttentionInput) error
 	ResetCommitAttempt(context.Context, ResetInput) error
