@@ -198,7 +198,7 @@ func (r *BunStorageContentRepo) MarkCommitAttempted(
 }
 
 func (r *BunStorageContentRepo) RecordCommitSubmission(ctx context.Context, input storagecommit.EvidenceInput) error {
-	if err := validateCommitEvidenceInput(input, true); err != nil {
+	if err := validateCommitSubmissionInput(input); err != nil {
 		return err
 	}
 	return r.mutateAttempt(ctx, input.Copy, "recording storage commit submission", func(db bun.IDB, _ int64) error {
@@ -718,11 +718,11 @@ func validateCommitCopyIdentity(identity storagecommit.CopyIdentity) error {
 	return nil
 }
 
-func validateCommitEvidenceInput(input storagecommit.EvidenceInput, requireSubmission bool) error {
+func validateCommitSubmissionInput(input storagecommit.EvidenceInput) error {
 	if err := validateCommitCopyIdentity(input.Copy); err != nil ||
 		input.AttemptID == "" ||
 		input.TransactionID == "" ||
-		(requireSubmission && input.StatusURL == "") {
+		input.StatusURL == "" {
 		return fmt.Errorf("recording storage commit evidence: %w", ErrInvalidInput)
 	}
 	return nil
