@@ -379,13 +379,15 @@ type UploadCopyBindingInput struct {
 // sent. AttemptID is the ledger row's identity and SourcePieceCID names the
 // piece being fetched, which is not the same as the content's own CID.
 type ReservePullRequestInput struct {
-	CopyID             int64
-	Generation         int64
-	TaskID             int64
-	AttemptID          string
-	SourceProviderID   types.OnChainID
-	SourceDataSetID    types.OnChainID
-	SourcePieceID      types.OnChainID
+	CopyID     int64
+	Generation int64
+	TaskID     int64
+	AttemptID  string
+	// On-chain identity is optional at the type level because zero is a legal
+	// value: the first piece of a data set is piece 0. Presence is nil-checked.
+	SourceProviderID   *types.OnChainID
+	SourceDataSetID    *types.OnChainID
+	SourcePieceID      *types.OnChainID
 	SourcePieceCID     string
 	SourceRetrievalURL string
 	CommitExtraDataHex string

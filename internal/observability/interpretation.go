@@ -157,13 +157,16 @@ func committedCopyHealthFromFacts(facts CopyFacts, dataSetObservation *DataSetOb
 
 func committedCopyEvidenceReasons(facts CopyFacts) []ReasonCode {
 	reasons := make([]ReasonCode, 0, 4)
-	if facts.ProviderID == nil || facts.ProviderID.IsZero() {
+	// Zero is a legal on-chain ID, so these report absence only from a nil
+	// pointer. The local data set row ID is a different kind of identifier:
+	// it is autoincrement, so zero there does mean unset.
+	if facts.ProviderID == nil {
 		reasons = append(reasons, ReasonCopyMissingProvider)
 	}
-	if facts.LocalDataSetID == nil || *facts.LocalDataSetID == 0 || facts.ChainDataSetID == nil || facts.ChainDataSetID.IsZero() {
+	if facts.LocalDataSetID == nil || *facts.LocalDataSetID == 0 || facts.ChainDataSetID == nil {
 		reasons = append(reasons, ReasonCopyMissingDataSet)
 	}
-	if facts.PieceID == nil || facts.PieceID.IsZero() {
+	if facts.PieceID == nil {
 		reasons = append(reasons, ReasonCopyMissingPiece)
 	}
 	if facts.RetrievalURL == nil || strings.TrimSpace(*facts.RetrievalURL) == "" {

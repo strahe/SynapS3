@@ -1281,7 +1281,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 			return repos.Contents.ReservePullRequest(ctx, repository.ReservePullRequestInput{
 				CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(),
 				AttemptID:        checkpoint.AttemptID,
-				SourceProviderID: source.ProviderID, SourceDataSetID: source.DataSetID, SourcePieceID: source.PieceID,
+				SourceProviderID: &source.ProviderID, SourceDataSetID: &source.DataSetID, SourcePieceID: &source.PieceID,
 				SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL,
 				CommitExtraDataHex: checkpoint.CommitExtraDataHex,
 			})

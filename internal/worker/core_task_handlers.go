@@ -538,7 +538,10 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 		case model.StorageCleanupCopyStatusRemoved, model.StorageCleanupCopyStatusUnsupported:
 			continue
 		}
-		if copyRow.DataSetID == nil || copyRow.DataSetID.IsZero() || copyRow.ProviderID.IsZero() || copyRow.PieceID.IsZero() || copyRow.PieceCID == "" {
+		// Provider and piece identity are NOT NULL on the cleanup ledger, and
+		// zero is a legal on-chain ID, so only a missing data set or piece CID
+		// means the provider request cannot be built.
+		if copyRow.DataSetID == nil || copyRow.PieceCID == "" {
 			message := "Storage provider details are incomplete"
 			if err := h.deps.Repositories.StorageCleanup.MarkCopyUnsupported(ctx, copyRow.ID, message); err != nil {
 				return retryTask(err, "cleanup_evidence_failed")

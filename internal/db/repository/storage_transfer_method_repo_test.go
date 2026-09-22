@@ -65,7 +65,10 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	if err != nil || ingress == nil || ingress.ID != copies[1].ID {
 		t.Fatalf("active ingress = %#v, err=%v", ingress, err)
 	}
-	pieceID := onChainID(t, "901")
+	// Zero is a legal on-chain piece ID: the first piece of a data set is piece
+	// 0. Committing the source with it keeps this test on the boundary where a
+	// presence check that treats zero as unset would reject a usable source.
+	pieceID := onChainID(t, "0")
 	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
 		StorageCopyID: copies[1].ID, ContentID: content.ID, CopyIndex: 1,
 		PieceCID: "bafk2bzacecpiecerestore", PieceID: &pieceID, RetrievalURL: "https://provider.example/piece",
@@ -81,6 +84,32 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 	sources, err := repos.Contents.ListReadableCommittedCopies(t.Context(), content.ID)
 	if err != nil || len(sources) != 1 || sources[0].CopyIndex != 1 {
 		t.Fatalf("pull sources = %#v, err=%v", sources, err)
+	}
+	source := sources[0]
+	if !source.PieceID.IsZero() {
+		t.Fatalf("source piece id = %s, want the zero boundary", source.PieceID)
+	}
+	generation, err := repos.Contents.NextCopyWorkGeneration(t.Context(), copies[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pullTask, created, err := repos.Tasks.Enqueue(t.Context(), &model.Task{
+		Type: model.TaskTypeStoragePull, IdempotencyKey: "zero-piece-pull", InputVersion: 1,
+		Input: []byte(`{}`), InputHash: "zero-piece-pull", Status: model.TaskStatusPending,
+		ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+	})
+	if err != nil || !created {
+		t.Fatalf("enqueue pull task = %#v, created=%v, err=%v", pullTask, created, err)
+	}
+	if err := repos.Contents.BindCopyTask(t.Context(), copies[0].ID, generation, pullTask.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Contents.ReservePullRequest(t.Context(), repository.ReservePullRequestInput{
+		CopyID: copies[0].ID, Generation: generation, TaskID: pullTask.ID, AttemptID: "zero-piece-attempt",
+		SourceProviderID: &source.ProviderID, SourceDataSetID: &source.DataSetID, SourcePieceID: &source.PieceID,
+		SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL, CommitExtraDataHex: "ab",
+	}); err != nil {
+		t.Fatalf("reserving a pull from a piece 0 source: %v", err)
 	}
 }
 
