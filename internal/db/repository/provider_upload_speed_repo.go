@@ -70,6 +70,19 @@ func (r *BunProviderUploadSpeedRepo) Finish(ctx context.Context, providerID stri
 	return nil
 }
 
+func (r *BunProviderUploadSpeedRepo) FailActiveTask(ctx context.Context, taskID int64, failureCode string) error {
+	if taskID < 1 || failureCode == "" {
+		return ErrInvalidInput
+	}
+	now := time.Now().UTC()
+	_, err := r.db.NewUpdate().Model((*providerbenchmark.Result)(nil)).
+		Set("state = ?", providerbenchmark.StateFailed).
+		Set("active_task_id = NULL").Set("duration_ms = NULL").Set("bytes_per_second = NULL").
+		Set("failure_code = ?", failureCode).Set("tested_at = ?", now).Set("updated_at = ?", now).
+		Where("active_task_id = ? AND state = ?", taskID, providerbenchmark.StateTesting).Exec(ctx)
+	return err
+}
+
 func (r *BunProviderUploadSpeedRepo) Get(ctx context.Context, providerID string) (*providerbenchmark.Result, error) {
 	var row providerbenchmark.Result
 	err := r.db.NewSelect().Model(&row).Where("provider_id = ?", providerID).Scan(ctx)

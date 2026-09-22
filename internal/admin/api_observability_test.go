@@ -3,14 +3,17 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/testutil"
@@ -175,6 +178,104 @@ func TestAPIObservabilityProviders(t *testing.T) {
 	}
 	if len(body.Items) != 1 || body.Items[0].Facts.ProviderID.String() != "101" {
 		t.Fatalf("items = %+v, want provider 101", body.Items)
+	}
+}
+
+type failingUploadSpeedList struct {
+	repository.ProviderUploadSpeedRepository
+}
+
+func (failingUploadSpeedList) ListByProviderIDs(context.Context, []string) (map[string]providerbenchmark.Result, error) {
+	return nil, errors.New("speed results unavailable")
+}
+
+func TestAPIObservabilityProvidersKeepsHealthWhenSpeedResultsFail(t *testing.T) {
+	checkedAt := time.Now().UTC()
+	service := observability.NewService(observability.ServiceOptions{
+		Store: &observabilityAPIStore{
+			providers: []observability.ProviderState{{
+				ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable, LastCheckedAt: checkedAt,
+			}},
+			providerLastCheckedAt: &checkedAt,
+		},
+	})
+	repos := repository.NewRepositories(testutil.NewTestDB(t))
+	repos.ProviderUploadSpeed = failingUploadSpeedList{ProviderUploadSpeedRepository: repos.ProviderUploadSpeed}
+	srv := &Server{repos: repos, observability: service, logger: testLogger()}
+	rr := httptest.NewRecorder()
+	srv.handleAPIObservabilityProviders(rr, httptest.NewRequest(http.MethodGet, "/api/v1/observability/providers", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	var page struct {
+		Items []struct {
+			Facts           observability.ProviderFacts `json:"facts"`
+			UploadSpeedTest json.RawMessage             `json:"upload_speed_test"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Facts.ProviderID.String() != "101" || page.Items[0].UploadSpeedTest != nil {
+		t.Fatalf("provider page = %+v", page.Items)
+	}
+}
+
+func TestAPIProviderUploadSpeedTestConcurrentAdmission(t *testing.T) {
+	db := testutil.NewTestFileDB(t)
+	db.SetMaxOpenConns(4)
+	repos := repository.NewRepositories(db)
+	checkedAt := time.Now().UTC()
+	serviceURL := "https://provider.example"
+	if err := repos.Observability.ReplaceProviderStates(t.Context(), checkedAt, []observability.ProviderState{{
+		ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable,
+		Active: new(true), HasPDP: new(true), ServiceURL: &serviceURL,
+		LastCheckedAt: checkedAt, ReasonCodes: []observability.ReasonCode{}, Evidence: map[string]any{},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		repos: repos, observability: observability.NewService(observability.ServiceOptions{Store: repos.Observability}),
+		taskService: newAdminTestTaskService(t, repos), logger: testLogger(),
+	}
+	const callers = 8
+	start := make(chan struct{})
+	statuses := make(chan int, callers)
+	var workers sync.WaitGroup
+	for range callers {
+		workers.Go(func() {
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/observability/providers/101/upload-speed-test", nil)
+			req.SetPathValue("provider_id", "101")
+			rr := httptest.NewRecorder()
+			srv.handleAPIProviderUploadSpeedTest(rr, req)
+			statuses <- rr.Code
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(statuses)
+	var accepted, conflicts int
+	for status := range statuses {
+		switch status {
+		case http.StatusAccepted:
+			accepted++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			t.Errorf("concurrent POST status = %d, want 202 or 409", status)
+		}
+	}
+	if accepted != 1 || conflicts != callers-1 {
+		t.Fatalf("concurrent admission: accepted=%d, conflicts=%d", accepted, conflicts)
+	}
+	page, err := repos.Tasks.List(t.Context(), repository.TaskListFilter{Type: model.TaskTypeProviderUploadSpeedTest})
+	if err != nil || len(page.Tasks) != 1 {
+		t.Fatalf("persisted tasks = %+v, err=%v", page.Tasks, err)
+	}
+	row, err := repos.ProviderUploadSpeed.Get(t.Context(), "101")
+	if err != nil || row == nil || row.State != providerbenchmark.StateTesting || row.ActiveTaskID == nil || *row.ActiveTaskID != page.Tasks[0].ID {
+		t.Fatalf("active test = %+v, err=%v", row, err)
 	}
 }
 

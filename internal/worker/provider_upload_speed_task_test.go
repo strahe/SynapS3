@@ -65,6 +65,52 @@ func TestProviderUploadSpeedTaskRecordsSuccessfulMeasurement(t *testing.T) {
 	}
 }
 
+func TestProviderUploadSpeedEngineFailureReleasesActiveTest(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		reason    string
+		breakTask func(*testing.T, handlerTestRuntime, *model.Task)
+	}{
+		{
+			name: "handler panic", reason: "handler_panic",
+			breakTask: func(*testing.T, handlerTestRuntime, *model.Task) {},
+		},
+		{
+			name: "invalid input hash", reason: "invalid_input_hash",
+			breakTask: func(t *testing.T, runtime handlerTestRuntime, taskRow *model.Task) {
+				if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("input_hash = ?", providerbenchmark.URLHash("wrong input")).
+					Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (time.Duration, error) {
+				calls.Add(1)
+				panic("probe failed unexpectedly")
+			})})
+			taskRow := seedSpeedTest(t, runtime)
+			tt.breakTask(t, runtime, taskRow)
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool { return task.Status == model.TaskStatusFailed })
+			if failed.FailureReason == nil || *failed.FailureReason != tt.reason {
+				t.Fatalf("task failure reason = %v, want %s", failed.FailureReason, tt.reason)
+			}
+			row, err := runtime.repos.ProviderUploadSpeed.Get(t.Context(), "101")
+			if err != nil || row == nil || row.State != providerbenchmark.StateFailed || row.ActiveTaskID != nil ||
+				row.FailureCode == nil || *row.FailureCode != tt.reason {
+				t.Fatalf("speed result after engine failure = %#v, err=%v", row, err)
+			}
+			if tt.reason == "handler_panic" && calls.Load() != 1 || tt.reason == "invalid_input_hash" && calls.Load() != 0 {
+				t.Fatalf("probe calls = %d, reason=%s", calls.Load(), tt.reason)
+			}
+		})
+	}
+}
+
 func TestProviderUploadSpeedRecoveryNeverReuploads(t *testing.T) {
 	var calls atomic.Int32
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{uploadSpeedProbe: uploadSpeedProbeFunc(func(context.Context, string) (time.Duration, error) {

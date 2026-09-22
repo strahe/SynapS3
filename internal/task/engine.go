@@ -293,7 +293,11 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 }
 
 func (e *Engine) failClaim(ctx context.Context, claimed *model.Task, reason string, cause error) error {
-	if err := e.commitResult(ctx, claimed, Fail(cause, reason, nil)); err != nil {
+	var settlement Settlement
+	if definition, ok := e.registry.Definition(claimed.Type); ok && definition.OnEngineFailure != nil {
+		settlement = definition.OnEngineFailure(claimed, reason)
+	}
+	if err := e.commitResult(ctx, claimed, Fail(cause, reason, settlement)); err != nil {
 		e.logger.Error("recording task engine failure", "task_id", claimed.ID, "claim_generation", claimed.ClaimGeneration, "error", err)
 		return err
 	}

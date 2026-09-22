@@ -51,6 +51,12 @@ func TestProviderUploadSpeedKeepsOnlyLatestResultAcrossHealthRefresh(t *testing.
 	if err := repos.ProviderUploadSpeed.Begin(t.Context(), "101", hash, second); err != nil {
 		t.Fatal(err)
 	}
+	if err := repos.ProviderUploadSpeed.FailActiveTask(t.Context(), first, "handler_panic"); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := repos.ProviderUploadSpeed.Get(t.Context(), "101"); err != nil || active == nil || active.State != providerbenchmark.StateTesting || active.ActiveTaskID == nil || *active.ActiveTaskID != second {
+		t.Fatalf("new active test after stale task failure = %#v, %v", active, err)
+	}
 	if err := repos.ProviderUploadSpeed.Finish(t.Context(), "101", first, providerbenchmark.StateSucceeded, 1000, providerbenchmark.SampleBytes, ""); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("stale task Finish = %v, want conflict", err)
 	}

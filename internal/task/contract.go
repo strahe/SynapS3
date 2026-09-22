@@ -94,6 +94,9 @@ type Definition struct {
 	// CanManualRetry optionally narrows AllowRetry for one failed task based on
 	// its durable failure evidence. Nil preserves the type-wide policy.
 	CanManualRetry func(*model.Task) bool
+	// OnEngineFailure settles domain state when the engine fails a claim before
+	// the handler can return its own result.
+	OnEngineFailure func(*model.Task, string) Settlement
 }
 
 func (d Definition) manualRetryAllowed(task *model.Task) bool {

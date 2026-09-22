@@ -24,6 +24,11 @@ func (h *TaskHandlers) providerUploadSpeedHandler() taskengine.Handler {
 				return err
 			}),
 			RetryLimit: new(int), AllowRetry: false,
+			OnEngineFailure: func(task *model.Task, reason string) taskengine.Settlement {
+				return func(ctx context.Context, repos *repository.Repositories) error {
+					return repos.ProviderUploadSpeed.FailActiveTask(ctx, task.ID, reason)
+				}
+			},
 		},
 		execute: h.executeProviderUploadSpeed,
 		recover: h.recoverProviderUploadSpeed,

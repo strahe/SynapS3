@@ -756,6 +756,7 @@ type ObservabilityRepository interface {
 type ProviderUploadSpeedRepository interface {
 	Begin(context.Context, string, string, int64) error
 	Finish(context.Context, string, int64, providerbenchmark.State, int64, int64, string) error
+	FailActiveTask(context.Context, int64, string) error
 	Get(context.Context, string) (*providerbenchmark.Result, error)
 	ListByProviderIDs(context.Context, []string) (map[string]providerbenchmark.Result, error)
 }

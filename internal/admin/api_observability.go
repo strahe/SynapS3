@@ -97,7 +97,7 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 	tests, err := s.repos.ProviderUploadSpeed.ListByProviderIDs(r.Context(), ids)
 	if err != nil {
 		s.logger.Error("api: failed to list provider upload speed tests", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		writeJSON(w, http.StatusOK, page)
 		return
 	}
 	items := make([]providerObservationWithSpeed, 0, len(page.Items))
