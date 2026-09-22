@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { activePiecesValue } from '@/lib/data-set-storage-health'
-import { providerUploadSpeedLabel } from '@/lib/provider-upload-speed'
+import { providerUploadSampleSize, providerUploadSpeedLabel } from '@/lib/provider-upload-speed'
 import { replicaLabel } from '@/lib/storage-status-labels'
 import {
   dataSetDisplayLabel,
@@ -278,7 +278,7 @@ function ProviderDetailContent({ provider }: { provider: ObservabilityProviderOb
       <SignalDetailBlock signal={provider.signal} />
       <DetailBlock title="Upload speed test">
         <DetailRow label="Result" value={providerUploadSpeedLabel(provider.upload_speed_test)} />
-        <DetailRow label="Sample size" value="32 MiB" />
+        <DetailRow label="Sample size" value={providerUploadSampleSize(provider.upload_speed_test)} />
         <DetailRow
           label="Tested"
           value={provider.upload_speed_test?.tested_at ? timeAgo(provider.upload_speed_test.tested_at) : '—'}

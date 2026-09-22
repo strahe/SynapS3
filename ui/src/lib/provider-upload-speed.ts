@@ -17,11 +17,29 @@ export function providerUploadSpeedLabel(test?: ProviderUploadSpeedTest): string
     case 'testing':
       return 'Testing upload speed…'
     case 'stale':
-      return 'Previous service address — test again when available'
+      return 'Outdated — Service URL no longer matches'
     case 'failed':
-      return test.failure_code === 'timeout' ? 'Upload test timed out' : 'Upload test failed'
+      switch (test.failure_code) {
+        case 'timeout':
+          return 'Upload test timed out'
+        case 'interrupted':
+          return 'Upload test interrupted — test again'
+        case 'unavailable':
+          return 'Upload test could not run'
+        case 'provider_changed':
+          return 'Provider no longer ready for this test'
+        case 'record_failed':
+          return 'Upload speed not recorded'
+        default:
+          return 'Upload test failed'
+      }
     case 'succeeded':
-      if (!test.bytes_per_second) return 'Upload test unavailable'
+      if (!test.bytes_per_second) return 'Upload speed not recorded'
       return `${(test.bytes_per_second / (1024 * 1024)).toFixed(1)} MiB/s`
   }
+}
+
+export function providerUploadSampleSize(test?: ProviderUploadSpeedTest): string {
+  if (!test) return '—'
+  return `${Number((test.sample_bytes / (1024 * 1024)).toFixed(1))} MiB`
 }

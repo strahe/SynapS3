@@ -38,7 +38,7 @@ func (h *TaskHandlers) providerUploadSpeedHandler() taskengine.Handler {
 func (h *TaskHandlers) executeProviderUploadSpeed(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 	input, err := taskengine.DecodeInput[providerbenchmark.Input](execution)
 	if err != nil {
-		return taskengine.Fail(err, "invalid_input", nil)
+		return h.failInvalidProviderUploadSpeedInput(execution, err)
 	}
 	if h.deps.Observability == nil || h.deps.UploadSpeedProbe == nil {
 		return h.failProviderUploadSpeed(execution, input, errors.New("upload speed probe unavailable"), "unavailable")
@@ -65,7 +65,7 @@ func (h *TaskHandlers) executeProviderUploadSpeed(ctx context.Context, execution
 		return effectErr
 	})
 	if errors.Is(err, taskengine.ErrResourceBusy) {
-		return taskengine.ResourceWait("Waiting to test provider upload speed")
+		return taskengine.ResourceWait("Waiting for another speed test or storage operation to finish")
 	}
 	if err != nil {
 		code := "upload_failed"
@@ -90,7 +90,7 @@ func (h *TaskHandlers) executeProviderUploadSpeed(ctx context.Context, execution
 func (h *TaskHandlers) recoverProviderUploadSpeed(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 	input, err := taskengine.DecodeInput[providerbenchmark.Input](execution)
 	if err != nil {
-		return taskengine.Fail(err, "invalid_input", nil)
+		return h.failInvalidProviderUploadSpeedInput(execution, err)
 	}
 	checkpoint, present, err := taskengine.DecodeCheckpoint[providerbenchmark.Checkpoint](execution)
 	if err != nil {
@@ -116,9 +116,16 @@ func (h *TaskHandlers) failProviderUploadSpeed(execution taskengine.Execution, i
 		message = "Provider upload speed test timed out"
 	}
 	if code == "provider_changed" {
-		message = "Provider is no longer available for this test"
+		message = "Provider is no longer ready for this test"
 	}
 	return taskengine.Fail(errors.New(message), code, func(ctx context.Context, repos *repository.Repositories) error {
 		return repos.ProviderUploadSpeed.Finish(ctx, input.ProviderID, execution.ID(), providerbenchmark.StateFailed, 0, 0, code)
+	})
+}
+
+func (h *TaskHandlers) failInvalidProviderUploadSpeedInput(execution taskengine.Execution, err error) taskengine.Result {
+	h.deps.Logger.Warn("provider upload speed task input is invalid", "task_id", execution.ID(), "error", err)
+	return taskengine.Fail(errors.New("upload speed test could not complete"), "invalid_input", func(ctx context.Context, repos *repository.Repositories) error {
+		return repos.ProviderUploadSpeed.FailActiveTask(ctx, execution.ID(), "invalid_input")
 	})
 }

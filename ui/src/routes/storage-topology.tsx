@@ -438,7 +438,7 @@ function StorageTopologyPage() {
       onError: (error) =>
         setUploadSpeedTestError(
           error instanceof APIError && error.status === 409
-            ? `Provider #${providerID} is not ready for a new test. Wait for the current test or refresh its status.`
+            ? `A test is already running, or provider #${providerID} is not available for testing. Check its details before trying again.`
             : `Could not start the upload speed test for provider #${providerID}. Try again.`
         ),
     })
@@ -484,7 +484,7 @@ function StorageTopologyPage() {
 
       {tab === 'providers' && uploadSpeedTestError && (
         <Alert variant="destructive">
-          <AlertTitle>Upload test unavailable</AlertTitle>
+          <AlertTitle>Upload speed test not started</AlertTitle>
           <AlertDescription>{uploadSpeedTestError}</AlertDescription>
         </Alert>
       )}
