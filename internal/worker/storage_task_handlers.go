@@ -175,6 +175,9 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 			}
 			bindingPlan = append(bindingPlan, frozen)
 		}
+		sort.Slice(bindingPlan, func(i, j int) bool { return bindingPlan[i].copyIndex < bindingPlan[j].copyIndex })
+		ingressIndex := h.fastestIngressIndex(ctx, bindingPlan)
+		ingressProviderID := bindingPlan[ingressIndex].provider
 
 		return taskengine.Complete("Storage work scheduled", func(ctx context.Context, repos *repository.Repositories) error {
 			bindings := make([]model.StorageDataSet, 0, len(bindingPlan))
@@ -204,10 +207,14 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 				bindings = append(bindings, *binding)
 			}
 			sort.Slice(bindings, func(i, j int) bool { return bindings[i].CopyIndex < bindings[j].CopyIndex })
+			ingress, err := repos.Contents.GetIngressCopy(ctx, upload.ID)
+			if err != nil {
+				return err
+			}
 			copyBindings := make([]repository.UploadCopyBindingInput, 0, len(bindings))
 			for i := range bindings {
 				method := model.StorageCopyTransferMethodPeerPull
-				if i == 0 {
+				if (ingress != nil && bindings[i].ProviderID.Equal(ingress.ProviderID)) || (ingress == nil && bindings[i].ProviderID.Equal(ingressProviderID)) {
 					method = model.StorageCopyTransferMethodIngress
 				}
 				copyBindings = append(copyBindings, repository.UploadCopyBindingInput{
@@ -804,7 +811,7 @@ func (h *TaskHandlers) finishDataSetEnsure(ctx context.Context, repos *repositor
 		return err
 	}
 	required := h.effectiveBucketCopies(bucket)
-	if _, err := repos.Buckets.PromoteReadyIfProvisioned(ctx, bucket.ID, required); err != nil {
+	if err := h.promoteBucketReady(ctx, repos, bucket.ID, required); err != nil {
 		return err
 	}
 	provisionTask, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeBucketProvision, bucketlifecycle.ProvisionKey(bucket.ID, bucket.DefaultCopies))
@@ -835,6 +842,35 @@ func (h *TaskHandlers) continueDataSetCopies(ctx context.Context, repos *reposit
 		}
 		if err := h.enqueueInitialCopyTask(ctx, repos, copyRow.ID, model.TaskTypeStorageTransferPlan); err != nil && !errors.Is(err, repository.ErrConflict) {
 			return err
+		}
+	}
+	_, err = h.taskService.WakeInTransaction(ctx, repos, wakeIDs)
+	return err
+}
+
+func (h *TaskHandlers) wakePeerPullPlans(ctx context.Context, repos *repository.Repositories, contentID int64) error {
+	if h.taskService == nil {
+		return errors.New("task service is unavailable")
+	}
+	copies, err := repos.Contents.ListCopies(ctx, contentID)
+	if err != nil {
+		return err
+	}
+	wakeIDs := make([]int64, 0, len(copies))
+	for i := range copies {
+		copyRow := &copies[i]
+		if copyRow.Status != model.StorageCopyStatusPending ||
+			copyRow.TransferMethod != model.StorageCopyTransferMethodPeerPull ||
+			copyRow.ActiveTaskID == nil {
+			continue
+		}
+		taskRow, err := repos.Tasks.GetByID(ctx, *copyRow.ActiveTaskID)
+		if err != nil {
+			return err
+		}
+		if taskRow != nil && taskRow.Type == model.TaskTypeStorageTransferPlan &&
+			taskRow.Status == model.TaskStatusPending && taskRow.WaitReason != nil && *taskRow.WaitReason == "source" {
+			wakeIDs = append(wakeIDs, taskRow.ID)
 		}
 	}
 	_, err = h.taskService.WakeInTransaction(ctx, repos, wakeIDs)
@@ -879,25 +915,94 @@ func (h *TaskHandlers) transferPlanHandler() taskengine.Handler {
 			if len(sources) > 0 {
 				return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStoragePull, "Storage copy is ready to transfer")
 			}
+			migration, err := h.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)
+			if err != nil {
+				return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
+			}
+			if !migration {
+				return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "source", "Waiting for a readable storage source", nil)
+			}
+			available, err := h.copyCacheAvailable(ctx, copyRow)
+			if err != nil {
+				return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed")
+			}
+			if !available {
+				return taskengine.Fail(errors.New("stored content migration has no readable source or local cache"), "migration_cache_missing", nil)
+			}
+			return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", "")
 		}
-		// Cached bytes are named by the content, so residency is asked of the
-		// content's cache entry rather than of a version that happens to exist.
-		cacheEntry, err := h.deps.Repositories.CacheEvictions.GetCacheEntry(ctx, copyRow.ContentID)
+		available, err := h.copyCacheAvailable(ctx, copyRow)
 		if err != nil {
 			return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed")
 		}
-		if cacheEntry != nil && cacheEntry.InCache && h.deps.Cache != nil {
-			bucket, err := h.deps.Repositories.Buckets.GetByID(ctx, copyRow.BucketID)
-			if err != nil {
-				return h.retryCopyTask(execution, input, copyRow, err, "copy_bucket_load_failed")
-			}
-			if bucket != nil && h.deps.Cache.Exists(ctx, bucket.Name, model.ContentCacheKey(copyRow.ContentID)) {
-				return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Storage copy is ready to transfer")
-			}
+		if available {
+			return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Storage copy is ready to transfer")
+		}
+		if copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
+			return taskengine.Fail(errors.New("stored content migration cannot read its local cache"), "migration_cache_missing", nil)
 		}
 		return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for a readable storage source", nil)
 	}
 	return taskHandler{definition: definition, execute: run, recover: run}
+}
+
+func (h *TaskHandlers) copyCacheAvailable(ctx context.Context, copyRow *model.StorageCopy) (bool, error) {
+	entry, err := h.deps.Repositories.CacheEvictions.GetCacheEntry(ctx, copyRow.ContentID)
+	if err != nil || entry == nil || !entry.InCache || h.deps.Cache == nil {
+		return false, err
+	}
+	bucket, err := h.deps.Repositories.Buckets.GetByID(ctx, copyRow.BucketID)
+	if err != nil || bucket == nil {
+		return false, err
+	}
+	return h.deps.Cache.Exists(ctx, bucket.Name, model.ContentCacheKey(copyRow.ContentID)), nil
+}
+
+func (h *TaskHandlers) advanceToCacheRestore(input storagepipeline.CopyGenerationInput, taskID int64, message, pullAttemptID string) taskengine.Result {
+	return taskengine.Complete(message, func(ctx context.Context, repos *repository.Repositories) error {
+		if err := repos.Contents.SetCopyCacheRestore(ctx, input.CopyID, input.Generation, taskID, pullAttemptID); err != nil {
+			return err
+		}
+		return h.enqueueSuccessorCopyTask(ctx, repos, input, taskID, model.TaskTypeStorageStore)
+	})
+}
+
+func (h *TaskHandlers) pullWithoutSource(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy) taskengine.Result {
+	migration, err := h.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)
+	if err != nil {
+		return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed")
+	}
+	if !migration {
+		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "source", "Waiting for a readable storage source", nil)
+	}
+	available, err := h.copyCacheAvailable(ctx, copyRow)
+	if err != nil {
+		return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed")
+	}
+	if !available {
+		return taskengine.Fail(errors.New("stored content migration has no readable source or local cache"), "migration_cache_missing", nil)
+	}
+	return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", "")
+}
+
+func (h *TaskHandlers) recoverMigrationFromCache(ctx context.Context, execution taskengine.Execution, input storagepipeline.CopyGenerationInput, copyRow *model.StorageCopy, pullAttemptID string) (taskengine.Result, bool) {
+	migration, err := h.deps.Repositories.Contents.IsPendingReplacementCopy(ctx, copyRow.ID)
+	if err != nil {
+		return h.retryCopyTask(execution, input, copyRow, err, "replacement_load_failed"), true
+	}
+	if !migration {
+		return taskengine.Result{}, false
+	}
+	available, err := h.copyCacheAvailable(ctx, copyRow)
+	if err != nil {
+		return h.retryCopyTask(execution, input, copyRow, err, "copy_cache_load_failed"), true
+	}
+	if !available {
+		return taskengine.Fail(errors.New("stored content migration failed and its local cache is unavailable"), "migration_cache_missing", func(ctx context.Context, repos *repository.Repositories) error {
+			return repos.Contents.AbandonMigrationPull(ctx, copyRow.ID, input.Generation, execution.ID(), pullAttemptID)
+		}), true
+	}
+	return h.advanceToCacheRestore(input, execution.ID(), "Storage copy is recovering from cache", pullAttemptID), true
 }
 
 func (h *TaskHandlers) storeHandler() taskengine.Handler {
@@ -989,6 +1094,9 @@ func (h *TaskHandlers) storeWithProviderSlot(
 	calculateReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
+				return taskengine.Fail(errors.New("stored content migration cannot read its local cache"), "migration_cache_missing", nil)
+			}
 			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
 		}
 		return h.retryCopyTask(execution, input, copyRow, err, "cache_open_failed")
@@ -1008,6 +1116,9 @@ func (h *TaskHandlers) storeWithProviderSlot(
 	storeReader, _, err := h.deps.Cache.Get(ctx, bucket.Name, cacheKey)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
+				return taskengine.Fail(errors.New("stored content migration cannot read its local cache"), "migration_cache_missing", nil)
+			}
 			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for retained cache data", nil)
 		}
 		return h.retryCopyTask(execution, input, copyRow, err, "cache_open_failed")
@@ -1018,7 +1129,7 @@ func (h *TaskHandlers) storeWithProviderSlot(
 		ProviderServiceURL: target.ServiceURL(),
 	}
 	var checkpointSettlement taskengine.Settlement
-	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
+	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
 		checkpoint.IngressAttempt = copyRow.IngressStoreAttempt + 1
 		checkpointSettlement = func(ctx context.Context, repos *repository.Repositories) error {
 			_, err := repos.Contents.BeginIngressStoreProgress(ctx, repository.BeginIngressStoreProgressInput{
@@ -1030,7 +1141,7 @@ func (h *TaskHandlers) storeWithProviderSlot(
 	var stored *storage.StoreResult
 	var progress *uploadProgressReporter
 	attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceProviderMutation, checkpoint, checkpointSettlement, func(ctx context.Context) error {
-		if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
+		if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress || copyRow.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
 			progress = h.newIngressProgressReporter(ctx, execution.ID(), input.Generation, copyRow.ID, checkpoint.IngressAttempt, content, bucket)
 		}
 		options := &storage.StoreOptions{PieceCID: pieceInfo.CIDv2}
@@ -1129,6 +1240,9 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 	if err != nil {
 		return taskengine.Fail(err, "invalid_checkpoint", nil)
 	}
+	if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress && !hasCheckpoint {
+		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageStore, "Storage copy is ready for ingress")
+	}
 	if !hasCheckpoint && !mayPull {
 		return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Storage transfer is ready", nil)
 	}
@@ -1142,7 +1256,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 			return h.retryCopyTask(execution, input, copyRow, err, "copy_source_load_failed")
 		}
 		if len(sources) == 0 {
-			return taskengine.Suspend(model.TaskResumeModeExecute, storageDependencyWait, "source", "Waiting for a readable storage source", nil)
+			return h.pullWithoutSource(ctx, execution, input, copyRow)
 		}
 		source := sources[0]
 		pieceCID, err := cid.Parse(source.PieceCID)
@@ -1167,7 +1281,7 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 			return repos.Contents.ReservePullRequest(ctx, repository.ReservePullRequestInput{
 				CopyID: copyRow.ID, Generation: input.Generation, TaskID: execution.ID(),
 				AttemptID:        checkpoint.AttemptID,
-				SourceProviderID: source.ProviderID, SourceDataSetID: source.DataSetID, SourcePieceID: source.PieceID,
+				SourceProviderID: &source.ProviderID, SourceDataSetID: &source.DataSetID, SourcePieceID: &source.PieceID,
 				SourcePieceCID: source.PieceCID, SourceRetrievalURL: source.RetrievalURL,
 				CommitExtraDataHex: checkpoint.CommitExtraDataHex,
 			})
@@ -1209,6 +1323,9 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 		case synapse.PullErrorRetryable:
 			return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "provider_confirmation", "Checking storage transfer", nil)
 		case synapse.PullErrorTerminal:
+			if result, recovered := h.recoverMigrationFromCache(ctx, execution, input, copyRow, checkpoint.AttemptID); recovered {
+				return result
+			}
 			return h.failPullTask(execution, input, copyRow, checkpoint.AttemptID, err, "pull_failed")
 		default:
 			return h.retryPullTask(execution, input, copyRow, checkpoint.AttemptID, err, "pull_request_failed")
@@ -1365,11 +1482,25 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 			if err := repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, execution.ID()); err != nil {
 				return err
 			}
+			if copyRow.TransferMethod == model.StorageCopyTransferMethodIngress {
+				failed, err := repos.Contents.ReopenFailedIngressForPull(ctx, copyRow.ContentID)
+				if err != nil {
+					return err
+				}
+				for _, failedCopy := range failed {
+					if err := h.enqueueInitialCopyTask(ctx, repos, failedCopy.ID, model.TaskTypeStorageTransferPlan); err != nil {
+						return err
+					}
+				}
+			}
 			// The content is readable once this copy commits, independently of
 			// which versions currently point at it.
 			if _, err := repos.Contents.BindReadableUploadForContent(ctx, repository.BindReadableUploadInput{
 				ContentID: copyRow.ContentID, BucketID: copyRow.BucketID,
 			}); err != nil {
+				return err
+			}
+			if err := h.wakePeerPullPlans(ctx, repos, copyRow.ContentID); err != nil {
 				return err
 			}
 			_, refs, err := repos.Contents.FinalizeUploadIfTargetCopiesMet(ctx, repository.NewFinalizeUploadInput(copyRow.ContentID))
@@ -1712,7 +1843,37 @@ func (h *TaskHandlers) settleCopyFailure(
 	}
 	// The content itself is flagged by MarkUploadCopyFailed, and only once no
 	// copy is left that holds or may still hold it.
-	return repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, execution.ID())
+	if err := repos.Contents.CompleteCopyTask(ctx, input.CopyID, input.Generation, execution.ID()); err != nil {
+		return err
+	}
+	if copyRow.TransferMethod != model.StorageCopyTransferMethodIngress {
+		return nil
+	}
+	readable, err := repos.Contents.HasReadableCommittedCopy(ctx, copyRow.ContentID)
+	if err != nil {
+		return err
+	}
+	if readable {
+		failed, err := repos.Contents.ReopenFailedIngressForPull(ctx, copyRow.ContentID)
+		if err != nil {
+			return err
+		}
+		for _, failedCopy := range failed {
+			if err := h.enqueueInitialCopyTask(ctx, repos, failedCopy.ID, model.TaskTypeStorageTransferPlan); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	promoted, err := repos.Contents.PromotePendingIngress(ctx, copyRow.ContentID)
+	if err != nil || promoted == nil {
+		return err
+	}
+	if promoted.ActiveTaskID != nil && h.taskService != nil {
+		_, err = h.taskService.WakeInTransaction(ctx, repos, []int64{*promoted.ActiveTaskID})
+		return err
+	}
+	return h.enqueueInitialCopyTask(ctx, repos, promoted.ID, model.TaskTypeStorageTransferPlan)
 }
 
 func commitAttentionFailureReason(code storagecommit.AttentionCode) string {

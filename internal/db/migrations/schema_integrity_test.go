@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	initialPortableSchemaFingerprint = "4a57bf16ec5d242f43154dd29183049c592641f4b7acee471f4aa269fb2d7b83"
+	initialPortableSchemaFingerprint = "cb2e36800894303f1513c2f63a36265e563a39de0a8185b12d5afa32350547aa"
 )
 
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {

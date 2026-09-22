@@ -13,6 +13,11 @@ import (
 
 const SampleBytes int64 = 32 << 20
 
+// UploadProbe measures one upload sample against a provider service URL.
+type UploadProbe interface {
+	Probe(context.Context, string) (time.Duration, error)
+}
+
 type State string
 
 const (

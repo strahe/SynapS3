@@ -11,6 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/uptrace/bun"
 )
 
@@ -194,6 +195,11 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int)
 		Where("storage_content.content_size > 0").
 		Where("object_cache.cache_accessed_at IS NOT NULL").
 		Where(minimumDurabilityMetSQL("storage_content", "durability_bucket")).
+		Where(noUnfinishedReplacementCacheDependencySQL("storage_content.id"),
+			storagereplacement.ItemStatusPending,
+			storagereplacement.ItemStatusAttention,
+			storagereplacement.StatusCompleted,
+			storagereplacement.StatusSuperseded).
 		OrderExpr("object_cache.cache_accessed_at, object_cache.content_id")
 	if limit > 0 {
 		query = query.Limit(limit)
@@ -248,6 +254,20 @@ func (r *BunCacheEvictionRepo) AuthorizeDeletion(
 		}
 		content := contents[contentID]
 		if content == nil {
+			return cacheeviction.ErrNoLongerEligible
+		}
+		var pendingReplacement int
+		if err := db.NewRaw(`SELECT COUNT(*) FROM storage_replacement_items AS item
+			JOIN storage_replacements AS replacement ON replacement.id = item.replacement_id
+			WHERE item.content_id = ? AND item.status IN (?, ?)
+			  AND replacement.status NOT IN (?, ?)`,
+			contentID, storagereplacement.ItemStatusPending,
+			storagereplacement.ItemStatusAttention,
+			storagereplacement.StatusCompleted, storagereplacement.StatusSuperseded).
+			Scan(ctx, &pendingReplacement); err != nil {
+			return err
+		}
+		if pendingReplacement > 0 {
 			return cacheeviction.ErrNoLongerEligible
 		}
 		bucket, err := lockBucketByID(ctx, db, content.BucketID)
@@ -456,6 +476,11 @@ func nextBucketDurabilityCandidate(ctx context.Context, db bun.IDB, bucketID int
 		Where("cache_entry.in_cache = ?", true).
 		Where("cache_entry.cache_active_task_id IS NULL").
 		Where(minimumDurabilityMetSQL("storage_content", "durability_bucket")).
+		Where(noUnfinishedReplacementCacheDependencySQL("storage_content.id"),
+			storagereplacement.ItemStatusPending,
+			storagereplacement.ItemStatusAttention,
+			storagereplacement.StatusCompleted,
+			storagereplacement.StatusSuperseded).
 		OrderExpr("storage_content.updated_at, storage_content.id").
 		Limit(1).
 		Scan(ctx)
@@ -478,6 +503,17 @@ func minimumDurabilityMetSQL(contentAlias, bucketAlias string) string {
 		distinctReadableSlotCountSQL("durable_copy", "durable_data_set", contentAlias+".id"),
 		bucketAlias, bucketAlias, contentAlias, contentAlias, bucketAlias,
 	)
+}
+
+func noUnfinishedReplacementCacheDependencySQL(contentIDExpr string) string {
+	return fmt.Sprintf(`NOT EXISTS (
+		SELECT 1 FROM storage_replacement_items AS cache_replacement_item
+		JOIN storage_replacements AS cache_replacement
+		  ON cache_replacement.id = cache_replacement_item.replacement_id
+		WHERE cache_replacement_item.content_id = %s
+		  AND cache_replacement_item.status IN (?, ?)
+		  AND cache_replacement.status NOT IN (?, ?)
+	)`, contentIDExpr)
 }
 
 func cacheAccessTime(entry *model.ObjectCache) time.Time {

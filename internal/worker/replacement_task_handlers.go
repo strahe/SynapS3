@@ -94,6 +94,13 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 		}
 
 		if !target.IsCurrent {
+			incomplete, err := h.deps.Repositories.Contents.ListIncompleteCopiesForDataSet(ctx, row.SourceDataSetID)
+			if err != nil {
+				return h.retryReplacement(execution, row.ID, err, "replacement_source_writes_failed")
+			}
+			if len(incomplete) > 0 {
+				return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "source_writes", "Waiting for current storage writes", nil)
+			}
 			return taskengine.Suspend(model.TaskResumeModeRecover, 0, "activation", "Activating replacement storage service", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Replacements.Activate(ctx, row.ID)
 			})
@@ -196,6 +203,11 @@ func (h *TaskHandlers) coordinateReplacementItem(
 			message = *copyTask.LastError
 		}
 		return taskengine.Fail(errors.New(message), "replacement_copy_failed", func(ctx context.Context, repos *repository.Repositories) error {
+			if copyTask.FailureReason != nil && *copyTask.FailureReason == "migration_cache_missing" {
+				if err := repos.Contents.CompleteCopyTask(ctx, copyRow.ID, copyRow.WorkGeneration, copyTask.ID); err != nil {
+					return err
+				}
+			}
 			if err := repos.Replacements.MarkReplacementItemAttention(ctx, replacement.ID, item.ID, message); err != nil {
 				return err
 			}

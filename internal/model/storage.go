@@ -40,8 +40,9 @@ const (
 type StorageCopyTransferMethod string
 
 const (
-	StorageCopyTransferMethodIngress  StorageCopyTransferMethod = "ingress"
-	StorageCopyTransferMethodPeerPull StorageCopyTransferMethod = "peer_pull"
+	StorageCopyTransferMethodIngress      StorageCopyTransferMethod = "ingress"
+	StorageCopyTransferMethodPeerPull     StorageCopyTransferMethod = "peer_pull"
+	StorageCopyTransferMethodCacheRestore StorageCopyTransferMethod = "cache_restore"
 )
 
 type StorageCopyStatus string
@@ -112,16 +113,15 @@ type StorageDataSet struct {
 	LastUsedContent  *StorageContent `bun:"rel:belongs-to,join:last_used_content_id=id"`
 }
 
-// StorageCopy places one content payload on one data set generation. Ingress
-// progress lives here rather than on the content because it belongs to the
-// concrete transfer that produced it.
+// StorageCopy places one content payload on one data set generation. Store
+// progress belongs to the concrete transfer, not the shared content.
 type StorageCopy struct {
 	bun.BaseModel `bun:"table:storage_copies"`
 
 	ID        int64 `bun:",pk,autoincrement,identity"`
 	ContentID int64 `bun:",notnull"`
 	BucketID  int64 `bun:",notnull"`
-	// ContentSize repeats the content size so the ingress bound stays a local
+	// ContentSize repeats the content size so the Store bound stays a local
 	// check; a composite foreign key keeps the repetition from drifting.
 	ContentSize      int64                     `bun:",notnull"`
 	StorageDataSetID int64                     `bun:",notnull"`

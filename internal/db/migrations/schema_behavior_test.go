@@ -294,7 +294,7 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 	})
 }
 
-func TestBaselineIngressRemainsUniqueAfterGenerationRetirement(t *testing.T) {
+func TestBaselineFailedIngressAllowsOneReplacementIngress(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
 		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
 			t.Fatalf("create initial schema: %v", err)
@@ -311,10 +311,11 @@ func TestBaselineIngressRemainsUniqueAfterGenerationRetirement(t *testing.T) {
 		}
 
 		currentDataSetID := insertBaselineTestDataSet(t, db, bucketID, "202", 0, 2, true)
+		insertBaselineTestCopy(t, db, contentID, bucketID, currentDataSetID, 0, "202", "ingress")
+		otherDataSetID := insertBaselineTestDataSet(t, db, bucketID, "303", 1, 1, true)
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
 			(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)
-			VALUES (?, ?, 1, ?, 0, '202', 'ingress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentID, bucketID, currentDataSetID)
-		insertBaselineTestCopy(t, db, contentID, bucketID, currentDataSetID, 0, "202", "peer_pull")
+			VALUES (?, ?, 1, ?, 1, '303', 'ingress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentID, bucketID, otherDataSetID)
 	})
 }
 

@@ -379,13 +379,15 @@ type UploadCopyBindingInput struct {
 // sent. AttemptID is the ledger row's identity and SourcePieceCID names the
 // piece being fetched, which is not the same as the content's own CID.
 type ReservePullRequestInput struct {
-	CopyID             int64
-	Generation         int64
-	TaskID             int64
-	AttemptID          string
-	SourceProviderID   types.OnChainID
-	SourceDataSetID    types.OnChainID
-	SourcePieceID      types.OnChainID
+	CopyID     int64
+	Generation int64
+	TaskID     int64
+	AttemptID  string
+	// On-chain identity is optional at the type level because zero is a legal
+	// value: the first piece of a data set is piece 0. Presence is nil-checked.
+	SourceProviderID   *types.OnChainID
+	SourceDataSetID    *types.OnChainID
+	SourcePieceID      *types.OnChainID
 	SourcePieceCID     string
 	SourceRetrievalURL string
 	CommitExtraDataHex string
@@ -477,10 +479,12 @@ type StorageContentRepository interface {
 	ListCopies(ctx context.Context, contentID int64) ([]model.StorageCopy, error)
 	CountCurrentGenerationCopySlots(ctx context.Context, contentID int64) (int, error)
 	ListReadableCommittedCopies(ctx context.Context, contentID int64) ([]ReadableStorageCopy, error)
+	IsPendingReplacementCopy(ctx context.Context, copyID int64) (bool, error)
 	HasReadableCommittedCopy(ctx context.Context, contentID int64) (bool, error)
 	ListBucketStorageHealthSummaries(ctx context.Context, bucketID int64, staleBefore time.Time, affectedVersionCap int) ([]BucketStorageHealthSummary, error)
 	ListBucketStorageHealthAffectedVersions(ctx context.Context, input BucketStorageHealthAffectedVersionsInput) (BucketStorageHealthAffectedVersionPage, error)
 	ListDataSetBindings(ctx context.Context, bucketID int64) ([]model.StorageDataSet, error)
+	ListReadyBucketProviderIDs(ctx context.Context) ([]string, error)
 	ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error)
 	GetDataSetBindingByID(ctx context.Context, id int64) (*model.StorageDataSet, error)
 	GetDataSetBindingByCopyIndex(ctx context.Context, bucketID int64, copyIndex int) (*model.StorageDataSet, error)
@@ -509,6 +513,10 @@ type StorageContentRepository interface {
 	BindCopyTask(ctx context.Context, copyID, generation, taskID int64) error
 	AuthorizeCopyTask(ctx context.Context, copyID, generation, taskID, claimGeneration int64) (*model.StorageCopy, error)
 	ReservePullRequest(ctx context.Context, input ReservePullRequestInput) error
+	SetCopyCacheRestore(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error
+	AbandonMigrationPull(ctx context.Context, copyID, generation, taskID int64, pullAttemptID string) error
+	PromotePendingIngress(ctx context.Context, contentID int64) (*model.StorageCopy, error)
+	ReopenFailedIngressForPull(ctx context.Context, contentID int64) ([]model.StorageCopy, error)
 	ReplaceCopyTask(ctx context.Context, copyID, generation, taskID, nextGeneration, nextTaskID int64) error
 	CompleteCopyTask(ctx context.Context, copyID, generation, taskID int64) error
 	NextDataSetRetirementGeneration(ctx context.Context, dataSetID int64) (int64, error)
@@ -755,6 +763,7 @@ type ObservabilityRepository interface {
 
 type ProviderUploadSpeedRepository interface {
 	Begin(context.Context, string, string, int64) error
+	BeginIfAbsent(context.Context, string, string, int64) error
 	Finish(context.Context, string, int64, providerbenchmark.State, int64, int64, string) error
 	FailActiveTask(context.Context, int64, string) error
 	Get(context.Context, string) (*providerbenchmark.Result, error)

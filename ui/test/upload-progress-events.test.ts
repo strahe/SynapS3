@@ -55,6 +55,44 @@ test('upload progress events patch object list cache by version id', () => {
   assert.equal(qc.getQueryCache().find({ queryKey: ['tasks'] })?.state.isInvalidated, false)
 })
 
+test('cache restore progress refreshes replica details without replacing ingress progress', () => {
+  const qc = new QueryClient()
+  const objectKey = ['objects', 'photos', '', '/', '', 50]
+  const provenanceKey = ['objectProvenance', 'photos', 'v1']
+  qc.setQueryData<ObjectListResponse>(objectKey, {
+    folders: [],
+    objects: [
+      {
+        id: 1,
+        key: 'image.jpg',
+        current_version_id: 'v1',
+        size: 10,
+        state: 'replicating',
+        status: 'syncing',
+        location: { cache: true, filecoin: true },
+        content_type: 'image/jpeg',
+        etag: 'etag',
+        created_at: '2026-05-06T00:00:00Z',
+        updated_at: '2026-05-06T00:00:00Z',
+        progress,
+      },
+    ],
+    has_more: false,
+  })
+  qc.setQueryData(provenanceKey, { version_id: 'v1' })
+  applyUploadProgressEventData(
+    qc,
+    JSON.stringify({
+      topic: 'upload_progress_updated',
+      version_id: 'v1',
+      bucket_name: 'photos',
+      progress: { ...progress, scope: 'cache_restore_store', uploaded_bytes: 8, percent: 80 },
+    })
+  )
+  assert.equal(qc.getQueryData<ObjectListResponse>(objectKey)?.objects[0]?.progress?.percent, 40)
+  assert.equal(qc.getQueryCache().find({ queryKey: provenanceKey })?.state.isInvalidated, true)
+})
+
 test('upload progress events ignore stale attempts and late running updates', () => {
   const qc = new QueryClient()
   const key = ['objects', 'photos', '', '/', '', 50]

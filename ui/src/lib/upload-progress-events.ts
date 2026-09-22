@@ -36,6 +36,12 @@ export function applyUploadProgressEventData(queryClient: QueryClient, raw: stri
   if (payload.topic !== 'upload_progress_updated' || !payload.version_id || !payload.progress) {
     return
   }
+  if (payload.progress.scope === 'cache_restore_store') {
+    if (payload.bucket_name) {
+      queryClient.invalidateQueries({ queryKey: ['objectProvenance', payload.bucket_name, payload.version_id] })
+    }
+    return
+  }
   applyUploadProgressUpdate(queryClient, payload)
 }
 
@@ -69,7 +75,7 @@ export function applyUploadStateChangedEventData(queryClient: QueryClient, raw: 
 
 export function applyUploadProgressUpdate(queryClient: QueryClient, payload: UploadProgressEventPayload) {
   const progress = payload.progress
-  if (!payload.version_id || !progress) return
+  if (!payload.version_id || !progress || progress.scope !== 'ingress_store') return
 
   queryClient.setQueriesData<ObjectListResponse>({ queryKey: ['objects'] }, (data) => {
     if (!data?.objects.length) return data

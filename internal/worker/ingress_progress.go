@@ -202,6 +202,9 @@ func uploadProgressEventPayload(upload *model.StorageCopy, done bool) map[string
 		"done":       done || (total > 0 && uploaded >= total),
 		"updated_at": upload.ProgressUpdatedAt.Format(time.RFC3339),
 	}
+	if upload.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
+		payload["scope"] = "cache_restore_store"
+	}
 	if percent := model.UploadProgressPercent(uploaded, total); percent != nil {
 		payload["percent"] = *percent
 	}

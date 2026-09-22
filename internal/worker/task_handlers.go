@@ -12,6 +12,7 @@ import (
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 )
@@ -32,17 +33,15 @@ type TaskHandlerDependencies struct {
 	Terminator             synapse.ServiceTerminator
 	Epochs                 synapse.ChainEpochReader
 	Observability          *observability.Service
-	UploadSpeedProbe       interface {
-		Probe(context.Context, string) (time.Duration, error)
-	}
-	ParkedPieces   synapse.ParkedPieceChecker
-	EvictionPolicy cache.EvictionPolicy
-	MaxCacheBytes  int64
-	LRUHighPercent int
-	LRULowPercent  int
-	DefaultCopies  int
-	MaxRetries     int
-	Logger         *slog.Logger
+	UploadSpeedProbe       providerbenchmark.UploadProbe
+	ParkedPieces           synapse.ParkedPieceChecker
+	EvictionPolicy         cache.EvictionPolicy
+	MaxCacheBytes          int64
+	LRUHighPercent         int
+	LRULowPercent          int
+	DefaultCopies          int
+	MaxRetries             int
+	Logger                 *slog.Logger
 }
 
 type EventPublisher interface {

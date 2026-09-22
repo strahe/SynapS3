@@ -20,6 +20,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/s3access"
 	"github.com/strahe/synaps3/internal/s3iam"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -69,6 +70,7 @@ type RuntimeOptions struct {
 	Settings         *admin.SettingsService
 	Filecoin         FilecoinServices
 	ProviderIdentity *admin.ProviderIdentityResolver
+	UploadSpeedProbe providerbenchmark.UploadProbe
 	S3Addresses      []string
 	Logger           *slog.Logger
 	ShutdownTimeout  time.Duration
@@ -116,6 +118,10 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	events := admin.NewEventHub()
 	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
+	uploadSpeedProbe := opts.UploadSpeedProbe
+	if uploadSpeedProbe == nil {
+		uploadSpeedProbe = synapse.NewPDPBatchUploadProbe(cfg.Filecoin.AllowPrivateNetworks)
+	}
 	pdpStatusChecker := synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{
 		Timeout:              15 * time.Second,
 		AllowPrivateNetworks: cfg.Filecoin.AllowPrivateNetworks,
@@ -133,7 +139,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		Terminator:       opts.Filecoin.Terminator,
 		Epochs:           opts.Filecoin.Epochs,
 		Observability:    observabilityService,
-		UploadSpeedProbe: synapse.NewPDPBatchUploadProbe(cfg.Filecoin.AllowPrivateNetworks),
+		UploadSpeedProbe: uploadSpeedProbe,
 		ParkedPieces:     pdpStatusChecker,
 		EvictionPolicy:   evictionPolicy,
 		MaxCacheBytes:    maxCacheBytes,

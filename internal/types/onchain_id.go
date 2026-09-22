@@ -52,6 +52,10 @@ func (id OnChainID) String() string {
 	return id.value.String()
 }
 
+// IsZero reports that the identifier is the number zero, which is a legal
+// on-chain ID: the first piece of a data set is piece 0. It does not mean the
+// identifier is unset, so never use it as a presence check. Express absence
+// with a nil *OnChainID or a NULL column instead.
 func (id OnChainID) IsZero() bool {
 	return id.value.IsZero()
 }

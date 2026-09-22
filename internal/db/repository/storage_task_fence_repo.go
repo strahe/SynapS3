@@ -87,7 +87,7 @@ func (r *BunStorageContentRepo) AuthorizeCopyTask(ctx context.Context, copyID, g
 func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input ReservePullRequestInput) error {
 	if input.CopyID < 1 || input.Generation < 1 || input.TaskID < 1 ||
 		input.AttemptID == "" || input.SourcePieceCID == "" ||
-		input.SourceProviderID.IsZero() || input.SourceDataSetID.IsZero() || input.SourcePieceID.IsZero() ||
+		input.SourceProviderID == nil || input.SourceDataSetID == nil || input.SourcePieceID == nil ||
 		input.SourceRetrievalURL == "" || input.CommitExtraDataHex == "" {
 		return ErrInvalidInput
 	}
@@ -137,8 +137,8 @@ func (r *BunStorageContentRepo) ReservePullRequest(ctx context.Context, input Re
 		attempt := &storagepull.Attempt{
 			AttemptID: input.AttemptID, ContentID: copyRow.ContentID,
 			StorageDataSetID: copyRow.StorageDataSetID, Status: storagepull.AttemptStatusAttempted,
-			SourceProviderID: input.SourceProviderID,
-			SourceDataSetID:  input.SourceDataSetID, SourcePieceID: input.SourcePieceID,
+			SourceProviderID: *input.SourceProviderID,
+			SourceDataSetID:  *input.SourceDataSetID, SourcePieceID: *input.SourcePieceID,
 			SourcePieceCID: input.SourcePieceCID, SourceRetrievalURL: input.SourceRetrievalURL,
 			AttemptedAt: now, CreatedAt: now, UpdatedAt: now,
 		}
