@@ -162,6 +162,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 	filecoin := NewMemoryFilecoin()
 	runtime, err := app.NewRuntime(ctx, app.RuntimeOptions{
 		Config: cfg, Database: database, Settings: settings, Logger: logger,
+		UploadSpeedProbe: filecoin,
 		Filecoin: app.FilecoinServices{
 			Storage: filecoin, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
 			Readiness: filecoin, Observability: filecoin,

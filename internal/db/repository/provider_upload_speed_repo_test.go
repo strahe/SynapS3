@@ -38,6 +38,9 @@ func TestProviderUploadSpeedKeepsOnlyLatestResultAcrossHealthRefresh(t *testing.
 	if err := repos.ProviderUploadSpeed.Finish(t.Context(), "101", first, providerbenchmark.StateSucceeded, 1000, providerbenchmark.SampleBytes, ""); err != nil {
 		t.Fatal(err)
 	}
+	if err := repos.ProviderUploadSpeed.BeginIfAbsent(t.Context(), "101", hash, second); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("automatic retest after success = %v, want conflict", err)
+	}
 	if err := repos.Observability.ReplaceProviderStates(t.Context(), time.Now(), []observability.ProviderState{{
 		ProviderID: onChainID(t, "101"), Status: observability.StatusAvailable,
 		ReasonCodes: []observability.ReasonCode{}, Evidence: map[string]any{},

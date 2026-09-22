@@ -66,8 +66,7 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 		}
 		if ready >= required {
 			return taskengine.Complete("Bucket storage is ready", func(ctx context.Context, repos *repository.Repositories) error {
-				_, err := repos.Buckets.PromoteReadyIfProvisioned(ctx, bucket.ID, required)
-				return err
+				return h.promoteBucketReady(ctx, repos, bucket.ID, required)
 			})
 		}
 		if covered == required && allPendingWorkBound {
@@ -145,8 +144,7 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 					return err
 				}
 			}
-			_, err := repos.Buckets.PromoteReadyIfProvisioned(ctx, bucket.ID, required)
-			return err
+			return h.promoteBucketReady(ctx, repos, bucket.ID, required)
 		}
 		allResolved := true
 		for i := range plan {
@@ -161,6 +159,19 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 		return taskengine.Suspend(model.TaskResumeModeExecute, storagePollInterval, "storage_service", "Preparing bucket storage", settlement)
 	}
 	return taskHandler{definition: definition, execute: run, recover: run}
+}
+
+func (h *TaskHandlers) promoteBucketReady(ctx context.Context, repos *repository.Repositories, bucketID int64, required int) error {
+	promoted, err := repos.Buckets.PromoteReadyIfProvisioned(ctx, bucketID, required)
+	if err != nil || !promoted || h.taskService == nil {
+		return err
+	}
+	refresh, err := repos.Tasks.GetByIdentity(ctx, model.TaskTypeObservabilityRefresh, "system:observability-refresh")
+	if err != nil || refresh == nil {
+		return err
+	}
+	_, err = h.taskService.WakeInTransaction(ctx, repos, []int64{refresh.ID})
+	return err
 }
 
 func (h *TaskHandlers) effectiveBucketCopies(bucket *model.Bucket) int {

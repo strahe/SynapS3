@@ -54,7 +54,7 @@ func TestSystemGoldenPath(t *testing.T) {
 	}
 	e2e.AssertS3Object(t, t.Context(), s3Client, bucket, key, content, checksum)
 
-	object := e2e.Eventually(t, t.Context(), 10*time.Second, "object to complete three-copy upload", func(ctx context.Context) (struct {
+	object := e2e.Eventually(t, t.Context(), 30*time.Second, "object to complete three-copy upload", func(ctx context.Context) (struct {
 		VersionID string
 		Snapshot  string
 	}, bool, error,

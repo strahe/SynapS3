@@ -3894,6 +3894,19 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	}
 }
 
+func TestCacheRestoreProgressUsesSeparateScope(t *testing.T) {
+	now := time.Now().UTC()
+	copyRow := &model.StorageCopy{
+		TransferMethod: model.StorageCopyTransferMethodCacheRestore,
+		ContentSize:    10, IngressStoreAttempt: 1, IngressBytesTransferred: 4,
+		ProgressUpdatedAt: &now,
+	}
+	progress := uploadProgressResponseFromUpload(copyRow)
+	if progress == nil || progress.Scope != "cache_restore_store" || progress.UploadedBytes != 4 || progress.Percent == nil || *progress.Percent != 40 {
+		t.Fatalf("cache restore progress = %#v", progress)
+	}
+}
+
 func TestAPIBucketObjectVersions(t *testing.T) {
 	srv, repos := newBucketAPITestServer(t)
 	ctx := context.Background()

@@ -762,6 +762,7 @@ type objectProvenanceCopyResponse struct {
 	DataSetID        *string                   `json:"data_set_id,omitempty"`
 	PieceID          *string                   `json:"piece_id,omitempty"`
 	TransferMethod   string                    `json:"transfer_method"`
+	Progress         *uploadProgressResponse   `json:"progress,omitempty"`
 	RetrievalURL     *string                   `json:"retrieval_url,omitempty"`
 	IsNewDataSet     bool                      `json:"is_new_data_set"`
 	AttentionCode    *string                   `json:"attention_code,omitempty"`
@@ -895,8 +896,12 @@ func uploadProgressResponseFromUpload(upload *model.StorageCopy) *uploadProgress
 		uploaded = total
 	}
 	percent := model.UploadProgressPercent(uploaded, total)
+	scope := "ingress_store"
+	if upload.TransferMethod == model.StorageCopyTransferMethodCacheRestore {
+		scope = "cache_restore_store"
+	}
 	return &uploadProgressResponse{
-		Scope:         "ingress_store",
+		Scope:         scope,
 		Attempt:       upload.IngressStoreAttempt,
 		UploadedBytes: uploaded,
 		TotalBytes:    total,
@@ -1843,6 +1848,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 			DataSetID:        onChainIDStringPtr(copyRow.DataSetID),
 			PieceID:          onChainIDStringPtr(copyRow.PieceID),
 			TransferMethod:   string(copyRow.TransferMethod),
+			Progress:         uploadProgressResponseFromUpload(&copyRow),
 			RetrievalURL:     copyRow.RetrievalURL,
 			IsNewDataSet:     copyRow.IsNewDataSet,
 			AttentionCode:    copyRow.CommitAttentionCode,

@@ -844,7 +844,15 @@ function ProvenanceCopies({ copies }: { copies: ObjectProvenanceCopy[] }) {
             {copies.map((copy) => (
               <TableRow key={`${copy.copy_index}-${copy.transfer_method}`}>
                 <TableCell className="px-3 font-mono text-xs">{replicaLabel(copy.copy_index)}</TableCell>
-                <TableCell className="px-3">{transferMethodLabel(copy.transfer_method)}</TableCell>
+                <TableCell className="px-3">
+                  {transferMethodLabel(copy.transfer_method)}
+                  {copy.transfer_method === 'cache_restore' && copy.progress && copy.status !== 'committed' && (
+                    <div className="text-xs text-muted-foreground">
+                      {formatBytes(copy.progress.uploaded_bytes)} of {formatBytes(copy.progress.total_bytes)} uploaded
+                      {copy.progress.percent !== undefined && ` · ${copy.progress.percent}%`}
+                    </div>
+                  )}
+                </TableCell>
                 <TableCell className="px-3">
                   <StatusBadge tone={copyStatusTone(copy)}>{copyStatusLabel(copy)}</StatusBadge>
                   {copy.attention_code && (

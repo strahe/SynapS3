@@ -864,6 +864,9 @@ func (h *TaskHandlers) observabilityHandler() taskengine.Handler {
 		if err := h.deps.Observability.RefreshAll(ctx); err != nil {
 			return retryTask(err, "observability_refresh_failed")
 		}
+		if err := h.scheduleMissingProviderSpeedTests(ctx); err != nil {
+			return retryTask(err, "provider_speed_schedule_failed")
+		}
 		return taskengine.Suspend(model.TaskResumeModeExecute, h.deps.Observability.RefreshInterval(), "scheduled", "Storage health refreshed", nil)
 	}
 	return taskHandler{definition: definition, execute: run, recover: run}

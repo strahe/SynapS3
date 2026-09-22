@@ -59,6 +59,8 @@ export function transferMethodLabel(method?: string) {
       return 'Ingress upload'
     case 'peer_pull':
       return 'Peer sync'
+    case 'cache_restore':
+      return 'From local cache'
     default:
       return method || '—'
   }

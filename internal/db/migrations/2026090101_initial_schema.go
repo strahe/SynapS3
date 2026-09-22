@@ -776,14 +776,14 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 				// evidence at all, so both directions are stated here.
 				"CONSTRAINT chk_storage_copies_committed_evidence CHECK ((status = 'committed') = (confirmed_attempt_id IS NOT NULL))",
 				"CONSTRAINT chk_storage_copies_confirmed_attempt_shape CHECK ((confirmed_attempt_id IS NULL AND confirmed_attempt_status IS NULL) OR (confirmed_attempt_id IS NOT NULL AND confirmed_attempt_id <> '' AND confirmed_attempt_status IS NOT NULL))",
-				"CONSTRAINT chk_storage_copies_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull'))",
+				"CONSTRAINT chk_storage_copies_transfer_method CHECK (transfer_method IN ('ingress', 'peer_pull', 'cache_restore'))",
 				"CONSTRAINT chk_storage_copies_optional_identity CHECK (provider_id <> '' AND (piece_id IS NULL OR piece_id <> '') AND (retrieval_url IS NULL OR retrieval_url <> '') AND (commit_extra_data_hex IS NULL OR commit_extra_data_hex <> ''))",
 				"CONSTRAINT chk_storage_copies_committed_shape CHECK (status <> 'committed' OR (piece_id IS NOT NULL AND piece_id <> '' AND retrieval_url IS NOT NULL AND retrieval_url <> ''))",
 				"CONSTRAINT chk_storage_copies_commit_ready CHECK (commit_ready_at IS NULL OR status IN ('piece_ready', 'committing', 'committed'))",
 				"CONSTRAINT chk_storage_copies_content_size CHECK (content_size >= 0)",
-				// Ingress progress belongs to the transfer that produces it, so
-				// only an ingress copy may carry it.
-				"CONSTRAINT chk_storage_copies_ingress_progress CHECK (transfer_method = 'ingress' OR (ingress_bytes_transferred = 0 AND ingress_store_attempt = 0 AND progress_updated_at IS NULL))",
+				// Store progress belongs to the transfer that produces it;
+				// peer-pull copies never carry it.
+				"CONSTRAINT chk_storage_copies_ingress_progress CHECK (transfer_method IN ('ingress', 'cache_restore') OR (ingress_bytes_transferred = 0 AND ingress_store_attempt = 0 AND progress_updated_at IS NULL))",
 				"CONSTRAINT chk_storage_copies_ingress_bytes CHECK (ingress_bytes_transferred >= 0 AND ingress_bytes_transferred <= content_size)",
 				"CONSTRAINT chk_storage_copies_ingress_attempt CHECK (ingress_store_attempt >= 0)",
 			},
@@ -949,7 +949,7 @@ func storageIndexes2026090101() []initialIndexSpec {
 		{name: "idx_storage_copies_content_slot", table: "storage_copies", columns: []string{"content_id", "copy_index"}},
 		{name: "idx_storage_copies_data_set_identity", table: "storage_copies", columns: []string{"storage_data_set_id", "bucket_id", "copy_index", "provider_id"}},
 		{name: "idx_storage_copies_content_transfer_method_index", table: "storage_copies", columns: []string{"content_id", "transfer_method", "copy_index"}},
-		{name: "idx_storage_copies_ingress_content", table: "storage_copies", columns: []string{"content_id"}, where: "transfer_method = 'ingress'", unique: true},
+		{name: "idx_storage_copies_ingress_content", table: "storage_copies", columns: []string{"content_id"}, where: "transfer_method = 'ingress' AND status <> 'failed'", unique: true},
 		{name: "idx_storage_copies_status_data_set_content", table: "storage_copies", columns: []string{"status", "storage_data_set_id", "content_id"}},
 		{name: "idx_storage_copies_status_piece_identity_content", table: "storage_copies", columns: []string{"status", "provider_id", "piece_id", "content_id"}},
 		{name: "idx_storage_copies_commit_ready", table: "storage_copies", columns: []string{"storage_data_set_id", "commit_ready_at", "id"}, where: "status = 'piece_ready' AND commit_ready_at IS NOT NULL"},

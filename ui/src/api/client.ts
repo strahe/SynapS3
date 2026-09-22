@@ -386,7 +386,7 @@ export interface ObjectLocation {
 export type ObjectStatus = 'uploading' | 'syncing' | 'success' | 'warning' | 'unavailable'
 export type ObjectState = 'cached' | 'uploading' | 'committing' | 'replicating' | 'stored' | 'failed'
 export interface UploadTransferProgress {
-  scope: 'ingress_store'
+  scope: 'ingress_store' | 'cache_restore_store'
   attempt: number
   uploaded_bytes: number
   total_bytes: number
@@ -598,6 +598,7 @@ export interface ObjectProvenanceCopy {
   data_set_id?: string
   piece_id?: string
   transfer_method: string
+  progress?: UploadTransferProgress
   retrieval_url?: string
   is_new_data_set: boolean
   attention_code?: string

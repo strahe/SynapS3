@@ -118,7 +118,7 @@ func (r *BunStorageContentRepo) GetByIDs(ctx context.Context, contentIDs []int64
 }
 
 // BeginIngressStoreProgress starts a fresh, fenced progress attempt on the
-// ingress copy. The caller runs this in the same transaction as the task
+// Store copy. The caller runs this in the same transaction as the task
 // checkpoint that authorizes the provider request.
 func (r *BunStorageContentRepo) BeginIngressStoreProgress(ctx context.Context, input BeginIngressStoreProgressInput) (*model.StorageCopy, error) {
 	if input.CopyID < 1 || input.Generation < 1 || input.TaskID < 1 || input.Attempt < 1 {
@@ -134,7 +134,7 @@ func (r *BunStorageContentRepo) BeginIngressStoreProgress(ctx context.Context, i
 		Set("updated_at = ?", now).
 		Where("id = ? AND work_generation = ? AND active_task_id = ?", input.CopyID, input.Generation, input.TaskID).
 		Where("ingress_store_attempt = ?", input.Attempt-1).
-		Where("status = ? AND transfer_method = ?", model.StorageCopyStatusPending, model.StorageCopyTransferMethodIngress).
+		Where("status = ? AND transfer_method IN (?, ?)", model.StorageCopyStatusPending, model.StorageCopyTransferMethodIngress, model.StorageCopyTransferMethodCacheRestore).
 		Returning("*").
 		Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -180,7 +180,7 @@ func (r *BunStorageContentRepo) ingressCopy(ctx context.Context, contentID int64
 	copyRow := new(model.StorageCopy)
 	err := r.db.NewSelect().
 		Model(copyRow).
-		Where("content_id = ? AND transfer_method = ?", contentID, model.StorageCopyTransferMethodIngress).
+		Where("content_id = ? AND transfer_method = ? AND status <> ?", contentID, model.StorageCopyTransferMethodIngress, model.StorageCopyStatusFailed).
 		Scan(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -205,7 +205,7 @@ func (r *BunStorageContentRepo) RecordIngressStoreProgress(ctx context.Context, 
 		Set("ingress_bytes_transferred = CASE WHEN ? > content_size THEN content_size WHEN ? > ingress_bytes_transferred THEN ? ELSE ingress_bytes_transferred END", input.BytesUploaded, input.BytesUploaded, input.BytesUploaded).
 		Where("id = ? AND work_generation = ? AND active_task_id = ?", input.CopyID, input.Generation, input.TaskID).
 		Where("ingress_store_attempt = ?", input.Attempt).
-		Where("status = ? AND transfer_method = ?", model.StorageCopyStatusPending, model.StorageCopyTransferMethodIngress).
+		Where("status = ? AND transfer_method IN (?, ?)", model.StorageCopyStatusPending, model.StorageCopyTransferMethodIngress, model.StorageCopyTransferMethodCacheRestore).
 		Returning("*").
 		Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -573,6 +573,22 @@ func (r *BunStorageContentRepo) ListDataSetBindings(ctx context.Context, bucketI
 		return nil, fmt.Errorf("listing storage data set bindings: %w", err)
 	}
 	return bindings, nil
+}
+
+func (r *BunStorageContentRepo) ListReadyBucketProviderIDs(ctx context.Context) ([]string, error) {
+	var ids []string
+	err := r.db.NewSelect().
+		TableExpr("storage_data_sets AS data_set").
+		ColumnExpr("DISTINCT data_set.provider_id").
+		Join("JOIN buckets AS bucket ON bucket.id = data_set.bucket_id").
+		Where("bucket.status = ? AND data_set.is_current = ? AND data_set.status = ?",
+			model.BucketStatusReady, true, model.StorageDataSetStatusReady).
+		OrderExpr("data_set.provider_id").
+		Scan(ctx, &ids)
+	if err != nil {
+		return nil, fmt.Errorf("listing ready bucket providers: %w", err)
+	}
+	return ids, nil
 }
 
 func (r *BunStorageContentRepo) ListDataSetSummaries(ctx context.Context, bucketID int64) ([]StorageDataSetSummary, error) {

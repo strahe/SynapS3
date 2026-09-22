@@ -28,6 +28,7 @@ test('replica and transfer labels hide zero-based storage internals', () => {
   assert.equal(taskReplicaLabel({}), '—')
   assert.equal(transferMethodLabel('ingress'), 'Ingress upload')
   assert.equal(transferMethodLabel('peer_pull'), 'Peer sync')
+  assert.equal(transferMethodLabel('cache_restore'), 'From local cache')
 })
 
 test('replica cleanup status labels describe user-visible cleanup state', () => {

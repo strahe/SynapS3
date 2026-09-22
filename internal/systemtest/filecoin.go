@@ -95,6 +95,19 @@ func NewMemoryFilecoin() *MemoryFilecoin {
 	}
 }
 
+// Probe returns stable relative upload durations without leaving the in-memory boundary.
+func (m *MemoryFilecoin) Probe(ctx context.Context, serviceURL string) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	for index, providerID := range m.providers {
+		if serviceURL == fmt.Sprintf("https://provider-%s.system.invalid", providerID.String()) {
+			return time.Duration(len(m.providers)-index) * time.Millisecond, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: unknown provider service URL", errInvalidFilecoinSequence)
+}
+
 func (m *MemoryFilecoin) PrepareUpload(ctx context.Context, _ uint64, targets []synapse.StorageTarget) (*sdkcosts.MultiContextCosts, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

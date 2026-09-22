@@ -12,6 +12,22 @@ import (
 
 type BunProviderUploadSpeedRepo struct{ db bun.IDB }
 
+func (r *BunProviderUploadSpeedRepo) BeginIfAbsent(ctx context.Context, providerID, hash string, taskID int64) error {
+	now := time.Now().UTC()
+	row := &providerbenchmark.Result{
+		ProviderID: providerID, State: providerbenchmark.StateTesting, ServiceURLHash: hash,
+		SampleBytes: providerbenchmark.SampleBytes, ActiveTaskID: &taskID, CreatedAt: now, UpdatedAt: now,
+	}
+	result, err := r.db.NewInsert().Model(row).On("CONFLICT (provider_id) DO NOTHING").Exec(ctx)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (r *BunProviderUploadSpeedRepo) Begin(ctx context.Context, providerID, hash string, taskID int64) error {
 	now := time.Now().UTC()
 	row := &providerbenchmark.Result{
