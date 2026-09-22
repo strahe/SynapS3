@@ -521,7 +521,6 @@ type StorageContentRepository interface {
 	ReopenFailedUploadCopy(ctx context.Context, copyID int64) error
 	ReserveCommitAttempt(ctx context.Context, input storagecommit.ReserveInput) (storagecommit.ReserveResult, error)
 	MarkCommitAttempted(ctx context.Context, input storagecommit.AttemptInput) (storagecommit.AttemptResult, error)
-	RecordCommitTransaction(ctx context.Context, input storagecommit.EvidenceInput) error
 	RecordCommitSubmission(ctx context.Context, input storagecommit.EvidenceInput) error
 	MarkCommitAttention(ctx context.Context, input storagecommit.AttentionInput) error
 	ResetCommitAttempt(ctx context.Context, input storagecommit.ResetInput) error

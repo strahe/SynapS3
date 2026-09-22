@@ -197,30 +197,6 @@ func (r *BunStorageContentRepo) MarkCommitAttempted(
 	return out, err
 }
 
-func (r *BunStorageContentRepo) RecordCommitTransaction(ctx context.Context, input storagecommit.EvidenceInput) error {
-	if err := validateCommitEvidenceInput(input, false); err != nil {
-		return err
-	}
-	return r.mutateAttempt(ctx, input.Copy, "recording storage commit transaction", func(db bun.IDB, _ int64) error {
-		res, err := db.NewUpdate().
-			Model((*storagecommit.Attempt)(nil)).
-			Set("transaction_id = COALESCE(transaction_id, ?)", input.TransactionID).
-			Set("updated_at = ?", commitInputTime(input.Now)).
-			Where("attempt_id = ?", input.AttemptID).
-			Where("content_id = ? AND storage_data_set_id = ?", input.Copy.ContentID, input.Copy.StorageDataSetID).
-			Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
-			Where("(transaction_id IS NULL OR transaction_id = ?)", input.TransactionID).
-			Exec(ctx)
-		if err != nil {
-			return err
-		}
-		if rows, _ := res.RowsAffected(); rows != 1 {
-			return ErrConflict
-		}
-		return nil
-	})
-}
-
 func (r *BunStorageContentRepo) RecordCommitSubmission(ctx context.Context, input storagecommit.EvidenceInput) error {
 	if err := validateCommitEvidenceInput(input, true); err != nil {
 		return err

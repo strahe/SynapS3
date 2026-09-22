@@ -133,7 +133,6 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		Terminator:     opts.Filecoin.Terminator,
 		Epochs:         opts.Filecoin.Epochs,
 		Observability:  observabilityService,
-		CommitStatus:   pdpStatusChecker,
 		ParkedPieces:   pdpStatusChecker,
 		EvictionPolicy: evictionPolicy,
 		MaxCacheBytes:  maxCacheBytes,

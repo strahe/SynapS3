@@ -12,7 +12,6 @@ import (
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/observability"
-	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/synapse"
 	taskengine "github.com/strahe/synaps3/internal/task"
 )
@@ -33,7 +32,6 @@ type TaskHandlerDependencies struct {
 	Terminator             synapse.ServiceTerminator
 	Epochs                 synapse.ChainEpochReader
 	Observability          *observability.Service
-	CommitStatus           storagecommit.AddPiecesStatusChecker
 	ParkedPieces           synapse.ParkedPieceChecker
 	EvictionPolicy         cache.EvictionPolicy
 	MaxCacheBytes          int64

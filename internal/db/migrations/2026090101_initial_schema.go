@@ -841,7 +841,7 @@ func storageCommitAttemptTable2026090101() initialTableSpec {
 				OR (status = 'released' AND confirmed_transaction_id IS NULL AND last_error IS NULL AND ((attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND status_url IS NULL AND attention_code IS NULL AND attention_at IS NULL) OR (attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL)))
 				OR (status = 'rejected' AND attempted_at IS NOT NULL AND extra_data_hex IS NOT NULL AND confirmed_transaction_id IS NULL AND last_error IS NOT NULL AND last_error <> '')
 			)`,
-			"CONSTRAINT chk_storage_commit_attempts_status_url CHECK (status_url IS NULL OR transaction_id IS NOT NULL)",
+			"CONSTRAINT chk_storage_commit_attempts_submission_evidence CHECK ((transaction_id IS NULL AND status_url IS NULL) OR (transaction_id IS NOT NULL AND status_url IS NOT NULL))",
 			"CONSTRAINT chk_storage_commit_attempts_attention CHECK ((attention_code IS NULL AND attention_at IS NULL) OR (attention_code IS NOT NULL AND attention_at IS NOT NULL AND attempted_at IS NOT NULL))",
 			"CONSTRAINT chk_storage_commit_attempts_release CHECK ((status = 'released' AND release_reason IS NOT NULL) OR (status <> 'released' AND release_reason IS NULL))",
 		},

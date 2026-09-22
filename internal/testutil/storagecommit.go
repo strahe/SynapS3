@@ -51,10 +51,12 @@ func CommitStorageCopy(
 		input.CommitAttemptID = fmt.Sprintf("attempt-%d-%d", input.ContentID, input.StorageCopyID)
 	}
 	now := time.Now()
+	statusURL := "https://provider.example/status/" + input.CommitAttemptID
 	attempt := &storagecommit.Attempt{
 		AttemptID: input.CommitAttemptID, ContentID: copyRow.ContentID,
 		StorageDataSetID: copyRow.StorageDataSetID, Status: storagecommit.AttemptStatusAttempted,
 		ExtraDataHex: &input.CommitExtraDataHex, TransactionID: &input.CommitTransactionID,
+		StatusURL:   &statusURL,
 		AttemptedAt: &now, CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := db.NewInsert().Model(attempt).Exec(ctx); err != nil {

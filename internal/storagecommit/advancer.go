@@ -12,10 +12,8 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/synapse"
-	idtypes "github.com/strahe/synaps3/internal/types"
 	"github.com/strahe/synapse-go/pdp"
 	"github.com/strahe/synapse-go/storage"
-	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 const (
@@ -24,13 +22,8 @@ const (
 	evidenceWriteTimeout  = 10 * time.Second
 )
 
-type AddPiecesStatusChecker interface {
-	GetAddPiecesStatus(context.Context, synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error)
-}
-
 type Advancer struct {
 	Store          Store
-	StatusChecker  AddPiecesStatusChecker
 	RequestTimeout time.Duration
 	AttentionAfter time.Duration
 	Now            func() time.Time
@@ -292,9 +285,6 @@ func (a *Advancer) observe(
 		}
 		return a.classifySDKStatus(ctx, input, identity, copyRow, attemptID, status)
 	}
-	if copyRow.CommitTransactionID != nil && *copyRow.CommitTransactionID != "" {
-		return a.observeTransaction(ctx, input, copyRow)
-	}
 	if result, ok := existingAttentionResult(
 		copyRow, attemptID, AttentionAttemptOnlyAmbiguous, false,
 	); ok {
@@ -311,73 +301,6 @@ func (a *Advancer) observe(
 		code = AttentionUnattributedPiece
 	}
 	return a.attentionForCopy(ctx, identity, copyRow, attemptID, code, false)
-}
-
-func (a *Advancer) observeTransaction(
-	ctx context.Context,
-	input AdvanceInput,
-	copyRow model.StorageCopy,
-) (AdvanceResult, error) {
-	identity := copyIdentity(input, false)
-	attemptID := *copyRow.CommitAttemptID
-	transactionID := *copyRow.CommitTransactionID
-	checker := a.StatusChecker
-	if checker == nil {
-		checker = synapse.NewPDPStatusChecker(synapse.PDPStatusCheckerOptions{Timeout: a.requestTimeout()})
-	}
-	requestCtx, cancel := context.WithTimeout(ctx, a.requestTimeout())
-	result, err := checker.GetAddPiecesStatus(requestCtx, synapse.AddPiecesStatusInput{
-		ServiceURL:         input.Target.ServiceURL(),
-		DataSetID:          input.Binding.DataSetID.String(),
-		TransactionID:      transactionID,
-		ExpectedPieceCount: len(input.Pieces),
-	})
-	cancel()
-	if err != nil {
-		if context.Cause(ctx) != nil {
-			return AdvanceResult{State: AdvancePending, AttemptID: attemptID}, nil
-		}
-		if result.State == synapse.PDPStatusMismatch {
-			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
-		}
-		return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
-	}
-	switch result.State {
-	case synapse.PDPStatusPending:
-		return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
-	case synapse.PDPStatusConfirmed:
-		pieceIDs := make([]sdktypes.BigInt, 0, len(result.ConfirmedPieceIDs))
-		for _, raw := range result.ConfirmedPieceIDs {
-			pieceID, err := idtypes.ParseOnChainID("confirmed piece ID", raw)
-			if err != nil {
-				return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
-			}
-			pieceIDs = append(pieceIDs, pieceID.SDK())
-		}
-		ref, bound := input.Target.DataSetRef()
-		if !bound {
-			return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
-		}
-		return AdvanceResult{
-			State:     AdvanceConfirmed,
-			AttemptID: attemptID,
-			Confirmation: &storage.CommitResult{
-				TransactionID:          transactionID,
-				ConfirmedTransactionID: confirmedTransactionID(transactionID, result.ConfirmedTransactionID),
-				DataSet:                ref,
-				PieceIDs:               pieceIDs,
-			},
-		}, nil
-	case synapse.PDPStatusRejected:
-		if err := a.reset(ctx, identity, attemptID, pdp.ErrTxRejected); err != nil {
-			return AdvanceResult{}, err
-		}
-		return AdvanceResult{State: AdvanceRejected, AttemptID: attemptID}, nil
-	case synapse.PDPStatusMismatch:
-		return a.attentionForCopy(ctx, identity, copyRow, attemptID, AttentionSubmissionMismatch, false)
-	default:
-		return a.pendingOrAttention(ctx, identity, copyRow, attemptID)
-	}
 }
 
 func (a *Advancer) classifySDKStatus(

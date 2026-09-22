@@ -1288,7 +1288,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 	target, err := h.openReadyDataSet(ctx, binding)
 	if err != nil {
 		if copyRow.CommitAttemptedAt != nil && copyRow.CommitAttemptID != nil {
-			advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents, StatusChecker: h.deps.CommitStatus}
+			advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents}
 			advanced, advanceErr := advancer.AdvanceUnavailable(ctx, *copyRow, *binding)
 			if advanceErr != nil {
 				return h.retryCopyTask(execution, input, copyRow, advanceErr, "commit_recovery_failed")
@@ -1302,7 +1302,7 @@ func (h *TaskHandlers) runCommit(ctx context.Context, execution taskengine.Execu
 		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "provider_confirmation", "Checking storage registration", nil)
 	}
-	advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents, StatusChecker: h.deps.CommitStatus}
+	advancer := storagecommit.Advancer{Store: h.deps.Repositories.Contents}
 	advance := func(ctx context.Context) (storagecommit.AdvanceResult, error) {
 		return advancer.Advance(ctx, storagecommit.AdvanceInput{
 			Copy: *copyRow, Binding: *binding, Target: target,

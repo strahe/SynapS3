@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
 	"github.com/strahe/synapse-go/pdp"
 )
@@ -70,25 +69,13 @@ type DataSetCreationStatusInput struct {
 	ExpectedDataSetID string
 }
 
-type AddPiecesStatusInput struct {
-	ServiceURL         string
-	StatusURL          string
-	DataSetID          string
-	TransactionID      string
-	ExpectedPieceCount int
-}
-
 type PDPStatusResult struct {
-	State                  PDPStatusState
-	StatusURL              string
-	TxStatus               string
-	DataSetID              string
-	DataSetCreated         bool
-	PiecesAdded            bool
-	PieceCount             int
-	ConfirmedPieceIDs      []string
-	ConfirmedTransactionID string
-	Error                  string
+	State          PDPStatusState
+	StatusURL      string
+	TxStatus       string
+	DataSetID      string
+	DataSetCreated bool
+	Error          string
 }
 
 func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input DataSetCreationStatusInput) PDPStatusResult {
@@ -131,76 +118,6 @@ func (c *PDPStatusChecker) CheckDataSetCreationStatus(ctx context.Context, input
 	}
 	result.State = classifyCreationStatus(status.TxStatus, status.DataSetCreated)
 	return result
-}
-
-func (c *PDPStatusChecker) CheckAddPiecesStatus(ctx context.Context, input AddPiecesStatusInput) PDPStatusResult {
-	result, err := c.GetAddPiecesStatus(ctx, input)
-	if err == nil {
-		return result
-	}
-	state := result.State
-	if state == "" {
-		state = PDPStatusUnavailable
-	}
-	return result.withError(state, err.Error())
-}
-
-// GetAddPiecesStatus performs one validated status request while preserving
-// the underlying error for operational callers that must classify retries.
-func (c *PDPStatusChecker) GetAddPiecesStatus(ctx context.Context, input AddPiecesStatusInput) (PDPStatusResult, error) {
-	statusURL := input.StatusURL
-	if statusURL == "" {
-		var err error
-		statusURL, err = buildAddPiecesStatusURL(input.ServiceURL, input.DataSetID, input.TransactionID)
-		if err != nil {
-			return PDPStatusResult{}, err
-		}
-	}
-	result := PDPStatusResult{StatusURL: statusURL}
-	if input.ExpectedPieceCount <= 0 {
-		return result, errors.New("missing expected piece count")
-	}
-	client, err := c.clientForStatusURL(statusURL)
-	if err != nil {
-		return result, err
-	}
-	status, err := client.GetAddPiecesStatus(ctx, statusURL)
-	if status == nil {
-		if errors.Is(err, pdp.ErrInvalidStatus) {
-			result.State = PDPStatusMismatch
-		}
-		if err == nil {
-			err = errors.New("empty add-pieces status")
-		}
-		return result, err
-	}
-	result.TxStatus = status.TxStatus
-	result.DataSetID = status.DataSetID.String()
-	result.PieceCount = status.PieceCount
-	result.PiecesAdded = status.PiecesAdded
-	if status.ConfirmedTxHash != (common.Hash{}) {
-		result.ConfirmedTransactionID = status.ConfirmedTxHash.Hex()
-	}
-	for _, id := range status.ConfirmedPieceIDs {
-		result.ConfirmedPieceIDs = append(result.ConfirmedPieceIDs, id.String())
-	}
-	if errors.Is(err, pdp.ErrInvalidStatus) {
-		result.State = PDPStatusMismatch
-		return result, err
-	}
-	if err != nil && !errors.Is(err, pdp.ErrTxRejected) {
-		return result, err
-	}
-	if err := validateAddPiecesStatusIdentity(input, result, status.TxHash.Hex()); err != nil {
-		result.State = PDPStatusMismatch
-		return result, err
-	}
-	if errors.Is(err, pdp.ErrTxRejected) {
-		result.State = PDPStatusRejected
-		return result, nil
-	}
-	result.State = classifyAddPiecesStatus(status.TxStatus, status.PiecesAdded, status.PieceCount, input.ExpectedPieceCount, len(result.ConfirmedPieceIDs))
-	return result, nil
 }
 
 // FindParkedPiece checks the provider-local piece endpoint once. Its client
@@ -295,19 +212,6 @@ func validateDataSetCreationStatusIdentity(input DataSetCreationStatusInput, res
 	return nil
 }
 
-func validateAddPiecesStatusIdentity(input AddPiecesStatusInput, result PDPStatusResult, statusTxHash string) error {
-	if expected := strings.TrimSpace(input.DataSetID); expected != "" && strings.TrimSpace(result.DataSetID) != expected {
-		return fmt.Errorf("status data set ID mismatch: got %s want %s", result.DataSetID, expected)
-	}
-	if expected := normalizeStatusTxHash(input.TransactionID); expected != "" {
-		got := normalizeStatusTxHash(statusTxHash)
-		if !strings.EqualFold(got, expected) {
-			return fmt.Errorf("status transaction ID mismatch: got %s want %s", statusTxHash, expected)
-		}
-	}
-	return nil
-}
-
 func normalizeStatusTxHash(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -319,34 +223,6 @@ func normalizeStatusTxHash(value string) string {
 	return strings.ToLower(value)
 }
 
-func buildAddPiecesStatusURL(serviceURL, dataSetID, transactionID string) (string, error) {
-	if serviceURL == "" {
-		return "", fmt.Errorf("missing service URL")
-	}
-	if dataSetID == "" {
-		return "", fmt.Errorf("missing data set ID")
-	}
-	if transactionID == "" {
-		return "", fmt.Errorf("missing transaction ID")
-	}
-	base, err := url.Parse(serviceURL)
-	if err != nil {
-		return "", fmt.Errorf("parse service URL: %w", err)
-	}
-	if base.Scheme != "http" && base.Scheme != "https" {
-		return "", fmt.Errorf("unsupported service URL scheme %q", base.Scheme)
-	}
-	base.Path = strings.TrimRight(base.Path, "/")
-	path, err := url.JoinPath(base.Path, "pdp", "data-sets", dataSetID, "pieces", "added", transactionID)
-	if err != nil {
-		return "", fmt.Errorf("build add-pieces status path: %w", err)
-	}
-	base.Path = path
-	base.RawQuery = ""
-	base.Fragment = ""
-	return base.String(), nil
-}
-
 func classifyCreationStatus(txStatus string, dataSetCreated bool) PDPStatusState {
 	switch txStatus {
 	case "pending":
@@ -356,31 +232,6 @@ func classifyCreationStatus(txStatus string, dataSetCreated bool) PDPStatusState
 			return PDPStatusConfirmed
 		}
 		return PDPStatusMismatch
-	case "rejected":
-		return PDPStatusRejected
-	default:
-		return PDPStatusUnknown
-	}
-}
-
-func classifyAddPiecesStatus(txStatus string, piecesAdded bool, pieceCount, expectedPieceCount, confirmedPieceIDCount int) PDPStatusState {
-	switch txStatus {
-	case "pending":
-		return PDPStatusPending
-	case "confirmed":
-		if !piecesAdded {
-			return PDPStatusMismatch
-		}
-		if expectedPieceCount <= 0 {
-			return PDPStatusMismatch
-		}
-		if pieceCount != expectedPieceCount {
-			return PDPStatusMismatch
-		}
-		if confirmedPieceIDCount != expectedPieceCount {
-			return PDPStatusMismatch
-		}
-		return PDPStatusConfirmed
 	case "rejected":
 		return PDPStatusRejected
 	default:

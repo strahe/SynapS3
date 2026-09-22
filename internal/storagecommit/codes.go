@@ -8,7 +8,6 @@ type AttentionCode string
 const (
 	AttentionAttemptOnlyAmbiguous AttentionCode = "attempt_only_ambiguous"
 	AttentionUnattributedPiece    AttentionCode = "unattributed_piece"
-	AttentionInvalidSubmission    AttentionCode = "invalid_submission"
 	AttentionSubmissionMismatch   AttentionCode = "submission_mismatch"
 	AttentionDataSetUnavailable   AttentionCode = "data_set_unavailable"
 	AttentionConfirmationTimeout  AttentionCode = "confirmation_timeout"
@@ -18,7 +17,6 @@ func (c AttentionCode) Valid() bool {
 	switch c {
 	case AttentionAttemptOnlyAmbiguous,
 		AttentionUnattributedPiece,
-		AttentionInvalidSubmission,
 		AttentionSubmissionMismatch,
 		AttentionDataSetUnavailable,
 		AttentionConfirmationTimeout:

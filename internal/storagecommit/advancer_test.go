@@ -961,158 +961,6 @@ func TestReleaseCommitAttentionResumesFencedFailedTask(t *testing.T) {
 	}
 }
 
-func TestAdvancerTxOnlyEvidenceConfirmsWithoutPieceStatus(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
-	identity := advancerCopyIdentity(copies[0])
-	if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
-		Copy: identity, AttemptID: "tx-only",
-	}); err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
-	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "tx-only", ExtraDataHex: "abcd",
-	}); err != nil {
-		t.Fatalf("mark attempted: %v", err)
-	}
-	if err := repos.Contents.RecordCommitTransaction(t.Context(), storagecommit.EvidenceInput{
-		Copy: identity, AttemptID: "tx-only", TransactionID: "0xtxonly",
-	}); err != nil {
-		t.Fatalf("record transaction: %v", err)
-	}
-	if _, err := db.NewUpdate().
-		Model((*storagecommit.Attempt)(nil)).
-		Set("attention_code = ?", "future_attention_code").
-		Set("attention_at = ?", time.Now()).
-		Where("attempt_id = ?", "tx-only").
-		Exec(t.Context()); err != nil {
-		t.Fatalf("set future tx-only attention: %v", err)
-	}
-	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
-	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
-	target.ClientDataSetIDValue = sdktypes.NewBigInt(9001)
-	target.PieceStatusFunc = func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-		t.Fatal("tx-only recovery used PieceStatus")
-		return nil, nil
-	}
-	checkerCalls := 0
-	checker := commitStatusCheckerFunc(func(context.Context, synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error) {
-		checkerCalls++
-		return synapse.PDPStatusResult{
-			State: synapse.PDPStatusConfirmed, ConfirmedPieceIDs: []string{"5001"},
-		}, nil
-	})
-	result, err := (&storagecommit.Advancer{Store: repos.Contents, StatusChecker: checker}).Advance(
-		t.Context(), storagecommit.AdvanceInput{
-			Copy: *copyRow, Binding: *binding, Target: target,
-			Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
-		})
-	if err != nil || result.State != storagecommit.AdvanceConfirmed || result.Confirmation == nil ||
-		result.Confirmation.ConfirmedTransactionID != "0xtxonly" || checkerCalls != 1 {
-		t.Fatalf("advance = %#v err=%v checkerCalls=%d", result, err, checkerCalls)
-	}
-}
-
-func TestAdvancerTxOnlyMismatchNeedsAttention(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
-	identity := advancerCopyIdentity(copies[0])
-	if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
-		Copy: identity, AttemptID: "tx-only-mismatch",
-	}); err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
-	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "tx-only-mismatch", ExtraDataHex: "abcd",
-	}); err != nil {
-		t.Fatalf("mark attempted: %v", err)
-	}
-	if err := repos.Contents.RecordCommitTransaction(t.Context(), storagecommit.EvidenceInput{
-		Copy: identity, AttemptID: "tx-only-mismatch", TransactionID: "0xmismatch",
-	}); err != nil {
-		t.Fatalf("record transaction: %v", err)
-	}
-	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
-	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
-	checker := commitStatusCheckerFunc(func(context.Context, synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error) {
-		return synapse.PDPStatusResult{State: synapse.PDPStatusMismatch}, nil
-	})
-
-	result, err := (&storagecommit.Advancer{Store: repos.Contents, StatusChecker: checker}).Advance(
-		t.Context(), storagecommit.AdvanceInput{
-			Copy: *copyRow, Binding: *binding, Target: target,
-			Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
-		})
-	if err != nil || result.State != storagecommit.AdvanceNeedsAttention ||
-		result.AttentionCode != storagecommit.AttentionSubmissionMismatch {
-		t.Fatalf("advance = %#v err=%v, want submission mismatch attention", result, err)
-	}
-	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
-	if persisted.CommitAttentionCode == nil ||
-		*persisted.CommitAttentionCode != string(storagecommit.AttentionSubmissionMismatch) {
-		t.Fatalf("mismatch attention was not persisted: %#v", persisted)
-	}
-}
-
-func TestAdvancerTxOnlyRequestTimeoutRemainsPending(t *testing.T) {
-	db := testutil.NewTestDB(t)
-	repos := repository.NewRepositories(db)
-	binding, copies, pieceCID := seedAdvancerCopies(t, db, 1)
-	identity := advancerCopyIdentity(copies[0])
-	if _, err := repos.Contents.ReserveCommitAttempt(t.Context(), storagecommit.ReserveInput{
-		Copy: identity, AttemptID: "tx-only-timeout",
-	}); err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
-	if _, err := repos.Contents.MarkCommitAttempted(t.Context(), storagecommit.AttemptInput{
-		Copy: identity, AttemptID: "tx-only-timeout", ExtraDataHex: "abcd",
-	}); err != nil {
-		t.Fatalf("mark attempted: %v", err)
-	}
-	if err := repos.Contents.RecordCommitTransaction(t.Context(), storagecommit.EvidenceInput{
-		Copy: identity, AttemptID: "tx-only-timeout", TransactionID: "0xtimeout",
-	}); err != nil {
-		t.Fatalf("record transaction: %v", err)
-	}
-	copyRow := loadAdvancerCopy(t, repos, copies[0].ID)
-	target := testutil.NewMockDataSetTarget(binding.ProviderID.SDK(), binding.DataSetID.SDK(), nil)
-	const requestTimeout = 50 * time.Millisecond
-	var observedDeadline time.Time
-	checker := commitStatusCheckerFunc(func(ctx context.Context, _ synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error) {
-		var ok bool
-		observedDeadline, ok = ctx.Deadline()
-		if !ok {
-			t.Fatal("status checker context has no deadline")
-		}
-		<-ctx.Done()
-		return synapse.PDPStatusResult{}, ctx.Err()
-	})
-	parentCtx := t.Context()
-	startedAt := time.Now()
-	result, err := (&storagecommit.Advancer{
-		Store: repos.Contents, StatusChecker: checker, RequestTimeout: requestTimeout,
-	}).Advance(parentCtx, storagecommit.AdvanceInput{
-		Copy: *copyRow, Binding: *binding, Target: target,
-		Pieces: []storage.PieceInput{{PieceCID: pieceCID}},
-	})
-	if err != nil || result.State != storagecommit.AdvancePending {
-		t.Fatalf("advance = %#v err=%v, want pending request timeout", result, err)
-	}
-	if context.Cause(parentCtx) != nil {
-		t.Fatalf("request timeout canceled parent context: %v", context.Cause(parentCtx))
-	}
-	deadlineAfter := observedDeadline.Sub(startedAt)
-	if deadlineAfter <= 0 || deadlineAfter > 2*requestTimeout {
-		t.Fatalf("checker deadline after %s, want finite deadline near %s", deadlineAfter, requestTimeout)
-	}
-	persisted := loadAdvancerCopy(t, repos, copies[0].ID)
-	if persisted.CommitAttentionAt != nil || persisted.CommitAttentionCode != nil {
-		t.Fatalf("recent request timeout wrote attention: %#v", persisted)
-	}
-}
-
 func TestAdvancerCanceledObservationDoesNotWriteAttention(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
@@ -1149,8 +997,6 @@ func TestAdvancerCanceledObservationDoesNotWriteAttention(t *testing.T) {
 	}
 }
 
-type commitStatusCheckerFunc func(context.Context, synapse.AddPiecesStatusInput) (synapse.PDPStatusResult, error)
-
 type failingCommitEvidenceStore struct {
 	storagecommit.Store
 	err error
@@ -1178,19 +1024,8 @@ func (s *failingMarkAttemptedStore) MarkCommitAttempted(
 	return storagecommit.AttemptResult{}, s.err
 }
 
-func (s *failingCommitEvidenceStore) RecordCommitTransaction(context.Context, storagecommit.EvidenceInput) error {
-	return s.err
-}
-
 func (s *failingCommitEvidenceStore) RecordCommitSubmission(context.Context, storagecommit.EvidenceInput) error {
 	return s.err
-}
-
-func (f commitStatusCheckerFunc) GetAddPiecesStatus(
-	ctx context.Context,
-	input synapse.AddPiecesStatusInput,
-) (synapse.PDPStatusResult, error) {
-	return f(ctx, input)
 }
 
 func TestCommitCapacityWakesOnlyTheQueueHead(t *testing.T) {
@@ -1265,12 +1100,22 @@ func TestCommitCapacityWakesOnlyTheQueueHead(t *testing.T) {
 		t.Fatalf("mark copy 0 attempted: %v", err)
 	}
 	pieceID := idtypes.OnChainIDFromSDK(sdktypes.NewBigInt(5001))
-	if err := repos.Contents.MarkUploadCopyCommitted(t.Context(), repository.MarkUploadCopyCommittedInput{
+	confirmation := repository.MarkUploadCopyCommittedInput{
 		StorageCopyID: copies[0].ID, ContentID: copies[0].ContentID, CopyIndex: 0,
 		PieceCID: pieceCID.String(), PieceID: &pieceID, RetrievalURL: "https://provider.example/piece",
 		CommitExtraDataHex: "abcd", CommitTransactionID: "0x01", CommitAttemptID: "queue-attempt-0",
 		CommitConfirmedTransactionID: "0x01",
+	}
+	if err := repos.Contents.MarkUploadCopyCommitted(t.Context(), confirmation); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("confirm copy 0 without submission evidence: %v, want conflict", err)
+	}
+	if err := repos.Contents.RecordCommitSubmission(t.Context(), storagecommit.EvidenceInput{
+		Copy: advancerCopyIdentity(copies[0]), AttemptID: "queue-attempt-0",
+		TransactionID: "0x01", StatusURL: "https://provider.example/status/queue-attempt-0",
 	}); err != nil {
+		t.Fatalf("record copy 0 submission: %v", err)
+	}
+	if err := repos.Contents.MarkUploadCopyCommitted(t.Context(), confirmation); err != nil {
 		t.Fatalf("confirm copy 0: %v", err)
 	}
 	runnable("after a confirmation frees one slot", 4)

@@ -1312,14 +1312,14 @@ func (r *BunStorageContentRepo) MarkUploadCopyCommitted(ctx context.Context, inp
 			attemptQuery := db.NewUpdate().
 				Model((*storagecommit.Attempt)(nil)).
 				Set("status = ?", storagecommit.AttemptStatusConfirmed).
-				Set("transaction_id = COALESCE(transaction_id, ?)", input.CommitTransactionID).
 				Set("confirmed_transaction_id = ?", input.CommitConfirmedTransactionID).
 				Set("resolved_at = ?", now).
 				Set("updated_at = ?", now).
 				Where("attempt_id = ?", input.CommitAttemptID).
 				Where("content_id = ? AND storage_data_set_id = ?", input.ContentID, copyIdentity.StorageDataSetID).
 				Where("status = ? AND resolved_at IS NULL", storagecommit.AttemptStatusAttempted).
-				Where("(transaction_id IS NULL OR transaction_id = ?)", input.CommitTransactionID)
+				Where("transaction_id = ?", input.CommitTransactionID).
+				Where("status_url IS NOT NULL")
 			if input.CommitExtraDataHex != "" {
 				attemptQuery = attemptQuery.Where("extra_data_hex = ?", input.CommitExtraDataHex)
 			}
