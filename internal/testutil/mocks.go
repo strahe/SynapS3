@@ -34,6 +34,14 @@ type MockStorageClient struct {
 	OpenTargetFunc          func(ctx context.Context, opts *OpenTargetOptions) (synapse.StorageTarget, error)
 	FindMatchingDataSetFunc func(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error)
 	OpenCleanupContextFunc  func(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (synapse.CleanupContext, error)
+	DeletionStateFunc       func(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error)
+}
+
+func (m *MockStorageClient) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+	if m.DeletionStateFunc == nil {
+		return synapse.CleanupPieceState{}, errors.New("MockStorageClient.DeletionState was not configured")
+	}
+	return m.DeletionStateFunc(ctx, dataSetID, pieceID)
 }
 
 // OpenTargetOptions lets worker tests configure one callback for both

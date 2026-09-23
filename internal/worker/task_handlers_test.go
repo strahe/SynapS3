@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ipfs/go-cid"
@@ -64,6 +65,7 @@ type handlerRuntimeOptions struct {
 	cache                  cache.Cache
 	events                 worker.EventPublisher
 	storage                *testutil.MockStorageClient
+	deletionState          func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error)
 	wallet                 synapse.WalletOperator
 	receipts               worker.WalletReceiptChecker
 	walletBroadcastTimeout time.Duration
@@ -95,6 +97,14 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 	storageClient := options.storage
 	if storageClient == nil {
 		storageClient = &testutil.MockStorageClient{}
+	}
+	if storageClient.DeletionStateFunc == nil {
+		storageClient.DeletionStateFunc = options.deletionState
+		if storageClient.DeletionStateFunc == nil {
+			storageClient.DeletionStateFunc = func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+				return synapse.CleanupPieceState{}, nil
+			}
+		}
 	}
 	gate := cacheaccess.NewGate()
 	tracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
@@ -580,7 +590,6 @@ func TestTerminalStoreFailureSettlesCopyAndContent(t *testing.T) {
 }
 
 type testCleanupContext struct {
-	pieceStatus func(context.Context, cid.Cid) (*storage.PieceStatus, error)
 	deletePiece func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error)
 }
 
@@ -588,18 +597,11 @@ func (c testCleanupContext) DeletePieceByID(ctx context.Context, pieceID sdktype
 	return c.deletePiece(ctx, pieceID)
 }
 
-func (c testCleanupContext) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
-	return c.pieceStatus(ctx, pieceCID)
-}
-
 // TestStorageCleanupContinuesPastUnsupportedCopy checks that remote cleanup
 // skips a copy the provider cannot delete and still schedules the rest.
 func TestStorageCleanupContinuesPastUnsupportedCopy(t *testing.T) {
 	var deleteCalls atomic.Int64
 	cleanupContext := testCleanupContext{
-		pieceStatus: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-			return &storage.PieceStatus{Exists: true}, nil
-		},
 		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 			deleteCalls.Add(1)
 			return &sdktypes.WriteResult{Hash: common.HexToHash("0x1")}, nil
@@ -610,7 +612,9 @@ func TestStorageCleanupContinuesPastUnsupportedCopy(t *testing.T) {
 			return cleanupContext, nil
 		},
 	}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient})
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+		return synapse.CleanupPieceState{Live: true}, nil
+	}})
 	ctx := t.Context()
 	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusUnsupported, model.StorageCleanupCopyStatusPending)
 	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 1}
@@ -636,7 +640,9 @@ func TestStorageCleanupContinuesPastUnsupportedCopy(t *testing.T) {
 func TestStorageCleanupFinalizesContent(t *testing.T) {
 	var cacheDeletes atomic.Int64
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
-		storage: removedPieceStorageClient(),
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return nil, errors.New("provider context must not be opened for an absent piece")
+		}},
 		cache: &testutil.MockCache{DeleteFunc: func(context.Context, string, string) error {
 			cacheDeletes.Add(1)
 			return nil
@@ -674,6 +680,827 @@ func TestStorageCleanupFinalizesContent(t *testing.T) {
 	}
 	if len(statuses) != 2 || statuses[0] != model.StorageCleanupCopyStatusUnsupported || statuses[1] != model.StorageCleanupCopyStatusRemoved {
 		t.Fatalf("cleanup ledger statuses = %v", statuses)
+	}
+}
+
+func TestStorageCleanupRecoveryIgnoresOwnUnacceptedCopy(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: removedPieceStorageClient()})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	cleanupCopy := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(cleanupCopy).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: cleanupCopy.StorageDataSetID, CopyIndex: 0,
+		TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: cleanupCopy.ProviderID,
+	}}); err != nil {
+		t.Fatalf("create committed copy binding: %v", err)
+	}
+	testutil.CommitStorageCopy(t, runtime.db, runtime.repos, repository.MarkUploadCopyCommittedInput{
+		ContentID: content.ID, CopyIndex: 0, PieceCID: cleanupCopy.PieceCID,
+		PieceID: &cleanupCopy.PieceID, RetrievalURL: "https://provider.example/piece",
+	})
+	storedContent, err := runtime.repos.Contents.GetByID(ctx, content.ID)
+	if err != nil || storedContent == nil || storedContent.AcceptedAt != nil {
+		t.Fatalf("unaccepted cleanup content = %#v, %v", storedContent, err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Set("wait_reason = ?", "references").
+		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("resume cleanup from reference wait: %v", err)
+	}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+}
+
+func TestStorageCleanupKeepsCheckingScheduledDeletionBeforeDeadline(t *testing.T) {
+	var pieceExists atomic.Bool
+	pieceExists.Store(true)
+	var pieceQueued atomic.Bool
+	pieceQueued.Store(true)
+	var receiptCalls atomic.Int64
+	var deleteCalls atomic.Int64
+	cleanupContext := testCleanupContext{
+		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+			deleteCalls.Add(1)
+			return nil, errors.New("unexpected duplicate deletion")
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: &testutil.MockStorageClient{
+		OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return cleanupContext, nil
+		},
+	}, deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+		return synapse.CleanupPieceState{Live: pieceExists.Load(), Queued: pieceQueued.Load()}, nil
+	}, receipts: testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
+		receiptCalls.Add(1)
+		return nil, ethereum.NotFound
+	}}})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	cleanupCopy := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(cleanupCopy).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, cleanupCopy.ID, common.HexToHash("0x1").Hex()); err != nil {
+		t.Fatalf("schedule deletion: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-23*time.Hour)).Where("id = ?", cleanupCopy.ID).Exec(ctx); err != nil {
+		t.Fatalf("age scheduled deletion: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("resume cleanup recovery: %v", err)
+	}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	pending := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
+			task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+	})
+	if pending.RetryCount != 0 || pending.AvailableAt.Before(time.Now().Add(45*time.Second)) {
+		t.Fatalf("scheduled cleanup did not keep a low-frequency confirmation wait: %#v", pending)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("scheduled cleanup sent %d duplicate deletions", deleteCalls.Load())
+	}
+	copies, err := runtime.repos.StorageCleanup.AuthorizeTask(ctx, content.ID, 1, taskRow.ID)
+	if err != nil || len(copies) != 1 || copies[0].Status != model.StorageCleanupCopyStatusDeleteScheduled {
+		t.Fatalf("cleanup copies during confirmation wait = %#v, err=%v", copies, err)
+	}
+	pieceQueued.Store(false)
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("advance pending receipt poll: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return receiptCalls.Load() >= 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("pending receipt sent %d duplicate deletions", deleteCalls.Load())
+	}
+
+	pieceExists.Store(false)
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("advance cleanup poll: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("completed cleanup sent %d duplicate deletions", deleteCalls.Load())
+	}
+}
+
+func TestStorageCleanupUnknownDeletionDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		withHash               bool
+		missingTime            bool
+		wantMissingTimeMessage bool
+		recentScheduled        bool
+		recentOtherCheckpoint  bool
+	}{
+		{name: "checkpoint takes precedence over recent scheduled time", withHash: true, recentScheduled: true},
+		{name: "scheduled time is fallback", withHash: true, missingTime: true},
+		{name: "unrecorded request"},
+		{name: "checkpoint without timestamp", missingTime: true, wantMissingTimeMessage: true},
+		{name: "another copy checkpoint is ignored", withHash: true, recentOtherCheckpoint: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var deleteCalls atomic.Int64
+			var pieceQueued atomic.Bool
+			pieceQueued.Store(true)
+			newHash := common.HexToHash("0x2")
+			cleanupContext := testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+				deleteCalls.Add(1)
+				return &sdktypes.WriteResult{Hash: newHash}, nil
+			}}
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+					return cleanupContext, nil
+				}},
+				deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+					return synapse.CleanupPieceState{Live: true, Queued: pieceQueued.Load(), BlockNumber: 100}, nil
+				},
+				receipts: testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
+					return nil, ethereum.NotFound
+				}},
+			})
+			ctx := t.Context()
+			content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+			copyRow := new(model.StorageCleanupCopy)
+			if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+				t.Fatalf("load cleanup copy: %v", err)
+			}
+			attemptedAt := time.Now().Add(-25 * time.Hour)
+			oldHash := common.HexToHash("0x1").Hex()
+			if tc.withHash {
+				if err := runtime.repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, oldHash); err != nil {
+					t.Fatalf("schedule deletion: %v", err)
+				}
+				scheduledAt := attemptedAt
+				if tc.recentScheduled {
+					scheduledAt = time.Now().Add(-time.Hour)
+				}
+				if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+					Set("scheduled_at = ?", scheduledAt).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+					t.Fatalf("age scheduled deletion: %v", err)
+				}
+			}
+			checkpointCopyID := copyRow.ID
+			if tc.recentOtherCheckpoint {
+				checkpointCopyID++
+				attemptedAt = time.Now().Add(-time.Hour)
+			}
+			checkpoint := map[string]any{"copy_id": checkpointCopyID}
+			if !tc.missingTime {
+				checkpoint["attempted_at"] = attemptedAt
+			}
+			encodedCheckpoint, err := json.Marshal(checkpoint)
+			if err != nil {
+				t.Fatalf("encode cleanup checkpoint: %v", err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
+				Set("checkpoint_json = ?", encodedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+				t.Fatalf("set cleanup checkpoint: %v", err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("resume_mode = ?", model.TaskResumeModeRecover).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+				t.Fatalf("resume cleanup recovery: %v", err)
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+			})
+			pieceQueued.Store(false)
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+				t.Fatalf("advance cleanup poll: %v", err)
+			}
+			failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusFailed
+			})
+			if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" ||
+				!runtime.service.Retryable(failed) || deleteCalls.Load() != 0 {
+				t.Fatalf("timed-out cleanup = %#v, delete calls = %d", failed, deleteCalls.Load())
+			}
+			if failed.LastError == nil || !strings.Contains(*failed.LastError, "Recover may submit another paid request") {
+				t.Fatalf("timed-out cleanup details = %v", failed.LastError)
+			}
+			if tc.wantMissingTimeMessage {
+				if strings.Contains(*failed.LastError, "after 24 hours") {
+					t.Fatalf("missing-time cleanup claims a completed wait: %q", *failed.LastError)
+				}
+			} else if !strings.Contains(*failed.LastError, "after 24 hours") {
+				t.Fatalf("timed-out cleanup omits the elapsed wait: %q", *failed.LastError)
+			}
+			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+				t.Fatalf("reload cleanup copy: %v", err)
+			}
+			if copyRow.Status != model.StorageCleanupCopyStatusFailed {
+				t.Fatalf("timed-out cleanup copy = %#v", copyRow)
+			}
+			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+				t.Fatalf("retry timed-out cleanup: %v", err)
+			}
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return deleteCalls.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+			})
+			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+				t.Fatalf("reload retried cleanup copy: %v", err)
+			}
+			if copyRow.Status != model.StorageCleanupCopyStatusDeleteScheduled || copyRow.DeleteTxHash == nil || *copyRow.DeleteTxHash != newHash.Hex() ||
+				copyRow.ScheduledAt == nil || copyRow.ScheduledAt.Before(time.Now().Add(-time.Minute)) {
+				t.Fatalf("retried cleanup copy = %#v", copyRow)
+			}
+		})
+	}
+}
+
+func TestStorageCleanupConfirmsRemovalAfterDeadline(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: removedPieceStorageClient()})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	copyRow := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, common.HexToHash("0x1").Hex()); err != nil {
+		t.Fatalf("schedule deletion: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-25*time.Hour)).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("age scheduled deletion: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("resume cleanup recovery: %v", err)
+	}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusCompleted
+	})
+}
+
+func TestStorageCleanupWaitsWhenDataSetIsNotLive(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: removedPieceStorageClient(),
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{}, errors.New("cleanup data set is not live")
+		},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	copyRows, err := runtime.repos.StorageCleanup.AuthorizeTask(ctx, content.ID, 1, taskRow.ID)
+	if err != nil || len(copyRows) != 1 {
+		t.Fatalf("cleanup copies = %#v, err=%v", copyRows, err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRows[0].ID, common.HexToHash("0x1").Hex()); err != nil {
+		t.Fatalf("schedule deletion: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-25*time.Hour)).Where("id = ?", copyRows[0].ID).Exec(ctx); err != nil {
+		t.Fatalf("age scheduled deletion: %v", err)
+	}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
+			task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+	})
+	copyRows, err = runtime.repos.StorageCleanup.AuthorizeTask(ctx, content.ID, 1, taskRow.ID)
+	if err != nil || len(copyRows) != 1 || copyRows[0].Status != model.StorageCleanupCopyStatusDeleteScheduled {
+		t.Fatalf("cleanup copy before confirmation = %#v, err=%v", copyRows, err)
+	}
+	if stored, err := runtime.repos.Contents.GetByID(ctx, content.ID); err != nil || stored == nil {
+		t.Fatalf("content before confirmation = %#v, err=%v", stored, err)
+	}
+}
+
+func TestStorageCleanupReissuesOnlyAfterConfirmedFailureAndManualRetry(t *testing.T) {
+	oldHash := common.HexToHash("0x1")
+	newHash := common.HexToHash("0x2")
+	var deleteCalls atomic.Int64
+	cleanupContext := testCleanupContext{
+		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+			deleteCalls.Add(1)
+			return &sdktypes.WriteResult{Hash: newHash}, nil
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return cleanupContext, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+		},
+		receipts: testReceiptChecker{check: func(_ context.Context, hash common.Hash) (*ethtypes.Receipt, error) {
+			if hash == oldHash {
+				return &ethtypes.Receipt{Status: ethtypes.ReceiptStatusFailed, BlockNumber: big.NewInt(99)}, nil
+			}
+			return nil, ethereum.NotFound
+		}},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	copyRow := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, oldHash.Hex()); err != nil {
+		t.Fatalf("schedule old request: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("scheduled_at = ?", time.Now().Add(-25*time.Hour)).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("age old request: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("resume_mode = ?", model.TaskResumeModeRecover).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("resume cleanup recovery: %v", err)
+	}
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 3}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_transaction_reverted" || !runtime.service.Retryable(failed) || deleteCalls.Load() != 0 {
+		t.Fatalf("confirmed failure task = %#v, delete calls = %d", failed, deleteCalls.Load())
+	}
+	if failed.LastError == nil || !strings.Contains(*failed.LastError, "Recover may submit another paid request") {
+		t.Fatalf("confirmed failure details = %v", failed.LastError)
+	}
+	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+		t.Fatalf("retry confirmed failure: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 3 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("retry sent %d deletion requests, want one", deleteCalls.Load())
+	}
+	if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload cleanup copy: %v", err)
+	}
+	if copyRow.Status != model.StorageCleanupCopyStatusDeleteScheduled || copyRow.DeleteTxHash == nil || *copyRow.DeleteTxHash != newHash.Hex() {
+		t.Fatalf("retry ledger = %#v", copyRow)
+	}
+}
+
+func TestStorageCleanupUnknownRequestOutcomeDoesNotResend(t *testing.T) {
+	var deleteCalls atomic.Int64
+	cleanupContext := testCleanupContext{
+		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+			deleteCalls.Add(1)
+			return nil, context.DeadlineExceeded
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return cleanupContext, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{Live: true}, nil
+		},
+	})
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("advance cleanup poll: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("unknown deletion sent %d requests, want one", deleteCalls.Load())
+	}
+	copies, err := runtime.repos.StorageCleanup.AuthorizeTask(t.Context(), content.ID, 1, taskRow.ID)
+	if err != nil || len(copies) != 1 || copies[0].Status != model.StorageCleanupCopyStatusPending {
+		t.Fatalf("unknown deletion ledger = %#v, err=%v", copies, err)
+	}
+}
+
+func TestStorageCleanupManualRetryWithoutHashDoesNotAutomaticallyResend(t *testing.T) {
+	oldHash := common.HexToHash("0x1")
+	var deleteCalls atomic.Int64
+	cleanupContext := testCleanupContext{
+		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+			deleteCalls.Add(1)
+			return nil, context.DeadlineExceeded
+		},
+	}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return cleanupContext, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+		},
+		receipts: testReceiptChecker{check: func(context.Context, common.Hash) (*ethtypes.Receipt, error) {
+			return &ethtypes.Receipt{Status: ethtypes.ReceiptStatusFailed, BlockNumber: big.NewInt(99)}, nil
+		}},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	copyRow := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, oldHash.Hex()); err != nil {
+		t.Fatalf("schedule old request: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, "confirmed rejected"); err != nil {
+		t.Fatalf("fail old request: %v", err)
+	}
+	oldAttempt := time.Now().Add(-25 * time.Hour)
+	checkpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "attempted_at": oldAttempt})
+	if err != nil {
+		t.Fatalf("encode cleanup checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusFailed).
+		Set("failure_reason = ?", "cleanup_outcome_unknown").
+		Set("finished_at = ?", time.Now()).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("prepare failed cleanup task: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
+		Set("checkpoint_json = ?", checkpoint).
+		Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("record unconfirmed retry checkpoint: %v", err)
+	}
+	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+		t.Fatalf("retry failed cleanup: %v", err)
+	}
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 3}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover &&
+			task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+	})
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("manual retry sent %d deletion requests, want one", deleteCalls.Load())
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("advance cleanup poll: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 3 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("automatic recovery sent %d deletion requests, want one", deleteCalls.Load())
+	}
+	if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload retried cleanup copy: %v", err)
+	}
+	if copyRow.Status != model.StorageCleanupCopyStatusPending || copyRow.DeleteTxHash != nil || copyRow.ScheduledAt != nil {
+		t.Fatalf("unrecorded cleanup retry = %#v", copyRow)
+	}
+}
+
+func TestStorageCleanupLegacyUnrecordedRetryWaitsForManualRetry(t *testing.T) {
+	oldHash := common.HexToHash("0x1")
+	newHash := common.HexToHash("0x2")
+	var deleteCalls atomic.Int64
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+				deleteCalls.Add(1)
+				return &sdktypes.WriteResult{Hash: newHash}, nil
+			}}, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+		},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	copyRow := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, oldHash.Hex()); err != nil {
+		t.Fatalf("schedule old request: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, "previous request failed"); err != nil {
+		t.Fatalf("fail old request: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("updated_at = ?", time.Now().Add(-time.Hour)).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("age old failure: %v", err)
+	}
+	checkpoint, err := json.Marshal(map[string]any{
+		"copy_id": copyRow.ID, "attempted_at": time.Now().Add(-30 * time.Minute), "retry_of_tx_hash": oldHash.Hex(),
+	})
+	if err != nil {
+		t.Fatalf("encode old retry checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
+		Set("checkpoint_json = ?", checkpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("record old retry checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("resume old retry: %v", err)
+	}
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 4}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+	})
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("old unrecorded retry sent %d duplicate requests", deleteCalls.Load())
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCleanupCopy)(nil)).
+		Set("updated_at = ?", time.Now().Add(-26*time.Hour)).Where("id = ?", copyRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("age old failure further: %v", err)
+	}
+	agedCheckpoint, err := json.Marshal(map[string]any{
+		"copy_id": copyRow.ID, "attempted_at": time.Now().Add(-25 * time.Hour), "retry_of_tx_hash": oldHash.Hex(),
+	})
+	if err != nil {
+		t.Fatalf("encode aged retry checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
+		Set("checkpoint_json = ?", agedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("age old retry checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("advance old retry poll: %v", err)
+	}
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" || !runtime.service.Retryable(failed) || deleteCalls.Load() != 0 {
+		t.Fatalf("old retry deadline = %#v, delete calls = %d", failed, deleteCalls.Load())
+	}
+	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+		t.Fatalf("retry timed-out old request: %v", err)
+	}
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 4 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("manual retry sent %d deletion requests, want one", deleteCalls.Load())
+	}
+}
+
+func TestStorageCleanupLegacyFailedCopyWithoutHashCanRetry(t *testing.T) {
+	newHash := common.HexToHash("0x2")
+	var deleteCalls atomic.Int64
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+				deleteCalls.Add(1)
+				return &sdktypes.WriteResult{Hash: newHash}, nil
+			}}, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+		},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	copyRow := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if err := runtime.repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, "remote removal was not confirmed"); err != nil {
+		t.Fatalf("fail legacy cleanup copy: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("status = ?", model.TaskStatusFailed).
+		Set("failure_reason = ?", "cleanup_outcome_unknown").
+		Set("finished_at = ?", time.Now()).
+		Set("resume_mode = ?", model.TaskResumeModeRecover).
+		Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("prepare failed cleanup task: %v", err)
+	}
+	if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+		t.Fatalf("retry legacy cleanup: %v", err)
+	}
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("legacy cleanup sent %d deletion requests, want one", deleteCalls.Load())
+	}
+	if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload cleanup copy: %v", err)
+	}
+	if copyRow.Status != model.StorageCleanupCopyStatusDeleteScheduled || copyRow.DeleteTxHash == nil || *copyRow.DeleteTxHash != newHash.Hex() {
+		t.Fatalf("legacy retry ledger = %#v", copyRow)
+	}
+}
+
+func TestStorageCleanupManualRetryChecksChainBeforeSending(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state synapse.CleanupPieceState
+	}{
+		{name: "already removed", state: synapse.CleanupPieceState{Live: false}},
+		{name: "already queued", state: synapse.CleanupPieceState{Live: true, Queued: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var deleteCalls atomic.Int64
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+					deleteCalls.Add(1)
+					return nil, errors.New("unexpected cleanup request")
+				}},
+				deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+					return tc.state, nil
+				},
+			})
+			ctx := t.Context()
+			content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+			copyRow := new(model.StorageCleanupCopy)
+			if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+				t.Fatalf("load cleanup copy: %v", err)
+			}
+			if err := runtime.repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, "unknown result"); err != nil {
+				t.Fatalf("fail cleanup copy: %v", err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("status = ?", model.TaskStatusFailed).
+				Set("failure_reason = ?", "cleanup_outcome_unknown").
+				Set("finished_at = ?", time.Now()).
+				Set("resume_mode = ?", model.TaskResumeModeRecover).
+				Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+				t.Fatalf("prepare failed cleanup task: %v", err)
+			}
+			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+				t.Fatalf("retry cleanup: %v", err)
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				if tc.state.Live {
+					return task.Status == model.TaskStatusPending && task.WaitReason != nil && *task.WaitReason == "provider_confirmation"
+				}
+				return task.Status == model.TaskStatusCompleted
+			})
+			if deleteCalls.Load() != 0 {
+				t.Fatalf("cleanup sent %d requests despite chain evidence", deleteCalls.Load())
+			}
+		})
+	}
+}
+
+func TestStorageCleanupManualRetryCheckpointFailureDoesNotSend(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trigger string
+	}{
+		{name: "ledger reset", trigger: `CREATE TRIGGER fail_cleanup_retry BEFORE UPDATE OF status ON storage_cleanup_copies
+			WHEN OLD.status = 'failed' AND NEW.status = 'pending'
+			BEGIN SELECT RAISE(FAIL, 'injected cleanup retry failure'); END`},
+		{name: "checkpoint write", trigger: `CREATE TRIGGER fail_cleanup_checkpoint BEFORE UPDATE OF checkpoint_json ON task_payloads
+			BEGIN SELECT RAISE(FAIL, 'injected checkpoint failure'); END`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			noRetries := 0
+			var deleteCalls atomic.Int64
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				maxRetries: &noRetries,
+				storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+					return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+						deleteCalls.Add(1)
+						return nil, nil
+					}}, nil
+				}},
+				deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+					return synapse.CleanupPieceState{Live: true}, nil
+				},
+			})
+			ctx := t.Context()
+			content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+			copyRow := new(model.StorageCleanupCopy)
+			if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+				t.Fatalf("load cleanup copy: %v", err)
+			}
+			if err := runtime.repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, "unknown result"); err != nil {
+				t.Fatalf("fail cleanup copy: %v", err)
+			}
+			if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+				Set("status = ?", model.TaskStatusFailed).
+				Set("failure_reason = ?", "cleanup_outcome_unknown").
+				Set("finished_at = ?", time.Now()).
+				Set("resume_mode = ?", model.TaskResumeModeRecover).
+				Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+				t.Fatalf("prepare failed cleanup task: %v", err)
+			}
+			if _, err := runtime.db.ExecContext(ctx, tc.trigger); err != nil {
+				t.Fatalf("install fault trigger: %v", err)
+			}
+			if err := runtime.service.Retry(ctx, taskRow.ID); err != nil {
+				t.Fatalf("retry cleanup: %v", err)
+			}
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusFailed
+			})
+			if failed.FailureReason == nil || *failed.FailureReason != "cleanup_not_started" || len(failed.Checkpoint) != 0 || deleteCalls.Load() != 0 {
+				t.Fatalf("failed pre-request settlement = %#v, delete calls = %d", failed, deleteCalls.Load())
+			}
+			if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+				t.Fatalf("reload cleanup copy: %v", err)
+			}
+			if copyRow.Status != model.StorageCleanupCopyStatusFailed {
+				t.Fatalf("failed pre-request cleanup copy = %#v", copyRow)
+			}
+		})
+	}
+}
+
+func TestStorageCleanupUnrecordedReturnedHashWaitsForManualRetry(t *testing.T) {
+	var deleteCalls atomic.Int64
+	newHash := common.HexToHash("0x2")
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		storage: &testutil.MockStorageClient{OpenCleanupContextFunc: func(context.Context, sdktypes.BigInt, storage.NewDataSetContextOptions) (synapse.CleanupContext, error) {
+			return testCleanupContext{deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
+				deleteCalls.Add(1)
+				return &sdktypes.WriteResult{Hash: newHash}, nil
+			}}, nil
+		}},
+		deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+			return synapse.CleanupPieceState{Live: true, BlockNumber: 100}, nil
+		},
+	})
+	ctx := t.Context()
+	content, taskRow := seedStorageCleanup(t, runtime, model.StorageCleanupCopyStatusPending)
+	copyRow := new(model.StorageCleanupCopy)
+	if err := runtime.db.NewSelect().Model(copyRow).Where("content_id = ?", content.ID).Scan(ctx); err != nil {
+		t.Fatalf("load cleanup copy: %v", err)
+	}
+	if _, err := runtime.db.ExecContext(ctx, `CREATE TRIGGER fail_cleanup_hash BEFORE UPDATE OF status ON storage_cleanup_copies
+		WHEN OLD.status = 'pending' AND NEW.status = 'delete_scheduled'
+		BEGIN SELECT RAISE(FAIL, 'injected cleanup hash failure'); END`); err != nil {
+		t.Fatalf("install fault trigger: %v", err)
+	}
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 2}
+	runtime.repos.Tasks = limited
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	first := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 1 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
+	})
+	if len(first.Checkpoint) == 0 || deleteCalls.Load() != 1 {
+		t.Fatalf("unrecorded request task = %#v, delete calls = %d", first, deleteCalls.Load())
+	}
+	if err := runtime.db.NewSelect().Model(copyRow).Where("id = ?", copyRow.ID).Scan(ctx); err != nil {
+		t.Fatalf("reload cleanup copy: %v", err)
+	}
+	if copyRow.Status != model.StorageCleanupCopyStatusPending || copyRow.DeleteTxHash != nil {
+		t.Fatalf("unrecorded request ledger = %#v", copyRow)
+	}
+	agedCheckpoint, err := json.Marshal(map[string]any{"copy_id": copyRow.ID, "attempted_at": time.Now().Add(-25 * time.Hour)})
+	if err != nil {
+		t.Fatalf("encode aged checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.TaskPayload)(nil)).
+		Set("checkpoint_json = ?", agedCheckpoint).Where("task_id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("age cleanup checkpoint: %v", err)
+	}
+	if _, err := runtime.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("available_at = ?", time.Now().Add(-time.Second)).Where("id = ?", taskRow.ID).Exec(ctx); err != nil {
+		t.Fatalf("advance cleanup poll: %v", err)
+	}
+	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 2 && task.Status == model.TaskStatusFailed
+	})
+	if failed.FailureReason == nil || *failed.FailureReason != "cleanup_outcome_unknown" || !runtime.service.Retryable(failed) || deleteCalls.Load() != 1 {
+		t.Fatalf("unrecorded hash outcome = %#v, delete calls = %d", failed, deleteCalls.Load())
 	}
 }
 
@@ -719,9 +1546,6 @@ func TestStorageCleanupRetriesCacheRelease(t *testing.T) {
 // removedPieceStorageClient reports every cleanup piece as already gone.
 func removedPieceStorageClient() *testutil.MockStorageClient {
 	cleanupContext := testCleanupContext{
-		pieceStatus: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-			return &storage.PieceStatus{Exists: false}, nil
-		},
 		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 			return nil, errors.New("unexpected remote deletion")
 		},
@@ -795,9 +1619,6 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 	noRetries := 0
 	var deleteCalls atomic.Int64
 	cleanupContext := testCleanupContext{
-		pieceStatus: func(context.Context, cid.Cid) (*storage.PieceStatus, error) {
-			return &storage.PieceStatus{Exists: true}, nil
-		},
 		deletePiece: func(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error) {
 			deleteCalls.Add(1)
 			return nil, errors.New("unexpected remote deletion")
@@ -808,7 +1629,9 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 			return cleanupContext, nil
 		},
 	}
-	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, maxRetries: &noRetries})
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{storage: storageClient, maxRetries: &noRetries, deletionState: func(context.Context, sdktypes.BigInt, sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+		return synapse.CleanupPieceState{Live: true}, nil
+	}})
 	bucket := &model.Bucket{Name: "cleanup-admission", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := runtime.repos.Buckets.Create(t.Context(), bucket); err != nil {
 		t.Fatalf("create cleanup admission bucket: %v", err)

@@ -51,7 +51,6 @@ type DataSetTarget interface {
 // CleanupContext abstracts the SDK operations needed to remove PDP pieces.
 type CleanupContext interface {
 	DeletePieceByID(context.Context, sdktypes.BigInt) (*sdktypes.WriteResult, error)
-	PieceStatus(context.Context, cid.Cid) (*storage.PieceStatus, error)
 }
 
 // StorageClient abstracts the synapse-go storage service for download plus
@@ -64,6 +63,8 @@ type StorageClient interface {
 	OpenDataSetTarget(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (DataSetTarget, error)
 	FindMatchingDataSet(ctx context.Context, providerID sdktypes.BigInt, metadata map[string]string, withCDN bool) (*storage.DataSetRef, error)
 	OpenCleanupContext(ctx context.Context, dataSetID sdktypes.BigInt, opts storage.NewDataSetContextOptions) (CleanupContext, error)
+	// DeletionState reads the exact piece ID and its removal queue at one chain block.
+	DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error)
 }
 
 // ParkedPieceState describes the provider-local state of a content-addressed

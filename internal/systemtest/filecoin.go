@@ -635,6 +635,24 @@ func (c *memoryDataSetTarget) DeletePieceByID(ctx context.Context, pieceID sdkty
 	return nil, fmt.Errorf("memory filecoin: unknown piece ID %s", pieceID.String())
 }
 
+func (m *MemoryFilecoin) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (synapse.CleanupPieceState, error) {
+	if err := ctx.Err(); err != nil {
+		return synapse.CleanupPieceState{}, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	dataSet := m.dataSets[dataSetID.String()]
+	if dataSet == nil {
+		return synapse.CleanupPieceState{BlockNumber: uint64(m.epoch)}, nil
+	}
+	for _, storedID := range dataSet.pieces {
+		if storedID.Equal(pieceID) {
+			return synapse.CleanupPieceState{Live: true, BlockNumber: uint64(m.epoch)}, nil
+		}
+	}
+	return synapse.CleanupPieceState{BlockNumber: uint64(m.epoch)}, nil
+}
+
 func (c *memoryDataSetTarget) PieceStatus(ctx context.Context, pieceCID cid.Cid) (*storage.PieceStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

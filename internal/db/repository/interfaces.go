@@ -331,6 +331,7 @@ type StorageCleanupRepository interface {
 	AuthorizeTask(ctx context.Context, contentID, generation, taskID int64) ([]model.StorageCleanupCopy, error)
 	MarkCopyRemoved(ctx context.Context, id int64) error
 	MarkCopyDeleteScheduled(ctx context.Context, id int64, txHash string) error
+	BeginFailedCopyRetry(ctx context.Context, id int64, oldHash string) error
 	MarkCopyFailed(ctx context.Context, id int64, message string) error
 	MarkCopyUnsupported(ctx context.Context, id int64, message string) error
 	UploadHasObjectReferences(ctx context.Context, contentID int64) (bool, error)
