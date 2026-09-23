@@ -340,6 +340,9 @@ func runServe(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("creating wallet receipt client: %w", err)
 	}
 	defer walletReceiptClient.Close()
+	if err := storageClient.ConfigureCleanupChain(walletReceiptClient); err != nil {
+		return fmt.Errorf("configuring storage cleanup: %w", err)
+	}
 
 	runtime, err := app.NewRuntime(ctx, app.RuntimeOptions{
 		Config:   cfg,

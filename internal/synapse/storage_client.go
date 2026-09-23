@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ipfs/go-cid"
 	sdkcosts "github.com/strahe/synapse-go/costs"
 	"github.com/strahe/synapse-go/storage"
@@ -21,6 +22,8 @@ type StorageServiceAdapter struct {
 	terminator storageServiceTerminator
 	dataSets   dataSetStateReader
 	identity   storage.ContextIdentity
+	verifier   common.Address
+	cleanup    *cleanupPieceReader
 }
 
 // AdaptStorageService wraps the SDK storage service. dataSets reads the FWSS
@@ -31,8 +34,27 @@ func AdaptStorageService(service *storage.Service, dataSets *warmstorage.Service
 	adapter := &StorageServiceAdapter{service: service, terminator: service, identity: identity}
 	if dataSets != nil {
 		adapter.dataSets = dataSets
+		adapter.verifier = dataSets.PDPVerifierAddress()
 	}
 	return adapter
+}
+
+// ConfigureCleanupChain uses the existing chain connection for exact piece
+// and scheduled-removal reads during cleanup.
+func (s *StorageServiceAdapter) ConfigureCleanupChain(chain cleanupChainCaller) error {
+	reader, err := newCleanupPieceReader(chain, s.verifier)
+	if err != nil {
+		return err
+	}
+	s.cleanup = reader
+	return nil
+}
+
+func (s *StorageServiceAdapter) DeletionState(ctx context.Context, dataSetID, pieceID sdktypes.BigInt) (CleanupPieceState, error) {
+	if s.cleanup == nil {
+		return CleanupPieceState{}, errors.New("cleanup chain reader is unavailable")
+	}
+	return s.cleanup.ObserveCleanupPiece(ctx, dataSetID, pieceID)
 }
 
 // ContextIdentity reports the payer, chain, and record keeper this service

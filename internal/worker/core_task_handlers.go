@@ -11,8 +11,8 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
-	"github.com/ipfs/go-cid"
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheeviction"
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -30,14 +30,16 @@ import (
 const (
 	dependencyWait        = time.Minute
 	externalPollInterval  = 5 * time.Second
-	cleanupAttentionAfter = 30 * time.Minute
+	cleanupPollInterval   = time.Minute
+	cleanupAttentionAfter = 24 * time.Hour
 	taskGCInterval        = time.Hour
 	cleanupGCPageSize     = 500
 )
 
 type cleanupCheckpoint struct {
-	CopyID      int64     `json:"copy_id"`
-	AttemptedAt time.Time `json:"attempted_at"`
+	CopyID        int64     `json:"copy_id"`
+	AttemptedAt   time.Time `json:"attempted_at"`
+	RetryOfTxHash string    `json:"retry_of_tx_hash,omitempty"`
 	// Finalized records that the content's rows were deleted.
 	Finalized bool `json:"finalized,omitempty"`
 }
@@ -538,64 +540,89 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 		case model.StorageCleanupCopyStatusRemoved, model.StorageCleanupCopyStatusUnsupported:
 			continue
 		}
-		// Provider and piece identity are NOT NULL on the cleanup ledger, and
-		// zero is a legal on-chain ID, so only a missing data set or piece CID
-		// means the provider request cannot be built.
-		if copyRow.DataSetID == nil || copyRow.PieceCID == "" {
+		// Zero is a legal on-chain ID; a missing data set is the only
+		// identity gap that prevents an exact piece-ID lookup.
+		if copyRow.DataSetID == nil {
 			message := "Storage provider details are incomplete"
 			if err := h.deps.Repositories.StorageCleanup.MarkCopyUnsupported(ctx, copyRow.ID, message); err != nil {
 				return retryTask(err, "cleanup_evidence_failed")
 			}
 			continue
 		}
-		pieceCID, err := cid.Parse(copyRow.PieceCID)
+		state, err := h.deps.Storage.DeletionState(ctx, copyRow.DataSetID.SDK(), copyRow.PieceID.SDK())
 		if err != nil {
-			message := "Stored data identifier is invalid"
-			if markErr := h.deps.Repositories.StorageCleanup.MarkCopyUnsupported(ctx, copyRow.ID, message); markErr != nil {
-				return retryTask(markErr, "cleanup_evidence_failed")
+			return taskengine.Suspend(model.TaskResumeModeRecover, cleanupPollInterval, "provider_confirmation", "Checking remote cleanup", nil)
+		}
+		if !state.Live {
+			if err := h.deps.Repositories.StorageCleanup.MarkCopyRemoved(ctx, copyRow.ID); err != nil {
+				return retryTask(err, "cleanup_evidence_failed")
 			}
 			continue
+		}
+		if state.Queued {
+			return taskengine.Suspend(model.TaskResumeModeRecover, cleanupPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
+		}
+		previousHash := ""
+		if copyRow.DeleteTxHash != nil {
+			previousHash = *copyRow.DeleteTxHash
+		}
+		retryingFailedCopy := copyRow.Status == model.StorageCleanupCopyStatusFailed
+		// Older attempts could checkpoint a retry without changing the failed row.
+		// Do not treat that in-flight attempt as a fresh manual retry.
+		if retryingFailedCopy && hasCheckpoint && checkpoint.CopyID == copyRow.ID &&
+			checkpoint.RetryOfTxHash == previousHash && !checkpoint.AttemptedAt.IsZero() &&
+			!checkpoint.AttemptedAt.Before(copyRow.UpdatedAt) {
+			return waitForStorageCleanupOutcome(copyRow, checkpoint, hasCheckpoint, "Waiting for remote cleanup")
+		}
+		if !retryingFailedCopy && previousHash != "" {
+			hashBytes, hashErr := hexutil.Decode(previousHash)
+			if h.deps.Receipts == nil || hashErr != nil || len(hashBytes) != common.HashLength {
+				return waitForStorageCleanupOutcome(copyRow, checkpoint, hasCheckpoint, "Checking remote cleanup")
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, h.deps.WalletReceiptTimeout)
+			receipt, receiptErr := h.deps.Receipts.TransactionReceipt(requestCtx, common.BytesToHash(hashBytes))
+			cancel()
+			if receiptErr != nil || receipt == nil || receipt.BlockNumber == nil || receipt.BlockNumber.Uint64() > state.BlockNumber {
+				return waitForStorageCleanupOutcome(copyRow, checkpoint, hasCheckpoint, "Waiting for remote cleanup")
+			}
+			message := "Removal was not queued. Recover may submit another paid request."
+			reason := "cleanup_transaction_not_scheduled"
+			if receipt.Status == ethtypes.ReceiptStatusFailed {
+				message = "Removal transaction failed. Recover may submit another paid request."
+				reason = "cleanup_transaction_reverted"
+			}
+			return taskengine.Fail(errors.New(message), reason, func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, message)
+			})
+		} else if !retryingFailedCopy && (copyRow.Status != model.StorageCleanupCopyStatusPending || (hasCheckpoint && checkpoint.CopyID == copyRow.ID)) {
+			return waitForStorageCleanupOutcome(copyRow, checkpoint, hasCheckpoint, "Waiting for remote cleanup")
+		}
+		if !allowDelete {
+			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Remote cleanup is ready", nil)
 		}
 		providerID := copyRow.ProviderID.SDK()
 		cleanupContext, err := h.deps.Storage.OpenCleanupContext(ctx, copyRow.DataSetID.SDK(), storage.NewDataSetContextOptions{ProviderID: &providerID})
 		if err != nil {
 			return retryTask(err, "cleanup_context_failed")
 		}
-		status, err := cleanupContext.PieceStatus(ctx, pieceCID)
-		if err != nil {
-			return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Checking remote cleanup", nil)
-		}
-		if status == nil || !status.Exists {
-			if err := h.deps.Repositories.StorageCleanup.MarkCopyRemoved(ctx, copyRow.ID); err != nil {
-				return retryTask(err, "cleanup_evidence_failed")
+		checkpoint = cleanupCheckpoint{CopyID: copyRow.ID, AttemptedAt: time.Now().UTC(), RetryOfTxHash: previousHash}
+		var settlement taskengine.Settlement
+		if retryingFailedCopy {
+			settlement = func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.StorageCleanup.BeginFailedCopyRetry(ctx, copyRow.ID, previousHash)
 			}
-			continue
 		}
-		if copyRow.Status == model.StorageCleanupCopyStatusDeleteScheduled || (hasCheckpoint && checkpoint.CopyID == copyRow.ID) {
-			attemptedAt := checkpoint.AttemptedAt
-			if attemptedAt.IsZero() && copyRow.ScheduledAt != nil {
-				attemptedAt = *copyRow.ScheduledAt
-			}
-			if !attemptedAt.IsZero() && time.Since(attemptedAt) >= cleanupAttentionAfter {
-				err := errors.New("remote replica deletion could not be confirmed")
-				return taskengine.Fail(err, "cleanup_outcome_unknown", func(ctx context.Context, repos *repository.Repositories) error {
-					return repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, err.Error())
-				})
-			}
-			return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
-		}
-		if !allowDelete {
-			return taskengine.Suspend(model.TaskResumeModeExecute, 0, "safe_to_execute", "Remote cleanup is ready", nil)
-		}
-		checkpoint = cleanupCheckpoint{CopyID: copyRow.ID, AttemptedAt: time.Now().UTC()}
 		var txHash string
-		attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceDestructiveMutation, checkpoint, nil, func(ctx context.Context) error {
+		attempted, err := execution.WithCheckpointedEffect(ctx, taskengine.ResourceDestructiveMutation, checkpoint, settlement, func(ctx context.Context) error {
 			result, deleteErr := cleanupContext.DeletePieceByID(ctx, copyRow.PieceID.SDK())
-			if result != nil {
+			if result != nil && result.Hash != (common.Hash{}) {
 				txHash = result.Hash.String()
 			}
 			return deleteErr
 		})
+		if txHash != "" {
+			err = errors.Join(err, h.deps.Repositories.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, txHash))
+		}
 		if err != nil {
 			if !attempted {
 				if errors.Is(err, taskengine.ErrResourceBusy) {
@@ -605,12 +632,29 @@ func (h *TaskHandlers) runStorageCleanup(ctx context.Context, execution taskengi
 			}
 			return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Checking remote cleanup", nil)
 		}
-		if err := h.deps.Repositories.StorageCleanup.MarkCopyDeleteScheduled(ctx, copyRow.ID, txHash); err != nil {
-			return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Recording remote cleanup", nil)
-		}
 		return taskengine.Suspend(model.TaskResumeModeRecover, externalPollInterval, "provider_confirmation", "Waiting for remote cleanup", nil)
 	}
 	return h.finishStorageCleanup(ctx, execution, input)
+}
+
+func waitForStorageCleanupOutcome(copyRow model.StorageCleanupCopy, checkpoint cleanupCheckpoint, hasCheckpoint bool, waitingMessage string) taskengine.Result {
+	attemptedAt := time.Time{}
+	if hasCheckpoint && checkpoint.CopyID == copyRow.ID {
+		attemptedAt = checkpoint.AttemptedAt
+	}
+	if attemptedAt.IsZero() && copyRow.ScheduledAt != nil {
+		attemptedAt = *copyRow.ScheduledAt
+	}
+	if attemptedAt.IsZero() || time.Since(attemptedAt) >= cleanupAttentionAfter {
+		message := "removal unconfirmed after 24 hours. Recover may submit another paid request"
+		if attemptedAt.IsZero() {
+			message = "removal outcome cannot be confirmed. Recover may submit another paid request"
+		}
+		return taskengine.Fail(errors.New(message), "cleanup_outcome_unknown", func(ctx context.Context, repos *repository.Repositories) error {
+			return repos.StorageCleanup.MarkCopyFailed(ctx, copyRow.ID, message)
+		})
+	}
+	return taskengine.Suspend(model.TaskResumeModeRecover, cleanupPollInterval, "provider_confirmation", waitingMessage, nil)
 }
 
 // finishStorageCleanup releases the content's cached bytes and then deletes its

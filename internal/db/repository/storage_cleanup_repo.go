@@ -108,6 +108,35 @@ func (r *BunStorageCleanupRepo) MarkCopyDeleteScheduled(ctx context.Context, id 
 	)
 }
 
+// BeginFailedCopyRetry resets the failed ledger row in the same transaction
+// that checkpoints the new external request.
+func (r *BunStorageCleanupRepo) BeginFailedCopyRetry(ctx context.Context, id int64, oldHash string) error {
+	now := time.Now()
+	query := r.db.NewUpdate().
+		Model((*model.StorageCleanupCopy)(nil)).
+		Set("status = ?", model.StorageCleanupCopyStatusPending).
+		Set("delete_tx_hash = NULL").
+		Set("scheduled_at = NULL").
+		Set("last_error = NULL").
+		Set("updated_at = ?", now).
+		Where("id = ?", id).
+		Where("status = ?", model.StorageCleanupCopyStatusFailed)
+	if oldHash == "" {
+		query = query.Where("delete_tx_hash IS NULL")
+	} else {
+		query = query.Where("delete_tx_hash = ?", oldHash)
+	}
+	result, err := query.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning failed storage cleanup retry: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return fmt.Errorf("beginning failed storage cleanup retry: %w", ErrConflict)
+	}
+	return nil
+}
+
 func (r *BunStorageCleanupRepo) MarkCopyFailed(ctx context.Context, id int64, message string) error {
 	now := time.Now()
 	res, err := r.db.NewUpdate().
@@ -207,6 +236,7 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 		LEFT JOIN storage_data_sets AS storage_data_set ON storage_data_set.id = storage_copy.storage_data_set_id
 		JOIN storage_contents AS active_content ON active_content.id = storage_copy.content_id
 		WHERE cleanup_copy.content_id = ?
+		  AND active_content.id <> cleanup_copy.content_id
 		  AND active_content.accepted_at IS NULL
 		  AND (
 			storage_copy.content_id = ?

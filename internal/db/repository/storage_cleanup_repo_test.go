@@ -9,7 +9,10 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/storagecommit"
 	"github.com/strahe/synaps3/internal/storagereplacement"
+	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/uptrace/bun"
 )
 
 // TestStorageCleanupBlocksReuseUntilContentIsFinalized walks content through
@@ -153,6 +156,282 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	}
 }
 
+func TestStorageCleanupReferenceChecksIgnoreOwnUnacceptedCopy(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := seedBucket(t, db, "cleanup-unaccepted-copy")
+	content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 10,
+		Checksum: testutil.StorageChecksum("cleanup-unaccepted-copy"), RequestedCopies: 3,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent: %v", err)
+	}
+	providerID := onChainID(t, "701")
+	dataSetID := onChainID(t, "801")
+	pieceID := onChainID(t, "901")
+	retrievalURL := "https://provider.example/piece"
+	seedCommittedUploadCopies(t, db, repos, bucket.ID, content.ID, "piece-cid", []storageUploadCopySeed{{
+		ProviderID: &providerID, DataSetID: &dataSetID, PieceID: &pieceID, RetrievalURL: &retrievalURL,
+	}})
+	committed, err := repos.Contents.GetUploadCopy(ctx, content.ID, 0)
+	if err != nil || committed == nil {
+		t.Fatalf("GetUploadCopy: %#v, %v", committed, err)
+	}
+	for copyIndex := 1; copyIndex < 3; copyIndex++ {
+		failedProvider := onChainID(t, strconv.Itoa(701+copyIndex))
+		binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+			BucketID: bucket.ID, ProviderID: failedProvider, CopyIndex: copyIndex, CreatedByContentID: content.ID,
+		})
+		if err != nil {
+			t.Fatalf("EnsureDataSetBinding(%d): %v", copyIndex, err)
+		}
+		if err := repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+			StorageDataSetID: binding.ID, CopyIndex: copyIndex,
+			TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: failedProvider,
+		}}); err != nil {
+			t.Fatalf("CreateUploadCopiesForBindings(%d): %v", copyIndex, err)
+		}
+		result, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
+			Set("status = ?", model.StorageCopyStatusFailed).
+			Where("content_id = ? AND copy_index = ?", content.ID, copyIndex).Exec(ctx)
+		if err != nil {
+			t.Fatalf("fail copy %d: %v", copyIndex, err)
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			t.Fatalf("failed copy %d rows = %d, want 1", copyIndex, rows)
+		}
+	}
+	version := newObjectVersion(bucket.ID, "file.txt", model.NewVersionID(), 10)
+	version.ContentID = &content.ID
+	if _, err := createVersion(t, repos, version); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	if referenced, err := repos.StorageCleanup.UploadHasObjectReferences(ctx, content.ID); err != nil || !referenced {
+		t.Fatalf("UploadHasObjectReferences = %t, %v, want true", referenced, err)
+	}
+	deleted, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: bucket.ID, Key: version.Key, VersionID: version.VersionID,
+	})
+	if err != nil || deleted.StorageCleanup == nil {
+		t.Fatalf("DeleteObjectVersionPermanently: %#v, %v", deleted, err)
+	}
+	storedContent, err := repos.Contents.GetByID(ctx, content.ID)
+	if err != nil || storedContent == nil || storedContent.AcceptedAt != nil {
+		t.Fatalf("unaccepted content after delete = %#v, %v", storedContent, err)
+	}
+	if referenced, err := repos.StorageCleanup.UploadHasObjectReferences(ctx, content.ID); err != nil || referenced {
+		t.Fatalf("UploadHasObjectReferences = %t, %v, want false", referenced, err)
+	}
+	checkCleanupReferences := func(want bool) {
+		t.Helper()
+		referenced, err := repos.StorageCleanup.CleanupHasObjectReferences(ctx, content.ID)
+		if err != nil || referenced != want {
+			t.Fatalf("CleanupHasObjectReferences = %t, %v, want %t", referenced, err, want)
+		}
+	}
+	checkCleanupReferences(false)
+
+	sharedContentID := seedContent(t, repos, bucket.ID, "cleanup-shared-copy", 10)
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, sharedContentID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: committed.StorageDataSetID, CopyIndex: 0,
+		TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: providerID,
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings(shared): %v", err)
+	}
+	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		ContentID: sharedContentID, CopyIndex: 0, PieceCID: "piece-cid", PieceID: &pieceID,
+		RetrievalURL: retrievalURL,
+	})
+	checkCleanupReferences(true)
+
+	if _, err := db.NewUpdate().Model((*model.StorageContent)(nil)).
+		Set("accepted_at = ?", time.Now()).Where("id = ?", sharedContentID).Exec(ctx); err != nil {
+		t.Fatalf("accept shared content: %v", err)
+	}
+	sharedVersion := newObjectVersion(bucket.ID, "shared.txt", model.NewVersionID(), 10)
+	sharedVersion.ContentID = &sharedContentID
+	if _, err := createVersion(t, repos, sharedVersion); err != nil {
+		t.Fatalf("create shared version: %v", err)
+	}
+	checkCleanupReferences(true)
+}
+
+func TestStorageCleanupSnapshotsEveryCommittedCopy(t *testing.T) {
+	db, repos, version, secondCopy, identity := seedCleanupCopyCommitBoundary(t)
+	ctx := t.Context()
+	attemptID := "late-copy-attempted"
+	if result, err := repos.Contents.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: identity, AttemptID: attemptID,
+	}); err != nil || result.State != storagecommit.ReservationAcquired {
+		t.Fatalf("ReserveCommitAttempt = %#v, %v", result, err)
+	}
+	if _, err := repos.Contents.MarkCommitAttempted(ctx, storagecommit.AttemptInput{
+		Copy: identity, AttemptID: attemptID, ExtraDataHex: "abcd",
+	}); err != nil {
+		t.Fatalf("MarkCommitAttempted: %v", err)
+	}
+	deleteVersion := func() (*repository.StorageCleanupReservation, error) {
+		result, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+			BucketID: version.BucketID, Key: version.Key, VersionID: version.VersionID,
+		})
+		return result.StorageCleanup, err
+	}
+	if cleanup, err := deleteVersion(); !errors.Is(err, repository.ErrPermanentDeleteStorageBusy) || cleanup != nil {
+		t.Fatalf("delete during attempted commit = %#v, %v, want storage busy", cleanup, err)
+	}
+	var cleanupRows int
+	if err := db.NewRaw("SELECT count(*) FROM storage_cleanup_copies WHERE content_id = ?", *version.ContentID).Scan(ctx, &cleanupRows); err != nil {
+		t.Fatalf("count cleanup copies before confirmation: %v", err)
+	}
+	if cleanupRows != 0 {
+		t.Fatalf("cleanup copies before confirmation = %d, want 0", cleanupRows)
+	}
+	if err := repos.Contents.RecordCommitSubmission(ctx, storagecommit.EvidenceInput{
+		Copy: identity, AttemptID: attemptID, TransactionID: "tx-late-copy",
+		StatusURL: "https://provider.example/status/late-copy",
+	}); err != nil {
+		t.Fatalf("RecordCommitSubmission: %v", err)
+	}
+	secondPieceID := onChainID(t, "902")
+	if err := repos.Contents.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		StorageCopyID: secondCopy.ID, ContentID: *version.ContentID, CopyIndex: secondCopy.CopyIndex,
+		PieceCID: "piece-cid", PieceID: &secondPieceID, RetrievalURL: "https://provider.example/second-piece",
+		CommitAttemptID: attemptID, CommitExtraDataHex: "abcd",
+		CommitTransactionID: "tx-late-copy", CommitConfirmedTransactionID: "tx-late-copy",
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyCommitted: %v", err)
+	}
+	cleanup, err := deleteVersion()
+	if err != nil || cleanup == nil {
+		t.Fatalf("delete after confirmation = %#v, %v", cleanup, err)
+	}
+	if err := db.NewRaw("SELECT count(*) FROM storage_cleanup_copies WHERE content_id = ?", *version.ContentID).Scan(ctx, &cleanupRows); err != nil {
+		t.Fatalf("count cleanup copies after confirmation: %v", err)
+	}
+	if cleanupRows != 2 {
+		t.Fatalf("cleanup copies after confirmation = %d, want both committed copies", cleanupRows)
+	}
+	var secondPieceSnapshots int
+	if err := db.NewRaw("SELECT count(*) FROM storage_cleanup_copies WHERE content_id = ? AND storage_data_set_id = ? AND piece_id = ?",
+		*version.ContentID, secondCopy.StorageDataSetID, secondPieceID).Scan(ctx, &secondPieceSnapshots); err != nil {
+		t.Fatalf("count second copy cleanup snapshot: %v", err)
+	}
+	if secondPieceSnapshots != 1 {
+		t.Fatalf("second copy cleanup snapshots = %d, want 1", secondPieceSnapshots)
+	}
+}
+
+func TestStorageCleanupCancelsUnattemptedCommitBeforeSnapshot(t *testing.T) {
+	db, repos, version, secondCopy, identity := seedCleanupCopyCommitBoundary(t)
+	ctx := t.Context()
+	attemptID := "late-copy-reserved"
+	if result, err := repos.Contents.ReserveCommitAttempt(ctx, storagecommit.ReserveInput{
+		Copy: identity, AttemptID: attemptID,
+	}); err != nil || result.State != storagecommit.ReservationAcquired {
+		t.Fatalf("ReserveCommitAttempt = %#v, %v", result, err)
+	}
+	deleted, err := repos.Objects.DeleteObjectVersionPermanently(ctx, repository.DeleteObjectVersionInput{
+		BucketID: version.BucketID, Key: version.Key, VersionID: version.VersionID,
+	})
+	if err != nil || deleted.StorageCleanup == nil {
+		t.Fatalf("delete with reserved commit = %#v, %v", deleted, err)
+	}
+	stored, err := repos.Contents.GetUploadCopyByID(ctx, secondCopy.ID)
+	if err != nil || stored == nil || stored.Status != model.StorageCopyStatusFailed {
+		t.Fatalf("second copy after delete = %#v, %v, want failed", stored, err)
+	}
+	attempt := new(storagecommit.Attempt)
+	if err := db.NewSelect().Model(attempt).Where("attempt_id = ?", attemptID).Scan(ctx); err != nil {
+		t.Fatalf("load reserved attempt after delete: %v", err)
+	}
+	if attempt.Status != storagecommit.AttemptStatusReleased || attempt.ResolvedAt == nil {
+		t.Fatalf("reserved attempt after delete = %#v, want released", attempt)
+	}
+	if _, err := repos.Contents.MarkCommitAttempted(ctx, storagecommit.AttemptInput{
+		Copy: identity, AttemptID: attemptID, ExtraDataHex: "abcd",
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("MarkCommitAttempted after delete = %v, want conflict", err)
+	}
+	secondPieceID := onChainID(t, "902")
+	if err := repos.Contents.MarkUploadCopyCommitted(ctx, repository.MarkUploadCopyCommittedInput{
+		StorageCopyID: secondCopy.ID, ContentID: *version.ContentID, CopyIndex: secondCopy.CopyIndex,
+		PieceCID: "piece-cid", PieceID: &secondPieceID, RetrievalURL: "https://provider.example/second-piece",
+		CommitAttemptID: attemptID, CommitExtraDataHex: "abcd",
+		CommitTransactionID: "tx-late-copy", CommitConfirmedTransactionID: "tx-late-copy",
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("MarkUploadCopyCommitted after delete = %v, want conflict", err)
+	}
+	var cleanupRows int
+	if err := db.NewRaw("SELECT count(*) FROM storage_cleanup_copies WHERE content_id = ?", *version.ContentID).Scan(ctx, &cleanupRows); err != nil {
+		t.Fatalf("count cleanup copies: %v", err)
+	}
+	if cleanupRows != 1 {
+		t.Fatalf("cleanup copies = %d, want only the committed copy", cleanupRows)
+	}
+}
+
+func seedCleanupCopyCommitBoundary(t *testing.T) (*bun.DB, *repository.Repositories, *model.ObjectVersion, *model.StorageCopy, storagecommit.CopyIdentity) {
+	t.Helper()
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := seedBucket(t, db, "cleanup-commit-boundary")
+	content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 10,
+		Checksum: testutil.StorageChecksum("cleanup-commit-boundary"), RequestedCopies: 2,
+	})
+	if err != nil {
+		t.Fatalf("EnsureContent: %v", err)
+	}
+	version := newObjectVersion(bucket.ID, "file.txt", model.NewVersionID(), 10)
+	version.ContentID = &content.ID
+	if _, err := createVersion(t, repos, version); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	firstProviderID := onChainID(t, "701")
+	firstDataSetID := onChainID(t, "801")
+	firstPieceID := onChainID(t, "901")
+	retrievalURL := "https://provider.example/first-piece"
+	seedCommittedUploadCopies(t, db, repos, bucket.ID, content.ID, "piece-cid", []storageUploadCopySeed{{
+		ProviderID: &firstProviderID, DataSetID: &firstDataSetID, PieceID: &firstPieceID, RetrievalURL: &retrievalURL,
+	}})
+	secondProviderID := onChainID(t, "702")
+	binding, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: secondProviderID, CopyIndex: 1, CreatedByContentID: content.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding(second): %v", err)
+	}
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: binding.ID, ContentID: content.ID, DataSetID: onChainID(t, "802"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady(second): %v", err)
+	}
+	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: binding.ID, CopyIndex: 1,
+		TransferMethod: model.StorageCopyTransferMethodPeerPull, ProviderID: secondProviderID,
+	}}); err != nil {
+		t.Fatalf("CreateUploadCopiesForBindings(second): %v", err)
+	}
+	secondCopy, err := repos.Contents.GetUploadCopy(ctx, content.ID, 1)
+	if err != nil || secondCopy == nil {
+		t.Fatalf("GetUploadCopy(second) = %#v, %v", secondCopy, err)
+	}
+	if err := repos.Contents.MarkUploadCopyPieceReady(ctx, repository.MarkUploadCopyPieceReadyInput{
+		StorageCopyID: secondCopy.ID, ContentID: content.ID, CopyIndex: 1,
+		PieceCID: "piece-cid", CommitExtraDataHex: "abcd", RequireEligibleCopy: true,
+	}); err != nil {
+		t.Fatalf("MarkUploadCopyPieceReady(second): %v", err)
+	}
+	identity := storagecommit.CopyIdentity{
+		StorageCopyID: secondCopy.ID, ContentID: content.ID, CopyIndex: 1,
+		StorageDataSetID: secondCopy.StorageDataSetID, RequireEligibleCopy: true,
+	}
+	return db, repos, version, secondCopy, identity
+}
+
 func TestStorageCleanupCopyTransitionsAreGuardedAndIdempotent(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -199,6 +478,35 @@ func TestStorageCleanupCopyTransitionsAreGuardedAndIdempotent(t *testing.T) {
 	if err := repos.StorageCleanup.MarkCopyDeleteScheduled(t.Context(), scheduled.ID, "0xother"); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("changed scheduling evidence = %v, want ErrConflict", err)
 	}
+	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), scheduled.ID, "0xtx"); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("retry live request = %v, want ErrConflict", err)
+	}
+	if err := repos.StorageCleanup.MarkCopyFailed(t.Context(), scheduled.ID, "confirmed rejected"); err != nil {
+		t.Fatalf("mark rejected request failed: %v", err)
+	}
+	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), scheduled.ID, "0xwrong"); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("retry wrong transaction = %v, want ErrConflict", err)
+	}
+	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), scheduled.ID, "0xtx"); err != nil {
+		t.Fatalf("begin rejected transaction retry: %v", err)
+	}
+	retrying := new(model.StorageCleanupCopy)
+	if err := db.NewSelect().Model(retrying).Where("id = ?", scheduled.ID).Scan(t.Context()); err != nil {
+		t.Fatalf("reload retrying copy: %v", err)
+	}
+	if retrying.Status != model.StorageCleanupCopyStatusPending || retrying.DeleteTxHash != nil || retrying.LastError != nil || retrying.ScheduledAt != nil {
+		t.Fatalf("retrying cleanup request = %#v", retrying)
+	}
+	if err := repos.StorageCleanup.MarkCopyDeleteScheduled(t.Context(), scheduled.ID, "0xretry"); err != nil {
+		t.Fatalf("schedule retry: %v", err)
+	}
+	replaced := new(model.StorageCleanupCopy)
+	if err := db.NewSelect().Model(replaced).Where("id = ?", scheduled.ID).Scan(t.Context()); err != nil {
+		t.Fatalf("reload retried copy: %v", err)
+	}
+	if replaced.Status != model.StorageCleanupCopyStatusDeleteScheduled || replaced.DeleteTxHash == nil || *replaced.DeleteTxHash != "0xretry" || replaced.ScheduledAt == nil || replaced.ScheduledAt.Before(*first.ScheduledAt) {
+		t.Fatalf("rescheduled cleanup request = %#v", replaced)
+	}
 	if err := repos.StorageCleanup.MarkCopyRemoved(t.Context(), scheduled.ID); err != nil {
 		t.Fatalf("MarkCopyRemoved(scheduled): %v", err)
 	}
@@ -209,6 +517,12 @@ func TestStorageCleanupCopyTransitionsAreGuardedAndIdempotent(t *testing.T) {
 	failed := insertCopy(802)
 	if err := repos.StorageCleanup.MarkCopyFailed(t.Context(), failed.ID, "unknown outcome"); err != nil {
 		t.Fatalf("MarkCopyFailed: %v", err)
+	}
+	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), failed.ID, "old hash"); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("retry hashless copy with wrong hash = %v, want ErrConflict", err)
+	}
+	if err := repos.StorageCleanup.BeginFailedCopyRetry(t.Context(), failed.ID, ""); err != nil {
+		t.Fatalf("retry hashless copy: %v", err)
 	}
 	if err := repos.StorageCleanup.MarkCopyRemoved(t.Context(), failed.ID); err != nil {
 		t.Fatalf("MarkCopyRemoved(failed): %v", err)
