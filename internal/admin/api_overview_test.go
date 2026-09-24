@@ -15,13 +15,41 @@ import (
 	"github.com/strahe/synaps3/internal/observability"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	"github.com/strahe/synaps3/internal/testutil"
+	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
 )
+
+type overviewHealthRepository struct {
+	repository.ObservabilityRepository
+	dataSets  []model.StorageDataSet
+	providers []observability.ProviderState
+	states    []observability.DataSetState
+	checkedAt time.Time
+	err       error
+}
+
+func (r *overviewHealthRepository) OverviewStorageStates(context.Context) ([]model.StorageDataSet, []observability.ProviderState, []observability.DataSetState, *time.Time, *time.Time, error) {
+	return r.dataSets, r.providers, r.states, &r.checkedAt, &r.checkedAt, r.err
+}
+
+func overviewHealthRepo(base repository.ObservabilityRepository, providerStatuses, dataSetStatuses []observability.Status, checkedAt time.Time) repository.ObservabilityRepository {
+	r := &overviewHealthRepository{ObservabilityRepository: base, checkedAt: checkedAt}
+	for i, status := range providerStatuses {
+		r.providers = append(r.providers, observability.ProviderState{ProviderID: types.NewOnChainID(uint64(i + 1)), Status: status})
+	}
+	for i, status := range dataSetStatuses {
+		providerID := types.NewOnChainID(uint64(i%len(providerStatuses) + 1))
+		r.dataSets = append(r.dataSets, model.StorageDataSet{ID: int64(i + 1), ProviderID: providerID})
+		r.states = append(r.states, observability.DataSetState{LocalDataSetID: int64(i + 1), Status: status})
+	}
+	return r
+}
 
 func TestAPIOverviewFilecoinStorageHealthUsesObservabilitySummaries(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	checkedAt := time.Now().UTC()
+	repos.Observability = overviewHealthRepo(repos.Observability, []observability.Status{observability.StatusAvailable, observability.StatusAvailable}, []observability.Status{observability.StatusAvailable, observability.StatusAvailable, observability.StatusAvailable}, checkedAt)
 	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
@@ -56,7 +84,8 @@ func TestAPIOverviewFilecoinStorageHealthUsesObservabilitySummaries(t *testing.T
 func TestAPIOverviewFilecoinStorageHealthWarnsForObservabilitySignalsWithoutReinterpretingSummary(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	checkedAt := time.Now().UTC()
+	repos.Observability = overviewHealthRepo(repos.Observability, []observability.Status{observability.StatusDegraded}, []observability.Status{observability.StatusUnknown}, checkedAt)
 	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
@@ -79,10 +108,11 @@ func TestAPIOverviewFilecoinStorageHealthWarnsForObservabilitySignalsWithoutRein
 	}
 }
 
-func TestAPIOverviewFilecoinStorageHealthRollsUpBlockingObservabilitySignal(t *testing.T) {
+func TestAPIOverviewKeepsBlockingLevelWhenObservationsAreStale(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
-	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	checkedAt := time.Now().UTC().Add(-10 * time.Minute)
+	repos.Observability = overviewHealthRepo(repos.Observability, []observability.Status{observability.StatusUnavailable}, []observability.Status{observability.StatusAvailable}, checkedAt)
 	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
@@ -102,6 +132,9 @@ func TestAPIOverviewFilecoinStorageHealthRollsUpBlockingObservabilitySignal(t *t
 	body := decodeOverviewResponse(t, srv)
 	if body.FilecoinStorageHealth.Level != observability.SignalBlocking {
 		t.Fatalf("filecoin storage health level = %s, want blocking", body.FilecoinStorageHealth.Level)
+	}
+	if !body.FilecoinStorageHealth.Providers.SummarySignal.Freshness.Stale {
+		t.Fatal("provider observation should be stale")
 	}
 }
 
@@ -125,6 +158,7 @@ func TestAPIOverviewFilecoinStorageHealthHandlesMissingObservability(t *testing.
 func TestAPIOverviewFilecoinStorageHealthHandlesObservabilityQueryFailures(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
+	repos.Observability = &overviewHealthRepository{ObservabilityRepository: repos.Observability, err: errors.New("provider rpc failed with sensitive detail")}
 	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).
 		WithObservability(observability.NewService(observability.ServiceOptions{
 			Store: &observabilityStateStore{
@@ -138,11 +172,8 @@ func TestAPIOverviewFilecoinStorageHealthHandlesObservabilityQueryFailures(t *te
 	if body.FilecoinStorageHealth.Level != observability.SignalWarning {
 		t.Fatalf("filecoin storage health level = %s, want warning", body.FilecoinStorageHealth.Level)
 	}
-	if got := body.FilecoinStorageHealth.PartialErrors["observability_providers"]; got != "provider health query failed" {
-		t.Fatalf("provider partial error = %q, want sanitized query failure", got)
-	}
-	if got := body.FilecoinStorageHealth.PartialErrors["observability_data_sets"]; got != "data set health query failed" {
-		t.Fatalf("data set partial error = %q, want sanitized query failure", got)
+	if got := body.FilecoinStorageHealth.PartialErrors["observability"]; got != "storage health query failed" {
+		t.Fatalf("storage partial error = %q, want sanitized query failure", got)
 	}
 }
 
@@ -150,7 +181,8 @@ func TestAPIOverviewFilecoinStorageHealthIgnoresTaskPressure(t *testing.T) {
 	db := testutil.NewTestDB(t)
 	repos := repository.NewRepositories(db)
 	taskService := newAdminTestTaskService(t, repos)
-	checkedAt := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	checkedAt := time.Now().UTC()
+	repos.Observability = overviewHealthRepo(repos.Observability, []observability.Status{observability.StatusAvailable}, []observability.Status{observability.StatusAvailable}, checkedAt)
 	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageStore, "running", model.TaskStatusRunning)
 	overviewSeedTask(t, taskService, repos, model.TaskTypeStorageStore, "failed", model.TaskStatusFailed)
 	srv := newTestServer(":0", db, &stubCache{rootDir: t.TempDir()}, 100, repos, nil, nil, config.DefaultFilecoinCopies, testLogger()).

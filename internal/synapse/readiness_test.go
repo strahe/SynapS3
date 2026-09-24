@@ -200,6 +200,23 @@ func TestReadinessCheckerStorageErrorsAreUnknownAndSanitized(t *testing.T) {
 	}
 }
 
+func TestReadinessCheckerDoesNotBlockOnPartialProviderInventory(t *testing.T) {
+	cfg := readyReadinessConfig()
+	cfg.DefaultCopies = 3
+	client := readyReadinessClient(2)
+	client.storage.infoErr = errors.New("provider lookup failed")
+	checker := NewReadinessChecker(cfg, client)
+
+	got := checker.CheckRuntime(context.Background())
+
+	requireResultStatus(t, got, ReadinessStatusUnknown)
+	requireCheckStatus(t, got.Checks, "providers", ReadinessStatusUnknown)
+	requireCheckStatus(t, got.Checks, "fwss_approval", ReadinessStatusUnknown)
+	if len(client.storage.costRefs) != 0 {
+		t.Fatalf("cost refs = %d, want none after incomplete provider inventory", len(client.storage.costRefs))
+	}
+}
+
 func TestReadinessCheckerDoesNotWarnForCancelledRequests(t *testing.T) {
 	cfg := readyReadinessConfig()
 	client := readyReadinessClient(1)

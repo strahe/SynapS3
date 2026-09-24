@@ -498,6 +498,18 @@ func (r *BunStorageContentRepo) ReleaseCommitAttention(ctx context.Context, inpu
 			}
 			return err
 		}
+		if initial.ActiveTaskID != nil {
+			res, err := db.NewUpdate().Model((*model.Task)(nil)).
+				Set("updated_at = updated_at").
+				Where("id = ? AND type = ?", *initial.ActiveTaskID, model.TaskTypeStorageCommit).
+				Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("locking storage commit task: %w", err)
+			}
+			if rows, _ := res.RowsAffected(); rows != 1 {
+				return ErrConflict
+			}
+		}
 		identity := storagecommit.CopyIdentity{
 			StorageCopyID:    initial.ID,
 			ContentID:        initial.ContentID,
@@ -528,10 +540,20 @@ func (r *BunStorageContentRepo) ReleaseCommitAttention(ctx context.Context, inpu
 		if err := projectResolvedCommitAttempt(ctx, db, copyID, now, true, true, nil); err != nil {
 			return fmt.Errorf("releasing storage confirmation attention: %w", err)
 		}
-		if err := wakeCommitFIFOHead(ctx, db, initial.StorageDataSetID); err != nil {
+		current := new(model.StorageCopy)
+		if err := db.NewSelect().Model(current).Where("id = ?", copyID).Scan(ctx); err != nil {
 			return err
 		}
-		return resumeCommitTaskAfterAttentionRelease(ctx, db, initial.ActiveTaskID)
+		if current.ContentID != initial.ContentID || current.StorageDataSetID != initial.StorageDataSetID ||
+			current.CopyIndex != initial.CopyIndex || current.WorkGeneration != initial.WorkGeneration ||
+			(current.ActiveTaskID == nil) != (initial.ActiveTaskID == nil) ||
+			(current.ActiveTaskID != nil && *current.ActiveTaskID != *initial.ActiveTaskID) {
+			return ErrConflict
+		}
+		if err := resumeCommitTaskAfterAttentionRelease(ctx, db, initial.ActiveTaskID); err != nil {
+			return err
+		}
+		return wakeCommitFIFOHead(ctx, db, initial.StorageDataSetID)
 	})
 }
 
@@ -549,6 +571,27 @@ func resumeCommitTaskAfterAttentionRelease(ctx context.Context, db bun.IDB, task
 	}
 	switch taskRow.Status {
 	case model.TaskStatusPending, model.TaskStatusRunning:
+		now := time.Now()
+		res, err := db.NewUpdate().Model((*model.Task)(nil)).
+			Set("status = ?", model.TaskStatusPending).
+			Set("resume_mode = ?", model.TaskResumeModeRecover).
+			Set("available_at = ?", now).
+			Set("retry_count = 0").
+			Set("claimed_at = NULL").
+			Set("lease_until = NULL").
+			Set("wait_reason = NULL").
+			Set("failure_reason = NULL").
+			Set("last_error = NULL").
+			Set("status_message = NULL").
+			Set("updated_at = ?", now).
+			Where("id = ? AND type = ? AND status = ? AND claim_generation = ?", taskRow.ID, model.TaskTypeStorageCommit, taskRow.Status, taskRow.ClaimGeneration).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("resuming released storage commit task: %w", err)
+		}
+		if rows, _ := res.RowsAffected(); rows != 1 {
+			return ErrConflict
+		}
 		return nil
 	case model.TaskStatusFailed:
 		if err := tasks.RetryFailed(ctx, taskRow.ID); err != nil {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -894,8 +896,8 @@ func TestAdvancerAttemptOnlyUsesPieceStatusAsDiagnosticEvidence(t *testing.T) {
 	}
 }
 
-func TestReleaseCommitAttentionResumesFencedFailedTask(t *testing.T) {
-	db := testutil.NewTestDB(t)
+func seedCommitAttentionTask(t *testing.T, db *bun.DB) (*repository.Repositories, model.StorageCopy, *model.Task, string) {
+	t.Helper()
 	repos := repository.NewRepositories(db)
 	_, copies, _ := seedAdvancerCopies(t, db, 1)
 	copyRow := copies[0]
@@ -935,6 +937,11 @@ func TestReleaseCommitAttentionResumesFencedFailedTask(t *testing.T) {
 	if err != nil || claimed == nil || claimed.ID != taskRow.ID {
 		t.Fatalf("claim commit task = %#v err=%v", claimed, err)
 	}
+	return repos, copyRow, claimed, attemptID
+}
+
+func TestReleaseCommitAttentionResumesFencedFailedTask(t *testing.T) {
+	repos, copyRow, claimed, attemptID := seedCommitAttentionTask(t, testutil.NewTestDB(t))
 	reason := string(storagecommit.AttentionAttemptOnlyAmbiguous)
 	message := "storage registration requires attention"
 	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
@@ -949,15 +956,105 @@ func TestReleaseCommitAttentionResumesFencedFailedTask(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("release commit attention: %v", err)
 	}
-	resumed, err := repos.Tasks.GetByID(t.Context(), taskRow.ID)
+	resumed, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
 	if err != nil || resumed == nil || resumed.Status != model.TaskStatusPending ||
 		resumed.ResumeMode != model.TaskResumeModeRecover || resumed.RetryCount != 0 {
 		t.Fatalf("resumed task = %#v err=%v", resumed, err)
 	}
 	persisted := loadAdvancerCopy(t, repos, copyRow.ID)
 	if persisted.Status != model.StorageCopyStatusPieceReady || persisted.CommitAttemptID != nil ||
-		persisted.ActiveTaskID == nil || *persisted.ActiveTaskID != taskRow.ID {
+		persisted.ActiveTaskID == nil || *persisted.ActiveTaskID != claimed.ID {
 		t.Fatalf("released copy = %#v, want piece-ready copy fenced to resumed task", persisted)
+	}
+}
+
+func TestReleaseCommitAttentionFencesRunningTask(t *testing.T) {
+	repos, copyRow, claimed, attemptID := seedCommitAttentionTask(t, testutil.NewTestDB(t))
+	if err := repos.Contents.ReleaseCommitAttention(t.Context(), storagecommit.ManualReleaseInput{
+		CopyID: copyRow.ID, ExpectedAttemptID: attemptID, AcknowledgePossibleDuplicate: true,
+	}); err != nil {
+		t.Fatalf("release commit attention: %v", err)
+	}
+	if err := repos.Tasks.Settle(t.Context(), claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
+		Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover,
+	}); !errors.Is(err, repository.ErrTaskLeaseLost) {
+		t.Fatalf("old task settlement = %v, want lost lease", err)
+	}
+	resumed, err := repos.Tasks.GetByID(t.Context(), claimed.ID)
+	if err != nil || resumed == nil || resumed.Status != model.TaskStatusPending ||
+		resumed.ResumeMode != model.TaskResumeModeRecover || resumed.LeaseUntil != nil || resumed.ClaimedAt != nil {
+		t.Fatalf("resumed task = %#v err=%v", resumed, err)
+	}
+	persisted := loadAdvancerCopy(t, repos, copyRow.ID)
+	if persisted.Status != model.StorageCopyStatusPieceReady || persisted.CommitAttemptID != nil ||
+		persisted.ActiveTaskID == nil || *persisted.ActiveTaskID != claimed.ID {
+		t.Fatalf("released copy = %#v", persisted)
+	}
+	next, err := repos.Tasks.ClaimNext(t.Context(), time.Minute)
+	if err != nil || next == nil || next.ID != claimed.ID || next.ClaimGeneration <= claimed.ClaimGeneration ||
+		next.ResumeMode != model.TaskResumeModeRecover {
+		t.Fatalf("next claim = %#v err=%v", next, err)
+	}
+}
+
+type commitReleaseTaskLockSignal struct {
+	once    sync.Once
+	started chan struct{}
+}
+
+type commitReleaseContextKey struct{}
+
+func (h *commitReleaseTaskLockSignal) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	query := strings.ToLower(event.Query)
+	if ctx.Value(commitReleaseContextKey{}) != nil && strings.Contains(query, "update") &&
+		strings.Contains(query, "tasks") && strings.Contains(query, "updated_at = updated_at") {
+		h.once.Do(func() { close(h.started) })
+	}
+	return ctx
+}
+
+func (*commitReleaseTaskLockSignal) AfterQuery(context.Context, *bun.QueryEvent) {}
+
+func TestPostgresReleaseCommitAttentionLocksTaskBeforeStorage(t *testing.T) {
+	db := testutil.NewTestPostgresDB(t)
+	repos, copyRow, claimed, attemptID := seedCommitAttentionTask(t, db)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin settlement: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := repository.NewRepositories(tx).Tasks.ValidateClaim(ctx, claimed.ID, claimed.ClaimGeneration); err != nil {
+		t.Fatalf("lock settling task: %v", err)
+	}
+	signal := &commitReleaseTaskLockSignal{started: make(chan struct{})}
+	db.AddQueryHook(signal)
+	released := make(chan error, 1)
+	go func() {
+		releaseCtx := context.WithValue(ctx, commitReleaseContextKey{}, true)
+		released <- repos.Contents.ReleaseCommitAttention(releaseCtx, storagecommit.ManualReleaseInput{
+			CopyID: copyRow.ID, ExpectedAttemptID: attemptID, AcknowledgePossibleDuplicate: true,
+		})
+	}()
+	select {
+	case <-signal.started:
+	case <-ctx.Done():
+		t.Fatalf("release did not try to lock the task first: %v", ctx.Err())
+	}
+	if _, err := tx.NewRaw("UPDATE storage_contents SET updated_at = updated_at WHERE id = ?", copyRow.ContentID).Exec(ctx); err != nil {
+		t.Fatalf("settlement storage lock: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit settlement: %v", err)
+	}
+	select {
+	case err := <-released:
+		if err != nil {
+			t.Fatalf("release after settlement lock: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("release deadlocked with settlement: %v", ctx.Err())
 	}
 }
 

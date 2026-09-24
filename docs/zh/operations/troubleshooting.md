@@ -132,11 +132,11 @@ synaps3 admin task list --status failed --limit 100
 synaps3 admin task retry 42
 ```
 
-API 会标明每个失败任务是否可使用 Retry。存储提供方替换从 **Details** → **Storage** → **Data Sets** 恢复。只有尚未发出广播的钱包操作可以从 Tasks 恢复；广播结果不确定时仍不可重试。Store 结果不确定时会提供 **Check again**，它只观察存储提供方，不会再次上传。远端副本删除超过 24 小时仍无法确认时，**Recover** 会先检查链上状态；若副本仍存在且未排队删除，可能再次提交付费请求，而先前的请求仍可能成功。若数据集在链上不再活跃，链上无法据此确认这份副本已删除，任务会继续核查，不会将其记为已删除。只有在核对失败结果后才使用 **Dismiss** 或 `synaps3 admin task acknowledge <id>`；确认后的任务会继续保留配置的时长，再由后台清理。失败任务积压时，任务页的 **Dismiss all** 会处理当前操作类型筛选下的失败任务，命令行对应 `synaps3 admin task acknowledge --type <操作> --yes`；在你确认之后才记录的失败仍会留在列表里。
+API 会标明每个失败任务是否可使用 Retry。存储提供方替换从 **Details** → **Storage** → **Data Sets** 恢复。只有尚未发出广播的钱包操作可以从 Tasks 恢复；广播结果不确定时仍不可重试。Store 失败时可使用 **Retry upload**；它先检查提供方，确认分片缺失才重新上传。远端副本删除超过 24 小时仍无法确认时，**Recover** 会先检查链上状态；若副本仍存在且未排队删除，可能再次提交付费请求，而先前的请求仍可能成功。若数据集在链上不再活跃，链上无法据此确认这份副本已删除，任务会继续核查，不会将其记为已删除。只有在核对失败结果后才使用 **Dismiss** 或 `synaps3 admin task acknowledge <id>`；确认后的任务会继续保留配置的时长，再由后台清理。失败任务积压时，任务页的 **Dismiss all** 会处理当前操作类型筛选下的失败任务，命令行对应 `synaps3 admin task acknowledge --type <操作> --yes`；在你确认之后才记录的失败仍会留在列表里。
 
 ## 存储提供方或 RPC 问题
 
-在仪表盘查看存储提供方健康状态和 Filecoin readiness，或检查 Admin API：
+在 Overview 查看本节点存储健康状态，在 Settings 查看 Filecoin readiness，或检查 Admin API：
 
 ```bash
 curl -u admin http://127.0.0.1:9090/api/v1/filecoin/readiness

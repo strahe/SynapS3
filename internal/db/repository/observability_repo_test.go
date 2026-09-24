@@ -8,6 +8,8 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/storagereplacement"
+	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
 )
 
@@ -88,6 +90,155 @@ func TestObservabilityRepoReplacesProviderStatesAndSummarizes(t *testing.T) {
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ProviderID.String() != "101" {
 		t.Fatalf("provider page after prune = total:%d items:%+v, want only provider 101", page.Total, page.Items)
+	}
+}
+
+func TestOverviewStorageStatesUsesLocalDependenciesWithoutFilteringGlobalObservations(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "overview-local")
+	current := seedStorageDataSet(t, db, bucket.ID, "101", "1001", model.StorageDataSetStatusReady)
+	retiredBucket := seedBucket(t, db, "overview-retired")
+	retired := seedStorageDataSet(t, db, retiredBucket.ID, "202", "2002", model.StorageDataSetStatusReady)
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("is_current = ?", false).Set("status = ?", model.StorageDataSetStatusRetired).
+		Where("id = ?", retired.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	checkedAt := time.Now().UTC()
+	if err := repos.Observability.ReplaceProviderStates(t.Context(), checkedAt, []observability.ProviderState{
+		{ProviderID: current.ProviderID, Status: observability.StatusAvailable},
+		{ProviderID: retired.ProviderID, Status: observability.StatusUnavailable},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Observability.ReplaceDataSetStates(t.Context(), checkedAt, []observability.DataSetState{
+		{
+			LocalDataSetID: current.ID, BucketID: bucket.ID, CopyIndex: current.CopyIndex,
+			ProviderID: current.ProviderID, Status: observability.StatusAvailable,
+		},
+		{
+			LocalDataSetID: retired.ID, BucketID: retiredBucket.ID, CopyIndex: retired.CopyIndex,
+			ProviderID: retired.ProviderID, Status: observability.StatusUnavailable,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dataSets, providers, states, providerCheckedAt, dataSetCheckedAt, err := repos.Observability.OverviewStorageStates(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dataSets) != 1 || dataSets[0].ID != current.ID || len(providers) != 1 || providers[0].ProviderID.String() != current.ProviderID.String() || len(states) != 1 || states[0].LocalDataSetID != current.ID {
+		t.Fatalf("scoped states = data sets:%#v providers:%#v observations:%#v", dataSets, providers, states)
+	}
+	if providerCheckedAt == nil || dataSetCheckedAt == nil {
+		t.Fatal("scoped overview lost collection freshness")
+	}
+	global, err := repos.Observability.ListProviderStates(t.Context(), observability.ListOptions{})
+	if err != nil || global.Summary.Total != 2 {
+		t.Fatalf("global provider observations = %#v, err=%v", global, err)
+	}
+}
+
+func TestOverviewStorageStatesIncludesBothSidesOfUnfinishedReplacement(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "overview-replacement")
+	source, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "301"), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, created, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID,
+		SelectionMode:    storagereplacement.SelectionModeManual,
+		TargetProviderID: onChainID(t, "302"), ClientRequestID: "overview-replacement",
+	})
+	if err != nil || !created {
+		t.Fatalf("replacement = %#v, created=%v, err=%v", replacement, created, err)
+	}
+	sets, _, _, _, _, err := repos.Observability.OverviewStorageStates(t.Context())
+	if err != nil || len(sets) != 2 {
+		t.Fatalf("unfinished replacement data sets = %#v, err=%v", sets, err)
+	}
+	seen := map[int64]bool{}
+	for _, row := range sets {
+		seen[row.ID] = true
+	}
+	if !seen[source.ID] || !seen[replacement.TargetDataSetID] {
+		t.Fatalf("replacement source and target missing: %#v", sets)
+	}
+	if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
+		Set("status = ?", storagereplacement.StatusCompleted).Where("id = ?", replacement.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	sets, _, _, _, _, err = repos.Observability.OverviewStorageStates(t.Context())
+	if err != nil || len(sets) != 1 || sets[0].ID != source.ID {
+		t.Fatalf("completed replacement without readable old copy = %#v, err=%v", sets, err)
+	}
+}
+
+func TestOverviewStorageStatesKeepsReadableOlderGenerationOnlyWhileReferenced(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "overview-old-readable")
+	content, err := repos.Contents.EnsureContent(t.Context(), repository.EnsureContentInput{
+		BucketID: bucket.ID, ContentSize: 128,
+		Checksum: testutil.StorageChecksum("overview-old-readable"), RequestedCopies: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := &model.ObjectVersion{
+		VersionID: model.NewVersionID(), BucketID: bucket.ID,
+		Key: "old.bin", ContentID: &content.ID, Size: 128, ETag: "old", ContentType: "application/octet-stream",
+	}
+	if _, err := repos.Objects.CreateVersionAndSetCurrent(t.Context(), version); err != nil {
+		t.Fatal(err)
+	}
+	old, err := repos.Contents.EnsureDataSetBinding(t.Context(), repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "401"), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSetID := onChainID(t, "1401")
+	clientID := onChainID(t, "2401")
+	if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
+		ID: old.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Contents.CreateUploadCopiesForBindings(t.Context(), content.ID, []repository.UploadCopyBindingInput{{
+		StorageDataSetID: old.ID, CopyIndex: 0, ProviderID: old.ProviderID,
+		TransferMethod: model.StorageCopyTransferMethodIngress,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	copies, err := repos.Contents.ListCopies(t.Context(), content.ID)
+	if err != nil || len(copies) != 1 {
+		t.Fatalf("copies = %#v, err=%v", copies, err)
+	}
+	pieceID := onChainID(t, "51")
+	testutil.CommitStorageCopy(t, db, repos, repository.MarkUploadCopyCommittedInput{
+		StorageCopyID: copies[0].ID, ContentID: content.ID, CopyIndex: 0,
+		PieceCID: "bafk2bzacecoverviewold", PieceID: &pieceID, RetrievalURL: "https://old.example/piece",
+	})
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("is_current = ?", false).
+		Where("id = ?", old.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	sets, _, _, _, _, err := repos.Observability.OverviewStorageStates(t.Context())
+	if err != nil || len(sets) != 1 || sets[0].ID != old.ID {
+		t.Fatalf("readable old data set = %#v, err=%v", sets, err)
+	}
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).Set("status = ?", model.StorageDataSetStatusRetired).
+		Where("id = ?", old.ID).Exec(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	sets, _, _, _, _, err = repos.Observability.OverviewStorageStates(t.Context())
+	if err != nil || len(sets) != 0 {
+		t.Fatalf("retired old data set = %#v, err=%v", sets, err)
 	}
 }
 

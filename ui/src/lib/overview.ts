@@ -242,6 +242,8 @@ export function filecoinStorageHealthReadyPercent(available: number, total: numb
 }
 
 export function filecoinStorageHealthStatusLabel(health: OverviewData['filecoin_storage_health']) {
+  if (health.providers?.summary_signal.freshness.stale || health.data_sets?.summary_signal.freshness.stale)
+    return hasFreshBlockingStorageHealthSignal(health) ? 'Blocked' : 'Health data outdated'
   if (Object.keys(health.partial_errors ?? {}).length > 0) return filecoinStorageHealthLevelLabel(health.level)
   if (health.level === 'blocking') return filecoinStorageHealthLevelLabel(health.level)
   if (hasFilecoinStorageHealthIssue(health.data_sets)) return 'Degraded'
@@ -249,6 +251,20 @@ export function filecoinStorageHealthStatusLabel(health: OverviewData['filecoin_
   if (!filecoinStorageHealthStateRecorded(health.data_sets) || !filecoinStorageHealthStateRecorded(health.providers))
     return 'Checking'
   return filecoinStorageHealthLevelLabel(health.level)
+}
+
+export function filecoinStorageHealthDisplayLevel(
+  health: OverviewData['filecoin_storage_health']
+): FilecoinStorageHealthLevel {
+  if (!health.providers?.summary_signal.freshness.stale && !health.data_sets?.summary_signal.freshness.stale)
+    return health.level
+  return hasFreshBlockingStorageHealthSignal(health) ? 'blocking' : 'warning'
+}
+
+function hasFreshBlockingStorageHealthSignal(health: OverviewData['filecoin_storage_health']) {
+  return [health.providers, health.data_sets].some(
+    (section) => section?.summary_signal.level === 'blocking' && !section.summary_signal.freshness.stale
+  )
 }
 
 export function filecoinStorageHealthPartialErrorRows(partialErrors: Record<string, string>) {

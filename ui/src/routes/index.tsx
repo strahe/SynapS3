@@ -10,6 +10,7 @@ import { useOverview } from '@/hooks/queries'
 import {
   attentionDisplayRows,
   filecoinStorageHealthCheckedLabel,
+  filecoinStorageHealthDisplayLevel,
   filecoinStorageHealthLevelStyle,
   filecoinStorageHealthPartialErrorRows,
   filecoinStorageHealthStatusLabel,
@@ -159,7 +160,7 @@ function StorageHealthCard({ health }: { health: OverviewData['filecoin_storage_
   const partialErrors = filecoinStorageHealthPartialErrorRows(health.partial_errors ?? {})
   const providers = filecoinStorageHealthSummaryRow('providers', 'Providers', health.providers)
   const dataSets = filecoinStorageHealthSummaryRow('data_sets', 'Data Sets', health.data_sets)
-  const healthStyle = filecoinStorageHealthLevelStyle(health.level)
+  const healthStyle = filecoinStorageHealthLevelStyle(filecoinStorageHealthDisplayLevel(health))
   return (
     <Card size="sm">
       <CardContent>
@@ -172,7 +173,7 @@ function StorageHealthCard({ health }: { health: OverviewData['filecoin_storage_
               </span>
             </div>
             <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-baseline gap-3">
-              <span className="text-muted-foreground">Storage copies</span>
+              <span className="text-muted-foreground">Data sets</span>
               <span className="truncate font-semibold text-foreground">
                 {formatOptionalNumber(dataSets.available)} / {formatOptionalNumber(dataSets.total)} ready
               </span>
@@ -180,7 +181,7 @@ function StorageHealthCard({ health }: { health: OverviewData['filecoin_storage_
             </div>
             <div
               role="progressbar"
-              aria-label="Storage copy readiness"
+              aria-label="Data set readiness"
               aria-valuemin={dataSets.readyPercent != null ? 0 : undefined}
               aria-valuemax={dataSets.readyPercent != null ? 100 : undefined}
               aria-valuenow={dataSets.readyPercent ?? undefined}

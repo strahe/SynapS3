@@ -67,7 +67,7 @@ SynapS3 不会修改不兼容的数据库。废弃的 `worker.upload`、`worker.
 - 只重试仪表盘或 API 标记为可重试的失败任务。
 - 从 **Details** → **Storage** → **Data Sets** 恢复存储提供方替换。
 - 钱包操作只有在尚未发出广播时才能从 Tasks 重试；广播结果不确定时仍不可重试。
-- Store 结果不确定时，**Check again** 只查询存储提供方，不会重新上传对象。
+- **Retry upload** 会先检查存储提供方是否已有分片；确认缺失后才重新上传。重传可能增加带宽用量或开启另一次上传会话。
 - `status=failed` 只列出尚未确认的失败；使用 `status=dismissed` 查看已确认的失败。
 - 使用 `synaps3 admin storage-confirmation list` 核对尚未解决的存储确认。
 

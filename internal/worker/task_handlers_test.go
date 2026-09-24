@@ -473,11 +473,7 @@ func (p *recordingWorkerEvents) Publish(topic string, payload map[string]any) {
 	}
 }
 
-// TestTerminalStoreFailureSettlesCopyAndContent checks that a store failure
-// settles everything the transfer owns: the copy is failed and unbound, ingress
-// progress stays on the copy that produced it, and the version's derived
-// position follows the copies to failed without a stored column.
-func TestTerminalStoreFailureSettlesCopyAndContent(t *testing.T) {
+func TestStoreResultMismatchRetainsCopyAndCheckpoint(t *testing.T) {
 	events := &recordingWorkerEvents{events: make(chan recordedWorkerEvent, 8)}
 	cacheStore := &testutil.MockCache{GetFunc: func(context.Context, string, string) (io.ReadCloser, *cache.ObjectInfo, error) {
 		return io.NopCloser(strings.NewReader(strings.Repeat("s", 128))), &cache.ObjectInfo{Size: 128}, nil
@@ -572,11 +568,11 @@ func TestTerminalStoreFailureSettlesCopyAndContent(t *testing.T) {
 	failedTask := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusFailed
 	})
-	if runtime.service.Retryable(failedTask) {
-		t.Fatal("terminal copy task is unexpectedly retryable")
+	if !runtime.service.Retryable(failedTask) || len(failedTask.Checkpoint) == 0 {
+		t.Fatal("Store result failure lost its recovery checkpoint")
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(ctx, copies[0].ID)
-	if err != nil || copyRow.Status != model.StorageCopyStatusFailed || copyRow.ActiveTaskID != nil {
+	if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID {
 		t.Fatalf("terminal copy = %#v, err=%v", copyRow, err)
 	}
 	// Ingress progress belongs to the transfer, so it survives on the copy.
@@ -584,7 +580,7 @@ func TestTerminalStoreFailureSettlesCopyAndContent(t *testing.T) {
 		t.Fatalf("terminal copy progress = attempt:%d bytes:%d at:%v", copyRow.IngressStoreAttempt, copyRow.IngressBytesTransferred, copyRow.ProgressUpdatedAt)
 	}
 	storedVersion, err := runtime.repos.Objects.GetVersionByID(ctx, version.VersionID)
-	if err != nil || storedVersion.State != model.ObjectStateFailed {
+	if err != nil || storedVersion.State != model.ObjectStateUploading {
 		t.Fatalf("terminal version = %#v, err=%v", storedVersion, err)
 	}
 }
@@ -2948,8 +2944,8 @@ func TestStoreManualRetryRequiresUnsettledRecoveryEvidence(t *testing.T) {
 		{name: "checkpointed owner missing", reason: "copy_owner_missing", checkpoint: checkpoint, want: true},
 		{name: "context failure before checkpoint", reason: "copy_context_failed"},
 		{name: "invalid checkpoint", reason: "invalid_checkpoint", checkpoint: checkpoint},
-		{name: "settled store result failure", reason: "store_result_invalid", checkpoint: checkpoint},
-		{name: "settled presign failure", reason: "commit_presign_failed", checkpoint: checkpoint},
+		{name: "store result failure", reason: "store_result_invalid", checkpoint: checkpoint, want: true},
+		{name: "presign failure", reason: "commit_presign_failed", checkpoint: checkpoint, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2965,7 +2961,7 @@ func TestStoreManualRetryRequiresUnsettledRecoveryEvidence(t *testing.T) {
 	}
 }
 
-func TestStoreUnknownRecoveryOnlyRechecksParkedPiece(t *testing.T) {
+func TestStoreRecoveryRetriesMissingPieceAfterCheckpoint(t *testing.T) {
 	payload := strings.Repeat("parked-store", 12)
 	payload = payload[:128]
 	info, err := piece.Calculate(strings.NewReader(payload))
@@ -3018,6 +3014,10 @@ func TestStoreUnknownRecoveryOnlyRechecksParkedPiece(t *testing.T) {
 		},
 	})
 	pipeline := seedCopyPipeline(t, runtime, model.StorageCopyStatusPending)
+	if _, err := runtime.db.NewUpdate().Model((*model.StorageCopy)(nil)).Set("transfer_method = ?", model.StorageCopyTransferMethodCacheRestore).
+		Where("id = ?", pipeline.target.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("set cache restore transfer: %v", err)
+	}
 	version := &model.ObjectVersion{
 		VersionID: model.NewVersionID(), BucketID: pipeline.upload.BucketID, Key: "parked-store.bin",
 		ContentID: &pipeline.upload.ID, Size: pipeline.upload.ContentSize, ETag: "parked-store",
@@ -3039,7 +3039,7 @@ func TestStoreUnknownRecoveryOnlyRechecksParkedPiece(t *testing.T) {
 	}
 	taskRow := bindCopyTask(t, runtime, pipeline.target, model.TaskTypeStorageStore)
 	limitedRepos := *runtime.repos
-	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 5}
+	limited := &limitedClaimRepository{TaskRepository: runtime.repos.Tasks, maximum: 6}
 	limitedRepos.Tasks = limited
 	runtime.repos.Tasks = limited
 	engine, err := taskengine.NewEngine(taskengine.EngineConfig{
@@ -3093,25 +3093,25 @@ func TestStoreUnknownRecoveryOnlyRechecksParkedPiece(t *testing.T) {
 	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
 		t.Fatalf("wake store recovery: %v", err)
 	}
-	failed := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
-		return task.Status == model.TaskStatusFailed
+	retrying := waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
+		return limited.claims.Load() == 5 && task.Status == model.TaskStatusPending && task.ResumeMode == model.TaskResumeModeRecover
 	})
-	if failed.FailureReason == nil || *failed.FailureReason != "store_outcome_unknown" || !runtime.service.Retryable(failed) {
-		t.Fatalf("unknown store task = %#v", failed)
+	if retrying.RetryCount != 1 || storeCalls.Load() != 2 {
+		t.Fatalf("retransmitted store = retry count:%d calls:%d, want 1/2", retrying.RetryCount, storeCalls.Load())
 	}
 	copyRow, err := runtime.repos.Contents.GetUploadCopyByID(t.Context(), pipeline.target.ID)
 	if err != nil || copyRow.Status != model.StorageCopyStatusPending || copyRow.ActiveTaskID == nil || *copyRow.ActiveTaskID != taskRow.ID {
 		t.Fatalf("unknown store copy = %#v, err=%v", copyRow, err)
 	}
 	parkedState.Store(synapse.ParkedPieceReady)
-	if err := runtime.service.Retry(t.Context(), taskRow.ID); err != nil {
-		t.Fatalf("retry unknown store: %v", err)
+	if _, err := runtime.db.NewRaw(`UPDATE tasks SET available_at = ? WHERE id = ?`, time.Now().Add(-time.Second), taskRow.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("wake retransmitted store recovery: %v", err)
 	}
 	waitForTask(t, runtime.repos, taskRow.ID, func(task *model.Task) bool {
 		return task.Status == model.TaskStatusCompleted
 	})
-	if storeCalls.Load() != 1 || cacheOpens.Load() != 2 || parkedCalls.Load() != 4 {
-		t.Fatalf("store recovery calls = store:%d cache:%d parked:%d, want 1/2/4", storeCalls.Load(), cacheOpens.Load(), parkedCalls.Load())
+	if storeCalls.Load() != 2 || cacheOpens.Load() != 4 || parkedCalls.Load() < 5 {
+		t.Fatalf("store recovery calls = store:%d cache:%d parked:%d", storeCalls.Load(), cacheOpens.Load(), parkedCalls.Load())
 	}
 }
 

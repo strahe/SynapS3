@@ -3,11 +3,52 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/uptrace/bun"
 )
+
+// OverviewStorageStates scopes health to local dependencies without changing global observations.
+func (r *BunObservabilityRepo) OverviewStorageStates(ctx context.Context) ([]model.StorageDataSet, []observability.ProviderState, []observability.DataSetState, *time.Time, *time.Time, error) {
+	var dataSets []model.StorageDataSet
+	err := r.db.NewSelect().Model(&dataSets).Where(overviewDataSetDependencySQL("storage_data_set")).Scan(ctx)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	var providers []observability.ProviderState
+	var observedDataSets []observability.DataSetState
+	if err := r.db.NewSelect().Model(&providers).ModelTableExpr("observability_provider_states AS provider_state").
+		Where(`EXISTS (SELECT 1 FROM storage_data_sets AS scoped_data_set
+			WHERE scoped_data_set.provider_id = provider_state.provider_id AND ` + overviewDataSetDependencySQL("scoped_data_set") + `)`).Scan(ctx); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	if err := r.db.NewSelect().Model(&observedDataSets).
+		Where(`EXISTS (SELECT 1 FROM storage_data_sets AS scoped_data_set
+			WHERE scoped_data_set.id = observability_data_set_state.local_data_set_id AND ` + overviewDataSetDependencySQL("scoped_data_set") + `)`).Scan(ctx); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	providerCheckedAt, err := r.collectionLastCheckedAt(ctx, observability.CollectionProviders)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	dataSetCheckedAt, err := r.collectionLastCheckedAt(ctx, observability.CollectionDataSets)
+	return dataSets, providers, observedDataSets, providerCheckedAt, dataSetCheckedAt, err
+}
+
+func overviewDataSetDependencySQL(alias string) string {
+	return fmt.Sprintf(`((%[1]s.is_current AND %[1]s.status <> 'retired')
+		OR EXISTS (SELECT 1 FROM storage_replacements AS replacement
+			WHERE replacement.status NOT IN ('completed', 'superseded')
+			AND (replacement.source_data_set_id = %[1]s.id OR replacement.target_data_set_id = %[1]s.id))
+		OR (%[1]s.status IN ('ready', 'draining') AND EXISTS (
+			SELECT 1 FROM storage_copies AS copy
+			JOIN object_versions AS version ON version.content_id = copy.content_id
+			WHERE copy.storage_data_set_id = %[1]s.id AND %[2]s)))`,
+		alias, readableCommittedCopyPredicateSQL("copy", alias))
+}
 
 const (
 	defaultObservabilityListLimit = 100

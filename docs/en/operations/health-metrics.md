@@ -38,6 +38,8 @@ Failed check:
 
 ## Background Task Activity
 
+The dashboard overview counts this node's data sets and their providers. The Providers page shows the full observed provider list.
+
 SynapS3 reports an unhealthy task processor when it stops reporting activity for longer than its configured health window. This detects stalled background storage even when no upload is active.
 
 Check background task state:

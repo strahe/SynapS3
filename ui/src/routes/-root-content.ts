@@ -1,5 +1,5 @@
 import type { FilecoinReadinessCheck, FilecoinReadinessData, FilecoinReadinessStatus } from '../api/client.ts'
-import { filecoinReadinessSummary, importantFilecoinReadinessChecks } from '../lib/filecoin-readiness.ts'
+import { importantFilecoinReadinessChecks } from '../lib/filecoin-readiness.ts'
 
 export type RootSettingsState = {
   mode: 'ready' | 'setup'
@@ -15,8 +15,11 @@ export type GlobalFilecoinReadinessAlertState =
       summary: string
       status: FilecoinReadinessStatus
       primaryCheck?: FilecoinReadinessCheck
+      details?: FilecoinReadinessData
       failed: boolean
     }
+
+const provisioningCheckIds = new Set(['providers', 'storage_cost', 'payment_funding', 'fwss_approval'])
 
 export function rootUsesSetupShell(settings: RootSettingsState | undefined) {
   return settings?.mode === 'setup' || settings?.runtime_available === false
@@ -62,25 +65,17 @@ export function globalFilecoinReadinessAlertState({
 
   if (!data) return { show: false }
 
-  const visibleChecks = importantFilecoinReadinessChecks(data.checks, dismissedCheckIds)
+  const checks = data.checks.filter((check) => !provisioningCheckIds.has(check.id))
+  const visibleChecks = importantFilecoinReadinessChecks(checks, dismissedCheckIds)
   const primaryCheck = visibleChecks[0]
   if (primaryCheck?.status === 'blocked' || primaryCheck?.status === 'unknown') {
     return {
       show: true,
       title: filecoinReadinessAlertTitle(primaryCheck.status),
-      summary: filecoinReadinessSummary(data, dismissedCheckIds),
+      summary: primaryCheck.message,
       status: primaryCheck.status,
       primaryCheck,
-      failed: false,
-    }
-  }
-
-  if (data.checks.length === 0 && (data.status === 'blocked' || data.status === 'unknown')) {
-    return {
-      show: true,
-      title: filecoinReadinessAlertTitle(data.status),
-      summary: filecoinReadinessSummary(data, dismissedCheckIds),
-      status: data.status,
+      details: { ...data, status: primaryCheck.status, checks },
       failed: false,
     }
   }
