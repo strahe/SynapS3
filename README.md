@@ -3,7 +3,6 @@
 [![CI](https://github.com/strahe/SynapS3/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/ci.yml)
 [![S3 Compatibility](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml)
 [![Package](https://img.shields.io/badge/package-GHCR-blue?logo=github)](https://github.com/strahe/SynapS3/pkgs/container/synaps3)
-[![Go Report](https://goreportcard.com/badge/github.com/strahe/synaps3)](https://goreportcard.com/report/github.com/strahe/synaps3)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/strahe/SynapS3?filename=go.mod)](go.mod)
 
 SynapS3 is an open-source, self-hosted S3-compatible gateway for Filecoin storage.
@@ -60,7 +59,7 @@ Writes commit to local cache and metadata before returning success. Reads use lo
 | Multipart | `ListMultipartUploads` | ✅ | Lists open uploads |
 | Multipart | `ListParts` | ✅ | Lists uploaded parts |
 
-Compatibility checks: [runs](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml) · [matrix tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_matrix_test.go) · [client tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_clients_test.go).
+See [S3 Compatibility runs](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml) for individual reports.
 
 ## License
 
