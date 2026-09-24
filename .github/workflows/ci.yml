@@ -114,33 +114,6 @@ jobs:
       - name: Test system runtime
         run: make test-system
 
-      - name: Install pinned S3 clients
-        run: |
-          set -euo pipefail
-          tools_dir="$(mktemp -d)"
-          case "$(uname -m)" in
-            x86_64) aws_arch=x86_64; client_arch=amd64 ;;
-            aarch64|arm64) aws_arch=aarch64; client_arch=arm64 ;;
-            *) echo "Unsupported S3 client architecture" >&2; exit 1 ;;
-          esac
-          mkdir -p "$RUNNER_TEMP/s3-client-bin"
-          curl --fail --location --retry 3 --silent --show-error \
-            "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}-2.31.0.zip" -o "$tools_dir/aws.zip"
-          unzip -q "$tools_dir/aws.zip" -d "$tools_dir"
-          "$tools_dir/aws/install" --install-dir "$RUNNER_TEMP/aws-cli" --bin-dir "$RUNNER_TEMP/s3-client-bin"
-          curl --fail --location --retry 3 --silent --show-error \
-            "https://downloads.rclone.org/v1.71.0/rclone-v1.71.0-linux-${client_arch}.zip" -o "$tools_dir/rclone.zip"
-          unzip -q "$tools_dir/rclone.zip" -d "$tools_dir"
-          install "$tools_dir/rclone-v1.71.0-linux-${client_arch}/rclone" "$RUNNER_TEMP/s3-client-bin/rclone"
-          curl --fail --location --retry 3 --silent --show-error \
-            "https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-${client_arch}.RELEASE.2025-08-13T08-35-41Z" \
-            -o "$RUNNER_TEMP/s3-client-bin/mc"
-          chmod +x "$RUNNER_TEMP/s3-client-bin/mc"
-          echo "$RUNNER_TEMP/s3-client-bin" >> "$GITHUB_PATH"
-
-      - name: Test AWS CLI, rclone, and MinIO Client
-        run: make test-s3-clients
-
       - name: Build dashboard systemtest server
         run: make build-systemtest-server
 

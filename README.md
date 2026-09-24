@@ -1,6 +1,7 @@
 # SynapS3
 
 [![CI](https://github.com/strahe/SynapS3/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/ci.yml)
+[![S3 Compatibility](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml/badge.svg?branch=main)](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml)
 [![Package](https://img.shields.io/badge/package-GHCR-blue?logo=github)](https://github.com/strahe/SynapS3/pkgs/container/synaps3)
 [![Go Report](https://goreportcard.com/badge/github.com/strahe/synaps3)](https://goreportcard.com/report/github.com/strahe/synaps3)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/strahe/SynapS3?filename=go.mod)](go.mod)
@@ -50,7 +51,7 @@ Writes commit to local cache and metadata before returning success. Reads use lo
 | Object | `ListObjects` | ✅ | Marker pagination |
 | Object | `ListObjectsV2` | ✅ | Continuation-token pagination |
 | Object | `ListObjectVersions` | ✅ | Lists object versions and delete markers |
-| Object | `GetObjectAttributes` | ✅ | Reports metadata and multipart `ObjectParts`; `TotalPartsCount` is not emitted |
+| Object | `GetObjectAttributes` | ⚠️ | Reports metadata and multipart `ObjectParts`; `TotalPartsCount` is not emitted |
 | Multipart | `CreateMultipartUpload` | ✅ | Starts an upload |
 | Multipart | `UploadPart` | ✅ | Uploads one part |
 | Multipart | `UploadPartCopy` | ⚠️ | Whole-object copy only; range copy is not supported |
@@ -58,6 +59,8 @@ Writes commit to local cache and metadata before returning success. Reads use lo
 | Multipart | `AbortMultipartUpload` | ✅ | Cancels an upload |
 | Multipart | `ListMultipartUploads` | ✅ | Lists open uploads |
 | Multipart | `ListParts` | ✅ | Lists uploaded parts |
+
+The [S3 Compatibility runs](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml) verify this matrix offline with [operation tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_matrix_test.go) and [AWS CLI, rclone, and MinIO Client tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_clients_test.go). No Filecoin network or wallet transactions are used. To run them locally, install the three clients and run `make test-s3-compatibility`.
 
 ## License
 

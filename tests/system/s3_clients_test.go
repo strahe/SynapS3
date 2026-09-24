@@ -1,4 +1,4 @@
-//go:build systemtest
+//go:build systemtest && s3compat
 
 package system_test
 
@@ -23,11 +23,7 @@ import (
 	"github.com/strahe/synaps3/tests/testutil/e2e"
 )
 
-// TestS3Clients is enabled explicitly in CI so the regular system tests need no external CLIs.
 func TestS3Clients(t *testing.T) {
-	if os.Getenv("SYNAPS3_TEST_S3_CLIENTS") != "1" {
-		t.Skip("set SYNAPS3_TEST_S3_CLIENTS=1 to run external S3 clients")
-	}
 	for _, name := range []string{"aws", "rclone", "mc"} {
 		if _, err := exec.LookPath(name); err != nil {
 			t.Fatalf("required S3 client %s is unavailable: %v", name, err)
@@ -100,7 +96,7 @@ func TestS3Clients(t *testing.T) {
 		get  []string
 	}{
 		{
-			"AWS CLI",
+			"AWS_CLI",
 			[]string{"aws", "--endpoint-url", endpoint, "s3", "cp", "--only-show-errors", input, "s3://s3-clients/aws.bin"},
 			[]string{"aws", "--endpoint-url", endpoint, "s3", "cp", "--only-show-errors", "s3://s3-clients/aws.bin"},
 		},

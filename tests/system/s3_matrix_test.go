@@ -1,4 +1,4 @@
-//go:build systemtest
+//go:build systemtest && s3compat
 
 package system_test
 
