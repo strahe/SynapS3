@@ -60,7 +60,7 @@ Writes commit to local cache and metadata before returning success. Reads use lo
 | Multipart | `ListMultipartUploads` | ✅ | Lists open uploads |
 | Multipart | `ListParts` | ✅ | Lists uploaded parts |
 
-The [S3 Compatibility runs](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml) verify this matrix offline with [operation tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_matrix_test.go) and [AWS CLI, rclone, and MinIO Client tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_clients_test.go). No Filecoin network or wallet transactions are used. To run them locally, install the three clients and run `make test-s3-compatibility`.
+Compatibility checks: [runs](https://github.com/strahe/SynapS3/actions/workflows/s3-compatibility.yml) · [matrix tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_matrix_test.go) · [client tests](https://github.com/strahe/SynapS3/blob/main/tests/system/s3_clients_test.go).
 
 ## License
 
