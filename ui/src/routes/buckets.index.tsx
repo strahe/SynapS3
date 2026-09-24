@@ -490,14 +490,15 @@ function OwnerCell({ ownerAccessKey, users }: { ownerAccessKey: string | null; u
   if (ownerAccessKey === internalRootOwnerAccessKey) {
     return <StatusBadge tone="neutral">Internal root</StatusBadge>
   }
-  const displayValue = ownerLabel(ownerAccessKey, users)
   return (
-    <CopyableValue
-      label="Owner access key"
-      value={ownerAccessKey}
-      displayValue={displayValue}
-      maxLength={displayValue.length}
-    />
+    <div className="max-w-56">
+      <CopyableValue
+        label="Owner access key"
+        value={ownerAccessKey}
+        displayValue={ownerLabel(ownerAccessKey, users)}
+        maxLength={28}
+      />
+    </div>
   )
 }
 

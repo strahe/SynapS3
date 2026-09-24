@@ -211,6 +211,23 @@ test('S3 user name appears in user and owner flows while copying the full access
   await page.getByRole('dialog', { name: 'Change bucket owner' }).getByRole('button', { name: 'Cancel' }).click()
 
   await page.route('**/api/v1/s3-users', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify([
+        { access_key: created.access_key, name: 'L'.repeat(128), role: 'userplus', bucket_count: 1 },
+      ]),
+    })
+  )
+  await page.reload()
+  const longNameOwnerCell = page.getByRole('row').filter({ hasText: 'named-owner-e2e' }).getByRole('cell').nth(1)
+  await expect(longNameOwnerCell).toContainText(created.access_key.slice(-6))
+  await expect
+    .poll(() => longNameOwnerCell.evaluate((cell) => cell.getBoundingClientRect().width))
+    .toBeLessThanOrEqual(256)
+  await page.unroute('**/api/v1/s3-users')
+
+  await page.route('**/api/v1/s3-users', (route) =>
     route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"unavailable"}' })
   )
   await page.reload()
