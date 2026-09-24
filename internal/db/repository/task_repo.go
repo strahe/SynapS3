@@ -191,6 +191,22 @@ func (r *BunTaskRepo) GetByIdentity(ctx context.Context, taskType model.TaskType
 	return task, nil
 }
 
+func (r *BunTaskRepo) PreviousStoreCheckpoints(ctx context.Context, copyID, taskID int64) ([]model.Task, error) {
+	if copyID < 1 || taskID < 1 {
+		return nil, ErrInvalidInput
+	}
+	var tasks []model.Task
+	err := withTaskPayload(r.db.NewSelect().Model(&tasks)).
+		Where("task.type = ? AND task.status = ?", model.TaskTypeStorageStore, model.TaskStatusFailed).
+		Where("task.subject_type = ? AND task.subject_key = ?", "storage_copy", fmt.Sprint(copyID)).
+		Where("task.id <> ? AND task_payload.checkpoint_json IS NOT NULL", taskID).
+		OrderExpr("task.id DESC").Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("selecting previous Store checkpoints: %w", err)
+	}
+	return tasks, nil
+}
+
 func (r *BunTaskRepo) ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error) {
 	if leaseDuration <= 0 {
 		return nil, fmt.Errorf("lease duration must be positive: %w", ErrInvalidInput)
@@ -313,6 +329,22 @@ func (r *BunTaskRepo) WriteCheckpoint(ctx context.Context, id, generation int64,
 		}
 		return nil
 	})
+}
+
+func (r *BunTaskRepo) ConsumeStoreRetry(ctx context.Context, id, generation int64) error {
+	now := time.Now()
+	result, err := r.db.NewUpdate().Model((*model.Task)(nil)).
+		Set("retry_count = retry_count + 1").Set("updated_at = ?", now).
+		Where("id = ? AND type = ? AND status = ?", id, model.TaskTypeStorageStore, model.TaskStatusRunning).
+		Where("claim_generation = ? AND lease_until > ?", generation, now).
+		Where("retry_limit IS NULL OR retry_count < retry_limit").Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("consuming Store retry: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrConflict
+	}
+	return nil
 }
 
 func (r *BunTaskRepo) ValidateClaim(ctx context.Context, id, generation int64) error {
@@ -471,6 +503,7 @@ func (r *BunTaskRepo) RetryFailed(ctx context.Context, id int64) error {
 		Set("resume_mode = ?", model.TaskResumeModeRecover).
 		Set("available_at = ?", now).
 		Set("retry_count = 0").
+		Set("retry_limit = CASE WHEN type = ? AND retry_limit = 0 THEN 1 ELSE retry_limit END", model.TaskTypeStorageStore).
 		Set("failure_reason = NULL").
 		Set("last_error = NULL").
 		Set("status_message = NULL").

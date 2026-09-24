@@ -4,6 +4,7 @@ import type { ObservabilityFreshness, ObservabilitySummary, OverviewData } from 
 import {
   attentionDisplayRows,
   filecoinStorageHealthCheckedLabel,
+  filecoinStorageHealthDisplayLevel,
   filecoinStorageHealthFreshnessLabel,
   filecoinStorageHealthLevelLabel,
   filecoinStorageHealthLevelStyle,
@@ -217,7 +218,7 @@ test('filecoin storage health status label prefers concrete storage and provider
   )
   assert.equal(
     filecoinStorageHealthStatusLabel(
-      filecoinStorageHealthFixture({ providers: { total: 2, available: 1, unavailable: 1 } })
+      filecoinStorageHealthFixture({ providers: { total: 2, available: 1, degraded: 1 } })
     ),
     'Provider degraded'
   )
@@ -227,6 +228,36 @@ test('filecoin storage health status label prefers concrete storage and provider
     ),
     'Blocked'
   )
+})
+
+test('outdated health data takes priority over old provider failures', () => {
+  const health = filecoinStorageHealthFixture(
+    { level: 'blocking', providers: { total: 1, unavailable: 1 } },
+    { providerFreshness: { stale: true, warnings: ['stale_state'], last_checked_at: '2026-01-01T00:00:00Z' } }
+  )
+  assert.equal(filecoinStorageHealthStatusLabel(health), 'Health data outdated')
+  assert.equal(filecoinStorageHealthDisplayLevel(health), 'warning')
+})
+
+test('fresh storage failures remain blocking when the other health group is outdated', () => {
+  for (const staleGroup of ['providers', 'data_sets'] as const) {
+    const health = filecoinStorageHealthFixture(
+      {
+        level: 'blocking',
+        providers: staleGroup === 'data_sets' ? { total: 1, unavailable: 1 } : { total: 1, available: 1 },
+        dataSets: staleGroup === 'providers' ? { total: 1, unavailable: 1 } : { total: 1, available: 1 },
+      },
+      {
+        providerFreshness:
+          staleGroup === 'providers' ? { stale: true, warnings: ['stale_state'] } : { stale: false, warnings: [] },
+        dataSetFreshness:
+          staleGroup === 'data_sets' ? { stale: true, warnings: ['stale_state'] } : { stale: false, warnings: [] },
+      }
+    )
+    assert.equal(filecoinStorageHealthStatusLabel(health), 'Blocked')
+    assert.equal(filecoinStorageHealthDisplayLevel(health), 'blocking')
+    assert.equal(filecoinStorageHealthCheckedLabel(health), 'Stale')
+  }
 })
 
 test('filecoin storage health partial error rows use fixed labels', () => {
@@ -260,14 +291,14 @@ function filecoinStorageHealthFixture(
     providers: {
       summary: filecoinStorageHealthSummaryFixture(providers),
       summary_signal: {
-        level: providers.unavailable || providers.degraded || providers.unknown ? 'warning' : 'ok',
+        level: providers.unavailable ? 'blocking' : providers.degraded || providers.unknown ? 'warning' : 'ok',
         freshness: options.providerFreshness ?? freshness,
       },
     },
     data_sets: {
       summary: filecoinStorageHealthSummaryFixture(dataSets),
       summary_signal: {
-        level: dataSets.unavailable || dataSets.degraded || dataSets.unknown ? 'warning' : 'ok',
+        level: dataSets.unavailable ? 'blocking' : dataSets.degraded || dataSets.unknown ? 'warning' : 'ok',
         freshness: options.dataSetFreshness ?? freshness,
       },
     },

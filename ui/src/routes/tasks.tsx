@@ -386,7 +386,7 @@ function TaskTable({
                       ) : (
                         <RotateCcw data-icon="inline-start" />
                       )}
-                      {task.failure_reason === 'store_outcome_unknown' ? 'Check again' : 'Recover'}
+                      {task.type === 'storage_store' ? 'Retry upload' : 'Recover'}
                     </Button>
                   )}
                   {task.acknowledgeable && (

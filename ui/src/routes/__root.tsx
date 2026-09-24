@@ -319,8 +319,8 @@ function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
                   type="button"
                   variant="outline"
                   size="sm"
-                  disabled={!data}
-                  onClick={() => data && setDetailsOpen(true)}
+                  disabled={!alert.details}
+                  onClick={() => alert.details && setDetailsOpen(true)}
                 >
                   Details
                 </Button>
@@ -331,7 +331,7 @@ function GlobalFilecoinReadinessAlert({ enabled }: { enabled: boolean }) {
       </div>
       <FilecoinReadinessDialog
         title="Filecoin Readiness"
-        data={data}
+        data={alert.details}
         open={detailsOpen}
         onOpenChange={setDetailsOpen}
         dismissedCheckIds={dismissedCheckIds}

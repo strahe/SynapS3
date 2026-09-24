@@ -184,36 +184,74 @@ func (s *Server) filecoinStorageHealthOverview(ctx context.Context) filecoinStor
 		return health
 	}
 
-	providers, err := s.observability.ListProviderObservations(ctx, observability.ListOptions{Limit: 1})
+	dataSetRows, providerStates, dataSetStates, providerCheckedAt, dataSetCheckedAt, err := s.repos.Observability.OverviewStorageStates(ctx)
 	if err != nil {
 		if s.logger != nil {
-			s.logger.Warn("overview: failed to load provider observability summary", "error", err)
+			s.logger.Warn("overview: failed to load storage observability summary", "error", err)
 		}
-		health.PartialErrors["observability_providers"] = "provider health query failed"
+		health.PartialErrors["observability"] = "storage health query failed"
 		health.Level = observability.WorstSignalLevel(health.Level, observability.SignalWarning)
-	} else {
-		health.Providers = &filecoinStorageHealthObservationOverview{
-			Summary:       providers.Summary,
-			SummarySignal: providers.SummarySignal,
-		}
-		health.Level = observability.WorstSignalLevel(health.Level, providers.SummarySignal.Level)
+		return health
 	}
-
-	dataSets, err := s.observability.ListDataSetObservations(ctx, observability.ListOptions{Limit: 1})
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("overview: failed to load data set observability summary", "error", err)
-		}
-		health.PartialErrors["observability_data_sets"] = "data set health query failed"
-		health.Level = observability.WorstSignalLevel(health.Level, observability.SignalWarning)
-	} else {
-		health.DataSets = &filecoinStorageHealthObservationOverview{
-			Summary:       dataSets.Summary,
-			SummarySignal: dataSets.SummarySignal,
-		}
-		health.Level = observability.WorstSignalLevel(health.Level, dataSets.SummarySignal.Level)
+	providerByID := make(map[string]observability.ProviderState, len(providerStates))
+	for _, state := range providerStates {
+		providerByID[state.ProviderID.String()] = state
+		providerCheckedAt = olderOverviewObservation(providerCheckedAt, state.LastCheckedAt)
 	}
+	dataSetByID := make(map[int64]observability.DataSetState, len(dataSetStates))
+	for _, state := range dataSetStates {
+		dataSetByID[state.LocalDataSetID] = state
+		dataSetCheckedAt = olderOverviewObservation(dataSetCheckedAt, state.LastCheckedAt)
+	}
+	providers := observability.Summary{}
+	dataSets := observability.Summary{Total: len(dataSetRows)}
+	seenProviders := make(map[string]bool, len(dataSetRows))
+	for _, row := range dataSetRows {
+		if state, ok := dataSetByID[row.ID]; ok {
+			addStorageHealthStatus(&dataSets, state.Status)
+		} else {
+			dataSets.Unknown++
+		}
+		id := row.ProviderID.String()
+		if seenProviders[id] {
+			continue
+		}
+		seenProviders[id] = true
+		providers.Total++
+		if state, ok := providerByID[id]; ok {
+			addStorageHealthStatus(&providers, state.Status)
+		} else {
+			providers.Unknown++
+		}
+	}
+	now := time.Now().UTC()
+	interval := s.observability.RefreshInterval()
+	providerSignal := observability.DefaultAttentionSummarySignal(providers, providerCheckedAt, interval, now)
+	dataSetSignal := observability.DefaultAttentionSummarySignal(dataSets, dataSetCheckedAt, interval, now)
+	health.Providers = &filecoinStorageHealthObservationOverview{Summary: providers, SummarySignal: providerSignal}
+	health.DataSets = &filecoinStorageHealthObservationOverview{Summary: dataSets, SummarySignal: dataSetSignal}
+	health.Level = observability.WorstSignalLevel(providerSignal.Level, dataSetSignal.Level)
 	return health
+}
+
+func olderOverviewObservation(current *time.Time, observed time.Time) *time.Time {
+	if observed.IsZero() || (current != nil && !observed.Before(*current)) {
+		return current
+	}
+	return &observed
+}
+
+func addStorageHealthStatus(summary *observability.Summary, status observability.Status) {
+	switch status {
+	case observability.StatusAvailable:
+		summary.Available++
+	case observability.StatusDegraded:
+		summary.Degraded++
+	case observability.StatusUnavailable:
+		summary.Unavailable++
+	default:
+		summary.Unknown++
+	}
 }
 
 func taskPipelineOverviewRows(counts []repository.TaskPipelineCount) []taskPipelineOverview {

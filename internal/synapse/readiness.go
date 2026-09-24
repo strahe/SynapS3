@@ -322,7 +322,7 @@ func (c *ReadinessChecker) checkStorage(
 	if err != nil {
 		c.addPartialError(result, "storage_info", err)
 	}
-	if info == nil {
+	if err != nil || info == nil {
 		result.unknown("providers", "Approved storage providers could not be checked.")
 		addStorageDependencyUnknowns(result, "Storage cost estimate could not be calculated.", "Payment funding could not be checked.", "FWSS approval could not be checked.")
 		return

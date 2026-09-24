@@ -683,9 +683,11 @@ type TaskRepository interface {
 	Enqueue(ctx context.Context, task *model.Task) (*model.Task, bool, error)
 	GetByID(ctx context.Context, id int64) (*model.Task, error)
 	GetByIdentity(ctx context.Context, taskType model.TaskType, idempotencyKey string) (*model.Task, error)
+	PreviousStoreCheckpoints(ctx context.Context, copyID, taskID int64) ([]model.Task, error)
 	ClaimNext(ctx context.Context, leaseDuration time.Duration) (*model.Task, error)
 	RenewLease(ctx context.Context, id, generation int64, leaseDuration time.Duration) (time.Time, error)
 	WriteCheckpoint(ctx context.Context, id, generation int64, checkpoint json.RawMessage) error
+	ConsumeStoreRetry(ctx context.Context, id, generation int64) error
 	ValidateClaim(ctx context.Context, id, generation int64) error
 	Settle(ctx context.Context, id, generation int64, transition TaskTransition) error
 	ShortenLease(ctx context.Context, id, generation int64, duration time.Duration) error
@@ -755,6 +757,7 @@ type WalletOperationRepository interface {
 }
 
 type ObservabilityRepository interface {
+	OverviewStorageStates(ctx context.Context) ([]model.StorageDataSet, []observability.ProviderState, []observability.DataSetState, *time.Time, *time.Time, error)
 	ReplaceProviderStates(ctx context.Context, checkedAt time.Time, states []observability.ProviderState) error
 	ListProviderStates(ctx context.Context, opts observability.ListOptions) (observability.ProviderStatePage, error)
 	ReplaceDataSetStates(ctx context.Context, checkedAt time.Time, states []observability.DataSetState) error

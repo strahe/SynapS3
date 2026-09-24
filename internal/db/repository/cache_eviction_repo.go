@@ -195,6 +195,7 @@ func (r *BunCacheEvictionRepo) ListLRUCandidates(ctx context.Context, limit int)
 		Where("storage_content.content_size > 0").
 		Where("object_cache.cache_accessed_at IS NOT NULL").
 		Where(minimumDurabilityMetSQL("storage_content", "durability_bucket")).
+		Where(noUnfinishedStoreCacheDependencySQL("storage_content.id")).
 		Where(noUnfinishedReplacementCacheDependencySQL("storage_content.id"),
 			storagereplacement.ItemStatusPending,
 			storagereplacement.ItemStatusAttention,
@@ -268,6 +269,17 @@ func (r *BunCacheEvictionRepo) AuthorizeDeletion(
 			return err
 		}
 		if pendingReplacement > 0 {
+			return cacheeviction.ErrNoLongerEligible
+		}
+		var pendingStore int
+		if err := db.NewRaw(`SELECT COUNT(*) FROM storage_copies AS copy
+			WHERE copy.content_id = ? AND copy.status IN ('pending', 'piece_ready', 'committing')
+			AND copy.transfer_method IN ('ingress', 'cache_restore')
+			AND EXISTS (SELECT 1 FROM object_versions AS version WHERE version.content_id = copy.content_id)`, contentID).
+			Scan(ctx, &pendingStore); err != nil {
+			return err
+		}
+		if pendingStore > 0 {
 			return cacheeviction.ErrNoLongerEligible
 		}
 		bucket, err := lockBucketByID(ctx, db, content.BucketID)
@@ -476,6 +488,7 @@ func nextBucketDurabilityCandidate(ctx context.Context, db bun.IDB, bucketID int
 		Where("cache_entry.in_cache = ?", true).
 		Where("cache_entry.cache_active_task_id IS NULL").
 		Where(minimumDurabilityMetSQL("storage_content", "durability_bucket")).
+		Where(noUnfinishedStoreCacheDependencySQL("storage_content.id")).
 		Where(noUnfinishedReplacementCacheDependencySQL("storage_content.id"),
 			storagereplacement.ItemStatusPending,
 			storagereplacement.ItemStatusAttention,
@@ -513,6 +526,16 @@ func noUnfinishedReplacementCacheDependencySQL(contentIDExpr string) string {
 		WHERE cache_replacement_item.content_id = %s
 		  AND cache_replacement_item.status IN (?, ?)
 		  AND cache_replacement.status NOT IN (?, ?)
+	)`, contentIDExpr)
+}
+
+func noUnfinishedStoreCacheDependencySQL(contentIDExpr string) string {
+	return fmt.Sprintf(`NOT EXISTS (
+		SELECT 1 FROM storage_copies AS store_copy
+		WHERE store_copy.content_id = %s
+		AND store_copy.status IN ('pending', 'piece_ready', 'committing')
+		AND store_copy.transfer_method IN ('ingress', 'cache_restore')
+		AND EXISTS (SELECT 1 FROM object_versions AS version WHERE version.content_id = store_copy.content_id)
 	)`, contentIDExpr)
 }
 

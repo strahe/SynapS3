@@ -67,7 +67,7 @@ After a restart, unfinished work becomes eligible to continue automatically.
 - Retry a failed task only when the dashboard or API marks it retryable.
 - Recover provider replacements from **Details** → **Storage** → **Data Sets**.
 - A wallet operation can be retried from Tasks only when no broadcast started. An uncertain broadcast remains non-retryable.
-- For an uncertain Store, **Check again** checks the provider without uploading the object again.
+- **Retry upload** checks whether the provider has the piece, then uploads it again if missing. A repeat can use more bandwidth or open another upload session.
 - `status=failed` lists unacknowledged failures. Use `status=dismissed` to list acknowledged failures.
 - Review unresolved storage confirmations with `synaps3 admin storage-confirmation list`.
 

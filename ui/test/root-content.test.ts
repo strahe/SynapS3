@@ -69,7 +69,7 @@ test('global filecoin readiness alert shows blocked checks first', () => {
   const alert = globalFilecoinReadinessAlertState({
     enabled: true,
     data: readinessData('blocked', [
-      { id: 'storage_cost', status: 'unknown', message: 'Storage cost could not be estimated.' },
+      { id: 'providers', status: 'blocked', message: 'Only 0 approved providers are available.' },
       { id: 'wallet_fil_gas', status: 'blocked', message: 'FIL gas balance is empty.' },
     ]),
   })
@@ -79,6 +79,10 @@ test('global filecoin readiness alert shows blocked checks first', () => {
   assert.equal(alert.status, 'blocked')
   assert.equal(alert.summary, 'FIL gas balance is empty.')
   assert.equal(alert.primaryCheck?.id, 'wallet_fil_gas')
+  assert.deepEqual(
+    alert.details?.checks.map((check) => check.id),
+    ['wallet_fil_gas']
+  )
 })
 
 test('global filecoin readiness alert shows unknown checks without blocked checks', () => {
@@ -86,27 +90,29 @@ test('global filecoin readiness alert shows unknown checks without blocked check
     enabled: true,
     data: readinessData('warning', [
       { id: 'payment_runway', status: 'warning', message: 'Payment runway is low.' },
-      { id: 'storage_cost', status: 'unknown', message: 'Storage cost could not be estimated.' },
+      { id: 'payment_account', status: 'unknown', message: 'Payment account could not be checked.' },
     ]),
   })
 
   assert.equal(alert.show, true)
   assert.equal(alert.title, 'Filecoin readiness unknown')
   assert.equal(alert.status, 'unknown')
-  assert.equal(alert.summary, 'Storage cost could not be estimated.')
-  assert.equal(alert.primaryCheck?.id, 'storage_cost')
+  assert.equal(alert.summary, 'Payment account could not be checked.')
+  assert.equal(alert.primaryCheck?.id, 'payment_account')
 })
 
-test('global filecoin readiness alert falls back to aggregate unknown when checks are empty', () => {
+test('global filecoin readiness alert ignores provider selection and its dependent checks', () => {
   const alert = globalFilecoinReadinessAlertState({
     enabled: true,
-    data: readinessData('unknown', []),
+    data: readinessData('blocked', [
+      { id: 'providers', status: 'blocked', message: 'Only 0 approved providers are available.' },
+      { id: 'storage_cost', status: 'unknown', message: 'Storage cost could not be estimated.' },
+      { id: 'payment_funding', status: 'unknown', message: 'Payment funding could not be checked.' },
+      { id: 'fwss_approval', status: 'unknown', message: 'FWSS approval could not be checked.' },
+    ]),
   })
 
-  assert.equal(alert.show, true)
-  assert.equal(alert.title, 'Filecoin readiness unknown')
-  assert.equal(alert.status, 'unknown')
-  assert.equal(alert.summary, 'Unknown')
+  assert.equal(alert.show, false)
 })
 
 test('global filecoin readiness alert shows query failures and respects disabled state', () => {
