@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ipfs/go-cid"
@@ -257,6 +258,79 @@ func TestIntegration_ColdReadAfterEviction(t *testing.T) {
 	if !rehydrated {
 		t.Fatal("expected cache to be rehydrated after cold read (timed out)")
 	}
+}
+
+func TestIntegration_ColdRangeRehydratesOnlyAfterCompleteRead(t *testing.T) {
+	ib := newIntegrationBackend(t)
+	ctx := t.Context()
+	bucket := testutil.SeedBucket(t, ib.db, "range-remote-bucket")
+	content := strings.Repeat("remote range content", 12)
+	putObject(t, ib.backend, bucket.Name, "range.bin", content)
+	version, err := ib.repos.Objects.GetCurrentVersionByBucketAndKey(ctx, bucket.ID, "range.bin")
+	if err != nil || version == nil {
+		t.Fatalf("version = %#v, %v", version, err)
+	}
+	pieceCID := buildDummyCID(t)
+	acceptBackendVersionUpload(t, ib.db, ib.repos, version.VersionID, pieceCID, "https://provider.example/range")
+	cacheKey := version.CacheKey()
+	evict := func() {
+		t.Helper()
+		if err := ib.repos.Objects.ClearContentCachePresence(ctx, *version.ContentID); err != nil {
+			t.Fatal(err)
+		}
+		if err := ib.cache.Delete(ctx, bucket.Name, cacheKey); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evict()
+	readBytes := 0
+	ib.storage.DownloadFunc = func(_ context.Context, _ cid.Cid, _ *storage.DownloadOptions) (io.ReadCloser, error) {
+		return io.NopCloser(&countingReader{Reader: strings.NewReader(content), count: &readBytes}), nil
+	}
+	getRange := func() *s3.GetObjectOutput {
+		t.Helper()
+		out, err := ib.backend.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket.Name), Key: aws.String("range.bin"), Range: aws.String("bytes=2-5"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	out := getRange()
+	got, err := io.ReadAll(out.Body)
+	if closeErr := out.Body.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || string(got) != content[2:6] || readBytes != len(content) {
+		t.Fatalf("cold range = %q, %v; source read %d/%d bytes", got, err, readBytes, len(content))
+	}
+	for attempt := 0; attempt < 200 && !ib.cache.Exists(ctx, bucket.Name, cacheKey); attempt++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ib.cache.Exists(ctx, bucket.Name, cacheKey) {
+		t.Fatal("complete cold range did not rehydrate cache")
+	}
+
+	evict()
+	out = getRange()
+	if err := out.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ib.cache.Exists(ctx, bucket.Name, cacheKey) {
+		t.Fatal("early close committed an incomplete cache entry")
+	}
+}
+
+type countingReader struct {
+	io.Reader
+	count *int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	*r.count += n
+	return n, err
 }
 
 func TestIntegration_MultipartUpload_Abort(t *testing.T) {

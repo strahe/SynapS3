@@ -40,8 +40,8 @@ SynapS3 mainly supports path-style S3 access for writing bucket and object data 
 | Ownership controls | `PutBucketOwnershipControls` | Partial | Accepts only `BucketOwnerPreferred`; rejects other ownership modes. |
 | Ownership controls | `DeleteBucketOwnershipControls` | Partial | Keeps the ACL-compatible `BucketOwnerPreferred` behavior. |
 | Object | `PutObject` | Supported | Stores an object through the cache-first write model. |
-| Object | `GetObject` | Supported | Reads from cache or committed remote storage. |
-| Object | `HeadObject` | Supported | Reads object metadata. |
+| Object | `GetObject` | Supported | Reads from cache or committed remote storage, including single byte ranges, version metadata, and `Last-Modified`. A cold remote range still downloads the complete source for integrity verification. |
+| Object | `HeadObject` | Supported | Reads object metadata, including custom metadata on the requested version. |
 | Object | `DeleteObject` | Supported | Creates a delete marker without `versionId`; with `versionId`, deletes an eligible data version or delete marker. |
 | Object | `DeleteObjects` | Supported | Applies the same version-aware deletion rules to each entry and reports entry-specific failures. |
 | Object | `CopyObject` | Supported | Source object must be readable from cache or committed remote storage. |

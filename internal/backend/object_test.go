@@ -1218,6 +1218,67 @@ func TestGetObject_FromCache(t *testing.T) {
 	}
 }
 
+func TestGetObjectRangeAndVersionMetadata(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := t.Context()
+	seedActiveBucket(t, tb, "range-bucket")
+	body := validTestObjectBody("range-body")
+	put, err := tb.backend.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), Body: strings.NewReader(body),
+		Metadata: map[string]string{"custom": "first"},
+	})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	putValidTestObject(t, tb, "range-bucket", "file.txt", "new version")
+	get, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), VersionId: &put.VersionID,
+		Range: aws.String("bytes=2-5"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject range: %v", err)
+	}
+	data, readErr := io.ReadAll(get.Body)
+	_ = get.Body.Close()
+	if readErr != nil || string(data) != body[2:6] || *get.ContentLength != 4 ||
+		get.ContentRange == nil || *get.ContentRange != fmt.Sprintf("bytes 2-5/%d", len(body)) ||
+		get.LastModified == nil || get.Metadata["custom"] != "first" {
+		t.Fatalf("range output = %#v body=%q readErr=%v", get, data, readErr)
+	}
+	head, err := tb.backend.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), VersionId: &put.VersionID,
+	})
+	if err != nil || head.Metadata["custom"] != "first" {
+		t.Fatalf("HeadObject metadata = %#v, %v", head, err)
+	}
+	for _, tc := range []struct {
+		name, request, expected string
+	}{
+		{"open-ended", "bytes=3-", body[3:]},
+		{"suffix", "bytes=-4", body[len(body)-4:]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tb.backend.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), VersionId: &put.VersionID, Range: &tc.request,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, readErr := io.ReadAll(out.Body)
+			_ = out.Body.Close()
+			if readErr != nil || string(got) != tc.expected || out.ContentRange == nil || *out.ContentLength != int64(len(tc.expected)) {
+				t.Fatalf("range %q = %q, %#v, %v", tc.request, got, out, readErr)
+			}
+		})
+	}
+	_, err = tb.backend.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("range-bucket"), Key: aws.String("file.txt"), Range: aws.String("bytes=999999-"),
+	})
+	if err == nil {
+		t.Fatal("out-of-range GetObject succeeded")
+	}
+}
+
 func TestGetObject_WithVersionIDReadsSpecifiedVersion(t *testing.T) {
 	tb := newTestBackend(t)
 	ctx := context.Background()

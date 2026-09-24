@@ -16,7 +16,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-system test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev ui-e2e-install
+.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-system test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev ui-e2e-install
 .PHONY: docker-init docker-up docker-verify docker-down docker-status docker-logs docker-password
 
 all: build
@@ -54,6 +54,9 @@ test-race:
 
 test-system:
 	$(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 ./tests/testutil/... ./internal/systemtest ./tests/system
+
+test-s3-clients:
+	SYNAPS3_TEST_S3_CLIENTS=1 $(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 -run '^TestS3Clients$$' ./tests/system
 
 test-integration: build-integration-server
 	$(CGO) go test -v $(GOFLAGS) -tags=integration -count=1 -timeout=45m ./tests/integration/...

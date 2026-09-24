@@ -136,6 +136,9 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 	if partNum < 1 || partNum > 10000 {
 		return s3response.CopyPartResult{}, s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, fmt.Sprint(*input.PartNumber))
 	}
+	if input.CopySourceRange != nil && *input.CopySourceRange != "" {
+		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 
 	// Parse and validate source object
 	srcBucketName, srcKey, srcVersionID, err := parseCopySource(*input.CopySource)
@@ -154,7 +157,6 @@ func (b *SynapseBackend) UploadPartCopy(ctx context.Context, input *s3.UploadPar
 	}
 	defer func() { _ = srcResult.Body.Close() }()
 
-	// NOTE: CopySourceRange for partial copies is not yet supported (future enhancement).
 	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(srcResult.Body))
 	if err != nil {
 		if errors.Is(err, objectlimits.ErrTooLarge) {

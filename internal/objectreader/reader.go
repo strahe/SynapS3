@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"sync"
 	"time"
@@ -55,6 +56,7 @@ type Result struct {
 	VersionID    string
 	ContentType  string
 	LastModified time.Time
+	Metadata     map[string]string
 	Source       Source
 	CacheMiss    bool
 }
@@ -242,6 +244,7 @@ func resultFromVersion(version *model.ObjectVersion, body io.ReadCloser, source 
 		VersionID:    version.VersionID,
 		ContentType:  version.ContentType,
 		LastModified: version.CreatedAt,
+		Metadata:     maps.Clone(version.Metadata),
 		Source:       source,
 		CacheMiss:    cacheMiss,
 	}
