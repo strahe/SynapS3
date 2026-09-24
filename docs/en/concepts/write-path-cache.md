@@ -30,6 +30,8 @@ The S3 response does not wait for Filecoin provider latency. After the write is 
 
 `GetObject` reads local cache first. If the cache entry is missing and an available remote copy is recorded, SynapS3 can retrieve the object from the storage provider, verify it, serve the response, and restore the local cache when possible.
 
+A single byte-range request returns only the requested bytes. On a cache miss, SynapS3 still downloads the complete remote object to verify it before the range response finishes; a complete read can also restore the local cache. Closing the request early does not leave a partial cache entry.
+
 Successful foreground cache opens refresh the entry's LRU access time. This includes S3 object and range reads, cached CopyObject sources, Admin content downloads, and version restores. Metadata-only operations such as `HeadObject` do not refresh it, and the background Uploader does not make an entry look recently used. A complete remote rehydration starts a new LRU age for the restored entry.
 
 Repeated reads of the same version coalesce access-time updates to at most one database write per minute. Access tracking is best effort and never turns a successful read into an error.

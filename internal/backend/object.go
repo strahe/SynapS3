@@ -27,6 +27,7 @@ import (
 	"github.com/strahe/synaps3/internal/storagecleanup"
 	"github.com/strahe/synaps3/internal/storagepipeline"
 	taskengine "github.com/strahe/synaps3/internal/task"
+	versitybackend "github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -200,15 +201,36 @@ func (b *SynapseBackend) GetObject(ctx context.Context, input *s3.GetObjectInput
 		admin.CacheHitsTotal.Inc()
 	}
 
-	admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
 	etag := fmt.Sprintf(`"%s"`, out.ETag)
 	contentType := out.ContentType
+	acceptRanges := "bytes"
+	length := out.Size
+	var contentRange *string
+	if input.Range != nil && *input.Range != "" {
+		start, count, valid, rangeErr := versitybackend.ParseObjectRange(out.Size, *input.Range)
+		if rangeErr != nil {
+			_ = out.Body.Close()
+			admin.ObjectOperationsTotal.WithLabelValues("get", "failure").Inc()
+			return nil, rangeErr
+		}
+		if valid {
+			out.Body = newRangeReadCloser(out.Body, start, count, out.Source == objectreader.SourceProvider)
+			length = count
+			rangeValue := fmt.Sprintf("bytes %d-%d/%d", start, start+count-1, out.Size)
+			contentRange = &rangeValue
+		}
+	}
+	admin.ObjectOperationsTotal.WithLabelValues("get", "success").Inc()
 	return &s3.GetObjectOutput{
 		Body:          out.Body,
-		ContentLength: &out.Size,
+		ContentLength: &length,
+		ContentRange:  contentRange,
+		AcceptRanges:  &acceptRanges,
 		ETag:          &etag,
 		ContentType:   &contentType,
 		VersionId:     &out.VersionID,
+		LastModified:  &out.LastModified,
+		Metadata:      out.Metadata,
 	}, nil
 }
 
@@ -239,6 +261,7 @@ func (b *SynapseBackend) HeadObject(ctx context.Context, input *s3.HeadObjectInp
 		ContentType:   &meta.ContentType,
 		LastModified:  &meta.LastModified,
 		VersionId:     &meta.VersionID,
+		Metadata:      meta.Metadata,
 	}, nil
 }
 
@@ -1074,6 +1097,7 @@ type objectMetadataResult struct {
 	VersionID         string
 	MultipartUploadID *string
 	LastModified      time.Time
+	Metadata          map[string]string
 }
 
 func (b *SynapseBackend) objectMetadata(ctx context.Context, bucketID int64, key, versionID string) (objectMetadataResult, error) {
@@ -1090,6 +1114,7 @@ func (b *SynapseBackend) objectMetadata(ctx context.Context, bucketID int64, key
 		VersionID:         version.VersionID,
 		MultipartUploadID: version.MultipartUploadID,
 		LastModified:      version.CreatedAt,
+		Metadata:          maps.Clone(version.Metadata),
 	}, nil
 }
 

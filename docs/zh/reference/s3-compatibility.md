@@ -40,8 +40,8 @@ SynapS3 主要支持 path-style S3 访问，负责把存储桶和对象数据写
 | Ownership Controls | `PutBucketOwnershipControls` | 部分支持 | 只接受 `BucketOwnerPreferred`，拒绝其他 ownership modes。 |
 | Ownership Controls | `DeleteBucketOwnershipControls` | 部分支持 | 保持 ACL 兼容的 `BucketOwnerPreferred` 行为。 |
 | 对象 | `PutObject` | 支持 | 按缓存优先的写入模型存储对象。 |
-| 对象 | `GetObject` | 支持 | 从缓存或已提交的远端存储读取。 |
-| 对象 | `HeadObject` | 支持 | 读取对象元数据。 |
+| 对象 | `GetObject` | 支持 | 从缓存或已提交的远端存储读取，支持单段字节 Range，并返回指定版本的自定义元数据和 `Last-Modified`。冷缓存远端 Range 仍需完整下载来源以校验内容。 |
+| 对象 | `HeadObject` | 支持 | 读取对象元数据，包括指定版本的自定义元数据。 |
 | 对象 | `DeleteObject` | 支持 | 不带 `versionId` 时创建 delete marker；带 `versionId` 时删除符合条件的数据版本或 delete marker。 |
 | 对象 | `DeleteObjects` | 支持 | 对每个条目应用相同的版本删除规则，并分别返回失败结果。 |
 | 对象 | `CopyObject` | 支持 | 源对象必须可从缓存或已提交的远端存储读取。 |
