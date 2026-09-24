@@ -343,9 +343,11 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `POST` | `/api/v1/settings/validate` | 验证设置请求内容，但不保存。 |
 | `GET` | `/api/v1/s3-users` | 列出 S3 用户。 |
 | `POST` | `/api/v1/s3-users` | 创建 S3 用户。 |
-| `PUT` | `/api/v1/s3-users/{accessKey}` | 更新 S3 用户 role。 |
+| `PUT` | `/api/v1/s3-users/{accessKey}` | 更新 S3 用户名称或 role。 |
 | `POST` | `/api/v1/s3-users/{accessKey}/secret` | 轮换 S3 secret key。 |
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | 删除 S3 用户。 |
+
+`POST /api/v1/s3-users` 除 `role` 外可选填 `name`。`PUT /api/v1/s3-users/{accessKey}` 可只提交其中一个字段；省略 `name` 表示不改名，传入 `"name": ""` 表示清除名称。名称会去除首尾空白，最长 128 个 Unicode 字符，不能包含控制字符；非空名称必须唯一，区分大小写。列表、创建和更新响应包含 `name`。Access Key 仍是凭据和存储桶所有者的身份标识。
 
 缓存设置在 `cache` 下提供 `eviction_policy`、`lru_high_watermark_percent` 和 `lru_low_watermark_percent`。有效策略为 `lru`、`after_upload` 和 `none`。水位必须满足 `0 <= low < high <= 100`，且只在 `lru` 策略下生效。
 

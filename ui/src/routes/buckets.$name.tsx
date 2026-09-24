@@ -274,14 +274,16 @@ function ChangeBucketOwnerDetailDialog({
                 id: 'current-owner',
                 label: 'Current owner',
                 value: ownerAccessKey ?? ownerLabel(ownerAccessKey),
-                displayValue: ownerLabel(ownerAccessKey),
+                displayValue: ownerLabel(ownerAccessKey, users),
+                maxLength: ownerLabel(ownerAccessKey, users).length,
                 copyable: Boolean(ownerAccessKey),
               },
               {
                 id: 'new-owner',
                 label: 'New owner',
                 value: selectedOwner || ownerLabel(null),
-                displayValue: ownerLabel(selectedOwner),
+                displayValue: ownerLabel(selectedOwner, users),
+                maxLength: ownerLabel(selectedOwner, users).length,
                 copyable: Boolean(selectedOwner),
               },
             ]}
@@ -2060,6 +2062,8 @@ function BucketDetailsSection({ title, children }: { title: string; children: Re
 }
 
 function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<typeof useBucket>['data']> }) {
+  const { data: users = [] } = useS3Users()
+  const ownerDisplay = ownerLabel(bucket.owner_access_key, users)
   return (
     <dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
       <BucketDetailField label="Objects" value={formatObjectCount(bucket.object_count)} />
@@ -2070,7 +2074,8 @@ function BucketDetailsOverview({ bucket }: { bucket: NonNullable<ReturnType<type
       <BucketDetailField
         label="Owner"
         value={bucket.owner_access_key ?? ownerLabel(bucket.owner_access_key)}
-        displayValue={ownerLabel(bucket.owner_access_key)}
+        displayValue={ownerDisplay}
+        maxLength={ownerDisplay.length}
         copyValue={bucket.owner_access_key ?? undefined}
         copyable={Boolean(bucket.owner_access_key)}
       />
@@ -2140,6 +2145,7 @@ function BucketDetailField({
   label,
   value,
   displayValue,
+  maxLength,
   copyValue,
   title,
   copyable,
@@ -2147,6 +2153,7 @@ function BucketDetailField({
   label: string
   value: string
   displayValue?: string
+  maxLength?: number
   copyValue?: string
   title?: string
   copyable?: boolean
@@ -2160,7 +2167,7 @@ function BucketDetailField({
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="mt-1 truncate font-medium" title={copyableValue ? undefined : (title ?? displayText)}>
         {copyableValue ? (
-          <CopyableValue label={label} value={copiedValue} displayValue={displayText} maxLength={28} />
+          <CopyableValue label={label} value={copiedValue} displayValue={displayText} maxLength={maxLength ?? 28} />
         ) : (
           displayText
         )}
@@ -2439,6 +2446,7 @@ function BucketDetailsSettings({
   bucket: NonNullable<ReturnType<typeof useBucket>['data']>
   onChangeOwner: () => void
 }) {
+  const { data: users = [] } = useS3Users()
   const updateCopyPolicy = useUpdateBucketCopyPolicy()
   const currentCopyPolicy = bucketCopyPolicyValue(bucket)
   const currentMinimumDurableCopies = minimumDurableCopiesValue(bucket)
@@ -2518,8 +2526,8 @@ function BucketDetailsSettings({
             <CopyableValue
               label="Owner"
               value={bucket.owner_access_key}
-              displayValue={ownerLabel(bucket.owner_access_key)}
-              maxLength={32}
+              displayValue={ownerLabel(bucket.owner_access_key, users)}
+              maxLength={ownerLabel(bucket.owner_access_key, users).length}
             />
           ) : (
             ownerLabel(bucket.owner_access_key)

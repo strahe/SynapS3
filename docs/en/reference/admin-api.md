@@ -343,9 +343,11 @@ Provider listings include the optional `upload_speed_test` for the latest manual
 | `POST` | `/api/v1/settings/validate` | Validate a settings payload without saving. |
 | `GET` | `/api/v1/s3-users` | List S3 users. |
 | `POST` | `/api/v1/s3-users` | Create an S3 user. |
-| `PUT` | `/api/v1/s3-users/{accessKey}` | Update an S3 user role. |
+| `PUT` | `/api/v1/s3-users/{accessKey}` | Update an S3 user name or role. |
 | `POST` | `/api/v1/s3-users/{accessKey}/secret` | Rotate an S3 secret key. |
 | `DELETE` | `/api/v1/s3-users/{accessKey}` | Delete an S3 user. |
+
+`POST /api/v1/s3-users` accepts an optional `name` alongside `role`. `PUT /api/v1/s3-users/{accessKey}` accepts either field; omit `name` to leave it unchanged or send `"name": ""` to clear it. Names are trimmed, limited to 128 Unicode characters, cannot contain control characters, and must be unique among nonempty names (case-sensitive). List, create, and update responses include `name`. Access keys remain the credential and bucket-owner identity.
 
 Cache settings expose `eviction_policy`, `lru_high_watermark_percent`, and `lru_low_watermark_percent` under `cache`. Valid policies are `lru`, `after_upload`, and `none`. Watermarks must satisfy `0 <= low < high <= 100` and only affect `lru`.
 

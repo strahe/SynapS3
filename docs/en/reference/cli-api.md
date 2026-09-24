@@ -73,9 +73,10 @@ Admin commands use HTTP Basic auth. The username comes from `admin.auth.username
 
 ```bash
 synaps3 admin status
-synaps3 admin s3-user create
+synaps3 admin s3-user create --name "Backup client"
 synaps3 admin s3-user list
 synaps3 admin s3-user update <access-key> --role userplus
+synaps3 admin s3-user update <access-key> --name "Archive client"
 synaps3 admin s3-user rotate-secret <access-key>
 synaps3 admin settings get
 synaps3 admin settings set cache.max_size_gb=200
@@ -90,6 +91,8 @@ synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --
 ```
 
 If no protected password file is available, enter the Admin password at the no-echo prompt. Do not place the password directly in shell history. S3 user creation and secret rotation show the secret only once; store it in a client credential file protected with `0600`.
+
+S3 user names are optional and unique. Use `admin s3-user update <access-key> --name ''` to clear a name. The user list shows names alongside full access keys.
 
 Admin global flags must appear after `admin` and before the subcommand:
 

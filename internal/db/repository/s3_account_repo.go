@@ -20,6 +20,9 @@ var _ S3AccountRepository = (*BunS3AccountRepo)(nil)
 func (r *BunS3AccountRepo) Create(ctx context.Context, account *model.S3Account) error {
 	_, err := r.db.NewInsert().Model(account).Exec(ctx)
 	if err != nil {
+		if isS3AccountNameUniqueViolation(err) {
+			return fmt.Errorf("inserting S3 account name: %w", ErrS3AccountNameExists)
+		}
 		if isUniqueViolation(err) {
 			return fmt.Errorf("inserting S3 account %q: %w", account.AccessKey, ErrAlreadyExists)
 		}
@@ -81,11 +84,17 @@ func (r *BunS3AccountRepo) Update(ctx context.Context, accessKey string, update 
 	if update.SecretKey != nil {
 		query.Set("secret_key = ?", *update.SecretKey)
 	}
+	if update.Name != nil {
+		query.Set("name = ?", *update.Name)
+	}
 	if update.Role != "" {
 		query.Set("role = ?", update.Role)
 	}
 	res, err := query.Exec(ctx)
 	if err != nil {
+		if isS3AccountNameUniqueViolation(err) {
+			return fmt.Errorf("updating S3 account name: %w", ErrS3AccountNameExists)
+		}
 		return fmt.Errorf("updating S3 account: %w", err)
 	}
 	rows, _ := res.RowsAffected()

@@ -18,6 +18,7 @@ type S3Account struct {
 	IsRoot    bool      `bun:",notnull,default:false"`
 	CreatedAt time.Time `bun:",nullzero,notnull"`
 	UpdatedAt time.Time `bun:",nullzero,notnull"`
+	Name      string    `bun:"type:text,notnull"`
 }
 
 var _ bun.BeforeAppendModelHook = (*S3Account)(nil)

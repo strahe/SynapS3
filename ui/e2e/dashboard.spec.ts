@@ -148,6 +148,80 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   await expect(page.getByRole('button', { name: 'Approve FWSS' })).toHaveCount(0)
 })
 
+test('S3 user name appears in user and owner flows while copying the full access key', async ({
+  page,
+  systemServer,
+}) => {
+  await page.goto(systemServer.adminURL)
+  await page.getByLabel('Username').fill('admin')
+  await page.getByLabel('Password').fill('system-test-admin-password')
+  await page.getByRole('button', { name: 'Sign In' }).click()
+  await page.getByRole('link', { name: 'Settings' }).click()
+  await page.getByRole('button', { name: 'Create S3 user' }).click()
+  const createDialog = page.getByRole('dialog', { name: 'Create S3 user' })
+  await createDialog.getByLabel('Name').fill('E2E backup client')
+  const createdResponse = page.waitForResponse(
+    (response) => response.url().endsWith('/api/v1/s3-users') && response.request().method() === 'POST'
+  )
+  await createDialog.getByRole('button', { name: 'Create user' }).click()
+  const created = (await (await createdResponse).json()) as { access_key: string }
+  await page
+    .getByRole('dialog', { name: 'S3 credentials generated' })
+    .getByRole('button', { name: 'Close' })
+    .first()
+    .click()
+  const initialLabel = `E2E backup client (…${created.access_key.slice(-6)})`
+  const userRow = page.getByRole('row').filter({ hasText: 'E2E backup client' })
+  await expect(userRow).toContainText(initialLabel)
+  await userRow.getByRole('button', { name: 'Edit user' }).click()
+  const editDialog = page.getByRole('dialog', { name: 'Edit S3 user' })
+  await editDialog.getByLabel('Name').fill('E2E archive client')
+  await editDialog.getByRole('button', { name: 'Save' }).click()
+  await expect(page.getByRole('row').filter({ hasText: 'E2E archive client' })).toBeVisible()
+
+  await page.getByRole('link', { name: 'Buckets' }).click()
+  await page.getByRole('button', { name: 'Create Bucket' }).click()
+  await page.getByRole('dialog', { name: 'Create Bucket' }).getByLabel('Owner').click()
+  await expect(
+    page.getByRole('option', { name: `E2E archive client (…${created.access_key.slice(-6)}) (userplus)` })
+  ).toBeVisible()
+  await page.getByRole('option', { name: `E2E archive client (…${created.access_key.slice(-6)}) (userplus)` }).click()
+  await page.getByRole('dialog', { name: 'Create Bucket' }).getByLabel('Bucket name').fill('named-owner-e2e')
+  await page.getByRole('dialog', { name: 'Create Bucket' }).getByRole('button', { name: 'Create', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'named-owner-e2e' })).toBeVisible()
+  await page.getByRole('button', { name: 'Details' }).click()
+  const ownerNote = page.getByRole('note', { name: `Owner: ${created.access_key}` }).first()
+  await expect(ownerNote).toContainText(`E2E archive client (…${created.access_key.slice(-6)})`)
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
+  await ownerNote.locator('..').getByRole('button', { name: 'Copy Owner' }).click()
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(created.access_key)
+
+  await page.keyboard.press('Escape')
+  await page.getByRole('link', { name: 'Buckets' }).first().click()
+  const bucketRow = page.getByRole('row').filter({ hasText: 'named-owner-e2e' })
+  await expect(bucketRow).toContainText(`E2E archive client (…${created.access_key.slice(-6)})`)
+  await bucketRow.getByRole('button', { name: 'Change owner' }).click()
+  await page.getByRole('dialog', { name: 'Change bucket owner' }).getByLabel('Owner').click()
+  await page.getByRole('option', { name: 'Internal root' }).click()
+  await page.getByRole('dialog', { name: 'Change bucket owner' }).getByRole('button', { name: 'Review' }).click()
+  await expect(page.getByRole('dialog', { name: 'Review bucket owner' })).toContainText(
+    `E2E archive client (…${created.access_key.slice(-6)})`
+  )
+  await page.getByRole('dialog', { name: 'Review bucket owner' }).getByRole('button', { name: 'Back' }).click()
+  await page.getByRole('dialog', { name: 'Change bucket owner' }).getByRole('button', { name: 'Cancel' }).click()
+
+  await page.route('**/api/v1/s3-users', (route) =>
+    route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"unavailable"}' })
+  )
+  await page.reload()
+  const fallbackRow = page.getByRole('row').filter({ hasText: 'named-owner-e2e' })
+  await expect(fallbackRow).toContainText(created.access_key)
+  await fallbackRow.getByRole('button', { name: 'Change owner' }).click()
+  await expect(page.getByRole('dialog', { name: 'Change bucket owner' }).getByLabel('Owner')).toContainText(
+    created.access_key
+  )
+})
+
 test('admin session renewal follows trusted activity and sign-out cancels an in-flight request', async ({
   page,
   systemServer,

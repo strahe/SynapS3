@@ -485,7 +485,7 @@ export function useCreateS3User() {
   const qc = useQueryClient()
 
   return useMutation({
-    mutationFn: (payload: { role?: S3UserRole }) => api.createS3User(payload),
+    mutationFn: (payload: { name?: string; role?: S3UserRole }) => api.createS3User(payload),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['s3Users'] })
     },
@@ -496,7 +496,8 @@ export function useUpdateS3User() {
   const qc = useQueryClient()
 
   return useMutation({
-    mutationFn: ({ accessKey, role }: { accessKey: string; role: S3UserRole }) => api.updateS3User(accessKey, { role }),
+    mutationFn: ({ accessKey, ...payload }: { accessKey: string; name?: string; role?: S3UserRole }) =>
+      api.updateS3User(accessKey, payload),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['s3Users'] })
     },

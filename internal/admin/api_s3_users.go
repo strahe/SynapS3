@@ -10,30 +10,38 @@ import (
 	"mime"
 	"net/http"
 	"slices"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/securetoken"
 	"github.com/versity/versitygw/auth"
 )
 
 type s3UserListItem struct {
 	AccessKey   string `json:"access_key"`
+	Name        string `json:"name"`
 	Role        string `json:"role"`
 	BucketCount int    `json:"bucket_count"`
 }
 
 type s3UserCredentialsResponse struct {
 	AccessKey string `json:"access_key"`
+	Name      string `json:"name"`
 	SecretKey string `json:"secret_key"`
 	Role      string `json:"role"`
 }
 
 type s3UserCreateRequest struct {
+	Name string `json:"name"`
 	Role string `json:"role,omitempty"`
 }
 
 type s3UserUpdateRequest struct {
-	Role string `json:"role"`
+	Name *string `json:"name"`
+	Role *string `json:"role"`
 }
 
 func (s *Server) handleAPIListS3Users(w http.ResponseWriter, r *http.Request) {
@@ -43,7 +51,7 @@ func (s *Server) handleAPIListS3Users(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accounts, err := s.s3IAM.ListUserAccounts()
+	accounts, err := s.repos.S3Accounts.ListNonRoot(r.Context())
 	if err != nil {
 		s.logger.Error("api: failed to list S3 users", "error", err)
 		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
@@ -57,13 +65,11 @@ func (s *Server) handleAPIListS3Users(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]s3UserListItem, 0, len(accounts))
 	for _, account := range accounts {
-		if account.Access == s.s3RootAccess {
-			continue
-		}
 		items = append(items, s3UserListItem{
-			AccessKey:   account.Access,
+			AccessKey:   account.AccessKey,
+			Name:        account.Name,
 			Role:        string(account.Role),
-			BucketCount: bucketCounts[account.Access],
+			BucketCount: bucketCounts[account.AccessKey],
 		})
 	}
 	slices.SortFunc(items, func(a, b s3UserListItem) int {
@@ -82,6 +88,11 @@ func (s *Server) handleAPICreateS3User(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid S3 user role"})
 		return
 	}
+	name, ok := normalizeS3UserName(req.Name)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "S3 user name must be at most 128 characters and contain no control characters"})
+		return
+	}
 
 	credentials, err := generateS3Credentials()
 	if err != nil {
@@ -89,13 +100,18 @@ func (s *Server) handleAPICreateS3User(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
 		return
 	}
-	account := auth.Account{
-		Access: credentials.AccessKey,
-		Secret: credentials.SecretKey,
-		Role:   role,
+	account := &model.S3Account{
+		AccessKey: credentials.AccessKey,
+		Name:      name,
+		SecretKey: credentials.SecretKey,
+		Role:      role,
 	}
-	if err := s.s3IAM.CreateAccount(account); err != nil {
-		if errors.Is(err, auth.ErrUserExists) {
+	if err := s.repos.S3Accounts.Create(r.Context(), account); err != nil {
+		if errors.Is(err, repository.ErrS3AccountNameExists) {
+			writeJSON(w, http.StatusConflict, settingsErrorResponse{Error: "S3 user name already exists"})
+			return
+		}
+		if errors.Is(err, repository.ErrAlreadyExists) {
 			writeJSON(w, http.StatusConflict, settingsErrorResponse{Error: "S3 user already exists"})
 			return
 		}
@@ -106,6 +122,7 @@ func (s *Server) handleAPICreateS3User(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusCreated, s3UserCredentialsResponse{
 		AccessKey: credentials.AccessKey,
+		Name:      name,
 		SecretKey: credentials.SecretKey,
 		Role:      string(role),
 	})
@@ -122,17 +139,43 @@ func (s *Server) handleAPIUpdateS3User(w http.ResponseWriter, r *http.Request) {
 	if !s.decodeS3UserWriteJSON(w, r, &req) {
 		return
 	}
-	role, ok := parseS3UserRole(req.Role, "")
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid S3 user role"})
+	if req.Name == nil && req.Role == nil {
+		writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "name or role is required"})
 		return
 	}
-	if err := s.s3IAM.UpdateUserAccount(accessKey, auth.MutableProps{Role: role}); err != nil {
-		if errors.Is(err, auth.ErrNoSuchUser) {
+	update := repository.S3AccountUpdate{}
+	if req.Name != nil {
+		name, ok := normalizeS3UserName(*req.Name)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "S3 user name must be at most 128 characters and contain no control characters"})
+			return
+		}
+		update.Name = &name
+	}
+	if req.Role != nil {
+		role, ok := parseS3UserRole(*req.Role, "")
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, settingsErrorResponse{Error: "invalid S3 user role"})
+			return
+		}
+		update.Role = role
+	}
+	if err := s.repos.S3Accounts.Update(r.Context(), accessKey, update); err != nil {
+		if errors.Is(err, repository.ErrS3AccountNameExists) {
+			writeJSON(w, http.StatusConflict, settingsErrorResponse{Error: "S3 user name already exists"})
+			return
+		}
+		if errors.Is(err, repository.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, settingsErrorResponse{Error: "S3 user not found"})
 			return
 		}
 		s.logger.Error("api: failed to update S3 user", "error", err, "access_key", accessKey)
+		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
+		return
+	}
+	account, err := s.repos.S3Accounts.GetByAccessKey(r.Context(), accessKey)
+	if err != nil || account == nil {
+		s.logger.Error("api: failed to load S3 user after update", "error", err, "access_key", accessKey)
 		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
 		return
 	}
@@ -142,7 +185,7 @@ func (s *Server) handleAPIUpdateS3User(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s3UserListItem{AccessKey: accessKey, Role: string(role), BucketCount: bucketCount})
+	writeJSON(w, http.StatusOK, s3UserListItem{AccessKey: accessKey, Name: account.Name, Role: string(account.Role), BucketCount: bucketCount})
 }
 
 func (s *Server) handleAPIRotateS3UserSecret(w http.ResponseWriter, r *http.Request) {
@@ -158,14 +201,14 @@ func (s *Server) handleAPIRotateS3UserSecret(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	account, err := s.s3IAM.GetUserAccount(accessKey)
+	account, err := s.repos.S3Accounts.GetByAccessKey(r.Context(), accessKey)
 	if err != nil {
-		if errors.Is(err, auth.ErrNoSuchUser) {
-			writeJSON(w, http.StatusNotFound, settingsErrorResponse{Error: "S3 user not found"})
-			return
-		}
 		s.logger.Error("api: failed to load S3 user for secret rotation", "error", err, "access_key", accessKey)
 		writeJSON(w, http.StatusInternalServerError, settingsErrorResponse{Error: "internal"})
+		return
+	}
+	if account == nil {
+		writeJSON(w, http.StatusNotFound, settingsErrorResponse{Error: "S3 user not found"})
 		return
 	}
 	secretKey, err := securetoken.URL(32)
@@ -181,9 +224,21 @@ func (s *Server) handleAPIRotateS3UserSecret(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusOK, s3UserCredentialsResponse{
 		AccessKey: accessKey,
+		Name:      account.Name,
 		SecretKey: secretKey,
 		Role:      string(account.Role),
 	})
+}
+
+func normalizeS3UserName(value string) (string, bool) {
+	if strings.ContainsFunc(value, unicode.IsControl) {
+		return "", false
+	}
+	name := strings.TrimSpace(value)
+	if utf8.RuneCountInString(name) > 128 {
+		return "", false
+	}
+	return name, true
 }
 
 func (s *Server) handleAPIDeleteS3User(w http.ResponseWriter, r *http.Request) {

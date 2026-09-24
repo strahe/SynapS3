@@ -33,6 +33,7 @@ import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useCreateS3User, useDeleteS3User, useRotateS3UserSecret, useS3Users, useUpdateS3User } from '@/hooks/queries'
+import { s3UserLabel } from '@/lib/s3-owner'
 import { syncClosedRoleDraft } from './change-role-draft'
 
 const s3UserRoles: S3UserRole[] = ['userplus', 'user', 'admin']
@@ -86,6 +87,7 @@ function S3UsersSection({
   const rotateUserSecret = useRotateS3UserSecret()
   const deleteUser = useDeleteS3User()
   const [createOpen, setCreateOpen] = useState(false)
+  const [createName, setCreateName] = useState('')
   const [createRole, setCreateRole] = useState<S3UserRole>('userplus')
   const [createReviewing, setCreateReviewing] = useState(false)
   const [rotateTarget, setRotateTarget] = useState<S3User | null>(null)
@@ -102,10 +104,11 @@ function S3UsersSection({
       return
     }
     createUser.mutate(
-      { role: createRole },
+      { name: createName.trim(), role: createRole },
       {
         onSuccess: (credentials: S3UserCredentials) => {
           onCredentials(credentials)
+          setCreateName('')
           setCreateRole('userplus')
           setCreateReviewing(false)
           setCreateOpen(false)
@@ -159,6 +162,7 @@ function S3UsersSection({
 
   function handleCreateOpenChange(next: boolean) {
     if (!next) {
+      setCreateName('')
       setCreateRole('userplus')
       setCreateReviewing(false)
       createUser.reset()
@@ -202,18 +206,30 @@ function S3UsersSection({
                   <DialogDescription>
                     {createReviewing
                       ? 'Admin users can administer S3 API operations and access all buckets.'
-                      : 'Select the role for this access key. The secret is shown once.'}
+                      : 'Add an optional name and select a role. The secret is shown once.'}
                   </DialogDescription>
                 </DialogHeader>
                 {createReviewing ? (
                   <ReviewDetails
                     rows={[
+                      { id: 'name', label: 'Name', value: createName.trim() || 'None' },
                       { id: 'role', label: 'Role', value: roleLabel(createRole) },
                       { id: 'access', label: 'Access', value: 'All buckets and S3 administration' },
                     ]}
                   />
                 ) : (
                   <FieldGroup>
+                    <Field>
+                      <FieldLabel htmlFor="create-s3-user-name">Name</FieldLabel>
+                      <Input
+                        id="create-s3-user-name"
+                        value={createName}
+                        onChange={(event) => setCreateName(event.target.value)}
+                        disabled={!s3UsersAvailable || createUser.isPending}
+                        placeholder="Optional name"
+                      />
+                      <FieldDescription>Names must be unique. You can add one later.</FieldDescription>
+                    </Field>
                     <Field>
                       <FieldLabel htmlFor="create-s3-user-role">Role</FieldLabel>
                       <RoleSelect
@@ -249,11 +265,11 @@ function S3UsersSection({
             </Dialog>
           </div>
 
-          <div className="overflow-hidden rounded-md border border-border">
+          <div className="overflow-x-auto rounded-md border border-border">
             <Table className="min-w-[48rem]">
               <TableHeader>
                 <TableRow className="bg-muted/40">
-                  <TableHead className="px-3">Access Key</TableHead>
+                  <TableHead className="px-3">User</TableHead>
                   <TableHead className="w-36 px-3">Role</TableHead>
                   <TableHead className="w-24 px-3 text-right">Buckets</TableHead>
                   <TableHead className="w-72 px-3 text-right">Actions</TableHead>
@@ -285,7 +301,12 @@ function S3UsersSection({
                     return (
                       <TableRow key={user.access_key}>
                         <TableCell className="max-w-0 px-3">
-                          <CopyableValue label="Access key" value={user.access_key} monospace maxLength={28} />
+                          <CopyableValue
+                            label="Access key"
+                            value={user.access_key}
+                            displayValue={s3UserLabel(user)}
+                            maxLength={s3UserLabel(user).length}
+                          />
                         </TableCell>
                         <TableCell className="px-3">
                           <RolePill role={user.role} />
@@ -293,7 +314,7 @@ function S3UsersSection({
                         <TableCell className="px-3 text-right tabular-nums">{user.bucket_count}</TableCell>
                         <TableCell className="px-3">
                           <div className="flex justify-end gap-2">
-                            <ChangeRoleDialog user={user} disabled={!s3UsersAvailable} />
+                            <EditS3UserDialog user={user} disabled={!s3UsersAvailable} />
                             <Button
                               type="button"
                               variant="outline"
@@ -337,7 +358,7 @@ function S3UsersSection({
         title="Rotate S3 secret?"
         description={
           rotateTarget
-            ? `Rotate the secret for ${rotateTarget.access_key}. Existing clients using the old secret will fail immediately. The new secret is shown once.`
+            ? `Rotate the secret for ${s3UserLabel(rotateTarget)}. Existing clients using the old secret will fail immediately. The new secret is shown once.`
             : ''
         }
         confirmLabel="Rotate secret"
@@ -353,7 +374,7 @@ function S3UsersSection({
         onOpenChange={handleDeleteOpenChange}
         title="Delete S3 user?"
         description={
-          deleteTarget ? `Delete ${deleteTarget.access_key}. Existing requests signed with this key will fail.` : ''
+          deleteTarget ? `Delete ${s3UserLabel(deleteTarget)}. Existing requests signed with this key will fail.` : ''
         }
         confirmLabel="Delete user"
         pending={Boolean(deleteTarget && deleteUser.isPending && deleteUser.variables === deleteTarget.access_key)}
@@ -364,16 +385,21 @@ function S3UsersSection({
   )
 }
 
-function ChangeRoleDialog({ user, disabled }: { user: S3User; disabled?: boolean }) {
+function EditS3UserDialog({ user, disabled }: { user: S3User; disabled?: boolean }) {
   const updateUser = useUpdateS3User()
   const [open, setOpen] = useState(false)
+  const [name, setName] = useState(user.name)
   const [role, setRole] = useState<S3UserRole>(user.role)
   const [reviewing, setReviewing] = useState(false)
   const updating = updateUser.isPending && updateUser.variables?.accessKey === user.access_key
+  const trimmedName = name.trim()
+  const nameChanged = trimmedName !== user.name
+  const roleChanged = role !== user.role
 
   useEffect(() => {
+    if (!open) setName(user.name)
     setRole((currentRole) => syncClosedRoleDraft(open, currentRole, user.role))
-  }, [open, user.role])
+  }, [open, user.name, user.role])
 
   const handleOpenChange = (next: boolean) => {
     if (!next) {
@@ -384,13 +410,13 @@ function ChangeRoleDialog({ user, disabled }: { user: S3User; disabled?: boolean
   }
 
   const handleUpdate = () => {
-    if (role === user.role) return
-    if (!reviewing) {
+    if (!nameChanged && !roleChanged) return
+    if (roleChanged && !reviewing) {
       setReviewing(true)
       return
     }
     updateUser.mutate(
-      { accessKey: user.access_key, role },
+      { accessKey: user.access_key, ...(nameChanged ? { name: trimmedName } : {}), ...(roleChanged ? { role } : {}) },
       {
         onSuccess: () => {
           setReviewing(false)
@@ -404,28 +430,40 @@ function ChangeRoleDialog({ user, disabled }: { user: S3User; disabled?: boolean
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button type="button" variant="outline" size="xs" disabled={disabled}>
-          Change role
+          Edit user
         </Button>
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{reviewing ? 'Review S3 user role' : 'Change S3 user role'}</DialogTitle>
+          <DialogTitle>{reviewing ? 'Review S3 user changes' : 'Edit S3 user'}</DialogTitle>
           <DialogDescription>
             {reviewing && role === 'admin'
               ? 'Admin users can administer S3 API operations and access all buckets.'
-              : 'Existing bucket ownership is unchanged. The role controls whether this key can create new buckets.'}
+              : 'Changing the name does not affect bucket ownership. The role controls S3 access.'}
           </DialogDescription>
         </DialogHeader>
         {reviewing ? (
           <ReviewDetails
             rows={[
               { id: 'access-key', label: 'Access key', value: user.access_key, copyable: true },
+              ...(nameChanged ? [{ id: 'name', label: 'Name', value: trimmedName || 'None' }] : []),
               { id: 'current-role', label: 'Current role', value: roleLabel(user.role) },
               { id: 'new-role', label: 'New role', value: roleLabel(role) },
             ]}
           />
         ) : (
           <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor={`name-${user.access_key}`}>Name</FieldLabel>
+              <Input
+                id={`name-${user.access_key}`}
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                disabled={updating}
+                placeholder="Optional name"
+              />
+              <FieldDescription>Leave blank to show the access key.</FieldDescription>
+            </Field>
             <Field>
               <FieldLabel htmlFor={`role-${user.access_key}`}>Role</FieldLabel>
               <RoleSelect id={`role-${user.access_key}`} value={role} disabled={updating} onChange={setRole} />
@@ -447,9 +485,9 @@ function ChangeRoleDialog({ user, disabled }: { user: S3User; disabled?: boolean
           >
             {reviewing ? 'Back' : 'Cancel'}
           </Button>
-          <Button type="button" disabled={role === user.role || updating} onClick={handleUpdate}>
+          <Button type="button" disabled={(!nameChanged && !roleChanged) || updating} onClick={handleUpdate}>
             {updating && <Loader2 data-icon="inline-start" className="animate-spin" />}
-            {reviewing ? 'Confirm role' : 'Review'}
+            {reviewing ? 'Confirm changes' : roleChanged ? 'Review' : 'Save'}
           </Button>
         </DialogFooter>
       </DialogContent>
