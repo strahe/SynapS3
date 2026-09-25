@@ -45,6 +45,9 @@ func TestRuntimeModelsMatchAppliedBaseline(t *testing.T) {
 		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
 			t.Fatalf("create initial schema: %v", err)
 		}
+		if err := runMigrationBody(t.Context(), db, up2026092401S3AccountName); err != nil {
+			t.Fatalf("add S3 account names: %v", err)
+		}
 		appliedTables := applicationSchemaTables(t, db)
 		if !slices.Equal(appliedTables, registeredTables) {
 			t.Fatalf("applied tables = %v, runtime model tables = %v", appliedTables, registeredTables)

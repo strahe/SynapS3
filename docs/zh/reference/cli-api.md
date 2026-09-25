@@ -73,9 +73,10 @@ Admin 命令使用 HTTP Basic auth。用户名来自 `admin.auth.username`；密
 
 ```bash
 synaps3 admin status
-synaps3 admin s3-user create
+synaps3 admin s3-user create --name "备份客户端"
 synaps3 admin s3-user list
 synaps3 admin s3-user update <access-key> --role userplus
+synaps3 admin s3-user update <access-key> --name "归档客户端"
 synaps3 admin s3-user rotate-secret <access-key>
 synaps3 admin settings get
 synaps3 admin settings set cache.max_size_gb=200
@@ -90,6 +91,8 @@ synaps3 admin storage-confirmation release 42 --attempt-id current-attempt-id --
 ```
 
 没有受保护的密码文件时，在无回显提示中输入 Admin 密码。不要把密码直接写入 shell history。创建 S3 用户和轮换 secret key 时只显示一次 secret key，请保存到权限为 `0600` 的客户端凭据文件。
+
+S3 用户名称可选且必须唯一。使用 `admin s3-user update <access-key> --name ''` 可清除名称。用户列表会同时显示名称和完整 Access Key。
 
 Admin 全局 flags 必须放在 `admin` 之后、子命令之前：
 

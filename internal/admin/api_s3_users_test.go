@@ -113,6 +113,94 @@ func TestS3UsersCreateRejectsInvalidRole(t *testing.T) {
 	}
 }
 
+func TestS3UsersNameCreateUpdateAndClear(t *testing.T) {
+	srv, _ := newS3UsersAPITestServer(t, "127.0.0.1:9090")
+	call := func(method, path, accessKey, body string, handler func(http.ResponseWriter, *http.Request)) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if accessKey != "" {
+			req.SetPathValue("accessKey", accessKey)
+		}
+		rr := httptest.NewRecorder()
+		handler(rr, req)
+		return rr
+	}
+	createdRR := call(http.MethodPost, "/api/v1/s3-users", "", `{"name":"  备份客户端  ","role":"user"}`, srv.handleAPICreateS3User)
+	if createdRR.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body=%s", createdRR.Code, createdRR.Body.String())
+	}
+	var created s3UserCredentialsResponse
+	if err := json.NewDecoder(createdRR.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Name != "备份客户端" {
+		t.Fatalf("created name = %q", created.Name)
+	}
+	if duplicate := call(http.MethodPost, "/api/v1/s3-users", "", `{"name":"备份客户端"}`, srv.handleAPICreateS3User); duplicate.Code != http.StatusConflict {
+		t.Fatalf("duplicate create status = %d, body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	other := call(http.MethodPost, "/api/v1/s3-users", "", `{"name":"Other"}`, srv.handleAPICreateS3User)
+	if other.Code != http.StatusCreated {
+		t.Fatalf("second create status = %d, body=%s", other.Code, other.Body.String())
+	}
+	path := "/api/v1/s3-users/" + created.AccessKey
+	conflict := call(http.MethodPut, path, created.AccessKey, `{"name":"Other","role":"admin"}`, srv.handleAPIUpdateS3User)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("duplicate update status = %d, body=%s", conflict.Code, conflict.Body.String())
+	}
+	unchanged, err := srv.repos.S3Accounts.GetByAccessKey(t.Context(), created.AccessKey)
+	if err != nil || unchanged == nil || unchanged.Role != auth.RoleUser || unchanged.Name != "备份客户端" {
+		t.Fatalf("account after rejected update = %#v, err=%v", unchanged, err)
+	}
+	updatedRR := call(http.MethodPut, path, created.AccessKey, `{"name":"Archive client"}`, srv.handleAPIUpdateS3User)
+	if updatedRR.Code != http.StatusOK {
+		t.Fatalf("name-only update status = %d, body=%s", updatedRR.Code, updatedRR.Body.String())
+	}
+	var updated s3UserListItem
+	if err := json.NewDecoder(updatedRR.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "Archive client" || updated.Role != string(auth.RoleUser) {
+		t.Fatalf("name-only update = %#v", updated)
+	}
+	roleOnly := call(http.MethodPut, path, created.AccessKey, `{"role":"admin"}`, srv.handleAPIUpdateS3User)
+	if roleOnly.Code != http.StatusOK {
+		t.Fatalf("role-only update status = %d, body=%s", roleOnly.Code, roleOnly.Body.String())
+	}
+	if err := json.NewDecoder(roleOnly.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "Archive client" || updated.Role != string(auth.RoleAdmin) {
+		t.Fatalf("role-only update = %#v", updated)
+	}
+	if cleared := call(http.MethodPut, path, created.AccessKey, `{"name":""}`, srv.handleAPIUpdateS3User); cleared.Code != http.StatusOK || !strings.Contains(cleared.Body.String(), `"name":""`) {
+		t.Fatalf("clear name status = %d, body=%s", cleared.Code, cleared.Body.String())
+	}
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/s3-users", nil)
+	listRR := httptest.NewRecorder()
+	srv.handleAPIListS3Users(listRR, listReq)
+	if listRR.Code != http.StatusOK || strings.Contains(listRR.Body.String(), created.SecretKey) || !strings.Contains(listRR.Body.String(), `"name":""`) {
+		t.Fatalf("list status = %d, body=%s", listRR.Code, listRR.Body.String())
+	}
+}
+
+func TestS3UsersRejectInvalidNames(t *testing.T) {
+	srv, _ := newS3UsersAPITestServer(t, "127.0.0.1:9090")
+	for _, name := range []string{"line\nbreak", "\nedge", strings.Repeat("a", 129)} {
+		body, err := json.Marshal(map[string]string{"name": name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/s3-users", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		srv.handleAPICreateS3User(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("name %q status = %d, body=%s", name, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 func TestS3UsersUpdateRotateAndDelete(t *testing.T) {
 	srv, iamSvc := newS3UsersAPITestServer(t, "127.0.0.1:9090")
 
@@ -407,6 +495,7 @@ func TestS3UsersRejectRootMutations(t *testing.T) {
 		call   func(http.ResponseWriter, *http.Request)
 	}{
 		{name: "update", method: http.MethodPut, path: "/api/v1/s3-users/" + rootAccess, body: `{"role":"user"}`, call: srv.handleAPIUpdateS3User},
+		{name: "rename", method: http.MethodPut, path: "/api/v1/s3-users/" + rootAccess, body: `{"name":"root"}`, call: srv.handleAPIUpdateS3User},
 		{name: "rotate", method: http.MethodPost, path: "/api/v1/s3-users/" + rootAccess + "/secret", body: `{}`, call: srv.handleAPIRotateS3UserSecret},
 		{name: "delete", method: http.MethodDelete, path: "/api/v1/s3-users/" + rootAccess, call: srv.handleAPIDeleteS3User},
 	} {

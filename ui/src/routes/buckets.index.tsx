@@ -2,8 +2,9 @@ import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { Database, Loader2, Plus, RefreshCw, UserRound } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
-import { type BucketItem, internalRootOwnerAccessKey } from '@/api/client'
+import { type BucketItem, internalRootOwnerAccessKey, type S3User } from '@/api/client'
 import { BucketOwnerSelect } from '@/components/app/BucketOwnerSelect'
+import { CopyableValue } from '@/components/app/CopyableValue'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
@@ -324,14 +325,16 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
                 id: 'current-owner',
                 label: 'Current owner',
                 value: bucket.owner_access_key ?? ownerLabel(bucket.owner_access_key),
-                displayValue: ownerLabel(bucket.owner_access_key),
+                displayValue: ownerLabel(bucket.owner_access_key, users),
+                maxLength: ownerLabel(bucket.owner_access_key, users).length,
                 copyable: Boolean(bucket.owner_access_key),
               },
               {
                 id: 'new-owner',
                 label: 'New owner',
                 value: ownerAccessKey || ownerLabel(null),
-                displayValue: ownerLabel(ownerAccessKey),
+                displayValue: ownerLabel(ownerAccessKey, users),
+                maxLength: ownerLabel(ownerAccessKey, users).length,
                 copyable: Boolean(ownerAccessKey),
               },
             ]}
@@ -385,6 +388,7 @@ function ChangeBucketOwnerDialog({ bucket }: { bucket: BucketItem }) {
 
 function BucketsPage() {
   const { data, isLoading, error } = useBuckets()
+  const { data: users = [] } = useS3Users()
   const qc = useQueryClient()
   const buckets = data ?? []
 
@@ -449,7 +453,7 @@ function BucketsPage() {
                     </Link>
                   </TableCell>
                   <TableCell className="px-4">
-                    <OwnerCell ownerAccessKey={bucket.owner_access_key} />
+                    <OwnerCell ownerAccessKey={bucket.owner_access_key} users={users} />
                   </TableCell>
                   <TableCell className="px-4">
                     <div>{bucketCopyPolicyLabel(bucket)}</div>
@@ -479,14 +483,23 @@ function BucketsPage() {
   )
 }
 
-function OwnerCell({ ownerAccessKey }: { ownerAccessKey: string | null }) {
+function OwnerCell({ ownerAccessKey, users }: { ownerAccessKey: string | null; users: S3User[] }) {
   if (!ownerAccessKey) {
     return <StatusBadge tone="warning">Unassigned</StatusBadge>
   }
   if (ownerAccessKey === internalRootOwnerAccessKey) {
     return <StatusBadge tone="neutral">Internal root</StatusBadge>
   }
-  return <code className="block max-w-56 truncate text-xs text-muted-foreground">{ownerAccessKey}</code>
+  return (
+    <div className="max-w-56">
+      <CopyableValue
+        label="Owner access key"
+        value={ownerAccessKey}
+        displayValue={ownerLabel(ownerAccessKey, users)}
+        maxLength={28}
+      />
+    </div>
+  )
 }
 
 function BucketStorageHealthCell({ bucket }: { bucket: BucketItem }) {

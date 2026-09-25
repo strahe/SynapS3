@@ -82,7 +82,7 @@ func TestMigrationRepairsMarkerForCompletePostState(t *testing.T) {
 	testMigrationDialects(t, testMigrationRepairsMarkerForCompletePostState)
 }
 
-func TestInitialBaselineRepairsMissingMarkerOnlyForCompletePostState(t *testing.T) {
+func TestInitialBaselineRepairsMissingMarkerAndAppliesLaterMigrations(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		if err := runMigrationBody(ctx, db, up2026090101InitialSchema); err != nil {
@@ -98,7 +98,7 @@ func TestInitialBaselineRepairsMissingMarkerOnlyForCompletePostState(t *testing.
 		if _, err := migrator.Migrate(ctx); err != nil {
 			t.Fatalf("repair baseline marker: %v", err)
 		}
-		assertAppliedMigrationCount(t, ctx, migrator, 1)
+		assertAppliedMigrationCount(t, ctx, migrator, 2)
 	})
 }
 

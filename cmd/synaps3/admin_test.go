@@ -498,27 +498,76 @@ func TestAdminS3UserCommands(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("Decode body: %v", err)
 			}
-			if body["role"] != "admin" {
-				t.Fatalf("role = %q, want admin", body["role"])
+			if body["role"] != "admin" || body["name"] != "Backup client" {
+				t.Fatalf("create body = %#v", body)
 			}
 			writeAdminTestJSON(t, w, http.StatusCreated, map[string]string{
 				"access_key": "ak",
+				"name":       "Backup client",
 				"secret_key": "sk",
 				"role":       "admin",
 			})
 		}))
 		defer ts.Close()
 
-		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "s3-user", "create", "--role", "admin", "--yes"})
+		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "s3-user", "create", "--name", "Backup client", "--role", "admin", "--yes"})
 		if err != nil {
 			t.Fatalf("admin s3-user create: %v\n%s", err, out)
 		}
 		if !strings.Contains(out, "ak") || !strings.Contains(out, "sk") {
 			t.Fatalf("create output missing credentials:\n%s", out)
 		}
-		for _, want := range []string{"S3 User Credentials", "Access key: ak", "Secret key: sk", "Role: admin"} {
+		for _, want := range []string{"S3 User Credentials", "Name: Backup client", "Access key: ak", "Secret key: sk", "Role: admin"} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("create output missing %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("update name without role and clear it", func(t *testing.T) {
+		var names []string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPut || r.URL.Path != "/api/v1/s3-users/ak" {
+				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if _, hasRole := body["role"]; hasRole {
+				t.Fatalf("name-only update sent role: %#v", body)
+			}
+			names = append(names, body["name"])
+			writeAdminTestJSON(t, w, http.StatusOK, map[string]any{
+				"access_key": "ak", "name": body["name"], "role": "user", "bucket_count": 0,
+			})
+		}))
+		defer ts.Close()
+		for _, name := range []string{"Archive client", ""} {
+			out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "s3-user", "update", "ak", "--name", name})
+			if err != nil {
+				t.Fatalf("update name %q: %v\n%s", name, err, out)
+			}
+		}
+		if !slices.Equal(names, []string{"Archive client", ""}) {
+			t.Fatalf("names = %#v", names)
+		}
+	})
+
+	t.Run("list shows name and full access key", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeAdminTestJSON(t, w, http.StatusOK, []map[string]any{{
+				"access_key": "full-access-key", "name": "Backup client", "role": "user", "bucket_count": 1,
+			}})
+		}))
+		defer ts.Close()
+		out, err := runAdminCommand(t, []string{"synaps3", "admin", "--admin-url", ts.URL, "s3-user", "list"})
+		if err != nil {
+			t.Fatalf("list users: %v\n%s", err, out)
+		}
+		for _, want := range []string{"NAME", "ACCESS_KEY", "Backup client", "full-access-key"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("list missing %q:\n%s", want, out)
 			}
 		}
 	})

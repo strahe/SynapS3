@@ -901,11 +901,13 @@ export type S3UserRole = 'user' | 'userplus' | 'admin'
 
 export interface S3User {
   access_key: string
+  name: string
   role: S3UserRole
   bucket_count: number
 }
 
 export interface S3UserCredentials extends SettingsS3Credentials {
+  name: string
   role: S3UserRole
 }
 
@@ -1226,12 +1228,12 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   getS3Users: () => fetchJSON<S3User[]>('/s3-users'),
-  createS3User: (payload: { role?: S3UserRole } = {}) =>
+  createS3User: (payload: { name?: string; role?: S3UserRole } = {}) =>
     fetchJSON<S3UserCredentials>('/s3-users', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  updateS3User: (accessKey: string, payload: { role: S3UserRole }) =>
+  updateS3User: (accessKey: string, payload: { name?: string; role?: S3UserRole }) =>
     fetchJSON<S3User>(`/s3-users/${encodeURIComponent(accessKey)}`, {
       method: 'PUT',
       body: JSON.stringify(payload),

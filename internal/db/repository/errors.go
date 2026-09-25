@@ -11,6 +11,8 @@ import (
 // ErrAlreadyExists is returned when an insert violates a unique constraint.
 var ErrAlreadyExists = errors.New("already exists")
 
+var ErrS3AccountNameExists = errors.New("S3 account name already exists")
+
 // ErrNotFound is returned when a CAS update matches zero rows (entity missing or wrong state).
 var ErrNotFound = errors.New("not found")
 
@@ -55,6 +57,14 @@ func isUniqueViolation(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint")
+}
+
+func isS3AccountNameUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505" && pgErr.ConstraintName == "uq_s3_accounts_name"
+	}
+	return strings.Contains(err.Error(), "UNIQUE constraint failed: s3_accounts.name")
 }
 
 func isSQLiteBusy(err error) bool {

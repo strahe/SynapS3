@@ -146,6 +146,7 @@ func adminS3UserCommand() *cli.Command {
 				Name:  "create",
 				Usage: "create an S3 user",
 				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "name", Usage: "optional S3 user name"},
 					&cli.StringFlag{Name: "role", Usage: "S3 user role: user, userplus, or admin"},
 					&cli.BoolFlag{Name: "yes", Usage: "confirm high-risk admin user creation"},
 				},
@@ -162,6 +163,9 @@ func adminS3UserCommand() *cli.Command {
 						return err
 					}
 					payload := map[string]string{}
+					if cmd.IsSet("name") {
+						payload["name"] = cmd.String("name")
+					}
 					if role != "" {
 						payload["role"] = role
 					}
@@ -177,9 +181,10 @@ func adminS3UserCommand() *cli.Command {
 			},
 			{
 				Name:      "update",
-				Usage:     "update an S3 user's role",
+				Usage:     "update an S3 user's name or role",
 				ArgsUsage: "<access-key>",
 				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "name", Usage: "S3 user name; empty clears the name"},
 					&cli.StringFlag{Name: "role", Usage: "S3 user role: user, userplus, or admin"},
 					&cli.BoolFlag{Name: "yes", Usage: "confirm admin role assignment"},
 				},
@@ -188,11 +193,16 @@ func adminS3UserCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					role := strings.TrimSpace(cmd.String("role"))
-					if err := validateAdminRole(role, false); err != nil {
-						return err
+					if !cmd.IsSet("name") && !cmd.IsSet("role") {
+						return errors.New("specify --name or --role")
 					}
-					if role == "admin" && !cmd.Bool("yes") {
+					role := strings.TrimSpace(cmd.String("role"))
+					if cmd.IsSet("role") {
+						if err := validateAdminRole(role, false); err != nil {
+							return err
+						}
+					}
+					if cmd.IsSet("role") && role == "admin" && !cmd.Bool("yes") {
 						return errors.New("assigning the admin role requires --yes")
 					}
 					client, opts, err := newAdminClientFromCommand(ctx, cmd)
@@ -201,7 +211,14 @@ func adminS3UserCommand() *cli.Command {
 					}
 					var updated adminS3User
 					path := "/api/v1/s3-users/" + url.PathEscape(accessKey)
-					if err := client.putJSON(ctx, path, map[string]string{"role": role}, &updated, true); err != nil {
+					payload := map[string]string{}
+					if cmd.IsSet("name") {
+						payload["name"] = cmd.String("name")
+					}
+					if cmd.IsSet("role") {
+						payload["role"] = role
+					}
+					if err := client.putJSON(ctx, path, payload, &updated, true); err != nil {
 						return err
 					}
 					if opts.JSON {
@@ -884,12 +901,14 @@ type adminCacheStats struct {
 
 type adminS3User struct {
 	AccessKey   string `json:"access_key"`
+	Name        string `json:"name"`
 	Role        string `json:"role"`
 	BucketCount int    `json:"bucket_count"`
 }
 
 type adminS3Credentials struct {
 	AccessKey string `json:"access_key"`
+	Name      string `json:"name"`
 	SecretKey string `json:"secret_key"`
 	Role      string `json:"role"`
 }
@@ -1372,9 +1391,9 @@ func writeAdminS3UsersTable(w io.Writer, users []adminS3User) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "ACCESS_KEY\tROLE\tBUCKETS")
+	_, _ = fmt.Fprintln(tw, "NAME\tACCESS_KEY\tROLE\tBUCKETS")
 	for _, user := range users {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\n", user.AccessKey, user.Role, user.BucketCount)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\n", user.Name, user.AccessKey, user.Role, user.BucketCount)
 	}
 	return tw.Flush()
 }
@@ -1383,11 +1402,15 @@ func writeAdminCredentials(w io.Writer, credentials adminS3Credentials) error {
 	if _, err := fmt.Fprintln(w, "S3 User Credentials"); err != nil {
 		return err
 	}
-	return writeAdminRows(w, "", []adminOutputRow{
+	rows := []adminOutputRow{
 		{Name: "Access key", Value: credentials.AccessKey},
 		{Name: "Secret key", Value: credentials.SecretKey},
 		{Name: "Role", Value: credentials.Role},
-	})
+	}
+	if credentials.Name != "" {
+		rows = append([]adminOutputRow{{Name: "Name", Value: credentials.Name}}, rows...)
+	}
+	return writeAdminRows(w, "", rows)
 }
 
 func writeAdminSettingsSummary(w io.Writer, settings adminSettingsResponse) error {

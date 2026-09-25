@@ -78,6 +78,7 @@ type S3AccountRepository interface {
 // S3AccountUpdate holds mutable S3 account fields.
 type S3AccountUpdate struct {
 	SecretKey *string
+	Name      *string
 	Role      auth.Role
 }
 
