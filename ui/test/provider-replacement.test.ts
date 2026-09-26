@@ -266,23 +266,55 @@ test('server faults do not surface internal text', () => {
 })
 
 function candidate(overrides: Partial<ReplacementProviderCandidate> = {}): ReplacementProviderCandidate {
-  return { provider_id: '303', eligible: true, previously_used: false, ...overrides }
+  return { provider_id: '303', manual_selectable: true, previously_used: false, ...overrides }
+}
+
+function savedProfile(name: string, location?: string): NonNullable<ReplacementProviderCandidate['provider_profile']> {
+  return {
+    provider_id: '303',
+    name,
+    description: '',
+    service_provider_address: '',
+    payee_address: '',
+    active: true,
+    service_url: 'https://provider.example',
+    registry_snapshot: {
+      version: 1,
+      pdp_offering: location
+        ? {
+            min_piece_size_bytes: '0',
+            max_piece_size_bytes: '0',
+            storage_price_per_tib_per_day: '0',
+            min_proving_period_epochs: '0',
+            location,
+            payment_token_address: '',
+            ipni_piece: false,
+            ipni_ipfs: false,
+            ipni_peer_id: '',
+            extra_capabilities_hex: {},
+          }
+        : null,
+    },
+    last_success_at: '2026-09-25T10:00:00Z',
+  }
 }
 
 // The API refuses these choices, so the chooser has to say so rather than
 // letting the operator find out from a 409.
 test('a provider that cannot take the replica says why', () => {
   assert.equal(
-    providerCandidateDisabledReason(candidate({ eligible: false, ineligible_reason: 'current_source' })),
+    providerCandidateDisabledReason(candidate({ manual_selectable: false, manual_block_reason: 'current_source' })),
     'This is the provider being replaced'
   )
   assert.equal(
-    providerCandidateDisabledReason(candidate({ eligible: false, ineligible_reason: 'already_serves_bucket' })),
+    providerCandidateDisabledReason(
+      candidate({ manual_selectable: false, manual_block_reason: 'already_serves_bucket' })
+    ),
     'Already stores a replica of this bucket'
   )
   // An unrecognised reason still has to read as a reason, not as a code.
   assert.equal(
-    providerCandidateDisabledReason(candidate({ eligible: false, ineligible_reason: 'something_new' })),
+    providerCandidateDisabledReason(candidate({ manual_selectable: false, manual_block_reason: 'something_new' })),
     'Cannot take this replica'
   )
   assert.equal(providerCandidateDisabledReason(candidate()), null)
@@ -290,14 +322,42 @@ test('a provider that cannot take the replica says why', () => {
 
 test('a provider reads as its name and falls back to its registry ID', () => {
   assert.equal(
-    providerCandidateLabel(candidate({ provider_identity: { registry_provider_id: '303', name: 'Acme' } })),
-    'Acme'
+    providerCandidateLabel(
+      candidate({
+        provider_profile: savedProfile('Saved name'),
+        provider_identity: { registry_provider_id: '303', name: 'Old cache' },
+      })
+    ),
+    'Saved name'
   )
+  assert.equal(providerCandidateLabel(candidate({ provider_profile: savedProfile('Acme') })), 'Acme')
   assert.equal(providerCandidateLabel(candidate()), 'Registry 303')
   // A blank name is not a name.
+  assert.equal(providerCandidateLabel(candidate({ provider_profile: savedProfile('  ') })), 'Registry 303')
   assert.equal(
-    providerCandidateLabel(candidate({ provider_identity: { registry_provider_id: '303', name: '  ' } })),
+    providerCandidateLabel(
+      candidate({ provider_identity: { registry_provider_id: '303', name: 'Uncollected cache' } })
+    ),
     'Registry 303'
+  )
+})
+
+test('stale and unavailable providers remain visible with concrete reasons', () => {
+  assert.equal(
+    providerCandidateDisabledReason(candidate({ manual_selectable: false, manual_block_reason: 'observation_stale' })),
+    'Health information is out of date. Refresh this provider.'
+  )
+  assert.equal(
+    providerCandidateDisabledReason(
+      candidate({ manual_selectable: false, manual_block_reason: 'provider_unavailable' })
+    ),
+    'Provider is not currently available'
+  )
+  assert.equal(
+    providerCandidateDisabledReason(
+      candidate({ manual_selectable: false, manual_block_reason: 'profile_url_changed' })
+    ),
+    'The provider service URL changed. Refresh this provider to check its health.'
   )
 })
 
@@ -306,14 +366,15 @@ test('a provider reads as its name and falls back to its registry ID', () => {
 test('a previously used provider is choosable but flagged', () => {
   assert.equal(providerCandidateNote(candidate({ previously_used: true })), 'Used by this bucket before')
   assert.equal(providerCandidateNote(candidate()), null)
-  assert.equal(providerCandidateNote(candidate({ eligible: false, previously_used: true })), null)
+  assert.equal(providerCandidateNote(candidate({ manual_selectable: false, previously_used: true })), null)
 })
 
 // Operators search by whichever they have to hand.
 test('providers are searchable by name and by registry ID', () => {
+  assert.equal(providerCandidateMatches(candidate({ provider_profile: savedProfile('Saved name') }), 'saved'), true)
   const acme = candidate({
     provider_id: '303',
-    provider_identity: { registry_provider_id: '303', name: 'Acme Storage', location: 'Berlin' },
+    provider_profile: savedProfile('Acme Storage', 'Berlin'),
   })
   assert.equal(providerCandidateMatches(acme, 'acme'), true)
   assert.equal(providerCandidateMatches(acme, '303'), true)
@@ -330,7 +391,7 @@ test('providers are searchable by name and by registry ID', () => {
 test('the id line under a provider name says what the number is', () => {
   assert.equal(
     providerCandidateRegistryLine(
-      candidate({ provider_id: '5', provider_identity: { registry_provider_id: '5', name: 'Mongo2Stor' } })
+      candidate({ provider_id: '5', provider_profile: { ...savedProfile('Mongo2Stor'), provider_id: '5' } })
     ),
     'Registry 5'
   )

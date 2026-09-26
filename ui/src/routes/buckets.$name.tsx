@@ -53,11 +53,13 @@ import { DetailTextDialog } from '@/components/app/DetailTextDialog'
 import { PageErrorState } from '@/components/app/PageErrorState'
 import { PageHeader } from '@/components/app/PageHeader'
 import { ProviderIdentityCell } from '@/components/app/ProviderIdentityCell'
+import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { ProviderReplacementProgress as ReplacementProgressView } from '@/components/app/ProviderReplacementProgress'
 import { ProviderSelect } from '@/components/app/ProviderSelect'
 import { ReviewDetails } from '@/components/app/ReviewDetails'
 import { bucketStatusTone, StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { UploadProgressRing, uploadProgressPercent } from '@/components/app/UploadProgress'
+import { WarmStoragePriceDetails } from '@/components/app/WarmStoragePriceDetails'
 import { StorageRiskHeader, StorageRiskView } from '@/components/buckets/StorageRiskView'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
@@ -108,14 +110,17 @@ import {
   usePermanentDeleteBucketObjectVersion,
   usePermanentDeleteDeletedBucketObject,
   useRefreshDataSetStorageHealth,
+  useRefreshProvider,
   useReplacementProviderCandidates,
   useRestoreBucketObject,
   useRestoreBucketObjectVersion,
   useRetryProviderReplacement,
   useS3Users,
   useStartProviderReplacement,
+  useTestProviderUploadSpeed,
   useUpdateBucketCopyPolicy,
   useUpdateBucketOwner,
+  useWarmStoragePriceList,
 } from '@/hooks/queries'
 import {
   bucketCopyPolicyLabel,
@@ -163,6 +168,7 @@ import {
   dataSetGenerationLabel,
   dataSetGenerationTone,
   dataSetReplaceable,
+  providerCandidateDisabledReason,
   replacementConfirmationSummary,
   replacementErrorMessage,
   replacementNextStep,
@@ -170,6 +176,7 @@ import {
   replacementStatusLabel,
   replacementStatusTone,
 } from '@/lib/provider-replacement'
+import { providerUploadSpeedLabel } from '@/lib/provider-upload-speed'
 import { ownerLabel } from '@/lib/s3-owner'
 import { type BucketPrefixCrumb, bucketPrefixCrumbs, duplicateObjectUploadKeys, objectUploadKey } from '@/lib/s3-prefix'
 import {
@@ -179,7 +186,7 @@ import {
 } from '@/lib/storage-confirmation-attention'
 import { objectStateLabel, replicaLabel, transferMethodLabel } from '@/lib/storage-status-labels'
 import { bucketStorageDataSetTopologyLinkModel } from '@/lib/storage-topology'
-import { cn, formatBytes, formatNumber, timeAgo } from '@/lib/utils'
+import { cn, formatBytes, formatNumber, formatTokenAmount, timeAgo } from '@/lib/utils'
 
 const objectBrowserSkeletonRows = ['row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6', 'row-7', 'row-8']
 
@@ -1835,12 +1842,16 @@ function ReplaceProviderDialog({
   onClose: () => void
 }) {
   const startReplacement = useStartProviderReplacement()
+  const refreshProvider = useRefreshProvider()
+  const testUploadSpeed = useTestProviderUploadSpeed()
   const [mode, setMode] = useState<'automatic' | 'manual'>('automatic')
   const [providerID, setProviderID] = useState('')
+  const [inspectedProviderID, setInspectedProviderID] = useState('')
   const [clientRequestID, setClientRequestID] = useState('')
+  const [confirmationRevision, setConfirmationRevision] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const dataSetID = dataSet?.id
-  // The registry is only worth reading while the operator is actually choosing.
+  const priceList = useWarmStoragePriceList(Boolean(dataSet))
   const candidates = useReplacementProviderCandidates(
     bucketName,
     dataSet?.id ?? null,
@@ -1848,11 +1859,32 @@ function ReplaceProviderDialog({
   )
 
   useEffect(() => {
+    if (priceList.data?.fingerprint) setClientRequestID(crypto.randomUUID())
+  }, [priceList.data?.fingerprint])
+
+  useEffect(() => {
+    if (priceList.isError) setConfirmationRevision((current) => current + 1)
+  }, [priceList.isError])
+
+  useEffect(() => {
+    if (!providerID || !candidates.data) return
+    const selected = candidates.data.providers.find((item) => item.provider_id === providerID)
+    if (!selected?.manual_selectable) {
+      setProviderID('')
+      setError('The selected provider is no longer available. Review its current details.')
+      setClientRequestID(crypto.randomUUID())
+      setConfirmationRevision((current) => current + 1)
+    }
+  }, [providerID, candidates.data])
+
+  useEffect(() => {
     if (dataSetID !== undefined) {
       setMode('automatic')
       setProviderID('')
+      setInspectedProviderID('')
       setError(null)
       setClientRequestID(crypto.randomUUID())
+      setConfirmationRevision((current) => current + 1)
     }
   }, [dataSetID])
 
@@ -1860,19 +1892,39 @@ function ReplaceProviderDialog({
 
   const namedProvider = dataSet.provider_identity?.name?.trim()
   const providerLabel = namedProvider || (dataSet.provider_id ? `Registry ${dataSet.provider_id}` : '—')
+  const inspectedProvider = candidates.data?.providers.find((item) => item.provider_id === inspectedProviderID)
+  const selectedProvider = candidates.data?.providers.find((item) => item.provider_id === providerID)
   const canChooseProvider =
-    mode === 'automatic' || (!candidates.isLoading && !candidates.isError && providerID.trim().length > 0)
+    mode === 'automatic' ||
+    (!candidates.isLoading && !candidates.isError && selectedProvider?.manual_selectable === true)
+  const canConfirmPrice = Boolean(priceList.data?.supported_token && !priceList.isError)
 
   const submit = () => {
-    if (!canChooseProvider || startReplacement.isPending) return
+    if (!canChooseProvider || !canConfirmPrice || startReplacement.isPending || !priceList.data) return
     const requestID = clientRequestID || crypto.randomUUID()
     if (!clientRequestID) setClientRequestID(requestID)
     setError(null)
     startReplacement.mutate(
-      { bucket: bucketName, dataSetID: dataSet.id, mode, providerID: providerID.trim(), clientRequestID: requestID },
+      {
+        bucket: bucketName,
+        dataSetID: dataSet.id,
+        mode,
+        providerID: providerID.trim(),
+        clientRequestID: requestID,
+        priceListFingerprint: priceList.data.fingerprint,
+      },
       {
         onSuccess: () => onClose(),
-        onError: (mutationError) => setError(replacementErrorMessage(mutationError)),
+        onError: (mutationError) => {
+          if (mutationError instanceof APIError && mutationError.code === 'price_list_changed') {
+            setClientRequestID(crypto.randomUUID())
+            setConfirmationRevision((current) => current + 1)
+            void priceList.refetch()
+            setError('The price list changed. Review the new prices and type replace again.')
+            return
+          }
+          setError(replacementErrorMessage(mutationError))
+        },
       }
     )
   }
@@ -1887,10 +1939,20 @@ function ReplaceProviderDialog({
       description="This starts paying a new provider, and new uploads go there. The old provider is ended after existing objects are readable on the new one."
       confirmLabel="Replace provider"
       typedTarget="replace"
+      confirmationResetKey={`${priceList.data?.fingerprint ?? 'unavailable'}:${confirmationRevision}`}
       pending={startReplacement.isPending}
-      confirmDisabled={!canChooseProvider}
+      confirmDisabled={!canChooseProvider || !canConfirmPrice}
       error={error}
-      contentClassName="data-[size=default]:max-w-lg data-[size=default]:sm:max-w-lg"
+      contentClassName="flex max-h-[90vh] w-[calc(100vw-2rem)] flex-col overflow-hidden data-[size=default]:max-w-3xl data-[size=default]:sm:max-w-3xl"
+      bodyClassName="min-h-0 flex-1 space-y-4 overflow-y-auto pr-2"
+      confirmationNotice={
+        priceList.data?.supported_token ? (
+          <p className="text-xs text-muted-foreground">
+            Storage rate: {formatTokenAmount(priceList.data.rates.storage_per_tib_per_month, 18, 'USDFC')} / TiB /
+            month. Review the full price list before confirming.
+          </p>
+        ) : undefined
+      }
       onConfirm={submit}
     >
       <ReviewDetails
@@ -1920,7 +1982,9 @@ function ReplaceProviderDialog({
             onValueChange={(value) => {
               setMode(value as 'automatic' | 'manual')
               setProviderID('')
+              setInspectedProviderID('')
               setClientRequestID(crypto.randomUUID())
+              setConfirmationRevision((current) => current + 1)
             }}
             disabled={startReplacement.isPending}
           >
@@ -1934,11 +1998,13 @@ function ReplaceProviderDialog({
               </SelectGroup>
             </SelectContent>
           </Select>
-          {mode === 'automatic' && <FieldDescription>Picks a provider this bucket has never used.</FieldDescription>}
+          {mode === 'automatic' && (
+            <FieldDescription>Uses an available, FWSS approved provider this bucket has not used.</FieldDescription>
+          )}
         </Field>
         {mode === 'manual' && (
           <Field data-disabled={startReplacement.isPending}>
-            <FieldLabel htmlFor="replacement-provider">Provider</FieldLabel>
+            <FieldLabel htmlFor="replacement-provider">Provider to review</FieldLabel>
             {candidates.isError ? (
               <FieldDescription>Provider choices couldn’t be loaded. Try again.</FieldDescription>
             ) : (
@@ -1946,16 +2012,134 @@ function ReplaceProviderDialog({
                 id="replacement-provider"
                 candidates={candidates.data?.providers ?? []}
                 value={providerID}
-                onChange={(value) => {
-                  setProviderID(value)
-                  setClientRequestID(crypto.randomUUID())
+                onInspect={(nextProviderID) => {
+                  setInspectedProviderID(nextProviderID)
+                  if (providerID && providerID !== nextProviderID) {
+                    setProviderID('')
+                    setClientRequestID(crypto.randomUUID())
+                    setConfirmationRevision((current) => current + 1)
+                  }
+                  setError(null)
                 }}
                 disabled={startReplacement.isPending || candidates.isLoading}
               />
             )}
+            {inspectedProvider && (
+              <div className="mt-3 space-y-3 rounded-md border p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <strong>
+                      {inspectedProvider.provider_profile?.name || `Registry ${inspectedProvider.provider_id}`}
+                    </strong>
+                    <p className="text-xs text-muted-foreground">
+                      {providerID === inspectedProvider.provider_id
+                        ? 'Selected for replacement'
+                        : 'Review before selecting'}
+                    </p>
+                  </div>
+                  {providerID !== inspectedProvider.provider_id && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={!inspectedProvider.manual_selectable || startReplacement.isPending}
+                      onClick={() => {
+                        setProviderID(inspectedProvider.provider_id)
+                        setClientRequestID(crypto.randomUUID())
+                        setConfirmationRevision((current) => current + 1)
+                      }}
+                    >
+                      Select this provider
+                    </Button>
+                  )}
+                </div>
+                {!inspectedProvider.manual_selectable && (
+                  <p className="text-sm text-muted-foreground">{providerCandidateDisabledReason(inspectedProvider)}</p>
+                )}
+                <ProviderProfileDetails
+                  profile={inspectedProvider.provider_profile}
+                  supportedTokenAddress={priceList.data?.supported_token ? priceList.data.token : undefined}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Health: {inspectedProvider.observation?.signal.status ?? 'Not checked'} ·{' '}
+                  {inspectedProvider.observation?.signal.freshness.last_checked_at
+                    ? timeAgo(inspectedProvider.observation.signal.freshness.last_checked_at)
+                    : 'No recent result'}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Upload speed: {providerUploadSpeedLabel(inspectedProvider.upload_speed_test)}
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={refreshProvider.isPending}
+                    onClick={() => refreshProvider.mutate(inspectedProvider.provider_id)}
+                  >
+                    Refresh provider
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={testUploadSpeed.isPending || !inspectedProvider.manual_selectable}
+                    onClick={() => testUploadSpeed.mutate(inspectedProvider.provider_id)}
+                  >
+                    {testUploadSpeed.isPending && testUploadSpeed.variables === inspectedProvider.provider_id
+                      ? 'Starting speed test…'
+                      : 'Test upload speed (32 MiB)'}
+                  </Button>
+                </div>
+                {refreshProvider.isError && refreshProvider.variables === inspectedProvider.provider_id && (
+                  <p className="text-xs text-destructive">Could not refresh this provider. Try again.</p>
+                )}
+                {refreshProvider.data?.provider_id === inspectedProvider.provider_id &&
+                  !refreshProvider.data.profile_result.success && (
+                    <p className="text-xs text-destructive">
+                      Registry refresh failed {timeAgo(refreshProvider.data.profile_result.attempted_at)}. The previous
+                      details remain available.
+                    </p>
+                  )}
+                {refreshProvider.data?.provider_id === inspectedProvider.provider_id &&
+                  refreshProvider.data.profile_result.success &&
+                  !refreshProvider.data.health_result.success && (
+                    <p className="text-xs text-destructive">
+                      Health check failed {timeAgo(refreshProvider.data.health_result.attempted_at)}. The previous
+                      result remains visible.
+                    </p>
+                  )}
+                {testUploadSpeed.isSuccess &&
+                  testUploadSpeed.variables === inspectedProvider.provider_id &&
+                  !inspectedProvider.upload_speed_test && (
+                    <p className="text-xs text-muted-foreground">Upload speed test started.</p>
+                  )}
+                {testUploadSpeed.isError && testUploadSpeed.variables === inspectedProvider.provider_id && (
+                  <p className="text-xs text-destructive">Could not start the speed test. Try again.</p>
+                )}
+              </div>
+            )}
           </Field>
         )}
       </FieldGroup>
+      <div className="space-y-2 rounded-md border p-3">
+        <h3 className="font-medium">Warm Storage prices</h3>
+        {priceList.isError ? (
+          <p className="text-sm text-destructive">Prices could not be loaded. Retry before replacing this provider.</p>
+        ) : priceList.data ? (
+          <WarmStoragePriceDetails price={priceList.data} />
+        ) : (
+          <p className="text-sm text-muted-foreground">Loading current prices…</p>
+        )}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={priceList.isFetching}
+          onClick={() => void priceList.refetch()}
+        >
+          Refresh prices
+        </Button>
+      </div>
     </DangerActionAlertDialog>
   )
 }

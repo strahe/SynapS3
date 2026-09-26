@@ -7,10 +7,12 @@ import type {
   ObservabilitySignal,
 } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
+import { ProviderProfileDetails } from '@/components/app/ProviderProfileDetails'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { useRefreshProvider, useRefreshProviderTiers } from '@/hooks/queries'
 import { activePiecesValue } from '@/lib/data-set-storage-health'
 import { providerUploadSampleSize, providerUploadSpeedLabel } from '@/lib/provider-upload-speed'
 import { replicaLabel } from '@/lib/storage-status-labels'
@@ -49,7 +51,7 @@ export function TopologyDetailSheet({
     <Sheet open={Boolean(selection)} onOpenChange={onOpenChange}>
       <SheetContent
         side="right"
-        className="data-[side=right]:w-[440px] data-[side=right]:max-w-[calc(100vw-2rem)] data-[side=right]:sm:max-w-[440px]"
+        className="data-[side=right]:w-[min(720px,calc(100vw-2rem))] data-[side=right]:sm:max-w-[720px]"
         onOpenAutoFocus={(event) => {
           event.preventDefault()
           titleRef.current?.focus({ preventScroll: true })
@@ -259,21 +261,74 @@ function DataSetDetailContent({
 }
 
 function ProviderDetailContent({ provider }: { provider: ObservabilityProviderObservation }) {
+  const refreshProvider = useRefreshProvider()
+  const refreshTiers = useRefreshProviderTiers()
   return (
     <>
+      <section className="flex flex-col gap-3">
+        <h3 className="text-sm font-semibold">
+          {provider.provider_profile?.name || `Registry ${provider.facts.provider_id}`}
+        </h3>
+        <ProviderProfileDetails profile={provider.provider_profile} />
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={refreshProvider.isPending}
+            onClick={() => refreshProvider.mutate(provider.facts.provider_id)}
+          >
+            Refresh provider
+          </Button>
+          <Button size="sm" variant="outline" disabled={refreshTiers.isPending} onClick={() => refreshTiers.mutate()}>
+            Refresh FWSS lists
+          </Button>
+        </div>
+        {refreshTiers.isPending && <p className="text-xs text-muted-foreground">Refreshing FWSS lists…</p>}
+        {!refreshTiers.isPending && refreshTiers.data && (
+          <div className="space-y-1 text-xs">
+            <p className={refreshTiers.data.approved_result.success ? 'text-muted-foreground' : 'text-destructive'}>
+              FWSS approved list {refreshTiers.data.approved_result.success ? 'updated' : 'could not be refreshed'}.
+            </p>
+            <p className={refreshTiers.data.endorsed_result.success ? 'text-muted-foreground' : 'text-destructive'}>
+              FWSS endorsed list {refreshTiers.data.endorsed_result.success ? 'updated' : 'could not be refreshed'}.
+            </p>
+          </div>
+        )}
+        {refreshTiers.isError && <p className="mt-2 text-xs text-destructive">Could not refresh FWSS lists.</p>}
+        {refreshProvider.data?.provider_id === provider.facts.provider_id &&
+          !refreshProvider.data.profile_result.success && (
+            <p className="mt-2 text-xs text-destructive">
+              Registry refresh failed {timeAgo(refreshProvider.data.profile_result.attempted_at)}. The previous details
+              remain available.
+            </p>
+          )}
+        {refreshProvider.data?.provider_id === provider.facts.provider_id &&
+          refreshProvider.data.profile_result.success &&
+          !refreshProvider.data.health_result.success && (
+            <p className="mt-2 text-xs text-destructive">
+              Health check failed {timeAgo(refreshProvider.data.health_result.attempted_at)}. The previous result
+              remains visible.
+            </p>
+          )}
+        {refreshProvider.isError && refreshProvider.variables === provider.facts.provider_id && (
+          <p className="mt-2 text-xs text-destructive">Could not refresh this provider.</p>
+        )}
+      </section>
       <DetailBlock title="Facts">
         <DetailRow label="Provider" value={formatOptionalTopologyID(provider.facts.provider_id)} mono copyable />
         <DetailRow label="Active" value={formatOptionalBool(provider.facts.active)} />
         <DetailRow label="Has PDP" value={formatOptionalBool(provider.facts.has_pdp)} />
         <DetailRow label="Health" value={formatOptionalTopologyText(provider.facts.health_status)} />
-        <DetailRow
-          label="Service URL"
-          value={formatOptionalTopologyText(provider.facts.service_url)}
-          mono
-          copyable
-          linkHref={provider.facts.service_url}
-          external
-        />
+        {(!provider.provider_profile || provider.facts.service_url !== provider.provider_profile.service_url) && (
+          <DetailRow
+            label="Observed service URL"
+            value={formatOptionalTopologyText(provider.facts.service_url)}
+            mono
+            copyable
+            linkHref={provider.facts.service_url}
+            external
+          />
+        )}
       </DetailBlock>
       <SignalDetailBlock signal={provider.signal} />
       <DetailBlock title="Upload speed test">

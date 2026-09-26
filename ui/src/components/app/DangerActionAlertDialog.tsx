@@ -26,8 +26,11 @@ export interface DangerActionAlertDialogProps {
   confirmDisabled?: boolean
   error?: string | null
   typedTarget?: string
+  confirmationResetKey?: string
   typedTargetLabel?: string
   contentClassName?: string
+  bodyClassName?: string
+  confirmationNotice?: ReactNode
   children?: ReactNode
 }
 
@@ -42,21 +45,35 @@ export function DangerActionAlertDialog({
   confirmDisabled = false,
   error,
   typedTarget,
+  confirmationResetKey,
   typedTargetLabel = 'Type to confirm',
   contentClassName,
+  bodyClassName,
+  confirmationNotice,
   children,
 }: DangerActionAlertDialogProps) {
   const inputId = useId()
   const inputRef = useRef<HTMLInputElement>(null)
   const [confirmInput, setConfirmInput] = useState('')
+  const previousResetKey = useRef(confirmationResetKey)
   const needsTypedConfirmation = typedTarget !== undefined
   const typedConfirmationValid =
-    !needsTypedConfirmation || (typedTarget.length > 0 && confirmationMatches(confirmInput, typedTarget))
+    !needsTypedConfirmation ||
+    (previousResetKey.current === confirmationResetKey &&
+      typedTarget.length > 0 &&
+      confirmationMatches(confirmInput, typedTarget))
   const canConfirm = !pending && !confirmDisabled && typedConfirmationValid
 
   useEffect(() => {
     if (!open) setConfirmInput('')
   }, [open])
+
+  useEffect(() => {
+    if (previousResetKey.current !== confirmationResetKey) {
+      previousResetKey.current = confirmationResetKey
+      setConfirmInput('')
+    }
+  }, [confirmationResetKey])
 
   useEffect(() => {
     if (open && needsTypedConfirmation && !pending) inputRef.current?.focus()
@@ -70,7 +87,9 @@ export function DangerActionAlertDialog({
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
 
-        {children}
+        {bodyClassName ? <div className={bodyClassName}>{children}</div> : children}
+
+        {confirmationNotice}
 
         {needsTypedConfirmation && (
           <FieldGroup>

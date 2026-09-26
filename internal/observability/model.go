@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -74,6 +75,32 @@ type Provider struct {
 	HasPDP       bool
 	ServiceURL   string
 	HealthStatus string
+	Profile      *ProviderProfile
+}
+
+// ProviderProfile is the last successful Registry read for one provider.
+type ProviderProfile struct {
+	bun.BaseModel          `bun:"table:provider_profiles"`
+	ProviderID             types.OnChainID `bun:"provider_id,pk,type:text" json:"provider_id"`
+	Name                   string          `bun:"name,type:text,notnull" json:"name"`
+	Description            string          `bun:"description,type:text,notnull" json:"description"`
+	ServiceProviderAddress string          `bun:"service_provider_address,type:text,notnull" json:"service_provider_address"`
+	PayeeAddress           string          `bun:"payee_address,type:text,notnull" json:"payee_address"`
+	Active                 bool            `bun:"active,notnull" json:"active"`
+	ServiceURL             string          `bun:"service_url,type:text,notnull" json:"service_url"`
+	RegistrySnapshot       json.RawMessage `bun:"registry_snapshot_json,type:jsonb,notnull" json:"registry_snapshot"`
+	LastSuccessAt          time.Time       `bun:"last_success_at,notnull" json:"last_success_at"`
+	Approved               bool            `bun:"-" json:"approved"`
+	ApprovedCheckedAt      *time.Time      `bun:"-" json:"approved_checked_at"`
+	Endorsed               bool            `bun:"-" json:"endorsed"`
+	EndorsedCheckedAt      *time.Time      `bun:"-" json:"endorsed_checked_at"`
+}
+
+type ProviderTierSnapshot struct {
+	bun.BaseModel `bun:"table:provider_tier_snapshots"`
+	Tier          string          `bun:"tier,pk,type:text"`
+	ProviderIDs   json.RawMessage `bun:"provider_ids_json,type:jsonb,notnull"`
+	CheckedAt     time.Time       `bun:"checked_at,notnull"`
 }
 
 type LocalDataSet struct {
@@ -100,6 +127,7 @@ type ChainDataSet struct {
 
 type ProviderState struct {
 	bun.BaseModel `bun:"table:observability_provider_states"`
+	Profile       *ProviderProfile `bun:"-" json:"-"`
 
 	ProviderID    types.OnChainID `bun:"provider_id,pk,type:text" json:"provider_id"`
 	Status        Status          `bun:"status,type:text,notnull" json:"status"`
@@ -109,6 +137,7 @@ type ProviderState struct {
 	ServiceURL    *string         `bun:"service_url,type:text" json:"service_url,omitempty"`
 	HealthStatus  *string         `bun:"health_status,type:text" json:"health_status,omitempty"`
 	LastCheckedAt time.Time       `bun:"last_checked_at,nullzero,notnull" json:"last_checked_at"`
+	LastAttemptAt time.Time       `bun:"last_attempt_at,nullzero,notnull" json:"last_attempt_at"`
 	LastError     *string         `bun:"last_error,type:text,nullzero" json:"last_error,omitempty"`
 	Evidence      map[string]any  `bun:"evidence_json,type:jsonb,notnull" json:"evidence"`
 }

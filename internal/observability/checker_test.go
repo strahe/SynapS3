@@ -69,6 +69,26 @@ func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
 	assertProviderState(t, providerStatesByID(got)["202"], StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
 }
 
+func TestCheckProviderKeepsProfileWhenHealthCheckDoesNotComplete(t *testing.T) {
+	id := onChainID(t, "202")
+	profile := &ProviderProfile{ProviderID: id, Name: "Saved name"}
+	checker := NewChecker(CheckerOptions{
+		ProviderSource: fakeProviderSource{byID: map[string]Provider{
+			"202": {ID: id, Active: true, HasPDP: true, ServiceURL: "https://provider.test", Profile: profile},
+		}},
+		ProviderHealth: func(context.Context, string, time.Duration) string { return "" },
+		Timeout:        time.Second,
+	})
+	checkedAt := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	state, err := checker.CheckProvider(context.Background(), checkedAt, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Profile != profile || state.Status != StatusUnknown || state.LastError == nil || state.HealthStatus != nil || !state.LastCheckedAt.Equal(checkedAt) {
+		t.Fatalf("partial provider refresh = %#v", state)
+	}
+}
+
 func TestCheckProvidersDegradesMissingServiceURL(t *testing.T) {
 	checker := NewChecker(CheckerOptions{
 		ProviderSource: fakeProviderSource{

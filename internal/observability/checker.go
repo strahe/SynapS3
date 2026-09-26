@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -131,53 +130,66 @@ func (c *Checker) CheckProviders(ctx context.Context, checkedAt time.Time, local
 			continue
 		}
 
-		provider := providers[key]
-		status := StatusAvailable
-		reasons := make([]ReasonCode, 0, 2)
-		if !provider.Active {
-			status = worseStatus(status, StatusUnavailable)
-			reasons = append(reasons, ReasonProviderInactive)
-		}
-		if !provider.HasPDP {
-			status = worseStatus(status, StatusUnavailable)
-			if !reasonCodeContains(reasons, ReasonProviderMissingPDP) {
-				reasons = append(reasons, ReasonProviderMissingPDP)
-			}
-		}
-		healthStatus := health[key]
-		if healthStatus == "" {
-			healthStatus = provider.HealthStatus
-		}
-		if healthStatus == "" {
-			healthStatus = "unknown"
-		}
-		if provider.HasPDP && (provider.ServiceURL == "" || healthStatus == "n/a" || healthStatus == "unreachable") {
-			status = worseStatus(status, StatusDegraded)
-			if !reasonCodeContains(reasons, ReasonProviderHTTPUnreachable) {
-				reasons = append(reasons, ReasonProviderHTTPUnreachable)
-			}
-		}
-
-		states = append(states, ProviderState{
-			ProviderID:    id,
-			Status:        status,
-			ReasonCodes:   reasons,
-			Active:        boolPtr(provider.Active),
-			HasPDP:        boolPtr(provider.HasPDP),
-			ServiceURL:    stringPtr(provider.ServiceURL),
-			HealthStatus:  stringPtr(healthStatus),
-			LastCheckedAt: checkedAt,
-			Evidence: map[string]any{
-				"service_url": provider.ServiceURL,
-				"has_pdp":     provider.HasPDP,
-			},
-		})
+		states = append(states, providerStateFromFacts(providers[key], health[key], checkedAt))
 	}
 
 	sort.Slice(states, func(i, j int) bool {
 		return lessOnChainID(states[i].ProviderID, states[j].ProviderID)
 	})
 	return states, nil
+}
+
+func (c *Checker) CheckProvider(ctx context.Context, checkedAt time.Time, id types.OnChainID) (ProviderState, error) {
+	if checkedAt.IsZero() {
+		checkedAt = c.checkedAt()
+	}
+	if c.providerSource == nil {
+		return ProviderState{}, ErrProviderNotFound
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, boundedSingleTimeout(c.timeout))
+	provider, err := c.providerSource.LookupProvider(lookupCtx, id)
+	cancel()
+	if err != nil {
+		errText := safeObservabilityError(err)
+		return ProviderState{ProviderID: id, Status: StatusUnknown, ReasonCodes: []ReasonCode{ReasonRegistryLookupFailed}, LastCheckedAt: checkedAt, LastError: &errText, Evidence: map[string]any{}}, nil
+	}
+	healthCtx, healthCancel := context.WithTimeout(ctx, boundedSingleTimeout(c.timeout))
+	health := c.checkProviderHealth(healthCtx, map[string]Provider{id.String(): provider})
+	healthCancel()
+	return providerStateFromFacts(provider, health[id.String()], checkedAt), nil
+}
+
+func providerStateFromFacts(provider Provider, healthStatus string, checkedAt time.Time) ProviderState {
+	if healthStatus == "" {
+		errText := "Provider health check did not complete"
+		return ProviderState{
+			Profile: provider.Profile, ProviderID: provider.ID, Status: StatusUnknown,
+			ReasonCodes: []ReasonCode{}, Active: boolPtr(provider.Active), HasPDP: boolPtr(provider.HasPDP),
+			ServiceURL: stringPtr(provider.ServiceURL), LastCheckedAt: checkedAt, LastError: &errText,
+			Evidence: map[string]any{"service_url": provider.ServiceURL, "has_pdp": provider.HasPDP},
+		}
+	}
+	status := StatusAvailable
+	reasons := make([]ReasonCode, 0, 2)
+	if !provider.Active {
+		status = worseStatus(status, StatusUnavailable)
+		reasons = append(reasons, ReasonProviderInactive)
+	}
+	if !provider.HasPDP {
+		status = worseStatus(status, StatusUnavailable)
+		reasons = append(reasons, ReasonProviderMissingPDP)
+	}
+	if provider.HasPDP && (provider.ServiceURL == "" || healthStatus == "n/a" || healthStatus == "unreachable") {
+		status = worseStatus(status, StatusDegraded)
+		reasons = append(reasons, ReasonProviderHTTPUnreachable)
+	}
+	return ProviderState{
+		Profile: provider.Profile, ProviderID: provider.ID, Status: status, ReasonCodes: reasons,
+		Active: boolPtr(provider.Active), HasPDP: boolPtr(provider.HasPDP),
+		ServiceURL: stringPtr(provider.ServiceURL), HealthStatus: stringPtr(healthStatus),
+		LastCheckedAt: checkedAt,
+		Evidence:      map[string]any{"service_url": provider.ServiceURL, "has_pdp": provider.HasPDP},
+	}
 }
 
 func (c *Checker) CheckDataSets(ctx context.Context, checkedAt time.Time, localDataSets []LocalDataSet) ([]DataSetState, error) {
@@ -495,10 +507,6 @@ func lessDecimalString(a, b string) bool {
 		return len(a) < len(b)
 	}
 	return a < b
-}
-
-func reasonCodeContains(codes []ReasonCode, want ReasonCode) bool {
-	return slices.Contains(codes, want)
 }
 
 func worseStatus(current, next Status) Status {

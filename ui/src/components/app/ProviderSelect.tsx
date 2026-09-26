@@ -18,17 +18,15 @@ interface ProviderSelectProps {
   id?: string
   candidates: ReplacementProviderCandidate[]
   value: string
-  onChange: (providerID: string) => void
+  onInspect: (providerID: string) => void
   disabled?: boolean
 }
 
 /**
  * A provider chooser that searches by name or registry ID. Providers that
- * cannot take the replica stay in the list, disabled and labelled with the
- * reason, so an operator looking for one they expected sees why rather than
- * finding it missing.
+ * cannot take the replica remain inspectable with their reason shown.
  */
-export function ProviderSelect({ id, candidates, value, onChange, disabled }: ProviderSelectProps) {
+export function ProviderSelect({ id, candidates, value, onInspect, disabled }: ProviderSelectProps) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
 
@@ -62,7 +60,7 @@ export function ProviderSelect({ id, candidates, value, onChange, disabled }: Pr
           className="w-full justify-between font-normal"
         >
           <span className={cn('truncate', !selected && 'text-muted-foreground')}>
-            {selected ? providerCandidateLabel(selected) : 'Select a provider'}
+            {selected ? providerCandidateLabel(selected) : 'Review a provider'}
           </span>
           <ChevronsUpDown className="size-4 shrink-0 opacity-50" />
         </Button>
@@ -90,15 +88,14 @@ export function ProviderSelect({ id, candidates, value, onChange, disabled }: Pr
               <button
                 key={candidate.provider_id}
                 type="button"
-                disabled={Boolean(disabledReason)}
                 onClick={() => {
-                  onChange(candidate.provider_id)
+                  onInspect(candidate.provider_id)
                   setOpen(false)
                   setQuery('')
                 }}
                 className={cn(
                   'flex w-full items-start gap-2 rounded-sm px-2 py-2 text-left text-sm',
-                  disabledReason ? 'cursor-not-allowed opacity-60' : 'hover:bg-accent hover:text-accent-foreground'
+                  disabledReason ? 'opacity-60 hover:bg-accent' : 'hover:bg-accent hover:text-accent-foreground'
                 )}
               >
                 <Check
@@ -110,6 +107,11 @@ export function ProviderSelect({ id, candidates, value, onChange, disabled }: Pr
                 <span className="min-w-0 flex-1">
                   <span className="block truncate">{providerCandidateLabel(candidate)}</span>
                   {registryLine && <span className="block truncate text-xs text-muted-foreground">{registryLine}</span>}
+                  {!candidate.provider_profile && (
+                    <span className="block truncate text-xs text-muted-foreground">
+                      Registry details not collected yet
+                    </span>
+                  )}
                   {(disabledReason || note) && (
                     <span className="block truncate text-xs text-muted-foreground">{disabledReason ?? note}</span>
                   )}

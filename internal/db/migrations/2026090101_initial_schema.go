@@ -608,27 +608,28 @@ type storagePullAttempt2026090101 struct {
 type storageReplacement2026090101 struct {
 	bun.BaseModel `bun:"table:storage_replacements"`
 
-	ID                  int64   `bun:",pk,autoincrement,identity"`
-	BucketID            int64   `bun:",notnull"`
-	CopyIndex           int     `bun:"type:integer,notnull"`
-	SourceDataSetID     int64   `bun:",notnull"`
-	TargetDataSetID     int64   `bun:",notnull"`
-	SelectionMode       string  `bun:"type:text,notnull"`
-	RequestedProviderID *string `bun:"type:text"`
-	ClientRequestID     string  `bun:"type:text,notnull"`
-	Status              string  `bun:"type:text,notnull"`
-	WaitReason          *string `bun:"type:text"`
-	FailureReason       *string `bun:"type:text"`
-	LastError           *string `bun:"type:text"`
-	ItemsTotal          int     `bun:"type:integer,notnull,default:0"`
-	ItemsCopied         int     `bun:"type:integer,notnull,default:0"`
-	SeedCursorContentID int64   `bun:",notnull,default:0"`
-	SeedingComplete     bool    `bun:",notnull,default:false"`
-	TaskGeneration      int64   `bun:",notnull,default:1"`
-	TaskID              *int64
-	SupersededByID      *int64
-	CreatedAt           time.Time `bun:",notnull"`
-	UpdatedAt           time.Time `bun:",notnull"`
+	ID                   int64   `bun:",pk,autoincrement,identity"`
+	BucketID             int64   `bun:",notnull"`
+	CopyIndex            int     `bun:"type:integer,notnull"`
+	SourceDataSetID      int64   `bun:",notnull"`
+	TargetDataSetID      int64   `bun:",notnull"`
+	SelectionMode        string  `bun:"type:text,notnull"`
+	RequestedProviderID  *string `bun:"type:text"`
+	ClientRequestID      string  `bun:"type:text,notnull"`
+	PriceListFingerprint string  `bun:"type:text,notnull"`
+	Status               string  `bun:"type:text,notnull"`
+	WaitReason           *string `bun:"type:text"`
+	FailureReason        *string `bun:"type:text"`
+	LastError            *string `bun:"type:text"`
+	ItemsTotal           int     `bun:"type:integer,notnull,default:0"`
+	ItemsCopied          int     `bun:"type:integer,notnull,default:0"`
+	SeedCursorContentID  int64   `bun:",notnull,default:0"`
+	SeedingComplete      bool    `bun:",notnull,default:false"`
+	TaskGeneration       int64   `bun:",notnull,default:1"`
+	TaskID               *int64
+	SupersededByID       *int64
+	CreatedAt            time.Time `bun:",notnull"`
+	UpdatedAt            time.Time `bun:",notnull"`
 }
 
 // storageDataSetTermination2026090101 records one data set's end of term. A
@@ -1053,8 +1054,29 @@ type observabilityProviderState2026090101 struct {
 	ServiceURL    *string         `bun:"type:text"`
 	HealthStatus  *string         `bun:"type:text"`
 	LastCheckedAt time.Time       `bun:",notnull"`
+	LastAttemptAt time.Time       `bun:",notnull"`
 	LastError     *string         `bun:"type:text"`
 	Evidence      json.RawMessage `bun:"evidence_json,type:jsonb,notnull"`
+}
+
+type providerProfile2026090101 struct {
+	bun.BaseModel          `bun:"table:provider_profiles"`
+	ProviderID             string          `bun:"type:text,pk"`
+	Name                   string          `bun:"type:text,notnull"`
+	Description            string          `bun:"type:text,notnull"`
+	ServiceProviderAddress string          `bun:"type:text,notnull"`
+	PayeeAddress           string          `bun:"type:text,notnull"`
+	Active                 bool            `bun:",notnull"`
+	ServiceURL             string          `bun:"type:text,notnull"`
+	RegistrySnapshot       json.RawMessage `bun:"registry_snapshot_json,type:jsonb,notnull"`
+	LastSuccessAt          time.Time       `bun:",notnull"`
+}
+
+type providerTierSnapshot2026090101 struct {
+	bun.BaseModel `bun:"table:provider_tier_snapshots"`
+	Tier          string          `bun:"type:text,pk"`
+	ProviderIDs   json.RawMessage `bun:"provider_ids_json,type:jsonb,notnull"`
+	CheckedAt     time.Time       `bun:",notnull"`
 }
 
 type providerUploadSpeedTest2026090101 struct {
@@ -1109,6 +1131,18 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 				"CONSTRAINT chk_observability_provider_identity CHECK (provider_id <> '')",
 				"CONSTRAINT chk_observability_provider_status CHECK (status IN ('available', 'degraded', 'unavailable', 'unknown'))",
 			},
+		},
+		{
+			name:        "provider_profiles",
+			model:       (*providerProfile2026090101)(nil),
+			jsonColumns: initialJSONColumns("provider_profiles"),
+			constraints: []string{"CONSTRAINT chk_provider_profiles_id CHECK (provider_id <> '')"},
+		},
+		{
+			name:        "provider_tier_snapshots",
+			model:       (*providerTierSnapshot2026090101)(nil),
+			jsonColumns: initialJSONColumns("provider_tier_snapshots"),
+			constraints: []string{"CONSTRAINT chk_provider_tier_snapshots_tier CHECK (tier IN ('approved', 'endorsed'))"},
 		},
 		{
 			name:  "provider_upload_speed_tests",

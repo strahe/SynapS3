@@ -139,6 +139,7 @@ const replacementErrorMessages: Record<string, string> = {
   replacement_no_eligible_provider:
     'No unused storage provider is available right now. Try again later or choose an available provider.',
   replacement_target_unavailable: 'That provider is not available for replacement right now. Choose another provider.',
+  approval_check_unavailable: 'Could not confirm FWSS approval. Try again.',
   replacement_idempotency_conflict: 'This confirmation changed after it was submitted. Close it and try again.',
   replacement_source_not_current: 'This replica no longer receives writes, so replacing it would change nothing.',
   replacement_superseded: 'A newer request has taken over this replica.',
@@ -193,6 +194,10 @@ export function replacementErrorMessage(error: unknown) {
 const providerIneligibleReasons: Record<string, string> = {
   current_source: 'This is the provider being replaced',
   already_serves_bucket: 'Already stores a replica of this bucket',
+  provider_unavailable: 'Provider is not currently available',
+  observation_stale: 'Health information is out of date. Refresh this provider.',
+  profile_missing: 'Provider details are unavailable. Refresh this provider.',
+  profile_url_changed: 'The provider service URL changed. Refresh this provider to check its health.',
 }
 
 /**
@@ -201,13 +206,13 @@ const providerIneligibleReasons: Record<string, string> = {
  * silent absence.
  */
 export function providerCandidateDisabledReason(candidate: ReplacementProviderCandidate) {
-  if (candidate.eligible) return null
-  return providerIneligibleReasons[candidate.ineligible_reason ?? ''] ?? 'Cannot take this replica'
+  if (candidate.manual_selectable) return null
+  return providerIneligibleReasons[candidate.manual_block_reason ?? ''] ?? 'Cannot take this replica'
 }
 
 /** A provider reads as its name; the registry ID identifies it. */
 export function providerCandidateLabel(candidate: ReplacementProviderCandidate) {
-  const name = candidate.provider_identity?.name?.trim()
+  const name = candidate.provider_profile?.name?.trim()
   return name || `Registry ${candidate.provider_id}`
 }
 
@@ -224,7 +229,7 @@ export function providerCandidateRegistryLine(candidate: ReplacementProviderCand
 
 /** Extra context for a choosable provider, or null when there is nothing to add. */
 export function providerCandidateNote(candidate: ReplacementProviderCandidate) {
-  if (!candidate.eligible || !candidate.previously_used) return null
+  if (!candidate.manual_selectable || !candidate.previously_used) return null
   return 'Used by this bucket before'
 }
 
@@ -236,6 +241,9 @@ export function providerCandidateMatches(candidate: ReplacementProviderCandidate
   const needle = query.trim().toLowerCase()
   if (!needle) return true
   if (candidate.provider_id.toLowerCase().includes(needle)) return true
-  const identity = candidate.provider_identity
-  return Boolean(identity?.name?.toLowerCase().includes(needle) || identity?.location?.toLowerCase().includes(needle))
+  const profile = candidate.provider_profile
+  return Boolean(
+    profile?.name?.toLowerCase().includes(needle) ||
+      profile?.registry_snapshot.pdp_offering?.location?.toLowerCase().includes(needle)
+  )
 }

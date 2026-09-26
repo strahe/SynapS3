@@ -11,6 +11,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	taskengine "github.com/strahe/synaps3/internal/task"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -20,10 +21,7 @@ import (
 // should use. It is injected so the admin API stays testable without a live
 // storage service.
 type providerReplacementSelector interface {
-	// ListReplacementProviders returns the approved, active providers a
-	// replacement may use, in a stable order. Which of them a given replica can
-	// actually take is decided by replacementProviderCandidates.
-	ListReplacementProviders(ctx context.Context) ([]idtypes.OnChainID, error)
+	ListReplacementProviderObservations(context.Context, *idtypes.OnChainID) ([]observability.ProviderObservation, error)
 }
 
 // WithProviderReplacement enables the provider replacement endpoints. Without it
@@ -34,9 +32,10 @@ func (s *Server) WithProviderReplacement(selector providerReplacementSelector) *
 }
 
 type startReplacementRequest struct {
-	Mode            string `json:"mode"`
-	ProviderID      string `json:"provider_id"`
-	ClientRequestID string `json:"client_request_id"`
+	Mode                 string `json:"mode"`
+	ProviderID           string `json:"provider_id"`
+	ClientRequestID      string `json:"client_request_id"`
+	PriceListFingerprint string `json:"price_list_fingerprint"`
 }
 
 // providerReplacementResponse is the operator-facing view of one replacement.
@@ -113,13 +112,18 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		return
 	}
 	req.ClientRequestID = strings.TrimSpace(req.ClientRequestID)
+	req.PriceListFingerprint = strings.TrimSpace(req.PriceListFingerprint)
 	if req.ClientRequestID == "" || len(req.ClientRequestID) > 128 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "client_request_id is required"})
 		return
 	}
+	if len(req.PriceListFingerprint) != 64 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "price list review is required"})
+		return
+	}
 
 	ctx := r.Context()
-	bucket, source, ok := s.replacementSubject(w, ctx, name, dataSetID)
+	bucket, ok := s.replacementBucket(w, ctx, name)
 	if !ok {
 		return
 	}
@@ -129,32 +133,57 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		s.writeReplacementError(w, storagereplacement.ErrInvalidTarget, name)
 		return
 	}
-	existing, err := s.repos.Replacements.GetByClientRequestID(ctx, bucket.ID, req.ClientRequestID)
-	if err != nil {
-		s.writeReplacementError(w, err, name)
+	if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
 		return
 	}
-	if existing != nil {
-		if !replacementReplayMatches(existing, source.ID, mode, req.ProviderID) {
-			s.writeReplacementError(w, storagereplacement.ErrIdempotencyConflict, name)
+	source, sourceErr := s.repos.Contents.GetDataSetBindingByID(ctx, dataSetID)
+	if sourceErr != nil || source == nil || source.BucketID != bucket.ID {
+		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
 			return
 		}
-		response, responseErr := s.providerReplacementResponse(ctx, bucket.Name, existing)
-		if responseErr != nil {
-			s.logger.Error("api: failed to build replacement replay response", "error", responseErr, "replacementID", existing.ID)
+		if sourceErr != nil {
+			s.logger.Error("api: failed to load data set for replacement", "error", sourceErr, "dataSetID", dataSetID)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "data set not found"})
+		}
+		return
+	}
+	price, priceErr := s.currentWarmStoragePrice(ctx)
+	if priceErr != nil {
+		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
 			return
 		}
-		writeJSON(w, http.StatusOK, response)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "price list unavailable", "code": "price_list_unavailable"})
+		return
+	}
+	if !price.SupportedToken {
+		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
+			return
+		}
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "unsupported price token", "code": "unsupported_price_token"})
+		return
+	}
+	if price.Fingerprint != req.PriceListFingerprint {
+		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
+			return
+		}
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "price list changed", "code": "price_list_changed"})
 		return
 	}
 	targetProvider, err := s.resolveReplacementProvider(ctx, bucket, source, mode, req.ProviderID)
 	if err != nil {
+		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
+			return
+		}
 		s.writeReplacementError(w, err, name)
 		return
 	}
 
 	if s.taskService == nil {
+		if s.writeReplacementReplay(w, ctx, bucket, dataSetID, req, mode) {
+			return
+		}
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "task service unavailable"})
 		return
 	}
@@ -165,6 +194,7 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 		row, created, authorizeErr = txRepos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 			BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: mode,
 			TargetProviderID: targetProvider, ClientRequestID: req.ClientRequestID,
+			PriceListFingerprint: req.PriceListFingerprint,
 		})
 		if authorizeErr != nil || !created {
 			return authorizeErr
@@ -201,13 +231,37 @@ func (s *Server) handleAPIStartDataSetReplacement(w http.ResponseWriter, r *http
 	writeJSON(w, status, response)
 }
 
+func (s *Server) writeReplacementReplay(w http.ResponseWriter, ctx context.Context, bucket *model.Bucket, dataSetID int64, req startReplacementRequest, mode storagereplacement.SelectionMode) bool {
+	existing, err := s.repos.Replacements.GetByClientRequestID(ctx, bucket.ID, req.ClientRequestID)
+	if err != nil {
+		s.writeReplacementError(w, err, bucket.Name)
+		return true
+	}
+	if existing == nil {
+		return false
+	}
+	if !replacementReplayMatches(existing, dataSetID, mode, req.ProviderID, req.PriceListFingerprint) {
+		s.writeReplacementError(w, storagereplacement.ErrIdempotencyConflict, bucket.Name)
+		return true
+	}
+	response, err := s.providerReplacementResponse(ctx, bucket.Name, existing)
+	if err != nil {
+		s.logger.Error("api: failed to build replacement replay response", "error", err, "replacementID", existing.ID)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return true
+	}
+	writeJSON(w, http.StatusOK, response)
+	return true
+}
+
 func replacementReplayMatches(
 	row *storagereplacement.Replacement,
 	sourceDataSetID int64,
 	mode storagereplacement.SelectionMode,
 	requested string,
+	priceListFingerprint string,
 ) bool {
-	if row.SourceDataSetID != sourceDataSetID || row.SelectionMode != mode {
+	if row.SourceDataSetID != sourceDataSetID || row.SelectionMode != mode || row.PriceListFingerprint != priceListFingerprint {
 		return false
 	}
 	if mode == storagereplacement.SelectionModeAutomatic {
@@ -219,7 +273,7 @@ func replacementReplayMatches(
 
 // resolveReplacementProvider turns the operator's choice into one provider.
 // Automatic selection excludes every provider the bucket has used, including
-// retired generations; a supplied Provider ID is used exactly as approved.
+// retired generations, and confirms FWSS approval on chain.
 func (s *Server) resolveReplacementProvider(
 	ctx context.Context,
 	bucket *model.Bucket,
@@ -236,7 +290,7 @@ func (s *Server) resolveReplacementProvider(
 		if providerID.Equal(source.ProviderID) {
 			return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
 		}
-		candidates, err := s.replacementProviderCandidates(ctx, bucket, source)
+		candidates, err := s.replacementProviderCandidatesFor(ctx, bucket, source, &providerID)
 		if err != nil {
 			return idtypes.OnChainID{}, err
 		}
@@ -250,10 +304,15 @@ func (s *Server) resolveReplacementProvider(
 			if candidate.IneligibleReason == providerIneligibleServesBucket {
 				return idtypes.OnChainID{}, storagereplacement.ErrTargetInUse
 			}
-			return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
+			return idtypes.OnChainID{}, storagereplacement.ErrTargetUnavailable
 		}
 		return idtypes.OnChainID{}, storagereplacement.ErrTargetUnavailable
 	case storagereplacement.SelectionModeAutomatic:
+		if s.warmStorageMarket == nil {
+			return idtypes.OnChainID{}, errApprovalCheckUnavailable
+		}
+		approvalCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
 		if requested != "" {
 			return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
 		}
@@ -261,40 +320,111 @@ func (s *Server) resolveReplacementProvider(
 		if err != nil {
 			return idtypes.OnChainID{}, err
 		}
-		providerID, ok := firstAutomaticChoice(candidates)
-		if !ok {
-			return idtypes.OnChainID{}, storagereplacement.ErrNoEligibleProvider
+		for _, candidate := range candidates {
+			if !candidate.Eligible || candidate.PreviouslyUsed {
+				continue
+			}
+			if !candidate.ApprovedFresh || candidate.Profile == nil {
+				continue
+			}
+			if !candidate.Profile.Approved {
+				continue
+			}
+			approved, checkErr := s.warmStorageMarket.IsProviderApproved(approvalCtx, candidate.ProviderID.SDK())
+			if checkErr != nil {
+				return idtypes.OnChainID{}, fmt.Errorf("%w: %v", errApprovalCheckUnavailable, checkErr)
+			}
+			if approved {
+				return candidate.ProviderID, nil
+			}
 		}
-		return providerID, nil
+		return idtypes.OnChainID{}, storagereplacement.ErrNoEligibleProvider
 	default:
 		return idtypes.OnChainID{}, storagereplacement.ErrInvalidTarget
 	}
 }
 
-// replacementProviderCandidates lists every approved provider together with
-// whether this replica can move to it. Both the automatic choice and the
-// dashboard's provider list read it, so neither can offer what Authorize
-// refuses.
+// replacementProviderCandidates lists every observed provider together with
+// whether this replica can move to it. Automatic selection applies the
+// separate approval requirement after the shared availability checks.
 func (s *Server) replacementProviderCandidates(
 	ctx context.Context,
 	bucket *model.Bucket,
 	source *model.StorageDataSet,
 ) ([]replacementProviderCandidate, error) {
-	if s.replacementSelector == nil {
+	return s.replacementProviderCandidatesFor(ctx, bucket, source, nil)
+}
+
+func (s *Server) replacementProviderCandidatesFor(
+	ctx context.Context,
+	bucket *model.Bucket,
+	source *model.StorageDataSet,
+	requested *idtypes.OnChainID,
+) ([]replacementProviderCandidate, error) {
+	if s.replacementSelector == nil || s.observability == nil {
 		return nil, errReplacementUnavailable
 	}
-	providers, err := s.replacementSelector.ListReplacementProviders(ctx)
+	observations, err := s.replacementSelector.ListReplacementProviderObservations(ctx, requested)
 	if err != nil {
 		return nil, err
+	}
+	providers := make([]idtypes.OnChainID, 0, len(observations))
+	for _, item := range observations {
+		providers = append(providers, item.Facts.ProviderID)
 	}
 	bindings, err := s.repos.Contents.ListDataSetBindings(ctx, bucket.ID)
 	if err != nil {
 		return nil, err
 	}
-	return replacementProviderCandidates(providers, bindings, source), nil
+	candidates := replacementProviderCandidates(providers, bindings, source)
+	profiles, err := s.repos.Observability.ProviderProfiles(ctx, providers)
+	if err != nil {
+		return nil, err
+	}
+	observed := make(map[string]observability.ProviderObservation, len(observations))
+	for _, item := range observations {
+		observed[item.Facts.ProviderID.String()] = item
+	}
+	now := time.Now().UTC()
+	for i := range candidates {
+		item := observed[candidates[i].ProviderID.String()]
+		candidates[i].Observation = &item
+		profile, hasProfile := profiles[candidates[i].ProviderID.String()]
+		if hasProfile {
+			copy := profile
+			candidates[i].Profile = &copy
+			candidates[i].ApprovedFresh = profile.ApprovedCheckedAt != nil &&
+				!profile.ApprovedCheckedAt.IsZero() && now.Sub(*profile.ApprovedCheckedAt) <= 2*s.observability.RefreshInterval()
+		}
+		if !candidates[i].Eligible {
+			continue
+		}
+		profileURLChanged := hasProfile && item.Facts.ServiceURL != nil && profile.ServiceURL != *item.Facts.ServiceURL
+		switch {
+		case hasProfile && !profile.Active:
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = "provider_unavailable"
+		case item.Signal.Freshness.Stale:
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = "observation_stale"
+		case item.Signal.Status != observability.StatusAvailable || item.Facts.Active == nil || !*item.Facts.Active || item.Facts.HasPDP == nil || !*item.Facts.HasPDP || item.Facts.ServiceURL == nil || *item.Facts.ServiceURL == "":
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = "provider_unavailable"
+		case !hasProfile:
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = "profile_missing"
+		case profileURLChanged:
+			candidates[i].Eligible = false
+			candidates[i].IneligibleReason = "profile_url_changed"
+		}
+	}
+	return candidates, nil
 }
 
-var errReplacementUnavailable = errors.New("storage service is unavailable")
+var (
+	errReplacementUnavailable   = errors.New("storage service is unavailable")
+	errApprovalCheckUnavailable = errors.New("provider approval check is unavailable")
+)
 
 // handleAPIRetryStorageReplacement resumes work an operator owns. Choosing a
 // different provider needs a new confirmation, so this endpoint never changes
@@ -354,6 +484,9 @@ func (s *Server) handleAPIRetryStorageReplacement(w http.ResponseWriter, r *http
 func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketName string) {
 	code := storagereplacement.Code(err)
 	switch {
+	case errors.Is(err, errApprovalCheckUnavailable):
+		s.logger.Warn("api: provider approval check failed", "error", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Could not confirm provider approval. Try again.", "code": "approval_check_unavailable"})
 	case errors.Is(err, errReplacementUnavailable):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage service is unavailable"})
 	case errors.Is(err, storagereplacement.ErrInvalidTarget):
@@ -449,7 +582,7 @@ func (s *Server) providerReplacementResponseWithProgress(
 	if err != nil {
 		return providerReplacementResponse{}, err
 	}
-	identities := s.providerIdentities(replacementProviderIDs(source, target))
+	identities := s.providerIdentities(ctx, replacementProviderIDs(source, target))
 	response := providerReplacementResponse{
 		ID:            row.ID,
 		BucketName:    bucketName,
@@ -558,38 +691,55 @@ func (s *Server) replacementSubject(
 	name string,
 	dataSetID int64,
 ) (*model.Bucket, *model.StorageDataSet, bool) {
+	bucket, ok := s.replacementBucket(w, ctx, name)
+	if !ok {
+		return nil, nil, false
+	}
+	source, ok := s.replacementDataSet(w, ctx, bucket, dataSetID)
+	return bucket, source, ok
+}
+
+func (s *Server) replacementBucket(w http.ResponseWriter, ctx context.Context, name string) (*model.Bucket, bool) {
 	bucket, err := s.repos.Buckets.GetByName(ctx, name)
 	if err != nil {
 		s.logger.Error("api: failed to load bucket for replacement", "error", err, "bucket", name)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return nil, nil, false
+		return nil, false
 	}
 	if bucket == nil || !bucket.Status.IsAdminVisible() {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
-		return nil, nil, false
+		return nil, false
 	}
+	return bucket, true
+}
+
+func (s *Server) replacementDataSet(w http.ResponseWriter, ctx context.Context, bucket *model.Bucket, dataSetID int64) (*model.StorageDataSet, bool) {
 	source, err := s.repos.Contents.GetDataSetBindingByID(ctx, dataSetID)
 	if err != nil {
 		s.logger.Error("api: failed to load data set for replacement", "error", err, "dataSetID", dataSetID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return nil, nil, false
+		return nil, false
 	}
 	if source == nil || source.BucketID != bucket.ID {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "data set not found"})
-		return nil, nil, false
+		return nil, false
 	}
-	return bucket, source, true
+	return source, true
 }
 
 // replacementProviderResponse is one row of the provider chooser. Ineligible
 // providers are included with the reason, so an operator can see why the
 // provider they were looking for cannot take this replica.
 type replacementProviderResponse struct {
-	ProviderID       string                    `json:"provider_id"`
-	Eligible         bool                      `json:"eligible"`
-	IneligibleReason string                    `json:"ineligible_reason,omitempty"`
-	PreviouslyUsed   bool                      `json:"previously_used"`
-	ProviderIdentity *providerIdentityResponse `json:"provider_identity,omitempty"`
+	ProviderID        string                             `json:"provider_id"`
+	ManualSelectable  bool                               `json:"manual_selectable"`
+	ManualBlockReason string                             `json:"manual_block_reason,omitempty"`
+	ApprovedFresh     bool                               `json:"approved_fresh"`
+	PreviouslyUsed    bool                               `json:"previously_used"`
+	ProviderIdentity  *providerIdentityResponse          `json:"provider_identity,omitempty"`
+	ProviderProfile   *observability.ProviderProfile     `json:"provider_profile,omitempty"`
+	Observation       *observability.ProviderObservation `json:"observation,omitempty"`
+	UploadSpeedTest   *providerUploadSpeedView           `json:"upload_speed_test,omitempty"`
 }
 
 // handleAPIListDataSetReplacementProviders lists the providers this replica can
@@ -621,17 +771,43 @@ func (s *Server) handleAPIListDataSetReplacementProviders(w http.ResponseWriter,
 	for _, candidate := range candidates {
 		providerIDs = append(providerIDs, candidate.ProviderID)
 	}
-	identities := s.providerIdentities(providerIDs)
+	profiles := make(map[string]observability.ProviderProfile, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Profile != nil {
+			profiles[candidate.ProviderID.String()] = *candidate.Profile
+		}
+	}
+	identities := s.providerIdentitiesFromProfiles(profiles)
+	keys := make([]string, 0, len(providerIDs))
+	for _, id := range providerIDs {
+		keys = append(keys, id.String())
+	}
+	speedTests, err := s.repos.ProviderUploadSpeed.ListByProviderIDs(ctx, keys)
+	if err != nil {
+		s.writeReplacementError(w, err, name)
+		return
+	}
 
 	providers := make([]replacementProviderResponse, 0, len(candidates))
 	for _, candidate := range candidates {
-		providers = append(providers, replacementProviderResponse{
-			ProviderID:       candidate.ProviderID.String(),
-			Eligible:         candidate.Eligible,
-			IneligibleReason: candidate.IneligibleReason,
-			PreviouslyUsed:   candidate.PreviouslyUsed,
-			ProviderIdentity: providerIdentityFromSnapshot(identities, candidate.ProviderID),
-		})
+		view := replacementProviderResponse{
+			ProviderID:        candidate.ProviderID.String(),
+			ManualSelectable:  candidate.Eligible,
+			ManualBlockReason: candidate.IneligibleReason,
+			ApprovedFresh:     candidate.ApprovedFresh,
+			PreviouslyUsed:    candidate.PreviouslyUsed,
+			ProviderIdentity:  providerIdentityFromSnapshot(identities, candidate.ProviderID),
+			Observation:       candidate.Observation,
+			ProviderProfile:   candidate.Profile,
+		}
+		if row, ok := speedTests[candidate.ProviderID.String()]; ok {
+			var observedServiceURL *string
+			if candidate.Observation != nil {
+				observedServiceURL = candidate.Observation.Facts.ServiceURL
+			}
+			view.UploadSpeedTest = uploadSpeedView(row, view.ProviderProfile, observedServiceURL)
+		}
+		providers = append(providers, view)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"providers": providers})
 }

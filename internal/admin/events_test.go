@@ -19,7 +19,6 @@ func TestAdminEventHubPublishesEnvelopeToSubscribers(t *testing.T) {
 
 	hub.publish("provider_identity_updated", map[string]any{
 		"provider_id": "101",
-		"identity":    &providerIdentityResponse{RegistryProviderID: "101", Name: "alpha-pdp"},
 	})
 
 	select {
@@ -36,8 +35,8 @@ func TestAdminEventHubPublishesEnvelopeToSubscribers(t *testing.T) {
 		if err := json.Unmarshal(event.data, &payload); err != nil {
 			t.Fatalf("Unmarshal event: %v", err)
 		}
-		if payload.Seq != 1 || payload.Topic != "provider_identity_updated" || payload.ProviderID != "101" || payload.Identity.Name != "alpha-pdp" {
-			t.Fatalf("payload = %#v, want provider identity envelope", payload)
+		if payload.Seq != 1 || payload.Topic != "provider_identity_updated" || payload.ProviderID != "101" || payload.Identity != nil {
+			t.Fatalf("payload = %#v, want provider ID only", payload)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("event was not delivered")
@@ -146,7 +145,7 @@ func TestAdminEventsHandlerStreamsProviderIdentityEvent(t *testing.T) {
 		t.Fatalf("read connected separator: %v", err)
 	}
 
-	srv.publishProviderIdentity(&providerIdentityResponse{RegistryProviderID: "101", Name: "alpha-pdp"})
+	srv.publishProviderIdentity("101")
 	lines := readSSEEventLines(t, reader)
 	if !containsLine(lines, "event: provider_identity_updated\n") {
 		t.Fatalf("SSE lines = %#v, want provider_identity_updated event", lines)
@@ -167,8 +166,8 @@ func TestAdminEventsHandlerStreamsProviderIdentityEvent(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(dataLine), "data: ")), &payload); err != nil {
 		t.Fatalf("Unmarshal SSE data: %v", err)
 	}
-	if payload.Seq != 1 || payload.Topic != "provider_identity_updated" || payload.ProviderID != "101" || payload.Identity.Name != "alpha-pdp" {
-		t.Fatalf("payload = %#v, want provider identity event payload", payload)
+	if payload.Seq != 1 || payload.Topic != "provider_identity_updated" || payload.ProviderID != "101" || payload.Identity != nil {
+		t.Fatalf("payload = %#v, want provider ID only", payload)
 	}
 }
 

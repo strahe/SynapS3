@@ -204,18 +204,20 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 自动选择新的存储提供方：
 
 ```json
-{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
+{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<从价格清单接口取得的指纹>" }
 ```
 
 自动选择会排除该存储桶用过的所有存储提供方，包括已退休的。也可以指定存储提供方：
 
 ```json
-{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
+{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<从价格清单接口取得的指纹>" }
 ```
 
-指定的存储提供方必须出现在完整的可用、活跃且支持 PDP 的存储提供方清单中。它可以是该存储桶以前用过的，前提是那次服务已经退休。正在被替换的存储提供方，以及任何仍持有该存储桶活跃代的存储提供方，都会被拒绝。
+指定的存储提供方必须有针对当前服务 URL 的未过期、可用、活跃且支持 PDP 的健康观测。它可以是该存储桶以前用过的，前提是那次服务已经退休。正在被替换的存储提供方，以及任何仍持有该存储桶活跃代的存储提供方，都会被拒绝。候选接口也返回不可选的已观测节点及原因，供查看详情。自动选择要求 FWSS approved 成员资格仍新鲜。endorsed 状态单独展示，不影响更换资格。
 
-`client_request_id` 为必填项，trim 后长度必须为 1–128 个字符。首次成功返回 `201 Created`。同一存储桶、来源、模式和手动存储提供方使用同一个 ID 精确重放时，会返回原记录和 `200 OK`，即使副本已经切换也一样。同一个 ID 携带不同参数会返回 `409 Conflict` 和 `replacement_idempotency_conflict`。自动模式的重放会在读取存储提供方清单前命中原记录，因此清单后续变化不会改选存储提供方。
+确认前读取 `GET /api/v1/filecoin/warm-storage/price-list`。接口返回当前币种地址、全部费率、费用、锁定额、读取时间及指纹；金额均为十进制整数字符串。新请求会重新读取合约价格；`price_list_unavailable`、`price_list_changed` 或 `unsupported_price_token` 都会阻止授权。价格变化后应审阅新清单并使用新的请求 ID。指纹记录授权时审阅的价格，链上价格此后仍可能变化。
+
+`client_request_id` 为必填项，trim 后长度必须为 1–128 个字符。首次成功返回 `201 Created`。同一存储桶、来源、模式、手动存储提供方和价格指纹使用同一个 ID 精确重放时，会返回原记录和 `200 OK`，即使副本已经切换也一样。同一个 ID 携带不同参数会返回 `409 Conflict` 和 `replacement_idempotency_conflict`。重放会在读取当前价格以及自动选择的批准状态前命中原记录，因此清单后续变化不会改选存储提供方。
 
 对同一副本再次确认会取代先前的请求并返回 `201 Created`，不是冲突。先前请求里尚未使用的存储提供方会被关闭。`replacement_active` 表示的是另一件事：该副本是另一次未完成替换的目标，必须先处理那一次。
 
@@ -255,11 +257,11 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_source_not_current`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
+这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_source_not_current`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
 
-`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出当前探测为可用的存储提供方，附带 `eligible`、取值为 `current_source` 或 `already_serves_bucket` 的 `ineligible_reason`，以及标记该存储桶用过并已完全退休的 `previously_used`。不能接管该副本的存储提供方会照常列出而不是省略，便于运营者看清预期中的存储提供方为何不可用。这份清单与存储拓扑页在 `Available` 过滤下读取的是同一份：在那里可用的存储提供方这里会提供，探测不通的两边都不会出现。可选性判定与确认阶段完全一致。自动选择更严格：它绝不会回到该存储桶用过的存储提供方，而手动选择可以。
+`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing` 和 `profile_url_changed`。手动选择不受 FWSS 批准名单限制，但仍须满足健康、最新资料处于启用状态和存储桶约束。自动选择还会排除该存储桶用过的所有存储提供方，并按 ID 顺序链上核对新鲜获批的候选。
 
-确认阶段只能检查 SynapS3 已记录的信息。如果某个存储提供方在链上仍为该存储桶运行着存储服务，会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移，没有任何风险。此前已正常退休的存储提供方可以再次选择。
+手动确认不核对 FWSS 批准名单，也不检查存储提供方是否仍在链上为该存储桶运行存储服务。后者会在替换准备目标时被发现：替换停在 `failed`，并写明存储提供方与数据集，运营者改选另一个存储提供方重新确认即可。此时副本尚未迁移。此前已正常退休的存储提供方可以再次选择。
 
 ### 存储确认处理
 
@@ -326,13 +328,20 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 | `GET` | `/api/v1/wallet/operations` | 列出钱包操作。 |
 | `GET` | `/api/v1/filecoin/readiness` | 检查 Filecoin readiness。 |
 | `POST` | `/api/v1/filecoin/readiness/preflight` | 验证待保存的 Filecoin 设置。 |
-| `GET` | `/api/v1/observability/providers` | 存储提供方健康数据。 |
+| `GET` | `/api/v1/filecoin/warm-storage/price-list` | 当前 Warm Storage 价格字段及审阅指纹。 |
+| `GET` | `/api/v1/observability/providers` | 存储提供方健康、已保存的 Registry 资料、独立的 FWSS approved 和 endorsed 状态及采集时间，以及最近测速。 |
 | `POST` | `/api/v1/observability/providers/refresh` | 刷新存储提供方健康状态。 |
+| `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | 刷新单个节点的 Registry 资料和健康状态；同 ID 并发刷新会冲突。 |
+| `POST` | `/api/v1/observability/provider-tiers/refresh` | 并行刷新 approved 和 endorsed 名单；分别返回成功状态、尝试时间及成功采集时间或错误。单路失败时保留该路之前的资料状态和采集时间。 |
 | `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | 对可用的存储提供方发起一次 32 MiB 上传测速。返回 `202 Accepted` 和 `task_id`；存储提供方不存在时返回 `404 Not Found`；已有测速进行中或存储提供方不满足测速条件时返回 `409 Conflict`。 |
 | `GET` | `/api/v1/observability/data-sets` | 本地数据集健康数据。 |
 | `POST` | `/api/v1/observability/data-sets/refresh` | 刷新数据集健康状态。 |
 
-存储提供方列表可选返回最近一次手动测速的 `upload_speed_test`。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。失败测速不能通过任务重试接口重试，请重新发起测速。
+存储提供方列表可选返回最近一次手动测速的 `upload_speed_test`。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。失败测速不能通过任务重试接口重试，请重新发起测速。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
+
+两份名单独立采集。采集时间为空时成员资格未知；成功采集后的 `false` 表示未列入。采集结果在两倍配置刷新间隔内视为新鲜。仅标注已有 Registry 资料的节点。
+
+单节点刷新响应分别包含 `profile_result` 和 `health_result`，各自给出是否成功、尝试时间，以及成功的采集时间或错误。某一部分失败时保留该部分上次成功的数据和观测时间。
 
 ## 设置和 S3 用户
 

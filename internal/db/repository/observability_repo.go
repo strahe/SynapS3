@@ -3,12 +3,16 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/types"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 )
 
 // OverviewStorageStates scopes health to local dependencies without changing global observations.
@@ -64,17 +68,160 @@ func (r *BunObservabilityRepo) ReplaceProviderStates(ctx context.Context, checke
 	return r.withTx(ctx, func(ctx context.Context, db bun.IDB) error {
 		now := time.Now().UTC()
 		checkedAt = normalizeCheckedAt(checkedAt, now)
-		for i := range states {
-			prepareProviderState(&states[i], checkedAt)
-		}
-		if _, err := db.NewDelete().Model((*observability.ProviderState)(nil)).Where("1 = 1").Exec(ctx); err != nil {
+		var current observability.CollectionState
+		err := db.NewSelect().Model(&current).Where("collection_type = ?", observability.CollectionProviders).Scan(ctx)
+		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		if err := insertProviderStateRows(ctx, db, states); err != nil {
+		if err == nil && current.LastCheckedAt.After(checkedAt) {
+			return nil
+		}
+		for i := range states {
+			prepareProviderState(&states[i], checkedAt)
+			if err := upsertProviderProfile(ctx, db, states[i].Profile, checkedAt); err != nil {
+				return err
+			}
+			if err := upsertProviderState(ctx, db, &states[i]); err != nil {
+				return err
+			}
+		}
+		ids := make([]string, 0, len(states))
+		for _, state := range states {
+			ids = append(ids, state.ProviderID.String())
+		}
+		deleteQuery := db.NewDelete().Model((*observability.ProviderState)(nil)).Where("last_attempt_at < ?", checkedAt)
+		if len(ids) > 0 {
+			deleteQuery = deleteQuery.Where("provider_id NOT IN (?)", bun.List(ids))
+		}
+		if _, err := deleteQuery.Exec(ctx); err != nil {
 			return err
 		}
 		return upsertObservabilityCollectionState(ctx, db, observability.CollectionProviders, checkedAt, now)
 	})
+}
+
+func (r *BunObservabilityRepo) UpsertProviderObservation(ctx context.Context, checkedAt time.Time, state observability.ProviderState) error {
+	return r.withTx(ctx, func(ctx context.Context, db bun.IDB) error {
+		checkedAt = normalizeCheckedAt(checkedAt, time.Now().UTC())
+		prepareProviderState(&state, checkedAt)
+		if err := upsertProviderProfile(ctx, db, state.Profile, checkedAt); err != nil {
+			return err
+		}
+		return upsertProviderState(ctx, db, &state)
+	})
+}
+
+func upsertProviderProfile(ctx context.Context, db bun.IDB, profile *observability.ProviderProfile, checkedAt time.Time) error {
+	if profile == nil {
+		return nil
+	}
+	profile.LastSuccessAt = checkedAt
+	guard := upsertTimestampGuard(db, "provider_profile", "last_success_at")
+	_, err := db.NewInsert().Model(profile).On("CONFLICT (provider_id) DO UPDATE").
+		Set("name = EXCLUDED.name").Set("description = EXCLUDED.description").
+		Set("service_provider_address = EXCLUDED.service_provider_address").
+		Set("payee_address = EXCLUDED.payee_address").Set("active = EXCLUDED.active").
+		Set("service_url = EXCLUDED.service_url").Set("registry_snapshot_json = EXCLUDED.registry_snapshot_json").
+		Set("last_success_at = EXCLUDED.last_success_at").
+		Where(guard).Exec(ctx)
+	return err
+}
+
+func upsertProviderState(ctx context.Context, db bun.IDB, state *observability.ProviderState) error {
+	guard := upsertTimestampGuard(db, "provider_state", "last_attempt_at")
+	if state.Status == observability.StatusUnknown && state.LastError != nil {
+		_, err := db.NewInsert().Model(state).On("CONFLICT (provider_id) DO UPDATE").
+			Set("last_attempt_at = EXCLUDED.last_attempt_at").Set("last_error = EXCLUDED.last_error").
+			Where(guard).Exec(ctx)
+		return err
+	}
+	_, err := db.NewInsert().Model(state).On("CONFLICT (provider_id) DO UPDATE").
+		Set("status = EXCLUDED.status").Set("reason_codes = EXCLUDED.reason_codes").
+		Set("active = EXCLUDED.active").Set("has_pdp = EXCLUDED.has_pdp").
+		Set("service_url = EXCLUDED.service_url").Set("health_status = EXCLUDED.health_status").
+		Set("last_checked_at = EXCLUDED.last_checked_at").Set("last_attempt_at = EXCLUDED.last_attempt_at").Set("last_error = EXCLUDED.last_error").
+		Set("evidence_json = EXCLUDED.evidence_json").
+		Where(guard).Exec(ctx)
+	return err
+}
+
+func upsertTimestampGuard(db bun.IDB, modelAlias, column string) string {
+	if db.Dialect().Name() == dialect.PG {
+		return modelAlias + "." + column + " <= EXCLUDED." + column
+	}
+	return column + " <= EXCLUDED." + column
+}
+
+func (r *BunObservabilityRepo) ProviderProfiles(ctx context.Context, ids []types.OnChainID) (map[string]observability.ProviderProfile, error) {
+	out := make(map[string]observability.ProviderProfile)
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []observability.ProviderProfile
+	if err := r.db.NewSelect().Model(&rows).Where("provider_id IN (?)", bun.List(ids)).Scan(ctx); err != nil {
+		return nil, err
+	}
+	var tiers []observability.ProviderTierSnapshot
+	if err := r.db.NewSelect().Model(&tiers).Scan(ctx); err != nil {
+		return nil, err
+	}
+	for _, tier := range tiers {
+		var providerIDs []string
+		if err := json.Unmarshal(tier.ProviderIDs, &providerIDs); err != nil {
+			return nil, fmt.Errorf("decoding %s provider tier: %w", tier.Tier, err)
+		}
+		members := make(map[string]struct{}, len(providerIDs))
+		for _, id := range providerIDs {
+			members[id] = struct{}{}
+		}
+		for i := range rows {
+			_, member := members[rows[i].ProviderID.String()]
+			checkedAt := tier.CheckedAt
+			switch tier.Tier {
+			case "approved":
+				rows[i].Approved = member
+				rows[i].ApprovedCheckedAt = &checkedAt
+			case "endorsed":
+				rows[i].Endorsed = member
+				rows[i].EndorsedCheckedAt = &checkedAt
+			}
+		}
+	}
+	for _, row := range rows {
+		out[row.ProviderID.String()] = row
+	}
+	return out, nil
+}
+
+func (r *BunObservabilityRepo) RecordApprovedProviders(ctx context.Context, startedAt time.Time, ids []types.OnChainID) error {
+	return r.recordProviderTier(ctx, startedAt, ids, "approved")
+}
+
+func (r *BunObservabilityRepo) RecordEndorsedProviders(ctx context.Context, startedAt time.Time, ids []types.OnChainID) error {
+	return r.recordProviderTier(ctx, startedAt, ids, "endorsed")
+}
+
+func (r *BunObservabilityRepo) recordProviderTier(ctx context.Context, startedAt time.Time, ids []types.OnChainID, tier string) error {
+	if startedAt.IsZero() {
+		return errors.New("provider tier check time is required")
+	}
+	providerIDs := make([]string, len(ids))
+	for i, id := range ids {
+		if id.IsZero() {
+			return errors.New("invalid provider tier ID")
+		}
+		providerIDs[i] = id.String()
+	}
+	encoded, err := json.Marshal(providerIDs)
+	if err != nil {
+		return err
+	}
+	snapshot := &observability.ProviderTierSnapshot{Tier: tier, ProviderIDs: encoded, CheckedAt: startedAt.UTC()}
+	guard := upsertTimestampGuard(r.db, "provider_tier_snapshot", "checked_at")
+	_, err = r.db.NewInsert().Model(snapshot).On("CONFLICT (tier) DO UPDATE").
+		Set("provider_ids_json = EXCLUDED.provider_ids_json").Set("checked_at = EXCLUDED.checked_at").
+		Where(guard).Exec(ctx)
+	return err
 }
 
 func (r *BunObservabilityRepo) ListProviderStates(ctx context.Context, opts observability.ListOptions) (observability.ProviderStatePage, error) {
@@ -188,6 +335,7 @@ func prepareProviderState(state *observability.ProviderState, checkedAt time.Tim
 	if state.LastCheckedAt.IsZero() {
 		state.LastCheckedAt = checkedAt
 	}
+	state.LastAttemptAt = checkedAt
 }
 
 func prepareDataSetState(state *observability.DataSetState, checkedAt time.Time) {
@@ -200,17 +348,6 @@ func prepareDataSetState(state *observability.DataSetState, checkedAt time.Time)
 	if state.LastCheckedAt.IsZero() {
 		state.LastCheckedAt = checkedAt
 	}
-}
-
-func insertProviderStateRows(ctx context.Context, db bun.IDB, states []observability.ProviderState) error {
-	for start := 0; start < len(states); start += observabilityStateInsertBatch {
-		end := min(start+observabilityStateInsertBatch, len(states))
-		batch := states[start:end]
-		if _, err := db.NewInsert().Model(&batch).Exec(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func insertDataSetStateRows(ctx context.Context, db bun.IDB, states []observability.DataSetState) error {

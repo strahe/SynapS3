@@ -289,7 +289,7 @@ func TestServiceRefreshProvidersWithContextRespectsCancellation(t *testing.T) {
 	}
 }
 
-func TestServiceRefreshAllRespectsCancellation(t *testing.T) {
+func TestServiceProviderRefreshRespectsCancellation(t *testing.T) {
 	started := make(chan struct{})
 	checker := &fakeRefreshChecker{
 		checkProviders: func(ctx context.Context, _ time.Time, _ []LocalDataSet) ([]ProviderState, error) {
@@ -307,13 +307,13 @@ func TestServiceRefreshAllRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- service.RefreshAll(ctx)
+		errCh <- service.RefreshProviderStates(ctx)
 	}()
 	<-started
 	cancel()
 
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
-		t.Fatalf("RefreshAll after cancellation: %v, want context canceled", err)
+		t.Fatalf("RefreshProviderStates after cancellation: %v, want context canceled", err)
 	}
 }
 
@@ -364,37 +364,6 @@ func TestServiceRefreshAppliesRefreshTimeout(t *testing.T) {
 
 	if _, err := service.RefreshProviders(context.Background(), ListOptions{}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("RefreshProviders error = %v, want context deadline exceeded", err)
-	}
-}
-
-func TestServiceRefreshAllAttemptsDataSetsAfterProviderFailure(t *testing.T) {
-	providerErr := errors.New("provider refresh failed")
-	checker := &fakeRefreshChecker{
-		checkProviders: func(context.Context, time.Time, []LocalDataSet) ([]ProviderState, error) {
-			return nil, providerErr
-		},
-		checkDataSets: func(context.Context, time.Time, []LocalDataSet) ([]DataSetState, error) {
-			return []DataSetState{{LocalDataSetID: 1, Status: StatusAvailable}}, nil
-		},
-	}
-	store := &fakeStateStore{}
-	service := NewService(ServiceOptions{
-		Checker: checker,
-		LocalDataSets: LocalDataSetSourceFunc(func(context.Context) ([]LocalDataSet, error) {
-			return []LocalDataSet{{ID: 1}}, nil
-		}),
-		Store: store,
-	})
-
-	err := service.RefreshAll(context.Background())
-	if !errors.Is(err, providerErr) {
-		t.Fatalf("RefreshAll error = %v, want provider refresh error", err)
-	}
-	if store.providerReplaces != 0 {
-		t.Fatalf("provider replaces = %d, want 0", store.providerReplaces)
-	}
-	if store.dataSetReplaces != 1 {
-		t.Fatalf("data set replaces = %d, want 1", store.dataSetReplaces)
 	}
 }
 

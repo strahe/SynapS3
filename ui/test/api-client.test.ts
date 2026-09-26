@@ -589,6 +589,37 @@ test('provider upload speed test posts to the selected provider with CSRF', asyn
   assert.equal(csrf, 'speed-csrf')
 })
 
+test('provider tier refresh posts once and reports both lists', async () => {
+  const originalFetch = globalThis.fetch
+  let url = ''
+  let method = ''
+  let csrf = ''
+  const response = {
+    approved_result: { success: true, attempted_at: '2026-09-25T10:00:00Z', checked_at: '2026-09-25T10:00:00Z' },
+    endorsed_result: {
+      success: false,
+      attempted_at: '2026-09-25T10:00:00Z',
+      error: 'Could not refresh endorsed providers',
+    },
+  }
+  globalThis.fetch = (async (input, init) => {
+    url = input.toString()
+    method = init?.method ?? ''
+    csrf = new Headers(init?.headers).get('X-SynapS3-CSRF') ?? ''
+    return new Response(JSON.stringify(response), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }) as typeof fetch
+  try {
+    setAdminCSRFToken('tier-csrf')
+    assert.deepEqual(await api.refreshProviderTiers(), response)
+  } finally {
+    setAdminCSRFToken('')
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(url, '/api/v1/observability/provider-tiers/refresh')
+  assert.equal(method, 'POST')
+  assert.equal(csrf, 'tier-csrf')
+})
+
 test('object download URL encodes bucket name and object key', () => {
   assert.equal(
     api.getObjectDownloadUrl('bucket-a', 'reports/April summary.txt'),

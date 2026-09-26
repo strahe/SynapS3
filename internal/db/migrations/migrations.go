@@ -32,6 +32,8 @@ var initialSchemaTableNames = []string{
 	"observability_collection_states",
 	"observability_data_set_states",
 	"observability_provider_states",
+	"provider_profiles",
+	"provider_tier_snapshots",
 	"provider_upload_speed_tests",
 	"s3_accounts",
 	"storage_cleanup_copies",
@@ -116,6 +118,13 @@ func validateTarget(ctx context.Context, db bun.IDB, registry *migrate.Migration
 				return nil
 			}
 		} else if appliedMigrationPrefix(names, registry) {
+			complete, err := baselinePostStateComplete(ctx, db, true)
+			if err != nil {
+				return fmt.Errorf("checking baseline schema: %w", err)
+			}
+			if !complete {
+				return incompatibleDatabaseError()
+			}
 			return nil
 		} else {
 			return incompatibleDatabaseError()
@@ -184,9 +193,23 @@ func applicationTableNames(ctx context.Context, db bun.IDB) ([]string, error) {
 }
 
 func initialSchemaPostStateComplete(ctx context.Context, db bun.IDB) (bool, error) {
+	return baselinePostStateComplete(ctx, db, false)
+}
+
+func baselinePostStateComplete(ctx context.Context, db bun.IDB, allowExtraTables bool) (bool, error) {
 	tables, err := applicationTableNames(ctx, db)
-	if err != nil || !slices.Equal(tables, initialSchemaTableNames) {
+	if err != nil {
 		return false, err
+	}
+	if !allowExtraTables && !slices.Equal(tables, initialSchemaTableNames) {
+		return false, nil
+	}
+	if allowExtraTables {
+		for _, required := range initialSchemaTableNames {
+			if !slices.Contains(tables, required) {
+				return false, nil
+			}
+		}
 	}
 	for _, column := range []struct {
 		table string
@@ -199,10 +222,15 @@ func initialSchemaPostStateComplete(ctx context.Context, db bun.IDB) (bool, erro
 		{"storage_commit_attempts", "attempt_id"},
 		{"storage_commit_attempts", "status_url"},
 		{"storage_replacement_items", "target_data_set_id"},
+		{"storage_replacements", "price_list_fingerprint"},
 		{"storage_cleanup_copies", "bucket_id"},
 		{"storage_cleanup_copies", "checksum"},
 		{"object_versions", "content_id"},
 		{"object_cache", "content_id"},
+		{"provider_profiles", "registry_snapshot_json"},
+		{"provider_tier_snapshots", "provider_ids_json"},
+		{"provider_tier_snapshots", "checked_at"},
+		{"observability_provider_states", "last_attempt_at"},
 	} {
 		exists, err := columnExists(ctx, db, column.table, column.name)
 		if err != nil || !exists {

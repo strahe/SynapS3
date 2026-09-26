@@ -76,14 +76,15 @@ type handlerRuntimeOptions struct {
 	uploadSpeedProbe       interface {
 		Probe(context.Context, string) (time.Duration, error)
 	}
-	policy        cache.EvictionPolicy
-	maxBytes      int64
-	highPercent   int
-	lowPercent    int
-	concurrency   int
-	maxRetries    *int
-	leaseDuration time.Duration
-	register      func(*worker.TaskHandlers, *taskengine.Registry) error
+	policy               cache.EvictionPolicy
+	maxBytes             int64
+	highPercent          int
+	lowPercent           int
+	concurrency          int
+	maxRetries           *int
+	leaseDuration        time.Duration
+	observabilityChecker observability.RefreshChecker
+	register             func(*worker.TaskHandlers, *taskengine.Registry) error
 }
 
 func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerTestRuntime {
@@ -113,7 +114,12 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		maxRetries = *options.maxRetries
 	}
 	var observabilityService *observability.Service
-	if options.uploadSpeedProbe != nil {
+	if options.observabilityChecker != nil {
+		observabilityService = observability.NewService(observability.ServiceOptions{
+			Store: repos.Observability, Checker: options.observabilityChecker,
+			LocalDataSets: observability.LocalDataSetSourceFunc(func(context.Context) ([]observability.LocalDataSet, error) { return nil, nil }),
+		})
+	} else if options.uploadSpeedProbe != nil {
 		observabilityService = observability.NewService(observability.ServiceOptions{Store: repos.Observability})
 	}
 	handlers, err := worker.NewTaskHandlers(worker.TaskHandlerDependencies{
@@ -470,6 +476,51 @@ func (p *recordingWorkerEvents) Publish(topic string, payload map[string]any) {
 	select {
 	case p.events <- recordedWorkerEvent{topic: topic, payload: payload}:
 	default:
+	}
+}
+
+type failingDataSetRefreshChecker struct{ dataSetAttempts atomic.Int64 }
+
+func (c *failingDataSetRefreshChecker) CheckProviders(context.Context, time.Time, []observability.LocalDataSet) ([]observability.ProviderState, error) {
+	id, _ := idtypes.ParseOnChainID("provider_id", "101")
+	return []observability.ProviderState{{ProviderID: id, Status: observability.StatusAvailable}}, nil
+}
+
+func (c *failingDataSetRefreshChecker) CheckDataSets(context.Context, time.Time, []observability.LocalDataSet) ([]observability.DataSetState, error) {
+	c.dataSetAttempts.Add(1)
+	return nil, errors.New("data set refresh failed")
+}
+
+func TestObservabilityTaskRetriesAfterPartialCatalogSuccess(t *testing.T) {
+	checker := &failingDataSetRefreshChecker{}
+	events := &recordingWorkerEvents{events: make(chan recordedWorkerEvent, 2)}
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{events: events, observabilityChecker: checker})
+	taskRow, _, err := runtime.service.Enqueue(t.Context(), taskengine.EnqueueRequest{
+		Type: model.TaskTypeObservabilityRefresh, IdempotencyKey: "observability-partial-test",
+		Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "observability",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	waitForTask(t, runtime.repos, taskRow.ID, func(row *model.Task) bool {
+		return row.Status == model.TaskStatusPending && row.RetryCount > 0 && row.FailureReason != nil && *row.FailureReason == "observability_refresh_failed"
+	})
+	if checker.dataSetAttempts.Load() == 0 {
+		t.Fatal("data set refresh was not attempted")
+	}
+	select {
+	case event := <-events.events:
+		if event.topic != "provider_catalog_updated" {
+			t.Fatalf("event = %q, want provider_catalog_updated", event.topic)
+		}
+	default:
+		t.Fatal("provider catalog event was not published")
+	}
+	page, err := runtime.repos.Observability.ListProviderStates(t.Context(), observability.ListOptions{})
+	if err != nil || len(page.Items) != 1 || page.Items[0].ProviderID.String() != "101" {
+		t.Fatalf("committed provider states = %#v, error=%v", page.Items, err)
 	}
 }
 

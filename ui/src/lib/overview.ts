@@ -91,6 +91,8 @@ const taskOperationLabels: Record<string, string> = {
   storage_dataset_retire: 'Retire service',
   wallet_operation: 'Wallet request',
   observability_refresh: 'Refresh health',
+  approved_provider_refresh: 'Refresh approved providers',
+  endorsed_provider_refresh: 'Refresh endorsed providers',
   provider_upload_speed_test: 'Test provider upload speed',
   task_gc: 'Remove expired task records',
 }

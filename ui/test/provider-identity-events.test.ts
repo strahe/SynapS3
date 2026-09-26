@@ -2,16 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { QueryClient } from '@tanstack/react-query'
 
-import type { BucketDetail, ObjectProvenance, ProviderIdentity } from '../src/api/client.ts'
+import type { BucketDetail, ObjectProvenance } from '../src/api/client.ts'
 import { applyProviderIdentityEventData } from '../src/lib/provider-identity-events.ts'
 
-const identity: ProviderIdentity = {
-  registry_provider_id: '101',
-  name: 'alpha-pdp',
-  filecoin_actor_id: 'f01234',
-}
-
-test('provider identity events patch bucket detail cache', () => {
+test('provider identity events invalidate matching bucket detail', () => {
   const qc = new QueryClient()
   qc.setQueryData<BucketDetail>(['bucket', 'photos'], {
     id: 1,
@@ -33,16 +27,14 @@ test('provider identity events patch bucket detail cache', () => {
       seq: 1,
       topic: 'provider_identity_updated',
       provider_id: '101',
-      identity,
     })
   )
 
-  const bucket = qc.getQueryData<BucketDetail>(['bucket', 'photos'])
-  assert.equal(bucket?.data_sets[0]?.provider_identity?.name, 'alpha-pdp')
-  assert.equal(bucket?.data_sets[1]?.provider_identity, undefined)
+  assert.equal(qc.getQueryState(['bucket', 'photos'])?.isInvalidated, true)
+  assert.equal(qc.getQueryData<BucketDetail>(['bucket', 'photos'])?.data_sets[0]?.provider_identity, undefined)
 })
 
-test('provider identity events patch provenance cache', () => {
+test('provider identity events invalidate matching provenance', () => {
   const qc = new QueryClient()
   qc.setQueryData<ObjectProvenance>(['objectProvenance', 'photos', 'v1'], {
     version_id: 'v1',
@@ -77,13 +69,14 @@ test('provider identity events patch provenance cache', () => {
       seq: 1,
       topic: 'provider_identity_updated',
       provider_id: '101',
-      identity,
     })
   )
 
-  const provenance = qc.getQueryData<ObjectProvenance>(['objectProvenance', 'photos', 'v1'])
-  assert.equal(provenance?.copies[0]?.provider_identity?.name, 'alpha-pdp')
-  assert.equal(provenance?.copies[1]?.provider_identity, undefined)
+  assert.equal(qc.getQueryState(['objectProvenance', 'photos', 'v1'])?.isInvalidated, true)
+  assert.equal(
+    qc.getQueryData<ObjectProvenance>(['objectProvenance', 'photos', 'v1'])?.copies[0]?.provider_identity,
+    undefined
+  )
 })
 
 test('provider identity events ignore unrelated providers', () => {
@@ -109,11 +102,22 @@ test('provider identity events ignore unrelated providers', () => {
       seq: 1,
       topic: 'provider_identity_updated',
       provider_id: '101',
-      identity,
     })
   )
 
   assert.equal(qc.getQueryData<BucketDetail>(['bucket', 'photos']), before)
+  assert.equal(qc.getQueryState(['bucket', 'photos'])?.isInvalidated, false)
+})
+
+test('provider identity events invalidate only matching replacement choices', () => {
+  const qc = new QueryClient()
+  qc.setQueryData(['replacement-providers', 'photos', 1], { providers: [{ provider_id: '101' }] })
+  qc.setQueryData(['replacement-providers', 'other', 2], { providers: [{ provider_id: '202' }] })
+
+  applyProviderIdentityEventData(qc, JSON.stringify({ topic: 'provider_identity_updated', provider_id: '101' }))
+
+  assert.equal(qc.getQueryState(['replacement-providers', 'photos', 1])?.isInvalidated, true)
+  assert.equal(qc.getQueryState(['replacement-providers', 'other', 2])?.isInvalidated, false)
 })
 
 function dataSet(providerID: string) {

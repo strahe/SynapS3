@@ -83,6 +83,8 @@ func runtimePersistentModels() []any {
 		(*model.WalletOperation)(nil),
 		(*observability.CollectionState)(nil),
 		(*observability.ProviderState)(nil),
+		(*observability.ProviderProfile)(nil),
+		(*observability.ProviderTierSnapshot)(nil),
 		(*providerbenchmark.Result)(nil),
 		(*observability.DataSetState)(nil),
 	}

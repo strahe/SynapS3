@@ -72,5 +72,12 @@ func CurrentServiceURL(ctx context.Context, service *observability.Service, prov
 		item.Facts.ServiceURL == nil || *item.Facts.ServiceURL == "" {
 		return "", false, nil
 	}
+	profile, err := service.ProviderProfile(ctx, providerID)
+	if err != nil {
+		return "", false, err
+	}
+	if profile != nil && profile.ServiceURL != *item.Facts.ServiceURL {
+		return "", false, nil
+	}
 	return *item.Facts.ServiceURL, true, nil
 }

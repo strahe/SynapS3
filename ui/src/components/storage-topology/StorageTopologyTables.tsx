@@ -52,10 +52,12 @@ export function ProvidersTableCard({
   return (
     <div className="flex flex-col gap-3">
       <InventoryTableFrame>
-        <Table className="min-w-[760px]">
+        <Table className="min-w-[1100px]">
           <TableHeader>
             <TableRow className="bg-muted/50">
               <TableHead className="whitespace-nowrap px-3 py-2">Provider</TableHead>
+              <TableHead className="whitespace-nowrap px-3 py-2">FWSS approved</TableHead>
+              <TableHead className="whitespace-nowrap px-3 py-2">FWSS endorsed</TableHead>
               <TableHead className="whitespace-nowrap px-3 py-2">Signal</TableHead>
               <TableHead className="whitespace-nowrap px-3 py-2">Registry</TableHead>
               <TableHead className="whitespace-nowrap px-3 py-2">Service URL</TableHead>
@@ -65,14 +67,29 @@ export function ProvidersTableCard({
           </TableHeader>
           <TableBody>
             {loading ? (
-              <InventoryLoadingRow colSpan={6} />
+              <InventoryLoadingRow colSpan={8} />
             ) : error ? (
-              <InventoryErrorRow colSpan={6} message={error} />
+              <InventoryErrorRow colSpan={8} message={error} />
             ) : rows.length > 0 ? (
               rows.map((row) => (
                 <TableRow key={row.providerID}>
                   <TableCell className="whitespace-nowrap px-3 py-2">
+                    {row.provider?.provider_profile?.name && (
+                      <span className="block font-medium">{row.provider.provider_profile.name}</span>
+                    )}
                     <CopyableValue label="Provider" value={row.providerID} monospace maxLength={16} />
+                  </TableCell>
+                  <TableCell className="px-3 py-2">
+                    <ProviderTierStatus
+                      listed={row.provider?.provider_profile?.approved}
+                      checkedAt={row.provider?.provider_profile?.approved_checked_at}
+                    />
+                  </TableCell>
+                  <TableCell className="px-3 py-2">
+                    <ProviderTierStatus
+                      listed={row.provider?.provider_profile?.endorsed}
+                      checkedAt={row.provider?.provider_profile?.endorsed_checked_at}
+                    />
                   </TableCell>
                   <TableCell className="whitespace-nowrap px-3 py-2">
                     <div className="flex items-center gap-2">
@@ -124,7 +141,7 @@ export function ProvidersTableCard({
               ))
             ) : (
               <InventoryEmptyRow
-                colSpan={6}
+                colSpan={8}
                 title="No providers found"
                 description="No provider observations match the current filters."
               />
@@ -135,6 +152,18 @@ export function ProvidersTableCard({
       {contextNote && <div className="text-sm text-muted-foreground">{contextNote}</div>}
       <TopologyPagination total={total} page={page} totalPages={totalPages} onPageChange={onPageChange} />
     </div>
+  )
+}
+
+function ProviderTierStatus({ listed, checkedAt }: { listed?: boolean; checkedAt?: string }) {
+  const known = Boolean(checkedAt)
+  return (
+    <StatusBadge
+      tone={known && listed ? 'success' : 'neutral'}
+      className={known && !listed ? 'text-foreground' : undefined}
+    >
+      {known ? (listed ? 'Yes' : 'No') : 'Unknown'}
+    </StatusBadge>
   )
 }
 

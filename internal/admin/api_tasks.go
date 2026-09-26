@@ -141,6 +141,8 @@ func validTaskType(taskType model.TaskType) bool {
 		model.TaskTypeStorageDataSetRetire,
 		model.TaskTypeWalletOperation,
 		model.TaskTypeObservabilityRefresh,
+		model.TaskTypeApprovedProviderRefresh,
+		model.TaskTypeEndorsedProviderRefresh,
 		model.TaskTypeProviderUploadSpeedTest,
 		model.TaskTypeGC:
 		return true
@@ -223,6 +225,10 @@ func taskOperationLabel(taskType model.TaskType) string {
 		return "Process wallet request"
 	case model.TaskTypeObservabilityRefresh:
 		return "Refresh storage health"
+	case model.TaskTypeApprovedProviderRefresh:
+		return "Refresh approved providers"
+	case model.TaskTypeEndorsedProviderRefresh:
+		return "Refresh endorsed providers"
 	case model.TaskTypeProviderUploadSpeedTest:
 		return "Test provider upload speed"
 	case model.TaskTypeGC:

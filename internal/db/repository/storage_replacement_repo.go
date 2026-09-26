@@ -169,16 +169,17 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		}
 
 		replacement := &storagereplacement.Replacement{
-			BucketID:        input.BucketID,
-			CopyIndex:       source.CopyIndex,
-			SourceDataSetID: source.ID,
-			TargetDataSetID: target.ID,
-			SelectionMode:   input.SelectionMode,
-			ClientRequestID: input.ClientRequestID,
-			Status:          storagereplacement.StatusPreparingTarget,
-			TaskGeneration:  1,
-			CreatedAt:       now,
-			UpdatedAt:       now,
+			BucketID:             input.BucketID,
+			CopyIndex:            source.CopyIndex,
+			SourceDataSetID:      source.ID,
+			TargetDataSetID:      target.ID,
+			SelectionMode:        input.SelectionMode,
+			PriceListFingerprint: input.PriceListFingerprint,
+			ClientRequestID:      input.ClientRequestID,
+			Status:               storagereplacement.StatusPreparingTarget,
+			TaskGeneration:       1,
+			CreatedAt:            now,
+			UpdatedAt:            now,
 		}
 		if input.SelectionMode == storagereplacement.SelectionModeManual {
 			providerID := input.TargetProviderID
@@ -242,7 +243,7 @@ func abandonUnsentReplacementTargets(ctx context.Context, db bun.IDB, sourceData
 }
 
 func replacementRequestMatches(row *storagereplacement.Replacement, input AuthorizeReplacementInput) bool {
-	if row.BucketID != input.BucketID || row.SourceDataSetID != input.SourceDataSetID || row.SelectionMode != input.SelectionMode {
+	if row.BucketID != input.BucketID || row.SourceDataSetID != input.SourceDataSetID || row.SelectionMode != input.SelectionMode || row.PriceListFingerprint != input.PriceListFingerprint {
 		return false
 	}
 	if input.SelectionMode != storagereplacement.SelectionModeManual {

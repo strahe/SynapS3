@@ -10,24 +10,21 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	idtypes "github.com/strahe/synaps3/internal/types"
-	"github.com/strahe/synapse-go/spregistry"
-	sdktypes "github.com/strahe/synapse-go/types"
 )
 
 const (
-	defaultProviderIdentityTTL             = 5 * time.Minute
-	defaultProviderIdentityRPCTimeout      = 5 * time.Second
-	defaultProviderIdentityRegistryTimeout = 5 * time.Second
-	defaultProviderIdentityActorTimeout    = 2 * time.Second
-	defaultProviderIdentityRefreshBackoff  = 60 * time.Second
-	defaultProviderIdentityQueueSize       = 128
-	defaultProviderIdentityActorWorkers    = 4
-	maxFilecoinRPCResponseBodyBytes        = 1 << 20
+	defaultProviderIdentityTTL            = 5 * time.Minute
+	defaultProviderIdentityRPCTimeout     = 5 * time.Second
+	defaultProviderIdentityActorTimeout   = 2 * time.Second
+	defaultProviderIdentityRefreshBackoff = 60 * time.Second
+	defaultProviderIdentityQueueSize      = 128
+	defaultProviderIdentityActorWorkers   = 4
+	maxFilecoinRPCResponseBodyBytes       = 1 << 20
 )
 
 type providerIdentityResponse struct {
@@ -44,7 +41,7 @@ type providerIdentityResponse struct {
 }
 
 type providerIdentityLookup interface {
-	ProviderIdentities([]idtypes.OnChainID) map[string]*providerIdentityResponse
+	EnrichActors(map[string]*providerIdentityResponse) map[string]*providerIdentityResponse
 }
 
 type providerIdentityRunner interface {
@@ -52,91 +49,72 @@ type providerIdentityRunner interface {
 }
 
 type providerIdentityPublisherSetter interface {
-	SetProviderIdentityPublisher(func(*providerIdentityResponse))
-}
-
-type providerIdentityRegistry interface {
-	GetPDPProvidersByIDs(context.Context, []sdktypes.BigInt) ([]spregistry.PDPProvider, error)
-	GetProvidersByIDs(context.Context, []sdktypes.BigInt) ([]*spregistry.ProviderInfo, error)
+	SetProviderIdentityPublisher(func(string))
 }
 
 type actorIdentityResolver interface {
 	ResolveActorID(context.Context, common.Address) (filecoinAddress string, actorID string, err error)
 }
 
-type providerIdentityCacheEntry struct {
-	identity  *providerIdentityResponse
-	expiresAt time.Time
+type actorCacheKey struct {
+	providerID string
+	address    string
 }
 
-// ProviderIdentityResolver asynchronously enriches Registry provider IDs for admin API responses.
+type actorCacheEntry struct {
+	filecoinAddress string
+	actorID         string
+	expiresAt       time.Time
+}
+
+// ProviderIdentityResolver caches only Filecoin fields derived from a saved service provider address.
 type ProviderIdentityResolver struct {
-	registry providerIdentityRegistry
-	actors   actorIdentityResolver
-	ttl      time.Duration
-	now      func() time.Time
-	logger   *slog.Logger
-
-	registryTimeout time.Duration
-	actorTimeout    time.Duration
-	refreshBackoff  time.Duration
-
-	refreshQueue chan []idtypes.OnChainID
-	actorQueue   chan string
+	actors         actorIdentityResolver
+	ttl            time.Duration
+	now            func() time.Time
+	logger         *slog.Logger
+	actorTimeout   time.Duration
+	refreshBackoff time.Duration
+	actorQueue     chan actorCacheKey
 
 	mu               sync.Mutex
-	cache            map[string]providerIdentityCacheEntry
-	refreshing       map[string]struct{}
-	refreshBackoffs  map[string]time.Time
-	actorRefreshing  map[string]struct{}
-	actorBackoffs    map[string]time.Time
-	publishIdentity  func(*providerIdentityResponse)
+	current          map[string]actorCacheKey
+	cache            map[actorCacheKey]actorCacheEntry
+	refreshing       map[actorCacheKey]struct{}
+	backoffs         map[actorCacheKey]time.Time
+	publishIdentity  func(string)
 	actorWorkerCount int
 }
 
-// NewProviderIdentityResolver creates a cached provider identity resolver backed by the Registry and Filecoin RPC.
-func NewProviderIdentityResolver(registry *spregistry.Service, rpcURL string, logger *slog.Logger) *ProviderIdentityResolver {
-	if registry == nil {
+func NewProviderIdentityResolver(rpcURL string, logger *slog.Logger) *ProviderIdentityResolver {
+	if rpcURL == "" {
 		return nil
 	}
-	var actors actorIdentityResolver
-	if rpcURL != "" {
-		actors = &lotusActorIdentityResolver{rpcURL: rpcURL, httpClient: &http.Client{Timeout: defaultProviderIdentityRPCTimeout}}
-	}
-	return newProviderIdentityResolver(registry, actors, defaultProviderIdentityTTL, time.Now, logger)
+	actors := &lotusActorIdentityResolver{rpcURL: rpcURL, httpClient: &http.Client{Timeout: defaultProviderIdentityRPCTimeout}}
+	return newProviderIdentityResolver(actors, defaultProviderIdentityTTL, time.Now, logger)
 }
 
-func newProviderIdentityResolver(
-	registry providerIdentityRegistry,
-	actors actorIdentityResolver,
-	ttl time.Duration,
-	now func() time.Time,
-	logger *slog.Logger,
-) *ProviderIdentityResolver {
+func newProviderIdentityResolver(actors actorIdentityResolver, ttl time.Duration, now func() time.Time, logger *slog.Logger) *ProviderIdentityResolver {
 	if now == nil {
 		now = time.Now
 	}
 	return &ProviderIdentityResolver{
-		registry:         registry,
 		actors:           actors,
 		ttl:              ttl,
 		now:              now,
 		logger:           logger,
-		registryTimeout:  defaultProviderIdentityRegistryTimeout,
 		actorTimeout:     defaultProviderIdentityActorTimeout,
 		refreshBackoff:   defaultProviderIdentityRefreshBackoff,
-		refreshQueue:     make(chan []idtypes.OnChainID, defaultProviderIdentityQueueSize),
-		actorQueue:       make(chan string, defaultProviderIdentityQueueSize),
-		cache:            make(map[string]providerIdentityCacheEntry),
-		refreshing:       make(map[string]struct{}),
-		refreshBackoffs:  make(map[string]time.Time),
-		actorRefreshing:  make(map[string]struct{}),
-		actorBackoffs:    make(map[string]time.Time),
+		actorQueue:       make(chan actorCacheKey, defaultProviderIdentityQueueSize),
+		current:          make(map[string]actorCacheKey),
+		cache:            make(map[actorCacheKey]actorCacheEntry),
+		refreshing:       make(map[actorCacheKey]struct{}),
+		backoffs:         make(map[actorCacheKey]time.Time),
 		actorWorkerCount: defaultProviderIdentityActorWorkers,
 	}
 }
 
-func (r *ProviderIdentityResolver) SetProviderIdentityPublisher(publish func(*providerIdentityResponse)) {
+func (r *ProviderIdentityResolver) SetProviderIdentityPublisher(publish func(string)) {
 	if r == nil {
 		return
 	}
@@ -149,314 +127,79 @@ func (r *ProviderIdentityResolver) Run(ctx context.Context) {
 	if r == nil {
 		return
 	}
+	var workers sync.WaitGroup
 	for i := 0; i < r.actorWorkerCount; i++ {
-		go r.runActorWorker(ctx)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			r.runActorWorker(ctx)
+		}()
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ids := <-r.refreshQueue:
-			r.refreshProviderIdentities(ctx, r.drainRefreshIDs(ids))
-		}
-	}
+	workers.Wait()
 }
 
-func (r *ProviderIdentityResolver) ProviderIdentities(providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {
-	out := make(map[string]*providerIdentityResponse)
-	if r == nil || r.registry == nil {
+func (r *ProviderIdentityResolver) EnrichActors(identities map[string]*providerIdentityResponse) map[string]*providerIdentityResponse {
+	out := make(map[string]*providerIdentityResponse, len(identities))
+	if r == nil {
+		for id, identity := range identities {
+			out[id] = cloneProviderIdentity(identity)
+		}
 		return out
 	}
-
-	seen := make(map[string]struct{}, len(providerIDs))
-	refreshIDs := make([]idtypes.OnChainID, 0)
-	for _, providerID := range providerIDs {
-		if providerID.IsZero() {
+	for id, identity := range identities {
+		if identity == nil {
 			continue
 		}
-		key := providerID.String()
-		if _, ok := seen[key]; ok {
-			continue
+		enriched := cloneProviderIdentity(identity)
+		key := actorCacheKey{providerID: id}
+		if common.IsHexAddress(identity.ServiceProviderAddress) {
+			key.address = common.HexToAddress(identity.ServiceProviderAddress).Hex()
 		}
-		seen[key] = struct{}{}
-
-		identity, stale := r.cachedSnapshot(key)
-		if identity != nil {
-			out[key] = identity
-			if !stale {
-				r.enqueueActor(identity)
-			}
+		r.mu.Lock()
+		if previous, ok := r.current[id]; ok && previous != key {
+			delete(r.cache, previous)
+			delete(r.backoffs, previous)
 		}
-		if identity == nil || stale {
-			refreshIDs = append(refreshIDs, providerID)
+		r.current[id] = key
+		cached, ok := r.cache[key]
+		if ok && key.address != "" {
+			enriched.FilecoinAddress = cached.filecoinAddress
+			enriched.FilecoinActorID = cached.actorID
+		}
+		shouldRefresh := key.address != "" && r.actors != nil && (!ok || cached.actorID == "" || (!cached.expiresAt.IsZero() && !r.now().Before(cached.expiresAt)))
+		r.mu.Unlock()
+		out[id] = enriched
+		if shouldRefresh {
+			r.enqueueActor(key)
 		}
 	}
-	r.enqueueRefresh(refreshIDs)
 	return out
 }
 
-func (r *ProviderIdentityResolver) cachedSnapshot(key string) (*providerIdentityResponse, bool) {
+func (r *ProviderIdentityResolver) enqueueActor(key actorCacheKey) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	entry, ok := r.cache[key]
-	if !ok || entry.identity == nil {
-		return nil, false
-	}
-	stale := !entry.expiresAt.IsZero() && !r.now().Before(entry.expiresAt)
-	return cloneProviderIdentity(entry.identity), stale
-}
-
-func (r *ProviderIdentityResolver) enqueueRefresh(providerIDs []idtypes.OnChainID) {
-	if len(providerIDs) == 0 {
-		return
-	}
-
-	now := r.now()
-	enqueue := make([]idtypes.OnChainID, 0, len(providerIDs))
-	r.mu.Lock()
-	for _, providerID := range providerIDs {
-		key := providerID.String()
-		if _, ok := r.refreshing[key]; ok {
-			continue
-		}
-		if until, ok := r.refreshBackoffs[key]; ok && now.Before(until) {
-			continue
-		}
-		r.refreshing[key] = struct{}{}
-		enqueue = append(enqueue, providerID)
-	}
-	r.mu.Unlock()
-
-	if len(enqueue) == 0 {
-		return
-	}
-	select {
-	case r.refreshQueue <- enqueue:
-	default:
-		r.clearRefreshing(enqueue)
-		if r.logger != nil {
-			r.logger.Debug("provider identity: refresh queue full", "count", len(enqueue))
-		}
-	}
-}
-
-func (r *ProviderIdentityResolver) drainRefreshIDs(first []idtypes.OnChainID) []idtypes.OnChainID {
-	ids := make([]idtypes.OnChainID, 0, len(first))
-	seen := make(map[string]struct{}, len(first))
-	add := func(batch []idtypes.OnChainID) {
-		for _, id := range batch {
-			key := id.String()
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			ids = append(ids, id)
-		}
-	}
-	add(first)
-	for {
-		select {
-		case batch := <-r.refreshQueue:
-			add(batch)
-		default:
-			return ids
-		}
-	}
-}
-
-func (r *ProviderIdentityResolver) refreshProviderIdentities(ctx context.Context, providerIDs []idtypes.OnChainID) {
-	if len(providerIDs) == 0 {
-		return
-	}
-	defer r.clearRefreshing(providerIDs)
-
-	callCtx := ctx
-	var cancel context.CancelFunc
-	if r.registryTimeout > 0 {
-		callCtx, cancel = context.WithTimeout(ctx, r.registryTimeout)
-		defer cancel()
-	}
-
-	sdkIDs := make([]sdktypes.BigInt, 0, len(providerIDs))
-	requested := make(map[string]idtypes.OnChainID, len(providerIDs))
-	for _, providerID := range providerIDs {
-		key := providerID.String()
-		requested[key] = providerID
-		sdkIDs = append(sdkIDs, providerID.SDK())
-	}
-
-	pdpProviders, err := r.registry.GetPDPProvidersByIDs(callCtx, sdkIDs)
-	if err != nil {
-		r.markRefreshBackoff(providerIDs)
-		if r.logger != nil {
-			r.logger.Debug("provider identity: failed to refresh PDP providers", "count", len(providerIDs), "error", err)
-		}
-		return
-	}
-
-	found := make(map[string]struct{}, len(pdpProviders))
-	for _, provider := range pdpProviders {
-		key := provider.Info.ID.String()
-		if _, ok := requested[key]; !ok || provider.Info.ID.IsZero() {
-			continue
-		}
-		found[key] = struct{}{}
-		identity := identityFromPDPProvider(&provider)
-		r.enqueueActor(r.storeAndPublish(identity))
-	}
-
-	missing := make([]idtypes.OnChainID, 0)
-	for key, providerID := range requested {
-		if _, ok := found[key]; !ok {
-			missing = append(missing, providerID)
-		}
-	}
-	r.refreshProviderInfoFallback(ctx, missing)
-}
-
-func (r *ProviderIdentityResolver) refreshProviderInfoFallback(ctx context.Context, providerIDs []idtypes.OnChainID) {
-	if len(providerIDs) == 0 {
-		return
-	}
-	callCtx := ctx
-	var cancel context.CancelFunc
-	if r.registryTimeout > 0 {
-		callCtx, cancel = context.WithTimeout(ctx, r.registryTimeout)
-		defer cancel()
-	}
-	sdkIDs := make([]sdktypes.BigInt, 0, len(providerIDs))
-	for _, providerID := range providerIDs {
-		sdkIDs = append(sdkIDs, providerID.SDK())
-	}
-	infos, err := r.registry.GetProvidersByIDs(callCtx, sdkIDs)
-	if err != nil {
-		r.markRefreshBackoff(providerIDs)
-		if r.logger != nil {
-			r.logger.Debug("provider identity: failed to refresh provider info fallback", "count", len(providerIDs), "error", err)
-		}
-		return
-	}
-	if len(infos) != len(providerIDs) {
-		r.markRefreshBackoff(providerIDs)
-		if r.logger != nil {
-			r.logger.Debug("provider identity: malformed provider info fallback", "got", len(infos), "want", len(providerIDs))
-		}
-		return
-	}
-	missing := make([]idtypes.OnChainID, 0)
-	for i, info := range infos {
-		if info == nil {
-			missing = append(missing, providerIDs[i])
-			continue
-		}
-		identity := identityFromProviderInfo(info)
-		r.enqueueActor(r.storeAndPublish(identity))
-	}
-	r.markRefreshBackoff(missing)
-}
-
-func (r *ProviderIdentityResolver) clearRefreshing(providerIDs []idtypes.OnChainID) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, providerID := range providerIDs {
-		delete(r.refreshing, providerID.String())
-	}
-}
-
-func (r *ProviderIdentityResolver) markRefreshBackoff(providerIDs []idtypes.OnChainID) {
-	if len(providerIDs) == 0 || r.refreshBackoff <= 0 {
-		return
-	}
-	until := r.now().Add(r.refreshBackoff)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, providerID := range providerIDs {
-		r.refreshBackoffs[providerID.String()] = until
-	}
-}
-
-func (r *ProviderIdentityResolver) storeAndPublish(identity *providerIdentityResponse) *providerIdentityResponse {
-	stored := r.store(identity)
-	if stored == nil {
-		return nil
-	}
-
-	r.mu.Lock()
-	publish := r.publishIdentity
-	r.mu.Unlock()
-	if publish != nil {
-		publish(cloneProviderIdentity(stored))
-	}
-	return stored
-}
-
-func (r *ProviderIdentityResolver) store(identity *providerIdentityResponse) *providerIdentityResponse {
-	if identity == nil || identity.RegistryProviderID == "" {
-		return nil
-	}
-	stored := cloneProviderIdentity(identity)
-	expiresAt := time.Time{}
-	if r.ttl > 0 {
-		expiresAt = r.now().Add(r.ttl)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if current := r.cache[stored.RegistryProviderID].identity; current != nil {
-		if sameServiceProviderAddress(stored.ServiceProviderAddress, current.ServiceProviderAddress) {
-			if stored.FilecoinAddress == "" {
-				stored.FilecoinAddress = current.FilecoinAddress
-			}
-			if stored.FilecoinActorID == "" {
-				stored.FilecoinActorID = current.FilecoinActorID
-			}
-		} else {
-			delete(r.actorBackoffs, stored.RegistryProviderID)
-		}
-	}
-	r.cache[stored.RegistryProviderID] = providerIdentityCacheEntry{identity: stored, expiresAt: expiresAt}
-	delete(r.refreshBackoffs, stored.RegistryProviderID)
-	return cloneProviderIdentity(stored)
-}
-
-func sameServiceProviderAddress(a, b string) bool {
-	if common.IsHexAddress(a) && common.IsHexAddress(b) {
-		return common.HexToAddress(a) == common.HexToAddress(b)
-	}
-	return a == b
-}
-
-func (r *ProviderIdentityResolver) enqueueActor(identity *providerIdentityResponse) {
-	if r == nil || r.actors == nil || identity == nil || identity.RegistryProviderID == "" || identity.FilecoinActorID != "" {
-		return
-	}
-	if !common.IsHexAddress(identity.ServiceProviderAddress) {
-		return
-	}
-
-	key := identity.RegistryProviderID
-	now := r.now()
-	r.mu.Lock()
-	if _, ok := r.actorRefreshing[key]; ok {
+	if r.current[key.providerID] != key {
 		r.mu.Unlock()
 		return
 	}
-	if until, ok := r.actorBackoffs[key]; ok && now.Before(until) {
+	if _, active := r.refreshing[key]; active {
 		r.mu.Unlock()
 		return
 	}
-	r.actorRefreshing[key] = struct{}{}
+	if until := r.backoffs[key]; r.now().Before(until) {
+		r.mu.Unlock()
+		return
+	}
+	r.refreshing[key] = struct{}{}
 	r.mu.Unlock()
-
 	select {
 	case r.actorQueue <- key:
 	default:
 		r.mu.Lock()
-		delete(r.actorRefreshing, key)
+		delete(r.refreshing, key)
 		r.mu.Unlock()
 		if r.logger != nil {
-			r.logger.Debug("provider identity: actor queue full", "provider_id", key)
+			r.logger.Debug("provider identity: actor queue full", "provider_id", key.providerID)
 		}
 	}
 }
@@ -472,85 +215,59 @@ func (r *ProviderIdentityResolver) runActorWorker(ctx context.Context) {
 	}
 }
 
-func (r *ProviderIdentityResolver) resolveActor(ctx context.Context, key string) {
+func (r *ProviderIdentityResolver) resolveActor(ctx context.Context, key actorCacheKey) {
 	defer func() {
 		r.mu.Lock()
-		delete(r.actorRefreshing, key)
+		delete(r.refreshing, key)
 		r.mu.Unlock()
 	}()
-
-	identity := r.identityForActorLookup(key)
-	if identity == nil || !common.IsHexAddress(identity.ServiceProviderAddress) {
+	r.mu.Lock()
+	current := r.current[key.providerID] == key
+	r.mu.Unlock()
+	if !current {
 		return
 	}
-
 	callCtx := ctx
 	var cancel context.CancelFunc
 	if r.actorTimeout > 0 {
 		callCtx, cancel = context.WithTimeout(ctx, r.actorTimeout)
 		defer cancel()
 	}
-	filecoinAddress, actorID, err := r.actors.ResolveActorID(callCtx, common.HexToAddress(identity.ServiceProviderAddress))
-	if err != nil {
-		if filecoinAddress != "" {
-			enriched := cloneProviderIdentity(identity)
-			enriched.FilecoinAddress = filecoinAddress
-			r.storeAndPublish(enriched)
-		}
-		r.markActorBackoff(key)
-		if r.logger != nil {
-			r.logger.Debug("provider identity: failed to resolve actor id", "provider_id", key, "error", err)
-		}
+	filecoinAddress, actorID, err := r.actors.ResolveActorID(callCtx, common.HexToAddress(key.address))
+	r.mu.Lock()
+	if r.current[key.providerID] != key {
+		r.mu.Unlock()
 		return
 	}
-
-	enriched := cloneProviderIdentity(identity)
-	enriched.FilecoinAddress = filecoinAddress
-	enriched.FilecoinActorID = actorID
-	r.storeAndPublish(enriched)
-	r.clearActorBackoff(key)
-}
-
-func (r *ProviderIdentityResolver) identityForActorLookup(key string) *providerIdentityResponse {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	entry := r.cache[key]
-	return cloneProviderIdentity(entry.identity)
-}
-
-func (r *ProviderIdentityResolver) markActorBackoff(key string) {
-	if r.refreshBackoff <= 0 {
-		return
+	old := r.cache[key]
+	next := old
+	if err == nil {
+		next.filecoinAddress = filecoinAddress
+		next.actorID = actorID
+	} else if filecoinAddress != "" && old.filecoinAddress == "" {
+		next.filecoinAddress = filecoinAddress
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.actorBackoffs[key] = r.now().Add(r.refreshBackoff)
-}
-
-func (r *ProviderIdentityResolver) clearActorBackoff(key string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.actorBackoffs, key)
-}
-
-func identityFromPDPProvider(provider *spregistry.PDPProvider) *providerIdentityResponse {
-	identity := identityFromProviderInfo(&provider.Info)
-	identity.ServiceURL = provider.Offering.ServiceURL
-	identity.Location = provider.Offering.Location
-	identity.ExtraCapabilities = formatExtraCapabilities(provider.Offering.ExtraCapabilities)
-	return identity
-}
-
-func identityFromProviderInfo(info *spregistry.ProviderInfo) *providerIdentityResponse {
-	if info == nil {
-		return nil
+	if next != old || err == nil {
+		expiresAt := time.Time{}
+		if r.ttl > 0 {
+			expiresAt = r.now().Add(r.ttl)
+		}
+		next.expiresAt = expiresAt
+		r.cache[key] = next
 	}
-	return &providerIdentityResponse{
-		RegistryProviderID:     info.ID.String(),
-		Name:                   info.Name,
-		Description:            info.Description,
-		ServiceProviderAddress: nonZeroAddressHex(info.ServiceProvider),
-		PayeeAddress:           nonZeroAddressHex(info.Payee),
+	if err != nil && r.refreshBackoff > 0 {
+		r.backoffs[key] = r.now().Add(r.refreshBackoff)
+	} else {
+		delete(r.backoffs, key)
+	}
+	publish := r.publishIdentity
+	changed := old.filecoinAddress != next.filecoinAddress || old.actorID != next.actorID
+	r.mu.Unlock()
+	if err != nil && r.logger != nil {
+		r.logger.Debug("provider identity: failed to resolve actor id", "provider_id", key.providerID, "error", err)
+	}
+	if changed && publish != nil {
+		publish(key.providerID)
 	}
 }
 
@@ -568,37 +285,34 @@ func cloneProviderIdentity(identity *providerIdentityResponse) *providerIdentity
 	return &out
 }
 
-func nonZeroAddressHex(addr common.Address) string {
-	if addr == (common.Address{}) {
-		return ""
-	}
-	return addr.Hex()
-}
-
-func formatExtraCapabilities(extra map[string][]byte) map[string]string {
-	if len(extra) == 0 {
+func identityCapabilitiesFromSnapshot(values map[string]string) map[string]string {
+	if len(values) == 0 {
 		return nil
 	}
-	out := make(map[string]string, len(extra))
-	for key, value := range extra {
-		out[key] = formatCapabilityValue(value)
-	}
-	return out
-}
-
-func formatCapabilityValue(value []byte) string {
-	if len(value) == 0 {
-		return ""
-	}
-	for _, b := range value {
-		if b == '\n' || b == '\r' || b == '\t' {
+	out := make(map[string]string, len(values))
+	for key, encoded := range values {
+		bytes, err := hex.DecodeString(strings.TrimPrefix(encoded, "0x"))
+		if err != nil {
+			out[key] = encoded
 			continue
 		}
-		if b < 32 || b > 126 {
-			return "0x" + hex.EncodeToString(value)
+		printable := true
+		for _, b := range bytes {
+			if b == '\n' || b == '\r' || b == '\t' {
+				continue
+			}
+			if b < 32 || b > 126 {
+				printable = false
+				break
+			}
+		}
+		if printable {
+			out[key] = string(bytes)
+		} else {
+			out[key] = encoded
 		}
 	}
-	return string(value)
+	return out
 }
 
 type lotusActorIdentityResolver struct {
