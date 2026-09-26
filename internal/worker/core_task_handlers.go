@@ -908,13 +908,48 @@ func (h *TaskHandlers) observabilityHandler() taskengine.Handler {
 		if h.deps.Observability == nil {
 			return taskengine.Fail(errors.New("observability service is unavailable"), "dependency_unavailable", nil)
 		}
-		if err := h.deps.Observability.RefreshAll(ctx); err != nil {
+		providerErr := h.deps.Observability.RefreshProviderStates(ctx)
+		if providerErr == nil && h.deps.Events != nil {
+			h.deps.Events.Publish("provider_catalog_updated", map[string]any{})
+		}
+		dataSetErr := h.deps.Observability.RefreshDataSetStates(ctx)
+		if err := errors.Join(providerErr, dataSetErr); err != nil {
 			return retryTask(err, "observability_refresh_failed")
 		}
 		if err := h.scheduleMissingProviderSpeedTests(ctx); err != nil {
 			return retryTask(err, "provider_speed_schedule_failed")
 		}
 		return taskengine.Suspend(model.TaskResumeModeExecute, h.deps.Observability.RefreshInterval(), "scheduled", "Storage health refreshed", nil)
+	}
+	return taskHandler{definition: definition, execute: run, recover: run}
+}
+
+func (h *TaskHandlers) providerTierHandler(taskType model.TaskType, tier string) taskengine.Handler {
+	definition := taskengine.Definition{
+		Type: taskType, InputVersion: 1,
+		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
+		RetryLimit: nil, AllowRetry: true,
+	}
+	run := func(ctx context.Context, _ taskengine.Execution) taskengine.Result {
+		if h.deps.Observability == nil {
+			return taskengine.Fail(errors.New("observability service is unavailable"), "dependency_unavailable", nil)
+		}
+		var err error
+		switch taskType {
+		case model.TaskTypeApprovedProviderRefresh:
+			_, err = h.deps.Observability.RefreshApprovedProviders(ctx)
+		case model.TaskTypeEndorsedProviderRefresh:
+			_, err = h.deps.Observability.RefreshEndorsedProviders(ctx)
+		default:
+			return taskengine.Fail(fmt.Errorf("unknown provider tier %s", tier), "invalid_tier", nil)
+		}
+		if err != nil {
+			return retryTask(err, tier+"_provider_refresh_failed")
+		}
+		if h.deps.Events != nil {
+			h.deps.Events.Publish("provider_catalog_updated", map[string]any{})
+		}
+		return taskengine.Suspend(model.TaskResumeModeExecute, h.deps.Observability.RefreshInterval(), "scheduled", "Provider list refreshed", nil)
 	}
 	return taskHandler{definition: definition, execute: run, recover: run}
 }

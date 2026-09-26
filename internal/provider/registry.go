@@ -20,18 +20,25 @@ type ListOptions struct {
 
 // ProviderDetail is the enriched output combining provider info, PDP offering, and health status.
 type ProviderDetail struct {
-	ID           types.OnChainID `json:"id"`
-	Name         string          `json:"name"`
-	Description  string          `json:"description,omitempty"`
-	Active       bool            `json:"active"`
-	Address      common.Address  `json:"address"`
-	HasPDP       bool            `json:"has_pdp"`
-	ServiceURL   string          `json:"service_url,omitempty"`
-	MinPieceSize *big.Int        `json:"min_piece_size,omitempty"`
-	MaxPieceSize *big.Int        `json:"max_piece_size,omitempty"`
-	StoragePrice *big.Int        `json:"storage_price,omitempty"`
-	Location     string          `json:"location,omitempty"`
-	HealthStatus string          `json:"health_status"`
+	ID                types.OnChainID   `json:"id"`
+	Name              string            `json:"name"`
+	Description       string            `json:"description,omitempty"`
+	Active            bool              `json:"active"`
+	Address           common.Address    `json:"address"`
+	Payee             common.Address    `json:"payee"`
+	HasPDP            bool              `json:"has_pdp"`
+	ServiceURL        string            `json:"service_url,omitempty"`
+	MinPieceSize      *big.Int          `json:"min_piece_size,omitempty"`
+	MaxPieceSize      *big.Int          `json:"max_piece_size,omitempty"`
+	StoragePrice      *big.Int          `json:"storage_price,omitempty"`
+	MinProvingPeriod  *big.Int          `json:"min_proving_period,omitempty"`
+	PaymentToken      common.Address    `json:"payment_token"`
+	IPNIPiece         bool              `json:"ipni_piece"`
+	IPNIIPFS          bool              `json:"ipni_ipfs"`
+	IPNIPeerID        string            `json:"ipni_peer_id,omitempty"`
+	ExtraCapabilities map[string][]byte `json:"extra_capabilities,omitempty"`
+	Location          string            `json:"location,omitempty"`
+	HealthStatus      string            `json:"health_status"`
 }
 
 // RegistryService wraps the synapse-go spregistry.Service for provider listing.
@@ -77,7 +84,6 @@ func listActiveProviders(ctx context.Context, reg *RegistryService) ([]ProviderD
 	var all []ProviderDetail
 	var offset uint64
 	const limit uint64 = 50
-	var skipped int
 
 	for {
 		page, err := reg.svc.GetPDPProviders(ctx, true, sdktypes.ListOptions{Offset: offset, Limit: limit})
@@ -87,8 +93,7 @@ func listActiveProviders(ctx context.Context, reg *RegistryService) ([]ProviderD
 		for _, p := range page.Providers {
 			detail, err := pdpProviderToDetail(p)
 			if err != nil {
-				skipped++
-				continue
+				return nil, fmt.Errorf("decoding active PDP provider: %w", err)
 			}
 			all = append(all, detail)
 		}
@@ -96,9 +101,6 @@ func listActiveProviders(ctx context.Context, reg *RegistryService) ([]ProviderD
 			break
 		}
 		offset += limit
-	}
-	if skipped > 0 {
-		fmt.Fprintf(os.Stderr, "Warning: %d provider(s) skipped due to invalid provider IDs\n", skipped)
 	}
 	return all, nil
 }
@@ -171,18 +173,25 @@ func pdpProviderToDetailWithFallback(p spregistry.PDPProvider, fallbackID uint64
 		return ProviderDetail{}, err
 	}
 	d := ProviderDetail{
-		ID:           id,
-		Name:         p.Info.Name,
-		Description:  p.Info.Description,
-		Active:       p.Info.IsActive,
-		Address:      p.Info.ServiceProvider,
-		HasPDP:       true,
-		ServiceURL:   p.Offering.ServiceURL,
-		MinPieceSize: p.Offering.MinPieceSizeInBytes,
-		MaxPieceSize: p.Offering.MaxPieceSizeInBytes,
-		StoragePrice: p.Offering.StoragePricePerTiBPerDay,
-		Location:     p.Offering.Location,
-		HealthStatus: "skipped",
+		ID:                id,
+		Name:              p.Info.Name,
+		Description:       p.Info.Description,
+		Active:            p.Info.IsActive,
+		Address:           p.Info.ServiceProvider,
+		Payee:             p.Info.Payee,
+		HasPDP:            true,
+		ServiceURL:        p.Offering.ServiceURL,
+		MinPieceSize:      p.Offering.MinPieceSizeInBytes,
+		MaxPieceSize:      p.Offering.MaxPieceSizeInBytes,
+		StoragePrice:      p.Offering.StoragePricePerTiBPerDay,
+		MinProvingPeriod:  p.Offering.MinProvingPeriodInEpochs,
+		PaymentToken:      p.Offering.PaymentTokenAddress,
+		IPNIPiece:         p.Offering.IPNIPiece,
+		IPNIIPFS:          p.Offering.IPNIIPFS,
+		IPNIPeerID:        p.Offering.IPNIPeerID,
+		ExtraCapabilities: p.Offering.ExtraCapabilities,
+		Location:          p.Offering.Location,
+		HealthStatus:      "skipped",
 	}
 	return d, nil
 }
@@ -221,6 +230,7 @@ func providerInfoToDetailWithFallbackID(info *spregistry.ProviderInfo, fallbackI
 		Description:  info.Description,
 		Active:       info.IsActive,
 		Address:      info.ServiceProvider,
+		Payee:        info.Payee,
 		HealthStatus: "skipped",
 	}, nil
 }

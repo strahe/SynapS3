@@ -160,10 +160,12 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 	}
 
 	filecoin := NewMemoryFilecoin()
+	market := memoryWarmStorageMarket{filecoin: filecoin}
 	runtime, err := app.NewRuntime(ctx, app.RuntimeOptions{
 		Config: cfg, Database: database, Settings: settings, Logger: logger,
 		UploadSpeedProbe: filecoin,
 		Filecoin: app.FilecoinServices{
+			Market: market, ApprovedProviders: market, Endorsements: market, ChainID: 314, USDFCAddress: memoryUSDFCAddress.Hex(),
 			Storage: filecoin, WalletQuery: filecoin, Wallet: filecoin, Receipts: filecoin,
 			Readiness: filecoin, Observability: filecoin,
 			Terminator: filecoin, Epochs: filecoin,

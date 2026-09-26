@@ -78,6 +78,7 @@ func TestSQLiteBaselineJSONUsesTextAndValidatesShape(t *testing.T) {
 		"task_payloads":                 {"input_json", "checkpoint_json"},
 		"multipart_uploads":             {"metadata"},
 		"object_versions":               {"metadata"},
+		"provider_tier_snapshots":       {"provider_ids_json"},
 		"observability_provider_states": {"reason_codes", "evidence_json"},
 		"observability_data_set_states": {"reason_codes", "evidence_json"},
 	} {

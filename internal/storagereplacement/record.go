@@ -18,16 +18,17 @@ type Replacement struct {
 	ID       int64 `bun:",pk,autoincrement,identity"`
 	BucketID int64 `bun:",notnull"`
 	// CopyIndex is the logical replica slot both generations belong to.
-	CopyIndex           int              `bun:"type:integer,notnull"`
-	SourceDataSetID     int64            `bun:",notnull"`
-	TargetDataSetID     int64            `bun:",notnull"`
-	SelectionMode       SelectionMode    `bun:"type:text,notnull"`
-	RequestedProviderID *types.OnChainID `bun:"type:text"`
-	ClientRequestID     string           `bun:"type:text,notnull"`
-	Status              Status           `bun:"type:text,notnull"`
-	WaitReason          *WaitReason      `bun:"type:text,nullzero"`
-	FailureReason       *FailureReason   `bun:"type:text,nullzero"`
-	LastError           *string          `bun:"type:text,nullzero"`
+	CopyIndex            int              `bun:"type:integer,notnull"`
+	SourceDataSetID      int64            `bun:",notnull"`
+	TargetDataSetID      int64            `bun:",notnull"`
+	SelectionMode        SelectionMode    `bun:"type:text,notnull"`
+	RequestedProviderID  *types.OnChainID `bun:"type:text"`
+	ClientRequestID      string           `bun:"type:text,notnull"`
+	PriceListFingerprint string           `bun:"type:text,notnull"`
+	Status               Status           `bun:"type:text,notnull"`
+	WaitReason           *WaitReason      `bun:"type:text,nullzero"`
+	FailureReason        *FailureReason   `bun:"type:text,nullzero"`
+	LastError            *string          `bun:"type:text,nullzero"`
 	// ItemsTotal and ItemsCopied are maintained inside the transactions that
 	// seed and complete items, so progress never needs a history-sized count.
 	ItemsTotal  int `bun:"type:integer,notnull,default:0"`

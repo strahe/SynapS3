@@ -3,22 +3,27 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	idtypes "github.com/strahe/synaps3/internal/types"
 )
 
 type stubProviderSelector struct {
-	providers []string
-	err       error
-	calls     int
+	providers     []string
+	err           error
+	calls         int
+	observability *observability.Service
 }
 
 func onChainIDValue(value string) idtypes.OnChainID {
@@ -29,33 +34,82 @@ func onChainIDValue(value string) idtypes.OnChainID {
 	return id
 }
 
-func (s *stubProviderSelector) ListReplacementProviders(context.Context) ([]idtypes.OnChainID, error) {
+func (s *stubProviderSelector) ListReplacementProviderObservations(ctx context.Context, requested *idtypes.OnChainID) ([]observability.ProviderObservation, error) {
 	s.calls++
 	if s.err != nil {
 		return nil, s.err
 	}
-	providers := make([]idtypes.OnChainID, 0, len(s.providers))
-	for _, id := range s.providers {
-		providers = append(providers, onChainIDValue(id))
+	if s.observability == nil {
+		return nil, nil
 	}
-	return providers, nil
+	page, err := s.observability.ListProviderObservations(ctx, observability.ListOptions{Limit: 200, ProviderID: requested})
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]bool, len(s.providers))
+	for _, id := range s.providers {
+		allowed[id] = true
+	}
+	items := make([]observability.ProviderObservation, 0, len(page.Items))
+	for _, item := range page.Items {
+		if allowed[item.Facts.ProviderID.String()] {
+			items = append(items, item)
+		}
+	}
+	return items, nil
 }
 
 type replacementAPIFixture struct {
-	srv     *Server
-	mux     *http.ServeMux
-	bucket  *model.Bucket
-	source  *model.StorageDataSet
-	request int
+	srv              *Server
+	mux              *http.ServeMux
+	bucket           *model.Bucket
+	source           *model.StorageDataSet
+	request          int
+	priceFingerprint string
+	market           *testWarmStorageMarket
 }
 
 func newReplacementAPIFixture(t *testing.T, selector providerReplacementSelector) *replacementAPIFixture {
+	return newReplacementAPIFixtureWithHealth(t, selector, true)
+}
+
+func newReplacementAPIFixtureWithHealth(t *testing.T, selector providerReplacementSelector, seedHealth bool) *replacementAPIFixture {
 	t.Helper()
 	srv, _ := newBucketAPITestServer(t)
+	srv.observability = observability.NewService(observability.ServiceOptions{
+		Store: srv.repos.Observability, RefreshInterval: 5 * time.Minute,
+	})
+	market := &testWarmStorageMarket{price: testPriceList()}
+	srv.WithWarmStorageMarket(market, 1, market.price.Token.Hex())
+	price, err := srv.currentWarmStoragePrice(context.Background())
+	if err != nil {
+		t.Fatalf("GetPriceList: %v", err)
+	}
 	if selector != nil {
 		srv.WithProviderReplacement(selector)
 	}
 	ctx := context.Background()
+	if stub, ok := selector.(*stubProviderSelector); ok {
+		stub.observability = srv.observability
+		if seedHealth {
+			active, pdp, url := true, true, "https://provider.example"
+			ids := make([]idtypes.OnChainID, 0, len(stub.providers))
+			for _, value := range stub.providers {
+				id := onChainIDValue(value)
+				ids = append(ids, id)
+				if err := srv.repos.Observability.UpsertProviderObservation(ctx, time.Now().UTC(), observability.ProviderState{
+					ProviderID: id, Status: observability.StatusAvailable,
+					Active: &active, HasPDP: &pdp, ServiceURL: &url,
+					Profile: &observability.ProviderProfile{ProviderID: id, Name: "Provider " + value, Active: true, ServiceURL: url, RegistrySnapshot: json.RawMessage(`{"version":1,"pdp_offering":null}`)},
+				}); err != nil {
+					t.Fatalf("Seed provider health: %v", err)
+				}
+			}
+			if err := srv.repos.Observability.RecordApprovedProviders(ctx, time.Now().UTC(), ids); err != nil {
+				t.Fatalf("Seed approval: %v", err)
+			}
+		}
+	}
 	bucket := &model.Bucket{Name: "replacement-bucket", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := srv.repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("Create bucket: %v", err)
@@ -78,7 +132,7 @@ func newReplacementAPIFixture(t *testing.T, selector providerReplacementSelector
 	if err != nil || source == nil {
 		t.Fatalf("GetDataSetBindingByID: %#v err=%v", source, err)
 	}
-	return &replacementAPIFixture{srv: srv, mux: newBucketAPIMux(srv), bucket: bucket, source: source}
+	return &replacementAPIFixture{srv: srv, mux: newBucketAPIMux(srv), bucket: bucket, source: source, priceFingerprint: price.Fingerprint, market: market}
 }
 
 func (f *replacementAPIFixture) start(t *testing.T, body string) *httptest.ResponseRecorder {
@@ -96,6 +150,9 @@ func (f *replacementAPIFixture) start(t *testing.T, body string) *httptest.Respo
 
 func (f *replacementAPIFixture) startRaw(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	if strings.Contains(body, `"client_request_id"`) && !strings.Contains(body, `"price_list_fingerprint"`) && strings.HasSuffix(body, "}") {
+		body = strings.TrimSuffix(body, "}") + `,"price_list_fingerprint":"` + f.priceFingerprint + `"}`
+	}
 	path := "/api/v1/buckets/" + f.bucket.Name + "/data-sets/" +
 		strconv.FormatInt(f.source.ID, 10) + "/replacement"
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
@@ -121,6 +178,116 @@ func decodeAPIError(t *testing.T, rec *httptest.ResponseRecorder) map[string]str
 		t.Fatalf("decode error response: %v", err)
 	}
 	return body
+}
+
+func TestReplacementManualDoesNotCheckApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		approved    map[string]bool
+		approvalErr error
+	}{
+		{name: "approved", approved: map[string]bool{"202": true}},
+		{name: "not approved", approved: map[string]bool{"202": false}},
+		{name: "approval query unavailable", approvalErr: errors.New("chain unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+			fixture.market.approved, fixture.market.approvalErr = tc.approved, tc.approvalErr
+			rec := fixture.start(t, `{"mode":"manual","provider_id":"202"}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d body=%s, want 201", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestReplacementAutomaticSkipsRevokedApproval(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202", "303"}})
+	fixture.market.approved = map[string]bool{"202": false, "303": true}
+	rec := fixture.start(t, `{"mode":"automatic"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if selected := decodeReplacement(t, rec).Target.ProviderID; selected != "303" {
+		t.Fatalf("selected %s, want 303", selected)
+	}
+}
+
+func TestReplacementAutomaticSkipsPreviouslyUsedRetiredProvider(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+	if _, err := fixture.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("generation = 2").Where("id = ?", fixture.source.ID).Exec(t.Context()); err != nil {
+		t.Fatalf("advance current generation: %v", err)
+	}
+	previous := &model.StorageDataSet{
+		BucketID: fixture.bucket.ID, ProviderID: onChainIDValue("202"), CopyIndex: 0,
+		Generation: 1, IsCurrent: false, Status: model.StorageDataSetStatusRetired,
+	}
+	if _, err := fixture.srv.db.NewInsert().Model(previous).Exec(t.Context()); err != nil {
+		t.Fatalf("seed retired provider: %v", err)
+	}
+	candidates, err := fixture.srv.replacementProviderCandidates(t.Context(), fixture.bucket, fixture.source)
+	if err != nil || len(candidates) != 1 || !candidates[0].Eligible || !candidates[0].PreviouslyUsed || !candidates[0].ApprovedFresh || candidates[0].Profile == nil || !candidates[0].Profile.Approved {
+		t.Fatalf("retired candidate = %#v, err=%v", candidates, err)
+	}
+	rec := fixture.start(t, `{"mode":"automatic"}`)
+	if rec.Code != http.StatusConflict || decodeAPIError(t, rec)["code"] != storagereplacement.CodeNoEligibleProvider {
+		t.Fatalf("status = %d body=%s, want no eligible provider", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReplacementManualAllowsFreshNegativeApprovalCache(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+	err := fixture.srv.repos.Observability.RecordApprovedProviders(context.Background(), time.Now().UTC(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.market.approved = map[string]bool{"202": false}
+	listed := fixture.listProviders(t)
+	var body struct {
+		Providers []replacementProviderResponse `json:"providers"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Providers) != 1 || !body.Providers[0].ManualSelectable || !body.Providers[0].ApprovedFresh || body.Providers[0].ManualBlockReason != "" {
+		t.Fatalf("candidates = %#v", body.Providers)
+	}
+	rec := fixture.start(t, `{"mode":"manual","provider_id":"202"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReplacementConcurrentIdempotentReplay(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+	fixture.srv.WithProviderReplacement(NewStorageProviderSelector(fixture.srv.observability))
+	body := `{"mode":"manual","provider_id":"202","client_request_id":"concurrent-replay","price_list_fingerprint":"` + fixture.priceFingerprint + `"}`
+	path := "/api/v1/buckets/" + fixture.bucket.Name + "/data-sets/" + strconv.FormatInt(fixture.source.ID, 10) + "/replacement"
+	start := make(chan struct{})
+	results := make([]*httptest.ResponseRecorder, 2)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			fixture.mux.ServeHTTP(rec, req)
+			results[index] = rec
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if results[0].Code+results[1].Code != http.StatusCreated+http.StatusOK {
+		t.Fatalf("statuses = %d (%s), %d (%s)", results[0].Code, results[0].Body.String(), results[1].Code, results[1].Body.String())
+	}
+	first, second := decodeReplacement(t, results[0]), decodeReplacement(t, results[1])
+	if first.ID != second.ID {
+		t.Fatalf("replacement IDs = %d, %d", first.ID, second.ID)
+	}
 }
 
 func TestAPIStartDataSetReplacementManualMode(t *testing.T) {
@@ -398,11 +565,11 @@ func TestAPIListDataSetReplacementProviders(t *testing.T) {
 		t.Fatalf("providers = %#v, want every approved provider listed", body.Providers)
 	}
 	source, replacement := body.Providers[0], body.Providers[1]
-	if source.ProviderID != "101" || source.Eligible ||
-		source.IneligibleReason != providerIneligibleCurrentSource {
+	if source.ProviderID != "101" || source.ManualSelectable ||
+		source.ManualBlockReason != providerIneligibleCurrentSource {
 		t.Fatalf("source provider = %#v, want it listed but not choosable", source)
 	}
-	if replacement.ProviderID != "303" || !replacement.Eligible || replacement.IneligibleReason != "" {
+	if replacement.ProviderID != "303" || !replacement.ManualSelectable || replacement.ManualBlockReason != "" {
 		t.Fatalf("replacement provider = %#v, want it choosable", replacement)
 	}
 }

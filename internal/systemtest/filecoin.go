@@ -5,6 +5,7 @@ package systemtest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -807,6 +808,10 @@ func (m *MemoryFilecoin) CheckProviders(ctx context.Context, checkedAt time.Time
 			ProviderID: appTypes.OnChainIDFromSDK(providerID), Status: observability.StatusAvailable,
 			ReasonCodes: []observability.ReasonCode{}, Active: &active, HasPDP: &hasPDP,
 			ServiceURL: &serviceURL, HealthStatus: &health, LastCheckedAt: checkedAt, Evidence: map[string]any{},
+			Profile: &observability.ProviderProfile{
+				ProviderID: appTypes.OnChainIDFromSDK(providerID), Name: "System provider " + providerID.String(),
+				Active: true, ServiceURL: serviceURL, RegistrySnapshot: json.RawMessage(`{"version":1,"pdp_offering":null}`),
+			},
 		})
 	}
 	return states, nil

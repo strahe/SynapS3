@@ -98,6 +98,10 @@ export function useObjectProvenance(name: string, versionId: string, enabled = t
     queryFn: () => api.getObjectProvenance(name, versionId),
     enabled: Boolean(name && versionId && enabled),
     staleTime: 0,
+    refetchInterval: (query) => {
+      const data = query.state.data
+      return data && data.success_copies >= data.requested_copies ? false : 1_000
+    },
   })
 }
 
@@ -165,8 +169,8 @@ export function useUpdateBucketCopyPolicy() {
 
 /**
  * The provider chooser, loaded only while the operator is actually choosing.
- * It reaches the registry, so it is not worth fetching for a dialog that is
- * closed or set to pick automatically.
+ * It reads current provider observations, so it is not worth fetching for a
+ * dialog that is closed or set to pick automatically.
  */
 export function useReplacementProviderCandidates(bucket: string, dataSetID: number | null, enabled: boolean) {
   return useQuery({
@@ -174,6 +178,7 @@ export function useReplacementProviderCandidates(bucket: string, dataSetID: numb
     queryFn: () => api.getReplacementProviders(bucket, dataSetID as number),
     enabled: enabled && dataSetID !== null,
     staleTime: 30_000,
+    refetchInterval: enabled ? 30_000 : false,
   })
 }
 
@@ -187,22 +192,61 @@ export function useStartProviderReplacement() {
       mode,
       providerID,
       clientRequestID,
+      priceListFingerprint,
     }: {
       bucket: string
       dataSetID: number
       mode: 'automatic' | 'manual'
       providerID?: string
       clientRequestID: string
+      priceListFingerprint: string
     }) =>
       api.startProviderReplacement(bucket, dataSetID, {
         mode,
         client_request_id: clientRequestID,
+        price_list_fingerprint: priceListFingerprint,
         ...(mode === 'manual' && providerID ? { provider_id: providerID } : {}),
       }),
     onSuccess: (_, variables) => {
       qc.invalidateQueries({ queryKey: ['bucket', variables.bucket] })
       qc.invalidateQueries({ queryKey: ['buckets'] })
       qc.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+}
+
+export function useWarmStoragePriceList(enabled: boolean) {
+  return useQuery({
+    queryKey: ['warm-storage-price-list'],
+    queryFn: api.getWarmStoragePriceList,
+    enabled,
+    staleTime: 0,
+    refetchInterval: enabled ? 30_000 : false,
+    refetchOnWindowFocus: true,
+    retry: false,
+  })
+}
+
+export function useRefreshProvider() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.refreshProvider,
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['replacement-providers'] })
+      qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
+    },
+  })
+}
+
+export function useRefreshProviderTiers() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.refreshProviderTiers,
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['replacement-providers'] })
+      qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
+      qc.invalidateQueries({ queryKey: ['bucket'] })
+      qc.invalidateQueries({ queryKey: ['objectProvenance'] })
     },
   })
 }
@@ -376,6 +420,7 @@ export function useTestProviderUploadSpeed() {
     mutationFn: api.testProviderUploadSpeed,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['observabilityProviders'] })
+      qc.invalidateQueries({ queryKey: ['replacement-providers'] })
       qc.invalidateQueries({ queryKey: ['tasks'] })
     },
   })

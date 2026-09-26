@@ -73,23 +73,3 @@ func TestReplacementProviderCandidates_KeepsIneligibleProvidersVisible(t *testin
 		t.Fatalf("candidates = %d, want every approved provider listed", len(candidates))
 	}
 }
-
-// Automatic selection goes further than eligibility: it never returns to a
-// provider this bucket has moved away from, even once that service is retired.
-func TestFirstAutomaticChoice_SkipsEveryProviderTheBucketHasUsed(t *testing.T) {
-	source := candidateBinding("101", model.StorageDataSetStatusReady)
-	bindings := []model.StorageDataSet{source, candidateBinding("202", model.StorageDataSetStatusRetired)}
-
-	got, ok := firstAutomaticChoice(replacementProviderCandidates(
-		candidateProviders("101", "202", "303"), bindings, &source))
-	if !ok || got.String() != "303" {
-		t.Fatalf("automatic choice = %v ok=%v, want the provider the bucket has never used", got, ok)
-	}
-
-	// With nothing new left, automatic selection reports it rather than
-	// silently reusing a retired provider.
-	if _, ok := firstAutomaticChoice(replacementProviderCandidates(
-		candidateProviders("101", "202"), bindings, &source)); ok {
-		t.Fatal("automatic selection reused a provider the bucket had moved away from")
-	}
-}

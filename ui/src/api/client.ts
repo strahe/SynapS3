@@ -158,6 +158,7 @@ export interface ObservabilityProviderObservation {
   facts: ObservabilityProviderFacts
   signal: ObservabilitySignal
   upload_speed_test?: ProviderUploadSpeedTest
+  provider_profile?: ProviderProfile
 }
 
 export interface ProviderUploadSpeedTest {
@@ -570,10 +571,61 @@ export type StorageCommitAttentionCode =
 /** One provider offered for a replacement, with why it cannot be chosen. */
 export interface ReplacementProviderCandidate {
   provider_id: string
-  eligible: boolean
-  ineligible_reason?: string
+  manual_selectable: boolean
+  manual_block_reason?: string
+  approved_fresh: boolean
   previously_used: boolean
   provider_identity?: ProviderIdentity
+  provider_profile?: ProviderProfile
+  observation?: ObservabilityProviderObservation
+  upload_speed_test?: ProviderUploadSpeedTest
+}
+
+export interface ProviderProfile {
+  provider_id: string
+  name: string
+  description: string
+  service_provider_address: string
+  payee_address: string
+  active: boolean
+  service_url: string
+  registry_snapshot: {
+    version: number
+    pdp_offering: null | {
+      min_piece_size_bytes: string
+      max_piece_size_bytes: string
+      storage_price_per_tib_per_day: string
+      min_proving_period_epochs: string
+      location: string
+      payment_token_address: string
+      ipni_piece: boolean
+      ipni_ipfs: boolean
+      ipni_peer_id: string
+      extra_capabilities_hex: Record<string, string>
+    }
+  }
+  last_success_at: string
+  approved: boolean
+  approved_checked_at?: string
+  endorsed: boolean
+  endorsed_checked_at?: string
+}
+
+export interface ProviderTierRefreshResult {
+  approved_result: { success: boolean; attempted_at: string; checked_at?: string; error?: string }
+  endorsed_result: { success: boolean; attempted_at: string; checked_at?: string; error?: string }
+}
+
+export interface WarmStoragePriceList {
+  chain_id: number
+  fwss_address: string
+  token: string
+  supported_token: boolean
+  rates: Record<string, string>
+  fees: Record<string, string>
+  lockups: Record<string, string>
+  observed_at: string
+  fingerprint: string
 }
 
 export interface ProviderIdentity {
@@ -982,7 +1034,12 @@ export const api = {
   startProviderReplacement: (
     name: string,
     dataSetID: number,
-    request: { mode: 'automatic' | 'manual'; provider_id?: string; client_request_id: string }
+    request: {
+      mode: 'automatic' | 'manual'
+      provider_id?: string
+      client_request_id: string
+      price_list_fingerprint: string
+    }
   ) =>
     fetchJSON<ProviderReplacement>(`/buckets/${encodeURIComponent(name)}/data-sets/${dataSetID}/replacement`, {
       method: 'POST',
@@ -994,6 +1051,17 @@ export const api = {
     fetchJSON<{ providers: ReplacementProviderCandidate[] }>(
       `/buckets/${encodeURIComponent(name)}/data-sets/${dataSetID}/replacement/providers`
     ),
+  getWarmStoragePriceList: () => fetchJSON<WarmStoragePriceList>('/filecoin/warm-storage/price-list'),
+  refreshProviderTiers: () =>
+    fetchJSON<ProviderTierRefreshResult>('/observability/provider-tiers/refresh', { method: 'POST' }),
+  refreshProvider: (providerID: string) =>
+    fetchJSON<{
+      provider_id: string
+      profile_result: { success: boolean; attempted_at: string; collected_at?: string; error?: string }
+      health_result: { success: boolean; attempted_at: string; observed_at?: string; error?: string }
+    }>(`/observability/providers/${encodeURIComponent(providerID)}/refresh`, {
+      method: 'POST',
+    }),
   getBucketObjects: (name: string, params: { prefix?: string; delimiter?: string; after?: string; limit?: number }) => {
     const sp = new URLSearchParams()
     if (params.prefix) sp.set('prefix', params.prefix)

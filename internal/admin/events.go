@@ -114,13 +114,12 @@ func (h *EventHub) publish(topic string, payload map[string]any) {
 	h.Publish(topic, payload)
 }
 
-func (s *Server) publishProviderIdentity(identity *providerIdentityResponse) {
-	if s == nil || s.events == nil || identity == nil || identity.RegistryProviderID == "" {
+func (s *Server) publishProviderIdentity(providerID string) {
+	if s == nil || s.events == nil || providerID == "" {
 		return
 	}
 	s.events.publish("provider_identity_updated", map[string]any{
-		"provider_id": identity.RegistryProviderID,
-		"identity":    identity,
+		"provider_id": providerID,
 	})
 }
 

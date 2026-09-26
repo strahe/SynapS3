@@ -341,18 +341,35 @@ type fakeAPIProviderIdentityResolver struct {
 	requests   [][]string
 }
 
-func (f *fakeAPIProviderIdentityResolver) ProviderIdentities(providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {
-	ids := make([]string, 0, len(providerIDs))
+func (f *fakeAPIProviderIdentityResolver) EnrichActors(identities map[string]*providerIdentityResponse) map[string]*providerIdentityResponse {
+	ids := make([]string, 0, len(identities))
 	out := make(map[string]*providerIdentityResponse)
-	for _, providerID := range providerIDs {
-		key := providerID.String()
+	for key, identity := range identities {
 		ids = append(ids, key)
-		if identity := f.identities[key]; identity != nil {
-			out[key] = identity
+		out[key] = cloneProviderIdentity(identity)
+		if cached := f.identities[key]; cached != nil {
+			out[key].FilecoinAddress = cached.FilecoinAddress
+			out[key].FilecoinActorID = cached.FilecoinActorID
 		}
 	}
 	f.requests = append(f.requests, ids)
 	return out
+}
+
+func TestProviderIdentitiesUseSavedRegistryProfile(t *testing.T) {
+	srv, repos := newBucketAPITestServer(t)
+	id := onChainID(t, "501")
+	if err := repos.Observability.UpsertProviderObservation(context.Background(), time.Now().UTC(), observability.ProviderState{
+		ProviderID: id, Status: observability.StatusAvailable,
+		Profile: &observability.ProviderProfile{ProviderID: id, Name: "Saved provider", ServiceURL: "https://saved.example", RegistrySnapshot: json.RawMessage(`{"version":1,"pdp_offering":{"location":"C=US","extra_capabilities_hex":{"status":"0x70726f64","binary":"0x00ff"}}}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv.WithProviderIdentityResolver(&fakeAPIProviderIdentityResolver{identities: map[string]*providerIdentityResponse{"501": {RegistryProviderID: "501", Name: "Stale resolver"}}})
+	identity := srv.providerIdentities(context.Background(), []idtypes.OnChainID{id})["501"]
+	if identity == nil || identity.Name != "Saved provider" || identity.ServiceURL != "https://saved.example" || identity.Location != "C=US" || identity.ExtraCapabilities["status"] != "prod" || identity.ExtraCapabilities["binary"] != "0x00ff" {
+		t.Fatalf("identity = %#v, want saved Registry values", identity)
+	}
 }
 
 func seedAdminObjectVersion(t *testing.T, db *bun.DB, repos *repository.Repositories, bucket *model.Bucket, key string, size int64, etag, checksum, contentType string, state model.ObjectState) (int64, string) {
@@ -1185,8 +1202,8 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if body.DataSets[0].CopyIndex != 0 || body.DataSets[0].ProviderID != "101" || body.DataSets[0].DataSetID != "1001" || body.DataSets[0].Status != string(model.StorageDataSetStatusReady) {
 		t.Fatalf("first data set = %#v, want provider scoped data set", body.DataSets[0])
 	}
-	if body.DataSets[0].ProviderIdentity == nil || body.DataSets[0].ProviderIdentity.Name != "alpha-pdp" || body.DataSets[0].ProviderIdentity.FilecoinActorID != "f01234" {
-		t.Fatalf("provider_identity = %#v, want enriched provider identity", body.DataSets[0].ProviderIdentity)
+	if body.DataSets[0].ProviderIdentity != nil {
+		t.Fatalf("provider_identity = %#v, want no identity without a saved Registry profile", body.DataSets[0].ProviderIdentity)
 	}
 	if body.DataSets[0].StorageHealth == nil ||
 		body.DataSets[0].StorageHealth.Status != string(observability.StatusDegraded) ||
@@ -1197,8 +1214,8 @@ func TestAPIBucketDetail_IncludesProviderDataSets(t *testing.T) {
 	if body.DataSets[1].ProviderID != "202" || body.DataSets[1].ProviderIdentity != nil {
 		t.Fatalf("second data set = %#v, want provider_id compatibility without identity when lookup fails", body.DataSets[1])
 	}
-	if !reflect.DeepEqual(identityResolver.requests, [][]string{{"101", "202"}}) {
-		t.Fatalf("provider identity requests = %#v, want one batched snapshot request", identityResolver.requests)
+	if len(identityResolver.requests) != 0 {
+		t.Fatalf("provider identity requests = %#v, want no Registry fallback", identityResolver.requests)
 	}
 }
 
@@ -1776,7 +1793,7 @@ func TestBucketStorageHealthAffectedVersionsResponseDeduplicatesProviderLookups(
 	createdAt := time.Date(2026, 5, 23, 12, 30, 0, 123456789, time.UTC)
 	status := observability.StatusUnavailable
 
-	resp := srv.bucketStorageHealthAffectedVersionsResponse(repository.BucketStorageHealthAffectedVersionPage{
+	resp := srv.bucketStorageHealthAffectedVersionsResponse(context.Background(), repository.BucketStorageHealthAffectedVersionPage{
 		Versions: []repository.BucketStorageHealthAffectedVersion{{
 			Version: model.ObjectVersion{
 				VersionID: "01J000000000000000APIR99",
@@ -1791,15 +1808,15 @@ func TestBucketStorageHealthAffectedVersionsResponseDeduplicatesProviderLookups(
 		}},
 	}, createdAt.Add(-time.Hour))
 
-	if got, want := identityResolver.requests, [][]string{{"501"}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("provider identity requests = %#v, want %#v", got, want)
+	if len(identityResolver.requests) != 0 {
+		t.Fatalf("provider identity requests = %#v, want no Registry fallback", identityResolver.requests)
 	}
 	if len(resp.Versions) != 1 || len(resp.Versions[0].RiskDataSets) != 2 {
 		t.Fatalf("response risk datasets = %#v, want two datasets", resp.Versions)
 	}
 	for _, dataSet := range resp.Versions[0].RiskDataSets {
-		if dataSet.ProviderIdentity == nil || dataSet.ProviderIdentity.Name != "risk-pdp" {
-			t.Fatalf("provider identity = %#v, want reused identity", dataSet.ProviderIdentity)
+		if dataSet.ProviderIdentity != nil {
+			t.Fatalf("provider identity = %#v, want none without a saved profile", dataSet.ProviderIdentity)
 		}
 	}
 }
@@ -3807,8 +3824,8 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	if detail.Copies[0].Health.Status != string(observability.StatusAvailable) || len(detail.Copies[0].Health.ReasonCodes) != 0 {
 		t.Fatalf("copy health = %#v, want healthy copy", detail.Copies[0].Health)
 	}
-	if detail.Copies[0].ProviderIdentity == nil || detail.Copies[0].ProviderIdentity.Name != "alpha-pdp" || detail.Copies[0].ProviderIdentity.FilecoinActorID != "f01234" {
-		t.Fatalf("copy provider_identity = %#v, want enriched copy identity", detail.Copies[0].ProviderIdentity)
+	if detail.Copies[0].ProviderIdentity != nil {
+		t.Fatalf("copy provider_identity = %#v, want none without a saved profile", detail.Copies[0].ProviderIdentity)
 	}
 	if detail.Copies[1].ProviderID != "102" || detail.Copies[1].ProviderIdentity != nil {
 		t.Fatalf("secondary copy = %#v, want provider_id compatibility without identity when lookup fails", detail.Copies[1])
@@ -3828,8 +3845,8 @@ func TestAPIBucketObjectProvenance(t *testing.T) {
 	if drainingDetail.SuccessCopies != 2 {
 		t.Fatalf("draining provenance = %#v, want draining dataset counted as readable", drainingDetail)
 	}
-	if !reflect.DeepEqual(identityResolver.requests[0], []string{"101", "102"}) {
-		t.Fatalf("provider identity request = %#v, want one provenance snapshot request", identityResolver.requests)
+	if len(identityResolver.requests) != 0 {
+		t.Fatalf("provider identity requests = %#v, want no Registry fallback", identityResolver.requests)
 	}
 
 	oldDetail, statusCode := getProvenance("provenance-bucket", oldVersionID)

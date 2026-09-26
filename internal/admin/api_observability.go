@@ -59,7 +59,53 @@ func (s *Server) handleAPIRefreshObservabilityProviders(w http.ResponseWriter, r
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	if s.events != nil {
+		s.events.Publish("provider_catalog_updated", map[string]any{})
+	}
 	s.writeProviderObservations(w, r, page)
+}
+
+func (s *Server) handleAPIRefreshProvider(w http.ResponseWriter, r *http.Request) {
+	if s.observability == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "provider refresh unavailable"})
+		return
+	}
+	id, err := idtypes.ParseOnChainID("provider_id", r.PathValue("provider_id"))
+	if err != nil || id.IsZero() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid provider ID"})
+		return
+	}
+	s.extendObservabilityRefreshWriteDeadline(w)
+	state, err := s.observability.RefreshProvider(r.Context(), id)
+	if errors.Is(err, observability.ErrProviderRefreshInProgress) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "provider refresh already in progress"})
+		return
+	}
+	if err != nil {
+		s.logger.Error("api: failed to refresh provider", "error", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "provider refresh failed"})
+		return
+	}
+	if s.events != nil {
+		s.events.Publish("provider_catalog_updated", map[string]any{"provider_id": id.String()})
+	}
+	profileSuccess := state.Profile != nil
+	healthSuccess := profileSuccess && (state.Status != observability.StatusUnknown || state.LastError == nil)
+	profileResult := map[string]any{"success": profileSuccess, "attempted_at": state.LastCheckedAt}
+	healthResult := map[string]any{"success": healthSuccess, "attempted_at": state.LastCheckedAt}
+	if profileSuccess {
+		profileResult["collected_at"] = state.Profile.LastSuccessAt
+	} else {
+		profileResult["error"] = "Registry details could not be read"
+	}
+	if healthSuccess {
+		healthResult["observed_at"] = state.LastCheckedAt
+	} else if !profileSuccess {
+		healthResult["error"] = "Health could not be checked without Registry details"
+	} else {
+		healthResult["error"] = "Provider health check did not complete"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"provider_id": id.String(), "profile_result": profileResult, "health_result": healthResult})
 }
 
 type providerUploadSpeedView struct {
@@ -71,9 +117,26 @@ type providerUploadSpeedView struct {
 	FailureCode    *string    `json:"failure_code,omitempty"`
 }
 
+func uploadSpeedView(row providerbenchmark.Result, profile *observability.ProviderProfile, observedServiceURL *string) *providerUploadSpeedView {
+	serviceURL := ""
+	if profile != nil {
+		serviceURL = profile.ServiceURL
+	} else if observedServiceURL != nil {
+		serviceURL = *observedServiceURL
+	}
+	if row.State != providerbenchmark.StateTesting && (serviceURL == "" || providerbenchmark.URLHash(serviceURL) != row.ServiceURLHash) {
+		return &providerUploadSpeedView{State: "stale", SampleBytes: row.SampleBytes, TestedAt: row.TestedAt}
+	}
+	return &providerUploadSpeedView{
+		State: string(row.State), SampleBytes: row.SampleBytes,
+		DurationMS: row.DurationMS, BytesPerSecond: row.BytesPerSecond, TestedAt: row.TestedAt, FailureCode: row.FailureCode,
+	}
+}
+
 type providerObservationWithSpeed struct {
 	observability.ProviderObservation
-	UploadSpeedTest *providerUploadSpeedView `json:"upload_speed_test,omitempty"`
+	UploadSpeedTest *providerUploadSpeedView       `json:"upload_speed_test,omitempty"`
+	ProviderProfile *observability.ProviderProfile `json:"provider_profile,omitempty"`
 }
 
 type providerPageWithSpeed struct {
@@ -91,8 +154,14 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	ids := make([]string, 0, len(page.Items))
+	profileIDs := make([]idtypes.OnChainID, 0, len(page.Items))
 	for _, item := range page.Items {
 		ids = append(ids, item.Facts.ProviderID.String())
+		profileIDs = append(profileIDs, item.Facts.ProviderID)
+	}
+	profiles, profileErr := s.repos.Observability.ProviderProfiles(r.Context(), profileIDs)
+	if profileErr != nil {
+		s.logger.Warn("api: failed to load provider profiles", "error", profileErr)
 	}
 	tests, err := s.repos.ProviderUploadSpeed.ListByProviderIDs(r.Context(), ids)
 	if err != nil {
@@ -103,14 +172,12 @@ func (s *Server) writeProviderObservations(w http.ResponseWriter, r *http.Reques
 	items := make([]providerObservationWithSpeed, 0, len(page.Items))
 	for _, item := range page.Items {
 		view := providerObservationWithSpeed{ProviderObservation: item}
+		if profile, ok := profiles[item.Facts.ProviderID.String()]; ok {
+			copy := profile
+			view.ProviderProfile = &copy
+		}
 		if row, ok := tests[item.Facts.ProviderID.String()]; ok {
-			view.UploadSpeedTest = &providerUploadSpeedView{
-				State: string(row.State), SampleBytes: row.SampleBytes,
-				DurationMS: row.DurationMS, BytesPerSecond: row.BytesPerSecond, TestedAt: row.TestedAt, FailureCode: row.FailureCode,
-			}
-			if row.State != providerbenchmark.StateTesting && (item.Facts.ServiceURL == nil || providerbenchmark.URLHash(*item.Facts.ServiceURL) != row.ServiceURLHash) {
-				view.UploadSpeedTest = &providerUploadSpeedView{State: "stale", SampleBytes: row.SampleBytes, TestedAt: row.TestedAt}
-			}
+			view.UploadSpeedTest = uploadSpeedView(row, view.ProviderProfile, item.Facts.ServiceURL)
 		}
 		items = append(items, view)
 	}

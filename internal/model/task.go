@@ -29,13 +29,15 @@ const (
 	TaskTypeStorageDataSetRetire          TaskType = "storage_dataset_retire"
 	TaskTypeWalletOperation               TaskType = "wallet_operation"
 	TaskTypeObservabilityRefresh          TaskType = "observability_refresh"
+	TaskTypeApprovedProviderRefresh       TaskType = "approved_provider_refresh"
+	TaskTypeEndorsedProviderRefresh       TaskType = "endorsed_provider_refresh"
 	TaskTypeProviderUploadSpeedTest       TaskType = "provider_upload_speed_test"
 	TaskTypeGC                            TaskType = "task_gc"
 )
 
 // RecurringSystemTaskTypes returns the perpetual maintenance task types.
 func RecurringSystemTaskTypes() []TaskType {
-	return []TaskType{TaskTypeCacheCapacityReconcile, TaskTypeObservabilityRefresh, TaskTypeGC}
+	return []TaskType{TaskTypeCacheCapacityReconcile, TaskTypeObservabilityRefresh, TaskTypeApprovedProviderRefresh, TaskTypeEndorsedProviderRefresh, TaskTypeGC}
 }
 
 // IsRecurringSystem reports whether the task is a perpetual maintenance loop

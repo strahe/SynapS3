@@ -112,6 +112,42 @@ func TestSystemProviderReplacement(t *testing.T) {
 	if source.Generation != 1 {
 		t.Fatalf("initial generation = %d, want 1", source.Generation)
 	}
+	var providers struct {
+		Items []struct {
+			ProviderProfile *struct {
+				ProviderID string `json:"provider_id"`
+			} `json:"provider_profile"`
+		} `json:"items"`
+	}
+	admin.PostJSON(t, t.Context(), "/api/v1/observability/providers/refresh", nil, &providers)
+	profileCount := 0
+	for _, provider := range providers.Items {
+		if provider.ProviderProfile != nil && provider.ProviderProfile.ProviderID != "" {
+			profileCount++
+		}
+	}
+	if profileCount < 2 {
+		t.Fatalf("provider refresh returned %d profiles, need two for replacement", profileCount)
+	}
+	var tiers struct {
+		Approved struct {
+			Success bool `json:"success"`
+		} `json:"approved_result"`
+	}
+	admin.PostJSON(t, t.Context(), "/api/v1/observability/provider-tiers/refresh", nil, &tiers)
+	if !tiers.Approved.Success {
+		t.Fatal("approved provider list did not refresh")
+	}
+	var price struct {
+		Fingerprint    string `json:"fingerprint"`
+		SupportedToken bool   `json:"supported_token"`
+	}
+	if _, err := admin.GetJSON(t.Context(), "/api/v1/filecoin/warm-storage/price-list", &price); err != nil {
+		t.Fatal(err)
+	}
+	if !price.SupportedToken || len(price.Fingerprint) != 64 {
+		t.Fatalf("invalid system price list: %#v", price)
+	}
 
 	// One confirmation authorizes the new service, the switch, the migration,
 	// and retirement of the old service.
@@ -119,8 +155,9 @@ func TestSystemProviderReplacement(t *testing.T) {
 	admin.PostJSON(t, t.Context(),
 		fmt.Sprintf("/api/v1/buckets/%s/data-sets/%d/replacement", bucket, source.ID),
 		map[string]string{
-			"mode":              "automatic",
-			"client_request_id": "system-provider-replacement",
+			"mode":                   "automatic",
+			"client_request_id":      "system-provider-replacement",
+			"price_list_fingerprint": price.Fingerprint,
 		}, &confirmed)
 	if confirmed.Status != "preparing_target" {
 		t.Fatalf("confirmed status = %s, want preparing_target", confirmed.Status)

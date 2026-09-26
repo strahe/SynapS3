@@ -624,11 +624,12 @@ type StorageReplacementRepository interface {
 
 // AuthorizeReplacementInput is one operator confirmation.
 type AuthorizeReplacementInput struct {
-	BucketID         int64
-	SourceDataSetID  int64
-	SelectionMode    storagereplacement.SelectionMode
-	TargetProviderID types.OnChainID
-	ClientRequestID  string
+	BucketID             int64
+	SourceDataSetID      int64
+	SelectionMode        storagereplacement.SelectionMode
+	TargetProviderID     types.OnChainID
+	ClientRequestID      string
+	PriceListFingerprint string
 }
 
 type RetryReplacementInput struct {
@@ -758,6 +759,10 @@ type WalletOperationRepository interface {
 }
 
 type ObservabilityRepository interface {
+	RecordApprovedProviders(context.Context, time.Time, []types.OnChainID) error
+	RecordEndorsedProviders(context.Context, time.Time, []types.OnChainID) error
+	ProviderProfiles(context.Context, []types.OnChainID) (map[string]observability.ProviderProfile, error)
+	UpsertProviderObservation(context.Context, time.Time, observability.ProviderState) error
 	OverviewStorageStates(ctx context.Context) ([]model.StorageDataSet, []observability.ProviderState, []observability.DataSetState, *time.Time, *time.Time, error)
 	ReplaceProviderStates(ctx context.Context, checkedAt time.Time, states []observability.ProviderState) error
 	ListProviderStates(ctx context.Context, opts observability.ListOptions) (observability.ProviderStatePage, error)

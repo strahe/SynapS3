@@ -2,6 +2,9 @@ package observability
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
+	"math/big"
 
 	"github.com/strahe/synaps3/internal/provider"
 	idtypes "github.com/strahe/synaps3/internal/types"
@@ -84,13 +87,55 @@ func providersFromDetails(details []provider.ProviderDetail) []Provider {
 }
 
 func providerFromDetail(detail provider.ProviderDetail) Provider {
+	extra := make(map[string]string, len(detail.ExtraCapabilities))
+	for key, value := range detail.ExtraCapabilities {
+		extra[key] = "0x" + hex.EncodeToString(value)
+	}
+	var offering any
+	if detail.HasPDP {
+		offering = map[string]any{
+			"service_url":                   detail.ServiceURL,
+			"min_piece_size_bytes":          decimalBigInt(detail.MinPieceSize),
+			"max_piece_size_bytes":          decimalBigInt(detail.MaxPieceSize),
+			"storage_price_per_tib_per_day": decimalBigInt(detail.StoragePrice),
+			"min_proving_period_epochs":     decimalBigInt(detail.MinProvingPeriod),
+			"location":                      detail.Location,
+			"payment_token_address":         detail.PaymentToken.Hex(),
+			"ipni_piece":                    detail.IPNIPiece,
+			"ipni_ipfs":                     detail.IPNIIPFS,
+			"ipni_peer_id":                  detail.IPNIPeerID,
+			"extra_capabilities_hex":        extra,
+		}
+	}
+	snapshot, _ := json.Marshal(map[string]any{
+		"version": 1,
+		"provider": map[string]any{
+			"id": detail.ID.String(), "name": detail.Name,
+			"description":              detail.Description,
+			"service_provider_address": detail.Address.Hex(),
+			"payee_address":            detail.Payee.Hex(), "active": detail.Active,
+		},
+		"pdp_offering": offering,
+	})
 	return Provider{
 		ID:           detail.ID,
 		Active:       detail.Active,
 		HasPDP:       detail.HasPDP,
 		ServiceURL:   detail.ServiceURL,
 		HealthStatus: detail.HealthStatus,
+		Profile: &ProviderProfile{
+			ProviderID: detail.ID, Name: detail.Name, Description: detail.Description,
+			ServiceProviderAddress: detail.Address.Hex(), PayeeAddress: detail.Payee.Hex(),
+			Active: detail.Active, ServiceURL: detail.ServiceURL, RegistrySnapshot: snapshot,
+		},
 	}
+}
+
+func decimalBigInt(value *big.Int) string {
+	if value == nil {
+		return ""
+	}
+	return value.String()
 }
 
 func onChainIDPtrFromSDK(id sdktypes.BigInt) *idtypes.OnChainID {

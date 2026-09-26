@@ -2,6 +2,7 @@ package admin
 
 import (
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/observability"
 	idtypes "github.com/strahe/synaps3/internal/types"
 )
 
@@ -18,6 +19,9 @@ const (
 // finding it silently missing.
 type replacementProviderCandidate struct {
 	ProviderID       idtypes.OnChainID
+	Observation      *observability.ProviderObservation
+	Profile          *observability.ProviderProfile
+	ApprovedFresh    bool
 	Eligible         bool
 	IneligibleReason string
 	// PreviouslyUsed marks a provider this bucket has used before and fully
@@ -26,9 +30,8 @@ type replacementProviderCandidate struct {
 	PreviouslyUsed bool
 }
 
-// replacementProviderCandidates applies the target rules once, so automatic
-// selection and the dashboard's provider list can never disagree about what is
-// choosable.
+// replacementProviderCandidates applies the bucket and source rules shared by
+// manual and automatic selection. Each mode applies its approval rules later.
 //
 // The rules follow StorageReplacementRepository.Authorize: the generation being
 // replaced cannot replace itself, and a provider still holding an unretired
@@ -72,17 +75,4 @@ func replacementProviderCandidates(
 		candidates = append(candidates, candidate)
 	}
 	return candidates
-}
-
-// firstAutomaticChoice picks the provider an automatic replacement should use.
-// It goes further than eligibility and skips every provider the bucket has ever
-// used, so an automatic choice never lands back where the operator moved away
-// from. Choosing one of those again stays available as a manual decision.
-func firstAutomaticChoice(candidates []replacementProviderCandidate) (idtypes.OnChainID, bool) {
-	for _, candidate := range candidates {
-		if candidate.Eligible && !candidate.PreviouslyUsed {
-			return candidate.ProviderID, true
-		}
-	}
-	return idtypes.OnChainID{}, false
 }

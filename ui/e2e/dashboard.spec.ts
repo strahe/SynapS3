@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer'
-import type { Page } from '@playwright/test'
+import type { Page, Request } from '@playwright/test'
 import { expect, test } from './fixtures'
 
 test.describe.configure({ mode: 'serial' })
@@ -64,13 +64,52 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   const objectRow = page.getByRole('row').filter({ hasText: 'dashboard.bin' })
   await expect(objectRow).toBeVisible()
   await expect(objectRow.getByText('Filecoin')).toBeVisible()
+  const requestCounts = { bucket: 0, provenance: 0 }
+  const countStorageRequests = (request: Request) => {
+    const path = new URL(request.url()).pathname
+    if (path === '/api/v1/buckets/dashboard-e2e') requestCounts.bucket++
+    if (path === '/api/v1/buckets/dashboard-e2e/objects/provenance') requestCounts.provenance++
+  }
+  page.on('request', countStorageRequests)
   await objectRow.getByRole('button', { name: 'Actions for dashboard.bin' }).click()
   await page.getByRole('menuitem', { name: 'Provenance' }).click()
   const provenance = page.getByRole('dialog', { name: 'Storage provenance' })
-  await expect(provenance.getByText('3 / 3', { exact: true })).toBeVisible()
+  await expect(provenance.getByText('3 / 3', { exact: true })).toBeVisible({ timeout: 30_000 })
   await expect(provenance.getByText('Stored', { exact: true })).toHaveCount(3)
+  page.off('request', countStorageRequests)
+  expect(requestCounts.bucket).toBeLessThan(100)
+  expect(requestCounts.provenance).toBeLessThan(100)
   await provenance.getByRole('button', { name: 'Close' }).click()
   await expect(provenance).toBeHidden()
+
+  await page.getByRole('button', { name: 'Details', exact: true }).click()
+  const bucketDetails = page.getByRole('dialog', { name: 'Bucket details' })
+  await bucketDetails.getByRole('button', { name: 'Replace provider for Replica 1' }).click()
+  const replacement = page.getByRole('alertdialog', { name: 'Replace provider' })
+  await replacement.getByRole('combobox', { name: 'New provider' }).click()
+  await page.getByRole('option', { name: 'Choose a provider' }).click()
+  const providerPicker = replacement.locator('#replacement-provider')
+  await providerPicker.click()
+  await page.getByRole('button', { name: /System provider 104/ }).click()
+  await replacement.getByRole('button', { name: 'Select this provider' }).click()
+  await expect(replacement.getByText(/Storage rate:/)).toBeVisible()
+  const confirmation = replacement.getByRole('textbox', { name: /Type to confirm/ })
+  await confirmation.fill('replace')
+  await expect(replacement.getByRole('button', { name: 'Replace provider' })).toBeEnabled()
+  const refreshURL = '**/api/v1/observability/providers/104/refresh'
+  await page.route(refreshURL, (route) => route.fulfill({ status: 503, body: '{"error":"unavailable"}' }))
+  await replacement.getByRole('button', { name: 'Refresh provider' }).click()
+  await expect(replacement.getByText('Could not refresh this provider. Try again.')).toBeVisible()
+  await page.unroute(refreshURL)
+  await providerPicker.click()
+  await page.getByRole('button', { name: /System provider 102/ }).click()
+  await expect(providerPicker).toHaveText('Review a provider')
+  await expect(confirmation).toHaveValue('')
+  await expect(replacement.getByText('Could not refresh this provider. Try again.')).toHaveCount(0)
+  await expect(replacement.getByRole('button', { name: 'Replace provider' })).toBeDisabled()
+  await replacement.getByRole('button', { name: 'Cancel' }).click()
+  await page.keyboard.press('Escape')
+  await expect(bucketDetails).toBeHidden()
 
   await page.getByRole('button', { name: 'Upload', exact: true }).click()
   await uploadDialog.getByLabel('Files').setInputFiles({

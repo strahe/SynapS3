@@ -11,6 +11,7 @@ import (
 	"github.com/strahe/synaps3/internal/cache"
 	"github.com/strahe/synaps3/internal/cacheaccess"
 	"github.com/strahe/synaps3/internal/db/repository"
+	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
 	"github.com/strahe/synaps3/internal/providerbenchmark"
 	"github.com/strahe/synaps3/internal/synapse"
@@ -99,6 +100,8 @@ func (h *TaskHandlers) RegisterCore(registry *taskengine.Registry) error {
 		h.storageCleanupHandler(),
 		h.walletHandler(),
 		h.observabilityHandler(),
+		h.providerTierHandler(model.TaskTypeApprovedProviderRefresh, "approved"),
+		h.providerTierHandler(model.TaskTypeEndorsedProviderRefresh, "endorsed"),
 		h.providerUploadSpeedHandler(),
 		h.gcHandler(),
 	} {

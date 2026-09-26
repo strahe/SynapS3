@@ -340,6 +340,10 @@ func runServe(ctx context.Context, src config.Source) error {
 		return fmt.Errorf("creating wallet receipt client: %w", err)
 	}
 	defer walletReceiptClient.Close()
+	approvedCatalog, err := synapse.NewApprovedProviderCatalog(walletReceiptClient, client.WarmStorage().ViewAddress())
+	if err != nil {
+		return fmt.Errorf("configuring approved provider catalog: %w", err)
+	}
 	if err := storageClient.ConfigureCleanupChain(walletReceiptClient); err != nil {
 		return fmt.Errorf("configuring storage cleanup: %w", err)
 	}
@@ -349,18 +353,23 @@ func runServe(ctx context.Context, src config.Source) error {
 		Database: database,
 		Settings: settingsSvc,
 		Filecoin: app.FilecoinServices{
-			Storage:       storageClient,
-			WalletQuery:   walletQuerier,
-			Wallet:        walletOperator,
-			Receipts:      walletReceiptClient,
-			Readiness:     filecoinReadiness,
-			Observability: observabilityChecker,
-			Terminator:    storageClient,
+			Market:            client.WarmStorage(),
+			ApprovedProviders: approvedCatalog,
+			Endorsements:      client.SPRegistry(),
+			ChainID:           uint64(client.Chain().ChainID()),
+			USDFCAddress:      client.ResolvedAddresses().USDFC.Hex(),
+			Storage:           storageClient,
+			WalletQuery:       walletQuerier,
+			Wallet:            walletOperator,
+			Receipts:          walletReceiptClient,
+			Readiness:         filecoinReadiness,
+			Observability:     observabilityChecker,
+			Terminator:        storageClient,
 			// The epoch comes from the same node that reports wallet receipts,
 			// so replacement adds no new RPC connection.
 			Epochs: synapse.NewChainEpochReader(walletReceiptClient),
 		},
-		ProviderIdentity: admin.NewProviderIdentityResolver(client.SPRegistry(), cfg.Filecoin.RPCURL, logger),
+		ProviderIdentity: admin.NewProviderIdentityResolver(cfg.Filecoin.RPCURL, logger),
 		Logger:           logger,
 	})
 	if err != nil {

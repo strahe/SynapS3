@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	initialPortableSchemaFingerprint = "cb2e36800894303f1513c2f63a36265e563a39de0a8185b12d5afa32350547aa"
+	initialPortableSchemaFingerprint = "45c3ff37abc1d6155e03e23ad4c47a3ae2b46b8e668b358727ade95349b85c70"
 )
 
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
@@ -139,7 +139,7 @@ func TestInitialSchemaContractSQLite(t *testing.T) {
 		"multipart_uploads", "multipart_parts", "storage_contents", "storage_data_sets",
 		"storage_copies", "storage_commit_attempts", "storage_replacements",
 		"storage_pull_attempts", "storage_replacement_items", "storage_cleanup_copies", "wallet_operations", "tasks",
-		"observability_collection_states", "observability_provider_states", "observability_data_set_states", "provider_upload_speed_tests",
+		"observability_collection_states", "observability_provider_states", "observability_data_set_states", "provider_profiles", "provider_tier_snapshots", "provider_upload_speed_tests",
 		"task_payloads", "storage_data_set_terminations",
 	} {
 		if exists, err := tableExists(t.Context(), db, table); err != nil || !exists {
@@ -369,6 +369,11 @@ func TestValidateTargetAcceptsOnlyAppliedMigrationPrefixes(t *testing.T) {
 			if err := newMigrator(db, registry).Init(t.Context()); err != nil {
 				t.Fatalf("initialize migration metadata: %v", err)
 			}
+			if len(tt.applied) > 0 {
+				if err := up2026090101InitialSchema(t.Context(), db); err != nil {
+					t.Fatalf("create baseline schema: %v", err)
+				}
+			}
 			for _, name := range tt.applied {
 				if _, err := db.Exec(`INSERT INTO bun_migrations (name, group_id) VALUES (?, 1)`, name); err != nil {
 					t.Fatalf("insert migration marker %q: %v", name, err)
@@ -476,6 +481,25 @@ func TestValidateTargetRejectsObsoleteCommitLedgerShape(t *testing.T) {
 		}
 		if err := ValidateTarget(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
 			t.Fatalf("validate obsolete commit ledger = %v, want incompatible database", err)
+		}
+	})
+}
+
+func TestValidateTargetRejectsBaselineWithoutProviderProfiles(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		migrator := NewMigrator(db)
+		if err := migrator.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := migrator.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE provider_profiles RENAME TO old_provider_profiles`); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateTarget(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
+			t.Fatalf("validate old baseline = %v, want rebuild guidance", err)
 		}
 	})
 }

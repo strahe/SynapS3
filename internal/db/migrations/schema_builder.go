@@ -54,6 +54,10 @@ func initialJSONColumns(table string) []initialJSONColumnSpec {
 		}
 	case "multipart_uploads", "object_versions":
 		return []initialJSONColumnSpec{{name: "metadata", shape: initialJSONObject}}
+	case "provider_profiles":
+		return []initialJSONColumnSpec{{name: "registry_snapshot_json", shape: initialJSONObject}}
+	case "provider_tier_snapshots":
+		return []initialJSONColumnSpec{{name: "provider_ids_json", shape: initialJSONArray}}
 	case "observability_provider_states", "observability_data_set_states":
 		return []initialJSONColumnSpec{
 			{name: "reason_codes", shape: initialJSONArray},

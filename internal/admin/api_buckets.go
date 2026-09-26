@@ -600,7 +600,7 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 		providerIDs = append(providerIDs, summary.ProviderID)
 		localIDs = append(localIDs, summary.ID)
 	}
-	identities := s.providerIdentities(providerIDs)
+	identities := s.providerIdentities(ctx, providerIDs)
 	healthByLocalID, healthFailed := s.dataSetStorageHealthStates(ctx, localIDs)
 	for _, summary := range summaries {
 		storageHealth := s.dataSetStorageHealthInfo(healthByLocalID[summary.ID])
@@ -681,11 +681,42 @@ func dataSetStorageHealthQueryFailureInfo() *dataSetStorageHealthInfo {
 	}
 }
 
-func (s *Server) providerIdentities(providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {
-	if s.providerIdentity == nil {
-		return nil
+func (s *Server) providerIdentities(ctx context.Context, providerIDs []idtypes.OnChainID) map[string]*providerIdentityResponse {
+	profiles := make(map[string]observability.ProviderProfile)
+	if s.repos != nil && s.repos.Observability != nil {
+		var err error
+		profiles, err = s.repos.Observability.ProviderProfiles(ctx, providerIDs)
+		if err != nil {
+			s.logger.Warn("api: failed to load saved provider profiles", "error", err)
+		}
 	}
-	return s.providerIdentity.ProviderIdentities(providerIDs)
+	return s.providerIdentitiesFromProfiles(profiles)
+}
+
+func (s *Server) providerIdentitiesFromProfiles(profiles map[string]observability.ProviderProfile) map[string]*providerIdentityResponse {
+	identities := make(map[string]*providerIdentityResponse, len(profiles))
+	for id, profile := range profiles {
+		identity := &providerIdentityResponse{
+			RegistryProviderID: id, Name: profile.Name, Description: profile.Description,
+			ServiceProviderAddress: profile.ServiceProviderAddress, PayeeAddress: profile.PayeeAddress,
+			ServiceURL: profile.ServiceURL,
+		}
+		var snapshot struct {
+			PDPOffering *struct {
+				Location             string            `json:"location"`
+				ExtraCapabilitiesHex map[string]string `json:"extra_capabilities_hex"`
+			} `json:"pdp_offering"`
+		}
+		if err := json.Unmarshal(profile.RegistrySnapshot, &snapshot); err == nil && snapshot.PDPOffering != nil {
+			identity.Location = snapshot.PDPOffering.Location
+			identity.ExtraCapabilities = identityCapabilitiesFromSnapshot(snapshot.PDPOffering.ExtraCapabilitiesHex)
+		}
+		identities[id] = identity
+	}
+	if s.providerIdentity != nil && len(identities) > 0 {
+		identities = s.providerIdentity.EnrichActors(identities)
+	}
+	return identities
 }
 
 func providerIdentityFromSnapshot(identities map[string]*providerIdentityResponse, providerID idtypes.OnChainID) *providerIdentityResponse {
@@ -1819,7 +1850,7 @@ func (s *Server) handleAPIBucketObjectProvenance(w http.ResponseWriter, r *http.
 	for _, copyRow := range provenance.Copies {
 		providerIDs = append(providerIDs, copyRow.ProviderID)
 	}
-	providerIdentities := s.providerIdentities(providerIDs)
+	providerIdentities := s.providerIdentities(ctx, providerIDs)
 	copyFacts := provenanceCopyHealthFacts(bucket.ID, version.VersionID, provenance.Upload, provenance.Copies)
 	copyObservations, copyHealthFailed := s.copyHealthDataSetObservations(ctx, copyHealthLocalDataSetIDs(copyFacts))
 	copyHealthInterval := s.copyHealthRefreshInterval()

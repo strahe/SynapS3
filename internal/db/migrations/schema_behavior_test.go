@@ -213,31 +213,31 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		var replacementID int64
 		if err := db.QueryRow(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
-			 selection_mode, client_request_id, status, created_at, updated_at)
-			VALUES (?, 0, ?, ?, 'manual', 'replacement-1', 'preparing_target', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			 selection_mode, client_request_id, price_list_fingerprint, status, created_at, updated_at)
+			VALUES (?, 0, ?, ?, 'manual', 'replacement-1', 'test-price', 'preparing_target', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 			RETURNING id`, bucketA, source, target).Scan(&replacementID); err != nil {
 			t.Fatalf("insert replacement: %v", err)
 		}
 		bucketBTarget := insertBaselineTestDataSet(t, db, bucketB, "303", 0, 2, false)
 		if _, err := db.Exec(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
-			 selection_mode, client_request_id, status, superseded_by_id, created_at, updated_at)
-			VALUES (?, 0, ?, ?, 'manual', 'replacement-superseded', 'superseded', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			 selection_mode, client_request_id, price_list_fingerprint, status, superseded_by_id, created_at, updated_at)
+			VALUES (?, 0, ?, ?, 'manual', 'replacement-superseded', 'test-price', 'superseded', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 			bucketB, bucketBSource, bucketBTarget, replacementID); err != nil {
 			t.Fatalf("insert superseded replacement provenance: %v", err)
 		}
 		mustRejectStatement(t, db, `DELETE FROM storage_replacements WHERE id = ?`, replacementID)
 		mustRejectStatement(t, db, `INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
-			 selection_mode, client_request_id, status, created_at, updated_at)
-			VALUES (?, 0, ?, ?, 'manual', 'replacement-2', 'waiting', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, source, target)
+			 selection_mode, client_request_id, price_list_fingerprint, status, created_at, updated_at)
+			VALUES (?, 0, ?, ?, 'manual', 'replacement-2', 'test-price', 'waiting', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, source, target)
 		if _, err := db.Exec(`UPDATE storage_replacements SET status = 'failed' WHERE id = ?`, replacementID); err != nil {
 			t.Fatalf("mark replacement retryable: %v", err)
 		}
 		mustRejectStatement(t, db, `INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
-			 selection_mode, client_request_id, status, created_at, updated_at)
-			VALUES (?, 0, ?, ?, 'manual', 'replacement-3', 'preparing_target', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, source, target)
+			 selection_mode, client_request_id, price_list_fingerprint, status, created_at, updated_at)
+			VALUES (?, 0, ?, ?, 'manual', 'replacement-3', 'test-price', 'preparing_target', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, source, target)
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
 			(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)
 			VALUES (?, ?, 1, ?, 0, '202', 'ingress', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, bucketA, target)
@@ -609,8 +609,8 @@ func TestBaselineTerminationBelongsToItsReplacementRole(t *testing.T) {
 		var replacementID int64
 		if err := db.QueryRow(`INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
-			 selection_mode, client_request_id, status, created_at, updated_at)
-			VALUES (?, 0, ?, ?, 'manual', 'termination-request', 'retiring', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			 selection_mode, client_request_id, price_list_fingerprint, status, created_at, updated_at)
+			VALUES (?, 0, ?, ?, 'manual', 'termination-request', 'test-price', 'retiring', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 			RETURNING id`, bucketID, source, target).Scan(&replacementID); err != nil {
 			t.Fatalf("insert replacement: %v", err)
 		}

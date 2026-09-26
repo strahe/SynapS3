@@ -142,7 +142,7 @@ func (s *Server) handleAPIBucketStorageHealthAffectedVersions(w http.ResponseWri
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.bucketStorageHealthAffectedVersionsResponse(page, staleBefore))
+	writeJSON(w, http.StatusOK, s.bucketStorageHealthAffectedVersionsResponse(r.Context(), page, staleBefore))
 }
 
 func (s *Server) bucketStorageHealthSummaries(ctx context.Context, bucketID int64) (map[int64]bucketStorageHealthSummaryResponse, bool) {
@@ -270,7 +270,7 @@ func bucketStorageHealthReasonsFromRepository(summary repository.BucketStorageHe
 	return reasons
 }
 
-func (s *Server) bucketStorageHealthAffectedVersionsResponse(page repository.BucketStorageHealthAffectedVersionPage, staleBefore time.Time) bucketStorageHealthAffectedVersionsResponse {
+func (s *Server) bucketStorageHealthAffectedVersionsResponse(ctx context.Context, page repository.BucketStorageHealthAffectedVersionPage, staleBefore time.Time) bucketStorageHealthAffectedVersionsResponse {
 	providerIDs := make([]idtypes.OnChainID, 0)
 	seenProviderIDs := make(map[string]struct{})
 	for _, version := range page.Versions {
@@ -283,7 +283,7 @@ func (s *Server) bucketStorageHealthAffectedVersionsResponse(page repository.Buc
 			providerIDs = append(providerIDs, dataSet.ProviderID)
 		}
 	}
-	identities := s.providerIdentities(providerIDs)
+	identities := s.providerIdentities(ctx, providerIDs)
 	resp := bucketStorageHealthAffectedVersionsResponse{
 		Versions:          make([]bucketStorageHealthAffectedVersionResponse, 0, len(page.Versions)),
 		HasMore:           page.HasMore,

@@ -50,12 +50,17 @@ type ReadinessProbe interface {
 // FilecoinServices contains the externally owned Filecoin integrations used by
 // the application runtime.
 type FilecoinServices struct {
-	Storage       synapse.StorageClient
-	WalletQuery   synapse.WalletQuerier
-	Wallet        synapse.WalletOperator
-	Receipts      worker.WalletReceiptChecker
-	Readiness     ReadinessProbe
-	Observability observability.RefreshChecker
+	Market            admin.WarmStorageMarket
+	ApprovedProviders observability.ApprovedProviderSource
+	Endorsements      observability.EndorsedProviderSource
+	ChainID           uint64
+	USDFCAddress      string
+	Storage           synapse.StorageClient
+	WalletQuery       synapse.WalletQuerier
+	Wallet            synapse.WalletOperator
+	Receipts          worker.WalletReceiptChecker
+	Readiness         ReadinessProbe
+	Observability     observability.RefreshChecker
 	// Terminator ends a replaced storage service. Epochs observes the chain so
 	// the gateway can tell an accepted termination from a completed one.
 	Terminator synapse.ServiceTerminator
@@ -117,7 +122,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 	cacheGate := cacheaccess.NewGate()
 	accessTracker := cacheaccess.NewTracker(cacheaccess.DefaultPersistenceInterval, repos.Objects)
 	events := admin.NewEventHub()
-	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability)
+	observabilityService := newObservabilityService(cfg, repos, opts.Filecoin.Observability, opts.Filecoin.ApprovedProviders, opts.Filecoin.Endorsements)
 	uploadSpeedProbe := opts.UploadSpeedProbe
 	if uploadSpeedProbe == nil {
 		uploadSpeedProbe = synapse.NewPDPBatchUploadProbe(cfg.Filecoin.AllowPrivateNetworks)
@@ -190,6 +195,14 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "observability",
 		},
 		{
+			Type: model.TaskTypeApprovedProviderRefresh, IdempotencyKey: "system:approved-provider-refresh",
+			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "approved-providers",
+		},
+		{
+			Type: model.TaskTypeEndorsedProviderRefresh, IdempotencyKey: "system:endorsed-provider-refresh",
+			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "endorsed-providers",
+		},
+		{
 			Type: model.TaskTypeGC, IdempotencyKey: "system:task-gc",
 			Input: systemtask.Input{}, SubjectType: "system", SubjectKey: "task-gc",
 		},
@@ -249,6 +262,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		WithSettings(opts.Settings).
 		WithFilecoinReadiness(opts.Filecoin.Readiness).
 		WithObservability(observabilityService).
+		WithWarmStorageMarket(opts.Filecoin.Market, opts.Filecoin.ChainID, opts.Filecoin.USDFCAddress).
 		WithTaskService(taskService).
 		WithS3IAM(iamService, rootAccount.Access)
 	if opts.ProviderIdentity != nil {
@@ -520,9 +534,11 @@ func (r *Runtime) Close() error {
 	return errors.Join(closeErrors...)
 }
 
-func newObservabilityService(cfg *config.Config, repos *repository.Repositories, checker observability.RefreshChecker) *observability.Service {
+func newObservabilityService(cfg *config.Config, repos *repository.Repositories, checker observability.RefreshChecker, approved observability.ApprovedProviderSource, endorsed observability.EndorsedProviderSource) *observability.Service {
 	return observability.NewService(observability.ServiceOptions{
-		Checker: checker,
+		ApprovedProviders: approved,
+		EndorsedProviders: endorsed,
+		Checker:           checker,
 		LocalDataSets: observability.LocalDataSetSourceFunc(func(ctx context.Context) ([]observability.LocalDataSet, error) {
 			summaries, err := repos.Contents.ListDataSetSummaries(ctx, 0)
 			if err != nil {

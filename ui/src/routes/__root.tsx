@@ -348,8 +348,31 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
     if (!enabled) return
 
     const events = new EventSource('/api/v1/events')
+    let lastCatalogRefresh = 0
+    let pendingCatalogRefresh: ReturnType<typeof setTimeout> | undefined
+    const refreshCatalog = () => {
+      lastCatalogRefresh = Date.now()
+      queryClient.invalidateQueries({ queryKey: ['observabilityProviders'] })
+      queryClient.invalidateQueries({ queryKey: ['replacement-providers'] })
+      queryClient.invalidateQueries({ queryKey: ['bucket'] })
+      queryClient.invalidateQueries({ queryKey: ['objectProvenance'] })
+    }
     events.addEventListener('provider_identity_updated', (event) => {
       applyProviderIdentityEventData(queryClient, event.data)
+    })
+    events.addEventListener('provider_catalog_updated', () => {
+      const remaining = 1_000 - (Date.now() - lastCatalogRefresh)
+      if (remaining <= 0 && !pendingCatalogRefresh) {
+        refreshCatalog()
+      } else if (!pendingCatalogRefresh) {
+        pendingCatalogRefresh = setTimeout(
+          () => {
+            pendingCatalogRefresh = undefined
+            refreshCatalog()
+          },
+          Math.max(0, remaining)
+        )
+      }
     })
     events.addEventListener('upload_progress_updated', (event) => {
       applyUploadProgressEventData(queryClient, event.data)
@@ -360,7 +383,10 @@ function AdminEventsBridge({ enabled }: { enabled: boolean }) {
     events.addEventListener('wallet_operation_updated', (event) => {
       applyWalletOperationEventData(queryClient, event.data)
     })
-    return () => events.close()
+    return () => {
+      events.close()
+      if (pendingCatalogRefresh) clearTimeout(pendingCatalogRefresh)
+    }
   }, [enabled, queryClient])
 
   return null

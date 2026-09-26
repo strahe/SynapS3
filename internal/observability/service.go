@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/strahe/synaps3/internal/types"
 )
 
 const dataSetStateLookupBatchSize = 900
@@ -44,6 +46,8 @@ type StateStore interface {
 }
 
 type ServiceOptions struct {
+	ApprovedProviders ApprovedProviderSource
+	EndorsedProviders EndorsedProviderSource
 	Checker           RefreshChecker
 	LocalDataSets     LocalDataSetSource
 	LocalDataSetCount LocalDataSetCountSource
@@ -54,6 +58,8 @@ type ServiceOptions struct {
 }
 
 type Service struct {
+	approvedProviders ApprovedProviderSource
+	endorsedProviders EndorsedProviderSource
 	checker           RefreshChecker
 	localDataSets     LocalDataSetSource
 	localDataSetCount LocalDataSetCountSource
@@ -63,6 +69,50 @@ type Service struct {
 	now               func() time.Time
 	providerRefresh   refreshGroup
 	dataSetRefresh    refreshGroup
+	approvedRefresh   refreshGroup
+	endorsedRefresh   refreshGroup
+	singleRefreshMu   sync.Mutex
+	singleRefreshes   map[string]bool
+}
+
+var ErrProviderRefreshInProgress = errors.New("provider refresh in progress")
+
+func (s *Service) RefreshProvider(ctx context.Context, id types.OnChainID) (ProviderState, error) {
+	checker, ok := s.checker.(interface {
+		CheckProvider(context.Context, time.Time, types.OnChainID) (ProviderState, error)
+	})
+	if !ok {
+		return ProviderState{}, errors.New("single-provider refresh unavailable")
+	}
+	store, ok := s.store.(interface {
+		UpsertProviderObservation(context.Context, time.Time, ProviderState) error
+	})
+	if !ok {
+		return ProviderState{}, errors.New("single-provider persistence unavailable")
+	}
+	key := id.String()
+	s.singleRefreshMu.Lock()
+	if s.singleRefreshes == nil {
+		s.singleRefreshes = make(map[string]bool)
+	}
+	if s.singleRefreshes[key] {
+		s.singleRefreshMu.Unlock()
+		return ProviderState{}, ErrProviderRefreshInProgress
+	}
+	s.singleRefreshes[key] = true
+	s.singleRefreshMu.Unlock()
+	defer func() { s.singleRefreshMu.Lock(); delete(s.singleRefreshes, key); s.singleRefreshMu.Unlock() }()
+	refreshCtx, cancel := context.WithTimeout(ctx, s.RefreshTimeout())
+	defer cancel()
+	checkedAt := s.checkedAt()
+	state, err := checker.CheckProvider(refreshCtx, checkedAt, id)
+	if err != nil {
+		return ProviderState{}, err
+	}
+	if err := store.UpsertProviderObservation(refreshCtx, checkedAt, state); err != nil {
+		return ProviderState{}, err
+	}
+	return state, nil
 }
 
 func NewService(opts ServiceOptions) *Service {
@@ -79,6 +129,8 @@ func NewService(opts ServiceOptions) *Service {
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Service{
+		approvedProviders: opts.ApprovedProviders,
+		endorsedProviders: opts.EndorsedProviders,
 		checker:           opts.Checker,
 		localDataSets:     opts.LocalDataSets,
 		localDataSetCount: opts.LocalDataSetCount,
@@ -113,7 +165,18 @@ func (s *Service) RefreshProvidersWithContext(ctx context.Context, opts ListOpti
 }
 
 func (s *Service) refreshProviders(ctx context.Context, opts ListOptions, detach bool) (ProviderStatePage, error) {
-	if err := s.providerRefresh.Do(ctx, s.refreshTimeout, detach, func(refreshCtx context.Context) error {
+	if err := s.refreshProviderStates(ctx, detach); err != nil {
+		return ProviderStatePage{}, err
+	}
+	return s.ListProviders(ctx, opts)
+}
+
+func (s *Service) RefreshProviderStates(ctx context.Context) error {
+	return s.refreshProviderStates(ctx, false)
+}
+
+func (s *Service) refreshProviderStates(ctx context.Context, detach bool) error {
+	return s.providerRefresh.Do(ctx, s.refreshTimeout, detach, func(refreshCtx context.Context) error {
 		local, err := s.listLocalDataSets(refreshCtx)
 		if err != nil {
 			return err
@@ -124,10 +187,7 @@ func (s *Service) refreshProviders(ctx context.Context, opts ListOptions, detach
 			return err
 		}
 		return s.store.ReplaceProviderStates(refreshCtx, checkedAt, states)
-	}); err != nil {
-		return ProviderStatePage{}, err
-	}
-	return s.ListProviders(ctx, opts)
+	})
 }
 
 func (s *Service) RefreshDataSets(ctx context.Context, opts ListOptions) (DataSetStatePage, error) {
@@ -135,7 +195,18 @@ func (s *Service) RefreshDataSets(ctx context.Context, opts ListOptions) (DataSe
 }
 
 func (s *Service) refreshDataSets(ctx context.Context, opts ListOptions, detach bool) (DataSetStatePage, error) {
-	if err := s.dataSetRefresh.Do(ctx, s.refreshTimeout, detach, func(refreshCtx context.Context) error {
+	if err := s.refreshDataSetStates(ctx, detach); err != nil {
+		return DataSetStatePage{}, err
+	}
+	return s.ListDataSets(ctx, opts)
+}
+
+func (s *Service) RefreshDataSetStates(ctx context.Context) error {
+	return s.refreshDataSetStates(ctx, false)
+}
+
+func (s *Service) refreshDataSetStates(ctx context.Context, detach bool) error {
+	return s.dataSetRefresh.Do(ctx, s.refreshTimeout, detach, func(refreshCtx context.Context) error {
 		local, err := s.listLocalDataSets(refreshCtx)
 		if err != nil {
 			return err
@@ -146,25 +217,29 @@ func (s *Service) refreshDataSets(ctx context.Context, opts ListOptions, detach 
 			return err
 		}
 		return s.store.ReplaceDataSetStates(refreshCtx, checkedAt, states)
-	}); err != nil {
-		return DataSetStatePage{}, err
-	}
-	return s.ListDataSets(ctx, opts)
-}
-
-func (s *Service) RefreshAll(ctx context.Context) error {
-	var errs []error
-	if _, err := s.refreshProviders(ctx, ListOptions{}, false); err != nil {
-		errs = append(errs, err)
-	}
-	if _, err := s.refreshDataSets(ctx, ListOptions{}, false); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	})
 }
 
 func (s *Service) ListProviders(ctx context.Context, opts ListOptions) (ProviderStatePage, error) {
 	return s.store.ListProviderStates(ctx, opts)
+}
+
+func (s *Service) ProviderProfile(ctx context.Context, id types.OnChainID) (*ProviderProfile, error) {
+	store, ok := s.store.(interface {
+		ProviderProfiles(context.Context, []types.OnChainID) (map[string]ProviderProfile, error)
+	})
+	if !ok {
+		return nil, nil
+	}
+	profiles, err := store.ProviderProfiles(ctx, []types.OnChainID{id})
+	if err != nil {
+		return nil, err
+	}
+	profile, ok := profiles[id.String()]
+	if !ok {
+		return nil, nil
+	}
+	return &profile, nil
 }
 
 func (s *Service) ListProviderObservations(ctx context.Context, opts ListOptions) (ProviderObservationPage, error) {
@@ -331,6 +406,7 @@ type refreshGroup struct {
 type refreshCall struct {
 	done               chan struct{}
 	cancel             context.CancelFunc
+	startedAt          time.Time
 	err                error
 	cancellableWaiters int
 	detachedWaiters    int
@@ -338,13 +414,24 @@ type refreshCall struct {
 }
 
 func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, detach bool, fn func(context.Context) error) error {
+	_, err := g.do(ctx, timeout, detach, nil, func(refreshCtx context.Context, _ time.Time) error {
+		return fn(refreshCtx)
+	})
+	return err
+}
+
+func (g *refreshGroup) DoAt(ctx context.Context, timeout time.Duration, startedAt func() time.Time, fn func(context.Context, time.Time) error) (time.Time, error) {
+	return g.do(ctx, timeout, false, startedAt, fn)
+}
+
+func (g *refreshGroup) do(ctx context.Context, timeout time.Duration, detach bool, startedAt func() time.Time, fn func(context.Context, time.Time) error) (time.Time, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	for {
 		if !detach {
 			if err := ctx.Err(); err != nil {
-				return err
+				return time.Time{}, err
 			}
 		}
 		g.mu.Lock()
@@ -361,6 +448,9 @@ func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, detach boo
 				done:   make(chan struct{}),
 				cancel: cancel,
 			}
+			if startedAt != nil {
+				call.startedAt = startedAt()
+			}
 			if detach {
 				call.detachedWaiters = 1
 			} else {
@@ -369,13 +459,15 @@ func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, detach boo
 			g.call = call
 			g.mu.Unlock()
 
-			go g.run(call, refreshCtx, fn)
-			return g.wait(ctx, call, detach)
+			go g.run(call, refreshCtx, func(refreshCtx context.Context) error {
+				return fn(refreshCtx, call.startedAt)
+			})
+			return call.startedAt, g.wait(ctx, call, detach)
 		}
 		if call.cancelled {
 			g.mu.Unlock()
 			if err := waitForRetiredRefresh(ctx, call, detach); err != nil {
-				return err
+				return time.Time{}, err
 			}
 			continue
 		}
@@ -385,7 +477,7 @@ func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, detach boo
 			call.cancellableWaiters++
 		}
 		g.mu.Unlock()
-		return g.wait(ctx, call, detach)
+		return call.startedAt, g.wait(ctx, call, detach)
 	}
 }
 

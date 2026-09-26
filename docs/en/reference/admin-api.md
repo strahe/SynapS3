@@ -204,18 +204,20 @@ The restore streams synchronously for up to one hour and requires enough cache c
 Choose the new provider automatically:
 
 ```json
-{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
+{ "mode": "automatic", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint from the price-list endpoint>" }
 ```
 
 Automatic selection excludes every provider the bucket has ever used, including retired ones. Or name the provider yourself:
 
 ```json
-{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584" }
+{ "mode": "manual", "provider_id": "202", "client_request_id": "019d2e22-8c36-7d5b-a6be-5f7fa6d6f584", "price_list_fingerprint": "<fingerprint from the price-list endpoint>" }
 ```
 
-A named provider must appear in the complete available, active, PDP-capable provider inventory. It may be one the bucket used before, provided that earlier service has already been retired. The provider being replaced, and any provider still holding a live generation of this bucket, are rejected.
+A named provider must have a fresh available, active, PDP-capable health observation for its current service URL. It may be one the bucket used before, provided that earlier service has already been retired. The provider being replaced, and any provider still holding a live generation of this bucket, are rejected. The candidate endpoint also returns ineligible observed providers and reasons so they can be inspected before selection. Fresh FWSS approved membership is required for automatic selection. Endorsed membership is displayed separately and does not determine replacement eligibility.
 
-`client_request_id` is required after trimming and must contain 1–128 characters. The first successful request returns `201 Created`. Replaying the same bucket, source, mode, and manual provider with the same ID returns the original record and `200 OK`, even after the replica has switched. Reusing the ID with different parameters returns `409 Conflict` with `replacement_idempotency_conflict`. An automatic replay is resolved before reading the provider inventory, so a later inventory change cannot choose a different provider.
+Read `GET /api/v1/filecoin/warm-storage/price-list` before confirmation. It returns the current token address, all rates, fees and lockups as decimal integer strings, the read time, and a fingerprint. A new confirmation rereads the contract price list; `price_list_unavailable`, `price_list_changed`, or `unsupported_price_token` prevents authorization. Review the updated list and use a new request ID after a price change. The fingerprint records the prices reviewed at authorization; on-chain prices may change later.
+
+`client_request_id` is required after trimming and must contain 1–128 characters. The first successful request returns `201 Created`. Replaying the same bucket, source, mode, manual provider, and price fingerprint with the same ID returns the original record and `200 OK`, even after the replica has switched. Reusing the ID with different parameters returns `409 Conflict` with `replacement_idempotency_conflict`. A replay is resolved before current price or, for automatic selection, approval checks, so changes to those inputs cannot authorize a different provider or block a matching replay.
 
 Confirming again for the same replica supersedes the earlier request and returns `201 Created`; it is not a conflict. The unused provider from the earlier request is shut down. `replacement_active` means something else: the replica is the target of another unfinished replacement, which has to be resolved first.
 
@@ -255,11 +257,11 @@ Conflicts return `409 Conflict` with a stable code:
 }
 ```
 
-The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_source_not_current`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, and `replacement_idempotency_conflict`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; a currently unavailable manual target returns `400` with `replacement_target_unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; an unavailable storage service returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
+The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_source_not_current`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, and `replacement_idempotency_conflict`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; an unavailable manual target returns `400` with `replacement_target_unavailable`; a failed on-chain approval check during automatic selection returns `503 Service Unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; an unavailable storage service returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
 
-`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists every provider currently reported available with `eligible`, an `ineligible_reason` of `current_source` or `already_serves_bucket`, and `previously_used` for a provider this bucket has used and fully retired. Providers that cannot take the replica are listed rather than omitted, so an operator can see why one they expected is unavailable. It is the same inventory the storage topology reports under the `Available` filter, so a provider listed there is offered here and an unreachable one is offered in neither. Eligibility is the same rule the confirmation enforces. Automatic selection is stricter still: it never returns to a provider this bucket has used, which a manual choice may.
+`GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists all providers with a recorded health observation. Each row includes `manual_selectable`, `manual_block_reason`, `approved_fresh`, `previously_used`, the saved Registry profile when available, health, and recent upload speed. An ineligible provider remains visible for inspection. Reasons include `current_source`, `already_serves_bucket`, `provider_unavailable`, `observation_stale`, `profile_missing`, and `profile_url_changed`. Manual selection does not depend on FWSS approval; it still requires a healthy provider with an active, current profile and the usual bucket constraints. Automatic selection also excludes every provider this bucket has used and checks fresh approved candidates on chain in ID order.
 
-Confirmation only checks what SynapS3 has recorded. A provider that still runs a storage service for this bucket on chain is detected when the replacement prepares its target: the replacement stops at `failed` with the provider and data set named, and the operator confirms again on a different provider. The replica has not moved at that point, so nothing is at risk. A provider whose earlier service for this bucket was retired normally can be chosen again.
+Manual confirmation does not check FWSS approval or whether the provider still runs a storage service for this bucket on chain. A provider that still runs a storage service for this bucket on chain is detected when the replacement prepares its target: the replacement stops at `failed` with the provider and data set named, and the operator confirms again on a different provider. The replica has not moved at that point. A provider whose earlier service for this bucket was retired normally can be chosen again.
 
 ### Storage confirmation attention
 
@@ -326,13 +328,20 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 | `GET` | `/api/v1/wallet/operations` | List wallet operations. |
 | `GET` | `/api/v1/filecoin/readiness` | Check Filecoin readiness. |
 | `POST` | `/api/v1/filecoin/readiness/preflight` | Validate pending Filecoin settings. |
-| `GET` | `/api/v1/observability/providers` | Provider health data. |
+| `GET` | `/api/v1/filecoin/warm-storage/price-list` | Current Warm Storage price fields and review fingerprint. |
+| `GET` | `/api/v1/observability/providers` | Provider health, saved Registry profile with independent FWSS approved and endorsed membership and collection times, and latest upload speed. |
 | `POST` | `/api/v1/observability/providers/refresh` | Refresh provider health. |
+| `POST` | `/api/v1/observability/providers/{provider_id}/refresh` | Refresh one provider's Registry profile and health. Concurrent requests for the same ID conflict. |
+| `POST` | `/api/v1/observability/provider-tiers/refresh` | Refresh approved and endorsed lists concurrently. Returns `approved_result` and `endorsed_result`, each with success, attempt time, and collection time or error. A failed list retains its previous profile flags and collection times. |
 | `POST` | `/api/v1/observability/providers/{provider_id}/upload-speed-test` | Start one 32 MiB upload speed test for an available provider. Returns `202 Accepted` with `task_id`, `404 Not Found` for an unknown provider, or `409 Conflict` if a test is already running or the provider is ineligible. |
 | `GET` | `/api/v1/observability/data-sets` | Local data set health data. |
 | `POST` | `/api/v1/observability/data-sets/refresh` | Refresh data set health. |
 
-Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests cannot be retried through the task retry endpoint; start a new test instead.
+Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests cannot be retried through the task retry endpoint; start a new test instead. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
+
+The two tier lists are collected independently. A profile with no collection time has unknown membership; after a successful collection, `false` means it was not listed. Membership is fresh for two configured refresh intervals. Only providers with a saved Registry profile are annotated.
+
+The single-provider refresh response has separate `profile_result` and `health_result` objects, each with success, attempt time, and a collection time or error. A failed part retains its previous successful data and observation time.
 
 ## Settings and S3 Users
 

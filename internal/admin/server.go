@@ -53,6 +53,9 @@ type Server struct {
 	wallet                synapse.WalletQuerier
 	filecoinReadiness     filecoinReadinessProbe
 	observability         *observability.Service
+	warmStorageMarket     WarmStorageMarket
+	marketChainID         uint64
+	usdfcAddress          string
 	providerIdentity      providerIdentityLookup
 	events                *EventHub
 	settings              *SettingsService
@@ -282,9 +285,12 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.HandleFunc("POST /api/v1/wallet/approve", s.handleAPIWalletApprove)
 		mux.HandleFunc("GET /api/v1/wallet/operations", s.handleAPIWalletOperations)
 		mux.HandleFunc("GET /api/v1/filecoin/readiness", s.handleAPIFilecoinReadiness)
+		mux.HandleFunc("GET /api/v1/filecoin/warm-storage/price-list", s.handleAPIWarmStoragePrice)
 		mux.HandleFunc("GET /api/v1/observability/providers", s.handleAPIObservabilityProviders)
+		mux.HandleFunc("POST /api/v1/observability/provider-tiers/refresh", s.handleAPIRefreshProviderTiers)
 		mux.HandleFunc("POST /api/v1/observability/providers/refresh", s.handleAPIRefreshObservabilityProviders)
 		mux.HandleFunc("POST /api/v1/observability/providers/{provider_id}/upload-speed-test", s.handleAPIProviderUploadSpeedTest)
+		mux.HandleFunc("POST /api/v1/observability/providers/{provider_id}/refresh", s.handleAPIRefreshProvider)
 		mux.HandleFunc("GET /api/v1/observability/data-sets", s.handleAPIObservabilityDataSets)
 		mux.HandleFunc("POST /api/v1/observability/data-sets/refresh", s.handleAPIRefreshObservabilityDataSets)
 		if s.s3IAM != nil {
