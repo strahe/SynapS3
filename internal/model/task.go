@@ -35,6 +35,14 @@ const (
 	TaskTypeGC                            TaskType = "task_gc"
 )
 
+// Task subjects that repository logic finds tasks by. Definitions of tasks
+// with these subjects derive them from the task input, so the subject always
+// names the row the input names.
+const (
+	TaskSubjectStorageContent = "storage_content"
+	TaskSubjectStorageCopy    = "storage_copy"
+)
+
 // RecurringSystemTaskTypes returns the perpetual maintenance task types.
 func RecurringSystemTaskTypes() []TaskType {
 	return []TaskType{TaskTypeCacheCapacityReconcile, TaskTypeObservabilityRefresh, TaskTypeApprovedProviderRefresh, TaskTypeEndorsedProviderRefresh, TaskTypeGC}

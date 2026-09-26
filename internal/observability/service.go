@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -294,9 +295,7 @@ func (s *Service) DataSetStatesByLocalIDs(ctx context.Context, localIDs []int64)
 		if err != nil {
 			return nil, err
 		}
-		for id, state := range batch {
-			out[id] = state
-		}
+		maps.Copy(out, batch)
 	}
 	return out, nil
 }
@@ -404,9 +403,11 @@ type refreshGroup struct {
 }
 
 type refreshCall struct {
-	done               chan struct{}
-	cancel             context.CancelFunc
-	startedAt          time.Time
+	done      chan struct{}
+	cancel    context.CancelFunc
+	startedAt time.Time
+	// result is what the refresh reports back, readable once done is closed.
+	result             time.Time
 	err                error
 	cancellableWaiters int
 	detachedWaiters    int
@@ -414,24 +415,27 @@ type refreshCall struct {
 }
 
 func (g *refreshGroup) Do(ctx context.Context, timeout time.Duration, detach bool, fn func(context.Context) error) error {
-	_, err := g.do(ctx, timeout, detach, nil, func(refreshCtx context.Context, _ time.Time) error {
-		return fn(refreshCtx)
+	_, _, err := g.do(ctx, timeout, detach, nil, func(refreshCtx context.Context, _ time.Time) (time.Time, error) {
+		return time.Time{}, fn(refreshCtx)
 	})
 	return err
 }
 
-func (g *refreshGroup) DoAt(ctx context.Context, timeout time.Duration, startedAt func() time.Time, fn func(context.Context, time.Time) error) (time.Time, error) {
+// DoAt shares one refresh started at startedAt() among concurrent callers. It
+// returns that start time and the result the refresh reported, which every
+// caller that waited for completion receives.
+func (g *refreshGroup) DoAt(ctx context.Context, timeout time.Duration, startedAt func() time.Time, fn func(context.Context, time.Time) (time.Time, error)) (time.Time, time.Time, error) {
 	return g.do(ctx, timeout, false, startedAt, fn)
 }
 
-func (g *refreshGroup) do(ctx context.Context, timeout time.Duration, detach bool, startedAt func() time.Time, fn func(context.Context, time.Time) error) (time.Time, error) {
+func (g *refreshGroup) do(ctx context.Context, timeout time.Duration, detach bool, startedAt func() time.Time, fn func(context.Context, time.Time) (time.Time, error)) (time.Time, time.Time, error) {
 	if err := ctx.Err(); err != nil {
-		return time.Time{}, err
+		return time.Time{}, time.Time{}, err
 	}
 	for {
 		if !detach {
 			if err := ctx.Err(); err != nil {
-				return time.Time{}, err
+				return time.Time{}, time.Time{}, err
 			}
 		}
 		g.mu.Lock()
@@ -459,15 +463,16 @@ func (g *refreshGroup) do(ctx context.Context, timeout time.Duration, detach boo
 			g.call = call
 			g.mu.Unlock()
 
-			go g.run(call, refreshCtx, func(refreshCtx context.Context) error {
+			go g.run(call, refreshCtx, func(refreshCtx context.Context) (time.Time, error) {
 				return fn(refreshCtx, call.startedAt)
 			})
-			return call.startedAt, g.wait(ctx, call, detach)
+			result, err := g.wait(ctx, call, detach)
+			return call.startedAt, result, err
 		}
 		if call.cancelled {
 			g.mu.Unlock()
 			if err := waitForRetiredRefresh(ctx, call, detach); err != nil {
-				return time.Time{}, err
+				return time.Time{}, time.Time{}, err
 			}
 			continue
 		}
@@ -477,26 +482,29 @@ func (g *refreshGroup) do(ctx context.Context, timeout time.Duration, detach boo
 			call.cancellableWaiters++
 		}
 		g.mu.Unlock()
-		return call.startedAt, g.wait(ctx, call, detach)
+		result, err := g.wait(ctx, call, detach)
+		return call.startedAt, result, err
 	}
 }
 
-func (g *refreshGroup) wait(ctx context.Context, call *refreshCall, detach bool) error {
+// wait reports the call's result only when the call finished; a caller that
+// stops waiting first gets its own context error.
+func (g *refreshGroup) wait(ctx context.Context, call *refreshCall, detach bool) (time.Time, error) {
 	if detach {
 		// Detached refreshes ignore caller cancellation but still wait for the
 		// shared refresh to finish, so they remain active waiters until done.
 		<-call.done
 		g.releaseDetached(call)
-		return call.err
+		return call.result, call.err
 	}
 	select {
 	case <-call.done:
-		return call.err
+		return call.result, call.err
 	case <-ctx.Done():
 		if g.release(call) {
 			<-call.done
 		}
-		return ctx.Err()
+		return time.Time{}, ctx.Err()
 	}
 }
 
@@ -526,7 +534,7 @@ func (g *refreshGroup) release(call *refreshCall) bool {
 	return true
 }
 
-func (g *refreshGroup) run(call *refreshCall, ctx context.Context, fn func(context.Context) error) {
+func (g *refreshGroup) run(call *refreshCall, ctx context.Context, fn func(context.Context) (time.Time, error)) {
 	defer call.cancel()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -540,7 +548,7 @@ func (g *refreshGroup) run(call *refreshCall, ctx context.Context, fn func(conte
 		g.mu.Unlock()
 	}()
 
-	call.err = fn(ctx)
+	call.result, call.err = fn(ctx)
 }
 
 func waitForRetiredRefresh(ctx context.Context, call *refreshCall, detach bool) error {

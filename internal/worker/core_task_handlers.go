@@ -141,7 +141,7 @@ func (h *TaskHandlers) planLRUEvictions(ctx context.Context, bytesToPlan int64) 
 				taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 					Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(candidate.ContentID, generation),
 					Input:       cacheeviction.EvictInput{ContentID: candidate.ContentID, Generation: generation, AccessedAt: &accessedAt},
-					SubjectType: "storage_content", SubjectKey: strconv.FormatInt(candidate.ContentID, 10),
+					SubjectType: model.TaskSubjectStorageContent, SubjectKey: strconv.FormatInt(candidate.ContentID, 10),
 				})
 				if err != nil {
 					return err
@@ -181,6 +181,9 @@ func (h *TaskHandlers) cacheEvictHandler() taskengine.Handler {
 		Type: model.TaskTypeCacheEvict, InputVersion: 1,
 		Codec:      taskengine.StrictJSONCodec(cacheeviction.ValidateEvictInput),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
+		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input cacheeviction.EvictInput) int64 {
+			return input.ContentID
+		}),
 	}
 	return taskHandler{
 		definition: definition,
@@ -470,7 +473,7 @@ func (h *TaskHandlers) cacheDurabilityHandler() taskengine.Handler {
 			taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 				Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(candidate.ID, generation),
 				Input:       cacheeviction.EvictInput{ContentID: candidate.ID, Generation: generation},
-				SubjectType: "storage_content", SubjectKey: strconv.FormatInt(candidate.ID, 10),
+				SubjectType: model.TaskSubjectStorageContent, SubjectKey: strconv.FormatInt(candidate.ID, 10),
 			})
 			if err != nil {
 				return err
@@ -486,6 +489,9 @@ func (h *TaskHandlers) storageCleanupHandler() taskengine.Handler {
 		Type: model.TaskTypeStorageCleanup, InputVersion: 1,
 		Codec:      taskengine.StrictJSONCodec(func(input *storagecleanup.Input) error { return storagecleanup.ValidateInput(*input) }),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
+		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagecleanup.Input) int64 {
+			return input.ContentID
+		}),
 	}
 	return taskHandler{
 		definition: definition,
@@ -937,9 +943,9 @@ func (h *TaskHandlers) providerTierHandler(taskType model.TaskType, tier string)
 		var err error
 		switch taskType {
 		case model.TaskTypeApprovedProviderRefresh:
-			_, err = h.deps.Observability.RefreshApprovedProviders(ctx)
+			_, _, err = h.deps.Observability.RefreshApprovedProviders(ctx)
 		case model.TaskTypeEndorsedProviderRefresh:
-			_, err = h.deps.Observability.RefreshEndorsedProviders(ctx)
+			_, _, err = h.deps.Observability.RefreshEndorsedProviders(ctx)
 		default:
 			return taskengine.Fail(fmt.Errorf("unknown provider tier %s", tier), "invalid_tier", nil)
 		}

@@ -250,6 +250,8 @@ func baselinePostStateComplete(ctx context.Context, db bun.IDB, allowExtraTables
 		{"object_versions", "state"},
 		{"object_versions", "storage_upload_id"},
 		{"storage_data_sets", "repair_task_id"},
+		{"storage_replacements", "items_total"},
+		{"observability_collection_states", "created_at"},
 	} {
 		exists, err := columnExists(ctx, db, column.table, column.name)
 		if err != nil || exists {

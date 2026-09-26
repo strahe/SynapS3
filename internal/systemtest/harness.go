@@ -108,7 +108,7 @@ func newHarness(ctx context.Context, logger *slog.Logger, s3Address string) (_ *
 	cfg.Filecoin.DefaultCopies = config.DefaultFilecoinCopies
 	// MemoryFilecoin is injected directly; this only satisfies production settings validation.
 	cfg.Filecoin.PrivateKey = offlinePrivateKeyPlaceholder
-	cfg.Filecoin.Observability.Interval = 40 * time.Millisecond
+	cfg.Filecoin.Observability.Interval = 2 * time.Second
 	cfg.Filecoin.Observability.Timeout = time.Second
 	cfg.Filecoin.Observability.Concurrency = 3
 	cfg.Worker.Tasks = config.TaskWorkerConfig{

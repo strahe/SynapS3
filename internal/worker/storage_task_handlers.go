@@ -100,6 +100,9 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 			return storagepipeline.ValidateUploadPlanInput(*input)
 		}),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
+		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageContent, func(input storagepipeline.UploadPlanInput) int64 {
+			return input.ContentID
+		}),
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagepipeline.UploadPlanInput](execution)
@@ -1702,6 +1705,9 @@ func copyDefinition(taskType model.TaskType, retryLimit *int) taskengine.Definit
 			return storagepipeline.ValidateCopyGenerationInput(*input)
 		}),
 		RetryLimit: retryLimit, AllowRetry: false,
+		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) int64 {
+			return input.CopyID
+		}),
 	}
 }
 
@@ -1770,7 +1776,7 @@ func (h *TaskHandlers) enqueueInitialCopyTask(ctx context.Context, repos *reposi
 	input := storagepipeline.CopyGenerationInput{CopyID: copyID, Generation: generation}
 	taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 		Type: taskType, IdempotencyKey: copyTaskKey(taskType, copyID, generation), Input: input,
-		SubjectType: "storage_copy", SubjectKey: fmt.Sprintf("%d", copyID),
+		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(copyID, 10),
 	})
 	if err != nil {
 		return err
@@ -1791,7 +1797,7 @@ func (h *TaskHandlers) enqueueSuccessorCopyTask(
 	next := storagepipeline.CopyGenerationInput{CopyID: current.CopyID, Generation: current.Generation + 1}
 	taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 		Type: nextType, IdempotencyKey: copyTaskKey(nextType, next.CopyID, next.Generation), Input: next,
-		SubjectType: "storage_copy", SubjectKey: fmt.Sprintf("%d", next.CopyID),
+		SubjectType: model.TaskSubjectStorageCopy, SubjectKey: strconv.FormatInt(next.CopyID, 10),
 	})
 	if err != nil {
 		return err
@@ -2171,7 +2177,7 @@ func (h *TaskHandlers) enqueueAfterUploadEvictions(ctx context.Context, repos *r
 		taskRow, _, err := h.taskService.EnqueueInTransaction(ctx, repos, taskengine.EnqueueRequest{
 			Type: model.TaskTypeCacheEvict, IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
 			Input:       cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
-			SubjectType: "storage_content", SubjectKey: strconv.FormatInt(contentID, 10),
+			SubjectType: model.TaskSubjectStorageContent, SubjectKey: strconv.FormatInt(contentID, 10),
 		})
 		if err != nil {
 			return err

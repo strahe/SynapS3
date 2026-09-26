@@ -24,27 +24,27 @@ func (s *Server) handleAPIRefreshProviderTiers(w http.ResponseWriter, r *http.Re
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		at, err := s.observability.RefreshApprovedProviders(r.Context())
-		approved.AttemptedAt = at
+		attemptedAt, checkedAt, err := s.observability.RefreshApprovedProviders(r.Context())
+		approved.AttemptedAt = attemptedAt
 		if err != nil {
 			s.logger.Warn("api: failed to refresh approved providers", "error", err)
 			approved.Error = "Could not refresh approved providers"
 			return
 		}
 		approved.Success = true
-		approved.CheckedAt = &at
+		approved.CheckedAt = &checkedAt
 	}()
 	go func() {
 		defer wg.Done()
-		at, err := s.observability.RefreshEndorsedProviders(r.Context())
-		endorsed.AttemptedAt = at
+		attemptedAt, checkedAt, err := s.observability.RefreshEndorsedProviders(r.Context())
+		endorsed.AttemptedAt = attemptedAt
 		if err != nil {
 			s.logger.Warn("api: failed to refresh endorsed providers", "error", err)
 			endorsed.Error = "Could not refresh endorsed providers"
 			return
 		}
 		endorsed.Success = true
-		endorsed.CheckedAt = &at
+		endorsed.CheckedAt = &checkedAt
 	}()
 	wg.Wait()
 	if approved.Success || endorsed.Success {

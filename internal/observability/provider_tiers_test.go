@@ -17,18 +17,28 @@ type tierTestStore struct {
 	endorsedCalls int
 	approvedIDs   []types.OnChainID
 	endorsedIDs   []types.OnChainID
+	// storedAt is the collection time a newer snapshot already holds; zero
+	// means each write is kept at the time it was given.
+	storedAt time.Time
 }
 
-func (s *tierTestStore) RecordApprovedProviders(_ context.Context, _ time.Time, ids []types.OnChainID) error {
+func (s *tierTestStore) RecordApprovedProviders(_ context.Context, startedAt time.Time, ids []types.OnChainID) (time.Time, error) {
 	s.approvedCalls++
 	s.approvedIDs = ids
-	return nil
+	return s.stored(startedAt), nil
 }
 
-func (s *tierTestStore) RecordEndorsedProviders(_ context.Context, _ time.Time, ids []types.OnChainID) error {
+func (s *tierTestStore) RecordEndorsedProviders(_ context.Context, startedAt time.Time, ids []types.OnChainID) (time.Time, error) {
 	s.endorsedCalls++
 	s.endorsedIDs = ids
-	return nil
+	return s.stored(startedAt), nil
+}
+
+func (s *tierTestStore) stored(startedAt time.Time) time.Time {
+	if s.storedAt.IsZero() {
+		return startedAt
+	}
+	return s.storedAt
 }
 
 type tierApprovedSource struct{ ids []sdktypes.BigInt }
@@ -95,10 +105,10 @@ func TestProviderTierRefreshesAreIndependent(t *testing.T) {
 	if !service.ProviderTiersAvailable() {
 		t.Fatal("tier sources should be available")
 	}
-	if _, err := service.RefreshApprovedProviders(context.Background()); err != nil {
+	if _, _, err := service.RefreshApprovedProviders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.RefreshEndorsedProviders(context.Background()); err == nil {
+	if _, _, err := service.RefreshEndorsedProviders(context.Background()); err == nil {
 		t.Fatal("expected endorsed RPC error")
 	}
 	if store.approvedCalls != 1 || store.endorsedCalls != 0 || len(store.approvedIDs) != 0 {
@@ -113,10 +123,10 @@ func TestProviderTierRefreshAllowsEndorsedWithoutApproved(t *testing.T) {
 		EndorsedProviders: tierEndorsedSource{ids: []sdktypes.BigInt{sdktypes.NewBigInt(202)}},
 		RefreshInterval:   time.Minute,
 	})
-	if _, err := service.RefreshApprovedProviders(context.Background()); err != nil {
+	if _, _, err := service.RefreshApprovedProviders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.RefreshEndorsedProviders(context.Background()); err != nil {
+	if _, _, err := service.RefreshEndorsedProviders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.approvedIDs) != 0 || len(store.endorsedIDs) != 1 || store.endorsedIDs[0].String() != "202" {
@@ -133,10 +143,10 @@ func TestApprovedRefreshDoesNotWaitForEndorsedRead(t *testing.T) {
 		RefreshInterval:   time.Minute,
 	})
 	done := make(chan error, 1)
-	go func() { _, err := service.RefreshEndorsedProviders(context.Background()); done <- err }()
+	go func() { _, _, err := service.RefreshEndorsedProviders(context.Background()); done <- err }()
 	<-started
 	approvedDone := make(chan error, 1)
-	go func() { _, err := service.RefreshApprovedProviders(context.Background()); approvedDone <- err }()
+	go func() { _, _, err := service.RefreshApprovedProviders(context.Background()); approvedDone <- err }()
 	select {
 	case err := <-approvedDone:
 		if err != nil {
@@ -152,25 +162,31 @@ func TestApprovedRefreshDoesNotWaitForEndorsedRead(t *testing.T) {
 }
 
 func TestConcurrentApprovedRefreshSharesOneReadAndCollectionTime(t *testing.T) {
-	store := &tierTestStore{fakeStateStore: &fakeStateStore{}}
-	source := &blockingApprovedSource{started: make(chan struct{}, 1), release: make(chan struct{})}
 	checkedAt := time.Date(2026, 9, 26, 8, 0, 0, 0, time.UTC)
+	newerSnapshot := checkedAt.Add(time.Minute)
+	store := &tierTestStore{fakeStateStore: &fakeStateStore{}, storedAt: newerSnapshot}
+	source := &blockingApprovedSource{started: make(chan struct{}, 1), release: make(chan struct{})}
 	service := NewService(ServiceOptions{
 		Store: store, ApprovedProviders: source, EndorsedProviders: tierEndorsedSource{},
 		Now: func() time.Time { return checkedAt }, RefreshInterval: time.Minute,
 	})
 	type result struct {
-		at  time.Time
-		err error
+		attemptedAt time.Time
+		checkedAt   time.Time
+		err         error
 	}
 	results := make(chan result, 2)
-	go func() { at, err := service.RefreshApprovedProviders(context.Background()); results <- result{at, err} }()
+	refresh := func() {
+		attemptedAt, stored, err := service.RefreshApprovedProviders(context.Background())
+		results <- result{attemptedAt, stored, err}
+	}
+	go refresh()
 	select {
 	case <-source.started:
 	case <-time.After(time.Second):
 		t.Fatal("approved read did not start")
 	}
-	go func() { at, err := service.RefreshApprovedProviders(context.Background()); results <- result{at, err} }()
+	go refresh()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		service.approvedRefresh.mu.Lock()
@@ -187,14 +203,16 @@ func TestConcurrentApprovedRefreshSharesOneReadAndCollectionTime(t *testing.T) {
 	if waiters != 2 {
 		t.Fatalf("approved waiters = %d, want both requests sharing read", waiters)
 	}
-	if _, err := service.RefreshEndorsedProviders(context.Background()); err != nil {
+	if _, _, err := service.RefreshEndorsedProviders(context.Background()); err != nil {
 		t.Fatalf("endorsed refresh blocked by approved read: %v", err)
 	}
 	close(source.release)
 	for range 2 {
 		got := <-results
-		if got.err != nil || !got.at.Equal(checkedAt) {
-			t.Fatalf("approved result = %#v, want shared time and success", got)
+		// Both callers share the read's start and the time of the snapshot the
+		// store kept, which a newer read already held.
+		if got.err != nil || !got.attemptedAt.Equal(checkedAt) || !got.checkedAt.Equal(newerSnapshot) {
+			t.Fatalf("approved result = %#v, want shared attempt and stored time", got)
 		}
 	}
 	if source.reads.Load() != 1 || store.approvedCalls != 1 || store.endorsedCalls != 1 {

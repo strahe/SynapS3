@@ -142,6 +142,17 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("validating %s input: %w", request.Type, err)
 	}
+	subjectType, subjectKey := request.SubjectType, request.SubjectKey
+	if definition.Subject != nil {
+		subject, err := definition.Subject(canonical)
+		if err != nil {
+			return nil, fmt.Errorf("deriving %s subject: %w", request.Type, err)
+		}
+		if subjectType != "" && (subjectType != subject.Type || subjectKey != subject.Key) {
+			return nil, fmt.Errorf("%s subject %s/%s does not name its input: %w", request.Type, subjectType, subjectKey, repository.ErrInvalidInput)
+		}
+		subjectType, subjectKey = subject.Type, subject.Key
+	}
 	sum := sha256.Sum256(canonical)
 	availableAt := request.AvailableAt
 	if availableAt.IsZero() {
@@ -154,9 +165,9 @@ func (s *Service) prepare(request EnqueueRequest) (*model.Task, error) {
 		Status:    model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute,
 		AvailableAt: availableAt, RetryLimit: cloneInt(definition.RetryLimit),
 	}
-	if request.SubjectType != "" {
-		task.SubjectType = &request.SubjectType
-		task.SubjectKey = &request.SubjectKey
+	if subjectType != "" {
+		task.SubjectType = &subjectType
+		task.SubjectKey = &subjectKey
 	}
 	return task, nil
 }

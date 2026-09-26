@@ -120,9 +120,7 @@ func (b *SynapseBackend) PutObject(ctx context.Context, input s3response.PutObje
 	})
 	if err != nil {
 		admin.ObjectOperationsTotal.WithLabelValues("put", "failure").Inc()
-		if cacheCommitted {
-			b.releaseContentCacheIfUnreferenced(ctx, bucketName, content.ID, "orphaned content cache file after put tx failure")
-		}
+		b.abandonFailedWriteContent(ctx, bucketName, content.ID, cacheCommitted, "orphaned content cache file after put tx failure")
 		return s3response.PutObjectOutput{}, contentWriteError(err)
 	}
 
@@ -811,9 +809,7 @@ func (b *SynapseBackend) copyObjectVersion(ctx context.Context, input copyObject
 		})
 	})
 	if err != nil {
-		if cacheCommitted {
-			b.releaseContentCacheIfUnreferenced(ctx, input.DestinationBucket.Name, content.ID, "orphaned content cache file after copy tx failure")
-		}
+		b.abandonFailedWriteContent(ctx, input.DestinationBucket.Name, content.ID, cacheCommitted, "orphaned content cache file after copy tx failure")
 		return copyObjectVersionResult{}, contentWriteError(err)
 	}
 
@@ -1233,12 +1229,16 @@ func (b *SynapseBackend) ensureContentForBytes(
 	if bucket.DefaultCopies > 0 {
 		requestedCopies = bucket.DefaultCopies
 	}
-	return repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+	content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
 		BucketID:        bucket.ID,
 		ContentSize:     size,
 		Checksum:        checksum,
 		RequestedCopies: model.ClampStorageCopies(requestedCopies),
 	})
+	if err != nil {
+		return nil, contentWriteError(err)
+	}
+	return content, nil
 }
 
 func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *repository.Repositories, _ int64, versionID string, contentID *int64, state model.ObjectState) error {
@@ -1254,7 +1254,7 @@ func (b *SynapseBackend) enqueuePostWriteTask(ctx context.Context, repos *reposi
 			Type:           model.TaskTypeUploadPlan,
 			IdempotencyKey: storagepipeline.UploadPlanKey(*contentID),
 			Input:          storagepipeline.UploadPlanInput{ContentID: *contentID},
-			SubjectType:    "storage_content",
+			SubjectType:    model.TaskSubjectStorageContent,
 			SubjectKey:     strconv.FormatInt(*contentID, 10),
 		})
 		return err
@@ -1283,7 +1283,7 @@ func (b *SynapseBackend) enqueueEvictionTask(ctx context.Context, repos *reposit
 		Type:           model.TaskTypeCacheEvict,
 		IdempotencyKey: cacheeviction.EvictTaskKey(contentID, generation),
 		Input:          cacheeviction.EvictInput{ContentID: contentID, Generation: generation},
-		SubjectType:    "storage_content",
+		SubjectType:    model.TaskSubjectStorageContent,
 		SubjectKey:     strconv.FormatInt(contentID, 10),
 	})
 	if err != nil {
@@ -1300,7 +1300,7 @@ func (b *SynapseBackend) bindStorageCleanupTask(ctx context.Context, repos *repo
 		Type:           model.TaskTypeStorageCleanup,
 		IdempotencyKey: storagecleanup.TaskKey(cleanup.ContentID, cleanup.Generation),
 		Input:          storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
-		SubjectType:    "storage_content",
+		SubjectType:    model.TaskSubjectStorageContent,
 		SubjectKey:     strconv.FormatInt(cleanup.ContentID, 10),
 	})
 	if err != nil {
@@ -1359,6 +1359,71 @@ func (b *SynapseBackend) releaseContentCacheIfUnreferenced(ctx context.Context, 
 		contentID,
 	); err != nil {
 		b.logger.Warn(message, "bucket", bucketName, "contentID", contentID, "error", err)
+	}
+}
+
+// abandonFailedWriteContent cleans up after a write whose version transaction
+// did not commit. Content that no version has ever named is deleted with its
+// cached file; content other versions share keeps its row, and its cached
+// bytes go only if nothing names them. A discard that fails leaves the row for
+// the startup scan.
+func (b *SynapseBackend) abandonFailedWriteContent(ctx context.Context, bucketName string, contentID int64, cacheCommitted bool, message string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	discarded, err := objectdeletion.DiscardOrphanedContent(
+		cleanupCtx,
+		b.cache,
+		b.cacheGate,
+		b.cacheAccessTracker,
+		b.repos.Contents,
+		bucketName,
+		contentID,
+	)
+	if err != nil {
+		b.logger.Warn("discarding content left by a failed write", "bucket", bucketName, "contentID", contentID, "error", err)
+	}
+	if !discarded && cacheCommitted {
+		b.releaseContentCacheIfUnreferenced(ctx, bucketName, contentID, message)
+	}
+}
+
+// orphanedContentScanBatch bounds how many rows one startup page reads.
+const orphanedContentScanBatch = 500
+
+// DiscardOrphanedContents deletes content created before createdBefore that no
+// object version has ever named: rows a write left when the process stopped
+// between resolving its content and committing its version. Each content is
+// handled on its own; one that fails is logged and retried on the next start.
+func (b *SynapseBackend) DiscardOrphanedContents(ctx context.Context, createdBefore time.Time) (discarded, failed int, err error) {
+	var afterID int64
+	for {
+		page, err := b.repos.Contents.ListOrphanedContents(ctx, createdBefore, afterID, orphanedContentScanBatch)
+		if err != nil {
+			return discarded, failed, err
+		}
+		for _, orphan := range page {
+			afterID = orphan.ContentID
+			ok, err := objectdeletion.DiscardOrphanedContent(
+				ctx,
+				b.cache,
+				b.cacheGate,
+				b.cacheAccessTracker,
+				b.repos.Contents,
+				orphan.BucketName,
+				orphan.ContentID,
+			)
+			if err != nil {
+				failed++
+				b.logger.Warn("discarding orphaned content", "bucket", orphan.BucketName, "contentID", orphan.ContentID, "error", err)
+				continue
+			}
+			if ok {
+				discarded++
+			}
+		}
+		if len(page) < orphanedContentScanBatch {
+			return discarded, failed, nil
+		}
 	}
 }
 

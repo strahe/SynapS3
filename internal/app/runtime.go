@@ -94,6 +94,7 @@ type Runtime struct {
 	s3Addresses   []string
 	logger        *slog.Logger
 	shutdown      time.Duration
+	startedAt     time.Time
 
 	mu      sync.Mutex
 	running bool
@@ -106,6 +107,7 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		return nil, err
 	}
 
+	startedAt := time.Now()
 	cfg := opts.Config
 	logger := opts.Logger
 	repos := repository.NewRepositories(opts.Database)
@@ -216,7 +218,6 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		backend.WithEvictionPolicy(evictionPolicy),
 		backend.WithDefaultCopies(cfg.Filecoin.DefaultCopies),
 	)
-
 	iamService := s3iam.NewService(repos)
 	rootAccount, err := iamService.EnsureRootAccount(ctx)
 	if err != nil {
@@ -305,7 +306,26 @@ func NewRuntime(ctx context.Context, opts RuntimeOptions) (_ *Runtime, err error
 		s3Addresses:   s3Addresses,
 		logger:        logger,
 		shutdown:      shutdownTimeout,
+		startedAt:     startedAt,
 	}, nil
+}
+
+// discardOrphanedContents removes content that writes of earlier processes
+// created but never named. It runs beside live writes: each discard rechecks
+// under the content's deletion gate and row lock that no version names the
+// content, so a write of the same bytes never loses content it named and at
+// worst is asked to retry.
+func (r *Runtime) discardOrphanedContents(ctx context.Context) {
+	discarded, failed, err := r.backend.DiscardOrphanedContents(ctx, r.startedAt)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.logger.Warn("scanning content left by interrupted writes", "error", err)
+		}
+		return
+	}
+	if discarded > 0 || failed > 0 {
+		r.logger.Info("discarded content left by interrupted writes", "discarded", discarded, "failed", failed)
+	}
 }
 
 func publishUploadTaskSettlement(events admin.EventPublisher, taskRow *model.Task, transition repository.TaskTransition) {
@@ -443,6 +463,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	})
 	group.Go(func() error {
 		r.accessTracker.Run(groupCtx, r.cacheGate, r.logger)
+		return nil
+	})
+	group.Go(func() error {
+		r.discardOrphanedContents(groupCtx)
 		return nil
 	})
 	group.Go(func() error {

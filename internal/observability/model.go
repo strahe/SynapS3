@@ -1,7 +1,6 @@
 package observability
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"time"
@@ -169,8 +168,6 @@ type CollectionState struct {
 
 	CollectionType CollectionType `bun:"collection_type,pk,type:text" json:"collection_type"`
 	LastCheckedAt  time.Time      `bun:"last_checked_at,nullzero,notnull" json:"last_checked_at"`
-	CreatedAt      time.Time      `bun:"created_at,nullzero,notnull" json:"created_at"`
-	UpdatedAt      time.Time      `bun:"updated_at,nullzero,notnull" json:"updated_at"`
 }
 
 type Summary struct {
@@ -283,23 +280,4 @@ type DataSetStatePage struct {
 	Total         int            `json:"total"`
 	Limit         int            `json:"limit"`
 	Offset        int            `json:"offset"`
-}
-
-var _ bun.BeforeAppendModelHook = (*CollectionState)(nil)
-
-// BeforeAppendModel stamps the audit columns on insert. The database has no
-// timestamp default, so every row is written with one encoding instead of two
-// that sort against each other inside the same second.
-func (c *CollectionState) BeforeAppendModel(_ context.Context, query bun.Query) error {
-	if _, ok := query.(*bun.InsertQuery); !ok {
-		return nil
-	}
-	now := time.Now().UTC()
-	if c.CreatedAt.IsZero() {
-		c.CreatedAt = now
-	}
-	if c.UpdatedAt.IsZero() {
-		c.UpdatedAt = now
-	}
-	return nil
 }

@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	initialPortableSchemaFingerprint = "45c3ff37abc1d6155e03e23ad4c47a3ae2b46b8e668b358727ade95349b85c70"
+	initialPortableSchemaFingerprint = "b2116d02e38f299f1b05bc61d74aabb6e78f518d96efc9bf3d7644c0f54c376c"
 )
 
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
@@ -485,23 +485,33 @@ func TestValidateTargetRejectsObsoleteCommitLedgerShape(t *testing.T) {
 	})
 }
 
-func TestValidateTargetRejectsBaselineWithoutProviderProfiles(t *testing.T) {
-	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		ctx := t.Context()
-		migrator := NewMigrator(db)
-		if err := migrator.Init(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := migrator.Migrate(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.ExecContext(ctx, `ALTER TABLE provider_profiles RENAME TO old_provider_profiles`); err != nil {
-			t.Fatal(err)
-		}
-		if err := ValidateTarget(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
-			t.Fatalf("validate old baseline = %v, want rebuild guidance", err)
-		}
-	})
+// A database created from an earlier edit of the unreleased baseline carries a
+// shape the current baseline no longer has, and must be rebuilt.
+func TestValidateTargetRejectsEarlierBaselineShapes(t *testing.T) {
+	for name, earlierShape := range map[string]string{
+		"without provider profiles":        `ALTER TABLE provider_profiles RENAME TO old_provider_profiles`,
+		"with replacement counters":        `ALTER TABLE storage_replacements ADD COLUMN items_total INTEGER NOT NULL DEFAULT 0`,
+		"with collection audit timestamps": `ALTER TABLE observability_collection_states ADD COLUMN created_at TIMESTAMP`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+				ctx := t.Context()
+				migrator := NewMigrator(db)
+				if err := migrator.Init(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := migrator.Migrate(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.ExecContext(ctx, earlierShape); err != nil {
+					t.Fatal(err)
+				}
+				if err := ValidateTarget(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
+					t.Fatalf("validate earlier baseline = %v, want rebuild guidance", err)
+				}
+			})
+		})
+	}
 }
 
 func runMigrationBody(ctx context.Context, db *bun.DB, body migrationBody) error {

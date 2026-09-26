@@ -137,20 +137,21 @@ func TestProviderTierMembershipKeepsIndependentLastCompleteReads(t *testing.T) {
 	if profile := read(first); profile.Approved || profile.ApprovedCheckedAt != nil || profile.Endorsed || profile.EndorsedCheckedAt != nil {
 		t.Fatalf("new profile = %#v, want unknown tier membership", profile)
 	}
-	if err := repos.Observability.RecordApprovedProviders(ctx, start.Add(time.Minute), []idtypes.OnChainID{first}); err != nil {
+	if _, err := repos.Observability.RecordApprovedProviders(ctx, start.Add(time.Minute), []idtypes.OnChainID{first}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repos.Observability.RecordEndorsedProviders(ctx, start.Add(2*time.Minute), []idtypes.OnChainID{second}); err != nil {
+	if _, err := repos.Observability.RecordEndorsedProviders(ctx, start.Add(2*time.Minute), []idtypes.OnChainID{second}); err != nil {
 		t.Fatal(err)
 	}
 	if profile := read(second); profile.Approved || profile.ApprovedCheckedAt == nil || !profile.Endorsed || profile.EndorsedCheckedAt == nil {
 		t.Fatalf("independent tiers = %#v", profile)
 	}
-	if err := repos.Observability.RecordApprovedProviders(ctx, start.Add(3*time.Minute), nil); err != nil {
-		t.Fatal(err)
+	if kept, err := repos.Observability.RecordApprovedProviders(ctx, start.Add(3*time.Minute), nil); err != nil || !kept.Equal(start.Add(3*time.Minute)) {
+		t.Fatalf("newer approval read kept at %s, err=%v", kept, err)
 	}
-	if err := repos.Observability.RecordApprovedProviders(ctx, start.Add(2*time.Minute), []idtypes.OnChainID{first}); err != nil {
-		t.Fatal(err)
+	// An older read leaves the newer snapshot and reports its time.
+	if kept, err := repos.Observability.RecordApprovedProviders(ctx, start.Add(2*time.Minute), []idtypes.OnChainID{first}); err != nil || !kept.Equal(start.Add(3*time.Minute)) {
+		t.Fatalf("older approval read kept at %s, err=%v, want the newer snapshot's time", kept, err)
 	}
 	if profile := read(first); profile.Approved || profile.ApprovedCheckedAt == nil || !profile.ApprovedCheckedAt.Equal(start.Add(3*time.Minute)) {
 		t.Fatalf("empty newer approval set = %#v", profile)
@@ -165,7 +166,7 @@ func TestProviderTierMembershipKeepsIndependentLastCompleteReads(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repos.Observability.RecordApprovedProviders(ctx, start.Add(2*time.Minute), []idtypes.OnChainID{later}); err != nil {
+	if _, err := repos.Observability.RecordApprovedProviders(ctx, start.Add(2*time.Minute), []idtypes.OnChainID{later}); err != nil {
 		t.Fatal(err)
 	}
 	if profile := read(later); profile.Approved || profile.ApprovedCheckedAt == nil || !profile.ApprovedCheckedAt.Equal(start.Add(3*time.Minute)) {
@@ -179,7 +180,7 @@ func TestProviderTierSnapshotAppliesToProfileCreatedAfterRead(t *testing.T) {
 	approved := onChainID(t, "101")
 	other := onChainID(t, "202")
 	checkedAt := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
-	if err := repos.Observability.RecordApprovedProviders(ctx, checkedAt, []idtypes.OnChainID{approved}); err != nil {
+	if _, err := repos.Observability.RecordApprovedProviders(ctx, checkedAt, []idtypes.OnChainID{approved}); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []idtypes.OnChainID{approved, other} {
@@ -217,13 +218,13 @@ func TestPostgresProviderCatalogRepeatedUpsertKeepsLatestTierSnapshot(t *testing
 	if err := repos.Observability.ReplaceProviderStates(ctx, start, []observability.ProviderState{state("First")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repos.Observability.RecordApprovedProviders(ctx, start.Add(time.Minute), []idtypes.OnChainID{id}); err != nil {
+	if _, err := repos.Observability.RecordApprovedProviders(ctx, start.Add(time.Minute), []idtypes.OnChainID{id}); err != nil {
 		t.Fatal(err)
 	}
 	if err := repos.Observability.UpsertProviderObservation(ctx, start.Add(2*time.Minute), state("Second")); err != nil {
 		t.Fatal(err)
 	}
-	if err := repos.Observability.RecordApprovedProviders(ctx, start.Add(90*time.Second), nil); err != nil {
+	if _, err := repos.Observability.RecordApprovedProviders(ctx, start.Add(90*time.Second), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := repos.Observability.ReplaceProviderStates(ctx, start.Add(time.Minute), []observability.ProviderState{state("Old scan")}); err != nil {

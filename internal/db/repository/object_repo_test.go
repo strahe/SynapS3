@@ -99,21 +99,21 @@ func TestObjectRepo_CountOverviewAttention(t *testing.T) {
 		t.Fatalf("seed healthy version: %v", err)
 	}
 
-	// Two distinct ways to need attention: every copy failed, and the content
-	// carries an ingest error.
+	// Attention is the derived failure: every copy failed. An error message
+	// left on content still being retried is display text and does not count.
 	failedCopies := newObjectVersion(bucket.ID, "failed-copies.txt", "01J00000000000000000000A02", 10)
 	if _, err := createVersion(t, repos, failedCopies); err != nil {
 		t.Fatalf("seed failed-copies version: %v", err)
 	}
 	seedFailedContentCopy(t, db, repos, bucket.ID, *failedCopies.ContentID)
 
-	failedContent := newObjectVersion(bucket.ID, "failed-content.txt", "01J00000000000000000000A03", 10)
-	if _, err := createVersion(t, repos, failedContent); err != nil {
-		t.Fatalf("seed failed-content version: %v", err)
+	staleMessage := newObjectVersion(bucket.ID, "stale-message.txt", "01J00000000000000000000A03", 10)
+	if _, err := createVersion(t, repos, staleMessage); err != nil {
+		t.Fatalf("seed stale-message version: %v", err)
 	}
 	if _, err := db.NewUpdate().Model((*model.StorageContent)(nil)).
 		Set("error_message = ?", "provider failed").
-		Where("id = ?", *failedContent.ContentID).
+		Where("id = ?", *staleMessage.ContentID).
 		Exec(ctx); err != nil {
 		t.Fatalf("record content failure: %v", err)
 	}
@@ -135,8 +135,8 @@ func TestObjectRepo_CountOverviewAttention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CountOverviewAttention: %v", err)
 	}
-	if counts.NeedsAttention != 2 {
-		t.Fatalf("NeedsAttention = %d, want 2", counts.NeedsAttention)
+	if counts.NeedsAttention != 1 {
+		t.Fatalf("NeedsAttention = %d, want 1", counts.NeedsAttention)
 	}
 	if counts.Unavailable != 1 {
 		t.Fatalf("Unavailable = %d, want 1", counts.Unavailable)

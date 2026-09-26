@@ -112,6 +112,16 @@ func TestSystemProviderReplacement(t *testing.T) {
 	if source.Generation != 1 {
 		t.Fatalf("initial generation = %d, want 1", source.Generation)
 	}
+	var price struct {
+		Fingerprint    string `json:"fingerprint"`
+		SupportedToken bool   `json:"supported_token"`
+	}
+	if _, err := admin.GetJSON(t.Context(), "/api/v1/filecoin/warm-storage/price-list", &price); err != nil {
+		t.Fatal(err)
+	}
+	if !price.SupportedToken || len(price.Fingerprint) != 64 {
+		t.Fatalf("invalid system price list: %#v", price)
+	}
 	var providers struct {
 		Items []struct {
 			ProviderProfile *struct {
@@ -126,8 +136,8 @@ func TestSystemProviderReplacement(t *testing.T) {
 			profileCount++
 		}
 	}
-	if profileCount < 2 {
-		t.Fatalf("provider refresh returned %d profiles, need two for replacement", profileCount)
+	if profileCount != systemtest.MemoryFilecoinProviders {
+		t.Fatalf("provider refresh returned %d profiles, want %d", profileCount, systemtest.MemoryFilecoinProviders)
 	}
 	var tiers struct {
 		Approved struct {
@@ -138,15 +148,31 @@ func TestSystemProviderReplacement(t *testing.T) {
 	if !tiers.Approved.Success {
 		t.Fatal("approved provider list did not refresh")
 	}
-	var price struct {
-		Fingerprint    string `json:"fingerprint"`
-		SupportedToken bool   `json:"supported_token"`
+	var candidates struct {
+		Providers []struct {
+			ProviderID        string `json:"provider_id"`
+			ManualSelectable  bool   `json:"manual_selectable"`
+			ManualBlockReason string `json:"manual_block_reason"`
+			ApprovedFresh     bool   `json:"approved_fresh"`
+			PreviouslyUsed    bool   `json:"previously_used"`
+			ProviderProfile   *struct {
+				Approved bool `json:"approved"`
+			} `json:"provider_profile"`
+		} `json:"providers"`
 	}
-	if _, err := admin.GetJSON(t.Context(), "/api/v1/filecoin/warm-storage/price-list", &price); err != nil {
+	if _, err := admin.GetJSON(t.Context(),
+		fmt.Sprintf("/api/v1/buckets/%s/data-sets/%d/replacement/providers", bucket, source.ID), &candidates); err != nil {
 		t.Fatal(err)
 	}
-	if !price.SupportedToken || len(price.Fingerprint) != 64 {
-		t.Fatalf("invalid system price list: %#v", price)
+	eligibleUnused := 0
+	for _, candidate := range candidates.Providers {
+		if !candidate.PreviouslyUsed && candidate.ManualSelectable && candidate.ApprovedFresh &&
+			candidate.ProviderProfile != nil && candidate.ProviderProfile.Approved {
+			eligibleUnused++
+		}
+	}
+	if eligibleUnused != 1 {
+		t.Fatalf("eligible unused replacement providers = %d, want 1; candidates = %+v", eligibleUnused, candidates.Providers)
 	}
 
 	// One confirmation authorizes the new service, the switch, the migration,

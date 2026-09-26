@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/model"
@@ -198,7 +199,7 @@ func (r *BunTaskRepo) PreviousStoreCheckpoints(ctx context.Context, copyID, task
 	var tasks []model.Task
 	err := withTaskPayload(r.db.NewSelect().Model(&tasks)).
 		Where("task.type = ? AND task.status = ?", model.TaskTypeStorageStore, model.TaskStatusFailed).
-		Where("task.subject_type = ? AND task.subject_key = ?", "storage_copy", fmt.Sprint(copyID)).
+		Where("task.subject_type = ? AND task.subject_key = ?", model.TaskSubjectStorageCopy, strconv.FormatInt(copyID, 10)).
 		Where("task.id <> ? AND task_payload.checkpoint_json IS NOT NULL", taskID).
 		OrderExpr("task.id DESC").Scan(ctx)
 	if err != nil {
