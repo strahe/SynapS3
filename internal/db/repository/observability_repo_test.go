@@ -298,6 +298,180 @@ func TestObservabilityRepoRecordsCollectionStateForEmptyRefresh(t *testing.T) {
 	}
 }
 
+func TestObservabilityRepoKeepsNewerCompleteSnapshots(t *testing.T) {
+	assertNewerCompleteSnapshotsWin(t, testDB(t))
+}
+
+// assertNewerCompleteSnapshotsWin checks that an older complete read, whether
+// empty or not, and a replay at the stored microsecond leave the newer
+// snapshot and its collection time in place.
+func assertNewerCompleteSnapshotsWin(t *testing.T, db *bun.DB) {
+	t.Helper()
+	ctx := t.Context()
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "snapshot-order")
+	local := seedStorageDataSet(t, db, bucket.ID, "101", "1001", model.StorageDataSetStatusReady)
+	provider := onChainID(t, "101")
+	newer := time.Date(2026, 9, 26, 10, 0, 0, 123456789, time.UTC)
+	stored := newer.Truncate(time.Microsecond)
+	dataSet := func(status observability.Status) []observability.DataSetState {
+		return dataSetSnapshot(local, status)
+	}
+	providers := func(status observability.Status) []observability.ProviderState {
+		return []observability.ProviderState{{ProviderID: provider, Status: status}}
+	}
+	if err := repos.Observability.ReplaceDataSetStates(ctx, newer, dataSet(observability.StatusAvailable)); err != nil {
+		t.Fatalf("ReplaceDataSetStates newer: %v", err)
+	}
+	if err := repos.Observability.ReplaceProviderStates(ctx, newer, providers(observability.StatusAvailable)); err != nil {
+		t.Fatalf("ReplaceProviderStates newer: %v", err)
+	}
+	for _, late := range []time.Time{newer.Add(-time.Minute), newer.Add(-300 * time.Nanosecond)} {
+		for _, states := range [][]observability.DataSetState{nil, dataSet(observability.StatusUnavailable)} {
+			if err := repos.Observability.ReplaceDataSetStates(ctx, late, states); err != nil {
+				t.Fatalf("ReplaceDataSetStates at %s: %v", late, err)
+			}
+		}
+		for _, states := range [][]observability.ProviderState{nil, providers(observability.StatusUnavailable)} {
+			if err := repos.Observability.ReplaceProviderStates(ctx, late, states); err != nil {
+				t.Fatalf("ReplaceProviderStates at %s: %v", late, err)
+			}
+		}
+	}
+
+	dataSets, err := repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDataSetStates: %v", err)
+	}
+	if len(dataSets.Items) != 1 || dataSets.Items[0].Status != observability.StatusAvailable ||
+		dataSets.LastCheckedAt == nil || !dataSets.LastCheckedAt.Equal(stored) {
+		t.Fatalf("data sets = %#v, want the newer snapshot at %s", dataSets, stored)
+	}
+	providerPage, err := repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListProviderStates: %v", err)
+	}
+	if len(providerPage.Items) != 1 || providerPage.Items[0].Status != observability.StatusAvailable ||
+		providerPage.LastCheckedAt == nil || !providerPage.LastCheckedAt.Equal(stored) {
+		t.Fatalf("providers = %#v, want the newer snapshot at %s", providerPage, stored)
+	}
+}
+
+func TestObservabilityRepoReplacesObservationsStoredAheadOfTheClock(t *testing.T) {
+	assertObservationsAheadOfTheClockAreReplaced(t, testDB(t))
+}
+
+// assertObservationsAheadOfTheClockAreReplaced checks that observations written
+// while the clock ran ahead do not block those taken after it moved back.
+func assertObservationsAheadOfTheClockAreReplaced(t *testing.T, db *bun.DB) {
+	t.Helper()
+	ctx := t.Context()
+	repos := repository.NewRepositories(db)
+	bucket := seedBucket(t, db, "clock-moved-back")
+	local := seedStorageDataSet(t, db, bucket.ID, "101", "1001", model.StorageDataSetStatusReady)
+	kept, dropped := onChainID(t, "101"), onChainID(t, "102")
+	ahead := time.Now().UTC().Add(time.Hour)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	if err := repos.Observability.ReplaceDataSetStates(ctx, ahead, dataSetSnapshot(local, observability.StatusAvailable)); err != nil {
+		t.Fatalf("ReplaceDataSetStates ahead: %v", err)
+	}
+	if err := repos.Observability.ReplaceProviderStates(ctx, ahead, []observability.ProviderState{
+		{ProviderID: kept, Status: observability.StatusAvailable}, {ProviderID: dropped, Status: observability.StatusAvailable},
+	}); err != nil {
+		t.Fatalf("ReplaceProviderStates ahead: %v", err)
+	}
+	if _, err := repos.Observability.RecordApprovedProviders(ctx, ahead, nil); err != nil {
+		t.Fatalf("RecordApprovedProviders ahead: %v", err)
+	}
+
+	if err := repos.Observability.ReplaceDataSetStates(ctx, now, dataSetSnapshot(local, observability.StatusUnavailable)); err != nil {
+		t.Fatalf("ReplaceDataSetStates now: %v", err)
+	}
+	if err := repos.Observability.ReplaceProviderStates(ctx, now, []observability.ProviderState{
+		{ProviderID: kept, Status: observability.StatusUnavailable},
+	}); err != nil {
+		t.Fatalf("ReplaceProviderStates now: %v", err)
+	}
+	if checkedAt, err := repos.Observability.RecordApprovedProviders(ctx, now, nil); err != nil || !checkedAt.Equal(now) {
+		t.Fatalf("approved providers checked at %s, err=%v, want %s", checkedAt, err, now)
+	}
+
+	dataSets, err := repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDataSetStates: %v", err)
+	}
+	if len(dataSets.Items) != 1 || dataSets.Items[0].Status != observability.StatusUnavailable ||
+		dataSets.LastCheckedAt == nil || !dataSets.LastCheckedAt.Equal(now) {
+		t.Fatalf("data sets = %#v, want the snapshot at %s", dataSets, now)
+	}
+	providerPage, err := repos.Observability.ListProviderStates(ctx, observability.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListProviderStates: %v", err)
+	}
+	if len(providerPage.Items) != 1 || providerPage.Items[0].ProviderID.String() != kept.String() ||
+		providerPage.Items[0].Status != observability.StatusUnavailable ||
+		providerPage.LastCheckedAt == nil || !providerPage.LastCheckedAt.Equal(now) {
+		t.Fatalf("providers = %#v, want only provider %s from the snapshot at %s", providerPage, kept, now)
+	}
+}
+
+func TestPostgresCompleteSnapshotOrdering(t *testing.T) {
+	t.Run("newer snapshot wins", func(t *testing.T) {
+		assertNewerCompleteSnapshotsWin(t, newPostgresTaskDB(t))
+	})
+	t.Run("observations stored ahead of the clock are replaced", func(t *testing.T) {
+		assertObservationsAheadOfTheClockAreReplaced(t, newPostgresTaskDB(t))
+	})
+	t.Run("equal time keeps the first commit", func(t *testing.T) {
+		db := newPostgresTaskDB(t)
+		ctx := t.Context()
+		repos := repository.NewRepositories(db)
+		bucket := seedBucket(t, db, "snapshot-race")
+		local := seedStorageDataSet(t, db, bucket.ID, "101", "1001", model.StorageDataSetStatusReady)
+		at := time.Date(2026, 9, 26, 11, 0, 0, 0, time.UTC)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := repository.NewRepositories(tx).Observability.ReplaceDataSetStates(ctx, at, dataSetSnapshot(local, observability.StatusAvailable)); err != nil {
+			t.Fatalf("first snapshot: %v", err)
+		}
+		late := make(chan error, 1)
+		go func() {
+			late <- repos.Observability.ReplaceDataSetStates(ctx, at, dataSetSnapshot(local, observability.StatusUnavailable))
+		}()
+		select {
+		case err := <-late:
+			t.Fatalf("a snapshot at the same time finished while the first held the collection: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-late; err != nil {
+			t.Fatalf("late snapshot: %v", err)
+		}
+		page, err := repos.Observability.ListDataSetStates(ctx, observability.ListOptions{Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) != 1 || page.Items[0].Status != observability.StatusAvailable ||
+			page.LastCheckedAt == nil || !page.LastCheckedAt.Equal(at) {
+			t.Fatalf("data sets = %#v, want the first committed snapshot", page)
+		}
+	})
+}
+
+func dataSetSnapshot(local *model.StorageDataSet, status observability.Status) []observability.DataSetState {
+	return []observability.DataSetState{{
+		LocalDataSetID: local.ID, BucketID: local.BucketID, CopyIndex: local.CopyIndex,
+		ProviderID: local.ProviderID, ChainDataSetID: local.DataSetID,
+		Status: status, ReasonCodes: []observability.ReasonCode{}, Evidence: map[string]any{},
+	}}
+}
+
 func TestObservabilityRepoReplacesDataSetStatesAndFilters(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)

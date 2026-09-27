@@ -59,3 +59,41 @@ func ReleaseContentCache(
 	})
 	return outcome, releaseErr
 }
+
+type orphanDiscardRepository interface {
+	DiscardOrphanedContent(ctx context.Context, contentID int64, release func() error) (bool, error)
+}
+
+// DiscardOrphanedContent deletes content no object version has ever named,
+// together with any file cached under its key. It holds the deletion gate on
+// the content key, so it cannot interleave with a write that is committing
+// those bytes and naming the content. It reports whether the content was
+// deleted.
+func DiscardOrphanedContent(
+	ctx context.Context,
+	c cache.Cache,
+	gate *cacheaccess.Gate,
+	tracker *cacheaccess.Tracker,
+	repository orphanDiscardRepository,
+	bucketName string,
+	contentID int64,
+) (bool, error) {
+	if gate == nil {
+		panic("orphaned content discard requires a cache access gate")
+	}
+	if tracker == nil {
+		panic("orphaned content discard requires a cache access tracker")
+	}
+	cacheKey := model.ContentCacheKey(contentID)
+	var discarded bool
+	var discardErr error
+	gate.GuardDeletion(cacheKey, func() {
+		discarded, discardErr = repository.DiscardOrphanedContent(ctx, contentID, func() error {
+			return c.Delete(ctx, bucketName, cacheKey)
+		})
+		if discardErr == nil && discarded {
+			tracker.Forget(contentID)
+		}
+	})
+	return discarded, discardErr
+}

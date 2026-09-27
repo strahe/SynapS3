@@ -470,6 +470,11 @@ func NewFinalizeUploadInput(contentID int64) FinalizeUploadInput {
 
 type StorageContentRepository interface {
 	EnsureContent(ctx context.Context, input EnsureContentInput) (*model.StorageContent, error)
+	// ListOrphanedContents and DiscardOrphanedContent find and delete content
+	// no object version has ever named, left by a write whose version
+	// transaction never committed.
+	ListOrphanedContents(ctx context.Context, createdBefore time.Time, afterID int64, limit int) ([]OrphanedContent, error)
+	DiscardOrphanedContent(ctx context.Context, contentID int64, release func() error) (bool, error)
 	GetByID(ctx context.Context, contentID int64) (*model.StorageContent, error)
 	GetByIDs(ctx context.Context, contentIDs []int64) (map[int64]model.StorageContent, error)
 	GetIngressCopy(ctx context.Context, contentID int64) (*model.StorageCopy, error)
@@ -759,8 +764,10 @@ type WalletOperationRepository interface {
 }
 
 type ObservabilityRepository interface {
-	RecordApprovedProviders(context.Context, time.Time, []types.OnChainID) error
-	RecordEndorsedProviders(context.Context, time.Time, []types.OnChainID) error
+	// RecordApprovedProviders and RecordEndorsedProviders return the collection
+	// time the stored tier snapshot carries after the write.
+	RecordApprovedProviders(context.Context, time.Time, []types.OnChainID) (time.Time, error)
+	RecordEndorsedProviders(context.Context, time.Time, []types.OnChainID) (time.Time, error)
 	ProviderProfiles(context.Context, []types.OnChainID) (map[string]observability.ProviderProfile, error)
 	UpsertProviderObservation(context.Context, time.Time, observability.ProviderState) error
 	OverviewStorageStates(ctx context.Context) ([]model.StorageDataSet, []observability.ProviderState, []observability.DataSetState, *time.Time, *time.Time, error)

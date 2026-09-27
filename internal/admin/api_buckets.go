@@ -1390,7 +1390,7 @@ func (s *Server) bindStorageCleanupTask(ctx context.Context, repos *repository.R
 		Type:           model.TaskTypeStorageCleanup,
 		IdempotencyKey: storagecleanup.TaskKey(cleanup.ContentID, cleanup.Generation),
 		Input:          storagecleanup.Input{ContentID: cleanup.ContentID, Generation: cleanup.Generation},
-		SubjectType:    "storage_content",
+		SubjectType:    model.TaskSubjectStorageContent,
 		SubjectKey:     strconv.FormatInt(cleanup.ContentID, 10),
 	})
 	if err != nil {

@@ -66,15 +66,10 @@ type BunObservabilityRepo struct {
 
 func (r *BunObservabilityRepo) ReplaceProviderStates(ctx context.Context, checkedAt time.Time, states []observability.ProviderState) error {
 	return r.withTx(ctx, func(ctx context.Context, db bun.IDB) error {
-		now := time.Now().UTC()
-		checkedAt = normalizeCheckedAt(checkedAt, now)
-		var current observability.CollectionState
-		err := db.NewSelect().Model(&current).Where("collection_type = ?", observability.CollectionProviders).Scan(ctx)
-		if err != nil && err != sql.ErrNoRows {
+		checkedAt = normalizeCheckedAt(checkedAt, time.Now())
+		claimed, err := claimObservabilityCollection(ctx, db, observability.CollectionProviders, checkedAt)
+		if err != nil || !claimed {
 			return err
-		}
-		if err == nil && current.LastCheckedAt.After(checkedAt) {
-			return nil
 		}
 		for i := range states {
 			prepareProviderState(&states[i], checkedAt)
@@ -89,14 +84,13 @@ func (r *BunObservabilityRepo) ReplaceProviderStates(ctx context.Context, checke
 		for _, state := range states {
 			ids = append(ids, state.ProviderID.String())
 		}
-		deleteQuery := db.NewDelete().Model((*observability.ProviderState)(nil)).Where("last_attempt_at < ?", checkedAt)
+		deleteQuery := db.NewDelete().Model((*observability.ProviderState)(nil)).
+			Where("(last_attempt_at < ? OR last_attempt_at > ?)", checkedAt, latestPlausibleObservationTime())
 		if len(ids) > 0 {
 			deleteQuery = deleteQuery.Where("provider_id NOT IN (?)", bun.List(ids))
 		}
-		if _, err := deleteQuery.Exec(ctx); err != nil {
-			return err
-		}
-		return upsertObservabilityCollectionState(ctx, db, observability.CollectionProviders, checkedAt, now)
+		_, err = deleteQuery.Exec(ctx)
+		return err
 	})
 }
 
@@ -116,23 +110,23 @@ func upsertProviderProfile(ctx context.Context, db bun.IDB, profile *observabili
 		return nil
 	}
 	profile.LastSuccessAt = checkedAt
-	guard := upsertTimestampGuard(db, "provider_profile", "last_success_at")
+	guard, latest := upsertTimestampGuard(db, "provider_profile", "last_success_at")
 	_, err := db.NewInsert().Model(profile).On("CONFLICT (provider_id) DO UPDATE").
 		Set("name = EXCLUDED.name").Set("description = EXCLUDED.description").
 		Set("service_provider_address = EXCLUDED.service_provider_address").
 		Set("payee_address = EXCLUDED.payee_address").Set("active = EXCLUDED.active").
 		Set("service_url = EXCLUDED.service_url").Set("registry_snapshot_json = EXCLUDED.registry_snapshot_json").
 		Set("last_success_at = EXCLUDED.last_success_at").
-		Where(guard).Exec(ctx)
+		Where(guard, latest).Exec(ctx)
 	return err
 }
 
 func upsertProviderState(ctx context.Context, db bun.IDB, state *observability.ProviderState) error {
-	guard := upsertTimestampGuard(db, "provider_state", "last_attempt_at")
+	guard, latest := upsertTimestampGuard(db, "provider_state", "last_attempt_at")
 	if state.Status == observability.StatusUnknown && state.LastError != nil {
 		_, err := db.NewInsert().Model(state).On("CONFLICT (provider_id) DO UPDATE").
 			Set("last_attempt_at = EXCLUDED.last_attempt_at").Set("last_error = EXCLUDED.last_error").
-			Where(guard).Exec(ctx)
+			Where(guard, latest).Exec(ctx)
 		return err
 	}
 	_, err := db.NewInsert().Model(state).On("CONFLICT (provider_id) DO UPDATE").
@@ -141,15 +135,42 @@ func upsertProviderState(ctx context.Context, db bun.IDB, state *observability.P
 		Set("service_url = EXCLUDED.service_url").Set("health_status = EXCLUDED.health_status").
 		Set("last_checked_at = EXCLUDED.last_checked_at").Set("last_attempt_at = EXCLUDED.last_attempt_at").Set("last_error = EXCLUDED.last_error").
 		Set("evidence_json = EXCLUDED.evidence_json").
-		Where(guard).Exec(ctx)
+		Where(guard, latest).Exec(ctx)
 	return err
 }
 
-func upsertTimestampGuard(db bun.IDB, modelAlias, column string) string {
+// observationClockSkew is how far ahead of this process's clock a stored
+// observation time can be without the clock having moved back.
+const observationClockSkew = time.Minute
+
+// latestPlausibleObservationTime is the latest observation time this clock
+// could have written. A later stored time was written before the clock moved
+// back; newer observations replace it instead of waiting for the clock to
+// catch up.
+func latestPlausibleObservationTime() time.Time {
+	return time.Now().UTC().Add(observationClockSkew)
+}
+
+// upsertTimestampGuard lets an observation replace one taken at the same or an
+// earlier time. The returned time is the guard's only argument.
+func upsertTimestampGuard(db bun.IDB, modelAlias, column string) (string, time.Time) {
+	return observationTimeGuard(db, modelAlias, column, "<=")
+}
+
+// snapshotTimestampGuard orders complete snapshots strictly. A snapshot taken
+// at the stored time is the same observation replayed, so the first commit
+// stands and a late equal or older read changes nothing. The returned time is
+// the guard's only argument.
+func snapshotTimestampGuard(db bun.IDB, modelAlias, column string) (string, time.Time) {
+	return observationTimeGuard(db, modelAlias, column, "<")
+}
+
+func observationTimeGuard(db bun.IDB, modelAlias, column, op string) (string, time.Time) {
+	stored := column
 	if db.Dialect().Name() == dialect.PG {
-		return modelAlias + "." + column + " <= EXCLUDED." + column
+		stored = modelAlias + "." + column
 	}
-	return column + " <= EXCLUDED." + column
+	return "(" + stored + " " + op + " EXCLUDED." + column + " OR " + stored + " > ?)", latestPlausibleObservationTime()
 }
 
 func (r *BunObservabilityRepo) ProviderProfiles(ctx context.Context, ids []types.OnChainID) (map[string]observability.ProviderProfile, error) {
@@ -193,35 +214,50 @@ func (r *BunObservabilityRepo) ProviderProfiles(ctx context.Context, ids []types
 	return out, nil
 }
 
-func (r *BunObservabilityRepo) RecordApprovedProviders(ctx context.Context, startedAt time.Time, ids []types.OnChainID) error {
+// RecordApprovedProviders stores a complete approved-tier read and returns the
+// collection time the stored snapshot carries, which is a newer read's time
+// when that read already committed.
+func (r *BunObservabilityRepo) RecordApprovedProviders(ctx context.Context, startedAt time.Time, ids []types.OnChainID) (time.Time, error) {
 	return r.recordProviderTier(ctx, startedAt, ids, "approved")
 }
 
-func (r *BunObservabilityRepo) RecordEndorsedProviders(ctx context.Context, startedAt time.Time, ids []types.OnChainID) error {
+// RecordEndorsedProviders is RecordApprovedProviders for the endorsed tier.
+func (r *BunObservabilityRepo) RecordEndorsedProviders(ctx context.Context, startedAt time.Time, ids []types.OnChainID) (time.Time, error) {
 	return r.recordProviderTier(ctx, startedAt, ids, "endorsed")
 }
 
-func (r *BunObservabilityRepo) recordProviderTier(ctx context.Context, startedAt time.Time, ids []types.OnChainID, tier string) error {
+func (r *BunObservabilityRepo) recordProviderTier(ctx context.Context, startedAt time.Time, ids []types.OnChainID, tier string) (time.Time, error) {
 	if startedAt.IsZero() {
-		return errors.New("provider tier check time is required")
+		return time.Time{}, errors.New("provider tier check time is required")
 	}
 	providerIDs := make([]string, len(ids))
 	for i, id := range ids {
 		if id.IsZero() {
-			return errors.New("invalid provider tier ID")
+			return time.Time{}, errors.New("invalid provider tier ID")
 		}
 		providerIDs[i] = id.String()
 	}
 	encoded, err := json.Marshal(providerIDs)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
-	snapshot := &observability.ProviderTierSnapshot{Tier: tier, ProviderIDs: encoded, CheckedAt: startedAt.UTC()}
-	guard := upsertTimestampGuard(r.db, "provider_tier_snapshot", "checked_at")
-	_, err = r.db.NewInsert().Model(snapshot).On("CONFLICT (tier) DO UPDATE").
+	snapshot := &observability.ProviderTierSnapshot{Tier: tier, ProviderIDs: encoded, CheckedAt: normalizeCheckedAt(startedAt, startedAt)}
+	result, err := r.db.NewInsert().Model(snapshot).On("CONFLICT (tier) DO UPDATE").
 		Set("provider_ids_json = EXCLUDED.provider_ids_json").Set("checked_at = EXCLUDED.checked_at").
-		Where(guard).Exec(ctx)
-	return err
+		Where(snapshotTimestampGuard(r.db, "provider_tier_snapshot", "checked_at")).Exec(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return time.Time{}, err
+	} else if rows == 1 {
+		return snapshot.CheckedAt, nil
+	}
+	var stored observability.ProviderTierSnapshot
+	if err := r.db.NewSelect().Model(&stored).Column("checked_at").Where("tier = ?", tier).Scan(ctx); err != nil {
+		return time.Time{}, fmt.Errorf("reading %s provider tier time: %w", tier, err)
+	}
+	return stored.CheckedAt.UTC(), nil
 }
 
 func (r *BunObservabilityRepo) ListProviderStates(ctx context.Context, opts observability.ListOptions) (observability.ProviderStatePage, error) {
@@ -255,18 +291,18 @@ func (r *BunObservabilityRepo) ListProviderStates(ctx context.Context, opts obse
 
 func (r *BunObservabilityRepo) ReplaceDataSetStates(ctx context.Context, checkedAt time.Time, states []observability.DataSetState) error {
 	return r.withTx(ctx, func(ctx context.Context, db bun.IDB) error {
-		now := time.Now().UTC()
-		checkedAt = normalizeCheckedAt(checkedAt, now)
+		checkedAt = normalizeCheckedAt(checkedAt, time.Now())
+		claimed, err := claimObservabilityCollection(ctx, db, observability.CollectionDataSets, checkedAt)
+		if err != nil || !claimed {
+			return err
+		}
 		for i := range states {
 			prepareDataSetState(&states[i], checkedAt)
 		}
 		if _, err := db.NewDelete().Model((*observability.DataSetState)(nil)).Where("1 = 1").Exec(ctx); err != nil {
 			return err
 		}
-		if err := insertDataSetStateRows(ctx, db, states); err != nil {
-			return err
-		}
-		return upsertObservabilityCollectionState(ctx, db, observability.CollectionDataSets, checkedAt, now)
+		return insertDataSetStateRows(ctx, db, states)
 	})
 }
 
@@ -361,27 +397,37 @@ func insertDataSetStateRows(ctx context.Context, db bun.IDB, states []observabil
 	return nil
 }
 
+// normalizeCheckedAt matches the stored precision, so the time a guard compares
+// is the time the row keeps.
 func normalizeCheckedAt(checkedAt time.Time, fallback time.Time) time.Time {
 	if checkedAt.IsZero() {
-		return fallback
+		checkedAt = fallback
 	}
-	return checkedAt.UTC()
+	return checkedAt.UTC().Truncate(time.Microsecond)
 }
 
-func upsertObservabilityCollectionState(ctx context.Context, db bun.IDB, collectionType observability.CollectionType, checkedAt time.Time, now time.Time) error {
-	row := observability.CollectionState{
-		CollectionType: collectionType,
-		LastCheckedAt:  checkedAt,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}
-	_, err := db.NewInsert().
+// claimObservabilityCollection records the time of a complete snapshot before
+// any of its rows are written. It reports false when a snapshot taken at the
+// same or a later time already committed; the caller then leaves the rows
+// alone. A stored time ahead of the clock does not count as later. On
+// PostgreSQL the conflicting row stays locked for the transaction, so
+// concurrent complete snapshots of one collection commit one at a time.
+func claimObservabilityCollection(ctx context.Context, db bun.IDB, collectionType observability.CollectionType, checkedAt time.Time) (bool, error) {
+	row := observability.CollectionState{CollectionType: collectionType, LastCheckedAt: checkedAt}
+	result, err := db.NewInsert().
 		Model(&row).
 		On("CONFLICT (collection_type) DO UPDATE").
 		Set("last_checked_at = EXCLUDED.last_checked_at").
-		Set("updated_at = EXCLUDED.updated_at").
+		Where(snapshotTimestampGuard(db, "collection_state", "last_checked_at")).
 		Exec(ctx)
-	return err
+	if err != nil {
+		return false, fmt.Errorf("recording %s collection time: %w", collectionType, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("recording %s collection time: %w", collectionType, err)
+	}
+	return rows == 1, nil
 }
 
 func normalizeObservabilityPagination(opts observability.ListOptions) (int, int) {

@@ -83,7 +83,9 @@ func TestReadyBucketSchedulesOneSpeedTestWhenProviderBecomesAvailable(t *testing
 	if second, err := repos.ProviderUploadSpeed.Get(t.Context(), "102"); err != nil || second != nil {
 		t.Fatalf("unavailable provider test = %#v, err=%v", second, err)
 	}
-	if err := repos.Observability.ReplaceProviderStates(t.Context(), now, states); err != nil {
+	// The next complete scan starts later; a scan at the same time would be the
+	// first one replayed.
+	if err := repos.Observability.ReplaceProviderStates(t.Context(), now.Add(time.Second), states); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.scheduleMissingProviderSpeedTests(t.Context()); err != nil {

@@ -3822,6 +3822,41 @@ func seedWalletTask(t *testing.T, runtime handlerTestRuntime, requestID string) 
 	return operation, taskRow
 }
 
+// Content and copy tasks are found by subject when bytes are deleted or a Store
+// checkpoint is adopted, so an enqueue whose subject names another row than
+// its input is refused before anything is stored.
+func TestContentAndCopyTasksRefuseSubjectsNamingAnotherRow(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			if err := handlers.RegisterCore(registry); err != nil {
+				return err
+			}
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	for _, request := range []taskengine.EnqueueRequest{
+		{
+			Type: model.TaskTypeUploadPlan, IdempotencyKey: storagepipeline.UploadPlanKey(7),
+			Input:       storagepipeline.UploadPlanInput{ContentID: 7},
+			SubjectType: model.TaskSubjectStorageContent, SubjectKey: "8",
+		},
+		{
+			Type: model.TaskTypeStorageCleanup, IdempotencyKey: "cleanup-7",
+			Input:       storagecleanup.Input{ContentID: 7, Generation: 1},
+			SubjectType: model.TaskSubjectStorageContent, SubjectKey: "8",
+		},
+		{
+			Type: model.TaskTypeStorageStore, IdempotencyKey: "store-7",
+			Input:       storagepipeline.CopyGenerationInput{CopyID: 7, Generation: 1},
+			SubjectType: model.TaskSubjectStorageCopy, SubjectKey: "8",
+		},
+	} {
+		if _, _, err := runtime.service.Enqueue(t.Context(), request); !errors.Is(err, repository.ErrInvalidInput) {
+			t.Errorf("%s naming another row = %v, want invalid input", request.Type, err)
+		}
+	}
+}
+
 func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing.T) {
 	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
@@ -3900,7 +3935,6 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	if _, err := runtime.db.NewUpdate().
 		Model((*storagereplacement.Replacement)(nil)).
 		Set("seeding_complete = ?", true).
-		Set("items_total = ?", 1).
 		Where("id = ?", replacement.ID).
 		Exec(ctx); err != nil {
 		t.Fatalf("complete replacement seeding: %v", err)
@@ -4048,7 +4082,7 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 				t.Fatalf("insert replacement item: %v", err)
 			}
 			if _, err := runtime.db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
-				Set("seeding_complete = ?", true).Set("items_total = ?", 1).
+				Set("seeding_complete = ?", true).
 				Where("id = ?", replacement.ID).Exec(ctx); err != nil {
 				t.Fatalf("complete replacement seeding: %v", err)
 			}

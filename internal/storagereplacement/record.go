@@ -29,10 +29,6 @@ type Replacement struct {
 	WaitReason           *WaitReason      `bun:"type:text,nullzero"`
 	FailureReason        *FailureReason   `bun:"type:text,nullzero"`
 	LastError            *string          `bun:"type:text,nullzero"`
-	// ItemsTotal and ItemsCopied are maintained inside the transactions that
-	// seed and complete items, so progress never needs a history-sized count.
-	ItemsTotal  int `bun:"type:integer,notnull,default:0"`
-	ItemsCopied int `bun:"type:integer,notnull,default:0"`
 	// SeedCursorContentID advances through storage uploads in bounded batches so
 	// no single transaction scales with retained bucket history.
 	SeedCursorContentID int64     `bun:",notnull,default:0"`

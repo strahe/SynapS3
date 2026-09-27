@@ -43,7 +43,7 @@ func TestReplacementCandidatesAndSubmitRejectStaleHealth(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.srv.repos.Observability.RecordApprovedProviders(context.Background(), now, []idtypes.OnChainID{onChainIDValue("202")}); err != nil {
+	if _, err := fixture.srv.repos.Observability.RecordApprovedProviders(context.Background(), now, []idtypes.OnChainID{onChainIDValue("202")}); err != nil {
 		t.Fatal(err)
 	}
 	rec := fixture.listProviders(t)

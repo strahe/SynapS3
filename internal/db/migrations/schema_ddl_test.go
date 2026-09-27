@@ -44,7 +44,7 @@ func TestFrozenBaselineDDLUsesNativeIdentityAndExplicitTypes(t *testing.T) {
 	assertDDLContains(t, postgresTaskPayloadDDL, `"input_json" jsonb not null`, `"checkpoint_json" jsonb`)
 	assertDDLNotContains(t, postgresTaskPayloadDDL, `"checkpoint_json" jsonb not null`)
 	assertDDLContains(t, postgresDataSetDDL, `"generation" bigint not null default 1`, `"copy_index" integer not null`)
-	assertDDLContains(t, postgresReplacementDDL, `"items_total" integer not null default 0`, `"items_copied" integer not null default 0`)
+	assertDDLContains(t, postgresReplacementDDL, `"copy_index" integer not null`, `"seed_cursor_content_id" bigint not null default 0`)
 	assertDDLContains(t, postgresObjectVersionDDL, `"metadata" jsonb not null default '{}'`)
 	assertDDLContains(t, postgresMultipartDDL, `primary key ("upload_id")`)
 	assertDDLNotContains(t, postgresMultipartDDL, `"id" bigint`)
@@ -63,7 +63,7 @@ func TestFrozenBaselineDDLUsesNativeIdentityAndExplicitTypes(t *testing.T) {
 	assertDDLContains(t, sqliteTaskDDL, `"type" text not null`, `"input_version" integer not null`, `"retry_limit" integer`)
 	assertDDLNotContains(t, sqliteTaskDDL, `"retry_limit" integer not null`)
 	assertDDLContains(t, sqliteDataSetDDL, `"generation" integer not null default 1`, `"copy_index" integer not null`)
-	assertDDLContains(t, sqliteReplacementDDL, `"items_total" integer not null default 0`, `"items_copied" integer not null default 0`)
+	assertDDLContains(t, sqliteReplacementDDL, `"copy_index" integer not null`, `"seed_cursor_content_id" integer not null default 0`)
 	assertDDLContains(t, sqliteMultipartDDL, `primary key ("upload_id")`)
 	assertDDLNotContains(t, sqliteMultipartDDL, `"id" integer`)
 }
@@ -82,7 +82,7 @@ func TestSQLiteBaselineJSONUsesTextAndValidatesShape(t *testing.T) {
 		"observability_provider_states": {"reason_codes", "evidence_json"},
 		"observability_data_set_states": {"reason_codes", "evidence_json"},
 	} {
-		applied := appliedSQLiteColumns(t, db, table)
+		applied := appliedTableColumns(t, db, table)
 		for _, name := range columns {
 			found := false
 			for _, column := range applied {

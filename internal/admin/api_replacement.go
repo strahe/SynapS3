@@ -515,7 +515,7 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 		})
 	case errors.Is(err, storagereplacement.ErrNoEligibleProvider):
 		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "no unused storage provider is available right now",
+			"error": "no provider is currently eligible for automatic replacement",
 			"code":  code,
 		})
 	case errors.Is(err, storagereplacement.ErrTargetUnavailable):
@@ -591,8 +591,8 @@ func (s *Server) providerReplacementResponseWithProgress(
 		SelectionMode: string(row.SelectionMode),
 		Source:        replacementDataSetView(source, identities),
 		Target:        replacementDataSetView(target, identities),
-		ItemsTotal:    row.ItemsTotal,
-		ItemsCopied:   row.ItemsCopied,
+		ItemsTotal:    progress.ItemsTotal,
+		ItemsCopied:   progress.ItemsCopied,
 		Progress: &replacementProgressResponse{
 			Scope: "provider_replacement", Phase: string(progress.Phase), SeedingComplete: progress.SeedingComplete,
 			ItemsTotal: progress.ItemsTotal, ItemsProcessed: progress.ItemsProcessed,

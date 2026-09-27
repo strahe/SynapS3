@@ -115,7 +115,7 @@ func (r *BunCacheEvictionRepo) PrepareEviction(ctx context.Context, contentID in
 			cacheeviction.ValidateEvictInput(&taskInput) != nil ||
 			taskInput.ContentID != contentID || taskInput.Generation != entry.CacheOperationGeneration ||
 			taskRow.IdempotencyKey != cacheeviction.EvictTaskKey(contentID, entry.CacheOperationGeneration) ||
-			taskRow.SubjectType == nil || *taskRow.SubjectType != "storage_content" ||
+			taskRow.SubjectType == nil || *taskRow.SubjectType != model.TaskSubjectStorageContent ||
 			taskRow.SubjectKey == nil || *taskRow.SubjectKey != expectedSubjectKey {
 			return CacheEvictionReservation{}, ErrConflict
 		}

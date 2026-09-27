@@ -649,6 +649,35 @@ func TestNew_SQLiteMemoryDSNAppliesManagedConnectionPragmas(t *testing.T) {
 	}
 }
 
+func TestNew_SQLiteRefusesDSNsWithoutForeignKeyEnforcement(t *testing.T) {
+	t.Parallel()
+
+	for name, setting := range map[string]string{
+		"pragma off":      "_pragma=foreign_keys(0)",
+		"pragma word off": "_pragma=foreign_keys(off)",
+		"assignment off":  "foreign_keys=off",
+		// The driver ignores this form, so enforcement stays off.
+		"assignment on": "foreign_keys=1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			db, err := New(config.DatabaseConfig{
+				Driver:       "sqlite",
+				DSN:          "file:foreign-keys-" + strings.ReplaceAll(name, " ", "-") + "?mode=memory&cache=shared&" + setting,
+				MaxOpenConns: 1,
+				MaxIdleConns: 1,
+			})
+			if db != nil {
+				_ = db.Close()
+			}
+			if !errors.Is(err, errSQLiteForeignKeysOff) {
+				t.Fatalf("New() error = %v, want foreign key enforcement refused", err)
+			}
+		})
+	}
+}
+
 func TestEnsureSQLitePragmasDoesNotDuplicateExistingSettings(t *testing.T) {
 	for name, query := range map[string]string{
 		"pragma":     "_pragma=journal_mode(WAL)&_pragma=busy_timeout(7000)&_pragma=foreign_keys(1)",

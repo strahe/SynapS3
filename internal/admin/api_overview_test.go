@@ -368,6 +368,12 @@ func overviewSeedFailedCopy(t *testing.T, db *bun.DB, repos *repository.Reposito
 	}}); err != nil {
 		t.Fatalf("seed failed copy: %v", err)
 	}
+	if _, err := db.NewUpdate().Model((*model.StorageCopy)(nil)).
+		Set("status = ?", model.StorageCopyStatusFailed).
+		Where("content_id = ?", contentID).
+		Exec(ctx); err != nil {
+		t.Fatalf("fail seeded copy: %v", err)
+	}
 	if _, err := db.NewUpdate().Model((*model.StorageContent)(nil)).
 		Set("error_message = ?", "ingest failed").
 		Where("id = ?", contentID).

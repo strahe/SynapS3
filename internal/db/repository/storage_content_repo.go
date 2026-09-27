@@ -21,10 +21,17 @@ type BunStorageContentRepo struct {
 
 var _ StorageContentRepository = (*BunStorageContentRepo)(nil)
 
+// ensureContentAttempts bounds how often EnsureContent inserts again after the
+// row it conflicted with was deleted before it could be read.
+const ensureContentAttempts = 3
+
 // EnsureContent returns the content row for one byte payload in a bucket,
 // creating it if this is the first time those bytes are written.
-// A uniqueness conflict returns the existing row without changing its frozen
-// requested-copy target.
+// A uniqueness conflict returns the existing row. Its requested-copy target
+// stays frozen once a version has named the content; a row no version has
+// named yet takes the target of this write. A finishing cleanup or the discard
+// of a failed write can delete the conflicting row before it is read; the
+// insert is then tried again.
 func (r *BunStorageContentRepo) EnsureContent(ctx context.Context, input EnsureContentInput) (*model.StorageContent, error) {
 	if input.BucketID <= 0 || input.ContentSize < 0 || !validStorageContentChecksum(input.Checksum) {
 		return nil, fmt.Errorf("ensuring storage content: %w", ErrInvalidInput)
@@ -33,25 +40,32 @@ func (r *BunStorageContentRepo) EnsureContent(ctx context.Context, input EnsureC
 	if !model.ValidStorageCopies(requestedCopies) {
 		return nil, fmt.Errorf("requested copies must be between %d and %d, got %d", model.StorageCopiesMin, model.StorageCopiesMax, requestedCopies)
 	}
-	content := &model.StorageContent{
-		BucketID:        input.BucketID,
-		Checksum:        input.Checksum,
-		ContentSize:     input.ContentSize,
-		RequestedCopies: requestedCopies,
-	}
-	if _, err := r.db.NewInsert().Model(content).Exec(ctx); err != nil {
-		if isUniqueViolation(err) {
-			existing, selectErr := r.findContentByBytes(ctx, input.BucketID, input.Checksum, input.ContentSize)
-			if selectErr != nil {
-				return nil, selectErr
-			}
-			if existing != nil {
-				return existing, nil
-			}
+	for range ensureContentAttempts {
+		content := &model.StorageContent{
+			BucketID:        input.BucketID,
+			Checksum:        input.Checksum,
+			ContentSize:     input.ContentSize,
+			RequestedCopies: requestedCopies,
 		}
-		return nil, fmt.Errorf("ensuring storage content: %w", err)
+		_, err := r.db.NewInsert().Model(content).Exec(ctx)
+		if err == nil {
+			return content, nil
+		}
+		if !isUniqueViolation(err) {
+			return nil, fmt.Errorf("ensuring storage content: %w", err)
+		}
+		existing, err := r.findContentByBytes(ctx, input.BucketID, input.Checksum, input.ContentSize)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			if err := r.adoptRequestedCopies(ctx, existing, requestedCopies); err != nil {
+				return nil, err
+			}
+			return existing, nil
+		}
 	}
-	return content, nil
+	return nil, fmt.Errorf("ensuring storage content: %w", ErrContentCleanupInProgress)
 }
 
 func validStorageContentChecksum(checksum string) bool {

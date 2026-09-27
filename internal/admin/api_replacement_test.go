@@ -105,7 +105,7 @@ func newReplacementAPIFixtureWithHealth(t *testing.T, selector providerReplaceme
 					t.Fatalf("Seed provider health: %v", err)
 				}
 			}
-			if err := srv.repos.Observability.RecordApprovedProviders(ctx, time.Now().UTC(), ids); err != nil {
+			if _, err := srv.repos.Observability.RecordApprovedProviders(ctx, time.Now().UTC(), ids); err != nil {
 				t.Fatalf("Seed approval: %v", err)
 			}
 		}
@@ -238,7 +238,7 @@ func TestReplacementAutomaticSkipsPreviouslyUsedRetiredProvider(t *testing.T) {
 
 func TestReplacementManualAllowsFreshNegativeApprovalCache(t *testing.T) {
 	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
-	err := fixture.srv.repos.Observability.RecordApprovedProviders(context.Background(), time.Now().UTC(), nil)
+	_, err := fixture.srv.repos.Observability.RecordApprovedProviders(context.Background(), time.Now().UTC(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

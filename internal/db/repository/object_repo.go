@@ -881,7 +881,8 @@ func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAtten
 	var count ObjectAttentionCount
 	// Pipeline position and cache residency are derived from the content's
 	// copies and its cache entry, so the counts read those rather than columns
-	// object_versions no longer owns.
+	// object_versions no longer owns. A content's error message is display text
+	// and can outlive the failure it describes, so it does not count here.
 	query := `WITH current_versions AS (
 			SELECT object_version.version_id,
 			       object_version.content_id,
@@ -896,11 +897,9 @@ func (r *BunObjectRepo) CountOverviewAttention(ctx context.Context) (ObjectAtten
 			  AND object_version.is_delete_marker = ?
 		)
 		SELECT
-			COALESCE(SUM(CASE WHEN current_version.state = ? OR version_content.error_message IS NOT NULL THEN 1 ELSE 0 END), 0) AS needs_attention,
+			COALESCE(SUM(CASE WHEN current_version.state = ? THEN 1 ELSE 0 END), 0) AS needs_attention,
 			COALESCE(SUM(CASE WHEN current_version.in_cache = ? AND NOT ` + usableCopyExistsSQL("current_version.content_id") + ` THEN 1 ELSE 0 END), 0) AS unavailable
-		FROM current_versions AS current_version
-		LEFT JOIN storage_contents AS version_content
-		  ON version_content.id = current_version.content_id`
+		FROM current_versions AS current_version`
 	err := r.db.NewRaw(query,
 		false,
 		model.ObjectStateFailed,
@@ -1131,7 +1130,7 @@ func prepareObjectVersionsForPermanentDelete(
 	taskQuery := db.NewSelect().
 		Model(&relatedTasks).
 		Column("id", "status").
-		Where("subject_type = ? AND subject_key IN (?)", "storage_content", bun.List(contentSubjectKeys)).
+		Where("subject_type = ? AND subject_key IN (?)", model.TaskSubjectStorageContent, bun.List(contentSubjectKeys)).
 		OrderExpr("id ASC")
 	if db.Dialect().Name() == dialect.PG {
 		taskQuery = taskQuery.For("UPDATE")

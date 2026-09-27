@@ -172,6 +172,39 @@ func TestServiceCanonicalEnqueueAndConflict(t *testing.T) {
 	}
 }
 
+func TestServiceDerivesDeclaredSubjectFromInput(t *testing.T) {
+	type rowInput struct {
+		RowID int64 `json:"row_id"`
+	}
+	definition := testDefinition(nil, false)
+	definition.Codec = StrictJSONCodec[rowInput](nil)
+	definition.Subject = SubjectFromInput("test_row", func(input rowInput) int64 { return input.RowID })
+	harness := newTaskHarness(t, scriptedHandler{definition: definition}, nil)
+
+	derived, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
+		Type: testTaskType, IdempotencyKey: "derived", Input: rowInput{RowID: 7},
+	})
+	if err != nil || derived.SubjectType == nil || *derived.SubjectType != "test_row" || derived.SubjectKey == nil || *derived.SubjectKey != "7" {
+		t.Fatalf("derived subject task = %#v, err=%v, want test_row/7", derived, err)
+	}
+	if _, _, err := harness.service.Enqueue(t.Context(), EnqueueRequest{
+		Type: testTaskType, IdempotencyKey: "matching", Input: rowInput{RowID: 8},
+		SubjectType: "test_row", SubjectKey: "8",
+	}); err != nil {
+		t.Fatalf("enqueue with the input's own subject: %v", err)
+	}
+	_, _, err = harness.service.Enqueue(t.Context(), EnqueueRequest{
+		Type: testTaskType, IdempotencyKey: "mismatched", Input: rowInput{RowID: 9},
+		SubjectType: "test_row", SubjectKey: "10",
+	})
+	if !errors.Is(err, repository.ErrInvalidInput) {
+		t.Fatalf("enqueue naming another row = %v, want invalid input", err)
+	}
+	if stored, err := harness.repos.Tasks.GetByIdentity(t.Context(), testTaskType, "mismatched"); err != nil || stored != nil {
+		t.Fatalf("refused task = %#v, err=%v, want nothing stored", stored, err)
+	}
+}
+
 func TestServiceWakeMakesFuturePendingTaskReady(t *testing.T) {
 	limit := 5
 	harness := newTaskHarness(t, scriptedHandler{definition: testDefinition(&limit, true)}, nil)

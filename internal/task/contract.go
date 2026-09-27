@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/strahe/synaps3/internal/db/repository"
@@ -97,6 +98,35 @@ type Definition struct {
 	// OnEngineFailure settles domain state when the engine fails a claim before
 	// the handler can return its own result.
 	OnEngineFailure func(*model.Task, string) Settlement
+	// Subject derives the task's subject from its canonical input. Types whose
+	// tasks repository logic finds by subject declare it; enqueue then fills
+	// the subject and refuses one that names a different row.
+	Subject SubjectFunc
+}
+
+// Subject names the domain row a task works on.
+type Subject struct {
+	Type string
+	Key  string
+}
+
+// SubjectFunc derives a task's subject from its canonical input.
+type SubjectFunc func(canonical json.RawMessage) (Subject, error)
+
+// SubjectFromInput decodes the canonical input as T and names the row id
+// returns, keyed by its decimal ID.
+func SubjectFromInput[T any](subjectType string, id func(T) int64) SubjectFunc {
+	return func(canonical json.RawMessage) (Subject, error) {
+		var value T
+		if err := json.Unmarshal(canonical, &value); err != nil {
+			return Subject{}, fmt.Errorf("decoding task subject: %w", err)
+		}
+		rowID := id(value)
+		if rowID <= 0 {
+			return Subject{}, errors.New("task subject ID must be positive")
+		}
+		return Subject{Type: subjectType, Key: strconv.FormatInt(rowID, 10)}, nil
+	}
 }
 
 func (d Definition) manualRetryAllowed(task *model.Task) bool {

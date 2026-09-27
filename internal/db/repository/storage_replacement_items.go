@@ -90,7 +90,6 @@ func (r *BunStorageReplacementRepo) SeedMigrationBatch(
 		query := db.NewUpdate().
 			Model((*storagereplacement.Replacement)(nil)).
 			Set("seed_cursor_content_id = ?", cursor).
-			Set("items_total = items_total + ?", inserted).
 			Set("updated_at = ?", time.Now()).
 			Where("id = ? AND seed_cursor_content_id = ?", row.ID, row.SeedCursorContentID)
 		if done {
@@ -354,11 +353,12 @@ func settleReplacementItem(
 		return ErrConflict
 	}
 	if status == storagereplacement.ItemStatusCopied {
+		// Progress is counted from the items; a copied item still counts as
+		// activity on the replacement.
 		_, err = db.NewUpdate().
 			Model((*storagereplacement.Replacement)(nil)).
-			Set("items_copied = items_copied + 1").
 			Set("updated_at = ?", now).
-			Where("id = ? AND items_copied < items_total", item.ReplacementID).
+			Where("id = ?", item.ReplacementID).
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("recording replacement progress: %w", err)

@@ -2,13 +2,18 @@ package migrations
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
+	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/migrate"
+
+	_ "modernc.org/sqlite"
 )
 
 // Bun stores the numeric migration name and derives "initial_schema" as its
@@ -20,36 +25,6 @@ var ErrIncompatibleDatabase = errors.New("database contains an incompatible Syna
 // Migrations is the global registry of database migrations.
 var Migrations = migrate.NewMigrations()
 
-var initialSchemaTableNames = []string{
-	"bucket_replica_slots",
-	"buckets",
-	"multipart_parts",
-	"multipart_uploads",
-	"object_cache",
-	"object_deletions",
-	"object_versions",
-	"objects",
-	"observability_collection_states",
-	"observability_data_set_states",
-	"observability_provider_states",
-	"provider_profiles",
-	"provider_tier_snapshots",
-	"provider_upload_speed_tests",
-	"s3_accounts",
-	"storage_cleanup_copies",
-	"storage_commit_attempts",
-	"storage_contents",
-	"storage_copies",
-	"storage_data_set_terminations",
-	"storage_data_sets",
-	"storage_pull_attempts",
-	"storage_replacement_items",
-	"storage_replacements",
-	"task_payloads",
-	"tasks",
-	"wallet_operations",
-}
-
 type migrationBody func(context.Context, bun.IDB) error
 
 // NewMigrator is the only supported migrator constructor. Migration markers
@@ -58,48 +33,33 @@ func NewMigrator(db *bun.DB) *migrate.Migrator {
 	return newMigrator(db, Migrations)
 }
 
-// ValidateTarget accepts an empty application database or a database whose
-// applied migrations and schema match the current unreleased baseline.
+// ValidateTarget refuses, before anything is written, a database that is not
+// this application's: its recorded migrations must be an ordered prefix of the
+// registry and its schema what they build, and without the marker table it
+// must hold no application tables.
 func ValidateTarget(ctx context.Context, db bun.IDB) error {
-	if err := validateTarget(ctx, db, Migrations); err != nil {
-		return err
-	}
-	markerExists, err := tableExists(ctx, db, "bun_migrations")
-	if err != nil || !markerExists {
-		return err
-	}
-	var names []string
-	if err := db.NewRaw("SELECT name FROM bun_migrations ORDER BY id").Scan(ctx, &names); err != nil {
-		return err
-	}
-	if len(names) == 0 {
-		return nil
-	}
-	statusURLExists, err := columnExists(ctx, db, "storage_commit_attempts", "status_url")
-	if err != nil {
-		return fmt.Errorf("checking commit status URL column: %w", err)
-	}
-	oldJSONExists, err := columnExists(ctx, db, "storage_commit_attempts", "submission_json")
-	if err != nil {
-		return fmt.Errorf("checking obsolete commit submission column: %w", err)
-	}
-	if !statusURLExists || oldJSONExists {
-		return incompatibleDatabaseError()
-	}
-	benchmarkExists, err := tableExists(ctx, db, "provider_upload_speed_tests")
-	if err != nil {
-		return fmt.Errorf("checking provider upload speed tests: %w", err)
-	}
-	if !benchmarkExists {
-		return incompatibleDatabaseError()
-	}
-	return nil
+	return validateTarget(ctx, db, Migrations)
+}
+
+// ValidateCurrentSchema requires exactly the schema the registered migrations
+// build, so the process never runs against a schema it was not built for.
+func ValidateCurrentSchema(ctx context.Context, db bun.IDB) error {
+	return validateSchema(ctx, db, Migrations, len(Migrations.Sorted()))
 }
 
 func validateTarget(ctx context.Context, db bun.IDB, registry *migrate.Migrations) error {
 	if !validMigrationRegistry(registry) {
 		return incompatibleDatabaseError()
 	}
+	// The markers and the schema come from one snapshot, so a runner migrating
+	// at the same time cannot make them disagree.
+	options := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
+	return db.RunInTx(ctx, options, func(ctx context.Context, tx bun.Tx) error {
+		return validateTargetSnapshot(ctx, tx, registry)
+	})
+}
+
+func validateTargetSnapshot(ctx context.Context, db bun.IDB, registry *migrate.Migrations) error {
 	markerExists, err := tableExists(ctx, db, "bun_migrations")
 	if err != nil {
 		return fmt.Errorf("checking migration metadata: %w", err)
@@ -109,28 +69,18 @@ func validateTarget(ctx context.Context, db bun.IDB, registry *migrate.Migration
 		if err := db.NewRaw("SELECT name FROM bun_migrations ORDER BY id").Scan(ctx, &names); err != nil {
 			return fmt.Errorf("reading migration metadata: %w", err)
 		}
-		if len(names) == 0 {
-			complete, err := initialSchemaPostStateComplete(ctx, db)
-			if err != nil {
-				return fmt.Errorf("checking initial schema post-state: %w", err)
-			}
-			if complete {
-				return nil
-			}
-		} else if appliedMigrationPrefix(names, registry) {
-			complete, err := baselinePostStateComplete(ctx, db, true)
-			if err != nil {
-				return fmt.Errorf("checking baseline schema: %w", err)
-			}
-			if !complete {
-				return incompatibleDatabaseError()
-			}
-			return nil
-		} else {
+		if !appliedMigrationPrefix(names, registry) {
 			return incompatibleDatabaseError()
 		}
+		err := validateSchema(ctx, db, registry, len(names))
+		// Bun records a migration only after it commits, so a crash in between
+		// leaves the next migration's schema; that migration reruns as a no-op.
+		if errors.Is(err, ErrIncompatibleDatabase) && len(names) < len(registry.Sorted()) &&
+			validateSchema(ctx, db, registry, len(names)+1) == nil {
+			return nil
+		}
+		return err
 	}
-
 	count, err := applicationTableCount(ctx, db)
 	if err != nil {
 		return fmt.Errorf("checking database contents: %w", err)
@@ -139,6 +89,57 @@ func validateTarget(ctx context.Context, db bun.IDB, registry *migrate.Migration
 		return incompatibleDatabaseError()
 	}
 	return nil
+}
+
+// validateSchema requires exactly the schema the first level registered
+// migrations build. The expected schema comes from running them on a private
+// in-memory SQLite database; PostgreSQL is compared on what the two dialects
+// share.
+func validateSchema(ctx context.Context, db bun.IDB, registry *migrate.Migrations, level int) error {
+	portable := db.Dialect().Name() == dialect.PG
+	got, err := describeSchema(ctx, db, portable)
+	if err != nil {
+		return fmt.Errorf("describing database schema: %w", err)
+	}
+	want, err := referenceSchema(ctx, registry, level, portable)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(got, want) {
+		return incompatibleSchemaError(want, got)
+	}
+	return nil
+}
+
+// referenceSchema describes the schema the first level registered migrations
+// build on a new private in-memory SQLite database.
+func referenceSchema(ctx context.Context, registry *migrate.Migrations, level int, portable bool) ([]string, error) {
+	if level == 0 {
+		return nil, nil
+	}
+	sqldb, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return nil, fmt.Errorf("opening schema reference: %w", err)
+	}
+	sqldb.SetMaxOpenConns(1)
+	reference := bun.NewDB(sqldb, sqlitedialect.New())
+	defer func() { _ = reference.Close() }()
+	applied := migrate.NewMigrations()
+	for _, migration := range registry.Sorted()[:level] {
+		applied.Add(migration)
+	}
+	migrator := newMigrator(reference, applied)
+	if err := migrator.Init(ctx); err != nil {
+		return nil, fmt.Errorf("building schema reference: %w", err)
+	}
+	if _, err := migrator.Migrate(ctx); err != nil {
+		return nil, fmt.Errorf("building schema reference: %w", err)
+	}
+	schema, err := describeSchema(ctx, reference, portable)
+	if err != nil {
+		return nil, fmt.Errorf("describing schema reference: %w", err)
+	}
+	return schema, nil
 }
 
 func appliedMigrationPrefix(names []string, registry *migrate.Migrations) bool {
@@ -192,85 +193,47 @@ func applicationTableNames(ctx context.Context, db bun.IDB) ([]string, error) {
 	return names, nil
 }
 
+// initialSchemaPostStateComplete reports whether the database holds exactly
+// the schema the baseline builds, which lets it repair a marker Bun lost after
+// its DDL committed.
 func initialSchemaPostStateComplete(ctx context.Context, db bun.IDB) (bool, error) {
-	return baselinePostStateComplete(ctx, db, false)
-}
-
-func baselinePostStateComplete(ctx context.Context, db bun.IDB, allowExtraTables bool) (bool, error) {
-	tables, err := applicationTableNames(ctx, db)
-	if err != nil {
+	count, err := applicationTableCount(ctx, db)
+	if err != nil || count == 0 {
 		return false, err
 	}
-	if !allowExtraTables && !slices.Equal(tables, initialSchemaTableNames) {
+	err = validateSchema(ctx, db, Migrations, 1)
+	if errors.Is(err, ErrIncompatibleDatabase) {
 		return false, nil
 	}
-	if allowExtraTables {
-		for _, required := range initialSchemaTableNames {
-			if !slices.Contains(tables, required) {
-				return false, nil
-			}
-		}
-	}
-	for _, column := range []struct {
-		table string
-		name  string
-	}{
-		{"multipart_uploads", "upload_id"},
-		{"storage_contents", "checksum"},
-		{"storage_copies", "content_id"},
-		{"storage_copies", "storage_data_set_id"},
-		{"storage_commit_attempts", "attempt_id"},
-		{"storage_commit_attempts", "status_url"},
-		{"storage_replacement_items", "target_data_set_id"},
-		{"storage_replacements", "price_list_fingerprint"},
-		{"storage_cleanup_copies", "bucket_id"},
-		{"storage_cleanup_copies", "checksum"},
-		{"object_versions", "content_id"},
-		{"object_cache", "content_id"},
-		{"provider_profiles", "registry_snapshot_json"},
-		{"provider_tier_snapshots", "provider_ids_json"},
-		{"provider_tier_snapshots", "checked_at"},
-		{"observability_provider_states", "last_attempt_at"},
-	} {
-		exists, err := columnExists(ctx, db, column.table, column.name)
-		if err != nil || !exists {
-			return false, err
-		}
-	}
-	for _, column := range []struct {
-		table string
-		name  string
-	}{
-		{"multipart_uploads", "id"},
-		{"storage_copies", "commit_attempt_id"},
-		{"storage_copies", "commit_transaction_id"},
-		{"storage_commit_attempts", "submission_json"},
-		{"storage_copies", "upload_id"},
-		{"storage_replacement_items", "target_copy_id"},
-		{"object_versions", "state"},
-		{"object_versions", "storage_upload_id"},
-		{"storage_data_sets", "repair_task_id"},
-	} {
-		exists, err := columnExists(ctx, db, column.table, column.name)
-		if err != nil || exists {
-			return false, err
-		}
-	}
-	for _, index := range []string{
-		"idx_storage_commit_attempts_unresolved_copy",
-		"idx_storage_data_sets_bucket_provider_active",
-		"idx_observability_data_set_states_provider_status",
-	} {
-		exists, err := indexExists(ctx, db, index)
-		if err != nil || !exists {
-			return false, err
-		}
-	}
-	return true, nil
+	return err == nil, err
 }
 
 func incompatibleDatabaseError() error {
 	return fmt.Errorf("%w; keep the existing database as a read-only backup and configure a new empty database", ErrIncompatibleDatabase)
+}
+
+func incompatibleSchemaError(want, got []string) error {
+	return fmt.Errorf("%w: the schema differs from what its recorded migrations build (missing: %s; unexpected: %s); keep the existing database as a read-only backup and configure a new empty database",
+		ErrIncompatibleDatabase, schemaLinesSummary(want, got), schemaLinesSummary(got, want))
+}
+
+// schemaLinesSummary names the first lines of lines that others lacks.
+func schemaLinesSummary(lines, others []string) string {
+	const shown = 5
+	var absent []string
+	for _, line := range lines {
+		if !slices.Contains(others, line) {
+			absent = append(absent, line)
+		}
+	}
+	switch {
+	case len(absent) == 0:
+		return "none"
+	case len(absent) > shown:
+		return fmt.Sprintf("%s and %d more", strings.Join(absent[:shown], ", "), len(absent)-shown)
+	default:
+		return strings.Join(absent, ", ")
+	}
 }
 
 func newMigrator(db *bun.DB, registry *migrate.Migrations) *migrate.Migrator {

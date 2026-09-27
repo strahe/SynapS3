@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -51,6 +52,32 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			(type, client_request_id, amount, status, tx_hash, submitted_at, created_at, updated_at)
 			VALUES ('fund', 'submitted-complete', '1', 'submitted', 'tx-complete', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
 			t.Fatalf("insert valid submitted wallet operation: %v", err)
+		}
+		walletTaskID := insertBaselineTestTask(t, db, "wallet-owner")
+		for name, statement := range map[string]string{
+			"confirmed without completion": `INSERT INTO wallet_operations
+				(type, client_request_id, amount, status, tx_hash, created_at, updated_at)
+				VALUES ('fund', 'confirmed-open', '1', 'confirmed', 'tx-open', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"pending with completion": `INSERT INTO wallet_operations
+				(type, client_request_id, amount, completed_at, created_at, updated_at)
+				VALUES ('fund', 'pending-completed', '1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"failed without error": `INSERT INTO wallet_operations
+				(type, client_request_id, amount, status, completed_at, created_at, updated_at)
+				VALUES ('fund', 'failed-silent', '1', 'failed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"unknown without broadcast": `INSERT INTO wallet_operations
+				(type, client_request_id, amount, status, last_error, completed_at, created_at, updated_at)
+				VALUES ('fund', 'unknown-unsent', '1', 'unknown', 'lost', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"settled holding its task": `INSERT INTO wallet_operations
+				(type, client_request_id, amount, status, last_error, task_id, completed_at, created_at, updated_at)
+				VALUES ('fund', 'failed-owned', '1', 'failed', 'rejected', ` + strconv.FormatInt(walletTaskID, 10) + `, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		} {
+			t.Run(name, func(t *testing.T) { mustRejectStatement(t, db, statement) })
+		}
+		// An approval already in place is confirmed without a transaction.
+		if _, err := db.Exec(`INSERT INTO wallet_operations
+			(type, client_request_id, amount, status, completed_at, created_at, updated_at)
+			VALUES ('approve', 'approve-in-place', '0', 'confirmed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
+			t.Fatalf("insert approval confirmed without transaction: %v", err)
 		}
 
 		// A data version is bytes plus a name, so it cannot exist without the
@@ -117,6 +144,36 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		copyID := insertBaselineTestCopy(t, db, contentA, bucketA, source, 0, "101", "ingress")
 		mustRejectStatement(t, db, `UPDATE storage_copies
 			SET confirmed_attempt_status = 'confirmed' WHERE id = ?`, copyID)
+		// Committed evidence must be the attempt made for this copy: a confirmed
+		// attempt for another content in the same data set cannot be borrowed.
+		if _, err := db.Exec(`INSERT INTO storage_commit_attempts
+			(attempt_id, content_id, storage_data_set_id, status, extra_data_hex, transaction_id, status_url,
+			 confirmed_transaction_id, attempted_at, resolved_at, created_at, updated_at)
+			VALUES ('attempt-other-content', ?, ?, 'confirmed', 'abcd', '0xother', 'https://provider.example/status/other',
+			 '0xother', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA2, source); err != nil {
+			t.Fatalf("insert confirmed attempt for another content: %v", err)
+		}
+		commitCopy := `UPDATE storage_copies
+			SET status = 'committed', piece_id = '1', retrieval_url = 'https://provider.example/piece',
+			    confirmed_attempt_id = ?, confirmed_attempt_status = 'confirmed'
+			WHERE id = ?`
+		mustRejectStatement(t, db, commitCopy, "attempt-other-content", copyID)
+		if _, err := db.Exec(`INSERT INTO storage_commit_attempts
+			(attempt_id, content_id, storage_data_set_id, status, extra_data_hex, transaction_id, status_url,
+			 confirmed_transaction_id, attempted_at, resolved_at, created_at, updated_at)
+			VALUES ('attempt-own', ?, ?, 'confirmed', 'abcd', '0xown', 'https://provider.example/status/own',
+			 '0xown', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, contentA, source); err != nil {
+			t.Fatalf("insert confirmed attempt for the copy: %v", err)
+		}
+		if _, err := db.Exec(commitCopy, "attempt-own", copyID); err != nil {
+			t.Fatalf("commit copy with its own attempt: %v", err)
+		}
+		if _, err := db.Exec(`UPDATE storage_copies
+			SET status = 'pending', piece_id = NULL, retrieval_url = NULL,
+			    confirmed_attempt_id = NULL, confirmed_attempt_status = NULL
+			WHERE id = ?`, copyID); err != nil {
+			t.Fatalf("reopen copy: %v", err)
+		}
 
 		mustRejectStatement(t, db, `INSERT INTO storage_copies
 			(content_id, bucket_id, content_size, storage_data_set_id, copy_index, provider_id, transfer_method, created_at, updated_at)
@@ -229,9 +286,24 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 		mustRejectStatement(t, db, `DELETE FROM storage_replacements WHERE id = ?`, replacementID)
 		mustRejectStatement(t, db, `INSERT INTO storage_replacements
 			(bucket_id, copy_index, source_data_set_id, target_data_set_id,
-			 selection_mode, client_request_id, price_list_fingerprint, status, created_at, updated_at)
-			VALUES (?, 0, ?, ?, 'manual', 'replacement-2', 'test-price', 'waiting', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, source, target)
-		if _, err := db.Exec(`UPDATE storage_replacements SET status = 'failed' WHERE id = ?`, replacementID); err != nil {
+			 selection_mode, client_request_id, price_list_fingerprint, status, wait_reason, created_at, updated_at)
+			VALUES (?, 0, ?, ?, 'manual', 'replacement-2', 'test-price', 'waiting', 'provider', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketA, source, target)
+		// Status and its reasons move together: only a waiting replacement
+		// has a wait reason, a failure reason survives only into superseded,
+		// and only a superseded replacement names its successor.
+		for _, statement := range []string{
+			`UPDATE storage_replacements SET status = 'waiting' WHERE id = ?`,
+			`UPDATE storage_replacements SET wait_reason = 'provider' WHERE id = ?`,
+			`UPDATE storage_replacements SET failure_reason = 'target_in_use' WHERE id = ?`,
+			`UPDATE storage_replacements SET superseded_by_id = id WHERE id = ?`,
+		} {
+			mustRejectStatement(t, db, statement, replacementID)
+		}
+		if _, err := db.Exec(`UPDATE storage_replacements SET status = 'waiting', wait_reason = 'provider' WHERE id = ?`, replacementID); err != nil {
+			t.Fatalf("mark replacement waiting: %v", err)
+		}
+		if _, err := db.Exec(`UPDATE storage_replacements
+			SET status = 'failed', wait_reason = NULL, failure_reason = 'target_in_use' WHERE id = ?`, replacementID); err != nil {
 			t.Fatalf("mark replacement retryable: %v", err)
 		}
 		mustRejectStatement(t, db, `INSERT INTO storage_replacements
@@ -651,5 +723,35 @@ func TestBaselineTerminationBelongsToItsReplacementRole(t *testing.T) {
 			VALUES (?, 'abandoned_target', ?, 90, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, replacementID, target); err != nil {
 			t.Fatalf("insert abandoned target termination: %v", err)
 		}
+	})
+}
+
+// Accounts without a name share the empty default; set names are unique byte
+// for byte, so names differing only in case are distinct.
+func TestBaselineAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		if err := runMigrationBody(ctx, db, up2026090101InitialSchema); err != nil {
+			t.Fatalf("create initial schema: %v", err)
+		}
+		const unnamed = `INSERT INTO s3_accounts (access_key, secret_key, role, is_root, created_at, updated_at)
+			VALUES (?, 'secret', 'user', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+		const named = `INSERT INTO s3_accounts (access_key, name, secret_key, role, is_root, created_at, updated_at)
+			VALUES (?, ?, 'secret', 'user', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+		for _, accessKey := range []string{"unnamed-1", "unnamed-2"} {
+			if _, err := db.Exec(unnamed, accessKey); err != nil {
+				t.Fatalf("unnamed account %s: %v", accessKey, err)
+			}
+		}
+		var name string
+		if err := db.NewRaw(`SELECT name FROM s3_accounts WHERE access_key = 'unnamed-1'`).Scan(ctx, &name); err != nil || name != "" {
+			t.Fatalf("unnamed account name = %q, err=%v", name, err)
+		}
+		for accessKey, accountName := range map[string]string{"alice-upper": "Alice", "alice-lower": "alice"} {
+			if _, err := db.Exec(named, accessKey, accountName); err != nil {
+				t.Fatalf("account named %s: %v", accountName, err)
+			}
+		}
+		mustRejectStatement(t, db, named, "alice-again", "Alice")
 	})
 }

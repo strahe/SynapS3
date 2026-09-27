@@ -1,14 +1,12 @@
 package migrations
 
 import (
-	"database/sql"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -44,9 +42,6 @@ func TestRuntimeModelsMatchAppliedBaseline(t *testing.T) {
 
 		if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
 			t.Fatalf("create initial schema: %v", err)
-		}
-		if err := runMigrationBody(t.Context(), db, up2026092401S3AccountName); err != nil {
-			t.Fatalf("add S3 account names: %v", err)
 		}
 		appliedTables := applicationSchemaTables(t, db)
 		if !slices.Equal(appliedTables, registeredTables) {
@@ -152,15 +147,6 @@ func runtimePersistentModelTablesFromAST(t *testing.T) []string {
 	return result
 }
 
-type appliedColumn struct {
-	Name       string
-	Type       string
-	NotNull    bool
-	Default    string
-	PrimaryKey bool
-	Generated  bool
-}
-
 func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) {
 	t.Helper()
 	typ := reflect.TypeOf(runtimeModel)
@@ -184,7 +170,7 @@ func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) 
 			PrimaryKey: field.IsPK,
 			Generated:  field.AutoIncrement && field.Identity,
 		}
-		if db.Dialect().Name() == dialect.SQLite && isInitialJSONColumn(table.Name, field.Name) {
+		if _, ok := initialJSONColumn(table.Name, field.Name); ok && db.Dialect().Name() == dialect.SQLite {
 			want.Type = "text"
 		}
 		// A runtime default changes Bun insert behavior by omitting zero values.
@@ -196,117 +182,4 @@ func assertRuntimeModelMatchesTable(t *testing.T, db *bun.DB, runtimeModel any) 
 			t.Errorf("%s column %d mismatch\n got: %#v\nwant: %#v", table.Name, i+1, got, want)
 		}
 	}
-}
-
-func appliedTableColumns(t *testing.T, db *bun.DB, table string) []appliedColumn {
-	t.Helper()
-	if db.Dialect().Name() == dialect.PG {
-		return appliedPostgresColumns(t, db, table)
-	}
-	return appliedSQLiteColumns(t, db, table)
-}
-
-func appliedSQLiteColumns(t *testing.T, db *bun.DB, table string) []appliedColumn {
-	t.Helper()
-	var tableDDL string
-	if err := db.NewRaw(`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?`, table).Scan(t.Context(), &tableDDL); err != nil {
-		t.Fatalf("read SQLite table DDL for %s: %v", table, err)
-	}
-	rows, err := db.Query(`SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?) ORDER BY cid`, table)
-	if err != nil {
-		t.Fatalf("read SQLite columns for %s: %v", table, err)
-	}
-	defer func() { _ = rows.Close() }()
-	var columns []appliedColumn
-	for rows.Next() {
-		var name, sqlType string
-		var notNull, primaryKey int
-		var defaultValue sql.NullString
-		if err := rows.Scan(&name, &sqlType, &notNull, &defaultValue, &primaryKey); err != nil {
-			t.Fatalf("scan SQLite column for %s: %v", table, err)
-		}
-		columns = append(columns, appliedColumn{
-			Name:       name,
-			Type:       normalizedSQLType(sqlType),
-			NotNull:    notNull != 0,
-			Default:    normalizedSQLDefault(defaultValue.String),
-			PrimaryKey: primaryKey != 0,
-			Generated:  primaryKey != 0 && name == "id" && strings.Contains(strings.ToUpper(tableDDL), "AUTOINCREMENT"),
-		})
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate SQLite columns for %s: %v", table, err)
-	}
-	return columns
-}
-
-func appliedPostgresColumns(t *testing.T, db *bun.DB, table string) []appliedColumn {
-	t.Helper()
-	rows, err := db.Query(`SELECT column_info.column_name,
-		       column_info.data_type,
-		       column_info.is_nullable = 'NO',
-		       column_info.column_default,
-		       column_info.is_identity = 'YES',
-		       EXISTS (
-		           SELECT 1
-		           FROM information_schema.table_constraints AS table_constraint
-		           JOIN information_schema.key_column_usage AS key_column
-		             ON key_column.constraint_schema = table_constraint.constraint_schema
-		            AND key_column.constraint_name = table_constraint.constraint_name
-		           WHERE table_constraint.table_schema = current_schema()
-		             AND table_constraint.table_name = column_info.table_name
-		             AND table_constraint.constraint_type = 'PRIMARY KEY'
-		             AND key_column.column_name = column_info.column_name
-		       )
-		FROM information_schema.columns AS column_info
-		WHERE column_info.table_schema = current_schema() AND column_info.table_name = ?
-		ORDER BY column_info.ordinal_position`, table)
-	if err != nil {
-		t.Fatalf("read PostgreSQL columns for %s: %v", table, err)
-	}
-	defer func() { _ = rows.Close() }()
-	var columns []appliedColumn
-	for rows.Next() {
-		var name, sqlType string
-		var notNull, generated, primaryKey bool
-		var defaultValue sql.NullString
-		if err := rows.Scan(&name, &sqlType, &notNull, &defaultValue, &generated, &primaryKey); err != nil {
-			t.Fatalf("scan PostgreSQL column for %s: %v", table, err)
-		}
-		columns = append(columns, appliedColumn{
-			Name:       name,
-			Type:       normalizedSQLType(sqlType),
-			NotNull:    notNull,
-			Default:    normalizedSQLDefault(defaultValue.String),
-			PrimaryKey: primaryKey,
-			Generated:  generated,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate PostgreSQL columns for %s: %v", table, err)
-	}
-	return columns
-}
-
-func normalizedSQLType(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	switch value {
-	case "timestamptz", "timestamp with time zone", "timestamp":
-		return "timestamp"
-	case "bytea", "blob":
-		return "binary"
-	default:
-		return value
-	}
-}
-
-var postgresDefaultCast = regexp.MustCompile(`::[a-zA-Z0-9_\"]+`)
-
-func normalizedSQLDefault(value string) string {
-	value = strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
-	value = postgresDefaultCast.ReplaceAllString(value, "")
-	for len(value) >= 2 && value[0] == '(' && value[len(value)-1] == ')' {
-		value = strings.TrimSpace(value[1 : len(value)-1])
-	}
-	return value
 }

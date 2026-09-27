@@ -160,6 +160,7 @@ type s3Account2026090101 struct {
 	IsRoot    bool      `bun:",notnull,default:false"`
 	CreatedAt time.Time `bun:",notnull"`
 	UpdatedAt time.Time `bun:",notnull"`
+	Name      string    `bun:"type:text,notnull,default:''"`
 }
 
 type bucket2026090101 struct {
@@ -318,10 +319,17 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			return err
 		}
 	}
+	// Nonempty account names compare byte for byte on both engines, so names
+	// differing only in case stay distinct.
+	accountName := `name COLLATE "C"`
+	if db.Dialect().Name() != dialect.PG {
+		accountName = "name COLLATE BINARY"
+	}
 	indexes := []initialIndexSpec{
 		{name: "idx_objects_bucket_key", table: "objects", columns: []string{"bucket_id", "key"}, unique: true},
 		{name: "idx_objects_current_version", table: "objects", columns: []string{"current_version_id"}, where: "current_version_id IS NOT NULL"},
 		{name: "idx_s3_accounts_single_root", table: "s3_accounts", columns: []string{"is_root"}, where: "is_root = TRUE", unique: true},
+		{name: "uq_s3_accounts_name", table: "s3_accounts", columns: []string{accountName}, where: "name <> ''", unique: true},
 		{name: "idx_buckets_owner_access_key", table: "buckets", columns: []string{"owner_access_key"}},
 		{name: "idx_buckets_durability_task", table: "buckets", columns: []string{"durability_task_id"}, where: "durability_task_id IS NOT NULL", unique: true},
 		{name: "idx_multipart_parts_upload_part", table: "multipart_parts", columns: []string{"upload_id", "part_number"}, unique: true},
@@ -549,7 +557,8 @@ type storageCopy2026090101 struct {
 	CommitReadyAt      *time.Time
 	// The confirmed commit attempt this copy projects. Its status is repeated so
 	// a composite foreign key can require the referenced attempt to be
-	// confirmed, which is what keeps the projection from drifting.
+	// confirmed, and the same key carries the copy's content and data set, so
+	// the attempt must be the one made for this copy.
 	ConfirmedAttemptID      *string `bun:"type:text"`
 	ConfirmedAttemptStatus  *string `bun:"type:text"`
 	IngressBytesTransferred int64   `bun:",notnull,default:0"`
@@ -621,8 +630,6 @@ type storageReplacement2026090101 struct {
 	WaitReason           *string `bun:"type:text"`
 	FailureReason        *string `bun:"type:text"`
 	LastError            *string `bun:"type:text"`
-	ItemsTotal           int     `bun:"type:integer,notnull,default:0"`
-	ItemsCopied          int     `bun:"type:integer,notnull,default:0"`
 	SeedCursorContentID  int64   `bun:",notnull,default:0"`
 	SeedingComplete      bool    `bun:",notnull,default:false"`
 	TaskGeneration       int64   `bun:",notnull,default:1"`
@@ -816,12 +823,13 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 }
 
 // storageCopyConfirmedAttemptForeignKey2026090101 welds the copy's committed
-// state to the ledger row that proves it. storage_copies is created before
-// storage_commit_attempts, so the constraint is forward-declared.
+// state to the ledger row that proves it, made for this copy's content and data
+// set. storage_copies is created before storage_commit_attempts, so the
+// constraint is forward-declared.
 func storageCopyConfirmedAttemptForeignKey2026090101() initialForwardForeignKey {
 	return initialForwardForeignKey{
 		name:       "fk_storage_copies_confirmed_attempt",
-		definition: "(confirmed_attempt_id, confirmed_attempt_status) REFERENCES storage_commit_attempts (attempt_id, status) ON UPDATE RESTRICT ON DELETE RESTRICT",
+		definition: "(confirmed_attempt_id, confirmed_attempt_status, content_id, storage_data_set_id) REFERENCES storage_commit_attempts (attempt_id, status, content_id, storage_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 	}
 }
 
@@ -833,7 +841,7 @@ func storageCommitAttemptTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_commit_attempts_identity CHECK (attempt_id <> '' AND (extra_data_hex IS NULL OR extra_data_hex <> '') AND (transaction_id IS NULL OR transaction_id <> '') AND (status_url IS NULL OR status_url <> '') AND (confirmed_transaction_id IS NULL OR confirmed_transaction_id <> '') AND (attention_code IS NULL OR attention_code <> '') AND (release_reason IS NULL OR release_reason <> ''))",
 			"CONSTRAINT chk_storage_commit_attempts_status CHECK (status IN ('reserved', 'attempted', 'confirmed', 'released', 'rejected'))",
 			// Candidate key for the copy's confirmed-attempt projection.
-			"CONSTRAINT uq_storage_commit_attempts_status UNIQUE (attempt_id, status)",
+			"CONSTRAINT uq_storage_commit_attempts_projection UNIQUE (attempt_id, status, content_id, storage_data_set_id)",
 			"CONSTRAINT chk_storage_commit_attempts_resolution CHECK ((status IN ('reserved', 'attempted') AND resolved_at IS NULL) OR (status IN ('confirmed', 'released', 'rejected') AND resolved_at IS NOT NULL))",
 			`CONSTRAINT chk_storage_commit_attempts_evidence_shape CHECK (
 				(status = 'reserved' AND attempted_at IS NULL AND extra_data_hex IS NULL AND transaction_id IS NULL AND status_url IS NULL AND confirmed_transaction_id IS NULL AND attention_code IS NULL AND attention_at IS NULL AND last_error IS NULL)
@@ -885,8 +893,14 @@ func storageReplacementTable2026090101() initialTableSpec {
 			"CONSTRAINT chk_storage_replacements_failure_reason CHECK (failure_reason IS NULL OR failure_reason <> '')",
 			"CONSTRAINT chk_storage_replacements_client_request_id CHECK (length(client_request_id) BETWEEN 1 AND 128)",
 			"CONSTRAINT chk_storage_replacements_distinct_data_sets CHECK (source_data_set_id <> target_data_set_id)",
-			"CONSTRAINT chk_storage_replacements_items CHECK (items_total >= 0 AND items_copied >= 0 AND items_copied <= items_total)",
 			"CONSTRAINT chk_storage_replacements_generation CHECK (task_generation >= 1)",
+			"CONSTRAINT chk_storage_replacements_wait_shape CHECK ((status = 'waiting') = (wait_reason IS NOT NULL))",
+			// Superseding keeps the failure that stopped an operator-paused
+			// replacement, so the reason may outlive the failed status.
+			"CONSTRAINT chk_storage_replacements_failure_shape CHECK (failure_reason IS NULL OR status IN ('failed', 'superseded'))",
+			// One direction only: the successor id is written after the
+			// successor row exists, which is after the status changed.
+			"CONSTRAINT chk_storage_replacements_superseded_shape CHECK (superseded_by_id IS NULL OR status = 'superseded')",
 		},
 		foreignKeys: []string{
 			"(bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
@@ -1015,6 +1029,11 @@ func createWalletSchema(ctx context.Context, db bun.IDB) error {
 			"CONSTRAINT chk_wallet_operations_type CHECK (type IN ('fund', 'withdraw', 'approve'))",
 			"CONSTRAINT chk_wallet_operations_status CHECK (status IN ('pending', 'submitted', 'confirmed', 'failed', 'unknown'))",
 			"CONSTRAINT chk_wallet_operations_submitted_shape CHECK (status <> 'submitted' OR (tx_hash IS NOT NULL AND submitted_at IS NOT NULL))",
+			// A settled operation has finished and released its task. An approval
+			// can be confirmed without a transaction, so tx_hash is not required.
+			"CONSTRAINT chk_wallet_operations_terminal_shape CHECK ((status IN ('confirmed', 'failed', 'unknown')) = (completed_at IS NOT NULL) AND (status NOT IN ('confirmed', 'failed', 'unknown') OR task_id IS NULL))",
+			// An unknown outcome is only possible once a broadcast may have gone out.
+			"CONSTRAINT chk_wallet_operations_failure_evidence CHECK ((status NOT IN ('failed', 'unknown') OR last_error IS NOT NULL) AND (status <> 'unknown' OR broadcast_attempted_at IS NOT NULL))",
 			"CONSTRAINT chk_wallet_operations_amount CHECK (" + amountCheck + ")",
 			// A uint256 in base 10 is at most 78 digits. The column stays text
 			// because the value is returned and compared verbatim.
@@ -1039,8 +1058,6 @@ type observabilityCollectionState2026090101 struct {
 
 	CollectionType string    `bun:"type:text,pk"`
 	LastCheckedAt  time.Time `bun:",notnull"`
-	CreatedAt      time.Time `bun:",notnull"`
-	UpdatedAt      time.Time `bun:",notnull"`
 }
 
 type observabilityProviderState2026090101 struct {

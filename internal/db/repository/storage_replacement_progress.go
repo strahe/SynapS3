@@ -66,8 +66,7 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		       replacement.status AS replacement_status,
 		       target.is_current AS target_is_current,
 		       replacement.seeding_complete,
-		       replacement.items_total,
-		       replacement.items_copied,
+		       item.id AS item_id,
 		       item.status AS item_status,
 		       CASE
 		         WHEN item.id IS NULL THEN NULL
@@ -99,8 +98,8 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		       replacement_status,
 		       target_is_current,
 		       seeding_complete,
-		       items_total,
-		       items_copied,
+		       COUNT(item_id) AS items_total,
+		       COALESCE(SUM(CASE WHEN item_status = 'copied' THEN 1 ELSE 0 END), 0) AS items_copied,
 		       COALESCE(SUM(CASE WHEN progress_status = 'pending' THEN 1 ELSE 0 END), 0) AS items_pending,
 		       COALESCE(SUM(CASE WHEN progress_status = 'active' THEN 1 ELSE 0 END), 0) AS items_active,
 		       COALESCE(SUM(CASE WHEN item_status = 'cancelled' THEN 1 ELSE 0 END), 0) AS items_cancelled,
@@ -110,7 +109,7 @@ func (r *BunStorageReplacementRepo) ReplacementProgresses(
 		       COALESCE(SUM(CASE WHEN progress_status = 'failed' THEN 1 ELSE 0 END), 0) AS items_failed,
 		       MIN(next_retry_at) AS next_retry_at
 	FROM item_progress
-	GROUP BY replacement_id, replacement_status, target_is_current, seeding_complete, items_total, items_copied`,
+	GROUP BY replacement_id, replacement_status, target_is_current, seeding_complete`,
 		now, now, bun.List(replacementIDs)).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("loading replacement progress: %w", err)
 	}
