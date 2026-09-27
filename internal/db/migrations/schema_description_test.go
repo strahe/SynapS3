@@ -94,9 +94,8 @@ func TestValidateCurrentSchemaRejectsDrift(t *testing.T) {
 
 func TestValidateCurrentSchemaRequiresEveryMigration(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
-		migrateToLevel(t, db, 1)
 		if err := ValidateCurrentSchema(t.Context(), db); !errors.Is(err, ErrIncompatibleDatabase) {
-			t.Fatalf("ValidateCurrentSchema before the last migration = %v, want ErrIncompatibleDatabase", err)
+			t.Fatalf("ValidateCurrentSchema before migrating = %v, want ErrIncompatibleDatabase", err)
 		}
 		migrateToLevel(t, db, len(Migrations.Sorted()))
 		if err := ValidateCurrentSchema(t.Context(), db); err != nil {
@@ -108,16 +107,19 @@ func TestValidateCurrentSchemaRequiresEveryMigration(t *testing.T) {
 // A schema that is not what its recorded migrations build is refused before a
 // pending migration writes to it.
 func TestValidateTargetRejectsDriftBeforePendingMigrations(t *testing.T) {
+	registry := migrate.NewMigrations()
+	registry.Add(Migrations.Sorted()[0])
+	registry.Add(migrate.Migration{Name: "2026999996"})
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
 		migrateToLevel(t, db, 1)
-		if err := ValidateTarget(t.Context(), db); err != nil {
-			t.Fatalf("ValidateTarget before the change = %v", err)
+		if err := validateTarget(t.Context(), db, registry); err != nil {
+			t.Fatalf("validateTarget before the change = %v", err)
 		}
 		if _, err := db.ExecContext(t.Context(), `DROP INDEX idx_tasks_type_id`); err != nil {
 			t.Fatal(err)
 		}
-		if err := ValidateTarget(t.Context(), db); !errors.Is(err, ErrIncompatibleDatabase) {
-			t.Fatalf("ValidateTarget = %v, want ErrIncompatibleDatabase", err)
+		if err := validateTarget(t.Context(), db, registry); !errors.Is(err, ErrIncompatibleDatabase) {
+			t.Fatalf("validateTarget = %v, want ErrIncompatibleDatabase", err)
 		}
 	})
 }

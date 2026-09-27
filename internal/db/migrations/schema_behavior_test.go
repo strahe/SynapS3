@@ -725,3 +725,33 @@ func TestBaselineTerminationBelongsToItsReplacementRole(t *testing.T) {
 		}
 	})
 }
+
+// Accounts without a name share the empty default; set names are unique byte
+// for byte, so names differing only in case are distinct.
+func TestBaselineAccountNamesAreUniqueOnlyWhenSet(t *testing.T) {
+	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
+		ctx := t.Context()
+		if err := runMigrationBody(ctx, db, up2026090101InitialSchema); err != nil {
+			t.Fatalf("create initial schema: %v", err)
+		}
+		const unnamed = `INSERT INTO s3_accounts (access_key, secret_key, role, is_root, created_at, updated_at)
+			VALUES (?, 'secret', 'user', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+		const named = `INSERT INTO s3_accounts (access_key, name, secret_key, role, is_root, created_at, updated_at)
+			VALUES (?, ?, 'secret', 'user', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+		for _, accessKey := range []string{"unnamed-1", "unnamed-2"} {
+			if _, err := db.Exec(unnamed, accessKey); err != nil {
+				t.Fatalf("unnamed account %s: %v", accessKey, err)
+			}
+		}
+		var name string
+		if err := db.NewRaw(`SELECT name FROM s3_accounts WHERE access_key = 'unnamed-1'`).Scan(ctx, &name); err != nil || name != "" {
+			t.Fatalf("unnamed account name = %q, err=%v", name, err)
+		}
+		for accessKey, accountName := range map[string]string{"alice-upper": "Alice", "alice-lower": "alice"} {
+			if _, err := db.Exec(named, accessKey, accountName); err != nil {
+				t.Fatalf("account named %s: %v", accountName, err)
+			}
+		}
+		mustRejectStatement(t, db, named, "alice-again", "Alice")
+	})
+}

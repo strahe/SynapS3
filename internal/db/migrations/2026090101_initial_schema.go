@@ -160,6 +160,7 @@ type s3Account2026090101 struct {
 	IsRoot    bool      `bun:",notnull,default:false"`
 	CreatedAt time.Time `bun:",notnull"`
 	UpdatedAt time.Time `bun:",notnull"`
+	Name      string    `bun:"type:text,notnull,default:''"`
 }
 
 type bucket2026090101 struct {
@@ -318,10 +319,17 @@ func createCoreRootSchema(ctx context.Context, db bun.IDB) error {
 			return err
 		}
 	}
+	// Nonempty account names compare byte for byte on both engines, so names
+	// differing only in case stay distinct.
+	accountName := `name COLLATE "C"`
+	if db.Dialect().Name() != dialect.PG {
+		accountName = "name COLLATE BINARY"
+	}
 	indexes := []initialIndexSpec{
 		{name: "idx_objects_bucket_key", table: "objects", columns: []string{"bucket_id", "key"}, unique: true},
 		{name: "idx_objects_current_version", table: "objects", columns: []string{"current_version_id"}, where: "current_version_id IS NOT NULL"},
 		{name: "idx_s3_accounts_single_root", table: "s3_accounts", columns: []string{"is_root"}, where: "is_root = TRUE", unique: true},
+		{name: "uq_s3_accounts_name", table: "s3_accounts", columns: []string{accountName}, where: "name <> ''", unique: true},
 		{name: "idx_buckets_owner_access_key", table: "buckets", columns: []string{"owner_access_key"}},
 		{name: "idx_buckets_durability_task", table: "buckets", columns: []string{"durability_task_id"}, where: "durability_task_id IS NOT NULL", unique: true},
 		{name: "idx_multipart_parts_upload_part", table: "multipart_parts", columns: []string{"upload_id", "part_number"}, unique: true},

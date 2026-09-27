@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	initialPortableSchemaFingerprint = "b2116d02e38f299f1b05bc61d74aabb6e78f518d96efc9bf3d7644c0f54c376c"
+	initialPortableSchemaFingerprint = "cae86066ebaba1cde6e8037138515326bf5c29672de039bbcda3a507ccfa0059"
 )
 
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
@@ -444,7 +444,7 @@ func TestFreshBaselineIsIdempotentAndCannotRollback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("migrate fresh schema: %v", err)
 		}
-		if len(first.Migrations) != 2 || first.Migrations[0].Name != InitialSchemaName || first.Migrations[1].Name != "2026092401" {
+		if len(first.Migrations) != 1 || first.Migrations[0].Name != InitialSchemaName {
 			t.Fatalf("first migration group = %#v", first.Migrations)
 		}
 		second, err := migrator.Migrate(ctx)
