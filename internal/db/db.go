@@ -55,6 +55,10 @@ func New(cfg config.DatabaseConfig) (*bun.DB, error) {
 			return nil, fmt.Errorf("opening sqlite connection: %w", err)
 		}
 		db = bun.NewDB(sqldb, sqlitedialect.New())
+		if err := requireSQLiteForeignKeys(db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Driver)
@@ -146,6 +150,9 @@ func RunMigrations(ctx context.Context, db *bun.DB) (retErr error) {
 		slog.Info("applied migrations", "group", group.ID, "count", len(group.Migrations))
 	} else {
 		slog.Info("no new migrations to apply")
+	}
+	if err := migrations.ValidateCurrentSchema(ctx, db); err != nil {
+		return err
 	}
 
 	// Statistics are an operational concern, not part of the frozen DDL, and the
@@ -255,6 +262,24 @@ func normalizeFileURLPath(path string) string {
 		return path[1:]
 	}
 	return path
+}
+
+var errSQLiteForeignKeysOff = errors.New("sqlite foreign key enforcement is off; remove the foreign_keys setting from the database DSN")
+
+// requireSQLiteForeignKeys refuses a connection that does not enforce foreign
+// keys, which an explicit DSN setting can turn off. Every pooled connection
+// opens from the same DSN.
+func requireSQLiteForeignKeys(db *bun.DB) error {
+	ctx, cancel := context.WithTimeout(context.Background(), sqlitePreflightTimeout)
+	defer cancel()
+	var enabled int
+	if err := db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&enabled); err != nil {
+		return fmt.Errorf("checking sqlite foreign key enforcement: %w", err)
+	}
+	if enabled != 1 {
+		return errSQLiteForeignKeysOff
+	}
+	return nil
 }
 
 func ensureSQLitePragmas(dsn string) string {

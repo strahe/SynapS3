@@ -68,13 +68,13 @@ func initialJSONColumns(table string) []initialJSONColumnSpec {
 	}
 }
 
-func isInitialJSONColumn(table, column string) bool {
+func initialJSONColumn(table, column string) (initialJSONColumnSpec, bool) {
 	for _, candidate := range initialJSONColumns(table) {
 		if candidate.name == column {
-			return true
+			return candidate, true
 		}
 	}
-	return false
+	return initialJSONColumnSpec{}, false
 }
 
 func createInitialTable(ctx context.Context, db bun.IDB, spec initialTableSpec) error {

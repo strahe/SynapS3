@@ -99,23 +99,34 @@ func TestInitialBaselineRepairsMissingMarkerAndAppliesLaterMigrations(t *testing
 			t.Fatalf("repair baseline marker: %v", err)
 		}
 		assertAppliedMigrationCount(t, ctx, migrator, 2)
+		if err := ValidateCurrentSchema(ctx, db); err != nil {
+			t.Fatalf("validate repaired schema: %v", err)
+		}
 	})
 }
 
-func TestInitialBaselineRejectsPartialPostStateWithEmptyMarker(t *testing.T) {
+// A partial baseline with an empty marker is refused unchanged, both before
+// startup migrates and by the baseline itself, so no later migration alters it.
+func TestPartialBaselineWithEmptyMarkerIsRefusedUnchanged(t *testing.T) {
 	testMigrationDialects(t, func(t *testing.T, db *bun.DB) {
 		ctx := t.Context()
 		migrator := NewMigrator(db)
 		if err := migrator.Init(ctx); err != nil {
 			t.Fatalf("initialize migrator: %v", err)
 		}
-		if _, err := db.ExecContext(ctx, "CREATE TABLE tasks (id INTEGER PRIMARY KEY)"); err != nil {
+		if _, err := db.ExecContext(ctx, "CREATE TABLE s3_accounts (access_key TEXT PRIMARY KEY)"); err != nil {
 			t.Fatalf("create partial baseline: %v", err)
 		}
 		if err := ValidateTarget(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
-			t.Fatalf("validate partial baseline = %v, want ErrIncompatibleDatabase", err)
+			t.Fatalf("ValidateTarget = %v, want ErrIncompatibleDatabase", err)
+		}
+		if _, err := migrator.Migrate(ctx); !errors.Is(err, ErrIncompatibleDatabase) {
+			t.Fatalf("Migrate = %v, want ErrIncompatibleDatabase", err)
 		}
 		assertAppliedMigrationCount(t, ctx, migrator, 0)
+		if exists, err := columnExists(ctx, db, "s3_accounts", "name"); err != nil || exists {
+			t.Fatalf("s3_accounts.name exists=%t err=%v after the refusal", exists, err)
+		}
 	})
 }
 

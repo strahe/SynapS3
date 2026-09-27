@@ -82,7 +82,7 @@ func TestSQLiteBaselineJSONUsesTextAndValidatesShape(t *testing.T) {
 		"observability_provider_states": {"reason_codes", "evidence_json"},
 		"observability_data_set_states": {"reason_codes", "evidence_json"},
 	} {
-		applied := appliedSQLiteColumns(t, db, table)
+		applied := appliedTableColumns(t, db, table)
 		for _, name := range columns {
 			found := false
 			for _, column := range applied {
