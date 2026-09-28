@@ -31,6 +31,9 @@ type BucketRepository interface {
 	UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error
 	// PromoteReadyIfProvisioned marks a provisioning bucket ready once enough current data sets are ready.
 	PromoteReadyIfProvisioned(ctx context.Context, id int64, requiredDataSets int) (bool, error)
+	// LockByID holds the bucket row until the caller's transaction ends. A
+	// transaction that also locks the bucket's data sets takes it first.
+	LockByID(ctx context.Context, id int64) error
 	// SetACL stores the bucket ACL JSON blob used by VersityGW access control.
 	SetACL(ctx context.Context, name string, acl []byte) error
 	// SetOwnerAndACL stores both the authoritative owner and compatible ACL.

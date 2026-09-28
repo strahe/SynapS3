@@ -112,6 +112,12 @@ func (h *TaskHandlers) bucketProvisionHandler() taskengine.Handler {
 		}
 
 		settlement := func(ctx context.Context, repos *repository.Repositories) error {
+			// Replacement activation locks the bucket before the data set it
+			// drains, and promotion below updates the bucket after these data
+			// sets are locked, so the bucket is locked first here too.
+			if err := repos.Buckets.LockByID(ctx, bucket.ID); err != nil {
+				return err
+			}
 			created := make([]model.StorageDataSet, 0, len(plan))
 			for i := range plan {
 				entry := plan[i]

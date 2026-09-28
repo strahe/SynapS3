@@ -292,6 +292,17 @@ func lockBucketByName(ctx context.Context, db bun.IDB, name string) (*model.Buck
 	return bucket, nil
 }
 
+func (r *BunBucketRepo) LockByID(ctx context.Context, id int64) error {
+	bucket, err := lockBucketByID(ctx, r.db, id)
+	if err != nil {
+		return err
+	}
+	if bucket == nil {
+		return fmt.Errorf("locking bucket %d: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 func lockBucketByID(ctx context.Context, db bun.IDB, id int64) (*model.Bucket, error) {
 	lockResult, err := db.NewUpdate().
 		Model((*model.Bucket)(nil)).

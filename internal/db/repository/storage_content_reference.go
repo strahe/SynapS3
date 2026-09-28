@@ -110,8 +110,9 @@ func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, ve
 	if version == nil || version.ContentID == nil || *version.ContentID <= 0 {
 		return nil
 	}
-	// The policy is read before the content lock, the same bucket-then-content
-	// order every other path that locks both uses.
+	// The policy is read before the content lock, as other paths that lock both
+	// do. Cache eviction locks the content first, but its cache gate keeps it
+	// from running beside a write of the same content.
 	defaultCopies, err := bucketCopyPolicyForReference(ctx, db, version.BucketID)
 	if err != nil {
 		return err
