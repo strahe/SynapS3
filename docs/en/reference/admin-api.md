@@ -339,6 +339,8 @@ Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` t
 
 Provider listings include the optional `upload_speed_test` for the latest manual test. A successful result reports `bytes_per_second`, `duration_ms`, `sample_bytes`, and `tested_at`; if the current `service_url` is missing or differs from the tested URL, the result is `stale` instead of a current speed. Tests run only when requested, and the speed is a single sample, not a guarantee for object uploads. Failed tests cannot be retried through the task retry endpoint; start a new test instead. Registry profile fields are provider declarations; they do not verify location or determine the actual Warm Storage bill.
 
+When a provider health check fails, the provider's `signal.last_error` says why: the check timed out, could not connect, was redirected, received an HTTP error status, or got a reply that is not from a PDP service.
+
 The two tier lists are collected independently. A profile with no collection time has unknown membership; after a successful collection, `false` means it was not listed. Membership is fresh for two configured refresh intervals. Only providers with a saved Registry profile are annotated.
 
 The single-provider refresh response has separate `profile_result` and `health_result` objects, each with success, attempt time, and a collection time or error. A failed part retains its previous successful data and observation time.

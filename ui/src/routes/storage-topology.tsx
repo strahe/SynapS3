@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { Database, RefreshCw, TriangleAlert } from 'lucide-react'
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
-import { APIError, type ObservabilityDataSetObservation, type ObservabilityProviderObservation } from '@/api/client'
+import type { ObservabilityDataSetObservation, ObservabilityProviderObservation } from '@/api/client'
 import { PageHeader } from '@/components/app/PageHeader'
 import { TopologyDetailSheet } from '@/components/storage-topology/StorageTopologyDetailSheet'
 import { DataSetsTableCard, ProvidersTableCard } from '@/components/storage-topology/StorageTopologyTables'
@@ -12,12 +12,12 @@ import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useObservabilityDataSets, useObservabilityProviders, useTestProviderUploadSpeed } from '@/hooks/queries'
+import { providerDisplayName } from '@/lib/provider-display'
+import { providerUploadSpeedTestErrorMessage } from '@/lib/provider-upload-speed'
 import {
   buildStorageTopologyGraph,
   buildTopologyProviderOptions,
   clampPageForLoadedTotal,
-  findDataSetTopologyNodeByLocalID,
-  findProviderTopologyNode,
   findStorageTopologySelection,
   mergeTopologyDataSetSnapshots,
   type ObservabilityStatusFilter,
@@ -35,8 +35,10 @@ import {
   type StorageTopologySelection,
   snapshotPageIsPartial,
   storageTopologyAllFilterValue,
+  storageTopologyDataSetSelection,
   storageTopologyDataSetSelectionSearch,
   storageTopologyPinnedContextForSelection,
+  storageTopologyProviderSelection,
   topologySummaryLabel,
 } from '@/lib/storage-topology'
 import {
@@ -186,7 +188,10 @@ function StorageTopologyPage() {
       ),
     [baseDataSets, pinnedDataSets, scopedDataSets, scopedDeepLinkSnapshotEnabled]
   )
-  const providerOptions = useMemo(() => buildTopologyProviderOptions(dataSets), [dataSets])
+  const providerOptions = useMemo(
+    () => buildTopologyProviderOptions(dataSets, graphProviders),
+    [dataSets, graphProviders]
+  )
   const bucketOptions = useMemo(
     () => Array.from(new Set(dataSets.map((dataSet) => dataSet.facts.bucket_name))).sort(),
     [dataSets]
@@ -254,6 +259,10 @@ function StorageTopologyPage() {
   const detailDataSets = useMemo(
     () => mergeDataSetObservations(pinnedDataSets, unpinnedDetailDataSets),
     [pinnedDataSets, unpinnedDetailDataSets]
+  )
+  const detailProvidersByID = useMemo(
+    () => new Map(detailProviders.map((provider) => [provider.facts.provider_id, provider])),
+    [detailProviders]
   )
   const snapshotLoading =
     providerSnapshot.isLoading ||
@@ -378,20 +387,14 @@ function StorageTopologyPage() {
   }
 
   function selectProvider(row: StorageTopologyProviderRow) {
-    const node = row.node ?? findProviderTopologyNode(graph, row.providerID)
-    const nextSelection = node
-      ? { type: 'node' as const, id: node.id, kind: node.kind }
-      : { type: 'provider' as const, providerID: row.providerID }
+    const nextSelection = storageTopologyProviderSelection(graph, row.providerID)
     setSelection({ source: 'local', selection: nextSelection })
     pinSelectionContext('local', nextSelection)
     clearSelectionSearchInRoute()
   }
 
   function selectDataSet(dataSet: ObservabilityDataSetObservation) {
-    const node = findDataSetTopologyNodeByLocalID(graph, dataSet.facts.local_data_set_id)
-    const nextSelection = node
-      ? { type: 'node' as const, id: node.id, kind: node.kind }
-      : { type: 'data-set' as const, localDataSetID: dataSet.facts.local_data_set_id }
+    const nextSelection = storageTopologyDataSetSelection(graph, dataSet.facts.local_data_set_id)
     setSelection({ source: 'route', selection: nextSelection })
     pinSelectionContext('route', nextSelection)
     updateSearch({ ...search, ...storageTopologyDataSetSelectionSearch(dataSet) })
@@ -434,13 +437,9 @@ function StorageTopologyPage() {
 
   function startProviderUploadSpeedTest(providerID: string) {
     setUploadSpeedTestError(null)
+    const providerName = providerDisplayName(providerID, detailProvidersByID.get(providerID)?.provider_profile?.name)
     testProviderUploadSpeed.mutate(providerID, {
-      onError: (error) =>
-        setUploadSpeedTestError(
-          error instanceof APIError && error.status === 409
-            ? `A test is already running, or provider #${providerID} is not available for testing. Check its details before trying again.`
-            : `Could not start the upload speed test for provider #${providerID}. Try again.`
-        ),
+      onError: (error) => setUploadSpeedTestError(providerUploadSpeedTestErrorMessage(error, providerName)),
     })
   }
 
@@ -454,14 +453,12 @@ function StorageTopologyPage() {
       <PageHeader
         className="shrink-0"
         title="Storage Topology"
+        meta={<span className="text-sm text-muted-foreground">{topologySummaryLabel(graph)}</span>}
         actions={
-          <div className="flex items-center gap-3">
-            <div className="text-sm text-muted-foreground">{topologySummaryLabel(graph)}</div>
-            <Button variant="outline" size="sm" onClick={refreshObservability} disabled={refreshing}>
-              <RefreshCw data-icon="inline-start" className={refreshing ? 'animate-spin' : undefined} />
-              Refresh
-            </Button>
-          </div>
+          <Button variant="outline" size="sm" onClick={refreshObservability} disabled={refreshing}>
+            <RefreshCw data-icon="inline-start" className={refreshing ? 'animate-spin' : undefined} />
+            Refresh
+          </Button>
         }
       />
 
@@ -522,6 +519,7 @@ function StorageTopologyPage() {
       ) : (
         <DataSetsTableCard
           dataSets={dataSetTableData}
+          providersByID={detailProvidersByID}
           total={dataSetTableTotal}
           page={dataSetPage}
           totalPages={dataSetTableTotalPages}
@@ -537,6 +535,7 @@ function StorageTopologyPage() {
         graph={graph}
         providers={detailProviders}
         dataSets={detailDataSets}
+        onNavigate={selectTopologySelection}
         onOpenChange={(open) => {
           if (open) return
           setSelection(null)

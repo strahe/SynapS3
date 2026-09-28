@@ -5,6 +5,7 @@ import {
   type ColorMode,
   Controls,
   type Edge,
+  type FitViewOptions,
   Handle,
   MarkerType,
   type Node,
@@ -13,15 +14,22 @@ import {
   PanOnScrollMode,
   Position,
   ReactFlow,
+  type ReactFlowInstance,
 } from '@xyflow/react'
-import { Database } from 'lucide-react'
-import { type ReactNode, useMemo, useSyncExternalStore } from 'react'
+import { Database, Gauge } from 'lucide-react'
+import { type ReactNode, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+import type { ObservabilitySignal } from '@/api/client'
 import { StatusBadge, type StatusTone } from '@/components/app/StatusBadge'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { activePiecesValue } from '@/lib/data-set-storage-health'
+import { providerRegistryLabel } from '@/lib/provider-display'
 import {
   bucketIssueTone,
+  countLabel,
   dataSetDisplayLabel,
-  observabilityStatusTone,
+  freshnessLabel,
+  observabilitySignalDetails,
   type StorageTopologyEdge,
   type StorageTopologyGraph,
   type StorageTopologyNode,
@@ -29,10 +37,11 @@ import {
   type StorageTopologySelection,
   storageTopologyGraphLayout,
 } from '@/lib/storage-topology'
-import { cn, formatNumber } from '@/lib/utils'
+import { cn } from '@/lib/utils'
+import { TopologySignalBadge, UploadSpeedText } from './TopologyStatus'
 
 type TopologyFlowNodeData = { topologyNode: StorageTopologyNode }
-type LaneFlowNodeData = { label: string; className: string }
+type LaneFlowNodeData = { label: string }
 type FlowEdgeData = { topologyEdge: StorageTopologyEdge }
 type TopologyFlowNode = Node<TopologyFlowNodeData, StorageTopologyNodeKind>
 type LaneFlowNode = Node<LaneFlowNodeData, 'lane'>
@@ -48,6 +57,8 @@ const graphNodeTypes = {
   lane: LaneHeaderGraphNode,
 } as NodeTypes
 
+const fitViewOptions: FitViewOptions<FlowNode> = { padding: 0.04, minZoom: 0.12, maxZoom: 1.25 }
+
 export default function TopologyGraphCanvas({
   graph,
   selection,
@@ -58,6 +69,12 @@ export default function TopologyGraphCanvas({
   onSelectionChange: (selection: StorageTopologySelection | null) => void
 }) {
   const colorMode = useReactFlowColorMode()
+  const containerRef = useRef<HTMLDivElement>(null)
+  const flowRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null)
+  const hasNodes = graph.nodes.length > 0
+  // A different set of nodes, such as after a filter change, starts from a fresh fit;
+  // a refresh that keeps the same nodes keeps the operator's pan and zoom.
+  const layoutKey = useMemo(() => graph.nodes.map((node) => node.id).join('|'), [graph.nodes])
   const topologyNodes = useMemo<TopologyFlowNode[]>(
     () =>
       graph.nodes.map((node) => ({
@@ -69,6 +86,7 @@ export default function TopologyGraphCanvas({
         draggable: false,
         connectable: false,
         selectable: true,
+        ariaLabel: node.data.path,
         sourcePosition: Position.Right,
         targetPosition: Position.Left,
       })),
@@ -76,19 +94,9 @@ export default function TopologyGraphCanvas({
   )
   const laneNodes = useMemo<LaneFlowNode[]>(
     () => [
-      laneHeaderNode('lane:buckets', 'Buckets', graph.buckets[0]?.x ?? storageTopologyGraphLayout.bucketX, 'w-56'),
-      laneHeaderNode(
-        'lane:data-sets',
-        'Data Sets',
-        graph.dataSets[0]?.x ?? storageTopologyGraphLayout.dataSetX,
-        'w-64'
-      ),
-      laneHeaderNode(
-        'lane:providers',
-        'Providers',
-        graph.providers[0]?.x ?? storageTopologyGraphLayout.providerX,
-        'w-56'
-      ),
+      laneHeaderNode('lane:buckets', 'Buckets', graph.buckets[0]?.x ?? storageTopologyGraphLayout.bucketX),
+      laneHeaderNode('lane:data-sets', 'Data Sets', graph.dataSets[0]?.x ?? storageTopologyGraphLayout.dataSetX),
+      laneHeaderNode('lane:providers', 'Providers', graph.providers[0]?.x ?? storageTopologyGraphLayout.providerX),
     ],
     [graph.buckets, graph.dataSets, graph.providers]
   )
@@ -107,6 +115,7 @@ export default function TopologyGraphCanvas({
           selectable: true,
           reconnectable: false,
           focusable: true,
+          ariaLabel: edge.data.path,
           interactionWidth: 24,
           style: { stroke, strokeWidth: selection?.type === 'edge' && selection.id === edge.id ? 3 : 2 },
           markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
@@ -115,7 +124,24 @@ export default function TopologyGraphCanvas({
     [graph.edges, selection]
   )
 
-  if (graph.nodes.length === 0) {
+  useEffect(() => {
+    const container = containerRef.current
+    if (!hasNodes || !container) return
+    let frame = 0
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+        void flowRef.current?.fitView(fitViewOptions)
+      })
+    })
+    observer.observe(container)
+    return () => {
+      cancelAnimationFrame(frame)
+      observer.disconnect()
+    }
+  }, [hasNodes])
+
+  if (!hasNodes) {
     return (
       <div className="flex h-full min-h-0 items-center justify-center p-6">
         <TopologyEmpty title="No topology" description="No observations match the current filters." />
@@ -125,13 +151,17 @@ export default function TopologyGraphCanvas({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="min-h-0 flex-1">
+      <div ref={containerRef} className="min-h-0 flex-1">
         <ReactFlow<FlowNode, FlowEdge>
+          key={layoutKey}
           nodes={flowNodes}
           edges={flowEdges}
           nodeTypes={graphNodeTypes}
+          onInit={(instance) => {
+            flowRef.current = instance
+          }}
           fitView
-          fitViewOptions={{ padding: 0.04, minZoom: 0.12, maxZoom: 1.25 }}
+          fitViewOptions={fitViewOptions}
           minZoom={0.12}
           maxZoom={1.8}
           colorMode={colorMode}
@@ -174,66 +204,97 @@ export default function TopologyGraphCanvas({
 
 function BucketGraphNode({ data, selected }: TopologyFlowNodeProps) {
   const node = data.topologyNode
+  const issueCount = node.data.issueCount ?? 0
   return (
-    <GraphNodeShell node={node} selected={selected} className="h-24 w-56 gap-1.5 p-2.5">
+    <GraphNodeShell node={node} selected={selected}>
       <Handle type="source" position={Position.Right} className="opacity-0" />
-      <GraphNodeHeader eyebrow="Bucket" title={node.label} />
-      <div className="flex flex-wrap gap-1">
-        <StatusBadge tone={bucketIssueTone(node.data.issueCount ?? 0, node.tone)}>
-          {issueCountLabel(node.data.issueCount ?? 0)}
+      <GraphNodeTitle title={node.label}>
+        <StatusBadge tone={bucketIssueTone(issueCount, node.tone)}>
+          {issueCount > 0 ? countLabel(issueCount, 'issue') : 'Healthy'}
         </StatusBadge>
-        <StatusBadge tone="neutral">{formatNumber(node.data.replicaCount ?? 0)} replicas</StatusBadge>
-      </div>
+      </GraphNodeTitle>
+      <GraphNodeLine>
+        {countLabel(node.data.replicaCount ?? 0, 'replica')} ·{' '}
+        {countLabel(node.data.providerIDs?.length ?? 0, 'provider')}
+      </GraphNodeLine>
     </GraphNodeShell>
   )
 }
 
 function DataSetGraphNode({ data, selected }: TopologyFlowNodeProps) {
   const node = data.topologyNode
+  const status = node.data.status ?? 'unknown'
+  const signal = node.data.signal
+  const problem = status === 'available' ? undefined : dataSetCardProblem(signal)
   return (
-    <GraphNodeShell node={node} selected={selected} className="h-24 w-64 gap-1.5 p-2.5">
+    <GraphNodeShell node={node} selected={selected}>
       <Handle type="target" position={Position.Left} className="opacity-0" />
       <Handle type="source" position={Position.Right} className="opacity-0" />
-      <GraphNodeHeader eyebrow={node.label} title={dataSetDisplayLabel(node.data)} />
-      <div className="flex flex-wrap gap-1">
-        <StatusBadge tone={observabilityStatusTone(node.data.status ?? 'unknown')}>{node.data.status}</StatusBadge>
-      </div>
+      <GraphNodeTitle title={node.label}>
+        <TopologySignalBadge status={status} signal={signal} />
+      </GraphNodeTitle>
+      <GraphNodeLine>{dataSetDisplayLabel(node.data)}</GraphNodeLine>
+      {problem ? (
+        <GraphNodeLine className={toneTextClass(node.tone)}>{problem}</GraphNodeLine>
+      ) : (
+        <GraphNodeLine>
+          Pieces:{' '}
+          {activePiecesValue({
+            active_piece_count: node.data.activePieceCount,
+            has_active_pieces: node.data.hasActivePieces,
+          })}
+        </GraphNodeLine>
+      )}
     </GraphNodeShell>
   )
 }
 
 function ProviderGraphNode({ data, selected }: TopologyFlowNodeProps) {
   const node = data.topologyNode
+  const status = node.data.status ?? 'unknown'
+  const registry = providerRegistryLabel(node.data.providerID ?? '')
+  const identity = [node.label === registry ? undefined : registry, node.data.location].filter(Boolean).join(' · ')
   return (
-    <GraphNodeShell node={node} selected={selected} className="h-24 w-56 gap-1.5 p-2.5">
+    <GraphNodeShell node={node} selected={selected}>
       <Handle type="target" position={Position.Left} className="opacity-0" />
-      <GraphNodeHeader eyebrow="Provider" title={`#${node.data.providerID}`} />
-      <div className="flex flex-wrap gap-1">
-        <StatusBadge tone={observabilityStatusTone(node.data.status ?? 'unknown')}>{node.data.status}</StatusBadge>
-      </div>
+      <GraphNodeTitle title={node.label}>
+        <TopologySignalBadge status={status} signal={node.data.signal} />
+      </GraphNodeTitle>
+      {identity && (
+        <GraphNodeLine>
+          {node.data.location ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>{identity}</span>
+              </TooltipTrigger>
+              <TooltipContent>Provider-declared location</TooltipContent>
+            </Tooltip>
+          ) : (
+            identity
+          )}
+        </GraphNodeLine>
+      )}
+      <GraphNodeLine icon={<Gauge className="size-3.5 shrink-0" aria-hidden="true" />}>
+        <UploadSpeedText test={node.data.uploadSpeedTest} />
+      </GraphNodeLine>
     </GraphNodeShell>
   )
 }
 
 function LaneHeaderGraphNode({ data }: LaneFlowNodeProps) {
   return (
-    <div
-      className={cn(
-        'rounded-md border bg-card/90 px-4 py-2 text-sm font-semibold text-muted-foreground shadow-xs',
-        data.className
-      )}
-    >
+    <div className="w-64 rounded-md border bg-card/90 px-4 py-2 text-sm font-semibold text-muted-foreground shadow-xs">
       {data.label}
     </div>
   )
 }
 
-function laneHeaderNode(id: string, label: string, x: number, className: string): LaneFlowNode {
+function laneHeaderNode(id: string, label: string, x: number): LaneFlowNode {
   return {
     id,
     type: 'lane',
     position: { x, y: -70 },
-    data: { label, className },
+    data: { label },
     draggable: false,
     connectable: false,
     selectable: false,
@@ -264,21 +325,18 @@ function readDocumentColorMode(): ColorMode {
 function GraphNodeShell({
   node,
   selected,
-  className,
   children,
 }: {
   node: StorageTopologyNode
   selected?: boolean
-  className?: string
   children: ReactNode
 }) {
   return (
     <div
       className={cn(
-        'flex flex-col gap-2 rounded-md border bg-card p-3 text-sm shadow-xs',
+        'flex h-24 w-64 flex-col gap-1 rounded-md border bg-card p-2.5 text-sm shadow-xs',
         nodeToneClasses(node.tone),
-        selected && 'ring-2 ring-ring',
-        className
+        selected && 'ring-2 ring-ring'
       )}
     >
       {children}
@@ -286,13 +344,28 @@ function GraphNodeShell({
   )
 }
 
-function GraphNodeHeader({ eyebrow, title }: { eyebrow: string; title: string }) {
+function GraphNodeTitle({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1">
-      <span className="text-xs text-muted-foreground">{eyebrow}</span>
+    <div className="flex min-w-0 items-center justify-between gap-2">
       <span className="truncate font-medium">{title}</span>
+      {children}
     </div>
   )
+}
+
+function GraphNodeLine({ icon, className, children }: { icon?: ReactNode; className?: string; children: ReactNode }) {
+  return (
+    <div className={cn('flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground', className)}>
+      {icon}
+      <span className="truncate">{children}</span>
+    </div>
+  )
+}
+
+function dataSetCardProblem(signal?: ObservabilitySignal) {
+  const [firstDetail, ...moreDetails] = observabilitySignalDetails(signal)
+  if (firstDetail) return moreDetails.length > 0 ? `${firstDetail} (+${moreDetails.length})` : firstDetail
+  return signal ? freshnessLabel(signal.freshness) : 'No state recorded'
 }
 
 function nodeToneClasses(tone: StatusTone) {
@@ -307,6 +380,17 @@ function nodeToneClasses(tone: StatusTone) {
       return 'border-[color:var(--status-info-border)] bg-[var(--status-info-bg)]'
     case 'neutral':
       return 'border-border bg-card'
+  }
+}
+
+function toneTextClass(tone: StatusTone) {
+  switch (tone) {
+    case 'warning':
+      return 'text-[color:var(--status-warning)]'
+    case 'danger':
+      return 'text-[color:var(--status-danger)]'
+    default:
+      return undefined
   }
 }
 
@@ -337,8 +421,4 @@ function TopologyEmpty({ title, description }: { title: string; description: str
       </EmptyHeader>
     </Empty>
   )
-}
-
-function issueCountLabel(count: number) {
-  return `${formatNumber(count)} ${count === 1 ? 'issue' : 'issues'}`
 }

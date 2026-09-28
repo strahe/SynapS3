@@ -339,6 +339,8 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 存储提供方列表可选返回最近一次手动测速的 `upload_speed_test`。成功结果包含 `bytes_per_second`、`duration_ms`、`sample_bytes` 和 `tested_at`；当前 `service_url` 缺失或与测速时不同，结果显示为 `stale`，不再作为当前速度。测速只在手动发起时运行，结果是单次样本，不保证实际对象上传速度。失败测速不能通过任务重试接口重试，请重新发起测速。Registry 资料由节点自行声明，不能据此确认位置，也不决定 Warm Storage 实际账单。
 
+存储提供方健康检查失败时，该提供方的 `signal.last_error` 会说明原因：检查超时、无法连接、被重定向、返回 HTTP 错误状态，或收到的不是 PDP 服务的应答。
+
 两份名单独立采集。采集时间为空时成员资格未知；成功采集后的 `false` 表示未列入。采集结果在两倍配置刷新间隔内视为新鲜。仅标注已有 Registry 资料的节点。
 
 单节点刷新响应分别包含 `profile_result` 和 `health_result`，各自给出是否成功、尝试时间，以及成功的采集时间或错误。某一部分失败时保留该部分上次成功的数据和观测时间。

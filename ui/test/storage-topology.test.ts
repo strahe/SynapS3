@@ -29,6 +29,7 @@ import {
   storageTopologyAllFilterValue,
   storageTopologyDataSetSelectionSearch,
   storageTopologyPinnedContextForSelection,
+  topologyDetailTarget,
   topologyGraphSummary,
   topologySummaryLabel,
 } from '../src/lib/storage-topology.ts'
@@ -57,6 +58,11 @@ const provider202: ObservabilityProviderObservation = {
     reason_codes: ['provider_http_unreachable'],
     freshness: { last_checked_at: '2026-05-21T08:00:00Z', stale: false, warnings: [] },
   },
+}
+
+const namedProvider202: ObservabilityProviderObservation = {
+  ...provider202,
+  provider_profile: { name: 'Acme Storage' } as ObservabilityProviderObservation['provider_profile'],
 }
 
 const provider606: ObservabilityProviderObservation = {
@@ -496,16 +502,16 @@ test('storage topology uses raw ids for value fields and prefixed ids for labels
   assert.equal(dataSetChainIDValue(mediaReplicaDataSet), '51002')
   assert.equal(dataSetChainIDValue(missingChainDataSet), '—')
   assert.equal(dataSetDisplayLabel(missingChainDataSet), 'No chain data set')
-  assert.equal(dataSetTopologyPath(mediaReplicaDataSet), 'media-prod -> Replica 2 -> Data Set #51002 -> Provider #202')
+  assert.equal(dataSetTopologyPath(mediaReplicaDataSet), 'media-prod -> Replica 2 -> Data Set #51002 -> Registry 202')
   assert.equal(
     dataSetTopologyPath(missingChainDataSet),
-    'research-data -> Replica 1 -> No chain data set -> Provider #101'
+    'research-data -> Replica 1 -> No chain data set -> Registry 101'
   )
 })
 
 test('storage topology graph builds unique bucket, replica, and used provider nodes', () => {
   const graph = buildStorageTopologyGraph(
-    [provider101, provider202, provider606],
+    [provider101, namedProvider202, provider606],
     [mediaDataSet, mediaReplicaDataSet, logsDataSet],
     { status: 'all', provider: allEntityFilterValue, bucket: allEntityFilterValue }
   )
@@ -523,7 +529,24 @@ test('storage topology graph builds unique bucket, replica, and used provider no
   assert.equal(graph.nodes.filter((node) => node.id === 'provider:202').length, 1)
   assert.deepEqual(topologyGraphSummary(graph), { buckets: 2, dataSets: 3, providers: 2 })
   assert.equal(topologySummaryLabel(graph), '2 buckets · 3 data sets · 2 providers')
-  assert.deepEqual(buildTopologyProviderOptions([mediaDataSet, mediaReplicaDataSet, logsDataSet]), ['101', '202'])
+  assert.equal(
+    topologySummaryLabel(
+      buildStorageTopologyGraph([provider101], [mediaDataSet], {
+        status: 'all',
+        provider: allEntityFilterValue,
+        bucket: allEntityFilterValue,
+      })
+    ),
+    '1 bucket · 1 data set · 1 provider'
+  )
+  assert.deepEqual(graph.providers.map((node) => node.label).sort(), ['Acme Storage', 'Registry 101'])
+  assert.deepEqual(
+    buildTopologyProviderOptions([mediaDataSet, mediaReplicaDataSet, logsDataSet], [provider101, namedProvider202]),
+    [
+      { value: '202', label: 'Acme Storage · Registry 202' },
+      { value: '101', label: 'Registry 101' },
+    ]
+  )
   assert.equal(bucketIssueTone(graph.buckets[0]?.data.issueCount ?? 0, graph.buckets[0]?.tone ?? 'neutral'), 'warning')
   assert.equal(
     graph.nodes.find((node) => node.id === 'provider:606'),
@@ -548,9 +571,48 @@ test('storage topology graph connects bucket to replicas and replicas to provide
     ]
   )
   assert.equal(graph.edges[0]?.data.path, 'media-prod -> Replica 1 -> Data Set #51001')
-  assert.equal(graph.edges[1]?.data.path, 'media-prod -> Replica 1 -> Data Set #51001 -> Provider #101')
+  assert.equal(graph.edges[1]?.data.path, 'media-prod -> Replica 1 -> Data Set #51001 -> Registry 101')
   assert.equal(graph.edges[1]?.data.chainDataSetID, '51001')
   assert.equal(graph.edges[1]?.data.clientDataSetID, '90001')
+})
+
+test('topology details show the data set behind a line and providers without a health observation', () => {
+  const dataSets = [mediaDataSet, mediaReplicaDataSet]
+  const graph = buildStorageTopologyGraph([provider101], dataSets, {
+    status: 'all',
+    provider: allEntityFilterValue,
+    bucket: allEntityFilterValue,
+  })
+  const edge = graph.edges.find((item) => item.id === 'data-set-provider:12:202')
+  const bucket = graph.nodes.find((node) => node.id === 'bucket:1')
+  const unobservedProvider = findProviderTopologyNode(graph, '202')
+  assert.ok(edge && bucket && unobservedProvider)
+
+  const edgeTarget = topologyDetailTarget({ type: 'edge', edge }, graph, [provider101], dataSets)
+  assert.equal(edgeTarget?.kind === 'data-set' ? edgeTarget.dataSet.facts.local_data_set_id : undefined, 12)
+
+  const bucketTarget = topologyDetailTarget({ type: 'node', node: bucket }, graph, [provider101], dataSets)
+  assert.deepEqual(
+    bucketTarget?.kind === 'bucket' ? bucketTarget.dataSets.map((dataSet) => dataSet.facts.local_data_set_id) : [],
+    [11, 12]
+  )
+
+  const providerTarget = topologyDetailTarget(
+    { type: 'node', node: unobservedProvider },
+    graph,
+    [provider101],
+    dataSets
+  )
+  assert.deepEqual(
+    providerTarget?.kind === 'provider'
+      ? [
+          providerTarget.providerID,
+          providerTarget.provider,
+          providerTarget.dataSets.map((dataSet) => dataSet.facts.local_data_set_id),
+        ]
+      : undefined,
+    ['202', undefined, [12]]
+  )
 })
 
 test('storage topology graph filters bucket and provider while retaining connected context', () => {

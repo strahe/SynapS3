@@ -24,9 +24,11 @@ func TestCheckProvidersMergesLocalAndRegistrySources(t *testing.T) {
 				"101": {ID: onChainID(t, "101"), Active: false, HasPDP: true, ServiceURL: "https://provider-101.test"},
 			},
 		},
-		ProviderHealth: func(context.Context, string, time.Duration) string { return "reachable" },
-		Timeout:        time.Second,
-		Concurrency:    2,
+		ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth {
+			return ProviderHealth{Status: "reachable"}
+		},
+		Timeout:     time.Second,
+		Concurrency: 2,
 	})
 
 	got, err := checker.CheckProviders(context.Background(), time.Time{}, []LocalDataSet{
@@ -56,9 +58,11 @@ func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
 				{ID: onChainID(t, "202"), Active: true, HasPDP: true, ServiceURL: "https://provider-202.test"},
 			},
 		},
-		ProviderHealth: func(context.Context, string, time.Duration) string { return "unreachable" },
-		Timeout:        time.Second,
-		Concurrency:    1,
+		ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth {
+			return ProviderHealth{Status: "unreachable", Detail: "Health check returned HTTP 503"}
+		},
+		Timeout:     time.Second,
+		Concurrency: 1,
 	})
 
 	got, err := checker.CheckProviders(context.Background(), time.Time{}, nil)
@@ -66,7 +70,11 @@ func TestCheckProvidersDegradesHTTPFailure(t *testing.T) {
 		t.Fatalf("CheckProviders: %v", err)
 	}
 
-	assertProviderState(t, providerStatesByID(got)["202"], StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
+	state := providerStatesByID(got)["202"]
+	assertProviderState(t, state, StatusDegraded, []ReasonCode{ReasonProviderHTTPUnreachable})
+	if state.LastError == nil || *state.LastError != "Health check returned HTTP 503" {
+		t.Fatalf("provider last error = %v, want the health check failure detail", state.LastError)
+	}
 }
 
 func TestCheckProviderKeepsProfileWhenHealthCheckDoesNotComplete(t *testing.T) {
@@ -76,7 +84,7 @@ func TestCheckProviderKeepsProfileWhenHealthCheckDoesNotComplete(t *testing.T) {
 		ProviderSource: fakeProviderSource{byID: map[string]Provider{
 			"202": {ID: id, Active: true, HasPDP: true, ServiceURL: "https://provider.test", Profile: profile},
 		}},
-		ProviderHealth: func(context.Context, string, time.Duration) string { return "" },
+		ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth { return ProviderHealth{} },
 		Timeout:        time.Second,
 	})
 	checkedAt := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
@@ -96,7 +104,7 @@ func TestCheckProvidersDegradesMissingServiceURL(t *testing.T) {
 				{ID: onChainID(t, "202"), Active: true, HasPDP: true},
 			},
 		},
-		ProviderHealth: func(context.Context, string, time.Duration) string { return "n/a" },
+		ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth { return ProviderHealth{Status: "n/a"} },
 		Timeout:        time.Second,
 		Concurrency:    1,
 	})
@@ -114,9 +122,11 @@ func TestCheckProvidersReturnsRegistryListFailure(t *testing.T) {
 		ProviderSource: fakeProviderSource{
 			listErr: errors.New("registry unavailable"),
 		},
-		ProviderHealth: func(context.Context, string, time.Duration) string { return "reachable" },
-		Timeout:        time.Second,
-		Concurrency:    1,
+		ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth {
+			return ProviderHealth{Status: "reachable"}
+		},
+		Timeout:     time.Second,
+		Concurrency: 1,
 	})
 
 	if _, err := checker.CheckProviders(context.Background(), time.Time{}, []LocalDataSet{
@@ -131,9 +141,11 @@ func TestCheckProvidersMarksLookupFailureUnknownWithSanitizedError(t *testing.T)
 		ProviderSource: fakeProviderSource{
 			lookupErr: errors.New("lookup unavailable https://rpc.example.test?token=secret"),
 		},
-		ProviderHealth: func(context.Context, string, time.Duration) string { return "reachable" },
-		Timeout:        time.Second,
-		Concurrency:    1,
+		ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth {
+			return ProviderHealth{Status: "reachable"}
+		},
+		Timeout:     time.Second,
+		Concurrency: 1,
 	})
 
 	got, err := checker.CheckProviders(context.Background(), time.Time{}, []LocalDataSet{
@@ -182,9 +194,11 @@ func TestCheckProvidersMarksMissingPDPUnavailable(t *testing.T) {
 				{ID: onChainID(t, "202"), Active: true, HasPDP: false},
 			},
 		},
-		ProviderHealth: func(context.Context, string, time.Duration) string { return "reachable" },
-		Timeout:        time.Second,
-		Concurrency:    1,
+		ProviderHealth: func(context.Context, string, time.Duration) ProviderHealth {
+			return ProviderHealth{Status: "reachable"}
+		},
+		Timeout:     time.Second,
+		Concurrency: 1,
 	})
 
 	got, err := checker.CheckProviders(context.Background(), time.Time{}, nil)

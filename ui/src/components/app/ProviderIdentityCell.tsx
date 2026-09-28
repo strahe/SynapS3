@@ -6,13 +6,14 @@ import type { ProviderIdentity } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { providerDisplayName } from '@/lib/provider-display'
 import { cn } from '@/lib/utils'
 import { CopyableValue } from './CopyableValue'
 
 export function ProviderIdentityCell({ providerID, identity }: { providerID?: string; identity?: ProviderIdentity }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const registryID = identity?.registry_provider_id ?? providerID
-  const label = identity?.name?.trim() || (registryID ? `Registry ${registryID}` : '—')
+  const label = registryID ? providerDisplayName(registryID, identity?.name) : identity?.name?.trim() || '—'
 
   if (!identity) {
     if (!registryID) {
@@ -98,7 +99,7 @@ function ProviderIdentityDetails({ providerID, identity }: { providerID?: string
   return (
     <div className="flex w-full select-text flex-col gap-3">
       <div className="font-medium">
-        {identity.name?.trim() || `Registry ${identity.registry_provider_id || providerID}`}
+        {providerDisplayName(identity.registry_provider_id || providerID || '', identity.name)}
       </div>
       <div className="grid grid-cols-1 gap-x-3 gap-y-2 text-xs sm:grid-cols-[9rem_minmax(0,1fr)]">
         {fields.map(([label, value]) => (

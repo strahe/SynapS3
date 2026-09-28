@@ -3,6 +3,8 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,17 +16,20 @@ import (
 	"github.com/strahe/synaps3/internal/types"
 )
 
-func TestCheckHealth_HTTPStatus(t *testing.T) {
+func TestProbeHTTPResponses(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
+		location   string
 		body       string
-		want       string
+		wantStatus string
+		wantDetail string
 	}{
-		{name: "ok", statusCode: http.StatusOK, body: "curio-pdp", want: "reachable"},
-		{name: "wrong service identity", statusCode: http.StatusOK, body: "not-pdp", want: "unreachable"},
-		{name: "4xx response", statusCode: http.StatusMethodNotAllowed, want: "unreachable"},
-		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, want: "unreachable"},
+		{name: "ok", statusCode: http.StatusOK, body: "curio-pdp", wantStatus: "reachable"},
+		{name: "wrong service identity", statusCode: http.StatusOK, body: "not-pdp", wantStatus: "unreachable", wantDetail: "Service URL did not answer as a PDP provider"},
+		{name: "4xx response", statusCode: http.StatusMethodNotAllowed, wantStatus: "unreachable", wantDetail: "Health check returned HTTP 405"},
+		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, wantStatus: "unreachable", wantDetail: "Health check returned HTTP 503"},
+		{name: "redirect", statusCode: http.StatusFound, location: "/elsewhere", wantStatus: "unreachable", wantDetail: "Health check was redirected (HTTP 302)"},
 	}
 
 	for _, tt := range tests {
@@ -36,23 +41,67 @@ func TestCheckHealth_HTTPStatus(t *testing.T) {
 				if r.URL.Path != "/pdp/ping" {
 					t.Errorf("path = %q, want /pdp/ping", r.URL.Path)
 				}
+				if tt.location != "" {
+					w.Header().Set("Location", tt.location)
+				}
 				w.WriteHeader(tt.statusCode)
 				_, _ = io.WriteString(w, tt.body)
 			}))
 			defer srv.Close()
 
-			status := CheckHealth(context.Background(), srv.URL, 2*time.Second)
-			if status != tt.want {
-				t.Errorf("status = %q, want %q", status, tt.want)
+			got := NewHealthChecker(nil).Probe(context.Background(), srv.URL, 2*time.Second)
+			if got.Status != tt.wantStatus || got.Detail != tt.wantDetail {
+				t.Errorf("probe = %+v, want status %q detail %q", got, tt.wantStatus, tt.wantDetail)
 			}
 		})
 	}
 }
 
-func TestCheckHealth_Unreachable(t *testing.T) {
-	status := CheckHealth(context.Background(), "http://127.0.0.1:1", 1*time.Second)
-	if status != "unreachable" {
-		t.Errorf("expected unreachable, got %q", status)
+func TestProbeTLSVerificationFailures(t *testing.T) {
+	cert := &x509.Certificate{DNSNames: []string{"other.example"}}
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "unknown authority", err: x509.UnknownAuthorityError{Cert: cert}},
+		{name: "hostname mismatch", err: x509.HostnameError{Certificate: cert, Host: "provider.example"}},
+		{name: "expired", err: x509.CertificateInvalidError{Cert: cert, Reason: x509.Expired, Detail: "certificate has expired"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &recordingRoundTripper{err: &tls.CertificateVerificationError{
+				UnverifiedCertificates: []*x509.Certificate{cert}, Err: tt.err,
+			}}
+			checker := NewHealthChecker(&http.Client{Transport: transport})
+			got := checker.Probe(t.Context(), "https://provider.example", time.Second)
+			if got.Status != "unreachable" || got.Detail != "Provider TLS certificate could not be verified" {
+				t.Errorf("probe = %+v, want unreachable with TLS verification failure detail", got)
+			}
+		})
+	}
+}
+
+func TestProbeConnectionRefused(t *testing.T) {
+	got := NewHealthChecker(nil).Probe(context.Background(), "http://127.0.0.1:1", time.Second)
+	if got.Status != "unreachable" || got.Detail != "Provider refused the connection" {
+		t.Errorf("probe = %+v, want unreachable with refused connection detail", got)
+	}
+}
+
+func TestProbeConnectionClosedBeforeReply(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	got := NewHealthChecker(nil).Probe(context.Background(), srv.URL, 2*time.Second)
+	if got.Status != "unreachable" || got.Detail != "Provider closed the connection before replying" {
+		t.Errorf("probe = %+v, want unreachable with closed connection detail", got)
 	}
 }
 
@@ -61,10 +110,10 @@ func TestCheckHealthLogsClientConstructionError(t *testing.T) {
 	checker := NewHealthChecker(nil)
 	checker.logger = slog.New(slog.NewTextHandler(&logs, nil))
 
-	status := checker.Check(context.Background(), "ftp://provider.example", time.Second)
+	got := checker.Probe(context.Background(), "ftp://provider.example", time.Second)
 
-	if status != "unreachable" {
-		t.Fatalf("status = %q, want unreachable", status)
+	if got.Status != "unreachable" || got.Detail != "Service URL is invalid" {
+		t.Fatalf("probe = %+v, want unreachable with invalid URL detail", got)
 	}
 	if !strings.Contains(logs.String(), "failed to create PDP health client") {
 		t.Fatalf("logs = %q, want PDP client construction warning", logs.String())
@@ -72,9 +121,12 @@ func TestCheckHealthLogsClientConstructionError(t *testing.T) {
 }
 
 func TestCheckHealth_EmptyURL(t *testing.T) {
-	status := CheckHealth(context.Background(), "", 1*time.Second)
-	if status != "n/a" {
+	if status := CheckHealth(context.Background(), "", 1*time.Second); status != "n/a" {
 		t.Errorf("expected n/a, got %q", status)
+	}
+	got := NewHealthChecker(nil).Probe(context.Background(), "", time.Second)
+	if got.Status != "n/a" || got.Detail != "Provider has no service URL" {
+		t.Errorf("probe = %+v, want n/a with missing URL detail", got)
 	}
 }
 
@@ -85,9 +137,9 @@ func TestCheckHealth_Timeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status := CheckHealth(context.Background(), srv.URL, 100*time.Millisecond)
-	if status != "unreachable" {
-		t.Errorf("expected unreachable (timeout), got %q", status)
+	got := NewHealthChecker(nil).Probe(context.Background(), srv.URL, 100*time.Millisecond)
+	if got.Status != "unreachable" || got.Detail != "Health check timed out" {
+		t.Errorf("probe = %+v, want unreachable with timeout detail", got)
 	}
 }
 
@@ -145,12 +197,16 @@ type recordingRoundTripper struct {
 	calls  int
 	method string
 	path   string
+	err    error
 }
 
 func (r *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	r.calls++
 	r.method = req.Method
 	r.path = req.URL.Path
+	if r.err != nil {
+		return nil, r.err
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader("curio-pdp")),

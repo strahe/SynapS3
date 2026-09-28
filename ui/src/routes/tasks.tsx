@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { ChevronLeft, ChevronRight, ListTodo, Loader2, RefreshCw, RotateCcw, X } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 
 import { api, type TaskItem } from '@/api/client'
 import { CopyableValue } from '@/components/app/CopyableValue'
@@ -17,6 +17,7 @@ import { Pagination, PaginationContent, PaginationItem } from '@/components/ui/p
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useTasks } from '@/hooks/queries'
 import { timeAgo } from '@/lib/utils'
 
@@ -164,7 +165,6 @@ function TasksPage() {
     <div className="flex flex-col gap-6 p-6">
       <PageHeader
         title="Tasks"
-        description="Review background operations and recover work that needs attention."
         actions={
           <div className="flex items-center gap-2">
             {status === 'failed' && (
@@ -345,8 +345,7 @@ function TaskTable({
             <TableHead className="px-4">Operation</TableHead>
             <TableHead className="px-4">Status</TableHead>
             <TableHead className="px-4">Subject</TableHead>
-            <TableHead className="w-24 px-4">Retries</TableHead>
-            <TableHead className="w-28 px-4">Updated</TableHead>
+            <TableHead className="w-28 px-4">Created</TableHead>
             <TableHead className="min-w-64 px-4">Details</TableHead>
             <TableHead className="px-4 text-right">Actions</TableHead>
           </TableRow>
@@ -359,15 +358,19 @@ function TaskTable({
               </TableCell>
               <TableCell className="px-4 font-medium">{task.operation}</TableCell>
               <TableCell className="px-4">
-                <StatusBadge tone={taskStatusTone(task.presentation_status)}>
-                  {presentationLabels[task.presentation_status]}
-                </StatusBadge>
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <StatusBadge tone={taskStatusTone(task.presentation_status)}>
+                    {presentationLabels[task.presentation_status]}
+                  </StatusBadge>
+                  {task.retry_count > 0 && (
+                    <span className="whitespace-nowrap text-xs text-muted-foreground">{taskRetriesLabel(task)}</span>
+                  )}
+                </div>
               </TableCell>
               <TableCell className="px-4">{taskSubject(task)}</TableCell>
-              <TableCell className="px-4">
-                {task.retry_limit === undefined ? task.retry_count : `${task.retry_count}/${task.retry_limit}`}
+              <TableCell className="px-4 text-muted-foreground">
+                <TaskCreatedTime task={task} />
               </TableCell>
-              <TableCell className="px-4 text-muted-foreground">{timeAgo(task.updated_at)}</TableCell>
               <TableCell className="max-w-96 px-4">
                 <TaskDetails task={task} />
               </TableCell>
@@ -426,14 +429,53 @@ function TaskDetails({ task }: { task: TaskItem }) {
   )
 }
 
+// Created, not last updated: a waiting task is rechecked every minute, so its
+// update time says nothing about when the work was requested or how long it has waited.
+function TaskCreatedTime({ task }: { task: TaskItem }) {
+  const lifecycle: Array<[label: string, time: string | undefined]> = [
+    ['Created', task.created_at],
+    ['Started', task.started_at],
+    ['Finished', task.finished_at],
+    [
+      'Next attempt',
+      task.status === 'pending' && new Date(task.available_at).getTime() > Date.now() ? task.available_at : undefined,
+    ],
+  ]
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="whitespace-nowrap">{timeAgo(task.created_at)}</span>
+      </TooltipTrigger>
+      <TooltipContent>
+        <dl className="grid grid-cols-[auto_auto] gap-x-3 gap-y-0.5">
+          {lifecycle
+            .filter((entry): entry is [string, string] => Boolean(entry[1]))
+            .map(([label, time]) => (
+              <Fragment key={label}>
+                <dt>{label}</dt>
+                <dd>{new Date(time).toLocaleString()}</dd>
+              </Fragment>
+            ))}
+        </dl>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function taskRetriesLabel(task: TaskItem) {
+  if (task.retry_limit !== undefined) return `${task.retry_count}/${task.retry_limit} retries`
+  return task.retry_count === 1 ? '1 retry' : `${task.retry_count} retries`
+}
+
 function taskSubject(task: TaskItem) {
   if (!task.subject_type || !task.subject_key) return 'System'
   const labels: Record<string, string> = {
-    object_version: 'Object version',
     bucket: 'Bucket',
+    provider: 'Registry',
+    storage_content: 'Stored content',
     storage_copy: 'Storage copy',
     storage_data_set: 'Storage service',
-    storage_upload: 'Stored content',
+    storage_replacement: 'Provider replacement',
     wallet_operation: 'Wallet request',
     system: 'System',
   }
