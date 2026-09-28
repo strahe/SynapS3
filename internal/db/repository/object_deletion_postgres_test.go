@@ -1,10 +1,9 @@
+//go:build postgres
+
 package repository_test
 
 import (
 	"context"
-	"fmt"
-	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +13,7 @@ import (
 	appdb "github.com/strahe/synaps3/internal/db"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
 )
 
@@ -50,52 +50,21 @@ func storageContentLockQuery(query string) bool {
 	return strings.Contains(query, "update") && strings.Contains(query, "storage_contents") && strings.Contains(query, "updated_at = updated_at")
 }
 
-func migratedPostgresDB(t *testing.T, dsn string) *bun.DB {
+func migratedPostgresDB(t *testing.T) *bun.DB {
 	t.Helper()
-	ctx := context.Background()
-	adminDB, err := appdb.New(config.DatabaseConfig{Driver: "postgres", DSN: dsn, MaxOpenConns: 1, MaxIdleConns: 1})
+	db, err := appdb.New(config.DatabaseConfig{Driver: "postgres", DSN: testpg.SchemaDSN(t), MaxOpenConns: 4, MaxIdleConns: 4})
 	if err != nil {
-		t.Fatalf("opening postgres admin connection: %v", err)
-	}
-	schema := fmt.Sprintf("synaps3_repository_%d", time.Now().UnixNano())
-	quotedSchema := quotePostgresIdentifier(schema)
-	if _, err := adminDB.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
-		_ = adminDB.Close()
-		t.Fatalf("creating postgres test schema: %v", err)
-	}
-	testDSN, err := postgresDSNWithSearchPath(dsn, schema)
-	if err != nil {
-		_ = adminDB.Close()
-		t.Fatalf("adding postgres test search path: %v", err)
-	}
-	db, err := appdb.New(config.DatabaseConfig{Driver: "postgres", DSN: testDSN, MaxOpenConns: 4, MaxIdleConns: 4})
-	if err != nil {
-		_ = adminDB.Close()
 		t.Fatalf("opening postgres test connections: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = db.Close()
-		_, _ = adminDB.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS "+quotedSchema+" CASCADE")
-		_ = adminDB.Close()
+		if err := db.Close(); err != nil {
+			t.Errorf("close PostgreSQL test database: %v", err)
+		}
 	})
-	if err := appdb.RunMigrations(ctx, db); err != nil {
+	if err := appdb.RunMigrations(context.Background(), db); err != nil {
 		t.Fatalf("running postgres test migrations: %v", err)
 	}
 	return db
-}
-
-func postgresDSNWithSearchPath(dsn, schema string) (string, error) {
-	if strings.Contains(dsn, "://") {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", err
-		}
-		query := u.Query()
-		query.Set("search_path", schema)
-		u.RawQuery = query.Encode()
-		return u.String(), nil
-	}
-	return strings.TrimSpace(dsn) + " search_path=" + schema, nil
 }
 
 func waitPostgresSignal(t *testing.T, signal <-chan struct{}, name string) {
@@ -124,11 +93,6 @@ func waitPostgresResult(t *testing.T, result <-chan error, name string) error {
 // on the content row. Cache release rechecks after both operations commit, so
 // the surviving follower must retain the shared file regardless of lock order.
 func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
-	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
-	}
-
 	for _, tc := range []struct {
 		name             string
 		blockedOperation string
@@ -137,7 +101,7 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 		{name: "reuse wins", blockedOperation: "reuse"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := migratedPostgresDB(t, dsn)
+			db := migratedPostgresDB(t)
 			repos := repository.NewRepositories(db)
 			ctx := context.Background()
 			bucket := seedBucket(t, db, "postgres-permanent-delete-"+strings.ReplaceAll(tc.name, " ", "-"))

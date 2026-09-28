@@ -1,14 +1,13 @@
+//go:build postgres
+
 package repository_test
 
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/migrations"
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
+	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 )
@@ -133,31 +133,15 @@ func TestPostgresTaskClaimSkipsLockedHeadWithoutLegacyAdvisoryLock(t *testing.T)
 
 func newPostgresTaskDB(t *testing.T) *bun.DB {
 	t.Helper()
-	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
-	}
-	config, err := pgx.ParseConfig(dsn)
+	config, err := pgx.ParseConfig(testpg.SchemaDSN(t))
 	if err != nil {
 		t.Fatalf("parse PostgreSQL DSN: %v", err)
 	}
-	adminSQL, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open PostgreSQL admin connection: %v", err)
-	}
-	adminDB := bun.NewDB(adminSQL, pgdialect.New())
-	schema := fmt.Sprintf("task_claim_%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()))))[:40]
-	quotedSchema := `"` + strings.ReplaceAll(schema, `"`, `""`) + `"`
-	if _, err := adminDB.Exec("CREATE SCHEMA " + quotedSchema); err != nil {
-		_ = adminDB.Close()
-		t.Fatalf("create PostgreSQL schema: %v", err)
-	}
-	config.RuntimeParams["search_path"] = schema
 	db := bun.NewDB(stdlib.OpenDB(*config), pgdialect.New())
 	t.Cleanup(func() {
-		_ = db.Close()
-		_, _ = adminDB.Exec("DROP SCHEMA " + quotedSchema + " CASCADE")
-		_ = adminDB.Close()
+		if err := db.Close(); err != nil {
+			t.Errorf("close PostgreSQL test database: %v", err)
+		}
 	})
 	if err := migrations.ValidateTarget(t.Context(), db); err != nil {
 		t.Fatalf("validate empty PostgreSQL schema: %v", err)

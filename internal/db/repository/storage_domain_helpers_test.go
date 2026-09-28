@@ -638,20 +638,6 @@ func commitStorageHealthCopy(
 	return got
 }
 
-func bindStorageHealthVersion(
-	t *testing.T,
-	repos *repository.Repositories,
-	bucketID, contentID int64,
-	version *model.ObjectVersion,
-) {
-	t.Helper()
-	if _, err := repos.Contents.BindReadableUploadForVersion(context.Background(), repository.BindReadableUploadForVersionInput{
-		ContentID: contentID, BucketID: bucketID, VersionID: version.VersionID,
-	}); err != nil {
-		t.Fatalf("BindReadableUploadForVersion: %v", err)
-	}
-}
-
 // A failed copy flags its content only once no copy is left that holds it or
 // may still hold it.
 func TestCopyFailureFlagsContentOnlyWhenNoCopyCanServeIt(t *testing.T) {

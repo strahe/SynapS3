@@ -1,9 +1,10 @@
+//go:build postgres
+
 package repository_test
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,17 +14,13 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/observability"
+	"github.com/strahe/synaps3/internal/testpg"
 	"github.com/uptrace/bun"
 )
 
 func TestPostgresPrefixPlan(t *testing.T) {
-	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
-	}
-
 	ctx := context.Background()
-	db := newPostgresPrefixTestDB(t, ctx, dsn)
+	db := newPostgresPrefixTestDB(t, ctx)
 	capture := new(postgresQueryCapture)
 	repos := repository.NewRepositories(db.WithQueryHook(capture))
 	bucket := seedBucket(t, db, "pg-prefix-plan-bucket")
@@ -80,30 +77,22 @@ func TestPostgresPrefixPlan(t *testing.T) {
 	assertPostgresPlanUsesIndex(t, db, "idx_object_versions_bucket_key_created", capture.match(t, `ORDER BY object_version.key COLLATE "C" ASC`))
 }
 
-func newPostgresPrefixTestDB(t *testing.T, ctx context.Context, dsn string) *bun.DB {
+func newPostgresPrefixTestDB(t *testing.T, ctx context.Context) *bun.DB {
 	t.Helper()
 	db, err := appdb.New(config.DatabaseConfig{
 		Driver:       "postgres",
-		DSN:          dsn,
+		DSN:          testpg.SchemaDSN(t),
 		MaxOpenConns: 1,
 		MaxIdleConns: 1,
 	})
 	if err != nil {
 		t.Fatalf("opening postgres test db: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	schema := fmt.Sprintf("synaps3_prefix_verify_%d", time.Now().UnixNano())
-	quotedSchema := quotePostgresIdentifier(schema)
-	if _, err := db.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
-		t.Fatalf("creating schema: %v", err)
-	}
 	t.Cleanup(func() {
-		_, _ = db.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS "+quotedSchema+" CASCADE")
+		if err := db.Close(); err != nil {
+			t.Errorf("close PostgreSQL test database: %v", err)
+		}
 	})
-	if _, err := db.ExecContext(ctx, "SET search_path TO "+quotedSchema); err != nil {
-		t.Fatalf("setting search_path: %v", err)
-	}
 	if err := appdb.RunMigrations(ctx, db); err != nil {
 		t.Fatalf("running postgres migrations: %v", err)
 	}
@@ -292,6 +281,16 @@ func assertPostgresPlanUsesIndex(t *testing.T, db *bun.DB, indexName string, que
 	t.Logf("plan for %s:\n%s", indexName, joined)
 }
 
-func quotePostgresIdentifier(identifier string) string {
-	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+func bindStorageHealthVersion(
+	t *testing.T,
+	repos *repository.Repositories,
+	bucketID, contentID int64,
+	version *model.ObjectVersion,
+) {
+	t.Helper()
+	if _, err := repos.Contents.BindReadableUploadForVersion(context.Background(), repository.BindReadableUploadForVersionInput{
+		ContentID: contentID, BucketID: bucketID, VersionID: version.VersionID,
+	}); err != nil {
+		t.Fatalf("BindReadableUploadForVersion: %v", err)
+	}
 }

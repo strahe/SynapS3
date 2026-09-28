@@ -1,9 +1,10 @@
+//go:build postgres
+
 package repository_test
 
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -84,11 +85,7 @@ func waitForPostgresLockWait(t *testing.T, db *bun.DB, table string) {
 
 func postgresRaceDB(t *testing.T) *bun.DB {
 	t.Helper()
-	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
-	}
-	return migratedPostgresDB(t, dsn)
+	return migratedPostgresDB(t)
 }
 
 // Replacement drains the source while an upload plan settles against it. The

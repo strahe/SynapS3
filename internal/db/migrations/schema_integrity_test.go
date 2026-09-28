@@ -2,24 +2,17 @@ package migrations
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"errors"
-	"fmt"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/migrate"
 	_ "modernc.org/sqlite"
@@ -63,47 +56,6 @@ func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
 			}
 		}
 	}
-}
-
-// A PostgreSQL database is validated against the SQLite reference on what the
-// two dialects share, so the baseline must build that shared schema on both.
-func TestInitialSchemaMatchesAcrossDialects(t *testing.T) {
-	db := newPostgresMigrationDB(t)
-	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-		t.Fatalf("create initial schema: %v", err)
-	}
-	sqliteDB := newSQLiteMigrationDB(t, "postgres_portable_schema_comparison")
-	if err := runMigrationBody(t.Context(), sqliteDB, up2026090101InitialSchema); err != nil {
-		t.Fatalf("create comparison SQLite schema: %v", err)
-	}
-	postgresSchema := portableSchema(t, db)
-	sqliteSchema := portableSchema(t, sqliteDB)
-	if !slices.Equal(postgresSchema, sqliteSchema) {
-		t.Fatalf("portable schema differs by dialect:\n%s", semanticSchemaDifference(sqliteSchema, postgresSchema))
-	}
-}
-
-func semanticSchemaDifference(wantLines, gotLines []string) string {
-	wantSet := make(map[string]struct{}, len(wantLines))
-	gotSet := make(map[string]struct{}, len(gotLines))
-	for _, line := range wantLines {
-		wantSet[line] = struct{}{}
-	}
-	for _, line := range gotLines {
-		gotSet[line] = struct{}{}
-	}
-	difference := make([]string, 0)
-	for _, line := range wantLines {
-		if _, ok := gotSet[line]; !ok {
-			difference = append(difference, "- "+line)
-		}
-	}
-	for _, line := range gotLines {
-		if _, ok := wantSet[line]; !ok {
-			difference = append(difference, "+ "+line)
-		}
-	}
-	return strings.Join(difference, "\n")
 }
 
 func TestInitialSchemaContractSQLite(t *testing.T) {
@@ -507,45 +459,4 @@ func newSQLiteMigrationDB(t *testing.T, name string) *bun.DB {
 	db := bun.NewDB(sqldb, sqlitedialect.New())
 	t.Cleanup(func() { _ = db.Close() })
 	return db
-}
-
-func newPostgresMigrationDB(t *testing.T) *bun.DB {
-	t.Helper()
-	dsn := postgresTestDSN(t)
-	pgConfig, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse PostgreSQL DSN: %v", err)
-	}
-	adminSQLDB, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open PostgreSQL admin connection: %v", err)
-	}
-	adminDB := bun.NewDB(adminSQLDB, pgdialect.New())
-	testHash := fmt.Sprintf("%x", sha256.Sum256([]byte(t.Name())))[:16]
-	schema := fmt.Sprintf("migration_%s_%x", testHash, time.Now().UnixNano())
-	if _, err := adminDB.Exec("CREATE SCHEMA " + quotePostgresName(schema)); err != nil {
-		_ = adminDB.Close()
-		t.Fatalf("create PostgreSQL schema: %v", err)
-	}
-	pgConfig.RuntimeParams["search_path"] = schema
-	db := bun.NewDB(stdlib.OpenDB(*pgConfig), pgdialect.New())
-	t.Cleanup(func() {
-		_ = db.Close()
-		_, _ = adminDB.Exec("DROP SCHEMA " + quotePostgresName(schema) + " CASCADE")
-		_ = adminDB.Close()
-	})
-	return db
-}
-
-func postgresTestDSN(t *testing.T) string {
-	t.Helper()
-	dsn := os.Getenv("SYNAPS3_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("SYNAPS3_POSTGRES_TEST_DSN is not set")
-	}
-	return dsn
-}
-
-func quotePostgresName(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }

@@ -16,7 +16,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-system test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev ui-e2e-install
+.PHONY: all build build-go build-systemtest-server build-integration-server docs-build test test-fast test-race test-postgres test-system test-s3-compatibility test-s3-clients test-integration test-ui-e2e test-docker-entrypoint test-docker-deployment lint fmt check verify-e2e verify-fast verify-norace verify-race clean run ui-install ui-build ui-dev ui-e2e-install
 .PHONY: docker-init docker-up docker-verify docker-down docker-status docker-logs docker-password
 
 all: build
@@ -51,6 +51,9 @@ test-fast:
 
 test-race:
 	$(CGO) go test -race -count=1 ./cmd/... ./internal/...
+
+test-postgres:
+	$(CGO) go test -tags=postgres -count=1 ./internal/testpg ./internal/db/migrations ./internal/db/repository ./internal/task ./internal/storagecommit
 
 test-system:
 	$(CGO) go test $(GOFLAGS) -tags='dev systemtest' -count=1 ./tests/testutil/... ./internal/systemtest ./tests/system

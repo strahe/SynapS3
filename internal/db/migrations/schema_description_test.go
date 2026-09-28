@@ -28,16 +28,6 @@ func appliedTableColumns(t *testing.T, db *bun.DB, table string) []appliedColumn
 	return columns
 }
 
-// portableSchema describes what both dialects share.
-func portableSchema(t *testing.T, db *bun.DB) []string {
-	t.Helper()
-	schema, err := describeSchema(t.Context(), db, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return schema
-}
-
 // migrateToLevel runs the first level registered migrations that have not run.
 func migrateToLevel(t *testing.T, db *bun.DB, level int) {
 	t.Helper()
@@ -142,29 +132,6 @@ func TestValidateTargetRejectsDriftBeforePendingMigrations(t *testing.T) {
 			t.Fatalf("validateTarget = %v, want ErrIncompatibleDatabase", err)
 		}
 	})
-}
-
-// The SQLite reference stores JSON as text, so a PostgreSQL JSON column counts
-// as JSON only while it keeps its own declared type.
-func TestValidateCurrentSchemaComparesPostgresJSONColumnType(t *testing.T) {
-	ctx := t.Context()
-	db := newPostgresMigrationDB(t)
-	migrateToLevel(t, db, len(Migrations.Sorted()))
-	if err := ValidateCurrentSchema(ctx, db); err != nil {
-		t.Fatalf("ValidateCurrentSchema before the change = %v", err)
-	}
-	for _, change := range []string{
-		`ALTER TABLE task_payloads DROP CONSTRAINT chk_task_payloads_input_json_json`,
-		`ALTER TABLE task_payloads ALTER COLUMN input_json TYPE text USING input_json::text`,
-		`ALTER TABLE task_payloads ADD CONSTRAINT chk_task_payloads_input_json_json CHECK (jsonb_typeof(input_json::jsonb) = 'object')`,
-	} {
-		if _, err := db.ExecContext(ctx, change); err != nil {
-			t.Fatalf("%s: %v", change, err)
-		}
-	}
-	if err := ValidateCurrentSchema(ctx, db); !errors.Is(err, ErrIncompatibleDatabase) {
-		t.Fatalf("ValidateCurrentSchema with a text JSON column = %v, want ErrIncompatibleDatabase", err)
-	}
 }
 
 // Editing a migration in place can change a table without renaming anything.
