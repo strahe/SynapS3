@@ -892,49 +892,50 @@ func TestCheckpointedEffectRollsBackEvidenceBeforeEffect(t *testing.T) {
 }
 
 func TestCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T) {
-	for name, openDB := range map[string]func(*testing.T) *bun.DB{
-		"sqlite":   testutil.NewTestFileDB,
-		"postgres": testutil.NewTestPostgresDB,
-	} {
-		t.Run(name, func(t *testing.T) {
-			limit := 5
-			var repos *repository.Repositories
-			var duringEffect json.RawMessage
-			harness := newTaskHarnessWithDB(t, openDB(t), scriptedHandler{
-				definition: testDefinition(&limit, true),
-				execute: func(ctx context.Context, execution Execution) Result {
-					attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, map[string]string{"attempt": "one"}, nil, func(ctx context.Context) error {
-						stored, err := repos.Tasks.GetByID(ctx, execution.ID())
-						if err != nil {
-							return err
-						}
-						duringEffect = stored.Checkpoint
-						return nil
-					})
-					if !attempted || err != nil {
-						return Fail(fmt.Errorf("checkpointed effect = attempted:%v err:%v", attempted, err), "unexpected_effect_result", nil)
-					}
-					return Complete("effect finished", nil)
-				},
-			}, nil)
-			repos = harness.repos
-			row := enqueueTestTask(t, harness, "checkpoint-commit", "checkpoint-commit")
-			harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+	t.Run("sqlite", func(t *testing.T) {
+		assertCheckpointedEffectCommitsCheckpointBeforeEffect(t, testutil.NewTestFileDB(t))
+	})
+	testPostgresCheckpointedEffect(t)
+}
 
-			stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
-			if err != nil {
-				t.Fatalf("load task: %v", err)
-			}
-			if stored.Status != model.TaskStatusCompleted {
-				t.Fatalf("task after effect = %#v", stored)
-			}
-			for label, raw := range map[string]json.RawMessage{"during effect": duringEffect, "after settlement": stored.Checkpoint} {
-				var checkpoint map[string]string
-				if err := json.Unmarshal(raw, &checkpoint); err != nil || checkpoint["attempt"] != "one" {
-					t.Fatalf("checkpoint %s = %s, err=%v", label, raw, err)
+func assertCheckpointedEffectCommitsCheckpointBeforeEffect(t *testing.T, db *bun.DB) {
+	t.Helper()
+	limit := 5
+	var repos *repository.Repositories
+	var duringEffect json.RawMessage
+	harness := newTaskHarnessWithDB(t, db, scriptedHandler{
+		definition: testDefinition(&limit, true),
+		execute: func(ctx context.Context, execution Execution) Result {
+			attempted, err := execution.WithCheckpointedEffect(ctx, ResourceProviderMutation, map[string]string{"attempt": "one"}, nil, func(ctx context.Context) error {
+				stored, err := repos.Tasks.GetByID(ctx, execution.ID())
+				if err != nil {
+					return err
 				}
+				duringEffect = stored.Checkpoint
+				return nil
+			})
+			if !attempted || err != nil {
+				return Fail(fmt.Errorf("checkpointed effect = attempted:%v err:%v", attempted, err), "unexpected_effect_result", nil)
 			}
-		})
+			return Complete("effect finished", nil)
+		},
+	}, nil)
+	repos = harness.repos
+	row := enqueueTestTask(t, harness, "checkpoint-commit", "checkpoint-commit")
+	harness.engine.executeClaim(t.Context(), claimTestTask(t, harness))
+
+	stored, err := harness.repos.Tasks.GetByID(t.Context(), row.ID)
+	if err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if stored.Status != model.TaskStatusCompleted {
+		t.Fatalf("task after effect = %#v", stored)
+	}
+	for label, raw := range map[string]json.RawMessage{"during effect": duringEffect, "after settlement": stored.Checkpoint} {
+		var checkpoint map[string]string
+		if err := json.Unmarshal(raw, &checkpoint); err != nil || checkpoint["attempt"] != "one" {
+			t.Fatalf("checkpoint %s = %s, err=%v", label, raw, err)
+		}
 	}
 }
 

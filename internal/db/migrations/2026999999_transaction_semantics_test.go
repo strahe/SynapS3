@@ -169,9 +169,7 @@ func testMigrationDialects(t *testing.T, test func(*testing.T, *bun.DB)) {
 	t.Run("SQLite", func(t *testing.T) {
 		test(t, newSQLiteMigrationDB(t, strings.ReplaceAll(t.Name(), "/", "_")))
 	})
-	t.Run("Postgres", func(t *testing.T) {
-		test(t, newPostgresMigrationDB(t))
-	})
+	testPostgresMigrationDialect(t, test)
 }
 
 func assertAppliedMigrationCount(t *testing.T, ctx context.Context, migrator *migrate.Migrator, want int) {
