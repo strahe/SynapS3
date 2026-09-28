@@ -50,7 +50,6 @@ func seedCommittedUploadCopies(t *testing.T, db *bun.DB, repos *repository.Repos
 		if copySeed.DataSetID != nil {
 			if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 				ID:        binding.ID,
-				ContentID: contentID,
 				DataSetID: *copySeed.DataSetID,
 			}); err != nil {
 				t.Fatalf("MarkDataSetReady: %v", err)

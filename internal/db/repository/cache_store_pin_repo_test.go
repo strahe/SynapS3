@@ -48,7 +48,7 @@ func TestUnfinishedStoreProtectsCacheAfterMinimumDurability(t *testing.T) {
 		dataSetID := onChainID(t, fmt.Sprint(301+i))
 		clientID := onChainID(t, fmt.Sprint(501+i))
 		if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-			ID: binding.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
+			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 		}); err != nil {
 			t.Fatal(err)
 		}

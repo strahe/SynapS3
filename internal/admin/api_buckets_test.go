@@ -434,7 +434,7 @@ func seedAdminCommittedCopies(t *testing.T, db *bun.DB, repos *repository.Reposi
 		if err != nil {
 			t.Fatalf("ensure dataset binding: %v", err)
 		}
-		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: contentID, DataSetID: copySeed.DataSetID}); err != nil {
+		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: copySeed.DataSetID}); err != nil {
 			t.Fatalf("mark dataset ready: %v", err)
 		}
 		transferMethod := copySeed.TransferMethod
@@ -528,7 +528,7 @@ func acceptAdminVersionUpload(t *testing.T, db *bun.DB, repos *repository.Reposi
 		providerID := binding.ProviderID
 		if binding.DataSetID == nil {
 			dataSetID := onChainID(t, fmt.Sprintf("1001%d%d", upload.ID, copyIndex))
-			if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID}); err != nil {
+			if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: dataSetID}); err != nil {
 				t.Fatalf("mark dataset %d ready: %v", copyIndex, err)
 			}
 		}
@@ -577,12 +577,12 @@ func bindAdminPartialUpload(t *testing.T, db *bun.DB, repos *repository.Reposito
 	primary := adminSlotBinding(t, repos, version.BucketID, 0, "101", upload.ID)
 	secondary := adminSlotBinding(t, repos, version.BucketID, 1, "202", upload.ID)
 	if primary.DataSetID == nil {
-		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 			t.Fatalf("primary dataset ready: %v", err)
 		}
 	}
 	if secondary.DataSetID == nil {
-		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
+		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, DataSetID: onChainID(t, "1002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
 			t.Fatalf("secondary dataset ready: %v", err)
 		}
 	}
@@ -632,7 +632,7 @@ func markAdminStoredOnPrimaryUpload(t *testing.T, db *bun.DB, repos *repository.
 	if err != nil {
 		t.Fatalf("primary binding: %v", err)
 	}
-	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("primary dataset ready: %v", err)
 	}
 	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{

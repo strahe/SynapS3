@@ -50,9 +50,9 @@ func (r *BunStorageReplacementRepo) SeedMigrationBatch(
 		}
 		if len(eligible) > 0 {
 			// The target copy is created before the item that names it, so the
-			// item is born with a target and its composite foreign key to that
-			// copy is checked from the first write rather than skipped while the
-			// column is still null.
+			// item is born with a target and its composite foreign key to the
+			// replacement's target is checked from the first write rather than
+			// skipped while the column is still null.
 			contents := &BunStorageContentRepo{db: db}
 			target, err := contents.GetDataSetBindingByID(ctx, row.TargetDataSetID)
 			if err != nil {

@@ -176,6 +176,42 @@ func (r *BunMultipartRepo) GetPartsByNumbers(ctx context.Context, uploadID strin
 	return parts, nil
 }
 
+// ReleaseInterruptedCompletions returns every completing upload to initiated.
+// A completion commits completed together with the version it creates, so an
+// upload still completing when the process starts belongs to a completion that
+// never finished; its parts are still on disk. bucket_id leads the only index
+// on status, so the filter names it to let that index serve the scan.
+func (r *BunMultipartRepo) ReleaseInterruptedCompletions(ctx context.Context) (int64, error) {
+	res, err := r.db.NewUpdate().
+		Model((*model.MultipartUpload)(nil)).
+		Set("status = ?", model.MultipartStatusInitiated).
+		Set("updated_at = ?", time.Now()).
+		Where("bucket_id IN (SELECT id FROM buckets)").
+		Where("status = ?", model.MultipartStatusCompleting).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("releasing interrupted multipart completions: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("releasing interrupted multipart completions: %w", err)
+	}
+	return rows, nil
+}
+
+func (r *BunMultipartRepo) DeletePartsExcept(ctx context.Context, uploadID string, keep []int) error {
+	query := r.db.NewDelete().
+		Model((*model.MultipartPart)(nil)).
+		Where("upload_id = ?", uploadID)
+	if len(keep) > 0 {
+		query = query.Where("part_number NOT IN (?)", bun.List(keep))
+	}
+	if _, err := query.Exec(ctx); err != nil {
+		return fmt.Errorf("deleting unassembled multipart parts: %w", err)
+	}
+	return nil
+}
+
 func (r *BunMultipartRepo) DeleteParts(ctx context.Context, uploadID string) error {
 	_, err := r.db.NewDelete().
 		Model((*model.MultipartPart)(nil)).

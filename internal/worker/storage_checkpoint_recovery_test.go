@@ -552,7 +552,7 @@ func TestPeerPullWaitsUntilStoreCopyIsReadable(t *testing.T) {
 		dataSetID := testOnChainID(t, int64(62001+i))
 		clientID := testOnChainID(t, int64(63001+i))
 		if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-			ID: binding.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
+			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 		}); err != nil {
 			t.Fatal(err)
 		}

@@ -19,7 +19,6 @@ const (
 	TaskTypeStorageTransferPlan           TaskType = "storage_transfer_plan"
 	TaskTypeStorageStore                  TaskType = "storage_store"
 	TaskTypeStoragePull                   TaskType = "storage_pull"
-	TaskTypeStorageCommitCoordinate       TaskType = "storage_commit_coordinate"
 	TaskTypeStorageCommit                 TaskType = "storage_commit"
 	TaskTypeProviderReplacementCoordinate TaskType = "provider_replacement_coordinate"
 	TaskTypeCacheCapacityReconcile        TaskType = "cache_capacity_reconcile"

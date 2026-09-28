@@ -229,8 +229,7 @@ export interface StorageDataSetSummary {
   data_set_id?: string
   client_data_set_id?: string
   status: string
-  created_by_upload_id?: number
-  last_used_upload_id?: number
+  created_by_content_id?: number
   committed_copies: number
   readable_copies: number
   physical_bytes: number

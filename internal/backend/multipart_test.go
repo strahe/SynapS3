@@ -16,6 +16,7 @@ import (
 	"github.com/strahe/synaps3/internal/model"
 	synaps3testutil "github.com/strahe/synaps3/internal/testutil"
 	"github.com/strahe/synapse-go/chain"
+	"github.com/uptrace/bun"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -509,6 +510,148 @@ func TestCompleteMultipartUploadIdenticalCurrentObjectCreatesNewVersion(t *testi
 	// yet, so the derived position is still cached.
 	if secondVersion.State != model.ObjectStateCached {
 		t.Fatalf("second version state = %s, want cached", secondVersion.State)
+	}
+}
+
+// uploadMultipartTestParts starts an upload and uploads one part per body,
+// returning the upload ID and the parts as a completion would name them.
+func uploadMultipartTestParts(t *testing.T, tb *testBackend, bucket, key string, bodies []string) (string, []types.CompletedPart) {
+	t.Helper()
+	ctx := context.Background()
+	initResult, err := tb.backend.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload(%s): %v", key, err)
+	}
+	parts := make([]types.CompletedPart, 0, len(bodies))
+	for i, body := range bodies {
+		partNumber := int32(i + 1)
+		partOut, err := tb.backend.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:     aws.String(bucket),
+			Key:        aws.String(key),
+			UploadId:   aws.String(initResult.UploadId),
+			PartNumber: &partNumber,
+			Body:       strings.NewReader(body),
+		})
+		if err != nil {
+			t.Fatalf("UploadPart(%s part %d): %v", key, partNumber, err)
+		}
+		parts = append(parts, types.CompletedPart{PartNumber: &partNumber, ETag: partOut.ETag})
+	}
+	return initResult.UploadId, parts
+}
+
+func completeMultipartTestParts(ctx context.Context, tb *testBackend, bucket, key, uploadID string, parts []types.CompletedPart) error {
+	_, _, err := tb.backend.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(bucket),
+		Key:             aws.String(key),
+		UploadId:        aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	return err
+}
+
+// Parts a completion leaves out are not part of the object, so its attributes
+// must not list them.
+func TestCompleteMultipartUploadDropsPartsItLeavesOut(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "partial-parts-bucket")
+	uploadID, parts := uploadMultipartTestParts(t, tb, "partial-parts-bucket", "partial.bin", []string{
+		validTestObjectBody("part-one"), "part-two", "part-three",
+	})
+	if err := completeMultipartTestParts(ctx, tb, "partial-parts-bucket", "partial.bin", uploadID, []types.CompletedPart{parts[0], parts[2]}); err != nil {
+		t.Fatalf("CompleteMultipartUpload: %v", err)
+	}
+
+	out, err := tb.backend.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+		Bucket:           aws.String("partial-parts-bucket"),
+		Key:              aws.String("partial.bin"),
+		ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectParts},
+	})
+	if err != nil {
+		t.Fatalf("GetObjectAttributes: %v", err)
+	}
+	if out.ObjectParts == nil {
+		t.Fatal("ObjectParts = nil, want the assembled parts")
+	}
+	if len(out.ObjectParts.Parts) != 2 {
+		t.Fatalf("ObjectParts lists %d parts, want only the 2 assembled", len(out.ObjectParts.Parts))
+	}
+	var total int64
+	for i, want := range []int32{1, 3} {
+		part := out.ObjectParts.Parts[i]
+		if part.PartNumber == nil || *part.PartNumber != want || part.Size == nil {
+			t.Fatalf("part %d = %#v, want part number %d", i, part, want)
+		}
+		total += *part.Size
+	}
+	if out.ObjectSize == nil || total != *out.ObjectSize {
+		t.Fatalf("part sizes sum to %d, want object size %v", total, out.ObjectSize)
+	}
+}
+
+// A process that stops during a completion leaves the upload completing. The
+// next start releases it, so the client can complete the same upload.
+func TestInterruptedMultipartCompletionCanFinishAfterRestart(t *testing.T) {
+	tb := newTestBackend(t)
+	ctx := context.Background()
+	seedActiveBucket(t, tb, "interrupted-bucket")
+	uploadID, parts := uploadMultipartTestParts(t, tb, "interrupted-bucket", "interrupted.bin", []string{
+		validTestObjectBody("part-one"), "part-two",
+	})
+	if err := tb.repos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusInitiated, model.MultipartStatusCompleting); err != nil {
+		t.Fatalf("leave upload completing: %v", err)
+	}
+
+	released, err := tb.backend.ReleaseInterruptedMultipartCompletions(ctx)
+	if err != nil || released != 1 {
+		t.Fatalf("ReleaseInterruptedMultipartCompletions = %d, %v, want 1 upload", released, err)
+	}
+	if err := completeMultipartTestParts(ctx, tb, "interrupted-bucket", "interrupted.bin", uploadID, parts); err != nil {
+		t.Fatalf("CompleteMultipartUpload after restart: %v", err)
+	}
+}
+
+// A completion whose request is canceled, as happens when the server shuts
+// down, still releases the upload instead of leaving it completing.
+func TestCanceledMultipartCompletionReleasesTheUpload(t *testing.T) {
+	tb := newTestBackend(t)
+	seedActiveBucket(t, tb, "canceled-complete-bucket")
+	uploadID, parts := uploadMultipartTestParts(t, tb, "canceled-complete-bucket", "canceled.bin", []string{
+		validTestObjectBody("part-one"), "part-two",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tb.db.AddQueryHook(cancelAfterQuery{match: "'completing'", cancel: cancel})
+
+	if err := completeMultipartTestParts(ctx, tb, "canceled-complete-bucket", "canceled.bin", uploadID, parts); err == nil {
+		t.Fatal("CompleteMultipartUpload succeeded after its request was canceled")
+	}
+	upload, err := tb.repos.Multiparts.GetByUploadID(context.Background(), uploadID)
+	if err != nil || upload == nil {
+		t.Fatalf("GetByUploadID = %#v, %v", upload, err)
+	}
+	if upload.Status != model.MultipartStatusInitiated {
+		t.Fatalf("upload status = %s, want %s", upload.Status, model.MultipartStatusInitiated)
+	}
+}
+
+// cancelAfterQuery cancels a request once a query containing match has run.
+type cancelAfterQuery struct {
+	match  string
+	cancel context.CancelFunc
+}
+
+func (cancelAfterQuery) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+func (h cancelAfterQuery) AfterQuery(_ context.Context, event *bun.QueryEvent) {
+	if strings.Contains(event.Query, h.match) {
+		h.cancel()
 	}
 }
 

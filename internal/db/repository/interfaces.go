@@ -27,7 +27,6 @@ type BucketRepository interface {
 	ListACLs(ctx context.Context) ([]BucketACLSnapshot, error)
 	// CountByStatus returns bucket counts grouped by status.
 	CountByStatus(ctx context.Context) ([]BucketStatusCount, error)
-	SoftDelete(ctx context.Context, id int64) error
 	// UpdateStatus atomically transitions bucket status using CAS.
 	UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error
 	// PromoteReadyIfProvisioned marks a provisioning bucket ready once enough current data sets are ready.
@@ -49,8 +48,6 @@ type BucketRepository interface {
 	CountByOwner(ctx context.Context, ownerAccessKey string) (int, error)
 	// AggregateCountsByOwner returns bucket counts grouped by authoritative owner access key.
 	AggregateCountsByOwner(ctx context.Context) (map[string]int, error)
-	// HardDelete permanently removes a bucket row.
-	HardDelete(ctx context.Context, id int64) error
 	// CountStorageDataSets returns provider-scoped data set count.
 	CountStorageDataSets(ctx context.Context) (int, error)
 }
@@ -248,7 +245,6 @@ type StorageDataSetSummary struct {
 	ClientDataSetID    *types.OnChainID           `bun:"client_data_set_id"`
 	Status             model.StorageDataSetStatus `bun:"status"`
 	CreatedByContentID *int64                     `bun:"created_by_content_id"`
-	LastUsedContentID  *int64                     `bun:"last_used_content_id"`
 	CommittedCopies    int64                      `bun:"committed_copies"`
 	ReadableCopies     int64                      `bun:"readable_copies"`
 	PhysicalBytes      int64                      `bun:"physical_bytes"`
@@ -351,7 +347,6 @@ type EnsureDataSetBindingInput struct {
 
 type MarkDataSetCreatingInput struct {
 	ID              int64
-	ContentID       int64
 	TransactionID   string
 	StatusURL       string
 	ClientDataSetID *types.OnChainID
@@ -359,7 +354,6 @@ type MarkDataSetCreatingInput struct {
 
 type MarkDataSetReadyInput struct {
 	ID              int64
-	ContentID       int64
 	DataSetID       types.OnChainID
 	ClientDataSetID *types.OnChainID
 }
@@ -839,11 +833,16 @@ type MultipartUploadRepository interface {
 	CountActiveByBucket(ctx context.Context, bucketID int64) (int64, error)
 	// SetStatus atomically transitions status using CAS (compare-and-swap) to prevent races.
 	SetStatus(ctx context.Context, contentID string, from, to model.MultipartStatus) error
+	// ReleaseInterruptedCompletions returns uploads left completing by a stopped
+	// process to initiated. It must run before the process accepts requests.
+	ReleaseInterruptedCompletions(ctx context.Context) (int64, error)
 	Delete(ctx context.Context, contentID string) error
 
 	// Part operations
 	CreatePart(ctx context.Context, part *model.MultipartPart) error
 	GetParts(ctx context.Context, contentID string, partNumberMarker, maxParts int) ([]model.MultipartPart, error)
 	GetPartsByNumbers(ctx context.Context, contentID string, numbers []int) ([]model.MultipartPart, error)
+	// DeletePartsExcept removes the parts a completion did not assemble.
+	DeletePartsExcept(ctx context.Context, uploadID string, keep []int) error
 	DeleteParts(ctx context.Context, contentID string) error
 }

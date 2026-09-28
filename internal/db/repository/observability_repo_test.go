@@ -205,7 +205,7 @@ func TestOverviewStorageStatesKeepsReadableOlderGenerationOnlyWhileReferenced(t 
 	dataSetID := onChainID(t, "1401")
 	clientID := onChainID(t, "2401")
 	if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-		ID: old.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
+		ID: old.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 	}); err != nil {
 		t.Fatal(err)
 	}

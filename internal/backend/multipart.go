@@ -19,6 +19,10 @@ import (
 	"github.com/versity/versitygw/s3response"
 )
 
+// multipartRollbackTimeout bounds releasing an upload after a failed
+// completion, which runs even when the request was canceled.
+const multipartRollbackTimeout = 10 * time.Second
+
 func (b *SynapseBackend) CreateMultipartUpload(ctx context.Context, input s3response.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
 	bucketName := derefStr(input.Bucket)
 	keyName := derefStr(input.Key)
@@ -220,11 +224,18 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
 
-	// Rollback CAS on any failure before the tx commits the final status.
+	// Rollback CAS on any failure before the tx commits the final status. The
+	// request context may already be canceled, for example during shutdown, and
+	// the upload must not be left completing.
 	completed := false
 	defer func() {
-		if !completed {
-			_ = b.repos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusInitiated)
+		if completed {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multipartRollbackTimeout)
+		defer cancel()
+		if err := b.repos.Multiparts.SetStatus(rollbackCtx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusInitiated); err != nil {
+			b.logger.Warn("releasing multipart upload after a failed completion", "uploadID", uploadID, "error", err)
 		}
 	}()
 
@@ -340,7 +351,12 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 				return err
 			}
 
-			return txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted)
+			if err := txRepos.Multiparts.SetStatus(ctx, uploadID, model.MultipartStatusCompleting, model.MultipartStatusCompleted); err != nil {
+				return err
+			}
+			// Object attributes list the upload's parts, so parts left out of the
+			// object must not remain listed.
+			return txRepos.Multiparts.DeletePartsExcept(ctx, uploadID, partNumbers)
 		})
 	})
 	if err != nil {
@@ -360,6 +376,13 @@ func (b *SynapseBackend) CompleteMultipartUpload(ctx context.Context, input *s3.
 		Key:    &keyName,
 		ETag:   &etag,
 	}, versionID, nil
+}
+
+// ReleaseInterruptedMultipartCompletions lets uploads that a stopped process
+// left completing be completed or aborted again. It must run before the S3
+// server accepts requests, while no completion can be in flight.
+func (b *SynapseBackend) ReleaseInterruptedMultipartCompletions(ctx context.Context) (int64, error) {
+	return b.repos.Multiparts.ReleaseInterruptedCompletions(ctx)
 }
 
 func (b *SynapseBackend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {

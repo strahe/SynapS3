@@ -44,7 +44,6 @@ func newAdminTestTaskService(t *testing.T, repos *repository.Repositories) *task
 		model.TaskTypeStorageTransferPlan,
 		model.TaskTypeStorageStore,
 		model.TaskTypeStoragePull,
-		model.TaskTypeStorageCommitCoordinate,
 		model.TaskTypeStorageCommit,
 		model.TaskTypeProviderReplacementCoordinate,
 		model.TaskTypeCacheCapacityReconcile,

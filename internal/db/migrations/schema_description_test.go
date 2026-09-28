@@ -28,14 +28,14 @@ func appliedTableColumns(t *testing.T, db *bun.DB, table string) []appliedColumn
 	return columns
 }
 
-// portableSchemaFingerprint hashes what both dialects share.
-func portableSchemaFingerprint(t *testing.T, db *bun.DB) (string, string) {
+// portableSchema describes what both dialects share.
+func portableSchema(t *testing.T, db *bun.DB) []string {
 	t.Helper()
 	schema, err := describeSchema(t.Context(), db, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return normalizedFingerprint(schema)
+	return schema
 }
 
 // migrateToLevel runs the first level registered migrations that have not run.
@@ -89,6 +89,26 @@ func TestValidateCurrentSchemaRejectsDrift(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// SQLite compares indexed text by the index's collation, so an account-name
+// index rebuilt with NOCASE would quietly make names case-insensitive.
+func TestValidateCurrentSchemaRejectsSQLiteIndexCollationDrift(t *testing.T) {
+	db := newSQLiteMigrationDB(t, "index_collation_drift")
+	migrateToLevel(t, db, len(Migrations.Sorted()))
+	for _, change := range []string{
+		`DROP INDEX uq_s3_accounts_name`,
+		// Everything but the collation matches the baseline's own DDL.
+		`CREATE UNIQUE INDEX "uq_s3_accounts_name" ON "s3_accounts" (name COLLATE NOCASE) WHERE (name <> '')`,
+	} {
+		if _, err := db.ExecContext(t.Context(), change); err != nil {
+			t.Fatalf("%s: %v", change, err)
+		}
+	}
+	err := ValidateCurrentSchema(t.Context(), db)
+	if !errors.Is(err, ErrIncompatibleDatabase) || !strings.Contains(err.Error(), "uq_s3_accounts_name") {
+		t.Fatalf("ValidateCurrentSchema = %v, want ErrIncompatibleDatabase naming uq_s3_accounts_name", err)
 	}
 }
 

@@ -385,6 +385,72 @@ func TestEnsureDataSetBindingDoesNotReuseProviderBeforeRetirement(t *testing.T) 
 	}
 }
 
+// Replacement can drain a generation whose creation is still in flight. The
+// creation then records what it sent and what it created, so the service can
+// still be ended, but the generation never takes its slot back.
+func TestDrainedGenerationRecordsItsCreationWithoutReturningToItsSlot(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := seedBucket(t, db, "drained-while-creating")
+	source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding(source): %v", err)
+	}
+	replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+		BucketID:         bucket.ID,
+		SourceDataSetID:  source.ID,
+		SelectionMode:    storagereplacement.SelectionModeManual,
+		TargetProviderID: onChainID(t, "202"),
+		ClientRequestID:  "drained-while-creating",
+	})
+	if err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: replacement.TargetDataSetID, DataSetID: onChainID(t, "2002"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady(target): %v", err)
+	}
+	if err := repos.Replacements.Activate(ctx, replacement.ID); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+
+	clientID := onChainID(t, "9001")
+	if err := repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+		ID: source.ID, TransactionID: "0xcreate", StatusURL: "https://provider.example/status", ClientDataSetID: &clientID,
+	}); err != nil {
+		t.Fatalf("MarkDataSetCreating(drained source): %v", err)
+	}
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: source.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: &clientID,
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady(drained source): %v", err)
+	}
+	drained, err := repos.Contents.GetDataSetBindingByID(ctx, source.ID)
+	if err != nil || drained == nil {
+		t.Fatalf("GetDataSetBindingByID(source) = %#v, %v", drained, err)
+	}
+	if drained.Status != model.StorageDataSetStatusDraining || drained.IsCurrent ||
+		drained.DataSetID == nil || !drained.DataSetID.Equal(onChainID(t, "1001")) ||
+		drained.CreateTransactionID == nil || *drained.CreateTransactionID != "0xcreate" {
+		t.Fatalf("drained source = %#v, want it draining with its creation recorded", drained)
+	}
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: source.ID, DataSetID: onChainID(t, "1003"),
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("MarkDataSetReady(another data set) error = %v, want ErrConflict", err)
+	}
+	// The target owns the slot now, and a creation step cannot move it back.
+	if err := repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+		ID: replacement.TargetDataSetID, TransactionID: "0xlate",
+	}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("MarkDataSetCreating(ready target) error = %v, want ErrConflict", err)
+	}
+}
+
 func TestRetryReplacementRejectsUnknownFailureReason(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -551,7 +617,7 @@ func commitStorageHealthCopy(
 	t.Helper()
 	binding := ensureCopyHealthBinding(t, repos, bucketID, contentID, copyIndex, providerID)
 	if err := repos.Contents.MarkDataSetReady(context.Background(), repository.MarkDataSetReadyInput{
-		ID: binding.ID, ContentID: contentID, DataSetID: onChainID(t, dataSetID),
+		ID: binding.ID, DataSetID: onChainID(t, dataSetID),
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady: %v", err)
 	}

@@ -26,8 +26,7 @@ func orphanedContentSQL(content string) string {
 		AND NOT EXISTS (SELECT 1 FROM object_versions AS orphan_version WHERE orphan_version.content_id = ` + content + `.id)
 		AND NOT EXISTS (SELECT 1 FROM storage_copies AS orphan_copy WHERE orphan_copy.content_id = ` + content + `.id)
 		AND NOT EXISTS (SELECT 1 FROM object_cache AS orphan_cache WHERE orphan_cache.content_id = ` + content + `.id)
-		AND NOT EXISTS (SELECT 1 FROM storage_data_sets AS orphan_created WHERE orphan_created.created_by_content_id = ` + content + `.id)
-		AND NOT EXISTS (SELECT 1 FROM storage_data_sets AS orphan_used WHERE orphan_used.last_used_content_id = ` + content + `.id)`
+		AND NOT EXISTS (SELECT 1 FROM storage_data_sets AS orphan_created WHERE orphan_created.created_by_content_id = ` + content + `.id)`
 }
 
 // ListOrphanedContents pages through content created before createdBefore that
@@ -96,25 +95,4 @@ func (r *BunStorageContentRepo) DiscardOrphanedContent(ctx context.Context, cont
 		return false, err
 	}
 	return discarded, nil
-}
-
-// adoptRequestedCopies lets content no version has ever named take the copy
-// target of the write about to name it. The target otherwise freezes when the
-// content is created, and a row left by a failed write would keep the policy
-// of that write.
-func (r *BunStorageContentRepo) adoptRequestedCopies(ctx context.Context, content *model.StorageContent, requestedCopies int) error {
-	if content.RequestedCopies == requestedCopies || content.CleanupGeneration != 0 || content.CleanupTaskID != nil {
-		return nil
-	}
-	result, err := r.db.NewRaw(`UPDATE storage_contents
-		SET requested_copies = ?, updated_at = ?
-		WHERE storage_contents.id = ? AND `+orphanedContentSQL("storage_contents"),
-		requestedCopies, time.Now(), content.ID).Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("adopting requested copies for content %d: %w", content.ID, err)
-	}
-	if rows, _ := result.RowsAffected(); rows == 1 {
-		content.RequestedCopies = requestedCopies
-	}
-	return nil
 }

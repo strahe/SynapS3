@@ -89,7 +89,7 @@ type Item struct {
 	// TargetDataSetID identifies the target generation. Together with ContentID
 	// it resolves exactly one bound copy without retaining a surrogate copy ID.
 	// It is NOT NULL because a nullable column would make the composite foreign
-	// key to that copy skip validation whenever it was unset.
+	// key to the replacement's target skip validation whenever it was unset.
 	TargetDataSetID int64      `bun:",notnull"`
 	Status          ItemStatus `bun:"type:text,notnull,default:'pending'"`
 	LastError       *string    `bun:"type:text,nullzero"`

@@ -512,20 +512,26 @@ func sqliteIndexLines(ctx context.Context, db bun.IDB, tables []string, portable
 	return lines, nil
 }
 
+// sqliteIndexColumns lists an index's key columns. A collation other than the
+// default BINARY is part of the column, because it decides which values an
+// index treats as equal.
 func sqliteIndexColumns(ctx context.Context, db bun.IDB, index string) ([]string, error) {
-	rows, err := db.QueryContext(ctx, `SELECT name, "desc" FROM pragma_index_xinfo(?) WHERE "key" = 1 ORDER BY seqno`, index)
+	rows, err := db.QueryContext(ctx, `SELECT name, "desc", coll FROM pragma_index_xinfo(?) WHERE "key" = 1 ORDER BY seqno`, index)
 	if err != nil {
 		return nil, fmt.Errorf("reading columns of index %s: %w", index, err)
 	}
 	defer func() { _ = rows.Close() }()
 	var columns []string
 	for rows.Next() {
-		var column sql.NullString
+		var column, collation sql.NullString
 		var descending bool
-		if err := rows.Scan(&column, &descending); err != nil {
+		if err := rows.Scan(&column, &descending, &collation); err != nil {
 			return nil, fmt.Errorf("reading columns of index %s: %w", index, err)
 		}
 		value := column.String
+		if collation.Valid && !strings.EqualFold(collation.String, "BINARY") {
+			value += " COLLATE " + collation.String
+		}
 		if descending {
 			value += " DESC"
 		}

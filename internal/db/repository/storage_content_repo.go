@@ -27,11 +27,10 @@ const ensureContentAttempts = 3
 
 // EnsureContent returns the content row for one byte payload in a bucket,
 // creating it if this is the first time those bytes are written.
-// A uniqueness conflict returns the existing row. Its requested-copy target
-// stays frozen once a version has named the content; a row no version has
-// named yet takes the target of this write. A finishing cleanup or the discard
-// of a failed write can delete the conflicting row before it is read; the
-// insert is then tried again.
+// A uniqueness conflict returns the existing row unchanged: the requested-copy
+// target is set when a version first names the content, not here. A finishing
+// cleanup or the discard of a failed write can delete the conflicting row
+// before it is read; the insert is then tried again.
 func (r *BunStorageContentRepo) EnsureContent(ctx context.Context, input EnsureContentInput) (*model.StorageContent, error) {
 	if input.BucketID <= 0 || input.ContentSize < 0 || !validStorageContentChecksum(input.Checksum) {
 		return nil, fmt.Errorf("ensuring storage content: %w", ErrInvalidInput)
@@ -59,9 +58,6 @@ func (r *BunStorageContentRepo) EnsureContent(ctx context.Context, input EnsureC
 			return nil, err
 		}
 		if existing != nil {
-			if err := r.adoptRequestedCopies(ctx, existing, requestedCopies); err != nil {
-				return nil, err
-			}
 			return existing, nil
 		}
 	}
@@ -619,7 +615,6 @@ func (r *BunStorageContentRepo) ListDataSetSummaries(ctx context.Context, bucket
 			storage_data_set.client_data_set_id,
 			storage_data_set.status,
 			storage_data_set.created_by_content_id,
-			storage_data_set.last_used_content_id,
 			COALESCE(copy_stats.committed_copies, 0) AS committed_copies,
 			COALESCE(copy_stats.readable_copies, 0) AS readable_copies,
 			COALESCE(copy_stats.physical_bytes, 0) AS physical_bytes,
@@ -721,23 +716,30 @@ func (r *BunStorageContentRepo) EnsureDataSetBinding(ctx context.Context, input 
 	return binding, err
 }
 
+// MarkDataSetCreating records a creation request that went out. A generation
+// that replacement drained while the request was in flight stays draining; the
+// request is still recorded so the data set it creates can be resolved.
 func (r *BunStorageContentRepo) MarkDataSetCreating(ctx context.Context, input MarkDataSetCreatingInput) error {
 	now := time.Now()
-	_, err := r.db.NewUpdate().
+	res, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
-		Set("status = ?", model.StorageDataSetStatusCreating).
+		Set("status = CASE WHEN status = ? THEN status ELSE ? END", model.StorageDataSetStatusDraining, model.StorageDataSetStatusCreating).
 		Set("create_transaction_id = ?", nullableString(input.TransactionID)).
 		Set("create_status_url = ?", nullableString(input.StatusURL)).
 		Set("client_data_set_id = ?", input.ClientDataSetID).
-		Set("last_used_content_id = ?", nullableInt64(input.ContentID)).
-		Set("last_error = NULL").
+		Set("last_error = CASE WHEN status = ? THEN last_error ELSE NULL END", model.StorageDataSetStatusDraining).
 		Set("updated_at = ?", now).
 		Where("id = ?", input.ID).
+		Where("status IN (?)", bun.List([]model.StorageDataSetStatus{
+			model.StorageDataSetStatusPending,
+			model.StorageDataSetStatusCreating,
+			model.StorageDataSetStatusDraining,
+		})).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("marking storage data set creating: %w", err)
 	}
-	return nil
+	return requireDataSetStatusUpdate(ctx, r.db, input.ID, res, "marking storage data set creating")
 }
 
 func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id int64, clientDataSetID types.OnChainID) error {
@@ -759,7 +761,7 @@ func (r *BunStorageContentRepo) RecordDataSetClientID(ctx context.Context, id in
 
 func (r *BunStorageContentRepo) MarkDataSetReady(ctx context.Context, input MarkDataSetReadyInput) error {
 	return r.runMaybeTx(ctx, func(db bun.IDB) error {
-		return markDataSetReady(ctx, db, input.ID, input.ContentID, input.DataSetID, input.ClientDataSetID)
+		return markDataSetReady(ctx, db, input.ID, input.DataSetID, input.ClientDataSetID)
 	})
 }
 
@@ -1792,7 +1794,7 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 		if existingByProvider.CopyIndex != input.CopyIndex {
 			return nil, fmt.Errorf("provider %s already bound to copy_index %d: %w", input.ProviderID, existingByProvider.CopyIndex, ErrAlreadyExists)
 		}
-		return existingByProvider, nil
+		return lockCurrentDataSetBinding(ctx, db, existingByProvider.ID)
 	}
 	if err != sql.ErrNoRows {
 		return nil, fmt.Errorf("selecting storage data set by provider: %w", err)
@@ -1821,7 +1823,6 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 		IsCurrent:          true,
 		Status:             model.StorageDataSetStatusPending,
 		CreatedByContentID: nullableInt64(input.CreatedByContentID),
-		LastUsedContentID:  nullableInt64(input.CreatedByContentID),
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
@@ -1844,7 +1845,7 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 				return nil, fmt.Errorf("provider %s remains reserved by non-retired data set generation %d: %w", input.ProviderID, existing.ID, ErrAlreadyExists)
 			}
 			if existing.CopyIndex == input.CopyIndex {
-				return existing, nil
+				return lockCurrentDataSetBinding(ctx, db, existing.ID)
 			}
 			return nil, fmt.Errorf("provider %s already bound to copy_index %d: %w", input.ProviderID, existing.CopyIndex, ErrAlreadyExists)
 		}
@@ -1856,19 +1857,48 @@ func ensureDataSetBinding(ctx context.Context, db bun.IDB, input EnsureDataSetBi
 	return binding, nil
 }
 
-func markDataSetReady(ctx context.Context, db bun.IDB, id int64, contentID int64, dataSetID types.OnChainID, clientDataSetID *types.OnChainID) error {
+// lockCurrentDataSetBinding holds the binding's row for the rest of the
+// transaction and fails when it no longer owns its slot. Replacement drains the
+// source under the same row lock, so work bound here cannot land on a
+// generation that stopped accepting writes after it was read.
+func lockCurrentDataSetBinding(ctx context.Context, db bun.IDB, id int64) (*model.StorageDataSet, error) {
+	res, err := db.NewUpdate().
+		Model((*model.StorageDataSet)(nil)).
+		Set("updated_at = updated_at").
+		Where("id = ? AND is_current", id).
+		Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("locking storage data set binding %d: %w", id, err)
+	}
+	if rows, _ := res.RowsAffected(); rows != 1 {
+		return nil, fmt.Errorf("storage data set binding %d is no longer current: %w", id, ErrConflict)
+	}
+	binding := new(model.StorageDataSet)
+	if err := db.NewSelect().Model(binding).Where("id = ?", id).Scan(ctx); err != nil {
+		return nil, fmt.Errorf("loading locked storage data set binding %d: %w", id, err)
+	}
+	return binding, nil
+}
+
+// markDataSetReady records the data set a generation's creation produced. A
+// generation that already left its slot never becomes ready again. One that
+// replacement drained while its creation was in flight stays draining but
+// still records the data set, so the service it created can be found and ended.
+func markDataSetReady(ctx context.Context, db bun.IDB, id int64, dataSetID types.OnChainID, clientDataSetID *types.OnChainID) error {
 	if dataSetID.IsZero() {
 		return fmt.Errorf("dataSetID is required: %w", ErrInvalidInput)
 	}
 	query := db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
-		Set("status = ?", model.StorageDataSetStatusReady).
+		Set("status = CASE WHEN status = ? THEN status ELSE ? END", model.StorageDataSetStatusDraining, model.StorageDataSetStatusReady).
 		Set("data_set_id = ?", dataSetID).
 		Set("client_data_set_id = COALESCE(?, client_data_set_id)", clientDataSetID).
-		Set("last_used_content_id = ?", nullableInt64(contentID)).
-		Set("last_error = NULL").
+		Set("last_error = CASE WHEN status = ? THEN last_error ELSE NULL END", model.StorageDataSetStatusDraining).
 		Set("updated_at = ?", time.Now()).
 		Where("id = ?", id).
+		Where(`(status IN (?, ?, ?) OR (status = ? AND (data_set_id IS NULL OR data_set_id = ?)))`,
+			model.StorageDataSetStatusPending, model.StorageDataSetStatusCreating, model.StorageDataSetStatusReady,
+			model.StorageDataSetStatusDraining, dataSetID).
 		Where(`NOT EXISTS (
 			SELECT 1 FROM storage_data_sets AS other
 			WHERE other.id <> ?
@@ -1888,15 +1918,19 @@ func markDataSetReady(ctx context.Context, db bun.IDB, id int64, contentID int64
 	if rows > 0 {
 		return nil
 	}
-	count, err := db.NewSelect().
-		Model((*model.StorageDataSet)(nil)).
-		Where("id = ?", id).
-		Count(ctx)
-	if err != nil {
+	current := new(model.StorageDataSet)
+	if err := db.NewSelect().Model(current).Where("id = ?", id).Scan(ctx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("storage data set %d not found: %w", id, ErrNotFound)
+		}
 		return fmt.Errorf("checking storage data set ready result: %w", err)
 	}
-	if count == 0 {
-		return fmt.Errorf("storage data set %d not found: %w", id, ErrNotFound)
+	eligible := current.Status == model.StorageDataSetStatusPending ||
+		current.Status == model.StorageDataSetStatusCreating ||
+		current.Status == model.StorageDataSetStatusReady ||
+		(current.Status == model.StorageDataSetStatusDraining && (current.DataSetID == nil || current.DataSetID.Equal(dataSetID)))
+	if !eligible {
+		return fmt.Errorf("storage data set %d is %s and cannot become ready: %w", id, current.Status, ErrConflict)
 	}
 	return fmt.Errorf("provider data set already bound to another bucket: %w", ErrAlreadyExists)
 }

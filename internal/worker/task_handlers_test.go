@@ -326,7 +326,7 @@ func seedStoredCacheObject(t *testing.T, runtime handlerTestRuntime, size int64,
 	t.Helper()
 	sequence := storedObjectSequence.Add(1)
 	ctx := t.Context()
-	bucket := &model.Bucket{Name: fmt.Sprintf("cache-task-%d", sequence), Status: model.BucketStatusActive, DefaultCopies: 2, MinimumDurableCopies: 2}
+	bucket := &model.Bucket{Name: fmt.Sprintf("cache-task-%d", sequence), Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
 	if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -356,7 +356,7 @@ func seedStoredCacheObject(t *testing.T, runtime handlerTestRuntime, size int64,
 		t.Fatalf("create data set binding: %v", err)
 	}
 	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-		ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("mark data set ready: %v", err)
 	}
@@ -592,7 +592,7 @@ func TestStoreResultMismatchRetainsCopyAndCheckpoint(t *testing.T) {
 		t.Fatalf("create terminal copy binding: %v", err)
 	}
 	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-		ID: binding.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("mark terminal copy binding ready: %v", err)
 	}
@@ -1634,7 +1634,7 @@ func seedStorageCleanup(t *testing.T, runtime handlerTestRuntime, statuses ...mo
 			t.Fatalf("create cleanup binding %d: %v", copyIndex, err)
 		}
 		if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-			ID: binding.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 		}); err != nil {
 			t.Fatalf("mark cleanup binding %d ready: %v", copyIndex, err)
 		}
@@ -1700,7 +1700,7 @@ func TestStorageCleanupAdmissionFailureDoesNotScheduleDeletion(t *testing.T) {
 		t.Fatalf("create cleanup admission binding: %v", err)
 	}
 	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-		ID: binding.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("mark cleanup admission binding ready: %v", err)
 	}
@@ -2170,7 +2170,7 @@ func seedCopyPipeline(t *testing.T, runtime handlerTestRuntime, targetStatus mod
 			t.Fatalf("create copy binding %d: %v", copyIndex, bindErr)
 		}
 		if readyErr := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-			ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
+			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 		}); readyErr != nil {
 			t.Fatalf("mark copy binding %d ready: %v", copyIndex, readyErr)
 		}
@@ -2276,7 +2276,7 @@ func seedReplacementPullTarget(t *testing.T, runtime handlerTestRuntime, cachePr
 	}
 	dataSetID, clientID := testOnChainID(t, 990002), testOnChainID(t, 990003)
 	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-		ID: replacement.TargetDataSetID, ContentID: pipeline.upload.ID,
+		ID:        replacement.TargetDataSetID,
 		DataSetID: dataSetID, ClientDataSetID: &clientID,
 	}); err != nil {
 		t.Fatal(err)
@@ -2589,7 +2589,7 @@ func TestDataSetEnsureSchedulesBoundCopyWorkWhenReady(t *testing.T) {
 	dataSetID := testOnChainID(t, 10000+sequence)
 	clientDataSetID := testOnChainID(t, 11000+sequence)
 	if err := runtime.repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-		ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+		ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 	}); err != nil {
 		t.Fatalf("mark data set ready: %v", err)
 	}
@@ -3894,7 +3894,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	}
 	sourceClientID := testOnChainID(t, 7402)
 	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-		ID: source.ID, ContentID: content.ID, DataSetID: testOnChainID(t, 7403), ClientDataSetID: &sourceClientID,
+		ID: source.ID, DataSetID: testOnChainID(t, 7403), ClientDataSetID: &sourceClientID,
 	}); err != nil {
 		t.Fatalf("mark source ready: %v", err)
 	}
@@ -3912,7 +3912,7 @@ func TestReplacementCoordinatorRetiresAfterCancelledItemsAreProcessed(t *testing
 	}
 	targetClientID := testOnChainID(t, 7405)
 	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-		ID: target.ID, ContentID: content.ID, DataSetID: testOnChainID(t, 7406), ClientDataSetID: &targetClientID,
+		ID: target.ID, DataSetID: testOnChainID(t, 7406), ClientDataSetID: &targetClientID,
 	}); err != nil {
 		t.Fatalf("mark target ready: %v", err)
 	}
@@ -4035,7 +4035,7 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 			}
 			sourceClientID := id(3)
 			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID: source.ID, ContentID: content.ID, DataSetID: id(2), ClientDataSetID: &sourceClientID,
+				ID: source.ID, DataSetID: id(2), ClientDataSetID: &sourceClientID,
 			}); err != nil {
 				t.Fatalf("mark source ready: %v", err)
 			}
@@ -4058,7 +4058,7 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 			}
 			targetClientID := id(7)
 			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-				ID: replacement.TargetDataSetID, ContentID: content.ID, DataSetID: id(6), ClientDataSetID: &targetClientID,
+				ID: replacement.TargetDataSetID, DataSetID: id(6), ClientDataSetID: &targetClientID,
 			}); err != nil {
 				t.Fatalf("mark target ready: %v", err)
 			}
