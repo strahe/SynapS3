@@ -6,6 +6,7 @@ import type {
   StorageDataSetSummary,
 } from '../api/client'
 import { APIError } from '../api/client.ts'
+import { providerDisplayName, providerRegistryLabel } from './provider-display.ts'
 import { formatBytes, formatNumber } from './utils.ts'
 
 const replacementStatusLabels: Record<ProviderReplacementStatus, string> = {
@@ -212,8 +213,7 @@ export function providerCandidateDisabledReason(candidate: ReplacementProviderCa
 
 /** A provider reads as its name; the registry ID identifies it. */
 export function providerCandidateLabel(candidate: ReplacementProviderCandidate) {
-  const name = candidate.provider_profile?.name?.trim()
-  return name || `Registry ${candidate.provider_id}`
+  return providerDisplayName(candidate.provider_id, candidate.provider_profile?.name)
 }
 
 /**
@@ -223,7 +223,7 @@ export function providerCandidateLabel(candidate: ReplacementProviderCandidate) 
  * already the ID, which would only repeat it.
  */
 export function providerCandidateRegistryLine(candidate: ReplacementProviderCandidate) {
-  const registryLine = `Registry ${candidate.provider_id}`
+  const registryLine = providerRegistryLabel(candidate.provider_id)
   return providerCandidateLabel(candidate) === registryLine ? null : registryLine
 }
 

@@ -1,4 +1,4 @@
-import type { ObservabilityProviderObservation, ProviderUploadSpeedTest } from '../api/client.ts'
+import { APIError, type ObservabilityProviderObservation, type ProviderUploadSpeedTest } from '../api/client.ts'
 
 export function canTestProviderUploadSpeed(provider?: ObservabilityProviderObservation) {
   return Boolean(
@@ -34,12 +34,36 @@ export function providerUploadSpeedLabel(test?: ProviderUploadSpeedTest): string
           return 'Upload test failed'
       }
     case 'succeeded':
-      if (!test.bytes_per_second) return 'Upload speed not recorded'
-      return `${(test.bytes_per_second / (1024 * 1024)).toFixed(1)} MiB/s`
+      return test.bytes_per_second ? formatUploadSpeed(test.bytes_per_second) : 'Upload speed not recorded'
+  }
+}
+
+/** A label that fits a table cell or graph card; the full label explains a failure. */
+export function providerUploadSpeedShortLabel(test?: ProviderUploadSpeedTest): string {
+  if (!test) return 'Not tested'
+  switch (test.state) {
+    case 'testing':
+      return 'Testing…'
+    case 'stale':
+      return 'Outdated'
+    case 'failed':
+      return 'Test failed'
+    case 'succeeded':
+      return test.bytes_per_second ? formatUploadSpeed(test.bytes_per_second) : 'Not recorded'
   }
 }
 
 export function providerUploadSampleSize(test?: ProviderUploadSpeedTest): string {
   if (!test) return '—'
   return `${Number((test.sample_bytes / (1024 * 1024)).toFixed(1))} MiB`
+}
+
+export function providerUploadSpeedTestErrorMessage(error: unknown, providerLabel: string) {
+  return error instanceof APIError && error.status === 409
+    ? `A test is already running, or ${providerLabel} is not available for testing. Check its details before trying again.`
+    : `Could not start the upload speed test for ${providerLabel}. Try again.`
+}
+
+function formatUploadSpeed(bytesPerSecond: number) {
+  return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MiB/s`
 }

@@ -7,10 +7,13 @@ import type {
   ObservabilitySignalLevel,
   ObservabilityStatus,
   ObservabilitySummary,
+  ProviderUploadSpeedTest,
   StorageDataSetSummary,
 } from '../api/client.ts'
+import { storageHealthReasonLabel } from './data-set-storage-health.ts'
+import { providerDisplayName, providerLocationLabel, providerRegistryLabel } from './provider-display.ts'
 import { replicaLabel } from './storage-status-labels.ts'
-import { formatNumber, timeAgo } from './utils.ts'
+import { formatNumber, timeAgo, titleCaseEnum } from './utils.ts'
 
 export const observabilityStatusOptions = ['all', 'available', 'degraded', 'unavailable', 'unknown'] as const
 export const storageTopologyAllFilterValue = '__all__'
@@ -49,11 +52,14 @@ export interface StorageTopologyNodeData {
   chainDataSetID?: string
   clientDataSetID?: string
   activePieceCount?: number
+  hasActivePieces?: boolean
   providerID?: string
   active?: boolean
   hasPDP?: boolean
   serviceURL?: string
   healthStatus?: string
+  location?: string
+  uploadSpeedTest?: ProviderUploadSpeedTest
   observation?: ObservabilityProviderObservation | ObservabilityDataSetObservation
 }
 
@@ -103,6 +109,21 @@ export type StorageTopologySelectionSource = 'route' | 'local'
 export interface SourcedStorageTopologySelection {
   source: StorageTopologySelectionSource
   selection: StorageTopologySelection
+}
+
+export type StorageTopologyDetailTarget =
+  | { kind: 'bucket'; node: StorageTopologyNode; dataSets: ObservabilityDataSetObservation[] }
+  | { kind: 'data-set'; dataSet: ObservabilityDataSetObservation; provider?: ObservabilityProviderObservation }
+  | {
+      kind: 'provider'
+      providerID: string
+      provider?: ObservabilityProviderObservation
+      dataSets: ObservabilityDataSetObservation[]
+    }
+
+export interface StorageTopologyProviderOption {
+  value: string
+  label: string
 }
 
 export type ResolvedStorageTopologySelection =
@@ -187,6 +208,22 @@ export function observabilityStatusTone(status: ObservabilityStatus): StorageTop
   }
 }
 
+export function observabilityStatusLabel(status: ObservabilityStatus) {
+  return titleCaseEnum(status)
+}
+
+/** Why a signal is not healthy, in reading order: its reasons, then the last recorded error. */
+export function observabilitySignalDetails(signal?: ObservabilitySignal) {
+  if (!signal) return []
+  const details = Array.from(new Set(signal.reason_codes.map(storageHealthReasonLabel)))
+  if (signal.last_error) details.push(signal.last_error)
+  return details
+}
+
+export function localStatusLabel(status: string) {
+  return titleCaseEnum(status) || '—'
+}
+
 export function localStatusTone(status: string): StorageTopologyTone {
   switch (status) {
     case 'ready':
@@ -223,7 +260,7 @@ export function dataSetChainIDValue(dataSet: DataSetDisplaySource) {
 }
 
 export function dataSetTopologyPath(dataSet: ObservabilityDataSetObservation) {
-  return `${dataSet.facts.bucket_name} -> ${replicaLabel(dataSet.facts.copy_index)} -> ${dataSetDisplayLabel(dataSet)} -> Provider #${dataSet.facts.provider_id}`
+  return `${dataSet.facts.bucket_name} -> ${replicaLabel(dataSet.facts.copy_index)} -> ${dataSetDisplayLabel(dataSet)} -> ${providerRegistryLabel(dataSet.facts.provider_id)}`
 }
 
 export function bucketStorageDataSetTopologyLinkModel(
@@ -246,8 +283,21 @@ export function bucketStorageDataSetTopologyLinkModel(
   }
 }
 
-export function buildTopologyProviderOptions(dataSets: ObservabilityDataSetObservation[]) {
-  return Array.from(new Set(dataSets.map((dataSet) => dataSet.facts.provider_id))).sort()
+export function buildTopologyProviderOptions(
+  dataSets: ObservabilityDataSetObservation[],
+  providers: ObservabilityProviderObservation[]
+): StorageTopologyProviderOption[] {
+  const names = new Map(providers.map((provider) => [provider.facts.provider_id, provider.provider_profile?.name]))
+  return Array.from(new Set(dataSets.map((dataSet) => dataSet.facts.provider_id)))
+    .map((providerID) => ({ value: providerID, label: providerOptionLabel(providerID, names.get(providerID)) }))
+    .sort((left, right) => left.label.localeCompare(right.label, undefined, { numeric: true }))
+}
+
+/** A provider filter option names the provider and keeps its registry ID searchable. */
+export function providerOptionLabel(providerID: string, name?: string) {
+  const displayName = providerDisplayName(providerID, name)
+  const registry = providerRegistryLabel(providerID)
+  return displayName === registry ? registry : `${displayName} · ${registry}`
 }
 
 export function topologyGraphSummary(graph: StorageTopologyGraph) {
@@ -260,7 +310,11 @@ export function topologyGraphSummary(graph: StorageTopologyGraph) {
 
 export function topologySummaryLabel(graph: StorageTopologyGraph) {
   const summary = topologyGraphSummary(graph)
-  return `${formatNumber(summary.buckets)} buckets · ${formatNumber(summary.dataSets)} data sets · ${formatNumber(summary.providers)} providers`
+  return [
+    countLabel(summary.buckets, 'bucket'),
+    countLabel(summary.dataSets, 'data set'),
+    countLabel(summary.providers, 'provider'),
+  ].join(' · ')
 }
 
 export function formatOptionalTopologyText(value: string | null | undefined) {
@@ -377,16 +431,6 @@ export function storageTopologyDataSetSelectionSearch(
   }
 }
 
-export function providerActiveFactBadge(active: boolean | undefined) {
-  if (active === undefined) return { label: 'unknown', tone: 'neutral' as const }
-  return active ? { label: 'active', tone: 'success' as const } : { label: 'inactive', tone: 'warning' as const }
-}
-
-export function providerPDPFactBadge(hasPDP: boolean | undefined, missingLabel = 'missing PDP') {
-  if (hasPDP === undefined) return { label: 'unknown', tone: 'neutral' as const }
-  return hasPDP ? { label: 'PDP', tone: 'success' as const } : { label: missingLabel, tone: 'warning' as const }
-}
-
 export function providerRowsForTopologyContext(
   graph: StorageTopologyGraph,
   providers: ObservabilityProviderObservation[],
@@ -488,6 +532,7 @@ export function buildStorageTopologyGraph(
       chainDataSetID: dataSet.facts.chain_data_set_id,
       clientDataSetID: dataSet.facts.client_data_set_id,
       activePieceCount: dataSet.facts.active_piece_count,
+      hasActivePieces: dataSet.facts.has_active_pieces,
       providerID: dataSet.facts.provider_id,
       observation: dataSet,
     },
@@ -572,6 +617,24 @@ export function findDataSetTopologyNodeByLocalID(graph: StorageTopologyGraph, lo
   return graph.dataSets.find((node) => node.data.localDataSetID === localDataSetID)
 }
 
+/** Selects the provider's graph node, or the provider itself when the current filters hide it. */
+export function storageTopologyProviderSelection(
+  graph: StorageTopologyGraph,
+  providerID: string
+): StorageTopologySelection {
+  const node = findProviderTopologyNode(graph, providerID)
+  return node ? { type: 'node', id: node.id, kind: node.kind } : { type: 'provider', providerID }
+}
+
+/** Selects the data set's graph node, or the data set itself when the current filters hide it. */
+export function storageTopologyDataSetSelection(
+  graph: StorageTopologyGraph,
+  localDataSetID: number
+): StorageTopologySelection {
+  const node = findDataSetTopologyNodeByLocalID(graph, localDataSetID)
+  return node ? { type: 'node', id: node.id, kind: node.kind } : { type: 'data-set', localDataSetID }
+}
+
 export function findStorageTopologySelection(
   graph: StorageTopologyGraph,
   lookup: StorageTopologySelectionLookup
@@ -623,6 +686,63 @@ export function resolveStorageTopologySelection(
     type: 'data-set',
     dataSet,
     provider: providers.find((item) => item.facts.provider_id === dataSet.facts.provider_id),
+  }
+}
+
+/**
+ * What the detail panel describes for a selection. A relationship line belongs
+ * to its data set, so selecting one shows that data set.
+ */
+export function topologyDetailTarget(
+  selection: ResolvedStorageTopologySelection,
+  graph: StorageTopologyGraph,
+  providers: ObservabilityProviderObservation[],
+  dataSets: ObservabilityDataSetObservation[]
+): StorageTopologyDetailTarget | null {
+  const findProvider = (providerID: string) => providers.find((provider) => provider.facts.provider_id === providerID)
+  const dataSetTarget = (localDataSetID: number | undefined): StorageTopologyDetailTarget | null => {
+    const dataSet = dataSets.find((item) => item.facts.local_data_set_id === localDataSetID)
+    return dataSet ? { kind: 'data-set', dataSet, provider: findProvider(dataSet.facts.provider_id) } : null
+  }
+
+  switch (selection.type) {
+    case 'edge':
+      return dataSetTarget(selection.edge.data.localDataSetID)
+    case 'data-set':
+      return { kind: 'data-set', dataSet: selection.dataSet, provider: selection.provider }
+    case 'provider': {
+      const providerID = selection.provider.facts.provider_id
+      return {
+        kind: 'provider',
+        providerID,
+        provider: selection.provider,
+        dataSets: dataSets.filter((dataSet) => dataSet.facts.provider_id === providerID).sort(compareDataSets),
+      }
+    }
+    case 'node': {
+      const node = selection.node
+      switch (node.kind) {
+        case 'bucket': {
+          const ids = new Set(node.data.dataSetIDs ?? [])
+          return {
+            kind: 'bucket',
+            node,
+            dataSets: dataSets.filter((dataSet) => ids.has(dataSet.facts.local_data_set_id)).sort(compareDataSets),
+          }
+        }
+        case 'data-set':
+          return dataSetTarget(node.data.localDataSetID)
+        case 'provider': {
+          const providerID = node.data.providerID ?? ''
+          return {
+            kind: 'provider',
+            providerID,
+            provider: findProvider(providerID),
+            dataSets: relatedDataSetsForProviderNode(graph, dataSets, providerID),
+          }
+        }
+      }
+    }
   }
 }
 
@@ -757,15 +877,16 @@ function providerNode(
   y: number
 ): StorageTopologyNode {
   const status = provider?.signal.status ?? 'unknown'
+  const label = providerDisplayName(providerID, provider?.provider_profile?.name)
   return {
     id: providerNodeID(providerID),
     kind: 'provider',
-    label: `Provider #${providerID}`,
+    label,
     tone: provider ? observabilityStatusTone(provider.signal.status) : 'neutral',
     x: storageTopologyGraphLayout.providerX,
     y,
     data: {
-      path: `Provider #${providerID}`,
+      path: label,
       providerID,
       status,
       level: provider?.signal.level,
@@ -774,6 +895,10 @@ function providerNode(
       hasPDP: provider?.facts.has_pdp,
       serviceURL: provider?.facts.service_url,
       healthStatus: provider?.facts.health_status,
+      location: providerLocationLabel(provider?.provider_profile?.registry_snapshot?.pdp_offering?.location, {
+        compact: true,
+      }),
+      uploadSpeedTest: provider?.upload_speed_test,
       observation: provider,
     },
   }
@@ -799,6 +924,10 @@ function compareDataSets(left: ObservabilityDataSetObservation, right: Observabi
   const copyDiff = left.facts.copy_index - right.facts.copy_index
   if (copyDiff !== 0) return copyDiff
   return left.facts.local_data_set_id - right.facts.local_data_set_id
+}
+
+export function countLabel(count: number, noun: string) {
+  return `${formatNumber(count)} ${count === 1 ? noun : `${noun}s`}`
 }
 
 function average(values: number[]) {

@@ -6,6 +6,7 @@ import {
   canTestProviderUploadSpeed,
   providerUploadSampleSize,
   providerUploadSpeedLabel,
+  providerUploadSpeedShortLabel,
 } from '../src/lib/provider-upload-speed.ts'
 
 const available: ObservabilityProviderObservation = {
@@ -56,6 +57,21 @@ test('upload speed labels distinguish results from failed or outdated tests', ()
     )
   }
   assert.equal(providerUploadSpeedLabel({ state: 'succeeded', sample_bytes: 32 << 20 }), 'Upload speed not recorded')
+})
+
+test('short upload speed labels keep a result to a few words', () => {
+  assert.equal(providerUploadSpeedShortLabel(), 'Not tested')
+  assert.equal(providerUploadSpeedShortLabel({ state: 'testing', sample_bytes: 32 << 20 }), 'Testing…')
+  assert.equal(
+    providerUploadSpeedShortLabel({ state: 'succeeded', sample_bytes: 32 << 20, bytes_per_second: 10 << 20 }),
+    '10.0 MiB/s'
+  )
+  assert.equal(providerUploadSpeedShortLabel({ state: 'succeeded', sample_bytes: 32 << 20 }), 'Not recorded')
+  assert.equal(
+    providerUploadSpeedShortLabel({ state: 'failed', sample_bytes: 32 << 20, failure_code: 'timeout' }),
+    'Test failed'
+  )
+  assert.equal(providerUploadSpeedShortLabel({ state: 'stale', sample_bytes: 32 << 20 }), 'Outdated')
 })
 
 test('sample size describes the saved test rather than an unstarted test', () => {

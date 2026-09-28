@@ -12,6 +12,10 @@ import (
 	sdktypes "github.com/strahe/synapse-go/types"
 )
 
+// ProviderHealth is one provider health probe result. A failed probe's Detail
+// becomes the provider's last error.
+type ProviderHealth = provider.HealthResult
+
 type RegistryProviderSource struct {
 	registry *provider.RegistryService
 }

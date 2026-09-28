@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer'
 import type { Page, Request } from '@playwright/test'
+import type { ObservabilityProviderObservation } from '../src/api/client'
 import { expect, test } from './fixtures'
 
 test.describe.configure({ mode: 'serial' })
@@ -185,6 +186,69 @@ test('admin dashboard manages and observes a stored object', async ({ page, syst
   await page.getByRole('link', { name: 'Wallet' }).click()
   await expect(page.getByText('FWSS approval is sufficient.')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Approve FWSS' })).toHaveCount(0)
+})
+
+test('provider details keep FWSS collection times independent and preserve the declared location', async ({
+  page,
+  systemServer,
+}) => {
+  const declaredLocation = 'C=US;ST=Texas;L=Austin;OU=Operations'
+  const olderCollection = new Date(Date.now() - 7.5 * 86_400_000).toISOString()
+  let endorsedCheckedAt: string | undefined = olderCollection
+  await page.route('**/api/v1/observability/providers**', async (route) => {
+    const response = await route.fetch()
+    const body = (await response.json()) as { items: ObservabilityProviderObservation[] }
+    const profile = body.items.find((item) => item.facts.provider_id === '101')?.provider_profile
+    if (!profile) throw new Error('System provider 101 has no profile')
+    profile.approved = false
+    profile.approved_checked_at = new Date(Date.now() - 150_000).toISOString()
+    profile.endorsed = true
+    profile.endorsed_checked_at = endorsedCheckedAt
+    profile.registry_snapshot.pdp_offering = {
+      min_piece_size_bytes: '127',
+      max_piece_size_bytes: '1065353216',
+      storage_price_per_tib_per_day: '0',
+      min_proving_period_epochs: '2880',
+      location: declaredLocation,
+      payment_token_address: '0x0000000000000000000000000000000000000000',
+      ipni_piece: false,
+      ipni_ipfs: false,
+      ipni_peer_id: '',
+      extra_capabilities_hex: {},
+    }
+    await route.fulfill({ response, json: body })
+  })
+
+  await page.goto(systemServer.adminURL)
+  await page.getByLabel('Username').fill('admin')
+  await page.getByLabel('Password').fill('system-test-admin-password')
+  await page.getByRole('button', { name: 'Sign In' }).click()
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible()
+
+  for (const collectionTime of [olderCollection, undefined]) {
+    endorsedCheckedAt = collectionTime
+    await page.goto(new URL('/storage-topology?tab=providers', systemServer.adminURL).toString())
+    const providerRow = page.getByRole('row').filter({ hasText: 'Registry 101' })
+    await providerRow.getByRole('button', { name: 'Details for System provider 101' }).click()
+    const details = page.getByRole('dialog', { name: 'System provider 101' })
+    const fwss = details.getByText('FWSS', { exact: true }).locator('..')
+    const approved = fwss.getByText(/^Approved: No/)
+    await expect(approved).toBeVisible()
+    await expect(approved).toContainText(/Checked \d+m ago/)
+    if (collectionTime) {
+      const endorsed = fwss.getByText(/^Endorsed: Yes/)
+      await expect(endorsed).toBeVisible()
+      await expect(endorsed).toContainText('Checked 7d ago')
+    } else {
+      await expect(fwss.getByText('Endorsed: Unknown', { exact: true })).toBeVisible()
+      await expect(fwss.getByText('Checked 7d ago', { exact: true })).toHaveCount(0)
+    }
+    const location = details.getByText('Declared location', { exact: true }).locator('..')
+    await expect(location).toContainText('Austin, Texas, US')
+    await details.getByRole('button', { name: 'Registry details', exact: true }).click()
+    await expect(details.getByText(declaredLocation, { exact: true })).toBeVisible()
+  }
+  await page.unrouteAll({ behavior: 'wait' })
 })
 
 test('S3 user name appears in user and owner flows while copying the full access key', async ({

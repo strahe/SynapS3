@@ -148,7 +148,7 @@ curl -u admin http://127.0.0.1:9090/api/v1/observability/providers
 恢复方式：
 
 - 恢复配置中的 `filecoin.rpc_url`。
-- 确认 SynapS3 主机能访问存储提供方 URL。
+- 确认 SynapS3 主机能访问存储提供方 URL。**Storage Topology** 中的存储提供方详情会显示最近一次健康检查失败的原因。
 - 除非明确需要并信任私有存储提供方 URL，否则保持 `filecoin.allow_private_networks = false`。
 
 ## S3 客户端无法上传

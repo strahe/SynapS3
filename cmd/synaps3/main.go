@@ -410,7 +410,7 @@ func newObservabilityChecker(cfg *config.Config, client *sdk.Client, logger *slo
 	providerHealth := provider.NewHealthChecker(nil)
 	return observability.NewChecker(observability.CheckerOptions{
 		ProviderSource: observability.NewRegistryProviderSource(provider.NewRegistryService(client.SPRegistry())),
-		ProviderHealth: providerHealth.Check,
+		ProviderHealth: providerHealth.Probe,
 		DataSetScanner: observability.NewStorageDataSetScanner(client.Storage()),
 		Timeout:        cfg.Filecoin.Observability.Timeout,
 		Concurrency:    cfg.Filecoin.Observability.Concurrency,

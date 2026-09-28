@@ -26,7 +26,7 @@ type ProviderSource interface {
 	LookupProvider(context.Context, types.OnChainID) (Provider, error)
 }
 
-type ProviderHealthFunc func(context.Context, string, time.Duration) string
+type ProviderHealthFunc func(context.Context, string, time.Duration) ProviderHealth
 
 type DataSetScanner interface {
 	ScanWalletDataSets(context.Context) ([]ChainDataSet, error)
@@ -159,8 +159,8 @@ func (c *Checker) CheckProvider(ctx context.Context, checkedAt time.Time, id typ
 	return providerStateFromFacts(provider, health[id.String()], checkedAt), nil
 }
 
-func providerStateFromFacts(provider Provider, healthStatus string, checkedAt time.Time) ProviderState {
-	if healthStatus == "" {
+func providerStateFromFacts(provider Provider, health ProviderHealth, checkedAt time.Time) ProviderState {
+	if health.Status == "" {
 		errText := "Provider health check did not complete"
 		return ProviderState{
 			Profile: provider.Profile, ProviderID: provider.ID, Status: StatusUnknown,
@@ -179,16 +179,20 @@ func providerStateFromFacts(provider Provider, healthStatus string, checkedAt ti
 		status = worseStatus(status, StatusUnavailable)
 		reasons = append(reasons, ReasonProviderMissingPDP)
 	}
-	if provider.HasPDP && (provider.ServiceURL == "" || healthStatus == "n/a" || healthStatus == "unreachable") {
+	var lastError *string
+	if provider.HasPDP && (provider.ServiceURL == "" || health.Status == "n/a" || health.Status == "unreachable") {
 		status = worseStatus(status, StatusDegraded)
 		reasons = append(reasons, ReasonProviderHTTPUnreachable)
+		if health.Detail != "" {
+			lastError = stringPtr(health.Detail)
+		}
 	}
 	return ProviderState{
 		Profile: provider.Profile, ProviderID: provider.ID, Status: status, ReasonCodes: reasons,
 		Active: boolPtr(provider.Active), HasPDP: boolPtr(provider.HasPDP),
-		ServiceURL: stringPtr(provider.ServiceURL), HealthStatus: stringPtr(healthStatus),
-		LastCheckedAt: checkedAt,
-		Evidence:      map[string]any{"service_url": provider.ServiceURL, "has_pdp": provider.HasPDP},
+		ServiceURL: stringPtr(provider.ServiceURL), HealthStatus: stringPtr(health.Status),
+		LastCheckedAt: checkedAt, LastError: lastError,
+		Evidence: map[string]any{"service_url": provider.ServiceURL, "has_pdp": provider.HasPDP},
 	}
 }
 
@@ -418,8 +422,8 @@ func (c *Checker) checkedAt() time.Time {
 	return c.now().UTC()
 }
 
-func (c *Checker) checkProviderHealth(ctx context.Context, providers map[string]Provider) map[string]string {
-	out := make(map[string]string, len(providers))
+func (c *Checker) checkProviderHealth(ctx context.Context, providers map[string]Provider) map[string]ProviderHealth {
+	out := make(map[string]ProviderHealth, len(providers))
 	if c.providerHealth == nil || len(providers) == 0 {
 		return out
 	}
@@ -447,9 +451,9 @@ func (c *Checker) checkProviderHealth(ctx context.Context, providers map[string]
 		go func(key string, provider Provider) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			status := c.providerHealth(ctx, provider.ServiceURL, c.timeout)
+			health := c.providerHealth(ctx, provider.ServiceURL, c.timeout)
 			mu.Lock()
-			out[key] = status
+			out[key] = health
 			mu.Unlock()
 		}(key, provider)
 	}

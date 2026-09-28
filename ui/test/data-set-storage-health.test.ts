@@ -43,10 +43,11 @@ test('data set storage health details hide ready local state', () => {
   )
 })
 
-test('active piece labels use exact counts when known and presence otherwise', () => {
-  assert.equal(activePiecesValue({ active_piece_count: 18, has_active_pieces: false }), '18')
+test('active piece labels report presence whether the chain gave a flag or a count', () => {
+  assert.equal(activePiecesValue({ active_piece_count: 18 }), 'Yes')
+  assert.equal(activePiecesValue({ active_piece_count: 0 }), 'None')
   assert.equal(activePiecesValue({ has_active_pieces: true }), 'Yes')
-  assert.equal(activePiecesValue({ has_active_pieces: false }), 'No')
+  assert.equal(activePiecesValue({ has_active_pieces: false }), 'None')
   assert.equal(activePiecesValue({}), '—')
 
   assert.deepEqual(
@@ -78,7 +79,7 @@ test('data set storage health details include non-ready local state', () => {
         },
       })
     ),
-    ['chain data set missing', 'local state: failed', 'just now']
+    ['Data set not found on chain', 'local state: failed', 'just now']
   )
 })
 
@@ -102,7 +103,7 @@ test('data set storage health details include last error only for attention stat
         },
       })
     ),
-    ['chain lookup failed', 'last error: request timed out', 'just now']
+    ['Could not check data sets on chain', 'last error: request timed out', 'just now']
   )
 
   assert.deepEqual(
@@ -117,7 +118,7 @@ test('data set storage health details include last error only for attention stat
         },
       })
     ),
-    ['chain data set unmanaged', 'just now']
+    ['Data set is not managed by Warm Storage', 'just now']
   )
 })
 
