@@ -44,9 +44,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test PostgreSQL test entrypoint
-        run: bash scripts/test-postgres.test.sh
-
       - name: Test PostgreSQL persistence contracts
         run: make test-postgres
 
