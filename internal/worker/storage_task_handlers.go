@@ -200,7 +200,7 @@ func (h *TaskHandlers) uploadPlanHandler() taskengine.Handler {
 						return err
 					}
 					if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-						ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+						ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 					}); err != nil {
 						return err
 					}
@@ -517,7 +517,7 @@ func (h *TaskHandlers) sendDataSetCreation(
 					checkpoint.StatusURL = sub.StatusURL
 					evidenceErr = execution.WriteCheckpointWith(ctx, checkpoint, func(ctx context.Context, repos *repository.Repositories) error {
 						return repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-							ID: binding.ID, ContentID: derefInt64(binding.CreatedByContentID), TransactionID: sub.TransactionID,
+							ID: binding.ID, TransactionID: sub.TransactionID,
 							StatusURL: sub.StatusURL, ClientDataSetID: &recordedID,
 						})
 					})
@@ -539,7 +539,7 @@ func (h *TaskHandlers) sendDataSetCreation(
 				return err
 			}
 			return repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
-				ID: binding.ID, ContentID: derefInt64(binding.CreatedByContentID), TransactionID: submission.TransactionID,
+				ID: binding.ID, TransactionID: submission.TransactionID,
 				StatusURL: submission.StatusURL, ClientDataSetID: &recordedID,
 			})
 		})
@@ -792,7 +792,7 @@ func failDataSetCopies(ctx context.Context, repos *repository.Repositories, data
 func (h *TaskHandlers) completeDataSetEnsure(binding *model.StorageDataSet, taskID int64, dataSetID, clientDataSetID idtypes.OnChainID) taskengine.Result {
 	return taskengine.Complete("Storage service is ready", func(ctx context.Context, repos *repository.Repositories) error {
 		if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-			ID: binding.ID, ContentID: derefInt64(binding.CreatedByContentID), DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
+			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientDataSetID,
 		}); err != nil {
 			return err
 		}
@@ -1518,26 +1518,6 @@ func (h *TaskHandlers) runPull(ctx context.Context, execution taskengine.Executi
 	return h.finishPieceTransferWithExtra(execution, input, copyRow, target, pieceCID, checkpoint.CommitExtraDataHex, checkpoint.AttemptID)
 }
 
-// commitCoordinateHandler finishes relay tasks that an earlier build enqueued
-// between transfer and commit; nothing enqueues this type any more.
-func (h *TaskHandlers) commitCoordinateHandler() taskengine.Handler {
-	definition := copyDefinition(model.TaskTypeStorageCommitCoordinate, h.retryLimit())
-	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
-		input, copyRow, handled, result := h.authorizeCopyTask(ctx, execution)
-		if handled {
-			return result
-		}
-		if copyRow.Status == model.StorageCopyStatusCommitted {
-			return h.completeCopyTask(input, execution.ID(), "Storage copy is complete")
-		}
-		if copyRow.Status != model.StorageCopyStatusPieceReady && copyRow.Status != model.StorageCopyStatusCommitting {
-			return h.failCopyTask(execution, input, copyRow, errors.New("storage copy has no transferable piece"), "piece_not_ready")
-		}
-		return h.advanceCopyTask(input, execution.ID(), model.TaskTypeStorageCommit, "Storage registration scheduled")
-	}
-	return taskHandler{definition: definition, execute: run, recover: run}
-}
-
 func (h *TaskHandlers) commitHandler() taskengine.Handler {
 	definition := copyDefinition(model.TaskTypeStorageCommit, h.retryLimit())
 	return taskHandler{
@@ -1828,8 +1808,6 @@ func copyTaskKey(taskType model.TaskType, copyID, generation int64) string {
 		return storagepipeline.StoreKey(copyID, generation)
 	case model.TaskTypeStoragePull:
 		return storagepipeline.PullKey(copyID, generation)
-	case model.TaskTypeStorageCommitCoordinate:
-		return storagepipeline.CommitCoordinateKey(copyID, generation)
 	case model.TaskTypeStorageCommit:
 		return storagepipeline.CommitKey(copyID, generation)
 	default:
@@ -2195,13 +2173,6 @@ func newAttemptID() (string, error) {
 		return "", fmt.Errorf("creating request identity: %w", err)
 	}
 	return hex.EncodeToString(value[:]), nil
-}
-
-func derefInt64(value *int64) int64 {
-	if value == nil {
-		return 0
-	}
-	return *value
 }
 
 func taskDerefString(value *string) string {

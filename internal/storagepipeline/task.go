@@ -8,13 +8,12 @@ import (
 )
 
 const (
-	UploadPlanKeyPrefix       = "upload-plan:"
-	DataSetEnsureKeyPrefix    = "storage-dataset-ensure:"
-	TransferPlanKeyPrefix     = "storage-transfer-plan:"
-	StoreKeyPrefix            = "storage-store:"
-	PullKeyPrefix             = "storage-pull:"
-	CommitCoordinateKeyPrefix = "storage-commit-coordinate:"
-	CommitKeyPrefix           = "storage-commit:"
+	UploadPlanKeyPrefix    = "upload-plan:"
+	DataSetEnsureKeyPrefix = "storage-dataset-ensure:"
+	TransferPlanKeyPrefix  = "storage-transfer-plan:"
+	StoreKeyPrefix         = "storage-store:"
+	PullKeyPrefix          = "storage-pull:"
+	CommitKeyPrefix        = "storage-commit:"
 )
 
 // UploadPlanInput names the content to ingest. Ingest is a property of the
@@ -55,10 +54,6 @@ func StoreKey(copyID, generation int64) string {
 
 func PullKey(copyID, generation int64) string {
 	return copyGenerationKey(PullKeyPrefix, copyID, generation)
-}
-
-func CommitCoordinateKey(copyID, generation int64) string {
-	return copyGenerationKey(CommitCoordinateKeyPrefix, copyID, generation)
 }
 
 func CommitKey(copyID, generation int64) string {

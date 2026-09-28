@@ -131,7 +131,6 @@ func validTaskType(taskType model.TaskType) bool {
 		model.TaskTypeStorageTransferPlan,
 		model.TaskTypeStorageStore,
 		model.TaskTypeStoragePull,
-		model.TaskTypeStorageCommitCoordinate,
 		model.TaskTypeStorageCommit,
 		model.TaskTypeProviderReplacementCoordinate,
 		model.TaskTypeCacheCapacityReconcile,
@@ -205,8 +204,6 @@ func taskOperationLabel(taskType model.TaskType) string {
 		return "Store content"
 	case model.TaskTypeStoragePull:
 		return "Transfer stored content"
-	case model.TaskTypeStorageCommitCoordinate:
-		return "Prepare storage confirmation"
 	case model.TaskTypeStorageCommit:
 		return "Confirm storage"
 	case model.TaskTypeProviderReplacementCoordinate:

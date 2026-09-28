@@ -50,14 +50,14 @@ func storageContentLockQuery(query string) bool {
 	return strings.Contains(query, "update") && strings.Contains(query, "storage_contents") && strings.Contains(query, "updated_at = updated_at")
 }
 
-func permanentDeletePostgresDB(t *testing.T, dsn string) *bun.DB {
+func migratedPostgresDB(t *testing.T, dsn string) *bun.DB {
 	t.Helper()
 	ctx := context.Background()
 	adminDB, err := appdb.New(config.DatabaseConfig{Driver: "postgres", DSN: dsn, MaxOpenConns: 1, MaxIdleConns: 1})
 	if err != nil {
 		t.Fatalf("opening postgres admin connection: %v", err)
 	}
-	schema := fmt.Sprintf("synaps3_permanent_delete_%d", time.Now().UnixNano())
+	schema := fmt.Sprintf("synaps3_repository_%d", time.Now().UnixNano())
 	quotedSchema := quotePostgresIdentifier(schema)
 	if _, err := adminDB.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
 		_ = adminDB.Close()
@@ -98,7 +98,7 @@ func postgresDSNWithSearchPath(dsn, schema string) (string, error) {
 	return strings.TrimSpace(dsn) + " search_path=" + schema, nil
 }
 
-func waitPostgresDeleteSignal(t *testing.T, signal <-chan struct{}, name string) {
+func waitPostgresSignal(t *testing.T, signal <-chan struct{}, name string) {
 	t.Helper()
 	select {
 	case <-signal:
@@ -107,7 +107,7 @@ func waitPostgresDeleteSignal(t *testing.T, signal <-chan struct{}, name string)
 	}
 }
 
-func waitPostgresDeleteResult(t *testing.T, result <-chan error, name string) error {
+func waitPostgresResult(t *testing.T, result <-chan error, name string) error {
 	t.Helper()
 	select {
 	case err := <-result:
@@ -137,7 +137,7 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 		{name: "reuse wins", blockedOperation: "reuse"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := permanentDeletePostgresDB(t, dsn)
+			db := migratedPostgresDB(t, dsn)
 			repos := repository.NewRepositories(db)
 			ctx := context.Background()
 			bucket := seedBucket(t, db, "postgres-permanent-delete-"+strings.ReplaceAll(tc.name, " ", "-"))
@@ -188,18 +188,18 @@ func TestPostgresPermanentDeleteSerializesContentReuse(t *testing.T) {
 			} else {
 				startReuse()
 			}
-			waitPostgresDeleteSignal(t, barrier.locked, "first storage content lock")
+			waitPostgresSignal(t, barrier.locked, "first storage content lock")
 			if tc.blockedOperation == "delete" {
 				startReuse()
 			} else {
 				startDelete()
 			}
-			waitPostgresDeleteSignal(t, barrier.attempted, "competing storage content lock")
+			waitPostgresSignal(t, barrier.attempted, "competing storage content lock")
 			close(barrier.release)
-			if err := waitPostgresDeleteResult(t, deleteResult, "permanent delete"); err != nil {
+			if err := waitPostgresResult(t, deleteResult, "permanent delete"); err != nil {
 				t.Fatalf("DeleteObjectVersionPermanently: %v", err)
 			}
-			if err := waitPostgresDeleteResult(t, reuseResult, "content reuse"); err != nil {
+			if err := waitPostgresResult(t, reuseResult, "content reuse"); err != nil {
 				t.Fatalf("CreateVersionAndSetCurrent(follower): %v", err)
 			}
 

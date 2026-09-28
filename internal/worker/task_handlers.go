@@ -126,7 +126,6 @@ func (h *TaskHandlers) RegisterStorage(registry *taskengine.Registry) error {
 		h.transferPlanHandler(),
 		h.storeHandler(),
 		h.pullHandler(),
-		h.commitCoordinateHandler(),
 		h.commitHandler(),
 	} {
 		if err := registry.Register(handler); err != nil {

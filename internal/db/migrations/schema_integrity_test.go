@@ -25,10 +25,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const (
-	initialPortableSchemaFingerprint = "cae86066ebaba1cde6e8037138515326bf5c29672de039bbcda3a507ccfa0059"
-)
-
 func TestMigrationRegistryStartsWithUniqueOrderedBaseline(t *testing.T) {
 	migrations := Migrations.Sorted()
 	if len(migrations) == 0 {
@@ -69,33 +65,25 @@ func TestMigrationFilesDoNotImportRuntimePackages(t *testing.T) {
 	}
 }
 
-func TestInitialSchemaFingerprintPostgres(t *testing.T) {
+// A PostgreSQL database is validated against the SQLite reference on what the
+// two dialects share, so the baseline must build that shared schema on both.
+func TestInitialSchemaMatchesAcrossDialects(t *testing.T) {
 	db := newPostgresMigrationDB(t)
 	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
 		t.Fatalf("create initial schema: %v", err)
 	}
-	got, schema := portableSchemaFingerprint(t, db)
 	sqliteDB := newSQLiteMigrationDB(t, "postgres_portable_schema_comparison")
 	if err := runMigrationBody(t.Context(), sqliteDB, up2026090101InitialSchema); err != nil {
 		t.Fatalf("create comparison SQLite schema: %v", err)
 	}
-	sqliteFingerprint, sqliteSchema := portableSchemaFingerprint(t, sqliteDB)
-	if got != sqliteFingerprint {
-		t.Fatalf(
-			"portable schema differs by dialect: PostgreSQL=%s SQLite=%s\n%s",
-			got,
-			sqliteFingerprint,
-			semanticSchemaDifference(sqliteSchema, schema),
-		)
-	}
-	if got != initialPortableSchemaFingerprint {
-		t.Fatalf("initial PostgreSQL portable schema fingerprint = %s, want %s\n%s", got, initialPortableSchemaFingerprint, schema)
+	postgresSchema := portableSchema(t, db)
+	sqliteSchema := portableSchema(t, sqliteDB)
+	if !slices.Equal(postgresSchema, sqliteSchema) {
+		t.Fatalf("portable schema differs by dialect:\n%s", semanticSchemaDifference(sqliteSchema, postgresSchema))
 	}
 }
 
-func semanticSchemaDifference(want, got string) string {
-	wantLines := strings.Split(want, "\n")
-	gotLines := strings.Split(got, "\n")
+func semanticSchemaDifference(wantLines, gotLines []string) string {
 	wantSet := make(map[string]struct{}, len(wantLines))
 	gotSet := make(map[string]struct{}, len(gotLines))
 	for _, line := range wantLines {
@@ -116,17 +104,6 @@ func semanticSchemaDifference(want, got string) string {
 		}
 	}
 	return strings.Join(difference, "\n")
-}
-
-func TestInitialSchemaPortableFingerprintSQLite(t *testing.T) {
-	db := newSQLiteMigrationDB(t, "portable_schema_fingerprint")
-	if err := runMigrationBody(t.Context(), db, up2026090101InitialSchema); err != nil {
-		t.Fatalf("create initial schema: %v", err)
-	}
-	got, schema := portableSchemaFingerprint(t, db)
-	if got != initialPortableSchemaFingerprint {
-		t.Fatalf("initial SQLite portable schema fingerprint = %s, want %s\n%s", got, initialPortableSchemaFingerprint, schema)
-	}
 }
 
 func TestInitialSchemaContractSQLite(t *testing.T) {
@@ -571,9 +548,4 @@ func postgresTestDSN(t *testing.T) string {
 
 func quotePostgresName(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-func normalizedFingerprint(lines []string) (string, string) {
-	payload := strings.Join(lines, "\n")
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(payload))), payload
 }

@@ -22,19 +22,14 @@ type BunWalletOperationRepo struct {
 
 var _ WalletOperationRepository = (*BunWalletOperationRepo)(nil)
 
+// CreateOrGet records a wallet request once per client request ID. A request
+// that loses a race to the same ID gets the winner's operation: the conflict
+// never raises an error, which on PostgreSQL would abort the caller's
+// transaction before the winner could be read.
 func (r *BunWalletOperationRepo) CreateOrGet(ctx context.Context, input CreateWalletOperationInput) (*model.WalletOperation, bool, error) {
 	if !validWalletOperationAmount(input.Type, input.Amount) {
 		return nil, false, ErrWalletOperationInvalidAmount
 	}
-	if existing, err := r.getByTypeAndClientRequestID(ctx, input.Type, input.ClientRequestID); err != nil {
-		return nil, false, err
-	} else if existing != nil {
-		if existing.Amount != input.Amount {
-			return nil, false, ErrWalletOperationConflict
-		}
-		return existing, false, nil
-	}
-
 	now := time.Now()
 	op := &model.WalletOperation{
 		Type:            input.Type,
@@ -44,20 +39,27 @@ func (r *BunWalletOperationRepo) CreateOrGet(ctx context.Context, input CreateWa
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	if _, err := r.db.NewInsert().Model(op).Exec(ctx); err != nil {
-		if isUniqueViolation(err) {
-			existing, selectErr := r.getByTypeAndClientRequestID(ctx, input.Type, input.ClientRequestID)
-			if selectErr != nil {
-				return nil, false, selectErr
-			}
-			if existing != nil && existing.Amount != input.Amount {
-				return nil, false, ErrWalletOperationConflict
-			}
-			return existing, false, nil
-		}
+	res, err := r.db.NewInsert().
+		Model(op).
+		On("CONFLICT (type, client_request_id) DO NOTHING").
+		Exec(ctx)
+	if err != nil {
 		return nil, false, fmt.Errorf("inserting wallet operation: %w", err)
 	}
-	return op, true, nil
+	if rows, _ := res.RowsAffected(); rows == 1 {
+		return op, true, nil
+	}
+	existing, err := r.getByTypeAndClientRequestID(ctx, input.Type, input.ClientRequestID)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing == nil {
+		return nil, false, fmt.Errorf("wallet operation %s/%s conflicted but was not found: %w", input.Type, input.ClientRequestID, ErrConflict)
+	}
+	if existing.Amount != input.Amount {
+		return nil, false, ErrWalletOperationConflict
+	}
+	return existing, false, nil
 }
 
 func (r *BunWalletOperationRepo) GetByID(ctx context.Context, id int64) (*model.WalletOperation, error) {

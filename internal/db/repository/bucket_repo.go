@@ -96,10 +96,6 @@ func (r *BunBucketRepo) ListActive(ctx context.Context) ([]model.Bucket, error) 
 	return buckets, nil
 }
 
-func (r *BunBucketRepo) SoftDelete(ctx context.Context, id int64) error {
-	return deleteBucketRow(ctx, r.db, id, "deleting bucket")
-}
-
 func (r *BunBucketRepo) UpdateStatus(ctx context.Context, id int64, from, to model.BucketStatus) error {
 	res, err := r.db.NewUpdate().
 		Model((*model.Bucket)(nil)).
@@ -296,6 +292,17 @@ func lockBucketByName(ctx context.Context, db bun.IDB, name string) (*model.Buck
 	return bucket, nil
 }
 
+func (r *BunBucketRepo) LockByID(ctx context.Context, id int64) error {
+	bucket, err := lockBucketByID(ctx, r.db, id)
+	if err != nil {
+		return err
+	}
+	if bucket == nil {
+		return fmt.Errorf("locking bucket %d: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 func lockBucketByID(ctx context.Context, db bun.IDB, id int64) (*model.Bucket, error) {
 	lockResult, err := db.NewUpdate().
 		Model((*model.Bucket)(nil)).
@@ -347,31 +354,6 @@ func (r *BunBucketRepo) AggregateCountsByOwner(ctx context.Context) (map[string]
 		counts[row.OwnerAccessKey] = row.Count
 	}
 	return counts, nil
-}
-
-func (r *BunBucketRepo) HardDelete(ctx context.Context, id int64) error {
-	return deleteBucketRow(ctx, r.db, id, "hard-deleting bucket")
-}
-
-// deleteBucketRow removes a bucket together with the replica slots it owns.
-// The slots are deleted explicitly rather than by cascade, so a slot a data set
-// still references blocks the delete instead of silently disappearing.
-func deleteBucketRow(ctx context.Context, db bun.IDB, id int64, action string) error {
-	return runMaybeTx(ctx, db, func(db bun.IDB) error {
-		if _, err := db.NewDelete().
-			Model((*model.BucketReplicaSlot)(nil)).
-			Where("bucket_id = ?", id).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("%s replica slots: %w", action, err)
-		}
-		if _, err := db.NewDelete().
-			Model((*model.Bucket)(nil)).
-			Where("id = ?", id).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("%s: %w", action, err)
-		}
-		return nil
-	})
 }
 
 func (r *BunBucketRepo) List(ctx context.Context) ([]model.Bucket, error) {

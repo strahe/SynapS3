@@ -36,7 +36,7 @@ func TestFailedIngressCanBeReplacedThenPulledFromCommittedSuccessor(t *testing.T
 		dataSetID := onChainID(t, fmt.Sprint(201+index))
 		clientID := onChainID(t, fmt.Sprint(301+index))
 		if err := repos.Contents.MarkDataSetReady(t.Context(), repository.MarkDataSetReadyInput{
-			ID: binding.ID, ContentID: content.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
+			ID: binding.ID, DataSetID: dataSetID, ClientDataSetID: &clientID,
 		}); err != nil {
 			t.Fatal(err)
 		}

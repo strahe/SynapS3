@@ -30,7 +30,6 @@ const taskOperations = [
   { value: 'storage_transfer_plan', label: 'Plan storage transfer' },
   { value: 'storage_store', label: 'Store content' },
   { value: 'storage_pull', label: 'Transfer stored content' },
-  { value: 'storage_commit_coordinate', label: 'Prepare storage confirmation' },
   { value: 'storage_commit', label: 'Confirm storage' },
   { value: 'provider_replacement_coordinate', label: 'Replace storage provider' },
   { value: 'cache_evict', label: 'Remove local cached copy' },

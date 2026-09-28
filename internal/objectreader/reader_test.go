@@ -837,7 +837,7 @@ func acceptReaderVersionUpload(t *testing.T, db *bun.DB, repos *repository.Repos
 	if err != nil {
 		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: upload.ID, DataSetID: dataSetID}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: dataSetID}); err != nil {
 		t.Fatalf("mark dataset ready: %v", err)
 	}
 	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
@@ -884,10 +884,10 @@ func bindReaderPrimaryCommittedUpload(t *testing.T, db *bun.DB, repos *repositor
 	if err != nil {
 		t.Fatalf("secondary binding: %v", err)
 	}
-	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: primary.ID, DataSetID: onChainID(t, "1001"), ClientDataSetID: onChainIDPtr(t, "9001")}); err != nil {
 		t.Fatalf("primary ready: %v", err)
 	}
-	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, ContentID: upload.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: secondary.ID, DataSetID: onChainID(t, "2002"), ClientDataSetID: onChainIDPtr(t, "9002")}); err != nil {
 		t.Fatalf("secondary ready: %v", err)
 	}
 	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{

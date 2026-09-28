@@ -70,6 +70,15 @@ func TestBaselineConstraintsRejectInvalidWrites(t *testing.T) {
 			"settled holding its task": `INSERT INTO wallet_operations
 				(type, client_request_id, amount, status, last_error, task_id, completed_at, created_at, updated_at)
 				VALUES ('fund', 'failed-owned', '1', 'failed', 'rejected', ` + strconv.FormatInt(walletTaskID, 10) + `, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"fund confirmed without transaction": `INSERT INTO wallet_operations
+				(type, client_request_id, amount, status, completed_at, created_at, updated_at)
+				VALUES ('fund', 'fund-confirmed-untracked', '1', 'confirmed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"speed test succeeded without duration": `INSERT INTO provider_upload_speed_tests
+				(provider_id, state, service_url_hash, sample_bytes, bytes_per_second, tested_at, created_at, updated_at)
+				VALUES ('speed-no-duration', 'succeeded', '` + strings.Repeat("a", 64) + `', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+			"speed test succeeded without throughput": `INSERT INTO provider_upload_speed_tests
+				(provider_id, state, service_url_hash, sample_bytes, duration_ms, tested_at, created_at, updated_at)
+				VALUES ('speed-no-throughput', 'succeeded', '` + strings.Repeat("a", 64) + `', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 		} {
 			t.Run(name, func(t *testing.T) { mustRejectStatement(t, db, statement) })
 		}
@@ -217,14 +226,6 @@ func TestBaselineStorageIdentityAndLedgerConstraints(t *testing.T) {
 			t.Fatalf("insert created-by provenance: %v", err)
 		}
 		mustRejectStatement(t, db, `DELETE FROM storage_contents WHERE id = ?`, createdByContent)
-
-		lastUsedContent := insertBaselineTestContent(t, db, bucketB, "provenance-last-used")
-		if _, err := db.Exec(`INSERT INTO storage_data_sets
-			(bucket_id, provider_id, copy_index, generation, is_current, status, last_used_content_id, created_at, updated_at)
-			VALUES (?, 'provenance-last-used', 2, 1, FALSE, 'retired', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, bucketB, lastUsedContent); err != nil {
-			t.Fatalf("insert last-used provenance: %v", err)
-		}
-		mustRejectStatement(t, db, `DELETE FROM storage_contents WHERE id = ?`, lastUsedContent)
 
 		if _, err := db.Exec(`INSERT INTO storage_commit_attempts
 			(attempt_id, content_id, storage_data_set_id, created_at, updated_at)

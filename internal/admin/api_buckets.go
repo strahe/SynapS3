@@ -107,7 +107,6 @@ type storageDataSetSummaryResponse struct {
 	ClientDataSetID    *string                   `json:"client_data_set_id,omitempty"`
 	Status             string                    `json:"status"`
 	CreatedByContentID *int64                    `json:"created_by_content_id,omitempty"`
-	LastUsedContentID  *int64                    `json:"last_used_content_id,omitempty"`
 	CommittedCopies    int64                     `json:"committed_copies"`
 	ReadableCopies     int64                     `json:"readable_copies"`
 	PhysicalBytes      int64                     `json:"physical_bytes"`
@@ -623,7 +622,6 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			ClientDataSetID:    onChainIDStringPtr(summary.ClientDataSetID),
 			Status:             string(summary.Status),
 			CreatedByContentID: summary.CreatedByContentID,
-			LastUsedContentID:  summary.LastUsedContentID,
 			CommittedCopies:    summary.CommittedCopies,
 			ReadableCopies:     summary.ReadableCopies,
 			PhysicalBytes:      summary.PhysicalBytes,

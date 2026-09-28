@@ -328,6 +328,19 @@ func (r *Runtime) discardOrphanedContents(ctx context.Context) {
 	}
 }
 
+// releaseInterruptedMultipartCompletions runs before the S3 server starts. A
+// failure leaves those uploads for the next start.
+func (r *Runtime) releaseInterruptedMultipartCompletions(ctx context.Context) {
+	released, err := r.backend.ReleaseInterruptedMultipartCompletions(ctx)
+	if err != nil {
+		r.logger.Warn("releasing multipart uploads left completing by a stopped process", "error", err)
+		return
+	}
+	if released > 0 {
+		r.logger.Info("released multipart uploads left completing by a stopped process", "uploads", released)
+	}
+}
+
 func publishUploadTaskSettlement(events admin.EventPublisher, taskRow *model.Task, transition repository.TaskTransition) {
 	if events == nil || taskRow == nil || transition.Status == model.TaskStatusPending || !uploadPipelineTask(taskRow.Type) {
 		return
@@ -353,7 +366,6 @@ func uploadPipelineTask(taskType model.TaskType) bool {
 		model.TaskTypeStorageTransferPlan,
 		model.TaskTypeStorageStore,
 		model.TaskTypeStoragePull,
-		model.TaskTypeStorageCommitCoordinate,
 		model.TaskTypeStorageCommit,
 		model.TaskTypeProviderReplacementCoordinate,
 		model.TaskTypeStorageDataSetRetire:
@@ -452,6 +464,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	r.running = true
 	r.mu.Unlock()
 
+	r.releaseInterruptedMultipartCompletions(ctx)
 	runCtx, cancel := context.WithCancel(ctx)
 	group, groupCtx := errgroup.WithContext(runCtx)
 	group.Go(func() error {

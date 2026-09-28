@@ -384,61 +384,6 @@ func TestBucketRepo_UpdateStatus(t *testing.T) {
 	}
 }
 
-func TestBucketRepo_HardDelete(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "hard-del", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	if err := repos.Buckets.HardDelete(ctx, bucket.ID); err != nil {
-		t.Fatalf("HardDelete: %v", err)
-	}
-
-	got, err := repos.Buckets.GetByID(ctx, bucket.ID)
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if got != nil {
-		t.Fatal("expected nil after hard delete")
-	}
-}
-
-func TestBucketRepo_SoftDelete(t *testing.T) {
-	db := testDB(t)
-	repos := repository.NewRepositories(db)
-	ctx := context.Background()
-
-	bucket := &model.Bucket{Name: "to-delete", Status: model.BucketStatusActive, DefaultCopies: 8, MinimumDurableCopies: 8}
-	if err := repos.Buckets.Create(ctx, bucket); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	if err := repos.Buckets.SoftDelete(ctx, bucket.ID); err != nil {
-		t.Fatalf("SoftDelete: %v", err)
-	}
-
-	got, err := repos.Buckets.GetByID(ctx, bucket.ID)
-	if err != nil {
-		t.Fatalf("GetByID after delete: %v", err)
-	}
-	if got != nil {
-		t.Fatal("expected bucket to be deleted")
-	}
-
-	// Should not appear in ListActive.
-	list, err := repos.Buckets.ListActive(ctx)
-	if err != nil {
-		t.Fatalf("ListActive: %v", err)
-	}
-	if len(list) != 0 {
-		t.Errorf("expected 0 active, got %d", len(list))
-	}
-}
-
 func TestBucketRepo_List(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)

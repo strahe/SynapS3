@@ -274,16 +274,13 @@ func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, 
 	if !ready {
 		return ErrContentCleanupNotReady
 	}
-	now := time.Now()
-	for _, column := range []string{"created_by_content_id", "last_used_content_id"} {
-		if _, err := r.db.NewUpdate().
-			Model((*model.StorageDataSet)(nil)).
-			Set(column+" = NULL").
-			Set("updated_at = ?", now).
-			Where(column+" = ?", contentID).
-			Exec(ctx); err != nil {
-			return fmt.Errorf("finalizing storage cleanup: clearing data set %s: %w", column, err)
-		}
+	if _, err := r.db.NewUpdate().
+		Model((*model.StorageDataSet)(nil)).
+		Set("created_by_content_id = NULL").
+		Set("updated_at = ?", time.Now()).
+		Where("created_by_content_id = ?", contentID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("finalizing storage cleanup: clearing data set created_by_content_id: %w", err)
 	}
 	for _, rows := range []struct {
 		model  any

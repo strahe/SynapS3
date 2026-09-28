@@ -10,6 +10,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 )
 
 // lockStorageContentsByID serializes object-version references with permanent
@@ -102,16 +103,19 @@ func lockStorageContentForCopyMutation(ctx context.Context, db bun.IDB, contentI
 }
 
 // prepareNewObjectVersionStorageReference locks the content a new version is
-// about to name.
-//
-// It no longer demands a readable committed copy first. That requirement came
-// from the old model, where a version only gained storage_upload_id once the
-// upload was already readable, so the reference doubled as a durability claim.
-// content_id is plain identity: it is set the moment the bytes are known, and
-// durability is read from the copy rows instead.
+// about to name, and freezes the bucket's current copy policy into content no
+// version has named before. content_id is plain identity: it is set the moment
+// the bytes are known, and durability is read from the copy rows.
 func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, version *model.ObjectVersion) error {
 	if version == nil || version.ContentID == nil || *version.ContentID <= 0 {
 		return nil
+	}
+	// The policy is read before the content lock, as other paths that lock both
+	// do. Cache eviction locks the content first, but its cache gate keeps it
+	// from running beside a write of the same content.
+	defaultCopies, err := bucketCopyPolicyForReference(ctx, db, version.BucketID)
+	if err != nil {
+		return err
 	}
 	contents, err := lockStorageContentsByID(ctx, db, []int64{*version.ContentID})
 	if errors.Is(err, ErrNotFound) {
@@ -131,6 +135,9 @@ func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, ve
 	if content.CleanupTaskID != nil {
 		return fmt.Errorf("storage content %d: %w", *version.ContentID, ErrContentCleanupInProgress)
 	}
+	if err := freezeRequestedCopiesOnFirstReference(ctx, db, content, defaultCopies); err != nil {
+		return err
+	}
 	// A data version is only created after its bytes are durably in the local
 	// cache, so the content is resident. Residency is per content: versions that
 	// share bytes share this row.
@@ -143,6 +150,60 @@ func prepareNewObjectVersionStorageReference(ctx context.Context, db bun.IDB, ve
 			return err
 		}
 	}
+	return nil
+}
+
+// bucketCopyPolicyForReference reads the policy a first reference freezes into
+// its content. PostgreSQL holds a share lock until the reference commits, so a
+// policy change cannot commit in between: content named before the change
+// keeps the old target and content named after it gets the new one. SQLite
+// serializes writers, so it needs no lock.
+func bucketCopyPolicyForReference(ctx context.Context, db bun.IDB, bucketID int64) (int, error) {
+	var defaultCopies int
+	query := db.NewSelect().
+		Model((*model.Bucket)(nil)).
+		Column("default_copies").
+		Where("id = ?", bucketID)
+	if db.Dialect().Name() == dialect.PG {
+		query = query.For("SHARE")
+	}
+	if err := query.Scan(ctx, &defaultCopies); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("bucket %d: %w", bucketID, ErrNotFound)
+		}
+		return 0, fmt.Errorf("reading bucket %d copy policy: %w", bucketID, err)
+	}
+	return defaultCopies, nil
+}
+
+// freezeRequestedCopiesOnFirstReference gives content its copy target when a
+// version names it for the first time; content some version has named keeps
+// its target. A version's removal raises cleanup_generation, so a row still at
+// zero that no version names has never been named.
+func freezeRequestedCopiesOnFirstReference(ctx context.Context, db bun.IDB, content *model.StorageContent, defaultCopies int) error {
+	requestedCopies := model.ClampStorageCopies(defaultCopies)
+	if content.RequestedCopies == requestedCopies || content.CleanupGeneration != 0 {
+		return nil
+	}
+	named, err := db.NewSelect().
+		Model((*model.ObjectVersion)(nil)).
+		Where("content_id = ?", content.ID).
+		Exists(ctx)
+	if err != nil {
+		return fmt.Errorf("checking references to storage content %d: %w", content.ID, err)
+	}
+	if named {
+		return nil
+	}
+	if _, err := db.NewUpdate().
+		Model((*model.StorageContent)(nil)).
+		Set("requested_copies = ?", requestedCopies).
+		Set("updated_at = ?", time.Now()).
+		Where("id = ?", content.ID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("freezing requested copies for storage content %d: %w", content.ID, err)
+	}
+	content.RequestedCopies = requestedCopies
 	return nil
 }
 

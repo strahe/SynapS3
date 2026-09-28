@@ -375,7 +375,7 @@ func acceptBackendVersionUpload(t *testing.T, db *bun.DB, repos *repository.Repo
 	if err != nil {
 		t.Fatalf("ensure dataset binding: %v", err)
 	}
-	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, ContentID: upload.ID, DataSetID: onChainID(t, "1001")}); err != nil {
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: binding.ID, DataSetID: onChainID(t, "1001")}); err != nil {
 		t.Fatalf("mark dataset ready: %v", err)
 	}
 	if err := repos.Contents.CreateUploadCopiesForBindings(ctx, upload.ID, []repository.UploadCopyBindingInput{{
@@ -426,7 +426,6 @@ func bindBackendPrimaryCommittedUpload(t *testing.T, db *bun.DB, repos *reposito
 	}
 	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
 		ID:        primary.ID,
-		ContentID: upload.ID,
 		DataSetID: onChainID(t, "1001"),
 	}); err != nil {
 		t.Fatalf("mark primary dataset ready: %v", err)

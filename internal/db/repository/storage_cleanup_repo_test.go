@@ -405,7 +405,7 @@ func seedCleanupCopyCommitBoundary(t *testing.T) (*bun.DB, *repository.Repositor
 		t.Fatalf("EnsureDataSetBinding(second): %v", err)
 	}
 	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
-		ID: binding.ID, ContentID: content.ID, DataSetID: onChainID(t, "802"),
+		ID: binding.ID, DataSetID: onChainID(t, "802"),
 	}); err != nil {
 		t.Fatalf("MarkDataSetReady(second): %v", err)
 	}

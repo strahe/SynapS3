@@ -100,7 +100,6 @@ type StorageDataSet struct {
 	CreateTransactionID  *string              `bun:"type:text,nullzero"`
 	CreateStatusURL      *string              `bun:"type:text,nullzero"`
 	CreatedByContentID   *int64               `bun:",nullzero"`
-	LastUsedContentID    *int64               `bun:",nullzero"`
 	LastError            *string              `bun:"type:text,nullzero"`
 	EnsureTaskID         *int64               `bun:",nullzero"`
 	RetirementGeneration int64                `bun:",notnull,default:0"`
@@ -110,7 +109,6 @@ type StorageDataSet struct {
 
 	Bucket           *Bucket         `bun:"rel:belongs-to,join:bucket_id=id"`
 	CreatedByContent *StorageContent `bun:"rel:belongs-to,join:created_by_content_id=id"`
-	LastUsedContent  *StorageContent `bun:"rel:belongs-to,join:last_used_content_id=id"`
 }
 
 // StorageCopy places one content payload on one data set generation. Store

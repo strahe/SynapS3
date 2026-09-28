@@ -81,11 +81,17 @@ func TestDiscardOrphanedContentRemovesOnlyContentNoVersionEverNamed(t *testing.T
 	}
 }
 
-func TestEnsureContentAdoptsCurrentCopiesOnlyForUnnamedContent(t *testing.T) {
+// A write registers its bytes long before its version commits, from a policy
+// read when it started. The target is settled only when a version first names
+// the content, from the bucket's policy at that moment, and then stays frozen.
+func TestFirstReferenceFreezesTheBucketsCurrentCopyPolicy(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
 	ctx := t.Context()
-	bucket := seedBucket(t, db, "adopt-bucket")
+	bucket := &model.Bucket{Name: "first-reference-policy", Status: model.BucketStatusActive, DefaultCopies: 1, MinimumDurableCopies: 1}
+	if err := repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("Create bucket: %v", err)
+	}
 	ensure := func(checksum string, copies int) *model.StorageContent {
 		t.Helper()
 		content, err := repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
@@ -96,25 +102,46 @@ func TestEnsureContentAdoptsCurrentCopiesOnlyForUnnamedContent(t *testing.T) {
 		}
 		return content
 	}
+	raisePolicy := func(copies int) {
+		t.Helper()
+		if _, err := repos.Buckets.UpdateCopyPolicy(ctx, repository.UpdateBucketCopyPolicyInput{
+			Name: bucket.Name, SetDefaultCopies: true, DefaultCopies: &copies,
+		}); err != nil {
+			t.Fatalf("UpdateCopyPolicy(%d): %v", copies, err)
+		}
+	}
+	name := func(key string, contentID int64) {
+		t.Helper()
+		version := newObjectVersion(bucket.ID, key, model.NewVersionID(), 10)
+		version.ContentID = &contentID
+		if _, err := createVersion(t, repos, version); err != nil {
+			t.Fatalf("name content with %s: %v", key, err)
+		}
+	}
+	requestedCopies := func(contentID int64) int {
+		t.Helper()
+		stored, err := repos.Contents.GetByID(ctx, contentID)
+		if err != nil || stored == nil {
+			t.Fatalf("GetByID(%d) = %#v, %v", contentID, stored, err)
+		}
+		return stored.RequestedCopies
+	}
 
-	// A failed write left this row; the next write of the same bytes brings
-	// the bucket's current policy.
-	left := ensure("left-behind", 1)
-	if adopted := ensure("left-behind", 3); adopted.ID != left.ID || adopted.RequestedCopies != 3 {
-		t.Fatalf("content after later write = %#v, want row %d with 3 copies", adopted, left.ID)
+	content := ensure("stale-snapshot", 1)
+	raisePolicy(3)
+	// A write that read the old policy registers the same bytes again.
+	if again := ensure("stale-snapshot", 1); again.ID != content.ID {
+		t.Fatalf("content after second registration = %d, want %d", again.ID, content.ID)
 	}
-	if stored, err := repos.Contents.GetByID(ctx, left.ID); err != nil || stored.RequestedCopies != 3 {
-		t.Fatalf("stored content = %#v, err=%v, want 3 copies", stored, err)
+	name("first.txt", content.ID)
+	if got := requestedCopies(content.ID); got != 3 {
+		t.Fatalf("requested copies after the first reference = %d, want the bucket's current 3", got)
 	}
 
-	// Once a version names the content, its target stays frozen.
-	named := newObjectVersion(bucket.ID, "named.txt", "01J00000000000000000000B02", 10)
-	named.ContentID = &ensure("named", 1).ID
-	if _, err := createVersion(t, repos, named); err != nil {
-		t.Fatalf("seed named version: %v", err)
-	}
-	if kept := ensure("named", 3); kept.RequestedCopies != 1 {
-		t.Fatalf("named content = %#v, want its original 1 copy", kept)
+	raisePolicy(4)
+	name("second.txt", content.ID)
+	if got := requestedCopies(content.ID); got != 3 {
+		t.Fatalf("requested copies after a later reference = %d, want the frozen 3", got)
 	}
 }
 

@@ -454,7 +454,6 @@ func createObjectLifecycleSchema(ctx context.Context, db bun.IDB) error {
 		{name: "idx_object_cache_lru", table: "object_cache", columns: []string{"cache_accessed_at", "content_id"}, where: "in_cache = TRUE"},
 		{name: "idx_object_cache_active_task", table: "object_cache", columns: []string{"cache_active_task_id"}, where: "cache_active_task_id IS NOT NULL", unique: true},
 		{name: "idx_object_deletions_bucket_key_deleted", table: "object_deletions", columns: []string{"bucket_id", "key", "deleted_at"}},
-		{name: "idx_object_deletions_content", table: "object_deletions", columns: []string{"content_id"}},
 		{name: "idx_object_deletions_bucket_deleted", table: "object_deletions", columns: []string{"bucket_id", "deleted_at DESC", "id DESC"}},
 	}
 	if db.Dialect().Name() != dialect.PG {
@@ -527,7 +526,6 @@ type storageDataSet2026090101 struct {
 	CreateTransactionID  *string `bun:"type:text"`
 	CreateStatusURL      *string `bun:"type:text"`
 	CreatedByContentID   *int64
-	LastUsedContentID    *int64
 	LastError            *string `bun:"type:text"`
 	EnsureTaskID         *int64
 	RetirementGeneration int64 `bun:",notnull,default:0"`
@@ -762,7 +760,6 @@ func createStorageSchema(ctx context.Context, db bun.IDB) error {
 			foreignKeys: []string{
 				"(bucket_id) REFERENCES buckets (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 				"(created_by_content_id, bucket_id) REFERENCES storage_contents (id, bucket_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-				"(last_used_content_id, bucket_id) REFERENCES storage_contents (id, bucket_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 				"(ensure_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 				"(retirement_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 			},
@@ -925,7 +922,7 @@ func storageReplacementItemTable2026090101() initialTableSpec {
 			"(replacement_id, target_data_set_id) REFERENCES storage_replacements (id, target_data_set_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
 		// content_id stays a value once cleanup deletes the content and its
-		// copies; cleanup waits while an item that blocks retirement names it.
+		// copies.
 	}
 }
 
@@ -958,7 +955,6 @@ func storageIndexes2026090101() []initialIndexSpec {
 		{name: "idx_storage_data_sets_bucket_copy_generation", table: "storage_data_sets", columns: []string{"bucket_id", "copy_index", "generation"}, unique: true},
 		{name: "idx_storage_data_sets_bucket_provider_active", table: "storage_data_sets", columns: []string{"bucket_id", "provider_id"}, where: "status <> 'retired'", unique: true},
 		{name: "idx_storage_data_sets_created_by_content", table: "storage_data_sets", columns: []string{"created_by_content_id"}},
-		{name: "idx_storage_data_sets_last_used_content", table: "storage_data_sets", columns: []string{"last_used_content_id"}},
 		{name: "idx_storage_data_sets_ensure_task", table: "storage_data_sets", columns: []string{"ensure_task_id"}, where: "ensure_task_id IS NOT NULL", unique: true},
 		{name: "idx_storage_data_sets_retirement_task", table: "storage_data_sets", columns: []string{"retirement_task_id"}, where: "retirement_task_id IS NOT NULL", unique: true},
 		{name: "idx_storage_copies_content_slot", table: "storage_copies", columns: []string{"content_id", "copy_index"}},
@@ -989,7 +985,6 @@ func storageIndexes2026090101() []initialIndexSpec {
 		{name: "idx_storage_replacements_bucket_request", table: "storage_replacements", columns: []string{"bucket_id", "client_request_id"}, unique: true},
 		{name: "idx_storage_replacements_task", table: "storage_replacements", columns: []string{"task_id"}, where: "task_id IS NOT NULL", unique: true},
 		{name: "idx_storage_replacement_items_state", table: "storage_replacement_items", columns: []string{"replacement_id", "status", "id"}},
-		{name: "idx_storage_replacement_items_content_id", table: "storage_replacement_items", columns: []string{"content_id"}},
 		{name: "idx_storage_replacement_items_target_copy", table: "storage_replacement_items", columns: []string{"content_id", "target_data_set_id"}},
 		{name: "idx_storage_cleanup_copies_content_status", table: "storage_cleanup_copies", columns: []string{"content_id", "status", "id"}},
 		{name: "idx_storage_cleanup_copies_data_set_identity", table: "storage_cleanup_copies", columns: []string{"storage_data_set_id", "bucket_id", "copy_index", "provider_id"}},
@@ -1029,9 +1024,10 @@ func createWalletSchema(ctx context.Context, db bun.IDB) error {
 			"CONSTRAINT chk_wallet_operations_type CHECK (type IN ('fund', 'withdraw', 'approve'))",
 			"CONSTRAINT chk_wallet_operations_status CHECK (status IN ('pending', 'submitted', 'confirmed', 'failed', 'unknown'))",
 			"CONSTRAINT chk_wallet_operations_submitted_shape CHECK (status <> 'submitted' OR (tx_hash IS NOT NULL AND submitted_at IS NOT NULL))",
-			// A settled operation has finished and released its task. An approval
-			// can be confirmed without a transaction, so tx_hash is not required.
+			// A settled operation has finished and released its task.
 			"CONSTRAINT chk_wallet_operations_terminal_shape CHECK ((status IN ('confirmed', 'failed', 'unknown')) = (completed_at IS NOT NULL) AND (status NOT IN ('confirmed', 'failed', 'unknown') OR task_id IS NULL))",
+			// Only an approval already in place is confirmed without a transaction.
+			"CONSTRAINT chk_wallet_operations_confirmation_evidence CHECK (status <> 'confirmed' OR type = 'approve' OR tx_hash IS NOT NULL)",
 			// An unknown outcome is only possible once a broadcast may have gone out.
 			"CONSTRAINT chk_wallet_operations_failure_evidence CHECK ((status NOT IN ('failed', 'unknown') OR last_error IS NOT NULL) AND (status <> 'unknown' OR broadcast_attempted_at IS NOT NULL))",
 			"CONSTRAINT chk_wallet_operations_amount CHECK (" + amountCheck + ")",
@@ -1167,7 +1163,7 @@ func createObservabilitySchema(ctx context.Context, db bun.IDB) error {
 			constraints: []string{
 				"CONSTRAINT chk_provider_upload_speed_tests_state CHECK (state IN ('testing', 'succeeded', 'failed'))",
 				"CONSTRAINT chk_provider_upload_speed_tests_identity CHECK (provider_id <> '' AND length(service_url_hash) = 64 AND sample_bytes > 0)",
-				"CONSTRAINT chk_provider_upload_speed_tests_result CHECK ((state = 'testing' AND active_task_id IS NOT NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NULL AND failure_code IS NULL) OR (state = 'succeeded' AND active_task_id IS NULL AND duration_ms > 0 AND bytes_per_second > 0 AND tested_at IS NOT NULL AND failure_code IS NULL) OR (state = 'failed' AND active_task_id IS NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NOT NULL AND failure_code IS NOT NULL))",
+				"CONSTRAINT chk_provider_upload_speed_tests_result CHECK ((state = 'testing' AND active_task_id IS NOT NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NULL AND failure_code IS NULL) OR (state = 'succeeded' AND active_task_id IS NULL AND duration_ms IS NOT NULL AND duration_ms > 0 AND bytes_per_second IS NOT NULL AND bytes_per_second > 0 AND tested_at IS NOT NULL AND failure_code IS NULL) OR (state = 'failed' AND active_task_id IS NULL AND duration_ms IS NULL AND bytes_per_second IS NULL AND tested_at IS NOT NULL AND failure_code IS NOT NULL))",
 			},
 			foreignKeys: []string{"(active_task_id) REFERENCES tasks (id) ON UPDATE RESTRICT ON DELETE RESTRICT"},
 		},

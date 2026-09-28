@@ -81,7 +81,6 @@ const taskOperationLabels: Record<string, string> = {
   storage_transfer_plan: 'Plan transfer',
   storage_store: 'Store content',
   storage_pull: 'Transfer content',
-  storage_commit_coordinate: 'Prepare confirmation',
   storage_commit: 'Confirm storage',
   provider_replacement_coordinate: 'Replace provider',
   cache_capacity_reconcile: 'Manage local cache capacity',
