@@ -143,6 +143,8 @@ const replacementErrorMessages: Record<string, string> = {
   approval_check_unavailable: 'Could not confirm FWSS approval. Try again.',
   replacement_idempotency_conflict: 'This confirmation changed after it was submitted. Close it and try again.',
   replacement_source_not_current: 'This replica no longer receives writes, so replacing it would change nothing.',
+  replacement_source_creating:
+    'This replica can be replaced only after its storage service is ready. If the setup failed, retry it from Tasks. While its provider stays unavailable, the setup keeps waiting and the replica cannot be replaced.',
   replacement_superseded: 'A newer request has taken over this replica.',
   replacement_not_retryable: 'This replacement is still progressing on its own.',
   replacement_task_running: 'Replacement work is still running. Try again shortly.',

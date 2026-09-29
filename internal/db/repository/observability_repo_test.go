@@ -149,6 +149,7 @@ func TestOverviewStorageStatesIncludesBothSidesOfUnfinishedReplacement(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	markSourceReady(t, repos, source.ID)
 	replacement, created, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID,
 		SelectionMode:    storagereplacement.SelectionModeManual,

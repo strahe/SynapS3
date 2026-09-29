@@ -65,6 +65,12 @@ func (r *BunStorageReplacementRepo) Authorize(ctx context.Context, input Authori
 		if !source.IsCurrent {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrSourceNotCurrent)
 		}
+		// A generation still being created may yet get a storage service on
+		// chain. Draining it now could leave that service with nothing to
+		// retire it, so the replacement waits until the creation settles.
+		if source.Status != model.StorageDataSetStatusReady {
+			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrSourceCreating)
+		}
 		if source.ProviderID.Equal(input.TargetProviderID) {
 			return fmt.Errorf("authorizing provider replacement: %w", storagereplacement.ErrInvalidTarget)
 		}
@@ -553,6 +559,39 @@ func (r *BunStorageReplacementRepo) MarkCleanupAttention(ctx context.Context, re
 		func(q *bun.UpdateQuery) *bun.UpdateQuery {
 			return q.Set("last_error = ?", lastError).Set("wait_reason = NULL")
 		})
+}
+
+// FailForEngineTask records on the replacement that the Engine failed its
+// current coordinator claim itself. A replacement resumes only through the Data
+// Sets retry, which accepts a failed or cleanup-attention replacement, so the
+// failure lands there. A coordinator that no longer owns the replacement
+// changes nothing.
+func (r *BunStorageReplacementRepo) FailForEngineTask(ctx context.Context, taskID int64, lastError string) error {
+	if taskID <= 0 || lastError == "" {
+		return fmt.Errorf("failing provider replacement for its task: %w", ErrInvalidInput)
+	}
+	return runMaybeTx(ctx, r.db, func(db bun.IDB) error {
+		row := new(storagereplacement.Replacement)
+		err := db.NewRaw(
+			`UPDATE storage_replacements SET updated_at = updated_at WHERE task_id = ? RETURNING *`,
+			taskID,
+		).Scan(ctx, row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("locking provider replacement for its task: %w", err)
+		}
+		replacements := &BunStorageReplacementRepo{db: db}
+		switch row.Status {
+		case storagereplacement.StatusRetiring:
+			return replacements.MarkCleanupAttention(ctx, row.ID, lastError)
+		case storagereplacement.StatusPreparingTarget, storagereplacement.StatusMigrating, storagereplacement.StatusWaiting:
+			return replacements.MarkFailed(ctx, row.ID, nil, lastError)
+		default:
+			return nil
+		}
+	})
 }
 
 func (r *BunStorageReplacementRepo) BeginRetirement(ctx context.Context, replacementID int64) error {

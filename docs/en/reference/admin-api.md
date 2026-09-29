@@ -221,7 +221,7 @@ Read `GET /api/v1/filecoin/warm-storage/price-list` before confirmation. It retu
 
 Confirming again for the same replica supersedes the earlier request and returns `201 Created`; it is not a conflict. The unused provider from the earlier request is shut down. `replacement_active` means something else: the replica is the target of another unfinished replacement, which has to be resolved first.
 
-Only the replica that currently receives writes can be replaced; a historical generation is reported with `"replaceable": false` in `GET /api/v1/buckets/{name}`.
+Only the replica that currently receives writes, and whose storage service is ready, can be replaced. A historical generation, or a replica still setting up its storage service, is reported with `"replaceable": false` in `GET /api/v1/buckets/{name}`; a request for a replica still setting up returns `409 Conflict` with `replacement_source_creating`.
 
 A successful first confirmation returns `201 Created` with the replacement record; an exact replay returns `200 OK`. `GET /api/v1/buckets/{name}` returns the bucket's recent replacements in `replacements`, newest first, up to the 50 most recent.
 
@@ -257,7 +257,7 @@ Conflicts return `409 Conflict` with a stable code:
 }
 ```
 
-The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_source_not_current`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, and `replacement_idempotency_conflict`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; an unavailable manual target returns `400` with `replacement_target_unavailable`; a failed on-chain approval check during automatic selection returns `503 Service Unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; an unavailable storage service returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
+The codes are `replacement_active`, `replacement_target_in_use`, `replacement_target_unavailable`, `replacement_no_eligible_provider`, `replacement_target_creating`, `replacement_source_not_current`, `replacement_source_creating`, `replacement_superseded`, `replacement_not_retryable`, `replacement_task_running`, and `replacement_idempotency_conflict`. An invalid provider choice returns `400 Bad Request` with `replacement_target_invalid`; an unavailable manual target returns `400` with `replacement_target_unavailable`; a failed on-chain approval check during automatic selection returns `503 Service Unavailable`; an unknown bucket, data set, or replacement returns `404 Not Found`; an unavailable storage service returns `503 Service Unavailable`; internal failures return `500 Internal Server Error`.
 
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` lists all providers with a recorded health observation. Each row includes `manual_selectable`, `manual_block_reason`, `approved_fresh`, `previously_used`, the saved Registry profile when available, health, and recent upload speed. An ineligible provider remains visible for inspection. Reasons include `current_source`, `already_serves_bucket`, `provider_unavailable`, `observation_stale`, `profile_missing`, and `profile_url_changed`. Manual selection does not depend on FWSS approval; it still requires a healthy provider with an active, current profile and the usual bucket constraints. Automatic selection also excludes every provider this bucket has used and checks fresh approved candidates on chain in ID order.
 
@@ -315,7 +315,7 @@ Passing that `as_of` back as `failed_before` dismisses exactly what was counted.
 
 `/api/v1/overview` groups `tasks.by_status` by `status`, so its `failed` count includes acknowledged failures. Use `tasks.attention.failed` for unacknowledged failures or `/api/v1/tasks/stats` for counts split between `failed` and `dismissed`.
 
-Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacement recovery remains in the Data Sets API. Wallet operations are retryable only before a broadcast starts. Retrying an uncertain Store checks the provider and does not upload the bytes again.
+Pagination is newest-first. When `next_cursor` is present, pass it as `cursor` to fetch the next page. Provider replacement recovery remains in the Data Sets API. Wallet operations are retryable before a broadcast starts or after an internal error; a retry sends the transaction only if it was never broadcast. Storage transfer tasks that stopped because of an internal error are also retryable. Retrying an uncertain Store checks the provider and does not upload the bytes again.
 
 ## Wallet and Filecoin
 

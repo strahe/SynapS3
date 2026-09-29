@@ -10,6 +10,7 @@ import (
 	"github.com/strahe/synaps3/internal/db/repository"
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
+	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/strahe/synaps3/internal/storagereplacement"
 	"github.com/strahe/synaps3/internal/testutil"
 	"github.com/uptrace/bun"
@@ -18,8 +19,9 @@ import (
 // TestStorageCleanupBlocksReuseUntilContentIsFinalized walks content through
 // its last delete: cleanup starts only once no live version remains, new
 // versions cannot name the content until it is finalized, and finalizing waits
-// for cached bytes and blocking replacement items before it deletes the
-// current-state rows and leaves the ledgers.
+// for cached bytes before it deletes the current-state rows and leaves the
+// ledgers. A replacement item naming the content does not hold it back; the
+// item is cancelled once the replacement reaches it.
 func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -79,6 +81,7 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 		t.Fatalf("reuse during cleanup = %v, want ErrContentCleanupInProgress", err)
 	}
 
+	markSourceReady(t, repos, source.ID)
 	replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 		TargetProviderID: onChainID(t, "202"), ClientRequestID: "cleanup-finalize",
@@ -92,6 +95,23 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	}
 	if _, err := db.NewInsert().Model(item).Exec(ctx); err != nil {
 		t.Fatalf("insert replacement item: %v", err)
+	}
+	pull := func(attemptID string, resolvedAt *time.Time) *storagepull.Attempt {
+		return &storagepull.Attempt{
+			AttemptID: attemptID, ContentID: contentID, StorageDataSetID: source.ID,
+			Status:           storagepull.AttemptStatusAttempted,
+			SourceProviderID: onChainID(t, "303"), SourceDataSetID: onChainID(t, "3003"), SourcePieceID: onChainID(t, "7"),
+			SourcePieceCID: "source-piece", SourceRetrievalURL: "https://source.example/piece",
+			AttemptedAt: time.Now(), ResolvedAt: resolvedAt,
+		}
+	}
+	earlier := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	openPull, resolvedPull := pull("open-pull", nil), pull("resolved-pull", &earlier)
+	if _, err := db.NewInsert().Model(openPull).Exec(ctx); err != nil {
+		t.Fatalf("insert open pull: %v", err)
+	}
+	if _, err := db.NewInsert().Model(resolvedPull).Exec(ctx); err != nil {
+		t.Fatalf("insert resolved pull: %v", err)
 	}
 	now := time.Now()
 	if _, err := db.NewInsert().Model(&model.ObjectCache{ContentID: contentID, InCache: true, CreatedAt: now, UpdatedAt: now}).
@@ -108,12 +128,6 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	}
 	if released, err := repos.Objects.ReleaseContentCacheIfUnreferenced(ctx, contentID, func() error { return nil }); err != nil || !released {
 		t.Fatalf("release cache = %t, %v", released, err)
-	}
-	if err := finalize(taskRow.ID); !errors.Is(err, repository.ErrContentCleanupNotReady) {
-		t.Fatalf("finalize with a replacement item in attention = %v, want ErrContentCleanupNotReady", err)
-	}
-	if _, err := db.NewUpdate().Model(item).Set("status = ?", storagereplacement.ItemStatusCancelled).WherePK().Exec(ctx); err != nil {
-		t.Fatalf("cancel replacement item: %v", err)
 	}
 	if err := finalize(taskRow.ID + 1); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("finalize by another task = %v, want ErrConflict", err)
@@ -141,6 +155,22 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 			t.Fatalf("%s rows naming the content = %d, want %d", rows.table, count, rows.want)
 		}
 	}
+	// Nothing can commit a pull for finalized content, so an open one is
+	// abandoned; a pull that already resolved keeps its evidence unchanged.
+	pulls := map[string]storagepull.Attempt{}
+	var pullRows []storagepull.Attempt
+	if err := db.NewSelect().Model(&pullRows).Where("content_id = ?", contentID).Scan(ctx); err != nil {
+		t.Fatalf("load pull attempts: %v", err)
+	}
+	for _, row := range pullRows {
+		pulls[row.AttemptID] = row
+	}
+	if got := pulls["open-pull"]; got.Status != storagepull.AttemptStatusAbandoned || got.ResolvedAt == nil || got.LastError == nil {
+		t.Fatalf("open pull after finalizing = %#v, want it abandoned", got)
+	}
+	if got := pulls["resolved-pull"]; got.Status != storagepull.AttemptStatusAttempted || got.ResolvedAt == nil || !got.ResolvedAt.Equal(earlier) {
+		t.Fatalf("resolved pull after finalizing = %#v, want it unchanged", got)
+	}
 	// A write that resolved the content before it was finalized is refused the
 	// same way, and a cache file left under its key is an orphan.
 	if err := reuse(); !errors.Is(err, repository.ErrContentCleanupInProgress) {
@@ -153,6 +183,25 @@ func TestStorageCleanupBlocksReuseUntilContentIsFinalized(t *testing.T) {
 	})
 	if err != nil || !released || releases != 1 {
 		t.Fatalf("orphan cache release = %t, %v, calls=%d", released, err, releases)
+	}
+
+	// Retrying the replacement puts the item back to pending; the coordinator
+	// then finds its content gone and cancels it instead of stalling.
+	if _, err := db.NewUpdate().Model(item).Set("status = ?", storagereplacement.ItemStatusPending).WherePK().Exec(ctx); err != nil {
+		t.Fatalf("reset replacement item: %v", err)
+	}
+	if _, err := repos.Replacements.AcquireItem(ctx, repository.AcquireReplacementItemInput{
+		ReplacementID: replacement.ID, ItemID: item.ID,
+	}); !errors.Is(err, storagereplacement.ErrItemCancelled) {
+		t.Fatalf("AcquireItem(finalized content) = %v, want ErrItemCancelled", err)
+	}
+	var itemStatus storagereplacement.ItemStatus
+	if err := db.NewSelect().Model((*storagereplacement.Item)(nil)).Column("status").
+		Where("id = ?", item.ID).Scan(ctx, &itemStatus); err != nil {
+		t.Fatalf("load replacement item: %v", err)
+	}
+	if itemStatus != storagereplacement.ItemStatusCancelled {
+		t.Fatalf("replacement item status = %s, want cancelled", itemStatus)
 	}
 }
 

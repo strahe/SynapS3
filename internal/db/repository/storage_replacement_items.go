@@ -218,7 +218,13 @@ func (r *BunStorageReplacementRepo) AcquireItem(ctx context.Context, input Acqui
 		if err != nil {
 			return err
 		}
-		if source == nil || target == nil || upload == nil || upload.BucketID != replacement.BucketID {
+		// Cleanup finalizes deleted content without waiting for its items, so
+		// an item whose content is gone has nothing left to migrate.
+		if upload == nil {
+			terminalErr = storagereplacement.ErrItemCancelled
+			return settleReplacementItem(ctx, db, item, storagereplacement.ItemStatusCancelled, "")
+		}
+		if source == nil || target == nil || upload.BucketID != replacement.BucketID {
 			return ErrConflict
 		}
 		version, err := selectLiveObjectVersionForStorageContent(ctx, db, upload, nil)

@@ -4143,6 +4143,255 @@ func TestReplacementWaitsForARetryableFailedMigrationTask(t *testing.T) {
 	}
 }
 
+// Activation waits for writes already bound to the source. A write whose task
+// failed can only finish through a retry, so the replacement keeps waiting while
+// one is possible and fails, naming the write, when none is.
+func TestReplacementActivationWaitsOnlyForRecoverableSourceWrites(t *testing.T) {
+	tests := []struct {
+		name       string
+		reason     string
+		checkpoint string
+		wantFailed bool
+	}{
+		{name: "retryable write", reason: "store_outcome_unknown", checkpoint: `{"attempted_at":"2026-09-11T00:00:00Z"}`},
+		{name: "engine failure", reason: "handler_panic"},
+		{name: "write that cannot be retried", reason: "store_result_invalid", wantFailed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+				register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+					if err := handlers.RegisterStorage(registry); err != nil {
+						return err
+					}
+					return handlers.RegisterReplacement(registry)
+				},
+			})
+			ctx := t.Context()
+			sequence := storedObjectSequence.Add(1)
+			id := func(offset int64) idtypes.OnChainID { return testOnChainID(t, 37000+sequence*10+offset) }
+			bucket := &model.Bucket{
+				Name: fmt.Sprintf("replacement-source-write-%d", sequence), Status: model.BucketStatusActive,
+				DefaultCopies: 1, MinimumDurableCopies: 1,
+			}
+			if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
+				t.Fatalf("create bucket: %v", err)
+			}
+			content, err := runtime.repos.Contents.EnsureContent(ctx, repository.EnsureContentInput{
+				BucketID: bucket.ID, ContentSize: 11, Checksum: testutil.StorageChecksum(bucket.Name), RequestedCopies: 1,
+			})
+			if err != nil {
+				t.Fatalf("ensure content: %v", err)
+			}
+			version := &model.ObjectVersion{
+				VersionID: model.NewVersionID(), BucketID: bucket.ID, Key: "writing.bin", Size: content.ContentSize,
+				ETag: bucket.Name, ContentType: "application/octet-stream", ContentID: &content.ID,
+			}
+			if _, err := runtime.repos.Objects.CreateVersionAndSetCurrent(ctx, version); err != nil {
+				t.Fatalf("create object version: %v", err)
+			}
+			source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+				BucketID: bucket.ID, ProviderID: id(1), CopyIndex: 0, CreatedByContentID: content.ID,
+			})
+			if err != nil {
+				t.Fatalf("create source: %v", err)
+			}
+			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+				ID: source.ID, DataSetID: id(2),
+			}); err != nil {
+				t.Fatalf("mark source ready: %v", err)
+			}
+			if err := runtime.repos.Contents.CreateUploadCopiesForBindings(ctx, content.ID, []repository.UploadCopyBindingInput{{
+				StorageDataSetID: source.ID, CopyIndex: 0, TransferMethod: model.StorageCopyTransferMethodIngress, ProviderID: id(1),
+			}}); err != nil {
+				t.Fatalf("create source copy: %v", err)
+			}
+			sourceCopy, err := runtime.repos.Contents.GetUploadCopyForDataSet(ctx, content.ID, source.ID)
+			if err != nil || sourceCopy == nil {
+				t.Fatalf("load source copy = %#v, err=%v", sourceCopy, err)
+			}
+			// The write to the source has stopped before the replacement starts.
+			storeTask := bindCopyTask(t, runtime, sourceCopy, model.TaskTypeStorageStore)
+			claimed, err := runtime.repos.Tasks.ClaimNext(ctx, time.Minute)
+			if err != nil || claimed == nil || claimed.ID != storeTask.ID {
+				t.Fatalf("claim source write = %#v, err=%v", claimed, err)
+			}
+			if tt.checkpoint != "" {
+				if err := runtime.repos.Tasks.WriteCheckpoint(ctx, claimed.ID, claimed.ClaimGeneration, json.RawMessage(tt.checkpoint)); err != nil {
+					t.Fatalf("write source checkpoint: %v", err)
+				}
+			}
+			reason, message := tt.reason, "write stopped"
+			if err := runtime.repos.Tasks.Settle(ctx, claimed.ID, claimed.ClaimGeneration, repository.TaskTransition{
+				Status: model.TaskStatusFailed, ResumeMode: model.TaskResumeModeRecover, FailureReason: &reason, LastError: &message,
+			}); err != nil {
+				t.Fatalf("fail source write: %v", err)
+			}
+			replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+				TargetProviderID: id(5), ClientRequestID: bucket.Name,
+			})
+			if err != nil {
+				t.Fatalf("authorize replacement: %v", err)
+			}
+			if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+				ID: replacement.TargetDataSetID, DataSetID: id(6),
+			}); err != nil {
+				t.Fatalf("mark target ready: %v", err)
+			}
+			coordinateTask, _, err := runtime.service.EnqueueTx(ctx, taskengine.EnqueueRequest{
+				Type:           model.TaskTypeProviderReplacementCoordinate,
+				IdempotencyKey: storagereplacement.CoordinateTaskKey(replacement.ID, replacement.TaskGeneration),
+				Input:          storagereplacement.CoordinateInput{ReplacementID: replacement.ID, Generation: replacement.TaskGeneration},
+				SubjectType:    "storage_replacement", SubjectKey: fmt.Sprint(replacement.ID),
+			}, func(ctx context.Context, repos *repository.Repositories, taskRow *model.Task, _ bool) error {
+				return repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, taskRow.ID)
+			})
+			if err != nil {
+				t.Fatalf("enqueue replacement coordinator: %v", err)
+			}
+
+			cancel, done := runHandlerEngine(t, runtime)
+			defer stopHandlerEngine(t, cancel, done)
+			if tt.wantFailed {
+				failed := waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusFailed
+				})
+				stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+				if failed.FailureReason == nil || *failed.FailureReason != "replacement_source_write_failed" || err != nil ||
+					stored.Status != storagereplacement.StatusFailed {
+					t.Fatalf("coordinator = %#v, replacement = %#v err=%v, want the replacement failed", failed, stored, err)
+				}
+				current, err := runtime.repos.Contents.GetDataSetBindingByID(ctx, source.ID)
+				if err != nil || current == nil || !current.IsCurrent {
+					t.Fatalf("source after failure = %#v, err=%v, want it still receiving writes", current, err)
+				}
+				return
+			}
+			waitForTask(t, runtime.repos, coordinateTask.ID, func(task *model.Task) bool {
+				return task.Status == model.TaskStatusPending && task.StatusMessage != nil &&
+					*task.StatusMessage == "Waiting for a failed storage write to be retried"
+			})
+			stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+			if err != nil || stored.Status == storagereplacement.StatusFailed {
+				t.Fatalf("replacement = %#v err=%v, want it waiting for the write retry", stored, err)
+			}
+		})
+	}
+}
+
+// A task the Engine failed itself keeps holding its domain row until it is
+// retried, so copy work and wallet operations offer Retry for failures a later
+// build can recover from. Failures the handlers settle keep their own policy.
+func TestEngineFailuresOfDomainOwnedTasksCanBeRetried(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			if err := handlers.RegisterCore(registry); err != nil {
+				return err
+			}
+			return handlers.RegisterStorage(registry)
+		},
+	})
+	retryable := func(taskType model.TaskType, reason string) bool {
+		return runtime.service.Retryable(&model.Task{Type: taskType, Status: model.TaskStatusFailed, FailureReason: &reason})
+	}
+	engineFailures := map[string]bool{
+		"handler_unavailable": true, "input_version_unsupported": true, "invalid_input": true,
+		"input_codec_panic": true, "handler_panic": true, "invalid_result": true,
+		"invalid_input_hash": false,
+	}
+	for _, taskType := range []model.TaskType{
+		model.TaskTypeStorageTransferPlan, model.TaskTypeStorageStore, model.TaskTypeStoragePull,
+		model.TaskTypeStorageCommit, model.TaskTypeWalletOperation,
+	} {
+		for reason, want := range engineFailures {
+			if got := retryable(taskType, reason); got != want {
+				t.Errorf("Retryable(%s, %s) = %v, want %v", taskType, reason, got, want)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		taskType model.TaskType
+		reason   string
+		want     bool
+	}{
+		{model.TaskTypeStoragePull, "pull_presign_failed", false},
+		{model.TaskTypeStorageCommit, "commit_rejected", false},
+		{model.TaskTypeStorageStore, "store_retry_limit", true},
+		{model.TaskTypeWalletOperation, "wallet_broadcast_not_started", true},
+		{model.TaskTypeWalletOperation, "wallet_broadcast_unknown", false},
+		{model.TaskTypeWalletOperation, "wallet_amount_invalid", false},
+	} {
+		if got := retryable(tc.taskType, tc.reason); got != tc.want {
+			t.Errorf("Retryable(%s, %s) = %v, want %v", tc.taskType, tc.reason, got, tc.want)
+		}
+	}
+}
+
+// The Engine can fail a coordinator claim before the handler runs, for
+// example when a build cannot read its input. The replacement then fails so the
+// Data Sets retry can resume it, instead of staying in progress with no
+// coordinator.
+func TestEngineFailedCoordinatorLeavesTheReplacementRetryable(t *testing.T) {
+	runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
+		register: func(handlers *worker.TaskHandlers, registry *taskengine.Registry) error {
+			if err := handlers.RegisterStorage(registry); err != nil {
+				return err
+			}
+			return handlers.RegisterReplacement(registry)
+		},
+	})
+	ctx := t.Context()
+	sequence := storedObjectSequence.Add(1)
+	id := func(offset int64) idtypes.OnChainID { return testOnChainID(t, 38000+sequence*10+offset) }
+	bucket := &model.Bucket{
+		Name: fmt.Sprintf("engine-failed-coordinator-%d", sequence), Status: model.BucketStatusActive,
+		DefaultCopies: 1, MinimumDurableCopies: 1,
+	}
+	if err := runtime.repos.Buckets.Create(ctx, bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	source, err := runtime.repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: id(1), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if err := runtime.repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{ID: source.ID, DataSetID: id(2)}); err != nil {
+		t.Fatalf("mark source ready: %v", err)
+	}
+	replacement, _, err := runtime.repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: id(5), ClientRequestID: bucket.Name,
+	})
+	if err != nil {
+		t.Fatalf("authorize replacement: %v", err)
+	}
+	// A coordinator written by a build whose input this one cannot read.
+	coordinator, _, err := runtime.repos.Tasks.Enqueue(ctx, &model.Task{
+		Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: bucket.Name,
+		InputVersion: 99, Input: []byte(`{}`), InputHash: bucket.Name,
+		Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("enqueue coordinator: %v", err)
+	}
+	if err := runtime.repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, coordinator.ID); err != nil {
+		t.Fatalf("bind coordinator: %v", err)
+	}
+
+	cancel, done := runHandlerEngine(t, runtime)
+	defer stopHandlerEngine(t, cancel, done)
+	failed := waitForTask(t, runtime.repos, coordinator.ID, func(task *model.Task) bool {
+		return task.Status == model.TaskStatusFailed
+	})
+	stored, err := runtime.repos.Replacements.GetByID(ctx, replacement.ID)
+	if failed.FailureReason == nil || *failed.FailureReason != "input_version_unsupported" || err != nil ||
+		!stored.Status.Retryable() {
+		t.Fatalf("coordinator = %#v, replacement = %#v err=%v, want the replacement retryable", failed, stored, err)
+	}
+}
+
 func TestRetirementAdmissionFailureDoesNotEnterCleanupAttention(t *testing.T) {
 	noRetries := 0
 	terminator := &testServiceTerminator{err: errors.New("unexpected termination")}

@@ -158,7 +158,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	handler, ok := e.registry.Handler(claimed.Type)
 	if !ok {
 		logger.Error("claimed task has no registered handler")
-		if e.failClaim(parent, claimed, "handler_unavailable", fmt.Errorf("no handler is registered for task type %q", claimed.Type)) != nil {
+		if e.failClaim(parent, claimed, failureHandlerUnavailable, fmt.Errorf("no handler is registered for task type %q", claimed.Type)) != nil {
 			e.abandonClaim(claimed)
 		}
 		return
@@ -166,14 +166,14 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	definition, ok := e.registry.Definition(claimed.Type)
 	if !ok {
 		logger.Error("claimed task definition is unavailable")
-		if e.failClaim(parent, claimed, "handler_unavailable", fmt.Errorf("no definition is registered for task type %q", claimed.Type)) != nil {
+		if e.failClaim(parent, claimed, failureHandlerUnavailable, fmt.Errorf("no definition is registered for task type %q", claimed.Type)) != nil {
 			e.abandonClaim(claimed)
 		}
 		return
 	}
 	if claimed.InputVersion != definition.InputVersion {
 		logger.Error("claimed task input version is unsupported", "input_version", claimed.InputVersion, "current_version", definition.InputVersion)
-		if e.failClaim(parent, claimed, "input_version_unsupported", fmt.Errorf("task input version %d is unsupported", claimed.InputVersion)) != nil {
+		if e.failClaim(parent, claimed, failureInputVersionUnsupported, fmt.Errorf("task input version %d is unsupported", claimed.InputVersion)) != nil {
 			e.abandonClaim(claimed)
 		}
 		return
@@ -181,9 +181,9 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	canonical, err := canonicalizeInput(definition.Codec, claimed.Input)
 	if err != nil {
 		logger.Error("claimed task input is invalid", "error", err)
-		reason := "invalid_input"
+		reason := failureInvalidInput
 		if errors.Is(err, ErrCodecPanic) {
-			reason = "input_codec_panic"
+			reason = failureInputCodecPanic
 		}
 		if e.failClaim(parent, claimed, reason, err) != nil {
 			e.abandonClaim(claimed)
@@ -194,7 +194,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	if !bytes.Equal(inputSum[:], decodeHash(claimed.InputHash)) {
 		err := errors.New("stored task input hash does not match its canonical input")
 		logger.Error("claimed task input hash is invalid")
-		if e.failClaim(parent, claimed, "invalid_input_hash", err) != nil {
+		if e.failClaim(parent, claimed, failureInvalidInputHash, err) != nil {
 			e.abandonClaim(claimed)
 		}
 		return
@@ -266,7 +266,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	if panicked != nil {
 		logger.Error("task handler panicked", "error", panicked, "stack", string(debug.Stack()))
 		stopLeaseRenewal()
-		if e.failClaim(parent, claimed, "handler_panic", fmt.Errorf("task handler panicked: %v", panicked)) != nil {
+		if e.failClaim(parent, claimed, failureHandlerPanic, fmt.Errorf("task handler panicked: %v", panicked)) != nil {
 			e.abandonClaim(claimed)
 		}
 		return
@@ -280,7 +280,7 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	if err := validateResult(result, claimed); err != nil {
 		logger.Error("task handler returned an invalid result", "error", err)
 		stopLeaseRenewal()
-		if e.failClaim(parent, claimed, "invalid_result", err) != nil {
+		if e.failClaim(parent, claimed, failureInvalidResult, err) != nil {
 			e.abandonClaim(claimed)
 		}
 		return
@@ -289,6 +289,33 @@ func (e *Engine) executeClaim(parent context.Context, claimed *model.Task) {
 	if err := e.commitResult(parent, claimed, result); err != nil {
 		logger.Error("settling task result", "error", err)
 		e.abandonClaim(claimed)
+	}
+}
+
+// Failure reasons the Engine records when it fails a claim itself.
+const (
+	failureHandlerUnavailable      = "handler_unavailable"
+	failureInputVersionUnsupported = "input_version_unsupported"
+	failureInvalidInput            = "invalid_input"
+	failureInputCodecPanic         = "input_codec_panic"
+	failureInvalidInputHash        = "invalid_input_hash"
+	failureHandlerPanic            = "handler_panic"
+	failureInvalidResult           = "invalid_result"
+)
+
+// RecoverableEngineFailure reports whether a failure the Engine recorded
+// itself may succeed on a later retry, for example once a build that can run
+// the task is deployed. Manual Retry runs in recover mode, which inspects the
+// recorded evidence before any new external effect, so retrying is as safe as
+// recovering after a crash at the same point. An input whose hash no longer
+// matches is corrupt and never recovers.
+func RecoverableEngineFailure(reason string) bool {
+	switch reason {
+	case failureHandlerUnavailable, failureInputVersionUnsupported, failureInvalidInput,
+		failureInputCodecPanic, failureHandlerPanic, failureInvalidResult:
+		return true
+	default:
+		return false
 	}
 }
 

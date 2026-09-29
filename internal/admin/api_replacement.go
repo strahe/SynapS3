@@ -533,6 +533,11 @@ func (s *Server) writeReplacementError(w http.ResponseWriter, err error, bucketN
 			"error": "this replica no longer receives writes, so replacing it would change nothing",
 			"code":  code,
 		})
+	case errors.Is(err, storagereplacement.ErrSourceCreating):
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "this replica is still setting up its storage service",
+			"code":  code,
+		})
 	case errors.Is(err, storagereplacement.ErrSuperseded):
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "a newer replacement has taken over this replica",
