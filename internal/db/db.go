@@ -287,17 +287,26 @@ func ensureSQLitePragmas(dsn string) string {
 		dsn = ensureSQLitePragma(dsn, "journal_mode", "journal_mode(WAL)")
 	}
 	dsn = ensureSQLitePragma(dsn, "foreign_keys", "foreign_keys(1)")
-	return ensureSQLitePragma(dsn, "busy_timeout", "busy_timeout(5000)")
+	dsn = ensureSQLitePragma(dsn, "busy_timeout", "busy_timeout(5000)")
+	// A deferred transaction that reads before it writes fails at its first
+	// write, without waiting, once another connection has committed; it cannot
+	// recover inside the same transaction. Write transactions therefore take the
+	// write lock at BEGIN. Read-only transactions still begin deferred.
+	return ensureSQLiteQueryEntry(dsn, "_txlock", "_txlock=immediate")
 }
 
 func ensureSQLitePragma(dsn, name, pragma string) string {
+	return ensureSQLiteQueryEntry(dsn, name, "_pragma="+pragma)
+}
+
+func ensureSQLiteQueryEntry(dsn, name, entry string) string {
 	if sqliteDSNHasPragma(dsn, name) {
 		return dsn
 	}
 	if strings.Contains(dsn, "?") {
-		return dsn + "&_pragma=" + pragma
+		return dsn + "&" + entry
 	}
-	return dsn + "?_pragma=" + pragma
+	return dsn + "?" + entry
 }
 
 func sqliteDSNHasPragma(dsn, name string) bool {
