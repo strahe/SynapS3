@@ -607,6 +607,7 @@ type StorageReplacementRepository interface {
 	MarkWaiting(ctx context.Context, replacementID int64, reason storagereplacement.WaitReason) error
 	MarkFailed(ctx context.Context, replacementID int64, reason *storagereplacement.FailureReason, lastError string) error
 	MarkCleanupAttention(ctx context.Context, replacementID int64, lastError string) error
+	FailForEngineTask(ctx context.Context, taskID int64, lastError string) error
 	BeginRetirement(ctx context.Context, replacementID int64) error
 	RecordTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error
 	RecordAbandonedTerminationEpoch(ctx context.Context, input RecordTerminationEpochInput) error

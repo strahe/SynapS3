@@ -221,7 +221,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 
 对同一副本再次确认会取代先前的请求并返回 `201 Created`，不是冲突。先前请求里尚未使用的存储提供方会被关闭。`replacement_active` 表示的是另一件事：该副本是另一次未完成替换的目标，必须先处理那一次。
 
-只有当前接收写入的副本可以被替换；历史代在 `GET /api/v1/buckets/{name}` 中返回 `"replaceable": false`。
+只有当前接收写入、且存储服务已就绪的副本可以被替换。历史代，以及仍在创建存储服务的副本，在 `GET /api/v1/buckets/{name}` 中返回 `"replaceable": false`；对仍在创建的副本发起替换返回 `409 Conflict` 和 `replacement_source_creating`。
 
 首次确认成功返回 `201 Created` 和替换记录；精确重放返回 `200 OK`。`GET /api/v1/buckets/{name}` 在 `replacements` 中返回该存储桶最近的替换记录，最新的在前，最多 50 条。
 
@@ -257,7 +257,7 @@ Admin 响应包含 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`
 }
 ```
 
-这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_source_not_current`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
+这些 code 包括 `replacement_active`、`replacement_target_in_use`、`replacement_target_unavailable`、`replacement_no_eligible_provider`、`replacement_target_creating`、`replacement_source_not_current`、`replacement_source_creating`、`replacement_superseded`、`replacement_not_retryable`、`replacement_task_running` 和 `replacement_idempotency_conflict`。无效存储提供方选择返回 `400 Bad Request` 和 `replacement_target_invalid`；当前不可用的手动目标返回 `400` 和 `replacement_target_unavailable`；自动选择时链上批准查询失败返回 `503 Service Unavailable`；未知的存储桶、数据集或替换记录返回 `404 Not Found`；存储服务不可用返回 `503 Service Unavailable`；内部失败返回 `500 Internal Server Error`。
 
 `GET /api/v1/buckets/{name}/data-sets/{id}/replacement/providers` 列出所有有健康观测记录的存储提供方。每项包含 `manual_selectable`、`manual_block_reason`、`approved_fresh`、`previously_used`、已有的 Registry 资料、健康状态和最近测速。不可选节点仍可查看。不可选原因包括 `current_source`、`already_serves_bucket`、`provider_unavailable`、`observation_stale`、`profile_missing` 和 `profile_url_changed`。手动选择不受 FWSS 批准名单限制，但仍须满足健康、最新资料处于启用状态和存储桶约束。自动选择还会排除该存储桶用过的所有存储提供方，并按 ID 顺序链上核对新鲜获批的候选。
 
@@ -315,7 +315,7 @@ curl -s "$ADMIN/api/v1/tasks/acknowledge/preview?type=storage_store"
 
 `/api/v1/overview` 的 `tasks.by_status` 按 `status` 聚合，因此其中的 `failed` 会包含已确认的失败。需要尚未确认的失败数时使用 `tasks.attention.failed`；需要分别统计 `failed` 和 `dismissed` 时使用 `/api/v1/tasks/stats`。
 
-分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换仍通过 Data Sets API 恢复。钱包操作只有在广播开始前才可重试。重试结果不确定的 Store 只会查询存储提供方，不会重新上传字节。
+分页按任务 ID 从新到旧。响应存在 `next_cursor` 时，把它作为下一次请求的 `cursor`。存储提供方替换仍通过 Data Sets API 恢复。钱包操作在广播开始前、或因内部错误停止后可以重试；只有从未广播过的交易才会在重试时发出。因内部错误停止的存储传输任务也可以重试。重试结果不确定的 Store 只会查询存储提供方，不会重新上传字节。
 
 ## 钱包和 Filecoin
 

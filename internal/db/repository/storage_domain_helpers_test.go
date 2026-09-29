@@ -107,6 +107,78 @@ func TestListCopiesDerivesNewDataSetFromCreatorContent(t *testing.T) {
 	}
 }
 
+// A replacement resumes only through the Data Sets retry. When the Engine
+// fails the coordinator claim itself, the replacement moves to the state that
+// retry accepts for its phase; a finished replacement or another task's claim
+// changes nothing.
+func TestFailForEngineTaskLeavesTheReplacementRetryable(t *testing.T) {
+	for _, tt := range []struct {
+		status     storagereplacement.Status
+		waitReason string
+		want       storagereplacement.Status
+	}{
+		{status: storagereplacement.StatusPreparingTarget, want: storagereplacement.StatusFailed},
+		{status: storagereplacement.StatusMigrating, want: storagereplacement.StatusFailed},
+		{status: storagereplacement.StatusWaiting, waitReason: string(storagereplacement.WaitReasonTargetCreating), want: storagereplacement.StatusFailed},
+		{status: storagereplacement.StatusRetiring, want: storagereplacement.StatusCleanupAttention},
+		{status: storagereplacement.StatusCompleted, want: storagereplacement.StatusCompleted},
+	} {
+		t.Run(string(tt.status), func(t *testing.T) {
+			db := testDB(t)
+			repos := repository.NewRepositories(db)
+			ctx := t.Context()
+			bucket := seedBucket(t, db, "engine-failed-coordinator")
+			source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+				BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
+			})
+			if err != nil {
+				t.Fatalf("EnsureDataSetBinding: %v", err)
+			}
+			markSourceReady(t, repos, source.ID)
+			replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
+				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+				TargetProviderID: onChainID(t, "202"), ClientRequestID: "engine-failed-coordinator",
+			})
+			if err != nil {
+				t.Fatalf("Authorize: %v", err)
+			}
+			coordinator, _, err := repos.Tasks.Enqueue(ctx, &model.Task{
+				Type: model.TaskTypeProviderReplacementCoordinate, IdempotencyKey: "engine-failed-coordinator",
+				InputVersion: 1, Input: []byte(`{}`), InputHash: "engine-failed-coordinator",
+			})
+			if err != nil {
+				t.Fatalf("enqueue coordinator: %v", err)
+			}
+			if err := repos.Replacements.BindTask(ctx, replacement.ID, replacement.TaskGeneration, coordinator.ID); err != nil {
+				t.Fatalf("BindTask: %v", err)
+			}
+			var waitReason *string
+			if tt.waitReason != "" {
+				waitReason = &tt.waitReason
+			}
+			if _, err := db.NewUpdate().Model((*storagereplacement.Replacement)(nil)).
+				Set("status = ?", tt.status).Set("wait_reason = ?", waitReason).
+				Where("id = ?", replacement.ID).Exec(ctx); err != nil {
+				t.Fatalf("set replacement status: %v", err)
+			}
+
+			if err := repos.Replacements.FailForEngineTask(ctx, coordinator.ID+1, "stopped"); err != nil {
+				t.Fatalf("FailForEngineTask(another task): %v", err)
+			}
+			if stored, err := repos.Replacements.GetByID(ctx, replacement.ID); err != nil || stored.Status != tt.status {
+				t.Fatalf("replacement after another task's failure = %#v, err=%v, want %s", stored, err, tt.status)
+			}
+			if err := repos.Replacements.FailForEngineTask(ctx, coordinator.ID, "stopped"); err != nil {
+				t.Fatalf("FailForEngineTask: %v", err)
+			}
+			stored, err := repos.Replacements.GetByID(ctx, replacement.ID)
+			if err != nil || stored.Status != tt.want {
+				t.Fatalf("replacement after engine failure = %#v, err=%v, want %s", stored, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestAuthorizeReplacementPreservesCurrentSource(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -120,6 +192,7 @@ func TestAuthorizeReplacementPreservesCurrentSource(t *testing.T) {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
 
+	markSourceReady(t, repos, source.ID)
 	replacement, created, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
 		BucketID:         bucket.ID,
 		SourceDataSetID:  source.ID,
@@ -152,6 +225,55 @@ func TestAuthorizeReplacementPreservesCurrentSource(t *testing.T) {
 	}
 }
 
+// A generation still being created may yet get a storage service on chain, so
+// it cannot become a replacement source until it is ready. A request that was
+// already authorized still replays after its source stops being ready.
+func TestAuthorizeReplacementWaitsForSourceCreation(t *testing.T) {
+	db := testDB(t)
+	repos := repository.NewRepositories(db)
+	ctx := t.Context()
+	bucket := seedBucket(t, db, "replacement-source-creating")
+	source, err := repos.Contents.EnsureDataSetBinding(ctx, repository.EnsureDataSetBindingInput{
+		BucketID: bucket.ID, ProviderID: onChainID(t, "101"), CopyIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("EnsureDataSetBinding: %v", err)
+	}
+	input := repository.AuthorizeReplacementInput{
+		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
+		TargetProviderID: onChainID(t, "202"), ClientRequestID: "source-creating",
+	}
+	if _, _, err := repos.Replacements.Authorize(ctx, input); !errors.Is(err, storagereplacement.ErrSourceCreating) {
+		t.Fatalf("Authorize(pending source) error = %v, want ErrSourceCreating", err)
+	}
+	if err := repos.Contents.MarkDataSetCreating(ctx, repository.MarkDataSetCreatingInput{
+		ID: source.ID, TransactionID: "0xcreate",
+	}); err != nil {
+		t.Fatalf("MarkDataSetCreating: %v", err)
+	}
+	if _, _, err := repos.Replacements.Authorize(ctx, input); !errors.Is(err, storagereplacement.ErrSourceCreating) {
+		t.Fatalf("Authorize(creating source) error = %v, want ErrSourceCreating", err)
+	}
+
+	markSourceReady(t, repos, source.ID)
+	replacement, created, err := repos.Replacements.Authorize(ctx, input)
+	if err != nil || !created {
+		t.Fatalf("Authorize(ready source) = %#v, created=%v, err=%v", replacement, created, err)
+	}
+	if err := repos.Contents.MarkDataSetReady(ctx, repository.MarkDataSetReadyInput{
+		ID: replacement.TargetDataSetID, DataSetID: onChainID(t, "2002"),
+	}); err != nil {
+		t.Fatalf("MarkDataSetReady(target): %v", err)
+	}
+	if err := repos.Replacements.Activate(ctx, replacement.ID); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	replayed, created, err := repos.Replacements.Authorize(ctx, input)
+	if err != nil || created || replayed == nil || replayed.ID != replacement.ID {
+		t.Fatalf("Authorize(replay) = %#v, created=%v, err=%v, want replacement %d", replayed, created, err, replacement.ID)
+	}
+}
+
 // An earlier replacement whose target may still be created on chain cannot be
 // abandoned: superseding it would leave that service untracked. Once the
 // target's creation fence is released, a new request proceeds as before.
@@ -165,6 +287,7 @@ func TestAuthorizeReplacementWaitsForEarlierTargetCreation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
+	markSourceReady(t, repos, source.ID)
 	first, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 		TargetProviderID: onChainID(t, "202"), ClientRequestID: "target-creating-first",
@@ -228,6 +351,7 @@ func TestAuthorizeReplacementStopsWaitingOnACreationThatNeverSent(t *testing.T) 
 			if err != nil {
 				t.Fatalf("EnsureDataSetBinding: %v", err)
 			}
+			markSourceReady(t, repos, source.ID)
 			first, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 				BucketID: bucket.ID, SourceDataSetID: source.ID, SelectionMode: storagereplacement.SelectionModeManual,
 				TargetProviderID: onChainID(t, "202"), ClientRequestID: "dead-fence-first",
@@ -293,6 +417,7 @@ func TestAttachReplacementTargetCopyRejectsMismatchedUpload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
+	markSourceReady(t, repos, source.ID)
 	replacement, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID,
 		SelectionMode:    storagereplacement.SelectionModeManual,
@@ -385,9 +510,9 @@ func TestEnsureDataSetBindingDoesNotReuseProviderBeforeRetirement(t *testing.T) 
 	}
 }
 
-// Replacement can drain a generation whose creation is still in flight. The
-// creation then records what it sent and what it created, so the service can
-// still be ended, but the generation never takes its slot back.
+// Replacement refuses a source that is still being created, but a drained
+// generation whose creation is in flight must still record what it sent and
+// what it created, so the service can be ended, and never take its slot back.
 func TestDrainedGenerationRecordsItsCreationWithoutReturningToItsSlot(t *testing.T) {
 	db := testDB(t)
 	repos := repository.NewRepositories(db)
@@ -399,6 +524,7 @@ func TestDrainedGenerationRecordsItsCreationWithoutReturningToItsSlot(t *testing
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding(source): %v", err)
 	}
+	markSourceReady(t, repos, source.ID)
 	replacement, _, err := repos.Replacements.Authorize(ctx, repository.AuthorizeReplacementInput{
 		BucketID:         bucket.ID,
 		SourceDataSetID:  source.ID,
@@ -416,6 +542,14 @@ func TestDrainedGenerationRecordsItsCreationWithoutReturningToItsSlot(t *testing
 	}
 	if err := repos.Replacements.Activate(ctx, replacement.ID); err != nil {
 		t.Fatalf("Activate: %v", err)
+	}
+	// Authorize no longer drains a generation mid-creation, so build that
+	// state directly: the drained source has not learned its data set yet.
+	if _, err := db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("data_set_id = NULL").
+		Where("id = ?", source.ID).
+		Exec(ctx); err != nil {
+		t.Fatalf("clearing drained source identity: %v", err)
 	}
 
 	clientID := onChainID(t, "9001")
@@ -461,6 +595,7 @@ func TestRetryReplacementRejectsUnknownFailureReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
+	markSourceReady(t, repos, source.ID)
 	replacement, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID,
 		SelectionMode:    storagereplacement.SelectionModeManual,
@@ -713,6 +848,7 @@ func TestRecordedTerminationEpochIsVisibleToTheRetirementGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureDataSetBinding: %v", err)
 	}
+	markSourceReady(t, repos, source.ID)
 	replacement, _, err := repos.Replacements.Authorize(t.Context(), repository.AuthorizeReplacementInput{
 		BucketID: bucket.ID, SourceDataSetID: source.ID,
 		SelectionMode:    storagereplacement.SelectionModeManual,

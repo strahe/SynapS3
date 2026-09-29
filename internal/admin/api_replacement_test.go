@@ -441,6 +441,52 @@ func TestAPIStartDataSetReplacementRejections(t *testing.T) {
 	}
 }
 
+// A replica still setting up its storage service is not offered for
+// replacement, and a request for it is refused with a stable code.
+func TestAPIStartDataSetReplacementWaitsForSourceCreation(t *testing.T) {
+	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
+	replaceable := func() bool {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/buckets/"+fixture.bucket.Name, nil)
+		rec := httptest.NewRecorder()
+		fixture.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET bucket status = %d body=%s", rec.Code, rec.Body.String())
+		}
+		var detail bucketDetailResponse
+		if err := json.NewDecoder(rec.Body).Decode(&detail); err != nil {
+			t.Fatalf("decode bucket: %v", err)
+		}
+		for _, dataSet := range detail.DataSets {
+			if dataSet.ID == fixture.source.ID {
+				return dataSet.Replaceable
+			}
+		}
+		t.Fatalf("bucket data sets = %#v, want source %d", detail.DataSets, fixture.source.ID)
+		return false
+	}
+	if !replaceable() {
+		t.Fatal("ready source replaceable = false, want true")
+	}
+
+	if _, err := fixture.srv.db.NewUpdate().Model((*model.StorageDataSet)(nil)).
+		Set("status = ?", model.StorageDataSetStatusCreating).
+		Where("id = ?", fixture.source.ID).
+		Exec(context.Background()); err != nil {
+		t.Fatalf("mark source creating: %v", err)
+	}
+	if replaceable() {
+		t.Fatal("creating source replaceable = true, want false")
+	}
+	rec := fixture.start(t, `{"mode":"manual","provider_id":"202"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s, want 409", rec.Code, rec.Body.String())
+	}
+	if got := decodeAPIError(t, rec)["code"]; got != storagereplacement.CodeSourceCreating {
+		t.Fatalf("code = %q, want %q", got, storagereplacement.CodeSourceCreating)
+	}
+}
+
 func TestAPIStartDataSetReplacementRequiresClientRequestID(t *testing.T) {
 	fixture := newReplacementAPIFixture(t, &stubProviderSelector{providers: []string{"202"}})
 	rec := fixture.startRaw(t, `{"mode":"manual","provider_id":"202"}`)

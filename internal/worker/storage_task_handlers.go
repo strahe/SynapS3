@@ -1016,6 +1016,9 @@ func (h *TaskHandlers) storeHandler() taskengine.Handler {
 		if task == nil || task.FailureReason == nil {
 			return false
 		}
+		if taskengine.RecoverableEngineFailure(*task.FailureReason) {
+			return true
+		}
 		switch *task.FailureReason {
 		case "store_not_started":
 			return len(task.Checkpoint) == 0
@@ -1684,7 +1687,13 @@ func copyDefinition(taskType model.TaskType, retryLimit *int) taskengine.Definit
 		Codec: taskengine.StrictJSONCodec(func(input *storagepipeline.CopyGenerationInput) error {
 			return storagepipeline.ValidateCopyGenerationInput(*input)
 		}),
-		RetryLimit: retryLimit, AllowRetry: false,
+		RetryLimit: retryLimit, AllowRetry: true,
+		// A copy task that the Engine failed itself still holds its copy, and
+		// only a retry can release it. Failures a handler settles keep their
+		// own policy.
+		CanManualRetry: func(task *model.Task) bool {
+			return task != nil && task.FailureReason != nil && taskengine.RecoverableEngineFailure(*task.FailureReason)
+		},
 		Subject: taskengine.SubjectFromInput(model.TaskSubjectStorageCopy, func(input storagepipeline.CopyGenerationInput) int64 {
 			return input.CopyID
 		}),

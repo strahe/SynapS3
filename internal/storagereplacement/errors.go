@@ -46,6 +46,11 @@ var (
 	// so replacing it would not change where writes go.
 	ErrSourceNotCurrent = errors.New("data set is not the current replica")
 
+	// ErrSourceCreating means the data set's own storage service may still be
+	// created on chain. Draining it first could leave that service with nothing
+	// to retire it, so replacement waits until the data set is ready.
+	ErrSourceCreating = errors.New("data set is still being created")
+
 	// ErrItemCancelled means this migration item no longer has executable work.
 	ErrItemCancelled = errors.New("replacement item is no longer executable")
 

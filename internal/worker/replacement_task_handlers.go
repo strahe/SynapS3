@@ -41,6 +41,17 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 		// The coordinator re-reads the replacement ledger on every wake and a
 		// replacement can run for days, so transient errors must not exhaust it.
 		RetryLimit: nil, AllowRetry: false,
+		// A replacement resumes only through the Data Sets retry, so a claim the
+		// Engine fails itself must leave the replacement in a state that retry
+		// accepts rather than in progress with no coordinator.
+		// The reason stays on the failed task; the replacement records what the
+		// operator can do about it.
+		OnEngineFailure: func(task *model.Task, _ string) taskengine.Settlement {
+			return func(ctx context.Context, repos *repository.Repositories) error {
+				return repos.Replacements.FailForEngineTask(ctx, task.ID,
+					"Replacement work stopped because of an internal error. Retry the replacement; if it stops again, check its task on the Tasks page.")
+			}
+		},
 	}
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		input, err := taskengine.DecodeInput[storagereplacement.CoordinateInput](execution)
@@ -99,7 +110,7 @@ func (h *TaskHandlers) replacementCoordinateHandler() taskengine.Handler {
 				return h.retryReplacement(execution, row.ID, err, "replacement_source_writes_failed")
 			}
 			if len(incomplete) > 0 {
-				return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "source_writes", "Waiting for current storage writes", nil)
+				return h.waitForSourceWrites(ctx, execution, row, incomplete)
 			}
 			return taskengine.Suspend(model.TaskResumeModeRecover, 0, "activation", "Activating replacement storage service", func(ctx context.Context, repos *repository.Repositories) error {
 				return repos.Replacements.Activate(ctx, row.ID)
@@ -215,6 +226,44 @@ func (h *TaskHandlers) coordinateReplacementItem(
 		})
 	}
 	return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "copy_work", "Waiting for stored content migration", nil)
+}
+
+// waitForSourceWrites holds activation until the writes bound to the source
+// finish. A write whose task failed finishes only through that task's retry; one
+// that cannot be retried would hold the replacement forever, so the replacement
+// fails and names it instead.
+func (h *TaskHandlers) waitForSourceWrites(
+	ctx context.Context,
+	execution taskengine.Execution,
+	replacement *storagereplacement.Replacement,
+	incomplete []model.StorageCopy,
+) taskengine.Result {
+	waitingForRetry := false
+	for i := range incomplete {
+		if incomplete[i].ActiveTaskID == nil {
+			continue
+		}
+		copyTask, err := h.deps.Repositories.Tasks.GetByID(ctx, *incomplete[i].ActiveTaskID)
+		if err != nil {
+			return h.retryReplacement(execution, replacement.ID, err, "replacement_source_writes_failed")
+		}
+		if copyTask == nil || copyTask.Status != model.TaskStatusFailed {
+			continue
+		}
+		if h.taskService != nil && h.taskService.Retryable(copyTask) {
+			waitingForRetry = true
+			continue
+		}
+		message := "a storage write to the current provider failed"
+		if copyTask.LastError != nil {
+			message += ": " + *copyTask.LastError
+		}
+		return h.failReplacement(replacement.ID, errors.New(message), "replacement_source_write_failed")
+	}
+	if waitingForRetry {
+		return taskengine.Suspend(model.TaskResumeModeRecover, storageDependencyWait, "source_writes", "Waiting for a failed storage write to be retried", nil)
+	}
+	return taskengine.Suspend(model.TaskResumeModeRecover, storagePollInterval, "source_writes", "Waiting for current storage writes", nil)
 }
 
 func (h *TaskHandlers) failReplacement(replacementID int64, err error, reason string) taskengine.Result {

@@ -16,6 +16,7 @@ const (
 	CodeTargetUnavailable   = "replacement_target_unavailable"
 	CodeIdempotencyConflict = "replacement_idempotency_conflict"
 	CodeSourceNotCurrent    = "replacement_source_not_current"
+	CodeSourceCreating      = "replacement_source_creating"
 )
 
 // Code maps a replacement error to its stable API code. It returns an empty
@@ -44,6 +45,8 @@ func Code(err error) string {
 		return CodeIdempotencyConflict
 	case errors.Is(err, ErrSourceNotCurrent):
 		return CodeSourceNotCurrent
+	case errors.Is(err, ErrSourceCreating):
+		return CodeSourceCreating
 	default:
 		return ""
 	}

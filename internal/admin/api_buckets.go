@@ -613,9 +613,9 @@ func (s *Server) storageDataSetSummaryResponses(ctx context.Context, summaries [
 			CopyIndex:  summary.CopyIndex,
 			Generation: summary.Generation,
 			IsCurrent:  summary.IsCurrent,
-			// Only the generation that receives writes can be replaced;
-			// replacing a historical one would move nothing.
-			Replaceable:        summary.IsCurrent && summary.Status != model.StorageDataSetStatusRetired,
+			// Only the generation that receives writes can be replaced, and
+			// only once its storage service is ready.
+			Replaceable:        summary.IsCurrent && summary.Status == model.StorageDataSetStatusReady,
 			ProviderID:         summary.ProviderID.String(),
 			ProviderIdentity:   providerIdentityFromSnapshot(identities, summary.ProviderID),
 			DataSetID:          onChainIDStringPtr(summary.DataSetID),

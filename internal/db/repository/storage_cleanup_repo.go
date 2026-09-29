@@ -9,7 +9,7 @@ import (
 
 	"github.com/strahe/synaps3/internal/model"
 	"github.com/strahe/synaps3/internal/storagecommit"
-	"github.com/strahe/synaps3/internal/storagereplacement"
+	"github.com/strahe/synaps3/internal/storagepull"
 	"github.com/uptrace/bun"
 )
 
@@ -253,7 +253,8 @@ func (r *BunStorageCleanupRepo) CleanupHasObjectReferences(ctx context.Context, 
 // FinalizeContent deletes the current-state rows of content whose remote
 // cleanup finished: its cache record, its copies, and the content row. Commit,
 // pull, replacement, cleanup, and deletion ledgers keep their rows and name the
-// content by value. It returns ErrContentCleanupNotReady while anything could
+// content by value; a pull still open for it is abandoned, since nothing can
+// commit it anymore. It returns ErrContentCleanupNotReady while anything could
 // still need those rows, and must run in the caller's transaction.
 func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, generation, taskID int64) error {
 	if contentID < 1 || generation < 1 || taskID < 1 {
@@ -273,6 +274,17 @@ func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, 
 	}
 	if !ready {
 		return ErrContentCleanupNotReady
+	}
+	now := time.Now()
+	if _, err := r.db.NewUpdate().
+		Model((*storagepull.Attempt)(nil)).
+		Set("status = ?", storagepull.AttemptStatusAbandoned).
+		Set("last_error = ?", "stored data was removed").
+		Set("resolved_at = ?", now).
+		Set("updated_at = ?", now).
+		Where("content_id = ? AND resolved_at IS NULL", contentID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("finalizing storage cleanup: abandoning open pulls: %w", err)
 	}
 	if _, err := r.db.NewUpdate().
 		Model((*model.StorageDataSet)(nil)).
@@ -299,8 +311,9 @@ func (r *BunStorageCleanupRepo) FinalizeContent(ctx context.Context, contentID, 
 
 // contentCleanupReady reports whether nothing can still need a cleaned-up
 // content's rows: no live version names it, its bytes are out of the cache with
-// no cache task running, no commit attempt or copy task is still open, and no
-// replacement item that blocks retirement names it.
+// no cache task running, and no commit attempt or copy task is still open.
+// Replacement items do not hold it back; the coordinator cancels an item once
+// its content is gone.
 func contentCleanupReady(ctx context.Context, db bun.IDB, contentID int64) (bool, error) {
 	unreferenced, err := contentIsUnreferenced(ctx, db, contentID)
 	if err != nil || !unreferenced {
@@ -326,12 +339,6 @@ func contentCleanupReady(ctx context.Context, db bun.IDB, contentID int64) (bool
 				WHERE copy_task.id = storage_copy.active_task_id
 				  AND copy_task.status IN (?, ?)
 			)`, model.TaskStatusPending, model.TaskStatusRunning)},
-		// Pending and attention items are the ones ItemStatus.Blocking counts.
-		{"replacement items", db.NewSelect().Model((*storagereplacement.Item)(nil)).
-			Where("content_id = ?", contentID).
-			Where("status IN (?)", bun.List([]storagereplacement.ItemStatus{
-				storagereplacement.ItemStatusPending, storagereplacement.ItemStatusAttention,
-			}))},
 	} {
 		count, err := check.query.Count(ctx)
 		if err != nil {

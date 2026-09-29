@@ -701,8 +701,12 @@ func (h *TaskHandlers) walletHandler() taskengine.Handler {
 		Type: model.TaskTypeWalletOperation, InputVersion: 1,
 		Codec:      taskengine.StrictJSONCodec(func(input *walletoperation.Input) error { return walletoperation.ValidateInput(*input) }),
 		RetryLimit: h.retryLimit(), AllowRetry: true,
+		// Recovery never broadcasts without proof that nothing was sent, so a
+		// failure the Engine recorded itself is as safe to retry as one that
+		// stopped before broadcast.
 		CanManualRetry: func(task *model.Task) bool {
-			return task != nil && task.FailureReason != nil && *task.FailureReason == "wallet_broadcast_not_started"
+			return task != nil && task.FailureReason != nil &&
+				(*task.FailureReason == "wallet_broadcast_not_started" || taskengine.RecoverableEngineFailure(*task.FailureReason))
 		},
 	}
 	return taskHandler{
@@ -736,7 +740,7 @@ func (h *TaskHandlers) executeWalletOperation(ctx context.Context, execution tas
 	}
 	amount, ok := new(big.Int).SetString(op.Amount, 10)
 	if !ok || !validTaskWalletAmount(op.Type, amount) {
-		return taskengine.Fail(errors.New("invalid wallet operation amount"), "invalid_input", func(ctx context.Context, repos *repository.Repositories) error {
+		return taskengine.Fail(errors.New("invalid wallet operation amount"), "wallet_amount_invalid", func(ctx context.Context, repos *repository.Repositories) error {
 			return repos.WalletOperations.MarkFailed(ctx, op.ID, execution.ID(), "invalid wallet operation amount")
 		})
 	}
