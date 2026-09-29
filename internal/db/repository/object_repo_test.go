@@ -537,7 +537,7 @@ func TestObjectRepo_CreateRestoredVersionAndSetCurrent(t *testing.T) {
 }
 
 func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinner(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "restore-objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "restore-objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
 	if err != nil {
 		t.Fatalf("opening sqlite db: %v", err)
 	}
@@ -609,7 +609,7 @@ func TestObjectRepo_CreateRestoredVersionAndSetCurrent_ConcurrentTokenHasOneWinn
 }
 
 func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
 	if err != nil {
 		t.Fatalf("opening sqlite db: %v", err)
 	}
@@ -678,7 +678,7 @@ func TestObjectRepo_CreateVersionAndSetCurrent_ConcurrentFirstUpload(t *testing.
 }
 
 func TestObjectRepo_CreateVersionAndSetCurrentIfChanged_ConcurrentIdenticalWriteReusesCurrent(t *testing.T) {
-	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	sqldb, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "objects.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
 	if err != nil {
 		t.Fatalf("opening sqlite db: %v", err)
 	}

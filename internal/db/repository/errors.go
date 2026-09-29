@@ -67,18 +67,7 @@ func isS3AccountNameUniqueViolation(err error) bool {
 	return strings.Contains(err.Error(), "UNIQUE constraint failed: s3_accounts.name")
 }
 
-func isSQLiteBusy(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
-}
-
 func shouldRetryObjectWrite(err error, canRestartTx bool) bool {
-	if isSQLiteBusy(err) {
-		return true
-	}
 	return canRestartTx && errors.Is(err, errConcurrentObjectCreate)
 }
 

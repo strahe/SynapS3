@@ -275,6 +275,63 @@ func TestNew_SQLiteConcurrentClaimsDoNotBusy(t *testing.T) {
 	}
 }
 
+func TestNew_SQLiteConcurrentReadThenWriteTransactionsDoNotBusy(t *testing.T) {
+	t.Parallel()
+
+	db, err := New(config.DatabaseConfig{
+		Driver:       "sqlite",
+		DSN:          "file:" + filepath.Join(t.TempDir(), "read-then-write.db") + "?_pragma=journal_mode(WAL)",
+		MaxOpenConns: 25,
+		MaxIdleConns: 5,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	if err := RunMigrations(ctx, db); err != nil {
+		t.Fatalf("RunMigrations() error = %v", err)
+	}
+
+	// Each transaction reads before it writes, like an S3 version write, while
+	// the others keep committing in between.
+	repos := repository.NewRepositories(db)
+	const workers, writesPerWorker = 8, 25
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Go(func() {
+			for i := range writesPerWorker {
+				versionID := fmt.Sprintf("01J0000000000000000%02d%05d", worker, i)
+				err := repos.WithTx(ctx, func(txRepos *repository.Repositories) error {
+					if _, err := txRepos.Tasks.CountByStatus(ctx); err != nil {
+						return err
+					}
+					_, _, err := txRepos.Tasks.Enqueue(ctx, &model.Task{
+						Type: model.TaskTypeUploadPlan, IdempotencyKey: "upload-plan:" + versionID,
+						InputVersion: 1, Input: []byte(fmt.Sprintf(`{"version_id":%q}`, versionID)), InputHash: versionID,
+						Status: model.TaskStatusPending, ResumeMode: model.TaskResumeModeExecute, AvailableAt: time.Now(),
+					})
+					return err
+				})
+				if err != nil {
+					t.Errorf("read-then-write transaction error = %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	count, err := db.NewSelect().Model((*model.Task)(nil)).Where("type = ?", model.TaskTypeUploadPlan).Count(ctx)
+	if err != nil {
+		t.Fatalf("counting tasks: %v", err)
+	}
+	if count != workers*writesPerWorker {
+		t.Fatalf("committed tasks = %d, want %d", count, workers*writesPerWorker)
+	}
+}
+
 func TestRunMigrations_ObjectVersionSchema(t *testing.T) {
 	db := newMigratedSQLiteDB(t, "schema.db")
 
@@ -680,15 +737,15 @@ func TestNew_SQLiteRefusesDSNsWithoutForeignKeyEnforcement(t *testing.T) {
 
 func TestEnsureSQLitePragmasDoesNotDuplicateExistingSettings(t *testing.T) {
 	for name, query := range map[string]string{
-		"pragma":     "_pragma=journal_mode(WAL)&_pragma=busy_timeout(7000)&_pragma=foreign_keys(1)",
-		"assignment": "journal_mode=WAL&busy_timeout=7000&foreign_keys=1",
+		"pragma":     "_pragma=journal_mode(WAL)&_pragma=busy_timeout(7000)&_pragma=foreign_keys(1)&_txlock=exclusive",
+		"assignment": "journal_mode=WAL&busy_timeout=7000&foreign_keys=1&_txlock=exclusive",
 	} {
 		t.Run(name, func(t *testing.T) {
 			dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3.db")) + "?" + query
 
 			got := ensureSQLitePragmas(dsn)
 
-			for _, want := range []string{"journal_mode", "busy_timeout", "foreign_keys"} {
+			for _, want := range []string{"journal_mode", "busy_timeout", "foreign_keys", "_txlock"} {
 				if count := strings.Count(strings.ToLower(got), want); count != 1 {
 					t.Fatalf("%s count = %d in %q, want 1", want, count, got)
 				}
@@ -696,17 +753,20 @@ func TestEnsureSQLitePragmasDoesNotDuplicateExistingSettings(t *testing.T) {
 			if !strings.Contains(got, "busy_timeout=7000") && !strings.Contains(got, "busy_timeout(7000)") {
 				t.Fatalf("managed pragmas overwrote existing busy_timeout: %q", got)
 			}
+			if !strings.Contains(got, "_txlock=exclusive") {
+				t.Fatalf("managed settings overwrote existing _txlock: %q", got)
+			}
 		})
 	}
 }
 
 func TestEnsureSQLitePragmasIgnoresSimilarQueryParameters(t *testing.T) {
 	dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3.db")) +
-		"?journal_mode_override=WAL&note=foreign_keys(1)&busy_timeout_ms=7000"
+		"?journal_mode_override=WAL&note=foreign_keys(1)&busy_timeout_ms=7000&txlock=deferred"
 
 	got := ensureSQLitePragmas(dsn)
 
-	for _, want := range []string{"journal_mode(WAL)", "foreign_keys(1)", "busy_timeout(5000)"} {
+	for _, want := range []string{"journal_mode(WAL)", "foreign_keys(1)", "busy_timeout(5000)", "_txlock=immediate"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("ensureSQLitePragmas() = %q, want %s", got, want)
 		}
@@ -719,7 +779,7 @@ func TestEnsureSQLitePragmasDoesNotAddWALForMemoryDSN(t *testing.T) {
 		if strings.Contains(strings.ToLower(got), "journal_mode") {
 			t.Fatalf("ensureSQLitePragmas(%q) = %q, want no journal_mode", dsn, got)
 		}
-		for _, want := range []string{"foreign_keys(1)", "busy_timeout(5000)"} {
+		for _, want := range []string{"foreign_keys(1)", "busy_timeout(5000)", "_txlock=immediate"} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("ensureSQLitePragmas(%q) = %q, want %s", dsn, got, want)
 			}

@@ -51,7 +51,7 @@ func NewTestFileDB(t *testing.T) *bun.DB {
 	t.Helper()
 
 	path := filepath.ToSlash(filepath.Join(t.TempDir(), "synaps3-test.db"))
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
 	return newTestSQLiteDB(t, dsn)
 }
 

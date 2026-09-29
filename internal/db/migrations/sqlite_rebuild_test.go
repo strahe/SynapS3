@@ -19,7 +19,7 @@ func newSQLiteRebuildDB(t *testing.T) *bun.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "rebuild.db")
 	sqldb, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+
-		"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+		"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate")
 	if err != nil {
 		t.Fatal(err)
 	}
