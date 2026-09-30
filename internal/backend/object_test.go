@@ -539,7 +539,7 @@ func TestPutObject_HappyPath(t *testing.T) {
 	}
 }
 
-func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
+func TestPutObjectRejectsInvalidBodySize(t *testing.T) {
 	tests := []struct {
 		name          string
 		body          string
@@ -557,6 +557,12 @@ func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
 			contentLength: ptrInt64(chain.MaxUploadSize + 1),
 			wantCode:      s3err.ErrEntityTooLarge,
 		},
+		{
+			name:          "body longer than declared length",
+			body:          validTestObjectBody("body") + "x",
+			contentLength: ptrInt64(chain.MinUploadSize),
+			wantCode:      s3err.ErrContentLengthMismatch,
+		},
 	}
 
 	for _, tt := range tests {
@@ -572,7 +578,7 @@ func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
 				ContentLength: tt.contentLength,
 			})
 			if err == nil {
-				t.Fatal("expected size limit error")
+				t.Fatal("expected body size error")
 			}
 			apiErr, ok := err.(s3err.APIError)
 			if !ok {
@@ -580,6 +586,9 @@ func TestPutObjectRejectsFOCUploadSizeLimits(t *testing.T) {
 			}
 			if want := s3err.GetAPIError(tt.wantCode); apiErr.Code != want.Code {
 				t.Fatalf("error code = %s, want %s", apiErr.Code, want.Code)
+			}
+			if used := tb.cache.UsedBytes(); used != 0 {
+				t.Fatalf("rejected body left %d bytes in the cache", used)
 			}
 		})
 	}

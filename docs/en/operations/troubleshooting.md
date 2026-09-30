@@ -112,7 +112,7 @@ Recovery options:
 - Use `after_upload` only when each version should be removed asynchronously after its bucket's minimum durable copies commit.
 - Use `none` when automatic removal must be disabled.
 
-LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. A refused write starts background cleanup but does not wait for it, so `503 SlowDown` can continue until cleanup catches up or safe candidates become available. Default S3 client retries may give up sooner; retry the upload later.
+LRU cannot remove multipart staging data, versions below their bucket's minimum durable copies, or versions without a readable committed remote copy. With `lru`, a refused write requests background cleanup when usage exceeds the effective low watermark. Writes do not wait for cleanup, so `503 SlowDown` can continue until cleanup catches up or safe candidates become available. Default S3 client retries may give up sooner; retry the upload later.
 
 Failed LRU deletion tasks remain visible as failed work. Fix the reported filesystem or database problem first; use `synaps3 admin task retry <id>` when the task is marked retryable.
 

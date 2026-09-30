@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -58,6 +59,7 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		Codec:      taskengine.StrictJSONCodec(func(input *systemtask.Input) error { return systemtask.ValidateInput(*input) }),
 		RetryLimit: nil, AllowRetry: true,
 	}
+	var pendingWriteRefusal atomic.Bool
 	run := func(ctx context.Context, execution taskengine.Execution) taskengine.Result {
 		if h.deps.EvictionPolicy != cache.EvictionPolicyLRU {
 			return taskengine.Suspend(model.TaskResumeModeExecute, taskGCInterval, "scheduled", "Automatic cache cleanup is disabled", nil)
@@ -78,7 +80,8 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		// A refused write starts a cycle below the high watermark too: when the
 		// headroom above it is smaller than the write, usage would otherwise never
 		// reach the watermark and the write would be refused indefinitely.
-		writeRefused := h.deps.Cache.ConsumeWriteRefusal()
+		writeRefused := pendingWriteRefusal.Swap(false)
+		writeRefused = h.deps.Cache.ConsumeWriteRefusal() || writeRefused
 		cycleActive := checkpoint.CycleActive
 		switch {
 		case usedBytes <= lowBytes:
@@ -89,6 +92,9 @@ func (h *TaskHandlers) cacheCapacityHandler() taskengine.Handler {
 		if cycleActive != checkpoint.CycleActive {
 			checkpoint.CycleActive = cycleActive
 			if err := execution.WriteCheckpoint(ctx, checkpoint); err != nil {
+				if writeRefused {
+					pendingWriteRefusal.Store(true)
+				}
 				return retryTask(err, "cache_capacity_checkpoint_failed")
 			}
 		}

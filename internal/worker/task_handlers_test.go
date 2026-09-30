@@ -1813,14 +1813,16 @@ func TestCacheCapacityTaskStaysPendingWhenLRUDisabled(t *testing.T) {
 func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 	// A 30-byte cache with watermarks at 27 and 18 bytes holds three 11-byte items.
 	tests := []struct {
-		name          string
-		used          int64
-		writeRefused  bool
-		maxWriteBytes int64
-		wantEvicted   int
+		name           string
+		used           int64
+		writeRefused   bool
+		failCheckpoint bool
+		maxWriteBytes  int64
+		wantEvicted    int
 	}{
 		{name: "usage at high watermark", used: 33, wantEvicted: 2},
 		{name: "write refused below high watermark", used: 22, writeRefused: true, wantEvicted: 1},
+		{name: "write refusal survives checkpoint failure", used: 22, writeRefused: true, failCheckpoint: true, wantEvicted: 1},
 		// A 25-byte write leaves room for only 5 bytes of cached data, below the
 		// low watermark.
 		{name: "cleanup keeps room for the largest write", used: 12, writeRefused: true, maxWriteBytes: 25, wantEvicted: 1},
@@ -1861,8 +1863,24 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 			if err != nil || !created {
 				t.Fatalf("enqueue cache capacity task = %#v created=%v err=%v", planner, created, err)
 			}
+			if tt.failCheckpoint {
+				if _, err := runtime.db.ExecContext(t.Context(), `CREATE TRIGGER fail_capacity_checkpoint BEFORE UPDATE OF checkpoint_json ON task_payloads
+					BEGIN SELECT RAISE(FAIL, 'injected checkpoint failure'); END`); err != nil {
+					t.Fatalf("install checkpoint fault: %v", err)
+				}
+			}
 			cancel, done := runHandlerEngine(t, runtime)
 			defer stopHandlerEngine(t, cancel, done)
+			if tt.failCheckpoint {
+				waitForTask(t, runtime.repos, planner.ID, func(task *model.Task) bool {
+					return task.Status == model.TaskStatusPending && task.RetryCount > 0 &&
+						task.LastError != nil && strings.Contains(*task.LastError, "injected checkpoint failure")
+				})
+				if _, err := runtime.db.ExecContext(t.Context(), `DROP TRIGGER fail_capacity_checkpoint`); err != nil {
+					t.Fatalf("remove checkpoint fault: %v", err)
+				}
+				wakeTask(t, runtime, planner.ID)
+			}
 
 			wantUsed := tt.used - int64(tt.wantEvicted)*11
 			deadline := time.Now().Add(3 * time.Second)
