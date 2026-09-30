@@ -78,6 +78,7 @@ type handlerRuntimeOptions struct {
 	}
 	policy               cache.EvictionPolicy
 	maxBytes             int64
+	maxWriteBytes        int64
 	highPercent          int
 	lowPercent           int
 	concurrency          int
@@ -130,7 +131,7 @@ func newHandlerTestRuntime(t *testing.T, options handlerRuntimeOptions) handlerT
 		Terminator:             options.terminator, Epochs: options.epochs,
 		ParkedPieces:  options.parkedPieces,
 		Observability: observabilityService, UploadSpeedProbe: options.uploadSpeedProbe,
-		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes,
+		EvictionPolicy: options.policy, MaxCacheBytes: options.maxBytes, MaxWriteBytes: options.maxWriteBytes,
 		LRUHighPercent: options.highPercent, LRULowPercent: options.lowPercent,
 		DefaultCopies: 2, MaxRetries: maxRetries, Logger: slog.Default(),
 	})
@@ -1809,16 +1810,20 @@ func TestCacheCapacityTaskStaysPendingWhenLRUDisabled(t *testing.T) {
 	}
 }
 
-func TestCacheCapacityTaskEvictsLRUItemsOnlyToLowWatermark(t *testing.T) {
+func TestCacheCapacityTaskEvictsLRUItemsOnlyToCleanupTarget(t *testing.T) {
 	// A 30-byte cache with watermarks at 27 and 18 bytes holds three 11-byte items.
 	tests := []struct {
-		name         string
-		used         int64
-		writeRefused bool
-		wantEvicted  int
+		name          string
+		used          int64
+		writeRefused  bool
+		maxWriteBytes int64
+		wantEvicted   int
 	}{
 		{name: "usage at high watermark", used: 33, wantEvicted: 2},
 		{name: "write refused below high watermark", used: 22, writeRefused: true, wantEvicted: 1},
+		// A 25-byte write leaves room for only 5 bytes of cached data, below the
+		// low watermark.
+		{name: "cleanup keeps room for the largest write", used: 12, writeRefused: true, maxWriteBytes: 25, wantEvicted: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1841,7 +1846,7 @@ func TestCacheCapacityTaskEvictsLRUItemsOnlyToLowWatermark(t *testing.T) {
 			}
 			runtime := newHandlerTestRuntime(t, handlerRuntimeOptions{
 				cache: cacheStore, policy: cache.EvictionPolicyLRU, maxBytes: 30,
-				highPercent: 90, lowPercent: 60, concurrency: 1,
+				maxWriteBytes: tt.maxWriteBytes, highPercent: 90, lowPercent: 60, concurrency: 1,
 			})
 			base := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Microsecond)
 			versions := []*model.ObjectVersion{

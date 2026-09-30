@@ -38,6 +38,7 @@ type TaskHandlerDependencies struct {
 	ParkedPieces           synapse.ParkedPieceChecker
 	EvictionPolicy         cache.EvictionPolicy
 	MaxCacheBytes          int64
+	MaxWriteBytes          int64 // largest single cache write; 0 means no room is kept for it
 	LRUHighPercent         int
 	LRULowPercent          int
 	DefaultCopies          int

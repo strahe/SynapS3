@@ -88,6 +88,12 @@ func (b *SynapseBackend) UploadPart(ctx context.Context, input *s3.UploadPartInp
 		return nil, s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, fmt.Sprint(*input.PartNumber))
 	}
 
+	// A part is reserved at its declared length, so an oversized one is rejected
+	// before it can be mistaken for a full cache.
+	if input.ContentLength != nil && *input.ContentLength > objectlimits.MaxFOCUploadSize {
+		return nil, objectSizeAPIError(&objectlimits.SizeError{Size: *input.ContentLength, Err: objectlimits.ErrTooLarge})
+	}
+
 	cacheInfo, err := b.cache.PutPart(ctx, *input.UploadId, partNum, objectlimits.LimitFOCUploadReader(input.Body), declaredWriteSize(input.ContentLength))
 	if err != nil {
 		if errors.Is(err, objectlimits.ErrTooLarge) {

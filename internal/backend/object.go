@@ -1073,6 +1073,7 @@ func contentWriteError(err error) error {
 
 // declaredWriteSize is the capacity a write reserves in the cache: its
 // declared length, or the largest object size when no length was declared.
+// Callers reject a declared length above the largest object size first.
 func declaredWriteSize(contentLength *int64) int64 {
 	if contentLength == nil || *contentLength <= 0 {
 		return objectlimits.MaxFOCUploadSize

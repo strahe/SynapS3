@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -575,21 +576,57 @@ func TestPutStagedHoldsCapacityUntilCommitOrRollback(t *testing.T) {
 	}
 }
 
-func TestPutRejectsBodyLongerThanDeclaredSize(t *testing.T) {
+func TestWriteRejectsBodyLongerThanDeclaredSize(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name  string
+		write func(fs *Filesystem, body string, size int64) error
+	}{
+		{name: "Put", write: func(fs *Filesystem, body string, size int64) error {
+			_, err := fs.Put(ctx, "bkt", "key", strings.NewReader(body), size)
+			return err
+		}},
+		{name: "PutPart", write: func(fs *Filesystem, body string, size int64) error {
+			_, err := fs.PutPart(ctx, "upload", 1, strings.NewReader(body), size)
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, err := NewFilesystem(t.TempDir(), 10)
+			if err != nil {
+				t.Fatalf("NewFilesystem: %v", err)
+			}
+
+			if err := tt.write(fs, "12345", 4); !errors.Is(err, ErrSizeExceeded) {
+				t.Fatalf("longer body err = %v, want ErrSizeExceeded", err)
+			}
+			if fs.UsedBytes() != 0 {
+				t.Fatalf("rejected write left %d bytes in the cache", fs.UsedBytes())
+			}
+			if err := tt.write(fs, "1234567890", 10); err != nil {
+				t.Fatalf("write after rejected write released its hold: %v", err)
+			}
+		})
+	}
+}
+
+func TestPutRefusesDeclaredSizeThatOverflowsAccounting(t *testing.T) {
 	ctx := context.Background()
 	fs, err := NewFilesystem(t.TempDir(), 10)
 	if err != nil {
 		t.Fatalf("NewFilesystem: %v", err)
 	}
+	if _, err := fs.Put(ctx, "bkt", "seed", strings.NewReader("a"), 1); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
-	if _, err := fs.Put(ctx, "bkt", "key", strings.NewReader("12345"), 4); !errors.Is(err, ErrSizeExceeded) {
-		t.Fatalf("Put longer body err = %v, want ErrSizeExceeded", err)
+	if _, err := fs.PutStaged(ctx, "bkt", "huge", unreadBody{t}, math.MaxInt64); err != ErrCacheFull {
+		t.Fatalf("PutStaged of MaxInt64 bytes err = %v, want ErrCacheFull", err)
 	}
-	if fs.Exists(ctx, "bkt", "key") {
-		t.Fatal("rejected write left a cache entry")
-	}
-	if _, err := fs.Put(ctx, "bkt", "key", strings.NewReader("1234567890"), 10); err != nil {
-		t.Fatalf("Put after rejected write released its hold: %v", err)
+	// Nothing was held, so a write that fits is still admitted.
+	if _, err := fs.Put(ctx, "bkt", "fits", strings.NewReader("123456789"), 9); err != nil {
+		t.Fatalf("Put after refused huge write: %v", err)
 	}
 }
 

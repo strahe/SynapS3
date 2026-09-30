@@ -59,7 +59,7 @@ Multipart uploads keep parts in local storage until completion. Completing an up
 | Cache disk is full | New writes can fail before Filecoin storage is involved. |
 | Background storage is not running | Confirmed writes remain local, but remote storage will not progress. |
 | Cache entry is evicted | Reads can still succeed when remote metadata exists and retrieval works. |
-| LRU has no safe candidate | Existing unsafe or in-progress data remains local; new writes can still fail with insufficient storage. |
+| LRU has no safe candidate | Existing unsafe or in-progress data remains local; new writes can still be refused with `SlowDown`. |
 | Database commit fails | The S3 write does not return success. |
 
 For capacity and recovery steps, see [Runtime Data](../configuration/runtime-data.md) and [Troubleshooting](../operations/troubleshooting.md).

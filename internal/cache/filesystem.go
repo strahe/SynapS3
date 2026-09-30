@@ -68,7 +68,8 @@ func (f *Filesystem) reserve(size int64) (*capacityReservation, error) {
 	}
 	f.capacityMu.Lock()
 	defer f.capacityMu.Unlock()
-	if f.usedBytes.Load()+f.reservedBytes+size > f.maxBytes {
+	// Compared as remaining room so a huge size cannot overflow the sum.
+	if size > f.maxBytes-f.usedBytes.Load()-f.reservedBytes {
 		f.writeRefused.Store(true)
 		return nil, ErrCacheFull
 	}
